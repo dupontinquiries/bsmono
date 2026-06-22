@@ -21,7 +21,7 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac; shift
 done
-HOST="$(rustc -vV 2>/dev/null | sed -n 's/^host: //p')"; HOST="${HOST:-x86_64-unknown-linux-gnu}"
+HOST="$( { rustc -vV 2>/dev/null || true; } | sed -n 's/^host: //p' || true)"; HOST="${HOST:-x86_64-unknown-linux-gnu}"
 
 rows="$(python3 - "$ROOT" <<'PY'
 import sys, os, tomllib

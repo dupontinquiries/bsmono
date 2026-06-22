@@ -12,7 +12,7 @@ role = "app"
 daemon = false
 flatpak = true
 runtime = "freedesktop"
-targets = ["desktop", "phone"]
+targets = ["desktop", "phone", "x86"]
 notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"
 
 [apps.voiceterm]
