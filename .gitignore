@@ -16,3 +16,8 @@ __pycache__/
 # on the next `gin import`). Config + README are tracked.
 /.gitmind/*.redb
 /.gitmind/store.redb
+
+# compiled shaders (.spv) are build artifacts regenerated from GLSL — don't track
+# new ones. (Pre-existing assets/shaders/*.spv stay tracked until the shader
+# build pipeline is wired to compile-on-build; see KITS_AND_BOUNDARIES / build-wiring.)
+*.spv

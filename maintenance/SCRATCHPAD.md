@@ -41,13 +41,14 @@ _(empty — current dump triaged below)_
   Candidate: a small Rust `repo-doctor` that wraps the static checks.
 - **B4 — Recommend additional tools, doc in the Claude AI docs.** `done→living`
   See `maintenance/TOOLING.md` (recommended set + rationale).
-- **B5 — Nix tooling (discussion open).** `idea (user interested)`
+- **B5 — Nix tooling (discussion open).** `idea (user interested; add as we go)`
   Strong fit for this repo's pain: many system deps (Qt6/gstreamer/vulkan/gtk4),
-  the dual 1.75+1.96 toolchain, and cross targets (aarch64/musl) all want
+  the dual 1.75+1.96 toolchain, and cross targets (aarch64/x86/riscv) all want
   reproducible pinning. A `flake.nix` dev shell + cross toolchains would make the
   build host reproducible; tradeoff is the learning/maintenance curve, and
-  flatpak already covers app *distribution*. Next: sketch a flake (devShell +
-  the two rustc versions + the apt deps as nix pkgs) for discussion.
+  flatpak already covers app *distribution*. User is fine adding nix artifacts
+  incrementally (like the gitmind fixture). Next: seed a starter `flake.nix`
+  (devShell + both rustc versions + the apt deps as nix pkgs) for discussion.
 
 ## C. snapclone FFI → full Rust (oxidation)
 
@@ -98,11 +99,17 @@ _(empty — current dump triaged below)_
   the right model is checkpoint-based: run `verify.sh` (fast static suspenders)
   plus a targeted `cargo check`/test on the crate I touched, occasionally,
   rather than streaming on every save.
+- **F6 — gitmind vs nested `.git` (cargo makes repos by default).** `idea`
+  `cargo new` creates a `.git` per crate; in a monorepo we don't want nested
+  repos. Quick upgrades to weigh: set `[cargo-new] vcs = "none"` (cargo config)
+  so new crates don't spawn `.git`; and check how `gin import` treats any nested
+  `.git` (ignore / submodule / choke) — possibly teach it to skip them.
 
 ## G. Kits, FFI boundaries, shared libs (planning)
 
-- **G1 — Start planning kits / FFI boundaries / shared libs.** `idea (start)`
-  Seeds to develop into `docs/architecture/KITS_AND_BOUNDARIES.md`:
+- **G1 — Kits / FFI boundaries / shared libs.** `in-progress`
+  First-pass plan written: **`docs/architecture/KITS_AND_BOUNDARIES.md`** (FFI
+  inventory + keep/oxidize/kit-ify + build-shape impact). Key seeds:
   - *Shared-lib candidates:* `peek` (already shared at tools/peek; lib API
     `view::read_to_string`), `gitmind-core` (CLI+GUI share it — the "can't drift"
     model), network-sim/`snapclone-net-intel` (→ a test harness, cf. E1),
@@ -112,8 +119,41 @@ _(empty — current dump triaged below)_
     Rust↔Qt, photosync C++ gui ↔ Rust daemon, unendlich Rust↔Vulkan/shaders.
   - *Kit candidates (from the original handoff):* experimentkit, gesturekit
     (bot-arena), the looking-glass pattern as the extraction discipline.
-  - First pass: classify each FFI seam as keep / oxidize / kit-ify, and name the
-    shared crates worth lifting to a top-level `shared/` or `crates/`.
+  - *New (this round):* unendlich's **linkme autoloader** is the **registry-kit**
+    (highest-value, pure-Rust, self-contained lift); build **variants** —
+    integrated snapclone+unendlich *sharing the DHT* vs *lean* playtester builds
+    without snapclone bloat — reshape the build via a `dht` cargo feature + a
+    top-level `shared/` layer. Sequencing is in the doc.
+
+## H. Deployment / install / uninstall
+
+- **H1 — Clean, low-effort teardown of system installs.** `idea`
+  Once systemd units + virtual keyboards get installed on a host, undoing them
+  should be smart and not manual. Track what each deploy installs (units, vkbd,
+  firewall rules) so a single `--uninstall` reverses it. Make install/uninstall
+  a **deployment stage** in the build scripts (alongside build/flatpak).
+  snapclone already ships systemd units — model the teardown there first.
+- **H2 — Phone installer GUI + self-hosted distribution.** `idea`
+  Ship an installer graphic for the phones that pulls from a good CDN ref / IP
+  hosting a basic server (**dufs** + solid firewall patches) and lets users pick
+  which actions to apply. Dovetails with the ops-doc self-hosted flatpak repo.
+
+## Build-shape & hardware reality (this round)
+
+- **Targets corrected** in `manifest/targets.toml`: build HOST is **aarch64
+  (Asahi, 16K pages)**; phone fleet is **aarch64 musl (FP5 pmOS/Alpine, ~4K
+  pages)**; **x86** and **riscv** are CROSS targets (no x86 hardware) — games
+  must reach x86 (added to unendlich) and eventually riscv. Mind 16K-vs-4K page
+  assumptions. This is *why* cross + snapclone oxidation matter.
+- **LOC north-star:** ~600K now; the kits/FFI work should trend it **down**
+  (dedup, fewer copies) — a maintainability goal, not size for its own sake.
+- **`.spv` shaders:** added a `*.spv` gitignore catch-all (stop runtime-generated
+  shaders littering). Pre-existing `assets/shaders/*.spv` stay tracked until the
+  shader pipeline compiles-on-build; build/test scripts should also run from a
+  scratch PWD so artifacts don't land in the repo. (TODO with build-wiring.)
+- **Stale monorepo unendlich:** the monorepo copy is a snapshot; the geom_probe
+  fix happened in the *standalone* unendlich repo, so verify here still shows
+  `PROBLEMS(5)`. Open: how to sync per-project fixes back (subtree pull? re-import?).
 
 ---
 
@@ -129,7 +169,7 @@ _(empty — current dump triaged below)_
 - `gitmind` (`gin` CLI) — **reliable core** (Trial 1). Builds clean; round-trip
   git→.gitmind→git is byte-faithful. GUI crate (Qt) untested/the "broken" part.
 
-## Portfolio LOC snapshot (rust, this tree)
+## Portfolio LOC snapshot (~600K total, tokei on the user's aarch64 host)
 
 unendlich 303K · voiceterm 135K · bo-suite 75K · logscope 50K · snapclone 42K ·
 ambient-learner 22K · bot-arena 13K · av1tuner 10K · gitmind 9K · photosync 1.1K ·
