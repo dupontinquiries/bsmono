@@ -46,6 +46,32 @@ rustflags = ["-C", "link-arg=-fuse-ld=mold"]
   (useful for unendlich's large tree).
 - **typos** — fast source typo check; cheap CI suspender.
 
+## System dependencies (apt) — for the build host
+
+Direct answer to "anything else permanent via apt?": **nothing apt-installs
+persists in the authoring sandbox** (it resets each session), and system
+packages can't live in the repo. So the durable form is this documented set,
+installed on your build host / CI image:
+
+```sh
+# toolchain + linker + native build
+sudo apt-get install -y build-essential clang mold cmake ninja-build pkg-config
+# Qt apps (voiceterm, bo-suite, and other Qt-cdylib frontends)
+sudo apt-get install -y qt6-base-dev qt6-declarative-dev
+# unendlich (Vulkan)
+sudo apt-get install -y libvulkan-dev vulkan-validationlayers glslang-tools
+# snapclone (GStreamer + the vendored opendht's deps)
+sudo apt-get install -y libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                        nettle-dev libgnutls28-dev libmsgpack-dev libargon2-dev
+# bot-arena (GTK4)
+sudo apt-get install -y libgtk-4-dev
+```
+
+(Verify exact package names against each project's build docs during the
+build-wiring stage; this is the starting set, not a guarantee.) The Rust cargo
+tools above (sccache/tokei/nextest/…) install per-user via `cargo install` or
+prebuilt binaries — not apt.
+
 ## Dual-toolchain matrix (which projects want what)
 
 - `kanal`-using benches → 1.75 (rustc < 1.81).

@@ -29,6 +29,35 @@ Ran against the canonical monorepo `main` (placeholder `.gitmind/` set aside).
 on full reconstruction). The only cost observed is a larger on-disk store than
 git's packfile. The upstream "broken" marker refers to the GUI, not the CLI.
 
+## Trial 2 — compression lever (2026-06-22)
+
+Tested the obvious space lever: the chunk store's `ZSTD_LEVEL` (9 → 19; the
+format is self-describing, so the level changes without migration and FastCDC
+boundaries — hence dedup — are untouched). Measured the 9-vs-19 delta directly
+on the repo's bytes, chunked at 64 KiB the way the store chunks them:
+
+| level | total | vs zstd-9 |
+|---|---|---|
+| zstd-9  | 81.1 MB | — |
+| zstd-19 | 79.9 MB | **−1.5%** |
+
+**Below the 5–10% bar → reverted.** The repo is mostly source text (compresses
+about the same at 9 and 19) plus already-compressed media. The real 110-vs-84 MB
+gap is git's **delta** compression, which a zstd level can't replicate. Logged
+"delta compression in the chunk store" as the real (bigger) lever in SCRATCHPAD.
+Fidelity is level-independent (zstd is lossless; Trial 1's byte-faithful
+round-trip stands).
+
+## .gitmind as a permanent fixture
+
+Made permanent **reproducibly**: `store.redb` is gitignored and rebuilt by
+`maintenance/gitmind-sync.sh` (`gin import`). Committing the raw store was
+rejected — it would ~double `.git` (redb is incompressible to git and can't
+delta) and a committed store would self-reference on the next import. Because
+the store is gitignored it is never a tracked git object, so `import` (which
+reads the git graph) never re-ingests it. Tracked: `.gitmind/config.toml` +
+`.gitmind/README.md`.
+
 ## Open questions for further trials
 
 - Does `.gitmind` stay correct after `native-commit` / `merge` / `rebase`

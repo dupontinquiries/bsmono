@@ -1,7 +1,9 @@
-# gitmind graph store — SCAFFOLD ONLY.
-# Populate on hardware with the gitmind CLI (`gin`); this file is a placeholder so
-# `.git` and `.gitmind` coexist from the first commit.
+# gitmind fixture — PERMANENT but REPRODUCIBLE.
+# The .gitmind object store (store.redb) is gitignored and rebuilt on demand by
+# maintenance/gitmind-sync.sh (`gin import`), so .gitmind is always present and
+# in-sync without bloating .git. This keeps git and gitmind side-by-side.
 [gitmind]
-version = 0
-initialized = false   # set by `gin init`
-note = "Tracks the monorepo as a concept/graph alongside git history."
+version = 1
+store = "store.redb"          # gitignored; regenerated, not committed
+committed_store = false       # see maintenance/gitmind-sync.sh and gitmind-eval.md
+zstd_level = 9                # level 19 saved only ~1.5% here (below the bar); kept at 9
