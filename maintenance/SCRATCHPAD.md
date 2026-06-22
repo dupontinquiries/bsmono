@@ -19,10 +19,12 @@ _(empty — current dump triaged below)_
   Inventory done (~40 docs, heavily clustered in `apps/unendlich/handoff/`).
   Catalog + unification plan now live at **`docs/agents/INDEX.md`**. Next:
   the link scheme so **web2qml/voiceterm users navigate via ZBrackets**.
-- **A2 — "Claude-specific vs general-LLM" notes file.** `queued`
-  Planned as `docs/agents/claude-vs-general.md`: separate Claude-specific
-  guidance from what generalizes, and what maps onto **logscope's tree-based
-  development** approach. (Synthesis step — pending greenlight.)
+- **A2 — "Claude-specific vs general-LLM" notes file.** `done`
+  Written: `docs/agents/claude-vs-general.md` — Claude-specific vs general-LLM
+  guidance + the logscope tree-based-development mapping; ZBracket cross-links.
+- **A3 — NEWCOMER_DEVELOPER.md (what each build-system tool does).** `done`
+  Root-level map of the entry points (verify.sh, build/build.sh, flatpak.sh,
+  gitmind-sync.sh), the manifests, the suspenders, and "first things to run".
 
 ## B. Tooling & maintenance dir (this directory)
 
@@ -39,6 +41,13 @@ _(empty — current dump triaged below)_
   Candidate: a small Rust `repo-doctor` that wraps the static checks.
 - **B4 — Recommend additional tools, doc in the Claude AI docs.** `done→living`
   See `maintenance/TOOLING.md` (recommended set + rationale).
+- **B5 — Nix tooling (discussion open).** `idea (user interested)`
+  Strong fit for this repo's pain: many system deps (Qt6/gstreamer/vulkan/gtk4),
+  the dual 1.75+1.96 toolchain, and cross targets (aarch64/musl) all want
+  reproducible pinning. A `flake.nix` dev shell + cross toolchains would make the
+  build host reproducible; tradeoff is the learning/maintenance curve, and
+  flatpak already covers app *distribution*. Next: sketch a flake (devShell +
+  the two rustc versions + the apt deps as nix pkgs) for discussion.
 
 ## C. snapclone FFI → full Rust (oxidation)
 
@@ -76,6 +85,35 @@ _(empty — current dump triaged below)_
   The 110-vs-84 MB gap vs `.git` is delta compression, not zstd level. A
   cross-chunk/cross-object delta scheme (the store is BLAKE3-addressed, FastCDC
   64K) could close or beat it. Bigger change than a level bump — a real project.
+- **F4 — gitmind branches for UI/UX base-swap experiments.** `idea`
+  When weighing "who has better UI/UX, w2q or snapclone", spike it: use gitmind
+  native branches / **`gin graft`** ("field-test another repo on a branch") to
+  take one app's UI code as the base for another, let the agent iterate, then
+  build/test/feel-out the quirks to inform the decision. graft is built for
+  exactly this. Needs a Qt6 host to actually build/feel the result.
+- **F5 — Live break-detection hook vs checkpoint checks.** `decided`
+  For the **human dev on hardware**: `gin watch` (autosnapshot on save) + a
+  build/test hook is cheap (background) and great. For the **agent (me)**: a
+  live per-save hook is high-token *and* doesn't survive the sandbox reset — so
+  the right model is checkpoint-based: run `verify.sh` (fast static suspenders)
+  plus a targeted `cargo check`/test on the crate I touched, occasionally,
+  rather than streaming on every save.
+
+## G. Kits, FFI boundaries, shared libs (planning)
+
+- **G1 — Start planning kits / FFI boundaries / shared libs.** `idea (start)`
+  Seeds to develop into `docs/architecture/KITS_AND_BOUNDARIES.md`:
+  - *Shared-lib candidates:* `peek` (already shared at tools/peek; lib API
+    `view::read_to_string`), `gitmind-core` (CLI+GUI share it — the "can't drift"
+    model), network-sim/`snapclone-net-intel` (→ a test harness, cf. E1),
+    rustcheck's check logic, a future `snapcore-protocol` (ops-doc) crate.
+  - *FFI boundaries already in the tree:* snapclone Rust↔C++ DataBus (canonical;
+    oxidation target C1), voiceterm Rust↔Qt (qmetaobject cdylib), gitmind-gui
+    Rust↔Qt, photosync C++ gui ↔ Rust daemon, unendlich Rust↔Vulkan/shaders.
+  - *Kit candidates (from the original handoff):* experimentkit, gesturekit
+    (bot-arena), the looking-glass pattern as the extraction discipline.
+  - First pass: classify each FFI seam as keep / oxidize / kit-ify, and name the
+    shared crates worth lifting to a top-level `shared/` or `crates/`.
 
 ---
 
