@@ -74,6 +74,24 @@ _(empty — current dump triaged below)_
   adds; all the flags are captured in the doc. **First lift = crypto-kit** (pure
   Rust, no FFI). Aligns with the ops-doc snapcore-daemon + the integrated/lean
   `dht` feature (build-variant split).
+  **Code-checked (this round):** snapclone's address-bearing rendezvous is
+  **C++** (`JamiAdapter_dht_impl.cpp`: CONNREQ value `from_sc_id\nhost:port\n
+  punch_host:punch_port\nts`, key `sha1(target+"/connreq")`, 10-min TTL == DHT
+  TTL). So the Rust trait basis is **unendlich's pure-Rust `dht_mailbox` +
+  `net_rendezvous`**, validated against snapclone's CONNREQ semantics + the
+  IP-protection invariant; the C++ OpenDHT backend stays **behind the daemon**.
+  The Rust mailbox crate is entry-model + the approval lifecycle (pure `&mut
+  self`, idempotent → trait-clean) + crypto. **Decisions:** apps go **async**
+  (no sync-compat shim in the kit — break + port them). Add a **ShuffleManager**
+  in snapcore: freshness-aware republish/placement (alive subset → fresh slot
+  with new TTL = the GC "new home"); onion-indirection layering = **v2** (privacy
+  network-effect, but costs lookup hops). Gate it on a **`Lifetime`/`is_shortlived()`
+  flag** on share-kit entries — set the flag now, implement only the ephemeral
+  path. **Long-term demand is real:** logscope is a serving fleet
+  (FLEET/PREWARM/SERVING + `gpu-gemm` serve/netserve) = persistent sessions;
+  voiceterm wants self-hosted notes/sessions + a `hive` tool-drop
+  (`voiceterm/src/sandbox.rs`). Durable elements likely host via **dufs (§H)**,
+  not pure DHT.
 
 ## E. CI: network simulation + quick-check tooling
 
