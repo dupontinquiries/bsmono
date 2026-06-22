@@ -1,9 +1,9 @@
 # AI-agent docs — index
 
 Single entry point to the agent-facing documentation scattered across the
-monorepo. This is the **catalog** (done); the **synthesis** (a Claude-specific
-vs general-LLM split, and ZBracket navigation for web2qml/voiceterm users) is
-the next step — see "Plan" below.
+monorepo. This is the **catalog**; the **synthesis** — a Claude-specific vs
+general-LLM split with the logscope-tree mapping — now lives at
+[[claude-vs-general]]. ZBracket nav (`[[name]]`) is the next wiring step.
 
 ## Catalog (≈40 docs)
 
@@ -30,9 +30,9 @@ the next step — see "Plan" below.
 
 1. **This INDEX = the hub.** Each project keeps its docs in place; this file is
    the navigable catalog. (Done.)
-2. **`docs/agents/claude-vs-general.md`** — separate what is Claude-specific
-   (tool names, sandbox quirks, our suspender workflow) from what generalizes to
-   any LLM, and what maps onto **logscope's tree-based development** approach.
+2. **[[claude-vs-general]]** — separates Claude-specific guidance from what
+   generalizes to any LLM, and maps the workflow onto **logscope's tree-based
+   development**. (Done.)
 3. **ZBracket navigation** — expose this catalog so web2qml/voiceterm users can
    walk it via ZBrackets (link scheme TBD against the w2q nav model).
 4. **Convention** — settle on one filename (`HANDOFF.md` vs `CLAUDE.md` vs
