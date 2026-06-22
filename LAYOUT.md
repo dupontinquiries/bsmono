@@ -41,22 +41,31 @@ initialised/populated by `gin` (gitmind CLI) on hardware — it is not built her
   embedded `snapclone/third_party/opendht` (and its nested `.git`) was dropped.
 - **rustcheck** → single source copy at `tools/rustcheck` (`.py` + `.rs`). The
   two extra copies and the ~10 M of bundled binary / py-env were dropped.
-- **peek** → `tools/peek` is canonical. (See deferred task below.)
+- **peek** → `tools/peek` is canonical. (See build-wiring status below.)
 
-## Deferred build-wiring tasks
+## Build-wiring status
 
-These are intentionally **not** done in the skeleton stage, because they edit
-build graphs that can only be validated by compiling — which happens on
-hardware, not here. Each is a tracked task for the build-wiring stage:
+The unified build is an **orchestrator** (`build/build.sh`) over each project's
+own build system, driven by `manifest/projects.toml` + `manifest/targets.toml`
+(no single cargo workspace — nested workspaces + C++/cmake can't be one). It
+prints the plan by default and runs host-target cargo builds with `--run`;
+cross targets and C++/cmake/hybrid projects print what they'd run (they need
+cross sysroots / Qt6 / cmake deps — the hardware stage). `build/flatpak.sh` is
+the Flatpak stage stub.
 
-1. **peek dedup repath.** `apps/gitmind` still embeds its own `crates/peek`
-   (peek is "copied around" because it's broadly useful — not divergent). Left
-   intact so gitmind's internal workspace stays coherent. Wire-up task: replace
-   it with a path dependency on `../../tools/peek` and delete the embedded copy.
-2. **opendht repath in snapclone.** `system/snapclone`'s CMake referenced
-   `third_party/opendht` (now removed). Repoint it to `../../vendor/opendht`.
-3. **No single cargo workspace.** Each sub-project keeps its own workspace; the
-   unified build is the orchestrator in `build/` driven by `manifest/`.
+- ✅ **opendht repath in snapclone (done).** `system/snapclone`'s CMake set
+  `OPENDHT_SUBMODULE_DIR` to the removed `third_party/opendht` (so it would
+  FATAL_ERROR). Now it prefers `../../vendor/opendht`, with the legacy submodule
+  names as fallback. (Full validation = a cmake configure on a Qt6 host.)
+- ✅ **orchestrator (done).** `build/build.sh` fleshed out; `--run --only peek`
+  builds for real, proving the cargo dispatch end-to-end.
+- ⏸ **peek dedup repath (deferred — not a path swap).** The two peeks have
+  **diverged in structure**, not just location: `tools/peek` is bin-centric
+  (`main.rs`/`peek2.rs`), while `apps/gitmind/crates/peek` is a lib+bins
+  (`lib.rs`+`view.rs`+`bin/`) and **gitmind-gui depends on the library**
+  (`peek::view::read_to_string`). Deduping needs `tools/peek` to expose the same
+  lib surface, then a repoint — and verifying it needs a Qt6 host to build the
+  GUI. Tracked as a reconciliation task, not a quick win.
 
 ## Excluded as cruft / artifacts (rebuildable)
 
