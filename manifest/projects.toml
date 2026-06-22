@@ -73,7 +73,7 @@ daemon = false
 flatpak = "tbd"
 runtime = "tbd"
 targets = ["desktop"]
-notes = "git-graph tool (gin); embeds crates/peek (dedup deferred: tools/peek is bin-centric, gitmind's is lib+bins consumed by the GUI); marked broken upstream"
+notes = "git-graph tool (gin); peek dedup DONE — GUI consumes tools/peek lib; marked broken upstream"
 
 [apps.logscope]
 path = "apps/logscope"
@@ -113,7 +113,7 @@ daemon = false
 flatpak = false
 runtime = "none"
 targets = ["desktop"]
-notes = "canonical peek; wiring-audit.sh; line-range viewer; DEPENDENCY_DIAGNOSIS"
+notes = "canonical peek, now lib+bins v0.2.0 (lib `view` consumed by gitmind GUI); wiring-audit.sh suspender"
 
 [tools.drift]
 path = "tools/drift"

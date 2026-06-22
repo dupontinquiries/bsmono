@@ -17,7 +17,7 @@ qmetaobject = "0.2"
 cstr = "0.2"
 serde_json = "1"
 gitmind-core = { path = "../core" }
-peek = { path = "../peek" }
+peek = { path = "../../../../tools/peek" }
 
 [features]
 # Build the GUI with the privileged PID-attributing watcher available.

@@ -60,13 +60,13 @@ the Flatpak stage stub.
   names as fallback. (Full validation = a cmake configure on a Qt6 host.)
 - ✅ **orchestrator (done).** `build/build.sh` fleshed out; `--run --only peek`
   builds for real, proving the cargo dispatch end-to-end.
-- ⏸ **peek dedup repath (deferred — not a path swap).** The two peeks have
-  **diverged in structure**, not just location: `tools/peek` is bin-centric
-  (`main.rs`/`peek2.rs`), while `apps/gitmind/crates/peek` is a lib+bins
-  (`lib.rs`+`view.rs`+`bin/`) and **gitmind-gui depends on the library**
-  (`peek::view::read_to_string`). Deduping needs `tools/peek` to expose the same
-  lib surface, then a repoint — and verifying it needs a Qt6 host to build the
-  GUI. Tracked as a reconciliation task, not a quick win.
+- ✅ **peek dedup (done).** Turned out not to be a path-swap but it wasn't a
+  blocker either: gitmind's `crates/peek` (v0.2.0) was a **superset** of
+  `tools/peek` (v0.1.0) — same six modules byte-identical, plus a `lib.rs` +
+  `view.rs`. So `tools/peek` was promoted to that lib+bins layout (the canonical
+  peek), gitmind-gui now path-depends on `tools/peek`, and the embedded copy was
+  removed. `gin` still builds; the GUI repoint is byte-identical code (only the
+  Qt GUI *build* is unverified, for lack of a Qt6 host).
 
 ## Excluded as cruft / artifacts (rebuildable)
 

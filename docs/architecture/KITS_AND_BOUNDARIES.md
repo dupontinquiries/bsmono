@@ -28,7 +28,7 @@ Pure-Rust reusable pieces worth lifting to a top-level `shared/` (or `kits/`).
 | candidate | source | reuse | notes |
 |---|---|---|---|
 | **registry-kit** (linkme autoloader) | unendlich `inventory.rs` + `*_registry*` | component/system/kernel auto-registration with **no central list** | `linkme` 0.3 distributed slices; self-contained (pulls nothing else in); user-flagged for reuse — **highest-value, lowest-risk lift** |
-| **peek-view** | tools/peek | file-viewer lib already used by gitmind-gui | the deferred dedup: make tools/peek expose the lib surface, then both consume it |
+| **peek-view** ✅ | tools/peek | file-viewer lib used by gitmind-gui | **done**: tools/peek promoted to lib+bins (v0.2.0); gitmind-gui consumes it; embedded copy removed. Stayed in tools/ (it's also the wiring-audit suspender), not shared/ |
 | **net-sim** | snapclone net-intel/diag + bo-suite `network_sim` | shared CI network-simulation harness | cf. scratchpad E1 |
 | **snapcore-protocol** (future) | ops-doc | the DHT wire/protocol crate | the shared lib that lets snapclone + unendlich share the DHT |
 | experimentkit / gesturekit | bot-arena | already kit-shaped | lift / standardize |
@@ -68,9 +68,9 @@ This is where the build shape changes (the user's intuition was right):
 
 ## 5. Recommended sequencing
 
-1. **Lift registry-kit** (linkme) — lowest risk, pure Rust, user-flagged,
-   immediately reusable; proves the `shared/` layer.
-2. **Reconcile peek-view** (the deferred dedup) into `shared/`.
+1. ✅ **Lift registry-kit** (linkme) — done: `shared/registry-kit`, built+tested.
+2. ✅ **peek-view reconcile** — done: tools/peek promoted to lib+bins; gitmind
+   consumes it; embedded copy removed (stayed in tools/, not shared/).
 3. **Decompose the DHT → `snapcore`** + define unendlich's `dht` feature — this
    is where build shape changes most (integrated vs lean).
 4. **Begin snapclone C++→Rust oxidation**, leaf-first, shrinking the FFI. As you
