@@ -107,9 +107,11 @@ _(empty — current dump triaged below)_
 
 ## G. Kits, FFI boundaries, shared libs (planning)
 
-- **G1 — Kits / FFI boundaries / shared libs.** `in-progress`
+- **G1 — Kits / FFI boundaries / shared libs.** `in-progress (steps 1-2 done)`
   First-pass plan written: **`docs/architecture/KITS_AND_BOUNDARIES.md`** (FFI
-  inventory + keep/oxidize/kit-ify + build-shape impact). Key seeds:
+  inventory + keep/oxidize/kit-ify + build-shape impact). Sequence progress:
+  ✅ registry-kit (shared/, built+tested) · ✅ peek-view reconcile (tools/peek
+  lib+bins, gitmind consumes it) · next: DHT→snapcore + variants. Key seeds:
   - *Shared-lib candidates:* `peek` (already shared at tools/peek; lib API
     `view::read_to_string`), `gitmind-core` (CLI+GUI share it — the "can't drift"
     model), network-sim/`snapclone-net-intel` (→ a test harness, cf. E1),

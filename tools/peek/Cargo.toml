@@ -1,8 +1,8 @@
 [package]
 name = "peek"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Fast line-range file viewer with bucket notation support"
+description = "Fast line-range file viewer (lib + peek/peek2 bins). The lib's `view` module renders file content (mmap + newline index, bucket/symbol selection) and is consumed by gitmind's GUI. Canonical home for peek (also carries wiring-audit.sh)."
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -11,14 +11,21 @@ globwalk = "0.9"
 anyhow = "1.0"
 thiserror = "2.0"
 
+[lib]
+name = "peek"
+path = "src/lib.rs"
+
 [[bin]]
 name = "peek"
-path = "src/main.rs"
+path = "src/bin/peek.rs"
+
+[[bin]]
+name = "peek2"
+path = "src/bin/peek2.rs"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3
 lto = true
-
-[[bin]]
-name = "peek2"
-path = "src/peek2.rs"
