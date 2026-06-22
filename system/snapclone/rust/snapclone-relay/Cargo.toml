@@ -1,0 +1,18 @@
+[package]
+name = "snapclone-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Magic Wormhole relay transport protocol for SnapClone"
+
+[lib]
+name = "snapclone_relay"
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow   = "1"
+bytes    = "1"
+tokio    = { version = "1", features = ["net", "time", "rt", "sync"] }
+tokio-tungstenite = { version = "0.23", features = ["native-tls"] }
+tracing  = "0.1"
+serde    = { version = "1", features = ["derive"] }
+serde_json = "1"

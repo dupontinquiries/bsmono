@@ -1,0 +1,358 @@
+project(
+    'opendht',
+    'c',
+    'cpp',
+    'cython',
+    license: 'MIT',
+    license_files: 'LICENSE',
+    version: '4.1.0',
+    meson_version: '>=1.1.0',
+    default_options: ['cpp_std=c++20', 'warning_level=3'],
+)
+
+gnutls = dependency('gnutls')
+nettle = dependency('nettle')
+msgpack = dependency('msgpack-cxx', required: false)
+argon2 = dependency('libargon2')
+fmt = dependency('fmt')
+
+proxy_enabled = get_option('proxy_client').enabled() or get_option('proxy_server').enabled()
+
+openssl = dependency('openssl', required: proxy_enabled)
+jsoncpp = dependency('jsoncpp', required: proxy_enabled)
+llhttp = dependency('llhttp', 'libllhttp', required: proxy_enabled)
+simdutf = dependency('simdutf', required: proxy_enabled)
+
+# restinio is a header-only library that may not ship a pkg-config file
+restinio_dep = dependency('restinio', required: false)
+if not restinio_dep.found()
+    cpp = meson.get_compiler('cpp')
+    if cpp.has_header('restinio/all.hpp', required: proxy_enabled)
+        restinio_dep = declare_dependency()
+    endif
+endif
+
+io_uring = host_machine.system() == 'linux' ? dependency('liburing', required: false) : disabler()
+
+deps = [
+    fmt,
+    gnutls,
+    nettle,
+    msgpack,
+    argon2,
+    openssl,
+    jsoncpp,
+    simdutf,
+    llhttp,
+]
+
+if restinio_dep.found()
+    deps += restinio_dep
+endif
+
+if host_machine.system() == 'linux' and io_uring.found()
+    deps += io_uring
+endif
+conf_data = configuration_data()
+
+add_project_arguments('-DMSGPACK_NO_BOOST', '-DASIO_STANDALONE', language: 'cpp')
+if io_uring.found()
+    add_project_arguments('-DASIO_HAS_IO_URING', '-DASIO_DISABLE_EPOLL', language: 'cpp')
+    conf_data.set('iouring_lib', ', liburing')
+endif
+add_project_arguments(
+    [
+        '-Wno-return-type',
+        '-Wno-deprecated',
+        '-Wnon-virtual-dtor',
+        '-pedantic-errors',
+        '-fvisibility=hidden',
+    ],
+    language: 'cpp',
+)
+
+opendht_inc = include_directories('include/opendht')
+opendht_interface_inc = include_directories('include', is_system: true)
+opendht_src = [
+    'src/utils.cpp',
+    'src/crypto.cpp',
+    'src/default_types.cpp',
+    'src/node.cpp',
+    'src/value.cpp',
+    'src/dht.cpp',
+    'src/callbacks.cpp',
+    'src/routing_table.cpp',
+    'src/node_cache.cpp',
+    'src/network_engine.cpp',
+    'src/securedht.cpp',
+    'src/dhtrunner.cpp',
+    'src/log.cpp',
+    'src/op_cache.cpp',
+    'src/network_utils.cpp',
+    'src/thread_pool.cpp',
+]
+
+if get_option('indexation').enabled()
+    opendht_src += 'src/indexation/pht.cpp'
+    add_project_arguments('-DOPENDHT_INDEXATION', language: 'cpp')
+endif
+if jsoncpp.found() and simdutf.found()
+    opendht_src += ['src/base64.cpp']
+    add_project_arguments('-DOPENDHT_JSONCPP', language: 'cpp')
+    conf_data.set('jsoncpp_lib', ', jsoncpp')
+endif
+if llhttp.found()
+    opendht_src += ['src/http.cpp', 'src/compat/os_cert.cpp']
+    if host_machine.system() == 'darwin'
+        deps += dependency('appleframeworks', modules: ['CoreFoundation', 'Security'])
+    endif
+    conf_data.set('http_lib', '-lllhttp')
+endif
+if openssl.found()
+    conf_data.set('openssl_lib', ', openssl')
+endif
+if get_option('proxy_client').enabled()
+    opendht_src += ['src/dht_proxy_client.cpp']
+    add_project_arguments('-DOPENDHT_PROXY_CLIENT', language: 'cpp')
+endif
+if get_option('proxy_server').enabled()
+    opendht_src += 'src/dht_proxy_server.cpp'
+    add_project_arguments('-DOPENDHT_PROXY_SERVER', language: 'cpp')
+endif
+if get_option('push_notifications').enabled()
+    add_project_arguments('-DOPENDHT_PUSH_NOTIFICATIONS', language: 'cpp')
+endif
+if get_option('peer_discovery').enabled()
+    opendht_src += 'src/peer_discovery.cpp'
+    add_project_arguments('-DOPENDHT_PEER_DISCOVERY', language: 'cpp')
+endif
+opendht = library(
+    'opendht',
+    opendht_src,
+    include_directories: opendht_inc,
+    dependencies: deps,
+    cpp_args: ['-DOPENDHT_BUILD', '-Dopendht_EXPORTS'],
+    install: true,
+)
+
+opendht_dep_args = []
+if get_option('default_library') != 'static'
+    opendht_dep_args += '-Dopendht_EXPORTS'
+endif
+
+opendht_dep = declare_dependency(
+    link_with: opendht,
+    include_directories: opendht_interface_inc,
+    compile_args: opendht_dep_args,
+)
+
+# Install library headers.
+install_subdir('include', install_dir: get_option('includedir'), strip_directory: true)
+
+conf_data.set('VERSION', meson.project_version())
+conf_data.set('prefix', get_option('prefix'))
+conf_data.set('exec_prefix', get_option('prefix'))
+conf_data.set('libdir', join_paths(get_option('prefix'), get_option('libdir')))
+conf_data.set('includedir', join_paths(get_option('prefix'), get_option('includedir')))
+conf_data.set('argon2_lib', ', libargon2')
+conf_data.set('simdutf_lib', ', simdutf')
+conf_data.set('opendht_public_cflags', '')
+conf_data.set('opendht_c_public_cflags', '')
+
+if get_option('default_library') != 'static'
+    conf_data.set('opendht_public_cflags', ' -Dopendht_EXPORTS')
+    conf_data.set('opendht_c_public_cflags', ' -Dopendht_c_EXPORTS')
+endif
+
+configure_file(
+    input: 'opendht.pc.in',
+    output: 'opendht.pc',
+    configuration: conf_data,
+    install: true,
+    install_dir: join_paths(get_option('prefix'), get_option('libdir'), 'pkgconfig'),
+)
+
+readline = meson.get_compiler('c').find_library('readline', required: get_option('tools'))
+
+if get_option('c').enabled()
+    opendht_c = library(
+        'opendht-c',
+        ['c/opendht.cpp', 'c/opendht_c.h'],
+        dependencies: [opendht_dep, msgpack, jsoncpp, fmt],
+        cpp_args: ['-DOPENDHT_C_BUILD', '-Dopendht_c_EXPORTS'],
+        install: true,
+    )
+
+    install_headers('c/opendht_c.h', subdir: 'opendht')
+
+    configure_file(
+        input: 'opendht-c.pc.in',
+        output: 'opendht-c.pc',
+        configuration: conf_data,
+        install: true,
+        install_dir: join_paths(get_option('prefix'), get_option('libdir'), 'pkgconfig'),
+    )
+
+    if get_option('tools').enabled()
+        dhtcnode = executable(
+            'dhtcnode',
+            'tools/dhtcnode.c',
+            include_directories: ['c', opendht_interface_inc],
+            link_with: opendht_c,
+            dependencies: [readline],
+            install: true,
+        )
+    endif
+endif
+
+if get_option('python').require(
+    get_option('indexation').enabled(),
+    error_message: 'python requires indexation',
+).allowed()
+    py = import('python').find_installation()
+    dep_py = py.dependency()
+    py.extension_module(
+        'opendht',
+        'python/opendht.pyx',
+        override_options: ['cython_language=cpp'],
+        dependencies: [opendht_dep, msgpack, jsoncpp, fmt, dep_py],
+        install: true,
+    )
+endif
+
+if get_option('tools').enabled()
+    dhtnode = executable(
+        'dhtnode',
+        'tools/dhtnode.cpp',
+        dependencies: [opendht_dep, readline, jsoncpp, msgpack, fmt, openssl],
+        install: true,
+    )
+    dhtchat = executable(
+        'dhtchat',
+        'tools/dhtchat.cpp',
+        dependencies: [opendht_dep, readline, jsoncpp, msgpack, fmt, openssl],
+        install: true,
+    )
+    dhtscanner = executable(
+        'dhtscanner',
+        'tools/dhtscanner.cpp',
+        dependencies: [opendht_dep, readline, jsoncpp, msgpack, fmt, openssl],
+        install: true,
+    )
+    if llhttp.found()
+        durl_deps = [msgpack, openssl]
+
+        if io_uring.found()
+            durl_deps += io_uring
+        endif
+
+        durl = executable(
+            'durl',
+            'tools/durl.cpp',
+            dependencies: [opendht_dep] + durl_deps,
+        )
+    endif
+endif
+
+# Unit tests
+if get_option('tests').enabled()
+    cppunit = dependency('cppunit')
+
+    test_infohash = executable(
+        'test_infohash',
+        'tests/test_infohash.cpp',
+        'tests/tests_runner.cpp',
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('Infohash', test_infohash)
+
+    test_value = executable(
+        'test_value',
+        'tests/test_value.cpp',
+        'tests/tests_runner.cpp',
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('Value', test_value)
+
+    test_parsedmessage = executable(
+        'test_parsedmessage',
+        'tests/test_parsedmessage.cpp',
+        'tests/tests_runner.cpp',
+        include_directories: opendht_inc,
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('ParsedMessage', test_parsedmessage)
+
+    test_networkengine = executable(
+        'test_networkengine',
+        'tests/test_networkengine.cpp',
+        'tests/tests_runner.cpp',
+        include_directories: opendht_inc,
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('NetworkEngine', test_networkengine)
+
+    test_crypto = executable(
+        'test_crypto',
+        'tests/test_crypto.cpp',
+        'tests/tests_runner.cpp',
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack, gnutls],
+    )
+    test('Crypto', test_crypto, timeout: 60)
+
+    test_dhtrunner = executable(
+        'test_dhtrunner',
+        'tests/test_dhtrunner.cpp',
+        'tests/tests_runner.cpp',
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('DhtRunner', test_dhtrunner, timeout: 60)
+
+    test_threadpool = executable(
+        'test_threadpool',
+        'tests/test_threadpool.cpp',
+        'tests/tests_runner.cpp',
+        dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+    )
+    test('ThreadPool', test_threadpool)
+
+    if get_option('proxy_client').enabled() or get_option('proxy_server').enabled()
+        test_http = executable(
+            'test_http',
+            'tests/test_http.cpp',
+            'tests/tests_runner.cpp',
+            dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+        )
+        test('Http', test_http)
+    endif
+
+    if get_option('peer_discovery').enabled()
+        test_peerdiscovery = executable(
+            'test_peerdiscovery',
+            'tests/test_peerdiscovery.cpp',
+            'tests/tests_runner.cpp',
+            dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+        )
+        test('PeerDiscovery', test_peerdiscovery)
+    endif
+
+    if get_option('proxy_server').enabled()
+        test_proxy = executable(
+            'test_dhtproxy',
+            'tests/test_dhtproxy.cpp',
+            'tests/tests_runner.cpp',
+            dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+        )
+        test('DhtProxy', test_proxy)
+
+        if get_option('long_tests').enabled()
+            test_proxystress = executable(
+                'test_dhtproxystress',
+                'tests/dhtproxy_stress_tester.cpp',
+                'tests/tests_runner.cpp',
+                dependencies: [opendht_dep, cppunit, jsoncpp, fmt, openssl, msgpack],
+            )
+            test('DhtProxy Stress', test_proxystress)
+        endif
+    endif
+endif

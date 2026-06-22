@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANC findings — V1 plan</title>
+<style>
+  :root {
+    --bg: #0e1012;
+    --card: #181a1c;
+    --border: #2a2e33;
+    --text: #d4d4d8;
+    --dim: #888c91;
+    --accent: #6080a0;
+    --win: #80c080;
+    --loss: #c08080;
+    --neutral: #c0a060;
+    --highlight: #6090c0;
+    --new: #d090c0;
+    --critical: #ff8c5a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro", "Segoe UI",
+                 system-ui, sans-serif;
+    line-height: 1.5;
+    max-width: 920px;
+    margin-left: auto; margin-right: auto;
+  }
+  header { margin-bottom: 24px; }
+  h1 { color: var(--accent); font-size: 22px; margin: 0 0 8px 0; }
+  h2 {
+    color: var(--accent);
+    font-size: 18px;
+    margin: 32px 0 8px 0;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 6px;
+  }
+  h3 { color: var(--text); font-size: 15px; margin: 16px 0 6px 0; }
+  p { margin: 8px 0; }
+  ul, ol { margin: 8px 0; padding-left: 20px; }
+  li { margin: 4px 0; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    margin: 16px 0;
+  }
+  .tldr {
+    background: linear-gradient(135deg, #1a2030, #181a1c);
+    border-left: 3px solid var(--accent);
+  }
+  .v1-summary {
+    background: linear-gradient(135deg, #2a1a20, #1a1010);
+    border-left: 3px solid var(--critical);
+  }
+  .new-badge {
+    background: var(--new);
+    color: var(--bg);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .critical-badge {
+    background: var(--critical);
+    color: var(--bg);
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-left: 8px;
+    vertical-align: middle;
+  }
+  .key-finding {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+    font-size: 13px;
+    margin: 2px 4px 2px 0;
+  }
+  .win-tag { background: rgba(128,192,128,.15); color: var(--win); }
+  .loss-tag { background: rgba(192,128,128,.15); color: var(--loss); }
+  .neutral-tag { background: rgba(192,160,96,.15); color: var(--neutral); }
+  .flip-tag {
+    background: rgba(208,144,192,.15);
+    color: var(--new);
+    border: 1px solid var(--new);
+  }
+  .critical-tag {
+    background: rgba(255,140,90,.15);
+    color: var(--critical);
+    border: 1px solid var(--critical);
+  }
+  .chart-wrap {
+    background: #0a0c0e;
+    border-radius: 6px;
+    padding: 12px;
+    margin: 12px 0;
+    height: 320px;
+    position: relative;
+  }
+  .chart-wrap canvas { max-height: 100%; }
+  .pull-quote {
+    border-left: 3px solid var(--neutral);
+    padding-left: 12px;
+    margin: 16px 0;
+    color: var(--text);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+    margin: 12px 0;
+  }
+  th, td {
+    padding: 6px 8px;
+    text-align: right;
+    border-bottom: 1px solid var(--border);
+  }
+  th { color: var(--dim); font-weight: 500; background: rgba(0,0,0,0.2); }
+  td.label { text-align: left; color: var(--dim); }
+  td.heat-good { background: rgba(128,192,128,.25); color: var(--win); font-weight: 600; }
+  td.heat-bad { background: rgba(192,128,128,.25); color: var(--loss); font-weight: 600; }
+  td.heat-critical { background: rgba(255,140,90,.25); color: var(--critical); font-weight: 600; }
+  .footer {
+    margin-top: 40px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--dim);
+    text-align: center;
+  }
+  img.spectrogram {
+    width: 100%; border-radius: 6px; margin: 12px 0;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ANC research findings & V1 plan</h1>
+  <p>Visual recap of the noise-cancellation research, now with
+     cross-reference against a real street recording.</p>
+</header>
+
+<div class="card v1-summary">
+  <h2>The V1 status <span class="critical-badge">CRITICAL</span></h2>
+  <p>Cross-referencing the canceller against a 40-second real-world
+     engine recording revealed that <strong>most of the experimental
+     wins on synthetic engine signals were artifacts of the textbook
+     synth being too easy</strong>. Real engines have 8+ substantial
+     harmonics with h2 often louder than the fundamental; the canceller
+     tracks 3 harmonics with fixed [1.0, 0.5, 0.25] amplitudes.</p>
+
+  <p>What this means for V1:</p>
+  <ul>
+    <li><strong>Ship the masker</strong> — music masker is genuinely
+        useful, validated, 39.8° annoyance tolerance, no phase
+        coherence required.</li>
+    <li><strong>Keep the canceller in research mode</strong> — it
+        works on textbook synth but not on real engines yet.</li>
+    <li><strong>The architectural path is clear</strong> — 8-harmonic
+        extension with measured amplitudes — but the implementation
+        has a bug that's preventing it from approaching the
+        empirically-measured 30 dB headroom.</li>
+  </ul>
+</div>
+
+<h2>1. The cross-reference: real recording vs textbook synth <span class="critical-badge">v1 reset</span></h2>
+
+<div class="card">
+  <p>A 40-second street recording showed dominant engine fundamentals
+     in the 70-140 Hz range (median 94 Hz, P10-P90: 70-141). The
+     loudest passby was at t=8s with fundamental at 117 Hz. Spectral
+     analysis revealed:</p>
+
+  <img src="recording_analysis.png" alt="Real recording spectrogram and harmonic comparison" class="spectrogram">
+
+  <p>The bottom panel of the spectrogram tells the v1 story:</p>
+
+  <table>
+    <thead>
+      <tr><th class="label">Harmonic</th><th>Frequency</th>
+          <th>Real (measured)</th><th>Textbook synth</th><th>Gap</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="label">h1</td><td>117 Hz</td><td>1.000</td><td>1.000</td><td>match</td></tr>
+      <tr><td class="label">h2</td><td>234 Hz</td><td class="heat-good">1.302</td><td>0.500</td><td class="heat-bad">+0.80</td></tr>
+      <tr><td class="label">h3</td><td>352 Hz</td><td>0.261</td><td>0.150</td><td>+0.11</td></tr>
+      <tr><td class="label">h4</td><td>469 Hz</td><td class="heat-good">0.882</td><td>0.031</td><td class="heat-critical">+0.85</td></tr>
+      <tr><td class="label">h5</td><td>586 Hz</td><td class="heat-good">0.783</td><td>0.025</td><td class="heat-critical">+0.76</td></tr>
+      <tr><td class="label">h6</td><td>703 Hz</td><td>0.499</td><td>0.020</td><td class="heat-bad">+0.48</td></tr>
+      <tr><td class="label">h7</td><td>820 Hz</td><td class="heat-good">0.793</td><td>0.011</td><td class="heat-critical">+0.78</td></tr>
+      <tr><td class="label">h8</td><td>938 Hz</td><td>0.136</td><td>0.010</td><td>+0.13</td></tr>
+    </tbody>
+  </table>
+
+  <p>Real engines have <strong>h2 louder than the fundamental</strong>
+     (1.30 vs 1.00) — typical of 4-stroke even-cylinder vehicles
+     where even harmonics are phase-aligned by firing order. h3 is
+     suppressed (the matching odd-harmonic dip), then h4 through h7
+     are all substantial (0.5-0.9 of the fundamental).</p>
+
+  <p>The canceller's 3-harmonic anti-noise with fixed [1.0, 0.5, 0.25]
+     amplitudes covers maybe 30% of the actual energy. The other 70%
+     is in h4-h7 where we don't even try.</p>
+</div>
+
+<h2>2. The ideal-canceller upper bound <span class="critical-badge">v1 target</span></h2>
+
+<div class="card">
+  <p>To quantify the headroom, I synthesized "ideal" anti-noise that
+     perfectly tracks all 8 measured harmonics, then measured what
+     the current canceller actually delivers:</p>
+
+  <div class="chart-wrap"><canvas id="chartHeadroom"></canvas></div>
+
+  <table>
+    <thead>
+      <tr><th class="label">Scenario</th><th>Wide band</th><th>Upper band</th></tr>
+    </thead>
+    <tbody>
+      <tr><td class="label">Baseline (no canceller)</td><td>0.00 dB</td><td>0.00 dB</td></tr>
+      <tr><td class="label">Current 3-harmonic</td><td class="heat-bad">-0.32 dB</td><td class="heat-bad">-0.63 dB</td></tr>
+      <tr><td class="label">Ideal 8-harmonic (upper bound)</td><td class="heat-good">+29.61 dB</td><td class="heat-good">+32.33 dB</td></tr>
+      <tr><td class="label"><strong>Available headroom</strong></td><td class="heat-critical">+29.93 dB</td><td class="heat-critical">+32.96 dB</td></tr>
+    </tbody>
+  </table>
+
+  <div class="pull-quote">
+    The current canceller is doing essentially nothing on real
+    engines (-0.32 dB on wide band). The theoretical ceiling is
+    +30 dB. Recovering even a third of that headroom would be a
+    clear audible improvement.
+  </div>
+</div>
+
+<h2>3. What we built, what works, what doesn't</h2>
+
+<div class="card">
+  <h3>Ship in V1 <span class="new-badge">PRODUCTION</span></h3>
+  <ul>
+    <li><strong>Music masker</strong> — 4-band comb peakingEq, 39.8°
+        annoyance tolerance, no phase coherence required, validated</li>
+    <li><strong>Backup-beeper masker</strong> — Voss-McCartney pink noise</li>
+    <li><strong>Drone canceller</strong> — works on stable tonal HVAC sources</li>
+    <li><strong>Audio capture dump</strong> — for ongoing research data collection</li>
+    <li><strong>FSM with geometry-aware Doppler gate</strong> — accepts perpendicular passbys</li>
+    <li><strong>Findings page</strong> — this document</li>
+  </ul>
+
+  <h3>Keep in research mode <span class="critical-badge">EXPERIMENTAL</span></h3>
+  <ul>
+    <li><strong>3-harmonic passby canceller</strong> — works on textbook,
+        not on real engines</li>
+    <li><strong>8-harmonic extended mode</strong> — architecturally
+        implemented, has a phase/amplitude application bug that
+        prevents it from approaching the 30 dB headroom</li>
+    <li><strong>JitterSmoother</strong> — only helps at high baseline
+        latency, gate on measured latency before enabling</li>
+    <li><strong>Per-harmonic phase lock</strong> — auto-mode wins under
+        reverb, loses on anechoic textbook (now we know real
+        environments ARE reverberant, so this is probably useful)</li>
+  </ul>
+</div>
+
+<h2>4. Findings that survived the real-recording cross-check</h2>
+
+<div class="card">
+  <p>Some findings hold up regardless of synth realism:</p>
+  <ul>
+    <li><strong>Latency vs jitter</strong> — Constant latency is
+        harmless; jitter destroys phase coherence. Still true on
+        real signals.</li>
+    <li><strong>Per-harmonic clipping</strong> — Independent
+        soft-clip on each harmonic avoids intermodulation
+        distortion. Still true.</li>
+    <li><strong>Geometry-aware Doppler gate</strong> — Real
+        recording's fundamental track jumps around (70-400 Hz with
+        no clean Doppler curve) — confirms the relaxed gate is
+        needed even more than I thought.</li>
+    <li><strong>Reverb finding</strong> — The recording's
+        estimated RT60 is in the 300-2000 ms range depending on
+        which segment you measure. Our reverb experiments
+        underestimated rather than overestimated.</li>
+  </ul>
+</div>
+
+<h2>5. Findings that were artifacts of textbook synth</h2>
+
+<div class="card">
+  <ul>
+    <li><strong>+9.78 dB passby suppression</strong> — only on
+        textbook signal with 3 harmonics. On realistic 8-harmonic
+        signal, current canceller is -0.32 dB.</li>
+    <li><strong>+2.38 dB saturation matching</strong> — the
+        per-harmonic-clipping fix is real but its measured benefit
+        was inflated by textbook simplicity.</li>
+    <li><strong>Per-harmonic phase lock comparisons</strong> — the
+        2.5 dB advantage of fixed offsets at "ideal conditions"
+        was for a 3-harmonic source. On 8-harmonic real signals,
+        the comparison is different (both modes near zero).</li>
+  </ul>
+
+  <div class="pull-quote">
+    The pattern is now 5× confirmed: theoretical wins on
+    synthetic signals are unreliable; cross-reference against
+    real recordings is necessary before drawing conclusions.
+  </div>
+</div>
+
+<h2>6. The v1 architecture target (post-v1 work)</h2>
+
+<div class="card">
+  <p>For the canceller to actually deliver on real engines, the
+     architecture needs:</p>
+  <ol>
+    <li><strong>Track N harmonics</strong>, where N is 6-10 with
+        adaptive detection of "live" harmonics (skip silent ones
+        to save compute).</li>
+    <li><strong>Measure amplitudes per window</strong> via Goertzel
+        — no fixed [1.0, 0.5, 0.25] profile. Real engine
+        amplitudes vary by vehicle type, RPM, distance.</li>
+    <li><strong>Sub-degree phase accuracy</strong> — a 16-trial
+        fundamental search gives ±π/16 (0.2 rad) accuracy, which
+        becomes π/2 (random) at h8. Goertzel-derived phase or
+        finer-grained search needed.</li>
+    <li><strong>Per-harmonic amplitude scaling in synthesis</strong>
+        — emit anti-noise with measured amplitude profile, not
+        textbook ratios.</li>
+  </ol>
+
+  <p>The implementation is in <code>passby_canceller.rs</code>
+     (set_n_harmonics, refresh_extended_harmonics, etc.) but
+     currently delivers only -0.15 dB vs the -0.83 dB legacy. The
+     ratio suggests the architecture is correct but the
+     phase/amplitude application chain has a bug.</p>
+</div>
+
+<h2>7. The recurring pattern, now 5× confirmed</h2>
+
+<div class="card">
+  <ol>
+    <li><strong>Octave shifting</strong> — needs gain ≥ 2.0, doubles total power.</li>
+    <li><strong>Sum-then-clip saturation</strong> — algorithm
+        choice matters; clip-each-harmonic is the right form.</li>
+    <li><strong>Per-harmonic phase lock</strong> — conditional, not absolute. Wins under jitter or reverb, loses on clean anechoic.</li>
+    <li><strong>Sliding-shelf saturation</strong> — uniform per-harmonic drive is best; ramping up doesn't help.</li>
+    <li><strong>3-harmonic canceller on textbook synth</strong> — the +9.78 dB win evaporated when tested on real signal.</li>
+  </ol>
+
+  <div class="pull-quote">
+    Each theoretical bet failed in its specific way. The research
+    process is "make the simulated environment harder until the
+    theoretical wins fall over, then figure out why." The real
+    recording was the final hardness check, and most of the wins
+    fell over.
+  </div>
+</div>
+
+<h2>8. V1 deliverables</h2>
+
+<div class="card">
+  <ul>
+    <li><code>bo-suite.zip</code> — source, 1001 controller tests + 252 mux tests passing</li>
+    <li><code>v1-plan.md</code> — what to ship, what to keep in research</li>
+    <li><code>anc-findings.html</code> — this document</li>
+    <li><code>recording_analysis.png</code> — spectrogram and harmonic comparison</li>
+    <li><code>recording_analysis.py</code> — analysis script for future recordings</li>
+  </ul>
+</div>
+
+<div class="footer">
+  Cross-reference recording: 39.5 s, 48 kHz, real street ambient.
+  Test infrastructure: cargo test -p bo-controller -- --nocapture.
+  All numbers reproducible.
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<script>
+const ROOT = getComputedStyle(document.documentElement);
+const TEXT = ROOT.getPropertyValue('--text').trim();
+const DIM = ROOT.getPropertyValue('--dim').trim();
+const BORDER = ROOT.getPropertyValue('--border').trim();
+const WIN = ROOT.getPropertyValue('--win').trim();
+const LOSS = ROOT.getPropertyValue('--loss').trim();
+const NEUTRAL = ROOT.getPropertyValue('--neutral').trim();
+const CRITICAL = ROOT.getPropertyValue('--critical').trim();
+
+Chart.defaults.color = TEXT;
+Chart.defaults.borderColor = BORDER;
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, system-ui";
+
+new Chart(document.getElementById('chartHeadroom'), {
+  type: 'bar',
+  data: {
+    labels: ['Wide band (60-1200 Hz)', 'Upper band (400-1200 Hz)'],
+    datasets: [
+      { label: 'Baseline (no canceller)', data: [0, 0], backgroundColor: DIM },
+      { label: 'Current 3-harmonic canceller', data: [-0.32, -0.63], backgroundColor: LOSS },
+      { label: 'Ideal 8-harmonic (upper bound)', data: [29.61, 32.33], backgroundColor: WIN },
+    ],
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false,
+    plugins: {
+      legend: { labels: { color: TEXT } },
+      tooltip: { backgroundColor: '#1a1c1f', borderColor: BORDER, borderWidth: 1 },
+      subtitle: {
+        display: true,
+        text: 'On realistic 120 Hz engine signature, anechoic, zero channel jitter',
+        color: DIM, font: { size: 12 }
+      },
+    },
+    scales: {
+      y: {
+        title: { display: true, text: 'Suppression (dB)', color: DIM },
+        grid: { color: BORDER }, ticks: { color: DIM },
+      },
+      x: { grid: { color: BORDER }, ticks: { color: DIM } },
+    },
+  },
+});
+</script>
+</body>
+</html>

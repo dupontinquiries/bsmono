@@ -1,0 +1,3422 @@
+//! Validates each GPU kernel against a CPU reference on the real Vulkan device.
+use gpu_kernels::Gpu;
+use gpu_kernels::Lin;
+mod simconvo;
+
+fn rnd(n: usize, seed: usize) -> Vec<f32> {
+    (0..n).map(|i| (((i * 1103515245 + seed * 12345 + 7) % 1000) as f32) / 500.0 - 1.0).collect()
+}
+fn maxerr(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
+
+fn cpu_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0; m * n];
+    for i in 0..m { for p in 0..k { let av = a[i * k + p]; for j in 0..n { c[i * n + j] += av * b[p * n + j]; } } }
+    c
+}
+fn cpu_linear(a: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+    let mut c = vec![0.0; m * n];
+    for i in 0..m { for j in 0..n { let mut s = 0.0; for p in 0..k { s += a[i * k + p] * w[j * k + p]; } c[i * n + j] = s; } }
+    c
+}
+fn cpu_softmax(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut o = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let base = r * cols;
+        let mx = x[base..base + cols].iter().cloned().fold(f32::MIN, f32::max);
+        let mut s = 0.0;
+        for c in 0..cols { let e = (x[base + c] - mx).exp(); o[base + c] = e; s += e; }
+        for c in 0..cols { o[base + c] /= s; }
+    }
+    o
+}
+fn cpu_rmsnorm(x: &[f32], w: &[f32], rows: usize, cols: usize, eps: f32) -> Vec<f32> {
+    let mut o = vec![0.0; rows * cols];
+    for r in 0..rows {
+        let base = r * cols;
+        let ss: f32 = x[base..base + cols].iter().map(|v| v * v).sum::<f32>() / cols as f32;
+        let inv = 1.0 / (ss + eps).sqrt();
+        for c in 0..cols { o[base + c] = x[base + c] * inv * w[c]; }
+    }
+    o
+}
+fn cpu_attention(q: &[f32], k: &[f32], v: &[f32], t: usize, d: usize) -> Vec<f32> {
+    let scale = 1.0 / (d as f32).sqrt();
+    let mut o = vec![0.0; t * d];
+    for i in 0..t {
+        let last = i;
+        let mut scores = vec![0.0f32; last + 1];
+        let mut mx = f32::MIN;
+        for j in 0..=last { let mut dot = 0.0; for c in 0..d { dot += q[i * d + c] * k[j * d + c]; } scores[j] = dot * scale; mx = mx.max(scores[j]); }
+        let mut sum = 0.0; for s in scores.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+        for j in 0..=last { let p = scores[j] / sum; for c in 0..d { o[i * d + c] += p * v[j * d + c]; } }
+    }
+    o
+}
+
+fn cpu_rope(x: &[f32], t: usize, d: usize, base: f32) -> Vec<f32> {
+    let half = d / 2;
+    let mut o = x.to_vec();
+    for row in 0..t {
+        for i in 0..half {
+            let freq = row as f32 / base.powf(2.0 * i as f32 / d as f32);
+            let (c, s) = (freq.cos(), freq.sin());
+            let x0 = x[row * d + 2 * i]; let x1 = x[row * d + 2 * i + 1];
+            o[row * d + 2 * i] = x0 * c - x1 * s;
+            o[row * d + 2 * i + 1] = x0 * s + x1 * c;
+        }
+    }
+    o
+}
+
+/// A single Llama-style transformer block (single attention head, SwiGLU MLP).
+/// Weights stored in nn.Linear layout [out, in] (matches `linear` = A·Wᵀ).
+struct Block { wq: Vec<f32>, wk: Vec<f32>, wv: Vec<f32>, wo: Vec<f32>,
+    wgate: Vec<f32>, wup: Vec<f32>, wdown: Vec<f32>, g1: Vec<f32>, g2: Vec<f32> }
+impl Block {
+    fn random(d: usize, h: usize) -> Self {
+        Block { wq: rnd(d * d, 21), wk: rnd(d * d, 22), wv: rnd(d * d, 23), wo: rnd(d * d, 24),
+            wgate: rnd(h * d, 25), wup: rnd(h * d, 26), wdown: rnd(d * h, 27), g1: rnd(d, 28), g2: rnd(d, 29) }
+    }
+}
+
+const BASE: f32 = 10000.0;
+const EPS: f32 = 1e-5;
+
+fn gpu_block(gpu: &Gpu, b: &Block, x: &[f32], t: usize, d: usize, h: usize) -> Vec<f32> {
+    let n1 = gpu.rmsnorm(x, &b.g1, t, d, EPS);
+    let q = gpu.rope(&gpu.linear(&n1, &b.wq, t, d, d), t, d, BASE);
+    let k = gpu.rope(&gpu.linear(&n1, &b.wk, t, d, d), t, d, BASE);
+    let v = gpu.linear(&n1, &b.wv, t, d, d);
+    let attn = gpu.attention(&q, &k, &v, t, d);
+    let o = gpu.linear(&attn, &b.wo, t, d, d);
+    let x2 = gpu.add(x, &o);
+    let n2 = gpu.rmsnorm(&x2, &b.g2, t, d, EPS);
+    let gate = gpu.linear(&n2, &b.wgate, t, h, d);
+    let up = gpu.linear(&n2, &b.wup, t, h, d);
+    let hmid = gpu.mul(&gpu.silu(&gate), &up);
+    let down = gpu.linear(&hmid, &b.wdown, t, d, h);
+    gpu.add(&x2, &down)
+}
+
+fn cpu_block(b: &Block, x: &[f32], t: usize, d: usize, h: usize) -> Vec<f32> {
+    let n1 = cpu_rmsnorm(x, &b.g1, t, d, EPS);
+    let q = cpu_rope_mh(&cpu_linear(&n1, &b.wq, t, d, d), t, d, BASE, d);
+    let k = cpu_rope_mh(&cpu_linear(&n1, &b.wk, t, d, d), t, d, BASE, d);
+    let v = cpu_linear(&n1, &b.wv, t, d, d);
+    let attn = cpu_attention(&q, &k, &v, t, d);
+    let o = cpu_linear(&attn, &b.wo, t, d, d);
+    let x2: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
+    let n2 = cpu_rmsnorm(&x2, &b.g2, t, d, EPS);
+    let gate = cpu_linear(&n2, &b.wgate, t, h, d);
+    let up = cpu_linear(&n2, &b.wup, t, h, d);
+    let hmid: Vec<f32> = gate.iter().zip(&up).map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv).collect();
+    let down = cpu_linear(&hmid, &b.wdown, t, d, h);
+    x2.iter().zip(&down).map(|(a, b)| a + b).collect()
+}
+
+/// A minimal valid GGUF byte image: v3, one f32 weight tensor, two metadata keys.
+fn gguf_fixture() -> Vec<u8> {
+    fn put_str(b: &mut Vec<u8>, s: &str) { b.extend_from_slice(&(s.len() as u64).to_le_bytes()); b.extend_from_slice(s.as_bytes()); }
+    let mut b = Vec::new();
+    b.extend_from_slice(b"GGUF");
+    b.extend_from_slice(&3u32.to_le_bytes());       // version
+    b.extend_from_slice(&1u64.to_le_bytes());       // tensor count
+    b.extend_from_slice(&2u64.to_le_bytes());       // metadata kv count
+    put_str(&mut b, "general.architecture"); b.extend_from_slice(&8u32.to_le_bytes()); put_str(&mut b, "llama"); // string
+    put_str(&mut b, "llama.embedding_length"); b.extend_from_slice(&4u32.to_le_bytes()); b.extend_from_slice(&16u32.to_le_bytes()); // u32
+    put_str(&mut b, "blk.0.attn_q.weight");
+    b.extend_from_slice(&2u32.to_le_bytes());       // n_dims
+    b.extend_from_slice(&16u64.to_le_bytes());
+    b.extend_from_slice(&16u64.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());       // ggml type 0 = f32
+    b.extend_from_slice(&0u64.to_le_bytes());       // data offset
+    b
+}
+
+struct HostBlock { g1: Vec<f32>, wq: Vec<f32>, wk: Vec<f32>, wv: Vec<f32>, wo: Vec<f32>,
+    g2: Vec<f32>, wgate: Vec<f32>, wup: Vec<f32>, wdown: Vec<f32> }
+struct HostModel { embed: Vec<f32>, layers: Vec<HostBlock>, out_norm: Vec<f32>, output: Vec<f32>,
+    d: usize, h: usize, vocab: usize, n_layers: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32 }
+
+fn gen_model(d: usize, h: usize, n: usize, vocab: usize, n_heads: usize, n_kv_heads: usize) -> HostModel {
+    let kv = n_kv_heads * (d / n_heads);
+    let mut seed = 1000usize;
+    let mut next = |len: usize| { seed += 1; rnd(len, seed) };
+    let embed = next(vocab * d);
+    let mut layers = Vec::new();
+    for _ in 0..n {
+        layers.push(HostBlock { g1: next(d), wq: next(d * d), wk: next(kv * d), wv: next(kv * d), wo: next(d * d),
+            g2: next(d), wgate: next(h * d), wup: next(h * d), wdown: next(d * h) });
+    }
+    let out_norm = next(d); let output = next(vocab * d);
+    HostModel { embed, layers, out_norm, output, d, h, vocab, n_layers: n, n_heads, n_kv_heads, base: BASE, eps: EPS }
+}
+
+fn cpu_rope_mh(x: &[f32], t: usize, dm: usize, base: f32, hd: usize) -> Vec<f32> {
+    let half = hd / 2; let mut o = x.to_vec();
+    for tok in 0..t {
+        for head in 0..dm / hd {
+            let off = tok * dm + head * hd;
+            for pp in 0..half {
+                // NORM/GGML rope: rotate the interleaved pair (2*pp, 2*pp+1). GGUF llama
+                // weights are permuted by the converter for exactly this pairing.
+                let freq = tok as f32 / base.powf(2.0 * pp as f32 / hd as f32);
+                let (c, s) = (freq.cos(), freq.sin());
+                let x0 = x[off + 2 * pp]; let x1 = x[off + 2 * pp + 1];
+                o[off + 2 * pp] = x0 * c - x1 * s;
+                o[off + 2 * pp + 1] = x0 * s + x1 * c;
+            }
+        }
+    }
+    o
+}
+fn cpu_mha(q: &[f32], k: &[f32], v: &[f32], t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Vec<f32> {
+    let hd = dm / n_heads; let kvdm = n_kv_heads * hd; let group = n_heads / n_kv_heads;
+    let scale = 1.0 / (hd as f32).sqrt(); let mut o = vec![0.0; t * dm];
+    for hh in 0..n_heads {
+        let b = hh * hd; let kb = (hh / group) * hd; // GQA: query head -> shared KV head
+        for i in 0..t {
+            let mut sc = vec![0.0f32; i + 1]; let mut mx = f32::MIN;
+            for j in 0..=i { let mut d = 0.0; for c in 0..hd { d += q[i * dm + b + c] * k[j * kvdm + kb + c]; } sc[j] = d * scale; mx = mx.max(sc[j]); }
+            let mut sum = 0.0; for s in sc.iter_mut() { *s = (*s - mx).exp(); sum += *s; }
+            for j in 0..=i { let p = sc[j] / sum; for c in 0..hd { o[i * dm + b + c] += p * v[j * kvdm + kb + c]; } }
+        }
+    }
+    o
+}
+fn cpu_block_mh(b: &Block, x: &[f32], t: usize, d: usize, h: usize, n_heads: usize, n_kv_heads: usize, base: f32) -> Vec<f32> {
+    let hd = d / n_heads; let kv = n_kv_heads * hd;
+    let n1 = cpu_rmsnorm(x, &b.g1, t, d, EPS);
+    let q = cpu_rope_mh(&cpu_linear(&n1, &b.wq, t, d, d), t, d, base, hd);
+    let k = cpu_rope_mh(&cpu_linear(&n1, &b.wk, t, kv, d), t, kv, base, hd);
+    let v = cpu_linear(&n1, &b.wv, t, kv, d);
+    let attn = cpu_mha(&q, &k, &v, t, d, n_heads, n_kv_heads);
+    let o = cpu_linear(&attn, &b.wo, t, d, d);
+    let x2: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
+    let n2 = cpu_rmsnorm(&x2, &b.g2, t, d, EPS);
+    let gate = cpu_linear(&n2, &b.wgate, t, h, d);
+    let up = cpu_linear(&n2, &b.wup, t, h, d);
+    let hmid: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| (g / (1.0 + (-g).exp())) * u).collect();
+    let down = cpu_linear(&hmid, &b.wdown, t, d, h);
+    x2.iter().zip(&down).map(|(a, b)| a + b).collect()
+}
+
+fn align32(x: u64) -> u64 { x.div_ceil(32) * 32 }
+
+/// Like `write_gguf` but reproduces real Llama-3.2 quirks that broke loading:
+/// no `llama.vocab_size` key (must be derived from the embedding), no
+/// `output.weight` tensor (tied to `token_embd`), and exotic metadata value
+/// types (float64, int8) that the parser must tolerate.
+fn write_gguf_llama3(m: &HostModel) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let kv = m.n_kv_heads * (m.d / m.n_heads);
+    let mut ts: Vec<(String, Vec<u64>, &[f32])> = Vec::new();
+    ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), m.embed.as_slice()));
+    for (i, b) in m.layers.iter().enumerate() {
+        ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), b.g1.as_slice()));
+        ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), b.wq.as_slice()));
+        ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), b.wk.as_slice()));
+        ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), b.wv.as_slice()));
+        ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), b.wo.as_slice()));
+        ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), b.g2.as_slice()));
+        ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), b.wgate.as_slice()));
+        ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), b.wup.as_slice()));
+        ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), b.wdown.as_slice()));
+    }
+    ts.push(("output_norm.weight".into(), v1(m.d), m.out_norm.as_slice()));
+    // (no output.weight — tied embeddings)
+
+    let mut offsets = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, data) in &ts { offsets.push(off); off = align32(off + (data.len() * 4) as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 10);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "test.scaling_factor"); u32b(&mut b, 12); b.extend_from_slice(&8.0f64.to_le_bytes()); // float64
+    s(&mut b, "test.signed_byte"); u32b(&mut b, 1); b.push((-7i8) as u8);                          // int8
+    // (deliberately no llama.vocab_size)
+    for (i, (name, dims, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, 0); u64b(&mut b, offsets[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, data)) in ts.iter().enumerate() {
+        let target = data_off + offsets[i];
+        while (b.len() as u64) < target { b.push(0); }
+        b.extend_from_slice(bytemuck::cast_slice(data));
+    }
+    b
+}
+
+/// Serialize a HostModel as a GGUF image (v3, all tensors f32, ggml ne ordering).
+/// Serialize a HostModel as a **Qwen2** GGUF (arch=qwen2, qwen2.* keys) with a Q/K/V bias per layer.
+/// `biases[i] = (bq[d], bk[kv], bv[kv])`. Used only by --gate-qwen2.
+/// CPU q8_0 encode of f32 weights: per 32-block, f16 scale d=amax/127 then 32×i8 = round(w/d).
+fn enc_q8_0(w: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w.len() / 32 * 34);
+    for blk in w.chunks(32) {
+        let amax = blk.iter().fold(0f32, |m, &x| m.max(x.abs()));
+        let d = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        out.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        for &x in blk { out.push(((x / d).round().clamp(-127.0, 127.0) as i32 as i8) as u8); }
+    }
+    out
+}
+
+/// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
+/// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
+fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let q8t = |w: &[f32]| (8u32, enc_q8_0(w));
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let (et, eb) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), et, eb));
+    for (i, b) in m.layers.iter().enumerate() {
+        let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wk); ts.push((format!("blk.{i}.attn_k.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wv); ts.push((format!("blk.{i}.attn_v.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wo); ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = f32t(&b.g2); ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wgate); ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wup); ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
+    }
+    let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
+    let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
+fn write_gguf_qwen2(m: &HostModel, biases: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let kv = m.n_kv_heads * (m.d / m.n_heads);
+    let mut ts: Vec<(String, Vec<u64>, &[f32])> = Vec::new();
+    ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), m.embed.as_slice()));
+    for (i, b) in m.layers.iter().enumerate() {
+        ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), b.g1.as_slice()));
+        ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), b.wq.as_slice()));
+        ts.push((format!("blk.{i}.attn_q.bias"), v1(m.d), biases[i].0.as_slice()));
+        ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), b.wk.as_slice()));
+        ts.push((format!("blk.{i}.attn_k.bias"), v1(kv), biases[i].1.as_slice()));
+        ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), b.wv.as_slice()));
+        ts.push((format!("blk.{i}.attn_v.bias"), v1(kv), biases[i].2.as_slice()));
+        ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), b.wo.as_slice()));
+        ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), b.g2.as_slice()));
+        ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), b.wgate.as_slice()));
+        ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), b.wup.as_slice()));
+        ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), b.wdown.as_slice()));
+    }
+    ts.push(("output_norm.weight".into(), v1(m.d), m.out_norm.as_slice()));
+    ts.push(("output.weight".into(), mat(m.vocab, m.d), m.output.as_slice()));
+
+    let mut offsets = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, data) in &ts { offsets.push(off); off = align32(off + (data.len() * 4) as u64); }
+
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "qwen2");
+    s(&mut b, "qwen2.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "qwen2.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "qwen2.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "qwen2.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "qwen2.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "qwen2.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "qwen2.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "qwen2.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, 0); u64b(&mut b, offsets[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, data)) in ts.iter().enumerate() {
+        let target = data_off + offsets[i];
+        while (b.len() as u64) < target { b.push(0); }
+        b.extend_from_slice(bytemuck::cast_slice(data));
+    }
+    b
+}
+
+fn write_gguf(m: &HostModel) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64]; // ggml ne = [in, out]
+    let v1 = |n: usize| vec![n as u64];
+    let kv = m.n_kv_heads * (m.d / m.n_heads);
+    let mut ts: Vec<(String, Vec<u64>, &[f32])> = Vec::new();
+    ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), m.embed.as_slice()));
+    for (i, b) in m.layers.iter().enumerate() {
+        ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), b.g1.as_slice()));
+        ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), b.wq.as_slice()));
+        ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), b.wk.as_slice()));
+        ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), b.wv.as_slice()));
+        ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), b.wo.as_slice()));
+        ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), b.g2.as_slice()));
+        ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), b.wgate.as_slice()));
+        ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), b.wup.as_slice()));
+        ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), b.wdown.as_slice()));
+    }
+    ts.push(("output_norm.weight".into(), v1(m.d), m.out_norm.as_slice()));
+    ts.push(("output.weight".into(), mat(m.vocab, m.d), m.output.as_slice()));
+
+    let mut offsets = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, data) in &ts { offsets.push(off); off = align32(off + (data.len() * 4) as u64); }
+
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, 0); u64b(&mut b, offsets[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, data)) in ts.iter().enumerate() {
+        let target = data_off + offsets[i];
+        while (b.len() as u64) < target { b.push(0); }
+        b.extend_from_slice(bytemuck::cast_slice(data));
+    }
+    b
+}
+
+fn cpu_model_forward(m: &HostModel, ids: &[u32]) -> Vec<f32> {
+    let t = ids.len();
+    let mut x = Vec::with_capacity(t * m.d);
+    for &id in ids { let s = id as usize * m.d; x.extend_from_slice(&m.embed[s..s + m.d]); }
+    for hb in &m.layers {
+        let b = Block { wq: hb.wq.clone(), wk: hb.wk.clone(), wv: hb.wv.clone(), wo: hb.wo.clone(),
+            wgate: hb.wgate.clone(), wup: hb.wup.clone(), wdown: hb.wdown.clone(), g1: hb.g1.clone(), g2: hb.g2.clone() };
+        x = cpu_block_mh(&b, &x, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base);
+    }
+    let xn = cpu_rmsnorm(&x, &m.out_norm, t, m.d, m.eps);
+    cpu_linear(&xn, &m.output, t, m.vocab, m.d)
+}
+
+fn f32_to_f16(f: f32) -> u16 {
+    let bits = f.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7fffff;
+    if exp <= 0 { return sign; }
+    if exp >= 0x1f { return sign | 0x7c00; }
+    let mut m = mant >> 13;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) {
+        m += 1;
+        if m == 0x400 { m = 0; exp += 1; if exp >= 0x1f { return sign | 0x7c00; } }
+    }
+    sign | ((exp as u16) << 10) | (m as u16)
+}
+
+/// Quantize f32 to Q4_0 (18-byte blocks of 32; nibbles chosen against the f16 scale).
+fn quantize_q4_0(data: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() / 32 * 18);
+    for block in data.chunks(32) {
+        let mut amax = 0.0f32; let mut max = 0.0f32;
+        for &x in block { if x.abs() > amax { amax = x.abs(); max = x; } }
+        let d = max / -8.0;
+        let dh = f32_to_f16(d);
+        let d16 = gpu_kernels::gguf::f16_to_f32(dh);
+        let id = if d16 != 0.0 { 1.0 / d16 } else { 0.0 };
+        out.extend_from_slice(&dh.to_le_bytes());
+        let mut nibs = [0u8; 32];
+        for (j, &x) in block.iter().enumerate() { nibs[j] = ((x * id + 8.5).floor() as i32).clamp(0, 15) as u8; }
+        for j in 0..16 { out.push(nibs[j] | (nibs[j + 16] << 4)); }
+    }
+    out
+}
+
+/// f32 → (ggml_type, bytes, effective f32). `q` requests Q4_0 when shape allows.
+fn pack(data: &[f32], q: bool) -> (u32, Vec<u8>, Vec<f32>) {
+    if q && data.len() % 32 == 0 {
+        let bytes = quantize_q4_0(data);
+        let eff = gpu_kernels::gguf::dequantize(2, &bytes, data.len()).unwrap();
+        (2, bytes, eff)
+    } else {
+        (0, bytemuck::cast_slice(data).to_vec(), data.to_vec())
+    }
+}
+
+fn serialize_gguf(ts: &[(String, Vec<u64>, u32, Vec<u8>)], m: &HostModel) -> Vec<u8> {
+    let mut offsets = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in ts { offsets.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offsets[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        let target = data_off + offsets[i];
+        while (b.len() as u64) < target { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
+/// Build a GGUF with Q4_0-quantized 2D weights (norms kept f32) and return both
+/// the bytes and the effective (dequantized) HostModel for the CPU reference.
+fn build_quantized_gguf(m: &HostModel) -> (Vec<u8>, HostModel) {
+    let mat = |r: usize, c: usize| vec![c as u64, r as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let (et, eb, embed) = pack(&m.embed, true); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), et, eb));
+    let mut layers = Vec::new();
+    for (i, blk) in m.layers.iter().enumerate() {
+        let (t0, b0, g1) = pack(&blk.g1, false); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t0, b0));
+        let (t1, b1, wq) = pack(&blk.wq, true); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t1, b1));
+        let (t2, b2, wk) = pack(&blk.wk, true); ts.push((format!("blk.{i}.attn_k.weight"), mat(m.d, m.d), t2, b2));
+        let (t3, b3, wv) = pack(&blk.wv, true); ts.push((format!("blk.{i}.attn_v.weight"), mat(m.d, m.d), t3, b3));
+        let (t4, b4, wo) = pack(&blk.wo, true); ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), t4, b4));
+        let (t5, b5, g2) = pack(&blk.g2, false); ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), t5, b5));
+        let (t6, b6, wgate) = pack(&blk.wgate, true); ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), t6, b6));
+        let (t7, b7, wup) = pack(&blk.wup, true); ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), t7, b7));
+        let (t8, b8, wdown) = pack(&blk.wdown, true); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t8, b8));
+        layers.push(HostBlock { g1, wq, wk, wv, wo, g2, wgate, wup, wdown });
+    }
+    let (tn, bn, out_norm) = pack(&m.out_norm, false); ts.push(("output_norm.weight".into(), v1(m.d), tn, bn));
+    let (to, bo, output) = pack(&m.output, true); ts.push(("output.weight".into(), mat(m.vocab, m.d), to, bo));
+    let eff = HostModel { embed, layers, out_norm, output, d: m.d, h: m.h, vocab: m.vocab, n_layers: m.n_layers, n_heads: m.n_heads, n_kv_heads: m.n_kv_heads, base: m.base, eps: m.eps };
+    (serialize_gguf(&ts, m), eff)
+}
+
+fn cpu_generate(m: &HostModel, prompt: &[u32], n_new: usize) -> Vec<u32> {
+    let mut toks = prompt.to_vec(); let mut out = Vec::new();
+    for _ in 0..n_new {
+        let logits = cpu_model_forward(m, &toks);
+        let next = gpu_kernels::argmax(&logits[logits.len() - m.vocab..]);
+        out.push(next); toks.push(next);
+    }
+    out
+}
+
+/// A GGUF with only tokenizer metadata (string arrays) and no tensors.
+fn build_tokenizer_gguf(tokens: &[&str], merges: &[&str]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, 0); u64b(&mut b, 2);
+    s(&mut b, "tokenizer.ggml.tokens"); u32b(&mut b, 9); u32b(&mut b, 8); u64b(&mut b, tokens.len() as u64);
+    for t in tokens { s(&mut b, t); }
+    s(&mut b, "tokenizer.ggml.merges"); u32b(&mut b, 9); u32b(&mut b, 8); u64b(&mut b, merges.len() as u64);
+    for m in merges { s(&mut b, m); }
+    b
+}
+
+/// Drive the memory-bounded coordinator over a chosen KV backing (f32 `Session` or int8 `SessionQ8`)
+/// and print the scaling readout. Generic so the f32 and q8 paths share one body — the only
+/// difference is `S`, and int8-KV's ~¼ footprint shows up directly as ~4× the peak concurrency.
+fn run_coordinator<S: gpu_kernels::KvSession>(
+    gpu: &Gpu, model: &gpu_kernels::Model, greedy: gpu_kernels::SamplerParams, prefix: &[u32],
+    n_req: usize, max_seq: usize, budget: usize, max_new: usize, budget_mb: usize, pctx: usize, tag: &str,
+) {
+    let mut pool = gpu_kernels::WorkerPool::<S>::new(gpu, model, greedy, None, n_req.max(1), max_seq, prefix).with_kv_budget(budget);
+    let kvs = pool.kv_per_session().max(1);
+    for r in 0..n_req { pool.admit(r as u64, "", vec![(r as u32 + 3) % model.vocab as u32], max_new); }
+    eprintln!("coordinator [{tag}]: {n_req} reqs | shared prefix={pctx} | KV/session={:.2} MiB | budget={budget_mb} MiB → fits ~{} concurrent | max_new={max_new}",
+        kvs as f64 / (1 << 20) as f64, budget / kvs);
+    let t = std::time::Instant::now();
+    let (mut ticks, mut total) = (0usize, 0usize);
+    while !pool.is_idle() { let rep = pool.step(); total += rep.emitted.len(); ticks += 1; }
+    let wall = t.elapsed().as_secs_f64().max(1e-3);
+    let peak = pool.peak_active().max(1);
+    println!("\ncoordinator [{tag}]: peak concurrent = {} sessions (KV-budget bounded)", pool.peak_active());
+    println!("  {n_req} requests → {total} tokens in {:.2}s over {ticks} ticks", wall);
+    println!("  aggregate {:.1} tok/s | {:.1} tok/s per session at peak", total as f64 / wall, total as f64 / wall / peak as f64);
+    println!("  raise budget_mb to admit more; int8-KV (`q8`) fits ~4× the f32 count at the same budget.");
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--inspect") {
+        if let Some(p) = args.get(i + 1) { inspect_gguf(p); return; }
+    }
+    if let Some(i) = args.iter().position(|a| a == "--qcheck") {
+        // Dequantize every tensor and report RMS by (role, ggml_type). If one quant type
+        // yields systematically tiny RMS for a role that another type renders normally,
+        // that type's dequant is mis-scaled.
+        let p = args.get(i + 1).expect("--qcheck <gguf>");
+        let _mm = gpu_kernels::mmap_ro(p).expect("mmap"); let bytes = &_mm[..];
+        let g = gpu_kernels::gguf::parse(&bytes).expect("parse");
+        let nm = |ty: u32| match ty { 0=>"F32",1=>"F16",6=>"Q5_0",8=>"Q8_0",12=>"Q4_K",13=>"Q5_K",14=>"Q6_K",_=>"?" };
+        let mut by_role: std::collections::BTreeMap<String, Vec<(u32, f32)>> = Default::default();
+        for t in &g.tensors {
+            let n: usize = t.dims.iter().product::<u64>() as usize;
+            let start = (g.data_offset + t.offset) as usize;
+            let nb = match gpu_kernels::gguf::type_nbytes(t.ggml_type, n) { Some(x) => x, None => continue };
+            if start + nb > bytes.len() { continue; }
+            let v = match gpu_kernels::gguf::dequantize(t.ggml_type, &bytes[start..start + nb], n) { Ok(v) => v, Err(_) => continue };
+            let rms = (v.iter().map(|x| x * x).sum::<f32>() / n as f32).sqrt();
+            let role = t.name.split('.').last().unwrap_or("?").to_string();
+            let role = if t.name.contains("ffn_") || t.name.contains("attn_") {
+                t.name.splitn(3, '.').nth(2).unwrap_or(&role).to_string()
+            } else { t.name.clone() };
+            by_role.entry(role).or_default().push((t.ggml_type, rms));
+        }
+        println!("{p}\nper-role RMS by quant type (looking for a type that is systematically tiny):");
+        for (role, v) in &by_role {
+            let mut by_ty: std::collections::BTreeMap<u32, (f32, u32)> = Default::default();
+            for &(ty, rms) in v { let e = by_ty.entry(ty).or_insert((0.0, 0)); e.0 += rms; e.1 += 1; }
+            let parts: Vec<String> = by_ty.iter().map(|(ty, (s, c))| format!("{}:rms~{:.4}(n{})", nm(*ty), s / *c as f32, c)).collect();
+            println!("  {:<16} {}", role, parts.join("  "));
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--probe") {
+        let path = args.get(i + 1).expect("--probe <gguf>");
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let gpu = Gpu::new();
+        let m = gpu.load_gguf(&bytes).expect("load");
+        eprintln!("probing forward: d={} layers={} heads={}/{} vocab={}", m.d, m.n_layers, m.n_heads, m.n_kv_heads, m.vocab);
+        let top = |v: &[f32], k: usize| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
+            idx.into_iter().take(k).map(|i| (i as u32, v[i])).collect::<Vec<_>>()
+        };
+        // Run the forward on several DISTINCT single tokens at pos 0. If the top logits are
+        // the same regardless of input token, the forward is ignoring its input (embedding
+        // /residual/attention) rather than just being low-quality.
+        for &t in &[791u32, 9822, 6342, 40, 1] {
+            let c = gpu.new_cache(m.n_layers, 2, m.kv_dim());
+            let logits = gpu.decode_step(&m, &c, t, 0);
+            let finite = logits.iter().all(|x| x.is_finite());
+            let (mn, mx) = logits.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+            println!("  input tok {t:>6}: finite={finite} range=[{mn:.2},{mx:.2}] top3={:?}", top(&logits, 3));
+        }
+        // Per-layer hidden-state trace through the (scale-validated) model_forward path on a
+        // short real prompt. A healthy stack holds a stable RMS and stays input-sensitive; a
+        // collapse/explosion at layer k localizes the fault to that block with real weights.
+        // If this trace looks healthy but decode_step above is washed out, the bug is in the
+        // KV/decode path, not the forward math.
+        let probe_ids = [1u32, 791, 9822, 6342]; // valid for both 49k and 128k vocabs
+        // Is the llama3 rope scaling actually loaded? Dump the factors; all-ones means the
+        // `rope_freqs.weight` tensor silently fell back (e.g. a length check missed), which
+        // would corrupt every layer's attention — the one structural thing the 1B has and
+        // the working models don't.
+        let rf = gpu.download(m.rope_factors());
+        let (rmn, rmx) = rf.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+        let all_ones = rf.iter().all(|&x| (x - 1.0).abs() < 1e-6);
+        eprintln!("rope_factors: len={} range=[{rmn:.4},{rmx:.4}] all_ones={all_ones}", rf.len());
+        eprintln!("per-block sub-step trace, ids={probe_ids:?} (n1/n2 = post-norm input scale; attn_out/ffn_out = each block's contribution):");
+        let logits = gpu.model_forward_trace(&m, &probe_ids, m.rope_factors());
+        eprintln!("    final logits top3 = {:?}", top(&logits[logits.len() - m.vocab..], 3));
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--tok") {
+        use gpu_kernels::tokenizer::Tokenizer;
+        let path = args.get(i + 1).expect("--tok <gguf> [text]");
+        let text = args.get(i + 2).map(|s| s.as_str()).unwrap_or("The capital of France is Paris.");
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let g = gpu_kernels::gguf::parse(&bytes).expect("parse");
+        let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+        let ids = tok.encode(text);
+        let back = tok.decode(&ids);
+        println!("encode {text:?}\n  -> {ids:?}");
+        println!("decode -> {back:?}");
+        println!("roundtrip_ok = {}", back.trim() == text.trim());
+        // decode a few individual ids to eyeball the byte-level mapping
+        for id in [12366u32, 8607, 9822, 6342, 128000, 128009] {
+            println!("  id {id:>6} -> {:?}", tok.decode(&[id]));
+        }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--simconvo-dump") {
+        let out = args.get(i + 1).cloned().unwrap_or_else(|| "simconvo_suite.txt".into());
+        simconvo::dump_to(&out);
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--simconvo") {
+        // Graded conversation harness: replay authored convos (easy→hard) and write a Markdown report
+        // of prefill/decode cost + degeneration across the difficulty gradient. Run on the M2.
+        simconvo::run(&args, i);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-branch") { simconvo::gate_branch(); return; }
+    if let Some(i) = args.iter().position(|a| a == "--simbranch") { simconvo::run_branch(&args, i); return; }
+    if args.iter().any(|a| a == "--gate-rubric") { simconvo::gate_rubric(); return; }
+    if args.iter().any(|a| a == "--gate-store") { gpu_kernels::store::gate_store(); return; }
+    if args.iter().any(|a| a == "--models") {
+        use gpu_kernels::store;
+        let roots = store::all_model_roots();
+        println!("models dir: {}", store::models_root().display());
+        for o in store::ollama_roots() { println!("ollama dir: {}", o.display()); }
+        println!("int8 cache: {}  (cap {:.0} GiB)", store::cache_root().display(),
+            store::cache_cap_bytes() as f64 / (1u64 << 30) as f64);
+        let models = store::list_models_in(&roots);
+        if models.is_empty() {
+            println!("\nno .gguf models found (set LOGSCOPE_MODELS_DIR, or drop GGUFs in the dir above)");
+        } else {
+            println!("\n{} unique model(s):", models.len());
+            for m in &models {
+                println!("  {:>8.2} GiB  {:016x}  {}", m.len as f64 / (1u64 << 30) as f64, m.key, m.name);
+            }
+        }
+        let dups = store::duplicate_models(&roots);
+        if !dups.is_empty() {
+            let reclaim: u64 = dups.iter().map(|(_, ps)| {
+                let one = std::fs::metadata(&ps[0]).map(|m| m.len()).unwrap_or(0);
+                one * (ps.len() as u64 - 1) // keep one copy, the rest is reclaimable
+            }).sum();
+            println!("\n{} duplicated model(s), {:.2} GiB reclaimable by keeping one copy each:",
+                dups.len(), reclaim as f64 / (1u64 << 30) as f64);
+            for (k, ps) in &dups {
+                println!("  key {k:016x}:");
+                for p in ps { println!("    {}", p.display()); }
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-autotune") {
+        // Validate the autotune MECHANISM (not the choice — perf isn't measurable on lavapipe): it
+        // returns a valid tile, the disk cache round-trips, and the chosen tile is bit-exact vs tile 1.
+        use gpu_kernels::{Gpu, store};
+        let gpu = Gpu::new();
+        eprintln!("gate-autotune: adapter = {}", gpu.adapter_name);
+        let (k, n) = (2048usize, 16384usize); // a 1B-class FFN up shape
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let best = gpu.autotune_matvec(k, n);
+        ck("autotune returns a tile in {1,2,4,8}", [1u32, 2, 4, 8].contains(&best));
+        // cache round-trip under a throwaway adapter key
+        let key = "test-adapter-xyz";
+        store::autotune_put(key, k, n, best);
+        ck("cache get == put", store::autotune_get(key, k, n) == Some(best));
+        ck("cache miss for unknown shape is None", store::autotune_get(key, k + 1, n).is_none());
+        store::autotune_put(key, k, n, if best == 1 { 4 } else { 1 }); // overwrite
+        ck("cache overwrite replaces (no dup rows)", store::autotune_get(key, k, n).is_some() && store::autotune_get(key, k, n) != Some(best));
+        // set + read back, and confirm the installed tile is bit-exact vs tile 1
+        gpu.set_matvec_tile(best);
+        ck("set_matvec_tile installs the value", gpu.matvec_tile() == best);
+        let mut rng = 0xabcd_1234u64; let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let qw = gpu.quantize_q8_resident(&w, n, k);
+        let a = gpu.upload(&act, 1, k);
+        let r1 = gpu.download(&gpu.matvec_decode(&a, &qw, 1));
+        let rb = gpu.download(&gpu.matvec_decode(&a, &qw, best));
+        let d = r1.iter().zip(&rb).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+        ck("chosen tile is bit-exact vs tile 1", d == 0.0);
+        println!("gate-autotune: chosen tile {best} | {}", if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-matvec") {
+        // The tiled decode mat-vec (LOGSCOPE_MATVEC_TILE>1) must be BIT-IDENTICAL to the classic
+        // one-workgroup-per-column kernel — same per-column accumulation, only the activation read is
+        // shared across a column tile. Check across FFN/attention/vocab shapes incl. a non-divisor
+        // tile and n>65535.
+        use gpu_kernels::Gpu;
+        let gpu = Gpu::new();
+        eprintln!("gate-matvec: adapter = {}", gpu.adapter_name);
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let shapes = [("ffn-down", 8192usize, 2048usize), ("ffn-gateup", 2048, 16384), ("attn-q", 2048, 2048), ("attn-kv-gqa", 2048, 512), ("vocab>32768", 512, 70000)];
+        let mut ok = true;
+        for (name, k, n) in shapes {
+            let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+            let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+            let qw = gpu.quantize_q8_resident(&w, n, k);
+            let a = gpu.upload(&act, 1, k);
+            let base = gpu.download(&gpu.matvec_decode(&a, &qw, 1));
+            let mut worst = 0.0f32;
+            for tile in [2u32, 4, 5, 8] { // 5 is a non-divisor of n → exercises the col<n guard
+                let t = gpu.download(&gpu.matvec_decode(&a, &qw, tile));
+                let d = base.iter().zip(&t).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                worst = worst.max(d);
+            }
+            let pass = worst == 0.0;
+            ok &= pass;
+            println!("  [{}] {name:>12} k={k} n={n}: tiled vs untiled max|Δ|={worst:.3e}", if pass { "\u{2713}" } else { "\u{2717} FAIL" });
+        }
+        println!("gate-matvec: {}", if ok { "tiled mat-vec is bit-identical to untiled \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-vit-block") {
+        // The fused `vit_block` (pre-norm ViT/CLIP layer) must match a plain-f32 CPU reference that
+        // recomputes the exact assembly: LN1 → full (bidirectional) MHA → residual → LN2 → MLP
+        // (fc1 → GELU → fc2) → residual. Checks residual placement, norm order/type (LayerNorm, NOT
+        // RMSNorm — mean-subtract + bias), the 1/√head_dim attention scale (no causal mask), bias
+        // paths on every Lin, and BOTH activations (QuickGELU and tanh-GELU).
+        use gpu_kernels::{Gpu, Lin, VisionBlock};
+        let gpu = Gpu::new();
+        eprintln!("gate-vit-block: adapter = {}", gpu.adapter_name);
+        let (t, d, n_heads, mlp, eps) = (5usize, 16usize, 4usize, 32usize, 1e-5f32);
+        let hd = d / n_heads;
+        let mut rng = 0x243f6a8885a308d3u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let vecf = |n: usize, s: f32, r: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..n).map(|_| r() * s).collect() };
+
+        // weights (small magnitudes keep the softmax/gelu in a sane range)
+        let x   = vecf(t * d, 1.0, &mut rnd);
+        let g1  = vecf(d, 1.0, &mut rnd); let b1 = vecf(d, 0.3, &mut rnd);
+        let g2  = vecf(d, 1.0, &mut rnd); let b2 = vecf(d, 0.3, &mut rnd);
+        let wq = vecf(d * d, 0.25, &mut rnd); let bq = vecf(d, 0.2, &mut rnd);
+        let wk = vecf(d * d, 0.25, &mut rnd); let bk = vecf(d, 0.2, &mut rnd);
+        let wv = vecf(d * d, 0.25, &mut rnd); let bv = vecf(d, 0.2, &mut rnd);
+        let wo = vecf(d * d, 0.25, &mut rnd); let bo = vecf(d, 0.2, &mut rnd);
+        let f1 = vecf(mlp * d, 0.25, &mut rnd); let bf1 = vecf(mlp, 0.2, &mut rnd);
+        let f2 = vecf(d * mlp, 0.25, &mut rnd); let bf2 = vecf(d, 0.2, &mut rnd);
+
+        // ---- pure-CPU reference ----
+        let layernorm = |xs: &[f32], g: &[f32], b: &[f32]| -> Vec<f32> {
+            let mut o = vec![0.0f32; xs.len()];
+            for r in 0..t {
+                let row = &xs[r * d..r * d + d];
+                let mean = row.iter().sum::<f32>() / d as f32;
+                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+                let inv = 1.0 / (var + eps).sqrt();
+                for c in 0..d { o[r * d + c] = (row[c] - mean) * inv * g[c] + b[c]; }
+            }
+            o
+        };
+        let linear = |a: &[f32], w: &[f32], bias: &[f32], rows: usize, nin: usize, nout: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * nout];
+            for i in 0..rows { for oo in 0..nout {
+                let mut acc = bias[oo];
+                for kk in 0..nin { acc += a[i * nin + kk] * w[oo * nin + kk]; }
+                o[i * nout + oo] = acc;
+            }}
+            o
+        };
+        let full_mha = |q: &[f32], k: &[f32], v: &[f32]| -> Vec<f32> {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut o = vec![0.0f32; t * d];
+            for h in 0..n_heads { let off = h * hd;
+                for i in 0..t {
+                    let mut sc = vec![0.0f32; t]; let mut mx = f32::MIN;
+                    for j in 0..t { let mut dot = 0.0; for c in 0..hd { dot += q[i * d + off + c] * k[j * d + off + c]; } sc[j] = dot * scale; mx = mx.max(sc[j]); }
+                    let mut sum = 0.0; for j in 0..t { sc[j] = (sc[j] - mx).exp(); sum += sc[j]; }
+                    for c in 0..hd { let mut acc = 0.0; for j in 0..t { acc += sc[j] / sum * v[j * d + off + c]; } o[i * d + off + c] = acc; }
+                }
+            }
+            o
+        };
+        let gelu_tanh = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&v| { let inner = 0.7978845608028654 * (v + 0.044715 * v * v * v); 0.5 * v * (1.0 + inner.tanh()) }).collect::<Vec<f32>>() };
+        let gelu_quick = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&v| v / (1.0 + (-1.702 * v).exp())).collect::<Vec<f32>>() };
+        let add = |a: &[f32], b: &[f32]| -> Vec<f32> { a.iter().zip(b).map(|(x, y)| x + y).collect::<Vec<f32>>() };
+
+        let cpu_ref = |quick: bool| -> Vec<f32> {
+            let h1 = layernorm(&x, &g1, &b1);
+            let q = linear(&h1, &wq, &bq, t, d, d);
+            let k = linear(&h1, &wk, &bk, t, d, d);
+            let vv = linear(&h1, &wv, &bv, t, d, d);
+            let attn = full_mha(&q, &k, &vv);
+            let o = linear(&attn, &wo, &bo, t, d, d);
+            let x2 = add(&x, &o);
+            let h2 = layernorm(&x2, &g2, &b2);
+            let a1 = linear(&h2, &f1, &bf1, t, d, mlp);
+            let act = if quick { gelu_quick(&a1) } else { gelu_tanh(&a1) };
+            let a2 = linear(&act, &f2, &bf2, t, mlp, d);
+            add(&x2, &a2)
+        };
+
+        // ---- GPU under test ----
+        let lin = |w: &[f32], bias: &[f32], nout: usize, nin: usize| Lin::f32(gpu.upload(w, nout, nin)).with_bias(Some(gpu.upload(bias, 1, nout)));
+        let mk = || VisionBlock {
+            g1: gpu.upload(&g1, 1, d), b1: gpu.upload(&b1, 1, d),
+            wq: lin(&wq, &bq, d, d), wk: lin(&wk, &bk, d, d), wv: lin(&wv, &bv, d, d), wo: lin(&wo, &bo, d, d),
+            g2: gpu.upload(&g2, 1, d), b2: gpu.upload(&b2, 1, d),
+            fc1: lin(&f1, &bf1, mlp, d), fc2: lin(&f2, &bf2, d, mlp),
+        };
+        let xt = gpu.upload(&x, t, d);
+        let mut ok = true;
+        for (name, quick) in [("tanh-GELU", false), ("QuickGELU", true)] {
+            let blk = mk();
+            let got = gpu.download(&gpu.vit_block(&blk, &xt, t, d, n_heads, eps, quick));
+            let want = cpu_ref(quick);
+            let worst = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let pass = worst < 2e-3;
+            ok &= pass;
+            println!("  [{}] {name:>10}: GPU vit_block vs CPU ref  max|Δ|={worst:.3e}", if pass { "\u{2713}" } else { "\u{2717} FAIL" });
+        }
+        println!("gate-vit-block: {}", if ok { "pre-norm ViT layer (LayerNorm + bidirectional MHA + GELU MLP, residuals) validated \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-submit") {
+        // Validate the submit-batching knob + the adaptive SubmitTuner. (1) the tuner's pure sweep/settle
+        // logic; (2) flush_every actually controls how many submits a framed op-chain costs; (3) batching
+        // is OUTPUT-INVARIANT (a framed dependent chain is bit-exact across flush values). The best
+        // flush_every (tok/s) is M2-measured; the mechanism + invariance are validated here.
+        use gpu_kernels::{SubmitTuner, gpu_submits, gpu_counters_reset};
+        let gpu = Gpu::new();
+        eprintln!("gate-submit: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1) SubmitTuner: current() tracks the candidate under test, settles on the min-median.
+        {
+            let mut t = SubmitTuner::new(&[16, 32, 64], 2);
+            let feed = [(16u32, 0.10f64), (16, 0.12), (32, 0.08), (32, 0.09), (64, 0.20), (64, 0.22)]; // 32 fastest
+            let mut tracks = true; let mut settled = None;
+            for (expect_cur, secs) in feed {
+                if t.current() != expect_cur { tracks = false; }
+                if let Some(c) = t.record(secs) { settled = Some(c); }
+            }
+            ck("SubmitTuner.current() tracks the candidate being sampled", tracks);
+            ck("SubmitTuner settles on the min-median candidate (32)", settled == Some(32) && t.settled() == Some(32));
+            ck("SubmitTuner recorded one median per candidate", t.results().len() == 3);
+            let held = t.current(); t.record(0.001); // post-settle samples ignored
+            ck("SubmitTuner holds the settled value", t.current() == held && held == 32);
+            ck("empty candidate set settles to the default", SubmitTuner::new(&[], 2).is_settled());
+        }
+
+        // (2)(3) framed dependent chain: square weight so each mat-vec feeds the next; 30 dependent passes.
+        let (n, k) = (128usize, 128);
+        let qw = gpu.quantize_q8_resident(&rnd(n * k, 2), n, k);
+        let seed = rnd(k, 3);
+        let run = |flush: u32| -> (Vec<f32>, u64) {
+            gpu.set_flush_every(flush);
+            gpu.begin_frame();
+            gpu_counters_reset(); // count submits for the framed region only
+            let mut x = gpu.upload(&seed, 1, k);
+            for _ in 0..30 { x = gpu.linear_q8_0_t(&x, &qw, 1); } // dependent chain spanning flush boundaries
+            gpu.end_frame();
+            let submits = gpu_submits();
+            (gpu.download(&x), submits)
+        };
+        let (r4, s4) = run(4);
+        let (r64, s64) = run(64);
+        ck(&format!("higher flush_every → fewer submits for the same work ({s4} at flush=4 vs {s64} at flush=64)"), s64 < s4 && s4 > 0);
+        let e = r4.iter().zip(&r64).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("framed dependent chain is BIT-EXACT across flush_every (max|Δ|={e:.2e})"), e == 0.0);
+        ck("set_flush_every clamps + reports the value in effect", gpu.set_flush_every(99999) == 1024 && gpu.set_flush_every(32) == 32);
+
+        println!("gate-submit: {} | submits {s4}→{s64} (flush 4→64), SUBMIT_PROFILES={:?}", if ok { "submit-batching matrix + tuner validated \u{2713}" } else { "FAIL \u{2717}" }, gpu_kernels::SUBMIT_PROFILES);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-gemm-spec") {
+        // Validate the override-constant GEMM specialization: each device-supported tile produces correct
+        // output, all tiles are bit-exact to EACH OTHER (same k-order accumulation), each is a distinct
+        // specialized pipeline, and the GEMM autotune populates the per-shape cache. Tile SPEED is
+        // M2-measured; the mechanism + correctness are validated here.
+        let gpu = Gpu::new();
+        eprintln!("gate-gemm-spec: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let cands = gpu.gemm_tile_candidates();
+        println!("  GEMM tile candidates (device-limited): {cands:?}");
+        ck("at least two tile candidates to choose among", cands.len() >= 2);
+
+        // distinct specialized pipelines are created — one per tile from a single shader source
+        let p0 = gpu.pipeline_count();
+        let qw0 = gpu.quantize_q8_resident(&rnd(64 * 64, 1), 64, 64);
+        let a0 = gpu.upload(&rnd(16 * 64, 2), 16, 64);
+        for &t in &cands { let _ = gpu.download(&gpu.linear_q8_0_gemm(&a0, &qw0, 16, t)); }
+        ck("override constants yield one distinct pipeline per tile", gpu.pipeline_count() >= p0 + cands.len());
+
+        // correctness vs naive + cross-tile bit-exactness, across shapes incl. non-multiples of the tiles
+        for &(m, n, k) in &[(16usize, 32, 64), (20, 48, 96), (33, 17, 128), (50, 130, 160), (256, 128, 256)] {
+            let qw = gpu.quantize_q8_resident(&rnd(n * k, 5), n, k);
+            let at = gpu.upload(&rnd(m * k, 9), m, k);
+            let naive = gpu.download(&gpu.linear_q8_0_t(&at, &qw, m));
+            let mut prev: Option<Vec<f32>> = None;
+            let (mut tiles_match, mut max_naive) = (true, 0.0f32);
+            for &t in &cands {
+                let g = gpu.download(&gpu.linear_q8_0_gemm(&at, &qw, m, t));
+                max_naive = max_naive.max(naive.iter().zip(&g).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max));
+                if let Some(p) = &prev { if p.iter().zip(&g).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max) != 0.0 { tiles_match = false; } }
+                prev = Some(g);
+            }
+            ck(&format!("GEMM all tiles match naive within tol [{m}×{n}×{k}] (max|Δ|={max_naive:.2e})"), max_naive < 1e-2);
+            ck(&format!("GEMM tiles {cands:?} BIT-EXACT to each other [{m}×{n}×{k}]"), tiles_match);
+        }
+
+        // autotune populates the per-shape GEMM cache, and the lookup returns a supported tile
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let model = gpu.load_gguf_quantized(&write_gguf_q8_0(&hm)).unwrap();
+        let shapes = gpu.model_decode_shapes(&model);
+        let tuned = gpu.autotune_gemm(&shapes, 64, None).len();
+        let distinct = { let mut s = shapes.clone(); s.sort(); s.dedup(); s.len() };
+        ck("autotune_gemm tuned each distinct shape once", tuned == distinct);
+        let (n0, k0) = shapes[0];
+        ck("gemm_tile_for returns a supported tile for a tuned shape", cands.contains(&gpu.gemm_tile_for(n0, k0)));
+
+        // persistence: GEMM tiles round-trip into a fresh GPU context (amortizes across launches/models)
+        let path = std::env::temp_dir().join("logscope_gemm_autotune_test.bin");
+        gpu.save_autotune(&path).unwrap();
+        let gpu2 = Gpu::new();
+        let (_, gloaded) = gpu2.load_autotune(&path).unwrap();
+        ck("GEMM tiles persist + reload into a fresh context", gloaded == tuned && gpu2.gemm_tile_for(n0, k0) == gpu.gemm_tile_for(n0, k0));
+        ck("a loaded GEMM shape is NOT re-probed (autotune skips cached shapes)", gpu2.autotune_gemm(&[(n0, k0)], 64, None).is_empty());
+        let _ = std::fs::remove_file(&path);
+
+        // end-to-end: a pinned tile routes through the tiled path and stays bit-exact
+        let (n, k) = (320usize, 128usize);
+        let qw = gpu.quantize_q8_resident(&rnd(n * k, 3), n, k);
+        let am = gpu.upload(&rnd(40 * k, 7), 40, k);
+        let base = gpu.download(&gpu.linear_q8_0_tiled_t(&am, &qw, 40));
+        gpu.set_gemm_tile(n, k, *cands.last().unwrap());
+        let viab = gpu.download(&gpu.linear_q8_0_tiled_t(&am, &qw, 40));
+        ck("set_gemm_tile routes through the tiled path + bit-exact", base == viab && gpu.gemm_tile_for(n, k) == *cands.last().unwrap());
+
+        println!("gate-gemm-spec: {} | tuned {} shapes, tiles {:?}", if ok { "GEMM override-constant specialization validated \u{2713}" } else { "FAIL \u{2717}" }, tuned, cands);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-autotune-cache") {
+        // Validate the shape-keyed, persistable autotune cache MECHANISM (the chosen tiles are noise on
+        // lavapipe — tile quality is M2-measured; what's validated here is enumerate→tune→lookup→persist
+        // and that a cached tile routes correctly through the decode path).
+        let gpu = Gpu::new();
+        eprintln!("gate-autotune-cache: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1) distinct shapes read off a real model
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let model = gpu.load_gguf_quantized(&write_gguf_q8_0(&hm)).unwrap();
+        let shapes = gpu.model_decode_shapes(&model);
+        ck("model_decode_shapes finds the model's mat-vec shapes (all k%32==0)", !shapes.is_empty() && shapes.iter().all(|&(_, k)| k % 32 == 0));
+
+        // (2) per-shape autotune populates the cache (one probe per DISTINCT shape)
+        let tuned = gpu.autotune_shapes(&shapes, None).len();
+        let distinct = { let mut s: Vec<_> = shapes.clone(); s.sort(); s.dedup(); s.len() };
+        ck("autotune_shapes tuned each distinct shape once", tuned == distinct);
+
+        // (3) lookup: cached tile for a tuned shape, global-profile fallback for an unknown shape
+        let (n0, k0) = shapes[0];
+        ck("decode_tile_for returns a cached tile for a tuned shape", (1..=8).contains(&gpu.decode_tile_for(n0, k0)));
+        ck("decode_tile_for falls back to the global profile for an unknown shape", gpu.decode_tile_for(7777, 8888) == gpu.decode_profile().tile);
+
+        // (4) persistence round-trips, and a SECOND Gpu loads the tuned tiles (amortizes across launches
+        //     and across models that share shapes — the multi-model payoff)
+        let path = std::env::temp_dir().join("logscope_autotune_test.bin");
+        gpu.save_autotune(&path).unwrap();
+        let gpu2 = Gpu::new();
+        let loaded = gpu2.load_autotune(&path).unwrap();
+        ck("save/load round-trips the cache into a fresh GPU context", loaded.0 == tuned && gpu2.decode_tile_for(n0, k0) == gpu.decode_tile_for(n0, k0));
+        ck("a loaded shape is NOT re-probed (autotune skips cached shapes)", gpu2.autotune_shapes(&[(n0, k0)], None).is_empty());
+        let _ = std::fs::remove_file(&path);
+
+        // (5) end-to-end: a forced per-shape tile routes through decode_tile_for → matvec and is bit-exact
+        //     to the default tile (tiles 1..8 are bit-exact, see gate-perf) — confirming the lookup feeds
+        //     the kernel correctly and the cache only changes SPEED.
+        let (n, k) = (320usize, 128usize);
+        let qw = gpu.quantize_q8_resident(&rnd(n * k, 3), n, k);
+        let a1 = gpu.upload(&rnd(k, 8), 1, k);
+        let base = gpu.download(&gpu.linear_q8_0_t(&a1, &qw, 1)); // default tile (no cache entry)
+        gpu.set_shape_tile(n, k, 8);                              // pin tile=8 for this shape
+        let viaq = gpu.download(&gpu.linear_q8_0_t(&a1, &qw, 1)); // routed at tile=8 via the cache
+        let e = base.iter().zip(&viaq).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("cached tile routes through decode + is bit-exact to default (speed-only)", e == 0.0 && gpu.decode_tile_for(n, k) == 8);
+
+        println!("gate-autotune-cache: {} | tuned {} distinct shapes", if ok { "shape-keyed autotune cache validated \u{2713}" } else { "FAIL \u{2717}" }, tuned);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-perf") {
+        // Validate the two prefill/decode speed levers are CORRECTNESS-preserving (speed is M2-measured).
+        // (1) the tiled prefill GEMM is bit-exact to the naive one across shapes incl. non-multiples of 16;
+        // (2) the decode mat-vec is identical across tile sizes (so LOGSCOPE_DECODE_TILE only changes speed).
+        let gpu = Gpu::new();
+        eprintln!("gate-perf: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        for &(m, n, k) in &[(16usize, 32, 64), (20, 48, 96), (33, 17, 128), (50, 130, 160), (835, 128, 256)] {
+            let w = rnd(n * k, 5);
+            let qw = gpu.quantize_q8_resident(&w, n, k);
+            let at = gpu.upload(&rnd(m * k, 9), m, k);
+            let naive = gpu.download(&gpu.linear_q8_0_t(&at, &qw, m));         // naive (env unset)
+            let tiled = gpu.download(&gpu.linear_q8_0_tiled_t(&at, &qw, m));   // tiled, explicit
+            let e = naive.iter().zip(&tiled).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            ck(&format!("tiled prefill GEMM == naive within float tol [{m}×{n}×{k}] (max|Δ|={e:.2e})"), e < 1e-2);
+        }
+
+        // decode mat-vec identical across tiles (the LOGSCOPE_DECODE_TILE values cover the profiles)
+        let (n, k) = (320usize, 128usize);
+        let qw = gpu.quantize_q8_resident(&rnd(n * k, 3), n, k);
+        let a1 = gpu.upload(&rnd(k, 8), 1, k);
+        let base = gpu.download(&gpu.matvec_decode(&a1, &qw, 1));
+        let mut tiles_ok = true; let mut tmax = 0.0f32;
+        for &tile in &[1u32, 2, 4, 8] { // the tiled mat-vec supports tile ≤ 8 (acc/red sized for 8)
+            let g = gpu.download(&gpu.matvec_decode(&a1, &qw, tile));
+            let e = g.iter().zip(&base).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            tmax = tmax.max(e);
+            if e > 1e-3 { tiles_ok = false; }
+        }
+        ck(&format!("decode mat-vec matches across tile ∈ {{1,2,4,8}} (max|Δ|={tmax:.2e}, speed-only)"), tiles_ok);
+        // The tiled GEMM is bit-exact to naive (above), and model prefill dispatches it via
+        // linear_q8_0_t when LOGSCOPE_PREFILL_TILED=1 — so a tiled-prefill forward is bit-identical to
+        // the naive forward by construction; no separate (env-cached) end-to-end check needed.
+        println!("gate-perf: {} (correctness only — speed is measured on the M2)", if ok { "speed levers validated \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-qkv") {
+        // Fused QKV projection == separate Q/K/V, bit-exact. The decode path issues three separate
+        // mat-vecs (wq, wk, wv); fusing them into one [d+2kv, d] projection (mirroring the existing
+        // wgate_up fusion) cuts 2 dispatches/layer. This gate proves the fusion is CORRECTNESS-
+        // preserving BEFORE the loader/hot-path is rewired (Turn 3): concatenating the output rows
+        // [q|k|v] then per-row quantizing is identical to quantizing each projection separately —
+        // verified through the REAL resident matmul (m=1 mat-vec and small-batch m=4), for int8 and
+        // 4-bit residency, and the concatenated bias (Qwen2's Q/K/V bias) matches per-projection add.
+        let gpu = Gpu::new();
+        eprintln!("gate-qkv: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // GQA-ish shape: d split into heads, kv smaller (grouped-query). k = d must be a multiple of 32.
+        let (d, kv) = (128usize, 32usize);
+        let n_fused = d + 2 * kv;
+        // f32 source rows per projection (distinct seeds) and their concatenation in [q; k; v] order —
+        // the same row order the fused matmul emits as output columns [q | k | v].
+        let wq_f = rnd(d * d, 1); let wk_f = rnd(kv * d, 2); let wv_f = rnd(kv * d, 3);
+        let mut wqkv_f = Vec::with_capacity(n_fused * d);
+        wqkv_f.extend_from_slice(&wq_f); wqkv_f.extend_from_slice(&wk_f); wqkv_f.extend_from_slice(&wv_f);
+
+        // Rebuild a fused [m, n_fused] result from the three separate [m, *] outputs, row by row.
+        let row_concat = |oq: &[f32], ok_: &[f32], ov: &[f32], m: usize| -> Vec<f32> {
+            let mut out = Vec::with_capacity(m * n_fused);
+            for r in 0..m {
+                out.extend_from_slice(&oq[r * d..(r + 1) * d]);
+                out.extend_from_slice(&ok_[r * kv..(r + 1) * kv]);
+                out.extend_from_slice(&ov[r * kv..(r + 1) * kv]);
+            }
+            out
+        };
+
+        // ── int8 resident (the decode mat-vec path) ──
+        let qq = gpu.quantize_q8_resident(&wq_f, d, d);
+        let qk = gpu.quantize_q8_resident(&wk_f, kv, d);
+        let qv = gpu.quantize_q8_resident(&wv_f, kv, d);
+        let qf = gpu.quantize_q8_resident(&wqkv_f, n_fused, d);
+        for &m in &[1usize, 4] {
+            let a = gpu.upload(&rnd(m * d, 10 + m), m, d);
+            let oq = gpu.download(&gpu.linear_q8_0_t(&a, &qq, m));
+            let ok_ = gpu.download(&gpu.linear_q8_0_t(&a, &qk, m));
+            let ov = gpu.download(&gpu.linear_q8_0_t(&a, &qv, m));
+            let of = gpu.download(&gpu.linear_q8_0_t(&a, &qf, m));
+            let exp = row_concat(&oq, &ok_, &ov, m);
+            let e = of.iter().zip(&exp).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            ck(&format!("int8 fused QKV == separate (m={m}) (max|Δ|={e:.2e})"), e == 0.0);
+        }
+
+        // ── 4-bit resident (q4 decode mat-vec path) ──
+        let q4q = gpu.quantize_q4_resident(&wq_f, d, d);
+        let q4k = gpu.quantize_q4_resident(&wk_f, kv, d);
+        let q4v = gpu.quantize_q4_resident(&wv_f, kv, d);
+        let q4f = gpu.quantize_q4_resident(&wqkv_f, n_fused, d);
+        for &m in &[1usize, 4] {
+            let a = gpu.upload(&rnd(m * d, 30 + m), m, d);
+            let oq = gpu.download(&gpu.linear_q4_0_t(&a, &q4q, m));
+            let ok_ = gpu.download(&gpu.linear_q4_0_t(&a, &q4k, m));
+            let ov = gpu.download(&gpu.linear_q4_0_t(&a, &q4v, m));
+            let of = gpu.download(&gpu.linear_q4_0_t(&a, &q4f, m));
+            let exp = row_concat(&oq, &ok_, &ov, m);
+            let e = of.iter().zip(&exp).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            ck(&format!("q4 fused QKV == separate (m={m}) (max|Δ|={e:.2e})"), e == 0.0);
+        }
+
+        // ── fused bias (Qwen2 carries Q/K/V bias) == per-projection bias add ──
+        let (bq, bk, bv) = (rnd(d, 7), rnd(kv, 8), rnd(kv, 9));
+        let mut bqkv = Vec::with_capacity(n_fused);
+        bqkv.extend_from_slice(&bq); bqkv.extend_from_slice(&bk); bqkv.extend_from_slice(&bv);
+        let m = 4usize;
+        let a = gpu.upload(&rnd(m * d, 99), m, d);
+        let sq = gpu.download(&gpu.add_bias_t(&gpu.linear_q8_0_t(&a, &qq, m), &gpu.upload(&bq, 1, d)));
+        let sk = gpu.download(&gpu.add_bias_t(&gpu.linear_q8_0_t(&a, &qk, m), &gpu.upload(&bk, 1, kv)));
+        let sv = gpu.download(&gpu.add_bias_t(&gpu.linear_q8_0_t(&a, &qv, m), &gpu.upload(&bv, 1, kv)));
+        let exp = row_concat(&sq, &sk, &sv, m);
+        let fused = gpu.download(&gpu.add_bias_t(&gpu.linear_q8_0_t(&a, &qf, m), &gpu.upload(&bqkv, 1, n_fused)));
+        let e = fused.iter().zip(&exp).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck(&format!("int8 fused QKV + fused bias == separate (m={m}) (max|Δ|={e:.2e})"), e == 0.0);
+
+        println!("gate-qkv: {}", if ok { "fused QKV is bit-exact vs separate — safe to wire into the loader \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-q8direct") {
+        // Direct q8_0 → int8-resident load (no f32 round-trip). Validates: q8_0_to_resident yields a
+        // QWeight that dequantizes to EXACTLY the q8_0 values (matmul bit-exact vs the dequant path), and
+        // a full q8_0 GGUF loads through the loader's direct path and matches a from-f32 reference.
+        let gpu = Gpu::new();
+        eprintln!("gate-q8direct: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1)(2) QWeight-level: encode w→q8_0, build QWeight directly, matmul must equal a CPU matmul
+        // over the q8_0-dequantized weights (the direct path introduces ZERO error beyond q8_0 itself).
+        let (n, k) = (40usize, 64usize);
+        let w = rnd(n * k, 11);
+        let bytes = enc_q8_0(&w);
+        let f32ref = gpu_kernels::gguf::dequantize(8, &bytes, n * k).unwrap();
+        let qw = gpu.q8_0_to_resident(&bytes, n, k);
+        for &m in &[1usize, 5] {
+            let a = rnd(m * k, 22 + m);
+            let g = gpu.download(&gpu.linear_q8_0_t(&gpu.upload(&a, m, k), &qw, m));
+            let c = cpu_linear(&a, &f32ref, m, n, k);
+            let e = g.iter().zip(&c).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            ck(if m == 1 { "direct q8_0 QWeight: mat-vec (m=1) == q8_0 dequant matmul" } else { "direct q8_0 QWeight: linear (m=5) == q8_0 dequant matmul" }, e < 1e-3);
+        }
+
+        // (3) end-to-end: a q8_0 GGUF loads through the loader's DIRECT path and tracks the from-f32 path.
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let mq8 = gpu.load_gguf_quantized(&write_gguf_q8_0(&hm)).expect("q8_0 GGUF loads (direct path)");
+        let mf32 = gpu.load_gguf(&write_gguf(&hm)).unwrap(); // original f32 weights
+        let ids = [1u32, 7, 13, 0, 21];
+        let (lq, lf) = (gpu.model_forward(&mq8, &ids), gpu.model_forward(&mf32, &ids));
+        let dot: f32 = lq.iter().zip(&lf).map(|(a, b)| a * b).sum();
+        let (na, nb) = (lq.iter().map(|x| x * x).sum::<f32>().sqrt(), lf.iter().map(|x| x * x).sum::<f32>().sqrt());
+        let cos = dot / (na * nb);
+        ck("q8_0 model loads via the direct path + tracks f32 (finite, cos>0.99)", lq.iter().all(|x| x.is_finite()) && cos > 0.99);
+        ck("q8_0 argmax == f32 argmax (near-lossless)", gpu_kernels::argmax(&lq[lq.len() - hm.vocab..]) == gpu_kernels::argmax(&lf[lf.len() - hm.vocab..]));
+        println!("gate-q8direct: {} | q8_0·f32 cos={:.5}", if ok { "direct q8_0 load validated \u{2713}" } else { "FAIL \u{2717}" }, cos);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-q4resident") {
+        // 4-bit resident matmul — the memory lever memplan flagged (q4 ≈ half of int8 → a 70B fits).
+        // Validates the new kernels are bit-exact vs a CPU dequant+matmul over the SAME q4 values, for
+        // both decode (m=1 mat-vec) and prefill (m>1 tiled), and that q4 is lossy-but-bounded vs f32.
+        let gpu = Gpu::new();
+        eprintln!("gate-q4resident: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (n, k) = (40usize, 64usize);
+        let w = rnd(n * k, 11);
+        // CPU: replicate the resident q4 quantization → effective (dequantized) weights + track the loss
+        let kb = k / 32;
+        let mut w_eff = vec![0f32; n * k];
+        let (mut maxerr_q, mut wmax) = (0f32, 0f32);
+        for r in 0..n {
+            for b in 0..kb {
+                let mut amax = 0f32;
+                for j in 0..32 { let v = w[r * k + b * 32 + j].abs(); amax = amax.max(v); wmax = wmax.max(v); }
+                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                for j in 0..32 {
+                    let idx = r * k + b * 32 + j;
+                    let q = (w[idx] / scale).round().clamp(-7.0, 7.0);
+                    w_eff[idx] = q * scale;
+                    maxerr_q = maxerr_q.max((w_eff[idx] - w[idx]).abs());
+                }
+            }
+        }
+        let q4 = gpu.quantize_q4_resident(&w, n, k);
+        // (1) decode mat-vec (m=1)
+        let a1 = rnd(k, 22);
+        let g1 = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a1, 1, k), &q4, 1));
+        let c1 = cpu_linear(&a1, &w_eff, 1, n, k);
+        let e1 = g1.iter().zip(&c1).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("q4 mat-vec (m=1) bit-exact vs CPU dequant+matmul", e1 < 1e-3);
+        // (2) prefill (m=5)
+        let m = 5; let a5 = rnd(m * k, 33);
+        let g5 = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a5, m, k), &q4, m));
+        let c5 = cpu_linear(&a5, &w_eff, m, n, k);
+        let e5 = g5.iter().zip(&c5).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("q4 linear (m=5) bit-exact vs CPU dequant+matmul", e5 < 1e-3);
+        // (3) lossy-but-bounded vs f32
+        ck("q4 is lossy but bounded (0 < err < max|w|)", maxerr_q > 0.0 && maxerr_q < wmax);
+        // (4) the memory lever memplan promised: q4 weight bytes ≈ half of int8
+        use gpu_kernels::memplan::*;
+        let l70 = ModelShape { d: 8192, ffn: 28672, layers: 80, vocab: 128256, n_heads: 64, n_kv_heads: 8, tied_embed: false };
+        let (q4b, i8b) = (resident_weight_bytes(&l70, Residency::Q4), resident_weight_bytes(&l70, Residency::Int8));
+        ck("70B q4 ≈ half of int8 (the planner's q4 path is now real)", q4b < i8b && q4b * 10 < i8b * 6);
+        // (5) end-to-end: a full model loads q4-resident through the loader (LOGSCOPE_Q4_RESIDENT) and
+        // tracks the f32 model (lossy, but the argmax direction holds).
+        std::env::set_var("LOGSCOPE_Q4_RESIDENT", "1");
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let mq4 = gpu.load_gguf_quantized(&write_gguf(&hm)).expect("q4-resident model loads");
+        std::env::remove_var("LOGSCOPE_Q4_RESIDENT");
+        let mf32 = gpu.load_gguf(&write_gguf(&hm)).unwrap();
+        let ids = [1u32, 7, 13, 0, 21];
+        let (lq, lf) = (gpu.model_forward(&mq4, &ids), gpu.model_forward(&mf32, &ids));
+        let dot: f32 = lq.iter().zip(&lf).map(|(a, b)| a * b).sum();
+        let (na, nb) = (lq.iter().map(|x| x * x).sum::<f32>().sqrt(), lf.iter().map(|x| x * x).sum::<f32>().sqrt());
+        let cos = dot / (na * nb);
+        ck("q4-resident model loads via the loader + tracks f32 (finite, cos>0.8)", lq.iter().all(|x| x.is_finite()) && cos > 0.8);
+        println!("gate-q4resident: {} | 70B int8 {:.1} GiB → q4 {:.1} GiB | model q4·f32 cos={:.4}",
+            if ok { "4-bit resident matmul validated \u{2713}" } else { "FAIL \u{2717}" }, gib(i8b), gib(q4b), cos);
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-qwen2") {
+        // Qwen2 = llama + a Q/K/V bias add + qwen2.* metadata. Validates: the bias-add kernel is
+        // bit-exact; a qwen2 GGUF loads (refusal lifted, qwen2.* dims read); a ZERO-bias qwen2 forward
+        // equals the llama path (bias is a clean no-op); a NONZERO bias changes the logits (bias is
+        // wired into the forward). Bit-exact-vs-a-real-Qwen2 stays M2-gated (converter quirks).
+        let gpu = Gpu::new();
+        eprintln!("gate-qwen2: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1) broadcast bias-add kernel bit-exact vs CPU
+        let (rows, cols) = (5usize, 16usize);
+        let a = rnd(rows * cols, 7); let bias = rnd(cols, 99);
+        let at = gpu.upload(&a, rows, cols); let bt = gpu.upload(&bias, 1, cols);
+        let got = gpu.download(&gpu.add_bias_t(&at, &bt));
+        let want: Vec<f32> = (0..rows * cols).map(|i| a[i] + bias[i % cols]).collect();
+        let kerr = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("add_bias_t broadcasts per-column, bit-exact vs CPU", kerr < 1e-6);
+
+        // a small GQA model + the token ids to run
+        let m = gen_model(64, 128, 2, 48, 4, 2);
+        let ids = [1u32, 7, 13, 0, 21];
+        let kv = m.n_kv_heads * (m.d / m.n_heads);
+        let zero: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..m.n_layers).map(|_| (vec![0.0; m.d], vec![0.0; kv], vec![0.0; kv])).collect();
+
+        // (2) zero-bias qwen2 loads and equals the llama path (same weights)
+        let qz = gpu.load_gguf(&write_gguf_qwen2(&m, &zero)).expect("zero-bias qwen2 loads");
+        let ll = gpu.load_gguf(&write_gguf(&m)).expect("llama loads");
+        let lz = gpu.model_forward(&qz, &ids); let ln = gpu.model_forward(&ll, &ids);
+        let d0 = lz.iter().zip(&ln).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("qwen2 arch accepted + qwen2.* dims read (zero-bias == llama)", d0 < 1e-5);
+
+        // (3) nonzero bias loads and changes the logits (bias flows into the forward)
+        let nz: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)> = (0..m.n_layers).map(|i| {
+            (rnd(m.d, 300 + i), rnd(kv, 400 + i), rnd(kv, 500 + i))
+        }).collect();
+        let qn = gpu.load_gguf(&write_gguf_qwen2(&m, &nz)).expect("nonzero-bias qwen2 loads");
+        let lnz = gpu.model_forward(&qn, &ids);
+        let dnz = lnz.iter().zip(&lz).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("nonzero Q/K/V bias changes the logits (bias is applied)", dnz > 1e-3);
+        // and int8-resident qwen2 also loads + runs (the bias rides the quantized projection too)
+        let qi = gpu.load_gguf_quantized(&write_gguf_qwen2(&m, &nz)).expect("int8 qwen2 loads");
+        let li = gpu.model_forward(&qi, &ids);
+        ck("int8-resident qwen2 argmax == f32 qwen2", gpu_kernels::argmax(&li[li.len()-m.vocab..]) == gpu_kernels::argmax(&lnz[lnz.len()-m.vocab..]));
+
+        // (4) genuinely unsupported arches still refuse
+        let mut gem = write_gguf(&m);
+        let kpos = gem.windows(b"general.architecture".len()).position(|w| w == b"general.architecture").unwrap();
+        let rel = gem[kpos..].windows(5).position(|w| w == b"llama").unwrap();
+        gem[kpos + rel..kpos + rel + 5].copy_from_slice(b"gemma"); // 5 bytes, in place
+        ck("gemma2/other arches still refused", gpu.load_gguf(&gem).is_err());
+
+        println!("gate-qwen2: {}", if ok { "Qwen2 bias path validated (correctness) \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-memplan") {
+        // Pure footprint/fit planner — no GPU. Asserts param counts, the int8 estimate matches the
+        // store.rs estimator + the M2 anchor, and the graded verdict (≤32B fits int8, 70B does not).
+        use gpu_kernels::memplan::*;
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let smol = ModelShape { d: 960, ffn: 2560, layers: 32, vocab: 49152, n_heads: 15, n_kv_heads: 5, tied_embed: true };
+        let l8 = ModelShape { d: 4096, ffn: 14336, layers: 32, vocab: 128256, n_heads: 32, n_kv_heads: 8, tied_embed: false };
+        let l70 = ModelShape { d: 8192, ffn: 28672, layers: 80, vocab: 128256, n_heads: 64, n_kv_heads: 8, tied_embed: false };
+        ck("SmolLM2-360M ≈ 362M params", (360_000_000..=365_000_000).contains(&smol.total_params()));
+        ck("Llama-8B ≈ 8.0B params", (7_900_000_000..=8_200_000_000).contains(&l8.total_params()));
+        ck("SmolLM2 int8 ≈ 0.5 GiB (M2 log says ~0.56)", { let g = gib(resident_weight_bytes(&smol, Residency::Int8)); (0.4..0.65).contains(&g) });
+        let big = 39_500u64 * (1 << 20);
+        ck("8B fits int8 on the M2", matches!(plan(&l8, big, 8192, 2, 400 * (1 << 20)), Fit::Resident { fmt: Residency::Int8, .. }));
+        ck("70B does NOT fit int8 on the M2", !matches!(plan(&l70, big, 4096, 2, 500 * (1 << 20)), Fit::Resident { fmt: Residency::Int8, .. }));
+        ck("70B int8 estimate strictly larger than 8B", resident_weight_bytes(&l70, Residency::Int8) > resident_weight_bytes(&l8, Residency::Int8));
+        ck("q4 footprint < int8 footprint", resident_weight_bytes(&l70, Residency::Q4) < resident_weight_bytes(&l70, Residency::Int8));
+        ck("kv scales linearly with context", kv_cache_bytes(&l8, 32768, 2) == kv_cache_bytes(&l8, 2048, 2) * 16);
+        // agreement with the loader's live budget reader (if memory is knowable here)
+        if let Some(b) = gpu_kernels::store::resident_budget_bytes() { ck("resident_budget_bytes is positive", b > 0); }
+        println!("gate-memplan: {} | fit table:", if ok { "planner checks \u{2713}" } else { "FAIL \u{2717}" });
+        for (name, s) in [("8B", l8), ("70B", l70)] {
+            println!("  {name:>4}: {:.1}B params | int8 {:.1} GiB | q4 {:.1} GiB | plan(39.5GiB)={:?}",
+                s.total_params() as f64 / 1e9, gib(resident_weight_bytes(&s, Residency::Int8)),
+                gib(resident_weight_bytes(&s, Residency::Q4)), plan(&s, big, 8192, 2, 400 * (1 << 20)));
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-arch") {
+        // Build a synthetic llama GGUF, flip general.architecture "llama"→"qwen2" in the bytes, and
+        // confirm load REFUSES with guidance (not a panic / cryptic missing-key error). Also confirms
+        // the unmodified llama bytes still load.
+        let gpu = Gpu::new();
+        eprintln!("gate-arch: adapter = {}", gpu.adapter_name);
+        let hm = gen_model(128, 256, 2, 200, 4, 2);
+        let (bytes, _eff) = build_quantized_gguf(&hm);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        ck("unmodified llama GGUF loads", gpu.load_gguf_quantized(&bytes).is_ok());
+        let mut patched = bytes.clone();
+        let key = b"general.architecture";
+        let kpos = patched.windows(key.len()).position(|w| w == key).expect("arch key present");
+        let rel = patched[kpos..].windows(5).position(|w| w == b"llama").expect("arch value present");
+        patched[kpos + rel..kpos + rel + 5].copy_from_slice(b"qwen2"); // same length, in-place
+        match gpu.load_gguf_quantized(&patched) {
+            Err(e) => { ck("non-llama arch refused with guidance", e.contains("qwen2") && e.contains("llama.cpp")); if !(e.contains("qwen2")) { eprintln!("    got: {e}"); } }
+            Ok(_) => ck("non-llama arch refused with guidance", false),
+        }
+        println!("gate-arch: {}", if ok { "architecture guard checks \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-worker") {
+        // Validates the LocalWorker core (Gpu::run_tokens): a fixed seed is deterministic, max_new is
+        // a hard bound, and a stop id in the set halts early (and isn't included in the output).
+        let gpu = Gpu::new();
+        eprintln!("gate-worker: adapter = {}", gpu.adapter_name);
+        let (d, h, n, vocab, nh, nkv) = (128usize, 256usize, 2usize, 200usize, 4usize, 2usize);
+        let hm = gen_model(d, h, n, vocab, nh, nkv);
+        let (bytes, _eff) = build_quantized_gguf(&hm);
+        let m = gpu.load_gguf_quantized(&bytes).expect("load synth");
+        let sp = gpu_kernels::SamplerParams { temperature: 0.8, top_k: 40, top_p: 0.95, repeat_penalty: 1.1, repeat_last_n: 64, min_p: 0.05 };
+        let prefix: Vec<u32> = vec![1, 5, 9, 13, 21];
+        let a = gpu.run_tokens(&m, &prefix, 24, &sp, &[], 0xC0FFEE);
+        let b = gpu.run_tokens(&m, &prefix, 24, &sp, &[], 0xC0FFEE);
+        let c = gpu.run_tokens(&m, &prefix, 24, &sp, &[], 0x1234);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        ck("same seed → identical tokens", a == b);
+        ck("max_new is a hard bound", a.len() <= 24);
+        ck("different seed → different sequence (usually)", a != c || a.is_empty());
+        // stop set = whatever the greedy continuation's first token is → must halt immediately (empty out).
+        let greedy_first = { let cache = gpu.new_cache(m.n_layers, prefix.len() + 2, m.kv_dim());
+            let lg = gpu.prefill_chunked(&m, &cache, &prefix, 512); gpu_kernels::argmax(&lg) };
+        let stopped = gpu.run_tokens(&m, &prefix, 24, &gpu_kernels::SamplerParams { temperature: 0.0, ..sp }, &[greedy_first], 0);
+        ck("stop id halts before emitting it", !stopped.contains(&greedy_first));
+        println!("gate-worker: {}", if ok { "run_tokens core checks \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-mmap") {
+        // Big-model fix: loading via mmap_ro must produce IDENTICAL weights (hence logits) to the old
+        // fs::read path — mmap only changes HOW the bytes are fetched, not the bytes. Build a synthetic
+        // quantized GGUF, write it to disk, load it both ways, and compare a prefill bit-for-bit.
+        let gpu = Gpu::new();
+        eprintln!("gate-mmap: adapter = {}", gpu.adapter_name);
+        let (d, h, n, vocab, nh, nkv) = (128usize, 256usize, 2usize, 200usize, 4usize, 2usize);
+        let hm = gen_model(d, h, n, vocab, nh, nkv);
+        let (bytes, _eff) = build_quantized_gguf(&hm);
+        let path = std::env::temp_dir().join("ls-gate-mmap.gguf");
+        std::fs::write(&path, &bytes).expect("write synth gguf");
+        let ps = path.to_str().unwrap();
+        // (a) read whole into RAM, (b) mmap — the two load paths.
+        let read_bytes = std::fs::read(ps).expect("read");
+        let m_read = gpu.load_gguf_quantized(&read_bytes).expect("load via read");
+        let mm = gpu_kernels::mmap_ro(ps).expect("mmap");
+        let m_mmap = gpu.load_gguf_quantized(&mm[..]).expect("load via mmap");
+        let mut worst = 0.0f32; let mut argmax_ok = true; let mut key_ok = true;
+        for &t in &[5usize, 16, 40] {
+            let prompt: Vec<u32> = (0..t).map(|j| (j as u32 * 7 + 1) % vocab as u32).collect();
+            let cr = gpu.new_cache(m_read.n_layers, t + 4, m_read.kv_dim());
+            let lr = gpu.prefill_batched(&m_read, &cr, &prompt);
+            let cm = gpu.new_cache(m_mmap.n_layers, t + 4, m_mmap.kv_dim());
+            let lm = gpu.prefill_batched(&m_mmap, &cm, &prompt);
+            let md = lr.iter().zip(&lm).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            worst = worst.max(md); argmax_ok &= gpu_kernels::argmax(&lr) == gpu_kernels::argmax(&lm);
+            eprintln!("  t={t:>3}: max|Δlogit|={md:.3e}");
+        }
+        // the content key must match between a full-slice hash and the seeked file reader, too.
+        key_ok &= gpu_kernels::store::content_key(&read_bytes) == gpu_kernels::store::content_key_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let verdict = if worst == 0.0 && argmax_ok && key_ok { "BIT-EXACT ✓" } else { "MISMATCH ✗" };
+        println!("gate-mmap: worst max|Δlogit|={worst:.3e} argmax_match={argmax_ok} content_key_match={key_ok} → {verdict}");
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-prefill") {
+        // Bit-exactness gate for the OOM fix: prefill_chunked (memory-bounded, O(chunk·T) transients)
+        // must produce the SAME last-token logits as prefill_batched (O(T) transients that OOM at high
+        // ctx on large models). If this holds, the harness/app can route large prompts to chunked and
+        // stop crashing past ~1k ctx. Runs on lavapipe (correctness only; perf is M2-side).
+        let gpu = Gpu::new();
+        eprintln!("gate-prefill: adapter = {}", gpu.adapter_name);
+        let (d, h, n, vocab, nh, nkv) = (128usize, 256usize, 2usize, 200usize, 4usize, 2usize);
+        let hm = gen_model(d, h, n, vocab, nh, nkv);
+        let (bytes, _eff) = build_quantized_gguf(&hm);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load synth");
+        let mut worst = 0.0f32; let mut argmax_ok = true;
+        for &t in &[5usize, 16, 17, 40, 100] {
+            let prompt: Vec<u32> = (0..t).map(|j| (j as u32 * 7 + 1) % vocab as u32).collect();
+            let cb = gpu.new_cache(model.n_layers, t + 4, model.kv_dim());
+            let lb = gpu.prefill_batched(&model, &cb, &prompt);
+            for &chunk in &[1usize, 8, 16, 4096] {
+                let cc = gpu.new_cache(model.n_layers, t + 4, model.kv_dim());
+                let lc = gpu.prefill_chunked(&model, &cc, &prompt, chunk);
+                let md = lb.iter().zip(&lc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let am = gpu_kernels::argmax(&lb) == gpu_kernels::argmax(&lc);
+                worst = worst.max(md); argmax_ok &= am;
+                eprintln!("  t={t:>3} chunk={chunk:>4}: max|Δlogit|={md:.3e} argmax_match={am}");
+            }
+        }
+        let verdict = if worst == 0.0 && argmax_ok { "BIT-EXACT ✓" }
+            else if worst < 1e-3 && argmax_ok { "within tol (argmax-identical) ✓" } else { "MISMATCH ✗" };
+        println!("gate-prefill: worst max|Δlogit|={worst:.3e} argmax_always_matches={argmax_ok} → {verdict}");
+        println!("  ⇒ prefill_chunked {} a safe drop-in for prefill_batched", if argmax_ok { "is" } else { "is NOT" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-kvtree") {
+        // KV-cache PREFIX TREE correctness gate. The tree reuses a cached lineage's KV for a DIFFERENT
+        // branch: seed the shared-prefix rows, then batch-prefill only the divergent suffix. That must
+        // reproduce a full fresh prefill of the branch — for a SIBLING (short shared prefix), an
+        // EXTENSION (full shared prefix), and the EXACT-prefix case (reuse all-but-1, re-prefill 1). If it
+        // holds, fanning N continuations off one leaf is 1 prefill + N decodes with identical logits.
+        // Runs on lavapipe (correctness only; the prefill-time speedup is M2-side).
+        let gpu = Gpu::new();
+        eprintln!("gate-kvtree: adapter = {}", gpu.adapter_name);
+        let (d, h, n, vocab, nh, nkv) = (128usize, 256usize, 2usize, 200usize, 4usize, 2usize);
+        let hm = gen_model(d, h, n, vocab, nh, nkv);
+        let (bytes, _eff) = build_quantized_gguf(&hm);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load synth");
+        let v = model.vocab;
+        let chunk = 16usize;
+        let pl = 24usize;                                                  // shared prefix length
+        let p: Vec<u32>  = (0..pl).map(|j| (j as u32 * 7 + 1) % vocab as u32).collect();
+        let a: Vec<u32>  = (0..6).map(|j| (100 + j) % vocab as u32).collect();   // sibling suffix A
+        let b: Vec<u32>  = (0..6).map(|j| (150 + j) % vocab as u32).collect();   // sibling suffix B
+        let pa: Vec<u32> = p.iter().chain(&a).copied().collect();          // lineage P+A (the cached one)
+        let pb: Vec<u32> = p.iter().chain(&b).copied().collect();          // sibling lineage P+B
+        let mut pax = pa.clone(); pax.push(177 % vocab as u32);            // extension P+A+x
+        let alen = a.len();
+
+        // full prefill of `ids` → its last-token logits (the reference)
+        let full = |ids: &[u32]| -> Vec<f32> {
+            let c = gpu.new_cache(model.n_layers, ids.len() + 4, model.kv_dim());
+            let lg = gpu.prefill_chunked(&model, &c, ids, chunk);
+            lg[lg.len() - v..].to_vec()
+        };
+        // source lineage P+A prefilled once into a cache we reuse FROM (the "cached branch tip")
+        let cache_pa = gpu.new_cache(model.n_layers, pa.len() + 4, model.kv_dim());
+        let _ = gpu.prefill_chunked(&model, &cache_pa, &pa, chunk);
+        // reuse: seed `l` rows from cache_pa, batch-prefill `suffix` at offset l → last-token logits
+        let reuse = |suffix: &[u32], l: usize| -> Vec<f32> {
+            let mut s = gpu.session_new(&model, l + suffix.len() + 4, 1);
+            gpu.seed_from_prefix(&model, &mut s, &cache_pa, l);
+            let all = gpu.verify_forward(&model, &s.cache, suffix, l);
+            all[all.len() - v..].to_vec()
+        };
+
+        let cases: [(&str, Vec<f32>, Vec<f32>); 3] = [
+            ("sibling  P+B  reuse(P)",     reuse(&b, pl),                          full(&pb)),
+            ("extend   P+A+x reuse(P+A)",  reuse(&pax[pl + alen..], pl + alen),    full(&pax)),
+            ("exact    P+A  reuse(P+A-1)", reuse(&pa[pl + alen - 1..], pl + alen - 1), full(&pa)),
+        ];
+        let mut worst = 0.0f32; let mut argmax_ok = true;
+        for (name, got, want) in &cases {
+            let md = got.iter().zip(want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            let am = gpu_kernels::argmax(got) == gpu_kernels::argmax(want);
+            worst = worst.max(md); argmax_ok &= am;
+            eprintln!("  {name}: max|Δlogit|={md:.3e} argmax_match={am}");
+        }
+        let verdict = if worst == 0.0 && argmax_ok { "BIT-EXACT ✓" }
+            else if worst < 1e-3 && argmax_ok { "within tol (argmax-identical) ✓" } else { "MISMATCH ✗" };
+        println!("gate-kvtree: worst max|Δlogit|={worst:.3e} argmax_always_matches={argmax_ok} → {verdict}");
+        println!("  ⇒ reusing a cached branch's KV for a different lineage {} a full prefill (pool reuse is safe; LOGSCOPE_KV_TREE=N)", if argmax_ok { "matches" } else { "does NOT match" });
+        return;
+    }
+    // A typo'd gate (e.g. --gate-map for --gate-mmap) used to fall through and silently run the full
+    // default suite. Catch any unrecognized --gate-* and list the real ones instead.
+    if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
+        eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
+        eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--bench") {
+        // Real-hardware decode profiler: where does a token's wall time actually go?
+        // Splits per-token wall into resource-setup (bind groups/dims bufs, CPU) vs gpu-sync
+        // (the poll waiting for the submitted dispatches). Run on the M2 to choose the fix:
+        // gpu-sync ≈ all wall ⇒ GPU-bound (fuse dispatches / write a mat-vec kernel);
+        // resource-setup large ⇒ cache bind groups. int8-resident, matching the app path.
+        let path = args.get(i + 1).expect("--bench <gguf> [n_decode] [prefill_ctx]");
+        let n: usize = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let ctx: usize = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let gpu = Gpu::new();
+        eprintln!("bench: adapter = {}", gpu.adapter_name);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load");
+        eprintln!("bench: d={} layers={} heads={}/{} ff={} vocab={} | prefill_ctx={ctx} | prewarming…",
+            model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.h, model.vocab);
+        gpu.prewarm(&model);
+        let cache = gpu.new_cache(model.n_layers, ctx + n + 16, model.kv_dim());
+        // prefill `ctx` tokens so decode attends a realistic-depth KV cache (the app runs at 500+)
+        let warm: Vec<u32> = (0..ctx.max(1)).map(|j| (j as u32) % model.vocab as u32).collect();
+        let _ = gpu.prefill_batched(&model, &cache, &warm);
+        let _ = gpu.decode_step(&model, &cache, 5, warm.len()); // warm decode pipelines (not counted)
+        gpu_kernels::gpu_counters_reset();
+        let t = std::time::Instant::now();
+        let mut pos = warm.len() + 1;
+        for _ in 0..n { let _ = gpu.decode_step(&model, &cache, 6, pos); pos += 1; }
+        let wall = t.elapsed().as_secs_f64();
+        let ms = |x: u64| (x as f64 / n as f64) / 1e6;
+        println!("bench: {n} decode steps at ctx≈{} → {:.2} tok/s ({:.1}ms/token)", ctx + n / 2, n as f64 / wall, wall * 1000.0 / n as f64);
+        println!("  per token: resource-setup {:.2}ms (bind groups+dims, CPU) | gpu-sync {:.2}ms (poll waiting for GPU) | other {:.2}ms",
+            ms(gpu_kernels::gpu_setup_ns()), ms(gpu_kernels::gpu_sync_ns()),
+            (wall * 1000.0 / n as f64) - ms(gpu_kernels::gpu_setup_ns()) - ms(gpu_kernels::gpu_sync_ns()));
+        println!("  (1 submit/token; ~210 dispatches/token. Run at ctx 8 vs 512 to separate the matmul floor from attention-over-KV growth.)");
+        println!("  → gpu-sync ≈ all of wall ⇒ GPU-bound: fix is fewer/bigger dispatches (fuse QKV+residual) and a dedicated m=1 mat-vec kernel. resource-setup large ⇒ cache bind groups.");
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--workers") {
+        // Sub-linear batched-decode curve: N workers sharing ONE resident model + ONE prefilled
+        // prefix, stepped together via decode_batched. The six weight matmuls run once per step
+        // for the whole batch (an m=N GEMM), so the memory-bound weight reads amortize across the
+        // batch — a batch-N step should cost far less than N separate single-worker steps. This
+        // is the floor the whole branch/voting picture rests on: keeping many warm branches alive
+        // is only affordable because breadth is sub-linear here. Run on the M2 to see the curve.
+        let path = args.get(i + 1).expect("--workers <gguf> [Nmax=8] [steps=48] [prefix_ctx=512]");
+        let nmax: usize = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let steps: usize = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(48);
+        let pctx: usize = args.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(512);
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let gpu = Gpu::new();
+        eprintln!("workers: adapter = {}", gpu.adapter_name);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load");
+        eprintln!("workers: d={} layers={} heads={}/{} vocab={} | shared prefix={pctx} | prewarming…",
+            model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.vocab);
+        gpu.prewarm(&model);
+        // the shared prefix is prefilled exactly once, then KV-forked into every worker
+        let prefix_toks: Vec<u32> = (0..pctx.max(1)).map(|j| (j as u32) % model.vocab as u32).collect();
+        let prefix = gpu.prefill_prefix(&model, &prefix_toks);
+        let plen = prefix_toks.len();
+        let max_seq = plen + steps + 16;
+        let mut sizes = vec![1usize];
+        let mut k = 2; while k <= nmax { sizes.push(k); k *= 2; }
+        if *sizes.last().unwrap() != nmax && nmax > 1 { sizes.push(nmax); }
+        let mut base_step_ms = 0.0f64;
+        println!("workers: N sessions share one model + one prefix, stepped together ({steps} steps)\n");
+        println!("  {:>4} {:>10} {:>12} {:>13} {:>12}", "N", "step ms", "agg tok/s", "per-wkr t/s", "vs separate");
+        for &nw in &sizes {
+            let mut sess: Vec<_> = (0..nw).map(|w| {
+                let mut s = gpu.session_new(&model, max_seq, 0x500 + w as u64);
+                gpu.seed_from_prefix(&model, &mut s, &prefix, plen);
+                s
+            }).collect();
+            let toks = vec![6u32; nw];
+            gpu.decode_batched(&model, &mut sess, &toks); // warm one step (uncounted)
+            let t = std::time::Instant::now();
+            for _ in 0..steps { gpu.decode_batched(&model, &mut sess, &toks); }
+            let wall = t.elapsed().as_secs_f64();
+            let step_ms = wall * 1000.0 / steps as f64;
+            let agg = (nw * steps) as f64 / wall;
+            if nw == 1 { base_step_ms = step_ms; }
+            let vs = (base_step_ms * nw as f64) / step_ms; // ×-cheaper than nw separate steps
+            println!("  {:>4} {:>10.1} {:>12.1} {:>13.2} {:>11.2}x", nw, step_ms, agg, agg / nw as f64, vs);
+        }
+        println!("\n  step ms = one batched decode step (yields N tokens). 'vs separate' = (N × the N=1 step) / the N step.");
+        println!("  1.0x = linear cost (no sharing); higher = weight reads amortizing across the batch (sub-linear).");
+        println!("  the win is per-wkr t/s holding near the N=1 rate as N grows — each branch stays ~as fast while many run.");
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--coordinator") {
+        // Memory-bounded coordinator (plan A+B+D): N requests share ONE resident model + ONE shared
+        // prefix, admitted up to a KV-memory budget, decoded together a tick at a time. Reports the
+        // peak concurrent batch the budget allows — the auto-discovered "instance count" — and the
+        // aggregate tok/s. Sweep <budget_mb> to see how far it scales before the knee/OOM.
+        let path = args.get(i + 1).expect("--coordinator <gguf> [n_req=32] [budget_mb=2048] [prefix_ctx=512] [max_new=64] [q8]");
+        let n_req: usize = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(32);
+        let budget_mb: usize = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(2048);
+        let pctx: usize = args.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(512);
+        let max_new: usize = args.get(i + 5).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let q8 = args.get(i + 6).map(|s| s == "q8" || s == "1").unwrap_or(false);
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let gpu = Gpu::new();
+        eprintln!("coordinator: adapter = {}", gpu.adapter_name);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load");
+        gpu.prewarm(&model);
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let prefix: Vec<u32> = (0..pctx.max(1)).map(|j| (j as u32) % model.vocab as u32).collect();
+        let max_seq = pctx + max_new + 16;
+        let budget = budget_mb << 20;
+        if q8 { run_coordinator::<gpu_kernels::SessionQ8>(&gpu, &model, greedy, &prefix, n_req, max_seq, budget, max_new, budget_mb, pctx, "int8-KV"); }
+        else  { run_coordinator::<gpu_kernels::Session>(&gpu, &model, greedy, &prefix, n_req, max_seq, budget, max_new, budget_mb, pctx, "f32-KV"); }
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--fleet") {
+        // Prefix-trie savings (plan item F): N branches sharing a common prefix (e.g. the conversation
+        // up to a fork) + a unique tail each. The trie prefills the shared prefix ONCE; without reuse
+        // each branch prefills it in full. A/B the same run_fleet_trie with reuse on (min_share=2) vs
+        // off (min_share=N+1) and report the prefill saved + wall speedup. This is the branch/voting
+        // substrate: forking a conversation costs one shared prefill plus the cheap divergent tails.
+        let path = args.get(i + 1).expect("--fleet <gguf> [branches=16] [shared=512] [tail=8] [max_new=32]");
+        let n: usize = args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(16);
+        let shared: usize = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(512);
+        let tail: usize = args.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(8);
+        let max_new: usize = args.get(i + 5).and_then(|s| s.parse().ok()).unwrap_or(32);
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let gpu = Gpu::new();
+        eprintln!("fleet: adapter = {}", gpu.adapter_name);
+        let model = gpu.load_gguf_quantized(&bytes).expect("load");
+        gpu.prewarm(&model);
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let v = model.vocab as u32;
+        let pre: Vec<u32> = (0..shared).map(|j| (j as u32).wrapping_mul(2654435761) % v).collect();
+        let build = || -> Vec<gpu_kernels::FleetRequest> {
+            (0..n).map(|w| {
+                let mut t = pre.clone();
+                for k in 0..tail { t.push(((w * 1000 + k) as u32).wrapping_mul(40503) % v); }
+                gpu_kernels::FleetRequest { id: w, tokens: t, max_new }
+            }).collect()
+        };
+        let max_seq = shared + tail + max_new + 16;
+        let t0 = std::time::Instant::now();
+        let trie = gpu.run_fleet_trie(&model, build(), &greedy, None, n.max(1), max_seq, 2);      // reuse
+        let t_trie = t0.elapsed().as_secs_f64().max(1e-3);
+        let t1 = std::time::Instant::now();
+        let naive = gpu.run_fleet_trie(&model, build(), &greedy, None, n.max(1), max_seq, n + 1);  // no reuse
+        let t_naive = t1.elapsed().as_secs_f64().max(1e-3);
+        let (pf_trie, pf_naive) = (shared + n * tail, n * (shared + tail));
+        println!("\nfleet trie: {n} branches share a {shared}-token prefix + {tail} unique each, max_new={max_new}");
+        println!("  prefill tokens: trie {pf_trie} vs no-reuse {pf_naive}  ({:.1}% saved — shared prefix computed once)", 100.0 * (1.0 - pf_trie as f64 / pf_naive as f64));
+        println!("  wall: trie {t_trie:.2}s vs no-reuse {t_naive:.2}s  ({:.2}× faster)", t_naive / t_trie);
+        println!("  outputs identical (trie reuse is output-invariant): {}", trie == naive);
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--spec") {
+        use gpu_kernels::tokenizer::Tokenizer;
+        // Speculative-decode bench: baseline target greedy vs draft+target speculative, on a real
+        // tokenized prompt. Reports tok/s, speedup, identical-output, and mean accepted draft
+        // length (how well the draft predicts the target — the thing that sets the speedup).
+        let tpath = args.get(i + 1).expect("--spec <target_gguf> <draft_gguf> [n_new=64] [K=4] [\"prompt\"]");
+        let dpath = args.get(i + 2).expect("need <draft_gguf>");
+        let n_new: usize = args.get(i + 3).and_then(|s| s.parse().ok()).unwrap_or(64);
+        let kk: usize = args.get(i + 4).and_then(|s| s.parse().ok()).unwrap_or(4);
+        let prompt_txt = args.get(i + 5).map(|s| s.as_str())
+            .unwrap_or("The bug was a race condition in the worker pool. The cleanest fix is to");
+        let tbytes = std::fs::read(tpath).expect("read target");
+        let dbytes = std::fs::read(dpath).expect("read draft");
+        let gpu = Gpu::new();
+        eprintln!("spec: adapter = {}", gpu.adapter_name);
+        let tg = gpu_kernels::gguf::parse(&tbytes).expect("parse target");
+        let tok = Tokenizer::from_gguf(&tg).expect("target tokenizer");
+        let target = gpu.load_gguf_quantized(&tbytes).expect("load target");
+        let draft = gpu.load_gguf_quantized(&dbytes).expect("load draft");
+        if target.vocab != draft.vocab {
+            eprintln!("spec: VOCAB MISMATCH target={} draft={} — draft and target must share a tokenizer/vocab", target.vocab, draft.vocab);
+            return;
+        }
+        let bos = tg.get_u32("tokenizer.ggml.bos_token_id").unwrap_or(128000);
+        let mut ids = vec![bos]; ids.extend(tok.encode(prompt_txt));
+        eprintln!("spec: target d={} L={} vocab={} | draft d={} L={} | prompt {} tok · n_new={n_new} · K={kk} | prewarming…",
+            target.d, target.n_layers, target.vocab, draft.d, draft.n_layers, ids.len());
+        gpu.prewarm(&target); gpu.prewarm(&draft);
+        let t0 = std::time::Instant::now();
+        let base = gpu.generate_kv(&target, &ids, n_new);
+        let base_s = t0.elapsed().as_secs_f64();
+        let mut st = gpu_kernels::SpecStats::default();
+        let t1 = std::time::Instant::now();
+        let spec = gpu.speculative_generate_stats(&target, &draft, &ids, n_new, kk, &mut st);
+        let spec_s = t1.elapsed().as_secs_f64();
+        println!("spec: baseline {:.2} tok/s ({:.0}ms) | speculative {:.2} tok/s ({:.0}ms) | speedup {:.2}x | identical-output {}",
+            n_new as f64 / base_s, base_s * 1000.0, n_new as f64 / spec_s, spec_s * 1000.0, base_s / spec_s, spec == base);
+        println!("  mean accepted {:.2} of K={kk} per round ({} rounds, {} tokens) → ~{:.2} tokens per target verify-forward",
+            st.accepted as f64 / st.rounds.max(1) as f64, st.rounds, st.emitted, st.emitted as f64 / st.rounds.max(1) as f64);
+        println!("  → speedup tracks acceptance: predictable spans (docs/boilerplate) accept more; hard tokens fall back to ~1. identical-output=true ⇒ no quality cost.");
+        println!("  text: {:?}", tok.decode(&spec));
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--gen" || a == "--genf") {
+        use gpu_kernels::tokenizer::Tokenizer;
+        let f32_path = args[i] == "--genf";
+        let path = args.get(i + 1).expect("--gen|--genf <gguf> [prompt]");
+        let prompt = args.get(i + 2).map(|s| s.as_str()).unwrap_or("The capital of France is");
+        let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+        let g = gpu_kernels::gguf::parse(&bytes).expect("parse");
+        let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+        let gpu = Gpu::new();
+        let model = if f32_path { gpu.load_gguf(&bytes) } else { gpu.load_gguf_quantized(&bytes) }.expect("load");
+        let bos = g.get_u32("tokenizer.ggml.bos_token_id").unwrap_or(128000);
+        let mut ids = vec![bos];
+        ids.extend(tok.encode(prompt));
+        eprintln!("prompt {prompt:?} -> {} tokens; {} loaded; generating greedy…",
+            ids.len(), if f32_path { "f32-resident" } else { "int8-resident" });
+        let out = gpu.generate_kv(&model, &ids, 12);
+        let gen = &out[ids.len().min(out.len())..];
+        println!("IDS: {gen:?}");
+        println!("TEXT: {:?}", tok.decode(gen));
+        return;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--loadstep") {
+        use std::sync::Arc;
+        let gpu = Arc::new(Gpu::new());
+        println!("GPU adapter: {}\n", gpu.adapter_name);
+        let model = match args.get(i + 1).filter(|p| !p.starts_with("--")) {
+            Some(path) => {
+                eprintln!("loading {path}");
+                let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+                Arc::new(gpu.load_gguf(&bytes).expect("load gguf"))
+            }
+            None => {
+                eprintln!("no model path — using a small synthetic model (perf is illustrative only)");
+                let hm = gen_model(256, 1024, 4, 1000, 4, 4);
+                Arc::new(gpu.load_gguf(&write_gguf(&hm)).expect("load synth"))
+            }
+        };
+        gpu.warm(&model);
+        load_step(gpu, model);
+        return;
+    }
+    let gpu = Gpu::new();
+    println!("GPU adapter: {}\n", gpu.adapter_name);
+    if args.iter().any(|a| a == "--concurrency" || a == "--scaling") {
+        concurrency_sweep(&gpu);
+        return;
+    }
+    println!("  [build tag: dequant=extractBits+if/else +diag]\n");
+    let mut fails = 0;
+    let mut check = |name: &str, err: f32, tol: f32| {
+        let ok = err <= tol && err.is_finite();
+        println!("  {name:<22} max|gpu-cpu| = {err:.3e}   {}", if ok { "OK" } else { fails += 1; "FAIL" });
+    };
+
+    // GEMM + LINEAR
+    let (m, n, k) = (96usize, 64usize, 80usize);
+    let a = rnd(m * k, 1); let b = rnd(k * n, 2); let w = rnd(n * k, 3);
+    check("gemm", maxerr(&gpu.gemm(&a, &b, m, n, k), &cpu_gemm(&a, &b, m, n, k)), 1e-3);
+    check("linear (Wᵀ)", maxerr(&gpu.linear(&a, &w, m, n, k), &cpu_linear(&a, &w, m, n, k)), 1e-3);
+
+    // Q4_0 dequant
+    let nblocks = 5usize;
+    let mut bytes = vec![0u8; nblocks * 16];
+    for (i, byte) in bytes.iter_mut().enumerate() { *byte = ((i * 37 + 11) % 256) as u8; }
+    let quant: Vec<u32> = bytemuck::cast_slice(&bytes).to_vec();
+    let scales: Vec<f32> = (0..nblocks).map(|i| 0.05 + i as f32 * 0.01).collect();
+    let got = gpu.dequant_q4_0(&quant, &scales, nblocks);
+    let mut want = vec![0.0f32; nblocks * 32];
+    for i in 0..nblocks * 32 {
+        let blk = i / 32; let within = i % 32;
+        let j = if within < 16 { within } else { within - 16 };
+        let byte = bytes[blk * 16 + j];
+        let nib = if within < 16 { byte & 0xf } else { (byte >> 4) & 0xf };
+        want[i] = (nib as f32 - 8.0) * scales[blk];
+    }
+    let dq_err = maxerr(&got, &want);
+    if dq_err > 1e-4 {
+        let mut shown = 0;
+        for i in 0..nblocks * 32 {
+            if (got[i] - want[i]).abs() > 1e-4 && shown < 6 {
+                let blk = i / 32; let within = i % 32;
+                let j = if within < 16 { within } else { within - 16 };
+                println!("    [dq] i={i} blk={blk} within={within} byte=0x{:02x}: got={:.4} want={:.4}",
+                    bytes[blk * 16 + j], got[i], want[i]);
+                shown += 1;
+            }
+        }
+        let n = 8.min(got.len());
+        println!("    [dq] got [0..8]={:?}", &got[0..n]);
+        println!("    [dq] want[0..8]={:?}", &want[0..n]);
+    }
+    check("dequant Q4_0", dq_err, 1e-4);
+
+    // softmax + rmsnorm
+    let (rows, cols) = (12usize, 40usize);
+    let x = rnd(rows * cols, 4);
+    check("softmax", maxerr(&gpu.softmax(&x, rows, cols), &cpu_softmax(&x, rows, cols)), 1e-3);
+    let wn = rnd(cols, 5);
+    check("rmsnorm", maxerr(&gpu.rmsnorm(&x, &wn, rows, cols, 1e-5), &cpu_rmsnorm(&x, &wn, rows, cols, 1e-5)), 1e-3);
+
+    // attention
+    let (t, dh) = (24usize, 16usize);
+    let q = rnd(t * dh, 6); let kk = rnd(t * dh, 7); let vv = rnd(t * dh, 8);
+    check("attention (causal)", maxerr(&gpu.attention(&q, &kk, &vv, t, dh), &cpu_attention(&q, &kk, &vv, t, dh)), 1e-3);
+
+    // multi-head attention vs CPU multi-head reference
+    let (t2, nh2, hd2) = (7usize, 4usize, 5usize); let dm2 = nh2 * hd2;
+    let (qm, km, vm) = (rnd(t2 * dm2, 40), rnd(t2 * dm2, 41), rnd(t2 * dm2, 42));
+    let g_mha = gpu.download(&gpu.attention_mh_t(&gpu.upload(&qm, t2, dm2), &gpu.upload(&km, t2, dm2), &gpu.upload(&vm, t2, dm2), t2, dm2, nh2, nh2));
+    check("multi-head attention", maxerr(&g_mha, &cpu_mha(&qm, &km, &vm, t2, dm2, nh2, nh2)), 1e-3);
+
+    // new small kernels
+    let xr = rnd(6 * 16, 9);
+    check("rope (interleaved NORM)", maxerr(&gpu.rope(&xr, 6, 16, 10000.0), &cpu_rope(&xr, 6, 16, 10000.0)), 1e-3);
+    let (aa, bb) = (rnd(100, 10), rnd(100, 11));
+    check("add", maxerr(&gpu.add(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x + y).collect::<Vec<_>>()), 1e-5);
+    check("mul", maxerr(&gpu.mul(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x * y).collect::<Vec<_>>()), 1e-5);
+    check("silu", maxerr(&gpu.silu(&aa), &aa.iter().map(|v| v / (1.0 + (-v).exp())).collect::<Vec<_>>()), 1e-4);
+    let table = rnd(20 * 8, 12); let ids = [3u32, 0, 19, 7, 12];
+    let mut gw = Vec::new(); for &id in &ids { gw.extend_from_slice(&table[id as usize * 8..id as usize * 8 + 8]); }
+    check("gather (embed)", maxerr(&gpu.gather(&table, &ids, 8), &gw), 0.0);
+
+    // one transformer block, composed entirely from GPU kernels, vs CPU reference
+    let (bt, bd, bh) = (6usize, 16usize, 32usize);
+    let blk = Block::random(bd, bh);
+    let x = rnd(bt * bd, 99);
+    check("transformer block (e2e)", maxerr(&gpu_block(&gpu, &blk, &x, bt, bd, bh), &cpu_block(&blk, &x, bt, bd, bh)), 1e-2);
+
+    // SAME block, but fully resident on the GPU: weights uploaded once, every
+    // intermediate stays on the device, only the final output is read back.
+    let bw = gpu_kernels::BlockWeights {
+        wq: Lin::f32(gpu.upload(&blk.wq, bd, bd)), wk: Lin::f32(gpu.upload(&blk.wk, bd, bd)), wv: Lin::f32(gpu.upload(&blk.wv, bd, bd)), wo: Lin::f32(gpu.upload(&blk.wo, bd, bd)),
+        // fused Q||K||V (kv==bd here → [3·bd, bd]), built from the same weights as wq/wk/wv, mirroring wgate_up
+        wqkv: Lin::f32(gpu.upload(&[&blk.wq[..], &blk.wk[..], &blk.wv[..]].concat(), 3 * bd, bd)),
+        wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
+        g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
+    };
+    let xt = gpu.upload(&x, bt, bd);
+    let ones = gpu.upload(&vec![1.0f32; bd / 2], 1, bd / 2); // plain RoPE (no llama3 scaling)
+    let resident = gpu.download(&gpu.block_forward(&bw, &xt, &ones, bt, bd, bh, 1, 1, BASE, EPS));
+    check("transformer block (resident)", maxerr(&resident, &cpu_block(&blk, &x, bt, bd, bh)), 1e-2);
+
+    // RoPE with per-dimension frequency factors (llama3 scaling from rope_freqs.weight):
+    // theta = pos·base^(-2i/hd) / factor[i]. Validate the GPU multi-head rope against a
+    // CPU reference that applies the same factors.
+    {
+        let (t, hd, heads) = (3usize, 8usize, 2usize);
+        let dm = hd * heads;
+        let mut seed2 = 0xfeed_face_u64 as u64;
+        let mut r = || { seed2 ^= seed2 << 13; seed2 ^= seed2 >> 7; seed2 ^= seed2 << 17; (seed2 >> 40) as f32 / 16_777_216.0 - 0.5 };
+        let xin: Vec<f32> = (0..t * dm).map(|_| r()).collect();
+        let factors: Vec<f32> = (0..hd / 2).map(|i| 1.0 + 0.5 * i as f32).collect(); // non-trivial
+        let base = 10000.0f32;
+        // CPU reference
+        let mut want = xin.clone();
+        for tok in 0..t {
+            for h in 0..heads {
+                let off = tok * dm + h * hd;
+                for i in 0..hd / 2 {
+                    let theta = tok as f32 / (base.powf(2.0 * i as f32 / hd as f32) * factors[i]);
+                    let (c, s) = (theta.cos(), theta.sin());
+                    let (x0, x1) = (xin[off + 2 * i], xin[off + 2 * i + 1]);
+                    want[off + 2 * i] = x0 * c - x1 * s;
+                    want[off + 2 * i + 1] = x0 * s + x1 * c;
+                }
+            }
+        }
+        let xg = gpu.upload(&xin, t, dm);
+        let fg = gpu.upload(&factors, 1, hd / 2);
+        let got = gpu.download(&gpu.rope_mh_t(&xg, &fg, t, dm, base, 0, hd));
+        check("rope freq-factors (llama3 scaling)", maxerr(&got, &want), 1e-4);
+    }
+
+    // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
+    // rope), vs CPU. The full-forward sweep diverged only when base was large.
+    for &(base, heads) in &[(10000.0f32, 8usize), (500000.0, 8), (500000.0, 2)] {
+        let (t, hd) = (6usize, 64usize);
+        let dm = hd * heads;
+        let mut sd = 0x1234_5678u64;
+        let mut r = || { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; (sd >> 40) as f32 / 16_777_216.0 - 0.5 };
+        let xin: Vec<f32> = (0..t * dm).map(|_| r()).collect();
+        let ones = vec![1.0f32; hd / 2];
+        let mut want = xin.clone();
+        for tok in 0..t { for h in 0..heads { let off = tok * dm + h * hd;
+            for i in 0..hd / 2 {
+                let theta = tok as f32 / base.powf(2.0 * i as f32 / hd as f32);
+                let (c, s) = (theta.cos(), theta.sin());
+                let (x0, x1) = (xin[off + 2 * i], xin[off + 2 * i + 1]);
+                want[off + 2 * i] = x0 * c - x1 * s;
+                want[off + 2 * i + 1] = x0 * s + x1 * c;
+            } } }
+        let xg = gpu.upload(&xin, t, dm);
+        let fg = gpu.upload(&ones, 1, hd / 2);
+        let got = gpu.download(&gpu.rope_mh_t(&xg, &fg, t, dm, base, 0, hd));
+        let e = maxerr(&got, &want);
+        println!("  rope-only base={base:.0} heads={heads} hd=64 -> max|gpu-cpu|={e:.2e} {}", if e < 1e-3 { "ok" } else { "<<< DIVERGES" });
+    }
+
+    // GGUF reader: parse a hand-built fixture and locate metadata + a weight tensor
+    let g = gpu_kernels::gguf::parse(&gguf_fixture()).expect("gguf parse");
+    let q = g.tensor("blk.0.attn_q.weight");
+    println!("  gguf: v{} arch={:?} n_embd={:?} tensor {:?} dims={:?} @data+{} (data@{})",
+        g.version, g.get_str("general.architecture"), g.get_u32("llama.embedding_length"),
+        q.map(|t| t.name.as_str()), q.map(|t| &t.dims), q.map(|t| t.offset).unwrap_or(0), g.data_offset);
+    let gguf_ok = g.get_str("general.architecture") == Some("llama")
+        && g.get_u32("llama.embedding_length") == Some(16)
+        && q.map(|t| (t.dims.as_slice(), t.ggml_type)) == Some((&[16u64, 16][..], 0))
+        && g.data_offset % 32 == 0;
+    check("gguf parse", if gguf_ok { 0.0 } else { 1.0 }, 0.5);
+
+    // full path: synthetic GGUF → load weights into resident tensors → stacked
+    // multi-block forward → logits, vs a CPU reference over the same weights.
+    let hm = gen_model(16, 32, 2, 24, 4, 4);
+    let model = gpu.load_gguf(&write_gguf(&hm)).expect("load_gguf");
+    let ids = [5u32, 0, 17, 3, 9];
+    let glog = gpu.model_forward(&model, &ids);
+    let clog = cpu_model_forward(&hm, &ids);
+    println!("  model: {} blocks d={} h={} heads={} vocab={}, {} tokens -> logits[{}], argmax(last)={}",
+        model.n_layers, model.d, model.h, model.n_heads, model.vocab, ids.len(), glog.len(),
+        { let last = &glog[glog.len() - model.vocab..]; last.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 });
+    check("model forward (load->resident->logits)", maxerr(&glog, &clog), 1e-2);
+
+    // Scale-shaped probes. The real Llama-3.2-1B garbles output while every SmolLM2 (any
+    // quant) is coherent; the config deltas are GQA group=4, rope_base=500000, and
+    // vocab>65536. None were exercised above (group=1, default base, vocab=24). CPU and GPU
+    // forward must still match bit-exact at these shapes — a divergence localizes the bug.
+    {
+        // (A) Sweep the deltas independently. Tuple: (name, d, ff, vocab, n_heads, n_kv, base).
+        // The last is the 1B's exact attention shape (d=2048, 32/8, head_dim=64) — never
+        // tested before (working models top out at 15 heads). Small vocab keeps it in RAM.
+        let cases: [(&str, usize, usize, usize, usize, usize, f32); 5] = [
+            ("g4 hd64 b5e5",     512,  1024, 96, 8,  2, 500000.0),
+            ("g4 hd64 b1e4",     512,  1024, 96, 8,  2, 10000.0),
+            ("g3 hd64 b5e5",     576,  1024, 96, 9,  3, 500000.0),
+            ("g4 hd128 b5e5",    1024, 1024, 96, 8,  2, 500000.0),
+            ("1B-shape 32/8 d2048", 2048, 8192, 96, 32, 8, 500000.0), // <- the real 1B's attn shape
+        ];
+        for &(name, d, ff, vocab, nh, nkv, base) in &cases {
+            let mut a = gen_model(d, ff, 2, vocab, nh, nkv);
+            a.base = base;
+            let ma = gpu.load_gguf(&write_gguf(&a)).expect("load");
+            let ids = [5u32, 0, 17, 3, 9, 40];
+            let e = maxerr(&gpu.model_forward(&ma, &ids), &cpu_model_forward(&a, &ids));
+            println!("  scale[{name}] group={} head_dim={} -> max|gpu-cpu|={e:.2e} {}",
+                nh / nkv, d / nh, if e < 1e-2 { "ok" } else { "<<< DIVERGES" });
+        }
+        let mut a = gen_model(2048, 8192, 2, 96, 32, 8); // gate the 1B's exact attention shape
+        a.base = 500000.0;
+        let ma = gpu.load_gguf(&write_gguf(&a)).expect("load A");
+        let ids = [5u32, 0, 17, 3, 9, 40];
+        check("scale: 1B-shape (32/8 heads, d=2048, base 5e5) forward", maxerr(&gpu.model_forward(&ma, &ids), &cpu_model_forward(&a, &ids)), 1e-2);
+    }
+    {
+        // (B) vocab > 65536 — any u16/i16 truncation of a token id or vocab index bites here.
+        let mut b = gen_model(256, 512, 1, 70000, 4, 2);
+        b.base = 500000.0;
+        let mb = gpu.load_gguf(&write_gguf(&b)).expect("load B");
+        let ids = [5u32, 0, 68000, 3, 65600]; // ids above 65536 both as input and (argmax) output
+        let (gb, cb) = (gpu.model_forward(&mb, &ids), cpu_model_forward(&b, &ids));
+        let v = mb.vocab;
+        let ax = |s: &[f32]| s.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0;
+        println!("  scaleB: vocab={v} ids>65536 -> argmax gpu={} cpu={} max|gpu-cpu|={:.2e}",
+            ax(&gb[gb.len() - v..]), ax(&cb[cb.len() - v..]), maxerr(&gb, &cb));
+        check("scale: vocab>65536 forward", maxerr(&gb, &cb), 1e-2);
+    }
+
+    // Full model on resident int8 weights: load the same f32 GGUF normally and with
+    // int8-resident projections, then confirm the int8 forward tracks the f32 forward
+    // (only quantization error differs). d=32/h=64 → every matrix has k%32==0, so the
+    // attention + FFN + output projections all run through the fused int8 kernel.
+    {
+        let hm32 = gen_model(32, 64, 2, 32, 4, 4);
+        let bytes = write_gguf(&hm32);
+        let mf32 = gpu.load_gguf(&bytes).expect("load f32");
+        let mq8 = gpu.load_gguf_quantized(&bytes).expect("load q8");
+        let ids = [5u32, 0, 17, 3, 9];
+        let lf = gpu.model_forward(&mf32, &ids);
+        let lq = gpu.model_forward(&mq8, &ids);
+        let amax = lf.iter().fold(0f32, |a, &v| a.max(v.abs())).max(1e-6);
+        let v = mf32.vocab;
+        let ax = |s: &[f32]| s.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let argmatch = ax(&lf[lf.len() - v..]) == ax(&lq[lq.len() - v..]);
+        println!("  int8-resident model: output quantized={}, rel logit err={:.3e}, last-token argmax matches f32={}",
+            mq8.output_is_quantized(), maxerr(&lf, &lq) / amax, argmatch);
+        check("int8-resident model forward ~ f32", if argmatch { maxerr(&lf, &lq) / amax } else { 1.0 }, 0.05);
+    }
+
+    // Real-model load quirks (the egui failure): no `llama.vocab_size` (derive from
+    // the embedding), tied embeddings (no `output.weight` → reuse token_embd), and
+    // exotic metadata value types (float64/int8) that must not break the parse.
+    {
+        let mut lm = gen_model(16, 32, 2, 24, 4, 2); // GQA, like Llama-3.2
+        lm.output = lm.embed.clone();                // tied: reference uses embedding as output proj
+        let bytes = write_gguf_llama3(&lm);
+        let model = gpu.load_gguf(&bytes).expect("load llama3-like gguf");
+        let ids = [5u32, 0, 17, 3, 9];
+        let glog = gpu.model_forward(&model, &ids);
+        let clog = cpu_model_forward(&lm, &ids);
+        println!("  llama3-like load: vocab derived={} (expected {}), tied output, float64+int8 metadata parsed",
+            model.vocab, lm.vocab);
+        check("llama3-like gguf (tied embed, no vocab_size, exotic meta)",
+            if model.vocab == lm.vocab { maxerr(&glog, &clog) } else { 1.0 }, 1e-2);
+    }
+
+    // grouped-query attention: n_kv_heads < n_heads (4 query heads share 2 KV heads).
+    // Exercises the kv-dim K/V projections, cache rows, and head→kv-head mapping.
+    let gq = gen_model(16, 32, 2, 24, 4, 2);
+    let gqm = gpu.load_gguf(&write_gguf(&gq)).expect("load gqa");
+    let gq_ids = [5u32, 0, 17, 3, 9];
+    println!("  gqa model: n_heads={} n_kv_heads={} (group {})", gqm.n_heads, gqm.n_kv_heads, gqm.n_heads / gqm.n_kv_heads);
+    check("gqa model forward", maxerr(&gpu.model_forward(&gqm, &gq_ids), &cpu_model_forward(&gq, &gq_ids)), 1e-2);
+    // Larger-model config: head_dim=128 (as in Llama-3 3B/8B; 1B is 64) with GQA, to prove
+    // the loader and attention/rope kernels read dims from metadata rather than assuming 1B.
+    {
+        let big = gen_model(256, 512, 2, 32, 2, 1); // d=256, 2 q-heads -> head_dim=128, 1 kv-head (GQA 2:1)
+        let bm = gpu.load_gguf(&write_gguf(&big)).expect("load head_dim=128");
+        let bids = [5u32, 0, 17, 3, 9];
+        let head_dim = bm.d / bm.n_heads;
+        println!("  larger config: d={} head_dim={head_dim} n_kv_heads={}", bm.d, bm.n_kv_heads);
+        check("larger config (head_dim=128, GQA) forward", maxerr(&gpu.model_forward(&bm, &bids), &cpu_model_forward(&big, &bids)), 1e-2);
+    }
+    let gq_dec = gpu.generate_kv(&gqm, &[5u32, 0, 17], 5);
+    let gq_cpu = cpu_generate(&gq, &[5u32, 0, 17], 5);
+    check("gqa kv-cache decode (gpu==cpu)", if gq_dec == gq_cpu { 0.0 } else { 1.0 }, 0.5);
+
+    // Anchor (prefix-fork) correctness: caching a shared prefix's KV and seeding a session
+    // from it, then prefilling only the unique suffix, must yield identical logits AND greedy
+    // tokens to prefilling the whole sequence fresh. This is the guarantee the prefix cache,
+    // continuous batching, and multi-instance state-sharing all depend on.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2); // d=64, 3 layers, GQA group 2
+        a.base = 100000.0;
+        let am = gpu.load_gguf(&write_gguf(&a)).expect("anchor load");
+        let prefix = [5u32, 9, 1, 7, 3, 2]; // shared anchor
+        let suffix = [4u32, 8, 6];          // a request's unique tail
+        let full: Vec<u32> = prefix.iter().chain(&suffix).copied().collect();
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        // reference: full prefill from scratch, then 8 greedy tokens
+        let mut sf = gpu.session_new(&am, 64, 1);
+        gpu.session_prefill(&am, &mut sf, &full);
+        let lf = sf.logits.clone();
+        let tf: Vec<u32> = std::iter::from_fn(|| gpu.session_step(&am, &mut sf, &greedy, None)).take(8).collect();
+        // anchor: build prefix KV once, fork into a session, prefill only the suffix
+        let anchor = gpu.prefill_prefix(&am, &prefix);
+        let mut sa = gpu.session_new(&am, 64, 1);
+        gpu.seed_from_prefix(&am, &mut sa, &anchor, prefix.len());
+        gpu.session_prefill(&am, &mut sa, &suffix);
+        let la = sa.logits.clone();
+        let ta: Vec<u32> = std::iter::from_fn(|| gpu.session_step(&am, &mut sa, &greedy, None)).take(8).collect();
+        let cmp = gpu_kernels::compare_logits(&lf, &la);
+        println!("  anchor: prefix-fork vs full -> argmax_match={} max|d|={:.2e} cos={:.5} tokens_match={}",
+            cmp.argmax_match, cmp.max_abs, cmp.cosine, tf == ta);
+        check("anchor: prefix-fork logits == full prefill", cmp.max_abs, 1e-3);
+        check("anchor: prefix-fork tokens == full prefill", if tf == ta { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Anchor-as-prior-turn (the multi-turn CHAT path that was producing 0 tokens / [stopped]):
+    // the backend's anchor is the PREVIOUS turn's session — cache built by prefill_batched, then
+    // EXTENDED by decode_step (the generated tokens) — and the next turn's shared prefix can run
+    // PAST the old prompt into those decoded rows. Seeding across that prefill→decode boundary
+    // must still match a full prefill, or the first decoded token comes out wrong (often eos).
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let am = gpu.load_gguf(&write_gguf(&a)).expect("anchor2 load");
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        // turn 1: prefill_batched + stream a few tokens — exactly the backend's first turn
+        let prompt1 = [5u32, 9, 1, 7, 3, 2, 8];
+        let mut s1 = gpu.session_new(&am, 64, 1);
+        s1.logits = gpu.prefill_batched(&am, &s1.cache, &prompt1);
+        s1.pos = prompt1.len();
+        let mut seen1 = prompt1.to_vec();
+        let mut rng = 1u64;
+        let gen = gpu.stream_session(&am, &mut s1, &mut seen1, 6, None, &greedy, &mut rng, &|| false, |_| true);
+        // turn 2: prompt2 shares the whole [prompt1 + generated] run, then a fresh suffix
+        let new_suffix = [4u32, 6];
+        let prompt2: Vec<u32> = seen1.iter().chain(&new_suffix).copied().collect();
+        let l = seen1.len(); // shared prefix runs INTO the decode_step region
+        let mut s2 = gpu.session_new(&am, 64, 2);
+        gpu.seed_from_prefix(&am, &mut s2, &s1.cache, l);
+        gpu.session_prefill(&am, &mut s2, &new_suffix);
+        let la = s2.logits.clone();
+        let mut s3 = gpu.session_new(&am, 64, 2);
+        s3.logits = gpu.prefill_batched(&am, &s3.cache, &prompt2);
+        let cmp = gpu_kernels::compare_logits(&s3.logits, &la);
+        println!("  anchor-prior-turn: generated={gen} l={l} (prompt1={}) reuse-vs-full argmax_match={} max|d|={:.2e} cos={:.5}",
+            prompt1.len(), cmp.argmax_match, cmp.max_abs, cmp.cosine);
+        check("anchor across prefill→decode boundary: reuse logits == full", cmp.max_abs, 2e-3);
+        check("anchor across prefill→decode boundary: argmax matches", if cmp.argmax_match { 0.0 } else { 1.0 }, 0.5);
+        // The backend prefills the suffix with the BATCHED kernel (verify_forward) rather than
+        // per-token decode_step, so reuse stays within machine precision of a full prefill (the
+        // fix for "produces once then stops"): validate that path matches the full prefill too.
+        let mut s4 = gpu.session_new(&am, 64, 2);
+        gpu.seed_from_prefix(&am, &mut s4, &s1.cache, l);
+        let allv = gpu.verify_forward(&am, &s4.cache, &new_suffix, l);
+        let v = am.vocab;
+        let lv = allv[allv.len() - v..].to_vec();
+        let cmpv = gpu_kernels::compare_logits(&s3.logits, &lv);
+        println!("  anchor-prior-turn (batched suffix): argmax_match={} max|d|={:.2e} cos={:.5}", cmpv.argmax_match, cmpv.max_abs, cmpv.cosine);
+        check("anchor batched-suffix reuse logits == full prefill", cmpv.max_abs, 2e-3);
+        check("anchor batched-suffix argmax matches full", if cmpv.argmax_match { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Chunked prefill (the long-context OOM fix): prefilling a prompt in small blocks via
+    // block_prefill_ext must give the SAME last-token logits as one batched prefill — but with
+    // O(chunk·T) attention scratch instead of O(T²), so a huge pasted context can't OOM the device.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let cm = gpu.load_gguf(&write_gguf(&a)).expect("chunk load");
+        let prompt: Vec<u32> = (0..37).map(|i| (i * 7 + 3) % 64).collect(); // 37 tokens, several blocks
+        let full = { let c = gpu.new_cache(cm.n_layers, prompt.len(), cm.kv_dim()); gpu.prefill_batched(&cm, &c, &prompt) };
+        for ch in [1usize, 4, 8, 16] {
+            let c = gpu.new_cache(cm.n_layers, prompt.len(), cm.kv_dim());
+            let chunked = gpu.prefill_chunked(&cm, &c, &prompt, ch);
+            let cmp = gpu_kernels::compare_logits(&full, &chunked);
+            println!("  chunked prefill (chunk={ch}): argmax_match={} max|d|={:.2e}", cmp.argmax_match, cmp.max_abs);
+            check(&format!("chunked prefill chunk={ch} == batched"), cmp.max_abs, 2e-3);
+            check(&format!("chunked prefill chunk={ch} argmax matches"), if cmp.argmax_match { 0.0 } else { 1.0 }, 0.5);
+        }
+    }
+
+    // int8 weight cache (the fast-reload path): a model saved to a sidecar blob and loaded back
+    // must be bit-identical to the freshly-dequantized one — same logits on the same prompt — so a
+    // crash-recovery reload skips the dequant without changing a single output.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let bytes = write_gguf(&a);
+        let fresh = gpu.load_gguf_quantized(&bytes).expect("fresh load");
+        let path = std::path::Path::new("/tmp/ls_int8_cache_test.bin");
+        let fp = (bytes.len() as u64, 12345);
+        gpu.save_int8_cache(&fresh, path, fp).expect("save cache");
+        let cached = gpu.load_int8_cache(path, fp).expect("load cache");
+        // stale fingerprint must be rejected
+        assert!(gpu.load_int8_cache(path, (bytes.len() as u64, 99999)).is_none(), "stale cache must be rejected");
+        let prompt = [5u32, 9, 1, 7, 3, 2, 8, 4];
+        let lf = { let c = gpu.new_cache(fresh.n_layers, prompt.len(), fresh.kv_dim()); gpu.prefill_batched(&fresh, &c, &prompt) };
+        let lc = { let c = gpu.new_cache(cached.n_layers, prompt.len(), cached.kv_dim()); gpu.prefill_batched(&cached, &c, &prompt) };
+        let cmp = gpu_kernels::compare_logits(&lf, &lc);
+        println!("  int8 cache: reload-vs-fresh argmax_match={} max|d|={:.2e}", cmp.argmax_match, cmp.max_abs);
+        check("int8 cache reload == fresh load", cmp.max_abs, 0.0);
+        check("int8 cache reload argmax matches", if cmp.argmax_match { 0.0 } else { 1.0 }, 0.5);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Warm-resume continuation (the no-reprefill auto-continue): copying a live session's KV into a
+    // larger session and resuming the decode (carrying its logits) must yield the SAME tokens as
+    // decoding straight through with enough room from the start.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let m = gpu.load_gguf(&write_gguf(&a)).expect("warm load");
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let prompt = [5u32, 9, 1, 7, 3, 2, 8];
+        // reference: one roomy session, 12 tokens straight through
+        let mut cref = gpu.session_new(&m, 64, 7);
+        cref.logits = gpu.prefill_batched(&m, &cref.cache, &prompt); cref.pos = prompt.len();
+        let mut seen_ref = prompt.to_vec(); let mut r1 = 7u64;
+        gpu.stream_session(&m, &mut cref, &mut seen_ref, 12, None, &greedy, &mut r1, &|| false, |_| true);
+        let ref_tokens = seen_ref[prompt.len()..].to_vec();
+        // warm: a session sized for only 6, decode 6, then copy KV into a bigger session + resume 6
+        let mut a6 = gpu.session_new(&m, prompt.len() + 6, 7);
+        a6.logits = gpu.prefill_batched(&m, &a6.cache, &prompt); a6.pos = prompt.len();
+        let mut seen6 = prompt.to_vec(); let mut r2 = 7u64;
+        gpu.stream_session(&m, &mut a6, &mut seen6, 6, None, &greedy, &mut r2, &|| false, |_| true);
+        let mut b = gpu.session_new(&m, a6.pos + 6, 7);
+        gpu.seed_from_prefix(&m, &mut b, &a6.cache, a6.pos);
+        b.pos = a6.pos; b.logits = a6.logits.clone();
+        let mut r3 = r2;
+        gpu.stream_session(&m, &mut b, &mut seen6, 6, None, &greedy, &mut r3, &|| false, |_| true);
+        let warm_tokens = seen6[prompt.len()..].to_vec();
+        let ok = ref_tokens == warm_tokens;
+        println!("  warm-resume continue: straight={:?}… warm={:?}… match={ok}", &ref_tokens[..ref_tokens.len().min(4)], &warm_tokens[..warm_tokens.len().min(4)]);
+        check("warm-resume continuation == straight-through decode", if ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // KV-budget admission (plan item D — memory-bounded coordinator). Bounding admission by a KV
+    // budget changes only WHEN a branch is admitted, never its tokens. A budget so tight it admits
+    // one-at-a-time must produce the SAME per-branch output as independent generate_kv; a roomy
+    // budget must admit all branches concurrently. Proves the ceiling gates safely and invariantly.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let m = gpu.load_gguf(&write_gguf(&a)).expect("budget load");
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let prefix = [5u32, 9, 1, 7];
+        let suffixes: [&[u32]; 3] = [&[2, 8], &[3, 6, 4], &[1]];
+        let max_new = 10usize;
+        let ms = prefix.len() + max_new + 8;
+        // reference: each branch = independent greedy decode over (prefix ++ suffix)
+        let refs: Vec<Vec<u32>> = suffixes.iter().map(|suf| {
+            let mut full = prefix.to_vec(); full.extend_from_slice(suf);
+            gpu.generate_kv(&m, &full, max_new)
+        }).collect();
+        let run = |budget: usize| -> (Vec<(u64, Vec<u32>)>, usize) {
+            let mut pool = gpu_kernels::WorkerPool::<gpu_kernels::Session>::new(&gpu, &m, greedy, None, 64, ms, &prefix).with_kv_budget(budget);
+            for (i, suf) in suffixes.iter().enumerate() { pool.admit(i as u64, "", suf.to_vec(), max_new); }
+            while !pool.is_idle() { let _ = pool.step(); }
+            let peak = pool.peak_active();
+            let mut out: Vec<(u64, Vec<u32>)> = pool.drain_done().into_iter().map(|b| (b.id, b.emitted)).collect();
+            out.sort_by_key(|r| r.0);
+            (out, peak)
+        };
+        let kv1 = m.n_layers * m.kv_dim() * 2 * 4 * ms; // bytes for one session's KV (f32 K+V)
+        let (tight, peak_tight) = run(kv1 + kv1 / 2);     // ~room for 1 → sequential
+        let (roomy, peak_roomy) = run(kv1 * 8);           // room for all 3 → concurrent
+        let match_tight = tight.iter().all(|(i, o)| refs.get(*i as usize) == Some(o));
+        let match_roomy = roomy.iter().all(|(i, o)| refs.get(*i as usize) == Some(o));
+        println!("  kv-budget coordinator: tight peak={peak_tight} (==1?) roomy peak={peak_roomy} (==3?) | output-invariant tight={match_tight} roomy={match_roomy}");
+        check("kv-budget tight admission == independent generate_kv", if match_tight { 0.0 } else { 1.0 }, 0.5);
+        check("kv-budget roomy admission == independent generate_kv", if match_roomy { 0.0 } else { 1.0 }, 0.5);
+        check("kv-budget tight serializes (peak==1)", if peak_tight == 1 { 0.0 } else { 1.0 }, 0.5);
+        check("kv-budget roomy runs all concurrently (peak==3)", if peak_roomy == 3 { 0.0 } else { 1.0 }, 0.5);
+
+        // int8-KV coordinator (plan item C): same pool on SessionQ8. Output must match the int8
+        // reference generate_kv_q8 (incl. the new q8 shared-prefix fork), and KV/session must be
+        // ~¼ of f32 — so the SAME budget admits ~4× more.
+        let refs_q8: Vec<Vec<u32>> = suffixes.iter().map(|suf| {
+            let mut full = prefix.to_vec(); full.extend_from_slice(suf);
+            gpu.generate_kv_q8(&m, &full, max_new)
+        }).collect();
+        let mut pq8 = gpu_kernels::WorkerPool::<gpu_kernels::SessionQ8>::new(&gpu, &m, greedy, None, 64, ms, &prefix).with_kv_budget(kv1 * 8);
+        for (i, suf) in suffixes.iter().enumerate() { pq8.admit(i as u64, "", suf.to_vec(), max_new); }
+        let mut peak_q8 = 0;
+        while !pq8.is_idle() { let _ = pq8.step(); peak_q8 = peak_q8.max(pq8.peak_active()); }
+        let kv_q8 = pq8.kv_per_session();
+        let mut oq8: Vec<(u64, Vec<u32>)> = pq8.drain_done().into_iter().map(|b| (b.id, b.emitted)).collect();
+        oq8.sort_by_key(|r| r.0);
+        let match_q8 = oq8.iter().all(|(i, o)| refs_q8.get(*i as usize) == Some(o));
+        let ratio = kv1 as f64 / kv_q8.max(1) as f64;
+        println!("  int8-KV coordinator: KV/session f32={kv1}B q8={kv_q8}B (~{ratio:.2}× smaller) peak={peak_q8} | output==generate_kv_q8: {match_q8}");
+        check("int8-KV coordinator == generate_kv_q8", if match_q8 { 0.0 } else { 1.0 }, 0.5);
+        check("int8-KV ~quadruples budget (KV >=3.4x smaller)", if ratio >= 3.4 { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Interleaved admission (plan item E): a prompt longer than PREFILL_CHUNK is prefilled in blocks
+    // across ticks while the running batch keeps decoding — a long prefill stall becomes a slowdown.
+    // Chunked prefill must give the SAME output as one-shot (same sequential decode_steps, regrouped),
+    // a >chunk prompt must span multiple ticks before going active, and a long-running branch must
+    // emit tokens during that prefill (the overlap).
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let m = gpu.load_gguf(&write_gguf(&a)).expect("load");
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let prefix = [5u32, 9];
+        let big: Vec<u32> = (0..600).map(|j| (j as u32 * 7 + 1) % 64).collect(); // > PREFILL_CHUNK (256)
+        let max_new = 8usize;
+        let mut full = prefix.to_vec(); full.extend_from_slice(&big);
+        let ref_big = gpu.generate_kv(&m, &full, max_new);
+        let ms = prefix.len() + big.len() + max_new + 8;
+        let mut pool = gpu_kernels::WorkerPool::<gpu_kernels::Session>::new(&gpu, &m, greedy, None, 8, ms, &prefix);
+        pool.admit(0, "small", vec![3, 6], 100_000); // long-running; should decode during the big admit
+        pool.admit(1, "big", big.clone(), max_new);
+        let (mut small_emits_before, mut big_active_tick, mut tick) = (0usize, 0usize, 0usize);
+        let mut big_out: Option<Vec<u32>> = None;
+        while big_out.is_none() && tick < 5000 {
+            let rep = pool.step(); tick += 1;
+            let big_active = pool.active_ids().contains(&1);
+            if !big_active && rep.emitted.iter().any(|(id, _)| *id == 0) { small_emits_before += 1; }
+            if big_active && big_active_tick == 0 { big_active_tick = tick; }
+            for b in pool.drain_done() { if b.id == 1 { big_out = Some(b.emitted); } }
+        }
+        pool.retire(0);
+        let out_match = big_out.as_deref() == Some(ref_big.as_slice());
+        let chunked = big_active_tick >= 2;
+        let overlapped = small_emits_before >= 1;
+        println!("  interleaved admit: big-active@tick={big_active_tick} (>=2?) small-emits-before={small_emits_before} (>=1?) out_match={out_match}");
+        check("interleaved admission == one-shot prefill output", if out_match { 0.0 } else { 1.0 }, 0.5);
+        check("interleaved admission chunks a big prompt (>=2 ticks)", if chunked { 0.0 } else { 1.0 }, 0.5);
+        check("interleaved admission overlaps decode of a running branch", if overlapped { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Batching + anchor: continuous-batched generation that seeds every request from a
+    // shared prefix (anchor), with each request carrying only its unique suffix, must
+    // produce per-request the SAME greedy tokens as a standalone full-prompt generate.
+    // This is the end-to-end guard for prefix-reuse + batching (what prewarm feeds into).
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let bm = gpu.load_gguf(&write_gguf(&a)).expect("batch load");
+        let prefix = [5u32, 9, 1, 7, 3, 2];
+        let reqs: [(usize, Vec<u32>); 3] = [(0, vec![4, 8]), (1, vec![2, 6, 1]), (2, vec![7])];
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let n_new = 6;
+        let mut refs: Vec<(usize, Vec<u32>)> = reqs.iter().map(|(id, suf)| {
+            let full: Vec<u32> = prefix.iter().chain(suf).copied().collect();
+            (*id, gpu.generate_kv(&bm, &full, n_new))
+        }).collect();
+        refs.sort_by_key(|x| x.0);
+        let anchor = gpu.prefill_prefix(&bm, &prefix);
+        let queue: Vec<(usize, Vec<u32>, usize)> = reqs.iter().map(|(id, suf)| (*id, suf.clone(), n_new)).collect();
+        let batched = gpu.run_batched(&bm, Some((&anchor, prefix.len())), queue, &greedy, None, 2, 64);
+        let ok = batched == refs;
+        println!("  batching+anchor: {} requests, batched-from-anchor == per-request generate = {ok}", reqs.len());
+        check("batching+anchor == per-request generate", if ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // WorkerPool facade: the stateful, tick-driven pool the app + voice/voting bridge drive must
+    // produce, per branch, the SAME greedy tokens as the already-validated run_batched. Guards the
+    // admit/step/finish bookkeeping (and the max_batch backfill path) in the facade.
+    {
+        let mut a = gen_model(64, 128, 3, 64, 4, 2);
+        a.base = 100000.0;
+        let bm = gpu.load_gguf(&write_gguf(&a)).expect("pool load");
+        let prefix = [5u32, 9, 1, 7, 3, 2];
+        let reqs: [(u64, Vec<u32>); 3] = [(0, vec![4, 8]), (1, vec![2, 6, 1]), (2, vec![7])];
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let n_new = 6;
+        let queue: Vec<(usize, Vec<u32>, usize)> = reqs.iter().map(|(id, suf)| (*id as usize, suf.clone(), n_new)).collect();
+        let anchor = gpu.prefill_prefix(&bm, &prefix);
+        let reference = gpu.run_batched(&bm, Some((&anchor, prefix.len())), queue, &greedy, None, 2, 64);
+        // same work through the stateful pool, driven one tick at a time (max_batch 2 ⇒ backfill)
+        let mut pool = gpu_kernels::WorkerPool::<gpu_kernels::Session>::new(&gpu, &bm, greedy, None, 2, 64, &prefix);
+        for (id, suf) in &reqs { pool.admit(*id, "", suf.clone(), n_new); }
+        let mut guard = 0;
+        while !pool.is_idle() && guard < 10_000 { let _ = pool.step(); guard += 1; }
+        let mut pool_out: Vec<(usize, Vec<u32>)> = pool.drain_done().into_iter().map(|b| (b.id as usize, b.emitted)).collect();
+        pool_out.sort_by_key(|x| x.0);
+        let ok = pool_out == reference;
+        println!("  WorkerPool (admit/step/drain, max_batch 2 backfill) == run_batched per branch = {ok}");
+        check("WorkerPool == run_batched", if ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Speculative decode: a draft model proposes K tokens, the target verifies them in ONE forward,
+    // and the accepted prefix + correction (+bonus when all K accept) must reproduce the target's
+    // OWN greedy decode exactly. A deliberately-different smaller draft forces accept/reject/bonus
+    // paths to all fire; the output must still equal generate_kv on the target, for every K.
+    {
+        let mut tgt = gen_model(64, 128, 3, 64, 4, 2); tgt.base = 100000.0;
+        let mut drf = gen_model(32, 64, 2, 64, 4, 2); drf.base = 100000.0; // smaller, SAME vocab=64
+        let tm = gpu.load_gguf(&write_gguf(&tgt)).expect("spec target");
+        let dm = gpu.load_gguf(&write_gguf(&drf)).expect("spec draft");
+        let prompt = [5u32, 9, 1, 7, 3];
+        let n_new = 12;
+        let reference = gpu.generate_kv(&tm, &prompt, n_new);
+        let mut all_ok = true;
+        for k in [1usize, 2, 4] {
+            let spec = gpu.speculative_generate(&tm, &dm, &prompt, n_new, k);
+            let ok = spec == reference; all_ok &= ok;
+            println!("  speculative(K={k}) == target greedy generate_kv = {ok}");
+        }
+        check("speculative decode == target greedy", if all_ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // Decode throughput profile: count GPU command submits + blocking syncs per token. Each
+    // decode op is a tiny 1-row kernel, so per-token latency is dominated by the COUNT of
+    // submits/syncs (CPU→GPU flushes), not by compute. This quantifies the structural cost
+    // the throughput work targets: collapse the per-token ops into ~one command submit and
+    // keep activations resident, rather than one flush per kernel.
+    {
+        let mut pm = gen_model(256, 512, 4, 256, 8, 2); // 4 layers, GQA group 2, f32-resident decode path
+        pm.base = 100000.0;
+        let pgm = gpu.load_gguf(&write_gguf(&pm)).expect("profile load");
+        let pc = gpu.new_cache(pgm.n_layers, 64, pgm.kv_dim());
+        let _ = gpu.decode_step(&pgm, &pc, 1, 0); // warm (compile pipelines) — not counted
+        gpu_kernels::gpu_counters_reset();
+        let n_steps = 20u64;
+        let t_wall = std::time::Instant::now();
+        for i in 0..n_steps { let _ = gpu.decode_step(&pgm, &pc, 2, 1 + i as usize); }
+        let wall_ns = t_wall.elapsed().as_nanos() as u64;
+        let (sub, _pol, setup, sync, nl) = (gpu_kernels::gpu_submits(), gpu_kernels::gpu_polls(), gpu_kernels::gpu_setup_ns(), gpu_kernels::gpu_sync_ns(), pgm.n_layers as u64);
+        let per = |x: u64| x / n_steps;
+        let per_layer = sub.saturating_sub(2 * n_steps) / (nl * n_steps);
+        println!("  decode profile ({} layers, {n_steps} steps): {} submits/token; 1B(16L) ≈ {} submits/token", nl, per(sub), per_layer * 16 + 2);
+        println!("  decode time/token: wall {:.2}ms = resource-setup {:.2}ms (bind groups+dims bufs) + gpu-sync {:.2}ms + other {:.2}ms",
+            per(wall_ns) as f64 / 1e6, per(setup) as f64 / 1e6, per(sync) as f64 / 1e6,
+            (per(wall_ns).saturating_sub(per(setup)).saturating_sub(per(sync))) as f64 / 1e6);
+        println!("  → if resource-setup dominates: cache bind groups/dims per (shader,shape). if gpu-sync dominates: fuse kernels / fewer dispatches. (lavapipe gpu-sync is software, not M2-representative; resource-setup IS CPU and indicative.)");
+    }
+
+    // greedy decode: GPU (recompute) vs CPU must produce identical tokens; the
+    // KV-cache path must produce identical tokens to the recompute path.
+    let prompt = [5u32, 0, 17];
+    let g_rec = gpu.generate(&model, &prompt, 6);
+    let g_kv = gpu.generate_kv(&model, &prompt, 6);
+    let c_ref = cpu_generate(&hm, &prompt, 6);
+    println!("  decode: prompt {prompt:?} -> recompute {g_rec:?}");
+    println!("                          kv-cache  {g_kv:?}");
+    println!("                          cpu       {c_ref:?}");
+    check("greedy decode (gpu==cpu)", if g_rec == c_ref { 0.0 } else { 1.0 }, 0.5);
+    check("kv-cache decode (==recompute)", if g_kv == g_rec { 0.0 } else { 1.0 }, 0.5);
+
+    // streaming KV decode must emit exactly the batched greedy tokens
+    let mut g_stream = Vec::new();
+    let mut srng = 1u64;
+    gpu.generate_kv_stream(&model, &prompt, 6, None,
+        &gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut srng, &|| false,
+        |t| { g_stream.push(t); true });
+    check("kv-cache stream (==generate_kv)", if g_stream == g_kv { 0.0 } else { 1.0 }, 0.5);
+    // batched prefill: one [T,d] pass filling the cache must match the sequential
+    // (forward_kv) last-token logits, and feed the same continuation (covered by the
+    // stream==generate_kv check above, since the stream now prefills batched).
+    {
+        let pp = [5u32, 0, 17, 9, 2, 7];
+        let seq = gpu.forward_kv(&model, &pp);
+        let cc = gpu.new_cache(model.n_layers, pp.len() + 2, model.kv_dim());
+        let bat = gpu.prefill_batched(&model, &cc, &pp);
+        check("batched prefill == sequential", maxerr(&seq, &bat), 5e-3);
+    }
+    // batched decode: stepping N sessions together must match each stepped alone.
+    {
+        let prompts: [&[u32]; 3] = [&[5, 0, 17], &[9, 2, 7, 3], &[1, 4]];
+        let mut ref_logits: Vec<Vec<f32>> = Vec::new();
+        let mut toks: Vec<u32> = Vec::new();
+        for pr in prompts {
+            let c = gpu.new_cache(model.n_layers, pr.len() + 2, model.kv_dim());
+            let pl = gpu.prefill_batched(&model, &c, pr);
+            let tk = gpu_kernels::argmax(&pl);
+            toks.push(tk);
+            ref_logits.push(gpu.decode_step(&model, &c, tk, pr.len())); // single-session step
+        }
+        let mut sess: Vec<gpu_kernels::Session> = prompts.iter().map(|_| gpu.session_new(&model, 8, 1)).collect();
+        for (s, pr) in sess.iter_mut().zip(prompts) { gpu.session_prefill(&model, s, pr); }
+        gpu.decode_batched(&model, &mut sess, &toks);                   // batched step
+        let mut e = 0f32;
+        for i in 0..3 { e = e.max(maxerr(&ref_logits[i], &sess[i].logits)); }
+        check("batched decode == per-session", e, 5e-3);
+    }
+    // prefix KV reuse: seed from a shared prefix + prefill only the suffix must equal a
+    // full prefill of prefix++suffix.
+    {
+        let prefix = [5u32, 0, 17, 9];
+        let suffix = [2u32, 7, 3];
+        let full: Vec<u32> = prefix.iter().chain(suffix.iter()).copied().collect();
+        let cfull = gpu.new_cache(model.n_layers, full.len() + 1, model.kv_dim());
+        let ref_logits = gpu.prefill_batched(&model, &cfull, &full);
+        let pc = gpu.prefill_prefix(&model, &prefix);
+        let mut s = gpu.session_new(&model, full.len() + 1, 1);
+        gpu.seed_from_prefix(&model, &mut s, &pc, prefix.len());
+        gpu.session_prefill(&model, &mut s, &suffix);
+        check("prefix KV reuse == full prefill", maxerr(&ref_logits, &s.logits), 5e-3);
+    }
+    // continuous batching: the serving loop (with backfill) must produce the same greedy
+    // tokens as running each request alone — and again when reusing a shared prefix.
+    {
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let reqs = vec![(0usize, vec![5u32, 0, 17], 5usize), (1, vec![9, 2, 7, 3], 4), (2, vec![1, 4, 8], 6)];
+        let got = gpu.run_batched(&model, None, reqs.clone(), &greedy, None, 2, 24); // max_batch 2 < 3 → backfill
+        let mut ok = true;
+        for (id, prompt, mx) in &reqs {
+            let exp = gpu.generate_kv(&model, prompt, *mx);
+            if got.iter().find(|r| r.0 == *id).map(|r| &r.1) != Some(&exp) { ok = false; }
+        }
+        check("continuous batching == per-request", if ok { 0.0 } else { 1.0 }, 0.5);
+
+        let prefix = vec![5u32, 0, 17, 9];
+        let pc = gpu.prefill_prefix(&model, &prefix);
+        let sufs = vec![(0usize, vec![2u32, 7], 4usize), (1, vec![3, 1], 3), (2, vec![6], 5)];
+        let g2 = gpu.run_batched(&model, Some((&pc, prefix.len())), sufs.clone(), &greedy, None, 2, 24);
+        let mut ok2 = true;
+        for (id, suf, mx) in &sufs {
+            let full: Vec<u32> = prefix.iter().chain(suf).copied().collect();
+            let exp = gpu.generate_kv(&model, &full, *mx);
+            if g2.iter().find(|r| r.0 == *id).map(|r| &r.1) != Some(&exp) { ok2 = false; }
+        }
+        check("continuous batching + prefix reuse", if ok2 { 0.0 } else { 1.0 }, 0.5);
+    }
+    // fleet scheduler: workers grouped by shared prefix, each group's KV propagated once.
+    // Two files (prefixes), several workers each; every worker's output must match running
+    // it standalone on its full prompt. Mirrors "ten workers on one file" at synthetic scale.
+    {
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let pa = vec![5u32, 0, 17, 9, 2];   // "file A" — shared by 3 workers
+        let pb = vec![1u32, 4, 8];          // "file B" — shared by 2 workers
+        let groups = vec![
+            gpu_kernels::PrefixGroup { prefix: pa.clone(), workers: vec![
+                (10usize, vec![7u32, 3], 4usize), (11, vec![6], 5), (12, vec![2, 1, 8], 3)] },
+            gpu_kernels::PrefixGroup { prefix: pb.clone(), workers: vec![
+                (20usize, vec![5u32], 5usize), (21, vec![9, 0], 4)] },
+        ];
+        let got = gpu.run_fleet(&model, groups, &greedy, None, 2, 32);
+        let mut ok = true;
+        for (pfx, ws) in [(&pa, vec![(10usize, vec![7u32,3], 4usize),(11,vec![6],5),(12,vec![2,1,8],3)]),
+                          (&pb, vec![(20usize, vec![5u32], 5usize),(21,vec![9,0],4)])] {
+            for (id, suf, mx) in &ws {
+                let full: Vec<u32> = pfx.iter().chain(suf).copied().collect();
+                let exp = gpu.generate_kv(&model, &full, *mx);
+                if got.iter().find(|r| r.0 == *id).map(|r| &r.1) != Some(&exp) { ok = false; }
+            }
+        }
+        check("fleet (grouped prefix propagation) == per-worker", if ok { 0.0 } else { 1.0 }, 0.5);
+
+        // nested-prefix trie: workers share a *path* (root prefix, then a deeper shared
+        // segment, then diverge) plus one worker that shares nothing. Every worker's output
+        // must match running it standalone — exercising multi-level cache extension and the
+        // no-share fallback in one shot.
+        let reqs = vec![
+            gpu_kernels::FleetRequest { id: 0, tokens: vec![3u32, 1, 4, 1, 5, 9], max_new: 4 }, // shares [3,1,4,1,5] with id1
+            gpu_kernels::FleetRequest { id: 1, tokens: vec![3u32, 1, 4, 1, 5, 2], max_new: 5 },
+            gpu_kernels::FleetRequest { id: 2, tokens: vec![3u32, 1, 4, 8],       max_new: 3 }, // shares only [3,1,4]
+            gpu_kernels::FleetRequest { id: 3, tokens: vec![7u32, 0, 6],          max_new: 4 }, // shares nothing
+        ];
+        let fulls: Vec<(usize, Vec<u32>, usize)> = reqs.iter().map(|r| (r.id, r.tokens.clone(), r.max_new)).collect();
+        let got = gpu.run_fleet_trie(&model, reqs, &greedy, None, 2, 32, 2);
+        let mut okt = true;
+        for (id, toks, mx) in &fulls {
+            let exp = gpu.generate_kv(&model, toks, *mx);
+            if got.iter().find(|r| r.0 == *id).map(|r| &r.1) != Some(&exp) { okt = false; }
+        }
+        check("fleet trie (nested prefix) == per-worker", if okt { 0.0 } else { 1.0 }, 0.5);
+
+        // int8 trie edge: a node built by extend_prefix_q8 (parent cache + segment), KV-forked into a
+        // q8 session and decoded, must match a from-scratch q8 prefill of (parent ++ segment). Lets the
+        // prefix trie run on int8-KV — the trie's shared prefill plus C's ~4× concurrency.
+        {
+            let parent = [3u32, 1, 4, 1]; let seg = [5u32, 9, 2];
+            let mut full = parent.to_vec(); full.extend_from_slice(&seg);
+            let n_new = 6usize;
+            let head = &seg[..seg.len() - 1]; let last = *seg.last().unwrap();
+            let pc = gpu.prefill_prefix_q8(&model, &parent);
+            let cc = gpu.extend_prefix_q8(&model, &pc, parent.len(), head); // node covers parent ++ head
+            let nlen = parent.len() + head.len();
+            let mut s = gpu.session_q8_new(&model, full.len() + n_new + 4, 7);
+            gpu.seed_from_prefix_q8(&model, &mut s, &cc, nlen);
+            gpu.session_q8_prefill(&model, &mut s, &[last]); // s.pos = full.len(), logits ready
+            let mut out = Vec::new();
+            for step in 0..n_new {
+                let nx = gpu_kernels::argmax(&s.logits); out.push(nx);
+                s.logits = gpu.decode_step_q8(&model, &s.cache, nx, full.len() + step); s.pos += 1;
+            }
+            let exp = gpu.generate_kv_q8(&model, &full, n_new);
+            check("int8 trie edge: extend_prefix_q8 == from-scratch q8 prefill", if out == exp { 0.0 } else { 1.0 }, 0.5);
+        }
+
+        // Stateful coordinator trie (F folded into WorkerPool): cache a shared prefix once, fork many
+        // branches from it via admit_at, plus a deeper node built by cache_prefix's trie-extend. Each
+        // branch's output must equal an independent generate_kv over (node tokens ++ its suffix).
+        {
+            let conv = [5u32, 9, 1, 7, 3];            // shared "conversation"
+            let deeper = [5u32, 9, 1, 7, 3, 2, 8];    // conv ++ [2,8] — cached via extend of conv
+            let forks: [(u64, &[u32], usize); 3] = [(0, &[4, 1], 6), (1, &[6], 5), (2, &[3, 3, 3], 4)];
+            let deep: (u64, &[u32], usize) = (10, &[9, 4], 5);
+            let mut pool = gpu_kernels::WorkerPool::<gpu_kernels::Session>::new(&gpu, &model, greedy, None, 16, 64, &[]);
+            let nc = pool.cache_prefix(&conv);
+            let nd = pool.cache_prefix(&deeper);      // conv is a prefix of deeper → extend (trie edge)
+            for (id, suf, mx) in forks { pool.admit_at(id, "", nc, suf.to_vec(), mx); }
+            pool.admit_at(deep.0, "", nd, deep.1.to_vec(), deep.2);
+            while !pool.is_idle() { let _ = pool.step(); }
+            let mut out: Vec<(u64, Vec<u32>)> = pool.drain_done().into_iter().map(|b| (b.id, b.emitted)).collect();
+            out.sort_by_key(|r| r.0);
+            let exp_of = |base: &[u32], suf: &[u32], mx: usize| { let mut f = base.to_vec(); f.extend_from_slice(suf); gpu.generate_kv(&model, &f, mx) };
+            let mut ok = nd == nc + 1; // deeper became its own node
+            for (id, suf, mx) in forks { if out.iter().find(|r| r.0 == id).map(|r| &r.1) != Some(&exp_of(&conv, suf, mx)) { ok = false; } }
+            if out.iter().find(|r| r.0 == deep.0).map(|r| &r.1) != Some(&exp_of(&deeper, deep.1, deep.2)) { ok = false; }
+            println!("  stateful trie: cached {} nodes, forked 4 branches, output==independent: {ok}", nd + 1);
+            check("stateful coordinator trie (cache_prefix + admit_at) == independent", if ok { 0.0 } else { 1.0 }, 0.5);
+        }
+
+        // batched extend_prefix must build the same cache as a from-scratch prefill: probe
+        // both caches with one decode step over their shared region and compare logits.
+        let pa = vec![5u32, 0, 17, 9]; let pb = vec![2u32, 7, 3];
+        let full: Vec<u32> = pa.iter().chain(&pb).copied().collect();
+        let ext = gpu.extend_prefix(&model, &gpu.prefill_prefix(&model, &pa), pa.len(), &pb);
+        let fc = gpu.prefill_prefix(&model, &full);
+        let probe = full[full.len() - 1];
+        let la = gpu.decode_step(&model, &ext, probe, full.len() - 1);
+        let lb = gpu.decode_step(&model, &fc, probe, full.len() - 1);
+        check("batched extend_prefix == full prefill", maxerr(&la, &lb), 5e-3);
+
+        // two-tier compression mechanism: f32 -> int8 -> f32 roundtrip within int8 error.
+        let xv = rnd(64 * 8, 31); let xt = gpu.upload(&xv, 64, 8);
+        let (qp, sc) = gpu.quantize_rows(&xt, 64, 8);
+        let back = gpu.download(&gpu.dequant_rows(&qp, &sc, 64, 8));
+        let mxabs = xv.iter().fold(0f32, |a, &v| a.max(v.abs()));
+        check("int8 KV quantize->dequant roundtrip", maxerr(&xv, &back), mxabs / 100.0 + 1e-4);
+
+        // smart prefix store: ranked two-tier eviction. Three prefixes, a budget that can't
+        // hold all hot; the frequently-reused one stays f32, the low-value ones demote to
+        // int8 (not dropped), and usage lands under budget.
+        let (kvd, nl) = (8usize, 2usize);
+        let mut store = gpu_kernels::PrefixStore::new(2600, nl, kvd);
+        store.insert(&gpu, 0xA, 4, gpu.new_cache(nl, 4, kvd));
+        for _ in 0..5 { store.get(0xA); }                       // small + frequently reused
+        store.insert(&gpu, 0xB, 4, gpu.new_cache(nl, 4, kvd));  // small + unused
+        store.insert(&gpu, 0xC, 16, gpu.new_cache(nl, 16, kvd)); // big + unused
+        store.enforce(&gpu);
+        let a_hot = matches!(store.tier_of(0xA), Some(gpu_kernels::Tier::Hot(_)));
+        let b_warm = matches!(store.tier_of(0xB), Some(gpu_kernels::Tier::Warm(_)));
+        let c_warm = matches!(store.tier_of(0xC), Some(gpu_kernels::Tier::Warm(_)));
+        let ok_store = a_hot && b_warm && c_warm && store.usage() <= 2600;
+        check("smart cache ranked two-tier eviction", if ok_store { 0.0 } else { 1.0 }, 0.5);
+
+        // streaming-window context eviction. (a) With sink+window ≥ context, no eviction
+        // happens and streaming decode is byte-identical to full-cache decode.
+        let sp = vec![5u32, 0, 17, 9, 2];
+        let ref_gen = gpu.generate_kv(&model, &sp, 6);
+        let cap = sp.len() + 6 + 2;
+        let sc_cache = gpu.new_cache(model.n_layers, cap, model.kv_dim());
+        let (sink, window) = (2usize, cap); // window large ⇒ never evicts
+        let mut logits = Vec::new();
+        for (i, &t) in sp.iter().enumerate() { logits = gpu.decode_step_stream(&model, &sc_cache, t, i, sink, window); }
+        let mut gen = Vec::new(); let mut p = sp.len();
+        for _ in 0..6 {
+            let nx = gpu_kernels::argmax(&logits); gen.push(nx);
+            logits = gpu.decode_step_stream(&model, &sc_cache, nx, p, sink, window); p += 1;
+        }
+        check("streaming window (no evict) == full decode", if gen == ref_gen { 0.0 } else { 1.0 }, 0.5);
+
+        // (b) O(1) bounded eviction: stream far past the cap; every slot stays < sink+window
+        // and each new token reuses exactly the oldest window token's slot (ring, no shift).
+        let (sk, wn) = (4usize, 8usize); let capn = sk + wn; let mut okev = true;
+        for pp in 0..2000usize {
+            let (slot, l) = gpu_kernels::stream_slot(pp, sk, wn);
+            if slot >= capn || l > capn { okev = false; }
+            if pp >= capn {
+                let (old, _) = gpu_kernels::stream_slot(pp - wn, sk, wn);
+                if slot != old || l != capn { okev = false; }
+            }
+        }
+        check("streaming window O(1) bounded eviction", if okev { 0.0 } else { 1.0 }, 0.5);
+
+        // LAN serving: constant-time key check, key generation, and a real loopback
+        // round-trip exercising auth (valid/invalid) + routing — no GPU (stub generator).
+        {
+            use gpu_kernels::netserve::{self, Keyring};
+            use std::io::{Read, Write};
+            use std::net::{TcpListener, TcpStream};
+            use std::sync::Arc;
+            let ct = netserve::ct_eq(b"abc", b"abc") && !netserve::ct_eq(b"abc", b"abd") && !netserve::ct_eq(b"abc", b"ab");
+            check("netserve constant-time key eq", if ct { 0.0 } else { 1.0 }, 0.5);
+            let (k1, k2) = (netserve::generate_key(), netserve::generate_key());
+            let keyok = k1.len() == 64 && k1.chars().all(|c| c.is_ascii_hexdigit()) && k1 != k2;
+            check("netserve key generation (64-hex, unique)", if keyok { 0.0 } else { 1.0 }, 0.5);
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let key = "testkey-abc123";
+            let keys = Keyring::new(vec![key.to_string()]);
+            let gen: Arc<dyn Fn(&str, usize) -> String + Send + Sync> =
+                Arc::new(|p: &str, max: usize| format!("echo[{max}]:{p}"));
+            std::thread::spawn(move || {
+                for _ in 0..3 {
+                    if let Ok((mut s, _)) = listener.accept() {
+                        if let Some(req) = netserve::read_request(&mut s) {
+                            let _ = s.write_all(&netserve::handle(&req, &keys, gen.as_ref()).bytes());
+                        }
+                    }
+                }
+            });
+            let req = |raw: String| -> (String, String) {
+                let mut s = TcpStream::connect(addr).unwrap();
+                s.write_all(raw.as_bytes()).unwrap();
+                let mut resp = String::new();
+                let _ = s.read_to_string(&mut resp);
+                let status = resp.lines().next().unwrap_or("").to_string();
+                let body = resp.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+                (status, body)
+            };
+            let (s_ok, b_ok) = req(format!("POST /generate?max=7 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {key}\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"));
+            let (s_bad, _) = req("POST /generate HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi".to_string());
+            let (s_h, b_h) = req("GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string());
+            let pass = s_ok.contains("200") && b_ok == "echo[7]:hello" && s_bad.contains("401") && s_h.contains("200") && b_h == "ok";
+            check("netserve loopback (auth gate + routing)", if pass { 0.0 } else { 1.0 }, 0.5);
+        }
+        // repetition penalty: a just-generated token is down-weighted so the model doesn't
+        // lock onto it; with penalty 1.0 (off) pick == argmax (greedy stays bit-exact).
+        {
+            let mut logits = vec![0.1f32; 16]; logits[5] = 2.0; logits[6] = 1.9;
+            let mut rng = 1u64;
+            let off = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+            let on = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.3, repeat_last_n: 64, min_p: 0.0 };
+            let a = gpu_kernels::pick(&logits, &off, &[5, 5, 5], &mut rng); // no penalty -> 5
+            let b = gpu_kernels::pick(&logits, &on, &[5, 5, 5], &mut rng);  // 5 penalized below 6 -> 6
+            check("repetition penalty steers off repeats", if a == 5 && b == 6 { 0.0 } else { 1.0 }, 0.5);
+        }
+        // min-p nucleus: with a peaked distribution and a high min_p, only the dominant token
+        // clears min_p*top_prob, so sampling collapses to it — a robust low-temp nucleus.
+        {
+            let mut logits = vec![0.0f32; 32]; logits[7] = 5.0;
+            let sp = gpu_kernels::SamplerParams { temperature: 1.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.5 };
+            let mut rng = 12345u64; let mut ok = true;
+            for _ in 0..200 { if gpu_kernels::sample(&logits, &sp, &mut rng) != 7 { ok = false; break; } }
+            check("min-p nucleus keeps only the dominant token", if ok { 0.0 } else { 1.0 }, 0.5);
+        }
+        // toolpipe: real binary piping, allowlist gate, concurrent runner, FSM driver.
+        {
+            use gpu_kernels::toolpipe::*;
+            let pol = Policy::new(&["echo", "tr", "grep", "sort", "wc"], 64 * 1024, std::time::Duration::from_secs(5));
+            // 1. a real pipe: echo "hello world" | tr a-z A-Z
+            let p = Pipeline::single("echo", &["hello world"]).pipe("tr", &["a-z", "A-Z"]);
+            let o = run_pipeline(&p, &pol).expect("pipe");
+            check("toolpipe echo|tr pipeline", if o.stdout.trim() == "HELLO WORLD" && o.ok() { 0.0 } else { 1.0 }, 0.5);
+            // 2. allowlist blocks anything not listed (e.g. rm)
+            let rejected = matches!(run_pipeline(&Pipeline::single("rm", &["-rf", "/"]), &pol), Err(ToolError::NotAllowed(_)));
+            check("toolpipe allowlist blocks non-listed binary", if rejected { 0.0 } else { 1.0 }, 0.5);
+            // 3. stdin fed to the first stage: "a\nb\nc\n" | wc -l -> 3
+            let o3 = run_pipeline(&Pipeline::single("wc", &["-l"]).with_stdin("a\nb\nc\n"), &pol).expect("stdin");
+            check("toolpipe stdin -> wc -l == 3", if o3.stdout.trim() == "3" { 0.0 } else { 1.0 }, 0.5);
+            // 4. concurrent runner: 16 jobs across 4 workers
+            let runner = ToolRunner::new(4, pol.clone());
+            for i in 0..16 { runner.submit(i, Pipeline::single("echo", &[&format!("job{i}")])); }
+            let (mut got, mut allok) = (0, true);
+            for _ in 0..16 { if let Some((_, r)) = runner.recv() { got += 1; if r.is_err() { allok = false; } } }
+            check("toolpipe concurrent runner (16 jobs)", if got == 16 && allok { 0.0 } else { 1.0 }, 0.5);
+            // 5. FSM driver: a bot that calls echo, emits the observed output, then Done
+            struct Echo(usize);
+            impl Bot for Echo {
+                fn step(&mut self, obs: &Observation) -> Action {
+                    self.0 += 1;
+                    match self.0 {
+                        1 => Action::Call(Pipeline::single("echo", &["from-fsm"])),
+                        2 => Action::Emit(obs.last.map(|o| o.stdout.trim().to_string()).unwrap_or_default()),
+                        _ => Action::Done,
+                    }
+                }
+            }
+            let log = drive(&mut Echo(0), &pol, 8);
+            let fsm_ok = matches!(log.status, Status::Done) && log.emitted.iter().any(|e| e == "from-fsm");
+            check("toolpipe FSM driver runs call->emit->done", if fsm_ok { 0.0 } else { 1.0 }, 0.5);
+            // 6. reference parser extracts a piped tool call from model text
+            let calls = parse_calls("preamble\n!run grep ERROR | sort\ntrailer");
+            check("toolpipe parse_calls extracts piped tool call", if calls.len() == 1 && calls[0].stages.len() == 2 { 0.0 } else { 1.0 }, 0.5);
+        }
+        // KV lossy-compression comparator: decode one step with full f32 KV vs the int8
+        // (Warm-tier) KV and measure divergence at the *logit* output — the metric a
+        // precision gate thresholds on. Also checks the comparator's identity property.
+        {
+            let m = gen_model(64, 256, 2, 48, 4, 2);
+            let mm = gpu.load_gguf(&write_gguf(&m)).expect("load");
+            let prefix = [5u32, 1, 9, 3, 7, 2, 8, 4];
+            let (n, kv_dim) = (prefix.len(), mm.kv_dim());
+            // decode the whole sequence with full f32 KV …
+            let cf = gpu.new_cache(mm.n_layers, n, kv_dim);
+            let mut l_f32 = vec![];
+            for pos in 0..n { l_f32 = gpu.decode_step(&mm, &cf, prefix[pos], pos); }
+            // … and again with the int8 (Warm-tier) KV
+            let cq = gpu.new_qcache(mm.n_layers, n, kv_dim);
+            let mut l_q8 = vec![];
+            for pos in 0..n { l_q8 = gpu.decode_step_q8(&mm, &cq, prefix[pos], pos); }
+            let id = gpu_kernels::compare_logits(&l_f32, &l_f32);   // identity: zero divergence
+            let kv = gpu_kernels::compare_logits(&l_f32, &l_q8);    // f32 vs int8 KV
+            println!("  KV f32 vs int8: argmax_match={} max|Δlogit|={:.3e} cos={:.5} KL={:.3e}", kv.argmax_match, kv.max_abs, kv.cosine, kv.kl);
+            let identity_ok = id.argmax_match && id.max_abs == 0.0 && (id.cosine - 1.0).abs() < 1e-4 && id.kl.abs() < 1e-4;
+            let int8_close = kv.cosine > 0.9; // int8 KV should track f32 closely at the logit level
+            check("logit comparator (identity + int8-KV divergence)", if identity_ok && int8_close { 0.0 } else { 1.0 }, 0.5);
+        }
+
+        // warm(): compiles the decode path up front; idempotent and non-empty.
+        let pc1 = gpu.warm(&model);
+        let pc2 = gpu.warm(&model);
+        check("warm() pipelines hot + idempotent", if pc1 > 0 && pc1 == pc2 { 0.0 } else { 1.0 }, 0.5);
+    }
+    // Gpu and Model are Send+Sync: a fleet can fan across OS threads sharing one Gpu +
+    // Model by reference. Run two workers concurrently and require byte-identical output
+    // to the sequential path (proves the Arc/Mutex pipeline cache is correct under threads).
+    {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<gpu_kernels::Gpu>();
+        assert_send_sync::<gpu_kernels::Model>();
+        let (p0, p1) = (vec![5u32, 0, 17], vec![9u32, 2, 7, 3]);
+        let seq0 = gpu.generate_kv(&model, &p0, 5);
+        let seq1 = gpu.generate_kv(&model, &p1, 5);
+        let (t0, t1) = std::thread::scope(|s| {
+            let h0 = s.spawn(|| gpu.generate_kv(&model, &p0, 5));
+            let h1 = s.spawn(|| gpu.generate_kv(&model, &p1, 5));
+            (h0.join().unwrap(), h1.join().unwrap())
+        });
+        check("threaded workers (shared Gpu/Model) == sequential", if t0 == seq0 && t1 == seq1 { 0.0 } else { 1.0 }, 0.5);
+    }
+    // int8 KV cache: lossy (per-row int8) but should track the f32 cache closely.
+    {
+        let pp = [5u32, 0, 17, 9, 2, 7, 3, 1];
+        let f = gpu.forward_kv(&model, &pp);
+        let q = gpu.forward_kv_q8(&model, &pp);
+        let amax = f.iter().cloned().fold(0f32, |a, b| a.max(b.abs())).max(1e-6);
+        let rel = maxerr(&f, &q) / amax;
+        let kvd = model.kv_dim();
+        println!("  int8 KV: rel logit err = {:.3e} | argmax f32={} q8={} | bytes/row {} -> {} ({:.1}x)",
+            rel, gpu_kernels::argmax(&f), gpu_kernels::argmax(&q), kvd * 4, kvd + 4, (kvd * 4) as f32 / (kvd + 4) as f32);
+        check("int8 KV tracks f32 (lossy)", rel, 0.12);
+    }
+    // int8 batched decode == per-session int8 decode (batching is exact; int8 is the
+    // only approximation and it's identical on both sides → bit-exact).
+    {
+        let prompts: [&[u32]; 3] = [&[5, 0, 17], &[9, 2, 7, 3], &[1, 4]];
+        let mut ref_logits: Vec<Vec<f32>> = Vec::new();
+        let mut toks: Vec<u32> = Vec::new();
+        for pr in prompts {
+            let mut s = gpu.session_q8_new(&model, 8, 1);
+            gpu.session_q8_prefill(&model, &mut s, pr);
+            let tk = gpu_kernels::argmax(&s.logits);
+            toks.push(tk);
+            ref_logits.push(gpu.decode_step_q8(&model, &s.cache, tk, pr.len()));
+        }
+        let mut sess: Vec<gpu_kernels::SessionQ8> = prompts.iter().map(|_| gpu.session_q8_new(&model, 8, 1)).collect();
+        for (s, pr) in sess.iter_mut().zip(prompts) { gpu.session_q8_prefill(&model, s, pr); }
+        gpu.decode_batched_q8(&model, &mut sess, &toks);
+        let mut e = 0f32;
+        for i in 0..3 { e = e.max(maxerr(&ref_logits[i], &sess[i].logits)); }
+        check("int8 batched decode == per-session", e, 5e-3);
+    }
+    // int8 continuous-batching scheduler == per-request int8 greedy generation.
+    {
+        let greedy = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+        let reqs = vec![(0usize, vec![5u32, 0, 17], 5usize), (1, vec![9, 2, 7, 3], 4), (2, vec![1, 4, 8], 6)];
+        let got = gpu.run_batched_q8(&model, reqs.clone(), &greedy, None, 2, 24);
+        let mut ok = true;
+        for (id, prompt, mx) in &reqs {
+            let exp = gpu.generate_kv_q8(&model, prompt, *mx);
+            if got.iter().find(|r| r.0 == *id).map(|r| &r.1) != Some(&exp) { ok = false; }
+        }
+        check("int8 scheduler == per-request int8", if ok { 0.0 } else { 1.0 }, 0.5);
+    }
+    // large 1-D dispatch must not exceed the 65535 workgroups/dim limit (the crash on a
+    // long pasted prompt: t*d/64 workgroups). wg1 splits the count across y.
+    {
+        let big = 5_000_000usize; // > 65535*64 elems -> old code dispatched >65535 workgroups
+        let a = gpu.upload(&vec![1.0f32; big], big, 1);
+        let b = gpu.upload(&vec![2.0f32; big], big, 1);
+        let r = gpu.download(&gpu.add_t(&a, &b));
+        let err = (r[0] - 3.0).abs().max((r[big - 1] - 3.0).abs());
+        check("large 1-D dispatch (>65535 wg)", err, 1e-5);
+    }
+    // fused SwiGLU must equal the separate silu(gate)*up it replaces (bit-exact).
+    {
+        let g = gpu.upload(&rnd(2048, 11), 4, 512);
+        let u = gpu.upload(&rnd(2048, 12), 4, 512);
+        let fused = gpu.download(&gpu.swiglu_t(&g, &u));
+        let split = gpu.download(&gpu.mul_t(&gpu.silu_t(&g), &u));
+        check("fused swiglu == silu*mul", maxerr(&fused, &split), 1e-6);
+    }
+    // packed SwiGLU over [m,2h]=[gate|up] (the fused projection's output) must equal the
+    // two-tensor swiglu it replaces in the FFN.
+    {
+        let (m, h) = (4usize, 128usize);
+        let gate = rnd(m * h, 21); let up = rnd(m * h, 22);
+        let mut packed = vec![0f32; m * 2 * h];
+        for r in 0..m { for c in 0..h {
+            packed[r * 2 * h + c] = gate[r * h + c];
+            packed[r * 2 * h + h + c] = up[r * h + c];
+        }}
+        let a = gpu.download(&gpu.swiglu_packed(&gpu.upload(&packed, m, 2 * h)));
+        let b = gpu.download(&gpu.swiglu_t(&gpu.upload(&gate, m, h), &gpu.upload(&up, m, h)));
+        check("packed swiglu == split swiglu", maxerr(&a, &b), 1e-6);
+    }
+    // early-stop: returning false after 2 tokens must yield exactly 2
+    let mut n = 0usize;
+    let got = gpu.generate_kv_stream(&model, &prompt, 6, None,
+        &gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut srng, &|| false,
+        |_| { n += 1; n < 2 });
+    check("kv-cache stream early-stop", if got == 2 && n == 2 { 0.0 } else { 1.0 }, 0.5);
+    // cancellation during prefill must bail out producing nothing (Stop responsiveness)
+    let cancelled = gpu.generate_kv_stream(&model, &prompt, 6, None,
+        &gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut srng, &|| true,
+        |_| true);
+    check("kv-cache prefill cancel", if cancelled == 0 { 0.0 } else { 1.0 }, 0.5);
+
+    // stronger KV check: cached forward over a *varying* sequence must match the
+    // full forward's last-position logits numerically (independent of argmax).
+    let seq = [5u32, 0, 17, 3, 9, 2];
+    let full = gpu.model_forward(&model, &seq);
+    let kv_last = gpu.forward_kv(&model, &seq);
+    check("kv-cache logits == full forward", maxerr(&kv_last, &full[full.len() - model.vocab..]), 1e-3);
+
+    // Q4_0 quantize→dequant round-trip, bounded by the per-block scale
+    let qx = rnd(64, 70);
+    let qd = gpu_kernels::gguf::dequantize(2, &quantize_q4_0(&qx), qx.len()).unwrap();
+    let amax = qx.iter().fold(0f32, |a, &x| a.max(x.abs()));
+    check("q4_0 round-trip (bounded)", maxerr(&qx, &qd), amax / 8.0);
+
+    // Q8_0 dequant: hand-built 34-byte block (f16 scale + 32×i8), w = scale·q
+    let q8_scale = 0.0123f32;
+    let mut q8_blk = f32_to_f16(q8_scale).to_le_bytes().to_vec();
+    let q8_q: Vec<i8> = (0..32).map(|i| (i as i32 * 9 - 60) as i8).collect();
+    for &q in &q8_q { q8_blk.push(q as u8); }
+    let q8_got = gpu_kernels::gguf::dequantize(8, &q8_blk, 32).unwrap();
+    let eff_d = gpu_kernels::gguf::f16_to_f32(f32_to_f16(q8_scale));
+    let q8_want: Vec<f32> = q8_q.iter().map(|&q| q as f32 * eff_d).collect();
+    check("q8_0 dequant", maxerr(&q8_got, &q8_want), 1e-6);
+
+    // Q4_1 dequant: hand-built 20-byte block (f16 d + f16 m + 16 nibble bytes), w = d·nib + m
+    let (d1, m1) = (0.05f32, -0.3f32);
+    let mut q41 = f32_to_f16(d1).to_le_bytes().to_vec();
+    q41.extend_from_slice(&f32_to_f16(m1).to_le_bytes());
+    let q41_nibs: Vec<u8> = (0..16).map(|j| ((j as u8) & 0xf) | (((15 - j as u8) & 0xf) << 4)).collect();
+    q41.extend_from_slice(&q41_nibs);
+    let q41_got = gpu_kernels::gguf::dequantize(3, &q41, 32).unwrap();
+    let (ed, em) = (gpu_kernels::gguf::f16_to_f32(f32_to_f16(d1)), gpu_kernels::gguf::f16_to_f32(f32_to_f16(m1)));
+    let mut q41_want = [0f32; 32];
+    for j in 0..16 { q41_want[j] = (q41_nibs[j] & 0xf) as f32 * ed + em; q41_want[j + 16] = ((q41_nibs[j] >> 4) & 0xf) as f32 * ed + em; }
+    check("q4_1 dequant", maxerr(&q41_got, &q41_want), 1e-6);
+
+    // ---- K-quant super-blocks (256 elems). Each test independently PACKS a block
+    // in the ggml layout, then checks dequantize() unpacks it to the values implied
+    // by the chosen scales/quants (so a layout or scale-packing bug shows up). ----
+    let f16rt = |x: f32| gpu_kernels::gguf::f16_to_f32(f32_to_f16(x));
+
+    // Q6_K (type 14): ql[128] qh[64] scales[16 int8] d(f16); q6 = nib|(hi2<<4), w=d·sc·(q−32)
+    {
+        let d = 0.0021f32; let ed = f16rt(d);
+        let sc: Vec<i8> = (0..16).map(|k| (k as i32 - 8) as i8).collect();
+        let mut ql = [0u8; 128]; let mut qh = [0u8; 64]; let mut want = [0f32; 256];
+        let vq = |half: usize, l: usize, slot: usize| -> u8 { (((l * 4 + slot) * 5 + half * 13) % 64) as u8 };
+        for half in 0..2 { for l in 0..32 {
+            let (bq, bh) = (half * 64, half * 32);
+            let (v1, v2, v3, v4) = (vq(half, l, 0), vq(half, l, 1), vq(half, l, 2), vq(half, l, 3));
+            ql[bq + l] = (v1 & 0xF) | ((v3 & 0xF) << 4);
+            ql[bq + l + 32] = (v2 & 0xF) | ((v4 & 0xF) << 4);
+            qh[bh + l] = ((v1 >> 4) & 3) | (((v2 >> 4) & 3) << 2) | (((v3 >> 4) & 3) << 4) | (((v4 >> 4) & 3) << 6);
+            let (o, is) = (half * 128, l / 16);
+            want[o + l] = ed * sc[half * 8 + is] as f32 * (v1 as i32 - 32) as f32;
+            want[o + l + 32] = ed * sc[half * 8 + is + 2] as f32 * (v2 as i32 - 32) as f32;
+            want[o + l + 64] = ed * sc[half * 8 + is + 4] as f32 * (v3 as i32 - 32) as f32;
+            want[o + l + 96] = ed * sc[half * 8 + is + 6] as f32 * (v4 as i32 - 32) as f32;
+        }}
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&ql); blk.extend_from_slice(&qh);
+        for &s in &sc { blk.push(s as u8); } blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        let got = gpu_kernels::gguf::dequantize(14, &blk, 256).unwrap();
+        check("q6_k dequant", maxerr(&got, &want), 1e-5);
+    }
+
+    // shared 6-bit scale/min packer (inverse of get_scale_min_k4) for Q4_K / Q5_K
+    let pack_k4 = |sc6: &[u8; 8], m6: &[u8; 8]| -> [u8; 12] {
+        let mut q = [0u8; 12];
+        for j in 0..4 { q[j] = sc6[j] & 63; q[j + 4] = m6[j] & 63; }
+        for j in 4..8 {
+            q[j + 4] = (sc6[j] & 0x0F) | ((m6[j] & 0x0F) << 4);
+            q[j - 4] |= ((sc6[j] >> 4) & 3) << 6;
+            q[j] |= ((m6[j] >> 4) & 3) << 6;
+        }
+        q
+    };
+
+    // Q4_K (type 12): d, dmin, 12 scale bytes, 128 nibble bytes. w = d·sc·nib − dmin·m
+    {
+        let (d, dmin) = (0.03f32, 0.011f32); let (ed, em) = (f16rt(d), f16rt(dmin));
+        let sc6: [u8; 8] = [3, 17, 40, 62, 9, 51, 28, 33];
+        let m6: [u8; 8] = [1, 22, 60, 7, 44, 13, 55, 19];
+        let scales = pack_k4(&sc6, &m6);
+        let qs: Vec<u8> = (0..128).map(|i| (((i * 3 + 1) % 16) | (((i * 5 + 2) % 16) << 4)) as u8).collect();
+        let mut want = [0f32; 256];
+        for k in 0..4 { for l in 0..32 {
+            let b = qs[k * 32 + l];
+            want[64 * k + l] = ed * sc6[2 * k] as f32 * (b & 0xF) as f32 - em * m6[2 * k] as f32;
+            want[64 * k + 32 + l] = ed * sc6[2 * k + 1] as f32 * (b >> 4) as f32 - em * m6[2 * k + 1] as f32;
+        }}
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        blk.extend_from_slice(&scales); blk.extend_from_slice(&qs);
+        let got = gpu_kernels::gguf::dequantize(12, &blk, 256).unwrap();
+        check("q4_k dequant", maxerr(&got, &want), 1e-5);
+    }
+
+    // Q5_K (type 13): d, dmin, 12 scale bytes, 32 qh bytes, 128 nibble bytes.
+    // 5th bit from qh via moving mask u1=1<<2k, u2=2<<2k. w = d·sc·(nib+16·hi) − dmin·m
+    {
+        let (d, dmin) = (0.02f32, 0.008f32); let (ed, em) = (f16rt(d), f16rt(dmin));
+        let sc6: [u8; 8] = [5, 30, 63, 12, 48, 21, 39, 7];
+        let m6: [u8; 8] = [2, 18, 50, 33, 9, 61, 24, 41];
+        let scales = pack_k4(&sc6, &m6);
+        let qs: Vec<u8> = (0..128).map(|i| (((i * 7 + 3) % 16) | (((i * 2 + 5) % 16) << 4)) as u8).collect();
+        let hb_lo = |k: usize, l: usize| ((k + l) % 2) as u8;       // 0/1 pattern
+        let hb_hi = |k: usize, l: usize| ((k + l + 1) % 2) as u8;
+        let mut qh = [0u8; 32];
+        for k in 0..4 { for l in 0..32 {
+            qh[l] |= hb_lo(k, l) << (2 * k);
+            qh[l] |= hb_hi(k, l) << (2 * k + 1);
+        }}
+        let mut want = [0f32; 256];
+        for k in 0..4 { for l in 0..32 {
+            let b = qs[k * 32 + l];
+            let lo = (b & 0xF) as i32 + 16 * hb_lo(k, l) as i32;
+            let hi = (b >> 4) as i32 + 16 * hb_hi(k, l) as i32;
+            want[64 * k + l] = ed * sc6[2 * k] as f32 * lo as f32 - em * m6[2 * k] as f32;
+            want[64 * k + 32 + l] = ed * sc6[2 * k + 1] as f32 * hi as f32 - em * m6[2 * k + 1] as f32;
+        }}
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&f32_to_f16(d).to_le_bytes());
+        blk.extend_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        blk.extend_from_slice(&scales); blk.extend_from_slice(&qh); blk.extend_from_slice(&qs);
+        let got = gpu_kernels::gguf::dequantize(13, &blk, 256).unwrap();
+        check("q5_k dequant", maxerr(&got, &want), 1e-5);
+    }
+
+    // Fused dequant-matmul: int8 weights stay resident, dequant happens inside the
+    // matmul. Validate against the f32 `linear` on the SAME dequantized weights, so
+    // any error is the fused kernel itself, not quantization loss.
+    {
+        let (m, n, k) = (3usize, 40usize, 64usize); // k multiple of 32
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 40) as f32 / 16_777_216.0 - 0.5 };
+        let a: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let kb = k / 32;
+        let mut qs = vec![0f32; n * kb];
+        let mut qbytes = vec![0i8; n * k];
+        let mut wdeq = vec![0f32; n * k];
+        for r in 0..n {
+            for b in 0..kb {
+                let mut amax = 0f32;
+                for j in 0..32 { amax = amax.max(w[r * k + b * 32 + j].abs()); }
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                qs[r * kb + b] = scale;
+                for j in 0..32 {
+                    let idx = r * k + b * 32 + j;
+                    let q = (w[idx] / scale).round().clamp(-127.0, 127.0) as i32 as i8;
+                    qbytes[idx] = q;
+                    wdeq[idx] = q as f32 * scale;
+                }
+            }
+        }
+        let mut qw = vec![0u32; n * k / 4];
+        for i in 0..n * k { qw[i / 4] |= (qbytes[i] as u8 as u32) << ((i % 4) * 8); }
+        let fused = gpu.linear_q8_0(&a, &qw, &qs, m, n, k);
+        let reference = gpu.linear(&a, &wdeq, m, n, k);
+        println!("  fused q8_0 linear: int8 weights resident, {}× smaller than f32 ({} vs {} bytes)", 4, n * k, n * k * 4);
+        check("fused q8_0 linear", maxerr(&fused, &reference), 1e-4);
+    }
+
+    // Resident fused: quantize f32 weights into a device-resident int8 QWeight, run
+    // the resident fused linear (upload→dispatch→download), and compare to the f32
+    // resident linear on the same dequantized weights. Proves the model-ready path.
+    {
+        let (m, n, k) = (4usize, 48usize, 96usize);
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        let mut rnd = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed >> 40) as f32 / 16_777_216.0 - 0.5 };
+        let a: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let kb = k / 32;
+        let mut wdeq = vec![0f32; n * k];
+        for r in 0..n {
+            for b in 0..kb {
+                let mut amax = 0f32;
+                for j in 0..32 { amax = amax.max(w[r * k + b * 32 + j].abs()); }
+                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                for j in 0..32 { let idx = r * k + b * 32 + j; wdeq[idx] = (w[idx] / scale).round().clamp(-127.0, 127.0) * scale; }
+            }
+        }
+        let at = gpu.upload(&a, m, k);
+        let qwt = gpu.quantize_q8_resident(&w, n, k);
+        let fused = gpu.download(&gpu.linear_q8_0_t(&at, &qwt, m));
+        let wt = gpu.upload(&wdeq, n, k);
+        let reference = gpu.download(&gpu.linear_t(&at, &wt, m, n, k));
+        check("resident fused q8_0 linear", maxerr(&fused, &reference), 1e-4);
+    }
+
+    // quantized model: Q4_0 weights written to a GGUF, loaded + dequantized on the
+    // GPU, full multi-head forward vs a CPU forward over the same effective weights.
+    let qm = gen_model(32, 64, 2, 32, 4, 4);
+    let (qbytes, eff) = build_quantized_gguf(&qm);
+    let qmodel = gpu.load_gguf(&qbytes).expect("load quantized");
+    let qids = [7u32, 1, 30, 4];
+    println!("  quantized model: d=32 h=64 heads=4 vocab=32, Q4_0 weights ({} bytes)", qbytes.len());
+    check("quantized model forward (Q4_0)", maxerr(&gpu.model_forward(&qmodel, &qids), &cpu_model_forward(&eff, &qids)), 1e-2);
+
+    // tokenizer: byte-level BPE encode/decode round-trip + merge correctness
+    use gpu_kernels::tokenizer::Tokenizer;
+    let mut toks: Vec<Vec<u8>> = (0u16..256).map(|c| vec![c as u8]).collect();
+    let pairs = [("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o")];
+    for (a, b) in pairs { let mut m = a.as_bytes().to_vec(); m.extend_from_slice(b.as_bytes()); toks.push(m); }
+    let merges: Vec<(Vec<u8>, Vec<u8>)> = pairs.iter().map(|(a, b)| (a.as_bytes().to_vec(), b.as_bytes().to_vec())).collect();
+    let tk = Tokenizer::new(toks, merges);
+    let ids = tk.encode("hello");
+    println!("  tokenizer: \"hello\" -> {} id(s) -> \"{}\"; \"hi xyz\" round-trips: {}",
+        ids.len(), tk.decode(&ids), tk.decode(&tk.encode("hi xyz")) == "hi xyz");
+    check("tokenizer encode merges (hello->1)", if ids.len() == 1 { 0.0 } else { 1.0 }, 0.5);
+    check("tokenizer round-trip", if tk.decode(&ids) == "hello" && tk.decode(&tk.encode("hi xyz")) == "hi xyz" { 0.0 } else { 1.0 }, 0.5);
+
+    // tokenizer loaded from GGUF string-array metadata (exercises array parsing)
+    let g = gpu_kernels::gguf::parse(&build_tokenizer_gguf(
+        &["h", "e", "l", "o", " ", "i", "x", "y", "z", "he", "ll", "hell", "hello"],
+        &["h e", "l l", "he ll", "hell o"])).unwrap();
+    let tg = Tokenizer::from_gguf(&g).unwrap();
+    check("tokenizer from gguf", if tg.decode(&tg.encode("hello")) == "hello" && tg.vocab_size() == 13 { 0.0 } else { 1.0 }, 0.5);
+
+    // byte-level (GPT-2) remap: every byte round-trips, space → 'Ġ', 'A' → 'A'
+    let enc = gpu_kernels::tokenizer::byte_to_unicode_table();
+    let dec: std::collections::HashMap<char, u8> = enc.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
+    let remap_ok = (0..256).all(|b| dec[&enc[b]] == b as u8) && enc[0x20] == '\u{0120}' && enc[b'A' as usize] == 'A';
+    check("byte<->unicode remap", if remap_ok { 0.0 } else { 1.0 }, 0.5);
+
+    // byte-level tokenizer: full vocab of remapped chars + a couple merges; encode
+    // then decode must reproduce text with spaces, punctuation, and non-ASCII.
+    let mut bl_toks: Vec<Vec<u8>> = (0..256).map(|b| enc[b].to_string().into_bytes()).collect();
+    let sp = '\u{0120}'.to_string(); // remapped space
+    let (he, sp_w) = ("h".to_string() + "e", sp.clone() + "w");
+    bl_toks.push(he.clone().into_bytes());
+    bl_toks.push(sp_w.clone().into_bytes());
+    let bl_merges = vec![(b"h".to_vec(), b"e".to_vec()), (sp.clone().into_bytes(), b"w".to_vec())];
+    let bt = Tokenizer::new_byte_level(bl_toks, bl_merges);
+    let samples = ["hello world!", " leading", "tabs\tand\nnewlines", "héllo, 世界 123"];
+    let bl_rt = samples.iter().all(|s| bt.decode(&bt.encode(s)) == *s);
+    let merged_he = bt.encode("he").len() == 1; // the h+e merge fired
+    println!("  byte-level: round-trips {} samples (incl. unicode); \"he\"->{} id", samples.len(), bt.encode("he").len());
+    check("byte-level tokenizer round-trip", if bl_rt && merged_he { 0.0 } else { 1.0 }, 0.5);
+
+    // Special/control tokens (e.g. <|eot_id|>): matched verbatim in input → single id,
+    // decoded literally (not byte-remapped), and round-tripping around normal text.
+    {
+        let enc2 = gpu_kernels::tokenizer::byte_to_unicode_table();
+        let mut toks: Vec<Vec<u8>> = (0..256).map(|b| enc2[b].to_string().into_bytes()).collect();
+        toks.push("<|eot_id|>".to_string().into_bytes()); // id 256, a control token
+        let mut t = Tokenizer::new_byte_level(toks, vec![]);
+        t.set_specials(vec![("<|eot_id|>".to_string(), 256)]);
+        let ids = t.encode("hi<|eot_id|>!");
+        let ok = ids.contains(&256) && t.is_special(256) && t.special_id("<|eot_id|>") == Some(256)
+            && t.decode(&[256]) == "<|eot_id|>" && t.decode(&t.encode("a<|eot_id|>b")) == "a<|eot_id|>b";
+        println!("  special tokens: \"hi<|eot_id|>!\" -> {} ids incl. control; literal decode + round-trip ok={}", ids.len(), ok);
+        check("special-token encode/decode", if ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
+    // sampling: temp=0 and top_k=1 reduce to argmax; nucleus stays in range
+    let slog = rnd(24, 80);
+    let greedy = gpu_kernels::argmax(&slog);
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let s0 = gpu_kernels::sample(&slog, &gpu_kernels::SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut rng);
+    let s1 = gpu_kernels::sample(&slog, &gpu_kernels::SamplerParams { temperature: 1.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut rng);
+    let s2 = gpu_kernels::sample(&slog, &gpu_kernels::SamplerParams { temperature: 0.8, top_k: 5, top_p: 0.9, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }, &mut rng);
+    check("sample temp=0 == argmax", if s0 == greedy { 0.0 } else { 1.0 }, 0.5);
+    check("sample top_k=1 == argmax", if s1 == greedy { 0.0 } else { 1.0 }, 0.5);
+    check("sample top-k/p in range", if (s2 as usize) < slog.len() { 0.0 } else { 1.0 }, 0.5);
+
+    println!();
+    println!("  pipeline cache: {} unique compute pipelines built and reused across all dispatches", gpu.pipeline_count());
+    if fails == 0 { println!("ALL KERNELS VALIDATED ON GPU ✓"); }
+    else { println!("{fails} kernel(s) FAILED"); std::process::exit(1); }
+}
+
+/// Concurrency / scaling sweep: stand up a DialoGPT-small-shaped synthetic model
+/// (random weights — we measure GPU throughput and scaling, not text), then run an
+/// increasing number of independent sessions round-robin and report aggregate tok/s.
+fn concurrency_sweep(gpu: &Gpu) {
+    eprintln!("== concurrency / scaling sweep ==");
+    eprintln!("shape: DialoGPT-small (d=768 L=12 H=12 ff=3072 vocab=50257), int8-resident\n");
+    let hm = gen_model(768, 3072, 12, 50257, 12, 12);
+    let bytes = write_gguf(&hm);
+    let t = std::time::Instant::now();
+    let model = gpu.load_gguf_quantized(&bytes).expect("load synthetic");
+    eprintln!("resident in {:.2}s | output int8={} | {} layers | KV/session ≈ {} KiB\n",
+        t.elapsed().as_secs_f32(), model.output_is_quantized(), model.n_layers,
+        model.n_layers * (8 + 4) * 2 * model.kv_dim() * 4 / 1024);
+
+    let prompt: Vec<u32> = (0..4).map(|i| (i * 997 % 50257) as u32).collect();
+    let steps = 4usize;
+    let sp = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 }; // greedy = no timing noise
+
+    // single-step latency baseline (1 session)
+    eprintln!("{:>4} {:>9} {:>10} {:>12} {:>11} {:>9}", "N", "tokens", "wall(s)", "agg tok/s", "per-sess", "speedup");
+    let mut base = 0f32;
+    for (i, &n) in [1usize, 2, 4, 8].iter().enumerate() {
+        let max_seq = prompt.len() + steps + 1;
+        let mut s: Vec<gpu_kernels::Session> = (0..n).map(|k| gpu.session_new(&model, max_seq, 0x51ed + k as u64)).collect();
+        for sess in s.iter_mut() { gpu.session_prefill(&model, sess, &prompt); }
+        let t0 = std::time::Instant::now();
+        let mut produced = 0usize;
+        for _ in 0..steps {
+            for sess in s.iter_mut() {
+                if gpu.session_step(&model, sess, &sp, None).is_some() { produced += 1; }
+            }
+        }
+        let secs = t0.elapsed().as_secs_f32().max(1e-6);
+        let agg = produced as f32 / secs;
+        if i == 0 { base = agg; }
+        eprintln!("{:>4} {:>9} {:>10.2} {:>12.2} {:>11.2} {:>8.2}x",
+            n, produced, secs, agg, agg / n as f32, agg / base.max(1e-6));
+    }
+    eprintln!("\nround-robin runs N independent single-row decodes per round; flat aggregate");
+    eprintln!("with falling per-session rate = the dispatch/bandwidth bound batched decode breaks.");
+
+    // batched decode: one [N,d] pass per round vs the round-robin baseline above
+    eprintln!("\n-- batched decode (one [N,d] pass per round) --");
+    eprintln!("{:>4} {:>9} {:>10} {:>12} {:>8}", "N", "tokens", "wall(s)", "agg tok/s", "vs RR");
+    for &n in &[1usize, 2, 4, 8] {
+        let max_seq = prompt.len() + steps + 1;
+        let mut s: Vec<gpu_kernels::Session> = (0..n).map(|k| gpu.session_new(&model, max_seq, 0x71a + k as u64)).collect();
+        for sess in s.iter_mut() { gpu.session_prefill(&model, sess, &prompt); }
+        let t0 = std::time::Instant::now();
+        let mut produced = 0usize;
+        for _ in 0..steps {
+            let toks: Vec<u32> = s.iter().map(|x| gpu_kernels::argmax(&x.logits)).collect();
+            gpu.decode_batched(&model, &mut s, &toks);
+            produced += n;
+        }
+        let secs = t0.elapsed().as_secs_f32().max(1e-6);
+        let agg = produced as f32 / secs;
+        eprintln!("{:>4} {:>9} {:>10.2} {:>12.2} {:>7.2}x", n, produced, secs, agg, agg / base.max(1e-6));
+    }
+    eprintln!("(on lavapipe, compute-bound + serialized, batched ≈ round-robin; the win is on a");
+    eprintln!(" real GPU where [N,d] matmuls fill idle lanes that single-row decode leaves empty.)");
+
+    // prefill: sequential (T decode_steps) vs batched (one [T,d] pass)
+    eprintln!("\n-- prefill: sequential vs batched --");
+    for &plen in &[24usize] {
+        let pr: Vec<u32> = (0..plen).map(|i| (i * 131 % 50257) as u32).collect();
+        let t0 = std::time::Instant::now();
+        let _ = gpu.forward_kv(&model, &pr);              // T sequential decode_steps
+        let seq = t0.elapsed().as_secs_f32();
+        let cc = gpu.new_cache(model.n_layers, plen + 1, model.kv_dim());
+        let t1 = std::time::Instant::now();
+        let _ = gpu.prefill_batched(&model, &cc, &pr);    // one batched pass
+        let bat = t1.elapsed().as_secs_f32();
+        eprintln!("  prompt {:>4} tok: sequential {:>7.2}s | batched {:>7.2}s | {:>5.2}x",
+            plen, seq, bat, seq / bat.max(1e-6));
+    }
+
+    // prefix KV reuse: N sessions share a long prefix (system + tool schemas) and differ
+    // only in a short suffix. Compare re-prefilling the whole prompt per session vs
+    // prefilling the prefix once and seeding each session from it.
+    eprintln!("\n-- prefix KV reuse (shared prefix, short per-session suffix) --");
+    let nsess = 3usize;
+    let plen = 32usize; let slen = 4usize;
+    let prefix: Vec<u32> = (0..plen).map(|i| (i * 53 % 50257) as u32).collect();
+    let t0 = std::time::Instant::now();
+    for _ in 0..nsess {
+        let suffix: Vec<u32> = (0..slen).map(|i| (i * 17 % 50257) as u32).collect();
+        let full: Vec<u32> = prefix.iter().chain(suffix.iter()).copied().collect();
+        let c = gpu.new_cache(model.n_layers, full.len() + 1, model.kv_dim());
+        let _ = gpu.prefill_batched(&model, &c, &full);
+    }
+    let no_reuse = t0.elapsed().as_secs_f32();
+    let t1 = std::time::Instant::now();
+    let pc = gpu.prefill_prefix(&model, &prefix);          // prefix computed once
+    for _ in 0..nsess {
+        let suffix: Vec<u32> = (0..slen).map(|i| (i * 17 % 50257) as u32).collect();
+        let mut s = gpu.session_new(&model, plen + slen + 1, 7);
+        gpu.seed_from_prefix(&model, &mut s, &pc, plen);   // copy prefix KV in
+        gpu.session_prefill(&model, &mut s, &suffix);      // prefill only the suffix
+    }
+    let reuse = t1.elapsed().as_secs_f32();
+    eprintln!("  {} sessions, prefix {} + suffix {} tok:", nsess, plen, slen);
+    eprintln!("    re-prefill each: {:>6.2}s | prefix-once + suffix: {:>6.2}s | {:>5.2}x",
+        no_reuse, reuse, no_reuse / reuse.max(1e-6));
+}
+
+/// Dynamic load-stepping: ramp up the number of *concurrent* instances (threads, each a
+/// session against the one shared resident model) and report per-instance and aggregate
+/// tokens/sec at each step, flagging where per-instance throughput crosses 1/2 and 1/10 of
+/// the single-instance baseline — i.e. how many you can stack before it degrades.
+fn load_step(gpu: std::sync::Arc<Gpu>, model: std::sync::Arc<gpu_kernels::Model>) {
+    use std::sync::{Arc, Barrier};
+    use std::time::Instant;
+    let prompt = vec![1u32, 2, 3, 4];
+    let t_decode = 24usize; // tokens each instance generates (timed)
+    let max_seq = 128usize;
+
+    let bench = |n: usize| -> f64 {
+        let barrier = Arc::new(Barrier::new(n + 1));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let (g, m, pr, b) = (gpu.clone(), model.clone(), prompt.clone(), barrier.clone());
+            handles.push(std::thread::spawn(move || {
+                let mut s = g.session_new(&m, max_seq, 0xABCD);
+                g.session_prefill(&m, &mut s, &pr);
+                let sp = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 1, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+                b.wait(); // all instances start decoding together
+                for _ in 0..t_decode { let _ = g.session_step(&m, &mut s, &sp, None); }
+            }));
+        }
+        barrier.wait();
+        let start = Instant::now();
+        for h in handles { let _ = h.join(); }
+        let wall = start.elapsed().as_secs_f64().max(1e-6);
+        t_decode as f64 / wall // per-instance tok/s (each did t_decode tokens concurrently)
+    };
+
+    let base = bench(1);
+    println!("\nload-step — concurrent instances against one shared resident model");
+    println!("  baseline (N=1): {base:.2} tok/s/instance\n");
+    println!("  {:>4} | {:>14} | {:>15} | {:>6}", "N", "per-inst tok/s", "aggregate t/s", "ratio");
+    println!("  {:->4}-+-{:->14}-+-{:->15}-+-{:->6}", "", "", "", "");
+    let (half, tenth) = (base * 0.5, base * 0.1);
+    let (mut n_half, mut n_tenth): (Option<usize>, Option<usize>) = (None, None);
+    for &n in &[1usize, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128] {
+        let pi = bench(n);
+        let (agg, ratio) = (pi * n as f64, pi / base);
+        let mut mark = String::new();
+        if n_half.is_none() && pi <= half { n_half = Some(n); mark.push_str("  <= 1/2"); }
+        if n_tenth.is_none() && pi <= tenth { n_tenth = Some(n); mark.push_str("  <= 1/10"); }
+        println!("  {n:>4} | {pi:>14.2} | {agg:>15.1} | {ratio:>5.2}x{mark}");
+        if n_tenth.is_some() { break; }
+    }
+    let s = |o: Option<usize>| o.map(|n| n.to_string()).unwrap_or_else(|| "> max tested".into());
+    println!("\n  => per-instance tok/s halves (<= 1/2 baseline) at N ~ {}", s(n_half));
+    println!("  => per-instance tok/s hits 1/10 baseline at  N ~ {}", s(n_tenth));
+}
+
+/// Validate our loader (gguf.rs + tokenizer.rs) against a real GGUF file without the
+/// full resident load (which would exceed sandbox RAM): parse metadata, build the
+/// tokenizer, round-trip text, and K-quant-dequant a few real tensors.
+fn inspect_gguf(path: &str) {
+    use gpu_kernels::gguf;
+    use gpu_kernels::tokenizer::Tokenizer;
+    let _mm = gpu_kernels::mmap_ro(path).expect("mmap gguf"); let bytes = &_mm[..];
+    eprintln!("inspect {} ({:.1} MiB)", path, bytes.len() as f32 / (1 << 20) as f32);
+    let g = gguf::parse(&bytes).expect("parse");
+    let arch = g.get_str("general.architecture").unwrap_or("?").to_string();
+    let gu = |k: &str| g.get_u32(&format!("{arch}.{k}")).unwrap_or(0);
+    let nh = gu("attention.head_count");
+    eprintln!("arch={arch} d={} layers={} heads={}/{} ff={} ctx={} rope_base={:?} | {} tensors",
+        gu("embedding_length"), gu("block_count"), nh,
+        g.get_u32(&format!("{arch}.attention.head_count_kv")).unwrap_or(nh),
+        gu("feed_forward_length"), gu("context_length"),
+        g.get_f32(&format!("{arch}.rope.freq_base")), g.tensors.len());
+    // tensor-type histogram — which quant formats does this model actually use?
+    {
+        let mut hist = std::collections::BTreeMap::new();
+        for t in &g.tensors { *hist.entry(t.ggml_type).or_insert(0u32) += 1; }
+        let nm = |ty: u32| match ty { 0=>"F32",1=>"F16",2=>"Q4_0",3=>"Q4_1",6=>"Q5_0",7=>"Q5_1",8=>"Q8_0",10=>"Q2_K",11=>"Q3_K",12=>"Q4_K",13=>"Q5_K",14=>"Q6_K",_=>"?" };
+        let parts: Vec<String> = hist.iter().map(|(ty, n)| format!("{}×{n}", nm(*ty))).collect();
+        eprintln!("  tensor types: {}", parts.join("  "));
+    }
+    // factors from scaling *metadata*. If a model (e.g. Llama-3.2) ships llama3 scaling as
+    // metadata only, it would run with plain RoPE — report which form is present.
+    {
+        let rf = format!("{arch}.rope.scaling");
+        let styp = g.get_str(&format!("{rf}.type")).unwrap_or("(none)");
+        let factor = g.get_f32(&format!("{rf}.factor"));
+        let lo = g.get_f32(&format!("{rf}.low_freq_factor"));
+        let hi = g.get_f32(&format!("{rf}.high_freq_factor"));
+        let orig = g.get_u32(&format!("{rf}.original_context_length"));
+        match g.tensor("rope_freqs.weight") {
+            Some(t) => {
+                let n = t.dims.iter().product::<u64>() as usize;
+                let start = (g.data_offset + t.offset) as usize;
+                let nb = gguf::type_nbytes(t.ggml_type, n).unwrap_or(0);
+                let v = gguf::dequantize(t.ggml_type, &bytes[start..start + nb], n).unwrap_or_default();
+                let (mn, mx) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                eprintln!("  rope scaling: rope_freqs.weight PRESENT (len {n}, range[{mn:.3},{mx:.3}]) -> applied ✓");
+            }
+            None => eprintln!("  rope scaling: NO rope_freqs.weight tensor | meta type={styp} factor={factor:?} low={lo:?} high={hi:?} orig_ctx={orig:?}{}",
+                if styp != "(none)" { "  <<< metadata-only scaling is NOT applied by the engine" } else { "" }),
+        }
+    }
+    let tok = Tokenizer::from_gguf(&g).expect("tokenizer");
+    eprintln!("tokenizer: byte_level={} vocab={}", tok.is_byte_level(), tok.vocab_size());
+    let test = "Hello, world!";
+    let ids = tok.encode(test);
+    let back = tok.decode(&ids);
+    eprintln!("  encode {:?} -> {:?} -> {:?} ({})", test, ids, back, if back == test { "roundtrip OK" } else { "DIFF" });
+    eprintln!("  <|eot_id|>={:?} eos_meta={:?} bos_meta={:?}",
+        tok.special_id("<|eot_id|>"), g.get_u32("tokenizer.ggml.eos_token_id"), g.get_u32("tokenizer.ggml.bos_token_id"));
+    // Chat-template control tokens must each encode to exactly one special id, else the
+    // instruct template is corrupted (byte-BPE splits the markers) and quality collapses.
+    let markers = ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"];
+    let mut markers_ok = true;
+    for mk in markers {
+        let ids = tok.encode(mk);
+        let ok = ids.len() == 1 && tok.is_special(ids[0]);
+        if !ok { markers_ok = false; }
+        eprintln!("  marker {:<20} -> {:?} {}", mk, ids, if ok { "single control id" } else { "SPLIT/non-special!" });
+    }
+    let templ = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are Logscope.<|eot_id|>\
+<|start_header_id|>user<|end_header_id|>\n\nlog grew to 157GB<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n";
+    let tids = tok.encode(templ);
+    let n_special = tids.iter().filter(|&&id| tok.is_special(id)).count();
+    eprintln!("  full template -> {} tokens, {} control ids (expect 9): {}",
+        tids.len(), n_special, if markers_ok && n_special == 9 { "VALID" } else { "INVALID" });
+    for name in ["blk.0.attn_q.weight", "blk.0.ffn_gate.weight", "blk.0.attn_v.weight"] {
+        if let Some(t) = g.tensor(name) {
+            let n: usize = t.dims.iter().product::<u64>() as usize;
+            let start = (g.data_offset + t.offset) as usize;
+            match gguf::dequantize(t.ggml_type, &bytes[start..], n) {
+                Ok(v) => {
+                    let finite = v.iter().all(|x| x.is_finite());
+                    let (mn, mx) = v.iter().fold((f32::MAX, f32::MIN), |(a, b), &x| (a.min(x), b.max(x)));
+                    eprintln!("  {name}: ggml_type={} {} elems dequant OK finite={} range[{:.3},{:.3}]", t.ggml_type, n, finite, mn, mx);
+                }
+                Err(e) => eprintln!("  {name}: dequant FAIL: {e}"),
+            }
+        } else { eprintln!("  {name}: ABSENT"); }
+    }
+    eprintln!("OK: parse + tokenizer + K-quant dequant validated against the real file.");
+}

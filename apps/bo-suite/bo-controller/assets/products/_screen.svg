@@ -1,0 +1,7 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+  <!-- TV (Beovision): rounded screen + soft stand -->
+  <rect x="8" y="14" width="48" height="30" rx="8" ry="8"/>
+  <path d="M26 50 h12" stroke-width="2.6"/>
+  <path d="M32 44 v6" stroke-width="2.2"/>
+</svg>

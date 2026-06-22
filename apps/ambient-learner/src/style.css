@@ -1,0 +1,868 @@
+/* Liquid Glass Effects & Dynamic Gradients */
+/* Modular CSS for Ambient Learner */
+
+/* ============================================================================
+   Design System Variables
+   ============================================================================ */
+
+:root {
+    /* Border Radius Scale - Consistent rounded corners */
+    --radius-xs: 8px;    /* Small elements */
+    --radius-sm: 12px;   /* Buttons, inputs */
+    --radius-md: 16px;   /* Cards, panels */
+    --radius-lg: 20px;   /* Large panels */
+    --radius-xl: 24px;   /* Modals, major sections */
+    --radius-2xl: 32px;  /* Hero elements */
+    
+    /* Spacing Scale - Consistent margins/padding */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 12px;
+    --space-lg: 16px;
+    --space-xl: 24px;
+    --space-2xl: 32px;
+    --space-3xl: 48px;
+    
+    /* Glass Effect Values */
+    --glass-blur-sm: 10px;
+    --glass-blur-md: 20px;
+    --glass-blur-lg: 30px;
+    
+    /* Shadow Scale */
+    --shadow-sm: 0 4px 16px 0 rgba(0, 0, 0, 0.08);
+    --shadow-md: 0 8px 32px 0 rgba(0, 0, 0, 0.12);
+    --shadow-lg: 0 12px 40px 0 rgba(0, 0, 0, 0.18);
+    --shadow-xl: 0 16px 48px 0 rgba(0, 0, 0, 0.2);
+}
+
+/* ============================================================================
+   Base Glass Effect
+   ============================================================================ */
+
+.glass-panel {
+    background: rgba(255, 255, 255, 0.08);
+    backdrop-filter: blur(var(--glass-blur-md)) saturate(180%);
+    -webkit-backdrop-filter: blur(var(--glass-blur-md)) saturate(180%);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: var(--radius-md);
+    box-shadow: var(--shadow-md);
+    overflow: hidden;  /* Ensures child content respects border-radius */
+}
+
+.glass-panel-strong {
+    background: rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(var(--glass-blur-lg)) saturate(200%);
+    -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(200%);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-lg);
+    overflow: hidden;
+}
+
+.glass-panel-subtle {
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(var(--glass-blur-sm)) saturate(150%);
+    -webkit-backdrop-filter: blur(var(--glass-blur-sm)) saturate(150%);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: var(--radius-sm);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+}
+
+/* ============================================================================
+   Temperature-Based Gradients
+   ============================================================================ */
+
+/* Cold (< 10°C) - Blue gradient */
+.temp-gradient-cold {
+    background: linear-gradient(135deg, 
+        rgba(59, 130, 246, 0.3) 0%,
+        rgba(147, 197, 253, 0.2) 50%,
+        rgba(191, 219, 254, 0.1) 100%);
+    background-size: 200% 200%;
+    animation: gradient-shift-cold 8s ease infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes gradient-shift-cold {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+/* Cool (10-18°C) - Cyan gradient */
+.temp-gradient-cool {
+    background: linear-gradient(135deg,
+        rgba(6, 182, 212, 0.3) 0%,
+        rgba(103, 232, 249, 0.2) 50%,
+        rgba(165, 243, 252, 0.1) 100%);
+    background-size: 200% 200%;
+    animation: gradient-shift-cool 10s ease infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes gradient-shift-cool {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+/* Moderate (18-24°C) - Green gradient */
+.temp-gradient-moderate {
+    background: linear-gradient(135deg,
+        rgba(34, 197, 94, 0.3) 0%,
+        rgba(134, 239, 172, 0.2) 50%,
+        rgba(187, 247, 208, 0.1) 100%);
+    background-size: 200% 200%;
+    animation: gradient-shift-moderate 12s ease infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes gradient-shift-moderate {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+/* Warm (24-28°C) - Yellow/Orange gradient */
+.temp-gradient-warm {
+    background: linear-gradient(135deg,
+        rgba(251, 191, 36, 0.3) 0%,
+        rgba(252, 211, 77, 0.2) 50%,
+        rgba(254, 240, 138, 0.1) 100%);
+    background-size: 200% 200%;
+    animation: gradient-shift-warm 10s ease infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes gradient-shift-warm {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+/* Hot (> 28°C) - Red/Orange gradient */
+.temp-gradient-hot {
+    background: linear-gradient(135deg,
+        rgba(239, 68, 68, 0.3) 0%,
+        rgba(251, 146, 60, 0.2) 50%,
+        rgba(253, 186, 116, 0.1) 100%);
+    background-size: 200% 200%;
+    animation: gradient-shift-hot 8s ease infinite;
+    border-radius: var(--radius-md);
+}
+
+@keyframes gradient-shift-hot {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    50% {
+        background-position: 100% 50%;
+    }
+}
+
+/* ============================================================================
+   Confidence-Based Effects
+   ============================================================================ */
+
+/* High confidence (> 0.8) - Solid, stable */
+.confidence-high {
+    opacity: 1.0;
+    animation: pulse-subtle 4s ease-in-out infinite;
+}
+
+@keyframes pulse-subtle {
+    0%, 100% {
+        opacity: 1.0;
+    }
+    50% {
+        opacity: 0.95;
+    }
+}
+
+/* Medium confidence (0.5-0.8) - Slightly animated */
+.confidence-medium {
+    opacity: 0.9;
+    animation: pulse-medium 3s ease-in-out infinite;
+}
+
+@keyframes pulse-medium {
+    0%, 100% {
+        opacity: 0.9;
+    }
+    50% {
+        opacity: 0.75;
+    }
+}
+
+/* Low confidence (< 0.5) - More animated, transparent */
+.confidence-low {
+    opacity: 0.7;
+    animation: pulse-strong 2s ease-in-out infinite;
+}
+
+@keyframes pulse-strong {
+    0%, 100% {
+        opacity: 0.7;
+    }
+    50% {
+        opacity: 0.5;
+    }
+}
+
+/* ============================================================================
+   Liquid Effects
+   ============================================================================ */
+
+.liquid-shimmer {
+    position: relative;
+    overflow: hidden;
+}
+
+.liquid-shimmer::before {
+    content: '';
+    position: absolute;
+    top: -50%;
+    left: -50%;
+    width: 200%;
+    height: 200%;
+    background: linear-gradient(
+        45deg,
+        transparent 30%,
+        rgba(255, 255, 255, 0.1) 50%,
+        transparent 70%
+    );
+    animation: shimmer 3s infinite;
+}
+
+@keyframes shimmer {
+    0% {
+        transform: translateX(-100%) translateY(-100%);
+    }
+    100% {
+        transform: translateX(100%) translateY(100%);
+    }
+}
+
+.liquid-wave {
+    background-size: 200% 200%;
+    animation: wave 15s ease infinite;
+}
+
+@keyframes wave {
+    0%, 100% {
+        background-position: 0% 50%;
+    }
+    25% {
+        background-position: 100% 0%;
+    }
+    50% {
+        background-position: 100% 100%;
+    }
+    75% {
+        background-position: 0% 100%;
+    }
+}
+
+/* ============================================================================
+   Glow Effects
+   ============================================================================ */
+
+.glow-cold {
+    border-radius: var(--radius-md);
+    box-shadow: 0 0 20px rgba(59, 130, 246, 0.4),
+                0 0 40px rgba(59, 130, 246, 0.2),
+                inset 0 0 20px rgba(59, 130, 246, 0.1);
+}
+
+.glow-cool {
+    border-radius: var(--radius-md);
+    box-shadow: 0 0 20px rgba(6, 182, 212, 0.4),
+                0 0 40px rgba(6, 182, 212, 0.2),
+                inset 0 0 20px rgba(6, 182, 212, 0.1);
+}
+
+.glow-moderate {
+    border-radius: var(--radius-md);
+    box-shadow: 0 0 20px rgba(34, 197, 94, 0.4),
+                0 0 40px rgba(34, 197, 94, 0.2),
+                inset 0 0 20px rgba(34, 197, 94, 0.1);
+}
+
+.glow-warm {
+    border-radius: var(--radius-md);
+    box-shadow: 0 0 20px rgba(251, 191, 36, 0.4),
+                0 0 40px rgba(251, 191, 36, 0.2),
+                inset 0 0 20px rgba(251, 191, 36, 0.1);
+}
+
+.glow-hot {
+    border-radius: var(--radius-md);
+    box-shadow: 0 0 20px rgba(239, 68, 68, 0.4),
+                0 0 40px rgba(239, 68, 68, 0.2),
+                inset 0 0 20px rgba(239, 68, 68, 0.1);
+}
+
+/* ============================================================================
+   Combined Effects
+   ============================================================================ */
+
+.glass-temp-display {
+    background: rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(var(--glass-blur-lg)) saturate(180%);
+    -webkit-backdrop-filter: blur(var(--glass-blur-lg)) saturate(180%);
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-radius: var(--radius-xl);
+    padding: var(--space-2xl);
+    transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    overflow: hidden;
+}
+
+.glass-temp-display:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-xl);
+}
+
+/* Temperature display inside glass panel - no nested glass */
+.glass-panel .display {
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+/* Labels inside glass panel - no nested glass */
+.glass-panel .title-2,
+.glass-panel .title-4 {
+    background: transparent;
+    border: none;
+    padding: 0;
+}
+
+/* ============================================================================
+   Utility Classes
+   ============================================================================ */
+
+.smooth-transition {
+    transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.slow-transition {
+    transition: all 1s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.fast-transition {
+    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ============================================================================
+   Dark Mode Support
+   ============================================================================ */
+
+@media (prefers-color-scheme: dark) {
+    .glass-panel {
+        background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: var(--radius-md);
+    }
+    
+    .glass-panel-strong {
+        background: rgba(0, 0, 0, 0.4);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: var(--radius-lg);
+    }
+    
+    .glass-panel-subtle {
+        background: rgba(0, 0, 0, 0.2);
+        border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: var(--radius-sm);
+    }
+}
+
+/* ============================================================================
+   Reduced Motion Support
+   ============================================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+/* ============================================================================
+   Battery Optimization - Animation Pause
+   ============================================================================ */
+
+/* Pause animations when app is inactive or user is idle */
+.animations-paused,
+.animations-paused * {
+    animation-play-state: paused !important;
+}
+
+/* Reduce animation complexity for low power mode */
+.low-power-mode .liquid-wave,
+.low-power-mode .liquid-shimmer,
+.low-power-mode .temp-gradient-cold,
+.low-power-mode .temp-gradient-cool,
+.low-power-mode .temp-gradient-moderate,
+.low-power-mode .temp-gradient-warm,
+.low-power-mode .temp-gradient-hot {
+    animation: none !important;
+    background-position: 0% 50%;
+}
+
+/* Keep only essential animations in low power */
+.low-power-mode .confidence-high,
+.low-power-mode .confidence-medium,
+.low-power-mode .confidence-low {
+    animation-duration: 8s !important; /* Slower pulse */
+}
+
+/* ============================================ */
+/* Phase 1: Floating Titles & Dynamic Colors   */
+/* ============================================ */
+
+/* Floating section titles */
+.section-title-float {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1.2px;
+    text-transform: uppercase;
+    padding: 8px 16px;
+    margin: 15px;
+    border-radius: 8px;
+    
+    /* Floating effect */
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    
+    /* Drop shadow */
+    box-shadow: 
+        0 4px 6px rgba(0, 0, 0, 0.4),
+        0 1px 3px rgba(0, 0, 0, 0.3),
+        inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+/* Dynamic color blur spill for each section */
+.section-live {
+    background: linear-gradient(135deg, 
+        rgba(33, 150, 243, 0.05) 0%, 
+        rgba(33, 150, 243, 0.02) 100%);
+    border-left: 3px solid rgba(33, 150, 243, 0.5);
+}
+
+.section-live .section-title-float {
+    color: rgba(100, 181, 246, 1);
+    box-shadow: 
+        0 4px 12px rgba(33, 150, 243, 0.6),
+        0 2px 6px rgba(33, 150, 243, 0.4),
+        inset 0 1px 0 rgba(100, 181, 246, 0.2);
+}
+
+.section-model {
+    background: linear-gradient(135deg, 
+        rgba(156, 39, 176, 0.05) 0%, 
+        rgba(156, 39, 176, 0.02) 100%);
+    border-left: 3px solid rgba(156, 39, 176, 0.5);
+}
+
+.section-model .section-title-float {
+    color: rgba(186, 104, 200, 1);
+    box-shadow: 
+        0 4px 12px rgba(156, 39, 176, 0.6),
+        0 2px 6px rgba(156, 39, 176, 0.4),
+        inset 0 1px 0 rgba(186, 104, 200, 0.2);
+}
+
+.section-history {
+    background: linear-gradient(135deg, 
+        rgba(255, 152, 0, 0.05) 0%, 
+        rgba(255, 152, 0, 0.02) 100%);
+    border-left: 3px solid rgba(255, 152, 0, 0.5);
+}
+
+.section-history .section-title-float {
+    color: rgba(255, 183, 77, 1);
+    box-shadow: 
+        0 4px 12px rgba(255, 152, 0, 0.6),
+        0 2px 6px rgba(255, 152, 0, 0.4),
+        inset 0 1px 0 rgba(255, 183, 77, 0.2);
+}
+
+.section-locations {
+    background: linear-gradient(135deg, 
+        rgba(76, 175, 80, 0.05) 0%, 
+        rgba(76, 175, 80, 0.02) 100%);
+    border-left: 3px solid rgba(76, 175, 80, 0.5);
+}
+
+.section-locations .section-title-float {
+    color: rgba(129, 199, 132, 1);
+    box-shadow: 
+        0 4px 12px rgba(76, 175, 80, 0.6),
+        0 2px 6px rgba(76, 175, 80, 0.4),
+        inset 0 1px 0 rgba(129, 199, 132, 0.2);
+}
+
+.section-sync {
+    background: linear-gradient(135deg, 
+        rgba(244, 67, 54, 0.05) 0%, 
+        rgba(244, 67, 54, 0.02) 100%);
+    border-left: 3px solid rgba(244, 67, 54, 0.5);
+}
+
+.section-sync .section-title-float {
+    color: rgba(239, 83, 80, 1);
+    box-shadow: 
+        0 4px 12px rgba(244, 67, 54, 0.6),
+        0 2px 6px rgba(244, 67, 54, 0.4),
+        inset 0 1px 0 rgba(239, 83, 80, 0.2);
+}
+
+/* Column separator with blur */
+.column-separator {
+    background: linear-gradient(
+        to bottom,
+        rgba(255, 255, 255, 0.05),
+        rgba(255, 255, 255, 0.15),
+        rgba(255, 255, 255, 0.05)
+    );
+    min-width: 1px;
+    margin: 20px 0;
+}
+
+/* ============================================================================
+   Seasonal Palettes
+   --------------------------------------------------------------------------
+   Each season tints the page background with a slow drifting gradient.
+   The classes are applied at the page-vbox level (page1..page5) by Rust so
+   every section gets a consistent, mood-appropriate atmosphere.
+   ============================================================================ */
+
+.season-winter {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(20, 30, 60, 0.55) 0%,
+            rgba(30, 50, 90, 0.40) 35%,
+            rgba(40, 60, 110, 0.30) 70%,
+            rgba(20, 30, 60, 0.55) 100%
+        );
+    background-size: 220% 220%;
+    animation: season-drift 26s ease-in-out infinite;
+}
+
+.season-spring {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(30, 60, 50, 0.55) 0%,
+            rgba(60, 110, 75, 0.35) 40%,
+            rgba(120, 170, 110, 0.25) 70%,
+            rgba(30, 60, 50, 0.55) 100%
+        );
+    background-size: 220% 220%;
+    animation: season-drift 30s ease-in-out infinite;
+}
+
+.season-summer {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(60, 30, 20, 0.55) 0%,
+            rgba(160, 90, 40, 0.30) 30%,
+            rgba(255, 180, 80, 0.20) 60%,
+            rgba(60, 30, 20, 0.55) 100%
+        );
+    background-size: 220% 220%;
+    animation: season-drift 22s ease-in-out infinite;
+}
+
+.season-autumn {
+    background:
+        linear-gradient(
+            135deg,
+            rgba(50, 20, 15, 0.55) 0%,
+            rgba(140, 60, 30, 0.35) 40%,
+            rgba(200, 100, 50, 0.25) 70%,
+            rgba(50, 20, 15, 0.55) 100%
+        );
+    background-size: 220% 220%;
+    animation: season-drift 28s ease-in-out infinite;
+}
+
+@keyframes season-drift {
+    0%, 100% { background-position: 0% 50%; }
+    25%      { background-position: 100% 30%; }
+    50%      { background-position: 100% 70%; }
+    75%      { background-position: 0%   70%; }
+}
+
+/* ============================================================================
+   Day-Phase Tints
+   --------------------------------------------------------------------------
+   Layered on top of the seasonal background. They use border-color shifts
+   plus a subtle inset shadow so they don't completely overwrite the
+   seasonal palette beneath.
+   ============================================================================ */
+
+.phase-night {
+    box-shadow: inset 0 0 200px rgba(0, 0, 30, 0.5);
+}
+
+.phase-dawn {
+    box-shadow: inset 0 60px 120px rgba(255, 130, 90, 0.18),
+                inset 0 -120px 240px rgba(40, 20, 80, 0.30);
+}
+
+.phase-morning {
+    box-shadow: inset 0 60px 120px rgba(255, 220, 140, 0.10),
+                inset 0 -120px 240px rgba(20, 50, 90, 0.20);
+}
+
+.phase-afternoon {
+    box-shadow: inset 0 0 240px rgba(140, 200, 255, 0.08);
+}
+
+.phase-dusk {
+    box-shadow: inset 0 60px 140px rgba(255, 110, 80, 0.14),
+                inset 0 -160px 240px rgba(80, 30, 90, 0.25);
+}
+
+.phase-evening {
+    box-shadow: inset 0 0 240px rgba(20, 10, 50, 0.45);
+}
+
+/* ============================================================================
+   Heat haze — applied to the temperature display when temp >= 28°C
+   --------------------------------------------------------------------------
+   Slow pulsing of brightness + subtle text-shadow ripple. This is the only
+   way to suggest "heat shimmer" in GTK CSS — we can't do real geometric
+   distortion, but a rhythmic glow does the job.
+   ============================================================================ */
+
+.heat-haze {
+    animation: heat-haze-pulse 3.4s ease-in-out infinite;
+}
+
+@keyframes heat-haze-pulse {
+    0%, 100% {
+        text-shadow:
+            0 0 12px rgba(255, 140, 60, 0.35),
+            0 0 24px rgba(255, 90, 30, 0.20);
+    }
+    50% {
+        text-shadow:
+            0 0 18px rgba(255, 180, 90, 0.55),
+            0 0 36px rgba(255, 110, 40, 0.30);
+    }
+}
+
+/* ============================================================================
+   Aurora — applied to the temperature display when temp <= 5°C
+   --------------------------------------------------------------------------
+   Cool color drift on the text fill itself. We can't easily animate a
+   gradient *fill* on a label in GTK, but we can cycle the color slowly
+   through cool hues, which reads as "cold wind, northern lights".
+   ============================================================================ */
+
+.aurora {
+    animation: aurora-shift 8s ease-in-out infinite;
+}
+
+@keyframes aurora-shift {
+    0%, 100% { color: rgba(150, 200, 255, 1.0); }
+    25%      { color: rgba(170, 230, 220, 1.0); }
+    50%      { color: rgba(200, 180, 240, 1.0); }
+    75%      { color: rgba(140, 210, 250, 1.0); }
+}
+
+/* ============================================================================
+   Sensor Health Indicator — animated pill on the Live page
+   --------------------------------------------------------------------------
+   Three states: ok (gentle pulse), degraded (faster amber blink),
+   unavailable (steady red, no animation).
+   ============================================================================ */
+
+.health-ok {
+    color: rgba(126, 211, 33, 1);
+    animation: health-breathe 3.6s ease-in-out infinite;
+}
+
+.health-degraded {
+    color: rgba(255, 152, 0, 1);
+    animation: health-blink 0.9s ease-in-out infinite;
+}
+
+.health-unavailable {
+    color: rgba(226, 74, 74, 1);
+    /* No animation — the user shouldn't miss this state. */
+}
+
+@keyframes health-breathe {
+    0%, 100% { opacity: 1.0; }
+    50%      { opacity: 0.55; }
+}
+
+@keyframes health-blink {
+    0%, 100% { opacity: 1.0; }
+    50%      { opacity: 0.35; }
+}
+
+/* ============================================================================
+   Calibration Celebration
+   --------------------------------------------------------------------------
+   A short flash applied to the calibration count label whenever a new
+   calibration completes. The class is added by Rust on each calibration
+   and removed via a short timer — so the keyframe runs once.
+   ============================================================================ */
+
+.calibration-flash {
+    animation: cal-flash 1.2s ease-out 1;
+}
+
+@keyframes cal-flash {
+    0%   { color: rgba(255, 255, 255, 1.0); text-shadow: 0 0 16px rgba(126, 211, 33, 0.9); }
+    50%  { color: rgba(126, 211, 33, 1.0);  text-shadow: 0 0 24px rgba(126, 211, 33, 0.7); }
+    100% { color: rgba(255, 255, 255, 1.0); text-shadow: 0 0 0px  rgba(126, 211, 33, 0.0); }
+}
+
+/* ============================================================================
+   Card Press — visual feedback on click without movement
+   --------------------------------------------------------------------------
+   Slight inner glow + shadow tighten on :active. We avoid translate/scale
+   because GTK doesn't transform arbitrary widgets reliably; box-shadow is
+   safe and has the same emotional effect.
+   ============================================================================ */
+
+.glass-panel:active,
+.glass-panel-strong:active,
+.glass-panel-subtle:active {
+    box-shadow:
+        0 2px 8px rgba(0, 0, 0, 0.10),
+        inset 0 0 24px rgba(255, 255, 255, 0.06);
+    transition: box-shadow 0.12s ease-out;
+}
+
+/* ============================================================================
+   Pressure-trend pill
+   --------------------------------------------------------------------------
+   Three classes that pair color with a gentle directional animation.
+   Falling pressure pulses faster and darker — the visual cue should match
+   "the weather is unsettled".
+   ============================================================================ */
+
+.pressure-rising {
+    color: rgba(95, 179, 255, 1);
+    animation: pressure-rise 6s ease-in-out infinite;
+}
+
+.pressure-steady {
+    color: rgba(136, 142, 168, 1);
+}
+
+.pressure-falling {
+    color: rgba(125, 111, 173, 1);
+    animation: pressure-fall 3.5s ease-in-out infinite;
+}
+
+@keyframes pressure-rise {
+    0%, 100% { opacity: 0.9; letter-spacing: 0px; }
+    50%      { opacity: 1.0; letter-spacing: 0.4px; }
+}
+
+@keyframes pressure-fall {
+    0%, 100% { opacity: 1.0; }
+    50%      { opacity: 0.65; }
+}
+
+/* ============================================================================
+   Page stagger-in
+   --------------------------------------------------------------------------
+   Fade + opacity ramp on initial page show. Used by Rust via
+   gtk::Revealer's slide-up transition for entrance and `.stagger-fade`
+   here for individual sub-cards.
+   ============================================================================ */
+
+.stagger-fade {
+    animation: stagger-fade 480ms cubic-bezier(0.25, 0.46, 0.45, 0.94) both;
+}
+
+.stagger-fade-1 { animation-delay:  60ms; }
+.stagger-fade-2 { animation-delay: 140ms; }
+.stagger-fade-3 { animation-delay: 220ms; }
+.stagger-fade-4 { animation-delay: 300ms; }
+.stagger-fade-5 { animation-delay: 380ms; }
+
+@keyframes stagger-fade {
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
+}
+
+/* ============================================================================
+   Idle Glow — applied to the temperature display so it always feels alive,
+   even when nothing's changing. Very gentle — 0.5% brightness oscillation.
+   ============================================================================ */
+
+.idle-glow {
+    animation: idle-glow-pulse 6s ease-in-out infinite;
+}
+
+@keyframes idle-glow-pulse {
+    0%, 100% {
+        box-shadow:
+            0 0 24px rgba(255, 255, 255, 0.04),
+            inset 0 0 24px rgba(255, 255, 255, 0.02);
+    }
+    50% {
+        box-shadow:
+            0 0 36px rgba(255, 255, 255, 0.08),
+            inset 0 0 36px rgba(255, 255, 255, 0.04);
+    }
+}
+
+/* ============================================================================
+   Forecast-Card Hover Lift
+   ============================================================================ */
+
+.forecast-card {
+    transition: box-shadow 320ms cubic-bezier(0.4, 0, 0.2, 1),
+                border-color 320ms ease-out;
+    border: 1px solid rgba(255, 255, 255, 0.10);
+}
+
+.forecast-card:hover {
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.32),
+        inset 0 0 24px rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.20);
+}
+
+/* ============================================================================
+   Reduced Motion (re-applied for the new classes)
+   ============================================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+    .season-winter, .season-spring, .season-summer, .season-autumn,
+    .heat-haze, .aurora, .health-ok, .health-degraded,
+    .calibration-flash, .pressure-rising, .pressure-falling,
+    .stagger-fade, .idle-glow {
+        animation: none !important;
+    }
+}

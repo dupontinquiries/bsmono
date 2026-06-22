@@ -1,0 +1,16 @@
+#compdef peek
+autoload -U is-at-least
+_peek() {
+    typeset -A opt_args
+    local curcontext="$curcontext" state line
+    _arguments \
+        '(-h --help)'{-h,--help}'[Print help]' \
+        '(-V --version)'{-V,--version}'[Print version]' \
+        '*:file:(files)' \
+        && return
+}
+if [ "$funcstack[1]" = "_peek" ]; then
+    _peek "$@"
+else
+    compdef _peek peek
+fi

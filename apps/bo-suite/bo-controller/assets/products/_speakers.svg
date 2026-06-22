@@ -1,0 +1,14 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Two rounded speaker cabinets, soft corners -->
+  <!-- Left cabinet -->
+  <rect x="8"  y="16" width="22" height="34" rx="6" ry="6"/>
+  <circle cx="19" cy="25" r="3"/>            <!-- tweeter -->
+  <circle cx="19" cy="38" r="6"/>            <!-- woofer -->
+  <circle cx="19" cy="38" r="1.6" fill="currentColor" stroke="none"/>
+  <!-- Right cabinet -->
+  <rect x="34" y="16" width="22" height="34" rx="6" ry="6"/>
+  <circle cx="45" cy="25" r="3"/>
+  <circle cx="45" cy="38" r="6"/>
+  <circle cx="45" cy="38" r="1.6" fill="currentColor" stroke="none"/>
+</svg>

@@ -1,0 +1,18 @@
+# Fan out cheap candidates, then merge the shortlist into ONE flat context for a big model to pick.
+# This is the thesis in miniature: a small model explores breadth; a big model judges — once.
+#
+# Run with two models (gen-runs passes them through as a pool):
+#   ./gen-runs.sh range 7-7 model "small=<1B.gguf> big=<8B.gguf>" subdir ./runs/pick/
+# (or a single model — :use falls through to it and the same flow still works).
+
+:open examples/kv-bench-seed.chat.md
+
+:use small
+:fa 6 'Implement the change described above as one concrete Rust function. Just the function.'
+
+# The six fan replies are the six most-recent leaves; reference them by relative position
+# (-1 = last). In the GUI you'd instead click their highlighted ids, e.g. :mergectx a9j,3df,...
+:use big
+:mergectx -1,-2,-3,-4,-5,-6 'Pick the single strongest implementation. Name its id, then say why it wins.'
+
+:export md

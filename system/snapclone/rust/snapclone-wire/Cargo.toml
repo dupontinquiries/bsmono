@@ -1,0 +1,14 @@
+[package]
+name        = "snapclone-wire"
+version     = "0.1.0"
+edition     = "2021"
+description = "Binary wire frame codecs for SnapClone peer discovery (SCAP / PTBL)"
+
+[lib]
+name       = "snapclone_wire"
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow  = "1"
+bytes   = "1"
+chrono  = { version = "0.4", features = ["serde"] }

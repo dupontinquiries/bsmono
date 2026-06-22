@@ -1,0 +1,10 @@
+[package]
+name = "drift-playground"
+version = "0.1.0"
+edition = "2021"
+
+# Drift is OFF by default. Turn it on with `--features drift-trace`.
+# When off, every drift macro below compiles to literally nothing —
+# zero cost, nothing added to the binary, the "pure" build is untouched.
+[features]
+drift-trace = []

@@ -1,0 +1,12 @@
+[package]
+name        = "snapclone-saliency"
+version     = "0.1.0"
+edition     = "2021"
+description = "Classical (non-ML) salient region detection for crop/focus selection"
+license     = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# No deps. Pure stdlib by design — keeps binary small and fast on FP5.

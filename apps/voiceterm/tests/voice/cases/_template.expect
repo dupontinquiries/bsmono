@@ -1,0 +1,9 @@
+# Sample expectation file. Replace this comment with assertions and add a
+# matching <name>.wav recording. See ../README.md for full format.
+#
+# Example:
+# transcript_contains: connect to smokey
+# top_intent: term_cmd
+# top_command_contains: bluetoothctl
+# min_score: 0.7
+# context_tab: terminal

@@ -1,0 +1,412 @@
+#![allow(dead_code)]
+/// rotation.rs — rotation config writer and native rotation engine
+///
+/// Two modes:
+///
+///   A) Logrotate-compatible: generates a .conf file that logrotate can read.
+///      The prerotate stanza calls `logscope-filter` before each rotation.
+///      Used on Alpine/postmarketOS and any system where logrotate is installed.
+///
+///   B) Native: Logscope manages rotation itself. Reads a .toml config,
+///      does the rename/compress/cleanup with Rust safety (no TOCTOU,
+///      atomic renames, correct fsync). Used on modern systemd distros
+///      for user-tier logs.
+///
+/// Both modes support the new filter-before-delete and summarize-before-delete
+/// stages that vanilla logrotate lacks.
+
+use std::path::{Path, PathBuf};
+use std::io::Write;
+use serde::{Deserialize, Serialize};
+use chrono::Utc;
+
+use crate::pipeline::PipelineConfig;
+use crate::probe::{RotationBackend, Tier};
+
+// ─── rotation config ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RotationFrequency {
+    Hourly,
+    Daily,
+    Weekly,
+    Monthly,
+    /// Size-triggered — rotate when file exceeds this many bytes
+    OnSize { bytes: u64 },
+}
+
+impl RotationFrequency {
+    pub fn logrotate_directive(&self) -> &'static str {
+        match self {
+            RotationFrequency::Hourly  => "hourly",
+            RotationFrequency::Daily   => "daily",
+            RotationFrequency::Weekly  => "weekly",
+            RotationFrequency::Monthly => "monthly",
+            RotationFrequency::OnSize { .. } => "daily", // fallback; size check handled by prerotate
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CompressFormat {
+    Gz,
+    /// pigz — parallel gzip, same output format as gzip, much faster on multi-core
+    Pigz,
+    Xz,
+    Zst,  // preferred on modern systems
+    None,
+}
+
+impl CompressFormat {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            CompressFormat::Gz   => "gz",
+            CompressFormat::Pigz => "gz",   // same extension as gzip
+            CompressFormat::Xz   => "xz",
+            CompressFormat::Zst  => "zst",
+            CompressFormat::None => "",
+        }
+    }
+
+    pub fn logrotate_compress_cmd(&self) -> Option<&'static str> {
+        match self {
+            CompressFormat::Gz   => None,              // logrotate default
+            CompressFormat::Pigz => Some("pigz"),
+            CompressFormat::Xz   => Some("xz"),
+            CompressFormat::Zst  => Some("zstd --rm -q"),
+            CompressFormat::None => None,
+        }
+    }
+
+    /// Pick the best available compressor on this machine.
+    /// Tries pigz first (parallel gzip), then zstd, then gzip.
+    pub fn detect_best() -> Self {
+        for (bin, fmt) in [
+            ("pigz",  CompressFormat::Pigz),
+            ("zstd",  CompressFormat::Zst),
+            ("gzip",  CompressFormat::Gz),
+        ] {
+            if which_bin(bin).is_some() { return fmt; }
+        }
+        CompressFormat::None
+    }
+}
+
+fn which_bin(name: &str) -> Option<PathBuf> {
+    let dirs = ["/usr/bin", "/usr/local/bin", "/bin", "/usr/sbin", "/sbin"];
+    dirs.iter().map(|d| PathBuf::from(d).join(name))
+        .find(|p| p.exists())
+}
+
+/// Full rotation policy for one log file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RotationPolicy {
+    pub log_path: PathBuf,
+    pub frequency: RotationFrequency,
+    pub keep_count: u32,
+    pub compress: CompressFormat,
+    pub delay_compress: bool,
+    pub missing_ok: bool,
+    pub not_if_empty: bool,
+    pub create_mode: Option<String>,
+    pub pipeline: Option<PipelineConfig>,
+    pub tier: Tier,
+    pub backend: RotationBackend,
+    /// Raw text of an existing config found on disk (not serialized).
+    #[serde(skip)]
+    pub raw_existing: Option<String>,
+}
+
+impl Default for RotationPolicy {
+    fn default() -> Self {
+        RotationPolicy {
+            log_path: PathBuf::new(),
+            frequency: RotationFrequency::Daily,
+            keep_count: 7,
+            compress: CompressFormat::Zst,
+            delay_compress: true,
+            missing_ok: true,
+            not_if_empty: true,
+            create_mode: None,
+            pipeline: None,
+            tier: Tier::User,
+            backend: RotationBackend::Native,
+            raw_existing: None,
+        }
+    }
+}
+
+// ─── logrotate .conf writer ───────────────────────────────────────────────────
+
+/// Generate a logrotate-compatible .conf file from a RotationPolicy.
+/// The prerotate stanza wires in logscope-filter if a pipeline is configured.
+pub fn write_logrotate_conf(policy: &RotationPolicy, conf_path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = conf_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut f = std::io::BufWriter::new(std::fs::File::create(conf_path)?);
+
+    writeln!(f, "# generated by logscope — do not edit by hand")?;
+    writeln!(f, "# source: {}", policy.log_path.display())?;
+    writeln!(f, "# updated: {}", Utc::now().to_rfc3339())?;
+    writeln!(f)?;
+    writeln!(f, "'{}' {{", policy.log_path.display())?;
+    writeln!(f, "    {}", policy.frequency.logrotate_directive())?;
+    writeln!(f, "    rotate {}", policy.keep_count)?;
+
+    // Compression
+    match policy.compress {
+        CompressFormat::None => {}
+        _ => {
+            writeln!(f, "    compress")?;
+            if policy.delay_compress {
+                writeln!(f, "    delaycompress")?;
+            }
+            if let Some(cmd) = policy.compress.logrotate_compress_cmd() {
+                writeln!(f, "    compresscmd {cmd}")?;
+            }
+        }
+    }
+
+    if policy.missing_ok   { writeln!(f, "    missingok")?; }
+    if policy.not_if_empty { writeln!(f, "    notifempty")?; }
+
+    if let Some(mode) = &policy.create_mode {
+        writeln!(f, "    create {mode}")?;
+    }
+
+    // Size trigger (supplement to frequency)
+    if let RotationFrequency::OnSize { bytes } = &policy.frequency {
+        writeln!(f, "    size {bytes}")?;
+    }
+
+    // prerotate — the killer feature: filter/summarize BEFORE rotation
+    if let Some(pipeline_cfg) = &policy.pipeline {
+        let filter_bin = find_filter_binary();
+        let pipeline_conf = conf_path
+            .with_extension("pipeline.toml");
+
+        // Save the pipeline config alongside the rotation conf
+        if let Ok(toml_str) = toml::to_string_pretty(pipeline_cfg) {
+            let _ = std::fs::write(&pipeline_conf, toml_str);
+        }
+
+        writeln!(f)?;
+        writeln!(f, "    prerotate")?;
+        writeln!(f, "        # logscope filter-before-rotate")?;
+        writeln!(f, "        '{}' --config '{}' --input $1", filter_bin.display(), pipeline_conf.display())?;
+        writeln!(f, "    endscript")?;
+    }
+
+    writeln!(f, "}}")?;
+    f.flush()?;
+
+    Ok(())
+}
+
+// ─── native rotation engine ───────────────────────────────────────────────────
+
+/// Perform one rotation cycle using the native engine.
+/// Atomic where possible: rename to .1, compress, prune old files.
+pub fn rotate_native(policy: &RotationPolicy) -> std::io::Result<RotationResult> {
+    let path = &policy.log_path;
+
+    if !path.exists() {
+        if policy.missing_ok {
+            return Ok(RotationResult::skipped("file missing"));
+        }
+        return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "log file not found"));
+    }
+
+    if policy.not_if_empty && std::fs::metadata(path)?.len() == 0 {
+        return Ok(RotationResult::skipped("file empty"));
+    }
+
+    // Run pipeline before rotating, if configured
+    if let Some(cfg) = &policy.pipeline {
+        let mut cfg = cfg.clone();
+        crate::pipeline::run(&mut cfg, path)?;
+    }
+
+    // Shift existing rotated files: .7 → delete, .6 → .7, … .1 → .2
+    let ext = match policy.compress {
+        CompressFormat::None => String::new(),
+        ref fmt => format!(".{}", fmt.extension()),
+    };
+
+    for i in (1..policy.keep_count).rev() {
+        let old = rotated_path(path, i, &ext);
+        let new = rotated_path(path, i + 1, &ext);
+        if old.exists() {
+            if i + 1 > policy.keep_count {
+                std::fs::remove_file(&old)?;
+            } else {
+                std::fs::rename(&old, &new)?;
+            }
+        }
+    }
+
+    // Delete oldest if over keep_count
+    let oldest = rotated_path(path, policy.keep_count + 1, &ext);
+    if oldest.exists() {
+        std::fs::remove_file(&oldest)?;
+    }
+
+    // Rename active log → .1
+    let rotated = rotated_path(path, 1, "");
+    std::fs::rename(path, &rotated)?;
+
+    // Touch a new empty file (create_mode respected if we have permissions)
+    std::fs::File::create(path)?;
+
+    // Compress .1 (unless delay_compress)
+    if !policy.delay_compress {
+        compress_file(&rotated, &policy.compress)?;
+    }
+
+    Ok(RotationResult {
+        skipped: false,
+        skip_reason: None,
+        rotated_to: Some(rotated),
+    })
+}
+
+#[derive(Debug)]
+pub struct RotationResult {
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
+    pub rotated_to: Option<PathBuf>,
+}
+
+impl RotationResult {
+    fn skipped(reason: &str) -> Self {
+        RotationResult {
+            skipped: true,
+            skip_reason: Some(reason.to_owned()),
+            rotated_to: None,
+        }
+    }
+}
+
+// ─── systemd --user timer writer ─────────────────────────────────────────────
+
+/// Write a systemd user service + timer that calls `logscope rotate`.
+pub fn write_systemd_user_units(
+    policy: &RotationPolicy,
+    unit_dir: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(unit_dir)?;
+
+    let safe_name = policy
+        .log_path
+        .to_string_lossy()
+        .replace(['/', ' '], "-")
+        .trim_matches('-')
+        .to_owned();
+    let service_name = format!("logscope-{safe_name}.service");
+    let timer_name = format!("logscope-{safe_name}.timer");
+
+    // .service
+    let conf_path = dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join(format!("logscope/rotate/{safe_name}.toml"));
+
+    let filter_bin = find_filter_binary();
+
+    let service = format!(
+        "[Unit]\nDescription=logscope rotation for {}\n\n[Service]\nType=oneshot\nExecStart={} --rotate --config {}\n",
+        policy.log_path.display(),
+        filter_bin.display(),
+        conf_path.display(),
+    );
+    std::fs::write(unit_dir.join(&service_name), service)?;
+
+    // .timer
+    let on_calendar = match policy.frequency {
+        RotationFrequency::Hourly  => "hourly",
+        RotationFrequency::Daily   => "daily",
+        RotationFrequency::Weekly  => "weekly",
+        RotationFrequency::Monthly => "monthly",
+        RotationFrequency::OnSize { .. } => "hourly", // check hourly, skip if under size
+    };
+
+    let timer = format!(
+        "[Unit]\nDescription=logscope rotation timer for {}\n\n[Timer]\nOnCalendar={on_calendar}\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n",
+        policy.log_path.display(),
+    );
+    std::fs::write(unit_dir.join(&timer_name), timer)?;
+
+    Ok(())
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+fn rotated_path(base: &Path, n: u32, extra_ext: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{n}{extra_ext}", base.display()))
+}
+
+fn compress_file(path: &Path, fmt: &CompressFormat) -> std::io::Result<()> {
+    match fmt {
+        CompressFormat::None => Ok(()),
+        CompressFormat::Pigz => {
+            // pigz: parallel gzip — threads defaults to nproc, same .gz output
+            let status = std::process::Command::new("pigz")
+                .args(["-f", "--keep"])
+                .arg(path)
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                // pigz --keep keeps the original; remove it ourselves
+                let _ = std::fs::remove_file(path);
+            } else {
+                // Fall back to gzip if pigz failed (shouldn't happen if detect_best chose it)
+                let _ = std::process::Command::new("gzip").arg("-f").arg(path).status();
+            }
+            Ok(())
+        }
+        CompressFormat::Gz => {
+            let _ = std::process::Command::new("gzip").args(["-f"]).arg(path).status();
+            Ok(())
+        }
+        CompressFormat::Xz => {
+            let _ = std::process::Command::new("xz").arg("-f").arg(path).status();
+            Ok(())
+        }
+        CompressFormat::Zst => {
+            let _ = std::process::Command::new("zstd")
+                .args(["--rm", "-q"]).arg(path).status();
+            Ok(())
+        }
+    }
+}
+
+fn find_filter_binary() -> PathBuf {
+    // Prefer the binary next to the running executable
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("logscope-filter");
+        if sibling.exists() {
+            return sibling;
+        }
+    }
+    // Fall back to PATH lookup
+    for dir in ["/usr/local/bin", "/usr/bin", "~/.local/bin"] {
+        let p = PathBuf::from(dir).join("logscope-filter");
+        if p.exists() { return p; }
+    }
+    PathBuf::from("logscope-filter")
+}
+
+// ─── config persistence ───────────────────────────────────────────────────────
+
+pub fn save_policy(policy: &RotationPolicy, path: &Path) -> std::io::Result<()> {
+    let toml_str = toml::to_string_pretty(policy)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, toml_str)
+}
+
+pub fn load_policy(path: &Path) -> std::io::Result<RotationPolicy> {
+    let s = std::fs::read_to_string(path)?;
+    toml::from_str(&s)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}

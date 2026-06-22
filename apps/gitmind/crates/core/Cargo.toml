@@ -1,0 +1,49 @@
+# gitmind-core — Qt-free heart of the repo manager.
+[package]
+name = "gitmind-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Content-defined chunking. We depend on a vetted implementation rather
+# than hand-rolling: chunk boundaries must be byte-for-byte STABLE
+# forever, because dedup correctness depends on the same bytes always
+# splitting at the same offsets. A subtle bug in a hand-rolled gear
+# table would silently destroy dedup across versions. fastcdc is the
+# FastCDC-2020 normalized-chunking algorithm, well tested.
+fastcdc = "3"
+# zstd replaces git's zlib/deflate. Far better ratio + speed, and unlike
+# git's per-object zlib we compress at the chunk layer so large binaries
+# dedup BEFORE compression. This is the answer to "bad file compression".
+zstd = "0.13"
+# BLAKE3 for content addressing: SIMD-parallel, ~GB/s per core, and it
+# is a tree hash so it parallelizes over a single large file. This is
+# the realistic "fast hashing" win (the GPU-native-git ask) — BLAKE3 on
+# CPU already saturates memory bandwidth; a GPU rarely beats it once you
+# count PCIe transfer.
+blake3 = "1"
+# redb: pure-Rust embedded key/value store (no C, no libsqlite). This is
+# the "database for storing those files efficiently": chunk table +
+# blob-manifest table + media-proxy table, all transactional, mmap'd.
+redb = "2"
+zip = "2"
+notify = "6"
+sha1 = "0.10"
+libc = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+default = []
+# Media proxy generation (AV1/AVIF). Off by default and isolated behind
+# a feature so the core builds with zero media-codec deps unless asked —
+# same clean-fallback pattern the reference uses for voice/llamacpp.
+# When ON this will pull the AV1 encoder bindings; originals are ALWAYS
+# stored losslessly regardless, proxies are an additive convenience.
+media-proxy = []
+# fanotify: privileged (CAP_SYS_ADMIN), Linux-only realtime watcher with
+# real per-write PID attribution. Opt-in so default/cross builds stay clean.
+fanotify = ["dep:libc"]
+
+[dev-dependencies]
+tempfile = "3"

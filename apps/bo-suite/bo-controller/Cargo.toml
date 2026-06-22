@@ -1,0 +1,75 @@
+[package]
+name = "bo-controller"
+version = "0.1.0"
+edition = "2021"
+
+[[example]]
+name = "api_explorer"
+path = "examples/api_explorer.rs"
+
+[dependencies]
+qmetaobject = "0.2"
+reqwest = { version = "0.11", features = ["json"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["full"] }
+cstr = "0.2"
+urlencoding = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+dbus = "0.9"
+# Used by lyrics_transcriber: stable hashing of source path for
+# cache filename + XDG data-dir lookup so transcripts live under
+# ~/.local/share/bo-controller/lyrics/<hash>.lrc.
+sha2 = "0.10"
+dirs = "5"
+
+# Added: compile-time-embedded fallback for the qml/ directory so the
+# binary runs from any working directory. This is the only new dependency
+# versus your original Cargo.toml.
+include_dir = "0.7"
+
+# mDNS / DNS-SD discovery of B&O devices on the LAN. Safe Rust, runs its
+# own daemon thread (no async-runtime dependency), tested against Avahi.
+mdns-sd = "0.11"
+
+# ── Media library ───────────────────────────────────────────────────
+# SQLite catalog of local audio files with fast indexed queries.
+rusqlite = { version = "0.31", features = ["bundled"] }   # bundled = no system sqlite needed
+walkdir = "2"            # fast recursive directory walk
+regex = "1"              # filename parser
+lofty   = "0.22"         # pure-Rust tag reader (ID3 / Vorbis / MP4 atoms / Opus)
+hound   = "3"            # WAV reader (input for the soundscape loop-finder)
+opus    = "0.3"          # libopus bindings — soundscape encoder (legacy)
+# audiopus — actively-maintained libopus binding with a cleaner streaming
+# API. Used by the new stem_split + podcast_diar paths. The older `opus`
+# crate stays for now (looper.rs + track_server.rs); migration is
+# incremental and contained to one site per turn.
+audiopus = "0.2"
+ogg     = "0.9"          # Ogg container framing for OggOpus output
+once_cell = "1"          # lazily-compiled regexes
+
+# libc — needed for prctl(PR_SET_PDEATHSIG, SIGTERM) on Linux so that
+# paplay/ffmpeg children get SIGTERM the moment our process dies, by
+# any means (clean exit, SIGKILL, window-manager force-close, crash).
+# Without this, the kernel reparents our children to init/systemd and
+# they keep playing audio after we're gone — exactly what the user
+# complained about. The pre_exec hook on tokio's Command lets us call
+# prctl right before exec, in the child process.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Audio analysis (BPM/key) is heavy (pulls ffmpeg/symphonia via bliss) and
+# slow to compile, so it's optional. Without it the library does everything
+# except compute BPM/key. Enable with:  cargo build --features analysis
+bliss-audio = { version = "0.9", optional = true }
+
+[features]
+default = []
+analysis = ["dep:bliss-audio"]
+
+[dev-dependencies]
+# Used in settings_store tests to redirect persistence to a
+# per-test temp dir.
+tempfile = "3"
+
+[build-dependencies]
+qmetaobject = "0.2"

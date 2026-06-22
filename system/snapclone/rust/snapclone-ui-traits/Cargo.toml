@@ -1,0 +1,16 @@
+[package]
+name        = "snapclone-ui-traits"
+version     = "0.1.0"
+edition     = "2021"
+description = """
+UI contracts for SnapClone — traits for tabs, gestures, contacts, and theme.
+Implement these to build any UI backend (Qt, egui, Slint, web) over the same core.
+"""
+
+[lib]
+name       = "snapclone_ui_traits"
+crate-type = ["rlib"]
+
+[dependencies]
+snapclone-core     = { path = "../snapclone-core"     }
+snapclone-identity = { path = "../snapclone-identity" }

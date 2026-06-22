@@ -1,0 +1,64 @@
+# Contributor: PhotoSync Contributors <photosync@example.com>
+# Maintainer: PhotoSync Contributors <photosync@example.com>
+pkgname=photosync-system
+pkgver=0.1.0
+pkgrel=0
+pkgdesc="High-compression photo sync system with deduplication"
+url="https://github.com/photosync/photosync-system"
+arch="all"
+license="MIT OR Apache-2.0"
+depends="
+    syncthing
+    zstd
+    sqlite
+    libcamera
+    "
+makedepends="
+    cargo
+    rust
+    sqlite-dev
+    zstd-dev
+    "
+install="$pkgname.post-install"
+subpackages="$pkgname-doc"
+source="$pkgname-$pkgver.tar.gz"
+builddir="$srcdir/$pkgname-$pkgver"
+
+build() {
+    cargo build --release --locked
+}
+
+check() {
+    cargo test --release --locked
+}
+
+package() {
+    # Install binaries
+    install -Dm755 target/release/photosync-daemon \
+        "$pkgdir"/usr/bin/photosync-daemon
+    install -Dm755 target/release/photosync-cli \
+        "$pkgdir"/usr/bin/photosync-cli
+    
+    # Install setup script
+    install -Dm755 scripts/setup-syncthing.sh \
+        "$pkgdir"/usr/bin/photosync-setup
+    
+    # Install systemd service (for systemd-based Alpine)
+    install -Dm644 systemd/photosync.service \
+        "$pkgdir"/usr/lib/systemd/user/photosync.service
+    
+    # Install OpenRC service (for Alpine's default init)
+    install -Dm755 packaging/apk/photosync.initd \
+        "$pkgdir"/etc/init.d/photosync
+    install -Dm644 packaging/apk/photosync.confd \
+        "$pkgdir"/etc/conf.d/photosync
+    
+    # Create state directory
+    install -dm755 "$pkgdir"/var/lib/photosync
+    
+    # Install documentation
+    install -Dm644 README.md \
+        "$pkgdir"/usr/share/doc/$pkgname/README.md
+}
+
+sha512sums=""

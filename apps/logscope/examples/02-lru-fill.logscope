@@ -1,0 +1,5 @@
+# Structured decomposition: open a skeleton reply, fan one sub-task per todo!() (KV-shared prefix),
+# splice the bodies back. Exercises: :open, :fill (+ auto-assemble in the CLI), :export.
+:open examples/lru-skeleton.chat.md
+:fill
+:export ascii

@@ -1,0 +1,18 @@
+# 06-kv-bench — purpose-built to MEASURE the KV prefix tree, not to test logic.
+#
+# It opens a long shared context (a ~60-line Grid module), then fans wide and continues deep off that one
+# leaf, so dozens of generations all reuse the SAME long prefix. That's the best case for the prefix tree:
+# with it on, the shared module is prefilled once and each branch only prefills its short differing tail;
+# with `nokv on`, every generation re-prefills the whole module.
+#
+# Run it twice and compare the gen(s) column:
+#   ./gen-runs.sh range 6-6 model ~/.local/share/logscope/llama-3.2-1b-instruct-q4_k_m.gguf subdir ./runs/kv-on/
+#   ./gen-runs.sh range 6-6 model ~/.local/share/logscope/llama-3.2-1b-instruct-q4_k_m.gguf nokv on subdir ./runs/kv-off/
+# The gap is the prefix tree's contribution. (Raise the fan width below for a bigger, clearer signal.)
+
+:open examples/kv-bench-seed.chat.md
+# 8 variants off the shared module — 8 generations, each reuses the module prefix (1 prefill + 8 tails when on)
+:fa 8 'Propose ONE concrete improvement to the Grid module above (correctness, performance, or API), with code. Angle: {lastmsg}'
+# deepen each branch 3 rounds — 24 more generations, each reusing its branch's (still module-rooted) prefix
+:ca 3
+:export ascii

@@ -1,0 +1,12 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Rounded headband arc -->
+  <path d="M14 36 V32 a18 18 0 0 1 36 0 V36"/>
+  <!-- Left earcup: soft rounded capsule -->
+  <rect x="9"  y="34" width="13" height="20" rx="6.5" ry="6.5"/>
+  <!-- Right earcup -->
+  <rect x="42" y="34" width="13" height="20" rx="6.5" ry="6.5"/>
+  <!-- Inner pad hints -->
+  <rect x="12.5" y="38" width="6" height="12" rx="3" stroke-width="1.6" opacity="0.7"/>
+  <rect x="45.5" y="38" width="6" height="12" rx="3" stroke-width="1.6" opacity="0.7"/>
+</svg>

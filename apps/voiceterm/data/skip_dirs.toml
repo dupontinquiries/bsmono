@@ -1,0 +1,44 @@
+# skip_dirs.toml
+#
+# Directory names that the "go deeper" smart cd command will NEVER
+# descend into — even if they're the only child. These are scaffolding
+# (vendored deps, build artifacts, IDE state, virtualenvs) rather than
+# places the user actually wants to navigate to.
+#
+# In a user overlay file at ~/.config/web2qml/data/skip_dirs.toml, the
+# array below extends the defaults. To allow descending into one of
+# these (e.g. you DO want vendor/ included for Go projects), use the
+# [remove] section:
+#
+#     [remove]
+#     skip_dirs = ["vendor"]
+
+skip_dirs = [
+  "node_modules",
+  "target",
+  "dist",
+  "build",
+  "out",
+  ".git",
+  ".hg",
+  ".svn",
+  ".cache",
+  ".idea",
+  ".vscode",
+  "vendor",
+  "__pycache__",
+  ".pytest_cache",
+  ".tox",
+  ".mypy_cache",
+  ".ruff_cache",
+  "venv",
+  ".venv",
+  "env",
+  ".env",
+  "bower_components",
+  "coverage",
+  ".coverage",
+  "logs",
+  "tmp",
+  "temp",
+]

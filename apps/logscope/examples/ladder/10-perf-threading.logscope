@@ -1,0 +1,22 @@
+# 10-perf-threading  (MEDIUM) — the CHECKED perf/threading block r189..r204.
+# Exercises: deeper context + one pickup (jump back to the threading build) +
+# a 3-round widen then deepen. ~hundreds of nodes.
+
+> Build r189 — toolchain.
+> Build r190 — harness stutterfix.
+> Build r191 — perf decouple threading.
+> Build r194 — splitmix cluster.
+> Build r195 — ocean seam mesher flight.
+> Build r196 — fastmath evidence oplanes.
+> Build r201 — sound fluid physics.
+> Build r202 — stutter guiscale dvorak docs.
+> Build r203 — settings loadworld rollback glass.
+> Build r204 — water keybind swim profiler.
+
+# pickup: return to the r191 threading node and branch a decoupling variant
+:goto 3    # pickup: r191 perf-decouple-threading
+> Re-cut the threading decouple differently here (work-stealing vs. fixed pools).
+:3fa 5 'Harden this against edge cases (expiry/re-launch, NaN or huge dt, bounds) while keeping it pure and panic-free. Current: {lastmsg}'
+:2ca
+:best
+:export md

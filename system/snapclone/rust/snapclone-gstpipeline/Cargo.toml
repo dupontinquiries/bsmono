@@ -1,0 +1,11 @@
+[package]
+name = "snapclone-gstpipeline"
+version = "0.1.0"
+edition = "2021"
+description = "Pure logic for the GstLaunchBackend: stderr error classification, the negotiation-failure recovery state machine (settle→relax→swap), and per-session guard lifecycle. Mirrors the C++ so the resume-negotiation regression is test-locked. No GStreamer, no Qt."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

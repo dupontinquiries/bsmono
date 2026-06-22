@@ -1,0 +1,24 @@
+# gitmind-gui — qmetaobject + QML touch frontend. Built the way the
+# web2qml reference is: one `Backend` QObject exposed as a QML context
+# property, QML embedded via qrc! for a self-contained binary. Needs Qt6
+# at build time, so it is NOT in the workspace default-members; build it
+# explicitly: `cargo build -p gitmind-gui`.
+[package]
+name = "gitmind-gui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gitmind-gui"
+path = "src/main.rs"
+
+[dependencies]
+qmetaobject = "0.2"
+cstr = "0.2"
+serde_json = "1"
+gitmind-core = { path = "../core" }
+peek = { path = "../peek" }
+
+[features]
+# Build the GUI with the privileged PID-attributing watcher available.
+fanotify = ["gitmind-core/fanotify"]

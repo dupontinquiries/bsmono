@@ -1,0 +1,11 @@
+# 09-shaders-mini  (BASIC) — shader / post-fx builds.
+# Exercises: a wider fan (visual builds invite more variants).
+
+> Build r136 — shaders.
+> Build r138 — dragonbend.
+> Build r155 — postfx audit.
+> Build r159 — hues music.
+> Build r244 — shader variants.
+:2fa 4 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:best
+:export md

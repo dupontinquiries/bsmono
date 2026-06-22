@@ -1,0 +1,69 @@
+# project_markers.toml
+#
+# Files whose presence makes a directory "definitively interesting"
+# — usually a project root. Used by the "go deeper" smart cd command
+# in src/smart_cd.rs.
+#
+# This file IS optional. If absent, the same defaults are baked into
+# the binary. This file exists for users who want to see/edit the
+# defaults inline, plus as the model for user overlay files at
+# ~/.config/web2qml/data/project_markers.toml.
+#
+# In a user overlay file, the additions LIST below extends the
+# defaults. To remove a default, use the [remove] section:
+#
+#     [remove]
+#     project_markers = ["go.mod"]
+#
+# Glob-form `*.ext` is supported (matches *.csproj, *.sln, etc.).
+
+project_markers = [
+  # Rust
+  "Cargo.toml",
+  # Node
+  "package.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  # Python
+  "pyproject.toml",
+  "setup.py",
+  "setup.cfg",
+  "requirements.txt",
+  "Pipfile",
+  "poetry.lock",
+  # Go
+  "go.mod",
+  # Java/Kotlin
+  "pom.xml",
+  "build.gradle",
+  "build.gradle.kts",
+  "settings.gradle",
+  # Ruby
+  "Gemfile",
+  "Rakefile",
+  # .NET
+  "*.csproj",
+  "*.sln",
+  # C/C++
+  "Makefile",
+  "CMakeLists.txt",
+  "configure",
+  "configure.ac",
+  "meson.build",
+  # Generic
+  "README.md",
+  "README",
+  "README.rst",
+  "LICENSE",
+  ".git",
+  ".hg",
+  ".svn",
+  # Web
+  "index.html",
+  # Containers
+  "Dockerfile",
+  "docker-compose.yml",
+  # CI
+  ".github",
+  ".gitlab-ci.yml",
+]

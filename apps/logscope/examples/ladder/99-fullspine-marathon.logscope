@@ -1,0 +1,137 @@
+# 99-fullspine-marathon  (BIG) — replay the ENTIRE r116..r286 spine (60 builds).
+# Main line = one user turn per real build. Every fix commit becomes a :goto pickup of
+# the build it patches. Every ~8th heavy build triggers a widen+deepen explosion, after
+# which we :goto back to the main line (so length compounds in controlled bursts, not
+# runaway). One mid-run re-seed as a context break. Checkpoints every ~10 builds.
+# 
+# LENGTH KNOB (HEAVY block = :3fa 5 then :2ca):
+#   down (2,5,2) ~5 h  |  default (3,5,2) ~a day  |  up (3,6,3) ~2 days.
+# Calibrate per_gen on script 05 first, then read the totals printed below.
+
+> Build r116c — fix.
+> Build r117 — caves kit wings.
+> Build r118 — haiku merge.
+> Build r119 — winding eggs soaring.
+> Build r120 — batch.
+:goto 5    # pickup: patch state before r121
+> Fix forward: Build r121 — fix phase4.
+> Build r123 — real craft climate.
+> Build r124 — survival.
+> Build r129 — fivepack.
+> Build r130 — player bending.
+:best
+:export md
+:goto 10    # pickup: patch state before r133b
+> Fix forward: Build r133b — gen2fix.
+:goto 11    # pickup: patch state before r133c
+> Fix forward: Build r133c — gen2fix2.
+> Build r134 — aibudget.
+> Build r136 — shaders.
+# HEAVY: widen+deepen on r136 (shaders)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 14    # pickup: back to main line after r136 burst
+> Build r138 — dragonbend.
+> Build r141 — ecology.
+# HEAVY: widen+deepen on r141 (ecology)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 421    # pickup: back to main line after r141 burst
+:goto 421    # pickup: patch state before r141b
+> Fix forward: Build r141b — fix.
+:goto 827    # pickup: patch state before r151c
+> Fix forward: Build r151c — fix.
+> Build r153 — cavegardens.
+> Build r154 — nav3d.
+:best
+:export md
+> Build r155 — postfx audit.
+# HEAVY: widen+deepen on r155 (postfx-audit)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 831    # pickup: back to main line after r155 burst
+:goto 831    # pickup: patch state before r157b
+> Fix forward: Build r157b — fix.
+> Build r159 — hues music.
+> Build r161 — pause respawn.
+> Build r162 — worldreset.
+> Build r163 — persistence.
+> Build r164 — f6 essence autosave.
+> Build r166 — hiding.
+:goto 1243    # pickup: patch state before r168
+> Fix forward: Build r168 — focusfix docs.
+> Build r169 — settings craft analytics.
+:best
+:export md
+:goto 1245    # pickup: patch state before r171
+> Fix forward: Build r171 — clickfix.
+> Build r174 — biomes macos.
+> Build r175 — punchlist.
+:goto 1248    # pickup: patch state before r176b
+> Fix forward: Build r176b — quotefix.
+> Build r177 — ocean advisor.
+> Build r178 — fsm swim veil.
+# HEAVY: widen+deepen on r178 (fsm-swim-veil)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 1251    # pickup: back to main line after r178 burst
+:goto 1251    # pickup: patch state before r180b
+> Fix forward: Build r180b — hotpocket scope.
+:goto 1657    # pickup: patch state before r182b
+> Fix forward: Build r182b — previewfix.
+> Build r185 — lockstep wizard.
+> Build r186 — quit spree dsp.
+:best
+:export md
+> Build r189 — toolchain.
+:goto 1661    # pickup: patch state before r190
+> Fix forward: Build r190 — harness stutterfix.
+> Build r191 — perf decouple threading.
+> Build r194 — splitmix cluster.
+> Build r195 — ocean seam mesher flight.
+> Build r196 — fastmath evidence oplanes.
+# HEAVY: widen+deepen on r196 (fastmath-evidence-oplanes)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 1666    # pickup: back to main line after r196 burst
+# context break: re-seed with the batchwire task, then resume the spine
+:open batchwire.chat.md
+:fill service_registry_batch.skeleton.rs
+:goto 1666    # pickup: back to spine main line
+> Build r201 — sound fluid physics.
+> Build r202 — stutter guiscale dvorak docs.
+> Build r203 — settings loadworld rollback glass.
+> Build r204 — water keybind swim profiler.
+# HEAVY: widen+deepen on r204 (water-keybind-swim-profiler)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 2093    # pickup: back to main line after r204 burst
+:best
+:export md
+> Build r233 — menu egui port timeline.
+:goto 2499    # pickup: patch state before r234
+> Fix forward: Build r234 — toggle fps fix.
+> Build r241 — thread.
+> Build r244 — shader variants.
+:goto 2502    # pickup: patch state before r245
+> Fix forward: Build r245 — menu fix profiler fix.
+> Build r247 — perf creature mesh zone.
+# HEAVY: widen+deepen on r247 (perf-creature-mesh-zone)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 2504    # pickup: back to main line after r247 burst
+> Build r248 — far cave skip roamer zone.
+> Build r279 — build sim chain.
+# HEAVY: widen+deepen on r279 (build-sim-chain)
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:goto 2911    # pickup: back to main line after r279 burst
+> Build r282 — stagger sim tick optimize.
+> Build r286 — build poi scorer.
+:best
+:export md
+
+# final deepen across the surviving frontier
+:2ca
+:best
+:export md

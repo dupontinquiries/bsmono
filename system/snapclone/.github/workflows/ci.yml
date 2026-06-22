@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── Linux build + test ────────────────────────────────────────────────────
+  build-linux:
+    name: Build & Test (Ubuntu / Qt 6)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.6.*'
+          modules: 'qtwebsockets qtmultimedia'
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1-mesa-dev libpulse-dev libdbus-1-dev clang-tidy
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSNAPCLONE_BUILD_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --parallel $(nproc)
+      - name: clang-tidy (non-blocking)
+        continue-on-error: true
+        run: find src -name '*.cpp' | xargs clang-tidy --config-file=.clang-tidy -p build 2>&1 | head -200
+
+  # ─── Sanitizer build ───────────────────────────────────────────────────────
+  sanitize:
+    name: ASAN + UBSAN
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.6.*'
+          modules: 'qtwebsockets qtmultimedia'
+      - run: sudo apt-get update && sudo apt-get install -y libgl1-mesa-dev libpulse-dev libdbus-1-dev
+      - run: cmake -B build-san -DCMAKE_BUILD_TYPE=Debug -DSNAPCLONE_BUILD_TESTS=ON -DSNAPCLONE_ENABLE_SANITIZERS=ON
+      - run: cmake --build build-san --parallel $(nproc)
+      - run: ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1 ctest --test-dir build-san --output-on-failure
+
+  # ─── Flatpak build ─────────────────────────────────────────────────────────
+  flatpak:
+    name: Flatpak Build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+      - run: flatpak install --user -y flathub org.kde.Platform//6.7 org.kde.Sdk//6.7
+      - run: flatpak-builder --user --install --force-clean .flatpak-build com.snapclone.SnapClone.json
+      - name: Smoke test
+        run: timeout 3 flatpak run com.snapclone.SnapClone || true
+
+  # ─── Windows build ─────────────────────────────────────────────────────────
+  build-windows:
+    name: Build (Windows / MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '6.6.*'
+          host: windows
+          arch: win64_msvc2022_64
+          modules: 'qtwebsockets qtmultimedia'
+      - run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release -DSNAPCLONE_BUILD_TESTS=OFF
+      - run: cmake --build build --config Release --parallel

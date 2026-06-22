@@ -1,0 +1,51 @@
+    let median = sorted[sorted.len() / 2];
+    if median < 0.001 { return false; }  // pure DC — already filtered
+    // Count how many windows fall within ±15% of the median.
+    let lo = median * 0.85;
+    let hi = median * 1.15;
+    let in_band = zcrs.iter().filter(|&&z| z >= lo && z <= hi).count();
+    let ratio = in_band as f32 / zcrs.len() as f32;
+    let is_drone = ratio >= 0.80;
+    if is_drone {
+        crate::clog!("drone-filter", "reject: {}/{} windows ({:.0}%) within ±15% of median ZCR {:.4}",
+            in_band, zcrs.len(), ratio * 100.0, median);
+    }
+    is_drone
+}
+
+/// Fallback: use system tools
+fn listen_external() -> String {
+    // whisper-cpp / whisper-cli with arecord
+    let model = model_path();
+    let model_str = model.to_string_lossy();
+    let cmd = format!(
+        "arecord -d 5 -f S16_LE -r 16000 -c 1 /tmp/web2qml_voice.wav 2>/dev/null && \
+         (which whisper-cli >/dev/null && whisper-cli -m '{}' -f /tmp/web2qml_voice.wav --no-prints 2>/dev/null | tail -1 || \
+          which whisper-cpp >/dev/null && whisper-cpp -m '{}' -f /tmp/web2qml_voice.wav --no-prints 2>/dev/null | tail -1)",
+        model_str, model_str
+    );
+
+    if let Ok(output) = std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !text.is_empty() { return text; }
+    }
+
+    // nerd-dictation fallback
+    if let Ok(output) = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("which nerd-dictation >/dev/null && timeout 5 nerd-dictation begin --output STDOUT 2>/dev/null")
+        .output()
+    {
+        if output.status.success() {
+            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !text.is_empty() { return text; }
+        }
+    }
+
+    let model_path = model_path();
+    if !model_path.exists() {
+        format!("[Voice tools not available. Build with --features voice and download model to {}]", model_path.display())
+    } else {
+        "[Voice failed: arecord/whisper not in PATH]".into()
+    }
+}

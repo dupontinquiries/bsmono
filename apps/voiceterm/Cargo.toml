@@ -1,0 +1,108 @@
+[package]
+name = "web2qml"
+version = "0.1.876"
+edition = "2021"
+
+[dependencies]
+qmetaobject = "0.2"
+scraper = "0.14"
+ureq = { version = "2", features = ["gzip"] }
+# v0.1.727: gzip for compressing persisted stores (decision_cache). Already in
+# the build tree transitively via ureq's gzip feature — direct dep = zero extra
+# compile cost, just brings flate2 into crate scope.
+flate2 = "1"
+portable-pty = "0.8"
+vte = "0.13"
+libc = "0.2"
+# Width-aware Unicode character handling. Used by pty_term.rs to track
+# wide characters (CJK, emoji, some box-drawing glyphs) as 2-cell-wide
+# instead of 1-cell-wide, so cursor positioning math stays correct
+# across mixed-width terminal output. Without this, fastfetch's ASCII
+# logo + emoji info section would misalign because emoji rendered
+# wider than our 1-cell assumption.
+unicode-width = "0.1"
+# Aho-Corasick for the security marker dictionary. Builds a single
+# automaton at startup, scans each line in one pass without per-line
+# allocation. Replaces the prior approach (lowercase-copy-per-line
+# + ~60 substring checks). Sub-ms gain per LLM call but consistent
+# across all calls. v0.1.167.
+aho-corasick = "1"
+whisper-rs = { version = "0.16", optional = true }
+cpal = { version = "0.15", optional = true }
+# v0.1.865: mail bridge crypto (gated behind the `mail-crypto` feature).
+crypto_secretbox = { version = "0.1", optional = true }
+bcrypt = { version = "0.15", optional = true }
+# v0.1.462 (llama.cpp backend arc): in-process GGUF inference,
+# GPU-accelerated via Vulkan (the universal target — Apple
+# Silicon via Honeykrisp, Qualcomm Adreno via Mesa Turnip, AMD
+# via RADV). Optional; gated behind the `llamacpp` feature.
+# NOTE: building with `llamacpp` requires `clang` on the system
+# (llama-cpp-2 uses bindgen) and the Vulkan SDK/headers (the
+# vulkan sub-feature sets GGML_VULKAN=ON). Pinned to 0.1.146 —
+# the latest as of this writing. Heads-up: 0.1.146 bundles a
+# llama.cpp without Gemma-4 chat-template support, so prefer
+# GGUFs that embed their own chat template (most bartowski
+# Qwen/Llama repos do).
+llama-cpp-2 = { version = "0.1.146", optional = true }
+# v0.1.606: encoding_rs is needed directly to build the UTF-8 decoder
+# that the non-deprecated token_to_piece API requires (llama-cpp-2 uses
+# it transitively at 0.8.35 but does not re-export it). Same minor so
+# cargo unifies to one copy — no duplicate-crate type mismatch. Optional,
+# pulled in only with the llamacpp feature.
+encoding_rs = { version = "0.8", optional = true }
+
+# v0.1.648: pure-Rust ML (candle) for the optional `wavenet` audio-prediction
+# core. Pure Rust — no C++/ONNX/Python — so it builds where llama.cpp's
+# Vulkan path can't. Optional; only linked with `--features wavenet`.
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+
+[features]
+default = []
+voice = ["whisper-rs", "cpal"]
+# GPU-accelerated whisper via Vulkan (Mesa, AMDVLK, RADV — works on Intel/AMD/Apple integrated)
+# Enable with: cargo build --release --features voice-vulkan
+voice-vulkan = ["voice", "whisper-rs/vulkan"]
+# CUDA backend (Nvidia only)
+voice-cuda = ["voice", "whisper-rs/cuda"]
+# Metal backend (Apple Silicon)
+voice-metal = ["voice", "whisper-rs/metal"]
+# Claude / Anthropic API as an alternative to local Ollama for LLM
+# queries. Enable with `--features claude` (combine with `voice` etc.
+# as needed). When OFF, the LLM path always routes to local Ollama,
+# the Backend's anthropic_api_key still exists (so QML bindings don't
+# break) but is inert — the user can store a key, it just isn't used.
+# This makes "compile without claude" a clean fallback path if the
+# Anthropic API or the JSON parser ever breaks: drop the feature,
+# rebuild, keep running on Ollama only.
+claude = []
+# v0.1.865: ProtonMail bridge at-rest crypto. OFF (default) → mail compiles with
+# inert providers (sealing/SRP/PGP return CryptoUnavailable, accounts session-only).
+# ON → NaCl-secretbox sealing (policy-gated + machine-bound) + bcrypt session gate.
+mail-crypto = ["crypto_secretbox", "bcrypt"]
+# v0.1.462: in-process llama.cpp backend with Vulkan offload.
+# Single feature that pulls the Vulkan sub-feature (the
+# Vulkan-everywhere plan — one build target across M-series,
+# Qualcomm, and AMD). When OFF, src/llama_backend.rs compiles to
+# stubs that return "not built with llamacpp" and no llama-cpp-2
+# dependency is linked — same clean-fallback pattern as `claude`.
+# Build: cargo build --release --features "llamacpp"
+# (combine with voice etc. as usual).
+llamacpp = ["llama-cpp-2", "llama-cpp-2/vulkan", "encoding_rs"]
+# v0.1.648: WaveNet-style audio-prediction core (src/wavenet_core.rs) in
+# candle (pure Rust). A shared core for the realtime-audio projects:
+# web2qml voice-DB augmentation, bo-mux predictive cancellation, etc. When
+# OFF (default), no candle dependency is linked and the module compiles
+# away entirely (it's all #[cfg(feature="wavenet")]). Build:
+# cargo build --release --features wavenet
+wavenet = ["candle-core", "candle-nn"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

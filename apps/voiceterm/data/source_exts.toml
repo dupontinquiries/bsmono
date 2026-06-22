@@ -1,0 +1,68 @@
+# source_exts.toml
+#
+# File extensions that count as "source code" for scoring purposes
+# in the "go deeper" smart cd command. Directories with multiple
+# files matching these extensions get scored higher (more likely
+# to be where actual code lives).
+#
+# In a user overlay file at ~/.config/web2qml/data/source_exts.toml,
+# the array below extends the defaults. To exclude an extension,
+# use the [remove] section.
+#
+# Note: extensions include the leading dot, e.g. ".rs" not "rs".
+
+source_exts = [
+  # Rust
+  ".rs",
+  # Python
+  ".py",
+  # JS/TS
+  ".ts",
+  ".tsx",
+  ".js",
+  ".jsx",
+  # Go
+  ".go",
+  # JVM
+  ".java",
+  ".kt",
+  ".kts",
+  ".scala",
+  # C/C++
+  ".c",
+  ".h",
+  ".cpp",
+  ".cc",
+  ".hpp",
+  # Ruby/PHP/Swift/ObjC
+  ".rb",
+  ".php",
+  ".swift",
+  ".m",
+  ".mm",
+  # .NET
+  ".cs",
+  ".fs",
+  ".vb",
+  # Shell
+  ".sh",
+  ".bash",
+  ".zsh",
+  ".fish",
+  # Scripting
+  ".lua",
+  ".pl",
+  ".pm",
+  # Editor / Lisp
+  ".vim",
+  ".el",
+  ".lisp",
+  ".clj",
+  # Web
+  ".html",
+  ".css",
+  ".scss",
+  ".sass",
+  # Database
+  ".sql",
+]

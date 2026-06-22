@@ -1,0 +1,25 @@
+# PhotoSync daemon configuration
+# /etc/conf.d/photosync
+
+# User and group to run daemon as
+PHOTOSYNC_USER="$USER"
+PHOTOSYNC_GROUP="$USER"
+
+# Directory to watch for new photos
+WATCH_DIR="$HOME/Pictures/PhotoSync"
+
+# Database path
+DB_PATH="/var/lib/photosync/photosync.db"
+
+# Block storage directory
+BLOCK_STORE="/var/lib/photosync/blocks"
+
+# Device identifier (hostname by default)
+DEVICE_ID="$(hostname)"
+
+# Thumbnail size in pixels
+THUMBNAIL_SIZE="256"
+
+# Additional options
+# Add any extra command-line arguments here
+#PHOTOSYNC_OPTS=""

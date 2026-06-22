@@ -1,0 +1,10 @@
+flowchart LR
+ac["AC Mains"] --> fuse["Fuse"]
+fuse --> rect["Bridge Rectifier"]
+rect --> filt["Filter Cap"]
+filt --> reg["Voltage Regulator"]
+reg --> out["DC Output"]
+reg -- "feedback" --> err["Error Amp"]
+err --> reg
+filt --> ovp["OVP Circuit"]
+ovp --> reg

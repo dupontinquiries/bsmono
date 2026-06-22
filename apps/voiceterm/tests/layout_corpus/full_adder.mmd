@@ -1,0 +1,13 @@
+flowchart TD
+A["A"] --> X1["XOR 1"]
+B["B"] --> X1
+A --> A1["AND 1"]
+B --> A1
+X1 --> X2["XOR 2"]
+Cin["Cin"] --> X2
+X1 --> A2["AND 2"]
+Cin --> A2
+X2 --> Sum["Sum"]
+A1 --> O1["OR"]
+A2 --> O1
+O1 --> Cout["Cout"]

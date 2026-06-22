@@ -1,0 +1,15 @@
+[package]
+name = "av1tuner_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+which.workspace = true
+zip.workspace = true

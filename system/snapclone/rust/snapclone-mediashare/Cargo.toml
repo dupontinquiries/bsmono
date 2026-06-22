@@ -1,0 +1,16 @@
+[package]
+name = "snapclone-mediashare"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Content addressing (chunk ids) — SHA-256.
+sha2 = "0.10"
+# Multiway key distribution: ephemeral X25519 + HKDF + ChaCha20-Poly1305.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }

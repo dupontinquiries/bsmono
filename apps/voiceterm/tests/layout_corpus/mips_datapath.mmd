@@ -1,0 +1,70 @@
+flowchart TD
+tmp5(" ")
+1s --> tmp5
+12s --> 1s
+1s["PC"]
+tmp5 --> 2s
+tmp1{{"4const"}} --> 2s
+2s[\"Add 4"/]
+tmp5 -- "Read Address" --> 3s
+3s -- "Instruction [31:0]" --> tmp7(" ")
+tmp7 --> tmp6(" ")
+tmp7 --> tmp8(" ")
+tmp6 -- "Instruction [20:16]" ---> tmp9
+3s["Instruction Memory"]
+RegDst{{"RegDst"}} --- 4s
+tmp9 --> 4s
+tmp8 -- "Instruction [15:11]" ---> 4s
+4s[" Mux 1 "]
+5f --> tmp4(" ")
+tmp6 -- "Instruction [25:21]" ---> 5a
+tmp9(" ") --> 5b
+4s --> 5c
+14s --> 5d
+subgraph 5s["Write Registers"]
+5a["Read register 1"]
+5b["Read register 2"]
+5c["Write Register"]
+5d["Write Data"]
+5e["Read Data 1"]
+5f["Read Data 2"]
+end
+tmp8 -- "Instruction [15:0]" ---> tmp10(" ")
+tmp10 -- "16 bits" --> 6s
+6s -- "32 bits" ---> tmp11
+6s(("Sign-extender"))
+tmp11((" ")) --> 7s
+7s(("shift left 2 bits"))
+tmp4 --> 8s
+tmp11 --> 8s
+ALUSrc{{"ALUSrc"}} --- 8s
+8s[" Mux 2"]
+ALUOp{{"ALUOp"}} --- 9s
+9s(("ALU Control"))
+tmp2((" "))
+2s --> tmp2
+tmp2 --> 10s
+7s --> 10s
+9s --> 10s
+10s[\"Upper ALU"/]
+8s --> 11s
+5e --> 11s
+11s[\"Lower ALU"/]
+PCSrc{{"PCSrc"}} --- 12s
+tmp2 --> 12s
+10s --> 12s
+12s[" Mux 3"]
+tmp3((" "))
+11s --> tmp3
+tmp3 --> 13a
+tmp4 --> 13b
+MemRead{{"MemRead"}} --- 13s
+subgraph 13s["Data Memory"]
+13a["Address"]
+13b["Write Data"]
+13c["Read Data"]
+end
+MemtoReg{{"MemtoReg"}} --- 14s
+tmp3 --> 14s
+13c --> 14s
+14s[" Mux 4"]

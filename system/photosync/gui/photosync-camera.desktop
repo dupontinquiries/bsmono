@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=PhotoSync Camera
+Comment=Snapchat-style camera app with compression and sync
+Icon=photosync-camera
+Exec=photosync-camera
+Categories=Graphics;Photography;Qt;
+Terminal=false
+StartupNotify=true
+X-GNOME-UsesNotifications=true
+Keywords=camera;photo;sync;libcamera;compression;

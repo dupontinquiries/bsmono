@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Runtime temp QML extraction dirs (created when running the embedded
+# fallback; cleaned up on exit but listed here just in case)
+bo-controller-qml-*/

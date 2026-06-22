@@ -1,0 +1,102 @@
+{
+  "name": "Forest \u2014 Quiet",
+  "_doc": "Non-water option in the noise-cover library. Calm forest ambience: high-frequency wind suggesting leaves + a low brown-noise pad suggesting distant rumble. No water sounds \u2014 for users who find moving water distracting or wakeful.",
+  "_pairs_with": "Tonal residual or weak-tonal traffic noise. Recommender picks this when the user has set a 'no water' preference and the canceller is in TONAL or WEAK gate-open state.",
+  "start_state": "calm",
+  "layers": [
+    {
+      "name": "wind_canopy",
+      "_doc": "300-3000 Hz filtered wind, suggesting air moving through high tree canopy. The primary masker for office-chatter, traffic-tonal-residue, and most mid-band noise.",
+      "pool": [
+        "clips/wind_soft_a.opus",
+        "clips/wind_soft_b.opus",
+        "clips/wind_soft_c.opus",
+        "clips/wind_soft_d.opus",
+        "clips/wind_soft_e.opus",
+        "clips/wind_soft_f.opus",
+        "clips/wind_soft_g.opus",
+        "clips/wind_soft_h.opus"
+      ],
+      "channel": "SL",
+      "crossfade_ms": 4000,
+      "gain_range": [
+        0.55,
+        0.8
+      ],
+      "pan_range": [
+        -0.25,
+        0.25
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000,
+      "swell_period_ms": 50000,
+      "swell_depth": 0.3
+    },
+    {
+      "name": "rumble_floor",
+      "_doc": "Brown noise 30-400 Hz. Low, sustained \u2014 like distant traffic, ventilation, or wind hitting building structure. Fills the sub-300-Hz band that wind_soft leaves bare.",
+      "pool": [
+        "clips/brown_pad_a.opus",
+        "clips/brown_pad_b.opus",
+        "clips/brown_pad_c.opus",
+        "clips/brown_pad_d.opus",
+        "clips/brown_pad_e.opus",
+        "clips/brown_pad_f.opus",
+        "clips/brown_pad_g.opus",
+        "clips/brown_pad_h.opus"
+      ],
+      "channel": "SR",
+      "crossfade_ms": 8000,
+      "gain_range": [
+        0.2,
+        0.45
+      ],
+      "pan_range": [
+        -0.15,
+        0.15
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000
+    }
+  ],
+  "states": [
+    {
+      "name": "calm",
+      "layer_weights": {
+        "wind_canopy": 1.0,
+        "rumble_floor": 0.6
+      },
+      "dwell_ms": [
+        45000,
+        90000
+      ],
+      "transitions": {
+        "breeze": 1.0
+      }
+    },
+    {
+      "name": "breeze",
+      "_doc": "Slightly more wind, slightly less rumble \u2014 suggests a gust without becoming a storm.",
+      "layer_weights": {
+        "wind_canopy": 1.0,
+        "rumble_floor": 0.3
+      },
+      "dwell_ms": [
+        30000,
+        60000
+      ],
+      "transitions": {
+        "calm": 1.0
+      }
+    }
+  ],
+  "description": "Gentle stereo woodland: soft wind through the canopy and rustling leaves."
+}

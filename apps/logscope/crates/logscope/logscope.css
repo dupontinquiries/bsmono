@@ -1,0 +1,702 @@
+/* logscope.css
+ *
+ * Uses only GTK/Adwaita semantic color tokens — no hardcoded hex except
+ * where Adwaita provides no semantic equivalent (cargo severity badges).
+ */
+
+/* ════════════════════════════════════════════════════════
+   BASE TYPOGRAPHY & UTILITY
+   ════════════════════════════════════════════════════════ */
+
+.file-info   { font-family: monospace; font-size: 0.85em; }
+.stats-label { font-family: monospace; font-size: 0.82em; opacity: 0.75; }
+.dim-label   { opacity: 0.6; font-size: 0.85em; }
+.numeric     { font-family: monospace; font-feature-settings: "tnum"; color: @accent_color; }
+.progress-pct { font-family: monospace; font-size: 2em; font-weight: bold; color: @accent_color; }
+
+/* ════════════════════════════════════════════════════════
+   OVERFLOW / MOBILE BASELINE
+   Every widget that can contribute to horizontal overflow
+   gets min-width:0 so the layout engine can shrink it.
+   ════════════════════════════════════════════════════════ */
+
+window, .application                { overflow: hidden; }
+entry                               { min-width: 0; }
+button > label                      { min-width: 0; }
+dropdown, .ollama-model-drop        { min-width: 120px; }
+popover > contents                  { max-width: calc(100vw - 24px); }
+actionbar > revealer > box          { min-width: 0; }
+actionbar > revealer > box > *      { min-width: 0; }
+tabbar > revealer > box > scrolledwindow > viewport > box > box { min-width: 0; }
+tabbar > revealer > box > scrolledwindow { min-width: 0; }
+tabbar                              { overflow: hidden; min-height: 38px; }
+tabbar tab                          { min-width: 0; padding: 0 8px; }
+
+/* ViewSwitcherBar */
+viewswitcherbar                     { min-width: 0; }
+viewswitcherbar > actionbar         { min-width: 0; }
+viewswitcher                        { min-width: 0; }
+viewswitcher > button               { min-width: 0; padding: 0 6px; }
+viewswitcher > button > stack > box > label { font-size: 0.75em; min-width: 0; }
+
+/* ════════════════════════════════════════════════════════
+   SIDEBAR
+   ════════════════════════════════════════════════════════ */
+
+.sidebar {
+    background-color: @sidebar_bg_color;
+    border-radius: 12px;
+    padding: 8px;
+}
+.sidebar-page { min-width: 0; }
+
+/* ════════════════════════════════════════════════════════
+   PEEK / SOURCE VIEW
+   ════════════════════════════════════════════════════════ */
+
+/* Monospace font stack — JetBrains → Cascadia → Fira → system mono */
+@define-color _mono_font "JetBrains Mono";
+
+.peek-view,
+.peek-source-view,
+.peek-line,
+.rot-editor,
+.cargo-snippet-view text,
+.cargo-msg-text,
+.sources-output,
+.sources-cmd-entry {
+    font-family: "JetBrains Mono", "Cascadia Code", "Fira Code", monospace;
+}
+
+.peek-view        { font-size: 0.82em; caret-color: @accent_color; }
+.peek-view text   { background-color: @view_bg_color; color: @view_fg_color; }
+
+.peek-source-view { background-color: @view_bg_color; padding: 4px 0; font-size: 0.83em; }
+.peek-source-view text {
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    font-size: 0.83em;
+}
+.peek-source-view text selection { background-color: @accent_bg_color; }
+textview.peek-source-view text   { caret-color: @accent_color; }
+
+.peek-list { background-color: @view_bg_color; }
+.peek-list > row { padding: 0; background: none; border: none; min-height: 0; }
+.peek-line { font-size: 0.82em; padding: 1px 8px; }
+.peek-run-first { opacity: 1.0; }
+
+.peek-tick      { font-family: monospace; font-size: 0.78em; color: @accent_color; opacity: 0.55; padding-left: 8px; min-width: 28px; }
+.peek-tick-line { opacity: 0.75; }
+
+.peek-jump-btn {
+    font-family: monospace; font-size: 0.78em; font-weight: bold;
+    min-width: 0; min-height: 28px; padding: 0 4px; border-radius: 6px;
+}
+.peek-jump-active { color: @accent_color; }
+
+.peek-sel-btn {
+    min-width: 0; min-height: 28px; padding: 0 6px;
+    font-size: 0.72em; font-family: monospace;
+}
+.peek-sel-info {
+    font-size: 0.72em; font-family: monospace;
+    color: @accent_color; min-width: 0;
+}
+
+/* ════════════════════════════════════════════════════════
+   PERSISTENT SELECTION OVERLAY
+   ════════════════════════════════════════════════════════ */
+
+.sel-persistent-frame {
+    border: 2px solid @accent_color;
+    border-radius: 8px;
+    background-color: @view_bg_color;
+    box-shadow: 0 2px 12px @shade_color;
+}
+.sel-handle-bar {
+    background-color: @accent_bg_color;
+    border-radius: 6px 6px 0 0;
+    padding: 2px 4px;
+    min-height: 32px;
+}
+.sel-handle     { font-size: 0.75em; color: @accent_fg_color; opacity: 0.7; cursor: ns-resize; }
+.sel-handle-btn {
+    min-width: 0; min-height: 26px; padding: 0 6px;
+    font-size: 0.68em; font-family: monospace;
+    color: @accent_fg_color; opacity: 0.9;
+}
+.sel-cardinal-btns { margin: 0 2px; }
+.sel-close-btn     { color: @accent_fg_color; min-width: 0; min-height: 28px; padding: 0 4px; }
+
+/* ════════════════════════════════════════════════════════
+   OLLAMA RESULT / ANALYSE BAR
+   ════════════════════════════════════════════════════════ */
+
+.ollama-result-box {
+    background-color: alpha(@accent_color, 0.08);
+    border-top: 1px solid alpha(@accent_color, 0.25);
+    border-radius: 0 0 8px 8px;
+    min-width: 0;
+}
+.ollama-result-text { font-size: 0.88em; line-height: 1.5; }
+.peek-analyse-bar {
+    background-color: alpha(@accent_color, 0.10);
+    border-top: 1px solid alpha(@accent_color, 0.20);
+    min-height: 36px;
+}
+
+/* ════════════════════════════════════════════════════════
+   TWO-LINE MODEL DROPDOWN
+   ════════════════════════════════════════════════════════ */
+
+.ollama-model-drop  { font-size: 0.82em; min-width: 0; }
+.ollama-mode-label  { font-size: 0.75em; font-weight: 600; color: @accent_color; opacity: 0.8; }
+
+.model-drop-name    { font-size: 0.88em; font-weight: 600; min-width: 0; }
+.model-drop-host    { font-size: 0.72em; opacity: 0.65; min-width: 0; }
+.model-drop-kind    { font-size: 0.68em; font-weight: 600; opacity: 0.7; border-radius: 3px; padding: 0 4px; }
+row:selected .model-drop-kind { opacity: 0.9; }
+
+/* ════════════════════════════════════════════════════════
+   TOKEN FREQUENCY
+   ════════════════════════════════════════════════════════ */
+
+.token-freq-list { background-color: @view_bg_color; }
+.token-freq-list > row.token-freq-row {
+    padding: 0; border-bottom: 1px solid @shade_color; min-height: 44px;
+}
+.token-freq-list > row.token-freq-row:selected,
+.token-freq-list > row.token-freq-row:active {
+    background-color: alpha(@accent_color, 0.12);
+}
+.token-freq-name    { font-size: 0.9em; font-weight: 500; min-width: 0; }
+.token-freq-count   { font-family: monospace; font-size: 0.78em; opacity: 0.65; }
+.token-action-btn   { min-width: 0; min-height: 28px; padding: 2px; opacity: 0.7; }
+.token-action-btn:hover { opacity: 1.0; }
+.token-freq-row, .token-freq-name { min-width: 0; }
+
+/* ════════════════════════════════════════════════════════
+   ROTATION TAB
+   ════════════════════════════════════════════════════════ */
+
+.rot-editor {
+    font-size: 0.82em;
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    border-radius: 6px;
+}
+
+/* ════════════════════════════════════════════════════════
+   CARGO TAB
+   ════════════════════════════════════════════════════════ */
+
+.cargo-tab { background-color: @view_bg_color; }
+.cargo-diag-card {
+    background-color: @card_bg_color;
+    border-radius: 8px;
+    border: 1px solid @shade_color;
+    margin-bottom: 8px;
+    min-width: 0;
+}
+.cargo-level-badge {
+    font-size: 0.72em; font-weight: bold;
+    padding: 2px 6px; border-radius: 4px; letter-spacing: 0.5px;
+}
+/* Severity colours — no semantic token maps to these */
+.cargo-error   { background-color: alpha(#e01b24, 0.20); color: #f66151; }
+.cargo-warning { background-color: alpha(#e5a50a, 0.20); color: #f5c211; }
+.cargo-note    { background-color: alpha(#3584e4, 0.15); color: #78aeed; }
+.cargo-code         { font-family: monospace; font-size: 0.82em; opacity: 0.7; }
+.cargo-snippet-view { min-width: 0; }
+.cargo-snippet-view text { font-size: 0.80em; }
+.cargo-msg-box {
+    background-color: alpha(@error_color, 0.04);
+    border-top: 1px solid @shade_color;
+    border-radius: 0 0 8px 8px;
+    padding: 4px;
+}
+.cargo-msg-text { font-size: 0.78em; white-space: pre-wrap; }
+.cargo-export-bar {
+    background-color: @headerbar_bg_color;
+    border-top: 1px solid @shade_color;
+}
+
+/* ════════════════════════════════════════════════════════
+   SOURCES TAB
+   ════════════════════════════════════════════════════════ */
+
+.sources-preset-btn  { padding: 4px 10px; border-radius: 8px; }
+.sources-btn-label   { font-size: 0.82em; }
+.sources-prompt      { font-family: monospace; font-weight: bold; color: @accent_color; margin-right: 2px; }
+.sources-cmd-entry   { font-size: 0.85em; }
+.sources-output      { font-size: 0.78em; background-color: @view_bg_color; min-width: 0; }
+.sources-output text { background-color: @view_bg_color; color: @view_fg_color; min-width: 0; }
+
+/* ════════════════════════════════════════════════════════
+   CHAT TAB
+   ════════════════════════════════════════════════════════ */
+
+.chat-host-entry { min-width: 0; font-family: monospace; font-size: 0.82em; }
+.chat-host-entry.error      { border-color: @error_color; }
+.chat-host-entry.error text { color: @error_color; }
+
+.chat-user-card {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    border-radius: 16px 16px 4px 16px;
+    padding: 10px 14px;
+    margin-start: 48px;
+    margin-bottom: 2px;
+    min-width: 0;
+}
+.chat-asst-card {
+    background-color: @card_bg_color;
+    border-radius: 4px 16px 16px 16px;
+    padding: 10px 14px;
+    margin-end: 24px;
+    margin-bottom: 2px;
+    min-width: 0;
+    box-shadow: 0 1px 3px alpha(@shade_color, 0.15);
+}
+/* Role group separator — extra space before a role switch */
+.chat-turn-gap { margin-top: 16px; }
+
+/* Thread connector line between consecutive same-role messages */
+.chat-asst-card + .chat-asst-card,
+.chat-user-card + .chat-user-card {
+    margin-top: 3px;
+}
+
+.chat-model-label {
+    font-size: 0.68em;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    opacity: 0.55;
+    margin-bottom: 2px;
+    text-transform: uppercase;
+}
+.chat-bubble-text { font-size: 0.9em; min-width: 0; word-break: break-word; line-height: 1.45; }
+.chat-input       { font-size: 0.9em; border-radius: 8px; padding: 4px; min-width: 0; }
+
+.chat-mem-label { font-size: 0.72em; font-family: monospace; padding: 0 4px; border-radius: 4px; }
+.chat-mem-ok    { color: @success_color; }
+.chat-mem-mid   { color: @warning_color; }
+.chat-mem-high  { color: @error_color; font-weight: bold; }
+
+.chat-token-lbl { font-size: 0.72em; color: @dim_label_color; font-family: monospace; }
+.chat-ctx-label { font-size: 0.8em; color: @accent_color; }
+.chat-ctx-bar   { background-color: @accent_bg_color; border-radius: 6px; padding: 4px 8px; }
+
+.chat-snippet-card {
+    background-color: @card_bg_color;
+    border-left: 3px solid @accent_color;
+    border-radius: 0 8px 8px 0;
+    padding: 6px 10px;
+    margin: 4px 0;
+    min-width: 0;
+}
+.chat-snippet-source  { font-size: 0.72em; font-weight: 600; color: @accent_color; opacity: 0.8; }
+.chat-snippet-ask-btn { font-size: 0.78em; padding: 2px 8px; margin-top: 4px; color: @accent_color; }
+
+/* ════════════════════════════════════════════════════════
+   BOTTOM / MISC BARS
+   ════════════════════════════════════════════════════════ */
+
+.bottom-stats-bar {
+    background-color: @headerbar_bg_color;
+    border-top: 1px solid @shade_color;
+    min-height: 34px;
+    padding: 0 12px;
+}
+
+button.pill {
+    border-radius: 999px;
+    padding: 2px 12px;
+    font-size: 0.82em;
+}
+
+popover.chart-popup > contents {
+    padding: 8px 12px;
+    font-family: monospace;
+    font-size: 0.85em;
+    max-width: 480px;
+}
+
+.success-label { color: @success_color; font-size: 0.85em; margin-bottom: 8px; }
+
+/* ════════════════════════════════════════════════════════
+   NARROW / MOBILE OVERRIDES  (≤ 600px via @media)
+   ════════════════════════════════════════════════════════ */
+
+@media (max-width: 600px) {
+    .progress-pct    { font-size: 1.4em; }
+    .stats-label     { font-size: 0.78em; }
+    .chat-user-card  { margin-start: 8px; }
+    .chat-asst-card  { margin-end: 8px; }
+    .model-drop-host { display: none; }  /* hide subtitle on tiny screens */
+}
+
+/* ════════════════════════════════════════════════════════
+   MODIFY TAB — clipboard router
+   ════════════════════════════════════════════════════════ */
+
+.modify-clip-bar {
+    background-color: @headerbar_bg_color;
+    border-bottom: 1px solid @shade_color;
+}
+
+.modify-clip-view text {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 0.80em;
+    background-color: alpha(@accent_color, 0.05);
+    color: @view_fg_color;
+    padding: 4px 8px;
+}
+.modify-clip-view {
+    background-color: alpha(@accent_color, 0.05);
+}
+
+.modify-mode-btn {
+    font-size: 0.80em;
+    font-weight: 600;
+    color: @accent_color;
+    border: 1px solid alpha(@accent_color, 0.4);
+    border-radius: 4px;
+    padding: 2px 8px;
+    min-width: 0;
+}
+
+.modify-cand-list { background-color: @view_bg_color; }
+.modify-cand-list > row {
+    border-bottom: 1px solid @shade_color;
+    min-height: 44px;
+}
+.modify-cand-list > row:selected {
+    background-color: alpha(@accent_color, 0.15);
+}
+.modify-cand-name {
+    font-size: 0.85em;
+    min-width: 0;
+}
+.modify-cand-badge {
+    font-size: 0.65em;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    letter-spacing: 0.3px;
+}
+.modify-badge-file   { background-color: alpha(@accent_color,   0.15); color: @accent_color; }
+.modify-badge-range  { background-color: alpha(@success_color,  0.15); color: @success_color; }
+.modify-badge-all    { background-color: alpha(@warning_color,  0.15); color: @warning_color; }
+.modify-badge-create { background-color: alpha(@error_color,    0.10); color: @error_color; }
+
+.modify-preview-view text {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 0.80em;
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+    padding: 4px 8px;
+}
+
+.modify-bottom-bar {
+    background-color: @headerbar_bg_color;
+    border-top: 1px solid @shade_color;
+    min-height: 48px;
+}
+
+/* On narrow screens: stack preview below list */
+@media (max-width: 480px) {
+    .modify-cand-list { max-width: 100%; }
+}
+
+
+/* ════════════════════════════════════════════════════════
+   CODE BLOCKS TAB
+   ════════════════════════════════════════════════════════ */
+
+.code-toolbar { background-color: @headerbar_bg_color; border-bottom: 1px solid @shade_color; }
+
+.code-file-list { background-color: @view_bg_color; }
+.code-file-list > row { border-bottom: 1px solid @shade_color; min-height: 40px; }
+.code-file-list > row:selected { background-color: alpha(@accent_color, 0.15); }
+.code-file-name { font-family: "JetBrains Mono", monospace; font-size: 0.78em; min-width: 0; }
+
+.code-badge {
+    font-size: 0.62em; font-weight: 700; padding: 1px 4px;
+    border-radius: 3px; letter-spacing: 0.3px; min-width: 28px;
+    text-align: center;
+}
+.code-badge-bin  { background-color: alpha(@accent_color,  0.2); color: @accent_color; }
+.code-badge-lib  { background-color: alpha(@success_color, 0.2); color: @success_color; }
+.code-badge-ui   { background-color: alpha(#9141ac,        0.2); color: #9141ac; }
+.code-badge-src  { background-color: alpha(@window_fg_color, 0.1); color: @window_fg_color; opacity: 0.7; }
+.code-badge-cfg  { background-color: alpha(@warning_color, 0.2); color: @warning_color; }
+.code-badge-test { background-color: alpha(@error_color,   0.15); color: @error_color; }
+.code-badge-gen  { opacity: 0.4; background-color: alpha(@shade_color, 0.3); }
+.code-badge-other { opacity: 0.4; }
+
+.code-source-view {
+    font-family: "JetBrains Mono", "Cascadia Code", monospace;
+    font-size: 0.82em;
+    background-color: @view_bg_color;
+    color: @view_fg_color;
+}
+.code-source-view text { background-color: @view_bg_color; }
+
+.code-ai-panel { min-width: 220px; max-width: 360px; background-color: @card_bg_color; }
+
+/* Sticky prompt bar — always visible at top of AI panel */
+.code-prompt-bar {
+    background-color: @headerbar_bg_color;
+    border-bottom: 1px solid @shade_color;
+    min-height: 44px;
+}
+.code-prompt-btn { font-size: 0.82em; min-width: 0; }
+.code-prompt-name { font-size: 0.82em; font-weight: 600; color: @accent_color; }
+
+.code-ai-response {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.80em;
+    background-color: @card_bg_color;
+}
+.code-ai-response text { background-color: @card_bg_color; }
+
+.code-insert-btn {
+    background-color: alpha(@accent_color, 0.12);
+    color: @accent_color;
+    border-radius: 6px;
+    font-size: 0.85em;
+    font-weight: 600;
+}
+.code-insert-btn:hover { background-color: alpha(@accent_color, 0.22); }
+.code-insert-btn:disabled { opacity: 0.4; }
+
+/* ── Bloc tab — Scratch-like touch programming ────────────────────────────── */
+
+/* Chip strip */
+.bloc-chip-area {
+    background-color: @headerbar_bg_color;
+    border-bottom: 1px solid @borders;
+    min-height: 60px;
+}
+.bloc-chip-placeholder { font-size: 0.8em; color: @dim_label_color; margin: 0 8px; align-self: center; }
+.bloc-chip-more        { font-size: 0.75em; color: @dim_label_color; margin: 0 4px; align-self: center; }
+
+/* Chips */
+.bloc-chip {
+    background-color: @card_bg_color;
+    border-radius: 10px;
+    border: 1px solid alpha(@borders, 0.5);
+    padding: 7px 11px;
+    min-width: 72px; min-height: 50px;
+    transition: background-color 90ms ease, border-color 90ms ease;
+}
+.bloc-chip:hover  { background-color: alpha(@accent_bg_color, 0.3); border-color: alpha(@accent_color, 0.4); }
+.bloc-chip:active { background-color: alpha(@accent_bg_color, 0.55); }
+.bloc-chip-flash  { background-color: @accent_bg_color; }
+
+/* Template chips get a warm tint to distinguish from plain completions */
+.bloc-chip-template {
+    border-color: alpha(#f6a800, 0.55);
+    background-color: alpha(#f6a800, 0.06);
+}
+.bloc-chip-template:hover { background-color: alpha(#f6a800, 0.18); }
+
+.bloc-chip-text  { font-size: 0.82em; font-family: monospace; font-weight: 500; }
+.bloc-chip-badge {
+    font-size: 0.60em; font-weight: 700; text-transform: uppercase;
+    border-radius: 3px; padding: 1px 4px;
+}
+.badge-freq { background: alpha(#888, 0.22); color: @dim_label_color; }
+.badge-tok  { background: alpha(#3584e4, 0.2); color: #3584e4; }
+.badge-ast  { background: alpha(#2ec27e, 0.2); color: #2ec27e; }
+.badge-lsp  { background: alpha(#c061cb, 0.2); color: #c061cb; }
+.badge-ai   { background: alpha(#ff7800, 0.2); color: #e06000; }
+.badge-pin  { background: alpha(#f6d32d, 0.25); color: #a07800; }
+
+/* Long-press chip preview */
+.bloc-chip-preview { font-size: 0.82em; font-family: monospace; padding: 4px; }
+
+/* Quick-insert toolbar */
+.bloc-quick-bar { background-color: alpha(@headerbar_bg_color, 0.6); }
+.bloc-quick-btn {
+    font-family: monospace;
+    font-size: 0.88em;
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 6px 12px;
+    min-height: 40px;
+    min-width: 44px;
+    border: 1px solid alpha(@borders, 0.5);
+    background-color: @card_bg_color;
+    transition: background-color 80ms ease;
+}
+.bloc-quick-btn:hover  { background-color: alpha(@accent_bg_color, 0.35); }
+.bloc-quick-btn:active { background-color: @accent_bg_color; }
+
+/* Category palette */
+.bloc-palette { border-right: 1px solid @borders; background-color: @sidebar_bg_color; }
+.bloc-palette-list { background: transparent; }
+.bloc-cat-label { font-size: 0.88em; font-weight: 500; }
+row:selected .bloc-cat-label {
+    color: @accent_fg_color;
+    font-weight: 700;
+}
+.bloc-palette-list row:selected { background-color: @accent_bg_color; border-radius: 6px; }
+
+/* Editor */
+.bloc-editor { font-size: 13pt; font-family: monospace; }
+.bloc-file-lbl    { font-size: 0.73em; font-family: monospace; }
+.bloc-lang-badge  {
+    font-size: 0.66em; font-weight: 700; text-transform: uppercase;
+    color: @accent_fg_color; background-color: @accent_bg_color;
+    border-radius: 4px; padding: 2px 7px;
+}
+.bloc-slot-lbl    { font-size: 0.75em; color: #f6a800; font-weight: 600; }
+.bloc-status-lbl  { font-size: 0.73em; font-family: monospace; }
+
+/* Library rows */
+.bloc-search       { font-size: 0.88em; }
+.bloc-row-name     { font-size: 0.86em; font-weight: 600; }
+.bloc-row-preview  { font-size: 0.73em; font-family: monospace; }
+.bloc-kind-badge   {
+    font-size: 0.64em; font-weight: 700; text-transform: uppercase;
+    color: @accent_fg_color; background-color: @accent_bg_color;
+    border-radius: 3px; padding: 1px 5px;
+}
+.bloc-slot-indicator { font-size: 0.9em; color: #f6a800; font-weight: bold; }
+
+/* ── Chat tab: markdown rendering ────────────────────────────────────────── */
+
+/* Rendered/Source toggle button */
+.chat-md-toggle {
+    font-size: 0.72em;
+    padding: 2px 8px;
+    border-radius: 6px;
+    border: 1px solid alpha(@borders, 0.5);
+    color: @dim_label_color;
+    min-height: 0;
+}
+.chat-md-toggle:checked {
+    background-color: alpha(@accent_bg_color, 0.25);
+    color: @accent_fg_color;
+    border-color: alpha(@accent_color, 0.4);
+}
+
+/* Markdown block elements */
+.chat-md-heading { margin-top: 6px; margin-bottom: 2px; }
+
+.chat-code-block {
+    background-color: @dark_1;
+    border-radius: 8px;
+    border: 1px solid alpha(@borders, 0.6);
+    margin-top: 4px; margin-bottom: 4px;
+    overflow: hidden;
+}
+.chat-code-header {
+    background-color: alpha(@borders, 0.25);
+    padding: 4px 8px;
+    border-bottom: 1px solid alpha(@borders, 0.4);
+}
+.chat-code-lang {
+    font-size: 0.70em; font-weight: 700;
+    text-transform: uppercase; color: @dim_label_color;
+    font-family: monospace;
+}
+.chat-code-copy { font-size: 0.72em; padding: 2px 8px; min-height: 0; }
+.chat-code-view  {
+    font-size: 0.84em;
+    padding: 8px;
+    background-color: transparent;
+}
+textview.chat-code-view text { background-color: transparent; }
+
+.chat-bq-row { margin-top: 2px; margin-bottom: 2px; }
+.chat-bq-bar {
+    background-color: @accent_color;
+    border-radius: 2px;
+    margin-top: 2px; margin-bottom: 2px;
+}
+.chat-bq-text { color: @dim_label_color; font-style: italic; }
+
+.chat-list-bullet { font-weight: bold; color: @accent_color; min-width: 16px; }
+
+/* ── Chat tab: image attachment bar ─────────────────────────────────────── */
+.chat-img-bar {
+    background-color: alpha(#f6a800, 0.08);
+    border-top: 1px solid alpha(#f6a800, 0.3);
+    border-bottom: 1px solid alpha(#f6a800, 0.3);
+    padding: 2px 0;
+}
+
+/* ── modify_tab ─────────────────────────────────────────────────────────── */
+.modify-preview-view {
+    font-size: 0.82em;
+    font-family: monospace;
+    padding: 4px;
+}
+textview.modify-preview-view text { background-color: transparent; }
+
+/* ── UiScheduler / general performance helpers ──────────────────────────── */
+/* Ensure transitions don't compound into perceived redraws */
+.bloc-chip { transition-duration: 90ms; }
+.chat-md-toggle { transition: none; }
+
+/* ── Adwaita semantic color fallbacks for dark/light ───────────────────── */
+@define-color dark_1 #1e1e1e;
+
+/* Regenerate button */
+.chat-regen-btn {
+    font-size: 0.75em;
+    color: @dim_label_color;
+    padding: 2px 8px;
+    min-height: 0;
+    opacity: 0.7;
+}
+.chat-regen-btn:hover { opacity: 1.0; color: @accent_color; }
+
+/* peek_view markdown tap indicator */
+.peek-md-indicator { font-size: 0.7em; color: @accent_color; }
+
+/* ── copy button on chat bubbles ─────────────────────────────────────────── */
+.chat-copy-btn {
+    min-height: 0;
+    min-width: 0;
+    padding: 3px 5px;
+    opacity: 0.5;
+    transition: opacity 100ms ease;
+}
+.chat-copy-btn:hover  { opacity: 1.0; }
+.chat-user-card:hover .chat-copy-btn,
+.chat-asst-card:hover .chat-copy-btn { opacity: 0.7; }
+
+/* ── sources tab AI panel ────────────────────────────────────────────────── */
+.sources-ai-panel {
+    background-color: alpha(@accent_bg_color, 0.06);
+    border-top: 1px solid alpha(@accent_color, 0.25);
+    border-bottom: 1px solid alpha(@accent_color, 0.25);
+}
+.sources-ai-result {
+    font-size: 0.88em;
+    line-height: 1.4;
+}
+
+/* ── code tab render toggle ──────────────────────────────────────────────── */
+.code-ai-panel .chat-md-toggle {
+    margin-inline-end: 4px;
+}
+
+/* ── Chat session browser ────────────────────────────────────────────────── */
+.chat-session-row {
+    border-radius: 6px;
+    padding: 4px 6px;
+}
+.chat-session-row:hover { background-color: alpha(@accent_bg_color, 0.2); }
+
+/* ── Code tab AI render toggle ───────────────────────────────────────────── */
+.code-render-toggle {
+    min-height: 0;
+    padding: 2px 8px;
+    font-size: 0.75em;
+}
+

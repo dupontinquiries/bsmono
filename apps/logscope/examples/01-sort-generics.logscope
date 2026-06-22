@@ -1,0 +1,7 @@
+# A branching coding session: a concrete impl, then generalize, then explore continuations.
+# Exercises: say turns, :ca depth, :best region selection, :export.
+> write a Rust function to sort a Vec<i32> ascending, no external crates
+> now make it generic over T: Ord and return a new sorted Vec
+:2ca
+:best
+:export md

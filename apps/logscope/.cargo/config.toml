@@ -1,0 +1,5 @@
+# Fast-iteration linking: mold (parallel linker) + prefer-dynamic (libstd linked as a .so
+# instead of statically baked into every binary) + split debuginfo (debug info stays in
+# separate files so the linker doesn't pack hundreds of MB into the executable).
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold", "-C", "prefer-dynamic"]

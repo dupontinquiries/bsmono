@@ -1,0 +1,12 @@
+[package]
+name        = "snapclone-theme"
+version     = "0.1.0"
+edition     = "2021"
+description = "Color palettes and design tokens for SnapClone UI — reusable across backends"
+
+[lib]
+name       = "snapclone_theme"
+crate-type = ["rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

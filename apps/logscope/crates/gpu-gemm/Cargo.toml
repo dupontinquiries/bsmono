@@ -1,0 +1,23 @@
+[package]
+name = "gpu-gemm"
+version = "0.1.0"
+edition = "2021"
+description = "Transformer GPU kernels on wgpu→Vulkan (GEMM, linear, Q4_0 dequant, softmax, RMSNorm, attention), each CPU-validated. The compute foundation for a wgpu/Burn inference backend."
+
+[lib]
+name = "gpu_kernels"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kernel-validate"
+path = "src/main.rs"
+
+[[bin]]
+name = "logscope-serve"
+path = "src/serve.rs"
+
+[dependencies]
+memmap2 = "0.9"  # mmap GGUFs (big-model loading) — scoped infra dep, not RAM-loading 40GB files
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }

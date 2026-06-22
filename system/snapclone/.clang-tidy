@@ -1,0 +1,49 @@
+# .clang-tidy
+#
+# Static analysis checks enforced on all SnapClone translation units.
+# Run via:   clang-tidy src/**/*.cpp -- -std=c++20 -I include
+#
+# CI should treat warnings as errors: --warnings-as-errors='*'
+
+Checks: >
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-avoid-magic-numbers,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  performance-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-uppercase-literal-suffix,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  misc-*,
+  -misc-non-private-member-variables-in-classes
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key:   readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key:   readability-identifier-naming.StructCase
+    value: CamelCase
+  - key:   readability-identifier-naming.FunctionCase
+    value: camelCase
+  - key:   readability-identifier-naming.VariableCase
+    value: camelCase
+  - key:   readability-identifier-naming.MemberPrefix
+    value: m_
+  - key:   readability-identifier-naming.ParameterCase
+    value: camelCase
+  - key:   readability-identifier-naming.NamespaceCase
+    value: CamelCase
+  - key:   readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key:   readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key:   readability-identifier-naming.ConstantPrefix
+    value: k
+  - key:   cppcoreguidelines-special-member-functions.AllowSoleDefaultDtor
+    value: true
+  - key:   modernize-use-default-member-init.UseAssignment
+    value: false

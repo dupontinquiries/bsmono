@@ -1,0 +1,13 @@
+# 08-survival-bending  (BASIC) — survival + gen2 + player-bending builds.
+# Exercises: linear context then a widen+deepen, still small.
+
+> Build r124 — survival.
+> Build r129 — fivepack.
+> Build r130 — player bending.
+> Build r133b — gen2fix.
+> Build r133c — gen2fix2.
+> Build r134 — aibudget.
+:1fa 4 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:2ca
+:best
+:export md

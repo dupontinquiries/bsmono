@@ -1,0 +1,53 @@
+# v0.1.707 — natural multiplexer voice phrasings → expected command.
+# Format: <mux>|<phrase>|<expected argv joined by spaces>   ('-' = expect None)
+# Used by the mux_phrasing_corpus regression test (tmux_voice.rs). These are
+# phrasings a user would actually DICTATE, drawn from the recorded corpus +
+# common speech, to guard the contains-based matchers against regressions.
+
+# ── tmux: panes ──
+tmux|open a vertical pane|split-window -v
+tmux|open a horizontal pane|split-window -h
+tmux|split the window|split-window -v
+tmux|make a new pane|split-window -v
+tmux|duplicate pane|split-window -v
+tmux|give me a pane on the right|split-window -h
+tmux|close pane|kill-pane
+tmux|zoom the pane|resize-pane -Z
+tmux|focus left|select-pane -L
+tmux|move to the pane below|select-pane -D
+
+# ── tmux: windows ──
+tmux|new window|new-window
+tmux|go to the next window|next-window
+tmux|previous window|previous-window
+tmux|go to window 3|select-window -t 3
+tmux|window two|select-window -t 2
+tmux|close window|kill-window
+tmux|detach|detach-client
+tmux|what's in my panes|list-panes -F #{pane_index}:#{pane_current_command}:#{pane_active}
+
+# ── tmux: non-commands (must NOT match) ──
+tmux|the quick brown fox|-
+tmux|open google|-
+tmux|read this section|-
+
+# ── zellij: panes ──
+zellij|open a new pane|action new-pane
+zellij|give me a pane on the right|action new-pane -d right
+zellij|split down|action new-pane -d down
+zellij|focus left|action move-focus left
+zellij|move focus down|action move-focus down
+zellij|close the pane|action close-pane
+zellij|toggle floating|action toggle-floating-panes
+zellij|grow left|action resize left
+
+# ── zellij: tabs ──
+zellij|make a new tab|action new-tab
+zellij|next tab|action go-to-next-tab
+zellij|go to tab 2|action go-to-tab 2
+zellij|switch to tab three|action go-to-tab 3
+zellij|what panes do i have|action list-panes --json
+
+# ── zellij: non-commands ──
+zellij|the quick brown fox|-
+zellij|pane|-

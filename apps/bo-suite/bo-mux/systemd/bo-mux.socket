@@ -1,0 +1,22 @@
+# bo-mux.socket — systemd USER unit for socket activation.
+#
+# Install to ~/.config/systemd/user/bo-mux.socket then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now bo-mux.socket
+#
+# The daemon is started on first connection to the socket and can be
+# restarted without losing the listener (graceful updates).
+
+[Unit]
+Description=bo-mux control socket
+PartOf=bo-mux.service
+
+[Socket]
+# %t expands to $XDG_RUNTIME_DIR for user units → /run/user/<uid>/bo-mux/control.sock
+ListenStream=%t/bo-mux/control.sock
+# Keep the socket dir tidy + private to the user.
+DirectoryMode=0700
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

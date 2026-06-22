@@ -1,0 +1,33 @@
+[package]
+name        = "snapclone-mailbox"
+version     = "0.1.0"
+edition     = "2021"
+description = """
+DHT mailbox rendezvous — deferred transfer model for SnapClone.
+Intent metadata propagates first; bulk data transfers when paths are warm.
+Implements NETWORK_ARCHITECTURE.md §6 Deferred Transfer Model.
+"""
+
+[lib]
+name       = "snapclone_mailbox"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow     = "1"
+chrono     = { version = "0.4", features = ["serde"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2       = "0.10"
+hex        = "0.4"
+tracing    = "0.1"
+# V32.34+ mailbox overhaul:
+#   ed25519-dalek — sign/verify mailbox entries so planted entries are
+#                   rejected (S-12). Already a workspace dep (crypto uses
+#                   it), resolves to rand_core 0.6.4 → getrandom 0.2.15.
+#                   We get OsRng for envelope padding (S-6) via its
+#                   re-exported rand_core, avoiding a fresh getrandom edge.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# rand_core 0.6 (already locked via ed25519-dalek) gives OsRng for the
+# envelope padding CSPRNG (S-6). The getrandom feature pulls getrandom
+# 0.2.x (compatible with the toolchain), NOT the 0.4.x that uuid wanted.
+rand_core     = { version = "0.6", features = ["getrandom"] }

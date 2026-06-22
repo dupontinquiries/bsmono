@@ -1,0 +1,16 @@
+[Unit]
+Description=Camera Server — stream FP5 cameras to trusted desktops
+After=pipewire.service camera-bridge.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=%h/.config/camera-bridge/env
+ExecStart=%h/.local/bin/camera-server --bind 0.0.0.0:7878
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

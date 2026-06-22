@@ -1,0 +1,14 @@
+# gitmind-sim — measurement harness. Builds real git repos and compares
+# gitmind's chunk store against git's loose and packed sizes across many
+# versions of large files. Not shipped; a bench/benchmarking tool.
+[package]
+name = "gitmind-sim"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gitmind-sim"
+path = "src/main.rs"
+
+[dependencies]
+gitmind-core = { path = "../core" }

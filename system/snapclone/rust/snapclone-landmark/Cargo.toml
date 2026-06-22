@@ -1,0 +1,32 @@
+[package]
+name        = "snapclone-landmark"
+version     = "0.1.0"
+edition     = "2021"
+description = "Landmark types, wire format, and verification scaffolding for SnapClone V32 landmarks feature"
+
+[lib]
+name       = "snapclone_landmark"
+crate-type = ["rlib"]
+
+[dependencies]
+# Core types used across the codebase. These are all already in the
+# workspace via other crates, so adding them here doesn't expand the
+# overall dependency footprint.
+serde   = { version = "1", features = ["derive"] }
+chrono  = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+# Used by other crates for byte-level wire formats.
+byteorder = "1"
+
+# Future work: ed25519 signing. Imported but not yet used — the
+# scaffolding here defines verification entry points; real signing
+# is plumbed in once we wire to the existing identity infrastructure.
+# Adding the dep now means we don't break callers when the real impl
+# lands.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+
+[features]
+default = []
+# Future: HTTP-fetched landmark catalogs (community-curated lists like
+# Wikipedia historical sites). Out of scope for V1 but stubbed.
+http-catalog = []

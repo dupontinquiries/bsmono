@@ -1,0 +1,23 @@
+# Cross-compilation targets. Referenced by manifest/projects.toml `targets`.
+
+[targets.desktop]
+triple = "x86_64-unknown-linux-gnu"
+description = "Desktop Linux (primary dev/run target)"
+flatpak_arch = "x86_64"
+
+[targets.phone]
+triple = "aarch64-unknown-linux-gnu"
+description = "Pinephone / postmarketOS / Plasma Mobile (also covers ARM servers)"
+flatpak_arch = "aarch64"
+notes = "snapclone camera-bridge cross-builds here via sysroot-over-rsync to PHONE_IP"
+
+[targets.alpine]
+triple = "x86_64-unknown-linux-musl"
+description = "Alpine-on-server (static musl)"
+flatpak_arch = "x86_64"
+notes = "no flatpak; static binary / distro package"
+
+# Optional, enable when needed:
+# [targets.alpine-arm]
+# triple = "aarch64-unknown-linux-musl"
+# description = "Alpine on ARM"

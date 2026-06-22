@@ -1,0 +1,16 @@
+[package]
+name = "snapclone-peer"
+version = "0.1.0"
+edition = "2021"
+description = "Peer session lifecycle state machine for SnapClone — no Qt, no I/O"
+
+[lib]
+name = "snapclone_peer"
+crate-type = ["rlib"]
+
+[dependencies]
+snapclone-identity = { path = "../snapclone-identity" }
+anyhow  = "1"
+chrono  = { version = "0.4", features = ["serde"] }
+serde   = { version = "1", features = ["derive"] }
+tracing = "0.1"

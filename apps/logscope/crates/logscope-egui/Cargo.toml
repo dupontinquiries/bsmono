@@ -1,0 +1,64 @@
+[package]
+name = "logscope-egui"
+version = "0.1.0"
+edition = "2021"
+description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
+
+[dependencies]
+# glow-only backend (eframe default pulls wgpu, whose default limits exceed the
+# Asahi driver's max_color_attachments=5). glow sidesteps it.
+eframe = { optional = true, version = "0.34", default-features = false, features = [
+    "glow", "default_fonts", "wayland", "x11", "accesskit",
+] }
+egui = { version = "0.34", optional = true }
+# logscope's real headless library (GTK gated off via default-features=false).
+# Adjust this path to your logscope checkout.
+logscope = { path = "../logscope", default-features = false }
+# light, pure-Rust analysis deps (match logscope: twox-hash for block hashing)
+twox-hash = "1.6"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# native OS file dialog (XDG portal backend — no GTK, matches the glow/no-GTK stance)
+rfd = { optional = true, version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+async-std = { version = "1", optional = true }  # reactor that drives rfd's portal (D-Bus) future off the UI thread
+# Rust sub-file AST (tree-sitter) for sub-file reasoning units; C grammar compiles via cc
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-rust = { version = "0.23", optional = true }
+# The pure-Rust clean-room GPU inference engine (wgpu→Vulkan). Optional/off by
+# default to keep the normal build light; enable with `--features wgpu-engine`.
+gpu-gemm = { path = "../gpu-gemm", optional = true }
+
+[features]
+default = ["gui", "gpu-scene"]
+# the egui/eframe GUI + its modules; off lets logscope-cli build lean (no eframe/vello)
+gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:async-std", "dep:tree-sitter", "dep:tree-sitter-rust"]
+wgpu-engine = ["dep:gpu-gemm"]
+# the GPU scene renderer (depth-sorted GLSL pass via an egui_glow callback over scene3d). DEFAULT so the GUI
+# uses the same renderer as scene-view — without it the GUI silently falls back to the CPU software path and
+# none of the shader work (pearl/frost/bloom/grade/underwater) appears. CPU-only build: --no-default-features --features gui
+gpu-scene = ["gui"]  # uses eframe::glow + eframe::egui_glow (re-exported by the glow backend)
+
+[lib]
+name = "logscope_egui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "logscope-egui"
+path = "src/main.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "logscope-cli"
+path = "src/bin/logscope-cli.rs"
+
+[[bin]]
+name = "scene-view"
+path = "src/bin/scene-view.rs"
+required-features = ["gpu-scene"]
+
+[[bin]]
+name = "pearl-input-view"
+path = "src/bin/pearl-input-view.rs"
+required-features = ["gui"]

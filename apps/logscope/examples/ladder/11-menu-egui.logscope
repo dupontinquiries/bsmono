@@ -1,0 +1,17 @@
+# 11-menu-egui  (MEDIUM) — menu egui-port / perf / shader-variants block r233..r247,
+# with a mid-run RE-SEED (import the batchwire seed) as a deliberate context break.
+# Exercises: fragmentation via re-seed + wide fan + deepen. ~1k nodes.
+
+> Build r233 — menu egui port timeline.
+> Build r234 — toggle fps fix.
+
+# context break: drop in an unrelated seed mid-run, then resume engine work
+:open batchwire.chat.md
+> Resume: apply the same wiring discipline to the menu services build r235.
+> Build r244 — shader variants.
+> Build r245 — menu fix profiler fix.
+> Build r247 — perf creature mesh zone.
+:3fa 5 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:3ca
+:best
+:export md
