@@ -60,10 +60,20 @@ _(empty — current dump triaged below)_
 
 ## D. DHT decomposition + Rust rebuild
 
-- **D1 — Pull the DHT apart, rebuild on new Rust portions.** `idea / strategic`
-  Aligns with the ops-doc Part 1 (snapcore-daemon + snapcore-protocol over
-  D-Bus). Decompose snapclone-dht/microdht/gossip/nat into reusable Rust pieces.
-  Dovetails with C1 (oxidation) and the daemon plan.
+- **D1 — Networking decomposition: snapcore / crypto-kit / share-kit.** `scoped`
+  Grounded boundary proposal: **`docs/architecture/NETWORKING_AND_CRYPTO.md`**.
+  Findings: snapclone networking is ~42 crates, well-layered;
+  `snapclone-crypto` is already best-of-breed (**hybrid ML-KEM-768 PQ**) → the
+  **crypto-kit** base; `snapclone-group` = Signal-style ratchet/seal;
+  `snapclone-mailbox` is the **share-kit** seam (per-app `MailboxId`, encrypted
+  fixed-size envelopes, "share the slot not the key"); the `dht`/`microdht`
+  split implies the DHT interface for **snapcore** (microdht = the net-sim
+  harness too). unendlich has **no** net/crypto → future consumer, not a merge
+  source. The node **ownership/lifecycle** layer (sleep/wake/refcount/parallel
+  pool/port arbitration) **doesn't exist yet** — the main new piece snapcore
+  adds; all the flags are captured in the doc. **First lift = crypto-kit** (pure
+  Rust, no FFI). Aligns with the ops-doc snapcore-daemon + the integrated/lean
+  `dht` feature (build-variant split).
 
 ## E. CI: network simulation + quick-check tooling
 
@@ -175,10 +185,13 @@ _(empty — current dump triaged below)_
   (or `josh` for ongoing bidirectional). gitmind's `graft` is for *experiments*,
   not the canonical sync. So the stale unendlich (`PROBLEMS(5)`) gets one subtree
   merge from its standalone repo, then lives here. (See report for the long form.)
-- **Parallel work (if a 2nd chat opens):** give it a disjoint lane on its own
-  branch — e.g. this chat = the registry-kit→…→oxidation sequence; the other =
-  a uikit/egui UX spike *or* DHT-rustify + snapclone⨯unendlich crossover. Use
-  separate branches (gitmind `graft`/native-branch or git) to avoid collisions.
+- **Parallel work (ACTIVE — 2nd chat running):** the other chat got last turn's
+  bundle and is doing **snapclone UI in rust+egui** (faithful look/feel, mini
+  demo, logscope-derived egui components, swipe/trackpad gestures + a logscope
+  reverse-port candidate) → the **uikit** lane. This chat owns snapclone
+  **networking** (snapcore/crypto-kit/share-kit). Lane split = **UI ⟂ networking**
+  within snapclone (different files) → low collision. `gin`'s Qt GUI is the
+  fallback small-base uikit test if the snapclone-egui spike stalls.
 
 ---
 

@@ -72,7 +72,9 @@ This is where the build shape changes (the user's intuition was right):
 2. ✅ **peek-view reconcile** — done: tools/peek promoted to lib+bins; gitmind
    consumes it; embedded copy removed (stayed in tools/, not shared/).
 3. **Decompose the DHT → `snapcore`** + define unendlich's `dht` feature — this
-   is where build shape changes most (integrated vs lean).
+   is where build shape changes most (integrated vs lean). Grounded boundary
+   proposal: **`docs/architecture/NETWORKING_AND_CRYPTO.md`** (the
+   snapcore / crypto-kit / share-kit split; first lift = **crypto-kit**, pure Rust).
 4. **Begin snapclone C++→Rust oxidation**, leaf-first, shrinking the FFI. As you
    port the UI, carry its swipe-gesture UX into the egui `uikit` (cpp&qt →
    rust&egui), rather than porting Qt 1:1.
