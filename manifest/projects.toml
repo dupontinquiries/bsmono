@@ -73,7 +73,7 @@ daemon = false
 flatpak = "tbd"
 runtime = "tbd"
 targets = ["desktop"]
-notes = "git-graph tool (gin); embeds crates/peek (dedup pending); marked broken upstream"
+notes = "git-graph tool (gin); embeds crates/peek (dedup deferred: tools/peek is bin-centric, gitmind's is lib+bins consumed by the GUI); marked broken upstream"
 
 [apps.logscope]
 path = "apps/logscope"
@@ -93,7 +93,7 @@ daemon = true            # snapclone-bus, camera-bridge units
 flatpak = false          # daemon is system-level; a GUI front-end could ship
 runtime = "none"
 targets = ["desktop", "phone"]
-notes = "DHT/identity/relay; canonical Rust↔C++ DataBus FFI; flatpak-build.sh present; CMake repath to vendor/opendht pending; cross-build to FP5/postmarketOS"
+notes = "DHT/identity/relay; canonical Rust↔C++ DataBus FFI; flatpak-build.sh present; CMake repath to vendor/opendht DONE; cross-build to FP5/postmarketOS"
 
 [system.photosync]
 path = "system/photosync"
