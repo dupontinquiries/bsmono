@@ -125,6 +125,17 @@ _(empty — current dump triaged below)_
     without snapclone bloat — reshape the build via a `dht` cargo feature + a
     top-level `shared/` layer. Sequencing is in the doc.
 
+- **G2 — `uikit` (egui UI layer across all apps).** `idea (major)`
+  Pipe **egui** across every app, replacing the Qt layer; build out the swipe
+  gestures and UI feel from snapclone (swipegestures) in egui. Approach Qt→egui
+  *fresh* — don't pattern-mine the older GTK→egui logscope port. Path: get apps
+  onto the Rust↔Qt FFI first (via snapclone), then port to egui generally →
+  `shared/uikit`. Lighter than Qt ⇒ also helps RISC-V viability. snapclone is the
+  first consumer. Parallel track to the registry-kit sequence (not a blocker).
+- **G3 — unendlich ⨯ logscope overlap (shared render pieces?).** `idea`
+  Both are GPU/render-heavy and likely overlap now. Investigate for a shared
+  render/GPU kit before extracting; feeds the LOC-down goal.
+
 ## H. Deployment / install / uninstall
 
 - **H1 — Clean, low-effort teardown of system installs.** `idea`
@@ -144,16 +155,28 @@ _(empty — current dump triaged below)_
   (Asahi, 16K pages)**; phone fleet is **aarch64 musl (FP5 pmOS/Alpine, ~4K
   pages)**; **x86** and **riscv** are CROSS targets (no x86 hardware) — games
   must reach x86 (added to unendlich) and eventually riscv. Mind 16K-vs-4K page
-  assumptions. This is *why* cross + snapclone oxidation matter.
-- **LOC north-star:** ~600K now; the kits/FFI work should trend it **down**
-  (dedup, fewer copies) — a maintainability goal, not size for its own sake.
-- **`.spv` shaders:** added a `*.spv` gitignore catch-all (stop runtime-generated
-  shaders littering). Pre-existing `assets/shaders/*.spv` stay tracked until the
-  shader pipeline compiles-on-build; build/test scripts should also run from a
-  scratch PWD so artifacts don't land in the repo. (TODO with build-wiring.)
-- **Stale monorepo unendlich:** the monorepo copy is a snapshot; the geom_probe
-  fix happened in the *standalone* unendlich repo, so verify here still shows
-  `PROBLEMS(5)`. Open: how to sync per-project fixes back (subtree pull? re-import?).
+  assumptions. *Why cross + snapclone oxidation matter.*
+- **RISC-V hardware:** eyeing a DC-ROMA RISC-V mainboard (III, RVA23-compliant)
+  for Framework 13 to test on. Blocker is GPU & CPU perf — the lighter `uikit`
+  (egui) family helps unblock the UI side; the heavy GPU work (unendlich, and
+  logscope's AI-GEMM backend) will still hit RISC-V hard.
+- **LOC north-star:** ~600K now; kits/FFI should trend it **down** (dedup) — a
+  maintainability goal, not size for its own sake.
+- **`.spv` shaders:** `*.spv` gitignore catch-all added. Committed
+  `assets/shaders/*.spv` are fine; the issue is **runtime-generated** shaders
+  landing in `$CWD` — they should write to a managed location
+  (`$XDG_CACHE_HOME/unendlich`, i.e. `~/.cache/unendlich`) for now, with an
+  installer-managed path later. Build/test scripts should also run from a scratch
+  PWD. (unendlich code change — do when we touch unendlich.)
+- **Per-project ↔ monorepo sync (decision):** make the **monorepo the source of
+  truth** going forward; pull any standalone fixes in *once* via **`git subtree`**
+  (or `josh` for ongoing bidirectional). gitmind's `graft` is for *experiments*,
+  not the canonical sync. So the stale unendlich (`PROBLEMS(5)`) gets one subtree
+  merge from its standalone repo, then lives here. (See report for the long form.)
+- **Parallel work (if a 2nd chat opens):** give it a disjoint lane on its own
+  branch — e.g. this chat = the registry-kit→…→oxidation sequence; the other =
+  a uikit/egui UX spike *or* DHT-rustify + snapclone⨯unendlich crossover. Use
+  separate branches (gitmind `graft`/native-branch or git) to avoid collisions.
 
 ---
 

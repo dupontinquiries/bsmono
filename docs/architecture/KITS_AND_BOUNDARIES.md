@@ -13,7 +13,7 @@ Seams where two sides change independently (the only places that can "drift").
 | boundary | where | mechanism | verdict |
 |---|---|---|---|
 | Rust ↔ C++ DataBus | **snapclone** (21 cdylib/staticlib crates, 30 `#[no_mangle]`) | hand-written C ABI | **OXIDIZE** — the whole C++ burden lives here |
-| Rust ↔ Qt | voiceterm, gitmind-gui | qmetaobject cdylib (macro-generated) | **KEEP** — thin; standardize as a kit |
+| Rust ↔ Qt | voiceterm, gitmind-gui, snapclone (C++ Qt) | qmetaobject cdylib | **KEEP now → migrate to a shared egui `uikit`** (G2) |
 | C++ gui ↔ Rust daemon | photosync | C++ UI over a Rust core | oxidize-candidate (small C++) |
 | Rust ↔ Vulkan | unendlich | GLSL → SPIR-V (`.spv`) | KEEP — not FFI; fix the `.spv` build (compile-on-build) |
 
@@ -32,6 +32,8 @@ Pure-Rust reusable pieces worth lifting to a top-level `shared/` (or `kits/`).
 | **net-sim** | snapclone net-intel/diag + bo-suite `network_sim` | shared CI network-simulation harness | cf. scratchpad E1 |
 | **snapcore-protocol** (future) | ops-doc | the DHT wire/protocol crate | the shared lib that lets snapclone + unendlich share the DHT |
 | experimentkit / gesturekit | bot-arena | already kit-shaped | lift / standardize |
+| **uikit** (egui) | fresh; carries snapclone's swipe-gesture UX | one egui UI layer across all apps, replacing Qt | think fresh on Qt→egui (don't pattern-mine the old GTK→egui logscope port); lighter than Qt → also helps RISC-V viability |
+| render-kit (?) | unendlich ⨯ logscope overlap | shared GPU/render pieces | investigate the overlap before extracting |
 
 `gitmind-core` isn't cross-app, but it's the **pattern exemplar**: one core, thin
 CLI/GUI frontends that "can't drift". Apply that shape when kit-ifying.
@@ -71,6 +73,11 @@ This is where the build shape changes (the user's intuition was right):
 2. **Reconcile peek-view** (the deferred dedup) into `shared/`.
 3. **Decompose the DHT → `snapcore`** + define unendlich's `dht` feature — this
    is where build shape changes most (integrated vs lean).
-4. **Begin snapclone C++→Rust oxidation**, leaf-first, shrinking the FFI.
+4. **Begin snapclone C++→Rust oxidation**, leaf-first, shrinking the FFI. As you
+   port the UI, carry its swipe-gesture UX into the egui `uikit` (cpp&qt →
+   rust&egui), rather than porting Qt 1:1.
+
+The egui **uikit** (G2) is a parallel track to this sequence, not a blocker —
+it can start whenever, and snapclone is its first real consumer.
 
 Each lands as its own change, built/tested on hardware (Qt, cross, GPU).

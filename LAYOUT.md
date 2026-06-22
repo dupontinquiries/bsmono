@@ -12,6 +12,7 @@ Projects are grouped by their primary role, not by language:
   identity / relay, the canonical Rust↔C++ FFI) and `photosync`.
 - **tools/** — the dev-loop and the three verification *suspenders*
   (`peek`, `drift`, `rustcheck`).
+- **shared/** — kit layer: reusable crates lifted out of apps (registry-kit, …).
 - **vendor/** — vendored third-party. Currently only `opendht`, refreshed to
   current upstream (replaces the stale copy that was embedded in snapclone).
 

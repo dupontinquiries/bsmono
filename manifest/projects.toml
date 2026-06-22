@@ -144,3 +144,13 @@ flatpak = false
 runtime = "none"
 targets = ["desktop", "phone", "alpine"]
 notes = "current upstream; consumed by snapclone"
+
+[shared.registry-kit]
+path = "shared/registry-kit"
+kind = "cargo"
+role = "shared-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "x86"]   # pure Rust → cross-clean
+notes = "link-time registry kit (linkme distributed slices); generalizes unendlich's service_registry; FIRST crate in shared/"

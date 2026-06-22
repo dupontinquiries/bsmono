@@ -1,0 +1,9 @@
+[package]
+name = "registry-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Link-time registries via linkme distributed slices — register entries from anywhere with no central list. Generalizes unendlich's service_registry autoloader."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+linkme = "0.3"
