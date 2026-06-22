@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:swamp",
+  "_comment": "Wet, low-lying biome. Maps to legacy Biome::Swamp.",
+  "surface_block": "moss",
+  "subsurface_block": "clay",
+  "_legacy_enum": "Swamp",
+  "has_precipitation": true,
+  "temperature": 0.8,
+  "downfall": 0.9,
+  "effects": {
+    "sky_color": 7907327,
+    "fog_color": 12638463,
+    "grass_color": 6975545,
+    "foliage_color": 6975545,
+    "ambient_light": 0.2
+  }
+}

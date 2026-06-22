@@ -1,0 +1,31 @@
+[package]
+name = "bo-mux"
+version = "0.1.0"
+edition = "2021"
+description = "Distributed multi-speaker channel mux, soundscape engine & control daemon for B&O + heterogeneous LAN devices"
+
+[lib]
+name = "bo_mux"
+path = "src/lib.rs"
+
+# The headless daemon. Run via systemd socket activation or standalone.
+[[bin]]
+name = "bo-muxd"
+path = "src/bin/bo-muxd.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Minimal signal handling for the daemon's graceful shutdown path
+# (restore the user's default PulseAudio sink on SIGTERM/SIGINT,
+# avoiding the "audio routing stays sticky after I closed the app"
+# UX failure). signal-hook-registry has no transitive deps and
+# implements only the async-signal-safe primitives we need.
+signal-hook-registry = "1.4"
+
+# For the integrated app, the mesh layer reuses the app's existing mdns-sd
+# daemon. As a standalone crate you'd add:
+#   mdns-sd = "0.11"          # discovery
+# and for the mux serving sketch:
+#   tiny_http = "0.12"        # per-channel HTTP
+#   symphonia = "0.5"         # source decode (or reuse bliss-audio's)

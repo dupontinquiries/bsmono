@@ -1,0 +1,36 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Beo Grace earbud (singular, viewed from the wearer-facing side).
+       Two parts:
+         • EARPIECE — the rounded teardrop that sits in the ear cup
+         • STEM — the short antenna/microphone arm extending downward
+       The two pieces meet at a soft notch, the way a real bud looks
+       when you turn it edge-on. -->
+
+  <!-- EARPIECE — a slightly tilted teardrop. The top is fatter
+       (driver chamber); the bottom narrows where it meets the stem. -->
+  <path d="M 20 14
+           Q 38 12 42 26
+           Q 44 36 36 40
+           Q 26 42 20 36
+           Q 15 28 20 14 Z"/>
+
+  <!-- DRIVER PORT — small circle inside the earpiece for the speaker
+       grille; marks the audio output. -->
+  <circle cx="29" cy="26" r="3.5" stroke-width="1.6" opacity="0.85"/>
+
+  <!-- STEM — short downward arm. A long thin pill shape with a
+       slightly bulbous tip where the microphone sits. -->
+  <path d="M 33 40
+           L 35 50
+           Q 36 55 32 55
+           Q 28 55 29 50
+           L 31 40 Z"/>
+
+  <!-- STEM MICROPHONE DOT — at the bottom of the stem. -->
+  <circle cx="32" cy="52" r="1.0" fill="currentColor" stroke="none"/>
+
+  <!-- TOUCH SURFACE — a faint ring around the upper part of the
+       earpiece, suggesting the capacitive area. -->
+  <path d="M 22 18 Q 32 14 40 20" stroke-width="0.9" opacity="0.55"/>
+</svg>

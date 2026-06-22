@@ -1,0 +1,17 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:jungle",
+  "_comment": "Hot wet rainforest. New addition; no legacy enum mapping (returns Forest).",
+  "surface_block": "grass",
+  "subsurface_block": "dirt",
+  "has_precipitation": true,
+  "temperature": 0.95,
+  "downfall": 0.9,
+  "effects": {
+    "sky_color": 7842047,
+    "fog_color": 12638463,
+    "grass_color": 5877296,
+    "foliage_color": 2900485,
+    "ambient_light": 0.2
+  }
+}

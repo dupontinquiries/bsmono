@@ -1,0 +1,591 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>unendlich · telemetry</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root{
+    --bg:#0a0c10; --panel:#10141b; --panel-2:#161b24; --line:#222a36;
+    --ink:#cdd6e3; --dim:#7b8798; --faint:#4b5563;
+    --amber:#f7a23b; --amber-soft:#ffce8a; --cyan:#57d6c9; --green:#8fd694;
+    --red:#ff6363; --violet:#9a8cff;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:
+      radial-gradient(1200px 600px at 80% -10%, #14202c 0%, transparent 60%),
+      radial-gradient(900px 500px at -10% 110%, #1a1410 0%, transparent 55%), var(--bg);
+    color:var(--ink); font-family:var(--mono); font-size:13px; line-height:1.45; -webkit-font-smoothing:antialiased;}
+  body::before{content:""; position:fixed; inset:0; pointer-events:none; z-index:9;
+    background:repeating-linear-gradient(0deg,rgba(255,255,255,.012) 0 1px,transparent 1px 3px); mix-blend-mode:overlay;}
+  .wrap{display:grid; grid-template-columns:340px 1fr; min-height:100vh}
+  aside{border-right:1px solid var(--line); background:linear-gradient(180deg,var(--panel) 0%,#0c0f15 100%); padding:18px 16px; display:flex; flex-direction:column; gap:14px}
+  .brand{display:flex; align-items:baseline; gap:8px; letter-spacing:.18em}
+  .brand b{font-size:15px; color:var(--amber); text-transform:uppercase; font-weight:700}
+  .brand span{font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:.28em}
+  .brand .dot{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);align-self:center;animation:pulse 2.4s infinite}
+  @keyframes pulse{0%,100%{opacity:.5}50%{opacity:1}}
+  .drop{border:1px dashed var(--line); border-radius:9px; background:var(--panel-2); padding:12px; text-align:center; color:var(--dim); cursor:pointer; transition:.15s; font-size:11px}
+  .drop:hover,.drop.hot{border-color:var(--amber); color:var(--amber-soft); background:#1a1206}
+  .drop.ok{border-color:var(--green); color:var(--green)}
+  .drop b{display:block; color:var(--ink); font-size:12px; letter-spacing:.06em; margin-bottom:3px}
+  .seclabel{font-size:9.5px; letter-spacing:.26em; text-transform:uppercase; color:var(--faint); margin:2px 0}
+  .ctl{display:flex; gap:6px; flex-wrap:wrap}
+  .ctl label{font-size:9px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); align-self:center}
+  select,.seg{background:#0b0e13; border:1px solid var(--line); color:var(--ink); font-family:var(--mono); font-size:10.5px; border-radius:6px; padding:5px 7px}
+  select:focus{outline:none;border-color:var(--cyan)}
+  .seg{display:inline-flex; padding:2px; gap:2px}
+  .seg button{background:transparent;border:none;color:var(--dim);font-family:var(--mono);font-size:10px;padding:4px 8px;border-radius:4px;cursor:pointer}
+  .seg button.on{background:var(--cyan);color:#06110f;font-weight:700}
+  .runlist{display:flex; flex-direction:column; gap:5px; overflow:auto; max-height:44vh; padding-right:2px}
+  .runitem{border:1px solid var(--line); border-radius:8px; padding:8px 10px; cursor:pointer; background:var(--panel-2); transition:.12s}
+  .runitem.on{border-color:var(--amber); box-shadow:inset 3px 0 0 var(--amber); background:#15110a}
+  .runitem .rt{display:flex; justify-content:space-between; align-items:center; gap:6px}
+  .runitem .idx{color:var(--amber); font-weight:700}
+  .runitem .ts{font-size:9.5px; color:var(--dim)}
+  .runitem .ov{font-size:10px; color:var(--cyan); margin-top:3px; word-break:break-all}
+  .runitem .ov.def{color:var(--faint)}
+  .runitem .tot{font-size:10px; color:var(--dim); margin-top:2px; display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+  .pill{font-size:9px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--dim)}
+  .pill.rd{border-color:#3a4658;color:var(--amber-soft)} .pill.mesh{border-color:var(--cyan);color:var(--cyan)}
+  .ev-dot{color:var(--green)} .crash{color:var(--red)}
+  .hint{font-size:10px; color:var(--faint); line-height:1.6}
+  main{padding:20px 26px 60px; overflow:auto}
+  .topbar{display:flex; justify-content:space-between; align-items:center; gap:18px; margin-bottom:18px; flex-wrap:wrap}
+  .topbar h1{margin:0; font-size:13px; letter-spacing:.24em; text-transform:uppercase; color:var(--dim); font-weight:600}
+  .topbar h1 em{color:var(--amber); font-style:normal}
+  .tbgroup{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+  .btn{font-family:var(--mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; background:var(--amber); color:#1a1206; border:none; padding:9px 15px; border-radius:7px; cursor:pointer; font-weight:700; transition:.15s}
+  .btn:hover{filter:brightness(1.12); transform:translateY(-1px)}
+  .btn.ghost{background:transparent; color:var(--dim); border:1px solid var(--line)}
+  .btn.ghost:hover{color:var(--amber-soft); border-color:var(--amber)}
+  .refresh{display:flex; align-items:center; gap:2px; border:1px solid var(--line); border-radius:7px; padding:3px; background:var(--panel-2)}
+  .refresh .lbl{font-size:9px; letter-spacing:.16em; text-transform:uppercase; color:var(--faint); padding:0 6px 0 5px}
+  .refresh button{font-family:var(--mono); font-size:10.5px; background:transparent; border:none; color:var(--dim); padding:5px 8px; border-radius:5px; cursor:pointer}
+  .refresh button.on{background:var(--green); color:#0a0c10; font-weight:700}
+  .refresh button:hover:not(.on){color:var(--green)}
+  .refresh .ms{font-size:9.5px; color:var(--green); padding:0 7px}
+  .empty{display:flex; flex-direction:column; align-items:center; justify-content:center; height:60vh; color:var(--faint); gap:14px; text-align:center}
+  .empty .big{font-size:48px; letter-spacing:.1em; color:#1c2533}
+  .panel{background:linear-gradient(180deg,var(--panel) 0%,#0c1016 100%); border:1px solid var(--line); border-radius:12px; padding:16px 18px; margin-bottom:16px}
+  .panel > h2{margin:0 0 14px; font-size:10.5px; letter-spacing:.24em; text-transform:uppercase; color:var(--dim); display:flex; align-items:center; gap:9px}
+  .panel > h2 .lead::before{content:""; display:inline-block; width:5px; height:14px; background:var(--amber); border-radius:1px; box-shadow:0 0 9px var(--amber); vertical-align:-2px; margin-right:9px}
+  .panel.cpu > h2 .lead::before{background:var(--cyan); box-shadow:0 0 9px var(--cyan)}
+  .panel.mesh > h2 .lead::before{background:var(--violet); box-shadow:0 0 9px var(--violet)}
+  .panel.wl > h2 .lead::before{background:var(--green); box-shadow:0 0 9px var(--green)}
+  .cp{margin-left:auto; background:transparent; border:1px solid var(--line); color:var(--dim); border-radius:5px; font-family:var(--mono); font-size:9.5px; letter-spacing:.06em; padding:3px 8px; cursor:pointer}
+  .cp:hover{border-color:var(--amber); color:var(--amber-soft)}
+  .runhead{display:flex; flex-wrap:wrap; gap:8px 18px; align-items:baseline}
+  .runhead .v{color:var(--amber); font-weight:700; font-size:14px}
+  .runhead .meta{font-size:11px; color:var(--dim)} .runhead .meta b{color:var(--ink)}
+  .crashbadge{font-size:10px; padding:3px 9px; border-radius:20px; background:#2a1010; border:1px solid var(--red); color:var(--red)}
+  .okbadge{font-size:10px; padding:3px 9px; border-radius:20px; background:#0e1f10; border:1px solid var(--green); color:var(--green)}
+  .row{display:grid; grid-template-columns:96px 1fr 200px; align-items:center; gap:12px; padding:5px 0}
+  .row .name{color:var(--ink); font-size:12px} .row .name small{color:var(--faint); font-size:9px; display:block}
+  .track{position:relative; height:22px; background:#0b0e13; border:1px solid var(--line); border-radius:5px; overflow:hidden}
+  .fill{position:absolute; top:0; bottom:0; left:0; background:linear-gradient(90deg,var(--amber),var(--amber-soft)); opacity:.85}
+  .fill.cyan{background:linear-gradient(90deg,#2c8f87,var(--cyan))}
+  .fill.violet{background:linear-gradient(90deg,#5a4fbf,var(--violet))}
+  .fill.green{background:linear-gradient(90deg,#4f9a57,var(--green))}
+  .fill.over{background:linear-gradient(90deg,#b03434,var(--red))!important}
+  .whisker{position:absolute; top:-2px; bottom:-2px; width:2px; background:#fff; opacity:.85}
+  .maxmark{position:absolute; top:3px; bottom:3px; width:2px; background:var(--red); opacity:.6}
+  .budget{position:absolute; top:-3px; bottom:-3px; width:0; border-left:1px dashed var(--faint)}
+  .budget::after{content:attr(data-l); position:absolute; top:-13px; left:2px; font-size:8px; color:var(--faint); white-space:nowrap}
+  .optimal{position:absolute; top:-3px; bottom:-3px; width:0; border-left:1px dashed var(--green)}
+  .read{font-size:11px; color:var(--dim); text-align:right; font-variant-numeric:tabular-nums}
+  .read b{color:var(--ink)} .read .p99{color:var(--amber-soft)} .read .mx{color:var(--red)} .read .warn{color:var(--red); font-weight:700}
+  .badges{display:flex; flex-wrap:wrap; gap:6px}
+  .badge{font-size:10px; padding:3px 8px; border-radius:20px; border:1px solid var(--line); color:var(--dim); white-space:nowrap}
+  .badge.ov{border-color:var(--cyan); color:var(--cyan); background:#0c1a1a}
+  .ach{display:grid; grid-template-columns:repeat(auto-fill,minmax(166px,1fr)); gap:9px}
+  .achi{border:1px solid var(--line); border-radius:8px; padding:9px 11px; background:#0b0e13; display:flex; gap:9px; align-items:center; min-height:48px; opacity:.32; transition:.15s}
+  .achi.got{opacity:1; border-color:var(--green); background:#0c1610}
+  .achi.bad.got{border-color:var(--red); background:#190d0d}
+  .achi .ic{font-size:16px; filter:grayscale(1); flex:0 0 auto} .achi.got .ic{filter:none}
+  .achi .tx{font-size:10.5px; line-height:1.3}
+  .achi .tx b{color:var(--ink); display:block} .achi.got .tx b{color:var(--green)} .achi.bad.got .tx b{color:var(--red)}
+  .achi .tx span{color:var(--faint)}
+  .ev-types{display:flex; flex-wrap:wrap; gap:7px}
+  .ev{font-size:11px; padding:4px 9px; border-radius:6px; background:#0b0e13; border:1px solid var(--line)}
+  .ev b{color:var(--amber)} .ev.spike b{color:var(--red)}
+  .curve{width:100%; height:180px; display:block}
+  .curve .grid{stroke:var(--line); stroke-width:1}
+  .curve .budget{stroke:var(--faint); stroke-dasharray:4 4; stroke-width:1}
+  .curve .optimal-line{stroke:var(--green); stroke-dasharray:5 4; stroke-width:1.2}
+  .curve .fps-mark{stroke:var(--faint); stroke-dasharray:2 5; stroke-width:.8; opacity:.55}
+  .curve .fps-lbl{fill:var(--faint); opacity:.75; font-size:8px; text-anchor:end}
+  .curve .axis{fill:var(--faint); font-size:9px}
+  .legend{display:flex; gap:16px; font-size:10px; color:var(--dim); margin-top:6px; flex-wrap:wrap}
+  .legend i{display:inline-block;width:14px;height:3px;vertical-align:middle;margin-right:5px;border-radius:2px}
+  /* compare scatter */
+  .scatter{width:100%; height:420px; display:block}
+  .scatter .grid{stroke:var(--line); stroke-width:1} .scatter .gridf{stroke:#161c26; stroke-width:1}
+  .scatter .axis{fill:var(--dim); font-size:10px} .scatter .axt{fill:var(--faint); font-size:11px; letter-spacing:.1em}
+  .scatter .conn{fill:none; stroke-width:1.4; opacity:.4}
+  .scatter circle{cursor:pointer} .scatter circle:hover{stroke:#fff;stroke-width:1.5}
+  /* sticky compare header */
+  .cmpsticky{position:sticky; top:0; z-index:8; background:#0b0e13; border:1px solid var(--line); border-radius:10px; padding:11px 14px; margin-bottom:14px; box-shadow:0 10px 20px -8px #06080c}
+  .cmpsticky .runs{display:flex; gap:10px; align-items:center; margin-bottom:9px; flex-wrap:wrap}
+  .cmpsticky .rn{font-size:12px; font-weight:700} .cmpsticky .rn.a{color:var(--amber)} .cmpsticky .rn.b{color:var(--cyan)}
+  .cmpsticky .vs{color:var(--faint); font-size:10px}
+  .cmpsticky .ctx{color:var(--faint); font-size:10px; margin-left:6px}
+  .flagdiff{display:flex; flex-wrap:wrap; gap:6px}
+  .fd{font-size:10px; border:1px solid var(--line); border-radius:6px; padding:3px 8px; display:flex; gap:6px; align-items:center; background:#0c1016}
+  .fd .k{color:var(--dim)} .fd .a{color:var(--amber-soft)} .fd .b{color:var(--cyan)} .fd .sep{color:var(--faint)}
+  .fd.same{opacity:.55} .fd.diff{border-color:#3a4658}
+  /* radar / multi-dim web */
+  .radar{width:100%; max-width:580px; height:430px; display:block; margin:0 auto}
+  .radar .ring{fill:none; stroke:#1a212c; stroke-width:1}
+  .radar .spoke{stroke:#1a212c; stroke-width:1}
+  .radar .lab{fill:var(--dim); font-size:10px}
+  .radar .polyA{fill:var(--amber); fill-opacity:.12; stroke:var(--amber); stroke-width:2; stroke-linejoin:round}
+  .radar .polyB{fill:var(--cyan); fill-opacity:.12; stroke:var(--cyan); stroke-width:2; stroke-linejoin:round}
+  .radar circle.pA{fill:var(--amber)} .radar circle.pB{fill:var(--cyan)}
+  .toast{position:fixed; bottom:22px; left:50%; transform:translateX(-50%) translateY(20px); background:var(--amber); color:#1a1206; padding:10px 18px; border-radius:8px; font-weight:700; font-size:11px; letter-spacing:.08em; opacity:0; transition:.25s; z-index:20}
+  .toast.show{opacity:1; transform:translateX(-50%) translateY(0)}
+  ::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#1c2430;border-radius:5px}::-webkit-scrollbar-track{background:transparent}
+</style>
+
+<div class="wrap">
+  <aside>
+    <div class="brand"><span class="dot"></span><b>unendlich</b><span>telemetry</span></div>
+    <div><div class="seclabel">run_summaries.txt</div><div class="drop" id="dropRuns"><b>drop or click</b>framed run blocks</div></div>
+    <div><div class="seclabel">events.jsonl</div><div class="drop" id="dropEvents"><b>drop or click</b>{uuid, ts_ms, kind, …}</div></div>
+    <div style="display:flex;gap:8px"><button class="btn ghost" id="loadDemo" style="flex:1">Load sample</button><button class="btn ghost" id="clearBtn">Clear</button></div>
+    <div class="ctl">
+      <label>sort</label>
+      <select id="sortSel"><option value="time">newest first</option><option value="rd">render distance</option><option value="gpu">GPU total ms</option><option value="dur">duration</option></select>
+      <label>mesher</label>
+      <span class="seg" id="meshFilter"><button data-v="all" class="on">all</button><button data-v="on">on</button><button data-v="off">off</button></span>
+    </div>
+    <div class="seclabel">runs — click to select / 2 to diff</div>
+    <div class="runlist" id="runList"></div>
+    <div class="hint" id="hint">Drop <b>run_summaries.txt</b> + (optional) <b>events.jsonl</b> — correlated by uuid. Green dashed line = your monitor's frame budget. Each panel's <b>⧉</b> copies just that section. Switch to <b>Compare</b> for render-distance ↔ performance.</div>
+  </aside>
+  <main>
+    <div class="topbar">
+      <div class="tbgroup">
+        <h1 style="margin-right:6px">session <em>profiler</em></h1>
+        <span class="seg" id="viewToggle"><button data-v="inspect" class="on">Inspect</button><button data-v="compare">Compare</button></span>
+      </div>
+      <div class="tbgroup">
+        <div class="refresh" id="refresh"><span class="lbl">refresh</span>
+          <button data-hz="30">30</button><button data-hz="60" class="on">60</button><button data-hz="120">120</button><button data-hz="144">144</button><button data-hz="165">165</button><button data-hz="240">240</button><button data-hz="360">360</button><button data-hz="500">500</button>
+          <span class="ms" id="refreshMs">16.7ms</span></div>
+        <button class="btn" id="copyBtn">⧉ Copy digest</button>
+      </div>
+    </div>
+    <div id="view"></div>
+  </main>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+//═══════════════ PARSERS (node-validated; unchanged across versions) ═══════════════
+const METRIC=/^\s*([a-z_]+)\s+n=\s*(\d+)\s+mean=\s*([\d.]+)ms±?\s*([\d.]+)?\s+p50=\s*([\d.]+)\s+p90=\s*([\d.]+)\s+p99=\s*([\d.]+)\s+min=\s*([\d.]+)\s+max=\s*([\d.]+)\s*(?:over_([\d.]+)ms=\s*(\d+)\s*\(([\d.]+)%\))?\s*$/;
+const WORKLOAD=/^\s*(loaded|rendering)\s+n=\s*(\d+)\s+min=\s*(\d+)\s+p50=\s*(\d+)\s+p90=\s*(\d+)\s+max=\s*(\d+)\s*$/;
+const FLAG=/^\s*((?:UNENDLICH_[A-Z_]+)|RUST_LOG)\s*=\s*(.+?)\s*$/;
+const GPU=new Set(["cull","froxel","main","shadow","total"]),CPU=new Set(["wait_fences","acquire","record","submit","present"]),MESH=new Set(["near","mid","far","vfar"]);
+const secOf=n=>GPU.has(n)?"gpu":CPU.has(n)?"cpu":MESH.has(n)?"mesher":null;
+const blank=()=>({run_id:null,ts:null,version:null,duration:null,cmdline:null,gpu:{},cpu:{},mesher:{},workload:{},flags:{},overrides:[],skipped:null});
+function applyMetric(r,line){
+  const mm=METRIC.exec(line);
+  if(mm){const name=mm[1],s=secOf(name); if(!s)return true;
+    r[s][name]={n:+mm[2],mean:+mm[3],p50:+mm[5],p90:+mm[6],p99:+mm[7],min:+mm[8],max:+mm[9],over_ms:mm[10]?+mm[10]:null,over_n:mm[11]?+mm[11]:null,over_pct:mm[12]?+mm[12]:null}; return true;}
+  if(line.includes("(no chunks meshed)")){const nm=line.trim().split(/\s+/)[0]; if(MESH.has(nm)&&!r.mesher[nm])r.mesher[nm]={empty:true}; return true;}
+  if(line.includes("skipped frames")){const sk=/skipped frames:\s*(\d+)/.exec(line); if(sk)r.skipped=+sk[1]; return true;}
+  const wm=WORKLOAD.exec(line); if(wm){r.workload[wm[1]]={min:+wm[3],p50:+wm[4],p90:+wm[5],max:+wm[6]}; return true;}
+  return false;
+}
+function parseFramed(text){
+  const runs=[]; let r=null;
+  for(const line of text.split(/\r?\n/)){
+    if(line.startsWith("==== VERSION ")) continue;
+    if(/^====.*RUN START/.test(line)){r=blank(); r.ts=(/RUN START (\S+)/.exec(line)||[])[1]||null; runs.push(r); continue;}
+    if(/^====.*RUN END/.test(line)){r=null; continue;}
+    if(!r) continue;
+    let m;
+    if((m=/^version:\s*(.+)$/.exec(line))){r.version=m[1].trim(); continue;}
+    if((m=/^uuid:\s*(.+)$/.exec(line))){r.run_id=m[1].trim(); continue;}
+    if((m=/^duration:\s*([\d.]+)s/.exec(line))){r.duration=+m[1]; continue;}
+    if((m=/^cmdline:\s*(.+)$/.exec(line))){r.cmdline=m[1].trim(); continue;}
+    if(/^env:\s*$/.test(line)||/^---- summaries ----/.test(line)) continue;
+    const fm=FLAG.exec(line);
+    if(fm){const name=fm[1],val=fm[2]; r.flags[name]=val; if(!val.startsWith("(default:"))r.overrides.push(name.replace("UNENDLICH_","")+"="+val); continue;}
+    applyMetric(r,line);
+  }
+  return runs;
+}
+function parseConsole(text){
+  const LP=/^\[([0-9T:\-Z]+)\s+\w+\s+(r-[0-9a-f]+)\s+unendlich_world\]\s*(.*)$/;
+  const runs=[]; let cur=null,curTs=null,curId=null;
+  const fresh=()=>{cur=blank(); cur.run_id=curId; cur.ts=curTs; runs.push(cur); return cur;};
+  for(const line of text.split(/\r?\n/)){
+    const m=LP.exec(line);
+    if(m){curTs=m[1]; const rid=m[2],msg=m[3];
+      if(/Appended run summary/.test(msg)){cur=null;curId=null;curTs=null;continue;}
+      if(cur&&cur.run_id&&cur.run_id!==rid) cur=null;
+      curId=rid; if(cur&&!cur.run_id){cur.run_id=rid;cur.ts=curTs;} continue;}
+    const mm=METRIC.exec(line);
+    if(mm){const s=secOf(mm[1]); if(!s)continue; if(!cur||cur[s][mm[1]])fresh();}
+    if(!cur){ if(WORKLOAD.test(line))fresh(); else continue; }
+    const fm=FLAG.exec(line);
+    if(fm){const name=fm[1],val=fm[2];cur.flags[name]=val; if(!val.startsWith("(default:"))cur.overrides.push(name.replace("UNENDLICH_","")+"="+val); continue;}
+    applyMetric(cur,line);
+  }
+  return runs.filter(r=>Object.keys(r.gpu).length||Object.keys(r.cpu).length||Object.keys(r.mesher).length||Object.keys(r.workload).length);
+}
+function parseRuns(text){
+  const runs=/====.*RUN START/.test(text)? parseFramed(text) : parseConsole(text);
+  runs.forEach((r,i)=>{ r.label="Run "+(i+1); r._idx=i;
+    r.rd=+(((r.flags["UNENDLICH_RENDER_DISTANCE"]||"").match(/\d+/)||[6])[0]);
+    r.gpuMesher = r.overrides.some(o=>/GPU_MESHER=1/.test(o)) || /UNENDLICH_GPU_MESHER\s*=\s*1/.test(r.flags["UNENDLICH_GPU_MESHER"]||"");
+  });
+  return runs;
+}
+function parseEvents(text){
+  const evs=[];
+  for(const ln of text.split(/\r?\n/)){const t=ln.trim(); if(!t)continue; try{const o=JSON.parse(t); if(o&&typeof o==="object")evs.push(o);}catch(e){}}
+  if(!evs.length) return null;
+  const byRun={};
+  for(const e of evs){const u=e.uuid||"(no-uuid)";
+    const R=byRun[u]||(byRun[u]={uuid:u,kinds:{},flags:[],frames:[],spikes:[],start:null,shutdown:null});
+    R.kinds[e.kind]=(R.kinds[e.kind]||0)+1;
+    if(e.kind==="start")R.start=e;
+    else if(e.kind==="shutdown")R.shutdown=e;
+    else if(e.kind==="flag"){if(e.source&&e.source!=="default")R.flags.push((e.name||"").replace("UNENDLICH_","")+"="+e.value);}
+    else if(e.kind==="frame_window")R.frames.push({t:+e.ts_ms||0,p50:+e.frame_p50_ms,rendering:+e.rendering,loaded:+e.loaded});
+    else if(/spike/.test(e.kind||""))R.spikes.push({t:+e.ts_ms||0,kind:e.kind,ms:e.wait_ms??e.gpu_ms??e.ms??null});
+  }
+  return {count:evs.length, runs:byRun};
+}
+//═══════════════ ACHIEVEMENTS ═══════════════
+function achievements(r,ev){
+  return [
+    {id:"complete", ic:"🏁", t:"Clean exit", d:"shutdown recorded", got: ev? !!ev.shutdown : (r.skipped!=null)},
+    {id:"crash", ic:"💥", t:"Crash / no exit", d:"no shutdown event", got: ev? !ev.shutdown : false, bad:true},
+    {id:"gpumesh", ic:"⚡", t:"GPU mesher", d:"GPU_MESHER=1", got: r.gpuMesher},
+    {id:"rd8", ic:"🛰️", t:"High render distance", d:"RD ≥ 8", got: r.rd>=8},
+    {id:"heavy", ic:"🏔️", t:"Heavy workload", d:"loaded_max ≥ 300", got: !!(r.workload.loaded&&r.workload.loaded.max>=300)},
+    {id:"long", ic:"⏱️", t:"Sustained session", d:"duration ≥ 120s", got: (r.duration||0)>=120 || !!(ev&&ev.shutdown&&(+ev.shutdown.duration_secs||0)>=120)},
+    {id:"waitspike", ic:"🧊", t:"Wait-fence spikes", d:"wait_fences_spike", got: ev? ev.spikes.some(s=>/wait/.test(s.kind)) : false, bad:true},
+    {id:"gpuspike", ic:"📈", t:"GPU spikes", d:"gpu_spike", got: ev? ev.spikes.some(s=>/gpu/.test(s.kind)) : false, bad:true},
+    {id:"overbudget", ic:"🚨", t:"Over frame budget", d:"a stage p99 > 8.3ms", got: !!((r.gpu.total&&r.gpu.total.p99>8.3)||(r.gpu.shadow&&r.gpu.shadow.p99>8.3)), bad:true},
+  ];
+}
+//═══════════════ STATE ═══════════════
+let RUNS=[], EVENTS=null, SEL=[], REFRESH_HZ=60, VIEW="inspect", SORT="time", MESH_FILTER="all", CMP_METRIC="gpu.total.mean";
+const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
+const fmt=(v,d=2)=>v==null||isNaN(v)?"–":(+v).toFixed(d);
+const frameBudget=()=>1000/REFRESH_HZ;
+const evFor=r=> (EVENTS&&r.run_id&&EVENTS.runs[r.run_id])||null;
+const runByIdx=i=>RUNS.find(r=>r._idx===i);
+function visibleRuns(){
+  let v=RUNS.slice();
+  if(MESH_FILTER==="on") v=v.filter(r=>r.gpuMesher);
+  else if(MESH_FILTER==="off") v=v.filter(r=>!r.gpuMesher);
+  const g=r=>r.gpu.total?r.gpu.total.mean:1e9;
+  if(SORT==="rd") v.sort((a,b)=>b.rd-a.rd||g(a)-g(b));
+  else if(SORT==="gpu") v.sort((a,b)=>g(a)-g(b));
+  else if(SORT==="dur") v.sort((a,b)=>(b.duration||0)-(a.duration||0));
+  else v.reverse(); // newest first (parse order = chronological append)
+  return v;
+}
+//═══════════════ SECTION TEXT (for per-panel copy + digest) ═══════════════
+function mline(m){if(!m)return"–";let s=`mean ${fmt(m.mean)} p99 ${fmt(m.p99)} max ${fmt(m.max)}`;if(m.over_n)s+=` [${m.over_n}×>${m.over_ms}ms]`;return s;}
+function secHead(r,ev){return `${r.label} ${r.version||""} RD=${r.rd} mesher=${r.gpuMesher?"on":"off"} ${r.duration?fmt(r.duration,0)+"s ":""}uuid=${r.run_id||"?"}`+(ev?`  exit=${ev.shutdown?ev.shutdown.reason:"NO SHUTDOWN(crash?)"}`:"");}
+const SEC={
+  gpu:r=>{if(!r.gpu.total&&!Object.keys(r.gpu).length)return[]; const L=[];
+    if(r.gpu.total)L.push(`GPU total ${mline(r.gpu.total)}`);
+    const sub=["cull","froxel","main","shadow"].filter(k=>r.gpu[k]).map(k=>`${k} ${fmt(r.gpu[k].mean)}/${fmt(r.gpu[k].p99)}`).join(" "); if(sub)L.push(`    ${sub}`); return L;},
+  cpu:r=>{const c=["wait_fences","acquire","record","submit","present"].filter(k=>r.cpu[k]).map(k=>`${k} ${fmt(r.cpu[k].mean)}/${fmt(r.cpu[k].p99)}${r.cpu[k].over_pct===100?"(100%>"+r.cpu[k].over_ms+")":""}`).join(" "); return c?[`CPU ${c}`]:[];},
+  mesher:r=>{const m=["near","mid","far","vfar"].map(k=>{const x=r.mesher[k];if(!x)return null;return x.empty?`${k} idle`:`${k} ${mline(x)} n=${x.n}`;}).filter(Boolean).join("; "); return m?[`MESH ${m}`]:[];},
+  workload:r=>{const w=Object.entries(r.workload).map(([k,x])=>`${k} p50 ${x.p50}/max ${x.max}`).join("; "); return w?[`WORKLOAD ${w}`+(r.skipped!=null?`  (skipped ${r.skipped})`:"")]:[];},
+  frame:(r,ev)=>{if(!ev||!ev.frames.length)return[]; const ps=ev.frames.map(f=>f.p50).filter(x=>!isNaN(x)); return ps.length?[`FRAME p50/window: min ${fmt(Math.min(...ps))} max ${fmt(Math.max(...ps))} over ${ev.frames.length} windows (budget ${fmt(frameBudget(),1)}ms @ ${REFRESH_HZ}Hz; ${ps.filter(x=>x>frameBudget()).length} windows over)`]:[];},
+  events:(r,ev)=>{if(!ev)return[]; const k=Object.entries(ev.kinds).map(([x,n])=>x+"×"+n).join(" "); const sp=ev.spikes.length?`; spikes: ${ev.spikes.length} (${[...new Set(ev.spikes.map(s=>s.kind))].join(",")})`:""; return [`EVENTS ${k}${sp}`];},
+  ach:(r,ev)=>{const got=achievements(r,ev).filter(a=>a.got); return [`✓ ${got.map(a=>a.t).join(", ")||"(none)"}`];},
+};
+function copySection(idx,sec){const r=runByIdx(idx); if(!r)return; const ev=evFor(r);
+  const lines=SEC[sec](r,ev); const text=secHead(r,ev)+"\n  "+(lines.join("\n  ")||"(no data)");
+  navigator.clipboard.writeText(text).then(()=>toast(sec+" copied"),()=>prompt("Copy:",text));}
+function digestRun(r){const ev=evFor(r); const L=[secHead(r,ev),`  overrides: ${(r.overrides.length?r.overrides:(ev?ev.flags:[])).join(" ")||"(defaults)"}`];
+  for(const s of ["events","gpu","cpu","mesher","workload","frame"]) SEC[s](r,ev).forEach(x=>L.push("  "+x));
+  SEC.ach(r,ev).forEach(x=>L.push("  "+x)); return L.join("\n");}
+function buildDigest(){const sel=SEL.length?SEL.map(runByIdx).filter(Boolean):visibleRuns();
+  const out=["═══ unendlich telemetry digest ═══"]; sel.forEach(r=>out.push(digestRun(r)));
+  if(sel.length===2){const[a,b]=sel,d=(x,y)=>x!=null&&y!=null?`${fmt(y-x)}ms (${fmt((y-x)/x*100,0)}%)`:"–";
+    out.push(`Δ ${a.label}→${b.label}: total ${d(a.gpu.total?.mean,b.gpu.total?.mean)}; shadow.p99 ${d(a.gpu.shadow?.p99,b.gpu.shadow?.p99)}; mesh.near ${d(a.mesher.near?.mean,b.mesher.near?.mean)}`);}
+  return out.join("\n");}
+//═══════════════ RENDER: sidebar list ═══════════════
+function selectRun(i){const k=SEL.indexOf(i); if(k>=0)SEL.splice(k,1); else{SEL.push(i); if(SEL.length>2)SEL.shift();} renderList(); if(VIEW==="inspect")renderView();}
+function renderList(){
+  const el=$("#runList"); el.innerHTML="";
+  const vis=visibleRuns();
+  if(!vis.length){el.innerHTML='<div class="hint" style="padding:6px 2px">'+(RUNS.length?"no runs match filter":"no runs parsed yet")+'</div>'; return;}
+  for(const r of vis){
+    const on=SEL.includes(r._idx), ev=evFor(r);
+    const tot=r.gpu.total?`GPU ${fmt(r.gpu.total.mean)}ms`:(r.mesher.near?`mesh ${fmt(r.mesher.near.mean)}ms`:"");
+    const evtag=ev?(ev.shutdown?`<span class="ev-dot">●</span>`:`<span class="crash">✖</span>`):"";
+    const d=document.createElement("div"); d.className="runitem"+(on?" on":"");
+    d.innerHTML=`<div class="rt"><span class="idx">${r.label}</span><span class="ts">${r.ts||""}</span></div>
+      <div class="tot"><span class="pill rd">RD ${r.rd}</span>${r.gpuMesher?'<span class="pill mesh">GPU mesh</span>':""}<span>${tot}</span>${r.duration?`<span>${fmt(r.duration,0)}s</span>`:""}${evtag}</div>
+      ${r.overrides.length?`<div class="ov">${r.overrides.join("  ")}</div>`:""}`;
+    d.onclick=()=>selectRun(r._idx); el.appendChild(d);
+  }
+}
+//═══════════════ RENDER: bars + panels ═══════════════
+function bar(name,sub,m,cls,scaleMax,budget,optimal){
+  if(!m||m.empty) return `<div class="row"><div class="name">${name}<small>${m&&m.empty?"idle":sub||""}</small></div><div class="track"></div><div class="read" style="color:var(--faint)">${m&&m.empty?"no chunks meshed":"—"}</div></div>`;
+  const w=Math.min(100,m.mean/scaleMax*100), p99=Math.min(100,m.p99/scaleMax*100), mx=Math.min(100,m.max/scaleMax*100);
+  const over=budget&&m.p99>budget, bpct=budget?Math.min(100,budget/scaleMax*100):null, opt=optimal!=null?Math.min(100,optimal/scaleMax*100):null;
+  const overTxt=m.over_n?`<span class="warn"> ${m.over_n}×>${m.over_ms}</span>`:"";
+  return `<div class="row"><div class="name">${name}<small>${sub||""}</small></div>
+    <div class="track"><div class="fill ${cls} ${over?"over":""}" style="width:${w}%"></div>
+      <div class="maxmark" style="left:${mx}%"></div><div class="whisker" style="left:${p99}%"></div>
+      ${bpct!=null?`<div class="budget" data-l="${budget}ms" style="left:${bpct}%"></div>`:""}
+      ${opt!=null?`<div class="optimal" style="left:${opt}%"></div>`:""}</div>
+    <div class="read"><b>${fmt(m.mean)}</b> p99 <span class="p99">${fmt(m.p99)}</span> <span class="mx">↑${fmt(m.max)}</span>${overTxt}</div></div>`;
+}
+function ph(title,cls,idx,sec){return `<h2><span class="lead">${title}</span><button class="cp" onclick="copySection(${idx},'${sec}')">⧉ copy</button></h2>`;}
+function gpuPanel(r){const order=["cull","froxel","main","shadow","total"],keys=order.filter(k=>r.gpu[k]); if(!keys.length)return"";
+  const fb=frameBudget(); const sc=Math.max(8.3,fb,...keys.map(k=>r.gpu[k].max))*1.05;
+  const rows=keys.map(k=>bar(k,"",r.gpu[k],"",sc,8.3,fb)).join("");
+  return `<div class="panel">${ph("GPU timers (lifetime)","",r._idx,"gpu")}${rows}</div>`;}
+function cpuPanel(r){const order=["wait_fences","acquire","record","submit","present"],keys=order.filter(k=>r.cpu[k]); if(!keys.length)return"";
+  const sc=Math.max(2,...keys.map(k=>r.cpu[k].max))*1.05;
+  const rows=keys.map(k=>bar(k,"",r.cpu[k],"cyan",sc,null,null)).join("");
+  return `<div class="panel cpu">${ph("CPU timers (lifetime)","cpu",r._idx,"cpu")}${rows}</div>`;}
+function meshPanel(r){const order=["near","mid","far","vfar"],present=order.filter(k=>r.mesher[k]); if(!present.length)return"";
+  const fb=frameBudget(); const sc=Math.max(fb,...present.map(k=>r.mesher[k]&&!r.mesher[k].empty?r.mesher[k].max:0))*1.05;
+  const rows=present.map(k=>bar(k,r.mesher[k]&&r.mesher[k].n?`n=${r.mesher[k].n}`:"",r.mesher[k],"violet",sc,null,fb)).join("");
+  return `<div class="panel mesh">${ph("Mesher per LOD","mesh",r._idx,"mesher")}${rows}</div>`;}
+function wlPanel(r){if(!Object.keys(r.workload).length)return"";
+  const sc=Math.max(...Object.values(r.workload).map(w=>w.max))*1.05;
+  const rows=Object.entries(r.workload).map(([k,w])=>`<div class="row"><div class="name">${k}<small>chunks</small></div>
+    <div class="track"><div class="fill green" style="width:${w.p50/sc*100}%"></div><div class="maxmark" style="left:${w.max/sc*100}%"></div></div>
+    <div class="read">p50 <b>${w.p50}</b> p90 ${w.p90} <span class="mx">↑${w.max}</span></div></div>`).join("");
+  return `<div class="panel wl">${ph("Workload shape","wl",r._idx,"workload")}${rows}</div>`;}
+function curvePanel(r,ev){if(!ev||!ev.frames.length)return"";
+  const W=860,H=180,padL=34,padB=20,padT=10,padR=8; const fr=ev.frames.filter(f=>!isNaN(f.p50)); if(!fr.length)return"";
+  const fb=frameBudget(); const tMax=Math.max(...fr.map(f=>f.t))||1, yMax=Math.max(fb*1.2,...fr.map(f=>f.p50))*1.08;
+  const cMax=Math.max(1,...fr.map(f=>Math.max(f.loaded||0,f.rendering||0)));
+  const X=t=>padL+(t/tMax)*(W-padL-padR), Y=v=>padT+(1-v/yMax)*(H-padT-padB), Yc=v=>padT+(1-v/cMax)*(H-padT-padB);
+  const poly=(pts,col,w,op)=>`<polyline fill="none" stroke="${col}" stroke-width="${w}" opacity="${op}" points="${pts.join(" ")}"/>`;
+  const p50=fr.map(f=>X(f.t)+","+Y(f.p50)), rnd=fr.filter(f=>!isNaN(f.rendering)).map(f=>X(f.t)+","+Yc(f.rendering)), lod=fr.filter(f=>!isNaN(f.loaded)).map(f=>X(f.t)+","+Yc(f.loaded));
+  const by=Y(fb), spikes=ev.spikes.map(s=>`<circle cx="${X(s.t)}" cy="${Y(Math.min(yMax*0.95,s.ms||yMax*0.5))}" r="3.5" fill="var(--red)"><title>${s.kind} ${s.ms||""}ms @${(s.t/1000).toFixed(1)}s</title></circle>`).join("");
+    const fpsMarks=[144,120,60,30].map(hz=>[hz,1000/hz]).filter(([hz,ms])=>ms<=yMax&&Math.abs(ms-fb)>0.25).map(([hz,ms])=>{const y=Y(ms);return `<line class="fps-mark" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/><text class="fps-lbl" x="${W-padR-2}" y="${y-2}">${hz}fps</text>`;}).join("");
+  return `<div class="panel">${ph(`Frame-time curve · ${fr.length} windows / ${(tMax/1000).toFixed(0)}s`,"",r._idx,"frame")}
+    <svg class="curve" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+      <line class="grid" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}"/><line class="grid" x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}"/>
+      ${fpsMarks}<line class="optimal-line" x1="${padL}" y1="${by}" x2="${W-padR}" y2="${by}"/>
+      <text class="axis" x="2" y="${padT+8}">${yMax.toFixed(0)}ms</text><text class="axis" style="fill:var(--green)" x="${W-padR-66}" y="${by-3}">${REFRESH_HZ}Hz · ${fb.toFixed(1)}ms</text>
+      ${poly(lod,"var(--green)",1,.30)}${poly(rnd,"var(--violet)",1,.30)}${poly(p50,"var(--amber)",2,1)}${spikes}
+    </svg>
+    <div class="legend"><span><i style="background:var(--amber)"></i>frame p50</span><span><i style="background:var(--green);opacity:.5"></i>loaded chunks</span><span><i style="background:var(--violet);opacity:.5"></i>rendering chunks</span><span><i style="background:var(--green)"></i>refresh budget</span><span><i style="background:var(--faint)"></i>fps targets</span>${ev.spikes.length?'<span><i style="background:var(--red);border-radius:50%;width:8px;height:8px"></i>spike</span>':""}</div></div>`;}
+function achPanel(r,ev){const cells=achievements(r,ev).map(a=>`<div class="achi ${a.got?"got":""} ${a.bad?"bad":""}"><span class="ic">${a.ic}</span><span class="tx"><b>${a.t}</b><span>${a.d}</span></span></div>`).join("");
+  return `<div class="panel wl">${ph("Achievements · what this run exercised","wl",r._idx,"ach")}<div class="ach">${cells}</div></div>`;}
+function eventsPanel(r,ev){if(!ev)return""; const t=Object.entries(ev.kinds).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`<span class="ev ${/spike/.test(k)?"spike":""}"><b>${k}</b> ×${v}</span>`).join("");
+  return `<div class="panel">${ph("Event kinds (events.jsonl)","",r._idx,"events")}<div class="ev-types">${t}</div></div>`;}
+function flagsPanel(r,ev){const src=r.overrides.length?r.overrides:(ev?ev.flags:[]); const ov=src.length?src.map(o=>`<span class="badge ov">${o}</span>`).join(""):'<span class="badge">all defaults</span>';
+  return `<div class="panel"><h2><span class="lead">Flags / overrides</span></h2><div class="badges">${ov}</div></div>`;}
+function runHead(r,ev){const crashed=ev&&!ev.shutdown, reason=ev&&ev.shutdown?ev.shutdown.reason:null;
+  return `<div class="panel"><div class="runhead"><span class="v">${r.version||r.label}</span>
+    <span class="meta">uuid <b>${r.run_id||"–"}</b></span><span class="meta">RD <b>${r.rd}</b></span><span class="meta">mesher <b>${r.gpuMesher?"on":"off"}</b></span>
+    ${r.duration?`<span class="meta">duration <b>${fmt(r.duration,0)}s</b></span>`:""}
+    ${crashed?'<span class="crashbadge">✖ no shutdown — crashed?</span>':(reason?`<span class="okbadge">✔ ${reason}</span>`:"")}</div></div>`;}
+function renderRun(r){const ev=evFor(r);
+  return runHead(r,ev)+achPanel(r,ev)+curvePanel(r,ev)+gpuPanel(r)+cpuPanel(r)+meshPanel(r)+wlPanel(r)+eventsPanel(r,ev)+flagsPanel(r,ev);}
+function deltaPanel(a,b){const cmp=(label,va,vb)=>{if(va==null||vb==null)return"";const d=vb-va,pct=va?d/va*100:0,cls=Math.abs(pct)<1?"badge":d<0?"okbadge":"crashbadge";
+    return `<div class="row"><div class="name">${label}</div><div class="read" style="text-align:left">${fmt(va)} → ${fmt(vb)}</div><div class="read"><span class="${cls}" style="padding:2px 7px">${d>0?"+":""}${fmt(d)}ms (${pct>0?"+":""}${fmt(pct,0)}%)</span></div></div>`;};
+  return `<div class="panel"><h2><span class="lead">Δ ${a.label} → ${b.label}</span></h2>
+    ${cmp("GPU total mean",a.gpu.total?.mean,b.gpu.total?.mean)}${cmp("GPU total p99",a.gpu.total?.p99,b.gpu.total?.p99)}
+    ${cmp("GPU shadow p99",a.gpu.shadow?.p99,b.gpu.shadow?.p99)}${cmp("CPU wait_fences",a.cpu.wait_fences?.mean,b.cpu.wait_fences?.mean)}
+    ${cmp("Mesher near mean",a.mesher.near?.mean,b.mesher.near?.mean)}</div>`;}
+//═══════════════ RENDER: compare (RD ↔ perf scatter) ═══════════════
+const CMP={
+  "gpu.total.mean":["GPU total mean",r=>r.gpu.total?.mean],
+  "gpu.total.p99":["GPU total p99",r=>r.gpu.total?.p99],
+  "gpu.shadow.p99":["GPU shadow p99",r=>r.gpu.shadow?.p99],
+  "mesher.near.mean":["Mesher near mean",r=>r.mesher.near?.mean],
+};
+function compareView(){
+  const vis=visibleRuns().filter(r=>CMP[CMP_METRIC][1](r)!=null);
+  const sel=`<div class="panel"><h2><span class="lead">Render distance ↔ performance</span>
+    <span class="seg" id="cmpMetric" style="margin-left:auto">${Object.entries(CMP).map(([k,v])=>`<button data-m="${k}" class="${k===CMP_METRIC?"on":""}">${v[0]}</button>`).join("")}</span></h2>`;
+  if(vis.length<1) return sel+`<div class="hint" style="padding:14px">No runs with this metric${MESH_FILTER!=="all"?` (mesher=${MESH_FILTER} filter active)`:""}.</div></div>`;
+  const W=900,H=420,padL=58,padB=46,padT=16,padR=18;
+  const ys=vis.map(r=>CMP[CMP_METRIC][1](r)); const yMax=Math.max(...ys)*1.12||1;
+  const rds=[...new Set(vis.map(r=>r.rd))].sort((a,b)=>a-b); const xMin=Math.min(...rds), xMax=Math.max(...rds);
+  const X=rd=>xMax===xMin?(padL+(W-padL-padR)/2):padL+((rd-xMin)/(xMax-xMin))*(W-padL-padR);
+  const Y=v=>padT+(1-v/yMax)*(H-padT-padB);
+  let grid=""; for(let i=0;i<=4;i++){const yy=padT+i/4*(H-padT-padB),val=yMax*(1-i/4); grid+=`<line class="gridf" x1="${padL}" y1="${yy}" x2="${W-padR}" y2="${yy}"/><text class="axis" x="${padL-6}" y="${yy+3}" text-anchor="end">${val.toFixed(1)}</text>`;}
+  const xticks=rds.map(rd=>`<text class="axis" x="${X(rd)}" y="${H-padB+16}" text-anchor="middle">${rd}</text><line class="gridf" x1="${X(rd)}" y1="${padT}" x2="${X(rd)}" y2="${H-padB}"/>`).join("");
+  const conn=g=>{const pts=vis.filter(r=>!!r.gpuMesher===g).sort((a,b)=>a.rd-b.rd); if(pts.length<2)return""; return `<polyline class="conn" stroke="${g?"var(--cyan)":"var(--amber)"}" points="${pts.map(r=>X(r.rd)+","+Y(CMP[CMP_METRIC][1](r))).join(" ")}"/>`;};
+  const dots=vis.map(r=>{const col=r.gpuMesher?"var(--cyan)":"var(--amber)";return `<circle cx="${X(r.rd)}" cy="${Y(CMP[CMP_METRIC][1](r))}" r="5" fill="${col}" opacity="0.85"><title>${r.label} · RD ${r.rd} · mesher ${r.gpuMesher?"on":"off"} · ${CMP[CMP_METRIC][0]} ${fmt(CMP[CMP_METRIC][1](r))}ms</title></circle>`;}).join("");
+  const svg=`<svg class="scatter" viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">
+    <line class="grid" x1="${padL}" y1="${padT}" x2="${padL}" y2="${H-padB}"/><line class="grid" x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}"/>
+    ${grid}${xticks}${conn(false)}${conn(true)}${dots}
+    <text class="axt" x="${padL+(W-padL-padR)/2}" y="${H-6}" text-anchor="middle">RENDER DISTANCE</text>
+    <text class="axt" transform="translate(14,${padT+(H-padT-padB)/2}) rotate(-90)" text-anchor="middle">${CMP[CMP_METRIC][0].toUpperCase()} (ms)</text></svg>
+    <div class="legend"><span><i style="background:var(--amber)"></i>GPU mesher off</span><span><i style="background:var(--cyan)"></i>GPU mesher on</span><span style="color:var(--faint)">${vis.length} runs plotted · lines connect same-mesher runs by RD</span></div></div>`;
+  // table
+  const rows=vis.slice().sort((a,b)=>a.rd-b.rd).map(r=>`<div class="row" style="grid-template-columns:80px 90px 1fr 110px"><div class="name">${r.label}</div><div class="read" style="text-align:left">RD ${r.rd}</div><div class="read" style="text-align:left">${r.gpuMesher?'<span class="pill mesh">GPU mesh</span>':'<span class="pill">cpu mesh</span>'}</div><div class="read"><b>${fmt(CMP[CMP_METRIC][1](r))}</b> ms</div></div>`).join("");
+  return sel+svg+`<div class="panel"><h2><span class="lead">Plotted runs</span><button class="cp" onclick="copyCompare()">⧉ copy table</button></h2>${rows}</div>`;
+}
+function copyCompare(){const vis=visibleRuns().filter(r=>CMP[CMP_METRIC][1](r)!=null).sort((a,b)=>a.rd-b.rd);
+  const text=[`RD ↔ ${CMP[CMP_METRIC][0]} (${MESH_FILTER==="all"?"all":"mesher="+MESH_FILTER})`,...vis.map(r=>`  RD ${r.rd}  mesher=${r.gpuMesher?"on":"off"}  ${CMP[CMP_METRIC][0]} ${fmt(CMP[CMP_METRIC][1](r))}ms  (${r.label})`)].join("\n");
+  navigator.clipboard.writeText(text).then(()=>toast("compare table copied"),()=>prompt("Copy:",text));}
+//═══════════════ RENDER: 2-run sticky header + radar ═══════════════
+function compareHeader(a,b){
+  const eff=v=>{const m=/\(default:\s*(.+)\)/.exec(v||""); return m?m[1].trim():(v||"").trim();};
+  const keys=[...new Set([...Object.keys(a.flags),...Object.keys(b.flags)])].sort();
+  const diff=[]; let same=0;
+  for(const k of keys){const va=eff(a.flags[k]),vb=eff(b.flags[k]),kk=k.replace("UNENDLICH_","");
+    if(va!==vb) diff.push(`<span class="fd diff"><span class="k">${kk}</span><span class="a">${va||"–"}</span><span class="sep">|</span><span class="b">${vb||"–"}</span></span>`);
+    else if(va) same++;}
+  return `<div class="cmpsticky"><div class="runs"><span class="rn a">${a.label}</span><span class="vs">vs</span><span class="rn b">${b.label}</span>
+      <span class="ctx">RD ${a.rd}|${b.rd} · mesher ${a.gpuMesher?"on":"off"}|${b.gpuMesher?"on":"off"} · ${fmt(a.duration,0)}s|${fmt(b.duration,0)}s</span></div>
+    <div class="flagdiff">${diff.join("")||'<span class="fd same"><span class="k">no differing flags</span></span>'}${same?`<span class="fd same"><span class="k">+${same} shared</span></span>`:""}</div></div>`;
+}
+function radarPanel(a,b){
+  const AX=[
+    ["GPU total p99", r=>r.gpu.total?.p99], ["Shadow p99", r=>r.gpu.shadow?.p99],
+    ["Main p99", r=>r.gpu.main?.p99], ["Froxel p99", r=>r.gpu.froxel?.p99],
+    ["CPU wait p99", r=>r.cpu.wait_fences?.p99], ["Mesher near", r=>r.mesher.near?.mean],
+    ["Frame p50 max", r=>{const e=evFor(r); if(!e||!e.frames.length)return null; const ps=e.frames.map(f=>f.p50).filter(x=>!isNaN(x)); return ps.length?Math.max(...ps):null;}],
+  ];
+  const axes=AX.map(([name,f])=>({name,a:f(a),b:f(b)})).filter(x=>x.a!=null&&x.b!=null);
+  if(axes.length<3) return ""; // need ≥3 shared dimensions for a web
+  const W=580,H=430,cx=W/2,cy=H/2+4,R=135,N=axes.length;
+  const dir=i=>{const ang=-Math.PI/2+i*2*Math.PI/N; return [Math.cos(ang),Math.sin(ang)];};
+  const ringPts=t=>axes.map((_,i)=>{const[dx,dy]=dir(i); return (cx+dx*R*t)+","+(cy+dy*R*t);}).join(" ");
+  const rings=[0.25,0.5,0.75,1].map(t=>`<polygon class="ring" points="${ringPts(t)}"/>`).join("");
+  const spokes=axes.map((_,i)=>{const[dx,dy]=dir(i); return `<line class="spoke" x1="${cx}" y1="${cy}" x2="${cx+dx*R}" y2="${cy+dy*R}"/>`;}).join("");
+  const pts=key=>axes.map((ax,i)=>{const mx=Math.max(ax.a,ax.b)||1; const[dx,dy]=dir(i); const rr=R*(ax[key]/mx); return [cx+dx*rr,cy+dy*rr];});
+  const polyOf=(key,cls)=>`<polygon class="${cls}" points="${pts(key).map(p=>p[0]+","+p[1]).join(" ")}"/>`;
+  const dots=(key,cls)=>pts(key).map(p=>`<circle class="${cls}" cx="${p[0]}" cy="${p[1]}" r="3"/>`).join("");
+  const labels=axes.map((ax,i)=>{const[dx,dy]=dir(i),lx=cx+dx*(R+20),ly=cy+dy*(R+20),anch=Math.abs(dx)<0.3?"middle":dx>0?"start":"end";
+    return `<text class="lab" x="${lx}" y="${ly}" text-anchor="${anch}">${ax.name}<tspan x="${lx}" dy="12" font-size="9"><tspan fill="var(--amber-soft)">${fmt(ax.a)}</tspan><tspan fill="var(--faint)"> → </tspan><tspan fill="var(--cyan)">${fmt(ax.b)}</tspan></tspan></text>`;}).join("");
+  return `<div class="panel"><h2><span class="lead">Multi-dimensional comparison · ${a.label} vs ${b.label}</span></h2>
+    <svg class="radar" viewBox="0 0 ${W} ${H}">${rings}${spokes}${polyOf("a","polyA")}${polyOf("b","polyB")}${dots("a","pA")}${dots("b","pB")}${labels}</svg>
+    <div class="legend"><span><i style="background:var(--amber)"></i>${a.label}</span><span><i style="background:var(--cyan)"></i>${b.label}</span><span style="color:var(--faint)">each axis normalized to the worse of the two · inward = better (lower ms)</span></div></div>`;
+}
+//═══════════════ RENDER: dispatch ═══════════════
+function renderView(){const v=$("#view");
+  if(!RUNS.length){v.innerHTML=`<div class="empty"><div class="big">⌁ ⌁ ⌁</div><div>No telemetry loaded.<br>Drop your <b style="color:var(--amber-soft)">run_summaries.txt</b> + <b style="color:var(--amber-soft)">events.jsonl</b>, or hit <b style="color:var(--amber-soft)">Load sample</b>.</div></div>`; return;}
+  if(VIEW==="compare"){v.innerHTML=compareView(); wireCompare(); return;}
+  const sel=SEL.length?SEL.map(runByIdx).filter(Boolean):[visibleRuns()[0]].filter(Boolean);
+  let html=""; if(sel.length===2)html+=compareHeader(sel[0],sel[1])+radarPanel(sel[0],sel[1])+deltaPanel(sel[0],sel[1]); for(const r of sel)html+=renderRun(r); v.innerHTML=html;
+}
+//═══════════════ WIRING ═══════════════
+function toast(t){const e=$("#toast");e.textContent=t;e.classList.add("show");setTimeout(()=>e.classList.remove("show"),1700);}
+function setRuns(t){RUNS=parseRuns(t);SEL=[];$("#dropRuns").classList.toggle("ok",RUNS.length>0);renderList();renderView();toast(RUNS.length?`parsed ${RUNS.length} run${RUNS.length>1?"s":""}`:"no runs found");}
+function setEvents(t){EVENTS=parseEvents(t);$("#dropEvents").classList.toggle("ok",!!EVENTS);renderList();renderView();toast(EVENTS?`${EVENTS.count} events · ${Object.keys(EVENTS.runs).length} runs`:"no JSON lines found");}
+function wireDrop(id,cb){const el=$(id);
+  el.onclick=()=>{const i=document.createElement("input");i.type="file";i.onchange=e=>{const f=e.target.files[0];if(f){const rd=new FileReader();rd.onload=()=>cb(rd.result);rd.readAsText(f);}};i.click();};
+  el.ondragover=e=>{e.preventDefault();el.classList.add("hot");};el.ondragleave=()=>el.classList.remove("hot");
+  el.ondrop=e=>{e.preventDefault();el.classList.remove("hot");const f=e.dataTransfer.files[0];if(f){const rd=new FileReader();rd.onload=()=>cb(rd.result);rd.readAsText(f);}};}
+function wireCompare(){const seg=$("#cmpMetric"); if(seg)seg.querySelectorAll("button").forEach(b=>b.onclick=()=>{CMP_METRIC=b.dataset.m;renderView();});}
+wireDrop("#dropRuns",setRuns); wireDrop("#dropEvents",setEvents);
+$("#clearBtn").onclick=()=>{RUNS=[];EVENTS=null;SEL=[];$("#dropRuns").classList.remove("ok");$("#dropEvents").classList.remove("ok");renderList();renderView();};
+$("#copyBtn").onclick=()=>{if(!RUNS.length){toast("nothing to copy");return;}const d=buildDigest();navigator.clipboard.writeText(d).then(()=>toast("digest copied → paste to Claude"),()=>prompt("Copy digest:",d));};
+$("#sortSel").onchange=e=>{SORT=e.target.value;renderList();if(VIEW==="compare")renderView();};
+$("#meshFilter").querySelectorAll("button").forEach(b=>b.onclick=()=>{MESH_FILTER=b.dataset.v;$("#meshFilter").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderList();renderView();});
+$("#viewToggle").querySelectorAll("button").forEach(b=>b.onclick=()=>{VIEW=b.dataset.v;$("#viewToggle").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));renderView();});
+$("#refresh").querySelectorAll("button").forEach(b=>b.onclick=()=>{REFRESH_HZ=+b.dataset.hz;$("#refresh").querySelectorAll("button").forEach(x=>x.classList.toggle("on",x===b));$("#refreshMs").textContent=frameBudget().toFixed(1)+"ms";renderView();});
+
+const SAMPLE_RUNS=`======================================================================
+==== VERSION 0.24.3-multi-queue-a START 2026-05-14T18:00:00Z ====
+======================================================================
+
+==== RUN START 2026-05-14T18:00:00Z ====
+version: 0.24.3-multi-queue-a
+uuid: r-aaaa000000000001
+duration: 130.6s
+cmdline: unendlich-world
+env:
+  UNENDLICH_RENDER_DISTANCE          = (default: 6)
+  UNENDLICH_GPU_MESHER               = (default: 0)
+  UNENDLICH_VSYNC                    = (default: 1)
+---- summaries ----
+  cull    n=  7866  mean=   0.05ms\u00b1  0.01  p50=  0.05  p90=  0.05  p99=  0.05  min=  0.00  max=   0.08  over_5.0ms=0 (0.0%)
+  froxel  n=  7866  mean=   0.12ms\u00b1  0.01  p50=  0.13  p90=  0.13  p99=  0.14  min=  0.00  max=   0.18  over_5.0ms=0 (0.0%)
+  main    n=  7866  mean=   0.59ms\u00b1  0.41  p50=  0.46  p90=  1.20  p99=  2.11  min=  0.00  max=   2.49  over_8.3ms=0 (0.0%)
+  shadow  n=  7866  mean=   1.26ms\u00b1  0.65  p50=  1.33  p90=  2.08  p99=  2.26  min=  0.00  max=  11.31  over_8.3ms=1 (0.0%)
+  total   n=  7866  mean=   2.03ms\u00b1  0.94  p50=  2.07  p90=  3.41  p99=  4.24  min=  0.00  max=  12.79  over_8.3ms=1 (0.0%)
+  (skipped frames: 0)
+  wait_fences  n=  7866  mean=   1.70ms\u00b1  0.95  p50=  1.64  p90=  2.91  p99=  4.04  min=  0.00  max=   5.08
+  record       n=  7866  mean=   1.75ms\u00b1  0.02  p50=  1.75  p90=  1.76  p99=  1.78  min=  1.73  max=   2.62  over_1.0ms=7866 (100.0%)
+  near  n=  3302  mean=  21.15ms\u00b1 15.29  p50= 21.43  p90= 39.63  p99= 46.00  min=  0.00  max=  51.88
+  mid   (no chunks meshed)
+  loaded     n=  33  min=    0  p50=  119  p90=  205  max=  253
+  rendering  n=  33  min=    1  p50=  120  p90=  180  max=  237
+==== RUN END 2026-05-14T18:02:10Z ====
+
+==== RUN START 2026-05-14T18:05:00Z ====
+version: 0.24.3-multi-queue-a
+uuid: r-bbbb000000000002
+duration: 252.0s
+cmdline: unendlich-world
+env:
+  UNENDLICH_RENDER_DISTANCE          = 8
+  UNENDLICH_GPU_MESHER               = 1
+  UNENDLICH_VSYNC                    = (default: 1)
+---- summaries ----
+  froxel  n= 15095  mean=   0.13ms\u00b1  0.01  p50=  0.13  p90=  0.13  p99=  0.14  min=  0.00  max=   0.38  over_5.0ms=0 (0.0%)
+  main    n= 15095  mean=   0.45ms\u00b1  0.13  p50=  0.45  p90=  0.63  p99=  0.71  min=  0.00  max=   0.95  over_8.3ms=0 (0.0%)
+  shadow  n= 15095  mean=   0.57ms\u00b1  0.11  p50=  0.58  p90=  0.70  p99=  0.77  min=  0.00  max=   4.53  over_8.3ms=0 (0.0%)
+  total   n= 15095  mean=   1.19ms\u00b1  0.20  p50=  1.21  p90=  1.41  p99=  1.59  min=  0.00  max=   5.31  over_8.3ms=0 (0.0%)
+  wait_fences  n= 15095  mean=   1.27ms\u00b1  0.33  p50=  1.23  p90=  1.74  p99=  2.03  min=  0.00  max=   2.79
+  near  n=  7250  mean=   0.13ms\u00b1  0.13  p50=  0.11  p90=  0.27  p99=  0.45  min=  0.00  max=   2.14
+  loaded     n=  50  min=    4  p50=  147  p90=  231  max=  256
+==== RUN END 2026-05-14T18:09:12Z ====
+
+==== RUN START 2026-05-14T18:12:00Z ====
+version: 0.24.3-multi-queue-a
+uuid: r-cccc000000000003
+duration: 95.0s
+cmdline: unendlich-world
+env:
+  UNENDLICH_RENDER_DISTANCE          = 12
+  UNENDLICH_GPU_MESHER               = 1
+---- summaries ----
+  shadow  n= 9000  mean=   1.10ms\u00b1  0.20  p50=  1.10  p90=  1.30  p99=  1.80  min=  0.00  max=   6.0  over_8.3ms=0 (0.0%)
+  total   n= 9000  mean=   2.40ms\u00b1  0.30  p50=  2.4  p90=  2.9  p99=  3.5  min=  0.00  max=   9.0  over_8.3ms=2 (0.0%)
+  near  n=  4000  mean=   0.18ms\u00b1  0.13  p50=  0.15  p90=  0.30  p99=  0.55  min=  0.00  max=   2.9
+  loaded     n=  40  min=    4  p50=  400  p90=  600  max=  720
+==== RUN END 2026-05-14T18:13:35Z ====
+
+==== RUN START 2026-05-14T18:20:00Z ====
+version: 0.24.3-multi-queue-a
+uuid: r-dddd000000000004
+duration: 88.0s
+cmdline: unendlich-world
+env:
+  UNENDLICH_RENDER_DISTANCE          = 12
+---- summaries ----
+  shadow  n= 5000  mean=   3.20ms\u00b1  1.50  p50=  3.0  p90=  6.0  p99=  9.5  min=  0.00  max=  18.0  over_8.3ms=40 (0.8%)
+  total   n= 5000  mean=   6.10ms\u00b1  2.20  p50=  5.8  p90=  9.5  p99=  13.0  min=  0.00  max=  22.0  over_8.3ms=120 (2.4%)
+  near  n=  6000  mean=  28.0ms\u00b1 16.0  p50= 27.0  p90= 48.0  p99= 60.0  min=  0.00  max=  72.0
+  loaded     n=  35  min=    0  p50=  380  p90=  580  max=  700
+==== RUN END 2026-05-14T18:21:28Z ====`;
+const SAMPLE_EVENTS=[
+ '{"uuid":"r-aaaa000000000001","ts_ms":0,"kind":"start","version":"0.24.3-multi-queue-a","binary":"unendlich-world","cmdline":"unendlich-world"}',
+ '{"uuid":"r-aaaa000000000001","ts_ms":3,"kind":"flag","name":"UNENDLICH_RENDER_DISTANCE","value":"6","source":"default"}',
+ ...Array.from({length:42},(_,i)=>{const t=(i+1)*3000;const v=2.0+(i%7===6?3.6:0)+Math.sin(i/3)*0.4;return `{"uuid":"r-aaaa000000000001","ts_ms":${t},"kind":"frame_window","frame_p50_ms":${v.toFixed(2)},"rendering":${120+i*2},"loaded":${119+i*3}}`;}),
+ '{"uuid":"r-aaaa000000000001","ts_ms":21000,"kind":"wait_fences_spike","wait_ms":8.7}',
+ '{"uuid":"r-aaaa000000000001","ts_ms":63000,"kind":"wait_fences_spike","wait_ms":6.2}',
+ '{"uuid":"r-aaaa000000000001","ts_ms":130600,"kind":"shutdown","reason":"window_closed","duration_secs":130.6}',
+ '{"uuid":"r-bbbb000000000002","ts_ms":0,"kind":"start","version":"0.24.3-multi-queue-a","binary":"unendlich-world","cmdline":"unendlich-world"}',
+ '{"uuid":"r-bbbb000000000002","ts_ms":3,"kind":"flag","name":"UNENDLICH_GPU_MESHER","value":"1","source":"env"}',
+ ...Array.from({length:50},(_,i)=>`{"uuid":"r-bbbb000000000002","ts_ms":${(i+1)*5000},"kind":"frame_window","frame_p50_ms":${(1.2+Math.sin(i/4)*0.2).toFixed(2)},"rendering":${112+i},"loaded":${147+i*2}}`),
+ '{"uuid":"r-bbbb000000000002","ts_ms":252000,"kind":"shutdown","reason":"duration_elapsed","duration_secs":252.0}',
+ '{"uuid":"r-dddd000000000004","ts_ms":0,"kind":"start","version":"0.24.3-multi-queue-a","binary":"unendlich-world","cmdline":"unendlich-world"}',
+ ...Array.from({length:18},(_,i)=>`{"uuid":"r-dddd000000000004","ts_ms":${(i+1)*4000},"kind":"frame_window","frame_p50_ms":${(6.0+Math.sin(i/2)*1.5).toFixed(2)},"rendering":${300+i*5},"loaded":${380+i*8}}`),
+ '{"uuid":"r-dddd000000000004","ts_ms":12000,"kind":"gpu_spike","gpu_ms":18.0}',
+].join("\n");
+$("#loadDemo").onclick=()=>{setRuns(SAMPLE_RUNS);setEvents(SAMPLE_EVENTS);};
+
+renderList(); renderView();
+</script>

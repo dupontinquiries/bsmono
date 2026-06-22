@@ -1,0 +1,15 @@
+[package]
+name        = "snapclone-coresched"
+version     = "0.1.0"
+edition     = "2021"
+description = "CPU efficiency-core classification + thread-placement policy for SnapClone. Parses Linux sysfs (cpu_capacity / cpufreq) to find efficiency vs performance cores on ARM big.LITTLE (Fairphone 5) AND Intel/AMD hybrid laptops, and decides which background thread CLASSES (DHT re-announce, thumbnailing, ambient palette, face detection, firewall shell-outs) should be demoted to E-cores via affinity / uclamp / nice to save battery — while keeping interactive work (UI, camera focus) on performance cores. Pure parsing + decision logic; the C++/Rust callers apply the placement with the actual syscalls. See docs/CORE_SCHEDULING.md."
+
+[lib]
+name       = "snapclone_coresched"
+crate-type = ["staticlib", "rlib"]
+
+# Pure std — sysfs parsing + classification + policy. No deps so it stays
+# testable in any toolchain (no snapclone-core, no edition2024 drift). The
+# actual syscalls (sched_setaffinity/setattr) live in the caller behind this
+# crate's decisions.
+[dependencies]

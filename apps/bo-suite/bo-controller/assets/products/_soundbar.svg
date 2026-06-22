@@ -1,0 +1,18 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Long pill soundbar, generously rounded ends -->
+  <rect x="6" y="25" width="52" height="14" rx="7" ry="7"/>
+  <!-- Left speaker grille (dots) -->
+  <g fill="currentColor" stroke="none">
+    <circle cx="15" cy="30" r="1"/><circle cx="19" cy="30" r="1"/><circle cx="23" cy="30" r="1"/>
+    <circle cx="15" cy="34" r="1"/><circle cx="19" cy="34" r="1"/><circle cx="23" cy="34" r="1"/>
+  </g>
+  <!-- Center power ring -->
+  <circle cx="32" cy="32" r="4.2"/>
+  <path d="M32 30 v2.4" stroke-width="1.8"/>
+  <!-- Right speaker grille (dots) -->
+  <g fill="currentColor" stroke="none">
+    <circle cx="41" cy="30" r="1"/><circle cx="45" cy="30" r="1"/><circle cx="49" cy="30" r="1"/>
+    <circle cx="41" cy="34" r="1"/><circle cx="45" cy="34" r="1"/><circle cx="49" cy="34" r="1"/>
+  </g>
+</svg>

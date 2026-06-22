@@ -1,0 +1,30 @@
+[package]
+name        = "snapclone-linkpreview"
+version     = "0.1.0"
+edition     = "2021"
+description = "URL preview metadata fetcher for SnapClone link snaps (Open Graph + oEmbed)"
+
+[lib]
+name       = "snapclone_linkpreview"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow  = "1"
+serde   = { version = "1", features = ["derive"] }
+tracing = "0.1"
+url     = "2"
+
+[dependencies.reqwest]
+version          = "0.12"
+default-features = false
+features         = ["rustls-tls", "blocking"]
+optional         = true
+
+[dependencies.scraper]
+version          = "0.18"
+default-features = false
+optional         = true
+
+[features]
+default = []
+fetch   = ["reqwest", "scraper"]   # enable HTTP fetching + HTML parsing

@@ -1,0 +1,65 @@
+[package]
+name        = "snapclone-crypto"
+version     = "0.1.0"
+edition     = "2021"
+description = "Rust crypto + DHT backend for SnapClone."
+license     = "GPL-3.0-or-later"
+build       = "build.rs"
+
+[lib]
+name       = "snapclone_crypto"
+# V32.33+: rlib added so `cargo test` can build the crate as a regular
+# library and run the in-source #[test] functions. staticlib is what
+# C++ links against (libsnapclone_crypto.a); rlib is what `cargo test`
+# needs to instantiate the unit tests. Having both is the standard
+# pattern when an FFI crate also needs its own test suite.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# ── Crypto ────────────────────────────────────────────────────────────────────
+aes-gcm       = { version = "0.10", features = ["aes"] }
+x25519-dalek  = { version = "2",    features = ["static_secrets"] }
+ed25519-dalek = { version = "2",    features = ["rand_core"] }
+# ── Post-quantum KEM (V32.33+ hybrid) ─────────────────────────────────────────
+# ML-KEM-768 (FIPS 203). Provides ~AES-192-equivalent post-quantum
+# security. Used in HYBRID with X25519 ECDH: both shared secrets are
+# concatenated and HKDF-expanded so an attacker has to break BOTH
+# primitives to recover the session key.
+#
+# We use the `fips203` crate (from integritychain) rather than the
+# RustCrypto `ml-kem` crate. Both are pure Rust, FIPS 203 compliant.
+# Reasons for fips203 here:
+#
+#   1. Cleaner FFI-friendly API — operates on plain byte arrays
+#      ([u8; 1184] for ek, [u8; 2400] for dk, [u8; 1088] for ct,
+#      [u8; 32] for ss). No hybrid_array / generic-array dance.
+#   2. Targets `no_std` by default — smaller dependency closure.
+#   3. The constant-time properties were reviewed by integritychain
+#      (their team is focused on FIPS compliance for production use).
+#
+# Cargo features:
+#   • ml-kem-768: enable just the 768 parameter set (skip 512/1024)
+#   • default-rng: enable RNG access via getrandom for try_keygen() /
+#     try_encaps() that don't require an explicit RNG argument
+#
+# Note: this crate has not been independently audited. For production
+# we should migrate to libcrux-ml-kem (formally verified) once the
+# integration cost is justified. Filed as future hardening in
+# CRYPTO_REVIEW.md.
+fips203       = { version = "0.4", default-features = false, features = ["ml-kem-768", "default-rng"] }
+hkdf          = "0.12"
+sha2          = "0.10"
+rand_core     = { version = "0.6",  features = ["getrandom"] }
+# V32.33+: pin getrandom < 0.3 — newer getrandom requires edition2024
+# (Rust 1.85+). Some indirect deps may try to pull 0.4.x, which forces
+# a too-new toolchain. The "getrandom" feature on rand_core already
+# brings in a compatible 0.2.x getrandom; explicit constraint here
+# documents the requirement and protects against drift.
+getrandom     = { version = "=0.2.15",  features = ["std"] }
+zeroize       = { version = "1",    features = ["derive"] }
+
+# Path is relative to this Cargo.toml (rust/snapclone-crypto/).
+
+[build-dependencies]
+cbindgen = "0.26"
+cc = "1"

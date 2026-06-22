@@ -1,0 +1,37 @@
+#version 450
+//
+// ui_downsample.comp — downsample the scene color to half resolution as the
+// first step of the frosted-UI blur (the cheap way to get a wide blur: shrink
+// first, then a small Gaussian covers a large screen radius).
+//
+// One invocation per DESTINATION (half-res) texel. Workgroup 8×8 → dispatch
+// (ceil(dst_w/8), ceil(dst_h/8), 1). A 4-tap bilinear box keeps it alias-light
+// and nearly free.
+//
+// Pairs with ui_blur.comp (the separable Gaussian) and the frosted-UI pass
+// contract in docs/FROSTED-UI.md.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_src;                 // full-res scene color (linear sampler)
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D u_dst;  // half-res output
+
+layout(push_constant) uniform PushConstants {
+    ivec2 dst_size; // size of u_dst in texels
+} pc;
+
+void main() {
+    ivec2 d = ivec2(gl_GlobalInvocationID.xy);
+    if (d.x >= pc.dst_size.x || d.y >= pc.dst_size.y) {
+        return;
+    }
+    // Center of this destination texel in source UV space.
+    vec2 uv = (vec2(d) + 0.5) / vec2(pc.dst_size);
+    vec2 texel = 1.0 / vec2(textureSize(u_src, 0));
+    // 4-tap box at the half-texel diagonals (each tap is itself bilinear).
+    vec3 c = texture(u_src, uv + texel * vec2(-0.5, -0.5)).rgb
+           + texture(u_src, uv + texel * vec2( 0.5, -0.5)).rgb
+           + texture(u_src, uv + texel * vec2(-0.5,  0.5)).rgb
+           + texture(u_src, uv + texel * vec2( 0.5,  0.5)).rgb;
+    imageStore(u_dst, d, vec4(c * 0.25, 1.0));
+}

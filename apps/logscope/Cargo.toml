@@ -1,0 +1,17 @@
+# logscope-suite — one workspace for the egui port. `logscope` (the headless
+# library) is vendored under crates/ so the app builds with no external setup.
+# gpu-gemm (the wgpu inference engine) and burn-probe (the correctness oracle)
+# are excluded from the default build to keep it light; build them on demand.
+[workspace]
+resolver = "2"
+members = ["crates/logscope", "crates/logscope-egui"]
+exclude = ["crates/gpu-gemm", "burn-probe"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+debug = 1
+split-debuginfo = "unpacked"

@@ -1,0 +1,55 @@
+{
+  "name": "Synth Pad \u2014 Drone",
+  "_doc": "Pure synthetic pad \u2014 full-spectrum pink noise with slow, gentle modulation. Not naturalistic; reads as 'background hum' or 'spacecraft cabin'. For users who want noise cover without ANY associative content (no water, no wind, no birds).",
+  "_pairs_with": "Anything. The pink-noise spectrum covers all the bands the canceller leaves residual in. Most useful when the user is concentrating (writing, reading) and finds naturalistic scenes distracting.",
+  "start_state": "ambient",
+  "layers": [
+    {
+      "name": "pad",
+      "_doc": "Pink noise, full-spectrum (20 Hz - 18 kHz). Long crossfades + slow rate randomization create a sense of gentle motion without obvious loops. The single layer is intentional \u2014 synth_pad's point is 'as little structure as possible'.",
+      "pool": [
+        "clips/pink_pad_a.opus",
+        "clips/pink_pad_b.opus",
+        "clips/pink_pad_c.opus",
+        "clips/pink_pad_d.opus",
+        "clips/pink_pad_e.opus",
+        "clips/pink_pad_f.opus",
+        "clips/pink_pad_g.opus",
+        "clips/pink_pad_h.opus"
+      ],
+      "channel": "C",
+      "crossfade_ms": 10000,
+      "gain_range": [
+        0.4,
+        0.65
+      ],
+      "pan_range": [
+        -0.1,
+        0.1
+      ],
+      "rate_range": [
+        0.995,
+        1.005
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000
+    }
+  ],
+  "states": [
+    {
+      "name": "ambient",
+      "_doc": "Only one state. There's no narrative arc to synthesize \u2014 synth_pad's value is constancy.",
+      "layer_weights": {
+        "pad": 1.0
+      },
+      "dwell_ms": [
+        60000,
+        120000
+      ],
+      "transitions": {
+        "ambient": 1.0
+      }
+    }
+  ],
+  "description": "Lush pink-noise pads with a slow chorus drift. Good for focus or sleep."
+}

@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logscope · spatial chat mock</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1b2129; --line:#2a313c;
+    --ink:#d6dee8; --dim:#8b97a6; --faint:#5c6675;
+    --cyan:#6ec6ff; --green:#8be09b; --amber:#e6b45c; --red:#ff7b6b; --purple:#c98fff;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{background:var(--bg);color:var(--ink);font:13px/1.5 system-ui,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column}
+  .cmdbar{display:flex;align-items:center;gap:10px;padding:7px 12px;background:#0b0e12;border-bottom:1px solid var(--line);font-family:var(--mono);font-size:12px}
+  .cmdbar .mode{color:var(--cyan);font-weight:700}
+  .cmdbar .line{color:var(--dim)}
+  .cmdbar .hint{margin-left:auto;color:var(--faint);font-size:11px}
+  .main{flex:1;display:flex;min-height:0}
+  .canvaswrap{flex:1;position:relative;overflow:hidden;background:radial-gradient(1200px 700px at 35% 30%,#11151b 0%,#0e1116 70%)}
+  svg{width:100%;height:100%;display:block;cursor:grab}
+  svg.dragging{cursor:grabbing}
+  .side{width:340px;border-left:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-height:0}
+  .side h3{margin:0;padding:10px 12px 6px;font-size:11px;letter-spacing:.06em;color:var(--dim);text-transform:uppercase;font-weight:700}
+  .detail{padding:0 12px 10px;border-bottom:1px solid var(--line);max-height:42%;overflow:auto}
+  .detail .who{font-family:var(--mono);font-size:11px;font-weight:700}
+  .detail .body{margin-top:5px;white-space:pre-wrap;color:var(--ink)}
+  .badge{display:inline-block;padding:1px 7px;border-radius:10px;font-size:10.5px;font-family:var(--mono);font-weight:700;vertical-align:middle}
+  .b-pass{background:rgba(139,224,155,.16);color:var(--green)}
+  .b-partial{background:rgba(230,180,92,.16);color:var(--amber)}
+  .b-fail{background:rgba(255,123,107,.16);color:var(--red)}
+  .b-none{background:rgba(139,151,166,.14);color:var(--dim)}
+  .agent{padding:8px 12px;overflow:auto;flex:1;min-height:0}
+  .agent .card{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:9px 10px;margin-bottom:8px}
+  .agent .card.lead{border-color:rgba(201,143,255,.5)}
+  .agent .title{color:var(--purple);font-weight:700;font-size:12px;display:flex;align-items:center;gap:6px}
+  .agent .meta{color:var(--faint);font-size:11px;font-family:var(--mono);margin:3px 0 6px}
+  .agent .sum{color:var(--ink);font-size:12.5px}
+  .agent .sum b{color:var(--green)}
+  .controls{display:flex;flex-wrap:wrap;gap:7px;align-items:center;padding:9px 12px;background:#0b0e12;border-top:1px solid var(--line)}
+  button{font:inherit;font-size:12px;background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:5px 11px;cursor:pointer}
+  button:hover{border-color:var(--cyan)}
+  button.go{border-color:rgba(230,180,92,.55);color:var(--amber)}
+  button.agentbtn{border-color:rgba(201,143,255,.55);color:var(--purple)}
+  button:disabled{opacity:.45;cursor:default}
+  .find{margin-left:auto;display:flex;align-items:center;gap:6px}
+  .find input{font:inherit;font-family:var(--mono);font-size:12px;background:#0e1116;color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:5px 9px;width:190px}
+  .seedwrap{display:flex;align-items:center;gap:5px;color:var(--faint);font-size:11px;font-family:var(--mono)}
+  .seedwrap input{width:62px;font:inherit;background:#0e1116;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:3px 6px}
+  .legend{position:absolute;left:12px;bottom:10px;display:flex;gap:12px;font-size:11px;color:var(--dim);font-family:var(--mono);background:rgba(11,14,18,.7);padding:5px 9px;border-radius:8px;border:1px solid var(--line)}
+  .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px;vertical-align:middle}
+  .stat{position:absolute;right:12px;top:10px;font-family:var(--mono);font-size:11px;color:var(--dim);background:rgba(11,14,18,.7);padding:5px 9px;border-radius:8px;border:1px solid var(--line);text-align:right}
+  text{font-family:var(--mono);user-select:none}
+  .node{cursor:pointer}
+  .pop{animation:pop .35s ease-out}
+  @keyframes pop{from{opacity:0;transform:scale(.4)}to{opacity:1;transform:scale(1)}}
+</style>
+</head>
+<body>
+  <div class="cmdbar">
+    <span class="mode" id="modechip">NORMAL</span>
+    <span class="line" id="cmdline">:</span>
+    <span class="hint">:o open · :ca continue-all · :fuzzd fan directives · / fuzzy-find · j/k move · click a node</span>
+  </div>
+
+  <div class="main">
+    <div class="canvaswrap">
+      <svg id="svg" viewBox="0 0 1000 700" preserveAspectRatio="xMidYMid meet"></svg>
+      <div class="legend">
+        <span><i style="background:var(--cyan)"></i>you</span>
+        <span><i style="background:var(--green)"></i>compiles+tests</span>
+        <span><i style="background:var(--amber)"></i>compiles, tests fail</span>
+        <span><i style="background:var(--red)"></i>build fails</span>
+        <span>◆ best region</span>
+      </div>
+      <div class="stat" id="stat"></div>
+    </div>
+
+    <div class="side">
+      <h3>Focused node</h3>
+      <div class="detail" id="detail"><div class="body" style="color:var(--faint)">Click a node, or open a chat below.</div></div>
+      <h3>Summary agent</h3>
+      <div class="agent" id="agent">
+        <div class="card"><div class="sum" style="color:var(--faint)">After the space grows, hit <b style="color:var(--purple)">Summarize best region</b> — a small model walks the tree, finds the branch where the most code compiled and passed tests, and writes it up here.</div></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="open">📂 :open sort-ints.chat</button>
+    <button id="ca" class="go" disabled>↪ :continue-all</button>
+    <button id="overnight" class="go" disabled>🌙 leave overnight (×6)</button>
+    <button id="fuzz" disabled>✦ :fuzzd focus</button>
+    <button id="reverify" disabled>⌗ re-verify</button>
+    <button id="summ" class="agentbtn" disabled>🤖 summarize best region</button>
+    <button id="reset">⟲ reset</button>
+    <span class="seedwrap">seed <input id="seed" type="number" value="7"></span>
+    <div class="find">
+      <span style="color:var(--faint);font-family:var(--mono)">/</span>
+      <input id="find" placeholder="fuzzy-find nodes…">
+    </div>
+  </div>
+
+<script>
+// ---- deterministic PRNG (mulberry32): integer seed → bit-reproducible space ----
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let rng = mulberry32(7);
+const ri = n => Math.floor(rng()*n);
+const pick = arr => arr[ri(arr.length)];
+
+// ---- mock "model": a bank of plausible continuations for "sort 1000 random ints in Rust" ----
+// each line carries a quality hint (0..1) the verifier biases on, so coherent good/bad regions emerge.
+const SEED_CHAT = [
+  {role:'user', text:"write a rust crate that sorts a vec of 1000 random ints"},
+  {role:'assistant', text:"I'll scaffold a small crate. The core is one function over a Vec<i32>; I'll sort in place and return it, then add a test that checks the result is non-decreasing.", q:0.9},
+];
+const CONT = [
+  {t:"Simplest correct version: `v.sort_unstable();` — it's the fastest comparison sort in std for primitives, no allocation.", q:0.96},
+  {t:"For stability I'll use `v.sort();` instead — slightly slower but a clean baseline.", q:0.93},
+  {t:"Let me hand-roll quicksort with a median-of-three pivot so the pivot choice is explicit.", q:0.7},
+  {t:"Counting/radix sort: ints fit in 32 bits, so four 8-bit passes beat comparison sort here.", q:0.62},
+  {t:"I'll parallelize with rayon's `par_sort_unstable` to use all cores.", q:0.55},
+  {t:"Trying an in-place unsafe pointer swap loop to avoid bounds checks.", q:0.2},
+  {t:"Adding a property test: `assert!(v.windows(2).all(|w| w[0] <= w[1]));`", q:0.9},
+  {t:"Generating the input with `rand::thread_rng()` and a fixed seed so the test is reproducible.", q:0.85},
+  {t:"Refactor: make it generic `fn sort<T: Ord>(mut v: Vec<T>) -> Vec<T>`.", q:0.78},
+  {t:"Benchmarking the three approaches with `criterion` to pick a default.", q:0.66},
+  {t:"Handling the empty and single-element cases explicitly before sorting.", q:0.88},
+  {t:"Switching to `i64` and 1M elements to stress the radix path.", q:0.5},
+  {t:"Forgot the `mut` on the binding — fixing the move so it compiles.", q:0.6},
+  {t:"Splitting into lib.rs + a bin that prints the sorted head, with `// file:` lines.", q:0.8},
+];
+const FUZZ_DIRECTIVES = ["shortest","fastest","no-deps","defensive","readable","prototyper"];
+
+// ---- state ----
+let nodes = [];           // {id,parent,role,text,verify,depth,x,y,fresh,dir}
+let focus = null;         // focused node id
+let region = null;        // {root, members:Set} highlighted best region
+let query = "";
+const find = document.getElementById('find');  // the fuzzy-find input (was an undeclared global → window.find)
+let view = {x:0,y:0,k:1};  // pan/zoom
+let busy = false;
+
+function reset(seed){
+  rng = mulberry32(seed|0);
+  nodes = []; focus=null; region=null; query=""; find.value="";
+  view={x:0,y:0,k:1};
+  setButtons(true);
+  render();
+  setCmd("");
+}
+function newNode(parent, role, text, q){
+  const id = nodes.length;
+  const depth = parent==null ? 0 : nodes[parent].depth+1;
+  nodes.push({id,parent,role,text,verify:null,depth,x:0,y:0,fresh:true,q});
+  return id;
+}
+
+// ---- :open — import a chat from a file (here: a baked-in linear seed) ----
+function openChat(){
+  reset(+seed.value);
+  let parent=null;
+  for(const m of SEED_CHAT){ parent = newNode(parent, m.role, m.text, m.q ?? 0.85); }
+  // verify the seed assistant node
+  nodes.filter(n=>n.role==='assistant').forEach(verifyNode);
+  focus = nodes.length-1;
+  layout(); render();
+  setCmd("open sort-ints.chat");
+  ['ca','overnight','fuzz','reverify','summ'].forEach(id=>document.getElementById(id).disabled=false);
+}
+
+// ---- verifier (mock cargo check + test): quality + lineage bias → pass/partial/fail ----
+function verifyNode(n){
+  if(n.role!=='assistant'){ n.verify=null; return; }
+  const parentBias = n.parent!=null && nodes[n.parent].verify==='pass' ? 0.12
+                    : n.parent!=null && nodes[n.parent].verify==='fail' ? -0.12 : 0;
+  const score = Math.max(0,Math.min(1,(n.q ?? 0.7)+parentBias+(rng()-0.5)*0.25));
+  n.verify = score>0.72 ? 'pass' : score>0.45 ? 'partial' : 'fail';
+}
+
+// ---- :continue-all — for every leaf, spawn a continuation (sometimes a fork) ----
+function leaves(){
+  const hasChild = new Set(nodes.map(n=>n.parent).filter(p=>p!=null));
+  return nodes.filter(n=>!hasChild.has(n.id) && n.role==='assistant');
+}
+function continueAll(){
+  const ls = leaves();
+  if(!ls.length) return 0;
+  let added=0;
+  for(const leaf of ls){
+    if(nodes.length>240) break;               // keep the overnight space bounded
+    const branches = rng()<0.28 ? 2 : (rng()<0.12 ? 0 : 1); // mostly 1, sometimes fork, sometimes a branch ends
+    for(let b=0;b<branches;b++){
+      const c = pick(CONT);
+      const id = newNode(leaf.id,'assistant',c.t,c.q);
+      verifyNode(nodes[id]); added++;
+    }
+  }
+  layout(); render();
+  setCmd("continue-all  ·  +"+added+" leaves expanded");
+  return added;
+}
+
+// ---- :fuzzd on the focused node — fan it into directive-varied branches ----
+function fuzzFocus(){
+  if(focus==null) return;
+  const par = nodes[focus].parent ?? focus;
+  for(let i=0;i<4;i++){
+    const c = pick(CONT), d = FUZZ_DIRECTIVES[i%FUZZ_DIRECTIVES.length];
+    const id = newNode(par,'assistant',"["+d+"] "+c.t, c.q);
+    verifyNode(nodes[id]);
+  }
+  layout(); render();
+  setCmd("fuzzd 4  ·  one branch per directive");
+}
+
+// ---- overnight: several rounds of continue-all with a little animation ----
+async function overnight(rounds){
+  if(busy) return; busy=true; setButtons(false);
+  for(let r=0;r<rounds;r++){
+    const a = continueAll();
+    stat.textContent = "round "+(r+1)+"/"+rounds+" · "+nodes.length+" nodes";
+    await sleep(420);
+    if(a===0 || nodes.length>240) break;
+  }
+  busy=false; setButtons(true);
+  setCmd("overnight complete  ·  "+nodes.length+" nodes to explore");
+}
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+// ---- the summary agent: find the subtree that compiled+tested best, write it up ----
+function subtreeStats(root){
+  const stack=[root]; let total=0,pass=0,partial=0,members=[];
+  const childrenOf = id => nodes.filter(n=>n.parent===id).map(n=>n.id);
+  while(stack.length){ const id=stack.pop(); members.push(id);
+    const v=nodes[id].verify; if(v){total++; if(v==='pass')pass++; else if(v==='partial')partial++;}
+    childrenOf(id).forEach(c=>stack.push(c)); }
+  return {root,members,total,pass,partial,ratio: total? pass/total : 0};
+}
+function summarizeBest(){
+  // candidate regions = every assistant node whose subtree has >=3 verified nodes; score by pass-ratio then size
+  const cands = nodes.filter(n=>n.role==='assistant').map(n=>subtreeStats(n.id)).filter(s=>s.total>=3);
+  if(!cands.length){ renderAgent(null); return; }
+  cands.sort((a,b)=> b.ratio-a.ratio || b.total-a.total);
+  const best = cands[0];
+  region = {root:best.root, members:new Set(best.members)};
+  focus = best.root;
+  layout(); render();
+  renderAgent(best);
+  setCmd("agent: summarized region #"+best.root+" ("+best.members.length+" nodes)");
+}
+function renderAgent(best){
+  if(!best){ agent.innerHTML='<div class="card"><div class="sum" style="color:var(--faint)">No region has ≥3 verified nodes yet — grow the space first (continue-all / overnight).</div></div>'; return; }
+  const lead = nodes[best.root];
+  const passNodes = best.members.filter(id=>nodes[id].verify==='pass');
+  const approach = passNodes.slice(0,3).map(id=>nodes[id].text.replace(/^\[[^\]]+\]\s*/,'')).map(t=>t.split(/[.:]/)[0]).filter(Boolean);
+  const pct = Math.round(best.ratio*100);
+  agent.innerHTML =
+    '<div class="card lead"><div class="title">🤖 best region — #'+best.root+'</div>'+
+    '<div class="meta">'+best.members.length+' nodes · '+best.pass+'/'+best.total+' green ('+pct+'%) · depth '+lead.depth+'→'+Math.max(...best.members.map(id=>nodes[id].depth))+'</div>'+
+    '<div class="sum">This branch is where the code actually held up: <b>'+best.pass+' of '+best.total+'</b> assistant turns compiled <i>and</i> passed the property test. '+
+    'It starts from “'+esc(lead.text.split(/[.:]/)[0])+'” and the winning moves were: '+ (approach.length? approach.map(esc).join('; ') : 'the stdlib path') +'. '+
+    'Recommend promoting this lineage and pruning the red siblings to reclaim context.</div></div>'+
+    '<div class="card"><div class="meta">why this one</div><div class="sum" style="color:var(--dim)">Ranked every subtree (≥3 verified) by pass-ratio, tie-broken by size. The compiler+tests are the grader, not the model — so “best” means most-verified, not most-confident.</div></div>';
+}
+
+// ---- layered tree layout (root left, depth → x; siblings spread on y) ----
+function layout(){
+  if(!nodes.length) return;
+  const children = id => nodes.filter(n=>n.parent===id).map(n=>n.id);
+  let slot=0;
+  const assignY=(id)=>{ const ch=children(id);
+    if(!ch.length){ nodes[id]._y=slot++; return nodes[id]._y; }
+    const ys=ch.map(assignY); nodes[id]._y=(Math.min(...ys)+Math.max(...ys))/2; return nodes[id]._y; };
+  nodes.filter(n=>n.parent==null).forEach(assignY);
+  const maxY = Math.max(1, slot-1), maxD = Math.max(1, Math.max(...nodes.map(n=>n.depth)));
+  const padX=70, padY=44, W=1000, H=700;
+  const spanX=(W-2*padX), spanY=(H-2*padY);
+  for(const n of nodes){
+    n.x = padX + (maxD? n.depth/maxD:0)*spanX;
+    n.y = padY + (maxY? n._y/maxY:0.5)*spanY;
+  }
+}
+
+// ---- render (SVG, rebuilt each change) ----
+const svg = document.getElementById('svg');
+function col(n){
+  if(n.role==='user') return 'var(--cyan)';
+  return n.verify==='pass'?'var(--green)':n.verify==='partial'?'var(--amber)':n.verify==='fail'?'var(--red)':'var(--dim)';
+}
+function matches(n){ if(!query) return true; const t=n.text.toLowerCase(); let i=0; for(const c of query.toLowerCase()){ i=t.indexOf(c,i); if(i<0) return false; i++; } return true; }
+function render(){
+  const parts=[];
+  parts.push(`<g transform="translate(${view.x},${view.y}) scale(${view.k})">`);
+  // edges
+  for(const n of nodes){ if(n.parent==null) continue; const p=nodes[n.parent];
+    const inReg = region && region.members.has(n.id) && region.members.has(p.id);
+    const dim = (query && !matches(n) && !matches(p));
+    const c = inReg ? 'var(--purple)' : 'var(--line)';
+    const w = inReg ? 2.2 : 1.1;
+    const mx=(p.x+n.x)/2;
+    parts.push(`<path d="M${p.x.toFixed(1)},${p.y.toFixed(1)} C${mx.toFixed(1)},${p.y.toFixed(1)} ${mx.toFixed(1)},${n.y.toFixed(1)} ${n.x.toFixed(1)},${n.y.toFixed(1)}" fill="none" stroke="${c}" stroke-width="${w}" opacity="${dim?0.15:(inReg?0.9:0.5)}"/>`);
+  }
+  // nodes
+  for(const n of nodes){
+    const r = n.role==='user'?7:5.4;
+    const inReg = region && region.members.has(n.id);
+    const dim = query && !matches(n);
+    const o = dim?0.18:1;
+    const cls = 'node'+(n.fresh?' pop':'');
+    if(inReg) parts.push(`<circle class="${cls}" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r+5}" fill="none" stroke="var(--purple)" stroke-width="1.6" opacity="${o}"/>`);
+    if(focus===n.id) parts.push(`<circle cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r+3}" fill="none" stroke="var(--amber)" stroke-width="2" opacity="${o}"/>`);
+    parts.push(`<circle class="${cls}" data-id="${n.id}" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r}" fill="${col(n)}" opacity="${o}"/>`);
+    if(n.role==='user') parts.push(`<circle data-id="${n.id}" cx="${n.x.toFixed(1)}" cy="${n.y.toFixed(1)}" r="${r+1.5}" fill="none" stroke="rgba(214,222,232,.45)" stroke-width="1" opacity="${o}"/>`);
+    // label only near-root / focused / region to avoid clutter
+    if((n.depth<=1 || focus===n.id || inReg) && !dim){
+      const label = (n.role==='user'?'you: ':'')+n.text.replace(/^\[[^\]]+\]\s*/,'').slice(0,26);
+      parts.push(`<text x="${(n.x+r+5).toFixed(1)}" y="${(n.y+3.5).toFixed(1)}" font-size="10.5" fill="${focus===n.id?'var(--amber)':inReg?'var(--purple)':'var(--dim)'}">${esc(label)}</text>`);
+    }
+  }
+  parts.push('</g>');
+  svg.innerHTML = parts.join('');
+  nodes.forEach(n=>n.fresh=false);
+  // stat
+  const a = nodes.filter(n=>n.role==='assistant');
+  const pass=a.filter(n=>n.verify==='pass').length, part=a.filter(n=>n.verify==='partial').length, fail=a.filter(n=>n.verify==='fail').length;
+  stat.textContent = nodes.length? `${nodes.length} nodes · ${leaves().length} leaves · ✓${pass} ◐${part} ✗${fail}` : '';
+}
+function renderDetail(){
+  if(focus==null){ detail.innerHTML='<div class="body" style="color:var(--faint)">Click a node, or open a chat below.</div>'; return; }
+  const n=nodes[focus];
+  const who = n.role==='user'?'<span class="who" style="color:var(--cyan)">you</span>':'<span class="who" style="color:var(--green)">assistant</span>';
+  const vb = n.role!=='assistant'?'' : n.verify==='pass'?'<span class="badge b-pass">compiles + tests pass</span>'
+            : n.verify==='partial'?'<span class="badge b-partial">compiles · tests fail</span>'
+            : n.verify==='fail'?'<span class="badge b-fail">build fails</span>':'<span class="badge b-none">unverified</span>';
+  detail.innerHTML = `<div style="display:flex;align-items:center;gap:8px;padding-top:8px">${who} <span style="color:var(--faint);font-family:var(--mono);font-size:11px">#${n.id} · depth ${n.depth}</span> ${vb}</div><div class="body">${esc(n.text)}</div>`;
+}
+function esc(s){return (s+'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+
+// ---- interaction: click node, pan, zoom, j/k move, fuzzy find ----
+svg.addEventListener('click', e=>{
+  const t=e.target.closest('[data-id]'); if(!t) return;
+  focus=+t.getAttribute('data-id'); region=null; render(); renderDetail();
+  setCmd("focus #"+focus);
+});
+let drag=null;
+svg.addEventListener('pointerdown', e=>{ drag={x:e.clientX,y:e.clientY,vx:view.x,vy:view.y}; svg.classList.add('dragging'); });
+window.addEventListener('pointerup', ()=>{ drag=null; svg.classList.remove('dragging'); });
+window.addEventListener('pointermove', e=>{ if(!drag) return; view.x=drag.vx+(e.clientX-drag.x); view.y=drag.vy+(e.clientY-drag.y); render(); });
+svg.addEventListener('wheel', e=>{ e.preventDefault(); const f=e.deltaY<0?1.12:0.89; view.k=Math.max(0.4,Math.min(3,view.k*f)); render(); }, {passive:false});
+window.addEventListener('keydown', e=>{
+  if(document.activeElement===find) return;
+  if(e.key==='j'||e.key==='k'){ // move focus along depth
+    if(focus==null){ focus=0; } else {
+      if(e.key==='j'){ const ch=nodes.filter(n=>n.parent===focus); if(ch.length) focus=ch[0].id; }
+      else { if(nodes[focus].parent!=null) focus=nodes[focus].parent; }
+    }
+    region=null; render(); renderDetail(); setCmd((e.key==='j'?'down':'up')+" → #"+focus);
+  }
+});
+find.addEventListener('input', ()=>{ query=find.value.trim(); render(); setCmd(query?("/"+query):""); });
+
+function setButtons(on){ ['open','ca','overnight','fuzz','reverify','summ','reset'].forEach(id=>{const b=document.getElementById(id); if(id!=='open'&&id!=='reset') b.disabled = !on || !nodes.length; }); }
+function setCmd(s){ document.getElementById('cmdline').textContent = ':'+s; }
+
+document.getElementById('open').onclick = openChat;
+document.getElementById('ca').onclick = ()=>!busy&&continueAll();
+document.getElementById('overnight').onclick = ()=>overnight(6);
+document.getElementById('fuzz').onclick = fuzzFocus;
+document.getElementById('reverify').onclick = ()=>{ rng=mulberry32((+seed.value|0)+nodes.length); nodes.forEach(n=>verifyNode(n)); region=null; render(); renderDetail(); setCmd("re-verified all"); };
+document.getElementById('summ').onclick = summarizeBest;
+document.getElementById('reset').onclick = ()=>reset(+seed.value);
+seed.onchange = ()=>reset(+seed.value);
+
+// boot: show an empty canvas with a hint; user clicks :open
+render();
+</script>
+</body>
+</html>

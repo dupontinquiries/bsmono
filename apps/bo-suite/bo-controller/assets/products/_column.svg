@@ -1,0 +1,8 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Tall rounded home speaker (Balance) -->
+  <rect x="20" y="8" width="24" height="48" rx="12" ry="12"/>
+  <circle cx="32" cy="34" r="7"/>
+  <circle cx="32" cy="34" r="1.8" fill="currentColor" stroke="none"/>
+  <path d="M24 17 q8 -3 16 0" stroke-width="1.6" opacity="0.7"/>
+</svg>

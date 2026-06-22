@@ -1,0 +1,12 @@
+# build artifacts
+target/
+build-*/
+dist/
+*.rlib
+*.rmeta
+# caches / os
+__pycache__/
+*.pyc
+.DS_Store
+# prebuilt binaries (rebuildable) — keep sources only
+**/scene-view-linux-x64

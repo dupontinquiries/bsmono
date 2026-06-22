@@ -1,0 +1,37 @@
+# RD=8 with MAX_UPLOADS_PER_FRAME=4 (down from default 16). Tests the
+# c.7 hypothesis: does reducing the upload rate keep `rendering:`
+# count lower and thus the GPU shadow/main cost lower?
+#
+# Expected: world fill takes longer, `rendering_max` over 30s should
+# be smaller than rd8_smoke (because we admit chunks more slowly).
+# If GPU cost tracks `rendering_max`, the GPU percentiles should
+# also drop.
+#
+# The c.7 data at MAX_UPLOADS=1 was extreme (rendering p50=7). This
+# spec at MAX_UPLOADS=4 is a more moderate test — slowing fill but
+# not throttling so hard that the world looks empty.
+
+spec_version = 1
+name = "rd8_low_upload"
+description = """
+RD=8 with upload cap reduced to 4 (default 16). Tests whether
+reducing the workload growth rate keeps GPU cost predictable.
+Same no-latency baseline defaults otherwise (MAILBOX, FIF=1,
+late-input).
+"""
+
+[engine]
+binary = "unendlich-world"
+duration_ms = 30000
+
+[env]
+UNENDLICH_RENDER_DISTANCE = "8"
+UNENDLICH_INDIRECT = "1"
+UNENDLICH_LOD_FACTORS = "4,8,16,32"
+UNENDLICH_MAX_UPLOADS_PER_FRAME = "4"
+
+[expect]
+duration_completed = true
+# No rendering/loaded assertions — the whole point of this spec is
+# to see what those numbers ARE with a slower fill. Asserting them
+# would prejudge the result.

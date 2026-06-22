@@ -1,0 +1,311 @@
+{
+  "name": "Forest \u2014 Immersive",
+  "description": "Spatial forest with a running brook, layered across three depth planes.",
+  "version": 2,
+  "layout": "Quad",
+  "start_state": "morning",
+  "layers": [
+    {
+      "name": "brook_close",
+      "_doc": "The primary water sound \u2014 bright, near-field. Pinned to FL so it has a clear sense of direction; close water should feel like it's coming from somewhere specific.",
+      "pool": [
+        "clips/brook_close_a.opus",
+        "clips/brook_close_b.opus",
+        "clips/brook_close_c.opus",
+        "clips/brook_close_d.opus",
+        "clips/brook_close_e.opus",
+        "clips/brook_close_f.opus",
+        "clips/brook_close_g.opus",
+        "clips/brook_close_h.opus"
+      ],
+      "routing": {
+        "Pin": {
+          "channel": "FL",
+          "gain": 0.85
+        }
+      },
+      "crossfade_ms": 3000,
+      "gain_range": [
+        0.7,
+        0.9
+      ],
+      "pan_range": [
+        -0.2,
+        0.0
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000
+    },
+    {
+      "name": "brook_mid",
+      "_doc": "Mid-distance brook, paired front-right + rear-right so it sits behind and beside the listener. Lower gain than the close brook keeps the close one as the focal source.",
+      "pool": [
+        "clips/brook_mid_a.opus",
+        "clips/brook_mid_b.opus",
+        "clips/brook_mid_c.opus",
+        "clips/brook_mid_d.opus",
+        "clips/brook_mid_e.opus",
+        "clips/brook_mid_f.opus",
+        "clips/brook_mid_g.opus",
+        "clips/brook_mid_h.opus"
+      ],
+      "routing": {
+        "Pair": {
+          "a": "FR",
+          "b": "RR",
+          "gain_per_channel": 0.55
+        }
+      },
+      "crossfade_ms": 4000,
+      "gain_range": [
+        0.55,
+        0.75
+      ],
+      "rate_range": [
+        0.98,
+        1.02
+      ],
+      "trigger_prob": 0.9,
+      "duration_ms": 16000
+    },
+    {
+      "name": "brook_far",
+      "_doc": "Distant brook spread diffusely across the rear channels. This is the 'envelopment' layer \u2014 it gives the listener the sense of being IN a place rather than facing a sound.",
+      "pool": [
+        "clips/brook_far_a.opus",
+        "clips/brook_far_b.opus",
+        "clips/brook_far_c.opus",
+        "clips/brook_far_d.opus",
+        "clips/brook_far_e.opus",
+        "clips/brook_far_f.opus",
+        "clips/brook_far_g.opus",
+        "clips/brook_far_h.opus"
+      ],
+      "routing": {
+        "Diffuse": {
+          "channels": [
+            [
+              "RL",
+              0.4
+            ],
+            [
+              "RR",
+              0.4
+            ],
+            [
+              "FL",
+              0.2
+            ]
+          ]
+        }
+      },
+      "crossfade_ms": 6000,
+      "gain_range": [
+        0.45,
+        0.65
+      ],
+      "rate_range": [
+        0.97,
+        1.03
+      ],
+      "trigger_prob": 0.8,
+      "duration_ms": 16000,
+      "swell_period_ms": 70000,
+      "swell_depth": 0.15
+    },
+    {
+      "name": "wind_canopy",
+      "_doc": "Mid-band wind across all four channels \u2014 the 'overhead' layer in the absence of dedicated height channels. Wide stereo content + 4-channel spread reads as enveloping wind through high canopy.",
+      "pool": [
+        "clips/wind_canopy_a.opus",
+        "clips/wind_canopy_b.opus",
+        "clips/wind_canopy_c.opus",
+        "clips/wind_canopy_d.opus",
+        "clips/wind_canopy_e.opus",
+        "clips/wind_canopy_f.opus",
+        "clips/wind_canopy_g.opus",
+        "clips/wind_canopy_h.opus"
+      ],
+      "routing": {
+        "Diffuse": {
+          "channels": [
+            [
+              "FL",
+              0.35
+            ],
+            [
+              "FR",
+              0.35
+            ],
+            [
+              "RL",
+              0.45
+            ],
+            [
+              "RR",
+              0.45
+            ]
+          ]
+        }
+      },
+      "crossfade_ms": 5000,
+      "gain_range": [
+        0.5,
+        0.75
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000,
+      "swell_period_ms": 40000,
+      "swell_depth": 0.3
+    },
+    {
+      "name": "wind_distant",
+      "_doc": "Low-band distant wind backdrop. Mono-narrow, panned slightly behind to suggest open landscape beyond the canopy.",
+      "pool": [
+        "clips/wind_distant_a.opus",
+        "clips/wind_distant_b.opus",
+        "clips/wind_distant_c.opus",
+        "clips/wind_distant_d.opus",
+        "clips/wind_distant_e.opus",
+        "clips/wind_distant_f.opus",
+        "clips/wind_distant_g.opus",
+        "clips/wind_distant_h.opus"
+      ],
+      "routing": {
+        "Pair": {
+          "a": "RL",
+          "b": "RR",
+          "gain_per_channel": 0.6
+        }
+      },
+      "crossfade_ms": 8000,
+      "gain_range": [
+        0.4,
+        0.6
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000,
+      "swell_period_ms": 55000,
+      "swell_depth": 0.25
+    },
+    {
+      "name": "leaves_rustle",
+      "_doc": "Sparse leaf rustles, very quiet. Distributed across all four channels with slight loudness variation per channel so the spatial position of each rustle differs across spawns.",
+      "pool": [
+        "clips/leaves_rustle_a.opus",
+        "clips/leaves_rustle_b.opus",
+        "clips/leaves_rustle_c.opus",
+        "clips/leaves_rustle_d.opus",
+        "clips/leaves_rustle_e.opus",
+        "clips/leaves_rustle_f.opus",
+        "clips/leaves_rustle_g.opus",
+        "clips/leaves_rustle_h.opus"
+      ],
+      "routing": {
+        "Diffuse": {
+          "channels": [
+            [
+              "FL",
+              0.25
+            ],
+            [
+              "FR",
+              0.3
+            ],
+            [
+              "RL",
+              0.4
+            ],
+            [
+              "RR",
+              0.35
+            ]
+          ]
+        }
+      },
+      "crossfade_ms": 2000,
+      "gain_range": [
+        0.3,
+        0.5
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 0.5,
+      "duration_ms": 16000
+    }
+  ],
+  "states": [
+    {
+      "name": "morning",
+      "_doc": "Full immersion: brook close + mid + far, canopy + distant wind, sparse rustles. The default state \u2014 what the user gets on initial load.",
+      "layer_weights": {
+        "brook_close": 1.0,
+        "brook_mid": 0.8,
+        "brook_far": 0.7,
+        "wind_canopy": 0.6,
+        "wind_distant": 0.5,
+        "leaves_rustle": 0.5
+      },
+      "dwell_ms": [
+        60000,
+        120000
+      ],
+      "transitions": {
+        "afternoon": 1.0
+      }
+    },
+    {
+      "name": "afternoon",
+      "_doc": "Wind takes over slightly, brook recedes \u2014 like the user drifted upslope. Subtle change but the transitions add 'time passing' depth.",
+      "layer_weights": {
+        "brook_close": 0.8,
+        "brook_mid": 0.9,
+        "brook_far": 0.6,
+        "wind_canopy": 1.0,
+        "wind_distant": 0.7,
+        "leaves_rustle": 0.7
+      },
+      "dwell_ms": [
+        90000,
+        150000
+      ],
+      "transitions": {
+        "morning": 0.7,
+        "stillness": 0.3
+      }
+    },
+    {
+      "name": "stillness",
+      "_doc": "Wind drops. Just water and the occasional rustle. Like the air settled \u2014 a 'breath' between states.",
+      "layer_weights": {
+        "brook_close": 1.0,
+        "brook_mid": 0.7,
+        "brook_far": 0.5,
+        "wind_canopy": 0.2,
+        "wind_distant": 0.3,
+        "leaves_rustle": 0.3
+      },
+      "dwell_ms": [
+        45000,
+        75000
+      ],
+      "transitions": {
+        "morning": 1.0
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:alpine_highlands",
+  "_comment": "Cold mountain biome. Maps to legacy Biome::AlpineHighlands.",
+  "surface_block": "granite",
+  "subsurface_block": "granite",
+  "_legacy_enum": "AlpineHighlands",
+  "has_precipitation": true,
+  "temperature": 0.2,
+  "downfall": 0.5,
+  "effects": {
+    "sky_color": 8364543,
+    "fog_color": 12638463,
+    "grass_color": 8237915,
+    "foliage_color": 8237915,
+    "ambient_light": 0.4
+  }
+}

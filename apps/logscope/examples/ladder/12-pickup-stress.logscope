@@ -1,0 +1,43 @@
+# 12-pickup-stress  (MEDIUM) — built to hammer PICKUP specifically.
+# Replays a base line, then a cascade of :goto jumps back to the real fix commits
+# (r133b/r133c/r141b/r151c/r157b...) issuing each fix from the node it patches.
+# Exercises: many long-distance context pickups across a fragmented tree.
+
+> Build r116c — fix.
+> Build r117 — caves kit wings.
+> Build r118 — haiku merge.
+> Build r119 — winding eggs soaring.
+> Build r120 — batch.
+> Build r121 — fix phase4.
+> Build r123 — real craft climate.
+> Build r124 — survival.
+> Build r129 — fivepack.
+> Build r130 — player bending.
+> Build r134 — aibudget.
+> Build r136 — shaders.
+> Build r138 — dragonbend.
+
+:goto 13    # pickup: patch the build before r133b
+> Fix forward from here: Build r133b — gen2fix.
+
+:goto 13    # pickup: patch the build before r133c
+> Fix forward from here: Build r133c — gen2fix2.
+
+> Build r141 — ecology.
+
+:goto 16    # pickup: patch the build before r141b
+> Fix forward from here: Build r141b — fix.
+
+:goto 16    # pickup: patch the build before r151c
+> Fix forward from here: Build r151c — fix.
+
+> Build r153 — cavegardens.
+
+:goto 19    # pickup: patch the build before r157b
+> Fix forward from here: Build r157b — fix.
+
+# one widen+deepen so the fragmented tree has real frontier
+:2fa 6 'Harden this against edge cases (expiry/re-launch, NaN or huge dt, bounds) while keeping it pure and panic-free. Current: {lastmsg}'
+:2ca
+:best
+:export md

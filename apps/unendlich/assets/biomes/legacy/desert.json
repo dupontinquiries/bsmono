@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:desert",
+  "_comment": "Hot dry sand biome. Maps to legacy Biome::Desert.",
+  "surface_block": "sand",
+  "subsurface_block": "sand",
+  "_legacy_enum": "Desert",
+  "has_precipitation": false,
+  "temperature": 1.6,
+  "downfall": 0.0,
+  "effects": {
+    "sky_color": 7254015,
+    "fog_color": 12638463,
+    "grass_color": 11842740,
+    "foliage_color": 11842740,
+    "ambient_light": 0.5
+  }
+}

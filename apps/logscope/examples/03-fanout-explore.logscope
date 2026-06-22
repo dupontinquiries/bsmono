@@ -1,0 +1,6 @@
+# Wide exploration: fuzz the same task into several variants per leaf, two rounds deep, then pick best.
+# Exercises: :fa (fuzzy-all, depth x width, templated), :best.
+> design an error type for a config loader
+:2fa 3 'propose a concrete Rust enum for: {lastmsg}'
+:best
+:export md

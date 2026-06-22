@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "bo-controller",
+    "bo-mux",
+]
+
+# Shared release-build optimizations for both crates. Override per crate
+# in their own Cargo.toml [profile.release] sections if needed.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.dev]
+opt-level = 0
+debug = true

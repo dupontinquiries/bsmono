@@ -1,0 +1,190 @@
+#version 450
+
+// unendlich GPU chunk culling.
+//
+// v0.20: emit indirect draws for visible chunks, replacing per-chunk
+// CPU draw calls. Single push-constant frustum, 64-wide workgroups.
+//
+// v0.24.0a: frustum planes moved out of push constants and into a
+// per-view SSBO (binding 3). Push constant shrinks to (view_index,
+// chunk_count). This is the foundation for multi-view culling in
+// v0.24.1 — the SSBO holds up to MAX_VIEWS = 8 view slots, and the
+// dispatch picks one via `pc.view_index`. CPU is still authoring
+// the planes themselves in v0.24.0a; v0.24.0b moves derivation onto
+// GPU via `view_compute.comp`.
+//
+// Reads chunk metadata, tests each AABB against the selected view's
+// frustum, writes VkDrawIndexedIndirectCommand entries for visible
+// chunks. CPU then issues a single `vkCmdDrawIndexedIndirectCount`
+// call to draw all of them in one go.
+//
+// Workgroup: 64 invocations, each handles one chunk. Dispatch
+// `(active_chunks + 63) / 64` workgroups.
+//
+// Synchronization:
+// - SSBO writes need shader-write -> indirect-command-read barrier
+//   between this dispatch and the subsequent draw.
+// - The atomic counter is monotonically incremented; CPU resets it
+//   to 0 (cmd_fill_buffer) before the dispatch.
+// - ViewParams SSBO writes (CPU host-coherent in v0.24.0a) are
+//   visible to the shader by submit-order; no explicit barrier
+//   needed since CPU writes complete before vkQueueSubmit.
+
+layout(local_size_x = 64) in;
+
+const uint FLAG_DEBUG_OVERLAY = 1u; // bit 0 = skip cull, always emit
+
+// ---- Chunk metadata (input) ----------------------------------------------
+
+struct ChunkDraw {
+    uint  index_count;     // 0 = inactive slot, skip
+    uint  first_index;     // slot.idx_offset / 4
+    // v0.24.20-vertex-pack: vert_base_aligned / sizeof(PackedVertex)
+    // (was 0 pre-pack — CPU pre-shifted indices instead). Propagated
+    // to the indirect command's vertexOffset; the GPU adds it to
+    // each index during fetch.
+    int   vertex_offset;
+    uint  flags;           // bit 0: debug-overlay (always emit)
+    vec4  aabb_min;        // xyz = AABB min for cull; w = chunk origin Y for vertex unpack
+    vec4  aabb_max;        // xyz = AABB max for cull; w reserved
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Chunks {
+    ChunkDraw chunks[];
+};
+
+// ---- Indirect command output ---------------------------------------------
+
+// Mirrors VkDrawIndexedIndirectCommand bit-for-bit. std430 layout puts
+// uint/int sequentially with no padding for these widths, which matches
+// the Vulkan spec for the indirect-draw command struct.
+struct DrawIndexedIndirect {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance;
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer Commands {
+    DrawIndexedIndirect commands[];
+};
+
+// One u32 counter, atomically incremented per visible chunk. CPU reads
+// it via cmd_draw_indexed_indirect_count.
+layout(std430, set = 0, binding = 2) buffer Counter {
+    uint visible_count;
+};
+
+// ---- View parameters (v0.24.0a) ------------------------------------------
+//
+// Per-view data. v0.24.0a only uses `planes`; matrix slots are
+// reserved for v0.24.0b's view_compute.comp to populate. Layout MUST
+// match `ViewParam` in `src/render/view_params.rs` (size = 384).
+//
+// Offsets:
+//      0    view              (mat4)
+//     64    projection        (mat4)
+//    128    view_proj         (mat4)
+//    192    inverse_view_proj (mat4)
+//    256    camera_pos        (vec4)
+//    272    near_far_aspect   (vec4)
+//    288    planes            (vec4 × 6)
+//    384    <- size
+struct ViewParam {
+    mat4 view;
+    mat4 projection;
+    mat4 view_proj;
+    mat4 inverse_view_proj;
+    vec4 camera_pos;
+    vec4 near_far_aspect;
+    vec4 planes[6];
+};
+
+layout(std430, set = 0, binding = 3) readonly buffer ViewParams {
+    ViewParam view_params[];
+};
+
+// ---- Push constants ------------------------------------------------------
+//
+// Shrunk in v0.24.0a from (planes[6], chunk_count, pad×3) — 112 bytes
+// — to (view_index, chunk_count) — 8 bytes. Frustum planes now come
+// from the SSBO.
+
+layout(push_constant) uniform PushConstants {
+    uint view_index;
+    uint chunk_count;
+    // v0.24.4 (shadow-stride): temporal stride for shadow amortization.
+    // Main cull passes (1, 0) = admit all. Shadow cull passes
+    // (UNENDLICH_SHADOW_CHUNK_STRIDE, frame_count % stride). When
+    // stride > 1, only chunks where (slot_index % stride) == phase
+    // pass to the draw list this frame.
+    uint stride;
+    uint stride_phase;
+} pc;
+
+// ---- AABB-vs-frustum test -----------------------------------------------
+//
+// "p-corner" trick: for each plane, find the AABB corner farthest along
+// the plane normal. If even that corner's signed distance is negative,
+// the entire AABB is outside this plane → reject.
+
+bool aabb_visible(vec3 mn, vec3 mx) {
+    for (int i = 0; i < 6; i++) {
+        vec4 p = view_params[pc.view_index].planes[i];
+        vec3 corner = vec3(
+            (p.x >= 0.0) ? mx.x : mn.x,
+            (p.y >= 0.0) ? mx.y : mn.y,
+            (p.z >= 0.0) ? mx.z : mn.z
+        );
+        float dist = dot(p.xyz, corner) + p.w;
+        if (dist < 0.0) return false;
+    }
+    return true;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.chunk_count) return;
+
+    ChunkDraw c = chunks[i];
+
+    // Inactive slot — skip.
+    if (c.index_count == 0u) return;
+
+    // v0.24.4 (shadow-stride): temporal amortization. When stride > 1
+    // (shadow cull only) we admit one in `stride` chunks per frame,
+    // cycling through which chunks via `stride_phase`. Inactive slot
+    // check above runs first so inactive slots don't break the
+    // residue pattern (they're already excluded). Active slots are
+    // distributed across residues by `slot_index % stride`.
+    //
+    // The shadow map is NOT cleared between frames in stride>1 mode
+    // (see ShadowMap::render_pass_load); previous frames' depth
+    // values remain valid for chunks we skip here.
+    if (pc.stride > 1u) {
+        if ((i % pc.stride) != pc.stride_phase) return;
+    }
+
+    // Cull test (debug overlay always passes).
+    bool always_emit = (c.flags & FLAG_DEBUG_OVERLAY) != 0u;
+    if (!always_emit) {
+        if (!aabb_visible(c.aabb_min.xyz, c.aabb_max.xyz)) return;
+    }
+
+    // Reserve a slot in the output and write the draw command.
+    //
+    // v0.24.20-vertex-pack: `first_instance` carries the chunk's slot
+    // index in the metadata SSBO so the vertex shader can recover the
+    // chunk origin via `gl_InstanceIndex`. Each draw command still
+    // renders one instance (instance_count=1), but Vulkan adds the
+    // per-draw `firstInstance` value into `gl_InstanceIndex` —
+    // effectively a free per-draw "which chunk is this?" channel that
+    // doesn't cost a push constant or a separate buffer.
+    uint slot = atomicAdd(visible_count, 1u);
+    commands[slot].index_count    = c.index_count;
+    commands[slot].instance_count = 1u;
+    commands[slot].first_index    = c.first_index;
+    commands[slot].vertex_offset  = c.vertex_offset;
+    commands[slot].first_instance = i;
+}

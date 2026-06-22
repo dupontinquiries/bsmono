@@ -1,0 +1,1106 @@
+// chunk_mesh_octree.comp — v0.24.27-octree-mesher.
+//
+// GPU mesher reading the octree as its world-data input, in place of
+// `SurfaceRecord[]`. Architecturally the unification step toward
+// "one substrate read by all consumers" from architecture-v1 §3.1.
+//
+// ## Dispatch model
+//
+// One invocation per chunk cell. Workgroup is 64 invocations.
+// Per chunk: 32³ = 32768 cells → 512 workgroups (X). Per batch of
+// chunks: dispatch (512, batch_chunks, 1). `gl_WorkGroupID.y`
+// indexes the chunk in the batch.
+//
+// Each invocation:
+// 1. Computes its chunk-local (x, y, z) from the invocation id.
+// 2. Samples the octree at that cell → block_id.
+// 3. If air or non-meshable, returns.
+// 4. Samples 6 neighbors (open-boundary: out-of-chunk → air).
+// 5. For each axis whose neighbor is air-or-transparent, emits a
+//    quad facing that direction.
+//
+// ## Open-boundary note
+//
+// This ship treats out-of-chunk neighbors as air. The current
+// production GPU mesher (`chunk_mesh_sparse.comp`) gets its
+// neighbor info from CPU-extracted SurfaceRecord face masks which
+// can include cross-chunk lookups when adjacent chunks are loaded.
+// We're losing that; faces at chunk boundaries that should be
+// culled (because the adjacent chunk has a solid block on the
+// other side) will be emitted anyway.
+//
+// Visual impact at chunk borders: double-shaded faces (this side +
+// the neighbor's side) with possible z-fighting. Inside chunks the
+// output is correct.
+//
+// A follow-up ship can bind the renderer's full OctreeBufferPool
+// (which has every loaded chunk's octree) and look up neighbor
+// chunks on the GPU. Filed in v0.24.27 readme.
+//
+// ## Vertex/index output format
+//
+// Matches `chunk_mesh_sparse.comp` byte-for-byte:
+// - vertex stride 24 bytes (pos.xyz f32, color.rgb f32). The
+//   readback path packs to A2B10G10R10_UNORM_PACK32 + R8G8B8A8 as
+//   it would for any other source.
+// - index u32. Each face = 2 tris = 6 indices.
+// - Indices are LOCAL to this chunk's vertex slot. The caller adds
+//   the chunk's vertex_base when uploading to the renderer pool.
+//
+// ## Per-chunk slot capacities
+//
+// Same as sparse: VERTEX_CAPACITY = 65535, INDEX_CAPACITY = 65535.
+// Worst-case theoretical (32³ cells × 24 verts/cell × 6 faces)
+// vastly exceeds these. In practice surface chunks emit < 30K
+// vertices. Counters flag overflow per chunk; caller can fall back
+// to CPU mesher for any chunk that overflows.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+// Types + constants for octree node layout. MUST come BEFORE the
+// SSBO declaration so `OctreeNode` is in scope when the SSBO
+// references it. See octree_types.glsl for the wire format.
+#include "octree_types.glsl"
+
+// Binding 0: every batched chunk's octree nodes, flat-packed. Per-
+// chunk slices are `[base..base+count)`; the per-chunk metadata
+// (binding 4) carries `base` for each slot.
+layout(std430, set = 0, binding = 0) readonly buffer OctreeNodes {
+    OctreeNode nodes[];
+};
+
+// Binding 1: flat vertex output buffer. 6 floats per vertex
+// (pos.xyz, color.rgb). std430 packs consecutively.
+layout(std430, set = 0, binding = 1) writeonly buffer Vertices {
+    float vertex_floats[];
+};
+
+// Binding 2: flat index output buffer. u32 per index.
+layout(std430, set = 0, binding = 2) writeonly buffer Indices {
+    uint indices[];
+};
+
+// Binding 3: per-batch counters. 4 u32 per chunk slot:
+//   [0]: vertex_count for chunk slot
+//   [1]: index_count for chunk slot
+//   [2]: overflow_flag (set if a thread exceeded capacity)
+//   [3]: reserved (zero)
+layout(std430, set = 0, binding = 3) buffer Counters {
+    uint counters[];
+};
+
+// Binding 4: per-chunk metadata. One ChunkMeta per slot in the
+// batch. Indexed by gl_WorkGroupID.y.
+struct ChunkMeta {
+    uint octree_base;       // first node index in the octree SSBO
+    uint vertex_base;       // vertex slot start
+    uint index_base;        // index slot start
+    uint counter_base;      // counters slot start (chunk_idx * 4)
+    int  chunk_origin_x;    // world origin
+    int  chunk_origin_y;
+    int  chunk_origin_z;
+    uint _pad;
+    // v0.24.30-cross-chunk: per-neighbor octree bases. u32::MAX
+    // (0xFFFFFFFFu) sentinel means the neighbor isn't resident
+    // in the shared pool (treat as air — open boundary).
+    uint neighbor_px;
+    uint neighbor_nx;
+    uint neighbor_py;
+    uint neighbor_ny;
+    uint neighbor_pz;
+    uint neighbor_nz;
+    // v0.24.33-climate-tint: per-chunk climate [0, 1].
+    float temperature;
+    float humidity;
+};
+layout(std430, set = 0, binding = 4) readonly buffer ChunkMetas {
+    ChunkMeta chunk_metas[];
+};
+
+// Sample function references global `nodes[]` from binding 0.
+#include "octree_sample.glsl"
+
+layout(push_constant) uniform PC {
+    uint vertex_capacity;   // per-chunk vertex slot capacity
+    uint index_capacity;    // per-chunk index slot capacity
+    uint batch_count;       // number of chunks in this batch
+    // v0.24.39-mid-lod: Mid LOD support. For Near, cell_count=32
+    // and cell_stride=1 (per-block iteration). For Mid, cell_count=16
+    // and cell_stride=2 (each cell represents a 2³ source block).
+    // Far/VeryFar (factor 4 and 8) are not yet wired up but use the
+    // same parameterization.
+    uint lod_cell_count;
+    uint lod_cell_stride;
+    uint _pad;
+} pc;
+
+// Workgroup of 64 invocations on the X axis. Y axis carries chunk
+// index in the batch (one invocation set per chunk).
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+// Block-id classification. Must match BlockId u8 values from
+// world::blocks. Air is 0; we also treat as non-meshable any value
+// equal to Water (9) for the "block is solid" test (water faces
+// emit elsewhere via a separate path). For the purposes of THIS
+// shader (opaque-only mesher v0), we treat anything that isn't
+// air or water as solid.
+//
+// This is the same classification `chunk_mesh_sparse.comp` uses
+// implicitly because SurfaceRecord extraction already filtered to
+// opaque-emitting faces. Behavior parity is the goal.
+bool is_solid_opaque(uint block_id) {
+    if (block_id == 0u) return false;       // Air
+    if (block_id == 9u) return false;       // Water (separate pass)
+    return true;
+}
+
+// v0.24.28-bumpy-foundation: classifies which blocks get the bumpy
+// 4×4 top-face treatment. Soft / natural materials. Mirrors the
+// CPU reference's `is_weatherable` in
+// `gpu_meshing_octree_cpu_ref.rs`.
+bool is_weatherable(uint block_id) {
+    return block_id == 2u   // Grass
+        || block_id == 3u   // Dirt
+        || block_id == 12u  // Sand
+        || block_id == 13u  // Gravel
+        || block_id == 32u; // Snow
+}
+
+// 2D hash producing [0, 1). Squirrel-noise-style; matches the CPU
+// `hash2d` in `gpu_meshing_octree_cpu_ref.rs` bit-for-bit so the
+// reference can be used as a falsification gate against this
+// shader's output.
+float hash2d(float x, float z) {
+    // v0.24.38-bumpy-asym: distinct per-axis multipliers so the
+    // hash isn't symmetric under x↔z swap. The v0.24.28 form used
+    // the same constants for both axes; the resulting bumpy
+    // pattern had a diagonal-mirror symmetry that read as a
+    // diagonal "stripe" artifact in playtest.
+    //
+    // Math: choosing different multipliers (123.34 vs 174.85)
+    // and different additive constants in the dot product breaks
+    // the px↔pz interchange symmetry. The wavelengths chosen are
+    // close enough to feel like the same kind of noise; the
+    // asymmetry just removes the artifact.
+    float px = fract(x * 123.34);
+    float pz = fract(z * 174.85);
+    float dot_p = px * (px + 45.32) + pz * (pz + 67.91);
+    float combined = px * pz * 0.7 + dot_p;
+    return abs(fract(combined));
+}
+
+// Bumpy displacement at a world (x, z) coordinate. Non-positive.
+// Two octaves of hash noise. Mirrors CPU `bumpy_height`.
+float bumpy_height(float wx, float wz) {
+    float n1 = hash2d(wx * 0.5, wz * 0.5);
+    float n2 = hash2d(wx * 1.5, wz * 1.5);
+    float n = n1 * 0.7 + n2 * 0.3;
+    return -n * 0.35;
+}
+
+// v0.24.30-cross-chunk: sample with cross-chunk awareness.
+//
+// If (x, y, z) is inside [0, 32), sample our own octree. Else,
+// translate to the corresponding neighbor's chunk-local coords and
+// sample THAT chunk's octree. If the neighbor isn't resident in
+// the shared pool (its `neighbor_*` is u32::MAX = `INVALID_BASE`),
+// fall back to open-boundary (return air).
+//
+// Only one axis can be out of range at a time when called from the
+// neighbor-sampling site below (we add ±1 to one axis at a time).
+// Diagonal-neighbor lookups are NOT supported by this function;
+// they'd need to chain two neighbor jumps and aren't called by
+// the current 6-face mesher.
+const uint INVALID_BASE = 0xFFFFFFFFu;
+
+uint sample_or_neighbor(ChunkMeta meta, int x, int y, int z) {
+    // Hot path: in-bounds. Sample our own octree.
+    if (x >= 0 && y >= 0 && z >= 0 && x < 32 && y < 32 && z < 32) {
+        return octree_sample(meta.octree_base, uvec3(uint(x), uint(y), uint(z)));
+    }
+
+    // Out-of-bounds on exactly one axis (by precondition). Identify
+    // which neighbor and translate.
+    uint neighbor_base;
+    int nx, ny, nz;
+
+    if (x == 32) {
+        neighbor_base = meta.neighbor_px;
+        nx = 0; ny = y; nz = z;
+    } else if (x == -1) {
+        neighbor_base = meta.neighbor_nx;
+        nx = 31; ny = y; nz = z;
+    } else if (y == 32) {
+        neighbor_base = meta.neighbor_py;
+        nx = x; ny = 0; nz = z;
+    } else if (y == -1) {
+        neighbor_base = meta.neighbor_ny;
+        nx = x; ny = 31; nz = z;
+    } else if (z == 32) {
+        neighbor_base = meta.neighbor_pz;
+        nx = x; ny = y; nz = 0;
+    } else if (z == -1) {
+        neighbor_base = meta.neighbor_nz;
+        nx = x; ny = y; nz = 31;
+    } else {
+        // Multi-axis OOB or invalid input. Caller violated the
+        // single-axis-OOB precondition. Return air for safety
+        // rather than reading random neighbor data.
+        return 0u;
+    }
+
+    if (neighbor_base == INVALID_BASE) {
+        return 0u;  // open-boundary fallback
+    }
+    return octree_sample(neighbor_base, uvec3(uint(nx), uint(ny), uint(nz)));
+}
+
+// Legacy open-boundary helper, kept for any caller that doesn't
+// have a ChunkMeta in scope. The production mesher uses
+// `sample_or_neighbor` instead.
+uint sample_or_air(uint octree_base, int x, int y, int z) {
+    if (x < 0 || y < 0 || z < 0 || x >= 32 || y >= 32 || z >= 32) {
+        return 0u;
+    }
+    return octree_sample(octree_base, uvec3(uint(x), uint(y), uint(z)));
+}
+
+// v0.24.37-vertex-ao: AO sampling. Returns true if the cell at
+// (x, y, z) is solid-opaque. For multi-axis OOB (the sample
+// crosses two or more chunk boundaries), returns false — accepted
+// artifact at chunk-corner inside-corners, sample_or_neighbor
+// only handles single-axis OOB. Visually negligible since chunks
+// are 32 blocks apart and corner-of-corner artifacts only show
+// when looking precisely at world-loaded-set boundaries.
+bool ao_solid(ChunkMeta meta, int x, int y, int z) {
+    int out_count = 0;
+    if (x < 0 || x >= 32) out_count++;
+    if (y < 0 || y >= 32) out_count++;
+    if (z < 0 || z >= 32) out_count++;
+    if (out_count > 1) return false;
+    return is_solid_opaque(sample_or_neighbor(meta, x, y, z));
+}
+
+// Minimum AO factor. Pure black (0.0) at fully-occluded corners
+// reads as harsh; 0.55 keeps the darkening visible but not
+// distracting. Matches typical Minecraft AO range.
+const float AO_MIN = 0.55;
+
+// Per-vertex AO using the Mojang formula. Three cell positions
+// surround the corner being lit:
+//   - s1, s2: the two cells edge-adjacent to the corner (one per
+//     face tangent axis).
+//   - c: the diagonal cell between s1 and s2.
+// AO level (0 = darkest, 3 = brightest):
+//   - if both sides solid: 0  (fully occluded inside-corner)
+//   - else: 3 - (s1 + s2 + c)  (gradual darkening)
+// Returned as [AO_MIN, 1.0] factor.
+float compute_ao(ChunkMeta meta,
+                 int s1x, int s1y, int s1z,
+                 int s2x, int s2y, int s2z,
+                 int cx,  int cy,  int cz) {
+    bool b1 = ao_solid(meta, s1x, s1y, s1z);
+    bool b2 = ao_solid(meta, s2x, s2y, s2z);
+    bool bc = ao_solid(meta, cx,  cy,  cz);
+    int level;
+    if (b1 && b2) {
+        level = 0;
+    } else {
+        int sum = (b1 ? 1 : 0) + (b2 ? 1 : 0) + (bc ? 1 : 0);
+        level = 3 - sum;
+    }
+    return mix(AO_MIN, 1.0, float(level) / 3.0);
+}
+
+// Per-face AO factor sets. Each returns 4 floats in the order
+// matching that face's emit_quad vertex order (CCW from outside).
+//
+// Convention for the (s1, s2, corner) for each face vertex: face
+// at plane normal ± axis_n; tangent axes are the other two. For
+// a vertex at (vy, vz) of a +X face: side1 = cell adjacent in
+// face_tangent_a direction, side2 = cell adjacent in
+// face_tangent_b direction, corner = cell diagonal of both.
+// "Adjacent" meaning the cell that shares an edge with the
+// corner, in the air-side half-space.
+vec4 ao4_face_px(ChunkMeta meta, int x, int y, int z) {
+    int xp = x + 1;
+    // emit_quad order for +X face: c100 (LL), c110 (HL), c111 (HH), c101 (LH)
+    float ll = compute_ao(meta, xp, y-1, z,    xp, y,   z-1,  xp, y-1, z-1);
+    float hl = compute_ao(meta, xp, y+1, z,    xp, y,   z-1,  xp, y+1, z-1);
+    float hh = compute_ao(meta, xp, y+1, z,    xp, y,   z+1,  xp, y+1, z+1);
+    float lh = compute_ao(meta, xp, y-1, z,    xp, y,   z+1,  xp, y-1, z+1);
+    return vec4(ll, hl, hh, lh);
+}
+vec4 ao4_face_nx(ChunkMeta meta, int x, int y, int z) {
+    int xm = x - 1;
+    // emit_quad order for -X face: c000 (LL), c001 (LH), c011 (HH), c010 (HL)
+    float ll = compute_ao(meta, xm, y-1, z,    xm, y,   z-1,  xm, y-1, z-1);
+    float lh = compute_ao(meta, xm, y-1, z,    xm, y,   z+1,  xm, y-1, z+1);
+    float hh = compute_ao(meta, xm, y+1, z,    xm, y,   z+1,  xm, y+1, z+1);
+    float hl = compute_ao(meta, xm, y+1, z,    xm, y,   z-1,  xm, y+1, z-1);
+    return vec4(ll, lh, hh, hl);
+}
+vec4 ao4_face_py(ChunkMeta meta, int x, int y, int z) {
+    int yp = y + 1;
+    // emit_quad order for +Y face (flat): c010 (LL), c011 (LH), c111 (HH), c110 (HL)
+    // tangent axes for +Y: X, Z
+    float ll = compute_ao(meta, x-1, yp, z,    x,   yp, z-1,  x-1, yp, z-1);
+    float lh = compute_ao(meta, x-1, yp, z,    x,   yp, z+1,  x-1, yp, z+1);
+    float hh = compute_ao(meta, x+1, yp, z,    x,   yp, z+1,  x+1, yp, z+1);
+    float hl = compute_ao(meta, x+1, yp, z,    x,   yp, z-1,  x+1, yp, z-1);
+    return vec4(ll, lh, hh, hl);
+}
+vec4 ao4_face_ny(ChunkMeta meta, int x, int y, int z) {
+    int ym = y - 1;
+    // emit_quad order for -Y face: c000 (LL), c100 (HL), c101 (HH), c001 (LH)
+    float ll = compute_ao(meta, x-1, ym, z,    x,   ym, z-1,  x-1, ym, z-1);
+    float hl = compute_ao(meta, x+1, ym, z,    x,   ym, z-1,  x+1, ym, z-1);
+    float hh = compute_ao(meta, x+1, ym, z,    x,   ym, z+1,  x+1, ym, z+1);
+    float lh = compute_ao(meta, x-1, ym, z,    x,   ym, z+1,  x-1, ym, z+1);
+    return vec4(ll, hl, hh, lh);
+}
+vec4 ao4_face_pz(ChunkMeta meta, int x, int y, int z) {
+    int zp = z + 1;
+    // emit_quad order for +Z face: c001 (LL), c101 (HL), c111 (HH), c011 (LH)
+    // tangent axes for +Z: X, Y
+    float ll = compute_ao(meta, x-1, y,   zp,  x,   y-1, zp,  x-1, y-1, zp);
+    float hl = compute_ao(meta, x+1, y,   zp,  x,   y-1, zp,  x+1, y-1, zp);
+    float hh = compute_ao(meta, x+1, y,   zp,  x,   y+1, zp,  x+1, y+1, zp);
+    float lh = compute_ao(meta, x-1, y,   zp,  x,   y+1, zp,  x-1, y+1, zp);
+    return vec4(ll, hl, hh, lh);
+}
+vec4 ao4_face_nz(ChunkMeta meta, int x, int y, int z) {
+    int zm = z - 1;
+    // emit_quad order for -Z face: c000 (LL), c010 (LH), c110 (HH), c100 (HL)
+    float ll = compute_ao(meta, x-1, y,   zm,  x,   y-1, zm,  x-1, y-1, zm);
+    float lh = compute_ao(meta, x-1, y,   zm,  x,   y+1, zm,  x-1, y+1, zm);
+    float hh = compute_ao(meta, x+1, y,   zm,  x,   y+1, zm,  x+1, y+1, zm);
+    float hl = compute_ao(meta, x+1, y,   zm,  x,   y-1, zm,  x+1, y-1, zm);
+    return vec4(ll, lh, hh, hl);
+}
+
+// Simple per-block color. Picks an RGB based on block id so the
+// debug visual is at least distinguishable. Production tinting
+// (climate, slope, weathering) is the CPU mesher's job; we keep
+// this minimal here since v0.24.27 is foundation, not visual
+// parity with the CPU mesher.
+//
+// Block-id colors approximate what the CPU mesher's
+// `compute_tinted_color_for_face` produces for the corresponding
+// blocks in flat, mid-day, no-climate conditions.
+vec3 color_for_block(uint block_id) {
+    if (block_id == 1u)  return vec3(0.50, 0.50, 0.50);   // Stone
+    if (block_id == 2u)  return vec3(0.30, 0.65, 0.20);   // Grass top
+    if (block_id == 3u)  return vec3(0.55, 0.40, 0.25);   // Dirt
+    if (block_id == 4u)  return vec3(0.45, 0.45, 0.45);   // Cobblestone
+    if (block_id == 7u)  return vec3(0.15, 0.15, 0.15);   // Bedrock
+    if (block_id == 11u) return vec3(0.95, 0.45, 0.10);   // Lava
+    if (block_id == 12u) return vec3(0.85, 0.80, 0.55);   // Sand
+    if (block_id == 13u) return vec3(0.50, 0.48, 0.45);   // Gravel
+    if (block_id == 14u) return vec3(0.85, 0.75, 0.30);   // GoldOre
+    if (block_id == 15u) return vec3(0.70, 0.60, 0.50);   // IronOre
+    if (block_id == 16u) return vec3(0.30, 0.30, 0.30);   // CoalOre
+    if (block_id == 17u) return vec3(0.40, 0.30, 0.20);   // OakLog
+    if (block_id == 18u) return vec3(0.20, 0.55, 0.18);   // OakLeaves
+    if (block_id == 19u) return vec3(0.85, 0.85, 0.80);   // BirchLog
+    if (block_id == 20u) return vec3(0.40, 0.65, 0.35);   // BirchLeaves
+    if (block_id == 21u) return vec3(0.20, 0.55, 0.20);   // Cactus
+    if (block_id == 22u) return vec3(0.65, 0.65, 0.75);   // Clay
+    if (block_id == 23u) return vec3(0.30, 0.55, 0.30);   // Moss
+    if (block_id == 24u) return vec3(0.78, 0.45, 0.25);   // RedSandstone
+    if (block_id == 25u) return vec3(0.95, 0.30, 0.40);   // Flower
+    if (block_id == 26u) return vec3(0.40, 0.70, 0.30);   // TallGrass
+    if (block_id == 27u) return vec3(0.30, 0.60, 0.30);   // Fern
+    if (block_id == 28u) return vec3(0.55, 0.40, 0.20);   // DeadBush
+    if (block_id == 29u) return vec3(0.30, 0.55, 0.25);   // Vine
+    if (block_id == 30u) return vec3(0.65, 0.50, 0.50);   // Dripstone
+    if (block_id == 31u) return vec3(0.75, 0.85, 0.95);   // Ice
+    if (block_id == 32u) return vec3(0.95, 0.95, 0.97);   // Snow
+    if (block_id == 33u) return vec3(0.85, 0.30, 0.30);   // Mushroom
+    if (block_id == 34u) return vec3(0.85, 0.85, 0.85);   // Cobweb
+    if (block_id == 35u) return vec3(0.55, 0.65, 0.55);   // Lichen
+    if (block_id == 36u) return vec3(0.85, 0.83, 0.78);   // Limestone
+    if (block_id == 37u) return vec3(0.92, 0.92, 0.89);   // Marble
+    if (block_id == 38u) return vec3(0.18, 0.17, 0.20);   // Basalt
+    if (block_id == 39u) return vec3(0.55, 0.52, 0.50);   // Tuff
+    if (block_id == 40u) return vec3(0.72, 0.55, 0.48);   // Granite
+    if (block_id == 41u) return vec3(0.30, 0.32, 0.38);   // Slate
+    if (block_id == 42u) return vec3(0.94, 0.94, 0.96);   // Calcite
+    if (block_id == 43u) return vec3(0.50, 0.50, 0.52);   // Andesite
+    if (block_id == 44u) return vec3(0.38, 0.36, 0.40);   // Schist
+    if (block_id == 45u) return vec3(0.93, 0.90, 0.78);   // Bone
+    if (block_id == 46u) return vec3(0.85, 0.55, 0.18);   // Amber
+    if (block_id == 47u) return vec3(0.78, 0.65, 0.95);   // Crystal
+    if (block_id == 56u) return vec3(0.45, 0.85, 0.95);   // DiamondOre
+    if (block_id == 80u) return vec3(0.95, 0.95, 0.97);   // SnowBlock
+    // Default: a noticeable magenta so genuinely-unhandled block ids stay
+    // visible in playtest. As of the render-parity pass this table mirrors the
+    // CPU mesher's block_color for every defined BlockId, so reaching this
+    // line now means a NEW block id was added without a shader color — not the
+    // old situation where common foliage (BirchLeaves, Flower, ...) fell
+    // through and whole cherry-blossom canopies rendered magenta.
+    return vec3(0.80, 0.20, 0.80);
+}
+
+// v0.24.34-position-tint: per-block-position color variance. Mirrors
+// the CPU mesher's `tint_for_position`. Adjacent blocks get subtly
+// different shades, breaking up the uniform-color look without
+// requiring per-block storage.
+//
+// The function is a deterministic 3-channel hash via trig-noise
+// octaves. Wavelengths chosen so adjacent blocks differ but a ~4×4
+// neighborhood reads as "one tone." Variance is per-block-type:
+// soft natural blocks (grass, leaves) get more variation; hard
+// blocks (stone) keep tighter palettes.
+//
+// Performance: 6 multiplications + 3 pairs of sin/cos per
+// vertex emission. Cheap relative to the octree walks already
+// happening for face-visibility checks.
+vec3 tint_for_position(uint block_id, vec3 wp) {
+    float variance;
+    if (block_id == 2u) {          // Grass
+        variance = 0.18;
+    } else if (block_id == 12u || block_id == 13u) {  // Sand / Gravel
+        variance = 0.12;
+    } else if (block_id == 3u) {   // Dirt
+        variance = 0.15;
+    } else if (block_id == 32u || block_id == 31u) { // Snow / Ice
+        variance = 0.08;
+    } else if (block_id == 18u) {  // OakLeaves
+        variance = 0.20;
+    } else {
+        variance = 0.08;  // hard blocks: minimal variation
+    }
+
+    float x = wp.x;
+    float y = wp.y;
+    float z = wp.z;
+    // Three channels, three different frequency mixtures. Matches the
+    // CPU port exactly so visual reads identically between mode 0 and
+    // mode 2 for blocks both meshers handle.
+    float r_n = sin(x * 0.13 + z * 0.17) * 0.5
+              + cos(x * 0.31 + y * 0.07) * 0.3;
+    float g_n = sin(x * 0.21 + z * 0.29) * 0.5
+              + cos(z * 0.43 + y * 0.11) * 0.3;
+    float b_n = sin(x * 0.37 + z * 0.41) * 0.5
+              + cos(x * 0.53 + y * 0.13) * 0.3;
+
+    return vec3(
+        1.0 + r_n * variance,
+        1.0 + g_n * variance,
+        1.0 + b_n * variance
+    );
+}
+
+// v0.24.33-climate-tint: per-chunk climate modulation. Currently
+// affects grass, leaves, dirt, and sand — the blocks whose color
+// reads most differently between biomes. Other blocks pass through
+// unchanged.
+//
+// `temperature` and `humidity` are both in [0, 1]. Both `0.5` (the
+// neutral fallback) yields exactly the base color. Failure modes
+// (NaN, out-of-range) are clamped via the mix() factor saturating.
+vec3 apply_climate_tint(vec3 base, uint block_id, float temperature, float humidity) {
+    // Clamp inputs defensively. NaN propagates through mix() as
+    // NaN-output, so we clamp before mixing.
+    float t = clamp(temperature, 0.0, 1.0);
+    float h = clamp(humidity, 0.0, 1.0);
+
+    if (block_id == 2u) {
+        // Grass. Lush green in humid+warm (jungle, swamp), pale
+        // yellow-tan in dry+cold (tundra, desert savanna).
+        float lushness = h * 0.7 + t * 0.3;
+        vec3 dry  = vec3(0.55, 0.55, 0.20);   // yellow-tan
+        vec3 lush = vec3(0.20, 0.65, 0.15);   // deep saturated green
+        return mix(dry, lush, lushness);
+    }
+    if (block_id == 18u) {
+        // Oak leaves. More responsive to humidity than grass.
+        float lushness = h;
+        return mix(vec3(0.40, 0.35, 0.10), vec3(0.20, 0.55, 0.18), lushness);
+    }
+    if (block_id == 3u) {
+        // Dirt. Slightly redder when warm+dry (desert dirt is more
+        // iron-oxide red); cooler-greyer in cold+humid.
+        float warmth = t * (1.0 - h);
+        return mix(base, vec3(0.65, 0.32, 0.15), warmth * 0.4);
+    }
+    if (block_id == 12u) {
+        // Sand. Slightly warmer (more red) in hot regions.
+        return base + vec3(t * 0.05, 0.0, -t * 0.05);
+    }
+    return base;
+}
+
+// Emit one quad with per-vertex color (4 vertices, 6 indices).
+// Allocates vertex+index space atomically in the chunk's counter
+// slot. Returns silently if either capacity is exhausted.
+//
+// v0.24.37-vertex-ao: per-vertex color enables AO darkening at
+// corners. Callers that don't want per-vertex variation can pass
+// the same color 4 times (use `emit_quad_uniform` wrapper).
+void emit_quad(
+    uint counter_base, uint vertex_base, uint index_base,
+    vec3 p0, vec3 p1, vec3 p2, vec3 p3,
+    vec3 c0, vec3 c1, vec3 c2, vec3 c3
+) {
+    uint v_offset = atomicAdd(counters[counter_base + 0u], 4u);
+    uint i_offset = atomicAdd(counters[counter_base + 1u], 6u);
+    if (v_offset + 4u > pc.vertex_capacity
+        || i_offset + 6u > pc.index_capacity) {
+        // Roll back? Can't easily. Just mark overflow and bail.
+        atomicMax(counters[counter_base + 2u], 1u);
+        return;
+    }
+    // Vertex layout: 6 floats per vertex (pos.xyz, color.rgb).
+    uint vb = vertex_base * 6u + v_offset * 6u;
+    vertex_floats[vb +  0u] = p0.x; vertex_floats[vb +  1u] = p0.y; vertex_floats[vb +  2u] = p0.z;
+    vertex_floats[vb +  3u] = c0.r; vertex_floats[vb +  4u] = c0.g; vertex_floats[vb +  5u] = c0.b;
+    vertex_floats[vb +  6u] = p1.x; vertex_floats[vb +  7u] = p1.y; vertex_floats[vb +  8u] = p1.z;
+    vertex_floats[vb +  9u] = c1.r; vertex_floats[vb + 10u] = c1.g; vertex_floats[vb + 11u] = c1.b;
+    vertex_floats[vb + 12u] = p2.x; vertex_floats[vb + 13u] = p2.y; vertex_floats[vb + 14u] = p2.z;
+    vertex_floats[vb + 15u] = c2.r; vertex_floats[vb + 16u] = c2.g; vertex_floats[vb + 17u] = c2.b;
+    vertex_floats[vb + 18u] = p3.x; vertex_floats[vb + 19u] = p3.y; vertex_floats[vb + 20u] = p3.z;
+    vertex_floats[vb + 21u] = c3.r; vertex_floats[vb + 22u] = c3.g; vertex_floats[vb + 23u] = c3.b;
+
+    // Two triangles per quad. Indices are LOCAL to this chunk's
+    // vertex slot (the renderer adds vertex_base on upload).
+    uint ib = index_base + i_offset;
+    indices[ib + 0u] = v_offset + 0u;
+    indices[ib + 1u] = v_offset + 1u;
+    indices[ib + 2u] = v_offset + 2u;
+    indices[ib + 3u] = v_offset + 0u;
+    indices[ib + 4u] = v_offset + 2u;
+    indices[ib + 5u] = v_offset + 3u;
+}
+
+// Backward-compat wrapper for emits that don't vary color per
+// vertex (e.g., bumpy sub-quads or any future caller that hasn't
+// adopted AO yet).
+void emit_quad_uniform(
+    uint counter_base, uint vertex_base, uint index_base,
+    vec3 p0, vec3 p1, vec3 p2, vec3 p3,
+    vec3 color
+) {
+    emit_quad(counter_base, vertex_base, index_base,
+              p0, p1, p2, p3, color, color, color, color);
+}
+
+// v0.24.28-bumpy-foundation: emit a 4×4 sub-grid of quads on the top
+// face of a block. The face is at world position `(px, py_top, pz)`
+// extending +1 along X and Z. Each sub-vertex is on a 5×5 grid with
+// `world_y = py_top + bumpy_height(world_x, world_z)`.
+//
+// 25 verts and 16 sub-quads (96 indices) per call. Mirrors the
+// CPU reference's `emit_bumpy_top_quad`. Adjacent blocks agree at
+// shared edges because the sub-vertex Y values are pure functions
+// of world coordinates.
+//
+// v0.24.38-bumpy-ao: 4 corner AO factors are bilinearly
+// interpolated across the 5×5 sub-grid. Corners follow the same
+// (LL, LH, HH, HL) order as `ao4_face_py`. Bumpy face now has
+// AO gradient matching adjacent flat surfaces.
+void emit_bumpy_top_quad(
+    uint counter_base, uint vertex_base, uint index_base,
+    float px, float py_top, float pz,
+    vec3 color, vec4 ao_corners
+) {
+    const uint GRID_N = 4u;       // sub-quads per side
+    const uint GRID_V = GRID_N + 1u; // vertex positions per side
+    const uint V_COUNT = GRID_V * GRID_V; // = 25
+    const uint I_COUNT = GRID_N * GRID_N * 6u; // = 96
+
+    uint v_offset = atomicAdd(counters[counter_base + 0u], V_COUNT);
+    uint i_offset = atomicAdd(counters[counter_base + 1u], I_COUNT);
+    if (v_offset + V_COUNT > pc.vertex_capacity
+        || i_offset + I_COUNT > pc.index_capacity) {
+        atomicMax(counters[counter_base + 2u], 1u);
+        return;
+    }
+
+    // Write 5×5 = 25 vertices in (i, j) row-major order.
+    for (uint i = 0u; i < GRID_V; i++) {
+        for (uint j = 0u; j < GRID_V; j++) {
+            float u = float(i) / float(GRID_N);
+            float v = float(j) / float(GRID_N);
+            float wx = px + u;
+            float wz = pz + v;
+            float bump = bumpy_height(wx, wz);
+
+            // v0.24.38-bumpy-ao: bilinear AO across the face.
+            // ao_corners = (LL, LH, HH, HL).
+            // u runs along X (LL → HL on bottom edge,
+            //                 LH → HH on top edge).
+            // v runs along Z.
+            float ao = mix(
+                mix(ao_corners.x, ao_corners.w, u),  // bottom edge (v=0): LL→HL
+                mix(ao_corners.y, ao_corners.z, u),  // top edge (v=1):    LH→HH
+                v
+            );
+            vec3 vc = color * ao;
+
+            uint v_idx_local = v_offset + i * GRID_V + j;
+            uint vb = vertex_base * 6u + v_idx_local * 6u;
+            vertex_floats[vb + 0u] = wx;
+            vertex_floats[vb + 1u] = py_top + bump;
+            vertex_floats[vb + 2u] = wz;
+            vertex_floats[vb + 3u] = vc.r;
+            vertex_floats[vb + 4u] = vc.g;
+            vertex_floats[vb + 5u] = vc.b;
+        }
+    }
+
+    // Write 16 sub-quads, each as 2 triangles. CCW winding from +Y.
+    for (uint qi = 0u; qi < GRID_N; qi++) {
+        for (uint qj = 0u; qj < GRID_N; qj++) {
+            uint v00 = v_offset + (qi      * GRID_V + qj);
+            uint v10 = v_offset + ((qi + 1u) * GRID_V + qj);
+            uint v11 = v_offset + ((qi + 1u) * GRID_V + (qj + 1u));
+            uint v01 = v_offset + (qi      * GRID_V + (qj + 1u));
+
+            uint ib = index_base + i_offset + (qi * GRID_N + qj) * 6u;
+            // CCW from +Y looking down: v00 -> v10 -> v11 -> v01.
+            indices[ib + 0u] = v00;
+            indices[ib + 1u] = v10;
+            indices[ib + 2u] = v11;
+            indices[ib + 3u] = v00;
+            indices[ib + 4u] = v11;
+            indices[ib + 5u] = v01;
+        }
+    }
+}
+
+// v0.24.40-greedy-mid: 1D greedy mesh-extent helpers, used only at
+// non-Near LODs (stride > 1). Each face direction picks a single
+// "run-axis" along which adjacent cells with the same block ID and
+// the same face-visibility get merged into a single longer quad.
+//
+// Why 1D and not 2D? 2D greedy needs sequential merging within a
+// slice, which doesn't parallelize cleanly across GPU threads. 1D
+// greedy lets each thread independently decide if it's a run-start
+// (look at the cell-before on the run-axis) and, if so, walk
+// forward to find the run extent. Non-start threads return early.
+// Vertex reduction: 2-10x for typical terrain, biggest wins on
+// flat plateaus.
+//
+// Why gated to stride > 1? Per-vertex AO from v0.24.37 differs per
+// corner of each quad; merging cells loses that variation. Bumpy
+// from v0.24.28 has 4×4 sub-grid per face; merging would need
+// extending the sub-grid. Per-position tint from v0.24.34 varies
+// per cell. All three are already disabled at Mid+ in v0.24.39,
+// so greedy at stride > 1 composes cleanly without losing visual.
+//
+// Constants for face_dir parameter (passed to helpers).
+const uint FACE_PX = 0u;
+const uint FACE_NX = 1u;
+const uint FACE_PY = 2u;
+const uint FACE_NY = 3u;
+const uint FACE_PZ = 4u;
+const uint FACE_NZ = 5u;
+
+// Constants for axis parameter.
+const uint AXIS_X = 0u;
+const uint AXIS_Y = 1u;
+const uint AXIS_Z = 2u;
+
+// Apply a +stride offset to (x, y, z) along `face_dir`.
+// Used to compute "the cell on the air side of this face."
+void offset_by_face(inout int x, inout int y, inout int z,
+                    uint face_dir, int is) {
+    if      (face_dir == FACE_PX) x += is;
+    else if (face_dir == FACE_NX) x -= is;
+    else if (face_dir == FACE_PY) y += is;
+    else if (face_dir == FACE_NY) y -= is;
+    else if (face_dir == FACE_PZ) z += is;
+    else                          z -= is;
+}
+
+// Apply a +stride offset along `axis`.
+void offset_by_axis(inout int x, inout int y, inout int z,
+                    uint axis, int delta) {
+    if      (axis == AXIS_X) x += delta;
+    else if (axis == AXIS_Y) y += delta;
+    else                     z += delta;
+}
+
+// Walk forward along `axis` from (x, y, z) and return total run
+// extent (multiple of stride). Run ends when:
+//   - Next cell's block differs from `self_block`, OR
+//   - Next cell's `face_dir` neighbor is solid (would not emit), OR
+//   - We exit the chunk in any axis.
+//
+// Includes the starting cell's own `stride` in the extent. So a
+// "run of length 1 cell" returns `stride` (one Mid cell = 2 source
+// blocks at Mid LOD).
+//
+// Max iterations: 32/stride. For Mid (stride=2): 16. For Far
+// (stride=4): 8. Bounded.
+uint find_greedy_run(
+    ChunkMeta meta,
+    int x, int y, int z,
+    uint axis, uint face_dir, uint stride,
+    uint self_block
+) {
+    uint extent = stride;
+    int is = int(stride);
+    uint max_steps = 32u / stride;
+
+    for (uint step = 1u; step < max_steps; step++) {
+        int nx = x, ny = y, nz = z;
+        offset_by_axis(nx, ny, nz, axis, is * int(step));
+        if (nx < 0 || ny < 0 || nz < 0 ||
+            nx >= 32 || ny >= 32 || nz >= 32) {
+            break;
+        }
+        uint next_block = octree_sample(meta.octree_base,
+                                         uvec3(uint(nx), uint(ny), uint(nz)));
+        if (next_block != self_block) break;
+
+        int fnx = nx, fny = ny, fnz = nz;
+        offset_by_face(fnx, fny, fnz, face_dir, is);
+        uint fn = sample_or_neighbor(meta, fnx, fny, fnz);
+        if (is_solid_opaque(fn)) break;
+
+        extent += stride;
+    }
+
+    return extent;
+}
+
+// Decide whether THIS cell should emit a quad for `face_dir`, and
+// if so, return the run extent. Returns 0 if the cell is NOT a
+// run-start (some earlier cell on the run-axis owns this run).
+//
+// At Near LOD (stride == 1u) this always returns 1 — every cell
+// is its own "run" of length 1, matching the v0.24.39 behavior.
+uint greedy_run_for_face(
+    ChunkMeta meta,
+    int x, int y, int z,
+    uint axis, uint face_dir, uint stride,
+    uint self_block
+) {
+    if (stride == 1u) return stride;
+
+    // Check the cell immediately BEFORE me on the run-axis. If it
+    // has the same block AND would also emit this face_dir, then
+    // it's already part of (or starts) a run that extends through
+    // me — I'm not the start.
+    int px = x, py = y, pz = z;
+    offset_by_axis(px, py, pz, axis, -int(stride));
+    if (px >= 0 && py >= 0 && pz >= 0 &&
+        px < 32 && py < 32 && pz < 32) {
+        uint prev_block = octree_sample(meta.octree_base,
+                                         uvec3(uint(px), uint(py), uint(pz)));
+        if (prev_block == self_block) {
+            int fpx = px, fpy = py, fpz = pz;
+            offset_by_face(fpx, fpy, fpz, face_dir, int(stride));
+            uint pfn = sample_or_neighbor(meta, fpx, fpy, fpz);
+            if (!is_solid_opaque(pfn)) {
+                // Prev cell same color + would emit. Not run-start.
+                return 0u;
+            }
+        }
+    }
+
+    // I'm the run-start. Walk forward.
+    return find_greedy_run(meta, x, y, z, axis, face_dir, stride, self_block);
+}
+
+void main() {
+    uint chunk_idx = gl_WorkGroupID.y;
+    if (chunk_idx >= pc.batch_count) return;
+
+    // v0.24.39-mid-lod: cell iteration is parameterized by
+    // lod_cell_count and lod_cell_stride. Near uses (32, 1) so each
+    // thread corresponds to one source block. Mid uses (16, 2) so
+    // each thread corresponds to a 2³ source-block group; we sample
+    // the LOW-CORNER block as the representative. Higher LODs scale
+    // the same way.
+    //
+    // Invariant: lod_cell_count * lod_cell_stride == 32.
+    uint cc = pc.lod_cell_count;
+    uint stride = pc.lod_cell_stride;
+
+    // Cell index within the chunk, in [0, cc³).
+    uint cell_idx = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+    if (cell_idx >= cc * cc * cc) return;
+
+    // Decode cell index → (mid_x, mid_y, mid_z) in LOD-space, then
+    // translate to chunk-local source-block coords by multiplying by
+    // stride. Convention matches Chunk's `block_index = x + z*N + y*N*N`.
+    uint mid_y = cell_idx / (cc * cc);
+    uint rem = cell_idx - mid_y * cc * cc;
+    uint mid_z = rem / cc;
+    uint mid_x = rem - mid_z * cc;
+    uint x = mid_x * stride;
+    uint y = mid_y * stride;
+    uint z = mid_z * stride;
+
+    ChunkMeta meta = chunk_metas[chunk_idx];
+
+    // Sample self at the representative block. For stride=1 this is
+    // the only block; for stride>1 we currently use the low-corner
+    // sample (center-of-cell would also work; aggregation/majority
+    // sampling is filed for follow-up).
+    // Sample self with the covering leaf extent (one descent; the block result
+    // is byte-identical to octree_sample). The extent powers the buried-cell
+    // fast path below.
+    uvec3 self_lo;
+    uint self_lsz;
+    uint self_block = octree_sample_ext(meta.octree_base, uvec3(x, y, z), self_lo, self_lsz);
+    if (!is_solid_opaque(self_block)) return;
+
+    // v0.24.41 buried-cell fast path (Near LOD only). If this solid cell sits
+    // STRICTLY inside a uniform leaf (every ±1 axis-neighbor lands in the same
+    // leaf, so is the same solid block), all six faces cull and nothing emits —
+    // skip the six neighbor descents. Provably identical to running the full
+    // path (which would cull all six); gated by the solid_*cube parity tests.
+    // Boundary cells (on the leaf edge, incl. chunk-edge cells whose neighbors
+    // live in another chunk) fail the strict-interior test and fall through.
+    if (stride == 1u
+        && self_lsz >= 2u
+        && x > self_lo.x && x + 1u < self_lo.x + self_lsz
+        && y > self_lo.y && y + 1u < self_lo.y + self_lsz
+        && z > self_lo.z && z + 1u < self_lo.z + self_lsz) {
+        return;
+    }
+
+    // v0.24.39-mid-lod: neighbor samples step by `stride` blocks.
+    // For stride>1 this skips intermediate cells (correct: a Mid
+    // cell's neighbor is the next Mid cell, which is `stride` source
+    // blocks away).
+    int is = int(stride);
+    uint n_px = sample_or_neighbor(meta, int(x) + is, int(y),       int(z));
+    uint n_nx = sample_or_neighbor(meta, int(x) - is, int(y),       int(z));
+    uint n_py = sample_or_neighbor(meta, int(x),       int(y) + is, int(z));
+    uint n_ny = sample_or_neighbor(meta, int(x),       int(y) - is, int(z));
+    uint n_pz = sample_or_neighbor(meta, int(x),       int(y),       int(z) + is);
+    uint n_nz = sample_or_neighbor(meta, int(x),       int(y),       int(z) - is);
+
+    vec3 color = color_for_block(self_block);
+    // v0.24.33-climate-tint: modulate base color by per-chunk
+    // temperature/humidity for biome-driven variation.
+    color = apply_climate_tint(color, self_block, meta.temperature, meta.humidity);
+    // v0.24.34-position-tint: per-block-position color variance
+    // mirroring CPU mesher's `tint_for_position`. Breaks up
+    // adjacent-block uniformity for natural blocks (grass, sand,
+    // leaves, etc.) without per-block storage.
+    //
+    // v0.24.40-greedy-mid: gated on stride == 1u (Near LOD). At Mid+
+    // LODs we use greedy meshing, which merges adjacent cells into
+    // single quads — per-block tint variation would be lost across
+    // the merge anyway. Keeping uniform color at Mid means runs
+    // compose cleanly.
+    if (stride == 1u) {
+        vec3 world_block_pos = vec3(
+            float(int(x) + meta.chunk_origin_x),
+            float(int(y) + meta.chunk_origin_y),
+            float(int(z) + meta.chunk_origin_z)
+        );
+        color = color * tint_for_position(self_block, world_block_pos);
+    }
+    // Defensive clamp — variance can push channels slightly above 1.0
+    // when both noise octaves peak the same direction; clamp so the
+    // emitted vertex color stays in legal range.
+    color = clamp(color, vec3(0.0), vec3(1.0));
+
+    // v0.24.27-fix3: vertex positions emitted in WORLD coordinates,
+    // matching the convention `chunk_mesh_sparse.comp` uses. Sparse
+    // does this via `SurfaceRecord.world_x/y/z` (CPU pre-computed);
+    // we do it by adding the chunk origin to the local cell index.
+    //
+    // The previous shader emitted chunk-local [0, 32] positions only,
+    // so every chunk's geometry rendered at world origin overlapping.
+    // Visual symptom: terrain appeared as a single chunk worth of
+    // geometry; everything else "missing." Diagnostic confirmed via
+    // octree-batch logs showing healthy mesh sizes (17K-35K verts)
+    // but only one chunk visible in the playtest.
+    vec3 p = vec3(
+        float(int(x) + meta.chunk_origin_x),
+        float(int(y) + meta.chunk_origin_y),
+        float(int(z) + meta.chunk_origin_z)
+    );
+
+    // For each face whose neighbor is not solid, emit a quad. The
+    // quad winding is counter-clockwise viewed from OUTSIDE the
+    // block — this matches the CPU mesher and `chunk_mesh_sparse`
+    // conventions.
+    //
+    // The 8 cube corners, named c000..c111 where the bits are
+    // (x, y, z) at high coord. Block occupies [p, p+s]³ where s
+    // is the LOD stride in world units (1 for Near, 2 for Mid).
+    float s = float(stride);
+    vec3 c000 = p + vec3(0.0, 0.0, 0.0);
+    vec3 c100 = p + vec3(s,   0.0, 0.0);
+    vec3 c010 = p + vec3(0.0, s,   0.0);
+    vec3 c110 = p + vec3(s,   s,   0.0);
+    vec3 c001 = p + vec3(0.0, 0.0, s);
+    vec3 c101 = p + vec3(s,   0.0, s);
+    vec3 c011 = p + vec3(0.0, s,   s);
+    vec3 c111 = p + vec3(s,   s,   s);
+
+    // v0.24.36-bumpy-side-align: when this block has a bumpy top
+    // emitted (weatherable AND top neighbor non-solid), drop the
+    // four upper corners by bumpy_height(world_x, world_z) so the
+    // adjacent side faces meet the bumpy surface seamlessly.
+    //
+    // v0.24.39-mid-lod: bumpy disabled at non-Near LODs (stride>1).
+    //
+    // v0.24.40-greedy-mid: the c*** corners are no longer used by
+    // side-face emits (greedy emits build q0..q3 directly). Instead
+    // we compute the 4 dy values explicitly here, then each side-
+    // face emit applies the appropriate dy to its top corner Y.
+    //
+    // dy naming: low/high X, low/high Z. LL = (p.x, p.z), HL = (p.x+s, p.z),
+    // LH = (p.x, p.z+s), HH = (p.x+s, p.z+s).
+    bool side_top_bumpy = stride == 1u
+                       && is_weatherable(self_block)
+                       && !is_solid_opaque(n_py);
+    float dy_LL = 0.0, dy_HL = 0.0, dy_LH = 0.0, dy_HH = 0.0;
+    if (side_top_bumpy) {
+        dy_LL = bumpy_height(p.x,     p.z);
+        dy_HL = bumpy_height(p.x + s, p.z);
+        dy_LH = bumpy_height(p.x,     p.z + s);
+        dy_HH = bumpy_height(p.x + s, p.z + s);
+        c010.y += dy_LL;
+        c110.y += dy_HL;
+        c011.y += dy_LH;
+        c111.y += dy_HH;
+    }
+
+    if (!is_solid_opaque(n_px)) {
+        // +X face. Run-axis: Y (vertical columns merge first).
+        // v0.24.40-greedy-mid: at stride>1, only the run-start cell
+        // emits; the quad's Y extent equals the run length. At Near
+        // (stride==1) every cell emits its own quad (run length 1).
+        uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                        AXIS_Y, FACE_PX, stride, self_block);
+        if (run > 0u) {
+            // CCW from +X: c100, c110, c111, c101.
+            // Y extends to `run` instead of `s`. Top corners (q1, q2)
+            // get bumpy dy adjustment at Near with weatherable top.
+            float ry = float(run);
+            vec3 q0 = p + vec3(s, 0.0,         0.0);
+            vec3 q1 = p + vec3(s, ry + dy_HL,  0.0);
+            vec3 q2 = p + vec3(s, ry + dy_HH,  s);
+            vec3 q3 = p + vec3(s, 0.0,         s);
+            vec4 ao = stride == 1u ? ao4_face_px(meta, int(x), int(y), int(z)) : vec4(1.0);
+            vec3 fc = color * 0.80;
+            emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                      q0, q1, q2, q3,
+                      fc * ao.x, fc * ao.y, fc * ao.z, fc * ao.w);
+        }
+    }
+    if (!is_solid_opaque(n_nx)) {
+        // -X face. Run-axis: Y.
+        uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                        AXIS_Y, FACE_NX, stride, self_block);
+        if (run > 0u) {
+            // CCW from -X: c000, c001, c011, c010.
+            float ry = float(run);
+            vec3 q0 = p + vec3(0.0, 0.0,         0.0);
+            vec3 q1 = p + vec3(0.0, 0.0,         s);
+            vec3 q2 = p + vec3(0.0, ry + dy_LH,  s);
+            vec3 q3 = p + vec3(0.0, ry + dy_LL,  0.0);
+            vec4 ao = stride == 1u ? ao4_face_nx(meta, int(x), int(y), int(z)) : vec4(1.0);
+            vec3 fc = color * 0.80;
+            emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                      q0, q1, q2, q3,
+                      fc * ao.x, fc * ao.y, fc * ao.z, fc * ao.w);
+        }
+    }
+    if (!is_solid_opaque(n_py)) {
+        // +Y face. v0.24.28-bumpy-foundation: weatherable
+        // blocks get a 4×4 sub-vertex grid with hash-based bumpy
+        // displacement; everything else stays flat.
+        // v0.24.40-greedy-mid: greedy active only at stride>1
+        // (which also disables bumpy). Run-axis: X.
+        if (stride == 1u && is_weatherable(self_block)) {
+            // Near + bumpy: per-cell emit, full bumpy/AO.
+            vec4 ao = ao4_face_py(meta, int(x), int(y), int(z));
+            emit_bumpy_top_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                                p.x, p.y + 1.0, p.z, color, ao);
+        } else {
+            uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                            AXIS_X, FACE_PY, stride, self_block);
+            if (run > 0u) {
+                // CCW from +Y: c010, c011, c111, c110.
+                // X extends to `run` instead of `s`. All 4 corners
+                // are top corners; apply dy per corner.
+                float rx = float(run);
+                vec3 q0 = p + vec3(0.0, s + dy_LL, 0.0);
+                vec3 q1 = p + vec3(0.0, s + dy_LH, s);
+                vec3 q2 = p + vec3(rx,  s + dy_HH, s);
+                vec3 q3 = p + vec3(rx,  s + dy_HL, 0.0);
+                vec4 ao = stride == 1u ? ao4_face_py(meta, int(x), int(y), int(z)) : vec4(1.0);
+                // flat-top-winding fix (confirmed by the panel winding sweep:
+                // flat tops were the only group culled at the CW+BACK default,
+                // i.e. wound OPPOSITE to the sides and the bumpy tops). Reverse
+                // the corner order (q0,q3,q2,q1) so the flat +Y matches them;
+                // AO follows the corners.
+                emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                          q0, q3, q2, q1,
+                          color * ao.x, color * ao.w, color * ao.z, color * ao.y);
+            }
+        }
+    }
+    if (!is_solid_opaque(n_ny)) {
+        // -Y face. Run-axis: X. No bumpy on bottom faces.
+        uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                        AXIS_X, FACE_NY, stride, self_block);
+        if (run > 0u) {
+            // CCW from -Y: c000, c100, c101, c001.
+            float rx = float(run);
+            vec3 q0 = p + vec3(0.0, 0.0, 0.0);
+            vec3 q1 = p + vec3(rx,  0.0, 0.0);
+            vec3 q2 = p + vec3(rx,  0.0, s);
+            vec3 q3 = p + vec3(0.0, 0.0, s);
+            vec4 ao = stride == 1u ? ao4_face_ny(meta, int(x), int(y), int(z)) : vec4(1.0);
+            vec3 fc = color * 0.55;
+            emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                      q0, q1, q2, q3,
+                      fc * ao.x, fc * ao.y, fc * ao.z, fc * ao.w);
+        }
+    }
+    if (!is_solid_opaque(n_pz)) {
+        // +Z face. Run-axis: X.
+        uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                        AXIS_X, FACE_PZ, stride, self_block);
+        if (run > 0u) {
+            // CCW from +Z: c001, c101, c111, c011.
+            // X extends to `run` instead of `s`. Top corners (q2, q3)
+            // get bumpy dy adjustment.
+            float rx = float(run);
+            vec3 q0 = p + vec3(0.0, 0.0,         s);
+            vec3 q1 = p + vec3(rx,  0.0,         s);
+            vec3 q2 = p + vec3(rx,  s + dy_HH,   s);
+            vec3 q3 = p + vec3(0.0, s + dy_LH,   s);
+            vec4 ao = stride == 1u ? ao4_face_pz(meta, int(x), int(y), int(z)) : vec4(1.0);
+            vec3 fc = color * 0.65;
+            emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                      q0, q1, q2, q3,
+                      fc * ao.x, fc * ao.y, fc * ao.z, fc * ao.w);
+        }
+    }
+    if (!is_solid_opaque(n_nz)) {
+        // -Z face. Run-axis: X.
+        uint run = greedy_run_for_face(meta, int(x), int(y), int(z),
+                                        AXIS_X, FACE_NZ, stride, self_block);
+        if (run > 0u) {
+            // CCW from -Z: c000, c010, c110, c100.
+            // X extends to `run` instead of `s`. Top corners (q1, q2)
+            // get bumpy dy adjustment.
+            float rx = float(run);
+            vec3 q0 = p + vec3(0.0, 0.0,         0.0);
+            vec3 q1 = p + vec3(0.0, s + dy_LL,   0.0);
+            vec3 q2 = p + vec3(rx,  s + dy_HL,   0.0);
+            vec3 q3 = p + vec3(rx,  0.0,         0.0);
+            vec4 ao = stride == 1u ? ao4_face_nz(meta, int(x), int(y), int(z)) : vec4(1.0);
+            vec3 fc = color * 0.65;
+            emit_quad(meta.counter_base, meta.vertex_base, meta.index_base,
+                      q0, q1, q2, q3,
+                      fc * ao.x, fc * ao.y, fc * ao.z, fc * ao.w);
+        }
+    }
+}

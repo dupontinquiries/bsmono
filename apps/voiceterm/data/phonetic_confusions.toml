@@ -1,0 +1,145 @@
+# Phonetic confusion sets for voice transcription correction.
+#
+# When whisper transcribes a voice command, common acoustic confusions
+# may produce the wrong word: "ls" → "less", "cd" → "see d", "pwd" →
+# "pi w d", etc. We use this table to expand each transcribed token
+# into a set of likely intended words, then run intent matching on
+# all of them.
+#
+# Each [[group]] is a set of words that sound similar enough to be
+# confused. Order within a group doesn't matter — we treat them
+# symmetrically (any one heard could be any other intended).
+#
+# Adding a new group: append a new [[group]] entry. Confusion sets are
+# loaded at startup; no rebuild needed.
+#
+# Tuning advice:
+# - Keep groups small (3-5 words). Bigger groups expand the candidate
+#   space too aggressively and slow intent matching.
+# - Put words ACTUAL whisper output produces, not just dictionary
+#   confusions. e.g. "ls" → "less" is real; "ls" → "lass" is unlikely
+#   from a US-trained model.
+# - Don't include very common words (the, and, is) — they appear in
+#   too many non-command contexts.
+
+# Common terminal command confusions
+[[group]]
+words = ["ls", "less", "list"]
+
+[[group]]
+words = ["cd", "seedy", "see d", "city"]
+
+[[group]]
+words = ["pwd", "pud", "pee w d"]
+
+[[group]]
+words = ["grep", "great", "grip", "grape"]
+
+[[group]]
+words = ["sudo", "pseudo", "sudoku", "sue dough"]
+
+[[group]]
+words = ["vim", "veeam", "vin"]
+
+[[group]]
+words = ["nano", "no", "nono"]
+
+[[group]]
+words = ["cat", "kat", "caught"]
+
+[[group]]
+words = ["echo", "ekko", "eco"]
+
+[[group]]
+words = ["man", "men", "mann"]
+
+[[group]]
+words = ["chmod", "shmod", "chamod", "chimod"]
+
+[[group]]
+words = ["chown", "shown", "chow n"]
+
+[[group]]
+words = ["mkdir", "make dir", "make directory"]
+
+[[group]]
+words = ["rmdir", "rm dir", "remove dir"]
+
+[[group]]
+words = ["touch", "tooch"]
+
+[[group]]
+words = ["find", "fine", "fined"]
+
+[[group]]
+words = ["which", "witch"]
+
+[[group]]
+words = ["whereis", "where is"]
+
+[[group]]
+words = ["history", "hist 'ree", "his story"]
+
+[[group]]
+words = ["clear", "cleer", "clayer"]
+
+[[group]]
+words = ["exit", "exi t", "exhibit"]
+
+# Browser navigation
+[[group]]
+words = ["forward", "for word", "foreword"]
+
+[[group]]
+words = ["back", "bach"]
+
+[[group]]
+words = ["reload", "real od", "re load"]
+
+[[group]]
+words = ["scroll", "stroll", "skroll"]
+
+[[group]]
+words = ["search", "serch"]
+
+# Editor commands
+[[group]]
+words = ["save", "safe", "sauve"]
+
+[[group]]
+words = ["quit", "qit", "quiet", "kit"]
+
+[[group]]
+words = ["copy", "kopy", "coppy"]
+
+[[group]]
+words = ["paste", "past", "based"]
+
+[[group]]
+words = ["undo", "un do", "and do"]
+
+[[group]]
+words = ["redo", "re do", "ready"]
+
+# Voice navigation
+[[group]]
+words = ["yes", "yeah", "yep", "yas"]
+
+[[group]]
+words = ["no", "nope", "naw", "nah"]
+
+[[group]]
+words = ["cancel", "kansul", "can sell"]
+
+[[group]]
+words = ["confirm", "comfirm"]
+
+# Numbers (whisper often mistypes)
+[[group]]
+words = ["one", "won", "wun"]
+
+[[group]]
+words = ["two", "to", "too"]
+
+[[group]]
+words = ["four", "for", "fore"]

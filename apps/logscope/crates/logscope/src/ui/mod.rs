@@ -1,0 +1,12 @@
+pub mod peek_view;
+pub mod rotation_tab;
+pub mod window;
+pub mod cargo_tab;
+pub mod ollama;
+pub mod sources_tab;
+pub mod chat_tab;
+pub mod components;
+pub mod modify_tab;
+pub mod code_tab;
+pub mod bloc_tab;
+pub mod markdown;

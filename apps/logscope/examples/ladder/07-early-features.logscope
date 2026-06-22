@@ -1,0 +1,15 @@
+# 07-early-features  (BASIC) — replay the opening feature builds as a shallow tree.
+# Exercises: short linear context + one small widen. Cheap warm-up / shape check.
+
+> Build r116c — fix.
+> Build r117 — caves kit wings.
+> Build r118 — haiku merge.
+> Build r119 — winding eggs soaring.
+> Build r120 — batch.
+> Build r121 — fix phase4.
+> Build r123 — real craft climate.
+> Build r124 — survival.
+# one small widen to branch the last build a few ways
+:2fa 3 'Produce a distinct implementation of this build step, trading off differently (simpler vs. faster vs. more general). Prior attempt: {lastmsg}'
+:best
+:export md

@@ -1,0 +1,11 @@
+# qml/qmldir
+#
+# Module directory file. Registers the Bo design-system singleton so any
+# QML file in this directory can `import "."` and reference Bo.* tokens.
+#
+# All the other components (VolumeDial, ProductSilhouette, etc.) are
+# auto-discovered by filename since they live in the same directory as
+# the loaded entry file — they don't need explicit lines here, but the
+# singleton MUST be declared to be usable as a singleton.
+
+singleton Bo 1.0 Bo.qml

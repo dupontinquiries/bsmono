@@ -1,0 +1,3758 @@
+it should be live there we go
+welcome back um since last time i've uh cleaned up the tracer stuff
+it doesn't make any sense to copy and paste it
+i needed to have it like a separate class for every endpoint
+i did
+i already knew like there was a block of memory for the main dcp endpoint
+i implemented that
+i add those things to the tracer and right
+i can see all the commands
+um and that's what i'm going to show you right
+actually um but uh let's go to this let's put this here
+uh but it's super slow
+if i start this
+i can actually kind of the scroll bar is going to be useful
+i'm pull up the screen and this is as you can see a super slow but that's
+i'm just going to go ahead and do that
+i'm just going to go ahead and do that and i'll see what happens
+we'll find out how much stuff is really required
+there will be a client for this in mini and python at some point
+that we can experiment with everything before writing a linux driver
+if i can do that, then that means i know enough to start writing a linux driver
+i should be getting a desktop pretty soon, i think
+dcp backlight, good question
+i saw some references to backlight
+but that's just a guess
+i know they do a lot of fancy stuff on iphones and with the hdr stuff
+there we go, finally got the apple
+i told you it's slow
+it's slow
+it's like everything is slow
+every block here is one frame, basically
+yeah, all the true tone stuff, too, yeah
+and obviously, supporting that on linux is sort of a different story, right
+one second, i'm going to go to get some water
+all right, have some water
+you can see i got syslogs working
+these are log messages from the dcp
+that's already coded
+this syslog protocol is pretty simple
+oh, that's weird
+what just happened here, though
+like, diff mode
+ like
+well, that's kind of strange
+like, my
+like, there's a backslash n thing
+there's something weird about this syslog there, actually
+but this one's fine, though, isn't it
+yeah, this one's fine
+oh, i
+i bet i know what happened here
+there's no null termator somehow, i bet
+i need to
+think about that
+but then why
+oh, yeah, it's probably the previous data in the log, then
+anyway, desktop when
+soon, hopefully
+oh, there we go
+yes, it's, like, 1 fps
+it's, like
+this is slow on purpose
+but that's fine
+i'm going to wait until, like, the blinking cursor shows up
+there we go
+is it blinking
+not quite
+i think it's blinking
+you get one frame for every blink of the cursor, which is what you expect
+and that's a long log
+i don't know if i can
+oh, wait, no, isn't there an export html thing
+that'd be pretty cool
+save as python file
+what does that even mean
+what is
+wait, what does that even do
+no, it's just text
+no, html document
+log, let's call this dcpboottrace.html
+i might upload this somewhere later
+that is slow
+oh, yeah
+that's good
+ooh, the font is definitely in the right font here
+or it hates the colors or something
+i think somehow the color
+oh, it must be the bold
+it's the bold stuff that changes the font size
+yeah, firefox doesn't love the amount of text on one screen here, does it
+but anyway
+you can worry about that later
+at least it works
+wow, the rendering is not great, isn't it
+i think it really
+we have the file
+we'll worry about showing it later
+at least this scrolls faster, actually
+here, where am i
+about the syslogs
+what happened to that
+i'll look at that in a bit
+actually, no, hold on
+where's the asc syslog log here
+gets a0 bytes
+just i have 128 bytes for the log and it just stops on a 0
+but i'm pretty sure the header doesn't have the length
+i'm not sure what happened there
+ntt, not the tbr
+yeah, this
+don't need that
+then pay whole page
+i think it's one page for the syslog
+this should be tracer.ep dot syslog dot state dot, i think that's it
+here we go
+those are fine, though
+let's just get trying
+here, what happened here
+power state f
+mode xf is 0
+oh, did i not split it
+oh, that's why
+i said it rstrip, but yeah, that's why
+that's why
+that makes sense
+ fix that bug
+ let's look at this
+it's just the volume and more the amount of commands sent around
+ yeah
+this is some system stuff
+i don't care about their buffers for, like, crash dumps
+it's mostly empty
+i'm not sure what that for is, but it's probably relevant
+ yeah, that's it
+and, uh, then, uh, here's where it gets interesting
+ iop is ep 20, and this is 21 hex
+um, there, there's a shared memory here that gets assigned here and get buff
+and it's empty initially
+as soon as it, um
+as soon as it acts
+ you know, the next message is received
+there's already stuff in this area
+these are pointers
+and, uh, this is interesting because i just realized this is actually the, um
+uh, with, like, it was, it was pointing to the head of the command
+you know
+this is kind of interesting
+a3 must be like the hello command
+the interesting thing is it got two headers here
+there's another
+it's not 85 and 86
+like let's compare these two right
+this is 100
+this is one command
+it's not a real gear but you can kind of see what this means yeah
+every command is like hex 80 bytes here, at least
+i'm pretty sure they're variable length
+like, are those pointers or what are those
+if we look forward to, like, here's something in 24
+that's more interesting
+it does the git buff
+the init is the same
+the things in the beginning are the same
+but then it's a 200
+this is one command, though
+it only has one header
+sorry, there's two commands here
+this is a length, obviously, of the command
+like 64 probably makes sense here, right
+actually, wait
+there's more than one thing here
+there's a 65 here
+that's a different thing, probably, though
+hold on
+maybe it's after the header
+it's probably, like, a payload
+these are contiguous
+and this would be 80-something
+this would be 60
+over here
+yeah, 64 starting here or something like that, right
+this would be the header
+the 64, the x64 bytes
+that makes a lot of sense
+are they just delimited by the headers
+this is the right pointer
+it's kind of strange
+or is it that this is offset
+it might just be that
+this is offset by the header size
+this will tell me that
+this is 200
+and it starts at c0
+it would be 2c0
+well, that makes sense
+because that's here
+with padding, that lines up
+that looks like the right pointer, all right
+that would start at here, at c0, right
+there's the little header area at the top
+that makes more sense than what i was thinking earlier
+and this is just the buffer size then, which also makes sense
+because it adds up to 4k
+i don't know what this is
+this is basically a data structure then that we have
+this is a ring buffer
+and this is the right pointer
+and we actually have two ring buffers in sequence
+one for commands and one for responses
+we can actually make a little class for that
+and yeah
+here's like one, right
+and also, clearly, these are padded to some extent
+because then the actual commands have a different kind of size
+it probably pads to like a cache line or something
+this is kind of interesting, though
+because this looks like it's
+this almost looks like it's like breaking up one command into two things
+like 2, 1, 2, 0, 1
+like this looks like it's splitting commands into blocks anyway
+which is a little bit weird
+but i guess we'll find out when i start breaking them up like that
+but this is definitely the size for this anyway
+and e8
+and this is 100
+i guess the padding has to be explicit in that case
+because it would be like f8 and one more
+maybe this is also the
+maybe the data starts here
+that would make sense
+and in that case
+yeah, because this is actually basically contiguous, except for that part
+but the simple video interface, does that match
+oh, 1, a bunch of zeros
+i think this is more of that serialized stuff
+but let me see
+let's even see what the other is to make sure that it's not dropping there
+these are d4
+see, these are separate
+but this looks like somehow a broken up command
+but it might not be
+it might just be two commands though
+the big one, e8, d0
+is there anything larger than e8
+e0, e0
+well, let's look forward
+and these are all short
+oh, there's some interesting stuff here
+no, those are the big ones
+oh, e8 again
+but there's only one command
+and that's the other protocol
+that's the dcp one
+5044, iop
+those are pretty small
+rightness scale
+and that's the main thing again
+maybe they are pretty short for those
+oh, there's one
+it's always e8
+but it always ends there
+maybe that's unrelated
+one second
+i actually need to use the toilet
+sorry about that
+ yes
+basically the pointers and stuff
+oh yeah, no, that's the header
+yep, that looks pretty much, oh, no, there's a c 0
+it's aligned to 4 0
+which makes sense, because that's more like a cache line size
+how did that happen
+probably here, right
+no, before that
+this was iop2b after this one, 44
+an e8, and i guess it ended up unaligned after that at 40
+yeah, i'm going to say, i'm going to call it 40 in that case
+i'm going to call it like that
+header, size, some kind of fields
+align to multiple of 4 0
+far away, because that's a cache line, right
+it makes sense that they would align to a cache line size
+that's why the pointers are done like that
+ yeah, and
+then this would be the size, it starts at 0, and this is the right pointer
+after that
+it would be at c0, 180, yeah, 1, c0, that makes sense, cool
+time to make a thing, and this might be moved to another file later, but for
+ ioep, and that needs two ring buffers, one for commands and one to responses
+we're going to make a separate class that we can reuse
+we're going to do a do i have reloadable in here
+i need to keep state on this too i do have an init here
+the state gets added after the init if i'm not mistaken, yes
+then we can just do it there and that makes more sense
+just make it a let's do it empty, it doesn't have to do anything there
+that does give it the dart
+that's fine
+we can add anything interesting there
+and actually, that will also solve this mon thing
+just do that
+i'm getting messages, this is my phone, yeah, yeah, i'll do that later
+also i got a call apparently, i don't know what this is
+you want a second
+give me one second, i need, i should call these guys
+one second, i need to take care of something
+i'll get this one in one second
+we'll take a quick look at this
+for each of your own interests, i'm going to do this
+if you have any questions, i'll just be like, that'd be great
+ sure
+um, i just, we're not going to do that
+ i want to do this thing
+it's a yeah
+ the way, the way you do it, like, you want to do it
+you want to do it, but then there's also the other one you want to do
+again, we don't want to do this all together
+and i don't want to do this all over again because that's not a good idea
+um, i want to do this
+you thank you
+thankfully, no biggie
+go back to that
+ yeah, this is a good idea
+get the start thing done here, do the add mon
+do the same thing on dcpp
+dcpp right here
+and that means i can get rid of
+this little hack here
+i can do the
+only if we have an shmem iova
+just do
+if we don't have a buffer, we can't do anything
+and we need buffs
+here, when we do this, add mon, and i need buffs
+and the mon will go away once this works, of course
+and actually, is this size mentioned anywhere
+i get the feeling it isn't
+i get the feeling it's hard-coded to one page each
+because this gets the
+this is the address, and there's no obvious size
+unless it's, like, some kind of mod thing going on, but
+kind of hard to say, really
+and it initializes the stuff, right
+because it happens with the replies
+that sure looks like it expects two pages, and
+yeah, i don't see
+i mean, of course, any of these could be some kind of multiple argument
+like, you know
+4k multiple or something, but
+i mean
+that would be complete random guesswork
+let's assume it's hard-coded
+we'll just make two little buffers like that
+we need the states, though
+and i need a lot of things, actually
+i'll just pass the ep, and
+let's call that base
+and, um
+actually, the interesting thing is, um
+that i want to initialize this after this comes through
+which means not on the getbuffack, but on this thing, on 8a
+because that's when the buffer is already initialized
+or maybe 8b
+it's hard to say
+either of these could be
+triggering that
+but we always get
+8b, don't we
+there's always an 8b
+see, because these are two replies that are contiguous
+i can't know
+you know, there's a race condition here, right
+ there's always an 8b
+let's play it safe and say it's 8b
+in which case
+i'm going to call it buffinitialized
+making the name up completely, but, you know
+and in that case, we just do self
+needbuffs here
+instead of calling it here
+that's when we know that, uh
+hopefully by here, they should definitely be ready
+ yeah, that's the buffer size
+i don't know what that is
+and, uh
+this is a here
+ the question is
+is there a difference between this one and this one
+this one has one command
+this one has two
+ this initializes
+ there's a, uh
+8b3, 8b3, 8b5
+nothing there
+at that point, it has
+received stuff
+ there's an 8b6
+ again, no arguments there
+ it goes to the next one
+ there seems to be no
+higher level indication of how many commands have been
+how many packets, i guess, have been sent
+and this header here
+does have a 2 there
+but that's a 2 also
+that's a c0
+it's d0, d0
+these are independent anyway
+they don't look like a continuation to me
+there's a 1 there
+but that might be just a command id
+iop space
+yeah, i don't see anything
+that would tell it how many commands
+to receive
+which means i just have to
+read until the
+right pointer
+and that's pretty much it
+and this is
+85, 86
+ob01, cafe
+01, cafe
+that's the address before that is 0902, cafe
+it's all the same, isn't it
+yeah, i just have to read until the end
+i'm just gonna read until the end
+you guys are awesome
+thank you
+i appreciate it
+see you at 10
+ on init, at this point hopefully the dart and everything works
+no, this gets added afterwards
+this is the real state-all
+ how do i
+ it's a reset method
+we don't need to do that again when we read that
+we just initialize them
+ at that point, yeah
+and the right pointer is at 80
+while right pointer doesn't equal self, .r state rptr, do i have a line up here
+i need those things
+can i just import all the utilities
+there's a lot of useful utilities here
+let's just get everything
+i don't know
+and the header is, in principle, 16 bytes
+is that just the counter, the thing over there
+no, actually, because this is 2d
+oh, no, there's the last one, yeah
+it goes to 2, 4, and there's
+yeah, it looks like a message id
+which makes sense
+then you have commands and replies
+it's the size and message id, and that's probably padding after that
+we need 16 bytes
+it would be magic size
+and it's size z and unknown
+remind myself how yielding works in python
+real quick test
+on the first thing it runs into the first first yield
+you have to ask for another one to get the stop iteration on that
+we don't know what the unk thing is, but let's just do
+a zero
+and if it ever is not zero, we'll find out
+that should be it pretty much for implementing this
+we'll just call this read, really
+and i need the max thing
+yield a thing
+it's not none
+ if we only want one message, we only yield one
+in that case here we have command and ack, right
+ for example, iubp26 gets a command here
+it sends a2
+i think ack is not printed, no, it is printed
+24, it receives an ack
+on iubp24
+it has stuff
+i don't know if these are actually linked to the commands
+i'm going to say send and resp, and that is a 5, is it
+8, 2 on 100, no, 8, 2 on 80, yeah
+the command does have the right pointer, but the ack thing does not
+command is not size, it's the right pointer in that case, right
+yeah, it's the right pointer
+it doesn't really matter, though, we can just assert that
+it's still a weird way to actually put in a command
+it's the same
+all right, let's delete
+it's not a data entry
+it's a data entry
+all right
+and i'm going to delete that
+online, we're going to delete that too
+we're going to delete the passing by the big
+we don't have a pass
+we do have a pass
+i like this log and i don't want to pollute the screen
+admon same thing here, is it
+ah sorry here yeah oh where did that come from
+epstate, i do need to import epstate from that
+there's no shmemiova, and i have
+oh, yeah, yeah, because we had that
+ actually, this should be done in
+in it
+should be done like that
+and this should be done here in it, too
+and that will take care of that
+ and
+we have
+names, shmemiova, admin
+why is
+that should do that
+ need struct
+ the cool thing here is that i can actually
+in principle, it should just work
+that was the init here
+it'll read around the same thing
+ i read missing one argument
+i read self base
+that's a zero there
+stream zero
+did we get anything
+this is the startup
+oh, i don't
+did we get a backup syntax error
+did we get a missing import
+i mean, would it help
+i'm seeing them here anyway
+i mean, kate probably has something, but
+but i don't know
+i assume there's something, but i mean
+you know, whatever
+i think this one will work
+ that didn't quite work though
+why none
+that didn't work
+oh no, that's
+oh, it is iap
+oh, these are the starts anyway, but we aren't getting the
+should be a2
+a2 and 85
+oh, was it different for the starts
+for the startups
+the regular messages get sent with, it's a2, 85
+the first time around
+it is 85 for the
+oh, it's a3 for the
+oh no, but a3 is just startups
+85 should still be the reply
+and for 85
+let's call
+at least let's call that thing startup
+or hello or something
+ well that just happened here
+the memory thing happened, but did i get the txrx wrong
+ah, that's why
+this is tx
+hopefully we're going to get the rest once
+aha, i think we got
+ the magic is broken
+wait, i just sent the hello, why
+ but we got something, or is that
+no, this is just the differs
+ let's see
+oh, and i just realized, the size, this is wrong, isn't it
+right, that's why
+this needs to be plus 16 anyway
+i don't think that's what exploded this thing, i guess it was the first message
+and we can read that after the payload
+whoa, i just happened to hear
+what's that
+that doesn't look right
+ah, ah, whoa, whoa, whoa
+self base
+ that did not work
+we do have iop
+is it 4c here
+no, it should be 4s
+oh, binary, yeah, duh
+ there we go
+we get the dumps
+and i forgot the freaking
+oh, let's do that
+i always do that
+we get the messages
+and, like, they're being correctly parsed
+we got rx0, rx1, hello
+and this is the same thing
+the same thing
+let's just keep going
+yeah, see the two messages there
+and see the memory differ there
+same data
+ iop, setbuff, ack, yes
+that's not the right thing
+it's iop, send
+stuff is happening
+and it looks pretty happy about all the splits and everything
+like, received some stuff there
+and it actually saw that here
+it tobereceive
+oh, that's interesting
+why did it receive when
+did i search these around
+oh, yeah, because it's right after that, right
+it received the previous message
+it's meant zero, received zero
+it might just be a raise, i mean
+see if we get that happening again
+a lot of stuff happened there
+it's zero, one
+zero, one
+maybe it's just, like, a toggle thing
+no, there's one, one here
+but there's definitely a counter at the top here
+that makes more sense
+apple, dcp, dpt, htc, which one
+i'm seeing
+i'm seeing that before
+this one
+you're talking about this one
+this is, um
+this is from a previous message
+but here's the way it got, um, printed
+oh, you're saying that this didn't show up in
+no, here it is
+it's here
+here's, uh
+was this before or after the thing i fixed
+as before
+that's the one that
+that, uh
+that was, like, offset
+um, but i'm trying to figure out if
+yeah, like, here, right
+here there's
+no, it's not
+it's still fine
+i think that was just a race condition back there
+ uh
+after that, uh
+it got received
+i'm not going to worry too much about that
+next time i do a whole run, we'll see if it, uh, breaks
+iop, whatever
+tx1, 2, 08
+2, 0b
+sorry, yeah, it's the other way around
+it's this first
+the command
+tx1, 2, 08, 2, 08
+yeah, i'm going to call that good
+ return true
+i can, uh
+get rid of this
+it should be faster
+not much faster, though
+probably that most of the slowdown is the, uh
+is this big one, anyway
+and a little bit faster
+ that is actually half of the story taken care of
+the other half
+ that happened
+ what is that this time
+wonder what that is
+ how about i just say magic size
+and, uh, then just return 
+we have to work out this thing
+that's the other interesting protocol, that's the dcp, the main channel
+the thing with the
+this puts a four
+i don't know what this four is
+there's always a four there for some reason at the beginning in dcpp
+it gets that
+one thing i'm looking for is the offset for the replies
+and there's a syslog here saying heap size, blah, blah
+i don't know where that comes from
+but again, this might just be hard-coded
+after this, hopefully, 2eb, 2c, 2d, management, 2d, yes, 2e, then 24
+this is the same thing as before
+26 and 7
+more init stuff, probably
+it's an interesting fail there
+it doesn't like that command, whatever that is
+and actually, did we have
+we had a name thing
+rené c
+end point
+yeah, self-name or type self-name lower
+basically, it would be nice just to
+ah, wait, i need to
+yeah, that's kind of annoying, isn't it
+no, i'm going to have to subclass these eventually anyway
+because we got the init messages at the top anyways
+interesting, though
+there's like two here, right
+on this endpoint
+on 20, it's system and power log service, i guess
+and there's test service, dcp expert service, this is this field service
+there's more
+easy to say
+let me just add theon apis
+ let me just add the on api
+ when i go into pending services, i'll say this
+that sounds like highlights
+that sounds like 팔mutans that mac is getting
+leave them alone
+that sounds like入izers
+that sounds like vrijwillian²www友 sugare로
+my pool likes this expert naming convention
+come on, this is called dptx
+25, 25 is what
+25 is apparently nothing
+that didn't actually send anything
+dcpavsacepcp, oh that was the previous one
+dcpdptxcontroller, dcpdav
+all right, we're done
+you're welcome
+ 25 was nothing
+26 is this
+and the penalty also dp
+28 is, what
+dcp md, cp 29xx
+yeah, i think this is more
+dcp, let's call this, dcp dp dev
+and let's call this one, dcp sac
+ dcp dev, dcp sac
+and the previous one was dptx, maybe
+yeah, dcp, dcp dptx
+dcp dev
+and we'll call this one, dcp, i bet that's an external chip
+mc, mc, i bet that's like an external encoder or something
+well, it's a mac thing, at least
+and it has firmware, apparently
+but i bet it's the hdmi encoder
+no, we don't need the dcp things in there
+this is dcp anyway
+it's just a fish
+it's the same thing
+we'll call this one, ok, it's the same thing
+ let me just save the interface
+yeah, it is ok
+input, i'm going to give it a couple of minutes
+what is input
+that's, that's dp dev
+dp sac, and dp tx, if that makes sense
+ av audio interface
+simple video interface and audio, both apparently
+i guess we call it audio video
+let's rename these things the next time
+i'll make sure that it's a very good example
+2b um is again dptx oh it's ccp
+uh 2a was nothing let's get htcp service uh 2b
+afk remote allocator uh 2d is remote alloc 2c is what this is nothing again
+this should be all of them
+the names make sense
+actually, let's clear that
+there we start seeing the other hex dumps are the ones with the main dcp thing
+it should be enough for them
+ um
+dcp, ep, that's the beginning
+nothing there until we get the first thing there
+there's a command, and the reply is at 6,000
+and that's it
+i think that's really all there is to it, and i bet the, um
+i know the argument is the length
+that's why it says 10 here
+i think that's all there is to it, really
+this is just a single big buffer that gets used for commands and replies
+let me get that right
+the av thing
+just making sure
+yeah, i think
+dpdev, dpdev, dpsac
+ let me make
+i'm gonna make a little note thing here just to make sure this all makes sense
+we got this style of command and reply
+the 2, a non-2, a non-0
+see, here's command that doesn't change anything, and it has a length 0
+that's it
+but then, um
+this type means something special, right
+if it's length 0
+ there's that
+and let's see
+i still get a reply, though, of length 10, which matches up
+type 2
+ is that the same
+yes, that is the same as the previous one
+and here's a command that, uh
+does write
+but then doesn't
+i have to reply
+why is that written before the reply
+am i polling between things
+maybe i am
+i must be
+otherwise, it wouldn't make sense
+i'm sorry
+that's probably a counter at that point because it's the same as that command
+we have another type of command and a different reply
+ we have a
+that doesn't make sense um hmm
+this that command replies 895d
+yeah no command different replies
+obviously it is a separate command uh
+repeated that and it got that with a different number which makes sense um
+it does it again and it gets a 901d and
+then that's interesting it like changes
+changes like changes after running the command
+you get changed to 011d
+this is interesting there's more than one command here d100 d
+it gets a reply
+maybe that's just like receive interrupts or something like that, right
+unless i'm not logging enough and there's more
+i'm dumping this much, but that was kind of ad hoc, i made it up
+if we just do that
+there is space for more
+that's unmapped
+it is 48
+i may not that much
+i might be missing data here
+yeah, i broke it with the control c
+unless you already do it anyway, it's a good idea
+isn't this just twice that, though
+actually it's just half and half
+i don't think it was missing anything
+ah, shit
+that was the start of the console
+ah, damn it
+that went quite smooth
+ah, it's working
+this is also nice and optimal
+and that's slower because i'm reading more data
+and that's a lot of stuff there
+what happened there
+i think there's, like, stack padding going on there
+but yeah, the reply definitely had some length going on
+again, that was a poll command
+we got a bunch of crap
+this is, like, the timing information, apparently
+that's definitely a length here
+and that is kind of interesting, because it implies that this is the header
+which is actually the same kind of header as the ilp thing earlier
+same length, too
+except for the unk thing
+which is
+ like, a 4cc type of thing
+and it was fmo earlier
+i'm also seeing
+is there anything else
+these have empty things, though
+it's not always that
+i wonder about that one
+it's like a toggle thing
+maybe it's an ack
+maybe the cpu writes
+when it's done
+no, but then it would be before
+or maybe it means not ready yet
+but then
+or, like, a toggle thing again
+it's set to 1 all the time
+then it gets set to 0
+when it gets
+when it sends the command
+that's kind of strange
+i'm not sure what's going on there
+especially if it's only in the replies
+i should
+that's a command at 0, but then there's something at 4000, two of them actually
+then 0
+628, which is a lot
+and the 628 one is this one, because that matches
+command 3
+ because
+oh, i know
+it's command 0, though
+it's command 0
+maybe it's just pulling a different channel
+i wonder if there's anything without len 0
+can i get more
+can i get that many frames here
+oh, i didn't think we did this many frames
+i'm getting there
+it really does look like command 3 is only used for len 0
+yeah, always len 0
+yep, that's all there is to it
+yeah, that's always that
+it always gets replies there
+yep, at 3
+and interestingly, it got the reply at 3 here
+oh, wait, wait, wait
+isn't this backwards
+it must be backwards
+and that also explains some of this
+ command 42 is not get next reply
+command 42 is acknowledge previous reply
+and that's what this does then, surely
+that must be the read acknowledged bit or something like that
+that's why the unk thing is the channel
+to speak
+and it's the same as whatever the read happened
+then there's command 3, 42
+acknowledges channel 3
+channel 3
+when it's actually sending commands, like
+that's probably, then bit 4 is probably acknowledge, and
+this is an acknowledge for what
+this is an acknowledge for nothing, apparently
+oh, look, and here's a different address again, oh, that's interesting
+then at 0
+this is channel 0, i thought it was 2, or is it just the lower bit
+and this is interesting here, because
+that's acting that reply then
+there's another reply on that same channel, and something happened here
+there should be another, uh, but there isn't
+but maybe this is just some kind of other shared memory thing, that could be
+i don't know if we see that again
+there's a reply here
+what are you talking about
+it sends a command again link zero
+this is always something that you need to set up to make sure that data is
+it's reset from the beginning again here
+that's another weird change there like why that offset
+at 40 you
+it's too slow to be clear about that
+ts well and
+talking about and and and and it's really fascinating how
+see, it ends in a command
+that's definitely an ack
+that's kind of what i wanted to see
+and look, there's stuff at 8,000
+a map page
+oh, because i'm not wrapping the pointer
+i'm dumb
+yeah, that would happen, wouldn't it
+that is dumb
+oh, that's a map
+well, that's going to break anyway, because it's already dumb
+i think we got most of what i wanted anyway
+like this stuff at 8,000
+8,000 here with the command
+that was a reply and none 3, 3 at 8
+this is not the best place to have a map page
+oh, that's a map page
+oh, that's the best place to have a map page
+this is weird
+display width, display height
+oh, that is not good
+a single byte
+oh, is it unaligned
+no, hold on
+780 by 438
+there's a 3 8th, but that's not right
+maybe it's like physical dimensions
+it's kind of weird, though
+and like the same command is used for db-pyming-mode-id
+oh, no, that's a zero
+it's really just a string
+it's really just putting strings there
+where's the data, though
+if this is getting some good parameter
+oh, but you know what
+there's a page with
+like, this might be another shared memory thing
+like, when something gets updated
+something gets updated
+maybe it gets that
+yeah, it's kind of weird
+but anyway, let's see
+back to the mapping thing
+we got the
+this changed 4 and 8
+it's almost like this is some kind of other shared memory thing
+oh, gosh
+this is going to be 
+ like here, it
+here's an ack for three
+here's the command on 2
+it gets a reply on 2
+length 3-c
+at zero
+it gets an ack of that and something changed there for some reason
+which is weird
+it's like it wasn't completely written when it read it
+one, two, three, four
+five, six, seven, eight
+no one got any answers from that
+i guess three just gave it one more chance
+robert, you got the answer
+that's a counter for sure
+did i not do the mod right
+not that one
+this is correct, right
+no, state
+epdp def
+that's correct
+oh, hold on
+probably because that's the wrap
+yeah, of course, at the end of the buffer it has to wrap
+it can always read a header at least
+this has to be aligned
+it's the payload failing, probably because the header is
+yeah, hold on
+it's not
+just has to wrap
+yeah, let's just do it in the main read thing
+payload io read
+size, comma, buff size, minus state rptr
+plus 16
+i should just minus 16, because we already read that
+we know that much is going to fit
+it's going to fit
+don't do it like that
+that should be fine to do like that
+but if block is less than size, then we append just that size minus block
+that should do it, i think
+or not
+state buff size
+it broke
+oh, an alignment thing
+hold on, hold on, hold on
+we got the header
+wrote too much, obviously
+our pointer is 40
+you guys are working on something
+yeah, this is
+do you guys want to try it again
+oh, no, don't worry about
+let's just dump the whole thing
+see what happened here
+you got 3f80
+size 98
+what's the 3 of c0
+3 of 40
+it should end at d8
+round it up
+it'll be f8, won't it
+yeah, 1c0
+what happened here
+actually, there's another iop message here, though
+oh, does it
+oh, if it doesn't fit, it just skips it, doesn't it
+because there's 98 there
+and there's 98, 98, 0, 3
+they're all 98, though
+i'm getting the feeling
+yeah, because obviously that doesn't make any sense
+it just goes ahead and
+and gives up
+2, 3, 3, 2, 3, yeah
+it has to be that
+what i'm going to do is rptr
+let's first cache this here
+just update it here
+right before the yield
+everything has worked
+what i can do is rptr here
+read that
+make sure that's that
+but if size is greater than how much space we have left, then rptr goes to 0
+and we read everything again
+that should just do the right thing
+and actually, this will be a light like that
+that might work
+it's, yeah
+the next one is broken, which is why we had the thing in the middle there
+let's just do a reboot for that one
+i don't need this anymore
+that's a nice little thing
+i need this to be the same size as the last one
+i'm gonna have to do that again
+i'm getting, i'm getting, i'm getting better at this
+uh, that
+i think that's just that
+see, this c8 here is the c8 here
+i think this stuff at like 80,000 is just some kind of global status thing
+95, 77, it looks like a frame counter, really
+64, frame presented, right
+it looks like a frame number, really
+oh, there it goes, 6
+and that also made the 1 happen there
+ this is interesting
+it stops there
+this is the actual data
+this is more like the length starting here
+but this says 14
+it's like there's an extra word here
+that gets it 0
+it looks like the commands are actually like the data is one word short
+i feel like it might be a a random box address or something
+there's multiple versions because i've said this here
+it's just- thank you
+this is interesting
+here's a command on this 6
+that's the same thing as always
+maybe this bit in the reply is like reply buffer empty or something like that
+you get a 0
+you get a 0 first
+you get a 2
+see, you got a reply here first with a 0
+a 2 after that
+it looks like it's probably a big flex thing
+i'm going to say it's not really like this
+what we actually have here
+it's not really like this
+and it's not really type at that point
+this is kind of bullshit
+and that
+then set shm is 40
+type is more like the low bit at that point
+like the low four bits
+because the reply is always of that, the commands always have that set
+i think that makes sense
+yeah, cause those always have it
+in that case, basically what we have is 0, type would be the little 4 bits
+the rest is basically flags
+ or maybe it's the channel thing
+that's hacking the other channel
+and onto this 3
+i think, um, reply type 42
+ arg command is basically bit 6
+ in this case, command and reply, these are there are two in both cases
+the top bits are kind of, uh, hmm
+it's always 42 or 2 for the type
+i think that it might just be ack in the end
+when reply is when it's 0
+is when there's actual reply data
+when it's 3, it's just an ack
+no, that's data that time around
+that's when there's data in 3
+data in 0
+ i'm going to do something real quick here
+ooh, what's with these
+what's with these
+the first time i see those
+that looks like a normal reply, though
+yeah, i don't know what that is
+some flag
+and that would be bit 22, i think
+ we got that
+there's also a type 1
+that looks fun
+is that the beginning only
+yeah, that's like the init, right
+ set shm-m is type 0
+that's like the reply to set shm-m, but that's basically it, isn't it
+it already has the 40 there
+ what's the next time that happens
+oh, that's, it's just been several times, isn't it
+ the only commands are always either 202 or 242 or 342
+and the commands with 202 are always the ones that have stuff
+oh, interesting
+when that, like i said, it's also got a command
+ we're going to say cmdmt for command
+and these are really common, to be honest
+i guess i'm just doing no command
+you can go in the common one, i guess
+and the replies are always 0 or 3, plus that flag
+unless it's a 42
+ when does this happen
+i'm just thinking these are exactly the same count
+where does that show up
+is it like
+oh, these are like the extended things, that's like the maximum length
+then why were there unknown 3s3 also
+like an async
+yeah, it looks like that
+2, 2, 1, d
+but then the same thing happened before with 2, 2, 1, d
+no, that's still the async
+oh, these are not real commands, though
+it's just pulling for more data this time
+i guess it's just getting more packets
+getting more packets out
+but it must have been in response to something, like here
+954a gets a reply with a bunch of stuff
+it's empty, though
+that's weird
+that's weird, because it gets like an act to the command
+it's like the command is still expecting more data and keeps pulling, i guess
+it's like, yeah, that's like a file
+it's like, yeah, we've got some of this stuff
+it gets back to us
+it just gets back to us
+but it's not like this is the best way to do it
+you get to the point where it's like, oh, oh, oh, oh, oh
+well, i'm going to go back to my memory
+this is the same thing, but asynchronous
+and in this case, it was after a present
+there's an async thing here, right
+with 121.0
+it's before that, which should have ended in a reply or something
+in a command, yeah, in an ack for the reply
+oh, no, there's another ack for the asynchronous thing
+that's still fine, though
+ah, here we go
+command reply to
+there's an asynchronous thing
+oh, my gosh
+anyway, the you sync stuff starts here, right
+yeah, there's a random reply after some other stuff
+this has to keep backing the replies
+there it is
+and, yeah, sorry, but this has to go away
+or, well, it doesn't have to go away, but
+i do message name, and just put the whole thing there
+and the heart.read
+and hopefully we don't need that anymore
+and i guess i am going to add that modder, though
+but there's only a couple bytes there
+this is 64 bytes
+120 is fine
+i can pull
+i can pull that there, and it will replace
+yeah, let's see how that works
+i keep forgetting to do that
+and we can return true there aren't we doing that already
+i don't know what caused that
+that was kind of weird
+or was it because it was the wrong
+no, it shouldn't have been
+why is that saying dc
+oh, yeah, we don't need that anymore
+that's definitely not needed
+where is that coming from, though
+update it yet
+and it's not messaged
+it's back
+what i need is
+i heard message come from anyway
+a bunch of people
+yeah, how about i don't recurse there
+and those should be strings for this to work properly
+yeah, there we go
+and it will have a high hex dump
+does that just present, or is it doing something else
+it just presents, doesn't it
+can i find the coordinates of the cursor
+looks like they're over there
+it looks like in the
+you can see them in
+another six, huh
+the hell is that about
+did it present
+that doesn't look like the right address
+no, that's not the right address
+there's somewhere else where things are happening
+i don't think that's right
+ here we go
+um, uh
+dcptracerstate, nah, dot ep
+dot, um
+that's nothing there
+nothing there, nothing there, length 3c, what's going on there
+no, it can't be that
+ what's going on
+oh, ho, that's another buffer at 8,000
+what the heck is that about
+it should be 4
+it should be 16, actually, right
+yes, it was complete then
+oh, i bet i know what this is
+is it going to be like an in-buff, out-buff kind of thing
+and that's why it writes afterwards
+i bet the replies don't have it or something
+or if they do, it's different
+no, they still
+it works out
+this is wrong
+and the replies have it at 0
+and the commands have it here
+and 0 here
+yeah, that's kind of interesting
+and i bet at the act command all that changes
+maybe it has to be the act
+i think command empty is just like the buffer
+it might make sense
+how about the replies earlier, though
+yeah, it's an act command with length
+what's going on with those
+ah, that's going on with those
+that's another marshall
+yeah, that's another
+that's that's a data structure again
+there's a d300 that might have something to do with that
+yeah, that's always one
+oh, that actually was kind of slow
+ there's a fade
+that's why it's doing that
+it's still doing the fade
+i don't even know why it starts doing the fade
+you you you you you you you you you you you you you
+it's getting pretty late and i think this is starting to make sense
+i think that's all reasonable yeah
+i think that's enough for today it's like 1am here and i should get some sleep
+a bit early to stream this time around
+hopefully some of the us folks can join in
+let's take care of that
+and i need to do a thing, because yes
+again, let's just talk about the ground map
+let's take a look here
+this reg array accessor thing and range in this case is a single range and
+basically what i want to do is um python doesn't have that does it i don't think
+um yeah numpy has it but i don't want to put in numpy just for this
+yeah let's just make a little quick thing
+in this yosukunai shimasu
+if um if if uh if if if if if if if if if if if if if if ah ah ah um ah
+yeah they want to return it as a multi-dimensional right
+that should be good enough
+then ready to go
+there you go
+all right i just stopped
+if it's a range, yeah
+if it's a range or a tuple
+they have to be at least the width
+we take all the steps
+and the range, does that get
+first of all, that should be over here
+sorry, range
+otherwise, convert it to tuple, in case it's a list or something
+basically, actually, let's just do it like this
+if it's an integer, then do it like this
+else, if it's a range, then convert it into a tuple
+actually, yeah, this will take care of that on it, because we have that already
+we don't even need that
+convert it to an nd
+the range
+which i might want to
+which i might want to, to this here, then i can just do for engine ranges
+and this is, i don't care if i'm peeking into that class anyway
+i can just put that in there
+and if you want, it's already in there
+it's already in there, it's already our let's make
+let's dead�� let's make
+if this is, for dangerous sustain
+i can just put the
+we know it's going to be an ndrange by then
+and at that point in the array accessor, that gets the range
+this will do the cartesian product thing for me
+this will do the single lookup for me, but it doesn't have to be an int
+if it's ndrange, yeah
+basically it's an int, or if it's a tuple, and all for an item, yeah
+if it's an int or it's a tuple of ints
+off equals self int
+much easier
+that should take care of that
+oh no, it should be an ndrange
+this is going to be a little bit more complicated
+this logic isn't going to work, because i'm mutating it
+and let's just put the logic for that into ndrange
+yeah, that should be fine
+but i don't want to do it linearly
+ i'm going to do it with a set and a store, like the list of addresses
+let's just do it like this for
+set map sum, iter tools, product, self-ranges, that should be just self-ranges
+ hopefully, it works
+hopefully, i didn't break anything
+many spam accounts
+i'm getting, like
+much spam lately
+ cool
+yeah, we have self-members
+how does that implement it
+is it contained
+yeah, it's contained, isn't it
+i can
+i think that didn't update since last
+ooh, 523 utils
+what else
+oh, yeah, if
+yeah, duh
+dart dump
+ that's broken int and range
+oh, wait, iter tools product
+i need
+yeah, that
+it's iter tools
+product star
+and the same here
+in populate
+range map, add address
+oh, um
+yeah, because that's the span
+uh, this does work, right
+if i have, like, python range
+i'm not going to support backwards because that's going to
+actually, does that work
+can i just do, like, max range 1,000
+is this optimized
+no, it's not optimized
+oh, it's trying to put it in memory, isn't it
+it's not happy, is it
+yeah, let's just not support step
+oh, we can do this, though
+we know that's going to be everything
+yeah, we don't support negative ones anyway
+i don't even need the span, then
+i can just say start
+we're not supporting step, but at least start will be the min of
+not the sum
+ah, yeah
+this will be the sum of the min
+not the min, sorry
+the map
+yeah, just the sum of range zero for rng in self ranges
+that'll do it
+basically, the biggest thing is going to be
+and it needs to be offset by the
+oh, this is a bit tricky, actually
+it'll be
+because if i have, like, range zero, ten, two, right
+it's actually going to be
+ooh, this is kind of tricky
+ the last element is eight, but then i have to add the last element of
+it'll be the last element of every subset
+but then i also need to add the last stride
+which is a bit tricky
+because it's exclusive
+because in this case, you know, like, nine doesn't really cut it
+it's going to be the sum of the last elements plus
+if it's here, yeah
+uh, sorry, that's not going to work
+yeah, step is min, min step
+it's not even min stride, it's min step
+that's what i should be calling it
+least step, let's call it
+ that should do it
+basically, step is going to be that
+where was i
+yeah, i think this works
+just element
+but i'm not sure if i want to care about that right
+do i want to do that
+nah, it's fine
+you can check for that later
+that should be enough to get that to work
+uh, min stride
+oh, i'm getting the
+let's just do it like that
+ and there's, yeah, i need a len for that
+ i think that works
+but it doesn't
+it didn't print the ttbrs
+why didn't it print the ttbrs
+ate , protection tror 
+ economics 
+it's got the tvrs
+an nd range, yeah
+what's the name of the map
+yeah, we're map in maps
+then array, reg, zone, map, name, yeah, address, index, address
+how does that even work
+there's no index method
+oh, if adder in adders
+the members must be broken in that case
+it's crashing, what
+how does that
+did i not save this
+i'm confused
+oh, yeah, that's fine
+oh, yeah, that's wrong
+why is that like the only member
+no, that's wrong
+oh, maps, i'm dumb
+ that's what i wanted
+except that's not enough
+i thought we had more than that
+oh, that's tcr
+ that's fine
+tcr has four, yes
+index is failing, yes
+how do i find the index
+oh, that's going to be tricky
+yeah, i need a mapping for that
+this is a test
+i'm going to give it a pass
+still a bit
+i don't know what it will do
+i don't know what it's going to do
+it's going to make it easier and easier to do
+i'm going to say i'm going to change the code
+let me change the code
+and it's going to say yes, etc
+there we go, there we go
+that's true
+ i'm going to say i'm going to do something else
+ let's just do it the dumb way
+and let's just make a dict here and say
+it's the product of the ranges, but i need to enumerate them
+it's the product of the enumeration of the ranges
+it'll be the product of everything enumerated
+what i want to do is index is the zero
+the address is one
+there's a sum of that
+we do that
+again say def index
+something like that
+getting there
+enumerate is not subscriptable
+oh, the
+mm hm
+thej worked
+the, the print there
+that can go away
+mmm hm
+list objects is again an anunciag to be red
+list esoidsong
+mm hmm
+ah, yeah, because there's a
+then in an accessor, that's fine
+that's going to
+an array accessor, get item, if it's an int, yeah, that's fine
+that's going to work
+list, right, right, acc.reg, the accessor is a list, why is the accessor a list
+661, how did we end up in the
+oh, right, right, sorry, here, yeah
+keep queue merge
+but no, it should be doing it here
+yeah, generator object, reg map, array reg, yeah
+ get that generator object
+just to test that
+that fails in list already, which is a problem
+oh, get item
+ stop
+why is this from array reg, right
+i'll sort of get this from here, this is reader's book
+no, that's still a different problem here
+um, product
+actually, i'll just do it this way anyway
+it'll just be
+nj4ij and zipcell for nj4ij
+and this item
+i'm missing a parentheses there
+why am i doing itertools product here anyway
+oh, sorry
+yeah, because these are single ones
+if it's not a tuple, assertlendrings1, return that
+yeah, and that's the problem
+this needs to be
+if it's an int
+if it's
+if it's all ints, then
+well, anyway, for
+ let's do
+yeah, if it's a single item, then we just return whatever it is
+otherwise, if it's all ints
+if it's all ints, if it's
+ this should do it for this
+if it's one of them, you just
+you don'talex it like this
+basically what i want is return the
+return the map of the sums of iter2's product of
+it'll be ij
+itter is this ij
+is instance
+ i'm getting somewhere
+t, t, v, r, blah, blah, blah
+let's get rid of the prints
+tcrs, yes
+t, t, v, r, 0, 1, 2, 3, yes
+i need to get rid of this tuple thing there in the prints
+i need to get rid of this index address
+the other thing is if the index is a single thing
+yeah, that makes that work
+finally, i need to, like, i don't want to print the parentheses there
+if it's a
+if it's a tuple, then idx equals comma.join
+that'll work
+actually, i can just do
+get rid of the
+oh, yeah, sorry
+yeah, this has to be there
+ah, that's kind of annoying
+the accessor getting a tuple, was that going to work
+yes, because it uses the range, and as long as that's a tuple, we're good
+that should fix that
+finally, i can use this to redo this in a different way, ttbr is equal to
+you have two ranges here
+it'll be four registers each
+in principle, i can actually just say ttbr
+self ttbr index
+and that should give me all those registers, if i'm not mistaken
+of course, it doesn't work, but we're getting there
+int object has no attribute reg
+oh, because when i read arrays like this
+it doesn't, yeah, i should, i should make it return accessors
+that's actually a dumb idea
+and actually, it's, it's an int
+if it's an int, return that, otherwise, let's just do it like that
+no, it only got one
+why did it only get one ttbr
+oh, yeah, because the range is not range four, it's range, i'm dumb
+what i actually want here is i range
+that range is fine yes yes
+it's another uh yak shaving on this infrastructure thing but
+the gpio thing that uh john
+sent me i can fix that up with uh with the thing here
+if i just say rq group
+we can have i range uh 740
+just do it like that make sure that's the tuple get rid of that
+this is more readable
+irq group and this is the rq group
+oh, i think i sent the wrong trace
+you have dcp on it
+that's fine though
+i can untrace everything
+hey, that looks good
+did we get any irqs
+ack to ack, cool
+i think that means it works
+that's cool
+yeah, cool
+i'll put the ack to ack
+the ack is off
+we will check
+it's on
+we'll put it on
+ we'll check it
+i'm going to call it back
+i think it's on
+does it really not do any like any gpio stuff until like much later
+i'm kind of surprised to be honest
+i'm pretty surprised it's not doing anything
+i assume that's normal
+it is off
+at least it remembered the wi-fi is off
+and also, the i2c is bitbanked
+this is a hard to write i2c controller
+that's kind of surprising
+wait, no
+we do have a hard to write i2c controller
+we know that
+why is it bitbanging i2c
+is it like bitbank it at the beginning
+that's kind of weird
+i can't plug in type c right
+because i have the port obstructed, but let's see
+it acts everything
+that is quite surprising
+can i like mess with bluetooth and and uh slow
+where's bluetooth here
+it's gonna ask me for it to pair for one
+yeah, it doesn't really care, does it
+meh, anyway, point is the tracer works
+ and it's probably a good idea to leave bluetooth off anyway
+i wouldn't want to do that
+one fewer thing to be annoying
+that's fine, and
+back to the asc tracer
+this already has code for the mailbox stuff on apple
+we just can't
+ maybe it's just because this one's already running
+we know, like, the sub type is, is the bottom bits, apparently
+i have seen these more frequently
+ we know, we're going to document these bits actually
+if i do, i don't know, the inbox, yeah, these are the difference
+are relevant
+but that's probably a good idea anyway, because it'll remove some spam
+might as well do it separately
+ for, for example, for inbox, sorry, for outbox 1
+i'm going to
+we can see from here that these bits are the
+that's 32 plus 8, 40
+ i'll call it inbox ptr
+is 43-40
+um, 47-44
+this'll be 52-48, outbox count 2
+56 sorry 51 and this is 52
+again count uh yeah
+the other thing is here i want to do inbox0.reg let's just say inbox0 not box0
+call this at box1 inbox1
+it'll just be let's do it like that
+here i can just have those like that
+do it like that
+actually, it should just be able to reload like this
+except send isn't working
+because there's nothing there
+it's fine
+and actually, these are two names
+this is called incount, outcount, outpunter, inpunter
+i think reloadme should work there
+no, it doesn't
+because that's already a regmap, which is already
+yeah, i need to rerun that
+these things here
+ this says the message zero
+the inbox message zero is
+is subtype on the top bits
+ there's a mapping thing involved then
+which, by the way, does wait just pull on the status thing
+yeah, it pulls on the status thing
+and if we show the authentication in the bottom of the browser
+the channel is in the bottom 8 bits of message 1
+that's channel 37, presumably also the inbox
+and yes, i thought
+the top bits of the message 0 are like the message type
+ apparently 8 bits
+it'll be 59, 52
+well, then it gets like an ep map thing
+endpoint 0 message type 8 is like an ep map thing
+did i see something like that here
+no, that's 4
+there's an
+there's an offset
+it gets a message with the base
+a bit mask of what endpoints exist
+it says endpoint start
+it's getting the endpoint sizes after that
+ah, i see
+and if it goes to the endpoint map again, it's because we have a subtype 8
+and subtype is 0, yeah
+if there's more left, then it acts with that 32 and 7, yes
+4, 0, and 7, what's that about
+but anyway, what i can do here is
+that i know about this, there's a channel type
+decorator here
+and the way that works is
+do i want to use hex or
+honestly, i kind of want to do this in the decorator
+or just
+it doesn't really have to be the metaclass
+in that case, it won't be name
+i'll just be like
+i've just got a channel and type
+don't need that right
+for anything if
+i can just say and bind it that way actually like that
+this will be name my rect type get attribute name just put it in like that
+the handler
+if i can get
+and i would do let's see in this case the unquote no i'm gonna do you go
+down and put the direction in there
+no, i think this is fine
+yeah, oh, that's mux1, yeah
+just do it like that, handlerrecttab is none
+i can just say handler
+i want the direction in there
+and we don't need these anymore, but, tx
+i kind of want to know if there's a, like, if there's, is there's a
+like, that kind of stuff, right
+there's a way of finding out
+which is none
+but, like, the one that takes an a
+is it in the code
+might be in the code thing
+yeah, it's like the actual code
+that's not what i want, though
+maybe there isn't
+oh, it's the beginning of varnames, huh
+i do want the direction in there, actually
+i mean, this only gets called at the, um, at the initialization time anyway
+does that work
+and let's do it
+i think that works
+let's define a few of the init things we have here
+0.6 is apparently idle
+i don't even know the tx thing, though
+yeah, whatever
+direction, channel, and message
+channel 0, message 6
+and i assume there's no rect type for that
+there's, like, wait, hello
+this is, like
+actually, this should be, like, an init, right
+then it waits for 0.1
+it sends a 0.2
+uh yeah a2i and i2a hello
+figures out how to uh adds it to this map
+i'm going to say name here
+i can just say in it equals this is like this like this
+i'm going to say in it equals this
+this one i actually want to do some interesting stuff with
+and i said i was moving these here
+no, i wasn't
+i did put them there, did i
+these eight, there are x
+in this case
+this will be based on
+i think this is
+this is our message
+it's going to be the same for 0.box1
+and we can just inherit from that
+and in that case, what we had here was 0.8
+it looks for the lower bits of the message
+the endpoint is that's plus the offset at the next bit
+uh, three bits there, right
+there was a continue flag there, that one, the
+sending eight is this, it's also an ack
+that's actually, um, of the thing, and that sends the, the same top bits
+the low bit is set if, if it's not zero
+i don't really know what's going on there, but it's just called a flag
+there's that subtype, and, uh
+that's bit, uh, what, 48
+yeah, 48
+and we do set that in the flag
+five is ep start
+and that does have the, uh, let's call this ep, actually
+uh, the ep should be, uh, eight bits here, hopefully
+ um, 39, 30, 42
+and i don't know what that low bit is
+i think there's something, like, generically used for those low bits
+yes, it's katana's github, sorry
+it's the u-boot from katana
+this is the code to initialize the nvme controller
+after that, it, um, sends ep start for every endpoint
+it, it's a zero message one
+it should be getting an endpoint and a of one or four
+ why one or four, though
+oh, probably because it's coming from the endpoint
+if it's zero, then it's going to be yeah
+ep-act should be fine
+and do it like that
+actually, just do it like this
+i can just say initstate here
+there's this mailbox address thing
+actually, i can probably just do that
+let me just use an object
+no, i can't do that
+i need a state thing
+but then i can just use that.dict, right
+we'll just do it like that
+in that case, it'll be state
+dot dict dot update
+yeah, something like that
+kind of hacky, but whatever
+and in that case, on apmap, i will do for inrange32 if r0.bitmap and r0
+what is this thing
+and this will be ep
+and this is going to base
+do i want to use large numbers for endpoints
+oh, that's a little garbage
+do they use nice numbers for these
+probably no
+but i think maybe decimal works better for this
+nah, but if i'm reading it off of hex, it's better to do it like that
+that's apmap
+we had the epac
+which is epac 0, really
+no, 8
+message 8 is epac
+it's the same as
+that's a good reason to have the direction thing
+send epac
+then 5 is epstart
+sorry, keep doing that
+epstart is 5
+i guess anything that comes in from that endpoint
+most of the time it's just the same thing
+here's the stuff
+all right, let's go back to the right thing
+no, that's not
+that doesn't make a lot of sense
+that's a special case, though
+what i can do, though, is do this
+hmm, i have no idea
+i think those are the only ones that make any sense
+honestly, i can just have the unknown one here, too
+always have a handler for that
+i don't even need this
+actually, i can just see
+they can be overridden by the subclass, if it wants to have a
+i'm not really figuring it out
+like, i'm looking at
+at kat tennis' code at this point and just kind of copying it
+but the point is, like, this is the very generic thing, the beginning, right
+after that is when, like
+i don't have any idea what the dcp thing does, right
+that's when it's going to get fun
+and to have a baseline for everything else to work, right
+n.1 or n.4
+ yeah, i don't know about that
+i won't find out about that
+but then it has
+zero message seven
+what is that
+power ok and power ack, i guess
+that kind of feels kind of dodgy, but
+well, i'm going to run it with just this
+see what actually happens
+and, yeah, trace dcp is fine
+ooh, what just happened
+oh, this is slow
+ooh, and, of course
+oh, no, that's just scrolling
+ooh, yeah
+i need that
+ like, if the script execution fails
+yeah, let me do a
+it's really annoying to have to reboot everything
+if it does a run code
+ basically
+how do i do the stack trace thing in python again
+there was a thing for
+yeah, trace back print tv
+print exception, was it
+print exe
+yeah, that's what i want
+and the same thing here
+if any of those fails, i
+i get a shit
+fail, and i can fix it
+it was going to fail again, or no, did i fix the enum thing
+oh, i didn't save this
+save that
+yeah, see, i get the shell, which is what i want
+what's broken
+message log
+unknown, unknown, unknown, unknown
+message log, why
+does static method not do what i think it does
+message, oh, log, yeah
+that's what i want
+static method, is that not correct
+ah, yeah, it has to be, yeah, well, anyway, that's not what i want
+it works
+ what just happened
+outbox zero, not defined
+handle message
+ah, it's r0, not outbox zero
+where did i get outbox zero from
+where did i get that from
+outbox zero, dirty handle message
+oh, here
+ah, inbox zero
+yeah, typo there
+something else broke
+it has an unpack, handle name, rec type
+can i get the
+message map
+that should be fine
+oh, the none, none thing
+ what
+i just realized that i'm losing messages here
+like every time i run it, it's not retrying
+but i guess, for
+ uh, yeah, because this is getting guest exception
+i want to wrap the tracers into a nicer shell thing
+and that will also fix it for asynchronous
+because otherwise it's going to suck
+if i do
+and i already have the content and all that stuff
+oh, i'll just do that
+in maps, under vm hooks, hook-mapped
+for vm hook, we'll do the same thing
+let's wrap it under our func
+and we have ident here
+yes, readhook
+ those will be the same as before, basically
+yeah, same as that
+shouldn't this be checking for
+yeah, that's another bug
+ i want to do that shell wrap thing, which is going to be
+basically, the run shell thing
+we can just do this shell wrap thing
+this shell wrap thing
+i need the shell wrap thing in here
+oh, right
+let me just
+down here
+ let's just
+let's just go ahead and
+i have a bug
+no, what's wrong
+this is the shell wrap thing
+but, actually, i actually have some problems with that
+what are you
+i don't know what your problem is
+you don't know
+but first
+i should just do a skip thing, to be honest, but that's kind of done here
+how do i
+nah, it's fine to clover them
+i'll just do it like this
+this exit console
+i just restore them
+bit hacky, but you know
+and this is a re-debugged shell, but it'll be like it'll be a hypervisor shell
+it'll be like a hypervisor
+i'll just do a skip
+this one needs to be like a thing there
+basically that
+if i do dot reload me
+oh, lambda can't use raise
+if i do count
+except for the tracer
+i can keep doing
+and hopefully get the same exception in the tracer
+i'm not losing any messages and they get a lot of spam
+still lost some before though
+i probably want to reboot
+and asc one of three
+tuple format
+2x r0.type
+1ep r0 type name r0
+also, why is that white
+how is r1ep, how can that be
+that doesn't make any sense
+why did that happen
+we lost the handler entirely
+i'm not, i'm not calling start on that
+i am
+just run that you oh i only have that, why
+i'm only getting this one
+why not message log
+oh, cuz i'm dumb
+i didn't finish writing that
+that would help
+why does that not work
+that scope doesn't work
+no, what
+let's just do it inline
+log yeah oh hold on no it should be fine
+um like you can do that right and
+i'm not actually not sure how the scopes work inside a class like that
+because i mean actually yeah like if i do that it still doesn't work
+if i do like uh ctracer
+that'll work but can i run like a can i do this no
+that does not work
+i can't do it like this anyway
+then these have to go outside
+i can do it
+it's still not in handle message
+this would be ast tracer object, and it should be the only one
+it should be that
+340, no, that is correct
+oh, is it because the read function gets put somewhere
+i can do that, but then
+no, that doesn't help
+it calls the read function from the handler
+oh, i know why, because it's already
+ah, of course
+of course, because i'm not reloading that when i do the shell wrap
+it's not right
+what i need is actually
+yeah, that's why
+maps equals that, and it should reload the same one
+uh, if i get in my own maps, event.address, and
+same as we were doing this
+and yeah, that's fine
+it's sorted
+yeah, this is fine
+shell wrap
+sorry, yeah
+basically this is
+that when the thing returns
+it won't be returned false
+basically it'll just be set like that first
+not in return and just return
+read write quarks that'll work and yeah that'll work
+i honestly i kind of want to
+just call that code here i maps first yeah oh oh
+isn't this wrong
+it's not wfunk, it's right
+that doesn't even work
+i think i kind of have to just do that
+yeah, i think just duplicating it is what it's going to have to be
+basically, yeah
+read, write, none, mmio maps, event address, is that right
+no, it's data address
+return mode, and read, write, corks, yes, yes
+i can just do it like before
+and that needs to be, that needs read to be true
+that should work, maybe
+i can't save the current thing
+that's not, it's like that, isn't it
+that works
+i can't continue this because that won't reload until i quit, but i can do skip
+the next one failed, correctly
+this does work
+and hopefully
+ if i go to trace dcp
+sorry, to here, esc, line 82, and the message, yes, inbox 1
+i come to the script again, and just control d
+and that's a different issue
+i have a dumb print here somewhere, don't i
+printing the map somewhere
+yes, here
+i did get ep start type 5
+yes, i do
+i did that
+that's nice
+i do want that little thing there
+assert handler, why
+don't we have the unknown handler
+we do have, oh
+we do have a lot of stuff
+106, 101, all right, yeah, we have all those
+why not unknown
+why is there no none, none, none one
+oh, because if channel is none, continue
+yeah, but none is valid
+this is a valid channel
+what i actually want is, let's just put a thing here
+let's just put a thing there
+back to unsupported formats
+string, what was that
+wait, why is ep
+how is that a tuple
+zero, and how is our zero type a tuple
+it's a register 64
+did i not instantiate it
+i did not instantiate it, didn't i
+but i did
+but this is our one
+no, our zero type
+but it is instantiated
+that is there
+message ep map
+oh, my register
+that's a bug in my register class
+it's only a bug in my register class
+it doesn't look at parent classes, that's why
+but it's really a test
+what did i do with this one
+well, i'm not sure fullywell, such a big maxwell thing
+it's completely random and
+hmmm, yeah
+fair enough
+that's perfect
+field set is fine
+but i actually
+yeah, if concern fields
+i actually want to do the parent classes first
+actually, that should always be there
+i should work like that
+and classes backwards
+then fields list dot extend like that
+cls dot dict if yeah, that should be fine like that
+just like that
+either an intra tuple
+the thing is in order, but the
+if there's an override, i want to keep the second one
+and that's kind of annoying
+i don't want to do this in init
+this is going to happen every time that it's instantiated
+actually, i want a meta class for this again
+yeah, basically just this kind of thing
+and this is should be actually reg map
+and i can do the reg meta for the other one
+i've also been wanting to shave this
+and i do have dct dot items
+that should actually be fine
+here, i need to do this thing
+fields, let's do it like that
+just print those for
+and see what happens
+ i know this is not done, but at least let's see what it does
+4k and yeah
+yeah, i know that, but what did we print
+i get the basis, which is just reloadable
+oh yeah, because this would be the register thing
+there's nothing there
+let's clean that up
+we get that
+finally the asc thing's message
+basically, it'll be
+i can't get mro on this yet, though, unfortunately
+but hopefully, i don't have more than one base class
+if basis and base is zero
+this'll work
+is subclass
+well, basis and the subclass base is zero
+actually, if basis and the subclass base is zero, register
+we can do it like this, this will work
+and i had fields list
+ oh no, i need dct
+field list is just list f.keys
+set f.keys, and that will work
+and keep the order properly, maybe
+ah, this doesn't work, because it's not defined yet
+because it's, yeah
+if base is and base is zero, let's just say, yeah
+let's say is not reloadable
+it doesn't crash
+i can run script again, continue
+what happened
+it didn't change
+let me print that again
+oh, it's like empty
+ this isn't actually working, or isn't it actually working
+oh this is backwards
+it's just an mro
+we get everything in the right order
+it's like it's message and it's still empty though
+yeah, i get that
+why is that not a thing
+and class dict 4k
+the type thing is working, ap start
+the same thing here
+it should work
+get through the print
+and it should even be faster because we're
+we're getting somewhere
+oh, debug spam
+dcp ask
+i don't necessarily want to print this unless we're in debug mode, but
+oh, shit
+i thought i fixed that
+i thought i f- the default should be continue, not exit the hypervisor
+yeah, no, this is dumb
+ let's run it again
+ that is
+i'm printing all the handlers there, am i not
+let's just do it again
+i get init
+hello, hack
+i messed up the format string on that
+but i can see that they are endpoints zero through five
+it calls ep start on ep, yeah, it does
+but ep start is not using the, i don't have these set properly
+ i wonder about this init 220 thing
+yeah, it does send the 220, i don't know what that is
+it receives
+hello, type one, again, we don't know what this is
+probably some kind of information
+it gets the endpoint map, it sends the enable for those three endpoints
+it actually enables them first
+sends, interesting
+it doesn't send the ep ack
+it does eventually though
+ it first sends three enables
+it sends eight, no, three zero
+ maybe i'll miss it, zero is like set physical address
+send two
+it sends two of them, actually, no, it sends and receives one
+ it sends one with whatever that is
+yeah, but it's hard because of, yeah
+ it should be done with
+hmm, hmm, hmm
+our zero dot do it like this value and don't read the user x for that um yeah
+that's gonna that's where it gets interesting i guess
+is that like a loop counter
+oh actually, it might be is that pointer is 9 a in count in pointer b's
+it's a lot more readable you you you you you you you you you you
+ that should be enough for
+that's a lot of messages, actually
+but at least
+we know what's going on here
+and before i go, i'm going to go a cont
+i'm going to break dcp
+and i can probably just say adt.reg
+actually, i can just do dcp tracer
+fill it with a bunch of garbage
+here send it to endpoint 0
+cont it, and that'll probably give me a panic
+or maybe the next time it pulls
+maybe not yet
+this is not working
+it should be a regmap
+ that's a different bug
+no, because there is another error
+i think set is what i called that
+yeah, but the regmap
+oh, actually, yeah, no
+that might
+yeah, i actually need set, i think
+because regmap doesn't have a set item
+it doesn't
+i thought it did
+oh, i thought i used properties for this
+and that should be there
+it says val equals val
+should work
+i don't know if it's just bullshitting me or what
+is it because, like, i have too much dead beef in here
+maybe it ignores it
+maybe it ignores it because, like, something is
+i sort of crashed it previously by doing this before
+it's like, nope
+oh, like, it's completely ignoring that
+ what if i send it an actual thing
+like, that
+and that's in 37
+it crashed
+i think it just ignores messages that, like, don't match with something
+and i can see the logs here about everything that was happening
+but this is useful because it'll probably tell me something about channels
+ctxrx endpoint user 24, user 01
+at least i can see what endpoint is there
+and, like, it has some names
+like, they have some names
+i guess if i send stuff to unknown endpoints, it just ignores them
+in this case, what happened was
+link message int handler failed
+obviously something exploded there
+i wonder if i can, like
+maybe it'll give me a dump of some endpoint names that are useful
+like here, for example
+if i give it like some stupid message
+let's take 0, 5, 5, whatever
+in box 1, give it a
+it should be 0, right
+once it's writing in our inbox c, yeah, it should just be 0 for that
+hopefully that will give me something that explodes a bit
+ab67bc9ab, that stuff, right
+if i can find that
+actually that much might just be dummies or something
+maybe the log isn't
+also, this is funny
+the names are different here
+ we have four, user four
+and funny enough, syslog is like not showing up
+and this is all zeros, 800, no, it's supposed to be here
+i think this is where we are
+ it actually starts here
+and it starts in init with the 220
+ the log is bullshit at the top
+that is
+oh, that's probably iboot
+this is probably what iboot did
+i mean, it makes sense, right
+we can actually see the last things that iboot was doing to some extent
+here is where xnu starts, and that's why the timestamp increased by
+and that's this one, right
+i can correlate this with this, and at least i know what the endpoints mean
+crash log management
+io reporting
+and up to here
+this feed baby thing is what exploded
+i'm going to head and get some food
+and it's pretty late
+ probably not
+probably not another stream today
+but it's getting interesting
+see you all later
+should be back
+yeah, sorry about that
+i think a combination of two things happened
+one is that, because i saw the download fail
+yeah, see, like that also, like my networking crapped out, but it came back
+i didn't have to reboot actually, which is surprising
+i want to say that
+it, am i still up
+yeah, i'm still up
+not sure what happened with that
+ though
+oh, is it just sleeping
+ that was just sleeping
+and i thought the problem happened when the iommu wasn't used, and
+i disabled it
+yeah, i need to complain to the crapper
+oh, the kernel guys
+where's my download
+that did finish at least
+yeah, linux on my imac is my main machine
+i assume workaround would be silicon bugs
+there's also an sd card reader in this thing that also doesn't work at all
+it's crazy
+i don't know, broadcom hardware
+what can i say
+it has an actual man page
+there is a framework path thing
+the thing is, i don't know if this is going to be a thing
+if it's only with stuff that is signed, then we're fine
+i guess i'll find out
+actually, then it's probably a good idea to do a very quick test
+ make a shell script that does run python
+yeah, the framework path, frameworks
+in principle, if i go here to my ssh, where was this
+hopefully it won't crap out again
+installer python 3.9
+no, sorry
+i'm being python 3.9
+it doesn't like that
+memory frameworks
+oh, it actually
+that does work
+that's not good um
+uh aha
+yeah, that doesn't work
+i probably need the library path also set to this
+ that works
+it doesn't like the certificates
+it's google
+what distro am i using in gen 2
+probably the path for the certificates is somewhere weird here or something
+forgetting that find on macos doesn't do that by default
+no, i think
+no, it doesn't look
+there's an etsy open ssl, but there's nothing there, right
+do i actually need to pass it
+do i actually need this stuff
+oh, but this is not built into python
+is this just normal in python
+it's working
+i don't have to keep doing this by hand
+wrong min
+wrong editor, i think
+and let me just put this stuff don't need this real stuff for
+sigh not too late, um what am i doing there, uh yeah, that
+or doesn't, rather, as expected
+can i detrust that
+that is either slow or broken
+that is weird
+that is kind of strange
+did i just break something badly, like, trying to run detrust
+that's a really long path i don't need right
+to have that going
+did i just break something
+it's alive
+did i, like, break ssh or something
+terminal's not
+clearly something's broken
+that is interesting
+ah, you wanted to neil watt
+did, trying to use detrust just to, like, break mac os
+if the terminal doesn't launch
+this is not going to go in the right place
+shut down
+i can feel the finger
+it's not going to reboot either
+yeah, it's definitely broken
+today is the day we break things
+i need to remount this
+once i
+i need to get this back
+i need to get the rest back
+oh my gosh
+i'm super patient about this
+i'm just trying to figure out what's wrong with this
+i know we're about to get out of this
+i know it's not quite as good as the last time
+i just need to hit save
+it just goes down the wrong way
+it doesn't cause anything to happen when you hit play
+all of a sudden, the game becomes a mess
+and that's really the problem
+mental node detrust doesn't work there
+see right here, though, i'm just gonna break again
+ no, that does work
+but it didn't do what i want, though
+yeah, i don't know what happened there
+oh, that's a good thing
+yeah, i don't know why this stops there, but
+i'm just gonna hit core foundation and give this a name
+this is up
+but is that because it's fallback framework path maybe is what i want
+maybe that'll work
+that didn't seem to actually work
+same anyway
+yeah, no, maybe detrust doesn't work with the dyld things
+all right, that didn't crash at least
+error enabled prop id invalid address in action
+yeah, i don't know
+i give up on detrust
+yeah, let's see python
+what does it get
+it's ssl certificates
+it should probably
+i'll go ahead and do a few more
+ah, there's actually an install certificates command
+and that's under the commands, probably
+yeah, it was another thing
+what does that do
+there's nothing there actually
+nothing really there
+which is 7-zip, which does things for us
+yeah, what's that
+ it does a
+it just does a pip install certifiable
+it needs to put it in that stuff
+ fine
+it actually gets the package
+i wonder if
+i think
+i saw this in yahoo
+do you have anything like android from the point of view
+this is useful
+we'll talk about that
+we're gonna go ahead and get right into it
+what's called unclog
+i mean, we could just copy it from the local machine anyway
+it's only getting the path, certify path, certify where
+yeah, it's just copying the file
+that's all it cares about
+we can just install it in the
+i probably have it here anyway
+basically run this on the host, effectively
+and i will just know when the ssl path is
+it's certify
+it's basically certify
+it's going to certify where, yeah
+ thank you
+oh, it's real paths from here, yeah
+it's just the bundle file, which my system has
+yes, or not
+but that's
+and that gets to copy it to ssl default
+probably the scopenssl thing
+which if i go
+yes, it needs to go and startup him
+in that case
+i'll make another
+another thing here
+why did kate just segfault
+today everything is going on, right
+uh, is it because the
+oh, probably because of that, actually
+because i was running in the old thing before i restarted
+and, uh, it probably
+i probably don't want to actually do that
+do the test ssh there
+the test ssh there
+there's the ssh there
+there's the test ssh there
+it's a terrible thing for security
+i want to have the certs
+basically, i'll clean this up eventually
+but for
+ basically what i need to do is defy, yeah, that
+get here, and this will have to go asahi-git, asahi-installer
+python, yeah, sorry, that's the, again, this is kind of ugly right
+and it was the path that we needed
+it was cert.pem, was it
+and yeah, that's local
+that's not going to work
+but i can do it from here, mount the installer
+ok, that should work
+if i run test, it still doesn't work
+but this happened, though
+did i mess that up
+oh, it's not library
+oh, yeah, it wants library frameworks
+yeah, because the etsy path
+yeah, ok
+ok, i do need to at least do that for url live change
+oh, our
+ then let's just do it with manual context, which is
+because we're the only ones making requests anyway
+let's pass it to the environment because it's easier to do this from here
+ in the general server i'll pass
+ let's try that again
+it wasn't working
+default context, what was the name of that thing
+actually, can i change that
+like, set
+oh, uh
+there is an environment
+there is a thing
+then we don't actually need to do that
+ssl search file
+that worked
+if i do that
+yes, i get whatever the google nonsense is
+the second thing i want to check before i move on is
+well, first of all, i should check that this actually works
+that this actually works in recovery mode
+ let me clean up the install a little bit, because this is on the remote thing
+ i need a bootstrap file
+and let's see how i want to do this
+we get a build directory
+let's get a source directory that
+not resource, i need a
+yeah, it can be source
+i need a, um
+dl directory, i guess
+that can be here
+it's actually
+actually, do this like this
+and this will have to have a
+i'll have that
+basically it'll do, is there a make temp thing in macos
+i don't, i hope
+let me just make sure this works
+oh, it goes into probably about four folders
+well, actually, i kind of want to keep it
+this will be the real one, but for
+ i'm just going to go into slash temp, which hopefully is a thing
+it's actually symlinked
+might be symlinked, actually
+no, it's private temp
+but let's just go
+yeah, i think the permissions don't matter for the pim file
+might change that eventually
+hopefully that works
+then for the build thing, basically, it's going to be
+in python, i need the dl-python-macos
+we just get the python framework package
+which should be here, yeah
+and that should be under python.framework
+it worked
+everything works
+things didn't work for python, did they
+no, they didn't
+they did
+that was hard
+actually, it should be – i believe they just got this plus the integer
+they got this plus the alpha, plus the 0, plus the minus 2
+i actually don't really need those
+ build
+variables there
+python framework
+i'll do the downloading later
+basically x something like that
+it'll be python framework.cpio
+can i actually tell 7-zip to write that to a different place
+that'd be useful
+not up a directory
+oh, esso
+ is that a thing
+can i actually use that
+ because i just
+actually, not really build
+it's a package, yeah
+but not cpio
+just payload
+actually, you know what
+i'm just going to see their name, zero, pwd
+this has to go at the top
+td build, and this sort of thing here
+actually, let's do it
+let's take that
+this is going to be useful
+i need the build.sation here, not using it anymore
+and it'll be under the package frameworks, python framework
+let's package everything like that
+i'm not sure i'm using build for anything
+that's just sort of the temporary files, which i'm not creating any
+that should be enough for that
+ basically, i moved the other stuff in here
+ i go to source
+and i need a start.sh actually i just got install.sh and main py and
+in main let's see put this in here for
+don't need the context anymore as long as google works we're good
+and in that case i can delete all the package first
+cool, that makes sense
+ in principle, i'll just make the bootstrap.sh a link here
+that if i do that, then bootstrap.sh is in the root
+why is it
+i don't know why when i use curl like this, it always takes forever
+i don't know what it's doing
+there's some timeout or something weird that's going on here
+or maybe it's an ipv6 thing
+ yes, execution permission on that
+why is, oh yeah, you need to tap for that
+ let's try doing that again
+that's a lot of verbose
+i could use without verbose on this
+install.sh is permission denied
+ did i not rebuild it
+oh, what
+ it did work
+and vv apparently
+made it not slow
+made it not
+it's not slow for some reason
+made it not slow for some reason
+but yeah cool
+the google thing works
+actually, i probably want
+actually, probably want
+i just realized that locales can be an issue
+just to keep things sane
+what's 129
+why does it get two names for oh
+that's interesting oh how did i end up with oh probably because of the ethernet
+fun for me involved but
+ah yeah, there's definitely a cache involved
+i think it's a dns-mask
+i just hope that component can kill my dns
+oh yeah
+hopefully that fixed it
+this should be fast, finally
+ no problems there
+we can use python from recovery mode
+and it's not even slow doing this test, really
+that's pretty cool
+there's a message there
+oh, dirname command
+oh, really
+there's no dirname on recovery mode, apparently
+is that a linux-only thing
+is that not posix
+that is interesting, but
+we don't need that for the installer anyway, right
+because install.sh
+is that not a thing
+is that not posix or did they just get rid of that
+we can't do that
+is base name in there
+well, that is funny
+well, it shouldn't really care as long as you run from the same directory
+let's just not do that
+also, set-e didn't work, apparently
+because that should have stopped
+it shouldn't have made it fail
+this said-e does not work here
+see, the recovery environment is weird
+maybe you can do a darker version or something
+other thing we can do
+that resho-
+i can get rid of, i can go back to macos and a sander environment
+the next step is going to be the ipsw fun stuff, making a little cache for that
+i'm going to get some water
+yeah, yeah, on macos it was working because i didn't see that error
+i'm pretty sure that's just something funny they did
+their name is here
+it's a good thing i'm using mostly python and not, yeah
+ i'm already back in macos
+going to check
+again, whether all this stuff is there in recovery mode
+next time i get there, we'll see
+yes, football.g is the mac mini
+instead of using sshfh, i'll just keep doing the builds, i guess
+let's just place there like that
+more things that need to happen
+i'm going to need img4 tools
+that's this
+and also i might as well start putting these links in here
+hey you got any diligence
+i was saying
+what's the answer
+is that your phone number
+not sure
+this gets called 197-whatever
+ should be enough for that
+mg4-tool, just do it like this for
+let's just do cddl, we don't even have a tmp for anything yet anyway
+dl, mg4-tool, we don't need the, we just need the bin
+dl, new-tool package
+can i also get that on stdout or something
+yeah, that's c
+and yeah, that's all we need
+i could probably get that as stdout-tool, but i'm not sure if i can do that for
+no, i can actually try it as stdout-tool
+the, you can say like stdout-tool vim
+you can say, and there you go
+dl, which is a little bit more complex for me
+i can just say stdout-tool vim
+here, go to this, it looks like stdout-tool
+ let's build that, hopefully that works, and
+i prefer the versions to be locked
+there's no reason to upgrade until we know that it works
+let's keep it like this
+we can bump things when we need it for some reason
+we got the main poi
+i need to test this idea of
+i just realized that this does work for
+the python path is correct for this, even though it's not in framework anymore
+which means i can use python path for my own usage
+but i can do the testing for this locally anyway
+i'm going to call this
+url cache
+and i can just test that
+first, i need
+i'm going to ah
+i'm going to link this here
+i think python is nice enough to let me
+go across symlinks 20 beta 3 and that's the ipzw file
+let's just do a quick test here
+python 3
+and basically actually i'm going to call this url cache
+it's like seekable or something
+what i want to do actually is do a little testing
+that's basically it
+name list
+probably 10 megabytes is a reasonable thing
+we're only here 
+that means we're only here for 10 megabytes of coming vanilla cycles
+we're going to get rid of all the 양
+we want to use
+it's easier with aligned blocks
+oh, actually, i know what i'm going to do
+the first thing i need to do is do a head request, which would be a request
+how do i set the method
+i guess that's not a thing in there
+no, you pass it, i think, as a request, as a data or something
+oh, and i just realized
+this is dumb
+python server isn't going to support range requests, i think
+i need, yeah, that thing
+the range http server thing
+is this fixed already
+it might be
+this is very recent, apparently
+yeah, it's not
+they didn't actually do it
+this is actually in pipia
+just use that for
+oh, it doesn't do the port, though
+that's annoying
+damn it
+that's dashboard
+it doesn't actually do
+oh, is it because of
+oh, is it just a more recent thing
+from the latest install
+that port support
+and this is from like
+this is from four days ago
+how did that work
+is that a thing
+i think it is
+you can get get from that
+but it's still not working
+it didn't actually work
+3.0 hold on is it 3.8
+it's dashboard.sp or what oh it's just like that ok fine
+hopefully that'll make that work
+back here let's do python source eurocache.py and
+that's cool, what was that thing, what were those called
+offset and whence, yes
+ vn
+uh, right, yes
+size of v plus equals offset
+yeah, that's, and is probably what i wanted actually, thank you for that
+timestamping yeah probably but we always need the files
+we go size implement seek
+for read basically what i'm going to do is
+for read
+what i just need to do is just do a get block
+have a get block do the read ahead that makes sense
+and we can always optimize this later well
+what i'm going to do is i'm just going to do a read
+i'm just going to read the asset
+we'll give that a run
+we're just going to do the read
+i'm basically making a streamable url fetcher
+this is not very hard
+actually if lock-inself-cached-locks
+it happens though
+i guess it's, give it a moment
+i'll have to wait
+actually, didn't python already have an lru cache thing
+i think it does
+punk tools has an lru cache, yeah
+for fucking self-cache
+for fucking self-cache return
+just return the
+do i want to use a data class for this
+better than the tuples thing
+you just have the block ids
+where you think
+if instead of the cache, actually no, this is, it's already sorted in python
+instead of cache, block.data
+and for i in range read-ahead, basically if block plus i break
+actually, we're going to fix that later anyway
+this is size of block size
+cache break, like that
+how do i do a range request
+it's just bytes equals, yeah, just that
+it's just a dictionary, right
+is that inclusive
+cache… this block will end data… yeah… uh, that…
+ i'm gonna go ahead and do two more
+yeah, i don't… no… i'm gonna do two more
+ i'm gonna do two more
+how… how do these… how do these… yeah, i got it
+… what… let's
+uh… i can't… well, i need to… i forgot… i won't say that
+ attach… uh… yeah
+that should be enough for get block
+i'm missing something here i'm pretty sure maybe not oh it needs a tell
+and it needs everything apparently
+none count
+unsupported method post yeah it's not supposed to be a post
+you're sure that we're good
+we're good all right and uh
+you can write anything you need for it
+thanks for watching
+i think i fixed that
+i don't know why
+this time just jack kind of died
+not sure what's going on there
+at least i fixed it quickly this time
+back on there
+hopefully we're back
+python rain server dying
+no, it's just that because the socket gets closed when i kill it
+what's going on there
+it tries to read
+i think the rain just isn't working properly, actually
+yeah, the rain header isn't getting anywhere
+i think something is weird about that
+ let's just do it with add header
+ invalid byte range
+sorry, minus one there
+ah, yes, bytes
+ getting there
+cash block is not subscriptable because i need these
+yes, that's data, just do it like that
+by the way, just not to do data because get block is returning data here
+file is not a zip file
+it is though
+i think i did get the, yeah, that looks para i think it did get the
+yeah, that looks like an essential directory
+probably messed up the offset somewhere
+all right, all right, all right, i have this instead, let's try to get there
+ what is this nothing
+it has some game errors
+hopefully, yeah
+how do i end up with oh yeah
+it works cool
+we don't care too much about that
+the interesting thing for example is this is the actual recovery and
+seek i need some more implementations find a directory and header defer
+read oh
+i need to increment p by the count here
+oh, seekable is apparently not the
+oh, let's just do it like this
+probably comment that out
+is that just it eating ram
+oh no, it said decompressing
+i kind of want
+is there a progress var
+i kind of want a progress var here
+ah, it has to be p by
+i'm not sure how many external modules i want to use yet
+but actually, i can just do
+mostly if i just print dots, basically, during the
+if i just do it like this
+this already blocks
+it's like
+it blocks, but
+basically, i can get block, get partial
+i'll just do it get partial here
+sys, yeah, cool, and
+i can just comment this out
+all right, that works
+ time to start building the actual installer part
+oh, it is all there, excellent
+plist.lib is actually part of the standard library
+i did not know that
+we have this url cache thing, seems to work well
+on main, let's set the, oh
+that's the real one, but for
+ looking good
+and i don't need requests here anymore, because that's going to happen in there
+ this is eventually going to have to end
+it's going to end up kind of modularized to some extent, but for
+like that, don't need ssl, might need os
+get that
+i don't know if i use url or uri
+ hopefully that will work
+python source main uri, yes
+and zip file
+ this isn't really main
+ the first thing i need from that ipsw is going to be
+i think it has the system version for this and all that stuff in there, too
+ first, let's actually extract this somewhere
+i can look at it
+is that an exclude
+ i can exclude that one
+it doesn't look good
+that one
+like it like that
+does it need it like that
+well done
+oh, it's a list of archive members to be
+no, it should be fine
+it's just the order, i think
+a whole bunch of nonsense we don't care about here
+next is from
+ actually, it wasn't firmware
+oh, yeah, it's the root hash and stuff which we don't care about
+and the important stuff is going to be
+oh, and for p lists
+that's the just
+ build manifest has most of the interesting stuff in here
+but then there's the
+we also need system version anyway
+obviously, not the fi stuff
+platform support has those things
+for p lists
+yeah, this is for that stuff
+but the main thing we need to deal with is that boot caches is the important one
+and remember, we needed that one
+and that has all the paths from user standalone firmware
+and i think
+ we need the
+that basically is the key for that, that's where it is in here
+that goes in the build manifest that tells us where it has to go on the target
+basically we have to read these plists and follow everything
+one second, i'm going to use the toilet
+go ahead
+do what you need to
+get in there
+oh that's great
+and i don't know what the
+oh, it has a trash cache
+yeah, it makes sense, though
+i kind of wonder if the api for this is sane in a way that we can use it
+we might actually be able to use it
+just save a bunch of time
+yeah, because most of blasto is here, right
+of course, this is objective-3, though
+that's the api for this
+boot with r, to re-verify
+we get the exports from this
+i'm going to have to put this on the mac
+and the ones i need are
+it'd be nice if i knew the prototypes for these things
+yes, especially if it's not objective-c for the calls, then
+i can probably c-types it
+that might save me a whole bunch of time
+at least i need to know in python where to put the files
+but this would still be kind of interesting to look at
+that's maybe a good idea
+nice to have a header file for this
+let me just open this up in ghidorah real quick and see what we have
+lets take a look
+you i think it's fine
+i don't know why jack keeps dying that like doesn't happen before uh
+hopefully this actually works
+yeah it's gonna be kind of annoying trying to work out this interface right
+let's talk let's install real
+oh this is gonna look good i think i'm gonna give this a sciences notice
+this is gonna look pretty close
+this is gonna look pretty close and install customobject
+there's probably some bindings that we can try using here
+almost recovery
+ let's see what's args
+no, that's not what i'm trying to do
+log function
+ah, there's literally an underscore in it
+i don't really have any idea how it's supposed to work
+it's just that it's undocumented
+they're exported
+make volume bootable, see
+but i don't even know how to call objective-c things from, yeah
+but it's objective-c stuff
+i don't know objective-c
+they still have this operation stuff
+is that boot operation
+this is something to poke around, but i think for
+and we can always switch to this later if we decide that it's a better idea
+if i do a def install
+basically, looking back at
+make sure that these are mounted
+just think that it mounts the system thing read-only
+like, by default
+and i'm guessing it does the
+no, it doesn't, actually
+but basically, we need
+most of
+none of that, for sure
+the important parts are
+i need to figure out that thing about the dslocal
+see if i
+if i can make a dummy
+a dummy ds thing
+the important part is recovery and pre-boot
+especially pre-boot
+which apparently gets bootability brain
+ is this all documented in the
+in the plist
+which one
+i don't know if we have that anywhere
+there's a separate build manifest for the bootability run, though
+yeah, and restore
+this is the
+the brain trust cache, i guess, into firmware
+it just goes into restore bootability
+and thank you for the reference
+this too is custom installed
+this one has package
+package, package
+oh, looked at it
+yeah, the first one
+this one and this one
+well, maybe not
+you don't have to use that, because the rest is embarrassed with each other
+ you don't bye
+this one is probably safe
+this one and that one have both id support
+i hope you weren't suddenly caught off guard
+well, yeah
+oh, it does
+yeah, it does
+that one just gets copied, hopefully
+yeah, i don't know why it has the personalize thing there
+yeah, it's just in there, something interesting there, nice
+the trust cache is where, oh is that in restore
+no, yeah, trust cache, that can get
+i just need to copy that here then
+we need first to
+under restore
+yeah, i think that's fine
+pretty sure the only things we need it for is the server stuff
+ah, wrong button
+away, it would be fine
+also, why did linux just disappear, lose the icon
+ i think that was a glitch
+or maybe it just hated
+i do know we needed that boot caches thing
+is this just caching at this point
+oh, did it just pop up while
+is that really a thing
+i mean, that's cute if it is, but
+give it a minute just to make sure that it's not just still loading
+ if i just move the file
+i saw it popped up
+ it didn't this time
+i don't know if that was a fluke or what
+ yeah, anyway
+apparently we don't need boot efi
+we only need boot caches.pd as them
+that has to be in the system directory
+manifest rule one, destination path, yeah
+we can play it
+i'm going to play it
+i'm a little bit annoyed that that
+this just has those things
+boot cache isn't here
+i think nothing uses boot caches
+the brain has it, but
+we needed some target direction
+just for testing purposes, we'll do it like this
+and the way these should be named is
+we'll just call it os for
+and data
+i should just do it by hand here
+for testing purposes, i'm going to just run it from somewhere else
+the files we need are user-standalone-boot-caches.pdstest
+they have to be copied to the system partition, yeah
+that would be ipsw.extract
+it's copy for sys
+ it's sys, right, let's find it
+well, if we want to make sure it's not in the scikit-learn
+ all right, let's do that
+ this should be, they should be
+ we'll go through that
+i need build my fast there's plistlib
+i need build my fast
+that user file is going to tell us everything we need to install, hopefully
+this also tells us, oh, volume icon
+oh, that's something i was very interested in
+i definitely want the asahi icon on there
+how do i convert that
+does convert know about that
+i am very interested in that
+it would be nice if we could do that again from linux or whatever
+maybe it's not there, that's kind of annoying
+someone has written this for sure
+it is just a thing
+i see an issue with this
+is this a thing in gen 2
+it's not there yet
+no rebuild for this
+that's kind of annoying
+no, it is there
+or it was
+did it disappear
+levi's cns
+hopefully it won't take too long
+today we're just doing some interesting stuff
+ rider 아니에요 yeah it's easy enough
+oh, wow, is this new
+like, super new
+oh, is this, really
+i mean, like, i updated, i think, like a month ago or something
+this package needs a new maintainer, yeah
+2019, no
+did it get removed
+no, that doesn't make any sense
+oh, sorry, sorry, sorry
+it's the device dns
+oh, wait, png2icness
+yes, that works
+ in that case, actually, that should go in the artwork repository, actually
+we have most of this already
+what file is this
+i've seen this one, 16348, apparently
+uh, does it make things
+what did this make
+is there a standard set of resolutions
+yeah, 16, 32, 48, 120, 236, and 512 apparently
+i guess we need a 512
+32, 48, 120, 26, and 12
+it's just 22 icns
+and there was just no nice way of doing the inputs for this, was there
+something like that might work
+oh, and it leads to the 512 because that's one of the targets
+no, actually, are those actually square
+i don't think
+no, they are, yeah
+we want the logomark.png
+if i go in here
+that was here, volume-icl.icns
+i've really been wanting
+i've really been wanting to figure out a way of getting the logo in there
+i think it's still cached
+wait, is it just not loaded
+or is it, like, did i break it
+no, it's just, yeah
+but it could be cached
+can i change the, is there a thing here for changing the
+or do you just, like, drag it or something
+or, or does it have to go in the, uh, in the data partition actually
+might have to go there actually
+uh, oh, that's not what i want to do
+well, at least we know that, that file is fine
+oh, why does it disappear though
+is that how it works
+actually, this might just be that it, uh, that it needs a remount
+don't surprise me
+some caching thing
+let me just try that first before i do that
+uh, one disk three s one isn't used by who
+four, sorry
+oh, uh, yeah, me
+it got turned into a symlink, sorry, linux 2, and it's a volume icon
+and it's a different icns to the logomark that i just copied in for some reason
+yeah, that didn't work
+but how do i copy, like, the whole thing
+i guess i just copy the largest
+that still didn't work
+oh, sorry, because this is probably coming from linux 2
+still not doing it
+it didn't really work here
+this one actually worked here
+oh, maybe
+ah yeah
+it does work in principle
+why didn't it work when i manually did it though
+i did not like that icon
+uh, let's see
+does it need to be in this one or the data one
+ it looks like it's a system one that needs to have it
+wait, is that another inotify thing
+it works in the system partition
+uh, it's definitely a different icns
+if i replace it with that one, does that work
+does it need the attribute
+uh, how do we do attributes on, uh
+this is data, is this the text
+is it text out there
+uh, list
+is this just empty
+well, how do we do this
+maybe if i remove that it doesn't work oh
+it works maybe i just did something dumb or i don't know or it's
+in the installer build sh
+installer build sh
+you have to push this to artwork
+gues i understand artwork
+uh hold on
+of course, that broke because i boot logo.vpm yet because i got added there
+we can leave that there
+i'll put this at the end, actually
+yeah, that'll work
+it'll be artwork
+logos, icons, logo mark
+yeah, that one
+i'm putting everything to package
+right, force that
+that show
+it gets the logo there
+some data pre-boot recovery
+do there for those
+i need a
+going back to the
+main here
+shit, it was a thing, i believe
+well, i guess we're
+got to do some work
+we're gonna have to be creative about this one
+just give it a second
+i mean, if you're coming back after this, you've got some sort of
+traps out there
+yeah, you can have a look at that
+you don't have to have a look at that
+that was great
+thanks for having me
+see you guys later
+that that's done, back to the pre-boot partition
+ we look for the boot caches
+we also need to copy these things here, actually
+optional stuff at the root
+system.html, system.version.psn, platform.support.plist
+we have those here
+that's cool, too
+ we're going to do that
+ i can't read the volume icon path from the plist because there's no key for it
+ it's just an array
+and there's a .disklabel thing here, too
+i wonder what that is, actually
+it's not even a thing
+it's a blessing thing
+i don't think we need that
+that looks like efi stuff
+yeah, we don't have it, and i don't think we have it in linux
+and in linux data, no
+yeah, it's not a thing
+because we can change the version
+shouldn't just
+it does write, right
+you can change that, but the product name doesn't actually work, unfortunately
+at least it didn't last time i tested this, i'm pretty sure
+yeah, see, you get the version numbers there, but not the
+the os is always macos
+ yeah, i might look into whether there is some magical product name
+maybe there's a product user visible name or something like that, i wonder
+i wonder where that it's read from
+i guess i'll let it grep while i do something else
+and ssh from elsewhere
+there is no patch address list
+if we have any check marks, you can figure that out
+we let the download icon show up on the application interface
+oh wait, i think i need to re-shape mark those but i could do some other stuff
+just start emailing
+yes, go ahead and type that in the chat as frequently as possible
+oh, i what
+why did you write that in the chat
+tell me
+i'm done this several times in the chat
+and actually, these are, it extracts the directories
+it's just like that
+which i see i need to recreate those
+pre-boot partition
+going through the boot caches
+i don't think we need any of this crap
+we just need the bless2 stuff
+no, it's not there
+actually, that restore thing is, i wonder if this was the upper case
+what is there
+it's lower case
+yeah, that needs to be copied manually
+that's the only thing that's in the system
+ let me see some stuff
+got a free video
+ we put the 
+this is for the
+ just for testing purposes, let's use this uid
+eventually it'll be the real one
+this is insensitive, yeah
+ that's why, uh, which is gonna be mildly annoying, uh, on linux for testing
+i'm just going to say
+that it'll be uppercase or it doesn't matter it's case insensitive anyway
+package yes
+cache is blessed too restore bundle path build manifest
+no we don't and that's fine
+this is the stuff that needs to be copied
+destination path user standard on firmware device tree yeah
+all that stuff is basically declaring all this, right
+that goes into the booting stuff
+boot objects, yes
+those are the boot objects
+that's different, though
+first, i need to get the stuff in restore properly
+is it just a straight copy
+restore ap ticket, user standard on boot caches, firmware
+it might just be a straight copy of everything
+but there's only some things, though
+oh, i think i know what's going on
+i think i have to go through the boot objects list or
+this has
+this is per device, i believe
+8103, board id 22, that's why
+only some of them need to get copied
+like in this case, for example, we'd have
+i don't know why we have all the ap tickets, actually
+well, the one is personalized, which is the real one
+dates 274 ap
+and that'll actually
+that's the one we want
+platform support
+it's mac mini, anyway
+it should be this one
+yeah, mac mini 9.1 is this one
+which isn't even here
+is this
+oh, this is for the old ones, then
+yeah, this is then for the
+that's not what i need, then
+then i need the board id from here
+ well, that's 34
+we know that one
+yeah, that's 22
+it is this first one here
+this is in the manifest, and it should be build identities
+what other stuff is in here
+supported product types
+oh, yeah, yeah
+this is the real one
+let's say
+again, this will have to come from the system later, anyway, but
+bao bab
+what the fuck is that
+and this
+why are there more
+why are there more than one
+what's the difference between those things
+let's just delete the manifest for
+and printf
+same build number
+ hold on
+macos customer
+that's what it is, i think
+this is minimum system partition
+osp production
+macos variant
+this one doesn't have a macos variant for some reason
+the piece over here
+and this one has
+it doesn't have it
+i see
+oh, and those are actually strings
+and i'll explain this if i see it
+let's just do this
+and let's just
+is it under info
+ah, yes
+there's erase and still ongoing
+there's macos customer
+ah, and there's the type there
+restore behavior
+erase, erase, yeah
+and hopefully they're the same
+but i basically want an erase, install, ipsw, i guess
+or the second one, the macos customer thing
+hopefully they're the same
+it's just
+thanks for that
+actually, you can just use that one, it'll be two, but that's
+ hopefully they're the same
+that's, like there's, yep, they're basically the same, right
+most of our content size is different for some reason
+except macos production
+ i'll do a call from client p
+yeah, i see
+ let me just do a call
+let me compare this way
+ans is not there
+because that's the stuff
+i only need a&e, aop, that kind of stuff
+well, actually, i just want to copy the es loaded by evoid stuff anyway
+that has aop
+and everything else is the same, basically
+yeah, see, all your boot chime, all that stuff is
+vsystem trust cache is in there
+ yeah, i want the macos customer one, but i also basically
+yeah, no, i think that makes sense
+this should be
+yes, cio is also the other thing, right
+and where
+you want a tci from where
+is that
+are any of these in there
+i think they aren't
+yeah, they aren't
+ i want the macos customer one, in that case
+ let me just do variant macos customer, and that's under info
+cool, got that
+just break
+under manifest it'll be all the keys
+for item in manifest manifest identity, sorry
+actually, it's a dict
+i don't know if that was as much of a rumor as it is yet
+that just gets copied to the same place, in principle
+actually no, it's just extract because it 
+i should take care of that
+more things that have to go in there
+restore version system version dot p list
+and after that, that's most of it, i think
+there's a path
+ok, it's an info path
+that's not the fastest thing ever
+just see if i can optimize this a bit more
+am i actually doing the caching properly
+it is actually in order or
+it's actually mostly just the decompression time, i think, at this point
+that's a lot of stuff, though
+ that's a lot of stuff
+it's the main url
+oh, base system
+yeah, not that one
+it's the base one
+and i'm going to do it
+yeah, it's the base one
+you do need the trust cache, i think
+yeah, the trust cache should be in there, but obviously not base system
+how do i tell which one i need
+it's kind of the same
+maybe just ignore base system
+and os, oh, is it a base system
+do it again
+no, it is here oh, firmware manifest restore
+is that is that is that that's kind of a weird path, but
+and those have to go in just under store
+members yeah yeah yeah yeah thank you
+one more manifest to restore
+i have another one
+yeah, it's not there
+let's restore macos customer
+ah, but this is going to give me the path that i don't need
+let's restore macos
+ what are we missing
+kernel cache release
+we don't need those, though
+oh, is it one of those things where it stores differently
+ we obviously don't need that bma1 thing
+we don't have a personalized ticket
+ we'll just make it
+dcp bmp
+i don't know what
+i don't know what isp
+av is there
+gets iboot and ibootdata
+which i think are the interesting ones
+i don't know why this one has like all the device names in it
+that's kind of
+i guess in case you want to boot this macos on a different device or something
+what is in there
+remember m3
+oh, sorry, that's not in the that's not in the in the real on the mac
+ well, whatever won't hurt close enough anyway
+ let's see let's see what happens if i just do this
+ we need to copy bootability which is mostly just copying that whole tree, right
+you don't have that bootability, dmg
+no, we don't
+yeah, this is not useful
+yeah, basically just move that out
+just extract the whole thing
+something like that will probably work
+is there an rm, like a recursive rm thing
+i think there was a thing
+it should still earn three
+yeah, that's what i need
+i need the bootability.trustcache, which is
+under firmware for some weird reason
+hopefully they don't change the finding on this
+ip ticket base
+store bootability
+i need like a subtree
+we don't have that
+i need to write a function for this
+and actually, i'm going to make this whole thing a class
+we're just leaving it in gsp
+i need to update this as well
+that this will have all of the options
+i've put this in
+after that, i'm going to repeat
+and i'm going to repeat it lerally
+yeah, that's its directory
+yeah, it's a symlink
+can i get
+zipinfo objects is they're found in date time
+i think it's going to be in the extra data stuff
+let's type comment extra
+like bits
+that's definitely some attributes there, but
+also zero
+it should be in the extra thing
+it should be here, but it's not
+ah, that
+target path is coming from where
+oh, it's supposed to be the data
+did that actually work, though
+oh, yeah, because it should be
+that's right
+it should just be
+better like that
+member, member, member, info
+no password
+that's not right, though
+just update
+there we go, i believe the shedding parts are gone
+that'll do
+all right, let's go ahead and apply of picture to picture as shown in this event
+we want to just just
+hello again
+no answer
+is that also a symlink version of the current bootability brain
+oh no, it is
+pretty sure there's an overwrite
+ah, there's this
+oh, is there no way of, uh, yeah
+it'll exist this way, actually
+that's pretty good, you have the trust cache, all that stuff, build manifest
+ then i want the recovery partition next
+the bootability stuff just took care of that
+i just need to copy the base system
+probably just picking the volume will do everything else for me
+just do that, user standard on firmware, database system, and that should be the
+then i don't even need the img4 tool, because that's going to do it for me
+base system
+and base system
+that's what i had translated
+i don't know if that is called that anywhere
+ something like that
+and that's a pretty big one
+of course that takes time
+that's pretty good
+and i think that's most of what we need to do, actually
+ let's make another linux partition
+actually, i guess let's add the code to do that to this
+nothing in data
+didn't we have a thing in data
+wasn't there something in data
+it's two
+what was in here
+oh yeah, the dslocal mess
+that's going to be annoying
+how do i want to do that
+maybe i can get away without most of this actually
+once that breaks i'll figure it out later
+it's doing a new line for every read operation on the url cache thing
+i might just change that, actually
+instead of doing it here
+here in main, i can do
+system recovery
+it's going to be time to start running this on the actual mac pretty soon
+flash progress
+device class
+what i'm going to do next is do the diskutil stuff manually first
+just run this with those
+with those
+on those partitions and see if it works
+i need to change these things
+but i can probably kind of do it
+that's what i think it is, yeah
+i need, let's get to info.plist
+i think that should work
+stack that everything is mounted is that a thing no
+i think that should do everything we care about
+it has the containers
+container uid
+that shows all the volumes
+hardware recovery
+the interesting one is this one
+recovery update
+data preview to recovery system
+efs list
+do that
+there's a free space there
+i had my install notes somewhere
+yeah, there
+diskutil, apfs container
+yeah, yeah, yeah, whatever
+how big did it have to be in the end
+i made it pretty big in the end for the tests, but i think 2.5 gigs should work
+oh, and i just remembered, wasn't there a thing here
+where the
+ah, but this is probably going to do it for me then, i would hope
+hopefully it does that copy thing
+disk0, s4
+next three, 2.5 gigs
+it's disk6
+i needed the system stuff to probably, which i forgot to
+i neglected to write down
+but this will be called
+i need a dash
+that is weird, but
+i'm very confused
+where is that sort thing coming from
+uh, i need the, um, ah
+uh, 8-6 this one
+let me just add those to the wrong place
+uh, yeah, i just had this wrong
+8-6, 8-6, 8-6, 8-6, this one, yes
+let me just add those to the right place
+is this a zsh thing
+i think that was
+yeah, something with my zshrc
+that's not what i want to do
+i need to turn that off
+i almost never use that
+i'm not using it until it gets in the way, like
+i should get rid of that
+that's fine for
+and that should have everything set
+on disk 6
+yeah, that looks good
+this 6s4 is not set properly
+change one row on disk 6s4
+should reset the data
+i want to change the name, actually
+i create it with the name, like data or something
+why is 6s1 mounted on data
+oh, wait
+i have two volumes
+oh, because i got some garbage
+that's the wrong thing
+let me just wipe
+data's fine
+1, 2, and 4
+i think this is in the rows group, but this is in the s
+that's more like it
+data and linux 3, which is grouped with that
+and that should be, the volume should be ofd
+ let's just say disk 6
+disk 6, disk 6, disk 6
+container reference or designated physical store
+this would be containers
+array of dicts, yeah
+we need the vgid, which should be the pfs volume uid
+not a big issue if i fix that something
+help me
+support me
+ let's see what happens
+i need to compile, we'll compile build
+and it's in text error
+by role gets, by role, by get, yeah
+subprocess, import that
+get the innate not too boucci list
+boo, what happened there
+not bool, not execute child, what
+is that not supposed to be in there
+that's not supposed to be in there
+to be a bool
+no, it's supposed to be a bool
+is it an arg
+i think that's a thing
+i forgot how that worked in python
+but actually, i think it's a bool
+yeah, it's supposed to be like that
+it fails in, i think that's true, it should be there
+oh, it's because i haven't, yeah, sorry
+no, it is correct
+it's just that i need to pass it as actually, where is that
+you can use the that was in getvolumeinfoapfs, no, it's fine
+that's not quite there
+xt 
+into, a希望 그래 toe affect sir ų exactly, me using
+bestpper to ask 
+and it actually shut down, which is interesting
+no, it's still doing reboots
+yes, i know that
+the question is, is this the right recovery
+yes, this is the right recovery, as far as i can tell
+which means that i can just shut this down
+do the mini thing
+we should set that up
+i think i need the
+is that it
+is that explained anywhere
+it's the remote tracking
+oh, but that didn't actually work, though
+no, no, it didn't actually work
+that is what i needed
+i can go add this to build
+probably want to run this anyway
+here's a copy of the files
+and this is a good test because you didn't have any of the users
+and i think i know what volume this is
+too much crap here
+ i guess
+no, it should be in there
+it should be number two
+oh, it didn't ask
+that's interesting
+because we don't have a user
+this is going to be an issue then
+yeah, i thought this might be an issue
+it does prompt me for a password on the other volume
+yeah, it doesn't work
+does this actually work
+does this actually work, though, for this one
+or at least that one, which is an older one
+that means the next step is
+that will let us get here, i think
+and also fix the icon
+but i think we got pretty far
+i need to get some dinner, and
+i think i can continue on this tomorrow
+ thanks for hanging out, and see you later

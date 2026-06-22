@@ -1,0 +1,208 @@
+{
+  "name": "Forest \u2014 5.1 Surround",
+  "layout": "FivePointOne",
+  "description": "Full surround woodland: birds up front, wind around you, a 30 Hz sub-pad.",
+  "author": "Example",
+  "version": 2,
+  "start_state": "dawn",
+  "layers": [
+    {
+      "name": "wind",
+      "pool": [
+        "wind_loop_a.opus",
+        "wind_loop_b.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Diffuse": {
+          "channels": [
+            [
+              "RL",
+              0.6
+            ],
+            [
+              "RR",
+              0.6
+            ],
+            [
+              "FL",
+              0.3
+            ],
+            [
+              "FR",
+              0.3
+            ]
+          ]
+        }
+      },
+      "crossfade_ms": 4000,
+      "gain_range": [
+        0.7,
+        1.0
+      ],
+      "pan_range": [
+        -0.15,
+        0.15
+      ],
+      "rate_range": [
+        0.97,
+        1.03
+      ],
+      "trigger_prob": 1.0,
+      "interval_ms": [
+        12000,
+        25000
+      ],
+      "duration_ms": 30000
+    },
+    {
+      "name": "birds",
+      "pool": [
+        "bird_chirp_1.opus",
+        "bird_chirp_2.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Pair": {
+          "a": "FL",
+          "b": "FR",
+          "gain_per_channel": 0.85
+        }
+      },
+      "crossfade_ms": 200,
+      "gain_range": [
+        0.6,
+        1.0
+      ],
+      "pan_range": [
+        -0.6,
+        0.6
+      ],
+      "rate_range": [
+        0.92,
+        1.08
+      ],
+      "trigger_prob": 0.8,
+      "interval_ms": [
+        3000,
+        9000
+      ],
+      "duration_ms": 2500
+    },
+    {
+      "name": "creek",
+      "pool": [
+        "creek_loop.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Pin": {
+          "channel": "C",
+          "gain": 0.7
+        }
+      },
+      "crossfade_ms": 2500,
+      "gain_range": [
+        0.5,
+        0.8
+      ],
+      "pan_range": [
+        0.0,
+        0.0
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "interval_ms": [
+        15000,
+        15000
+      ],
+      "duration_ms": 20000
+    },
+    {
+      "name": "subharmonic",
+      "pool": [
+        "sub_pad_30hz.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Pin": {
+          "channel": "LFE",
+          "gain": 0.5
+        }
+      },
+      "crossfade_ms": 6000,
+      "gain_range": [
+        0.3,
+        0.7
+      ],
+      "pan_range": [
+        0.0,
+        0.0
+      ],
+      "rate_range": [
+        0.98,
+        1.02
+      ],
+      "trigger_prob": 0.7,
+      "interval_ms": [
+        45000,
+        90000
+      ],
+      "duration_ms": 40000
+    }
+  ],
+  "states": [
+    {
+      "name": "dawn",
+      "layer_weights": {
+        "wind": 1.0,
+        "birds": 0.6,
+        "creek": 0.8,
+        "subharmonic": 0.3
+      },
+      "dwell_ms": [
+        60000,
+        120000
+      ],
+      "transitions": {
+        "midday": 1.0
+      }
+    },
+    {
+      "name": "midday",
+      "layer_weights": {
+        "wind": 0.6,
+        "birds": 1.0,
+        "creek": 0.8,
+        "subharmonic": 0.2
+      },
+      "dwell_ms": [
+        180000,
+        360000
+      ],
+      "transitions": {
+        "dusk": 1.0,
+        "dawn": 0.2
+      }
+    },
+    {
+      "name": "dusk",
+      "layer_weights": {
+        "wind": 0.8,
+        "birds": 0.4,
+        "creek": 0.8,
+        "subharmonic": 0.5
+      },
+      "dwell_ms": [
+        90000,
+        180000
+      ],
+      "transitions": {
+        "dawn": 1.0
+      }
+    }
+  ]
+}

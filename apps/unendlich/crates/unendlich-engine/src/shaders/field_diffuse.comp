@@ -1,0 +1,57 @@
+#version 450
+// field_diffuse.comp — one explicit 2D field-diffusion step on the GPU.
+//
+// Bit-for-bit mirror of `sim::field_diffuse_ref::diffuse_step` (R22: every GPU
+// kernel ships a CPU reference that defines its math; this .comp is proven
+// bit-parity against that reference on lavapipe by the coordinator). One thread
+// per cell, gather-only: each output cell is a pure function of the INPUT grid,
+// so the dispatch is order-independent (Jacobi, not Gauss–Seidel).
+//
+// Boundary: no-flux (Neumann) via neighbour-index clamping — the off-grid term
+// becomes (c - c) = 0, so total field is conserved.
+//
+// Operation order matches the Rust reference exactly and the result is marked
+// `precise` so the driver may not fuse/reassociate (e.g. into an FMA), which is
+// what lets the readback equal the f32 reference bit-for-bit.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer Src { float src[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform PC {
+    uint  w;
+    uint  h;
+    float coeff;
+    float dt;
+} pc;
+
+uint cell_idx(uint x, uint y) { return y * pc.w + x; }
+
+void main() {
+    uint x = gl_GlobalInvocationID.x;
+    uint y = gl_GlobalInvocationID.y;
+    if (x >= pc.w || y >= pc.h) {
+        return; // padding invocation from the rounded-up dispatch
+    }
+
+    float c = src[cell_idx(x, y)];
+
+    // No-flux boundary: clamp neighbour indices to the grid edge.
+    uint xm = (x > 0u)          ? x - 1u : 0u;
+    uint xp = (x + 1u < pc.w)   ? x + 1u : pc.w - 1u;
+    uint ym = (y > 0u)          ? y - 1u : 0u;
+    uint yp = (y + 1u < pc.h)   ? y + 1u : pc.h - 1u;
+
+    float left  = src[cell_idx(xm, y)];
+    float right = src[cell_idx(xp, y)];
+    float down  = src[cell_idx(x, ym)];
+    float up    = src[cell_idx(x, yp)];
+
+    // Same left-to-right association as the reference's
+    //   (left - c) + (right - c) + (up - c) + (down - c)
+    precise float laplacian = (left - c) + (right - c) + (up - c) + (down - c);
+    precise float result    = c + pc.coeff * pc.dt * laplacian;
+
+    dst[cell_idx(x, y)] = result;
+}

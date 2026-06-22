@@ -1,0 +1,96 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -16,10 +16,10 @@
+ 
+ [dependencies]
+ # GTK4 + Adwaita (GUI only — filter binary uses a separate minimal set)
+-gtk4 = { version = "0.9", features = ["v4_12"] }
+-libadwaita = { version = "0.7", features = ["v1_4"] }
+-glib = "0.20"
+-gio = "0.20"
++gtk4 = { version = "0.9", features = ["v4_12"], optional = true }
++libadwaita = { version = "0.7", features = ["v1_4"], optional = true }
++glib = { version = "0.20", optional = true }
++gio = { version = "0.20", optional = true }
+ 
+ # Hashing
+ twox-hash = "1.6"
+@@ -63,15 +63,33 @@
+ 
+ # Conversation DB + compression
+ rusqlite = { version = "0.31", features = ["bundled"] }
+-zstd     = "0.13"
++zstd     = { version = "0.13", optional = true }
+ 
+ base64 = "0.22"  # image encoding for multimodal Ollama
+ 
++# Local GGML/GGUF inference (the ollama->ggml path) — optional, behind `llamacpp`
++llama-cpp-2 = { version = "0.1.146", optional = true }
++encoding_rs = { version = "0.8", optional = true }
++
+ # Tree-sitter — syntax-aware bloc scoring and AST navigation
+-tree-sitter = "0.22"
+-tree-sitter-rust       = "0.21"
+-tree-sitter-python     = "0.21"
+-tree-sitter-javascript = "0.21"
++tree-sitter = { version = "0.24", optional = true }
++tree-sitter-rust       = { version = "0.23", optional = true }
++tree-sitter-python     = { version = "0.23", optional = true }
++tree-sitter-javascript = { version = "0.23", optional = true }
++
++[features]
++# default keeps the GTK app + all modules building exactly as before
++default = ["gui", "convo", "bloc"]
++gui   = ["dep:gtk4", "dep:libadwaita", "dep:glib", "dep:gio"]   # the GTK4/Adwaita UI
++convo = ["dep:zstd"]                                            # conversation_db compression
++bloc  = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "dep:tree-sitter-javascript"]
++# local GGUF inference via llama.cpp (Vulkan). Needs clang + Vulkan SDK to build.
++# FFI body (shared by both backends)
++llama-ffi = ["dep:llama-cpp-2", "dep:encoding_rs"]
++# GPU (Vulkan) build — needs clang + Vulkan SDK + glslc on the build host
++llamacpp = ["llama-ffi", "llama-cpp-2/vulkan"]
++# CPU-only build — validates the FFI without a shader compiler (sandbox-friendly)
++llamacpp-cpu = ["llama-ffi"]
+ 
+ [profile.release]
+ opt-level = 3
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,7 +9,10 @@
+ pub mod rotation;
+ pub mod silence;
+ pub mod shorten;
++#[cfg(feature = "convo")]
+ pub mod conversation_db;
+ pub mod model_selector;
+ pub mod providers;
++pub mod llm_backend;
++#[cfg(feature = "bloc")]
+ pub mod bloc_engine;
+--- a/src/bloc_engine.rs
++++ b/src/bloc_engine.rs
+@@ -231,9 +231,9 @@
+     };
+ 
+     let language: Option<tree_sitter::Language> = match lang_name {
+-        "rust"       => Some(tree_sitter_rust::language()),
+-        "python"     => Some(tree_sitter_python::language()),
+-        "javascript" => Some(tree_sitter_javascript::language()),
++        "rust"       => Some(tree_sitter_rust::LANGUAGE.into()),
++        "python"     => Some(tree_sitter_python::LANGUAGE.into()),
++        "javascript" => Some(tree_sitter_javascript::LANGUAGE.into()),
+         _            => None,
+     };
+ 
+@@ -755,9 +755,9 @@
+         TemplateBlocDef { category: "Operators", label: "||",
+             text: "‸a‸ || ‸b‸", lang: None },
+         TemplateBlocDef { category: "Operators", label: "format!",
+-            text: "format!("‸pattern‸", ‸args‸)", lang: Some("rust") },
++            text: "format!(\"‸pattern‸\", ‸args‸)", lang: Some("rust") },
+         TemplateBlocDef { category: "Operators", label: "println!",
+-            text: "println!("‸pattern‸", ‸args‸)", lang: Some("rust") },
++            text: "println!(\"‸pattern‸\", ‸args‸)", lang: Some("rust") },
+         TemplateBlocDef { category: "Operators", label: "vec!",
+             text: "vec![‸items‸]", lang: Some("rust") },
+     ]

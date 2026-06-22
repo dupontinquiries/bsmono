@@ -1,0 +1,24 @@
+# 05-multimodel — the point of model classes: route each phase of the work to the model that fits it.
+# A big model writes the scaffold (the hard part: structure, the right todo!() seams), a small fast model
+# fills each hole (cheap, parallel-ish, KV-shares the skeleton prefix), then the compile oracle grades the
+# assembled result — no model needed for that, just rustc.
+#
+#   logscope-cli \
+#     --model big=~/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf \
+#     --model small=~/.local/share/logscope/llama-3.2-1b-instruct-q4_k_m.gguf \
+#     --max 1024 examples/05-multimodel.logscope
+#
+# Each :use switch is a full prefill on the newly-active model (it hasn't seen the lineage) — expected; the
+# reuse you measured in 06 happens *within* a model's run (small's fills all share the skeleton prefix).
+# Swap any name=path for name=mock to dry-run the control flow off-GPU.
+
+:use big
+> Write a Rust LRU cache: `pub struct Lru<K, V>` with `get(&mut self, k: &K) -> Option<&V>` and
+> `put(&mut self, k: K, v: V)`. Give the full struct and impl, but leave each method body as `todo!()`.
+:use small
+:fill
+:use big
+> Here is the assembled cache. Review it for correctness and point out any eviction bug.
+:check
+:best
+:export md

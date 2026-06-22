@@ -1,0 +1,19 @@
+# ~/.config/systemd/user/snapclone-bus.service
+# Keeps the SnapClone data bus daemon running for IPC with other apps.
+
+[Unit]
+Description=SnapClone Local Data Bus
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/snapclone-bus
+Restart=on-failure
+RestartSec=2s
+Nice=10
+CPUSchedulingPolicy=idle
+Environment=RUST_LOG=warn
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

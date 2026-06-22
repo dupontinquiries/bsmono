@@ -1,0 +1,238 @@
+{
+  "BeosoundStage": {
+    "emoji": "\ud83d\udcfa",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound Stage",
+    "form": "soundbar",
+    "accent": "#C8A04B",
+    "accentSoft": "#3a3018",
+    "shape": "bar",
+    "tagline": "Soundbar",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power",
+      "autoroute"
+    ]
+  },
+  "BeosoundBalance": {
+    "emoji": "\ud83d\udd0a",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound Balance",
+    "form": "speaker",
+    "accent": "#B98A5E",
+    "accentSoft": "#3a2c1c",
+    "shape": "column",
+    "tagline": "Home speaker",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeosoundLevel": {
+    "emoji": "\ud83d\udd0a",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound Level",
+    "form": "speaker",
+    "accent": "#9FB0A2",
+    "accentSoft": "#222e26",
+    "shape": "tablet",
+    "tagline": "Portable home speaker",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeosoundA5": {
+    "emoji": "\ud83e\uddfa",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound A5",
+    "form": "portable",
+    "accent": "#C68B5C",
+    "accentSoft": "#33241a",
+    "shape": "disc",
+    "tagline": "Portable speaker",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeosoundA9": {
+    "emoji": "\u2b55",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound A9",
+    "form": "disc",
+    "accent": "#D8D2C7",
+    "accentSoft": "#2e2c28",
+    "shape": "disc",
+    "tagline": "Wall / floor disc",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeosoundEmerge": {
+    "emoji": "\ud83d\udcda",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beosound Emerge",
+    "form": "speaker",
+    "accent": "#A98E6B",
+    "accentSoft": "#2f271d",
+    "shape": "spine",
+    "tagline": "Bookshelf speaker",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeoplayA9": {
+    "emoji": "\u2b55",
+    "icon": "audio-speakers-symbolic",
+    "name": "Beoplay A9",
+    "form": "disc",
+    "accent": "#D8D2C7",
+    "accentSoft": "#2e2c28",
+    "shape": "disc",
+    "tagline": "Wall / floor disc",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeovisionEclipse": {
+    "emoji": "\ud83d\udcfa",
+    "icon": "video-display-symbolic",
+    "name": "Beovision Eclipse",
+    "form": "tv",
+    "accent": "#8FA6C2",
+    "accentSoft": "#1e2733",
+    "shape": "screen",
+    "tagline": "OLED television",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeovisionContour": {
+    "emoji": "\ud83d\udcfa",
+    "icon": "video-display-symbolic",
+    "name": "Beovision Contour",
+    "form": "tv",
+    "accent": "#8FA6C2",
+    "accentSoft": "#1e2733",
+    "shape": "screen",
+    "tagline": "OLED television",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "sources",
+      "soundmode",
+      "power"
+    ]
+  },
+  "BeoplayH100": {
+    "emoji": "\ud83c\udfa7",
+    "icon": "audio-headphones-symbolic",
+    "name": "Beoplay H100",
+    "form": "headphones",
+    "accent": "#C9A27A",
+    "accentSoft": "#33281d",
+    "shape": "cans",
+    "tagline": "Headphones",
+    "controls": [
+      "volume",
+      "mute"
+    ]
+  },
+  "BeoplayHX": {
+    "emoji": "\ud83c\udfa7",
+    "icon": "audio-headphones-symbolic",
+    "name": "Beoplay HX",
+    "form": "headphones",
+    "accent": "#B59A78",
+    "accentSoft": "#2f261d",
+    "shape": "cans",
+    "tagline": "Headphones",
+    "controls": [
+      "volume",
+      "mute"
+    ]
+  },
+  "Unknown Type": {
+    "emoji": "\ud83c\udfb5",
+    "icon": "audio-card-symbolic",
+    "name": "Bang & Olufsen",
+    "form": "generic",
+    "accent": "#C8A04B",
+    "accentSoft": "#33291a",
+    "shape": "disc",
+    "tagline": "Audio device",
+    "controls": [
+      "volume",
+      "mute",
+      "nowplaying",
+      "library",
+      "spaces",
+      "stream",
+      "sources",
+      "soundmode",
+      "power",
+      "autoroute"
+    ]
+  }
+}

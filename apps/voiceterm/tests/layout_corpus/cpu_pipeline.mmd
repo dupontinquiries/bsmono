@@ -1,0 +1,10 @@
+flowchart LR
+IF["Fetch"] --> ID["Decode"]
+ID --> EX["Execute"]
+EX --> MEM["Memory"]
+MEM --> WB["Writeback"]
+ID -- "stall" --> IF
+EX -- "forward" --> ID
+MEM -- "forward" --> EX
+WB --> RF["Reg File"]
+RF --> ID

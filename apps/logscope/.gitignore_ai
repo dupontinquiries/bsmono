@@ -1,0 +1,4 @@
+target/
+*.png
+scene-view.log
+pearl-view.log

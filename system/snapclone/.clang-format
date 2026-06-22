@@ -1,0 +1,69 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# ─── Indentation ─────────────────────────────────────────────────────────────
+IndentWidth:          4
+TabWidth:             4
+UseTab:               Never
+IndentCaseLabels:     true
+IndentPPDirectives:   BeforeHash
+AccessModifierOffset: -4
+
+# ─── Line length ─────────────────────────────────────────────────────────────
+ColumnLimit:          100
+ReflowComments:       true
+
+# ─── Braces ──────────────────────────────────────────────────────────────────
+BreakBeforeBraces:    Allman
+BraceWrapping:
+  AfterClass:         true
+  AfterControlStatement: Always
+  AfterEnum:          true
+  AfterFunction:      true
+  AfterNamespace:     false
+  AfterStruct:        true
+  BeforeElse:         true
+  BeforeCatch:        true
+
+# ─── Spacing ─────────────────────────────────────────────────────────────────
+SpaceBeforeParens:    ControlStatements
+SpaceAfterCStyleCast: true
+SpacesInParentheses:  false
+SpaceInEmptyParentheses: false
+SpaceBeforeAssignmentOperators: true
+
+# ─── Alignment ───────────────────────────────────────────────────────────────
+AlignConsecutiveAssignments:
+  Enabled:            true
+  AcrossEmptyLines:   false
+  AcrossComments:     false
+AlignConsecutiveDeclarations:
+  Enabled:            false
+AlignTrailingComments:
+  Kind:               Always
+  OverEmptyLines:     1
+
+# ─── Includes ────────────────────────────────────────────────────────────────
+SortIncludes:         CaseSensitive
+IncludeBlocks:        Regroup
+IncludeCategories:
+  # Module-internal headers first
+  - Regex:    '^"(core|network|storage|crypto|ui)/'
+    Priority: 1
+  # Qt headers
+  - Regex:    '^<Q'
+    Priority: 2
+  # Standard library
+  - Regex:    '^<'
+    Priority: 3
+
+# ─── Miscellaneous ───────────────────────────────────────────────────────────
+Cpp11BracedListStyle:    true
+Standard:                c++20
+PointerAlignment:        Right
+ReferenceAlignment:      Right
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+MaxEmptyLinesToKeep:     2

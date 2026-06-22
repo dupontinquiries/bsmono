@@ -1,0 +1,43 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Beosound Emerge: book-shaped portable speaker. Tapers from
+       fat at the left edge to slim at the right (like a book lying
+       on its side viewed from the spine, with one cover thicker
+       than the other). Sits on a slightly wider base for stability. -->
+
+  <!-- BODY — front face (the bigger trapezoid). Tilted right edge
+       makes it slimmer at the right. -->
+  <path d="M 14 12
+           L 14 50      
+           L 48 48      
+           L 46 14
+           Z"/>
+
+  <!-- FRONT-FACE FABRIC GRILLE — vertical lines to suggest the
+       woven cloth front of the Emerge. -->
+  <g stroke-width="0.8" opacity="0.55">
+    <line x1="20" y1="16" x2="20" y2="48"/>
+    <line x1="24" y1="16" x2="24" y2="48"/>
+    <line x1="28" y1="16" x2="28" y2="48"/>
+    <line x1="32" y1="16" x2="32" y2="48"/>
+    <line x1="36" y1="16" x2="36" y2="48"/>
+    <line x1="40" y1="16" x2="40" y2="48"/>
+    <line x1="44" y1="16" x2="44" y2="48"/>
+  </g>
+
+  <!-- TOP CAP — narrow rounded band across the top suggesting the
+       hardwood/aluminum cap. -->
+  <path d="M 14 12 Q 30 8 46 14" stroke-width="1.6"/>
+
+  <!-- EXPANDED FOOTPRINT — wider base, sticking out slightly
+       beyond the body on both sides for stability. -->
+  <path d="M 11 50
+           Q 11 56 16 56
+           L 47 56
+           Q 51 56 49 50
+           Z"/>
+
+  <!-- SOFT BASE SHADOW — fainter line emphasizing it rests on
+       a surface. -->
+  <line x1="14" y1="59" x2="48" y2="59" stroke-width="1" opacity="0.4"/>
+</svg>

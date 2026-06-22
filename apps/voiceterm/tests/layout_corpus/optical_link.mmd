@@ -1,0 +1,12 @@
+flowchart LR
+src["Laser Source"] --> mod2["Modulator"]
+mod2 --> fiber["Optical Fiber"]
+fiber --> amp["EDFA Amplifier"]
+amp --> fiber2["Fiber Span 2"]
+fiber2 --> demux["WDM Demux"]
+demux --> pd1["Photodiode 1"]
+demux --> pd2["Photodiode 2"]
+pd1 --> tia1["TIA 1"]
+pd2 --> tia2["TIA 2"]
+tia1 --> dsp["DSP"]
+tia2 --> dsp

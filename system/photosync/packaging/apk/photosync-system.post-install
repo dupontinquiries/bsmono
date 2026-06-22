@@ -1,0 +1,34 @@
+#!/bin/sh
+# PhotoSync post-install script
+
+cat << 'EOF'
+
+PhotoSync has been installed successfully!
+
+To set up PhotoSync:
+
+  1. Run the setup script:
+     $ photosync-setup
+
+  2. For systemd-based systems:
+     $ systemctl --user enable photosync.service
+     $ systemctl --user start photosync.service
+
+  3. For OpenRC (Alpine default):
+     $ rc-update add photosync default
+     $ rc-service photosync start
+
+  4. Configure Syncthing:
+     - Open http://localhost:8384
+     - Add ~/Pictures/PhotoSync as a shared folder
+     - Connect to other devices
+
+For more information:
+  $ man photosync-daemon
+  $ photosync-cli --help
+
+Documentation: /usr/share/doc/photosync-system/README.md
+
+EOF
+
+exit 0

@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+    <id>com.snapclone.SnapClone</id>
+    <name>SnapClone</name>
+    <summary>Distributed ephemeral snap messenger</summary>
+    <metadata_license>CC0-1.0</metadata_license>
+    <project_license>GPL-3.0-or-later</project_license>
+
+    <description>
+        <p>
+            SnapClone is a serverless, peer-to-peer snap messenger built on Qt 6.
+            No account registration or central server required — peers discover each
+            other automatically on the local network via a gossip protocol, and
+            communicate directly over encrypted WebSocket connections.
+        </p>
+        <p>Features:</p>
+        <ul>
+            <li>Camera-first fullscreen UI — point and snap</li>
+            <li>LAN peer discovery via UDP gossip (no router/server needed)</li>
+            <li>End-to-end encrypted payloads</li>
+            <li>Ephemeral snaps with configurable expiry</li>
+            <li>Network diagnostics with one-click firewall fix commands</li>
+            <li>Automatic firewall port opening via D-Bus (firewalld / UFW)</li>
+        </ul>
+    </description>
+
+    <launchable type="desktop-id">com.snapclone.SnapClone.desktop</launchable>
+
+    <url type="homepage">https://github.com/yourname/snapclone</url>
+    <url type="bugtracker">https://github.com/yourname/snapclone/issues</url>
+
+    <releases>
+        <release version="1.0.0" date="2026-04-02">
+            <description>
+                <p>Initial release.</p>
+            </description>
+        </release>
+    </releases>
+
+    <content_rating type="oars-1.1">
+        <content_attribute id="social-chat">intense</content_attribute>
+        <content_attribute id="social-audio">intense</content_attribute>
+        <content_attribute id="social-contacts">intense</content_attribute>
+    </content_rating>
+
+    <requires>
+        <display_length compare="ge">360</display_length>
+    </requires>
+    <recommends>
+        <control>pointing</control>
+        <control>touch</control>
+    </recommends>
+</component>

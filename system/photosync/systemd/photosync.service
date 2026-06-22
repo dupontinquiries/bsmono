@@ -1,0 +1,33 @@
+[Unit]
+Description=PhotoSync Daemon - Photo compression and deduplication service
+After=network.target syncthing@.service
+Wants=syncthing@.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/photosync-daemon \
+    --watch-dir %h/Pictures/PhotoSync \
+    --db-path /var/lib/photosync/photosync.db \
+    --block-store /var/lib/photosync/blocks \
+    --device-id %H \
+    --thumbnail-size 256 \
+    --process-existing
+Restart=on-failure
+RestartSec=10
+User=%u
+Group=%u
+
+# Security hardening
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/photosync %h/Pictures/PhotoSync
+
+# Resource limits
+LimitNOFILE=65536
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

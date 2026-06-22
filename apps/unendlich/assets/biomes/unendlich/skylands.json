@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:skylands",
+  "_comment": "floating shelves (r174 registry parity set)",
+  "temperature": 0.4,
+  "downfall": 0.2,
+  "has_precipitation": false,
+  "effects": {},
+  "_legacy_enum": "Skylands"
+}

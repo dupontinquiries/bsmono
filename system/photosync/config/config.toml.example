@@ -1,0 +1,135 @@
+# PhotoSync System Configuration Example
+# Copy to ~/.config/photosync/config.toml and customize
+
+[general]
+# Device identifier (used for tracking in the database)
+device_id = "my-laptop"
+
+# Watch directory for new photos
+watch_dir = "~/Pictures/PhotoSync"
+
+# Database location
+db_path = "/var/lib/photosync/photosync.db"
+
+# Block storage directory
+block_store = "/var/lib/photosync/blocks"
+
+[compression]
+# Compression level for zstd (1-22, higher = better compression but slower)
+# Recommended: 19 for archival, 10 for faster processing
+level = 19
+
+# Compression algorithm: "zstd" or "brotli"
+algorithm = "zstd"
+
+[deduplication]
+# Chunk size in bytes (1 MiB = 1048576)
+# Larger chunks = less overhead, smaller chunks = better deduplication
+chunk_size = 1048576
+
+# Hash algorithm: "sha256" or "xxh64"
+# sha256 = cryptographically secure, xxh64 = faster
+hash_algorithm = "sha256"
+
+# Enable content-defined chunking (vs fixed-size)
+# Better deduplication but slower
+content_defined = false
+
+[thumbnails]
+# Thumbnail size in pixels (width/height)
+size = 256
+
+# Thumbnail format: "jpeg" or "webp"
+format = "jpeg"
+
+# JPEG quality (1-100)
+jpeg_quality = 85
+
+# Generate thumbnails for these extensions
+extensions = ["jpg", "jpeg", "png", "webp", "heic", "raw", "cr2", "nef", "arw", "dng"]
+
+[syncthing]
+# Enable Syncthing integration
+enabled = true
+
+# Syncthing configuration directory
+config_dir = "~/.config/syncthing"
+
+# Auto-configure Syncthing on setup
+auto_configure = true
+
+# Compression setting for Syncthing
+# "always", "metadata", or "never"
+compression = "always"
+
+# File versioning
+versioning_enabled = true
+versioning_type = "simple"
+versions_to_keep = 5
+
+[performance]
+# Number of worker threads (0 = auto-detect)
+worker_threads = 0
+
+# Process priority (nice value: -20 to 19, higher = lower priority)
+nice_level = 10
+
+# I/O scheduling class: "idle", "best-effort", or "realtime"
+io_class = "idle"
+
+# Maximum concurrent file operations
+max_concurrent_ops = 4
+
+[security]
+# Enable encryption at rest (requires LUKS/dm-crypt setup)
+encrypt_blocks = false
+
+# Verify block checksums on read
+verify_checksums = true
+
+# Enable access control
+enable_acl = false
+
+# Allowed device IDs (empty = allow all)
+allowed_devices = []
+
+[logging]
+# Log level: "error", "warn", "info", "debug", "trace"
+level = "info"
+
+# Log to file
+log_file = "/var/log/photosync/photosync.log"
+
+# Enable syslog
+syslog = true
+
+# Log format: "plain" or "json"
+format = "plain"
+
+[advanced]
+# SQLite journal mode: "delete", "truncate", "persist", "memory", "wal", "off"
+sqlite_journal_mode = "wal"
+
+# SQLite synchronous mode: "off", "normal", "full", "extra"
+sqlite_sync_mode = "normal"
+
+# Enable SQLite auto-vacuum
+sqlite_auto_vacuum = true
+
+# Database cache size in KB
+sqlite_cache_size = 8192
+
+# Enable periodic garbage collection
+auto_gc_enabled = true
+
+# GC interval in hours
+auto_gc_interval = 24
+
+# Enable automatic backups
+auto_backup_enabled = false
+
+# Backup directory
+backup_dir = "~/PhotoSync-Backups"
+
+# Backup interval in hours
+backup_interval = 168  # Weekly

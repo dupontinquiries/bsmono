@@ -1,0 +1,46 @@
+<svg color="#C8A04B" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" fill="none"
+     stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Beosound Stage: long pill-shaped bar with a polished wood endcap
+       at one side and fabric weave across the main face. Stylized line
+       art that reads as a stage/bar at a glance. -->
+
+  <!-- Outer pill body, generously rounded. -->
+  <rect x="4" y="22" width="56" height="20" rx="10" ry="10"/>
+
+  <!-- LEFT END — wood barrier accent. A short vertical band plus
+       a couple of grain lines, suggesting a darker hardwood cheek. -->
+  <line x1="13" y1="25" x2="13" y2="39"/>
+  <path d="M9 28 Q11 30 9 32 Q11 34 9 36" stroke-width="1.1" opacity="0.7"/>
+
+  <!-- FABRIC TEXTURE — a regular weave across the speaker face.
+       Diagonal hatching evokes the woven cloth grille without
+       drawing every thread. -->
+  <g stroke-width="0.9" opacity="0.55">
+    <line x1="17" y1="25" x2="22" y2="39"/>
+    <line x1="20" y1="25" x2="25" y2="39"/>
+    <line x1="23" y1="25" x2="28" y2="39"/>
+    <line x1="26" y1="25" x2="31" y2="39"/>
+    <line x1="29" y1="25" x2="34" y2="39"/>
+    <line x1="32" y1="25" x2="37" y2="39"/>
+    <line x1="35" y1="25" x2="40" y2="39"/>
+    <line x1="38" y1="25" x2="43" y2="39"/>
+    <line x1="41" y1="25" x2="46" y2="39"/>
+    <line x1="44" y1="25" x2="49" y2="39"/>
+    <line x1="47" y1="25" x2="52" y2="39"/>
+    <line x1="50" y1="25" x2="55" y2="39"/>
+  </g>
+  <g stroke-width="0.9" opacity="0.4">
+    <line x1="22" y1="25" x2="17" y2="39"/>
+    <line x1="28" y1="25" x2="23" y2="39"/>
+    <line x1="34" y1="25" x2="29" y2="39"/>
+    <line x1="40" y1="25" x2="35" y2="39"/>
+    <line x1="46" y1="25" x2="41" y2="39"/>
+    <line x1="52" y1="25" x2="47" y2="39"/>
+  </g>
+
+  <!-- Small power dot on the right endcap. -->
+  <circle cx="54" cy="32" r="1.2" fill="currentColor" stroke="none"/>
+
+  <!-- Faint base shadow line, suggesting the bar sits on a surface. -->
+  <line x1="10" y1="46" x2="54" y2="46" stroke-width="1.1" opacity="0.45"/>
+</svg>

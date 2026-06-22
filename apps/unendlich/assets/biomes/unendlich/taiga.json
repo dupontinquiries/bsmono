@@ -1,0 +1,9 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:taiga",
+  "_comment": "conifer cold (r174 registry parity set)",
+  "temperature": 0.2,
+  "downfall": 0.6,
+  "has_precipitation": true,
+  "effects": {}
+}

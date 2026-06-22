@@ -1,0 +1,12 @@
+flowchart TD
+beam["Beam Collision"] --> det["Detector"]
+det --> trk["Tracker"]
+det --> cal["Calorimeter"]
+det --> muon["Muon Chamber"]
+trk --> l1["L1 Trigger"]
+cal --> l1
+muon --> l1
+l1 --> hlt["High-Level Trigger"]
+hlt --> daq["DAQ"]
+daq --> store["Mass Storage"]
+store --> grid["Computing Grid"]

@@ -1,0 +1,71 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+**/dhtnode
+**/dhtchat
+**/dhtscanner
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*ConfigVersion.cmake
+*.pc
+
+# VSCode
+.vscode/*
+
+# Visual Studio
+.vs/
+CMakeSettings.json
+
+# Eclipse CDT
+.cproject
+.project
+language.settings.xml
+
+# Python
+*.pyc
+*.stamp
+python/opendht.cpp
+python/setup.py
+python/dist/
+wheelhouse/
+*.egg-info/
+
+# Doxygen
+doc/Doxyfile
+
+# git backup files
+*.orig
+
+# vim swap files
+*.swp
+*.swo
+
+# build dir
+build
+build_dev
+.DS_Store
+build-*/
+install/
+vcpkg_installed/
+

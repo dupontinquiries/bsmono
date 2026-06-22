@@ -1,0 +1,75 @@
+{
+  "type": "minecraft:biome",
+  "_id": "arenas:flank_grove",
+  "_comment": "Flanking grove off the lane: dense trees, hidden paths.",
+  "surface_block": "moss",
+  "subsurface_block": "dirt",
+  "has_precipitation": true,
+  "temperature": 0.6,
+  "downfall": 0.7,
+  "effects": {
+    "sky_color": 7907327,
+    "fog_color": 8233593,
+    "water_color": 4159204,
+    "water_fog_color": 329011,
+    "grass_color": 4022087,
+    "foliage_color": 4022087,
+    "ambient_light": 0.1,
+    "ambient_particle": {
+      "probability": 0.004,
+      "options": {
+        "type": "minecraft:mycelium"
+      }
+    }
+  },
+  "spawners": {
+    "monster": [
+      {
+        "type": "arenas:skirmish_camp_guardian_boss",
+        "weight": 1,
+        "minCount": 1,
+        "maxCount": 1
+      },
+      {
+        "type": "arenas:satyr_warrior",
+        "weight": 8,
+        "minCount": 1,
+        "maxCount": 2
+      },
+      {
+        "type": "arenas:harpy_scout",
+        "weight": 6,
+        "minCount": 1,
+        "maxCount": 2
+      }
+    ]
+  },
+  "features": [
+    [],
+    [
+      "arenas:skirmish_jungle_floor"
+    ],
+    [
+      "arenas:skirmish_fern_scatter",
+      "arenas:skirmish_mushroom_ring"
+    ],
+    [],
+    [
+      "arenas:skirmish_stone_ruin_fragment",
+      "arenas:skirmish_overgrown_wall"
+    ],
+    [
+      "arenas:skirmish_guardian_camp_altar"
+    ],
+    [
+      "arenas:skirmish_ancient_oak_large"
+    ],
+    [
+      "arenas:skirmish_hanging_vine"
+    ],
+    [
+      "arenas:skirmish_speed_rune_pad"
+    ],
+    []
+  ]
+}

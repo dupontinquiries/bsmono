@@ -1,0 +1,45 @@
+# gitmind — touch-first advanced repo manager.
+#
+# Workspace layout follows the reference project's "pure core + thin
+# wiring" philosophy: all logic lives in a Qt-free core crate that is
+# independently testable, and each frontend (gui/tui/cli) is a thin
+# shell over it. This is what makes the binary "separable as a tui and
+# cli" — they are literally different binaries linking the same core,
+# not feature-flags inside one giant main.
+#
+# Crates:
+#   core  — pure Rust: backend trait, chunk store, checkpoint engine,
+#           ingest + merge. No Qt, no UI. The heart.
+#   cli   — scriptable command-line frontend (this is buildable today).
+#   gui   — (added next) qmetaobject 0.2 + QML touch app, one Backend
+#           QObject exposed as a context property, exactly like the
+#           reference's main.rs bootstrap.
+#   tui   — (added next) ratatui terminal frontend.
+#
+# "gitmind" is a placeholder name; rename the dir + crate prefixes and
+# nothing in the design changes.
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+    "crates/sim",
+    "crates/peek",
+    "crates/gui",
+]
+# `cargo build` builds the whole toolbox EXCEPT the Qt GUI (which needs Qt6
+# present). Build the GUI explicitly with `cargo build -p gitmind-gui`.
+default-members = ["crates/core", "crates/cli", "crates/sim", "crates/peek"]
+
+# Match the reference's size-first release profile so the shipped
+# binaries stay small. The core does the heavy lifting; LTO across the
+# thin frontend is cheap.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

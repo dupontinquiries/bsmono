@@ -1,0 +1,12 @@
+[package]
+name = "layout_tool"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone graph-layout evaluator: runs web2qml's mermaid parser + layered layout over any .mmd/.md file and reports node positions + legibility metrics."
+
+[[bin]]
+name = "layout_tool"
+path = "src/main.rs"
+
+# No dependencies — the layout engine modules are pure std and are pulled in by
+# #[path] directly from ../../src so there is a single source of truth.

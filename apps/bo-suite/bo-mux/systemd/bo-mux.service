@@ -1,0 +1,29 @@
+# bo-mux.service — systemd USER unit for the bo-mux daemon.
+#
+# Install to ~/.config/systemd/user/bo-mux.service alongside bo-mux.socket.
+# Started on-demand by bo-mux.socket (socket activation), so you normally
+# enable the SOCKET, not this service directly.
+
+[Unit]
+Description=bo-mux soundscape & multi-speaker daemon
+Requires=bo-mux.socket
+After=bo-mux.socket
+
+[Service]
+Type=simple
+# %h = user home. The updater installs the binary here.
+ExecStart=%h/.local/bin/bo-muxd
+Restart=on-failure
+RestartSec=2
+
+# Hardening (user service; conservative so it can still reach the LAN and
+# read the user's music/scene dirs).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Allow writing only the daemon's own data + runtime dirs.
+ReadWritePaths=%h/.local/share/bo-mux
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

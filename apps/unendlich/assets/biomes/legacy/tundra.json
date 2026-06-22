@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:tundra",
+  "_comment": "Frozen flat biome. Maps to legacy Biome::Tundra.",
+  "surface_block": "snow_block",
+  "subsurface_block": "dirt",
+  "_legacy_enum": "Tundra",
+  "has_precipitation": true,
+  "temperature": 0.05,
+  "downfall": 0.3,
+  "effects": {
+    "sky_color": 8364543,
+    "fog_color": 12638463,
+    "grass_color": 11132908,
+    "foliage_color": 10341596,
+    "ambient_light": 0.4
+  }
+}

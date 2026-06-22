@@ -1,0 +1,2 @@
+scene_key -> reference (drop <key>.png into tools/refs/ to add one)
+mansion_garden -> garden marble-planet concept (epic_garden_planet)

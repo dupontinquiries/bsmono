@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# PhotoSync daemon OpenRC init script
+
+name="photosync"
+description="PhotoSync photo compression and deduplication daemon"
+
+command="/usr/bin/photosync-daemon"
+command_args="--watch-dir ${WATCH_DIR} \
+              --db-path ${DB_PATH} \
+              --block-store ${BLOCK_STORE} \
+              --device-id ${DEVICE_ID} \
+              --thumbnail-size ${THUMBNAIL_SIZE}"
+command_user="${PHOTOSYNC_USER}:${PHOTOSYNC_GROUP}"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+    after syncthing
+}
+
+start_pre() {
+    # Ensure directories exist
+    checkpath --directory --mode 0755 --owner ${command_user} \
+        "${WATCH_DIR}" \
+        "$(dirname ${DB_PATH})" \
+        "${BLOCK_STORE}"
+}

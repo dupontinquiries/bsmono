@@ -1,0 +1,135 @@
+{
+  "name": "River \u2014 Calm",
+  "_doc": "Stereo-friendly water soundscape. Uses the same brook clip pool as the forest scenes (so no new audio assets needed) but routes ONLY water \u2014 no wind, no leaves, no creatures. The result is a single continuous river-like wash, ideal as a focus/sleep noise cover. Authored for Stereo layout so it works on a single device or a single BT speaker; the bo-mux RouteStrategy::Auto handles upmix to Quad when multiple speakers are available.",
+  "_pairs_with": "Any tonal residual the canceller leaves; broadband content fades naturally into this.",
+  "version": 2,
+  "layout": "Stereo",
+  "start_state": "calm",
+  "layers": [
+    {
+      "name": "brook_left",
+      "_doc": "Brook clip pool routed to the LEFT channel. Gain centered around 0.75 with mild range \u2014 should sound like a steady river rather than a wave-pulsing recording.",
+      "pool": [
+        "clips/brook_close_a.opus",
+        "clips/brook_close_b.opus",
+        "clips/brook_close_c.opus",
+        "clips/brook_close_d.opus",
+        "clips/brook_close_e.opus",
+        "clips/brook_close_f.opus",
+        "clips/brook_close_g.opus",
+        "clips/brook_close_h.opus"
+      ],
+      "routing": {
+        "Pin": {
+          "channel": "FL",
+          "gain": 0.8
+        }
+      },
+      "crossfade_ms": 3500,
+      "gain_range": [
+        0.7,
+        0.85
+      ],
+      "pan_range": [
+        -0.15,
+        0.0
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 18000
+    },
+    {
+      "name": "brook_right",
+      "_doc": "Independent brook stream on the RIGHT channel. Using brook_mid clips (slightly different than brook_close) avoids the comb-filter effect of playing identical content on both sides \u2014 gives the river its width.",
+      "pool": [
+        "clips/brook_mid_a.opus",
+        "clips/brook_mid_b.opus",
+        "clips/brook_mid_c.opus",
+        "clips/brook_mid_d.opus",
+        "clips/brook_mid_e.opus",
+        "clips/brook_mid_f.opus",
+        "clips/brook_mid_g.opus",
+        "clips/brook_mid_h.opus"
+      ],
+      "routing": {
+        "Pin": {
+          "channel": "FR",
+          "gain": 0.75
+        }
+      },
+      "crossfade_ms": 3500,
+      "gain_range": [
+        0.65,
+        0.8
+      ],
+      "pan_range": [
+        0.0,
+        0.15
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 17000
+    },
+    {
+      "name": "river_bed",
+      "_doc": "Low-frequency 'bed' of distant water + far brook \u2014 the foundation under the two close streams. Diffuse routing spreads it across whatever speakers are present, so it sounds like environmental space rather than coming from one direction.",
+      "pool": [
+        "clips/brook_far_a.opus",
+        "clips/brook_far_b.opus",
+        "clips/brook_far_c.opus",
+        "clips/brook_far_d.opus",
+        "clips/brook_far_e.opus",
+        "clips/brook_far_f.opus",
+        "clips/brook_far_g.opus",
+        "clips/brook_far_h.opus"
+      ],
+      "routing": {
+        "Auto": {
+          "prefer": [
+            "FL",
+            "FR"
+          ]
+        }
+      },
+      "crossfade_ms": 5000,
+      "gain_range": [
+        0.4,
+        0.55
+      ],
+      "pan_range": [
+        -0.3,
+        0.3
+      ],
+      "rate_range": [
+        0.985,
+        1.015
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 24000,
+      "swell_period_ms": 75000,
+      "swell_depth": 0.12
+    }
+  ],
+  "states": [
+    {
+      "name": "calm",
+      "layer_weights": {
+        "brook_left": 1.0,
+        "brook_right": 1.0,
+        "river_bed": 1.0
+      },
+      "dwell_ms": [
+        120000,
+        240000
+      ],
+      "transitions": {}
+    }
+  ],
+  "description": "Steady stereo water: a close babbling brook over a deeper river bed."
+}

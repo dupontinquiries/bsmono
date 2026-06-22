@@ -1,0 +1,181 @@
+{
+  "name": "Forest \u2014 Day Cycle",
+  "start_state": "dawn",
+  "layers": [
+    {
+      "name": "water",
+      "pool": [
+        "clips/brook_close_a.opus",
+        "clips/brook_close_b.opus",
+        "clips/brook_mid_c.opus",
+        "clips/brook_mid_d.opus"
+      ],
+      "channel": "SL",
+      "crossfade_ms": 3000,
+      "gain_range": [
+        0.8,
+        1.0
+      ],
+      "pan_range": [
+        -0.3,
+        0.1
+      ],
+      "rate_range": [
+        0.99,
+        1.01
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 9000,
+      "interval_ms": [
+        4500,
+        9000
+      ],
+      "swell_period_ms": 60000,
+      "swell_depth": 0.15
+    },
+    {
+      "name": "birds",
+      "pool": [
+        "clips/leaves_rustle_a.opus",
+        "clips/leaves_rustle_b.opus",
+        "clips/leaves_rustle_c.opus",
+        "clips/leaves_rustle_d.opus"
+      ],
+      "channel": "SR",
+      "crossfade_ms": 800,
+      "gain_range": [
+        0.5,
+        0.95
+      ],
+      "pan_range": [
+        -0.6,
+        0.6
+      ],
+      "rate_range": [
+        0.97,
+        1.05
+      ],
+      "trigger_prob": 0.7,
+      "duration_ms": 3500,
+      "interval_ms": [
+        2000,
+        3500
+      ]
+    },
+    {
+      "name": "wind",
+      "pool": [
+        "clips/wind_canopy_a.opus",
+        "clips/wind_canopy_b.opus",
+        "clips/wind_distant_c.opus",
+        "clips/wind_distant_d.opus"
+      ],
+      "channel": "C",
+      "crossfade_ms": 5000,
+      "gain_range": [
+        0.3,
+        0.7
+      ],
+      "pan_range": [
+        -0.2,
+        0.2
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 12000,
+      "interval_ms": [
+        6000,
+        12000
+      ],
+      "swell_period_ms": 45000,
+      "swell_depth": 0.28
+    },
+    {
+      "name": "pad",
+      "pool": [
+        "clips/brown_pad_a.opus",
+        "clips/brown_pad_b.opus",
+        "clips/brown_pad_c.opus",
+        "clips/brown_pad_d.opus"
+      ],
+      "channel": "FL",
+      "crossfade_ms": 8000,
+      "gain_range": [
+        0.25,
+        0.4
+      ],
+      "pan_range": [
+        0.0,
+        0.0
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 30000,
+      "interval_ms": [
+        15000,
+        30000
+      ]
+    }
+  ],
+  "states": [
+    {
+      "name": "dawn",
+      "layer_weights": {
+        "water": 0.6,
+        "birds": 1.0,
+        "wind": 0.4,
+        "pad": 0.5
+      },
+      "dwell_ms": [
+        60000,
+        120000
+      ],
+      "transitions": {
+        "midday": 3.0,
+        "dawn": 1.0
+      }
+    },
+    {
+      "name": "midday",
+      "layer_weights": {
+        "water": 1.0,
+        "birds": 0.7,
+        "wind": 0.6,
+        "pad": 0.3
+      },
+      "dwell_ms": [
+        90000,
+        180000
+      ],
+      "transitions": {
+        "dusk": 2.0,
+        "dawn": 1.0
+      }
+    },
+    {
+      "name": "dusk",
+      "layer_weights": {
+        "water": 0.8,
+        "birds": 0.3,
+        "wind": 0.9,
+        "pad": 0.8
+      },
+      "dwell_ms": [
+        60000,
+        120000
+      ],
+      "transitions": {
+        "dawn": 1.0,
+        "midday": 1.0
+      }
+    }
+  ],
+  "version": 2,
+  "description": "Dawn to dusk woodland that drifts through birds, water, wind and a low pad."
+}

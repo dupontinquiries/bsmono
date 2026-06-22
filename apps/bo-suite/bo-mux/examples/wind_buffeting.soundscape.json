@@ -1,0 +1,104 @@
+{
+  "name": "Wind \u2014 Buffeting",
+  "_doc": "Heavy low-band wind, like wind hitting a building corner or a car driving with a window cracked. Primary purpose: mask broadband sub-200-Hz rumble (HVAC, distant traffic, aircraft pass-overs) without the user perceiving water sounds.",
+  "_pairs_with": "Broadband, low-fundamental noise. Recommender picks this in place of RainRumble when the user prefers wind to water.",
+  "start_state": "steady",
+  "layers": [
+    {
+      "name": "rumble_body",
+      "_doc": "Brown noise 30-400 Hz, heavy \u2014 the masking workhorse here. Higher gain than forest_quiet's rumble_floor because broadband rumble needs more energy to mask.",
+      "pool": [
+        "clips/brown_pad_a.opus",
+        "clips/brown_pad_b.opus",
+        "clips/brown_pad_c.opus",
+        "clips/brown_pad_d.opus",
+        "clips/brown_pad_e.opus",
+        "clips/brown_pad_f.opus",
+        "clips/brown_pad_g.opus",
+        "clips/brown_pad_h.opus"
+      ],
+      "channel": "C",
+      "crossfade_ms": 6000,
+      "gain_range": [
+        0.6,
+        0.85
+      ],
+      "pan_range": [
+        -0.1,
+        0.1
+      ],
+      "rate_range": [
+        1.0,
+        1.0
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000,
+      "swell_period_ms": 30000,
+      "swell_depth": 0.25
+    },
+    {
+      "name": "buffet_overlay",
+      "_doc": "Mid-band wind (300-3000 Hz) layered for spectral coverage. Quieter than the rumble body \u2014 provides the 'wind character' on top of the heavy low end without dominating.",
+      "pool": [
+        "clips/wind_soft_a.opus",
+        "clips/wind_soft_b.opus",
+        "clips/wind_soft_c.opus",
+        "clips/wind_soft_d.opus",
+        "clips/wind_soft_e.opus",
+        "clips/wind_soft_f.opus",
+        "clips/wind_soft_g.opus",
+        "clips/wind_soft_h.opus"
+      ],
+      "channel": "SL",
+      "crossfade_ms": 3000,
+      "gain_range": [
+        0.3,
+        0.55
+      ],
+      "pan_range": [
+        -0.4,
+        0.4
+      ],
+      "rate_range": [
+        0.98,
+        1.02
+      ],
+      "trigger_prob": 1.0,
+      "duration_ms": 16000,
+      "swell_period_ms": 12000,
+      "swell_depth": 0.45
+    }
+  ],
+  "states": [
+    {
+      "name": "steady",
+      "layer_weights": {
+        "rumble_body": 1.0,
+        "buffet_overlay": 0.7
+      },
+      "dwell_ms": [
+        45000,
+        75000
+      ],
+      "transitions": {
+        "gusts": 1.0
+      }
+    },
+    {
+      "name": "gusts",
+      "_doc": "Slightly more buffet_overlay, suggesting wind catching the building. Subtle \u2014 the perceived loudness shouldn't change much, just texture.",
+      "layer_weights": {
+        "rumble_body": 0.95,
+        "buffet_overlay": 1.0
+      },
+      "dwell_ms": [
+        30000,
+        60000
+      ],
+      "transitions": {
+        "steady": 1.0
+      }
+    }
+  ],
+  "description": "Gusty, broadband wind for masking traffic, HVAC or office chatter."
+}

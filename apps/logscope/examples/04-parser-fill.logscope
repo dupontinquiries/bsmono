@@ -1,0 +1,4 @@
+# Another fill target with a different shape (free functions, nested types).
+:open examples/parser-skeleton.chat.md
+:fill
+:export ascii

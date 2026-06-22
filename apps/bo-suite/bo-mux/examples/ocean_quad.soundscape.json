@@ -1,0 +1,152 @@
+{
+  "name": "Ocean \u2014 Quad",
+  "layout": "Quad",
+  "description": "Quadraphonic shoreline: waves rolling, gulls overhead, a distant whale.",
+  "author": "Example",
+  "version": 2,
+  "start_state": "calm",
+  "layers": [
+    {
+      "name": "waves",
+      "pool": [
+        "wave_break_1.opus",
+        "wave_break_2.opus",
+        "wave_break_3.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Pair": {
+          "a": "FL",
+          "b": "FR",
+          "gain_per_channel": 0.9
+        }
+      },
+      "crossfade_ms": 3000,
+      "gain_range": [
+        0.7,
+        1.0
+      ],
+      "pan_range": [
+        -0.4,
+        0.4
+      ],
+      "rate_range": [
+        0.95,
+        1.05
+      ],
+      "trigger_prob": 1.0,
+      "interval_ms": [
+        5000,
+        12000
+      ],
+      "duration_ms": 8000,
+      "swell_period_ms": 18000,
+      "swell_depth": 0.35
+    },
+    {
+      "name": "gulls",
+      "pool": [
+        "gull_call_a.opus",
+        "gull_call_b.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Auto": {
+          "prefer": [
+            "FL",
+            "FR",
+            "RL",
+            "RR"
+          ]
+        }
+      },
+      "crossfade_ms": 150,
+      "gain_range": [
+        0.4,
+        0.8
+      ],
+      "pan_range": [
+        -1.0,
+        1.0
+      ],
+      "rate_range": [
+        0.9,
+        1.1
+      ],
+      "trigger_prob": 0.5,
+      "interval_ms": [
+        10000,
+        30000
+      ],
+      "duration_ms": 1500,
+      "swell_period_ms": 40000,
+      "swell_depth": 0.2
+    },
+    {
+      "name": "whale_distant",
+      "pool": [
+        "whale_long_a.opus"
+      ],
+      "channel": "",
+      "routing": {
+        "Pair": {
+          "a": "RL",
+          "b": "RR",
+          "gain_per_channel": 0.55
+        }
+      },
+      "crossfade_ms": 8000,
+      "gain_range": [
+        0.4,
+        0.6
+      ],
+      "pan_range": [
+        -0.2,
+        0.2
+      ],
+      "rate_range": [
+        0.98,
+        1.02
+      ],
+      "trigger_prob": 0.7,
+      "interval_ms": [
+        60000,
+        180000
+      ],
+      "duration_ms": 25000
+    }
+  ],
+  "states": [
+    {
+      "name": "calm",
+      "layer_weights": {
+        "waves": 1.0,
+        "gulls": 0.5,
+        "whale_distant": 0.4
+      },
+      "dwell_ms": [
+        300000,
+        600000
+      ],
+      "transitions": {
+        "storm": 0.3,
+        "calm": 1.0
+      }
+    },
+    {
+      "name": "storm",
+      "layer_weights": {
+        "waves": 1.5,
+        "gulls": 0.2,
+        "whale_distant": 0.6
+      },
+      "dwell_ms": [
+        180000,
+        360000
+      ],
+      "transitions": {
+        "calm": 1.0
+      }
+    }
+  ]
+}

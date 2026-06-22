@@ -1,0 +1,777 @@
+summarize minecraft 100 days as a big long test of the whole game engine in all its components that a claude code could analyze for coverage scoring based on numerical multi ranking system 
+
+If you wanted to treat a typical "Minecraft 100 Days" playthrough as a giant integration test for the entire game engine, you can think of it as a coverage benchmark rather than a gameplay video.
+
+The goal is not "did the player survive 100 days?" but:
+
+How much of the engine, simulation, content pipeline, rendering system, AI system, progression system, networking model, and world-generation stack was exercised during the run?
+
+A Claude-Code style analyzer could assign scores across hundreds of categories and produce a coverage report similar to software test coverage.
+
+Minecraft 100 Days as Engine Validation
+Tier 1: Core Engine Coverage
+
+Measures whether the fundamental simulation systems were exercised.
+
+Category	Score
+Input handling	0-100
+Character movement	0-100
+Collision detection	0-100
+Physics simulation	0-100
+Chunk loading	0-100
+Chunk unloading	0-100
+Save system	0-100
+Persistence system	0-100
+Entity management	0-100
+Tick scheduler	0-100
+
+Example:
+
+Movement:
+Walked: 112 km
+Swam: 4 km
+Boated: 23 km
+Elytra: 51 km
+
+Coverage: 98%
+World Generation Coverage
+
+How much procedural generation was exercised.
+
+System	Coverage
+Overworld terrain	0-100
+Cave generation	0-100
+River generation	0-100
+Ocean generation	0-100
+Structures	0-100
+Villages	0-100
+Strongholds	0-100
+Ancient Cities	0-100
+Trial Chambers	0-100
+Nether generation	0-100
+End generation	0-100
+
+Example:
+
+Visited:
+8 biomes
+4 villages
+2 woodland mansions
+1 stronghold
+1 ancient city
+
+Worldgen Coverage:
+61%
+Rendering Coverage
+
+How much renderer functionality was forced to execute.
+
+Geometry
+Blocks rendered
+Particles rendered
+Animated blocks
+Tile entities
+Water surfaces
+Lava surfaces
+Transparent geometry
+Vegetation
+Lighting
+Daylight
+Night
+Torch lighting
+Redstone lighting
+Glowstone
+Nether lighting
+Beacon lighting
+Weather
+Rain
+Snow
+Thunderstorm
+Fog
+Clouds
+
+Coverage Example:
+
+Renderer:
+Geometry 95%
+Lighting 82%
+Weather 47%
+
+Overall:
+81%
+Entity System Coverage
+
+Measures diversity of entity simulation.
+
+Passive Mobs
+Cow
+Pig
+Sheep
+Chicken
+Horse
+Wolf
+Cat
+Bee
+Camel
+Hostile Mobs
+Zombie
+Skeleton
+Spider
+Creeper
+Enderman
+Witch
+Pillager
+Warden
+Blaze
+Ghast
+
+Coverage score:
+
+Encountered 34/78 entities
+
+Entity Coverage:
+44%
+AI Coverage
+
+Tests behavioral systems.
+
+Behaviors
+Pathfinding
+Target selection
+Group behavior
+Village routines
+Raid logic
+Trading logic
+Panic logic
+Combat logic
+Fleeing logic
+Breeding logic
+
+Example:
+
+AI States Exercised:
+147 / 312
+
+Coverage:
+47%
+Combat Coverage
+
+Measures battle systems.
+
+Weapon Types
+Sword
+Axe
+Bow
+Crossbow
+Trident
+Potion
+Damage Sources
+Fall
+Lava
+Fire
+Drowning
+Projectile
+Melee
+Explosion
+Magic
+Void
+
+Coverage:
+
+Combat Coverage:
+72%
+Crafting Coverage
+
+Tests recipe systems.
+
+Categories
+Basic crafting
+Stone tools
+Iron tools
+Diamond tools
+Netherite
+Food
+Potions
+Redstone
+Transportation
+Decoration
+
+Coverage:
+
+Crafted:
+384 recipes
+
+Recipe Coverage:
+29%
+Redstone Coverage
+
+Tests game logic systems.
+
+Components
+Lever
+Button
+Repeater
+Comparator
+Observer
+Piston
+Sticky piston
+Hopper
+Dropper
+Dispenser
+
+Coverage:
+
+Redstone:
+18 / 42 components
+
+Coverage:
+43%
+Progression Coverage
+
+Measures progression graph traversal.
+
+Wood Age
+Stone Age
+Iron Age
+Diamond Age
+Nether Access
+Blaze Rods
+End Access
+Dragon Fight
+Elytra
+Beacon
+Netherite
+
+Coverage:
+
+Progression:
+92%
+Advancement Coverage
+
+Equivalent to achievement coverage.
+
+Total Advancements:
+122
+
+Unlocked:
+74
+
+Coverage:
+60.7%
+Economy Coverage
+Villager trades
+Emerald generation
+Enchantments
+Anvil use
+Repair system
+Brewing
+Experience system
+
+Coverage:
+
+67%
+Resource Pipeline Coverage
+
+Measures item diversity.
+
+Unique blocks obtained
+Unique items obtained
+Unique foods consumed
+Unique ores mined
+Unique crops grown
+
+Coverage:
+
+Inventory Diversity:
+58%
+Automation Coverage
+
+Measures factory-style gameplay.
+
+Auto farms
+Mob farms
+Sorters
+Smelters
+Item transport
+Villager breeders
+
+Coverage:
+
+Automation:
+21%
+Technical Stress Coverage
+
+Measures actual engine load.
+
+Chunk Activity
+Chunks generated
+Chunks revisited
+Chunks modified
+Chunks persisted
+Entity Activity
+Peak entities
+Average entities
+Pathfinding calls
+Combat events
+Rendering Activity
+Frames rendered
+Unique models
+Particle emissions
+Light updates
+
+Example:
+
+Stress Score:
+83%
+Numerical Multi-Ranking System
+
+A Claude-Code analyzer could produce weighted scores:
+
+Movement:            98
+World Generation:    61
+Rendering:           81
+AI:                  47
+Combat:              72
+Crafting:            29
+Progression:         92
+Economy:             67
+Automation:          21
+Stress:              83
+
+Weighted aggregate:
+
+Gameplay Coverage:   71.4%
+Engine Coverage:     68.9%
+Content Coverage:    54.2%
+Stress Coverage:     83.0%
+
+Final result:
+
+Minecraft 100 Days
+Engine Validation Score
+
+Simulation ........ 82
+World Systems ..... 66
+Rendering ......... 81
+AI Systems ........ 47
+Content ........... 54
+Progression ....... 92
+Stress ............ 83
+
+Overall Coverage:
+72.1%
+
+From a software-testing perspective, a well-played "100 Days" series is essentially a long-running exploratory integration test that simultaneously exercises:
+
+world generation
+persistence
+chunk streaming
+rendering
+physics
+AI
+combat
+inventory systems
+crafting
+economy
+automation
+progression
+boss encounters
+long-term save stability
+
+making it surprisingly close to a real-world end-to-end validation suite for a sandbox game engine. A more advanced analyzer could extend this to thousands of metrics and generate heatmaps showing which subsystems, assets, codepaths, ECS components, shaders, biomes, recipes, AI states, and progression branches were never exercised during the 100-day run.
+
+
+
+hat about for ECS/wiring type of coverage... what is actually in the game per say
+
+For an ECS or dependency-wiring focused engine, the interesting metric is often not "what gameplay feature happened?" but:
+
+Which components, systems, resources, events, jobs, pipelines, and graph edges became active?
+
+A Minecraft-style sandbox is actually a huge wiring graph.
+
+ECS Coverage Layers
+
+Imagine your engine as:
+
+Entities
+ ├─ Components
+ │   ├─ Position
+ │   ├─ Velocity
+ │   ├─ Health
+ │   └─ Inventory
+ │
+ ├─ Systems
+ │   ├─ Physics
+ │   ├─ AI
+ │   ├─ Rendering
+ │   └─ Audio
+ │
+ ├─ Events
+ │   ├─ Damage
+ │   ├─ Pickup
+ │   └─ ChunkLoaded
+ │
+ └─ Resources
+     ├─ World
+     ├─ Time
+     └─ AssetCache
+
+Coverage becomes:
+
+Entity Coverage
+Component Coverage
+System Coverage
+Event Coverage
+Resource Coverage
+Dependency Coverage
+Component Coverage
+
+Suppose your engine contains:
+
+Transform
+Velocity
+PhysicsBody
+Health
+Inventory
+Player
+NPC
+Light
+AudioEmitter
+NetworkReplica
+ChunkResident
+AnimationState
+
+Coverage report:
+
+Components Registered: 120
+Components Instantiated: 87
+Components Updated: 73
+Components Mutated: 61
+
+Coverage: 72.5%
+
+More useful:
+
+Unused Components:
+---------------
+BossBar
+QuestMarker
+HorseInventory
+FishingHook
+System Coverage
+
+Systems are often where bugs hide.
+
+MovementSystem
+PhysicsSystem
+ChunkSystem
+LightingSystem
+AISystem
+AudioSystem
+WeatherSystem
+
+Coverage:
+
+Executed Once
+Executed 100 Times
+Executed 1M Times
+
+Example:
+
+MovementSystem        8,200,000 ticks
+PhysicsSystem         8,200,000 ticks
+WeatherSystem             2,100 ticks
+BossSystem                    14 ticks
+
+You quickly discover:
+
+BossSystem
+never actually tested
+Wiring Graph Coverage
+
+This is where ECS gets interesting.
+
+Suppose systems consume:
+
+Movement
+ ├─ Transform
+ ├─ Velocity
+ └─ Input
+
+Physics
+ ├─ Transform
+ ├─ Velocity
+ └─ Collider
+
+Represent as graph:
+
+Velocity ─────► Physics
+Velocity ─────► Movement
+Transform ────► Physics
+Transform ────► Renderer
+
+Coverage becomes:
+
+Graph Edges Activated
+---------------------
+
+1423 / 2150
+
+Not merely:
+
+Physics ran
+
+but:
+
+Physics ran using
+Transform+Velocity+Collider
+
+which is a different path.
+
+Archetype Coverage
+
+Most ECS engines organize entities into archetypes.
+
+Example:
+
+Player
+= Transform
++ Velocity
++ Health
++ Inventory
+
+Zombie
+= Transform
++ Velocity
++ Health
++ AI
+
+Boat
+= Transform
++ Velocity
++ Inventory
+
+Coverage:
+
+Archetypes Defined: 350
+Archetypes Spawned: 143
+
+Coverage: 40%
+
+This catches huge blind spots.
+
+Event Coverage
+
+Many engines become event buses.
+
+BlockPlaced
+BlockBroken
+DamageTaken
+ChunkLoaded
+EntitySpawned
+InventoryChanged
+
+Coverage:
+
+Events Defined: 500
+Events Fired: 312
+
+Coverage: 62%
+
+Even better:
+
+Event Subscribers Triggered
+
+because:
+
+DamageTaken
+
+might fire but nobody actually handles it.
+
+Resource Coverage
+
+Resources are global state.
+
+Time
+Weather
+BiomeRegistry
+AssetRegistry
+PathCache
+NavigationMesh
+
+Coverage:
+
+Resources Accessed
+Resources Mutated
+Resources ReadOnly
+
+Example:
+
+NavigationMesh
+Never Loaded
+Scheduler Coverage
+
+For engines using task graphs:
+
+Physics
+ ├─ Collision
+ ├─ Constraint Solve
+ └─ Integration
+
+Rendering
+ ├─ Visibility
+ ├─ Culling
+ └─ Draw Submission
+
+Coverage:
+
+Nodes Executed
+Dependencies Traversed
+Parallel Branches Traversed
+
+Example:
+
+Task Nodes:
+92 / 131
+
+Coverage:
+70%
+Dataflow Coverage
+
+This is often the most valuable.
+
+Track actual movement of data:
+
+Input
+ ↓
+ Movement
+ ↓
+ Physics
+ ↓
+ Collision
+ ↓
+ Damage
+ ↓
+ Audio
+ ↓
+ Rendering
+
+Coverage:
+
+Input→Movement
+Movement→Physics
+Physics→Collision
+Collision→Damage
+
+Activated
+
+But:
+
+Physics→VehicleSystem
+
+Never Activated
+State Machine Coverage
+
+Minecraft-like games contain hundreds.
+
+Example zombie:
+
+Idle
+Wander
+AcquireTarget
+Pathfind
+Attack
+Burning
+Drowning
+Dead
+
+Coverage:
+
+States Seen:
+7 / 8
+
+Transitions:
+21 / 34
+
+Transition coverage is far more valuable than state coverage.
+
+Interaction Coverage
+
+The hardest thing to discover manually.
+
+Example:
+
+Water
++
+Lava
+=
+Obsidian
+
+or
+
+Boat
++
+Ice
++
+Player
+
+Coverage:
+
+Unique interactions seen:
+8,214
+
+Possible:
+92,000
+
+This often uncovers bugs.
+
+What Is Actually "In The Game"?
+
+For a wiring-centric analyzer, the game is not:
+
+Blocks
+Mobs
+Biomes
+
+The game is:
+
+Entities
+Components
+Archetypes
+Systems
+Resources
+Events
+Tasks
+States
+Interactions
+Dataflows
+
+A Minecraft-like world might expose:
+
+400 entity types
+200 component types
+500 systems
+1000 event types
+300 resources
+5000 archetypes
+10000 scheduler nodes
+100000 interaction pairs
+
+A coverage report could then look like:
+
+Entity Types .......... 71%
+Components ............ 83%
+Archetypes ............ 46%
+Systems ............... 92%
+Events ................ 67%
+Resources ............. 78%
+Task Graph ............ 74%
+State Machines ........ 55%
+Interactions .......... 31%
+Dataflows ............. 69%
+
+Overall Wiring Coverage:
+66.8%
+
+For an ECS engine under active development, "interaction coverage" and "archetype coverage" are usually the most valuable metrics because they reveal combinations of components and system dependencies that never execute during normal gameplay, which is where many integration bugs live

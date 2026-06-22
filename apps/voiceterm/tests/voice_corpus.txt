@@ -1,0 +1,67 @@
+# voice command corpus — phrase => expected intent kind (to_qml_string field 0)
+# Used by:
+#   - the sandbox-runnable parse regression test (voice_intent::corpus_regression)
+#   - scripts/voice_tts_harness.sh (local: TTS -> whisper -> parse -> check)
+# Lines: "<phrase>\t<expected_kind>". '#' comments + blank lines ignored.
+#
+# EVERY pair below was verified against the live parser (parse().to_qml_string)
+# do not hand-edit a kind without re-running the regression test; the parser is
+# the source of truth and several "obvious" guesses were wrong (e.g. "open the
+# editor" routes to edit_current_note, not open_in_editor).
+
+# -- editor / notes --
+edit this note	edit_current_note
+open the editor	edit_current_note
+open note editor	edit_current_note
+edit in editor	open_in_editor
+search my notes for cloak	search_notes
+find cloak in my notes	search_notes
+redo	editor_redo
+redo that	editor_redo
+
+# -- undo / rollback --
+undo	rollback
+undo that	rollback
+rollback	rollback
+roll back last	rollback
+scratch that	rollback
+
+# -- navigation --
+go back	go_back
+go forward	go_forward
+go to the top	go_top
+go to the bottom	go_bottom
+bottom	go_bottom
+reload	reload
+
+# -- web search --
+search for rust lifetimes	search
+google rust lifetimes	search
+
+# -- scrolling --
+page down	scroll_page
+scroll down	scroll
+
+# -- niftyplot view (v0.1.698) --
+rotate the diagram	rotate_graph
+fan the layers	rotate_graph
+isometric view	rotate_graph
+expand	expand_node
+go deeper	expand_node
+collapse	collapse_node
+show fewer	collapse_node
+flatten	flatten_graph
+collapse to 2d	flatten_graph
+
+# -- read aloud (v0.1.701) --
+read this section	read_section
+read it	read_section
+speak this	read_section
+narrate this	read_section
+
+# -- natural phrasings (v0.1.708) --
+open up the editor	edit_current_note
+read me this section	read_section
+take me to the top	go_top
+take me to the bottom	go_bottom
+pull up the editor	edit_current_note

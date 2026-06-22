@@ -1,0 +1,106 @@
+# simconvo suite — edit, then run:  kernel-validate --simconvo <gguf> this_file.txt
+# format: '# id | diff | stress', then U:/A: turns (multi-line until next marker). %FILE% expands to a sample Rust file.
+
+# fn-reverse | 1 | tiny code, short ctx
+U: Write a Rust function that reverses a string. Just the function.
+
+# explain-result | 1 | short factual
+U: In one short paragraph, what is Rust's Result<T, E> for?
+
+# struct-impl | 2 | small multi-part code
+U: Write a Rust struct Counter with a `new` and an `incr` method that returns the new value.
+
+# fix-bug | 2 | spot+fix a bug
+U: This Rust panics on empty input. Fix it:
+
+fn first(v: &[i32]) -> i32 { v[0] }
+
+# multi-turn | 3 | carry context across turns
+U: Define a Rust trait Shape with an `area(&self) -> f64` method.
+A: trait Shape { fn area(&self) -> f64; }
+U: Now implement it for a Circle { r: f64 } using PI = 3.14159.
+A: struct Circle { r: f64 } impl Shape for Circle { fn area(&self) -> f64 { 3.14159 * self.r * self.r } }
+U: Add a Rectangle { w: f64, h: f64 } impl too.
+
+# reason-over-file | 3 | reason about an embedded file
+U: Here is a file:
+
+%FILE%
+
+The decorate() pass is slow on big grids. In two sentences, why, and what would speed it up?
+
+# refactor-2file | 4 | two files in context, cross-file change
+U: File a.rs:
+
+%FILE%
+
+File b.rs:
+
+pub fn run(g: &mut Grid) { g.decorate(); }
+
+Move decorate() out of Grid into b.rs as a free function `decorate(g: &mut Grid)`. Show both files after.
+
+# continue-midfile | 4 | continue a half-written file (the case that broke)
+U: Write a Rust function `fn render(g: &Grid) -> Vec<u8>` that returns one byte per cell, value*16.
+A: fn render(g: &Grid) -> Vec<u8> {
+    let mut out = Vec::with_capacity(g.w * g.h);
+    for y in 0..g.h {
+        for x in 0..g.w {
+            out.push(
+U: continue
+
+# long-synthesis | 5 | long-ish ctx, synthesis
+U: Read this module:
+
+%FILE%
+
+I also have a renderer that reads Grid::get in a hot loop, a loader that fills cells from disk, and a decorator that rewrites 1->2. Walk me through the data flow and name the one method that every part depends on.
+A: The shared dependency is Grid::get / the cells buffer; loader writes cells, decorate rewrites them, renderer reads them via get.
+U: Given that, if I made cells private and only exposed get/set, which of those three would break, and why?
+
+# underspecified-long | 5 | ambiguous + long -> degeneration probe
+U: %FILE%
+
+%FILE%
+
+Make it better and faster and also fix the thing. Rewrite everything the right way.
+
+# bigfile-1k | 5 | ~1k ctx, find the coarse remesh
+U: Module world.rs:
+
+%BIG%
+
+A single block edit calls World::set_block, and the renderer remeshes any chunk whose dirty flag is set by rebuilding it from scratch. In two sentences: which method makes a single-block edit reprocess all 32768 cells, and what granularity would fix it?
+
+# bigfile-2k | 5 | ~1.8k ctx, two files, cross-file trace
+U: world.rs:
+
+%BIG%
+
+mesh.rs:
+
+%BIG2%
+
+Trace what happens to the mesh when I call world.set_block(c, 5, 5, 5, 0) to carve a block. Which chunks must remesh, and does the current code remesh the correct set?
+A: set_block marks that chunk dirty and build_mesh rebuilds it fully. Neighboring chunks are not re-marked, so a block on a chunk border leaves a seam, because neighbor_solid treats out-of-chunk cells as air.
+U: Right. What's the minimal change to neighbor_solid and the dirty-marking to kill the seam without remeshing the whole world?
+
+# bigfile-3k | 5 | ~2.4k ctx, three files, design under load
+U: Three files.
+
+world.rs:
+
+%BIG%
+
+mesh.rs:
+
+%BIG2%
+
+legacy grid.rs:
+
+%FILE%
+
+We want per-edit incremental remeshing: only the touched chunk plus any neighbor across the shared face. Design the dirty-tracking and the cross-chunk neighbor lookup mesh.rs needs.
+A: Mark the edited chunk dirty, and if the edit is on a face boundary (coord 0 or CHUNK-1) also mark the adjacent chunk. neighbor_solid must accept a World reference to read across chunk borders instead of returning air.
+U: Good. Now name every existing method that changes signature or body, and what the grid.rs legacy decorate() pass should become in this design.
+

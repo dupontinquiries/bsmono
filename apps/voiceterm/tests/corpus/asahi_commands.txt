@@ -1,0 +1,154 @@
+stop it there
+let's stop it there
+i'm going to do a quick dump of this syslog buff
+let's look at this there's like two commands here right or something
+let's see what happened
+let's see
+let's look further down
+let's go with that
+let's put that in there
+i want to do this thing
+i'm going to do this, and i'm going to do this
+let's do that again
+let's do it, uh
+let's make it a new one
+let's go way later
+let's see, right, all right, i'm just going to delete this
+let's see what we just did there
+let's do
+let's do header
+run script
+let's see about that
+run it again, and continue
+let's go to the top
+i want to start naming these by what they actually are
+let's do that
+let's look at the main one
+let me do a little bit of bisection there
+let's do it like that and see what happens
+let's look at that
+let's try this again
+let's see if i can find the first time that happens
+let's see how many unique things we have
+i'm going to go back to my memory
+let's do it like the, let's just do it like this
+let's see if there was any of the six things here
+i need to add a tag value
+let's see about moving the cursor
+trace gpio and this
+i want to make this support multidimensional ranges
+let's do that first before going back to dcp
+let's do it like this
+i'm going to make this a little bit more complicated
+i need to find the in thing
+let's see if that works
+let's kill
+stop will be
+let's see, that's the lowest min
+find the smallest range
+let's put that in here
+let's see, let's change
+i need to add the second element of everything
+let me see
+switch over to the hardware
+let's make a little
+let's go ahead
+start and bitmap
+let me put this thing back on
+let's put the name in there, too
+let's kill that
+i should do a thing
+i'm going to do a thing
+run script, trace tcp, which is the same thing
+let's make that
+let's do that, actually
+let's make a nicer tracer debug
+let's put this right here
+run shell
+let's do it like that
+let's see if it works
+let's do it a bit differently
+i'm going to do it like i'm not going to read
+i want to do this in the class because this is this is going to be slow
+i want to do mini
+i should make that not do that, what
+let's run it again
+let's make it that too run script
+let's use wr
+let's see what the dead beef was there
+let me do that properly
+i need to do it like that
+i'm going to use a request package, actually, if it works better
+let's see if we can do this
+let me start making a little script here
+let's see what happens when you hit play
+let's run through the game
+let's run command line tools, probably
+let's go on the ssh
+let's put it in here
+let's run it
+i want to do kate from here
+let's see if that works, actually
+build is
+let's do a
+let's see if i can do that
+let's go to source
+let's see what happens
+let's see, where am i
+let's do a rebuild of that and
+i'm going to try running this in recovery mode
+stopped it from
+let me make this boot first
+let's go to partial
+let's see how this works with range requests
+i'm going to make it one megabyte blocks, but make it reterf them at once
+i'm going to do the read
+i'm going to do a read this cache stuff is
+i need to do it as a… nah, hold on
+i'm going to do the installer backwards, i guess
+let's do os pre-boot
+let's open somewhere
+let me see what's args
+let's do set log function, yeah
+i'm going to go with the
+build manifest
+let's look at everything in volumes pre-boot
+let's make sure that still thinks this is bootable
+let's go
+let's see… let's see
+let's see if that works, yep, that's the right thing
+let's look at what those look like to make sure that's all kosher
+let's see if that did anything
+let's see what that does with, uh
+let's try ejecting those again
+i need to open that
+copy that
+let's do a quick search of that, actually
+let me go ahead and click it to see if we have a free brand
+build identity, ship id, yeah, yeah, yeah, yeah
+build manifest, board id 34
+let's do everything except the manifest
+let's do this
+let's see how that works
+build my tests path
+let's do the install
+let's run that off
+i'm going to do it
+let's see that
+let's see if it was the same in 9.4
+let's see yeah yeah
+let's do a new lens there
+i'm going to do some errors here
+i should check, yeah, basically, for zipinfo
+let's do this with info list
+let's see if it's going to be in the extra data stuff or not
+let's see, let's see, let's see
+find exists for symlink
+let's see that we did through the bar too
+let's close that
+check for those
+let's do check here
+close reboot
+let's make a new one
+let's run that again
+let's see if i can get mini in there

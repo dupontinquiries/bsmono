@@ -1,0 +1,27 @@
+# gitmind-cli — scriptable command-line frontend over gitmind-core.
+# A separate binary (not a feature flag) so `gitmind` the CLI ships
+# without any Qt/GUI weight, per the "separable as a tui and cli" goal.
+[package]
+name = "gitmind-cli"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gitmind_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gitmind"
+path = "src/bin/gitmind.rs"
+
+[[bin]]
+name = "gin"
+path = "src/bin/gin.rs"
+
+[dependencies]
+gitmind-core = { path = "../core" }
+libc = "0.2"
+
+[features]
+# Opt-in privileged watcher with real PID attribution (Linux + CAP_SYS_ADMIN).
+fanotify = ["gitmind-core/fanotify"]

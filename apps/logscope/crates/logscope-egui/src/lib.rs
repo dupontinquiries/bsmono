@@ -1,0 +1,67 @@
+//! logscope-egui as a library. Two binaries build on it: the egui GUI (main.rs, needs the `gui` feature)
+//! and the headless script CLI (bin/logscope-cli.rs, builds lean without `gui`). The CLI's whole closure
+//! is egui-free — backend, fabric, genguard, vimmode, consensus, decompose, bestregion, kvtree,
+//! treeexport, script, runner — so those stay ungated; everything that touches egui/eframe/rfd is behind
+//! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
+
+// ── CLI closure (egui-free; always built) ────────────────────────────────────
+pub mod backend;
+#[allow(dead_code)] pub mod fabric;
+pub mod genguard;
+#[allow(dead_code)] pub mod consensus;
+#[allow(dead_code)] pub mod vimmode;
+#[allow(dead_code)] pub mod treeexport;
+#[allow(dead_code)] pub mod bestregion;
+#[allow(dead_code)] pub mod kvtree;
+#[allow(dead_code)] pub mod decompose;
+#[allow(dead_code)] pub mod quest;
+#[allow(dead_code)] pub mod verdict;
+#[allow(dead_code)] pub mod script;
+#[allow(dead_code)] pub mod runner;
+#[allow(dead_code)] pub mod chatdump;
+#[allow(dead_code)] pub mod refresh;
+#[allow(dead_code)] pub mod prompts;
+#[allow(dead_code)] pub mod cmdpalette;
+
+// ── GUI + its supporting modules (need egui/eframe/rfd/tree-sitter) ───────────
+#[cfg(feature = "gui")] pub mod analysis;
+#[cfg(feature = "gui")] pub mod app;
+#[cfg(feature = "gui")] pub mod model;
+#[cfg(feature = "gui")] pub mod theme;
+#[cfg(feature = "gui")] pub mod ui;
+#[cfg(feature = "gui")] pub mod wizard;
+#[cfg(all(feature = "gui", feature = "gpu-scene"))] pub mod scene_preview;
+#[cfg(feature = "gui")] pub mod filepicker;
+#[cfg(feature = "gui")] pub mod workspace;
+#[cfg(feature = "gui")] pub mod vault;
+#[cfg(feature = "gui")] pub mod ast;
+#[cfg(feature = "gui")] pub mod vertices;
+#[cfg(feature = "gui")] pub mod fabric_net;
+#[cfg(feature = "gui")] pub mod context_graph;
+#[cfg(feature = "gui")] pub mod retrieval;
+#[cfg(feature = "gui")] pub mod pipeline;
+#[cfg(feature = "gui")] pub mod diff;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod scroll;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod cards;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod coach;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod race;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod genviz;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod palette;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod corpus;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod merge;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod coordinator;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod sandbox;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod convograph;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod spatial;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod gpuscene;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod texgen;
+#[cfg(feature = "gpu-scene")] pub mod glow_scene;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod estimate;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod multiparty;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod directives;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod mount;
+#[cfg(feature = "gui")] pub mod tabs;

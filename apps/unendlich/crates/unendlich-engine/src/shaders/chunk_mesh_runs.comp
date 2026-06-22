@@ -1,0 +1,206 @@
+#version 450
+//
+// chunk_mesh_runs.comp — v0.24.10 GPU mesher: 1D-merged runs.
+//
+// Reads a SurfaceRun[] buffer (1D-merged surface runs from
+// extract_surface_runs) and emits one quad per run. Run length
+// determines the quad's extent along U; the V axis is always 1.
+//
+// Compared to chunk_mesh_sparse.comp (records → up to 6 quads per
+// record), this kernel emits exactly 1 quad per run. With typical
+// 3-5× compression ratio, this drops total quad count by 3-5×,
+// proportionally reducing vertex writes and GPU compute time.
+//
+// Per-chunk slot layout matches chunk_mesh_sparse.comp:
+//   - Runs occupy [pc.record_offset .. pc.record_offset + pc.record_count)
+//     in the records storage buffer.
+//   - Vertices land in this chunk's vertex slot starting at pc.vertex_offset.
+//   - Indices land in this chunk's index slot starting at pc.index_offset.
+//   - Counters (vertex, index, overflow) at pc.counter_offset.
+//
+// This kernel is BINARY-COMPATIBLE with the SparseGpuMesher's existing
+// buffer layout: SurfaceRun is also 16 bytes, the vertex/index/counter
+// buffers are identical. Only the kernel and the input format differ.
+
+layout(local_size_x = 64) in;
+
+struct SurfaceRun {
+    int world_x;
+    int world_y;
+    int world_z;
+    uint packed; // bits 0..8 = block_type; bits 8..11 = face dir; bits 11..27 = length
+};
+
+layout(std430, set = 0, binding = 0) readonly buffer Records {
+    SurfaceRun records[];
+};
+
+layout(std430, set = 0, binding = 1) writeonly buffer Vertices {
+    float vertex_floats[];
+};
+
+layout(std430, set = 0, binding = 2) writeonly buffer Indices {
+    uint indices[];
+};
+
+layout(std430, set = 0, binding = 3) buffer Counters {
+    uint counters[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint record_count;
+    uint vertex_capacity;
+    uint index_capacity;
+    uint record_offset;
+    uint vertex_offset;
+    uint index_offset;
+    uint counter_offset;
+    uint _pad;
+} pc;
+
+// FaceDir values must match world::surface::FaceDir.
+const uint FACE_POS_X = 0u;
+const uint FACE_NEG_X = 1u;
+const uint FACE_POS_Y = 2u;
+const uint FACE_NEG_Y = 3u;
+const uint FACE_POS_Z = 4u;
+const uint FACE_NEG_Z = 5u;
+
+// Block colors — same palette as chunk_mesh_sparse.comp.
+vec3 block_color(uint block_type) {
+    if (block_type == 1u)  return vec3(0.50, 0.50, 0.55);
+    if (block_type == 2u)  return vec3(0.55, 0.40, 0.25);
+    if (block_type == 3u)  return vec3(0.30, 0.65, 0.25);
+    if (block_type == 4u)  return vec3(0.85, 0.80, 0.55);
+    if (block_type == 5u)  return vec3(0.65, 0.65, 0.60);
+    if (block_type == 6u)  return vec3(0.45, 0.35, 0.20);
+    if (block_type == 7u)  return vec3(0.30, 0.50, 0.25);
+    if (block_type == 8u)  return vec3(0.80, 0.80, 0.85);
+    if (block_type == 9u)  return vec3(0.75, 0.85, 0.95);
+    if (block_type == 12u) return vec3(0.40, 0.40, 0.45);
+    float h = float(block_type) * 0.61803398875;
+    return vec3(
+        fract(h * 3.7),
+        fract(h * 5.3),
+        fract(h * 7.1)
+    ) * 0.5 + 0.4;
+}
+
+void write_vertex(uint v_local, vec3 pos, vec3 color) {
+    uint base = (pc.vertex_offset + v_local) * 6u;
+    vertex_floats[base + 0u] = pos.x;
+    vertex_floats[base + 1u] = pos.y;
+    vertex_floats[base + 2u] = pos.z;
+    vertex_floats[base + 3u] = color.r;
+    vertex_floats[base + 4u] = color.g;
+    vertex_floats[base + 5u] = color.b;
+}
+
+// Emit a quad. p0,p1,p2,p3 are corner positions in world space; counter-
+// clockwise viewed from outside the face.
+void emit_quad(uint v_base_local, uint i_base_local,
+               vec3 p0, vec3 p1, vec3 p2, vec3 p3, vec3 color)
+{
+    write_vertex(v_base_local + 0u, p0, color);
+    write_vertex(v_base_local + 1u, p1, color);
+    write_vertex(v_base_local + 2u, p2, color);
+    write_vertex(v_base_local + 3u, p3, color);
+    uint i_global = pc.index_offset + i_base_local;
+    indices[i_global + 0u] = v_base_local + 0u;
+    indices[i_global + 1u] = v_base_local + 1u;
+    indices[i_global + 2u] = v_base_local + 2u;
+    indices[i_global + 3u] = v_base_local + 0u;
+    indices[i_global + 4u] = v_base_local + 2u;
+    indices[i_global + 5u] = v_base_local + 3u;
+}
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    if (tid >= pc.record_count) return;
+
+    SurfaceRun r = records[pc.record_offset + tid];
+    uint block_type = r.packed & 0xFFu;
+    uint face = (r.packed >> 8u) & 0x7u;
+    uint length = (r.packed >> 11u) & 0xFFFFu;
+    if (length == 0u) return;
+
+    // Reserve output space: 4 verts + 6 indices for one quad.
+    uint v_base_local = atomicAdd(counters[pc.counter_offset + 0u], 4u);
+    uint i_base_local = atomicAdd(counters[pc.counter_offset + 1u], 6u);
+    if (v_base_local + 4u > pc.vertex_capacity
+        || i_base_local + 6u > pc.index_capacity)
+    {
+        atomicAdd(counters[pc.counter_offset + 2u], 1u);
+        return;
+    }
+
+    vec3 color = block_color(block_type);
+    float fx = float(r.world_x);
+    float fy = float(r.world_y);
+    float fz = float(r.world_z);
+    float fl = float(length);
+
+    // Build the 4 corners based on face direction. Run extends `length`
+    // blocks along the run axis (varies per face per FaceDir::run_axis).
+    //
+    // Face conventions (matching the v1 sparse kernel for per-block quads):
+    //   +X: run along Y. Face is on the +X plane (x = world_x + 1).
+    //       Quad: y ∈ [world_y, world_y + length], z ∈ [world_z, world_z + 1]
+    //   -X: run along Y. Face on the -X plane (x = world_x).
+    //   +Y: run along X. Face on the +Y plane (y = world_y + 1).
+    //       Quad: x ∈ [world_x, world_x + length], z ∈ [world_z, world_z + 1]
+    //   -Y: run along X. Face on the -Y plane.
+    //   +Z: run along X. Face on the +Z plane (z = world_z + 1).
+    //       Quad: x ∈ [world_x, world_x + length], y ∈ [world_y, world_y + 1]
+    //   -Z: run along X. Face on the -Z plane.
+    if (face == FACE_POS_X) {
+        // +X face: outward-facing normal is +X. CCW from outside (looking from +X).
+        float x = fx + 1.0;
+        emit_quad(v_base_local, i_base_local,
+            vec3(x, fy,        fz),         // 0: -Y,-Z
+            vec3(x, fy,        fz + 1.0),   // 1: -Y,+Z
+            vec3(x, fy + fl,   fz + 1.0),   // 2: +Y,+Z
+            vec3(x, fy + fl,   fz),         // 3: +Y,-Z
+            color);
+    } else if (face == FACE_NEG_X) {
+        float x = fx;
+        emit_quad(v_base_local, i_base_local,
+            vec3(x, fy,        fz + 1.0),
+            vec3(x, fy,        fz),
+            vec3(x, fy + fl,   fz),
+            vec3(x, fy + fl,   fz + 1.0),
+            color);
+    } else if (face == FACE_POS_Y) {
+        float y = fy + 1.0;
+        emit_quad(v_base_local, i_base_local,
+            vec3(fx,        y, fz),
+            vec3(fx + fl,   y, fz),
+            vec3(fx + fl,   y, fz + 1.0),
+            vec3(fx,        y, fz + 1.0),
+            color);
+    } else if (face == FACE_NEG_Y) {
+        float y = fy;
+        emit_quad(v_base_local, i_base_local,
+            vec3(fx,        y, fz + 1.0),
+            vec3(fx + fl,   y, fz + 1.0),
+            vec3(fx + fl,   y, fz),
+            vec3(fx,        y, fz),
+            color);
+    } else if (face == FACE_POS_Z) {
+        float z = fz + 1.0;
+        emit_quad(v_base_local, i_base_local,
+            vec3(fx + fl,   fy,        z),
+            vec3(fx,        fy,        z),
+            vec3(fx,        fy + 1.0,  z),
+            vec3(fx + fl,   fy + 1.0,  z),
+            color);
+    } else { // FACE_NEG_Z
+        float z = fz;
+        emit_quad(v_base_local, i_base_local,
+            vec3(fx,        fy,        z),
+            vec3(fx + fl,   fy,        z),
+            vec3(fx + fl,   fy + 1.0,  z),
+            vec3(fx,        fy + 1.0,  z),
+            color);
+    }
+}

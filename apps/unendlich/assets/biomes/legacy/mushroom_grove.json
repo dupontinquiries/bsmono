@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:mushroom_grove",
+  "_comment": "Fantasy biome — perpetually misty mycelium forest. Themed pocket biome (rare). Mild temperature, very high humidity, low light. Plants thrive in steady Mature stage; should host giant fungal canopy structures (future feature).",
+  "surface_block": "grass",
+  "subsurface_block": "dirt",
+  "_legacy_enum": "TemperateForest",
+  "has_precipitation": true,
+  "temperature": 0.55,
+  "downfall": 1.0,
+  "effects": {
+    "sky_color": 6710998,
+    "fog_color": 9211020,
+    "grass_color": 7975275,
+    "foliage_color": 6463294,
+    "ambient_light": 0.25
+  }
+}

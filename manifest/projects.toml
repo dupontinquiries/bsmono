@@ -1,0 +1,146 @@
+# Per-project metadata. Drives the build orchestrator and Flatpak CI.
+# kind:    cargo | hybrid (cargo+cmake/C++) | cmake | python+rust
+# role:    app | daemon | app+daemon | service | tool | vendored-lib
+# flatpak: true | false | partial   (partial = only one component ships)
+# runtime: kde | gnome | freedesktop | none | tbd   (Flatpak runtime)
+# targets: subset of manifest/targets.toml ids; "all" = every linux target
+
+[apps.unendlich]
+path = "apps/unendlich"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = true
+runtime = "freedesktop"
+targets = ["desktop", "phone"]
+notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"
+
+[apps.voiceterm]
+path = "apps/voiceterm"
+kind = "cargo"            # qmetaobject cdylib (Rust↔Qt, not Rust↔C++)
+role = "app"
+daemon = false
+flatpak = true
+runtime = "kde"
+targets = ["desktop", "phone"]
+notes = "QML voice app; pulseaudio; android via build-android.sh; QtState pattern"
+
+[apps.bo-suite]
+path = "apps/bo-suite"
+kind = "cargo"
+role = "app+daemon"
+daemon = true            # bo-mux has a systemd unit
+flatpak = "partial"      # bo-controller (kde) ships; bo-mux is a daemon
+runtime = "kde"
+targets = ["desktop"]
+notes = "bo-controller app + bo-mux daemon; B&O speaker control"
+
+[apps.av1tuner]
+path = "apps/av1tuner"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = true
+runtime = "tbd"          # GUI toolkit not yet confirmed
+targets = ["desktop"]
+notes = "AV1 encoding GUI; per-segment isolation/resume; runtime TBD"
+
+[apps.ambient-learner]
+path = "apps/ambient-learner"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = true
+runtime = "freedesktop"
+targets = ["desktop", "phone"]
+notes = "sensor/awareness; likely needs a portal for sensor access"
+
+[apps.bot-arena]
+path = "apps/bot-arena"
+kind = "cargo"
+role = "tool"            # evolutionary code-agent runner; also a candidate GUI
+daemon = false
+flatpak = true
+runtime = "gnome"
+targets = ["desktop"]
+notes = "QD/MAP-Elites; verified build; experimentkit/gesturekit source"
+
+[apps.gitmind]
+path = "apps/gitmind"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = "tbd"
+runtime = "tbd"
+targets = ["desktop"]
+notes = "git-graph tool (gin); embeds crates/peek (dedup pending); marked broken upstream"
+
+[apps.logscope]
+path = "apps/logscope"
+kind = "cargo"
+role = "service"
+daemon = false           # server-side, hosted (FLEET/PREWARM/SERVING docs)
+flatpak = false
+runtime = "none"
+targets = ["desktop", "alpine"]
+notes = "LLM frontend + multiple backends; 10-100 instance hosting"
+
+[system.snapclone]
+path = "system/snapclone"
+kind = "hybrid"
+role = "system-service"
+daemon = true            # snapclone-bus, camera-bridge units
+flatpak = false          # daemon is system-level; a GUI front-end could ship
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "DHT/identity/relay; canonical Rust↔C++ DataBus FFI; flatpak-build.sh present; CMake repath to vendor/opendht pending; cross-build to FP5/postmarketOS"
+
+[system.photosync]
+path = "system/photosync"
+kind = "hybrid"
+role = "daemon"
+daemon = true            # photosync.service -> photosync-daemon
+flatpak = false          # more library/daemon than app, for now
+runtime = "none"
+targets = ["desktop", "alpine"]
+notes = "compression/dedup daemon + C++ gui (CameraManager/VideoRecorder/PhotoProcessor)"
+
+[tools.peek]
+path = "tools/peek"
+kind = "cargo"
+role = "tool"            # SUSPENDER: wiring-audit
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "canonical peek; wiring-audit.sh; line-range viewer; DEPENDENCY_DIAGNOSIS"
+
+[tools.drift]
+path = "tools/drift"
+kind = "cargo"
+role = "tool"            # SUSPENDER: boundary-drift reconciliation
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "cargo plugin + macros; makes cross-boundary assumptions explicit"
+
+[tools.rustcheck]
+path = "tools/rustcheck"
+kind = "python+rust"
+role = "tool"            # SUSPENDER: lint/check
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "source only (.py + .rs); bundled binaries dropped"
+
+[vendor.opendht]
+path = "vendor/opendht"
+kind = "cmake"
+role = "vendored-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "alpine"]
+notes = "current upstream; consumed by snapclone"
