@@ -15,15 +15,14 @@ _(empty — current dump triaged below)_
 
 ## A. AI-agent documentation unification
 
-- **A1 — Unify the AI-agent docs across projects.** `idea`
-  Many projects carry agent-facing docs (CLAUDE.md, AGENTS.md, HANDOFF*.md,
-  TOOLBOX.md, etc.). Unify them and link so that **web2qml/voiceterm users can
-  navigate via the ZBrackets** UI. → First step is an inventory of every
-  agent-doc in the tree (count + paths) before deciding the link scheme.
-- **A2 — "Claude-specific vs general-LLM" notes file.** `idea`
-  Separate what is Claude-specific from what generalizes, and what can be
-  adapted to **logscope's tree-based development approach** + general LLM usage.
-  → Likely a `docs/agents/` index on `main` plus a per-project backlink.
+- **A1 — Unify the AI-agent docs across projects.** `in-progress`
+  Inventory done (~40 docs, heavily clustered in `apps/unendlich/handoff/`).
+  Catalog + unification plan now live at **`docs/agents/INDEX.md`**. Next:
+  the link scheme so **web2qml/voiceterm users navigate via ZBrackets**.
+- **A2 — "Claude-specific vs general-LLM" notes file.** `queued`
+  Planned as `docs/agents/claude-vs-general.md`: separate Claude-specific
+  guidance from what generalizes, and what maps onto **logscope's tree-based
+  development** approach. (Synthesis step — pending greenlight.)
 
 ## B. Tooling & maintenance dir (this directory)
 
@@ -67,11 +66,16 @@ _(empty — current dump triaged below)_
 ## F. gitmind evaluation (side-by-side with git)
 
 - **F1 — Actively use gitmind; run two side-by-side repos.** `in-progress (positive)`
-  Trial 1 done (`maintenance/gitmind-eval.md`): `gin` CLI **builds clean**;
-  checkpoint + native import + **export-native is byte-faithful** (identical
-  HEAD tree hash, 4335/4335 files). `.gitmind` ~30% larger than `.git`. The
-  "broken" marker is only the Qt GUI crate. Next trials: native-commit/merge/
-  rebase correctness, watch+gc storage bounds, `graft`.
+  Trial 1: `gin` CLI builds clean; checkpoint + native import + **export-native
+  byte-faithful**. Trial 2: zstd 9→19 saves only **1.5%** (below bar, reverted);
+  delta compression is the real lever (see F3). `.gitmind` made a **permanent
+  reproducible fixture** — `store.redb` gitignored, rebuilt by
+  `maintenance/gitmind-sync.sh`; config + README tracked. Next trials:
+  native-commit/merge/rebase correctness, watch+gc storage bounds, `graft`.
+- **F3 — Delta compression in gitmind's chunk store.** `idea (real space lever)`
+  The 110-vs-84 MB gap vs `.git` is delta compression, not zstd level. A
+  cross-chunk/cross-object delta scheme (the store is BLAKE3-addressed, FastCDC
+  64K) could close or beat it. Bigger change than a level bump — a real project.
 
 ---
 

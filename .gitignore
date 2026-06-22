@@ -10,3 +10,9 @@ __pycache__/
 .DS_Store
 # prebuilt binaries (rebuildable) — keep sources only
 **/scene-view-linux-x64
+
+# gitmind: the bulk object store is regenerated via maintenance/gitmind-sync.sh,
+# never committed (it's incompressible to git and a committed store self-references
+# on the next `gin import`). Config + README are tracked.
+/.gitmind/*.redb
+/.gitmind/store.redb
