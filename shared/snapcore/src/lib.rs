@@ -44,6 +44,7 @@
 pub mod cluster;
 pub mod lookup;
 pub mod node;
+pub mod proximity;
 pub mod routing;
 pub mod sim;
 pub mod store;
