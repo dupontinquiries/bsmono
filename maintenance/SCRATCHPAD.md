@@ -354,3 +354,26 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
   ratchet + per-recipient seal + epoch), then share-kit (mailbox over snapcore +
   crypto-kit). Note: lifting eventually repoints snapclone-crypto -> crypto-kit
   (other Claude is in snapclone UI; crypto.rs is different files, low collision).
+
+  **crypto-kit GROUP layer — DONE (commit follows):**
+  shared/crypto-kit/src/group.rs: sender-key ratchet + per-recipient sealing,
+  lifted from snapclone-group/{ratchet.rs,seal.rs}, built ENTIRELY on crypto-kit's
+  own primitives (no duplicated AEAD/KDF). SenderChain: from_root/generate(OsRng)/
+  next_message_key->(idx,MK)/message_key_for(target)/export_root; CK_{i+1}=
+  HKDF(CK_i,RATCHET), MK_i=HKDF(CK_i,MSG_KEY); zeroize on drop+advance; one-way
+  (forward secrecy within epoch). seal_sender_key/open_sender_key reimplemented on
+  x25519_shared + derive_session_key(SENDERKEY_SEAL) + seal/open (byte-array API,
+  OsRng, Option not SealError — consistent w/ crypto-kit). Labels byte-identical to
+  snapclone (snapclone-v1-group-*) for wire compat. Content enc = crypto_kit::seal/
+  open under MK (no redundant wrapper). **28 crypto-kit tests pass** (+8 group):
+  ratchet agreement, forward-secrecy-can't-rewind, distinct-per-index, label
+  separation, seal roundtrip, wrong-recipient-fails, and THE headline
+  epoch_rekey_excludes_removed_and_newly_added_members (removed member can't read
+  new epoch; newly-added can't read prior — proven from ratchet+seal, membership
+  bookkeeping deferred to share-kit). crypto-kit now: ffi (C ABI) + safe Rust API
+  (hybrid PQ + sign + AEAD) + group (ratchet/seal). ~1.5K LOC.
+  NEXT: share-kit — the mailbox over snapcore + crypto-kit. Generalize
+  snapclone-group/mailbox.rs's group_id/groupmsg bucket -> app-supplied namespace
+  (unendlich sessions + snapclone groups share it); carry Lifetime flag +
+  DeliveryHint profiles; wire SenderChain epochs + seal_sender_key fan-out onto
+  snapcore's cluster roster (announce co-members = the member set to seal to).
