@@ -41,6 +41,7 @@
 //! crate is deterministic and unit-testable with no wall clock and no network —
 //! the multi-node story is exercised on loopback, which is what microdht enabled.
 
+pub mod cluster;
 pub mod lookup;
 pub mod node;
 pub mod routing;

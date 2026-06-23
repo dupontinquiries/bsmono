@@ -315,3 +315,21 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
   NEXT layers: cluster overlay (explicit shared-mailbox dense peer set) · ID-windowed
   maintenance scheduler + data-type trickle-down · then real UDP transport
   (STUN/UPnP/relay done; hole-punch FSM port) replacing SimTransport.
+
+  **snapcore cluster overlay (resilience layer) — DONE:**
+  cluster.rs: explicit clusters (ClusterId = keyspace point, roster lives in DHT
+  under that key). Clusters{} = dense per-cluster member sets (no XOR filtering,
+  liveness + cap), join/leave/record_member/members/shared_with (the bridge
+  relation = id-mapping: a node in 2 clusters bridges them). DHT-backed roster:
+  announce() stores contact under cluster key (multi-value), discover() reads it
+  back. Resilience primitives: lookup_value_resilient() (ask co-members FIRST,
+  global Kademlia fallback) + replicate_to_cluster() (durability-through-
+  population). **25 tests pass offline** incl. THE headline: a node with an EMPTY
+  global routing table still fetches a value via its cluster co-members
+  (cluster_path_finds_value_when_global_path_is_dead), plus announce/discover
+  round-trips the roster through the DHT, plus replicate distributes to co-members.
+  snapcore now: routing core + value store + iterative lookup + multi-node sim +
+  cluster resilience overlay, ~1450 LOC, all offline-provable.
+  NEXT: real UDP transport (swap SimTransport; STUN/UPnP/relay done, hole-punch
+  FSM the one port — offline-provability hands to field validation) AND/OR
+  ID-windowed maintenance scheduler + data-type trickle-down. Then crypto-kit.
