@@ -300,3 +300,18 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
     header tags), so readable for analysis. Real-world necessities it confirms:
     proxy-client/server (= daemon-as-proxy for CGNAT/asleep), multicast LAN
     peer-discovery (= bo-suite LAN path), replacement-cache + liveness, rate_limiter.
+
+  **snapcore iterative lookup + multi-node sim (this round) — DONE:**
+  Added store.rs (lifted microdht store: TTL, re-announce dedup+refresh,
+  multi-value, per-key cap), node.rs (Node = routing+store, Transport RPC trait,
+  FindValue, handlers that learn the caller), lookup.rs (iterative lookup_nodes /
+  lookup_value, terminate when k-closest all queried), sim.rs (in-memory Network +
+  SimTransport = the net-sim foundation, backlog E1). **19 tests pass offline**,
+  incl. the headline: store-on-node-A is findable-from-node-Z purely via routing,
+  and lookup converges to the TRUE k-closest after the real Kademlia join
+  (each node self-looks-up on bootstrap → star becomes connected). Note: a single
+  bootstrap star does NOT converge in one shot (expected Kademlia property) — the
+  self-lookup join is what connects it. snapcore now a working DHT in-sim.
+  NEXT layers: cluster overlay (explicit shared-mailbox dense peer set) · ID-windowed
+  maintenance scheduler + data-type trickle-down · then real UDP transport
+  (STUN/UPnP/relay done; hole-punch FSM port) replacing SimTransport.
