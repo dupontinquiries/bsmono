@@ -333,3 +333,24 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
   NEXT: real UDP transport (swap SimTransport; STUN/UPnP/relay done, hole-punch
   FSM the one port — offline-provability hands to field validation) AND/OR
   ID-windowed maintenance scheduler + data-type trickle-down. Then crypto-kit.
+
+  **crypto scan + crypto-kit v0.1 — DONE:**
+  Monorepo crypto (by Cargo.toml deps, the reliable signal — usage grep
+  over-reports on words like "design"/"verify"): sha2, ed25519-dalek, x25519-dalek,
+  hkdf, aes-gcm, fips203 (ML-KEM-768), zeroize, rand_core. snapclone uses the full
+  hybrid-PQ stack; other apps a subset (hashing/signing/AEAD). **crates.io IS
+  reachable** in this sandbox (online `cargo build` fetches+compiles dalek/fips203/
+  aes-gcm) — so crypto crates ARE buildable here (only the pre-seeded offline cache
+  lacked them). **shared/crypto-kit v0.1** = snapclone-crypto LIFTED, dual face:
+  src/ffi.rs (the verbatim C-ABI sc_* surface for the C++/Qt side, +14 tests) and
+  src/lib.rs (a SAFE idiomatic Rust API for Rust consumers: x25519/ed25519/
+  ml-kem-768 keygen+agree, derive_hybrid_session_key = HKDF-SHA256(x25519_ss ‖
+  mlkem_ss, "snapclone-v1-pq-session"), seal/open AES-256-GCM [nonce|ct+tag]).
+  Added Debug/PartialEq derives to CryptoError (ABI-neutral). **20 tests pass**
+  incl. full hybrid PQ handshake end-to-end (both sides derive same key; breaks if
+  either half breaks) + seal-under-hybrid-key round-trip. snapcore also got
+  proximity stubs (BLE/acoustic/adhoc, unimplemented!()+TODO) on the dense layer.
+  NEXT: snapclone-group ratchet/seal as crypto-kit's GROUP layer (sender-key
+  ratchet + per-recipient seal + epoch), then share-kit (mailbox over snapcore +
+  crypto-kit). Note: lifting eventually repoints snapclone-crypto -> crypto-kit
+  (other Claude is in snapclone UI; crypto.rs is different files, low collision).
