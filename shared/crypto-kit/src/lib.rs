@@ -17,6 +17,7 @@
 //! HKDF domain-separation label is kept identical to snapclone's wire format.
 
 pub mod ffi;
+pub mod group;
 
 pub use ffi::{
     CryptoError, KEY_LEN, MLKEM_CT_LEN, MLKEM_DK_LEN, MLKEM_EK_LEN, MLKEM_SS_LEN, NONCE_LEN,
