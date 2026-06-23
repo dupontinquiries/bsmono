@@ -230,3 +230,37 @@ _(empty — current dump triaged below)_
 unendlich 303K · voiceterm 135K · bo-suite 75K · logscope 50K · snapclone 42K ·
 ambient-learner 22K · bot-arena 13K · av1tuner 10K · gitmind 9K · photosync 1.1K ·
 rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
+
+  **App routing survey (this round) — what the suite wants out of routing:**
+  - **bo-suite**: already a real audio MESH (mesh/peer_auth/sync/chan_server) —
+    wants to DECOUPLE control from LAN → LAN discovery (mDNS) + beyond-LAN
+    control channel, low-latency, peer-auth (has it).
+  - **photosync**: self-hosted photo sync SERVER (daemon/sync_server) — wants
+    family reach THROUGH NAT → shared-mailbox + content-blob-swarm, **DURABLE**
+    (photos persist), private group.
+  - **ambient-learner**: weather/screen-temp + DB/history, NO net yet — wants
+    community calibration + historical-data SHARING → public/community data pool,
+    **DURABLE**, many small contributors, read-mostly.
+  - **voiceterm**: zettelkasten ([[zbracket]] .md graph) + security sandbox —
+    wants to SHARE note graphs → content-addressed linked notes, **DURABLE**,
+    selective (per-note/collection) visibility.
+  - **logscope**: LAN LLM serving (SERVING.md, key-gated, instance-stacking) +
+    conversation/LIVE sharing — wants live real-time sessions + durable
+    conversation artifacts + remote (decouple from LAN), key access.
+  **KEY FINDING — DURABLE is the MAJORITY need** (photosync/voiceterm/ambient/
+  logscope); only snapclone(snaps)/unendlich(frames) are ephemeral. snapclone's
+  "ephemeral by construction" is the minority → the durable content-swarm
+  (participant re-replication + opt-in pinning) is FIRST-CLASS, not deferred.
+  Requirement clusters: LAN discovery · beyond-LAN NAT reach · durable distributed
+  content sharing · public/community pooling · live sessions · access spectrum
+  (private/public/key-gated). These JUSTIFY a real distributed DHT — relay-first
+  alone would NOT cover durable distributed pooling.
+  **DECISION (sequence revised): cleanroom pure-Rust DHT FIRST, then crypto.**
+  Scope reframe: "grow microdht's done storage (TTL/re-announce/multi-value/cap)
+  into distributed Kademlia + wire existing STUN(done)/UPnP(done)/relay(done) +
+  port the hole-punch FSM" — NOT reimplement OpenDHT blind. Kademlia is a
+  published algorithm (impl from the paper + microdht semantics), which also moots
+  licensing. **Distributed routing IS testable offline** (N nodes on loopback =
+  microdht's whole purpose); only NAT-traversal-over-internet is hardware-gated
+  (the Fairphones). LICENSE CAVEAT: vendored opendht LICENSE reads MIT-style but
+  upstream OpenDHT is GPLv3 — confirm which governs; cleanroom-from-spec sidesteps.
