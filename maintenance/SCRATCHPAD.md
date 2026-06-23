@@ -264,3 +264,39 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
   microdht's whole purpose); only NAT-traversal-over-internet is hardware-gated
   (the Fairphones). LICENSE CAVEAT: vendored opendht LICENSE reads MIT-style but
   upstream OpenDHT is GPLv3 — confirm which governs; cleanroom-from-spec sidesteps.
+
+  **Routing-core build + algorithm tweaks (this round):**
+  - Phones aren't proxy-relegated by *capability* — modern SoCs run full Kademlia
+    fine. The real constraints are network *position* + OS lifecycle:
+    OS background-suspension (the big one for STOCK phones — but our fleet is
+    mainline-Linux/postmarketOS, so a persistent daemon runs like a server →
+    barrier absent), CGNAT inbound reachability, address churn, radio battery.
+    => participation is a RUNTIME POLICY, not impossibility (coresched seam).
+  - **Algorithm tweaks accepted, all as LAYERS over the k-bucket core:**
+    (1) **Explicit clusters** = smaller connected graphs + id-mapping. A cluster
+        IS a shared mailbox/group/LAN-affinity set you JOIN (not emergent). Two
+        tiers: sparse global Kademlia (find cluster) + dense intra-cluster peer
+        set (kept regardless of XOR distance). Node-in-two-mailboxes = live bridge
+        = the id-mapping. Unifies with durability-through-population.
+    (2) **ID-windowed maintenance scheduling** — batch refresh/re-announce into
+        ID-derived time windows to amortize radio TAIL energy; the data-type/
+        Lifetime flag trickles app->share-kit->snapcore->coresched as a
+        power-policy input (ephemeral never wakes radio; durable earns a window).
+    (3) **Policy matrix**: battery/cellular -> minimize radio (ID-window batch);
+        wifi/plugged -> minimize CPU via uclamp.max + little-core affinity, be a
+        fuller node. Crossed with the data-type flag.
+    (4) **HE for "compression" = REFRAME**: HE expands, doesn't compress. The real
+        fit is homomorphic AGGREGATION/SKETCHING of bulk events (private
+        aggregation): many encrypted readings -> one compact aggregate w/o
+        decrypting. Fits ambient-learner community calibration pool (maybe
+        logscope analytics). Additive-only (Paillier) or packed lattice; heavy,
+        read-mostly pool only, NOT phone hot path. FILED as research spike.
+  - **BUILT: `shared/snapcore` v0.1.0** — routing core. NodeId(160-bit)+XOR metric,
+    k-buckets with OpenDHT's replacement-cache + good/questionable/bad liveness,
+    `closest()` find-node. Zero-dep, logical-clock (deterministic), 9 tests pass
+    offline. Layers next: cluster overlay, ID-windowed scheduler, then lift
+    microdht storage + wire transport (STUN/UPnP/relay done; hole-punch FSM port).
+  - OpenDHT licensing RESOLVED: vendored tree is `SPDX MIT` throughout (LICENSE +
+    header tags), so readable for analysis. Real-world necessities it confirms:
+    proxy-client/server (= daemon-as-proxy for CGNAT/asleep), multicast LAN
+    peer-discovery (= bo-suite LAN path), replacement-cache + liveness, rate_limiter.
