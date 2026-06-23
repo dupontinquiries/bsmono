@@ -1,0 +1,25 @@
+[package]
+name = "crypto-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared crypto primitives for the monorepo: hybrid X25519 + ML-KEM-768 (FIPS 203) key agreement, Ed25519 signatures, AES-256-GCM AEAD, HKDF-SHA256. Lifted from snapclone-crypto, with a safe Rust API plus the original C-ABI surface."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# ── classical primitives ──────────────────────────────────────────────────────
+aes-gcm       = { version = "0.10", features = ["aes"] }
+x25519-dalek  = { version = "2",    features = ["static_secrets"] }
+ed25519-dalek = { version = "2",    features = ["rand_core"] }
+hkdf          = "0.12"
+sha2          = "0.10"
+# ── post-quantum KEM (hybrid) ─────────────────────────────────────────────────
+# ML-KEM-768 (FIPS 203), pure Rust, no_std-friendly. Same crate snapclone uses.
+fips203       = { version = "0.4",  default-features = false, features = ["ml-kem-768", "default-rng"] }
+# ── rng / hygiene ─────────────────────────────────────────────────────────────
+rand_core     = { version = "0.6",  features = ["getrandom"] }
+# pin getrandom < 0.3 to match rand_core 0.6 (the 0.4.x line wants edition2024)
+getrandom     = { version = "=0.2.15", features = ["std"] }
+zeroize       = { version = "1",    features = ["derive"] }
