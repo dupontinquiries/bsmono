@@ -1,0 +1,12 @@
+[package]
+name = "kitfinder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Structural clone miner for the monorepo: normalize functions to a rename-insensitive token stream, cluster exact (Type-2) and near-duplicate (MinHash/LSH) clones, and rank cross-crate duplication into shared-library (kit) extraction candidates. Zero-dependency (std only). Implements the token-stream half of the clone-mining design (Algorithm 1)."
+
+[[bin]]
+name = "kitfinder"
+path = "src/main.rs"
+
+[dependencies]
