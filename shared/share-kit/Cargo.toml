@@ -12,3 +12,4 @@ path = "src/lib.rs"
 snapcore = { path = "../snapcore" }
 crypto-kit = { path = "../crypto-kit" }
 sha2 = "0.10"
+core-kit = { path = "../core-kit" }

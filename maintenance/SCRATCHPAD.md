@@ -635,3 +635,39 @@ apps/rusty-board = latest broken HEAD; the 17 range-commits don't touch swipe.rs
 recognizer.rs by name → inspect the whole gestures/ at the endpoints). FUTURE:
 recover core via bisect/diff; reusable primitive = a swipe/touch-kit (path→keys→
 words). NOT active now.
+
+---
+## core-kit v0.1 + first kit-to-kit repoint  (this session)
+
+[CODE] **shared/core-kit** v0.1 — zero-dep foundational leaf utilities, **12 tests
+--offline**. The BROADEST-reach duplication (most places, not biggest clones), per
+kitfinder: the LCG multiplier 1664525 appears 137×, splitmix constants dozens,
+now_secs/now_ms/now_nanos copied across 8+ crates, hex {:02x} loops in 4+.
+  - time.rs: now_secs/now_millis/now_nanos (SystemTime→UNIX_EPOCH, .unwrap_or(0)
+    clock-skew-safe; nanos is u128) + Stopwatch (monotonic Instant wrapper).
+  - hex.rs: encode (lowercase, table-driven) + decode (upper/lower, None on
+    odd-len/non-hex). The canonical {:02x}/from_str_radix replacement.
+  - rng.rs: SplitMix64 (the constants kitfinder/audio-kit/snapcore-sim all copy) —
+    next_u64/next_f64/next_bounded/shuffle. NON-crypto (keys → crypto-kit/net-kit).
+[STANCE] core-kit is the BOTTOM of the kit stack — pure, zero-dep, depended on even
+by other kits. rng adoption in EXISTING code is opt-in (swapping a PRNG changes its
+sequence; not a blind find-replace) — documented.
+
+[REPOINT — VERIFIED] Dogfooded: share-kit::keys dropped its private `hex` fn and now
+calls core_kit::hex::encode (added core-kit path dep). share-kit rebuilds, 7/7 still
+pass. FIRST cross-kit dependency — the stack is now a real DAG (share-kit →
+{snapcore, crypto-kit, core-kit}). Demonstrates the repoint pattern on code that
+actually builds in the sandbox (unlike the stale apps).
+
+[NOT churned, deliberately] kitfinder keeps its inline hex/splitmix (stays portable/
+standalone for export bundles); net-kit/audio-kit keep theirs for now (marginal
+dedup vs a new dep edge). More kit-to-kit dogfooding available but low-priority.
+
+[KIT STACK now] core-kit (foundation) · registry-kit · snapcore · crypto-kit ·
+net-kit · share-kit(→core) · audio-kit · voice-kit. 8 kits + kitfinder.
+
+NEXT candidates (open): the ESCAPING family is heterogeneous (percent=transport/
+net-kit; html/xml/toml/path=general text) → needs a where-does-it-live decision,
+not a quick build. App repoints are the remaining payoff but un-verifiable in
+sandbox (stale apps, heavy deps). voiceterm loop-trimmer off-by-one (found earlier)
+is a fix-at-source-when-repointing item.
