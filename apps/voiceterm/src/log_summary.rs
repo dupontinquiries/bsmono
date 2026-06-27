@@ -1272,9 +1272,7 @@ fn clean_summary_output(text: &str) -> String {
     s.trim().to_string()
 }
 
-fn epoch_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn epoch_secs() -> u64 { core_kit::time::now_secs() }
 
 #[cfg(test)]
 mod email_prompt_tests {

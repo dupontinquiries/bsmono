@@ -61,9 +61,7 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(Cache::new()))
 }
 
-fn now_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn now_secs() -> u64 { core_kit::time::now_secs() }
 
 /// Look up a cached response for `prompt`. Returns None if no entry
 /// exists. Updates last_used to keep LRU eviction current.

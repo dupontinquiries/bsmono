@@ -792,9 +792,7 @@ fn escape_field(s: &str) -> String {
     s.replace('\x1F', " ").replace('\n', " ").replace('\r', "")
 }
 
-fn epoch_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn epoch_secs() -> u64 { core_kit::time::now_secs() }
 
 /// Strip ANSI/VT escape sequences for clean output capture
 fn strip_ansi(s: &str) -> String {
