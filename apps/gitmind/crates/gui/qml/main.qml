@@ -102,6 +102,9 @@ ApplicationWindow {
 
         // ── Apps: version-pinned binaries ────────────────────────────
         Apps { id: apps }
+
+        // ── Deploy: discover devices, push the repo, make a launcher ──
+        Deploy { id: deploy }
     }
 
     footer: TabBar {
@@ -113,6 +116,7 @@ ApplicationWindow {
         TabButton { text: "branches" }
         TabButton { text: "view" }
         TabButton { text: "apps" }
+        TabButton { text: "deploy" }
     }
 
     // Drain checkpoints the background watcher recorded; update the timeline

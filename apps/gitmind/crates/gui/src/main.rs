@@ -28,6 +28,8 @@ use gitmind_core::watch::WatchPolicy;
 use gitmind_core::watch_session::WatchSession;
 
 // Embed the QML into the binary so the shipped GUI has no external files.
+mod deploy;
+
 qrc!(register_qml,
     "/" {
         "qml/main.qml",
@@ -37,6 +39,7 @@ qrc!(register_qml,
         "qml/Branches.qml",
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
+        "qml/Deploy.qml",
     },
 );
 
@@ -96,6 +99,12 @@ struct Backend {
     app_desktop: qt_method!(fn(&self, name: QString, label: QString, terminal: bool) -> QString),
     app_remove: qt_method!(fn(&self, name: QString, label: QString) -> QString),
     app_install: qt_method!(fn(&self, name: QString, path: QString, label: QString, commit: QString) -> QString),
+
+    // ── deploy: discover SSH devices, browse + push the repo, remote build + .desktop ──
+    discover_devices: qt_method!(fn(&self, subnet: QString) -> QString),
+    list_remote_dirs: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    push_repo: qt_method!(fn(&self, user: QString, host: QString, dir: QString) -> QString),
+    deploy_app: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
 
     session: WatchSession,
 }
@@ -611,6 +620,50 @@ impl Backend {
         let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
         match native::apply_patch_to_dir(&text.to_string(), r.root()) {
             Ok(n) => QString::from(json!({"ok": true, "applied": n}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    // ── deploy ───────────────────────────────────────────────────────────
+    /// Scan the LAN for hosts with SSH open. `subnet` empty = auto-detect /24.
+    /// Synchronous: blocks ~1–2s while the /24 is probed (64 threads, 300ms each).
+    fn discover_devices(&self, subnet: QString) -> QString {
+        let prefix = subnet.to_string();
+        let prefix = if prefix.trim().is_empty() {
+            match deploy::local_subnet24() {
+                Some(p) => p,
+                None => return err_json("could not detect the local subnet — type one like 192.168.1"),
+            }
+        } else { prefix.trim().to_string() };
+        let devices = deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
+        let arr: Vec<_> = devices.iter()
+            .map(|d| json!({"ip": d.ip, "hostname": d.hostname}))
+            .collect();
+        QString::from(json!({"ok": true, "subnet": prefix, "devices": arr}).to_string())
+    }
+
+    /// List subdirectories of `path` on the device — drives the folder picker.
+    fn list_remote_dirs(&self, user: QString, host: QString, path: QString) -> QString {
+        match deploy::list_remote_dirs(&user.to_string(), &host.to_string(), &path.to_string()) {
+            Ok((pwd, dirs)) => QString::from(json!({"ok": true, "path": pwd, "dirs": dirs}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// rsync the monorepo working tree (this repo) to `dir` on the device.
+    fn push_repo(&self, user: QString, host: QString, dir: QString) -> QString {
+        let root = match repo() { Ok(r) => r.root().to_string_lossy().into_owned(), Err(e) => return err_json(&e) };
+        match deploy::push_repo(&root, &user.to_string(), &host.to_string(), &dir.to_string()) {
+            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// On the device: build `app` from the pushed tree and install it with a
+    /// .desktop launcher (shows up on Plasma Mobile). Blocks for the remote build.
+    fn deploy_app(&self, user: QString, host: QString, dir: QString, app: QString) -> QString {
+        match deploy::deploy_app(&user.to_string(), &host.to_string(), &dir.to_string(), &app.to_string()) {
+            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
             Err(e) => err_json(&e),
         }
     }
