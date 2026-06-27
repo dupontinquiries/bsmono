@@ -1,0 +1,11 @@
+[package]
+name = "core-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The foundational leaf utilities the monorepo re-implements everywhere: UNIX/monotonic time helpers, hex encode/decode, and a deterministic SplitMix64 PRNG. Zero-dependency (std only). The bottom of the kit stack — even the other shared kits reach for these."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

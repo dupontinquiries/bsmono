@@ -19,14 +19,6 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
-}
-
 /// Map a logical name to a keyspace point: the first 160 bits of its SHA-256.
 fn key_of(name: &str) -> Key {
     let h = sha256(name.as_bytes());
@@ -37,7 +29,7 @@ fn key_of(name: &str) -> Key {
 
 /// The lowercase-hex SHA-256 content id of a blob (its name in the BLOB bucket).
 pub fn content_hash(blob: &[u8]) -> String {
-    hex(&sha256(blob))
+    core_kit::hex::encode(&sha256(blob))
 }
 
 /// The per-epoch FEED bucket key for `<namespace>:<id>:<epoch>`.

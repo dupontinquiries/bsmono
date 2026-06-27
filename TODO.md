@@ -14,10 +14,19 @@ Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
 | share-kit | the MAILBOX over snapcore + crypto-kit (DHT-as-host two-layer) | ✅ v0.1, 7 tests |
 | audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
 | voice-kit | whisper post-proc: hallucination filtering (union) + ggml model resolution | ✅ v0.1, 10 tests |
+| core-kit | foundational leaf utils: time / hex / rng (SplitMix64) | ✅ v0.1, 12 tests; share-kit repointed |
 
 All build & test `--offline` (crypto-kit/share-kit need the cached crates.io deps).
 
 ## In-flight / next on the kits
+
+- [x] core-kit dogfooded: share-kit hex → core_kit::hex (first kit-to-kit dep, verified).
+- [ ] More kit-to-kit dogfooding (opt-in, low-priority): net-kit::auth hex,
+      crypto-kit hex → core-kit; audio-kit::gen RNG → core_kit::rng (changes noise
+      sequence — fine, but opt-in). kitfinder stays standalone (portable export).
+- [ ] ESCAPING family — needs a home decision: percent-escape is transport
+      (net-kit::wire, already there); html/xml/toml/path are general text (core-kit
+      `escape` module? a text-kit?). Heterogeneous — design before building.
 
 - [ ] **net-kit growth**: generic UDP transport (abstract enlist's `UdpTransport`
       over `wire` encode/decode); then the Transport-trait question as an explicit
