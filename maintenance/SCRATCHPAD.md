@@ -703,3 +703,41 @@ integration surface compiles; user builds+runs the apps via GUI to confirm the r
 file, not a module → place to fix the loop-trimmer off-by-one at source); unendlich
 worldgen RNG → core_kit::rng (opt-in, changes sequence); the scattered now_ms/hex
 app copies → core-kit. Plus the only-in-monorepo reconcile (SISTER_STATUS.md).
+
+---
+## Build / deploy phase — kickoff  (this session)
+
+Moving from kits → builds/integration/deploy. Existing infra found (good shape):
+build/build.sh (manifest-driven cross-target orchestrator, plan-or-run),
+build/flatpak.sh (flatpak plan stub), verify.sh (rustcheck + coarse wiring
+suspenders), manifest/{projects,targets}.toml.
+
+[FIXED] projects.toml only had registry-kit under [shared.*] — registered the other
+7 kits (core/snapcore/crypto/net/share/audio/voice), all kind=cargo role=shared-lib,
+targets desktop/phone/x86/alpine (pure Rust → cross-clean). Verified core/net/audio/
+voice build through `build/build.sh --run` on the host (sandbox host = x86_64-gnu, so
+they build for the x86 target here; on the user's Asahi box they'll build desktop).
+
+[NEW] build/deploy.sh + manifest/fleet.toml — deploy phone builds to the FP5 fleet
+VIA GITMIND. Model: gitmind is gate + distribution. `gin check` records green per
+commit; deploy ships a green commit; device activates via `gin app build|install
+--commit C --target phone --use --desktop`. Two per-app modes: build (phone builds
+natively, aarch64, no cross sysroot) | pin (desktop cross-builds aarch64-musl, gin
+app install pins the binary). Plan-printing stub (consistent with build/flatpak);
+real run needs fleet SSH + a green commit. fleet.toml is a template (placeholder
+device addresses).
+
+[COMPLETENESS] Sync (55fa049) captured ALL sister work incl. GUI: bo-suite controller
+QML, gitmind Apps.qml + peek crate, logscope anamorph prototypes, unendlich shaders +
+WorldSession, voiceterm mail, snapclone C++ mid-call/tiling UI. NOT in this hand-off:
+ambient-learner, av1tuner, bot-arena, photosync (sit at prior state).
+
+[RECONCILE] gitmind's synced crates/peek == canonical tools/peek (v0.2.0, byte-id) →
+gitmind should path-dep tools/peek instead of carrying a copy (dedup follow-up).
+
+NEXT (build/integration/deploy roadmap):
+- cross sysroots: `rustup target add aarch64-unknown-linux-musl` + musl linker for the
+  phone target; then build/build.sh --run can actually cross-build (currently plans).
+- flatpak.sh: resolve runtime=tbd (av1tuner, gitmind), wire flatpak-cargo-generator.
+- deploy.sh --run once fleet addresses + mode decided per app.
+- follow-up repoints (voiceterm voice.rs hallucination; unendlich RNG; now_ms/hex sweep).
