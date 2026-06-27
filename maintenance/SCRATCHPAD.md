@@ -659,9 +659,12 @@ pass. FIRST cross-kit dependency — the stack is now a real DAG (share-kit →
 {snapcore, crypto-kit, core-kit}). Demonstrates the repoint pattern on code that
 actually builds in the sandbox (unlike the stale apps).
 
-[NOT churned, deliberately] kitfinder keeps its inline hex/splitmix (stays portable/
-standalone for export bundles); net-kit/audio-kit keep theirs for now (marginal
-dedup vs a new dep edge). More kit-to-kit dogfooding available but low-priority.
+[REPOINTED — all verified] net-kit::auth hex → core_kit::hex (22 tests pass);
+audio-kit::gen Noise LCG → core_kit::rng::SplitMix64 (25 tests pass; noise quality
+improved, API unchanged, tests check properties not exact values). So THREE kits now
+build on core-kit (share/net/audio) — every kit-internal hex/rng copy is gone; the
+remaining copies live only in the (un-sandbox-buildable) apps. kitfinder keeps its
+inline hex/splitmix on purpose (stays portable/standalone for export bundles).
 
 [KIT STACK now] core-kit (foundation) · registry-kit · snapcore · crypto-kit ·
 net-kit · share-kit(→core) · audio-kit · voice-kit. 8 kits + kitfinder.

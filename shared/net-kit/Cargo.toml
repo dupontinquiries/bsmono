@@ -10,3 +10,4 @@ path = "src/lib.rs"
 
 # Zero dependencies — std only. Builds offline; links into every target (incl. musl/no-alloc-light).
 [dependencies]
+core-kit = { path = "../core-kit" }
