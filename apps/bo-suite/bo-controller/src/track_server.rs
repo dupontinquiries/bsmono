@@ -246,7 +246,7 @@ fn random_token() -> String {
             *b = (now >> (i * 4)) as u8;
         }
     }
-    buf.iter().map(|b| format!("{:02x}", b)).collect()
+    core_kit::hex::encode(&buf)
 }
 
 fn run_listener(listener: TcpListener, routes: RouteTable) {
