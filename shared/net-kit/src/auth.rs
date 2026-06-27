@@ -23,14 +23,6 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for x in b {
-        s.push_str(&format!("{x:02x}"));
-    }
-    s
-}
-
 /// A random 32-byte token as a 64-char hex string. Uses OS entropy
 /// (`/dev/urandom`); falls back to a time/pid mix only if that's unavailable
 /// (weaker — note it in logs). For cryptographic keys use `crypto-kit`; this is
@@ -39,7 +31,7 @@ pub fn generate_key() -> String {
     let mut buf = [0u8; 32];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
         if f.read_exact(&mut buf).is_ok() {
-            return hex(&buf);
+            return core_kit::hex::encode(&buf);
         }
     }
     let mut s = std::time::SystemTime::now()
@@ -53,7 +45,7 @@ pub fn generate_key() -> String {
         s ^= s << 17;
         *b = s as u8;
     }
-    hex(&buf)
+    core_kit::hex::encode(&buf)
 }
 
 /// The set of accepted tokens. Empty keyring = OPEN (no auth).

@@ -9,3 +9,4 @@ description = "Shared DSP primitives for the monorepo: signal level (RMS/peak/dB
 path = "src/lib.rs"
 
 [dependencies]
+core-kit = { path = "../core-kit" }

@@ -55,7 +55,7 @@ impl Tone {
 /// the sum approximates 1/f spectral density. Deterministic for a given seed.
 #[derive(Clone, Debug)]
 pub struct Noise {
-    rng: u32,
+    rng: core_kit::rng::SplitMix64,
     pink_rows: [f32; 5],
     pink_counter: u32,
 }
@@ -63,12 +63,12 @@ pub struct Noise {
 impl Noise {
     /// New generator seeded with `seed` (forced non-zero).
     pub fn new(seed: u32) -> Self {
-        Self { rng: seed | 1, pink_rows: [0.0; 5], pink_counter: 0 }
+        Self { rng: core_kit::rng::SplitMix64::new((seed | 1) as u64), pink_rows: [0.0; 5], pink_counter: 0 }
     }
     /// Next white-noise sample in `[-1, 1]`.
     pub fn next_white(&mut self) -> f32 {
-        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
-        (self.rng as i32 as f32) / (i32::MAX as f32)
+        // splitmix64 f64 in [0,1) mapped to [-1, 1)
+        self.rng.next_f64() as f32 * 2.0 - 1.0
     }
     /// Next pink-noise sample in ~`[-1, 1]` (Voss-McCartney, 5 rows, normalized).
     pub fn next_pink(&mut self) -> f32 {
