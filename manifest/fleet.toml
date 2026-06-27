@@ -1,28 +1,25 @@
 # manifest/fleet.toml — the Fairphone 5 fleet (postmarketOS / Alpine, aarch64-musl).
 #
-# Read by build/deploy.sh. Fill in real device addresses (these are placeholders).
-# Per-device fields:
-#   host   pmOS sshd address (IP or .local mDNS name) reachable from the build host
+# Read by build/deploy.sh. Fill in real addresses (these are placeholders).
+#   host   pmOS sshd address (IP or .local mDNS) reachable from the laptop
 #   user   ssh user on the device
-#   mode   build | pin
-#            build = phone pulls the green commit and builds natively (no cross sysroot)
-#            pin   = desktop cross-builds aarch64-musl, `gin app install` pins the binary
-#   apps   which phone-target projects to deploy here (must have target=phone in projects.toml:
-#            unendlich, voiceterm, ambient-learner, snapclone, photosync)
-#   repo   path to the monorepo checkout on the device (for the `git checkout <green>` hop)
+#   mode   build | cross
+#            build = phone pulls the commit and builds natively (the realistic path
+#                    for GUI apps — postmarketOS has Qt6/GTK4/Mesa as apk packages)
+#            cross = laptop cross-builds aarch64-musl, scp + gin app install
+#                    (only works for PURE-RUST apps with no C deps: gin, peek)
+#   repo   path to the monorepo checkout on the device (for the git checkout hop)
 
 [fleet.fp5-1]
 host  = "fp5-1.local"          # TODO: real IP/mDNS
 user  = "user"
-mode  = "build"
-apps  = ["voiceterm", "ambient-learner"]
+mode  = "build"                # GUI apps build on the phone
 repo  = "~/monorepo"
-notes = "daily driver — light apps, build on device"
+notes = "daily driver"
 
 [fleet.fp5-2]
 host  = "fp5-2.local"          # TODO: real IP/mDNS
 user  = "user"
-mode  = "pin"                  # heavy GPU engine → cross-build + pin (once a musl sysroot exists)
-apps  = ["unendlich"]
+mode  = "build"                # set to "cross" only for pure-Rust tools (gin/peek)
 repo  = "~/monorepo"
-notes = "test/gaming unit"
+notes = "test unit"
