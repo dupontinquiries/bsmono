@@ -1,0 +1,12 @@
+[package]
+name = "net-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared transport-protocol primitives for the monorepo: LAN shared-token auth (constant-time), a percent-escaped line/datagram wire codec, dependency-free JSON field extraction, and a minimal HTTP/1.1 client. Zero-dependency (std only) — the common plumbing beneath the various app Transport traits (snapcore DHT RPC, logscope fleet bus, photosync/netserve HTTP)."
+
+[lib]
+path = "src/lib.rs"
+
+# Zero dependencies — std only. Builds offline; links into every target (incl. musl/no-alloc-light).
+[dependencies]
