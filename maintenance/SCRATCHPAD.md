@@ -570,3 +570,31 @@ cross-cutting primitives) — own crate or shared module, app-local. Possible
 audio-kit additions if they recur: zero-crossing rate (podcast_diar has it, a VAD
 feature), a generalized harmonic-ratio (bo's engine_timbre_score, pure-on-goertzel
 → voicing detection), biquad filters.
+
+---
+## CORRECTION + rusty-board ingested  (this session)
+
+[FIX] I conflated two apps. **bo-suite = the SPEAKER-CONTROL app** (the cancellers/
+masker/beeper/Goertzel = audio-kit consumers). **rusty-board = a SEPARATE app: a
+GTK4/libadwaita on-screen VOICE KEYBOARD** (Gboard-style swipe typing + whisper-rs
+voice input, Wayland layer-shell, D-Bus). Earlier audio-kit notes/commits that say
+"rusty-board (bo-suite)" mean bo-suite. audio-kit lib.rs doc fixed.
+
+[INGEST] **apps/rusty-board** added to the monorepo (was standalone, not in the
+tree). 54 rs files. Structure: gestures/ (the swipe engine — adaptive_dictionary,
+ai_swipe, boundary, cardinal 49K, hitbox_nudger, llm_swipe, ngram, recognizer 41K,
+swipe 45K — speed-aware path→word decoding, Damerau-Levenshtein, n-grams, velocity
+pivots), voice/ (whisper: recorder/transcriber/service/hallucination/readiness),
+plus ui/ keyboard/ layouts/ steno/ llm/ ipc/(D-Bus) compositor/ config/. GTK4 deps
+→ won't build in sandbox (system libs); ingest+survey only.
+
+[AUDIO-KIT CONSUMER] voice/recorder.rs `current_level()`/`level_meter()` =
+mic-level metering (audio-kit::level). VAD/voicing gating on whisper input →
+level::rms + pitch. Modest but real — rusty-board joins the audio-kit consumer set
+(voice-input side, distinct from bo-suite's speaker-output DSP).
+
+[FLAG] rusty-board's swipe gestures are BROKEN (per user). The engine is large
+(~100K of gestures/) and speed-aware (stop-velocity thresholds, velocity-minima
+pivots = deliberate letter stops). Symptom not yet specified — need the failure
+mode before diving. Candidate future: a voice-kit shared by rusty-board + voiceterm
+(both whisper voice apps).

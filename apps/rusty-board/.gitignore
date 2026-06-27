@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Models (large binary files)
+resources/models/*.bin
+resources/models/*.gguf
+
+# Build artifacts
+*.log
+*.tmp

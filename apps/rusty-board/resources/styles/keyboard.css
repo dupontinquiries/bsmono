@@ -1,0 +1,849 @@
+/* ============================================================
+   RustyBoard — keyboard.css
+   GTK4 / libadwaita styling with slick keyboard aesthetics.
+   ============================================================ */
+
+/* Root background — the keyboard surface. We pull from libadwaita's
+   semantic colors so it adapts to light/dark themes automatically.
+   Padding shrunk from 8px to 4px for 300%-scaled phone displays
+   where every logical px is 3 actual px on screen. */
+.keyboard-view {
+    background: alpha(@view_bg_color, var(--rb-keyboard-opacity, 0.95));
+    border-radius: 16px 16px 0 0;
+    padding: 4px;
+    transition: background-color 250ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* Each row of keys */
+.keyboard-row {
+    margin: 1px 0;
+}
+
+/* ------------------------------------------------------------
+   Suggestion bar (the word ribbon above the keyboard)
+   ------------------------------------------------------------ */
+.suggestions-bar {
+    padding: 2px 4px;
+    border-bottom: 1px solid alpha(@borders, 0.3);
+}
+
+.suggestion-pill {
+    background: transparent;
+    border: none;
+    border-radius: 12px;
+    padding: 4px 10px;
+    font-size: 13px;
+    color: @window_fg_color;
+    transition: background-color 150ms ease-out;
+}
+
+.suggestion-pill:hover {
+    background: alpha(@window_fg_color, 0.08);
+}
+
+.suggestion-pill:active {
+    background: alpha(var(--rb-accent), 0.15);
+}
+
+/* ------------------------------------------------------------
+   Key buttons — base style.
+   min-height shrunk from 50 to 44px so a 4-row keyboard fits
+   in ~200 logical px (= ~600 actual px at 300% scaling), which
+   is roughly 25% of a typical 800-tall phone display.
+   ------------------------------------------------------------ */
+.key-button {
+    background: alpha(@card_bg_color, 0.9);
+    border: 1px solid alpha(@borders, 0.4);
+    border-radius: var(--rb-key-radius, 8px);
+    padding: 2px;
+    margin: 0;
+    min-height: 44px;
+    font-weight: 500;
+    box-shadow: 0 1px 2px alpha(black, 0.1);
+    /* Animations: snappy press feedback (~60ms), bouncy release
+       (~160ms cubic-bezier overshoot). The "transform" axis carries
+       the press-pulse — :active scales down to 0.94, then springs
+       back to 1.0 on release thanks to the eased cubic-bezier. */
+    transition:
+        background-color 60ms ease-out,
+        transform 160ms cubic-bezier(0.34, 1.56, 0.64, 1),
+        border-color 100ms ease-out,
+        box-shadow 80ms ease-out;
+}
+
+.key-button:hover {
+    background: alpha(@card_bg_color, 1.0);
+    box-shadow: 0 2px 4px alpha(black, 0.15);
+}
+
+.key-button:active,
+.key-button.pressed {
+    background: alpha(var(--rb-accent), 0.4);
+    border-color: alpha(var(--rb-accent), 0.7);
+    transform: scale(0.94);
+    box-shadow: 0 0 0 alpha(black, 0);
+    /* Snappier press-down (don't wait for the bouncy curve). */
+    transition:
+        background-color 30ms ease-out,
+        transform 60ms ease-out,
+        border-color 40ms ease-out,
+        box-shadow 30ms ease-out;
+}
+
+.key-label {
+    font-size: 16px;
+    color: @window_fg_color;
+}
+
+/* ------------------------------------------------------------
+   Key type variants
+   ------------------------------------------------------------ */
+.key-modifier {
+    background: alpha(@window_fg_color, 0.06);
+    color: @window_fg_color;
+    font-weight: 600;
+}
+
+.key-modifier:hover {
+    background: alpha(@window_fg_color, 0.10);
+}
+
+.key-action {
+    background: alpha(var(--rb-accent), 0.85);
+    color: white;
+    font-weight: 600;
+}
+
+.key-action:hover {
+    background: var(--rb-accent);
+}
+
+.key-action:active {
+    background: shade(var(--rb-accent), 0.8);
+}
+
+.key-special {
+    background: alpha(@window_fg_color, 0.04);
+    color: alpha(@window_fg_color, 0.85);
+}
+
+/* Shift key — visually distinct when active or locked */
+.key-modifier.shift-active {
+    background: alpha(var(--rb-accent), 0.25);
+    color: var(--rb-accent);
+    border-color: alpha(var(--rb-accent), 0.5);
+}
+
+.key-modifier.shift-locked {
+    background: var(--rb-accent);
+    color: white;
+    box-shadow:
+        inset 0 0 0 2px alpha(white, 0.2),
+        0 0 12px alpha(var(--rb-accent), 0.4);
+}
+
+/* ------------------------------------------------------------
+   Voice key — recording indicator
+   ------------------------------------------------------------ */
+.key-special.voice-active {
+    background: #e01b24;
+    color: white;
+    box-shadow:
+        0 0 16px alpha(#e01b24, 0.6),
+        inset 0 0 0 2px alpha(white, 0.3);
+    animation: voice-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes voice-pulse {
+    0%, 100% {
+        box-shadow:
+            0 0 16px alpha(#e01b24, 0.6),
+            inset 0 0 0 2px alpha(white, 0.3);
+    }
+    50% {
+        box-shadow:
+            0 0 24px alpha(#e01b24, 0.9),
+            inset 0 0 0 2px alpha(white, 0.5);
+    }
+}
+
+/* ------------------------------------------------------------
+   Swipe trail — drawn over the keyboard during a swipe gesture
+   ------------------------------------------------------------ */
+.swipe-trail {
+    /* The actual trail is rendered via Cairo in `swipe_trail.rs`. This
+       class exists so users can target the layer for transparency or
+       blend-mode tweaks. We also disable picking via `can-target=false`
+       in code so the trail never steals events from the keys below. */
+    background: transparent;
+}
+
+/* ------------------------------------------------------------
+   Long-press popover
+   ------------------------------------------------------------ */
+.extended-keys-popover {
+    background: @popover_bg_color;
+    border-radius: 12px;
+    padding: 4px;
+    box-shadow: 0 8px 24px alpha(black, 0.3);
+    /* Scale + fade-in when the popover appears. GTK4 doesn't run
+       animations on popovers natively, but this CSS will at least
+       affect the opening if the popover is shown via fade. */
+    transition:
+        transform 180ms cubic-bezier(0.34, 1.56, 0.64, 1),
+        opacity 140ms ease-out;
+}
+
+.extended-keys-popover .key-button {
+    min-width: 44px;
+    margin: 1px;
+}
+
+/* ------------------------------------------------------------
+   Magnifier (key preview on press) — slightly larger pop with
+   a soft shadow that scales with the press depth.
+   ------------------------------------------------------------ */
+.key-magnifier {
+    background: @card_bg_color;
+    border: 1px solid alpha(@borders, 0.4);
+    border-radius: 12px;
+    padding: 6px 14px;
+    box-shadow: 0 4px 12px alpha(black, 0.25);
+    font-size: 28px;
+    font-weight: 500;
+    transition:
+        transform 120ms cubic-bezier(0.34, 1.56, 0.64, 1),
+        opacity 90ms ease-out;
+}
+
+/* ------------------------------------------------------------
+   Settings panel — smooth slide-in via opacity/transform.
+   GTK4 ToolbarView swap doesn't animate by default; if we
+   wrap content in a transition-capable class we can at least
+   fade-cross.
+   ------------------------------------------------------------ */
+.settings-panel {
+    transition: opacity 180ms ease-out;
+}
+
+.settings-panel.entering {
+    opacity: 0;
+}
+
+/* Shift-key state transitions */
+.key-modifier.shift-active,
+.key-modifier.shift-locked {
+    transition:
+        background-color 140ms ease-out,
+        color 140ms ease-out,
+        box-shadow 200ms ease-out;
+}
+
+/* ------------------------------------------------------------
+   Microterm — glanceable-info strip above the keyboard rows.
+   Shown by gtk4::Revealer (slide-down) when content is set.
+   Should look subtle and not steal attention from typing.
+   ------------------------------------------------------------ */
+.microterm {
+    background: alpha(@card_bg_color, 0.6);
+    border-bottom: 1px solid alpha(@borders, 0.25);
+}
+
+.microterm-status,
+.microterm-voice-partial,
+.microterm-placeholder {
+    font-size: 12px;
+    color: alpha(@window_fg_color, 0.85);
+    padding: 4px 8px;
+}
+
+.microterm-voice-partial {
+    font-style: italic;
+    color: alpha(@window_fg_color, 0.95);
+}
+
+.microterm-voice-meter trough {
+    background: alpha(@window_fg_color, 0.1);
+    border-radius: 4px;
+    min-height: 6px;
+}
+
+.microterm-voice-meter progress {
+    background: #e01b24;
+    border-radius: 4px;
+    min-height: 6px;
+}
+
+.microterm-placeholder {
+    opacity: 0.6;
+    font-family: monospace;
+}
+
+/* Voice word chips — draggable transcript fragments */
+.microterm-voice-chip {
+    background: alpha(@card_bg_color, 0.8);
+    border: 1px solid alpha(@borders, 0.35);
+    border-radius: 8px;
+    padding: 2px 4px;
+    transition: background 120ms ease-out, border-color 120ms ease-out;
+}
+
+.microterm-voice-chip:hover {
+    background: alpha(@accent_color, 0.18);
+    border-color: alpha(@accent_color, 0.6);
+}
+
+.microterm-voice-word {
+    font-size: 12px;
+    color: alpha(@window_fg_color, 0.92);
+    padding: 0 4px;
+}
+
+/* LLM prompt entry */
+.microterm-llm-entry {
+    min-height: 24px;
+    font-size: 13px;
+}
+
+/* TapHoldButton — ported from QML ToolBtn. Pill-shaped button with
+   a progress bar underneath that fills during a press-and-hold. */
+.tap-hold-button {
+    border-radius: 14px;
+    padding: 8px 14px;
+    background: alpha(@card_bg_color, 0.8);
+    border: 1px solid alpha(@borders, 0.3);
+    transition: background 100ms ease-out, border-color 100ms ease-out;
+}
+
+.tap-hold-button:hover {
+    background: alpha(@accent_color, 0.12);
+    border-color: alpha(@accent_color, 0.45);
+}
+
+.tap-hold-button:active {
+    background: alpha(@accent_color, 0.22);
+}
+
+.tap-hold-button.danger {
+    color: #e01b24;
+    border-color: alpha(#e01b24, 0.35);
+}
+
+.tap-hold-button.danger:hover {
+    background: alpha(#e01b24, 0.10);
+    border-color: alpha(#e01b24, 0.6);
+}
+
+.tap-hold-progress {
+    min-height: 3px;
+    margin: 0 6px 3px 6px;
+    opacity: 0.95;
+}
+
+.tap-hold-progress trough {
+    background: transparent;
+    min-height: 3px;
+}
+
+.tap-hold-progress progress {
+    background: @accent_color;
+    border-radius: 2px;
+    min-height: 3px;
+}
+
+.tap-hold-button.danger ~ .tap-hold-progress progress,
+.tap-hold-progress.danger progress {
+    background: #e01b24;
+}
+
+/* Microterm cancel button — ✕ at the right edge */
+.microterm-cancel {
+    background: transparent;
+    border: none;
+    color: alpha(@window_fg_color, 0.5);
+    font-size: 14px;
+    padding: 2px 8px;
+    min-width: 20px;
+    min-height: 20px;
+    border-radius: 10px;
+}
+
+.microterm-cancel:hover {
+    background: alpha(#e01b24, 0.15);
+    color: #e01b24;
+}
+
+.microterm-cancel:active {
+    background: alpha(#e01b24, 0.25);
+}
+
+/* Voice / LLM key icons — bundled SVGs, rendered grayscale.
+   currentColor on the SVG paths means CSS color drives the tint. */
+.key-icon {
+    color: alpha(@window_fg_color, 0.7);
+    -gtk-icon-style: symbolic;
+}
+
+.key-button:hover .key-icon {
+    color: alpha(@window_fg_color, 0.9);
+}
+
+.key-button:active .key-icon,
+.key-button:checked .key-icon {
+    color: @accent_color;
+}
+
+/* Voice key icon — slightly desaturated by default; turns red
+   when recording (a future Recording state could add a CSS
+   class to drive this). */
+.key-icon-voice {
+    color: alpha(@window_fg_color, 0.75);
+}
+
+/* Magic / LLM key icon — leans slightly toward the accent so
+   users notice the AI feature. */
+.key-icon-magic {
+    color: alpha(@window_fg_color, 0.7);
+}
+
+/* Settings panel compact mode — narrower, smaller widgets,
+   denser layout. Applied via the .settings-compact class on
+   the panel root, scoping the smaller styles only here. */
+.settings-compact {
+    font-size: 12px;
+}
+
+.settings-compact .heading {
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.settings-compact label.caption {
+    font-size: 10px;
+    opacity: 0.7;
+}
+
+.settings-compact button {
+    padding: 4px 10px;
+    min-height: 24px;
+    min-width: 0;
+    border-radius: 8px;
+    font-size: 11px;
+}
+
+.settings-compact button.pill {
+    padding: 3px 8px;
+    border-radius: 999px;
+}
+
+.settings-compact button.settings-done {
+    padding: 4px 12px;
+    font-weight: 600;
+}
+
+/* gtk4::Scale slider trough and slider handle */
+.settings-compact scale {
+    min-height: 20px;
+    margin: 0;
+}
+
+.settings-compact scale trough {
+    min-height: 4px;
+}
+
+.settings-compact scale slider {
+    min-width: 16px;
+    min-height: 16px;
+    margin: -7px;
+}
+
+.settings-compact entry {
+    min-height: 24px;
+    padding: 3px 8px;
+    font-size: 12px;
+}
+
+/* Section dividers more subtle */
+.settings-compact label.section-header {
+    font-size: 11px;
+    font-weight: 700;
+    opacity: 0.6;
+    margin-top: 6px;
+    margin-bottom: 2px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* TapHoldButton in settings — shrink */
+.settings-compact .tap-hold-button {
+    padding: 4px 10px;
+    min-height: 26px;
+    font-size: 11px;
+    border-radius: 8px;
+}
+
+.settings-compact .tap-hold-progress {
+    min-height: 2px;
+    margin: 0 4px 1px 4px;
+}
+
+
+/* Canvas overlay — shown when the character-draw canvas is open
+   (user swiped up on space). Side buttons let the user
+   confirm/cancel without long-pressing space. The middle area
+   is left transparent so the strokes (drawn via the swipe trail)
+   are visible over the dimmed keyboard. */
+.canvas-overlay {
+    /* Dim the keyboard behind the canvas so the user sees this
+       is a modal-ish mode. Not fully opaque — the user still
+       wants to see the keys as a positional reference while
+       drawing. */
+    background: alpha(black, 0.35);
+}
+
+.canvas-overlay .canvas-cancel {
+    background: alpha(@destructive_color, 0.85);
+    color: white;
+    font-size: 20px;
+    font-weight: 700;
+    border-radius: 24px;
+    border: 2px solid alpha(white, 0.4);
+    padding: 0;
+}
+
+.canvas-overlay .canvas-cancel:active {
+    background: @destructive_color;
+}
+
+.canvas-overlay .canvas-confirm {
+    background: alpha(@accent_color, 0.9);
+    color: white;
+    font-size: 20px;
+    font-weight: 700;
+    border-radius: 24px;
+    border: 2px solid alpha(white, 0.4);
+    padding: 0;
+}
+
+.canvas-overlay .canvas-confirm:active {
+    background: @accent_color;
+}
+
+/* Glass effect — applied via `.glass-keyboard` CSS class when the
+   user enables it in settings. Aims for a restrained, professional
+   look in the style of macOS Sonoma's window vibrancy or iOS
+   Control Center — NOT layered gradients with sheen on every
+   surface.
+
+   ## Mobile performance considerations
+
+   This stylesheet ran into noticeable lag on Plasma Mobile / FP5.
+   Several pieces contributed:
+
+   1. backdrop-filter blur(30px) — GTK4 doesn't support backdrop-
+      filter natively, but on any renderer that DID partially honor
+      it, a 30px Gaussian blur is fatal on Snapdragon 7+ Gen 1
+      without working GPU offload (~60ms+ per frame).
+   2. Low alpha values (0.55 on keyboard, 0.45 on keys) forced full
+      alpha-compositing against the wallpaper every frame. Stacking
+      transparencies multiplies the cost: each semi-transparent
+      layer becomes another compositing pass.
+   3. transition: background-color on glass keys STACKED on top of
+      the base key's four transitions (bg + transform + border +
+      shadow), giving five simultaneous animations per tap. Each
+      animation = multiple repaint frames before settle.
+   4. inset box-shadow on both the keyboard root AND every key
+      forced offscreen compositing passes per shadow.
+
+   The rewrite below preserves the glass feel (subtle translucency,
+   uniform tint, hairline highlight) while drastically reducing
+   per-frame work:
+     - No backdrop-filter (was a no-op anyway in GTK4)
+     - Higher alphas (less compositing)
+     - No transitions on glass keys (instant press feedback)
+     - Borders instead of inset shadows
+*/
+
+.glass-keyboard {
+    /* Higher alpha than before (0.85 vs 0.55) for less compositing
+       cost. Still subtly translucent — the wallpaper hints
+       through — but not so transparent that GTK has to fully
+       alpha-blend the entire keyboard surface every frame. This
+       is the single biggest performance win in the rewrite. */
+    background: alpha(@view_bg_color, 0.85);
+    /* Single 1px highlight on the top edge — the "light catching
+       the bevel" cue. A border draws in one pass; inset box-shadow
+       requires offscreen compositing.  */
+    border-top: 1px solid alpha(white, 0.12);
+    /* Suppress the inherited 250ms background-color transition
+       from .keyboard-view. Theme switches and layout transitions
+       fire this animation across the entire keyboard surface;
+       on mobile that's a heavy ~15-frame full-surface
+       repaint queue. Instant cuts feel snappier in glass mode
+       and remove the cost entirely. */
+    transition: none;
+}
+
+.glass-keyboard .key-button {
+    /* Flat key surface with higher alpha (0.78 vs 0.45). The
+       alpha-stack used to be 0.45 × 0.55 = 0.247 effective opacity
+       per key against wallpaper, requiring two compositing passes.
+       Now it's 0.78 × 0.85 = 0.663, with each pass cheaper
+       because the alphas are higher. */
+    background: alpha(@card_bg_color, 0.78);
+    /* Hairline border — same trick as the keyboard top edge.
+       No inset shadow on each key — that was 30 extra offscreen
+       passes per repaint. */
+    border: 1px solid alpha(@borders, 0.35);
+    color: @window_fg_color;
+    box-shadow: none;
+    /* INSTANT press feedback. No transition.
+
+       Pre-fix: glass keys had `transition: background-color 80ms`
+       which stacked on top of the base .key-button's four
+       transitions (bg, transform, border, shadow). Five
+       simultaneous animations per tap meant ~10 repaint frames
+       before each press settled — multiplied by 30 keys when the
+       user typed quickly, the renderer was overwhelmed.
+
+       Removing the transition entirely means a tap = one repaint
+       (color flips). The visual feel is snappier rather than less
+       polished — instant feedback is what fast typing wants. */
+    transition: none;
+}
+
+.glass-keyboard .key-button:hover {
+    background: alpha(@card_bg_color, 0.88);
+}
+
+.glass-keyboard .key-button:active,
+.glass-keyboard .key-button.pressed {
+    /* Pressed: solid accent at moderate opacity. EXPLICITLY override
+       every animatable property from the base .key-button:active —
+       without this, the base rule's `transform: scale(0.94)`,
+       `border-color`, `box-shadow`, and 4-property `transition`
+       cascade through to glass keys because the glass selector
+       only overrides properties it sets, and unset ones inherit.
+       The result was glass keys still running a transform animation
+       + a 4-property transition queue on every press, which was the
+       single largest remaining per-tap cost on mobile. Pure color-
+       flip is one repaint with no animation. */
+    background: alpha(@accent_color, 0.75);
+    color: white;
+    transform: none;
+    border-color: alpha(@borders, 0.35);
+    box-shadow: none;
+    transition: none;
+}
+
+/* Modifier/special keys: subtly darker than letter keys for
+   distinguishability. */
+.glass-keyboard .key-modifier,
+.glass-keyboard .key-special {
+    background: alpha(@card_bg_color, 0.55);
+    border: 1px solid alpha(@borders, 0.30);
+}
+
+.glass-keyboard .key-modifier:hover,
+.glass-keyboard .key-special:hover {
+    background: alpha(@card_bg_color, 0.65);
+}
+
+/* Microterm strip stays opaque — text readability beats the
+   glass aesthetic there. Slightly higher alpha than pre-fix
+   (0.92 vs 0.88) to match the keyboard's new higher opacity. */
+.glass-keyboard .microterm {
+    background: alpha(@view_bg_color, 0.92);
+    border-top: 1px solid alpha(@borders, 0.30);
+}
+
+/* Stenotype layout — 4 buttons styled as approximated parallelograms.
+   The visible silhouette is suggested by asymmetric border-radius:
+   L-side buttons have rounded top-LEFT and bottom-RIGHT corners
+   (giving a `\` lean), R-side mirrored for `/`. Together: \\//.
+   
+   Real parallelograms would need a custom WidgetImpl::snapshot
+   override; this CSS-only approximation is good enough for v0 and
+   matches the visualizer's general shape language. */
+.key-steno {
+    background: linear-gradient(180deg, #2a2a2a 0%, #1f1f1f 100%);
+    border: 1px solid #3a3a3a;
+    color: #f1ebd8;
+    font-size: 22px;
+    font-weight: 600;
+}
+.key-steno:hover {
+    background: linear-gradient(180deg, #353535 0%, #2a2a2a 100%);
+}
+.key-steno:active,
+.key-steno.pressed {
+    background: @accent_color;
+    color: white;
+}
+/* Left-side steno buttons lean `\` — sharp top-right and bottom-left,
+   rounded top-left and bottom-right. */
+.key-steno-L {
+    border-radius: 24px 4px 24px 4px;
+}
+/* Right-side mirror — lean `/`. */
+.key-steno-R {
+    border-radius: 4px 24px 4px 24px;
+}
+
+/* ------------------------------------------------------------
+   Layout / page transition.
+   When the keyboard rebuilds (page switch letters↔symbols↔numbers,
+   mode change, shift state), `rebuild_view` adds `.kb-rebuilding`
+   to the keyboard-view for one frame, then removes it. The class
+   carries a from-state (slightly faded + nudged up); removing it
+   animates back to rest. GPU-cheap — only opacity + transform are
+   animated, both compositor-friendly. No layout reflow.
+
+   The effect reads as a quick "settle" — the new page eases in from
+   2px above at 0.6 opacity rather than hard-popping. Subtle on
+   purpose: 140ms is below the threshold where it feels sluggish but
+   above where it's invisible.
+   ------------------------------------------------------------ */
+.keyboard-view {
+    /* Add transform+opacity to the existing transition list so the
+       settle animates. (The base rule already transitions
+       background-color.) */
+    transition:
+        background-color 250ms cubic-bezier(0.4, 0, 0.2, 1),
+        opacity 140ms ease-out,
+        transform 140ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.keyboard-view.kb-rebuilding {
+    opacity: 0.6;
+    transform: translateY(-2px);
+}
+
+/* Per-key staggered settle is too expensive to orchestrate per
+   rebuild on the FP5 (would need N timeouts), so the whole-view
+   settle above is the chosen approach. If we later move to a
+   gtk::Stack we can use its native crossfade instead. */
+
+/* ------------------------------------------------------------
+   Commit flash — positive feedback when a word lands.
+   Added to a key (usually the spacebar) for one keyframe cycle by
+   `Animator::commit_flash`, then removed. A quick accent-tinted
+   glow that blooms and fades. Teaches the springboard mechanic
+   (swipe a word → space pulses) and gives the keyboard a sense of
+   responsiveness. Compositor-driven keyframe, no main-loop cost.
+   ------------------------------------------------------------ */
+.commit-flash {
+    animation: commit-flash-kf 360ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes commit-flash-kf {
+    0% {
+        box-shadow: 0 0 0 0 alpha(var(--rb-accent), 0.0);
+        background: alpha(var(--rb-accent), 0.0);
+    }
+    35% {
+        box-shadow: 0 0 12px 2px alpha(var(--rb-accent), 0.55);
+        background: alpha(var(--rb-accent), 0.30);
+    }
+    100% {
+        box-shadow: 0 0 0 0 alpha(var(--rb-accent), 0.0);
+        background: alpha(var(--rb-accent), 0.0);
+    }
+}
+
+/* ------------------------------------------------------------
+   Post-release key press pulse. Added to a key for one keyframe
+   cycle by `Animator::key_press_pulse` after the click handler
+   fires, then removed at 240ms. Mimics the previous adw::Spring
+   feedback (1.0 → 0.7 dip, bounce back, settle) but runs entirely
+   on the GTK compositor — no main-loop ticks, no per-frame Rust
+   callbacks. This is hit on every keypress so it's a per-character
+   perf path: typing at 5cps eliminates ~65 callbacks/sec vs the
+   old spring impl.
+   ------------------------------------------------------------ */
+.press-pulse {
+    animation: press-pulse-kf 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes press-pulse-kf {
+    0% {
+        opacity: 1.0;
+    }
+    18% {
+        opacity: 0.7;
+    }
+    55% {
+        opacity: 1.05;
+    }
+    100% {
+        opacity: 1.0;
+    }
+}
+
+/* ------------------------------------------------------------
+   Steno suggestion ribbon. Reuses the voice chip styles for the
+   candidate chips; these add the phoneme-buffer hint label and a
+   marker for vowel-fuzzy (approximate) candidates so the user can
+   tell an exact match from a best-guess.
+   ------------------------------------------------------------ */
+.microterm-steno-hint {
+    color: #807968;
+    font-family: monospace;
+    font-size: 12px;
+    margin-right: 4px;
+    opacity: 0.85;
+}
+.microterm-steno-fuzzy {
+    /* Vowel-approximate match — dimmer + italic so exact matches
+       read as the confident choice. */
+    font-style: italic;
+    opacity: 0.8;
+}
+
+/* ------------------------------------------------------------
+   Arcade-buffer keys: thin (0.33-unit-wide) flanks on either
+   side of the Dvorak spacebar. Visually distinctive so the
+   narrow hit area is findable; functionally Backspace (left)
+   and Return (right) at thumb-natural positions next to the
+   spacebar — like the side buttons on an arcade machine
+   flanking the main joystick.
+
+   Touch target is intentionally narrow (~20px on phone).
+   The accent-tinted border + smaller padding distinguishes
+   them from the neighboring full-width keys so the thumb can
+   land on the right one without precision.
+
+   The keys still use the standard `.key-button` press / state
+   animations (press-pulse, :active scale) so they feel like
+   normal keys when tapped — only the resting visual is
+   different.
+   ------------------------------------------------------------ */
+.arcade-buffer {
+    /* Accent-tinted border + faint accent background so the
+       narrow strip reads as a distinct touch target rather
+       than empty space between the larger neighbors. */
+    background: alpha(var(--rb-accent), 0.10);
+    border: 1px solid alpha(var(--rb-accent), 0.55);
+    /* Tighter horizontal padding — at 0.33 unit width there's
+       no room for the default ~8px side padding without
+       clipping the glyph. */
+    padding-left: 0;
+    padding-right: 0;
+    /* Slightly thicker vertical padding so the buffer reads as
+       slightly taller than its actual row height when seen
+       next to the spacebar (which has its own larger padding).
+       Pulls the buffer toward "arcade button" feel. */
+    padding-top: 8px;
+    padding-bottom: 8px;
+    /* Smaller font for the ⌫ / ⏎ glyph so it fits the narrow
+       cell without truncation. */
+    font-size: 16px;
+    /* No min-width override — the row builder sets explicit
+       width_request via set_width_request, which honors the
+       0.33 unit. */
+}
+.arcade-buffer:active,
+.arcade-buffer.pressed {
+    /* Pressed: solid accent at moderate opacity. The standard
+       :active scale-down still applies via the base
+       .key-button:active rule. */
+    background: alpha(var(--rb-accent), 0.4);
+    border-color: alpha(var(--rb-accent), 0.8);
+}
