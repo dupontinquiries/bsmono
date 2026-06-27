@@ -377,3 +377,50 @@ rustcheck/peek/drift small. Plus ~92K C++, ~56K QML, ~14K Python.
   (unendlich sessions + snapclone groups share it); carry Lifetime flag +
   DeliveryHint profiles; wire SenderChain epochs + seal_sender_key fan-out onto
   snapcore's cluster roster (announce co-members = the member set to seal to).
+
+---
+## net-kit v0.1 + patches/ workflow  (this session)
+
+[DECISION] DEFER share-kit, build net-kit FIRST. net-kit is the layer *beneath*
+share-kit (the mailbox needs transport; transport primitives come first). Good
+sequencing: snapcore's future real transport + share-kit's daemon protocol both
+layer auth+wire from net-kit.
+
+[WORKFLOW] **patches/** — rendezvous for sister-session output (snapclone-UI port,
+logscope distributed-fleet session). Each entry = `<name>.patch` (consolidated
+git diff) + `<name>.HANDOFF.md` (spec/API/integration). Two purposes: (1) pending
+application to the standalone repo it targets, (2) SOURCE MATERIAL to mine for
+shared/ kits. NOT auto-applied (target standalone trees ≠ monorepo snapshot).
+First entry: logscope-distributed-fleet (the "speaker reactions in the AI tree"
+work — enlist/dispatch/bridge/ollama/localexec/speculate/voicefan/devloop, 117-test
+lean suite green; voicefan = speaker→tree fanout BUILT, reaction CLASSIFIER pending).
+
+[SURVEY] Transport/auth/wire/http duplication across the monorepo is severe:
+ct_eq in 5+ (voiceterm/mail_crypto, bo-suite/peer_auth, logscope/netserve, both
+crypto crates); hand-rolled HTTP/1.1 in ~8 (bo-suite chan/track, logscope
+netserve/fabric_net, snapclone-upnp/ssdp); percent line-codec in ~6 (voiceterm
+qml_gen/recall/manpages/layout_tool, unendlich/session_wire); JSON parse in
+voiceterm/hf_hub + ollama; raw sockets in ~25; FOUR Transport traits (snapcore
+node.rs, unendlich sim/net/transport.rs, logscope fabric_net.rs, + enlist).
+
+[CODE] **shared/net-kit** v0.1 — zero-dep (std only), offline-provable, **17 tests
+pass --offline**. Standalone crate like the other shared kits (no workspace).
+  - auth.rs: ct_eq (constant-time) + generate_key (/dev/urandom + time/pid
+    fallback, 64-hex) + Keyring (constant-time membership, empty=open) + frame/
+    unframe (token framing "<tok>\t<line>"). = union of netserve auth + enlist auth.
+  - wire.rs: esc/unesc (percent %,\t,\n,, — byte-identical to enlist) + encode_
+    fields/decode_fields (tab line, flat case). Doc caveat: comma-sub-list fields
+    built manually w/ esc (can't compose encode_fields — would double-escape).
+  - json.rs: escape + find_string_field (targeted top-level extractor, not fooled
+    by key-in-value) + read_json_string (pub; handles \uXXXX). From ollama.rs.
+  - http.rs: Request{method,path,host,content_type,body}+post_json()+to_wire()
+    (HTTP/1.1, correct Content-Length, Connection:close); Response{status,body};
+    parse_response; roundtrip(host,req,timeout) TcpStream seam. From ollama.rs.
+[STANCE] net-kit does NOT unify the four Transport traits (different abstractions,
+different protocols) — it's the SHARED PLUMBING concrete transports reuse. Trait
+unification is a separate design question, parked.
+
+NEXT (net-kit growth, mapped not built): http SERVER side (lift netserve serve/
+handle + photosync sync_server); generic UDP transport (abstract enlist's
+UdpTransport over encode/decode); then the Transport-trait question as a design
+item. THEN share-kit on top of snapcore+crypto-kit+net-kit.
