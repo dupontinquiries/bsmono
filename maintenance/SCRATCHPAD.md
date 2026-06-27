@@ -523,3 +523,50 @@ net-kit/share-kit — and it re-derived those same signals (ct_eq, json escape,
 crypto dup) plus surfaced new ones (audio, time). The doc's Algorithm 2 (call
 graph + community detection) + the AI-reviewer layer (name + draft each
 extraction) are the future build-out.
+
+---
+## audio-kit v0.1 — the kit kitfinder pointed at  (this session)
+
+[CODE] **shared/audio-kit** v0.1 — zero-dep DSP primitives, **25 tests --offline**.
+The leaf audio building blocks; apps' strategies (cancellers, diarizers,
+synthesis) stay as CONSUMERS. Modules:
+  - level.rs: rms (byte-identical lift from podcast_diar/voiceterm-separation/
+    snapclone-audio) + peak + lin_to_db/db_to_lin (the spectrogram's 20·log10
+    factored out) + normalize_peak.
+  - goertzel.rs: goertzel(samples,freq,sr) (NaN/Inf-safe magnitude) + Spectrogram
+    Config + spectrogram/spectrogram_at_freqs — LIFTED VERBATIM from bo-suite
+    audio_features.rs (the module copied across bo-mux+bo-controller = the 27K-tok
+    duplication kitfinder flagged #1). Goertzel over FFT for narrow bands.
+  - pitch.rs: estimate_fundamental(samples,lo,hi,sr) — Goertzel bin-scan +
+    parabolic interpolation, lifted from passby_canceller. ONE CHANGE: dropped the
+    canceller's absolute magnitude floor (tuned for un-normalized levels, wrong
+    for [-1,1] audio) → reports the peak whenever energy is found; caller gates on
+    rms/voicing. The right split for a primitive.
+  - window.rs: Window{Rectangular,Hann,Hamming} coeff/generate/apply (NEW — taper
+    for spectral/voice feature work; audio_features uses rectangular).
+  - gen.rs: Tone (sine osc, phase accumulator) + Noise (white LCG + Voss-McCartney
+    pink) lifted from beeper/masker. Useful for synthesis (unendlich), masking
+    (bo), and test signals.
+  - HEADLINE TEST generated_tone_is_recovered_by_the_analyzers: gen::Tone(330Hz)
+    → goertzel peaks at 330 + estimate_fundamental returns 330±5. The primitives
+    compose end to end.
+
+[CONSUMERS] (per user): rusty-board (bo-suite) cancellers/masker/beeper →
+goertzel/pitch/gen (or keep specialized cancellers, take primitives); voiceterm/
+web2qml separation+features → rms/goertzel/window; logscope voice reactions →
+rms/pitch (level/voicing gate on the in-flight generation — ties to the voicefan
+reaction classifier in patches/); unendlich game audio → gen.
+
+[VALIDATION LOOP] kitfinder found audio_features as the #1 dup (27K tok, bo-mux↔
+bo-controller) → built audio-kit from it → the lifts are byte-faithful so the apps
+now MATCH audio-kit (the repoint, like net-kit's ct_eq/json). The tool found the
+kit; we built it.
+
+NEXT (audio-kit growth / consumers): repoint bo-suite audio_features → audio-kit
+(delete both copies); repoint voiceterm/snapclone-audio rms; wire logscope voice-
+reaction level/voicing gate. SEPARATE: the bo-internal cancellers (drone/passby,
+~27K beyond audio_features) are a bo-dsp split WITHIN bo-suite (strategies, not
+cross-cutting primitives) — own crate or shared module, app-local. Possible
+audio-kit additions if they recur: zero-crossing rate (podcast_diar has it, a VAD
+feature), a generalized harmonic-ratio (bo's engine_timbre_score, pure-on-goertzel
+→ voicing detection), biquad filters.
