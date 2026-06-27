@@ -13,6 +13,7 @@ Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
 | net-kit | transport plumbing: auth / wire / json / http (client+server) | ✅ built, 22 tests |
 | share-kit | the MAILBOX over snapcore + crypto-kit (DHT-as-host two-layer) | ✅ v0.1, 7 tests |
 | audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
+| voice-kit | whisper post-proc: hallucination filtering (union) + ggml model resolution | ✅ v0.1, 10 tests |
 
 All build & test `--offline` (crypto-kit/share-kit need the cached crates.io deps).
 
@@ -65,11 +66,14 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 ## rusty-board (newly ingested)
 
-- [ ] Swipe gestures are BROKEN — need the symptom/failure mode before diving
-      (engine is ~100K across `src/gestures/`: speed-aware path→word decode,
-      Damerau-Levenshtein, n-grams, velocity-minima pivots).
-- [ ] Wire voice/recorder level metering onto audio-kit `level`; assess a shared
-      **voice-kit** with voiceterm (both are whisper voice apps).
+- [ ] Swipe gestures BROKEN — breadcrumb recorded in
+      `patches/rusty-board-swipe-regression.NOTES.md` (good core ≈ commits
+      876a0fa..7d3efea; rusty-board-git.zip has the history). FUTURE: bisect/diff
+      to recover the core → a reusable **swipe/touch-kit** (path→keys→words). Not active.
+- [ ] **voice-kit consumers**: repoint rusty-board `src/voice/` + voiceterm
+      `src/voice.rs` onto voice-kit (hallucination + model). Wire voice/recorder
+      level metering onto audio-kit `level`; a VAD gate (voice-kit over audio-kit)
+      is the next voice-kit growth.
 
 ## Source-of-truth hygiene
 
