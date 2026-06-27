@@ -1,0 +1,63 @@
+{
+  "name": "en_us_qwerty",
+  "display_name": "English (QWERTY)",
+  "language": "en",
+  "direction": "ltr",
+  "symbols_layout": "symbols",
+  "rows": [
+    {
+      "weight": 1.0,
+      "keys": [
+        { "label": "q", "shifted": "Q", "extended": ["1"] },
+        { "label": "w", "shifted": "W", "extended": ["2"] },
+        { "label": "e", "shifted": "E", "extended": ["3", "é", "è", "ê", "ë"] },
+        { "label": "r", "shifted": "R", "extended": ["4"] },
+        { "label": "t", "shifted": "T", "extended": ["5"] },
+        { "label": "y", "shifted": "Y", "extended": ["6"] },
+        { "label": "u", "shifted": "U", "extended": ["7", "ü", "ú", "ù"] },
+        { "label": "i", "shifted": "I", "extended": ["8", "í", "ï", "î"] },
+        { "label": "o", "shifted": "O", "extended": ["9", "ó", "ò", "ô", "ö"] },
+        { "label": "p", "shifted": "P", "extended": ["0"] }
+      ]
+    },
+    {
+      "weight": 1.0,
+      "keys": [
+        { "label": "a", "shifted": "A", "extended": ["à", "á", "â", "ä", "å"] },
+        { "label": "s", "shifted": "S" },
+        { "label": "d", "shifted": "D" },
+        { "label": "f", "shifted": "F" },
+        { "label": "g", "shifted": "G" },
+        { "label": "h", "shifted": "H" },
+        { "label": "j", "shifted": "J" },
+        { "label": "k", "shifted": "K" },
+        { "label": "l", "shifted": "L" }
+      ]
+    },
+    {
+      "weight": 1.0,
+      "keys": [
+        { "label": "⇧", "action": { "kind": "shift" }, "key_type": "modifier", "width": 1.5, "swipe_target": false },
+        { "label": "z", "shifted": "Z" },
+        { "label": "x", "shifted": "X" },
+        { "label": "c", "shifted": "C" },
+        { "label": "v", "shifted": "V" },
+        { "label": "b", "shifted": "B" },
+        { "label": "n", "shifted": "N" },
+        { "label": "m", "shifted": "M" },
+        { "label": "⌫", "action": { "kind": "backspace" }, "key_type": "special", "width": 1.5, "swipe_target": false }
+      ]
+    },
+    {
+      "weight": 1.0,
+      "keys": [
+        { "label": "?123", "action": { "kind": "symbols_toggle" }, "key_type": "modifier", "width": 1.5, "swipe_target": false },
+        { "label": "🎤", "action": { "kind": "voice" }, "key_type": "special", "width": 1.0, "swipe_target": false },
+        { "label": " ", "action": { "kind": "space" }, "key_type": "special", "width": 5.0, "swipe_target": false },
+        { "label": ",", "shifted": ",", "extended": ["!", "?", ";"] },
+        { "label": ".", "shifted": ".", "extended": ["?", "!", "…"] },
+        { "label": "⏎", "action": { "kind": "return" }, "key_type": "action", "width": 1.5, "swipe_target": false }
+      ]
+    }
+  ]
+}

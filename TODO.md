@@ -35,9 +35,10 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       crypto-kit; snapclone groups → share-kit (epoch-gated cutover; feed
       `namespace="group-feed"` gives byte-compatible keys).
 
-- [ ] **audio-kit consumers** (the payoff): repoint bo-suite `audio_features`
-      → audio-kit (delete both copies); voiceterm/snapclone-audio `rms`; wire
-      logscope voice-reaction level/voicing gate; unendlich synthesis on `gen`.
+- [ ] **audio-kit consumers** (the payoff): repoint **bo-suite** (speaker control)
+      `audio_features` → audio-kit (delete both copies); voiceterm/snapclone-audio
+      `rms`; logscope voice-reaction level/voicing gate; unendlich synthesis on
+      `gen`; **rusty-board** (voice keyboard) mic-level metering → `level::rms`.
 - [ ] **bo-dsp split** (app-local, NOT a kit): bo-suite's drone/passby cancellers
       (~27K tok beyond audio_features, bo-controller↔bo-mux) are STRATEGIES — pull
       into a bo-internal shared crate/module that consumes audio-kit primitives.
@@ -61,6 +62,14 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       cross-crate kit aggregation. Future: full AST/PDG, call-graph + community
       detection (doc's Algorithm 2), the LOC-ROI work queue, the AI-reviewer layer
       that names + drafts each extraction.
+
+## rusty-board (newly ingested)
+
+- [ ] Swipe gestures are BROKEN — need the symptom/failure mode before diving
+      (engine is ~100K across `src/gestures/`: speed-aware path→word decode,
+      Damerau-Levenshtein, n-grams, velocity-minima pivots).
+- [ ] Wire voice/recorder level metering onto audio-kit `level`; assess a shared
+      **voice-kit** with voiceterm (both are whisper voice apps).
 
 ## Source-of-truth hygiene
 

@@ -9,10 +9,12 @@
 //! recur in voiceterm and snapclone-audio.
 //!
 //! audio-kit holds the PRIMITIVES; each app's strategies are consumers:
-//!   * rusty-board (bo-suite): the tone/drone cancellers, spectral masker, and
+//!   * bo-suite (speaker control): the tone/drone cancellers, spectral masker, and
 //!     backup beeper build on [`goertzel`](goertzel::goertzel) / [`pitch`] / [`gen`].
 //!   * voiceterm / web2qml: speaker separation + voice features build on
 //!     [`level::rms`] / [`goertzel`] / [`window`].
+//!   * rusty-board (voice keyboard): whisper voice input — mic-level metering
+//!     ([`level::rms`]) and VAD / voicing gating ([`pitch`]).
 //!   * logscope: voice reactions (level/voicing gating of an in-flight generation)
 //!     build on [`level::rms`] / [`pitch`].
 //!   * unendlich: game-audio synthesis builds on [`gen`].

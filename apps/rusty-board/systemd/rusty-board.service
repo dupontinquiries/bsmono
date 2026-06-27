@@ -1,0 +1,25 @@
+[Unit]
+Description=RustyBoard on-screen keyboard
+Documentation=https://github.com/example/rusty-board
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN_DIR@/rusty-board
+Restart=on-failure
+RestartSec=2
+
+# Limit resources — keyboard shouldn't dominate the system.
+MemoryHigh=512M
+MemoryMax=1G
+CPUWeight=80
+
+# Standard hardening for a user service that needs audio + display.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/rusty-board %h/.local/share/rusty-board
+
+[Install]
+WantedBy=graphical-session.target

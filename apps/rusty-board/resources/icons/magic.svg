@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LLM / "magic" icon. Grayscale symbolic style; uses
+  currentColor so CSS controls actual color.
+
+  A primary 4-pointed sparkle/star with a smaller secondary
+  sparkle upper-right for depth. Same metaphor used by
+  Gemini / Copilot / Apple Intelligence.
+
+  Construction:
+    - Primary sparkle centered at (8, 8). Four points at
+      (8, 2), (14, 8), (8, 14), (2, 8). Between adjacent
+      points we use a quadratic Bezier curve whose control
+      point is at (8, 8) — the center. This gives a perfect
+      concave inward curve (the "sparkle pinch") that's
+      mathematically symmetric.
+    - Secondary sparkle centered at (12.5, 11.5) with same
+      construction at smaller scale; 60% opacity for depth.
+
+  Quadratic with control at center is the cleanest way to
+  draw a 4-pointed sparkle/star. Previous cubic-with-double-
+  control-at-center variant had asymmetric numeric drift.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16">
+  <!-- Primary sparkle, perfectly centered. -->
+  <path d="M 8 2
+           Q 8 8 14 8
+           Q 8 8 8 14
+           Q 8 8 2 8
+           Q 8 8 8 2 Z"
+        fill="currentColor"/>
+  <!-- Secondary sparkle, upper-right, ~half scale. -->
+  <path d="M 12.5 9
+           Q 12.5 11.5 15 11.5
+           Q 12.5 11.5 12.5 14
+           Q 12.5 11.5 10 11.5
+           Q 12.5 11.5 12.5 9 Z"
+        fill="currentColor" opacity="0.6"/>
+</svg>

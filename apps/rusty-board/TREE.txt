@@ -1,0 +1,65 @@
+rusty-board/
+├── .gitignore
+├── Cargo.toml
+├── LICENSE
+├── README.md
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── CUSTOMIZATION.md
+├── resources/
+│   ├── dictionary_en.txt          Frequency-ordered word list (~600 words)
+│   ├── icons/
+│   │   └── io.rustyboard.Keyboard.svg
+│   ├── layouts/
+│   │   ├── en_us_dvorak_ortho.json    Strict 10-column ortholinear Dvorak
+│   │   ├── en_us_qwerty.json          Traditional staggered QWERTY
+│   │   └── symbols.json
+│   ├── models/
+│   │   └── README.md              (Whisper models placed here)
+│   └── styles/
+│       └── keyboard.css
+├── scripts/
+│   ├── download-model.sh
+│   ├── install.sh                 (now checks for gtk4-layer-shell)
+│   └── uninstall.sh
+├── src/
+│   ├── bin/
+│   │   └── config.rs              rusty-board-config CLI (show/path/reset)
+│   ├── compositor/                NEW — desktop integration
+│   │   ├── mod.rs
+│   │   ├── placement.rs           gtk4-layer-shell anchoring; X11 fallback
+│   │   ├── virtual_keyboard.rs    Trait + Wayland/xdotool/noop dispatcher
+│   │   └── wayland_backend.rs     Real zwp_virtual_keyboard_v1 + zwp_input_method_v2 (gdk4-wayland connection sharing)
+│   ├── config/
+│   │   └── mod.rs                 TOML config schema + load/save
+│   ├── gestures/
+│   │   ├── mod.rs
+│   │   ├── recognizer.rs          DL edit-distance + spatial + frequency + speed-aware weights
+│   │   └── swipe.rs               SwipeTracker, smoothed pivot detection, path_avg_velocity
+│   ├── ipc/
+│   │   ├── dbus.rs                io.rustyboard.Keyboard1 D-Bus interface
+│   │   └── mod.rs
+│   ├── keyboard/
+│   │   ├── engine.rs              KeyboardEngine — symbols/numbers transitions fixed
+│   │   ├── key.rs                 Key, KeyAction, KeyType
+│   │   ├── mod.rs                 KeypadState re-exported here
+│   │   └── state.rs               KeypadState state machine
+│   ├── layouts/
+│   │   └── mod.rs                 Layout schema + builtins (qwerty, dvorak ortho, symbols, numbers)
+│   ├── lib.rs
+│   ├── main.rs                    Application entry — adw::Application
+│   ├── ui/
+│   │   ├── animations.rs          Spring + timed animations
+│   │   ├── key_widget.rs          KeyWidget (one per key)
+│   │   ├── keyboard_view.rs       KeyboardView — page swaps now actually rebuild widgets
+│   │   ├── mod.rs
+│   │   ├── swipe_trail.rs         Cairo overlay drawing the live swipe path
+│   │   ├── theme.rs               CSS provider with config overrides
+│   │   └── window.rs              adw::ApplicationWindow + layer-shell + vkbd bridge
+│   └── voice/
+│       ├── mod.rs                 Feature-gated voice module
+│       ├── recorder.rs            cpal + ringbuf audio capture, resampling
+│       ├── service.rs             VoiceService orchestrator
+│       └── transcriber.rs         whisper-rs wrapper
+└── systemd/
+    └── rusty-board.service        User-mode autostart unit

@@ -1,0 +1,45 @@
+{
+  "name": "symbols",
+  "display_name": "Symbols",
+  "language": "*",
+  "direction": "ltr",
+  "rows": [
+    {
+      "keys": [
+        { "label": "1", "shifted": "1" },
+        { "label": "2", "shifted": "2" },
+        { "label": "3", "shifted": "3" },
+        { "label": "4", "shifted": "4" },
+        { "label": "5", "shifted": "5" },
+        { "label": "6", "shifted": "6" },
+        { "label": "7", "shifted": "7" },
+        { "label": "8", "shifted": "8" },
+        { "label": "9", "shifted": "9" },
+        { "label": "0", "shifted": "0" }
+      ]
+    },
+    {
+      "keys": [
+        { "label": "@" }, { "label": "#" }, { "label": "$" }, { "label": "_" },
+        { "label": "&" }, { "label": "-" }, { "label": "+" },
+        { "label": "(" }, { "label": ")" }, { "label": "/" }
+      ]
+    },
+    {
+      "keys": [
+        { "label": "*" }, { "label": "\"" }, { "label": "'" }, { "label": ":" },
+        { "label": ";" }, { "label": "!" }, { "label": "?" },
+        { "label": "⌫", "action": { "kind": "backspace" }, "key_type": "special", "width": 1.5, "swipe_target": false }
+      ]
+    },
+    {
+      "keys": [
+        { "label": "ABC", "action": { "kind": "symbols_toggle" }, "key_type": "modifier", "width": 1.5, "swipe_target": false },
+        { "label": "," },
+        { "label": " ", "action": { "kind": "space" }, "key_type": "special", "width": 5.0, "swipe_target": false },
+        { "label": "." },
+        { "label": "⏎", "action": { "kind": "return" }, "key_type": "action", "width": 1.5, "swipe_target": false }
+      ]
+    }
+  ]
+}

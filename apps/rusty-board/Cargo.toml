@@ -1,0 +1,185 @@
+[package]
+name = "rusty-board"
+version = "0.1.0"
+edition = "2021"
+authors = ["RustyBoard Contributors"]
+description = "A modern Rust-based on-screen keyboard with GTK4/Adwaita, swipe typing, and Whisper voice input"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/example/rusty-board"
+readme = "README.md"
+keywords = ["keyboard", "input-method", "gtk", "wayland", "voice"]
+categories = ["accessibility", "gui"]
+
+[dependencies]
+# GTK4 and Adwaita
+# All gtk-rs crates must be from the same release matrix; mixing causes
+# duplicate `links = "gtk-4"` errors at link time. The 0.10/0.21 matrix
+# is what gtk4-layer-shell 0.7 requires (it pulls in gtk4-sys 0.10), so
+# everything else has to match.
+gtk4 = { version = "0.10", features = ["v4_12"] }
+libadwaita = { version = "0.8", features = ["v1_5"] }
+glib = "0.21"
+gio = "0.21"
+gdk4 = "0.10"
+cairo = { version = "0.21", package = "cairo-rs" }
+pango = "0.21"
+
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization & config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Voice input (whisper-rs)
+whisper-rs = { version = "0.13", optional = true }
+cpal = { version = "0.15", optional = true }
+hound = { version = "3.5", optional = true }
+ringbuf = { version = "0.4", optional = true }
+
+# Wayland virtual keyboard + input method protocols. We share GTK's
+# Wayland connection by enabling gdk4-wayland's `wayland_crate` feature,
+# which exposes the underlying `wl_display`/`wl_seat` as wayland-client
+# `WlDisplay`/`WlSeat`. That lets us bind protocol globals on the same
+# connection GDK is already pumping, so the input-method focus events
+# the compositor sends actually reach us (the compositor routes them to
+# only one input-method client per seat).
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"], optional = true }
+wayland-protocols-misc = { version = "0.3", features = ["client"], optional = true }
+smithay-client-toolkit = { version = "0.19", optional = true }
+# gdk4-wayland exposes the GTK display's wl_display for sharing.
+# Must match the gtk-rs 0.10 release matrix above.
+gdk4-wayland = { version = "0.10", features = ["wayland_crate", "v4_4"], optional = true }
+# Xkbcommon, for synthesizing the keymap we send to the compositor and
+# resolving keysyms to keycodes for virtual_keyboard's key() events.
+xkbcommon = { version = "0.8", optional = true }
+# GTK4 + layer-shell — anchors the keyboard window to the bottom edge of
+# the screen as a layer surface (so other windows resize around it and we
+# don't steal focus). This is the GTK4-friendly equivalent of what the
+# Maliit platform plugin does for Qt apps.
+gtk4-layer-shell = { version = "0.7", optional = true }
+
+# Math for swipe gesture recognition
+nalgebra = "0.33"
+
+# libc for memfd_create (used by wayland keymap upload). The xkb keymap
+# we send the compositor goes through an anonymous in-memory file, and
+# memfd_create is the Linux-specific way to make one without leaving
+# anything on disk.
+libc = { version = "0.2", optional = true }
+
+# IPC (D-Bus for integration)
+zbus = { version = "4.4", default-features = false, features = ["tokio"], optional = true }
+
+# LLM: HTTP client for OpenAI-compatible chat completions. rustls-tls
+# avoids the OpenSSL system-dep on Alpine/postmarketOS. We use blocking
+# inside a worker thread to keep the dependency surface small (no
+# tokio inside the LLM worker; tokio is already pulled in by dbus but
+# we don't need its runtime for a simple POST).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"], optional = true }
+
+# Utility
+once_cell = "1.20"
+parking_lot = "0.12"
+crossbeam-channel = "0.5"
+dashmap = "6.1"
+directories = "5.0"
+
+[features]
+# ============================================================
+# FEATURE TREE
+# ============================================================
+# Two layers:
+#   (1) PRIMITIVES — fine-grained capability toggles. Each gates a
+#       discrete subsystem and its dependencies.
+#   (2) PROFILES — named build bundles that compose primitives into
+#       the four shipping configurations. Build a profile with e.g.
+#       `cargo build --no-default-features --features basic`.
+#
+# `default` points at the everything-on profile so existing
+# `cargo build` behavior is unchanged.
+# ============================================================
+
+# ---- (1) Primitives ----------------------------------------
+# Voice input via whisper-rs (model in RAM, mic capture, transcribe).
+voice = ["whisper-rs", "cpal", "hound", "ringbuf"]
+# LLM / function-calling: text transforms, /continue, command-surface
+# actions that invoke the model. Pulls in the HTTP client.
+llm = ["reqwest"]
+# Wayland integration: layer-shell, input-method + virtual-keyboard
+# protocols, xkb keymap. Without this the keyboard can't actually
+# inject text on a Wayland session (useful only for dev/testing on X
+# or in a window).
+wayland = [
+    "wayland-client",
+    "wayland-protocols",
+    "wayland-protocols-misc",
+    "smithay-client-toolkit",
+    "gdk4-wayland",
+    "xkbcommon",
+    "gtk4-layer-shell",
+    "libc",
+]
+# D-Bus IPC (show/hide, external control, future global-menu mirror).
+dbus = ["zbus"]
+# Experimental input surfaces beyond plain QWERTY/Dvorak tap+swipe:
+# cardinal grid, stenotype, character-draw canvas, and the
+# command/palette surface. Pure-Rust + GTK, no extra crates — the
+# flag just compiles the modules in or out so a lean build stays
+# small and has a smaller attack/switch surface.
+input-modes = []
+
+# ---- (2) Named build profiles ------------------------------
+# basic: the smallest useful keyboard. QWERTY/Dvorak, tap + swipe-
+# typing, on a Wayland session. No voice, no LLM, no experimental
+# modes. This is the "just type" build.
+basic = ["wayland", "dbus"]
+
+# full-keyboard: every input SURFACE (cardinal, steno, palette,
+# character-draw) but still no cloud/compute features. The richest
+# *typing* experience without voice or LLM.
+full-keyboard = ["basic", "input-modes"]
+
+# build-voice: full keyboard + voice transcription. No LLM.
+build-voice = ["full-keyboard", "voice"]
+
+# build-functioncalling: the works — full keyboard + voice + LLM /
+# function-calling. This is what `default` ships.
+build-functioncalling = ["build-voice", "llm"]
+
+default = ["build-functioncalling"]
+
+[[bin]]
+name = "rusty-board"
+path = "src/main.rs"
+
+[[bin]]
+name = "rusty-board-config"
+path = "src/bin/config.rs"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+
+[package.metadata.deb]
+maintainer = "RustyBoard <noreply@example.com>"
+section = "x11"
+depends = "$auto, libgtk-4-1, libadwaita-1-0"

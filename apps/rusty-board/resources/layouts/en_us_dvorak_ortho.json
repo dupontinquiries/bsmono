@@ -1,0 +1,72 @@
+{
+  "name": "en_us_dvorak_ortho",
+  "display_name": "English (Dvorak — Ortholinear)",
+  "language": "en",
+  "direction": "ltr",
+  "symbols_layout": "symbols",
+  "ortholinear": true,
+  "grid_columns": 10.0,
+
+  "_comment": "Strict 10-column ortholinear grid. Every row sums to exactly 10 unit widths and has offset=0, so keys form a perfect rectangular grid with no row stagger. Letter keys are all width=1.0 (default).",
+
+  "rows": [
+    {
+      "offset": 0.0,
+      "keys": [
+        { "label": "'", "shifted": "\"", "extended": ["`"] },
+        { "label": ",", "shifted": "<" },
+        { "label": ".", "shifted": ">" },
+        { "label": "p", "shifted": "P" },
+        { "label": "y", "shifted": "Y" },
+        { "label": "f", "shifted": "F" },
+        { "label": "g", "shifted": "G" },
+        { "label": "c", "shifted": "C" },
+        { "label": "r", "shifted": "R" },
+        { "label": "l", "shifted": "L" }
+      ]
+    },
+    {
+      "offset": 0.0,
+      "keys": [
+        { "label": "a", "shifted": "A", "extended": ["à", "á", "â", "ä", "å"] },
+        { "label": "o", "shifted": "O", "extended": ["ó", "ò", "ô", "ö"] },
+        { "label": "e", "shifted": "E", "extended": ["é", "è", "ê", "ë"] },
+        { "label": "u", "shifted": "U", "extended": ["ü", "ú", "ù"] },
+        { "label": "i", "shifted": "I", "extended": ["í", "ï", "î"] },
+        { "label": "d", "shifted": "D" },
+        { "label": "h", "shifted": "H" },
+        { "label": "t", "shifted": "T" },
+        { "label": "n", "shifted": "N" },
+        { "label": "s", "shifted": "S", "extended": ["ß"] }
+      ]
+    },
+    {
+      "offset": 0.0,
+      "_comment": "Shift + 8 letters + Backspace = 10 cells",
+      "keys": [
+        { "label": "⇧", "action": { "kind": "shift" }, "key_type": "modifier", "swipe_target": false },
+        { "label": "q", "shifted": "Q" },
+        { "label": "j", "shifted": "J" },
+        { "label": "k", "shifted": "K" },
+        { "label": "x", "shifted": "X" },
+        { "label": "b", "shifted": "B" },
+        { "label": "m", "shifted": "M" },
+        { "label": "w", "shifted": "W" },
+        { "label": "v", "shifted": "V" },
+        { "label": "⌫", "action": { "kind": "backspace" }, "key_type": "special", "swipe_target": false }
+      ]
+    },
+    {
+      "offset": 0.0,
+      "_comment": "Symbols + Voice + Space(4) + z + / + Return(2) = 1+1+4+1+1+2 = 10 cells",
+      "keys": [
+        { "label": "?123", "action": { "kind": "symbols_toggle" }, "key_type": "modifier", "swipe_target": false },
+        { "label": "🎤", "action": { "kind": "voice" }, "key_type": "special", "swipe_target": false },
+        { "label": " ", "action": { "kind": "space" }, "key_type": "special", "width": 4.0, "swipe_target": false },
+        { "label": "z", "shifted": "Z" },
+        { "label": "/", "shifted": "?", "extended": ["\\"] },
+        { "label": "⏎", "action": { "kind": "return" }, "key_type": "action", "width": 2.0, "swipe_target": false }
+      ]
+    }
+  ]
+}
