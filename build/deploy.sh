@@ -1,84 +1,70 @@
 #!/usr/bin/env bash
-# build/deploy.sh — ship phone-target builds to the Fairphone 5 fleet via gitmind.
+# build/deploy.sh — get an app onto the Fairphone 5 fleet.
 #
-# gitmind is both the GATE and the distribution layer:
-#   desktop : develop -> commit -> `gin check` records pass/fail per commit
-#   deploy  : pick a GREEN commit -> push it to each device in manifest/fleet.toml
-#   device  : `gin app build|install ... --use --desktop` activates it on the phone
-# Because .gitmind/store.redb rebuilds from the git graph, the git repo itself is
-# the sync channel — a device `git pull` to the green commit is the transport; the
-# binary is then either built there (mode=build) or pinned from a cross-build
-# (mode=pin).
+# Reality check: your apps are GUI apps (Qt6 / GTK4 / Vulkan). `rustup target add
+# aarch64-unknown-linux-musl` only installs Rust's std for musl — NOT Qt6/GTK4/Mesa
+# built for musl. So you cannot cross-compile them on the laptop without a full
+# aarch64-musl sysroot. The realistic path is to BUILD ON THE PHONE: postmarketOS
+# ships those libraries as apk packages. Pure-Rust binaries (gin, peek) cross-build
+# on the laptop fine — use mode=cross for those.
 #
-# Per-app modes (set in fleet.toml):
-#   build  phone builds natively (aarch64, NO cross sysroot needed):
-#            gin app build <name> --commit <C> --target phone --release --use --desktop
-#   pin    desktop cross-builds aarch64-musl, pins the binary, phone activates:
-#            (desktop) cargo build --release --target aarch64-unknown-linux-musl
-#            gin app install <name> <bin> --commit <C> --target phone --use --desktop
+# ── one-time phone setup (the script can't do this; do it once per device) ──
+#   sudo apk add rust cargo git
+#   # + the app's toolkit:
+#   #   voiceterm / bo-suite (Qt):  sudo apk add qt6-qtbase-dev qt6-qtdeclarative-dev pulseaudio-dev
+#   #   logscope / av1tuner (GTK):  sudo apk add gtk4.0-dev
+#   #   unendlich (Vulkan):         sudo apk add vulkan-headers mesa-dev
+#   git clone <repo-or-bundle> ~/monorepo      # the phone's working checkout
 #
-# PLAN-printing by default; real execution needs fleet SSH + a green commit (--run).
-#   build/deploy.sh                       # plan: green-candidate -> whole fleet
-#   build/deploy.sh --commit <oid>        # plan a specific commit (must be green)
-#   build/deploy.sh --only fp5-1          # one device
-#   build/deploy.sh --run --commit <oid>  # execute (needs gin + ssh to the fleet)
+# Modes (per device, in manifest/fleet.toml):
+#   build  (default): ssh phone → git checkout <commit> → cargo build --release →
+#                     gin import → gin app install <app> … --use --desktop
+#   cross  (pure-Rust only): laptop cross-builds aarch64-musl → scp → gin app install
+#
+# PLAN by default (prints the exact ssh/cargo/scp). --run executes.
+#   build/deploy.sh --app voiceterm --only fp5-1            # show me what it will do
+#   build/deploy.sh --app voiceterm --only fp5-1 --run      # do it
+#   build/deploy.sh --app gin       --only fp5-1 --run      # gin: laptop cross-build (set mode=cross)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUN=0; COMMIT=""; ONLY=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --run) RUN=1 ;;
-    --commit) COMMIT="${2:-}"; shift ;;
-    --only) ONLY="${2:-}"; shift ;;
-    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
-  esac; shift
-done
-GIN="$ROOT/apps/gitmind/target/release/gin"; [ -x "$GIN" ] || GIN="gin"
+RUN=0; APP=""; ONLY=""; COMMIT=""
+while [ $# -gt 0 ]; do case "$1" in
+  --run) RUN=1 ;;
+  --app) APP="${2:-}"; shift ;;
+  --only) ONLY="${2:-}"; shift ;;
+  --commit) COMMIT="${2:-}"; shift ;;
+  -h|--help) sed -n '2,35p' "$0"; exit 0 ;;
+  *) echo "unknown arg: $1" >&2; exit 2 ;;
+esac; shift; done
+[ -n "$APP" ] || { echo "need --app <name>. phone-target apps: voiceterm unendlich ambient-learner bo-suite snapclone photosync (or gin/peek via mode=cross)" >&2; exit 2; }
 FLEET="$ROOT/manifest/fleet.toml"
-[ -f "$FLEET" ] || { echo "no manifest/fleet.toml — copy the template and fill in devices" >&2; exit 1; }
+[ -f "$FLEET" ] || { echo "no manifest/fleet.toml (copy the template, fill in device addresses)" >&2; exit 1; }
+COMMIT="${COMMIT:-$(git -C "$ROOT" rev-parse --short HEAD)}"
+# gin (pure-Rust CLI) lives in apps/gitmind, binary name 'gin'
+APPDIR="apps/$APP"; BIN="$APP"
+[ "$APP" = "gin" ] && APPDIR="apps/gitmind" && BIN="gin"
 
-echo "deploy — $([ "$RUN" = 1 ] && echo RUN || echo PLAN)"
+echo "deploy app=$APP commit=$COMMIT — $([ "$RUN" = 1 ] && echo RUN || echo PLAN)"
+do_run() { echo "    \$ $*"; if [ "$RUN" = 1 ]; then "$@"; fi; }
 
-# 1. resolve the commit to deploy: explicit --commit (verify green) or latest green candidate.
-if [ -n "$COMMIT" ]; then
-  echo "commit: $COMMIT  (will verify green via: gin check --commit $COMMIT)"
-else
-  echo "commit: <latest green> — resolve via: gin check --candidates  (newest ✓)"
-  [ "$RUN" = 1 ] && COMMIT="$("$GIN" check --candidates 2>/dev/null | sed -n 's/^✓ \([0-9a-f]\{7,\}\).*/\1/p' | head -1)"
-  [ "$RUN" = 1 ] && [ -z "$COMMIT" ] && { echo "no green candidates from gin check" >&2; exit 1; }
-fi
-echo
-
-# 2. fleet × apps -> deploy plan, cross-referenced with projects.toml phone-targets.
-python3 - "$ROOT" "$FLEET" "${ONLY}" "${COMMIT:-GREEN}" <<'PY'
-import sys, os, tomllib
-root, fleet_path, only, commit = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-P = tomllib.load(open(os.path.join(root,"manifest","projects.toml"),"rb"))
-# which projects legitimately target the phone?
-phone_ok=set()
-for grp,items in P.items():
-    if not isinstance(items,dict): continue
-    for name,m in items.items():
-        if isinstance(m,dict) and "phone" in (m.get("targets") or []): phone_ok.add(name)
-F = tomllib.load(open(fleet_path,"rb")).get("fleet",{})
-if not F: print("  (fleet.toml has no [fleet.*] devices)"); sys.exit(0)
-for dev,cfg in F.items():
-    if only and only!=dev: continue
-    host=cfg.get("host","?"); user=cfg.get("user","user"); mode=cfg.get("mode","build")
-    print(f"▸ {dev}  ({user}@{host}, mode={mode})")
-    print(f"    ssh {user}@{host}  git -C <repo> fetch && git checkout {commit}   # sync the green commit")
-    for app in cfg.get("apps",[]):
-        warn = "" if app in phone_ok else "   ⚠ not marked target=phone in projects.toml"
-        if mode=="build":
-            print(f"    [{app}] (on device) gin app build {app} --commit {commit} --target phone --release --use --desktop{warn}")
-        else:  # pin
-            print(f"    [{app}] (desktop)   cargo build --release --target aarch64-unknown-linux-musl   # in {app}'s dir{warn}")
-            print(f"    [{app}] (device)    gin app install {app} <bin> --commit {commit} --target phone --use --desktop")
+python3 - "$FLEET" "$ONLY" <<'PY' | while IFS='|' read -r DEV HOST USER MODE REPO; do
+import sys, tomllib
+F=tomllib.load(open(sys.argv[1],"rb")).get("fleet",{}); only=sys.argv[2]
+for d,c in F.items():
+    if only and only!=d: continue
+    print("|".join([d, c.get("host",""), c.get("user","user"), c.get("mode","build"), c.get("repo","~/monorepo")]))
 PY
+  echo "▸ $DEV  ($USER@$HOST, mode=$MODE)"
+  if [ "$MODE" = "cross" ]; then
+    echo "  laptop cross-build (pure-Rust apps only) → scp → register on phone:"
+    do_run sh -c "cd '$ROOT/$APPDIR' && cargo build --release --target aarch64-unknown-linux-musl --bin $BIN"
+    LBIN="$ROOT/$APPDIR/target/aarch64-unknown-linux-musl/release/$BIN"
+    do_run scp "$LBIN" "$USER@$HOST:~/$BIN"
+    do_run ssh "$USER@$HOST" "gin app install $APP ~/$BIN --commit $COMMIT --target phone --use --desktop"
+  else
+    echo "  phone pulls the commit, builds natively, registers (needs rust + the app's apk deps already installed):"
+    do_run ssh "$USER@$HOST" "cd $REPO && git fetch --all && git checkout $COMMIT && cd $APPDIR && cargo build --release --bin $BIN && gin import && gin app install $APP target/release/$BIN --commit $COMMIT --target phone --use --desktop"
+  fi
+done
 echo
-echo "notes:"
-echo "  - build mode needs the phone's build deps (rustup target / Qt6 / Vulkan headers); heavy"
-echo "    apps (unendlich) are better as mode=pin once a cross sysroot exists."
-echo "  - 'gin check' must have recorded the commit green first (build/verify stage)."
-echo "  - real run needs reachable fleet SSH; this stub prints the gitmind commands it would issue."
+echo "next: open the app from your launcher (gin app install --desktop made an entry), or 'gin app run $APP' on the phone."
