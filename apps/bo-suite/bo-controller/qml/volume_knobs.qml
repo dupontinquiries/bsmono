@@ -396,6 +396,7 @@ Window {
                 out.push({ label: "Queue",     index: idx++ })
                 out.push({ label: "Artists",   index: idx++ })
                 out.push({ label: "Albums",    index: idx++ })
+                out.push({ label: "All Tracks", index: idx++ })
                 out.push({ label: "Tags",      index: idx++ })
                 out.push({ label: "Search",    index: idx++ })
                 out.push({ label: "History",   index: idx++ })
@@ -1678,6 +1679,19 @@ Window {
                     visible: albumsRoot.inDetail
                     onBackTapped: { albumsRoot.inDetail = false }
                 }
+            }
+        }
+
+        // ░░ PAGE — ALL TRACKS ░░
+        // Flat, title-ordered list of every track — the UI half of the
+        // missing-tracks fix. Unlike Artists/Albums/Tags (which join
+        // through track_artists and so hide files that parsed with no
+        // artist), this lists FROM tracks directly, so nothing in the
+        // library is ever unreachable. No detail overlay; it's a leaf.
+        Loader {
+            active: window.hasControl("library")
+            sourceComponent: AllTracksPage {
+                accent: window.accent
             }
         }
 

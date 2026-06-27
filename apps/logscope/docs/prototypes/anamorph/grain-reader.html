@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Grain Reader — text emerges from the flow</title>
+<style>
+  html,body{margin:0;height:100%;background:#05060a;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#9aa}
+  #c{display:block;width:100vw;height:100vh;touch-action:none}
+  #hud{position:fixed;left:14px;top:12px;font-size:12px;line-height:1.5;opacity:.75;pointer-events:none;text-shadow:0 0 6px #000}
+  #hud b{color:#cde}
+  #panel{position:fixed;right:14px;top:12px;background:rgba(10,14,18,.72);border:1px solid #223;border-radius:8px;padding:10px 12px;font-size:11px;width:190px}
+  #panel h4{margin:0 0 6px;color:#bdf;font-weight:600;letter-spacing:.04em}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{width:62px;color:#9bd}
+  .row input{flex:1}
+  #hint{position:fixed;left:0;right:0;bottom:12px;text-align:center;font-size:12px;opacity:.55;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div>the grain is <b>uniform everywhere</b> — only its <b>direction</b> carries the text</div><div id="st"></div></div>
+<div id="panel">
+  <h4>FLOW</h4>
+  <div class="row"><label>spin</label><input id="lSpin" type="range" min="-0.6" max="0.6" step="0.01" value="0.16"></div>
+  <div class="row"><label>tilt axis</label><input id="lTilt" type="range" min="-0.6" max="0.6" step="0.01" value="0.05"></div>
+  <div class="row"><label>focus</label><input id="lFoc" type="range" min="0" max="1" step="0.01" value="0.0"></div>
+  <div class="row"><label>length</label><input id="lLen" type="range" min="0.02" max="0.09" step="0.005" value="0.05"></div>
+  <div class="row"><label>density</label><input id="lDen" type="range" min="800" max="4000" step="100" value="2600"></div>
+  <div class="row"><label>hue</label><input id="lHue" type="range" min="0" max="1" step="0.01" value="0.55"></div>
+</div>
+<div id="hint">drag to rotate · scroll to jog · let it spin — the letters surface as a section turns to face you, then dissolve back into grain</div>
+<script>
+"use strict";
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let DPR=Math.min(2,window.devicePixelRatio||1),Wd=0,Ht=0;
+function resize(){Wd=cv.clientWidth||innerWidth||800;Ht=cv.clientHeight||innerHeight||600;cv.width=Wd*DPR;cv.height=Ht*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',resize);
+const lever=id=>parseFloat(document.getElementById(id).value);
+
+const SECTIONS=[
+  "Keep a seek cursor and remember the byte offset.",
+  "Watch the inode; on change reopen the path.",
+  "If it shrinks below your offset, reset to zero.",
+  "Stream lines so memory stays bounded.",
+];
+const TAU=Math.PI*2, rand=(s=>()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return (s>>>0)/4294967296;})(0x51f3a>>>0);
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm=v=>{const l=Math.hypot(v[0],v[1],v[2])||1;return [v[0]/l,v[1]/l,v[2]/l];};
+function rotY(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0]*c+p[2]*s,p[1],-p[0]*s+p[2]*c];}
+function rotX(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0],p[1]*c-p[2]*s,p[1]*s+p[2]*c];}
+function hsl(h,s,l){h=((h%1)+1)%1;const a=s*Math.min(l,1-l);const f=n=>{const k=(n+h*12)%12;return l-a*Math.max(-1,Math.min(k-3,9-k,1));};return [f(0),f(8),f(4)];}
+
+// per-section glyph FLOW field: coverage + stroke-tangent angle (the direction the grain follows on letters)
+const G=128, tcan=document.createElement('canvas'), tctx=tcan.getContext('2d');
+function glyphFlow(text,wrap){
+  const px=46,lh=px*1.26,words=text.split(/\s+/);let lines=[],cur="";
+  for(const w of words){if(cur&&cur.length+w.length+1>wrap){lines.push(cur);cur="";}cur=cur?cur+" "+w:w;} if(cur)lines.push(cur);
+  tcan.width=960;tcan.height=Math.max(150,lines.length*lh+px);tctx.clearRect(0,0,tcan.width,tcan.height);
+  tctx.fillStyle="#fff";tctx.font=`700 ${px}px ui-monospace,monospace`;tctx.textBaseline="alphabetic";
+  lines.forEach((l,i)=>tctx.fillText(l,6,px+i*lh));
+  const W=tcan.width,H=tcan.height,d=tctx.getImageData(0,0,W,H).data;
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9,raw=[];
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const v=d[(y*W+x)*4+3]>128?1:0;if(v){mnx=Math.min(mnx,x);mny=Math.min(mny,y);mxx=Math.max(mxx,x);mxy=Math.max(mxy,y);}raw.push(v);}
+  const half=Math.max(mxx-mnx,mxy-mny)/2,cxp=(mnx+mxx)/2,cyp=(mny+mxy)/2,sc=half/0.9;
+  // sample coverage into G grid in [-1,1]
+  const cov=new Float32Array(G*G);
+  for(let gy=0;gy<G;gy++)for(let gx=0;gx<G;gx++){
+    const nx=(gx/G*2-1), ny=-(gy/G*2-1); const sx=Math.round(cxp+nx*sc), sy=Math.round(cyp-ny*sc);
+    cov[gy*G+gx]=(sx>=0&&sy>=0&&sx<W&&sy<H&&raw[sy*W+sx])?1:0;
+  }
+  // blur coverage -> smooth field, then gradient -> tangent angle (perp to gradient)
+  const bl=new Float32Array(G*G);
+  for(let y=0;y<G;y++)for(let x=0;x<G;x++){let s=0,n=0;for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const xx=x+dx,yy=y+dy;if(xx>=0&&yy>=0&&xx<G&&yy<G){s+=cov[yy*G+xx];n++;}}bl[y*G+x]=s/n;}
+  const ang=new Float32Array(G*G);
+  for(let y=0;y<G;y++)for(let x=0;x<G;x++){const xm=Math.max(0,x-1),xp=Math.min(G-1,x+1),ym=Math.max(0,y-1),yp=Math.min(G-1,y+1);
+    const gx=bl[y*G+xp]-bl[y*G+xm], gy=bl[yp*G+x]-bl[ym*G+x]; ang[y*G+x]=Math.atan2(gx,-gy);} // perp to gradient (note canvas y down)
+  return {cov,ang};
+}
+const FLOW=SECTIONS.map((t,i)=>({text:t, phi:i*(TAU/SECTIONS.length), ...glyphFlow(t,18)}));
+const sampleCov=(F,x,y)=>{const gx=((x*0.5+0.5)*G)|0,gy=((0.5-y*0.5)*G)|0;return gx>=0&&gy>=0&&gx<G&&gy<G?F.cov[gy*G+gx]:0;};
+const sampleAng=(F,x,y)=>{const gx=((x*0.5+0.5)*G)|0,gy=((0.5-y*0.5)*G)|0;return gx>=0&&gy>=0&&gx<G&&gy<G?F.ang[gy*G+gx]:0;};
+
+// uniform grain on a Fibonacci sphere; bake per-section flow direction (3D tangent dirs) at each detent
+let GR=[];
+function buildGrain(N){
+  const ga=Math.PI*(3-Math.sqrt(5)); GR=[];
+  for(let i=0;i<N;i++){
+    const y=1-2*(i+0.5)/N, r=Math.sqrt(Math.max(0,1-y*y)), th=i*ga;
+    const p=[Math.cos(th)*r,y,Math.sin(th)*r];
+    const dirs=FLOW.map(F=>{
+      const q=rotY(p,-F.phi);                       // bring this section to the front frame
+      let a, on=0;
+      if(q[2]>0.05 && sampleCov(F,q[0],q[1])>0.5){ a=sampleAng(F,q[0],q[1]); on=1; }
+      else { a=(i*12.9898)%TAU; }                   // off-letter grain: incoherent (the camouflage)
+      let w=[Math.cos(a),Math.sin(a),0];            // flow dir in the front plane
+      const qn=norm(q); const d=dot(w,qn); w=[w[0]-d*qn[0],w[1]-d*qn[1],w[2]-d*qn[2]]; w=norm(w); // tangent-plane
+      const v=rotY(w,F.phi);                         // back to sphere-local
+      return {v,on};
+    });
+    GR.push({p,dirs});
+  }
+}
+buildGrain(2600);
+let lastN=2600;
+
+let yaw=0, dragYaw=0, pitchExtra=0, scrollJog=0;
+let drag=false, lx=0, ly=0;
+cv.addEventListener('pointerdown',e=>{drag=true;lx=e.clientX;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{if(drag){dragYaw+=(e.clientX-lx)*0.005;pitchExtra+=(e.clientY-ly)*0.004;lx=e.clientX;ly=e.clientY;}});
+cv.addEventListener('pointerup',()=>drag=false);
+cv.addEventListener('wheel',e=>{e.preventDefault();dragYaw+=e.deltaY*0.0016;},{passive:false});
+
+function draw(){
+  if(!Wd||!Ht){resize();if(!Wd||!Ht){requestAnimationFrame(draw);return;}}
+  const N=lever('lDen')|0; if(N!==lastN){buildGrain(N);lastN=N;}
+  const t=performance.now()*0.001, dt=1/60;
+  yaw+=lever('lSpin')*dt;
+  const totYaw=yaw+dragYaw, pitch=lever('lTilt')*Math.sin(t*0.2)+pitchExtra*0.0+lever('lTilt');
+  const FOC=lever('lFoc'),LEN=lever('lLen'),HUE=lever('lHue');
+  ctx.fillStyle="rgba(5,6,10,1)";ctx.fillRect(0,0,Wd,Ht);
+  const cx=Wd*0.5,cy=Ht*0.5,R=Math.min(Wd,Ht)*0.4;
+  // nearest section to the front = active (its flow can resolve now)
+  let active=0,best=-2; for(let s=0;s<FLOW.length;s++){const c=Math.cos(totYaw+FLOW[s].phi);if(c>best){best=c;active=s;}}
+  const coh=Math.max(0,best); // 1 when that section faces straight on
+  const proj=p=>{let q=rotX(rotY(p,totYaw),pitch);return [cx+q[0]*R,cy-q[1]*R,q[2]];};
+
+  ctx.save();ctx.globalCompositeOperation="lighter";ctx.lineCap="round";
+  for(const g of GR){
+    const d=g.dirs[active]; const half=LEN*(1+FOC*coh*d.on*1.4);  // focus subtly lengthens coherent grain
+    const A=proj([g.p[0]-d.v[0]*half,g.p[1]-d.v[1]*half,g.p[2]-d.v[2]*half]);
+    const B=proj([g.p[0]+d.v[0]*half,g.p[1]+d.v[1]*half,g.p[2]+d.v[2]*half]);
+    const depth=(A[2]+B[2])*0.25+0.5; if(depth<0.04) continue;
+    const col=hsl(HUE+0.12*g.p[1]+0.04*d.on*coh, 0.5- 0.35*d.on*coh*FOC, 0.5+0.18*depth); // near-uniform; focus desaturates letters to white
+    const a=(0.18+0.5*depth)*(1+FOC*coh*d.on*0.8);
+    ctx.strokeStyle=`rgba(${col[0]*255|0},${col[1]*255|0},${col[2]*255|0},${Math.min(1,a)})`;
+    ctx.lineWidth=1.1; ctx.beginPath();ctx.moveTo(A[0],A[1]);ctx.lineTo(B[0],B[1]);ctx.stroke();
+  }
+  ctx.restore();
+  document.getElementById('st').innerHTML=`section <b>${active+1}/${FLOW.length}</b> · facing <b>${(coh*100|0)}%</b> — “${FLOW[active].text}”`;
+  requestAnimationFrame(draw);
+}
+resize();requestAnimationFrame(draw);
+</script>
+</body>
+</html>

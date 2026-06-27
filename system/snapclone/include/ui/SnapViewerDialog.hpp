@@ -28,6 +28,7 @@
 
 #include "ui/MobileDialog.hpp"
 #include <QPixmap>
+#include <QList>
 #include <QElapsedTimer>
 #include "core/Types.hpp"
 
@@ -50,6 +51,11 @@ public:
     /// \param parent      Parent widget (typically InboxWidget or MainWindow).
     explicit SnapViewerDialog(const Core::Snap &snap, QWidget *parent = nullptr);
 
+    /// V32.45+: turn the viewer into a browsable feed player over an ordered
+    /// list of image/text snaps. Switches off the view-once auto-expiry timer
+    /// and shows ◀ / position / ▶ navigation; \a startIndex is the snap tapped.
+    void setPlaylist(const QList<Core::Snap> &snaps, int startIndex);
+
 signals:
     /// Emitted when the user explicitly saves the image to disk.
     /// Carries the path it was saved to so the caller can show a status message.
@@ -62,9 +68,15 @@ signals:
     /// Emitted when the timer expires (mirrors AppController::snapViewExpired).
     void viewTimerExpired(SnapClone::Core::SnapId id);
 
+    /// V32.45+: emitted each time a snap is shown in playlist/feed mode, so the
+    /// host can mark it viewed (browsing the feed counts as opening each one).
+    void snapViewed(SnapClone::Core::SnapId id);
+
 private slots:
     void onSaveClicked();
     void onTimerTick();
+    void navPrev();
+    void navNext();
 
 protected:
     bool eventFilter(QObject *obj, QEvent *e) override;
@@ -74,6 +86,9 @@ protected:
 private:
     void buildUi(const Core::Snap &snap);
     void loadImage(const QByteArray &jpegBytes);
+    void loadSnap(const Core::Snap &snap);   // populate media + meta for a snap
+    void showSnapAt(int index);              // navigate the playlist
+    void updateNavState();                   // position label + button enable
     [[nodiscard]] QString buildSavePath(const Core::Snap &snap) const;
 
     Core::Snap   m_snap;
@@ -97,6 +112,15 @@ private:
     qint64       m_totalMs       = 0;      // total duration for progress bar range
     QElapsedTimer m_elapsed;               // measures actual wall-clock time elapsed
     bool         m_saved         = false;    // prevents double-save on rapid clicks
+
+    // V32.45+: feed-player playlist (image/text snaps). Empty == single-snap
+    // view-once mode (legacy behaviour).
+    QList<Core::Snap> m_playlist;
+    int          m_index         = -1;
+    QWidget     *m_navBar        = nullptr;
+    QPushButton *m_prevBtn       = nullptr;
+    QPushButton *m_nextBtn       = nullptr;
+    QLabel      *m_posLabel      = nullptr;
 };
 
 } // namespace SnapClone::UI

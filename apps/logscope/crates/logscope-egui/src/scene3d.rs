@@ -310,16 +310,16 @@ fn mistfall() -> Scene {
     let ms = (map_radius() / 40.0).clamp(1.0, 2.6); // scale the water + scatter to fill the doubled room
     let td = tune_density(); // LOGSCOPE_TUNE_DENSITY → harness/Markov can search detail amount
     // DEEP water bed — a dark layer well below the surface; the translucent surface lets the depth read through
-    let mut deep = m3::disc(v(0.0, -6.6, 0.0), 30.0 * ms, 90, c(0x04, 0x0c, 0x10));
+    let mut deep = m3::disc(v(0.0, -6.8, 0.0), 24.0 * ms, 90, c(0x04, 0x0c, 0x10));
     m3::tint_up(&mut deep, c(0x08, 0x16, 0x1c), c(0x02, 0x06, 0x08)); deep.mat = M::WATER; deep.emissive = 0.015; s.add(deep, Float::STILL);
     for k in 0..((10.0 * ms * td) as i32) { // submerged boulders on the bed → a depth cue
         let a = hash(k, 41) * std::f32::consts::TAU; let r = (hash(k, 42)).sqrt() * 14.0 * ms;
         let mut bd = m3::rock(v(a.cos() * r, -6.4 + hash(k, 43) * 0.4, a.sin() * r), 0.8 + hash(k, 44) * 1.2, 60 + k as u32, c(0x16, 0x24, 0x2a));
         m3::tint_up(&mut bd, c(0x22, 0x34, 0x3a), c(0x0c, 0x16, 0x1a)); bd.mat = M::STONE; s.add(bd, Float::STILL);
     }
-    let mut water = m3::disc(v(0.0, -5.2, 0.0), 30.0 * ms, 110, c(0x12, 0x1e, 0x22)); // dropped further so everything clearly floats above it
+    let mut water = m3::disc(v(0.0, -6.3, 0.0), 22.0 * ms, 110, c(0x12, 0x1e, 0x22)); // a low contained POOL (not a frame-filling sea) so it reads at the cavern bottom, well below the floating scene
     m3::tint_up(&mut water, c(0x1c, 0x30, 0x36), c(0x0a, 0x14, 0x16)); water.mat = M::WATER;
-    water.emissive = 0.04; m3::set_alpha(&mut water, 172); // translucent → the deep bed shows through as depth
+    water.emissive = 0.04; m3::set_alpha(&mut water, 104); // translucent → the deep bed + low objects show through as depth
     s.add(water, Float::STILL);
     // drifting MIST LAYERS — faint translucent sheets at varied heights for depth + atmosphere (height variation)
     for k in 0..((6.0 * ms) as i32) {
@@ -331,10 +331,23 @@ fn mistfall() -> Scene {
         s.add(veil, Float { amp: 0.4, speed: 0.1 + hash(k, 95) * 0.12, phase: hash(k, 96) * 6.28, drift: 0.8 });
     }
 
-    // the portal ring, standing, tilted slightly back
-    let mut ring = m3::torus(v(0.0, 0.6, -2.0), 3.2, 0.42, 72, 22, c(0x33, 0x44, 0x4c));
-    m3::tint_height(&mut ring, -2.6, 3.8, c(0x26, 0x34, 0x3a), c(0x4e, 0x66, 0x70)); ring.mat = M::STONE;
-    s.add(ring, Float { amp: 0.05, speed: 0.4, phase: 0.0, drift: 0.0 });
+    // PORTAL RINGS scale with the conversation: a big chat raises a vertical ARCHIPELAGO of standing portals — each
+    // with a hue from the bioluminescent palette + its own height / size / phase (its local context) — not one ring.
+    let n_portals = (env_params().nodes / 22).clamp(1, 5) as i32;
+    let portal_hues = [c(0x4e, 0x66, 0x70), c(0x6a, 0x5a, 0x2e), c(0x5e, 0x2e, 0x52), c(0x2e, 0x66, 0x5a), c(0x46, 0x4e, 0x76)];
+    let mut portal = |s: &mut Scene, px: f32, py: f32, pz: f32, rad: f32, idx: i32| {
+        let hue = portal_hues[(idx as usize) % portal_hues.len()];
+        let mut ring = m3::torus(v(px, py, pz), rad, 0.42 * (rad / 3.2), 72, 22, c(0x33, 0x44, 0x4c));
+        m3::tint_height(&mut ring, py - 3.2, py + 3.2, c(0x26, 0x34, 0x3a), hue); ring.mat = M::STONE;
+        s.add(ring, Float { amp: 0.05 + 0.04 * hash(idx, 31), speed: 0.4, phase: hash(idx, 32) * 6.28, drift: 0.0 });
+    };
+    portal(&mut s, 0.0, 0.6, -2.0, 3.2, 0); // the main portal, standing tilted slightly back
+    for i in 1..n_portals {
+        let ang = hash(i, 40) * std::f32::consts::TAU;
+        let rad_out = (7.0 + hash(i, 41) * 5.0) * (1.0 + (ms - 1.0) * 0.55); // spaced out, still near enough for the fog
+        let py = 0.6 + (hash(i, 42) - 0.35) * 5.0;     // across heights → the vertical archipelago
+        portal(&mut s, ang.cos() * rad_out, py, -2.0 + ang.sin() * rad_out, 1.8 + hash(i, 43) * 1.4, i);
+    }
 
     // floating stone islands + cairns — a VERTICAL ARCHIPELAGO: more islands spread wider and across heights
     let n_isle = ((5.0 + 8.0 * (ms - 1.0)).max(5.0) * td) as i32;
@@ -544,11 +557,21 @@ fn archive() -> Scene {
             ban.mat = M::PAPER; s.add(ban, Float { amp: 0.05, speed: 0.3, phase: hash(k as i32, 90) * 6.28, drift: 0.1 });
         }
     }
-    // the archive's heart: a lectern with a glowing tome at the far end of the nave
-    let lz = depth - 1.6;
-    let mut stand = m3::tube(v(0.0, yf, lz), v(0.0, yf + 1.4, lz), 0.34, 12, c(0x5a, 0x46, 0x2c)); stand.mat = M::WOOD; s.add(stand, Float::STILL);
-    let mut tome = m3::paper_fold(v(0.0, yf + 1.6, lz), 1.2, 0.5, c(0xf6, 0xea, 0xc8)); tome.mat = M::PAPER; tome.emissive = 0.6; s.add(tome, Float { amp: 0.02, speed: 0.5, phase: 0.0, drift: 0.0 });
-    contact_shadow(&mut s, 0.0, lz, 1.3, yf, 120);
+    // LECTERNS scale with the conversation: a long chat lines the nave with several glowing tomes (stations down
+    // the aisle), each varied by a per-station seed, instead of one lectern marooned at the far end.
+    let n_lec = (env_params().nodes / 22).clamp(1, 5) as i32;
+    let mut lectern = |s: &mut Scene, px: f32, lz: f32, idx: i32| {
+        let mut stand = m3::tube(v(px, yf, lz), v(px, yf + 1.4, lz), 0.34, 12, c(0x5a, 0x46, 0x2c)); stand.mat = M::WOOD; s.add(stand, Float::STILL);
+        let mut tome = m3::paper_fold(v(px, yf + 1.6, lz), 1.2, 0.5, c(0xf6, 0xea, 0xc8)); tome.mat = M::PAPER; tome.emissive = 0.5 + 0.2 * hash(idx, 71);
+        s.add(tome, Float { amp: 0.02, speed: 0.5, phase: hash(idx, 72) * 6.28, drift: 0.0 });
+        contact_shadow(s, px, lz, 1.3, yf, 120);
+    };
+    lectern(&mut s, 0.0, depth - 1.6, 0); // the archive's heart, at the far end of the nave
+    for i in 1..n_lec {
+        let lz = (depth - 1.6) - i as f32 * ((2.0 * depth - 3.0) / n_lec as f32); // spread down the FULL nave
+        let px = ((i % 2) as f32 - 0.5) * 3.6;                            // alternate further off the central aisle
+        lectern(&mut s, px, lz, i);
+    }
     // (removed: the autumn leaf-clusters that drifted up the nave — they read as floating green/amber balls
     //  and cluttered the architecture; the arch/window rhythm now carries the Archive's character instead.)
     s
@@ -643,11 +666,21 @@ fn reading_room() -> Scene {
         }
         contact_shadow(&mut s, bx, bz, 0.6, yf, 90);
     }
-    // central reading table with a faintly glowing tome
-    let mut tbl = m3::tube(v(0.0, yf, 0.0), v(0.0, yf + 0.9, 0.0), 1.4, 20, wood_lo); tbl.mat = M::WOOD; s.add(tbl, Float::STILL);
-    let mut ttop = m3::disc(v(0.0, yf + 0.92, 0.0), 1.8, 30, c(0x6a, 0x50, 0x30)); ttop.mat = M::WOOD; s.add(ttop, Float::STILL);
-    let mut tome = m3::paper_fold(v(0.0, yf + 1.0, 0.0), 0.5, 0.3, c(0xff, 0xf0, 0xd0)); tome.mat = M::PAPER; tome.emissive = 0.5;
-    s.add(tome, Float { amp: 0.06, speed: 0.5, phase: 0.0, drift: 0.0 });
+    // READING TABLES scale with the conversation: a big chat furnishes the floor with several glowing-tome tables
+    // arranged around the central one (each varied per-station), instead of a single lonely table on the rug.
+    let n_tbl = (env_params().nodes / 22).clamp(1, 5) as i32;
+    let mut table = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
+        let mut tbl = m3::tube(v(px, yf, pz), v(px, yf + 0.9, pz), 1.4 * scl, 20, wood_lo); tbl.mat = M::WOOD; s.add(tbl, Float::STILL);
+        let mut ttop = m3::disc(v(px, yf + 0.92, pz), 1.8 * scl, 30, c(0x6a, 0x50, 0x30)); ttop.mat = M::WOOD; s.add(ttop, Float::STILL);
+        let mut tome = m3::paper_fold(v(px, yf + 1.0, pz), 0.5 * scl, 0.3, c(0xff, 0xf0, 0xd0)); tome.mat = M::PAPER; tome.emissive = 0.4 + 0.2 * hash(idx, 71);
+        s.add(tome, Float { amp: 0.06, speed: 0.5, phase: hash(idx, 72) * 6.28, drift: 0.0 });
+    };
+    table(&mut s, 0.0, 0.0, 1.0, 0); // the central reading table
+    for i in 1..n_tbl {
+        let ang = std::f32::consts::FRAC_PI_4 + (i as f32 - 1.0) * std::f32::consts::FRAC_PI_2;
+        let rad = (7.0 + i as f32 * 0.3) * rs; // pushed out toward the colonnade, staggered
+        table(&mut s, ang.cos() * rad, ang.sin() * rad, 0.8, i);
+    }
     s
 }
 
@@ -765,17 +798,8 @@ fn enclose(s: &mut Scene, wall_mat: f32, wall_lo: Color32, wall_hi: Color32, she
         m3::tint_up(&mut band, wall_hi, wall_lo); band.mat = wall_mat;
         s.add(band, Float::STILL);
     }
-    // concentric terraces stepping out from the central platform toward the wall (the brief's nested rings)
-    let plat_r = 13.0_f32 * sc;
-    for i in 0..3 {
-        let t = i as f32 / 3.0;
-        let ri = plat_r + (r - plat_r - 5.0 * sc) * t;
-        let ro = ri + (r - plat_r) / 3.2;
-        let hh = y0 + 0.3 + i as f32 * 0.7; // rise gently outward toward the wall
-        let mut terr = m3::annulus(v(0.0, hh, 0.0), ri, ro, 96, wall_lo);
-        m3::tint_up(&mut terr, wall_hi, wall_lo); terr.mat = wall_mat;
-        s.add(terr, Float::STILL);
-    }
+    // (removed: the 3 concentric floor TERRACES — those big origin-centred nested annuli read as distracting
+    //  rings cutting across the room. The floor disc + central platform carry the ground; objects sit directly.)
     // the dome closing the room, narrowing to an oculus skylight high overhead
     let rise = 14.0 * sc;
     let mut dome = m3::dome_cap(v(0.0, y0 + h, 0.0), r, rise, r * 0.28, 72, 8, wall_lo);
@@ -982,25 +1006,42 @@ fn old_library() -> Scene {
     let mut floor = m3::disc(v(0.0, -3.0, 0.0), 34.0, 120, c(0x2e, 0x22, 0x14));
     m3::tint_up(&mut floor, c(0x4a, 0x38, 0x20), c(0x20, 0x18, 0x0e)); floor.mat = M::WOOD;
     s.add(floor, Float::STILL);
-    // the lectern: a stout stand + a slanted desktop
-    let mut stand = m3::tube(v(0.0, -3.0, 0.0), v(0.0, -0.5, 0.0), 0.42, 16, c(0x46, 0x32, 0x1c));
-    m3::tint_height(&mut stand, -3.0, -0.5, c(0x30, 0x20, 0x12), c(0x5a, 0x42, 0x26)); stand.mat = M::WOOD;
-    s.add(stand, Float::STILL);
-    let mut desk = m3::disc(v(0.0, -0.45, 0.0), 1.5, 28, c(0x52, 0x3c, 0x22));
-    m3::tint_up(&mut desk, c(0x6a, 0x4e, 0x2c), c(0x3c, 0x2c, 0x18)); desk.mat = M::WOOD;
-    s.add(desk, Float::STILL);
-    // the open tome — a large page, glowing faintly so it reads as the focal point (the words)
-    let mut tome = m3::paper_fold(v(0.0, 0.0, 0.0), 1.3, 0.55, c(0xf2, 0xe6, 0xc6));
-    tome.mat = M::PAPER; tome.emissive = 0.55;
-    s.add(tome, Float { amp: 0.02, speed: 0.5, phase: 0.0, drift: 0.0 });
-    // loose pages drifting up around the lectern
-    for k in 0..8 {
-        let ang = std::f32::consts::TAU * k as f32 / 8.0;
-        let rad = 2.2 + hash(k, 3) * 3.2;
-        let p = v(ang.cos() * rad, -0.6 + hash(k, 4) * 4.2, ang.sin() * rad);
-        let mut pf = m3::paper_fold(p, 0.28 + hash(k, 5) * 0.16, 0.30, c(0xe8, 0xd6, 0xae));
-        pf.mat = M::PAPER;
-        s.add(pf, Float { amp: 0.5 + hash(k, 7) * 0.5, speed: 0.6 + hash(k, 8) * 0.5, phase: hash(k, 9) * 6.28, drift: 0.6 });
+    // CENTERPIECES SCALE WITH THE CONVERSATION: a big chat earns several lecterns (focal "open tomes") spread
+    // into the diagonal gaps between the bookshelf corridors, not one lonely stand in a vast hall. Each is varied
+    // by a per-station seed (tome glow hue + intensity, page count) so they read as distinct stations of thought
+    // distinguished by their local context — the procedural answer to "one centerpiece feels empty when big".
+    let pr = env_params();
+    let n_centers = (pr.nodes / 22).clamp(1, 5) as i32;
+    let glow_tints = [c(0xf2, 0xe6, 0xc6), c(0xf0, 0xdc, 0xb0), c(0xe8, 0xe2, 0xd0), c(0xf4, 0xd8, 0xa8), c(0xe6, 0xd0, 0xc4)];
+    let mut lectern = |s: &mut Scene, px: f32, pz: f32, scl: f32, idx: i32| {
+        let yb = -3.0_f32;
+        let mut stand = m3::tube(v(px, yb, pz), v(px, yb + 2.5 * scl, pz), 0.42 * scl, 16, c(0x46, 0x32, 0x1c));
+        m3::tint_height(&mut stand, yb, yb + 2.5 * scl, c(0x30, 0x20, 0x12), c(0x5a, 0x42, 0x26)); stand.mat = M::WOOD; s.add(stand, Float::STILL);
+        let dy = yb + 2.55 * scl;
+        let mut desk = m3::disc(v(px, dy, pz), 1.5 * scl, 28, c(0x52, 0x3c, 0x22));
+        m3::tint_up(&mut desk, c(0x6a, 0x4e, 0x2c), c(0x3c, 0x2c, 0x18)); desk.mat = M::WOOD; s.add(desk, Float::STILL);
+        // the open tome — glowing focal point; hue + glow vary per station (its local context)
+        let tint = glow_tints[(idx as usize) % glow_tints.len()];
+        let mut tome = m3::paper_fold(v(px, dy + 0.45 * scl, pz), 1.3 * scl, 0.55 * scl, tint);
+        tome.mat = M::PAPER; tome.emissive = 0.45 + 0.22 * hash(idx, 71);
+        s.add(tome, Float { amp: 0.02, speed: 0.5, phase: hash(idx, 72) * 6.28, drift: 0.0 });
+        let mut pool = m3::disc(v(px, yb + 0.02, pz), 2.4 * scl, 24, tint); // soft glow pool grounds the station as a lit focal point
+        pool.mat = M::PAPER; pool.emissive = 0.10; s.add(pool, Float::STILL);
+        for k in 0..(5 + (3.0 * scl) as i32) {                       // loose pages drifting up around this lectern
+            let ang = hash(idx * 13 + k, 3) * std::f32::consts::TAU;
+            let rad = (2.0 + hash(idx * 13 + k, 4) * 3.0) * scl;
+            let p = v(px + ang.cos() * rad, -0.6 + hash(idx * 13 + k, 5) * 4.0 * scl, pz + ang.sin() * rad);
+            let mut pf = m3::paper_fold(p, (0.26 + hash(idx * 13 + k, 6) * 0.16) * scl, 0.30, c(0xe8, 0xd6, 0xae));
+            pf.mat = M::PAPER;
+            s.add(pf, Float { amp: 0.5 + hash(idx * 13 + k, 7) * 0.5, speed: 0.6 + hash(idx * 13 + k, 8) * 0.5, phase: hash(idx * 13 + k, 9) * 6.28, drift: 0.6 });
+        }
+    };
+    lectern(&mut s, 0.0, 0.0, 1.0, 0);                               // the main lectern at the heart
+    for i in 1..n_centers {
+        // satellites sit in the diagonal gaps BETWEEN the four bookshelf corridors, so they never block an aisle
+        let ang = std::f32::consts::FRAC_PI_4 + (i as f32 - 1.0) * std::f32::consts::FRAC_PI_2;
+        let rad = 10.5 + i as f32 * 2.4; // pushed well out into the diagonal gaps, staggered so they don't ring up
+        lectern(&mut s, ang.cos() * rad, ang.sin() * rad, 0.7, i);
     }
     // RECTANGULAR BOOKSHELF HALLWAYS radiating from the lectern — wooden stacks lining each corridor, capped at
     // the end, so the room reads as aisles of a wooden library.
@@ -2822,7 +2863,7 @@ fn forest() -> Scene {
         let a = hash(k, 70) * TAU; let rad = (hash(k, 71)).sqrt() * 72.0; // sqrt → even areal density
         let (lx, lz) = (a.cos() * rad, a.sin() * rad);
         let r = 0.16 + hash(k, 72) * 0.22;
-        let mut leaf = m3::disc(v(lx, yf + 0.02 + hash(k, 73) * 0.02, lz), r, 5, leafcols[k as usize % leafcols.len()]);
+        let mut leaf = m3::disc(v(lx, yf + terrain(lx, lz) + 0.02 + hash(k, 73) * 0.02, lz), r, 5, leafcols[k as usize % leafcols.len()]);
         m3::scale_xz(&mut leaf, 1.0, 0.6 + hash(k, 74) * 0.5); // elongate slightly → leaf-ish, not perfect circles
         leaf.mat = M::MOSS; s.add(leaf, Float::STILL);
     }
@@ -2833,7 +2874,7 @@ fn forest() -> Scene {
         let rad = 5.0 + hash(k, 2) * 9.0;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
         let hgt = 5.0 + hash(k, 3) * 3.5;
-        let origin = v(tx, yf, tz);
+        let origin = v(tx, yf + terrain(tx, tz), tz);
         let lean = normv(v((hash(k, 4) - 0.5) * 0.2, 1.0, (hash(k, 5) - 0.5) * 0.2));
         tree_branch(&mut s, origin, lean, hgt, 0.5 + hash(k, 6) * 0.3, 2, 7);
         let cc = addv(origin, mulv(lean, hgt + 0.4));
@@ -2841,12 +2882,12 @@ fn forest() -> Scene {
             let aa = TAU * j as f32 / 7.0;
             let p = addv(cc, v(aa.cos() * 1.7, hash(k * 7 + j, 1) * 0.9 - 0.3, aa.sin() * 1.7));
             if let Some(bc) = crown((k * 7 + j) as i32) {
-                let mut puff = m3::leaf_cluster(p, 1.5, (k * 7 + j) as u32, bc);
+                let mut puff = m3::leaf_cluster(p, 1.15, (k * 7 + j) as u32, bc);
                 m3::tint_up(&mut puff, shade(bc, 1.25), shade(bc, 0.6)); puff.mat = M::MOSS;
                 s.add(puff, Float { amp: 0.08, speed: 0.6, phase: hash(k * 7 + j, 2) * 6.28, drift: 0.05 });
             }
         }
-        contact_shadow(&mut s, tx, tz, 1.5, yf, 110);
+        contact_shadow(&mut s, tx, tz, 1.5, yf + terrain(tx, tz), 110);
     }
 
     // MANY TALL THIN trees — slender trunks rising high with a small high canopy (the "way more tall thin trees")
@@ -2857,13 +2898,13 @@ fn forest() -> Scene {
         let hgt = 8.0 + hash(k, 12) * 6.0;
         let thin = 0.18 + hash(k, 13) * 0.16;          // slender
         let lean = normv(v((hash(k, 14) - 0.5) * 0.08, 1.0, (hash(k, 15) - 0.5) * 0.08));
-        tree_branch(&mut s, v(tx, yf, tz), lean, hgt, thin, 1, 70 + k);
-        let cc = v(tx, yf + hgt, tz);
+        tree_branch(&mut s, v(tx, yf + terrain(tx, tz), tz), lean, hgt, thin, 1, 70 + k);
+        let cc = v(tx, yf + terrain(tx, tz) + hgt, tz);
         for j in 0..4 {                                 // small tight crown high up
             let aa = TAU * j as f32 / 4.0 + hash(k, 16) * 6.28;
             let p = addv(cc, v(aa.cos() * 1.0, hash(k * 4 + j, 1) * 0.7, aa.sin() * 1.0));
             if let Some(bc) = crown((k * 4 + j) as i32 + 5000) {
-                let mut puff = m3::leaf_cluster(p, 1.0 + hash(k, 17) * 0.5, (k * 4 + j) as u32, bc);
+                let mut puff = m3::leaf_cluster(p, 0.55 + hash(k, 17) * 0.3, (k * 4 + j) as u32, bc);
                 m3::tint_up(&mut puff, shade(bc, 1.25), shade(bc, 0.6)); puff.mat = M::MOSS;
                 s.add(puff, Float { amp: 0.12, speed: 0.7, phase: hash(k * 4 + j, 2) * 6.28, drift: 0.08 });
             }
@@ -3095,31 +3136,48 @@ fn treehouse() -> Scene {
         s.add(puff, Float { amp: 0.06, speed: 0.5, phase: hash(k, 100) * 6.28, drift: 0.04 });
     }
 
-    // CREATURES — a couple perched ON platform decks, the rest WALKING the bridges (grounded on the actual plank
-    // surface, facing along the span). The bridge sag is sag·4·t·(1−t) below the chord (matches rope_bridge).
+    // CREATURES — rabbits + cats roam the FOREST FLOOR far below; hanging creatures dangle from procedural ROPES
+    // in the canopy ABOVE the walk; a few cross the bridges (one gripping the handrail rope as it goes).
     let bsag = 1.3_f32;
-    for i in [0usize, 2] {
-        let (px, pz, py) = plats[i];
-        let ang = hash(i as i32, 5) * TAU; let off = 0.7 + hash(i as i32, 6) * 0.4;
-        critter(&mut s, (i % 2) as u32, v(px + ang.cos() * off, py, pz + ang.sin() * off), ang + std::f32::consts::PI, 1100 + i as u32);
+    // rabbits + cats on the forest floor (not perched on the canopy decks)
+    for k in 0..8 {
+        let a = hash(k, 60) * TAU; let rad = 3.0 + hash(k, 61) * 18.0;
+        critter(&mut s, if k % 3 == 0 { 1 } else { 0 }, v(a.cos() * rad, -8.0, a.sin() * rad), hash(k, 62) * TAU, 1300 + k as u32);
     }
+    // hanging creatures on procedural ROPES dropped from the tree canopy ABOVE the walk
+    for (i, (tx, tz)) in trees.iter().enumerate() {
+        for r in 0..2i32 {
+            let th = 13.5 + (hsh(i as u32 * 5 + 10) - 0.5) * 4.0 + canopy_lift;
+            let key = i as i32 * 2 + r;
+            let aa = hash(key, 52) * TAU;
+            let off = 1.3 + hash(key, 51) * 1.4;
+            let top = v(*tx + aa.cos() * off, -8.0 + th - 3.0 - hash(key, 50) * 2.0, *tz + aa.sin() * off);
+            let drop = 1.6 + hash(key, 53) * 1.6;
+            let bot = v(top.x, top.y - drop, top.z);
+            let mut rope = m3::tube(top, bot, 0.04, 5, c(0x6a, 0x52, 0x32)); rope.mat = M::WOOD;
+            s.add(rope, Float { amp: 0.06, speed: 0.5, phase: hash(key, 54) * 6.28, drift: 0.5 });
+            swinger(&mut s, bot, 0.4, 1180 + key as u32);
+        }
+    }
+    // a couple WALK the bridges — grounded on the swinging plank, facing along the span, riding the bridge's sway
     for i in 0..4 {
-        if hash(i as i32, 9) < 0.45 { continue; }
-        let (a, b) = (plats[i], plats[(i + 1) % 4]); // plats = (x, z, y)
+        if hash(i as i32, 9) < 0.4 { continue; }
+        let (a, b) = (plats[i], plats[(i + 1) % 4]);
         let t = 0.38 + hash(i as i32, 12) * 0.24;
         let (dx, dy, dz) = (b.0 - a.0, b.2 - a.2, b.1 - a.1);
         let droop = bsag * 4.0 * t * (1.0 - t);
         let pos = v(a.0 + dx * t, a.2 + dy * t - droop, a.1 + dz * t); // on the plank
-        // ride the SAME sway as bridge i (seed i*31) so it stays planted on the swinging span
         let sway = Float { amp: 0.12, speed: 0.5, phase: hash((i * 31) as i32, 1) * 6.28, drift: 0.6 };
         critter_m(&mut s, (i % 2) as u32, pos, dz.atan2(dx), 1160 + i as u32, sway);
     }
-    // HANGERS anchored to real fixed points — gripping a platform rail and dangling into the open below the walk
-    for i in 0..3 {
-        let (px, pz, py) = plats[i % 4];
-        let ang = hash(i as i32, 7) * TAU;
-        let anchor = v(px + ang.cos() * 2.0, py + 0.72, pz + ang.sin() * 2.0); // the platform rail = the fixed grip
-        swinger(&mut s, anchor, 1.0 + hsh(i as u32 * 7 + 30) * 0.7, 1180 + i as u32);
+    // a HANGING creature CROSSES a bridge, gripping the handrail rope as it goes (the new traverse pose: it dangles
+    // from the rope with its feet skimming the plank, riding the same sway as the span)
+    {
+        let (a, b) = (plats[0], plats[1]);
+        let t = 0.5; let (dx, dy, dz) = (b.0 - a.0, b.2 - a.2, b.1 - a.1);
+        let droop = bsag * 4.0 * t * (1.0 - t);
+        let grip = v(a.0 + dx * t, a.2 + dy * t - droop + 1.05, a.1 + dz * t); // hand at handrail height above the plank
+        swinger(&mut s, grip, 0.95, 1190);
     }
     s
 }
@@ -3579,7 +3637,7 @@ impl Default for EnvParams { fn default() -> Self { Self { nodes: 40, branches: 
 thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cell::Cell::new(EnvParams { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0 }) }; }
 /// Feed the live conversation's shape to the environment generator (call before `with_env`/`render_env`).
 pub fn set_env_params(p: EnvParams) { ENV_PARAMS.with(|c| c.set(p)); }
-fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
+pub fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
 
 /// Atlantis hall semi-axes (rx along the spine, rz across it) — large enough to CONTAIN the conversation
 /// flow on each axis. `ext_x/ext_z` are the graph's world-space half-spans (fed from the live layout);

@@ -192,34 +192,57 @@ pub fn message_pane_qml(style: &PaneStyle, m: &MessageView) -> String {
 }
 
 /// Compose pane: a minimal To/Subject/Body form with a Send button.
-pub fn compose_pane_qml(style: &PaneStyle, to: Option<&str>) -> String {
-    let mut o = String::with_capacity(768);
+pub fn compose_pane_qml(
+    style: &PaneStyle,
+    to: Option<&str>,
+    subject: Option<&str>,
+    body: Option<&str>,
+) -> String {
+    let mut o = String::with_capacity(896);
     pane_header(&mut o, style, "Compose");
     let _ = std::fmt::Write::write_fmt(
         &mut o,
         format_args!(
-            "Column {{\nwidth: parent.width\nspacing: 6\nTextField {{ objectName: \"mail_to\"; width: parent.width; placeholderText: \"To\"; text: \"{to}\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nTextField {{ objectName: \"mail_subject\"; width: parent.width; placeholderText: \"Subject\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nTextArea {{ objectName: \"mail_body\"; width: parent.width; height: 240; placeholderText: \"Message\"; wrapMode: TextArea.Wrap; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nRow {{ spacing: 8\n",
+            "Column {{\nwidth: parent.width\nspacing: 6\nTextField {{ objectName: \"mail_to\"; width: parent.width; placeholderText: \"To\"; text: \"{to}\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nTextField {{ objectName: \"mail_subject\"; width: parent.width; placeholderText: \"Subject\"; text: \"{subject}\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nTextArea {{ objectName: \"mail_body\"; width: parent.width; height: 240; placeholderText: \"Message\"; text: \"{body}\"; wrapMode: TextArea.Wrap; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nRow {{ spacing: 8\n",
             to = q(to.unwrap_or("")),
+            subject = q(subject.unwrap_or("")),
+            body = q(body.unwrap_or("")),
             fg = q(&style.fg),
             ff = q(&style.font_family),
             fs = style.font_px,
         ),
     );
-    // The Send button gathers field values by objectName (same pattern the
-    // project's form submit uses) and hands them to the backend.
+    // Send/Save capture the backend's `status\tdetail` wire and show it
+    // on the status line (same pattern as the login form), so the user
+    // sees "Draft saved" or the honest "sending not available" note
+    // rather than a silent no-op.
     push_button(
         &mut o,
         style,
         "Send",
-        "if (backend) backend.mail_send(\
-         _root_to(), _root_subject(), _root_body())",
+        "if (backend) _setStatus(backend.mail_send(_root_to(), _root_subject(), _root_body()))",
     );
-    push_button(&mut o, style, "Save draft", "if (backend) backend.mail_save_draft(_root_to(), _root_subject(), _root_body())");
+    push_button(
+        &mut o,
+        style,
+        "Save draft",
+        "if (backend) _setStatus(backend.mail_save_draft(_root_to(), _root_subject(), _root_body()))",
+    );
     o.push_str("}\n");
-    // Tiny helpers to read the named fields (kept inline so the snippet is
+    // Status line + field readers (kept inline so the snippet is
     // self-contained when injected into a Loader).
+    let _ = std::fmt::Write::write_fmt(
+        &mut o,
+        format_args!(
+            "Text {{ id: _status; objectName: \"compose_status\"; width: parent.width; text: \"\"; visible: text.length > 0; wrapMode: Text.WordWrap; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\n",
+            fg = q(&style.fg),
+            ff = q(&style.font_family),
+            fs = style.font_px,
+        ),
+    );
     o.push_str(
-        "function _root_to() { return _field(\"mail_to\") }\n\
+        "function _setStatus(r) { if (!r) { _status.text=\"\"; return } var p=r.split(\"\\t\"); if (p[0]===\"ok\") { _status.color=\"#86c986\"; _status.text=(p[1]||\"Done\") } else { _status.color=\"#e0928f\"; _status.text=(p[1]||\"Failed\") } }\n\
+         function _root_to() { return _field(\"mail_to\") }\n\
          function _root_subject() { return _field(\"mail_subject\") }\n\
          function _root_body() { return _field(\"mail_body\") }\n\
          function _field(n) { for (var i=0;i<children.length;i++){ var c=children[i]; if(c.objectName===n) return c.text||\"\" } return \"\" }\n",
@@ -707,7 +730,7 @@ mod tests {
 
     #[test]
     fn compose_pane_has_fields_and_send() {
-        let qml = compose_pane_qml(&PaneStyle::dark_default(), Some("a@b.c"));
+        let qml = compose_pane_qml(&PaneStyle::dark_default(), Some("a@b.c"), None, None);
         assert!(qml.contains("objectName: \"mail_to\""));
         assert!(qml.contains("text: \"a@b.c\""));
         assert!(qml.contains("mail_send("));

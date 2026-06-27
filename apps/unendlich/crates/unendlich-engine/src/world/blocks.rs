@@ -673,7 +673,10 @@ mod tests {
                 | BlockId::Sandstone | BlockId::Obsidian | BlockId::CopperOre | BlockId::Quartz
                 | BlockId::DiamondOre | BlockId::OakPlanks | BlockId::StoneBricks | BlockId::Bricks
                 | BlockId::Glass | BlockId::IronBlock | BlockId::GoldBlock | BlockId::CoalBlock
-                | BlockId::Bookshelf | BlockId::Pumpkin | BlockId::SnowBlock => {}
+                | BlockId::Bookshelf | BlockId::Pumpkin | BlockId::SnowBlock
+                | BlockId::MossyCobblestone | BlockId::PolishedStone | BlockId::SmoothSandstone
+                | BlockId::Terracotta | BlockId::ChiseledStoneBricks | BlockId::DarkOakPlanks
+                | BlockId::PolishedBasalt => {}
             }
         }
         for b in BlockId::ALL { _forces_update(b); }

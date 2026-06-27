@@ -99,6 +99,9 @@ ApplicationWindow {
 
         // ── File viewer (peek) ───────────────────────────────────────
         PeekViewer { id: viewer }
+
+        // ── Apps: version-pinned binaries ────────────────────────────
+        Apps { id: apps }
     }
 
     footer: TabBar {
@@ -109,6 +112,7 @@ ApplicationWindow {
         TabButton { text: "timeline" }
         TabButton { text: "branches" }
         TabButton { text: "view" }
+        TabButton { text: "apps" }
     }
 
     // Drain checkpoints the background watcher recorded; update the timeline

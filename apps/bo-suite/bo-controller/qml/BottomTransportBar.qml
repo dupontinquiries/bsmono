@@ -91,7 +91,7 @@ Item {
                 delegate: Rectangle {
                     property bool isActive: modelData.device_url === qtobj.active_url
                     height: 26; radius: 13
-                    width: chipLbl.implicitWidth + badgePill.width + 22
+                    width: chipRow.implicitWidth + 16
                     color: isActive
                         ? Qt.rgba(0.78, 0.63, 0.29, 0.25)
                         : Qt.rgba(1, 1, 1, 0.04)
@@ -99,6 +99,7 @@ Item {
                     border.width: isActive ? 2 : 1
 
                     Row {
+                        id: chipRow
                         anchors.centerIn: parent
                         spacing: 5
                         // ▶ glyph marks the device that's currently
@@ -119,6 +120,78 @@ Item {
                             font.weight: Font.DemiBold
                             anchors.verticalCenter: parent.verticalCenter
                         }
+                        // Head-of-queue track — what this speaker is set to
+                        // play. Shows the multi-speaker "different streams"
+                        // picture at a glance. Elided so a long title can't
+                        // blow out the chip; hidden when unknown.
+                        Text {
+                            visible: (modelData.head_title || "") !== ""
+                            text: "· " + (modelData.head_title || "")
+                            color: isActive ? Bo.silver : Bo.slate
+                            font.pixelSize: 9
+                            font.italic: true
+                            elide: Text.ElideRight
+                            width: Math.min(implicitWidth, 96)
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        // Per-device volume. For the ACTIVE device this is an
+                        // inline −/+ stepper (routes through the safe volume
+                        // path). For INACTIVE devices it's read-only: volume
+                        // can only be routed through the active device's
+                        // driver + product ceiling, so we show their
+                        // remembered level but don't fake a control that
+                        // would silently switch devices. Tap the chip body to
+                        // make a device active, then its stepper appears.
+                        // Hidden entirely when the level is unknown (-1).
+                        Row {
+                            id: volStepper
+                            property int devVol: isActive
+                                ? qtobj.volume
+                                : (modelData.volume || -1)
+                            visible: devVol >= 0
+                            spacing: 1
+                            anchors.verticalCenter: parent.verticalCenter
+
+                            Text {
+                                visible: isActive
+                                text: "−"
+                                color: Bo.silver
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                                anchors.verticalCenter: parent.verticalCenter
+                                MouseArea {
+                                    width: 20; height: 24
+                                    anchors.centerIn: parent
+                                    enabled: isActive
+                                    onClicked: qtobj.set_device_volume(
+                                        modelData.device_url,
+                                        Math.max(0, volStepper.devVol - 5))
+                                }
+                            }
+                            Text {
+                                text: "🔊" + volStepper.devVol
+                                color: isActive ? Bo.bone : Bo.slate
+                                font.pixelSize: 9
+                                font.weight: isActive ? Font.DemiBold : Font.Normal
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Text {
+                                visible: isActive
+                                text: "+"
+                                color: Bo.silver
+                                font.pixelSize: 12
+                                font.weight: Font.DemiBold
+                                anchors.verticalCenter: parent.verticalCenter
+                                MouseArea {
+                                    width: 20; height: 24
+                                    anchors.centerIn: parent
+                                    enabled: isActive
+                                    onClicked: qtobj.set_device_volume(
+                                        modelData.device_url,
+                                        Math.min(100, volStepper.devVol + 5))
+                                }
+                            }
+                        }
                         // Queue-count badge
                         Rectangle {
                             id: badgePill
@@ -137,6 +210,11 @@ Item {
                         }
                     }
                     MouseArea {
+                        // Below the inline volume stepper (z-order) so taps
+                        // on − / + adjust volume rather than switching the
+                        // queue view. Taps anywhere else on the chip still
+                        // select this device's queue.
+                        z: -1
                         anchors.fill: parent
                         onClicked: qtobj.load_queue_for_device(modelData.device_url)
                     }
@@ -396,13 +474,16 @@ Item {
                             titleBlock.estimatedSec = resumeSec
                             titleBlock._pausedAtSec = resumeSec
                         } else {
-                            // Resume from paused position if we have one.
+                            // Resume. If we have a remembered position and
+                            // the same track is still loaded, seek_to alone
+                            // replays from that offset — one spawn, no race.
+                            // Only fall back to play_track (from 0) when
+                            // there's no position to resume to.
                             var from = titleBlock._pausedAtSec || 0
-                            if (qtobj.last_played_track_id_qml > 0) {
+                            if (from > 0 && qtobj.last_played_track_id_qml > 0) {
+                                qtobj.seek_to(from)
+                            } else if (qtobj.last_played_track_id_qml > 0) {
                                 qtobj.play_track(qtobj.last_played_track_id_qml)
-                                if (from > 0) {
-                                    Qt.callLater(function() { qtobj.seek_to(from) })
-                                }
                             }
                             titleBlock._pausedAtSec = 0
                         }

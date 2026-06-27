@@ -102,6 +102,35 @@ pub fn flow(parents: &[Option<usize>], times_secs: &[f64]) -> Vec<Vec3> {
         let yc = ((xi * 0.11 + 0.6).sin() * 2.4 + (xi * 0.05 - 0.3).sin() * 1.0) * th;  // vertical roll, tunable
         pos[i] = Vec3::new(xi, yc + ly[i], zc + lz[i]);
     }
+    // BREATHING-ROOM relaxation — give the graph room around scene objects. Gentle node-node repulsion (in z/y
+    // only, so the time axis x stays anchored and the forward reading order is preserved) keeps turns from
+    // clumping, and a soft center-clearing pushes nodes out of the central zone where a scene's centerpiece sits,
+    // so the conversation flows AROUND objects instead of through them. Tunable via LOGSCOPE_TUNE_CLEAR / _BREATHE.
+    let clear_r = std::env::var("LOGSCOPE_TUNE_CLEAR").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(4.5).max(0.0);
+    let breathe = std::env::var("LOGSCOPE_TUNE_BREATHE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 3.0);
+    if breathe > 0.0 {
+        for _ in 0..14 {
+            let mut disp = vec![Vec3::new(0.0, 0.0, 0.0); n];
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if (pos[i].x - pos[j].x).abs() > 3.5 { continue; } // only near-in-time turns interact
+                    let (dz, dy) = (pos[i].z - pos[j].z, pos[i].y - pos[j].y);
+                    let d2 = dz * dz + dy * dy + 0.001;
+                    if d2 < 4.0 { // only push apart turns that are actually crowding (within ~2u) — keeps the flow line
+                        let f = (1.0 - d2 / 4.0) * 0.5 * breathe / d2.sqrt();
+                        disp[i].z += dz * f; disp[i].y += dy * f; disp[j].z -= dz * f; disp[j].y -= dy * f;
+                    }
+                }
+                let rxz = (pos[i].x * pos[i].x + pos[i].z * pos[i].z).sqrt();
+                if rxz < clear_r && rxz > 0.01 {
+                    let push = (clear_r - rxz) * 0.12 * breathe;
+                    disp[i].x += pos[i].x / rxz * push * 0.35;
+                    disp[i].z += pos[i].z / rxz * push;
+                }
+            }
+            for i in 0..n { pos[i].x += disp[i].x; pos[i].y += disp[i].y; pos[i].z += disp[i].z; }
+        }
+    }
     pos
 }
 

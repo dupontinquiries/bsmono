@@ -306,6 +306,26 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         "#)?;
     }
 
+    if current < 5 {
+        // ── Track ratings ───────────────────────────────────────────
+        //
+        // A 0–5 star rating per track (0 = unrated). Stored on the track
+        // row; a path-keyed mirror keeps it durable across rescans the
+        // same way tags are (a track that gets a new id on re-add must
+        // not silently lose its rating). The scanner re-links these after
+        // each walk via relink_ratings_by_path.
+        conn.execute_batch(r#"
+            ALTER TABLE tracks ADD COLUMN rating INTEGER NOT NULL DEFAULT 0;
+
+            CREATE TABLE IF NOT EXISTS track_rating_by_path (
+                path    TEXT PRIMARY KEY,
+                rating  INTEGER NOT NULL DEFAULT 0
+            );
+
+            PRAGMA user_version = 5;
+        "#)?;
+    }
+
     Ok(())
 }
 
@@ -314,6 +334,52 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 // straightforward.
 #[allow(dead_code)]
 fn _migrate_v3_marker() {}
+
+/// Set a track's star rating (0–5; 0 = unrated). Writes both the track
+/// row and the durable path-keyed mirror in one transaction, so the
+/// rating survives a rescan that gives the file a new track id. Values
+/// outside 0..=5 are clamped.
+pub fn set_track_rating(conn: &mut Connection, track_id: i64, rating: i64) -> rusqlite::Result<()> {
+    let r = rating.clamp(0, 5);
+    let tx = conn.transaction()?;
+    tx.execute("UPDATE tracks SET rating = ?1 WHERE id = ?2", params![r, track_id])?;
+    // Mirror by path (if the track has one) for durability.
+    let path: Option<String> = tx.query_row(
+        "SELECT path FROM tracks WHERE id = ?1", params![track_id],
+        |row| row.get(0)).optional()?;
+    if let Some(p) = path {
+        tx.execute(
+            "INSERT INTO track_rating_by_path (path, rating) VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET rating = excluded.rating",
+            params![p, r])?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Read a track's star rating (0 if unrated or unknown).
+pub fn track_rating(conn: &Connection, track_id: i64) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT rating FROM tracks WHERE id = ?1", params![track_id],
+                   |r| r.get(0)).optional().map(|o| o.unwrap_or(0))
+}
+
+/// Re-link path-mirrored ratings back onto track rows after a rescan.
+/// Mirrors relink_tags_by_path: a file that was re-added with a new id
+/// gets its previously-set rating restored from the path mirror. Only
+/// overwrites when the mirror has a non-zero rating, so a fresh scan
+/// can't wipe a rating the user just set on the new row.
+pub fn relink_ratings_by_path(conn: &Connection) -> rusqlite::Result<usize> {
+    let n = conn.execute(
+        "UPDATE tracks
+         SET rating = (SELECT m.rating FROM track_rating_by_path m WHERE m.path = tracks.path)
+         WHERE EXISTS (
+             SELECT 1 FROM track_rating_by_path m
+             WHERE m.path = tracks.path AND m.rating > 0
+         )
+         AND rating = 0",
+        [])?;
+    Ok(n)
+}
 
 // Inline trailing function from before the schema-expansion patch.
 #[allow(dead_code)]
@@ -574,6 +640,9 @@ pub struct TrackSummary {
     pub key_text: Option<String>,
     pub album: Option<String>,
     pub year: Option<u16>,
+    /// 0–5 star rating (0 = unrated).
+    #[serde(default)]
+    pub rating: i64,
 }
 
 pub fn recent(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<TrackSummary>> {
@@ -590,6 +659,32 @@ pub fn recent(conn: &Connection, limit: usize) -> rusqlite::Result<Vec<TrackSumm
     let mut summaries = rows_to_summaries(&mut stmt, params![limit as i64])?;
     apply_overrides(conn, &mut summaries)?;
     Ok(summaries)
+}
+
+/// Every track in the library, paginated, ordered by title. Uses
+/// `FROM tracks` with a COALESCE'd artist subquery (NOT an inner join on
+/// track_artists), so tracks with no artist link still appear — the
+/// belt-and-suspenders guarantee that no track is ever unreachable
+/// regardless of how its filename parsed. Returns (rows, total_count).
+pub fn all_tracks_page(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<(Vec<TrackSummary>, i64)> {
+    let mut stmt = conn.prepare(r#"
+        SELECT t.id, t.path, t.title, t.album, t.year, t.bpm, t.camelot, t.key_text,
+               COALESCE((SELECT a.name FROM artists a
+                          JOIN track_artists ta ON ta.artist_id = a.id
+                         WHERE ta.track_id = t.id AND ta.role = 'primary'
+                         ORDER BY ta.ord LIMIT 1), 'Unknown Artist')
+        FROM tracks t
+        ORDER BY t.title COLLATE NOCASE
+        LIMIT ?1 OFFSET ?2
+    "#)?;
+    let mut summaries = rows_to_summaries(&mut stmt, params![limit, offset])?;
+    apply_overrides(conn, &mut summaries)?;
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
+    Ok((summaries, total))
 }
 
 pub fn by_artist_id(conn: &Connection, artist_id: i64) -> rusqlite::Result<Vec<TrackSummary>> {
@@ -767,6 +862,10 @@ pub(crate) fn rows_to_summaries(
             camelot: r.get(6)?,
             key_text: r.get(7)?,
             primary_artist: r.get(8)?,
+            // Name-based so this works regardless of column order, and
+            // tolerant of queries that don't select it (older/narrower
+            // SELECTs default to unrated rather than erroring).
+            rating: r.get::<_, i64>("rating").unwrap_or(0),
         })
     })?;
     for row in rows { out.push(row?); }

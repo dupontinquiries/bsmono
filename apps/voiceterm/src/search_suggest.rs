@@ -303,6 +303,63 @@ pub fn suggest_commands(
     out
 }
 
+/// v0.1.877: built-in manpage suggestions. The web2qml manpage docs
+/// (welcome, mail, etc. — `manpages::list_names()`) live at
+/// `web2qml://man/<name>` but were never offered by the search bar:
+/// INTERNAL_PAGES only lists a few hand-picked routes, and the ManPage
+/// kind above is for *shell-command* man pages (`man tar`), not these
+/// docs. This surfaces them as Internal navigations.
+///
+/// Matching: a name equal to the query ranks highest, a name the query
+/// prefixes next, a name containing the query lowest. A leading "man "
+/// is stripped so "man mail" finds "mail", and a bare "man" offers the
+/// manpage index. Kept separate from build() (additive, like
+/// suggest_commands) so build()'s signature/FFI stay fixed.
+pub fn suggest_manpages(query: &str, names: &[&str], cap: usize) -> Vec<Suggestion> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() { return Vec::new(); }
+    // "man mail" → "mail"; bare "man" handled below as the index.
+    let body = q.strip_prefix("man ").map(|s| s.trim()).unwrap_or(q.as_str());
+
+    let mut out: Vec<Suggestion> = Vec::new();
+
+    // Bare "man" → the manpage index page.
+    if q == "man" {
+        out.push(Suggestion {
+            kind: SuggestKind::Internal,
+            label: "man — manual index (web2qml)".to_string(),
+            target: "web2qml://man".to_string(),
+            score: 72,
+        });
+    }
+
+    if !body.is_empty() {
+        for name in names {
+            let nl = name.to_lowercase();
+            let score = if nl == body {
+                75
+            } else if nl.starts_with(body) {
+                68
+            } else if nl.contains(body) {
+                58
+            } else {
+                continue;
+            };
+            out.push(Suggestion {
+                kind: SuggestKind::Internal,
+                label: format!("{} (man page)", name),
+                target: format!("web2qml://man/{}", name),
+                score,
+            });
+        }
+    }
+
+    out.sort_by(|a, b| b.score.cmp(&a.score));
+    dedup_by_target(&mut out);
+    out.truncate(cap);
+    out
+}
+
 /// Serialize suggestions for QML: one per line,
 /// `tag\x1Flabel\x1Ftarget`.
 pub fn to_wire(suggestions: &[Suggestion]) -> String {
@@ -474,5 +531,27 @@ mod tests {
         }];
         let w = to_wire(&s);
         assert_eq!(w, "h\u{1f}GitHub\u{1f}https://github.com\n");
+    }
+
+    #[test]
+    fn suggest_manpages_matches() {
+        let names = ["welcome", "mail", "mail-storage", "email"];
+        // Exact name → the page, as an Internal navigation.
+        let r = suggest_manpages("mail", &names, 5);
+        assert!(r.iter().any(|s| s.target == "web2qml://man/mail"
+            && s.kind == SuggestKind::Internal), "got: {:?}", r);
+        // Prefix match.
+        assert!(suggest_manpages("wel", &names, 5)
+            .iter().any(|s| s.target == "web2qml://man/welcome"));
+        // "man mail" strips the lead-in.
+        assert!(suggest_manpages("man mail", &names, 5)
+            .iter().any(|s| s.target == "web2qml://man/mail"));
+        // Bare "man" → the manual index.
+        assert!(suggest_manpages("man", &names, 5)
+            .iter().any(|s| s.target == "web2qml://man"));
+        // Empty query → nothing.
+        assert!(suggest_manpages("", &names, 5).is_empty());
+        // A query matching no page → nothing.
+        assert!(suggest_manpages("zzzznope", &names, 5).is_empty());
     }
 }

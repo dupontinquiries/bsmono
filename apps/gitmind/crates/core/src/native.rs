@@ -131,15 +131,26 @@ pub fn commit_worktree(
     message: &str,
 ) -> Result<NativeCommit, String> {
     let refname = format!("refs/heads/{branch}");
-    let parents: Vec<String> = store
+    let mut parents: Vec<String> = store
         .refs()?
         .into_iter()
         .find(|(n, _)| *n == refname)
         .map(|(_, v)| vec![v])
         .unwrap_or_default();
+    // If a merge is in progress, the resolved worktree becomes a two-parent
+    // merge commit; MERGE_HEAD is cleared afterward.
+    let mh = merge_head(store)?;
+    if let Some(other) = &mh {
+        if !parents.iter().any(|p| p == other) {
+            parents.push(other.clone());
+        }
+    }
     let commit = commit_dir(store, dir, &parents, name, email, message)?;
     store.put_ref(&refname, &commit.oid)?;
     store.put_ref("HEAD", &refname)?;
+    if mh.is_some() {
+        store.delete_ref("MERGE_HEAD")?;
+    }
     Ok(commit)
 }
 
@@ -282,7 +293,7 @@ pub struct CheckoutReport {
 
 /// Write a native tree into `dir` recursively, restoring blob content and
 /// applying the executable bit. Counts files written.
-fn materialize_tree(
+pub fn materialize_tree(
     store: &ChunkStore,
     tree_oid: &str,
     dir: &Path,
@@ -418,7 +429,7 @@ pub struct BranchInfo {
 }
 
 /// Resolve a branch name or commit oid/prefix to a commit oid.
-fn resolve_ref_or_commit(store: &ChunkStore, s: &str) -> Result<String, String> {
+pub fn resolve_ref_or_commit(store: &ChunkStore, s: &str) -> Result<String, String> {
     let refname = format!("refs/heads/{s}");
     if let Some((_, oid)) = store.refs()?.into_iter().find(|(n, _)| *n == refname || n == s) {
         return Ok(oid);
@@ -579,37 +590,41 @@ pub fn cherry_pick(
     let mut base: BTreeMap<String, (String, String)> = BTreeMap::new();
     flatten_tree_full(store, &hmeta.tree, "", &mut base)?;
 
-    match apply_commit_delta(store, &c, &base)? {
-        ApplyResult::Conflicts(paths) => Ok(PickOutcome::Conflicts(paths)),
-        ApplyResult::Merged(_, false) => Ok(PickOutcome::Empty),
-        ApplyResult::Merged(map, true) => {
-            let cmeta = crate::portage::native_commit(store, &c)?;
-            let tree = build_tree_from_map(store, &map)?;
-            let ts = now_secs();
-            let line = gitobj::ident_line(name, email, ts, "+0000");
-            let (oid, bytes) = gitobj::build_commit(&tree, &[head_oid], &line, &line, &cmeta.message);
-            store_obj(store, KIND_COMMIT, &oid, &bytes)?;
-            advance_head(store, &oid)?;
-            Ok(PickOutcome::Committed(NativeCommit { oid, tree }))
-        }
+    let o = apply_commit_delta(store, &c, &base)?;
+    if !o.conflicts.is_empty() {
+        let mut paths: Vec<String> = o.conflicts.into_iter().map(|x| x.path).collect();
+        paths.sort();
+        return Ok(PickOutcome::Conflicts(paths));
     }
+    if !o.applied {
+        return Ok(PickOutcome::Empty);
+    }
+    let cmeta = crate::portage::native_commit(store, &c)?;
+    let tree = build_tree_from_map(store, &o.merged)?;
+    let ts = now_secs();
+    let line = gitobj::ident_line(name, email, ts, "+0000");
+    let (oid, bytes) = gitobj::build_commit(&tree, &[head_oid], &line, &line, &cmeta.message);
+    store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+    advance_head(store, &oid)?;
+    Ok(PickOutcome::Committed(NativeCommit { oid, tree }))
 }
 
 /// Result of applying one commit's change onto a base tree map.
-enum ApplyResult {
-    /// (resulting tree map, whether anything actually changed)
-    Merged(BTreeMap<String, (String, String)>, bool),
-    Conflicts(Vec<String>),
+struct ApplyOutcome {
+    merged: BTreeMap<String, (String, String)>,
+    conflicts: Vec<ConflictDetail>,
+    applied: bool,
 }
 
 /// Apply the change a commit made (vs its first parent) onto `base`
-/// (path → (mode, oid)) at file granularity. Clean when `base` still matches
-/// the commit's parent for each touched file; conflict when both sides differ.
+/// (path → (mode, oid)) at file granularity. Returns the merged map (clean
+/// paths only), per-file conflicts (ours = current base, theirs = commit),
+/// and whether anything changed.
 fn apply_commit_delta(
     store: &ChunkStore,
     commit_oid: &str,
     base: &BTreeMap<String, (String, String)>,
-) -> Result<ApplyResult, String> {
+) -> Result<ApplyOutcome, String> {
     let cmeta = crate::portage::native_commit(store, commit_oid)?;
     let mut p_map: BTreeMap<String, (String, String)> = BTreeMap::new();
     if let Some(par) = cmeta.parents.first() {
@@ -620,37 +635,36 @@ fn apply_commit_delta(
     flatten_tree_full(store, &cmeta.tree, "", &mut c_map)?;
 
     let mut out = base.clone();
-    let mut conflicts: Vec<String> = Vec::new();
+    let mut conflicts: Vec<ConflictDetail> = Vec::new();
     let mut applied = false;
     let paths: BTreeSet<String> = p_map.keys().chain(c_map.keys()).cloned().collect();
     for path in paths {
         let pv = p_map.get(&path);
         let cv = c_map.get(&path);
-        let bv = out.get(&path);
+        let bv = base.get(&path);
         match (pv, cv) {
             (None, Some(cval)) => match bv {
                 None => { out.insert(path, cval.clone()); applied = true; }
                 Some(b) if b == cval => {}
-                Some(_) => conflicts.push(path),
+                Some(_) => conflicts.push(ConflictDetail { path, ours: bv.cloned(), theirs: cv.cloned() }),
             },
             (Some(_), None) => match bv {
                 Some(b) if Some(b) == pv => { out.remove(&path); applied = true; }
                 None => {}
-                Some(_) => conflicts.push(path),
+                Some(_) => conflicts.push(ConflictDetail { path, ours: bv.cloned(), theirs: None }),
             },
             (Some(pval), Some(cval)) if pval != cval => match bv {
                 Some(b) if b == pval => { out.insert(path, cval.clone()); applied = true; }
                 Some(b) if b == cval => {}
-                _ => conflicts.push(path),
+                _ => conflicts.push(ConflictDetail { path, ours: bv.cloned(), theirs: cv.cloned() }),
             },
             _ => {}
         }
     }
-    if !conflicts.is_empty() {
-        conflicts.sort();
-        return Ok(ApplyResult::Conflicts(conflicts));
+    for c in &conflicts {
+        out.remove(&c.path);
     }
-    Ok(ApplyResult::Merged(out, applied))
+    Ok(ApplyOutcome { merged: out, conflicts, applied })
 }
 
 /// First-parent chain from `oid` back to the root (inclusive, tip-first).
@@ -715,24 +729,25 @@ pub fn rebase(
     let mut parent = o_tip.clone();
     let mut count = 0;
     for c in &replay {
-        match apply_commit_delta(store, c, &base_map)? {
-            ApplyResult::Conflicts(paths) => {
-                return Ok(RebaseOutcome::Conflicts { commit: c.clone(), paths });
-            }
-            ApplyResult::Merged(_, false) => { /* empty commit, drop it */ }
-            ApplyResult::Merged(map, true) => {
-                let tree = build_tree_from_map(store, &map)?;
-                let cmeta = crate::portage::native_commit(store, c)?;
-                let ts = now_secs();
-                let line = gitobj::ident_line(name, email, ts, "+0000");
-                let (oid, bytes) =
-                    gitobj::build_commit(&tree, &[parent.clone()], &line, &line, &cmeta.message);
-                store_obj(store, KIND_COMMIT, &oid, &bytes)?;
-                base_map = map;
-                parent = oid;
-                count += 1;
-            }
+        let o = apply_commit_delta(store, c, &base_map)?;
+        if !o.conflicts.is_empty() {
+            let mut paths: Vec<String> = o.conflicts.into_iter().map(|x| x.path).collect();
+            paths.sort();
+            return Ok(RebaseOutcome::Conflicts { commit: c.clone(), paths });
         }
+        if !o.applied {
+            continue; // empty commit, drop it
+        }
+        let tree = build_tree_from_map(store, &o.merged)?;
+        let cmeta = crate::portage::native_commit(store, c)?;
+        let ts = now_secs();
+        let line = gitobj::ident_line(name, email, ts, "+0000");
+        let (oid, bytes) =
+            gitobj::build_commit(&tree, &[parent.clone()], &line, &line, &cmeta.message);
+        store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+        base_map = o.merged;
+        parent = oid;
+        count += 1;
     }
     store.put_ref(&branch_ref, &parent)?;
     // If HEAD is this branch, keep HEAD symbolic (already is); worktree sync is
@@ -929,38 +944,11 @@ pub fn merge(
     }
 
     let base_oid = base.ok_or("no common ancestor between the branches")?;
-    let mut base_map = BTreeMap::new();
-    flatten_tree_full(store, &crate::portage::native_commit(store, &base_oid)?.tree, "", &mut base_map)?;
-    let mut our_map = BTreeMap::new();
-    flatten_tree_full(store, &crate::portage::native_commit(store, &ours)?.tree, "", &mut our_map)?;
-    let mut their_map = BTreeMap::new();
-    flatten_tree_full(store, &crate::portage::native_commit(store, &theirs)?.tree, "", &mut their_map)?;
-
-    let all: BTreeSet<String> =
-        base_map.keys().chain(our_map.keys()).chain(their_map.keys()).cloned().collect();
-    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
-    let mut conflicts: Vec<String> = Vec::new();
-    for path in all {
-        let b = base_map.get(&path);
-        let o = our_map.get(&path);
-        let t = their_map.get(&path);
-        let chosen: Option<&(String, String)> = if o == t {
-            o // same on both sides (including both deleted)
-        } else if b == o {
-            t // only theirs changed
-        } else if b == t {
-            o // only ours changed
-        } else {
-            conflicts.push(path);
-            continue;
-        };
-        if let Some(v) = chosen {
-            merged.insert(path, v.clone());
-        }
-    }
+    let (merged, conflicts) = three_way(store, &base_oid, &ours, &theirs)?;
     if !conflicts.is_empty() {
-        conflicts.sort();
-        return Ok(MergeOutcome::Conflicts(conflicts));
+        let mut paths: Vec<String> = conflicts.into_iter().map(|c| c.path).collect();
+        paths.sort();
+        return Ok(MergeOutcome::Conflicts(paths));
     }
 
     let into = store.refs()?.into_iter().find(|(n, _)| n == "HEAD")
@@ -974,4 +962,433 @@ pub fn merge(
     store_obj(store, KIND_COMMIT, &oid, &bytes)?;
     advance_head(store, &oid)?;
     Ok(MergeOutcome::Merged { commit: oid })
+}
+
+// ---------------------------------------------------------------------------
+// Conflict resolution: markers in the worktree + a MERGE_HEAD state
+// ---------------------------------------------------------------------------
+
+struct ConflictDetail {
+    path: String,
+    ours: Option<(String, String)>,   // (mode, oid)
+    theirs: Option<(String, String)>,
+}
+
+/// Shared file-level 3-way: returns the cleanly-merged map (conflicting paths
+/// omitted) plus the list of conflicts with each side's blob.
+fn three_way(
+    store: &ChunkStore,
+    base_oid: &str,
+    ours: &str,
+    theirs: &str,
+) -> Result<(BTreeMap<String, (String, String)>, Vec<ConflictDetail>), String> {
+    let mut base_map = BTreeMap::new();
+    flatten_tree_full(store, &crate::portage::native_commit(store, base_oid)?.tree, "", &mut base_map)?;
+    let mut our_map = BTreeMap::new();
+    flatten_tree_full(store, &crate::portage::native_commit(store, ours)?.tree, "", &mut our_map)?;
+    let mut their_map = BTreeMap::new();
+    flatten_tree_full(store, &crate::portage::native_commit(store, theirs)?.tree, "", &mut their_map)?;
+
+    let all: BTreeSet<String> =
+        base_map.keys().chain(our_map.keys()).chain(their_map.keys()).cloned().collect();
+    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
+    let mut conflicts: Vec<ConflictDetail> = Vec::new();
+    for path in all {
+        let b = base_map.get(&path);
+        let o = our_map.get(&path);
+        let t = their_map.get(&path);
+        let chosen: Option<&(String, String)> = if o == t {
+            o
+        } else if b == o {
+            t
+        } else if b == t {
+            o
+        } else {
+            conflicts.push(ConflictDetail { path, ours: o.cloned(), theirs: t.cloned() });
+            continue;
+        };
+        if let Some(v) = chosen {
+            merged.insert(path, v.clone());
+        }
+    }
+    Ok((merged, conflicts))
+}
+
+/// Blob as lossy UTF-8 text, newline-terminated for marker assembly.
+fn read_text_lossy(store: &ChunkStore, oid: &str) -> Result<String, String> {
+    let mut s = String::from_utf8_lossy(&read_blob(store, oid)?).to_string();
+    if !s.is_empty() && !s.ends_with('\n') {
+        s.push('\n');
+    }
+    Ok(s)
+}
+
+fn conflict_marker(ours: &str, theirs: &str) -> String {
+    format!("<<<<<<< ours\n{ours}=======\n{theirs}>>>>>>> theirs\n")
+}
+
+fn write_blob_to(store: &ChunkStore, oid: &str, full: &Path) -> Result<(), String> {
+    let content = read_blob(store, oid)?;
+    if let Some(p) = full.parent() {
+        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(full, content).map_err(|e| e.to_string())
+}
+
+/// Is a merge currently in progress (MERGE_HEAD set)?
+pub fn merge_head(store: &ChunkStore) -> Result<Option<String>, String> {
+    Ok(store.refs()?.into_iter().find(|(n, _)| n == "MERGE_HEAD").map(|(_, v)| v))
+}
+
+/// Merge `theirs_ref` into HEAD AND reflect the result in the working tree.
+/// On conflict, writes clean files plus `<<<<<<< / ======= / >>>>>>>` markers
+/// for conflicting files, records MERGE_HEAD, and leaves HEAD unmoved so a
+/// later `commit_worktree` finishes the merge as a two-parent commit.
+pub fn merge_into_worktree(
+    store: &ChunkStore,
+    theirs_ref: &str,
+    dir: &Path,
+    name: &str,
+    email: &str,
+) -> Result<MergeOutcome, String> {
+    let ours = resolve_head(store)?.ok_or("no HEAD to merge into")?;
+    let theirs = resolve_ref_or_commit(store, theirs_ref)?;
+    if ours == theirs {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    let ours_chain = first_parent_chain(store, &ours)?;
+    let theirs_chain = first_parent_chain(store, &theirs)?;
+    let theirs_set: BTreeSet<String> = theirs_chain.iter().cloned().collect();
+    let base = ours_chain.iter().find(|c| theirs_set.contains(*c)).cloned();
+    if base.as_deref() == Some(theirs.as_str()) {
+        return Ok(MergeOutcome::UpToDate);
+    }
+    if theirs_chain.contains(&ours) {
+        advance_head(store, &theirs)?;
+        let _ = materialize_commit(store, dir, &theirs);
+        return Ok(MergeOutcome::FastForward { new_tip: theirs });
+    }
+    let base_oid = base.ok_or("no common ancestor between the branches")?;
+    let (merged, conflicts) = three_way(store, &base_oid, &ours, &theirs)?;
+
+    if conflicts.is_empty() {
+        let into = store.refs()?.into_iter().find(|(n, _)| n == "HEAD")
+            .and_then(|(_, t)| t.strip_prefix("refs/heads/").map(|s| s.to_string()))
+            .unwrap_or_else(|| "HEAD".to_string());
+        let tree = build_tree_from_map(store, &merged)?;
+        let ts = now_secs();
+        let line = gitobj::ident_line(name, email, ts, "+0000");
+        let msg = format!("Merge {theirs_ref} into {into}");
+        let (oid, bytes) = gitobj::build_commit(&tree, &[ours, theirs], &line, &line, &msg);
+        store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+        advance_head(store, &oid)?;
+        let _ = materialize_commit(store, dir, &oid);
+        return Ok(MergeOutcome::Merged { commit: oid });
+    }
+
+    // Conflicts: write clean files, then marker files; record MERGE_HEAD.
+    for (path, (_mode, oid)) in &merged {
+        write_blob_to(store, oid, &dir.join(path))?;
+    }
+    let mut paths = Vec::new();
+    for c in &conflicts {
+        let ours_text = match &c.ours { Some((_, o)) => read_text_lossy(store, o)?, None => String::new() };
+        let theirs_text = match &c.theirs { Some((_, o)) => read_text_lossy(store, o)?, None => String::new() };
+        let full = dir.join(&c.path);
+        if let Some(p) = full.parent() {
+            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&full, conflict_marker(&ours_text, &theirs_text)).map_err(|e| e.to_string())?;
+        paths.push(c.path.clone());
+    }
+    store.put_ref("MERGE_HEAD", &theirs)?;
+    paths.sort();
+    Ok(MergeOutcome::Conflicts(paths))
+}
+
+// ---------------------------------------------------------------------------
+// Worktree sync + cherry-pick / rebase resolve flows
+// ---------------------------------------------------------------------------
+
+/// Sync the working tree to exactly `commit_oid`'s tree: write its files and
+/// remove tracked files no longer present. Leaves HEAD untouched (unlike
+/// `checkout`, which moves HEAD).
+fn materialize_commit(store: &ChunkStore, dir: &Path, commit_oid: &str) -> Result<(), String> {
+    let meta = crate::portage::native_commit(store, commit_oid)?;
+    let mut to_map = BTreeMap::new();
+    flatten_tree_full(store, &meta.tree, "", &mut to_map)?;
+    for (path, (_m, oid)) in &to_map {
+        write_blob_to(store, oid, &dir.join(path))?;
+    }
+    // Remove current (non-ignored) worktree files not in the target tree.
+    let ignore = crate::gmignore::GmIgnore::load_all(dir);
+    let mut cur: BTreeMap<String, String> = BTreeMap::new();
+    let _ = hash_worktree(dir, dir, &ignore, &mut cur);
+    for path in cur.keys() {
+        if !to_map.contains_key(path) {
+            remove_and_prune(dir, path);
+        }
+    }
+    Ok(())
+}
+
+/// Write a clean merged map + conflict markers into the working tree.
+fn write_worktree_conflicts(
+    store: &ChunkStore,
+    dir: &Path,
+    merged: &BTreeMap<String, (String, String)>,
+    conflicts: &[ConflictDetail],
+) -> Result<Vec<String>, String> {
+    for (path, (_m, oid)) in merged {
+        write_blob_to(store, oid, &dir.join(path))?;
+    }
+    let mut paths = Vec::new();
+    for c in conflicts {
+        let ours = match &c.ours { Some((_, o)) => read_text_lossy(store, o)?, None => String::new() };
+        let theirs = match &c.theirs { Some((_, o)) => read_text_lossy(store, o)?, None => String::new() };
+        let full = dir.join(&c.path);
+        if let Some(p) = full.parent() {
+            std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&full, conflict_marker(&ours, &theirs)).map_err(|e| e.to_string())?;
+        paths.push(c.path.clone());
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+/// Cherry-pick reflecting the result in the working tree. On conflict, writes
+/// clean files + markers and returns Conflicts; the user resolves and runs
+/// `native-commit` (an ordinary single-parent commit). No persistent state.
+pub fn cherry_pick_into_worktree(
+    store: &ChunkStore,
+    commit_ref: &str,
+    dir: &Path,
+    name: &str,
+    email: &str,
+) -> Result<PickOutcome, String> {
+    let c = resolve_commit_oid(store, commit_ref)?;
+    let head_oid = resolve_head(store)?.ok_or("no HEAD to cherry-pick onto")?;
+    let hmeta = crate::portage::native_commit(store, &head_oid)?;
+    let mut base = BTreeMap::new();
+    flatten_tree_full(store, &hmeta.tree, "", &mut base)?;
+
+    let o = apply_commit_delta(store, &c, &base)?;
+    if !o.conflicts.is_empty() {
+        let paths = write_worktree_conflicts(store, dir, &o.merged, &o.conflicts)?;
+        return Ok(PickOutcome::Conflicts(paths));
+    }
+    if !o.applied {
+        return Ok(PickOutcome::Empty);
+    }
+    let cmeta = crate::portage::native_commit(store, &c)?;
+    let tree = build_tree_from_map(store, &o.merged)?;
+    let ts = now_secs();
+    let line = gitobj::ident_line(name, email, ts, "+0000");
+    let (oid, bytes) = gitobj::build_commit(&tree, &[head_oid], &line, &line, &cmeta.message);
+    store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+    advance_head(store, &oid)?;
+    materialize_commit(store, dir, &oid)?;
+    Ok(PickOutcome::Committed(NativeCommit { oid, tree }))
+}
+
+// --- Rebase with conflict pause / continue / abort -------------------------
+
+fn rebase_in_progress(store: &ChunkStore) -> Result<bool, String> {
+    Ok(store.refs()?.iter().any(|(n, _)| n == "REBASE_BRANCH"))
+}
+
+fn clear_rebase_state(store: &ChunkStore) {
+    for k in ["REBASE_BRANCH", "REBASE_ONTO", "REBASE_TODO", "REBASE_CUR", "REBASE_ORIG"] {
+        let _ = store.delete_ref(k);
+    }
+}
+
+/// Drive the replay loop from `parent` over `todo` (oldest-first). On a clean
+/// commit it advances; on conflict it writes markers, stores rebase state, and
+/// returns Conflicts; when todo empties it finalizes the branch + worktree.
+fn rebase_drive(
+    store: &ChunkStore,
+    dir: &Path,
+    branch: &str,
+    mut parent: String,
+    mut base_map: BTreeMap<String, (String, String)>,
+    todo: &[String],
+    name: &str,
+    email: &str,
+) -> Result<RebaseOutcome, String> {
+    let mut count = 0;
+    for (i, c) in todo.iter().enumerate() {
+        let o = apply_commit_delta(store, c, &base_map)?;
+        if !o.conflicts.is_empty() {
+            let paths = write_worktree_conflicts(store, dir, &o.merged, &o.conflicts)?;
+            // Persist state so `rebase --continue` can resume after the user
+            // resolves the markers. Remaining = commits AFTER this one.
+            let remaining = todo[i + 1..].join(",");
+            store.put_ref("REBASE_BRANCH", branch)?;
+            store.put_ref("REBASE_ONTO", &parent)?;
+            store.put_ref("REBASE_CUR", c)?;
+            store.put_ref("REBASE_TODO", &remaining)?;
+            return Ok(RebaseOutcome::Conflicts { commit: c.clone(), paths });
+        }
+        if !o.applied {
+            continue;
+        }
+        let cmeta = crate::portage::native_commit(store, c)?;
+        let tree = build_tree_from_map(store, &o.merged)?;
+        let ts = now_secs();
+        let line = gitobj::ident_line(name, email, ts, "+0000");
+        let (oid, bytes) = gitobj::build_commit(&tree, &[parent.clone()], &line, &line, &cmeta.message);
+        store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+        parent = oid;
+        base_map = o.merged;
+        count += 1;
+    }
+    // finalize
+    store.put_ref(&format!("refs/heads/{branch}"), &parent)?;
+    store.put_ref("HEAD", &format!("refs/heads/{branch}"))?;
+    clear_rebase_state(store);
+    materialize_commit(store, dir, &parent)?;
+    Ok(RebaseOutcome::Rebased { new_tip: parent, commits: count })
+}
+
+/// Start a rebase that materializes into the worktree and pauses on conflict.
+pub fn rebase_into_worktree(
+    store: &ChunkStore,
+    branch: &str,
+    onto: &str,
+    dir: &Path,
+    name: &str,
+    email: &str,
+) -> Result<RebaseOutcome, String> {
+    if rebase_in_progress(store)? {
+        return Err("a rebase is already in progress (use --continue or --abort)".into());
+    }
+    let branch_ref = format!("refs/heads/{branch}");
+    if !store.refs()?.iter().any(|(n, _)| *n == branch_ref) {
+        return Err(format!("no such branch: {branch}"));
+    }
+    let b_tip = resolve_ref_or_commit(store, branch)?;
+    let o_tip = resolve_ref_or_commit(store, onto)?;
+    let branch_chain = first_parent_chain(store, &b_tip)?;
+    let onto_set: BTreeSet<String> = first_parent_chain(store, &o_tip)?.into_iter().collect();
+    let mut replay: Vec<String> =
+        branch_chain.iter().filter(|c| !onto_set.contains(*c)).cloned().collect();
+    replay.reverse();
+    if replay.is_empty() {
+        store.put_ref(&branch_ref, &o_tip)?;
+        materialize_commit(store, dir, &o_tip)?;
+        return Ok(RebaseOutcome::UpToDate);
+    }
+    store.put_ref("REBASE_ORIG", &b_tip)?;
+    let mut base_map = BTreeMap::new();
+    flatten_tree_full(store, &crate::portage::native_commit(store, &o_tip)?.tree, "", &mut base_map)?;
+    rebase_drive(store, dir, branch, o_tip, base_map, &replay, name, email)
+}
+
+/// Continue a paused rebase: commit the resolved worktree as the conflicted
+/// step (a single-parent commit on the new base), then replay the rest.
+pub fn rebase_continue(
+    store: &ChunkStore,
+    dir: &Path,
+    name: &str,
+    email: &str,
+) -> Result<RebaseOutcome, String> {
+    if !rebase_in_progress(store)? {
+        return Err("no rebase in progress".into());
+    }
+    let refs = store.refs()?;
+    let get = |k: &str| refs.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let branch = get("REBASE_BRANCH").ok_or("corrupt rebase state")?;
+    let onto = get("REBASE_ONTO").ok_or("corrupt rebase state")?;
+    let cur = get("REBASE_CUR").ok_or("corrupt rebase state")?;
+    let todo: Vec<String> = get("REBASE_TODO").unwrap_or_default()
+        .split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+
+    // Commit the resolved worktree as the replayed `cur` commit.
+    let ignore = crate::gmignore::GmIgnore::load_all(dir);
+    let tree = build_tree_from_dir(store, dir, dir, &ignore)?;
+    let cmeta = crate::portage::native_commit(store, &cur)?;
+    let ts = now_secs();
+    let line = gitobj::ident_line(name, email, ts, "+0000");
+    let (oid, bytes) = gitobj::build_commit(&tree, &[onto.clone()], &line, &line, &cmeta.message);
+    store_obj(store, KIND_COMMIT, &oid, &bytes)?;
+    let mut base_map = BTreeMap::new();
+    flatten_tree_full(store, &tree, "", &mut base_map)?;
+    rebase_drive(store, dir, &branch, oid, base_map, &todo, name, email)
+}
+
+/// Abort a paused rebase: restore the branch + worktree to the original tip.
+pub fn rebase_abort(store: &ChunkStore, dir: &Path) -> Result<(), String> {
+    if !rebase_in_progress(store)? {
+        return Err("no rebase in progress".into());
+    }
+    let refs = store.refs()?;
+    let branch = refs.iter().find(|(n, _)| n == "REBASE_BRANCH").map(|(_, v)| v.clone())
+        .ok_or("corrupt rebase state")?;
+    let orig = refs.iter().find(|(n, _)| n == "REBASE_ORIG").map(|(_, v)| v.clone())
+        .ok_or("corrupt rebase state")?;
+    store.put_ref(&format!("refs/heads/{branch}"), &orig)?;
+    store.put_ref("HEAD", &format!("refs/heads/{branch}"))?;
+    clear_rebase_state(store);
+    materialize_commit(store, dir, &orig)?;
+    Ok(())
+}
+
+/// Public: is a rebase paused for conflict resolution?
+pub fn rebase_status(store: &ChunkStore) -> Result<Option<String>, String> {
+    Ok(store.refs()?.into_iter().find(|(n, _)| n == "REBASE_CUR").map(|(_, v)| v))
+}
+
+// ---------------------------------------------------------------------------
+// Spread: materialize one path (or whole trees) from several commits at once
+// ---------------------------------------------------------------------------
+
+/// Write `path`'s blob from each (label, rev) into `into` as
+/// `{label}--{basename}`, so several versions sit side by side for native
+/// viewers (images, audio, kdenlive projects, code, ...). Skips revs lacking
+/// the path. Returns the filenames written.
+pub fn spread_file(
+    store: &ChunkStore,
+    path: &str,
+    revs: &[(String, String)],
+    into: &Path,
+) -> Result<Vec<String>, String> {
+    std::fs::create_dir_all(into).map_err(|e| e.to_string())?;
+    let base = path.rsplit('/').next().unwrap_or(path);
+    let mut written = Vec::new();
+    for (label, rref) in revs {
+        let oid = resolve_ref_or_commit(store, rref)?;
+        let meta = crate::portage::native_commit(store, &oid)?;
+        let mut map = BTreeMap::new();
+        flatten_tree_full(store, &meta.tree, "", &mut map)?;
+        if let Some((_m, boid)) = map.get(path) {
+            let content = read_blob(store, boid)?;
+            let name = format!("{label}--{base}");
+            std::fs::write(into.join(&name), content).map_err(|e| e.to_string())?;
+            written.push(name);
+        }
+    }
+    Ok(written)
+}
+
+/// Materialize each (label, rev)'s whole tree into `into/{label}/` — the
+/// worktree-style spread, for projects whose files reference each other
+/// (e.g. a kdenlive project plus its assets). Returns the subdir labels.
+pub fn spread_tree(
+    store: &ChunkStore,
+    revs: &[(String, String)],
+    into: &Path,
+) -> Result<Vec<String>, String> {
+    let mut dirs = Vec::new();
+    for (label, rref) in revs {
+        let oid = resolve_ref_or_commit(store, rref)?;
+        let meta = crate::portage::native_commit(store, &oid)?;
+        let sub = into.join(label);
+        std::fs::create_dir_all(&sub).map_err(|e| e.to_string())?;
+        let mut n = 0;
+        materialize_tree(store, &meta.tree, &sub, &mut n)?;
+        dirs.push(label.clone());
+    }
+    Ok(dirs)
 }

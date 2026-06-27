@@ -24,11 +24,12 @@ members = [
     "crates/core",
     "crates/cli",
     "crates/sim",
+    "crates/peek",
     "crates/gui",
 ]
 # `cargo build` builds the whole toolbox EXCEPT the Qt GUI (which needs Qt6
 # present). Build the GUI explicitly with `cargo build -p gitmind-gui`.
-default-members = ["crates/core", "crates/cli", "crates/sim"]
+default-members = ["crates/core", "crates/cli", "crates/sim", "crates/peek"]
 
 # Match the reference's size-first release profile so the shipped
 # binaries stay small. The core does the heavy lifting; LTO across the

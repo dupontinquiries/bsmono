@@ -128,6 +128,17 @@ pub struct Layer {
     pub swell_period_ms: Millis,
     #[serde(default)]
     pub swell_depth: f32,
+    /// Timing humanization: fraction [0,1] of the inter-trigger step by
+    /// which each event's onset is randomly nudged earlier/later, so
+    /// events don't land on a rigid grid. Real ambient sounds (birdsong,
+    /// drips, distant calls) arrive irregularly, in loose clusters with
+    /// uneven gaps; a fixed step makes them tick like a metronome under
+    /// careful listening. 0 (default) keeps the exact prior grid timing,
+    /// so existing scenes are bit-for-bit unchanged. ~0.3-0.5 reads as
+    /// natural; 1.0 is maximally loose. Deterministic (same seeded RNG),
+    /// so all mesh nodes still agree on the schedule.
+    #[serde(default)]
+    pub timing_jitter: f32,
 }
 
 impl Layer {
@@ -144,6 +155,7 @@ impl Layer {
             spread: Vec::new(),
             swell_period_ms: 0,
             swell_depth: 0.0,
+            timing_jitter: 0.0,
         }
     }
 }
@@ -300,6 +312,23 @@ pub fn direct_seeded(
 
                 let fires = rng.unit() < (layer.trigger_prob * weight).min(1.0);
                 if fires && !layer.pool.is_empty() {
+                    // Humanize the onset: nudge it within ±(jitter·step/2)
+                    // so events don't snap to the rigid `step` grid. Clamped
+                    // to the state window so a nudge never reorders past the
+                    // boundary or goes negative. jitter 0 → no change (exact
+                    // prior timing). Drawn from the seeded RNG so the
+                    // schedule stays deterministic across mesh nodes.
+                    let onset = if layer.timing_jitter > 0.0 {
+                        let span = (layer.timing_jitter.clamp(0.0, 1.0)
+                                    * step as f32) as i64;
+                        let delta = if span > 0 {
+                            rng.bounded(span as usize * 2 + 1) as i64 - span
+                        } else { 0 };
+                        let j = lt as i64 + delta;
+                        j.clamp(t as i64, state_end as i64 - 1).max(0) as Millis
+                    } else {
+                        lt
+                    };
                     // Determine the channel set this trigger sounds from.
                     // With a populated `spread` (2+ resolved channels) we
                     // emit a DECORRELATED copy per channel so the layer
@@ -333,13 +362,13 @@ pub fn direct_seeded(
                             (ci as Millis) * (12 + rng.bounded(18) as Millis)
                         } else { 0 };
                         events.push(PlayEvent {
-                            at_ms: lt + decorr_ms,
+                            at_ms: onset + decorr_ms,
                             layer: layer.name.clone(),
                             channel: chan.clone(),
                             clip,
                             gain: rng.range(layer.gain_range.0, layer.gain_range.1)
                                   * chan_gain
-                                  * swell_gain(layer, lt + decorr_ms),
+                                  * swell_gain(layer, onset + decorr_ms),
                             pan: rng.range(layer.pan_range.0, layer.pan_range.1),
                             rate: rng.range(layer.rate_range.0, layer.rate_range.1),
                             crossfade_ms: layer.crossfade_ms,
@@ -509,6 +538,55 @@ mod tests {
         }
     }
 
+    /// Helper: a forest where every layer has timing jitter applied.
+    fn forest_jittered(j: f32) -> Soundscape {
+        let mut s = forest();
+        for l in &mut s.layers { l.timing_jitter = j; }
+        s
+    }
+
+    #[test]
+    fn timing_jitter_zero_is_exact_prior_grid() {
+        // jitter 0 must reproduce the schedule bit-for-bit (no regression
+        // for existing scenes that don't set it).
+        let plain = direct(&forest(), 42, 0, 60_000);
+        let jzero = direct(&forest_jittered(0.0), 42, 0, 60_000);
+        assert_eq!(plain.events, jzero.events,
+            "timing_jitter 0 must not change the schedule at all");
+    }
+
+    #[test]
+    fn timing_jitter_changes_onsets_but_stays_deterministic() {
+        // Non-zero jitter must (a) actually move some onsets off the grid,
+        // and (b) still be identical for the same seed (mesh sync relies
+        // on this).
+        let a = direct(&forest_jittered(0.5), 42, 0, 60_000);
+        let b = direct(&forest_jittered(0.5), 42, 0, 60_000);
+        assert_eq!(a.events, b.events, "jitter must stay deterministic per seed");
+
+        let plain = direct(&forest(), 42, 0, 60_000);
+        // Same number of fires (jitter doesn't change WHETHER something
+        // fires, only WHEN), but at least some onsets differ.
+        let moved = a.events.iter().zip(plain.events.iter())
+            .filter(|(x, y)| x.at_ms != y.at_ms)
+            .count();
+        assert!(moved > 0, "jitter should move at least some event onsets");
+    }
+
+    #[test]
+    fn timing_jitter_keeps_events_sorted_and_in_window() {
+        let sched = direct(&forest_jittered(1.0), 99, 0, 120_000);
+        // still globally sorted
+        for w in sched.events.windows(2) {
+            assert!(w[0].at_ms <= w[1].at_ms, "events must stay time-sorted");
+        }
+        // and no event landed before the schedule start
+        for e in &sched.events {
+            assert!(e.at_ms <= 120_000 + 20_000,
+                "no event should be wildly past the horizon");
+        }
+    }
+
     #[test]
     fn weighted_rng_respects_weights() {
         let mut rng = Rng::new(123);
@@ -590,6 +668,7 @@ mod tests {
                 spread: Vec::new(),
                 swell_period_ms: 0,
                 swell_depth: 0.0,
+                timing_jitter: 0.0,
             }],
             states: vec![SceneState { name: "s".into(), layer_weights: w,
                 dwell_ms: (120_000, 120_001), transitions: vec![] }],

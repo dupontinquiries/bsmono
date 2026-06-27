@@ -105,11 +105,8 @@ elseif(SNAPCLONE_OPENDHT_BACKEND)
     # System deps (Alpine/postmarketOS):
     #   apk add gnutls-dev nettle-dev argon2-dev msgpack-cxx-dev
 
-    # OpenDHT source dir. Prefer the monorepo's shared vendor/ copy; fall back
-    # to the legacy in-tree submodule names if someone still has them.
-    if(EXISTS "${CMAKE_SOURCE_DIR}/../../vendor/opendht/CMakeLists.txt")
-        set(OPENDHT_SUBMODULE_DIR "${CMAKE_SOURCE_DIR}/../../vendor/opendht")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/opendht/CMakeLists.txt")
+    # Support both directory names for the opendht submodule
+    if(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/opendht/CMakeLists.txt")
         set(OPENDHT_SUBMODULE_DIR "${CMAKE_SOURCE_DIR}/thirdparty/opendht")
     else()
         set(OPENDHT_SUBMODULE_DIR "${CMAKE_SOURCE_DIR}/third_party/opendht")

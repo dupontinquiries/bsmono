@@ -1,6 +1,6 @@
 [package]
 name = "web2qml"
-version = "0.1.876"
+version = "0.1.879"
 edition = "2021"
 
 [dependencies]
@@ -32,6 +32,10 @@ cpal = { version = "0.15", optional = true }
 # v0.1.865: mail bridge crypto (gated behind the `mail-crypto` feature).
 crypto_secretbox = { version = "0.1", optional = true }
 bcrypt = { version = "0.15", optional = true }
+# v0.1.879: asymmetric crypto for in-house (device-as-provider) peer
+# messaging — NaCl crypto_box (X25519 + XSalsa20-Poly1305). Encrypts a
+# message to a recipient's public key, authenticated by the sender's.
+crypto_box = { version = "0.9", optional = true, default-features = false, features = ["std", "salsa20", "getrandom"] }
 # v0.1.462 (llama.cpp backend arc): in-process GGUF inference,
 # GPU-accelerated via Vulkan (the universal target — Apple
 # Silicon via Honeykrisp, Qualcomm Adreno via Mesa Turnip, AMD
@@ -79,7 +83,7 @@ claude = []
 # v0.1.865: ProtonMail bridge at-rest crypto. OFF (default) → mail compiles with
 # inert providers (sealing/SRP/PGP return CryptoUnavailable, accounts session-only).
 # ON → NaCl-secretbox sealing (policy-gated + machine-bound) + bcrypt session gate.
-mail-crypto = ["crypto_secretbox", "bcrypt"]
+mail-crypto = ["crypto_secretbox", "bcrypt", "crypto_box"]
 # v0.1.462: in-process llama.cpp backend with Vulkan offload.
 # Single feature that pulls the Vulkan sub-feature (the
 # Vulkan-everywhere plan — one build target across M-series,

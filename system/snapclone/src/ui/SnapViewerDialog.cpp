@@ -105,27 +105,8 @@ void SnapViewerDialog::buildUi(const Core::Snap &snap)
     m_imageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     root->addWidget(m_imageLabel, 1);
 
-    if (!snap.encryptedBlob.isEmpty()) {
-        // Live snap — blob is in memory from the receive pipeline.
-        loadImage(snap.encryptedBlob);
-    } else if (!snap.localPath.isEmpty()) {
-        // Snap restored from DB — blob was cleared to save RAM; read from disk.
-        QFile f(snap.localPath);
-        if (f.open(QIODevice::ReadOnly)) {
-            loadImage(f.readAll());
-        } else {
-            qCWarning(lcViewer) << "Cannot read media file:" << snap.localPath;
-            m_imageLabel->setText(tr("Media file not found"));
-            m_imageLabel->setStyleSheet(
-                QStringLiteral("background:#000; color:%1; font-size:16px;")
-                    .arg(QLatin1String(Theme::TEXT_SECONDARY())));
-        }
-    } else {
-        m_imageLabel->setText(tr("Media not available"));
-        m_imageLabel->setStyleSheet(
-            QStringLiteral("background:#000; color:%1; font-size:16px;")
-                .arg(QLatin1String(Theme::TEXT_SECONDARY())));
-    }
+    // Media is populated by loadSnap() at the end of buildUi (and again on each
+    // playlist navigation), so image and text snaps share one code path.
 
     // ── Countdown bar ─────────────────────────────────────────────────────
     m_countdown = new QProgressBar(this);
@@ -210,6 +191,31 @@ void SnapViewerDialog::buildUi(const Core::Snap &snap)
     m_imageLabel->setCursor(Qt::PointingHandCursor);
     m_imageLabel->installEventFilter(this);
 
+    // ── Feed navigation bar (shown only in playlist mode) ─────────────────
+    m_navBar = new QWidget(this);
+    m_navBar->setStyleSheet(
+        QStringLiteral("background: %1;").arg(QLatin1String(Theme::BG_CARD())));
+    auto *navRow = new QHBoxLayout(m_navBar);
+    navRow->setContentsMargins(Theme::SPACE_MD, Theme::SPACE_XS,
+                               Theme::SPACE_MD, Theme::SPACE_XS);
+    navRow->setSpacing(Theme::SPACE_SM);
+    m_prevBtn = new QPushButton(QStringLiteral("\u25C0"), m_navBar);   // ◀
+    m_prevBtn->setFixedSize(44, 32);
+    connect(m_prevBtn, &QPushButton::clicked, this, &SnapViewerDialog::navPrev);
+    navRow->addWidget(m_prevBtn);
+    navRow->addStretch();
+    m_posLabel = new QLabel(QString(), m_navBar);
+    m_posLabel->setObjectName(QStringLiteral("subtitleLabel"));
+    m_posLabel->setAlignment(Qt::AlignCenter);
+    navRow->addWidget(m_posLabel);
+    navRow->addStretch();
+    m_nextBtn = new QPushButton(QStringLiteral("\u25B6"), m_navBar);   // ▶
+    m_nextBtn->setFixedSize(44, 32);
+    connect(m_nextBtn, &QPushButton::clicked, this, &SnapViewerDialog::navNext);
+    navRow->addWidget(m_nextBtn);
+    m_navBar->hide();              // setPlaylist() reveals it for multi-snap feeds
+    root->addWidget(m_navBar);
+
     // ── Action bar ────────────────────────────────────────────────────────
     auto *actionBar = new QWidget(this);
     actionBar->setStyleSheet(
@@ -231,7 +237,102 @@ void SnapViewerDialog::buildUi(const Core::Snap &snap)
     actionRow->addWidget(m_closeBtn);
 
     root->addWidget(actionBar);
+
+    // Populate media + meta for the initial snap (image or text).
+    loadSnap(snap);
 }
+
+// ─── Media / meta population (shared by initial build + playlist nav) ─────────
+void SnapViewerDialog::loadSnap(const Core::Snap &snap)
+{
+    m_snap = snap;
+
+    const QString senderDisplay = snap.senderId.value.contains(QLatin1Char('@'))
+        ? snap.senderId.value.section(QLatin1Char('@'), 0, 0)
+        : snap.senderId.value;
+    if (m_metaLabel)
+        m_metaLabel->setText(tr("From %1\n%2").arg(
+            senderDisplay,
+            snap.sentAt.toLocalTime().toString(QStringLiteral("ddd d MMM  hh:mm"))));
+
+    if (snap.mediaType == Core::MediaType::Text) {
+        // Render the message inline; contrast against the black stage uses the
+        // primary text token (always legible on #000).
+        m_fullPixmap = QPixmap();
+        m_imageLabel->setPixmap(QPixmap());
+        const QString body = !snap.caption.isEmpty()
+            ? snap.caption
+            : QString::fromUtf8(snap.encryptedBlob);
+        m_imageLabel->setWordWrap(true);
+        m_imageLabel->setAlignment(Qt::AlignCenter);
+        m_imageLabel->setText(body);
+        m_imageLabel->setStyleSheet(QStringLiteral(
+            "background:#000000; color:%1; padding:28px; font-size:%2px;")
+            .arg(QLatin1String(Theme::TEXT_PRIMARY())).arg(Theme::FONT_LG));
+        return;
+    }
+
+    // Image (and unknown) path — decode bytes from memory or disk.
+    m_imageLabel->setWordWrap(false);
+    m_imageLabel->setAlignment(Qt::AlignCenter);
+    m_imageLabel->setStyleSheet(QStringLiteral("background:#000000;"));
+    if (!snap.encryptedBlob.isEmpty()) {
+        loadImage(snap.encryptedBlob);
+    } else if (!snap.localPath.isEmpty()) {
+        QFile f(snap.localPath);
+        if (f.open(QIODevice::ReadOnly)) {
+            loadImage(f.readAll());
+        } else {
+            qCWarning(lcViewer) << "Cannot read media file:" << snap.localPath;
+            m_imageLabel->setText(tr("Media file not found"));
+            m_imageLabel->setStyleSheet(
+                QStringLiteral("background:#000; color:%1; font-size:16px;")
+                    .arg(QLatin1String(Theme::TEXT_SECONDARY())));
+        }
+    } else {
+        m_imageLabel->setText(tr("Media not available"));
+        m_imageLabel->setStyleSheet(
+            QStringLiteral("background:#000; color:%1; font-size:16px;")
+                .arg(QLatin1String(Theme::TEXT_SECONDARY())));
+    }
+}
+
+// ─── Feed-player playlist navigation ─────────────────────────────────────────
+void SnapViewerDialog::setPlaylist(const QList<Core::Snap> &snaps, int startIndex)
+{
+    m_playlist = snaps;
+    if (m_playlist.size() <= 1) return;   // nothing to navigate — stay single-snap
+
+    // Browsing the feed is self-paced: drop the view-once auto-expiry timer and
+    // its countdown bar, and reveal the ◀ / position / ▶ controls instead.
+    if (m_timer) m_timer->stop();
+    if (m_countdown) m_countdown->hide();
+    if (m_navBar) m_navBar->show();
+
+    m_index = -1;
+    showSnapAt(qBound(0, startIndex, m_playlist.size() - 1));
+}
+
+void SnapViewerDialog::showSnapAt(int index)
+{
+    if (index < 0 || index >= m_playlist.size()) return;
+    m_index = index;
+    const Core::Snap &snap = m_playlist[index];
+    loadSnap(snap);
+    emit snapViewed(snap.id);   // host marks it viewed (browsing == opening)
+    updateNavState();
+}
+
+void SnapViewerDialog::updateNavState()
+{
+    if (m_posLabel)
+        m_posLabel->setText(tr("%1 / %2").arg(m_index + 1).arg(m_playlist.size()));
+    if (m_prevBtn) m_prevBtn->setEnabled(m_index > 0);
+    if (m_nextBtn) m_nextBtn->setEnabled(m_index < m_playlist.size() - 1);
+}
+
+void SnapViewerDialog::navPrev() { showSnapAt(m_index - 1); }
+void SnapViewerDialog::navNext() { showSnapAt(m_index + 1); }
 
 void SnapViewerDialog::loadImage(const QByteArray &jpegBytes)
 {
@@ -363,6 +464,10 @@ void SnapViewerDialog::keyPressEvent(QKeyEvent *e)
 {
     if (e->key() == Qt::Key_Escape || e->key() == Qt::Key_Back) {
         reject();
+    } else if (!m_playlist.isEmpty() &&
+               (e->key() == Qt::Key_Left || e->key() == Qt::Key_Right)) {
+        if (e->key() == Qt::Key_Left) navPrev();
+        else                          navNext();
     } else {
         QDialog::keyPressEvent(e);
     }

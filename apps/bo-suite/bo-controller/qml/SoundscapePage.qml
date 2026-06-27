@@ -1,6 +1,7 @@
 // qml/SoundscapePage.qml
 //
-// Soundscape creator. Takes a stereo WAV file, finds the cleanest
+// Soundscape creator. Takes a stereo audio file (WAV, or compressed:
+// Opus/mp3/FLAC/m4a/ogg — decoded via ffmpeg), finds the cleanest
 // possible loop point via random-walk MFCC + sample-discontinuity
 // search, and writes the result as an OggOpus file ready for a
 // soundscape player.
@@ -117,7 +118,8 @@ Item {
             Text {
                 width: parent.width
                 text: "Make a seamless looping clip for your soundscapes. "
-                    + "Feed it a stereo WAV; it random-walks thousands of "
+                    + "Feed it a stereo audio file (WAV, or compressed: "
+                    + "Opus, mp3, FLAC, m4a, ogg); it random-walks thousands of "
                     + "(start, end) pairs, scores each by sample discontinuity "
                     + "+ MFCC timbral distance, then refines the best with local "
                     + "perturbation. Output is OggOpus, ready to drop into your "
@@ -132,7 +134,7 @@ Item {
                 width: parent.width
                 spacing: 4
                 Text {
-                    text: "INPUT WAV"
+                    text: "INPUT AUDIO"
                     color: Bo.silver
                     font.pixelSize: 9
                     font.weight: Font.DemiBold
@@ -144,7 +146,7 @@ Item {
                     TextField {
                         id: inputField
                         width: parent.width - 80 - Bo.gapSM
-                        placeholderText: "/path/to/source.wav"
+                        placeholderText: "/path/to/source.wav (or .opus, .mp3, .flac…)"
                         text: root.inputPath
                         color: Bo.bone
                         font.pixelSize: Bo.captionSize

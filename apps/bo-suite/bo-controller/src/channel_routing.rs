@@ -78,6 +78,104 @@ impl VirtualChannel {
     }
 }
 
+/// Equal-power pan law. Maps a pan position in [-1, +1] (left→right,
+/// 0 = center) to (left_gain, right_gain) such that left²+right² == 1
+/// at every position — constant perceived loudness across the arc, the
+/// standard choice for placing a source in the stereo field. At center
+/// both gains are √½ ≈ 0.707 (the −3 dB pan-center convention), at hard
+/// left (−1) it's (1, 0), at hard right (+1) it's (0, 1). NaN/out-of-
+/// range pans are clamped so a bad value can't blow up the field.
+pub fn equal_power_pan(pan: f32) -> (f32, f32) {
+    let p = if pan.is_finite() { pan.clamp(-1.0, 1.0) } else { 0.0 };
+    // Map [-1,+1] → angle [0, π/2]. 0 → π/4 (center).
+    let theta = (p + 1.0) * 0.5 * std::f32::consts::FRAC_PI_2;
+    (theta.cos(), theta.sin())
+}
+
+/// One stem placed in the stereo field: which stem, its gain, and its
+/// pan position (-1 left … 0 center … +1 right).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StemPlacement {
+    pub stem: Stem,
+    pub gain: f32,
+    pub pan:  f32,
+}
+
+/// A stereo virtual channel — the spatializer for separated stems. Where
+/// `VirtualChannel` sums stems into a MONO channel (gain only), this
+/// places each stem in the stereo field with an equal-power pan, so a
+/// four-stem separation can be spread out: e.g. drums center, lead vocal
+/// center, piano panned left, synth panned right. Output is interleaved
+/// stereo (L, R pairs).
+///
+/// `width` post-scales the resulting Side (difference) component using
+/// the same M/S trick as the realtime mixer's spatializer, so the whole
+/// placed field can be widened or narrowed as a unit on top of the
+/// per-stem pans. width 1.0 = pans as-authored; 0 = mono; up to 2.0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StereoStemChannel {
+    pub name: String,
+    pub placements: Vec<StemPlacement>,
+    pub width: f32,
+}
+
+impl StereoStemChannel {
+    /// A channel with the four stems spread across a natural default
+    /// stage: rhythm section anchored center, harmonic instruments out
+    /// to the sides. A sensible starting point the user can then tweak.
+    pub fn default_stage(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            placements: vec![
+                StemPlacement { stem: Stem::Drums, gain: 1.0, pan:  0.0 },
+                StemPlacement { stem: Stem::Voice, gain: 1.0, pan:  0.0 },
+                StemPlacement { stem: Stem::Piano, gain: 1.0, pan: -0.6 },
+                StemPlacement { stem: Stem::Synth, gain: 1.0, pan:  0.6 },
+            ],
+            width: 1.0,
+        }
+    }
+
+    /// Mix + spatialize into interleaved stereo. Returns a Vec of
+    /// (left, right) pairs, one per input sample. Pure + allocation-per-
+    /// call (mirrors VirtualChannel::mix; a smoothed variant can follow
+    /// the ChannelGainSmoother pattern if click-free pan moves are
+    /// needed). No clipping — the caller limits if required.
+    pub fn mix(&self, stems: &StemBlock) -> Vec<(f32, f32)> {
+        let n = stems.len();
+        let mut out = vec![(0.0_f32, 0.0_f32); n];
+        for p in &self.placements {
+            let g = if p.gain.is_finite() { p.gain } else { 0.0 };
+            if g == 0.0 { continue; }
+            let (lg, rg) = equal_power_pan(p.pan);
+            let src = match p.stem {
+                Stem::Drums => &stems.drums,
+                Stem::Voice => &stems.voice,
+                Stem::Piano => &stems.piano,
+                Stem::Synth => &stems.synth,
+            };
+            let m = src.len().min(n);
+            for i in 0..m {
+                let s = src[i] * g;
+                out[i].0 += s * lg;
+                out[i].1 += s * rg;
+            }
+        }
+        // Apply the channel-wide width via M/S, matching the realtime
+        // mixer's spatializer semantics.
+        let w = if self.width.is_finite() { self.width.clamp(0.0, 2.0) } else { 1.0 };
+        if (w - 1.0).abs() > f32::EPSILON {
+            for frame in out.iter_mut() {
+                let mid  = (frame.0 + frame.1) * 0.5;
+                let side = (frame.0 - frame.1) * 0.5 * w;
+                frame.0 = mid + side;
+                frame.1 = mid - side;
+            }
+        }
+        out
+    }
+}
+
 /// Stateful per-channel gain smoother. Avoids audible clicks when
 /// the user changes a stem gain mid-playback.
 ///
@@ -500,6 +598,87 @@ mod tests {
         let stems = mk_stems(8);
         let out = ch.mix(&stems);
         assert_eq!(out, vec![0.5_f32; 8]);
+    }
+
+    #[test]
+    fn pan__equal_power_law_is_constant_loudness() {
+        // left² + right² == 1 at every pan position.
+        for p in [-1.0_f32, -0.5, 0.0, 0.3, 1.0] {
+            let (l, r) = equal_power_pan(p);
+            assert!(((l * l + r * r) - 1.0).abs() < 1e-5,
+                "pan {} not constant-power: l={} r={}", p, l, r);
+        }
+        // Center is -3 dB equal split.
+        let (l, r) = equal_power_pan(0.0);
+        assert!((l - r).abs() < 1e-6 && (l - 0.707_106_77).abs() < 1e-4);
+        // Hard left / right.
+        let (ll, lr) = equal_power_pan(-1.0);
+        assert!(ll > 0.999 && lr < 1e-4);
+        let (rl, rr) = equal_power_pan(1.0);
+        assert!(rr > 0.999 && rl < 1e-4);
+        // NaN clamps to center, not a blown-up value.
+        let (nl, nr) = equal_power_pan(f32::NAN);
+        assert!((nl - nr).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stereo__panned_stem_lands_on_correct_side() {
+        // Piano hard-left, synth hard-right; verify each appears only on
+        // its side. drums/voice silent here so we isolate the pans.
+        let ch = StereoStemChannel {
+            name: "s".into(),
+            placements: vec![
+                StemPlacement { stem: Stem::Piano, gain: 1.0, pan: -1.0 },
+                StemPlacement { stem: Stem::Synth, gain: 1.0, pan:  1.0 },
+            ],
+            width: 1.0,
+        };
+        let stems = mk_stems(4);   // piano=0.2, synth=0.1
+        let out = ch.mix(&stems);
+        // Left should carry the piano (0.2), right the synth (0.1).
+        assert!((out[0].0 - 0.2).abs() < 1e-4, "left={}", out[0].0);
+        assert!((out[0].1 - 0.1).abs() < 1e-4, "right={}", out[0].1);
+    }
+
+    #[test]
+    fn stereo__centered_stems_are_equal_l_r() {
+        // A centered stem appears equally in both channels at -3 dB.
+        let ch = StereoStemChannel {
+            name: "c".into(),
+            placements: vec![
+                StemPlacement { stem: Stem::Voice, gain: 1.0, pan: 0.0 },
+            ],
+            width: 1.0,
+        };
+        let out = ch.mix(&mk_stems(4));   // voice = 0.3
+        assert!((out[0].0 - out[0].1).abs() < 1e-6, "center should be equal L/R");
+        assert!((out[0].0 - 0.3 * 0.707_106_77).abs() < 1e-4);
+    }
+
+    #[test]
+    fn stereo__width_zero_collapses_pans_to_mono() {
+        let ch = StereoStemChannel {
+            name: "w".into(),
+            placements: vec![
+                StemPlacement { stem: Stem::Piano, gain: 1.0, pan: -1.0 },
+                StemPlacement { stem: Stem::Synth, gain: 1.0, pan:  1.0 },
+            ],
+            width: 0.0,
+        };
+        let out = ch.mix(&mk_stems(4));
+        // width 0 → L == R (mono) even though stems were hard-panned.
+        assert!((out[0].0 - out[0].1).abs() < 1e-6,
+            "width 0 should collapse to mono: {} vs {}", out[0].0, out[0].1);
+    }
+
+    #[test]
+    fn stereo__default_stage_spreads_four_stems() {
+        let ch = StereoStemChannel::default_stage("stage");
+        let out = ch.mix(&mk_stems(4));
+        // Piano panned left, synth right → left and right differ.
+        assert!(out[0].0.is_finite() && out[0].1.is_finite());
+        assert!((out[0].0 - out[0].1).abs() > 1e-4,
+            "default stage should produce a non-mono field");
     }
 
     #[test]

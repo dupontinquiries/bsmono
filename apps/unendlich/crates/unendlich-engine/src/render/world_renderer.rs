@@ -956,7 +956,7 @@ impl WorldRenderer {
         // r306: build the neural G-buffer pass only when explicitly enabled. It
         // reuses the chunk pipeline's layout so the same per-frame descriptor set
         // binds against it. Default-off ⇒ the rest of the renderer is unchanged.
-        let gbuffer = if std::env::var("UNENDLICH_NEURAL_GBUFFER").ok().as_deref() == Some("1") {
+        let gbuffer = if std::env::var("UNENDLICH_NEURAL_GBUFFER").ok().as_deref() != Some("0") {
             log::info!(
                 "[neural] UNENDLICH_NEURAL_GBUFFER=1 — building parallel G-buffer pass \
                  (inert producer: fills normal/albedo/worldpos, nothing samples them yet)"
@@ -982,7 +982,7 @@ impl WorldRenderer {
         // r308: background MLP trainer. Independent flag — it's a CPU thread that
         // needs no GPU resources; it idles until the ground-truth sample feed is
         // wired. Bakes Q8 weights the shade pass can poll + hot-swap.
-        let neural_trainer = if std::env::var("UNENDLICH_NEURAL_TRAIN").ok().as_deref() == Some("1") {
+        let neural_trainer = if std::env::var("UNENDLICH_NEURAL_TRAIN").ok().as_deref() != Some("0") {
             log::info!(
                 "[neural] UNENDLICH_NEURAL_TRAIN=1 — background trainer thread spawned \
                  (idle until the ground-truth sample feed is wired)"
@@ -1550,7 +1550,7 @@ impl WorldRenderer {
             mesh_cache_capacity: std::env::var("UNENDLICH_MESH_CACHE_SIZE")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(0),
+                .unwrap_or(256),
             mesh_cache_seq: 0,
             mesh_cache_hits: 0,
             mesh_cache_misses: 0,

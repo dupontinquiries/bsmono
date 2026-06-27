@@ -411,6 +411,8 @@ pub struct Chat {
     last_prompt_tokens: usize,     // prompt size of the in-flight generation (for the live estimate)
     queue: std::collections::VecDeque<(String, Option<usize>)>, // (text, parent) fired while busy → run when free
     fold_pos: Vec<crate::spatial::Vec3>, // cached protein-fold layout (recomputed when the tree changes)
+    flex_pos: Vec<crate::spatial::Vec3>, // cached obstacle-AVOIDED render positions (strand weaved around scenery)
+    flex_key: Option<(usize, crate::scene3d::EnvParams)>, // (node count, env) the flex was computed for
     mode: crate::vimmode::Mode,    // modal control (Normal/Insert/Command/Search) — both views now
     cmdline: String,               // the `:` command buffer
     search_q: String,              // the `/` search buffer
@@ -472,6 +474,8 @@ impl Default for Chat {
             gen_samples: Vec::new(), last_prompt_tokens: 0,
             queue: std::collections::VecDeque::new(),
             fold_pos: Vec::new(),
+            flex_pos: Vec::new(),
+            flex_key: None,
             mode: crate::vimmode::Mode::Insert, cmdline: String::new(), search_q: String::new(),
             search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, leader_pending: false,
             request_smaller_model: false,
@@ -1265,13 +1269,118 @@ impl Chat {
         }
         let pos = {
             let mut p = self.fold_pos.clone();
-            // raise the conversation off the floor to about the eye level of someone walking the hall, so the
-            // fly camera (which rides the strand) moves through at head height rather than skimming the floor.
-            if theme::active().name == "Atlantis" { for q in &mut p { q.y += 1.9; } }
+            // SEAT THE CONVERSATION ON THE FLOOR: the flow meander + sibling fanning can dip a node below a scene's
+            // floor (≈ −3.2), so the strand pokes "into the ground". Lift the whole graph so its LOWEST node sits a
+            // little above the floor — and only ever lift UP (never push a high graph down), so open scenes are
+            // unaffected. This raises the walk to about eye level for the fly camera that rides the strand.
+            let min_y = p.iter().map(|q| q.y).fold(f32::INFINITY, f32::min);
+            if min_y.is_finite() {
+                let target_bottom = -1.6; // sit the lowest node about here, clear of typical floors (~-3.2)
+                let lift = (target_bottom - min_y).max(0.0);
+                for q in &mut p { q.y += lift; }
+            }
             p
         };
 
-        // section coloring (contiguous same-topic runs) + supersession (collapsible churn)
+        // HALL ROUTING: in hall-based scenes (Atlantis) the strand should run DOWN the open hallway lane along x,
+        // not balloon into the furnished rotunda. Scale the graph laterally so its WIDEST node fits inside the clear
+        // central corridor (between the colonnade rows + book-stacks), so it threads the open lane instead of the
+        // columns. Scene-aware: round/open scenes keep their full spread. The geom harness then measures the drop.
+        let pos = {
+            let mut p = pos;
+            if theme::active().name == "Atlantis" {
+                // moderate lateral compression: enough to read as a strand running down the hall (strand_aspect
+                // ~2.7) without packing onto the central-axis structure (tighter lanes measured WORSE clip, since
+                // the rotunda+halls are columned through their full height — a true clip fix needs a clear conduit
+                // in the scene, tracked separately).
+                for q in &mut p { q.z *= 0.42; }
+            }
+            p
+        };
+
+        // OBSTACLE FLEX: weave the strand AROUND solid scenery instead of clipping through it. The geom harness
+        // showed tuning can't fix this (the strand balls up among thousands of obstacles), so push each node out
+        // of any mid-size solid object it overlaps — along the smaller x/z penetration, biased to z so the time
+        // axis (x) stays ordered, clamped near its spine spot. Cached per (node-count, env): the scene is
+        // deterministic for a conversation, so this runs once, not per frame.
+        let pos = {
+            let key = (n, crate::scene3d::env_params());
+            if self.flex_key.as_ref() != Some(&key) {
+                let orig = pos.clone();
+                let mut fp = pos.clone();
+                let mut obs: Vec<([f32; 2], [f32; 2], [f32; 2])> = Vec::new(); // (x[lo,hi], z[lo,hi], y[lo,hi])
+                crate::scene3d::with_env(theme::active().name, 0.0, |meshes| {
+                    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+                    for m in meshes { for v in &m.verts { lo[0] = lo[0].min(v.x); lo[2] = lo[2].min(v.z); hi[0] = hi[0].max(v.x); hi[2] = hi[2].max(v.z); } }
+                    let rext = (hi[0] - lo[0]).max(hi[2] - lo[2]).max(1.0);
+                    for m in meshes {
+                        if m.verts.is_empty() { continue; }
+                        let (mut blo, mut bhi) = (m.verts[0], m.verts[0]);
+                        for v in &m.verts { blo.x = blo.x.min(v.x); blo.y = blo.y.min(v.y); blo.z = blo.z.min(v.z); bhi.x = bhi.x.max(v.x); bhi.y = bhi.y.max(v.y); bhi.z = bhi.z.max(v.z); }
+                        let hx = (bhi.x - blo.x).max(bhi.z - blo.z); let vy = bhi.y - blo.y;
+                        let fp_min = (bhi.x - blo.x).min(bhi.z - blo.z);
+                        if hx < rext * 0.5 && vy > 1.5 && fp_min > 0.4 { obs.push(([blo.x, bhi.x], [blo.z, bhi.z], [blo.y, bhi.y])); }
+                    }
+                });
+                let r = 0.5f32; let cap = 8.0f32;
+                for _ in 0..12 {
+                    for (qi, q) in fp.iter_mut().enumerate() {
+                        for (ox, oz, oy) in &obs {
+                            if q.x + r > ox[0] && q.x - r < ox[1] && q.z + r > oz[0] && q.z - r < oz[1] && q.y > oy[0] - r && q.y < oy[1] + r {
+                                let (px_lo, px_hi) = ((q.x + r) - ox[0], ox[1] - (q.x - r));
+                                let (pz_lo, pz_hi) = ((q.z + r) - oz[0], oz[1] - (q.z - r));
+                                // smallest penetration wins, but penalise x-moves (×1.6) so the strand goes AROUND
+                                // sideways and keeps its time order along x
+                                let cands = [(px_lo * 1.6, 0u8), (px_hi * 1.6, 1), (pz_lo, 2), (pz_hi, 3)];
+                                let mut best = (f32::INFINITY, 4u8);
+                                for &(v, a) in &cands { if v < best.0 { best = (v, a); } }
+                                match best.1 { 0 => q.x -= px_lo, 1 => q.x += px_hi, 2 => q.z -= pz_lo, _ => q.z += pz_hi }
+                            }
+                        }
+                        // keep each node near its spine position so the strand doesn't scatter
+                        let (dx, dz) = (q.x - orig[qi].x, q.z - orig[qi].z);
+                        let d = (dx * dx + dz * dz).sqrt();
+                        if d > cap { q.x = orig[qi].x + dx / d * cap; q.z = orig[qi].z + dz / d * cap; }
+                    }
+                }
+                self.flex_pos = fp; self.flex_key = Some(key);
+            }
+            if self.flex_pos.len() == n { self.flex_pos.clone() } else { pos }
+        };
+
+        // GEOMETRY DUMP (LOGSCOPE_GEOM_DUMP=1) for the geometric self-check harness (tools/geom_check.py): writes
+        // scene object AABBs + graph node positions + the scene AABB to /tmp/scene_geom_<theme>.json, so bbox-
+        // overlap + range tests can measure graph↔scene fit (into-the-ground, object clipping, out-of-bounds,
+        // spine/axis alignment) objectively instead of eyeballing renders.
+        if std::env::var("LOGSCOPE_GEOM_DUMP").is_ok() {
+            use std::fmt::Write as _;
+            let mut objs = String::new();
+            let (mut smin, mut smax) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            crate::scene3d::with_env(theme::active().name, 0.0, |meshes| {
+                for (i, m) in meshes.iter().enumerate() {
+                    if m.verts.is_empty() { continue; }
+                    let (mut lo, mut hi) = (m.verts[0], m.verts[0]);
+                    for vtx in &m.verts {
+                        lo.x = lo.x.min(vtx.x); lo.y = lo.y.min(vtx.y); lo.z = lo.z.min(vtx.z);
+                        hi.x = hi.x.max(vtx.x); hi.y = hi.y.max(vtx.y); hi.z = hi.z.max(vtx.z);
+                    }
+                    smin[0] = smin[0].min(lo.x); smin[1] = smin[1].min(lo.y); smin[2] = smin[2].min(lo.z);
+                    smax[0] = smax[0].max(hi.x); smax[1] = smax[1].max(hi.y); smax[2] = smax[2].max(hi.z);
+                    let _ = write!(objs, "{}{{\"i\":{},\"lo\":[{:.3},{:.3},{:.3}],\"hi\":[{:.3},{:.3},{:.3}],\"mat\":{},\"emis\":{:.2}}}",
+                        if objs.is_empty() { "" } else { "," }, i, lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, m.mat as u32, m.emissive);
+                }
+            });
+            let mut nodes = String::new();
+            for (i, q) in pos.iter().enumerate() {
+                let _ = write!(nodes, "{}{{\"i\":{},\"p\":[{:.3},{:.3},{:.3}]}}", if nodes.is_empty() { "" } else { "," }, i, q.x, q.y, q.z);
+            }
+            let json = format!(
+                "{{\"theme\":\"{}\",\"nodes\":{},\"bounds\":{{\"lo\":[{:.2},{:.2},{:.2}],\"hi\":[{:.2},{:.2},{:.2}]}},\"objects\":[{}],\"graph\":[{}]}}",
+                theme::active().name, pos.len(), smin[0], smin[1], smin[2], smax[0], smax[1], smax[2], objs, nodes);
+            let path = format!("/tmp/scene_geom_{}.json", theme::active().name.replace(' ', "_"));
+            let _ = std::fs::write(path, json);
+        }
+
         let segs = g.segments();
         // PROCEDURAL THEMING: feed the conversation's shape to the environment generator so the hall is built
         // FROM the conversation — size from node count, colonnade from topic-segments, lanterns from branches,

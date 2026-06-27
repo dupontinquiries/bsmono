@@ -201,6 +201,14 @@ impl LogscopeApp {
 }
 
 impl eframe::App for LogscopeApp {
+    // Force an OPAQUE window clear (alpha = 1.0). Without this, KWin/Wayland composites the desktop — and any
+    // app windows behind logscope — through any pixels the scene/UI hasn't painted fully opaque (the renderer
+    // clears its offscreen targets to alpha 0). Forcing the window's base clear opaque stops that ghosting.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        let c = visuals.window_fill();
+        [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0, 1.0]
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_scan(&ctx);

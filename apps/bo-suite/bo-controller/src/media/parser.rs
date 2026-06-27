@@ -167,9 +167,20 @@ pub fn parse(filename: &str, extra_known: &[String]) -> ParsedTrack {
     };
 
     // 5. Parse the artist segment
-    let (artists, features) = parse_artists(&artists_seg, extra_known);
+    let (mut artists, features) = parse_artists(&artists_seg, extra_known);
     if artists.is_empty() && !artists_seg.is_empty() {
         confidence = confidence.saturating_sub(20);
+    }
+    // Guarantee at least one artist. Filenames with no " - " separator
+    // (e.g. "Serenitas.opus", "blinkun x jeremih.opus") parse with an
+    // empty artist segment, which previously produced NO track_artists
+    // row — and since the library is browsed by artist/album/tag, those
+    // tracks became invisible (the reported "missing tracks"). Assigning
+    // a sentinel "Unknown Artist" makes every track reachable on the
+    // Artists page under a single predictable bucket. Confidence is
+    // already low for these, so they sort/era appropriately.
+    if artists.is_empty() {
+        artists.push("Unknown Artist".to_string());
     }
 
     // 6. Light cleanup of title
@@ -336,6 +347,33 @@ mod tests {
     fn multi_artist() {
         let r = p("Daft Punk, Justice - One More Time");
         assert_eq!(r.artists, vec!["Daft Punk", "Justice"]);
+    }
+
+    #[test]
+    fn no_separator_gets_unknown_artist() {
+        // Single-segment filenames (no " - ") must still get an artist so
+        // they're reachable on the Artists page — the "missing tracks" bug.
+        let r = p("Serenitas.opus");
+        assert_eq!(r.artists, vec!["Unknown Artist"]);
+        assert_eq!(r.title, "Serenitas");
+        let r2 = p("blinkun x jeremih.opus");
+        assert_eq!(r2.artists, vec!["Unknown Artist"]);
+        assert_eq!(r2.title, "blinkun x jeremih");
+    }
+
+    #[test]
+    fn empty_filename_still_gets_artist() {
+        // Even a degenerate name must never produce zero artists.
+        let r = p(".opus");
+        assert_eq!(r.artists.len(), 1);
+        assert_eq!(r.artists[0], "Unknown Artist");
+    }
+
+    #[test]
+    fn real_artist_not_overwritten_by_fallback() {
+        // The fallback must only apply when there's genuinely no artist.
+        let r = p("Aphex Twin - Windowlicker.flac");
+        assert_eq!(r.artists, vec!["Aphex Twin"]);
     }
 
     #[test]

@@ -2103,5 +2103,18 @@ mod tests {
         assert!(final_phase != PassbyPhase::Peak,
             "FSM should not be stuck in Peak after 15s; saw_peak={}, final={:?}",
             saw_peak, final_phase);
+        // If we reached Peak, the FSM must have PROGRESSED past it. A full
+        // return to Quiet needs PEAK_MAX_MS (~8s) + RECEDE_MAX_MS (~25s) =
+        // ~33s, longer than this 15s probe, so we don't require Quiet here
+        // (that would be a false failure). We DO require it left Peak —
+        // i.e. it's now in Recede or Quiet, never stalled. saw_quiet_after_peak
+        // is the stronger signal when the probe is long enough to see it.
+        if saw_peak {
+            assert!(
+                saw_quiet_after_peak
+                    || matches!(final_phase, PassbyPhase::Recede | PassbyPhase::Quiet),
+                "after Peak the FSM must progress (Recede/Quiet), not stall; \
+                 final={:?}", final_phase);
+        }
     }
 }

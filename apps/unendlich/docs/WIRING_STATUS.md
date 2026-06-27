@@ -9269,3 +9269,272 @@ Added BLOCK_CLAY/RED_SANDSTONE/BASALT consts (22/24/38). glslangValidator RC=0. 
 mesher colours, so no render change. DEVICE-VERIFY: mesa shows red sandstone, mangrove clay, swamp moss, frozen
 ocean ice. Worldgen-shader change but pure block-id selection — worst case cosmetic, timebending-recoverable.
 NEXT (optional): mirror the biome into subsurface_block_type too (still climate-only sand/dirt).
+
+## r463 — Device-log triage (log-r462) + first fixes
+Operator uploaded a 7.5-min Asahi/M2 device log (multiplayer, lauscher, water, multiworld, frame timing, LOD).
+Stored it durably + began triage.
+- docs/device_logs/log-r462.log — the raw log (kept for repeated review).
+- docs/device_logs/TRIAGE_r462.md — LIVING triage doc: T1 mesh hitches (near max 889ms), T2 runaway population
+  (FIXED), T3 LOD never demotes (RD=4 ≤ first band 4), T4 raycast non-axis normal, T5 LAN re-announces every ~2s,
+  T6 unreliable frame-section timing. Each with log evidence + priority + next steps. No ERROR/PANIC; 69 WARN
+  (68 LONG FRAME + 1 raycast).
+- FIX T2 (ecology): breeding was gated by ROAMER_CAP=96 while natural spawns + spawn director gate on carrying
+  capacity (~8) — so colonies bred toward 96 and mass-starved (117 starvation events, herds 25–40 vs cap 8).
+  Breeding now uses the same carrying cap. Population should settle near capacity; churn collapses. Tuning knob
+  to make fauna denser: raise the popdyn Colony capacity.
+- AID T1 (perf): the 889ms "near" meshing max is dispatch_us/batch.len() in the octree GPU dispatch — a dispatch
+  STALL, not CPU meshing. Added a "[mesh-stall] octree dispatch Nms for K chunks" WARN (threshold 100ms) so the
+  next run names the offending batch + size. Lib + bin compile.
+- NEXT: T1 (read the new mesh-stall warns — batch size vs driver stall), T3 (LOD/render-distance reconcile), T4
+  (octree raycast normal), T5 (LAN announce cadence). Multi-world bugs need a world-switch capture (not exercised
+  in this single-world log).
+## r463-FIX — geom_probe.rs Tier-0 unclosed-delim
+rustcheck flagged exactly one Tier-0 problem: examples/geom_probe.rs:99 — coord_main()'s '{' opened but never
+closed (body removed in a prior edit, leaving the brace dangling to EOF). Closed it as an explicit no-op stub;
+rustcheck --fast now PASS (static OK), braces 45/45. Example-only file, so it never affected the lib/bin gates —
+which is why it persisted. NOTE: old_main() below still references an undefined `coord` (a separate SEMANTIC
+issue that would only bite on `cargo build --example geom_probe`); not fixed here.
+
+## r464 — Hot-metal thermodynamics (new physics) + water-quench interaction; brain-evo idea logged
+Operator: "keep working on physics … water physics plus hot metal physics." Introduced hot-metal physics that
+interacts with water (quench) and lava (heat/melt).
+- NEW CORE sim/hot_metal.rs (flatten-VERIFIED, 6 tests): step_metal(temp, neighbour_hot, in_water, dt, params)
+  = conduction in from a hotter neighbour (lava 1150°C / fire 800°C) + radiative cooling (hotter→faster) +
+  fast water QUENCH; quench_steam(temp, in_water); is_molten(temp) at MELT_C 1500°C; glow(temp) → blackbody
+  incandescence colour (dull-red→orange→yellow→white) + 0..1 intensity. Physically grounded: lava (1150) makes
+  iron GLOW but is below iron's melt point (1500), so lava alone won't melt it — a hotter source (forge/
+  dragon-breath) is needed.
+- WIRED (bin, gated UNENDLICH_HOT_METAL, default on): bounded tick (frame_count%20==7, mouse_captured) — a
+  radius-6 discovery scan adds metal cells (Iron/Gold/Copper ore + blocks) adjacent to lava (cap 96), then
+  evolves every tracked cell: reads hottest neighbour + wetness, steps temperature, detects quench-steam, melts
+  →Lava at MELT_C (one-time set_block; no per-tick remeshing → respects the T1 hitch budget), and drops cells
+  that cool to ambient. Logs "[hot-metal] N cell(s) hot (max T°C), quench-steam Q, melted→lava M". Reset on
+  world switch (added to the r453 leak-sweep). hot_metal: HashMap<[i32;3], f32>.
+- WATER-PHYSICS TIE-IN: quench is the hot-metal/water interaction — hot metal flooded with water cools fast and
+  flags steam. The VISIBLE steam puff (inject into smoke_field) + temperature-graded EMISSIVE glow (chunk.frag,
+  needs per-block temp like lava) + melt-from-a-hotter-source are the next VISIBLE steps (deferred to keep this
+  increment perf-safe and shader-risk-free). glow() core is ready for the emissive when temp plumbing lands.
+- Lib+bin compile; core tested. DEVICE-VERIFY (physics is mostly internal until the visuals land): place Iron
+  beside lava, then flood with water → watch for "[hot-metal] … quench-steam" lines.
+
+## FUTURE IDEA logged (docs/BACKLOG.md) — pretrained mob brains via evolved simvectors
+Per operator: evolve compact controller "simvectors" offline (GA over the fauna FSM/perception/forage params,
+fitness = survival/feed/evade per biome), cache the best per (species, habitat), and seed each mob's brain from
+that prior at spawn (via r462 fauna_roster::pick_for_biome) so mobs are competent the moment the player sees them.
+Ties to genetics/popdyn/predation/forage + the §3b per-species FSM. See BACKLOG.md for the full sketch.
+
+## r465 — Shader pass 1/n: final colour grade (vibrance + contrast)
+Operator: "hit a few messages with shader passes … make graphics better all around" (then pivot to Fairphone-5
+GPU friendliness). Starting the shader-pass series with a safe, broadly-visible, mobile-cheap change.
+- chunk.frag: after the ACES tonemap, a gentle colour grade — luminance-weighted VIBRANCE (dull pixels boosted
+  more than already-saturated ones, so no neon) + a mild CONTRAST S-curve about mid-grey. ~6 ALU ops, applies to
+  the whole frame, toggleable via CHUNK_COLOR_GRADE (1 default; 0 = neutral tonemap output). Conservative values
+  (vib ≤0.16, contrast 1.055) so it enhances without fighting the existing careful lighting/fog/aerial-perspective.
+- glslangValidator RC=0. The render shader is already advanced (analytic water waves + fresnel, Cook-Torrance
+  GGX PBR, hemispheric ambient, volumetric fog, aerial perspective, ACES, underwater FX) — so passes here are
+  polish, not gaps. DEVICE-VERIFY: colours should read a touch richer/punchier; if too strong, lower vib/contrast
+  or set CHUNK_COLOR_GRADE 0.
+
+### Shader-pass roadmap (next messages)
+- Water sparkle/glint polish + snow/ice specular twinkle.
+- Sky/horizon gradient + sun disc/halo softness.
+- Emissive hot-metal glow (uses sim::hot_metal::glow) once per-block temperature reaches the shader.
+- Cheap contact-AO / corner darkening tuning; distant-LOD seam hiding.
+Each pass: one focused, glslang-validated, toggleable change — small + reviewable, which also keeps the Fairphone
+GPU bring-up low-risk.
+
+### NEXT FOCUS (operator) — Fairphone 5 / Alpine Linux GPU backend friendliness (crashes; phone powers off)
+Whole-device power-off on GPU init/run = likely driver/power/thermal fault on the mobile GPU (Mali/Panfrost or
+the Adreno+Freedreno on FP5? — confirm GPU). Because a hard power-off won't flush logs, plan a crash-capture path
+that survives: line-buffered/fsync'd log to disk per frame-phase, a "last breadcrumb" file written before each
+risky GPU call (device create, swapchain, first submit), and env toggles to force-disable expensive features
+(GPU worldgen/meshing, fog march, dynamic lights, color grade) to bisect what triggers the fault. Operator will
+share crashlogs later — I'll help set up the persistent breadcrumb logging then.
+
+## r466 — Shader pass 2 + unwired-shader audit + ungate default features + crash breadcrumbs
+Multi-part work session (operator).
+
+### Shader pass 2/n — snow/ice sparkle (chunk.frag)
+Twinkling pinpoint glints on snow/ice: a high-frequency world-space hash makes sparse ~1/8-block cells glint,
+each on its own time phase, brightest facing the camera with the sun up. Drives off a new `snow_factor` (altitude
+snow cap OR intrinsically bright/blue albedo → catches SnowBlock/Ice/tundra/frozen-ocean). ~1 hash + a few ALU,
+gated CHUNK_SNOW_SPARKLE (default 1). glslang RC=0. Mobile-cheap.
+
+### Unwired-shader audit → docs/device_logs/UNWIRED_SHADERS.md
+Compiled-but-not-instantiated on default runs: sky.vert/sky.frag (dedicated atmospheric sky pass — built, never
+wired into a pipeline; sky is currently fog-in-chunk.frag — wiring it is a future render feature, not a flag),
+clouds.frag (superseded by cloud-as-fog; not even compiled), neural_feat_lean/neural_feat_octree.comp (alternate
+neural feature extractors; only the gbuf variant is loaded). Everything else is wired. See the doc.
+
+### Ungated 23 features to DEFAULT-ON (keep =0 override)
+Flipped each listed UNENDLICH_* default OFF→ON so `./smoke-latest.sh` matches the operator's full command without
+the env prefix; every one still honours `UNENDLICH_X=0` to disable (critical for the Fairphone bisect below):
+TEXTURES, FRAME_PROFILE, MOB_BANDS, PARTICLES, AWARENESS, ABILITY_CAST, COMBAT_MODS, AGGRO, ARBITER, WITNESS,
+WING_BUFFET, WEATHER_SIM, WATER_SIM, WATER_FLOW_SHADER, WATER_DEBUG, WATER_ICE, WATER_EVAP, WATER_RAIN,
+WATER_BOIL, WATER_EROSION; NEURAL_GBUFFER + NEURAL_TRAIN (Some("1")→ !=Some("0")); MESH_CACHE_SIZE default 0→256.
+(WATER_FLOW_EROSION, LAVA_WATER, PLANT_STAGGER, SURFACE_SCAN_SEED were already default-on.) Per-variable edits —
+no blanket sed — so unrelated flags were untouched. Lib+bin compile.
+
+### Crash breadcrumbs (src/breadcrumb.rs) — for the Fairphone-5/Alpine power-off
+NEW breadcrumb module: drop_crumb(stage) writes one line + flush + sync_all (fsync) so the bytes hit storage
+before the next risky GPU call — after a hard power-off the LAST line of the file is the last stage reached.
+reset() truncates at startup. Gated UNENDLICH_BREADCRUMB (default on), path via UNENDLICH_BREADCRUMB_FILE
+(default unendlich_breadcrumb.log in cwd). Wired in the bin at: main startup → "gpu: creating Vulkan context"
+(brackets VulkanContext::new) → "Vulkan context ready" → "gpu: creating WorldRenderer" (brackets the
+device/swapchain/pipeline setup) → "WorldRenderer ready" → "gpu: first frame presented OK" → slow heartbeat
+("alive: frame N") every ~600 frames. Verified write/fsync/read works.
+
+### ⚠ FAIRPHONE-5 BRING-UP NOTE
+The ungating turned on heavy/experimental paths GLOBALLY — NEURAL_TRAIN (background trainer thread),
+NEURAL_GBUFFER (parallel G-buffer pass), WATER_DEBUG, and the full water sim. On the M2/Asahi these are wanted;
+on the crashing Fairphone they likely INCREASE the fault surface. Bisect recipe for the FP5: run with the
+breadcrumbs on, read the last line after a power-off (tells you ctx vs renderer vs first-frame vs running), then
+disable heavy features one at a time via =0 (start: UNENDLICH_NEURAL_TRAIN=0 UNENDLICH_NEURAL_GBUFFER=0
+UNENDLICH_GPU=0? UNENDLICH_WATER_SIM=0 UNENDLICH_FRAME_PROFILE=0). First datapoint still needed: which GPU/driver
+the FP5 build uses. Next: add finer breadcrumbs inside VulkanContext::new + WorldRenderer::new (device vs
+swapchain vs each pipeline) + before the first GPU worldgen/mesh dispatch, once we see where the last crumb lands.
+
+## r467 — Multi-world duplication hunt (kitfinder) + WorldSession abstraction
+Operator uploaded `kitfinder` (zero-dep structural clone miner). Built it + ran it on unendlich, then built
+the abstraction the findings pointed to.
+
+### Findings (kitfinder + manual audit)
+- kitfinder: the big world-relevant clones are EXACT copy-paste between the two binaries — `populate_debug_scene()`
+  (1476 tokens) and `format_workload_summary()` shared by unendlich_fullgame.rs + unendlich_world.rs. (Report saved:
+  docs/device_logs/kitfinder_report_r466.txt.) The rest of the top clones are example PNG writers + tiny RNG
+  helpers (lcg/mix) — noise.
+- Manual audit of the per-world reset: unendlich_world.rs does NOT world-switch (0 reset logic) and lacks the
+  per-world sim state, so it is NOT a diverged reset sibling — no fix-in-one-not-other divergence there. The
+  fullgame reset block is actually thorough (clears ~20 items incl. roamers/drops/dragon maps/water/sediment/
+  lava/sapling/hot_metal/location). The LAN + meshing_in_flight omissions are documented-intentional.
+- THE REAL ISSUE (structural, not an active leak): per-world state lived as ~20 loose `let mut` vars reset by a
+  50-line hand-maintained block. Every new per-world feature had to remember a `.clear()` there — I'd had to add
+  one 3× (saplings r452, location r461, hot_metal r464). "Forgot to reset the new field" IS the multi-world
+  leak-bug class.
+
+### Abstraction: world/world_session.rs (the manager)
+NEW `WorldSession` struct owns per-world accumulators; `reset(seed)` is `*self = Self::new(seed)` — a full rebuild,
+so the compiler forces new() to construct EVERY field and a field can never be silently missed on reset. Tested.
+Migrated the 4 newest accumulators into it (saplings, hot_metal, locations, current_region) and COLLAPSED their
+4 manual reset lines into a single `session.reset(fg_world_seed)` in the world-switch handler (fg_world_seed is
+set to the new seed first). Bin + lib compile; word-boundary rename (hot_metal_enabled + the sim::hot_metal module
+path preserved). Net: future per-world state added to WorldSession is auto-reset — the bug class is gone for
+anything living in the session.
+
+### NEXT (incremental migration to finish the job)
+Move the remaining per-world accumulators into WorldSession until the manual reset block is empty: water_flow/
+water_dirty/sediment/water_flow_tiles, lava_registered, fg_evict_queue, lan_outgoing_edits, spawned_regions,
+dragon_activities/hunts/bend_intents, fire_positions, fg_colony/fg_thermal/fg_imbue/bend_resonance, precip01,
+world_clock_elapsed. Each move + delete its manual reset line; when the block only calls session.reset(), the
+drift risk is fully retired. Also: dedupe populate_debug_scene/format_workload_summary across the two binaries
+(extract to a shared fn) — kitfinder will confirm the clone mass drops.
+
+### Tooling
+kitfinder lives at the uploaded bundle; build with `cargo build --release` (zero deps), run
+`./target/release/kitfinder <path> --min-tokens 20 --top 30`. Re-run after the dedup work to watch clone mass fall.
+
+## r468 — WorldSession migration batch 2 (8 more accumulators) + test-gate fixes
+Continuing the r467 abstraction (operator: "do one then the next next turn" — this is the migration; dedup next).
+- Moved 8 more per-world accumulators into WorldSession: spawned_regions, fire_positions, dragon_activities,
+  dragon_hunts, dragon_bend_intents, lava_registered, lan_outgoing_edits, fg_evict_queue (all empty-on-reset
+  collections with engine types). 12 fields now reset via the single `session.reset(fg_world_seed)`.
+- Removed the 8 now-redundant individual `.clear()` lines from the world-switch block (session.reset() covers
+  them). The per-tick lan_outgoing_edits flush (a 2nd use) was preserved. Manual block shrank to the harder cases:
+  app-owned (fg_app.drops/stamina), config-dependent (water_dirty = water_sim_enabled, water_flow/sediment/
+  flow_tiles), seed-derived (fg_colony), specific-value scalars (fg_thermal/fg_imbue/bend_resonance/precip01/
+  world_clock), and roamers (central). Those migrate in later passes (or stay manual where reset ≠ default).
+- Word-boundary rename preserved module paths (dragon_activity/dragon_hunt/dragon_bending_ai singular modules)
+  and hot_metal_enabled.
+- TEST-GATE FIXES (found via `cargo check --lib --tests`, which the normal lib gate skips):
+  (1) the r467 WorldSession test used a non-existent PlantState::default()/HuntState: Default — rewritten to
+  populate only trivially-constructable fields (the `*self = new()` reset covers the rest structurally).
+  (2) the r456 block additions (MossyCobblestone … PolishedBasalt) had silently broken blocks.rs
+  `all_const_is_exhaustive` — the deliberate no-wildcard guard test that flags exactly this. Added the 7 blocks.
+- Lib (+tests) and bin compile. LESSON: run `cargo check --lib --tests` after adding BlockId/Biome variants —
+  the guard tests live there and the --lib gate doesn't compile them.
+- NEXT TURN: dedupe populate_debug_scene() + format_workload_summary() across unendlich_fullgame.rs /
+  unendlich_world.rs (kitfinder's exact-clone finding); extract to a shared fn + re-run kitfinder to confirm the
+  clone mass drops.
+
+## r469 — Dedupe populate_debug_scene + format_workload_summary across the two binaries
+The "next" half of the r467/r468 work (operator: "do one then the next next turn"). kitfinder's exact-clone class
+was these two functions copy-pasted between unendlich_fullgame.rs + unendlich_world.rs.
+- Verified the two copies are BYTE-IDENTICAL (diff) — no hidden divergence/bug, just duplication.
+- Extracted both to a new lib module `src/debug_scene.rs` (pub fns + the 4 format_workload_summary tests).
+  Rewrote unendlich_engine:: → crate:: paths; added imports (PhysicsBody, runtime_render_distance, ChunkCoord).
+- Deleted both copies (+ the duplicated tests + orphaned doc comments) from both bins; qualified the 4 call
+  sites to unendlich_engine::debug_scene::*. One home now — a fix lands once, can't diverge.
+- VERIFIED with kitfinder: both functions gone from the clone report; exact-clone mass 50,372 → 48,188 dup
+  tokens (~2,184 removed; 486 → 480 classes). lib (+tests) + unendlich-fullgame compile.
+- ⚠ PRE-EXISTING (not from this change): unendlich_world.rs has input-API bit-rot (WindowEvent vs InputEvent,
+  Key vs Keycode, MouseButton vs MouseBtn at lines ~1283/1316/1352) and does not compile on its own — unrelated
+  to the dedup (my call sites compile). The world bin isn't in the standard gates. Worth a separate cleanup pass
+  (or retiring unendlich_world.rs if unendlich_fullgame supersedes it — kitfinder shows they share much code).
+
+### WorldSession migration — remaining (continues the r467/r468 arc)
+Still manual in the world-switch block: roamers, fg_app.drops/stamina (app-owned), water_dirty/water_flow/
+sediment/water_flow_tiles (config-dependent), fg_colony (seed-derived), fg_thermal/fg_imbue/bend_resonance/
+prev_fall_vy/precip01/world_clock_elapsed (specific reset values). Migrate the collections next; leave or
+special-case the value-resets.
+
+## r470 — Fix duplicate-biome warnings (device-log sanity check) + deterministic loader
+Sanity-check log (post-fable, 2026-06-27) verdict: r463 population fix HOLDING (zero starvation spam,
+roamer_tick stable ~12.8ms), r467/r468 WorldSession reset WORKING ("[launch] gameplay state reset"), r469
+dedup didn't break the build. Steady-state 70-72 FPS, p99 frame ≤18ms. The scary `cpu: draw=199ms` is the
+1-second CUMULATIVE (199.8/72≈2.77ms = zone=draw p50), not per-frame — confirmed T6 is a label quirk, not a
+regression. Rare catastrophic spikes (frame_total max 1221ms, tick_sim max 748ms) cluster at menu/world-load
+transitions (incl. the first plant_lifecycle=17.8ms scan on a fresh world), not steady gameplay.
+
+NEW ISSUE found + fixed: 10 `WARN biome_loader] Biome ID 'unendlich:X' duplicated — replacing previous entry`.
+ROOT CAUSE: assets/biomes/ has 4 namespaces — unendlich/ (22, canonical), legacy/ (13), arenas/ (8), relics/
+(6). legacy/ re-defined 10 of the canonical IDs (alpine_highlands, beach, desert, jungle, plains, savanna,
+swamp, taiga, temperate_forest, tundra). Worse, the loader walked dirs via read_dir whose order is NOT
+guaranteed — so WHICH copy won an ID collision was nondeterministic across filesystems (latent correctness bug,
+not just noise).
+FIX (two parts):
+1. Deleted the 10 duplicate legacy files (kept the 3 genuinely unique legacy biomes: badlands, mushroom_grove,
+   wetlands). assets/biomes now: 39 files, zero duplicate _id values (verified).
+2. Made biome_loader::load_directory deterministic: collect all .json paths, SORT, then load — so later
+   namespaces (e.g. unendlich/) deterministically win an ID clash regardless of read_dir order.
+Added regression test `load_directory_is_deterministic_on_id_collision` (tempdir, two namespaces, asserts the
+sorted-last one wins). Flatten-tested the sort logic; lib (+tests) compile. Expected runtime: "Loaded 39 biomes"
+with NO duplicate warnings (DEVICE-VERIFY on next run).
+
+LESSON: biome `id` field in JSON is `_id`, not `id`. Loader walks assets/biomes/<namespace>/<id>.json recursively.
+
+## r471 — Hot-metal quench steam puff (makes the r464 sim visible)
+The r464 hot-metal sim (metal near lava heats, quenches in water, melts at 1500°C) ran but had no visible cue.
+Wired the quench → steam puff the design called for, reusing the existing spawn-anchored SmokeField (32×24×32,
+already advected by sim::smoke_gpu::step_smoke from F9 fires) rather than a new particle system:
+- hot-metal tick (frame%20==7) now collects each cell where `hm::quench_steam(t1, wet)` fires into a per-frame
+  `pending_steam: Vec<[i32;3]>`.
+- the smoke-step block injects those as FireSources at intensity 0.6 (lighter than fire's 1.0) using the same
+  world→cell mapping as fires; the gate now also fires when steam is pending (so steam shows even with no fires).
+- net effect: dropping water on lava-heated metal flashes localized haze above the quench site, then it advects/
+  dissipates. Intermittent (tick cadence) — reads as puffs. Limitation: only within the smoke field's ~64-block
+  spawn-anchored extent (same as fires); far-from-spawn quenches are clipped. Bin compiles. DEVICE-VERIFY the
+  visual on the next GPU run (steam haze when hot metal meets water).
+
+NEXT shader/visual follow-ups still open: emissive hot-metal GLOW needs a per-block temperature→shader data path
+(mesher or uniform) that doesn't exist yet — bigger task, device-only-verifiable, deferred until there's device
+feedback. Sky/horizon gradient + sun disc and water-glint polish remain on the roadmap.
+
+## r472 — Shader: sun-glitter path on water (chunk.frag)
+First of the resumed shader passes (operator OK'd more shader work; Fairphone bring-up still later). Picked a
+LOW-RISK target: the water surface block in chunk.frag is already wired + sophisticated (fresnel, planar sky
+reflection, a tight sun glint pow(...,200), Beer-Lambert refraction, real-depth volumetric bottom, shore foam).
+It had ONE smooth glint blob; real sun-on-water shows a shimmering glitter path.
+- Added `CHUNK_WATER_GLITTER` (#define, default 1, =0 → old single glint) next to CHUNK_SNOW_SPARKLE.
+- After the existing glint: near the sun's mirror direction (align>0.5), two scrolling world-space hash12
+  octaves gate a much sharper lobe (pow(align,700)) per-fragment → the reflection scatters into sparkly
+  micro-glints. Rides the wave normal (refl_dir uses the wave-perturbed N) so it travels with the swell;
+  `align` gates it to ~zero cost away from the highlight. Uses w_time (=atmos_params.w) for the scroll, matching
+  the wave animation clock.
+- VALIDATED: glslangValidator -V chunk.frag → RC=0; rustcheck → PASS (0 shader-err). Regenerated
+  assets/shaders/chunk.frag.spv (was stale) + updated the .spv.hash sidecar so build.rs ships it fresh.
+- DEVICE-VERIFY the look on the next GPU run (sparkly glitter path on sunlit water; set CHUNK_WATER_GLITTER=0 in
+  chunk.frag to A/B against the old single glint). Tunables if too strong/weak: the 1.2 intensity, the
+  smoothstep(0.62,1.0) sparsity, and pow(align,700) tightness.
+
+Shader roadmap remaining: sky/horizon gradient + sun disc (needs wiring the unwired sky.frag — a new pass, higher
+risk, deferred), emissive hot-metal glow (needs a per-block temp→shader data path), contact-AO / LOD-seam.

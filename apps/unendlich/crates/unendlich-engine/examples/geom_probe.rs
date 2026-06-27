@@ -97,6 +97,8 @@ fn main() {
 
 #[allow(dead_code)]
 fn coord_main() {
+    // stub (dead code) — body removed; left as a no-op so the file stays structurally valid.
+}
 
 #[allow(dead_code)]
 fn old_main() {

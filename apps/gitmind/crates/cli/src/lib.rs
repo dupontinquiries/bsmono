@@ -86,6 +86,11 @@ pub fn run() -> i32 {
         "cherry-pick" | "pick" => cmd_native_cherry_pick(rest),
         "rebase" => cmd_native_rebase(rest),
         "merge" => cmd_native_merge(rest),
+        "spread" => cmd_spread(rest),
+        "repack" => cmd_repack(rest),
+        "var" => cmd_var(rest),
+        "app" => cmd_app(rest),
+        "check" => cmd_check(rest),
         "patch" => cmd_patch(rest),
         "apply" => cmd_apply(rest),
         "zip" => cmd_zip(rest),
@@ -586,6 +591,386 @@ fn cmd_apply(rest: &[String]) -> i32 {
     }
 }
 
+fn cmd_spread(rest: &[String]) -> i32 {
+    use gitmind_core::{native, portage};
+    let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+    let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+    let tree_mode = flag(rest, "--tree");
+    let into = opt(rest, "--into").map(|s| s.to_string())
+        .unwrap_or_else(|| "spread".to_string());
+    let label_kind = opt(rest, "--label").unwrap_or("index"); // index|oid|branch
+
+    // Build the (label, rev) list from a selection flag.
+    let revs: Vec<(String, String)> = if let Some(list) = opt(rest, "--revs") {
+        list.split(',').filter(|s| !s.is_empty()).enumerate()
+            .map(|(i, r)| (label_for(label_kind, i, r, r), r.to_string()))
+            .collect()
+    } else if flag(rest, "--branches") {
+        match native::branch_list(&store) {
+            Ok(bs) => bs.into_iter().map(|b| (b.name.clone(), b.name)).collect(),
+            Err(e) => return err(&e),
+        }
+    } else {
+        // default / --last N: walk native history from HEAD
+        let n = opt(rest, "--last").and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
+        let mut cur = match native::resolve_head(&store) {
+            Ok(Some(o)) => Some(o),
+            Ok(None) => return err("no native commits — run `gin native-commit` first"),
+            Err(e) => return err(&e),
+        };
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some(oid) = cur {
+            if i >= n { break; }
+            out.push((label_for(label_kind, i, &oid, &oid), oid.clone()));
+            cur = portage::native_commit(&store, &oid).ok().and_then(|m| m.parents.first().cloned());
+            i += 1;
+        }
+        out
+    };
+    if revs.is_empty() {
+        return err("no revisions selected");
+    }
+
+    let into_path = std::path::Path::new(&into);
+    if tree_mode {
+        match native::spread_tree(&store, &revs, into_path) {
+            Ok(dirs) => { println!("spread {} tree(s) into {}/:", dirs.len(), into);
+                          for d in &dirs { println!("  {d}/"); } 0 }
+            Err(e) => err(&e),
+        }
+    } else {
+        let path = match rest.iter().find(|a| !a.starts_with('-')) {
+            Some(p) => p,
+            None => return err("usage: gin spread <path> [--last N|--revs a,b|--branches] [--into dir] [--tree]"),
+        };
+        match native::spread_file(&store, path, &revs, into_path) {
+            Ok(w) if w.is_empty() => { println!("'{path}' not found in any selected revision"); 0 }
+            Ok(w) => { println!("spread {} version(s) of {path} into {}/:", w.len(), into);
+                       for f in &w { println!("  {f}"); } 0 }
+            Err(e) => err(&e),
+        }
+    }
+}
+
+fn label_for(kind: &str, idx: usize, oid: &str, rref: &str) -> String {
+    match kind {
+        "oid" => oid[..oid.len().min(8)].to_string(),
+        "branch" => rref.to_string(),
+        _ => format!("head{:02}", idx + 1),
+    }
+}
+
+fn cmd_repack(rest: &[String]) -> i32 {
+    let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+    let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+    let min_gain = opt(rest, "--min-gain").and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.05);
+    match store.repack(min_gain) {
+        Ok(r) => {
+            let pct = if r.bytes_before > 0 {
+                100.0 * (r.bytes_before - r.bytes_after) as f64 / r.bytes_before as f64
+            } else { 0.0 };
+            println!("repack: {} chunks scanned, {} deltified", r.chunks_scanned, r.chunks_deltified);
+            println!("        {} → {} stored bytes ({:.1}% smaller)", r.bytes_before, r.bytes_after, pct);
+            0
+        }
+        Err(e) => err(&e),
+    }
+}
+
+fn cmd_var(rest: &[String]) -> i32 {
+    use gitmind_core::varcache;
+    let sub = match rest.first() {
+        Some(s) => s.as_str(),
+        None => return err("usage: gin var <stash|restore|list|pin|unpin> ..."),
+    };
+    let args = &rest[1..];
+    let var_dir = std::path::Path::new(".var");
+    let pointer = |name: &str| var_dir.join(name);
+
+    match sub {
+        "stash" => {
+            let dir = args.iter().find(|a| !a.starts_with('-')).map(|s| s.as_str()).unwrap_or("target");
+            let dpath = std::path::Path::new(dir);
+            if !dpath.exists() { return err(&format!("no such directory: {dir}")); }
+            let name = opt(args, "--name").map(|s| s.to_string())
+                .unwrap_or_else(|| dpath.file_name().and_then(|s| s.to_str()).unwrap_or("cache").to_string());
+            let store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            let oid = match varcache::stash(&store, dpath) { Ok(o) => o, Err(e) => return err(&e) };
+            if let Err(e) = std::fs::create_dir_all(var_dir).and_then(|_| std::fs::write(pointer(&name), &oid)) {
+                return err(&e.to_string());
+            }
+            if flag(args, "--pin") { let _ = varcache::pin(&store, &name, &oid); }
+            if flag(args, "--repack") {
+                if let Ok(r) = store.repack(0.05) {
+                    println!("repacked: {} chunks deltified, {} → {} bytes", r.chunks_deltified, r.bytes_before, r.bytes_after);
+                }
+            }
+            println!("stashed {dir} → {} (pointer .var/{name})", &oid[..oid.len().min(12)]);
+            println!("commit .var/{name} (tiny); the bytes live system-wide in {}", varcache::var_store_path().display());
+            0
+        }
+        "restore" => {
+            let name = match args.iter().find(|a| !a.starts_with('-')) {
+                Some(n) => n, None => return err("usage: gin var restore <name> [--into dir]"),
+            };
+            let oid = match std::fs::read_to_string(pointer(name)) {
+                Ok(s) => s.trim().to_string(),
+                Err(_) => return err(&format!("no pointer .var/{name}")),
+            };
+            let into = opt(args, "--into").unwrap_or(name);
+            let store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            match varcache::restore(&store, &oid, std::path::Path::new(into)) {
+                Ok(()) => { println!("restored .var/{name} → {into}/"); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "list" => {
+            println!("pointers (.var/):");
+            if let Ok(rd) = std::fs::read_dir(var_dir) {
+                for e in rd.flatten() {
+                    if let Ok(oid) = std::fs::read_to_string(e.path()) {
+                        println!("  {}  {}", e.file_name().to_string_lossy(), &oid.trim()[..oid.trim().len().min(12)]);
+                    }
+                }
+            }
+            if let Ok(store) = varcache::open_var_store() {
+                if let Ok(ps) = varcache::pins(&store) {
+                    if !ps.is_empty() {
+                        println!("pinned (system store):");
+                        for (n, o) in ps { println!("  {n}  {}", &o[..o.len().min(12)]); }
+                    }
+                }
+            }
+            0
+        }
+        "pin" | "unpin" => {
+            let name = match args.iter().find(|a| !a.starts_with('-')) {
+                Some(n) => n, None => return err(&format!("usage: gin var {sub} <name>")),
+            };
+            let store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            if sub == "pin" {
+                let oid = match std::fs::read_to_string(pointer(name)) {
+                    Ok(s) => s.trim().to_string(), Err(_) => return err(&format!("no pointer .var/{name}")),
+                };
+                match varcache::pin(&store, name, &oid) { Ok(()) => { println!("pinned {name}"); 0 } Err(e) => err(&e) }
+            } else {
+                match varcache::unpin(&store, name) { Ok(()) => { println!("unpinned {name}"); 0 } Err(e) => err(&e) }
+            }
+        }
+        "gc" => {
+            let mut store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            let path = varcache::var_store_path();
+            let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if !flag(args, "--no-repack") {
+                if let Ok(r) = store.repack(0.05) {
+                    println!("repacked: {} chunks deltified", r.chunks_deltified);
+                }
+            }
+            match store.compact() {
+                Ok(moved) => {
+                    let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    println!("compacted ({}): {} → {} bytes", if moved { "reclaimed" } else { "no-op" }, before, after);
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        _ => err("usage: gin var <stash|restore|list|pin|unpin|gc> ..."),
+    }
+}
+
+fn cmd_check(rest: &[String]) -> i32 {
+    use gitmind_core::{checks, native, portage};
+    let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+    let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+
+    // `--candidates` just lists already-green commits.
+    if flag(rest, "--candidates") {
+        match checks::candidates(&store) {
+            Ok(cs) if cs.is_empty() => { println!("no passing checks recorded yet"); return 0; }
+            Ok(cs) => {
+                for c in cs {
+                    let subj = portage::native_commit(&store, &c.commit).ok()
+                        .and_then(|m| m.message.lines().next().map(|s| s.to_string())).unwrap_or_default();
+                    println!("✓ {}  {} ({} ms)", &c.commit[..c.commit.len().min(12)], subj, c.duration_ms);
+                }
+                return 0;
+            }
+            Err(e) => return err(&e),
+        }
+    }
+
+    let cmd: Vec<String> = match opt(rest, "--cmd") {
+        Some(c) => c.split_whitespace().map(|s| s.to_string()).collect(),
+        None => checks::default_cmd(),
+    };
+
+    // Which commits to check: explicit target, --last N, or HEAD.
+    let targets: Vec<String> = if let Some(n) = opt(rest, "--last").and_then(|s| s.parse::<usize>().ok()) {
+        let mut cur = native::resolve_head(&store).ok().flatten();
+        let mut out = Vec::new();
+        while let (Some(oid), true) = (cur.clone(), out.len() < n) {
+            out.push(oid.clone());
+            cur = portage::native_commit(&store, &oid).ok().and_then(|m| m.parents.first().cloned());
+        }
+        out
+    } else if let Some(t) = rest.iter().find(|a| !a.starts_with('-')) {
+        match native::resolve_ref_or_commit(&store, t) { Ok(o) => vec![o], Err(e) => return err(&e) }
+    } else {
+        match native::resolve_head(&store) { Ok(Some(o)) => vec![o], _ => return err("no commit to check") }
+    };
+
+    let mut failures = 0;
+    for oid in &targets {
+        println!("checking {} …", &oid[..oid.len().min(12)]);
+        match checks::run(&store, oid, &cmd) {
+            Ok(st) => {
+                println!("  {} {} (code {}, {} ms)", checks::marker(Some(&st)),
+                         if st.ok { "ok" } else { "FAILED" }, st.code, st.duration_ms);
+                if !st.ok { failures += 1; }
+            }
+            Err(e) => { eprintln!("  error: {e}"); failures += 1; }
+        }
+    }
+    if failures > 0 { 1 } else { 0 }
+}
+
+fn cmd_app(rest: &[String]) -> i32 {
+    use gitmind_core::{binpin, varcache};
+    let sub = match rest.first() { Some(s) => s.as_str(), None =>
+        return err("usage: gin app <install|build|use|list|log|run|desktop|remove> ...") };
+    let args = &rest[1..];
+    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+
+    match sub {
+        "install" => {
+            let (name, binpath) = match pos.as_slice() {
+                [n, p, ..] => (n.as_str(), p.as_str()),
+                _ => return err("usage: gin app install <name> <binary> [--label L] [--commit C] [--use] [--desktop]"),
+            };
+            let bytes = match std::fs::read(binpath) { Ok(b) => b, Err(e) => return err(&e.to_string()) };
+            let store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            let label = opt(args, "--label").map(|s| s.to_string()).unwrap_or_else(|| default_label(args));
+            let commit = opt(args, "--commit").unwrap_or("manual").to_string();
+            let target = opt(args, "--target").unwrap_or("host").to_string();
+            match binpin::install(&store, name, &label, &commit, &target, &bytes, flag(args, "--use")) {
+                Ok(v) => {
+                    println!("installed {name}@{label} → {}", v.path);
+                    if flag(args, "--desktop") {
+                        match binpin::write_desktop(name, &label, flag(args, "--terminal"), None) {
+                            Ok(p) => println!("pinned: {}", p.display()),
+                            Err(e) => return err(&e),
+                        }
+                    }
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "build" => {
+            let name = match pos.first() { Some(n) => n.as_str(), None =>
+                return err("usage: gin app build <name> [commit] [--cmd \"...\"] [--artifact path] [--target T] [--label L]") };
+            let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+            let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+            let commit = pos.get(1).map(|s| s.as_str()).unwrap_or("HEAD").to_string();
+            let target = opt(args, "--target").map(|s| s.to_string());
+            let cmd: Vec<String> = match opt(args, "--cmd") {
+                Some(c) => c.split_whitespace().map(|s| s.to_string()).collect(),
+                None => {
+                    let mut c = vec!["cargo".to_string(), "build".to_string(), "--release".to_string()];
+                    if let Some(t) = &target { c.push("--target".to_string()); c.push(t.clone()); }
+                    c
+                }
+            };
+            let artifact = opt(args, "--artifact").map(|s| s.to_string()).unwrap_or_else(|| match &target {
+                Some(t) => format!("target/{t}/release/{name}"),
+                None => format!("target/release/{name}"),
+            });
+            let work = std::env::temp_dir().join(format!("gitmind-build-{name}-{}", std::process::id()));
+            println!("building {name} from {commit} ({})…", target.as_deref().unwrap_or("host"));
+            let bytes = match binpin::build_from_commit(&store, &commit, &work, &cmd, &artifact) {
+                Ok(b) => b, Err(e) => return err(&e),
+            };
+            let vstore = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err(&e) };
+            let label = opt(args, "--label").map(|s| s.to_string())
+                .unwrap_or_else(|| commit[..commit.len().min(8)].to_string());
+            let resolved = gitmind_core::native::resolve_ref_or_commit(&store, &commit).unwrap_or(commit.clone());
+            match binpin::install(&vstore, name, &label, &resolved, target.as_deref().unwrap_or("host"), &bytes, flag(args, "--use")) {
+                Ok(v) => { println!("installed {name}@{label} → {} ({} bytes)", v.path, bytes.len());
+                    if flag(args, "--desktop") { let _ = binpin::write_desktop(name, &label, flag(args, "--terminal"), None); }
+                    0 }
+                Err(e) => err(&e),
+            }
+        }
+        "use" => match pos.as_slice() {
+            [n, l, ..] => match binpin::use_version(n, l) {
+                Ok(()) => { println!("now using {n}@{l}"); 0 } Err(e) => err(&e) },
+            _ => err("usage: gin app use <name> <label>"),
+        },
+        "list" => {
+            if let Some(n) = pos.first() {
+                let m = binpin::load_manifest(n);
+                for v in &m.versions {
+                    let cur = if m.current.as_deref() == Some(&v.label) { "*" } else { " " };
+                    println!("{cur} {}@{}  {}  {}", n, v.label, &v.commit[..v.commit.len().min(8)], v.target);
+                }
+            } else {
+                for a in binpin::list_apps() {
+                    let m = binpin::load_manifest(&a);
+                    println!("{a}  ({} versions, current {})", m.versions.len(), m.current.as_deref().unwrap_or("-"));
+                }
+            }
+            0
+        }
+        "log" => {
+            let n = match pos.first() { Some(n) => n, None => return err("usage: gin app log <name>") };
+            let mut m = binpin::load_manifest(n);
+            m.versions.sort_by(|a, b| b.installed.cmp(&a.installed));
+            for v in &m.versions {
+                println!("{}@{}  commit {}  target {}  installed {}",
+                    n, v.label, &v.commit[..v.commit.len().min(12)], v.target, v.installed);
+            }
+            0
+        }
+        "run" => {
+            use std::os::unix::process::CommandExt;
+            let n = match pos.first() { Some(n) => n, None => return err("usage: gin app run <name> [label] [-- args]") };
+            let m = binpin::load_manifest(n);
+            let label = pos.get(1).map(|s| s.to_string())
+                .or_else(|| m.current.clone())
+                .unwrap_or_default();
+            let path = match binpin::version_path(n, &label) { Some(p) => p, None =>
+                return err(&format!("no installed {n}@{label}")) };
+            let passthrough: Vec<&String> = match args.iter().position(|a| a == "--") {
+                Some(i) => args[i + 1..].iter().collect(), None => Vec::new(),
+            };
+            let e = std::process::Command::new(&path).args(passthrough).exec();
+            err(&format!("exec failed: {e}"))
+        }
+        "desktop" => match pos.as_slice() {
+            [n, l, ..] => match binpin::write_desktop(n, l, flag(args, "--terminal"), opt(args, "--icon")) {
+                Ok(p) => { println!("wrote {}", p.display()); 0 } Err(e) => err(&e) },
+            _ => err("usage: gin app desktop <name> <label> [--terminal] [--icon NAME]"),
+        },
+        "remove" => match pos.as_slice() {
+            [n, l, ..] => match binpin::remove(n, l) {
+                Ok(()) => { println!("removed {n}@{l}"); 0 } Err(e) => err(&e) },
+            _ => err("usage: gin app remove <name> <label>"),
+        },
+        _ => err("usage: gin app <install|build|use|list|log|run|desktop|remove> ..."),
+    }
+}
+
+/// A default version label from a `--commit`/HEAD-ish hint, else a timestamp.
+fn default_label(args: &[String]) -> String {
+    if let Some(c) = opt(args, "--commit") {
+        return c[..c.len().min(8)].to_string();
+    }
+    format!("v{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0))
+}
+
 fn cmd_native_merge(rest: &[String]) -> i32 {
     use gitmind_core::native::{self, MergeOutcome};
     let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
@@ -595,21 +980,20 @@ fn cmd_native_merge(rest: &[String]) -> i32 {
         None => return err("usage: gin merge <branch>"),
     };
     let (name, email) = identity(&repo);
-    match native::merge(&store, theirs, &name, &email) {
+    match native::merge_into_worktree(&store, theirs, repo.root(), &name, &email) {
         Ok(MergeOutcome::UpToDate) => { println!("already up to date"); 0 }
         Ok(MergeOutcome::FastForward { new_tip }) => {
-            sync_worktree_to_head(&store, repo.root());
             println!("fast-forwarded to {}", &new_tip[..new_tip.len().min(12)]);
             0
         }
         Ok(MergeOutcome::Merged { commit }) => {
-            sync_worktree_to_head(&store, repo.root());
             println!("merged {theirs} → merge commit {}", &commit[..commit.len().min(12)]);
             0
         }
         Ok(MergeOutcome::Conflicts(paths)) => {
-            eprintln!("merge conflicts (nothing committed):");
+            eprintln!("merge conflicts — markers written to:");
             for p in &paths { eprintln!("  {p}"); }
+            eprintln!("resolve them, then `gin native-commit -m \"merge\"` to finish.");
             1
         }
         Err(e) => err(&e),
@@ -620,8 +1004,34 @@ fn cmd_native_rebase(rest: &[String]) -> i32 {
     use gitmind_core::native::{self, RebaseOutcome};
     let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
     let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
-    // Forms: `rebase <onto>` (rebase current branch onto <onto>)
-    //        `rebase <branch> --onto <onto>`
+    let (name, email) = identity(&repo);
+
+    if flag(rest, "--abort") {
+        return match native::rebase_abort(&store, repo.root()) {
+            Ok(()) => { println!("rebase aborted; branch restored"); 0 }
+            Err(e) => err(&e),
+        };
+    }
+    let finish = |out: Result<RebaseOutcome, String>| -> i32 {
+        match out {
+            Ok(RebaseOutcome::Rebased { new_tip, commits }) => {
+                println!("rebase complete: {commits} commit(s) → {}", &new_tip[..new_tip.len().min(12)]);
+                0
+            }
+            Ok(RebaseOutcome::UpToDate) => { println!("already up to date"); 0 }
+            Ok(RebaseOutcome::Conflicts { commit, paths }) => {
+                eprintln!("rebase paused at {} — conflicts, markers written to:", &commit[..commit.len().min(12)]);
+                for p in &paths { eprintln!("  {p}"); }
+                eprintln!("resolve them, then `gin rebase --continue` (or `gin rebase --abort`).");
+                1
+            }
+            Err(e) => err(&e),
+        }
+    };
+    if flag(rest, "--continue") {
+        return finish(native::rebase_continue(&store, repo.root(), &name, &email));
+    }
+
     let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with('-')).collect();
     let onto_flag = opt(rest, "--onto");
     let (branch, onto) = match (onto_flag, positional.as_slice()) {
@@ -629,24 +1039,9 @@ fn cmd_native_rebase(rest: &[String]) -> i32 {
         (Some(o), []) => (current_branch(&store).unwrap_or_else(|| "main".into()), o.to_string()),
         (None, [o]) => (current_branch(&store).unwrap_or_else(|| "main".into()), o.to_string()),
         (None, [b, o, ..]) => (b.to_string(), o.to_string()),
-        _ => return err("usage: gin rebase <onto>   |   gin rebase <branch> --onto <onto>"),
+        _ => return err("usage: gin rebase <onto> | <branch> --onto <onto> | --continue | --abort"),
     };
-    let (name, email) = identity(&repo);
-    match native::rebase(&store, &branch, &onto, &name, &email) {
-        Ok(RebaseOutcome::Rebased { new_tip, commits }) => {
-            sync_worktree_to_head(&store, repo.root());
-            println!("rebased {branch} onto {onto}: {commits} commit(s) replayed → {}",
-                     &new_tip[..new_tip.len().min(12)]);
-            0
-        }
-        Ok(RebaseOutcome::UpToDate) => { println!("{branch} is up to date with {onto}"); 0 }
-        Ok(RebaseOutcome::Conflicts { commit, paths }) => {
-            eprintln!("rebase stopped at {} — conflicts (nothing moved):", &commit[..commit.len().min(12)]);
-            for p in &paths { eprintln!("  {p}"); }
-            1
-        }
-        Err(e) => err(&e),
-    }
+    finish(native::rebase_into_worktree(&store, &branch, &onto, repo.root(), &name, &email))
 }
 
 fn current_branch(store: &gitmind_core::store::ChunkStore) -> Option<String> {
@@ -708,34 +1103,19 @@ fn cmd_native_cherry_pick(rest: &[String]) -> i32 {
         .unwrap_or_else(|| "gitmind".to_string());
     let email = repo.git(&["config", "user.email"]).ok().filter(|s| !s.is_empty())
         .unwrap_or_else(|| "gitmind@local".to_string());
-    match native::cherry_pick(&store, target, &name, &email) {
+    match native::cherry_pick_into_worktree(&store, target, repo.root(), &name, &email) {
         Ok(PickOutcome::Committed(c)) => {
-            // Sync the working tree to the branch HEAD now points at.
-            sync_worktree_to_head(&store, repo.root());
             println!("cherry-picked → {} (working tree updated)", &c.oid[..c.oid.len().min(12)]);
             0
         }
         Ok(PickOutcome::Empty) => { println!("nothing to do — already present on HEAD"); 0 }
         Ok(PickOutcome::Conflicts(paths)) => {
-            eprintln!("cherry-pick conflicts (nothing committed):");
+            eprintln!("cherry-pick conflicts — markers written to:");
             for p in &paths { eprintln!("  {p}"); }
+            eprintln!("resolve them, then `gin native-commit -m \"...\"` to finish.");
             1
         }
         Err(e) => err(&e),
-    }
-}
-
-fn sync_worktree_to_head(store: &gitmind_core::store::ChunkStore, root: &std::path::Path) {
-    use gitmind_core::native;
-    if let Ok(refs) = store.refs() {
-        if let Some((_, target)) = refs.iter().find(|(n, _)| n == "HEAD") {
-            let r = if let Some(b) = target.strip_prefix("refs/heads/") {
-                native::checkout(store, b, root)
-            } else {
-                native::checkout(store, target, root)
-            };
-            let _ = r;
-        }
     }
 }
 
@@ -761,6 +1141,12 @@ fn cmd_native_status() -> i32 {
     use gitmind_core::native;
     let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
     let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+    if let Ok(Some(mh)) = native::merge_head(&store) {
+        println!("merge in progress (MERGE_HEAD {}) — resolve, then `gin native-commit`", &mh[..mh.len().min(12)]);
+    }
+    if let Ok(Some(cur)) = native::rebase_status(&store) {
+        println!("rebase in progress (at {}) — resolve, then `gin rebase --continue`", &cur[..cur.len().min(12)]);
+    }
     match native::status(&store, repo.root()) {
         Ok(changes) if changes.is_empty() => {
             println!("working tree matches native HEAD (clean)");
@@ -777,7 +1163,7 @@ fn cmd_native_status() -> i32 {
 }
 
 fn cmd_native_log(rest: &[String]) -> i32 {
-    use gitmind_core::{native, portage};
+    use gitmind_core::{checks, native, portage};
     let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
     let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
     let limit = rest.iter().find_map(|a| a.parse::<usize>().ok()).unwrap_or(20);
@@ -792,7 +1178,8 @@ fn cmd_native_log(rest: &[String]) -> i32 {
         match portage::native_commit(&store, &oid) {
             Ok(meta) => {
                 let subject = meta.message.lines().next().unwrap_or("");
-                println!("{}  {}", &oid[..oid.len().min(12)], subject);
+                let mark = checks::marker(checks::get(&store, &oid).ok().flatten().as_ref());
+                println!("{} {}  {}", mark, &oid[..oid.len().min(12)], subject);
                 cur = meta.parents.first().cloned();
                 shown += 1;
             }
@@ -893,8 +1280,17 @@ fn print_help(prog: &str) {
     println!("  native-checkout | nco <ref> materialize a native commit/branch into the worktree");
     println!("  native-branch | nb [name] [-d name]   list/create/delete native branches");
     println!("  cherry-pick | pick <oid>    apply a commit's change onto the current branch");
-    println!("  rebase <onto> | <branch> --onto <onto>   replay a branch's commits onto a new base");
+    println!("  rebase <onto> | --continue | --abort   replay commits; pauses on conflict with markers");
     println!("  merge <branch>              3-way merge a branch into the current one (no git)");
+    println!("  spread <path> [--last N|--revs a,b|--branches] [--into dir] [--tree]");
+    println!("                              lay several versions side by side ({{head01}}--file) for native viewers");
+    println!("  repack [--min-gain 0.05]    cross-file delta-compress the store (storage only, oids unchanged)");
+    println!("  var stash [dir] [--name N] [--pin] | restore <name> [--into dir] | list | pin/unpin <name>");
+    println!("                              system-wide dedup cache for build artifacts (target/, node_modules)");
+    println!("  app install <name> <bin> | build <name> [commit] | use <name> <label> | list | log | run | desktop | remove");
+    println!("                              version-pinned binaries in ~/.local/bin + .desktop pins (GNOME), dedup'd");
+    println!("  check [commit] [--last N] [--cmd \"...\"] | --candidates");
+    println!("                              cache a build/check verdict per commit; native-log shows ✓/✗/· markers");
     println!("  patch <commit> [-o file]    export a commit as a unified diff (git-apply compatible)");
     println!("  apply <file.patch>          apply a unified diff to the working tree (no git)");
     println!("  zip <archive> [--apply]     dry-run summary of an overwriting extract, then apply");

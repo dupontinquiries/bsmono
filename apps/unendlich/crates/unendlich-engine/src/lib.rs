@@ -141,6 +141,8 @@ pub mod world;
 pub mod sim;        // [applied onto 88b5542] simulation subsystem
 #[cfg(feature = "audio")]
 pub mod audio; // spatial music playback (rodio); pure mixer lives in sim::spatial_audio
+pub mod breadcrumb;
+pub mod debug_scene;
 pub mod app;        // app core: the testable composition layer the thin bin calls
 pub mod items;      // [applied] inventory/placement/crafting/drops/loot + debug ui/hud
 pub mod telemetry;  // [applied] run telemetry: achievements/report/window

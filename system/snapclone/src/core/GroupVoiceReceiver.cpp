@@ -18,7 +18,7 @@ namespace {
 constexpr int kSampleRate = 16000;
 constexpr int kChannels = 1;
 constexpr int kFrameMs = 20;
-constexpr int kJitterTarget = 3;   // ~60 ms prime
+constexpr int kJitterTarget = 2;   // ~40 ms prime (was 3/~60ms; lower base latency)
 constexpr int kJitterMax = 50;     // ~1 s cap
 constexpr int kMaxDecodeSamples = 1920; // 120 ms @ 16k = largest Opus frame
 constexpr int kMaxPayloadBytes = 4096;
@@ -30,7 +30,7 @@ constexpr int kMaxPayloadBytes = 4096;
 // run the tick at half a frame so it refills well before the cushion drains.
 // kPlayoutGain is a modest clamped makeup boost for low decoded levels (the
 // voice-profile AGC/normalization will supersede it).
-constexpr int   kCushionFrames = 4;            // ~80 ms cushion (bounds latency)
+constexpr int   kCushionFrames = 3;            // ~60 ms cushion (was 4/~80ms; bounds latency)
 constexpr float kPlayoutGain   = 1.5f;         // ~+3.5 dB baseline makeup
 
 // Opus only encodes a fixed set of frame durations; snap a requested ms to the
@@ -213,6 +213,29 @@ void GroupVoiceReceiver::onVoiceFrame(const QString &senderId, const QByteArray 
                    reinterpret_cast<const uint8_t *>(payload.constData()), plen);
 }
 
+void GroupVoiceReceiver::enqueuePreroll(const QString &senderId, const QByteArray &wireFrame)
+{
+    // Captured during the ring (before accept). We strip the wire header to the
+    // Opus payload now and FIFO it per sender; onPlayoutTick drains it ahead of
+    // the live jitter, one frame per tick, in arrival order — so the head of the
+    // message plays instead of being dropped by the live jitter's drop-oldest
+    // cap (which is what cut the first 1-2s on a tight-loop replay).
+    uint8_t ver = 0, codec = 0, flags = 0;
+    uint32_t seq = 0, ts = 0;
+    QByteArray payload(wireFrame.size(), Qt::Uninitialized);
+    size_t plen = 0;
+    const int rc = sc_voice_frame_decode(
+        reinterpret_cast<const uint8_t *>(wireFrame.constData()),
+        static_cast<size_t>(wireFrame.size()),
+        &ver, &seq, &ts, &codec, &flags,
+        reinterpret_cast<uint8_t *>(payload.data()),
+        static_cast<size_t>(payload.size()), &plen);
+    if (rc != 0) return;
+    payload.resize(static_cast<int>(plen));
+    (void)streamFor(senderId);   // ensure a decoder exists for this peer
+    m_preroll[senderId.toStdString()].push_back(payload);
+}
+
 void GroupVoiceReceiver::onPlayoutTick()
 {
     if (!m_io || !m_sink) return;
@@ -239,23 +262,38 @@ void GroupVoiceReceiver::onPlayoutTick()
 
         for (auto &entry : m_streams) {
             PeerStream &st = entry.second;
-            if (!st.jitter) continue;
-            size_t flen = 0;
-            const int r = sc_jitter_pop(
-                st.jitter, reinterpret_cast<uint8_t *>(m_frameBuf.data()),
-                static_cast<size_t>(m_frameBuf.size()), &flen);
-
             int samples = 0;
-            if (r == 0) {                   // frame ready → decode it
+
+            // V32.49: drain this peer's captured pre-roll first, in order, ahead
+            // of its live jitter — so an accepted call plays the head of the
+            // message rather than dropping it. Live frames that land during the
+            // drain go to the jitter and play once the pre-roll empties.
+            auto pit = m_preroll.find(entry.first);
+            if (pit != m_preroll.end() && !pit->second.empty()) {
+                const QByteArray pkt = pit->second.front();
+                pit->second.pop_front();
                 if (m_decoderOk && st.decoder)
                     samples = sc_opus_decode(
-                        st.decoder, reinterpret_cast<const uint8_t *>(m_frameBuf.constData()),
-                        flen, pcm, pcmCap, 0);
-            } else if (r == 1) {            // gap → packet-loss concealment
-                if (m_decoderOk && st.decoder)
-                    samples = sc_opus_decode(st.decoder, nullptr, 0, pcm, pcmCap, 0);
+                        st.decoder, reinterpret_cast<const uint8_t *>(pkt.constData()),
+                        static_cast<size_t>(pkt.size()), pcm, pcmCap, 0);
+            } else {
+                if (!st.jitter) continue;
+                size_t flen = 0;
+                const int r = sc_jitter_pop(
+                    st.jitter, reinterpret_cast<uint8_t *>(m_frameBuf.data()),
+                    static_cast<size_t>(m_frameBuf.size()), &flen);
+
+                if (r == 0) {                   // frame ready → decode it
+                    if (m_decoderOk && st.decoder)
+                        samples = sc_opus_decode(
+                            st.decoder, reinterpret_cast<const uint8_t *>(m_frameBuf.constData()),
+                            flen, pcm, pcmCap, 0);
+                } else if (r == 1) {            // gap → packet-loss concealment
+                    if (m_decoderOk && st.decoder)
+                        samples = sc_opus_decode(st.decoder, nullptr, 0, pcm, pcmCap, 0);
+                }
+                // r == 2 (silence / empty / error): this peer contributes nothing.
             }
-            // r == 2 (silence / empty / error): this peer contributes nothing.
 
             const size_t n = qMin(static_cast<size_t>(samples < 0 ? 0 : samples), frameSamples);
             for (size_t i = 0; i < n; ++i) mix[i] += pcm[i];
@@ -323,6 +361,7 @@ void GroupVoiceReceiver::clearStreams()
         if (entry.second.decoder) sc_opus_decoder_free(entry.second.decoder);
     }
     m_streams.clear();
+    m_preroll.clear();
 }
 
 } // namespace SnapClone::Core

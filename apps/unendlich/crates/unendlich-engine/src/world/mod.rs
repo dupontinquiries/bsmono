@@ -74,6 +74,7 @@ pub mod water_flow_tiles; // r418: persistent sparse flow-vector tiles (phase 2 
 pub mod water_evaporate; // r423: dries isolated shallow puddles (guarded; never lakes)
 pub mod water_sources; // r424: rain fills exposed columns up to a shallow cap (puddles, no flood)
 pub mod named_locations;
+pub mod world_session;
 pub mod world_list; // r439: world registry + load ruleset (no concurrent worlds to start)
 pub mod sediment_map; // r443: suspended-sediment transport table for mass-conserving erosion
 pub mod water_field_batch; // r406: threaded multi-chunk settle + evap/rain cycle

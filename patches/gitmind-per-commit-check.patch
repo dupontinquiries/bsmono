@@ -1,0 +1,397 @@
+diff -ruN a/crates/cli/src/lib.rs b/crates/cli/src/lib.rs
+--- a/crates/cli/src/lib.rs	2026-06-27 11:59:14.368906941 +0000
++++ b/crates/cli/src/lib.rs	2026-06-27 11:59:14.373141824 +0000
+@@ -90,6 +90,7 @@
+         "repack" => cmd_repack(rest),
+         "var" => cmd_var(rest),
+         "app" => cmd_app(rest),
++        "check" => cmd_check(rest),
+         "patch" => cmd_patch(rest),
+         "apply" => cmd_apply(rest),
+         "zip" => cmd_zip(rest),
+@@ -779,6 +780,62 @@
+     }
+ }
+ 
++fn cmd_check(rest: &[String]) -> i32 {
++    use gitmind_core::{checks, native, portage};
++    let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
++    let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
++
++    // `--candidates` just lists already-green commits.
++    if flag(rest, "--candidates") {
++        match checks::candidates(&store) {
++            Ok(cs) if cs.is_empty() => { println!("no passing checks recorded yet"); return 0; }
++            Ok(cs) => {
++                for c in cs {
++                    let subj = portage::native_commit(&store, &c.commit).ok()
++                        .and_then(|m| m.message.lines().next().map(|s| s.to_string())).unwrap_or_default();
++                    println!("✓ {}  {} ({} ms)", &c.commit[..c.commit.len().min(12)], subj, c.duration_ms);
++                }
++                return 0;
++            }
++            Err(e) => return err(&e),
++        }
++    }
++
++    let cmd: Vec<String> = match opt(rest, "--cmd") {
++        Some(c) => c.split_whitespace().map(|s| s.to_string()).collect(),
++        None => checks::default_cmd(),
++    };
++
++    // Which commits to check: explicit target, --last N, or HEAD.
++    let targets: Vec<String> = if let Some(n) = opt(rest, "--last").and_then(|s| s.parse::<usize>().ok()) {
++        let mut cur = native::resolve_head(&store).ok().flatten();
++        let mut out = Vec::new();
++        while let (Some(oid), true) = (cur.clone(), out.len() < n) {
++            out.push(oid.clone());
++            cur = portage::native_commit(&store, &oid).ok().and_then(|m| m.parents.first().cloned());
++        }
++        out
++    } else if let Some(t) = rest.iter().find(|a| !a.starts_with('-')) {
++        match native::resolve_ref_or_commit(&store, t) { Ok(o) => vec![o], Err(e) => return err(&e) }
++    } else {
++        match native::resolve_head(&store) { Ok(Some(o)) => vec![o], _ => return err("no commit to check") }
++    };
++
++    let mut failures = 0;
++    for oid in &targets {
++        println!("checking {} …", &oid[..oid.len().min(12)]);
++        match checks::run(&store, oid, &cmd) {
++            Ok(st) => {
++                println!("  {} {} (code {}, {} ms)", checks::marker(Some(&st)),
++                         if st.ok { "ok" } else { "FAILED" }, st.code, st.duration_ms);
++                if !st.ok { failures += 1; }
++            }
++            Err(e) => { eprintln!("  error: {e}"); failures += 1; }
++        }
++    }
++    if failures > 0 { 1 } else { 0 }
++}
++
+ fn cmd_app(rest: &[String]) -> i32 {
+     use gitmind_core::{binpin, varcache};
+     let sub = match rest.first() { Some(s) => s.as_str(), None =>
+@@ -1106,7 +1163,7 @@
+ }
+ 
+ fn cmd_native_log(rest: &[String]) -> i32 {
+-    use gitmind_core::{native, portage};
++    use gitmind_core::{checks, native, portage};
+     let repo = match open_repo() { Ok(r) => r, Err(e) => return err(&e) };
+     let store = match open_store(&repo) { Ok(s) => s, Err(e) => return err(&e) };
+     let limit = rest.iter().find_map(|a| a.parse::<usize>().ok()).unwrap_or(20);
+@@ -1121,7 +1178,8 @@
+         match portage::native_commit(&store, &oid) {
+             Ok(meta) => {
+                 let subject = meta.message.lines().next().unwrap_or("");
+-                println!("{}  {}", &oid[..oid.len().min(12)], subject);
++                let mark = checks::marker(checks::get(&store, &oid).ok().flatten().as_ref());
++                println!("{} {}  {}", mark, &oid[..oid.len().min(12)], subject);
+                 cur = meta.parents.first().cloned();
+                 shown += 1;
+             }
+@@ -1231,6 +1289,8 @@
+     println!("                              system-wide dedup cache for build artifacts (target/, node_modules)");
+     println!("  app install <name> <bin> | build <name> [commit] | use <name> <label> | list | log | run | desktop | remove");
+     println!("                              version-pinned binaries in ~/.local/bin + .desktop pins (GNOME), dedup'd");
++    println!("  check [commit] [--last N] [--cmd \"...\"] | --candidates");
++    println!("                              cache a build/check verdict per commit; native-log shows ✓/✗/· markers");
+     println!("  patch <commit> [-o file]    export a commit as a unified diff (git-apply compatible)");
+     println!("  apply <file.patch>          apply a unified diff to the working tree (no git)");
+     println!("  zip <archive> [--apply]     dry-run summary of an overwriting extract, then apply");
+diff -ruN a/crates/core/src/checks.rs b/crates/core/src/checks.rs
+--- a/crates/core/src/checks.rs	1970-01-01 00:00:00.000000000 +0000
++++ b/crates/core/src/checks.rs	2026-06-27 11:59:14.372885667 +0000
+@@ -0,0 +1,124 @@
++//! Per-commit build/check status — turn the log into "what's green".
++//!
++//! For each commit we can materialize its tree, run a check command (default
++//! `cargo check`), and cache the verdict keyed by commit oid in the store's
++//! CHECKS table. The native log then shows a marker per commit (✓ builds, ✗
++//! broken, · unknown) so good candidates to test/run/pin are visible at a
++//! glance. Results are cached: a commit is only re-checked on demand.
++
++use crate::store::ChunkStore;
++use serde::{Deserialize, Serialize};
++use std::path::Path;
++
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct CheckStatus {
++    pub commit: String,
++    /// Whether the check command exited 0.
++    pub ok: bool,
++    /// Process exit code (or -1 if killed by signal / unknown).
++    pub code: i32,
++    pub duration_ms: u64,
++    /// Unix seconds when the check ran.
++    pub ran_at: u64,
++    /// The command that was run (for provenance / re-runs).
++    pub cmd: Vec<String>,
++}
++
++fn now_secs() -> u64 {
++    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
++}
++
++/// Run a check command against a commit's materialized tree and cache the
++/// result. The command runs in a fresh temp worktree containing the commit's
++/// files (default for the caller: `cargo check`). Output is inherited so the
++/// user sees compiler errors live; only the verdict is stored.
++pub fn run(
++    store: &ChunkStore,
++    commit_ref: &str,
++    cmd: &[String],
++) -> Result<CheckStatus, String> {
++    let commit = crate::native::resolve_ref_or_commit(store, commit_ref)?;
++    let meta = crate::portage::native_commit(store, &commit)?;
++    let work = std::env::temp_dir().join(format!("gitmind-check-{}-{}", &commit[..commit.len().min(8)], std::process::id()));
++    let _ = std::fs::remove_dir_all(&work);
++    std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
++    let mut n = 0;
++    crate::native::materialize_tree(store, &meta.tree, &work, &mut n)?;
++
++    let (prog, rest) = cmd.split_first().ok_or("empty check command")?;
++    let start = std::time::Instant::now();
++    let status = std::process::Command::new(prog)
++        .args(rest)
++        .current_dir(&work)
++        .status()
++        .map_err(|e| format!("check command failed to start: {e}"))?;
++    let duration_ms = start.elapsed().as_millis() as u64;
++    let _ = std::fs::remove_dir_all(&work);
++
++    let st = CheckStatus {
++        commit: commit.clone(),
++        ok: status.success(),
++        code: status.code().unwrap_or(-1),
++        duration_ms,
++        ran_at: now_secs(),
++        cmd: cmd.to_vec(),
++    };
++    let json = serde_json::to_vec(&st).map_err(|e| e.to_string())?;
++    store.put_check(&commit, &json)?;
++    Ok(st)
++}
++
++/// Fetch a cached status for a commit, if present.
++pub fn get(store: &ChunkStore, commit: &str) -> Result<Option<CheckStatus>, String> {
++    match store.get_check(commit)? {
++        Some(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
++        None => Ok(None),
++    }
++}
++
++/// A one-char marker for the log: ✓ green / ✗ broken / · unknown.
++pub fn marker(status: Option<&CheckStatus>) -> &'static str {
++    match status {
++        Some(s) if s.ok => "✓",
++        Some(_) => "✗",
++        None => "·",
++    }
++}
++
++/// Commits with a cached passing check — the good test/run/pin candidates.
++pub fn candidates(store: &ChunkStore) -> Result<Vec<CheckStatus>, String> {
++    let mut out: Vec<CheckStatus> = store
++        .list_checks()?
++        .into_iter()
++        .filter_map(|(_, b)| serde_json::from_slice::<CheckStatus>(&b).ok())
++        .filter(|s| s.ok)
++        .collect();
++    out.sort_by(|a, b| b.ran_at.cmp(&a.ran_at));
++    Ok(out)
++}
++
++/// The default check command (overridable on the CLI).
++pub fn default_cmd() -> Vec<String> {
++    vec!["cargo".to_string(), "check".to_string(), "--quiet".to_string()]
++}
++
++/// Materialize-and-run is unavailable when a worktree path is supplied; this
++/// helper lets callers run a check against an already-present directory
++/// (e.g. the live worktree) without going through the store.
++pub fn run_in_dir(commit: &str, dir: &Path, cmd: &[String]) -> Result<CheckStatus, String> {
++    let (prog, rest) = cmd.split_first().ok_or("empty check command")?;
++    let start = std::time::Instant::now();
++    let status = std::process::Command::new(prog)
++        .args(rest)
++        .current_dir(dir)
++        .status()
++        .map_err(|e| format!("check command failed to start: {e}"))?;
++    Ok(CheckStatus {
++        commit: commit.to_string(),
++        ok: status.success(),
++        code: status.code().unwrap_or(-1),
++        duration_ms: start.elapsed().as_millis() as u64,
++        ran_at: now_secs(),
++        cmd: cmd.to_vec(),
++    })
++}
+diff -ruN a/crates/core/src/lib.rs b/crates/core/src/lib.rs
+--- a/crates/core/src/lib.rs	2026-06-27 11:59:14.369497069 +0000
++++ b/crates/core/src/lib.rs	2026-06-27 11:59:14.372816104 +0000
+@@ -57,6 +57,7 @@
+ pub mod native;
+ pub mod varcache;
+ pub mod binpin;
++pub mod checks;
+ 
+ // Re-exports for the common path so frontends import one place.
+ pub use backend::{RepoBackend, GitCli, RepoStatus};
+diff -ruN a/crates/core/src/store.rs b/crates/core/src/store.rs
+--- a/crates/core/src/store.rs	2026-06-27 11:59:14.369761145 +0000
++++ b/crates/core/src/store.rs	2026-06-27 11:59:14.371935301 +0000
+@@ -58,6 +58,8 @@
+ // ref name → git oid so branches/tags survive too.
+ const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
+ const REFS: TableDefinition<&str, &str> = TableDefinition::new("refs");
++/// Per-commit build/check status, JSON-encoded, keyed by commit oid.
++const CHECKS: TableDefinition<&str, &[u8]> = TableDefinition::new("checks");
+ 
+ /// git object kinds, as stored in the OBJECTS table.
+ pub const KIND_COMMIT: u8 = 1;
+@@ -184,6 +186,7 @@
+             { w.open_table(BLOBS).map_err(|e| e.to_string())?; }
+             { w.open_table(OBJECTS).map_err(|e| e.to_string())?; }
+             { w.open_table(REFS).map_err(|e| e.to_string())?; }
++            { w.open_table(CHECKS).map_err(|e| e.to_string())?; }
+             w.commit().map_err(|e| e.to_string())?;
+         }
+         Ok(ChunkStore { db })
+@@ -479,6 +482,33 @@
+         }
+         Ok(out)
+     }
++
++    /// Record a commit's build/check status (JSON bytes), keyed by commit oid.
++    pub fn put_check(&self, commit: &str, json: &[u8]) -> Result<(), String> {
++        let w = self.db.begin_write().map_err(|e| e.to_string())?;
++        {
++            let mut t = w.open_table(CHECKS).map_err(|e| e.to_string())?;
++            t.insert(commit, json).map_err(|e| e.to_string())?;
++        }
++        w.commit().map_err(|e| e.to_string())
++    }
++
++    pub fn get_check(&self, commit: &str) -> Result<Option<Vec<u8>>, String> {
++        let r = self.db.begin_read().map_err(|e| e.to_string())?;
++        let t = r.open_table(CHECKS).map_err(|e| e.to_string())?;
++        Ok(t.get(commit).map_err(|e| e.to_string())?.map(|v| v.value().to_vec()))
++    }
++
++    pub fn list_checks(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
++        let r = self.db.begin_read().map_err(|e| e.to_string())?;
++        let t = r.open_table(CHECKS).map_err(|e| e.to_string())?;
++        let mut out = Vec::new();
++        for row in t.iter().map_err(|e| e.to_string())? {
++            let (k, v) = row.map_err(|e| e.to_string())?;
++            out.push((k.value().to_string(), v.value().to_vec()));
++        }
++        Ok(out)
++    }
+ 
+     /// Load a manifest without restoring (for the UI to show size, chunk
+     /// count, media kind without touching chunk bytes).
+diff -ruN a/crates/core/tests/git_integration.rs b/crates/core/tests/git_integration.rs
+--- a/crates/core/tests/git_integration.rs	2026-06-27 11:59:14.370092794 +0000
++++ b/crates/core/tests/git_integration.rs	2026-06-27 11:59:14.372993780 +0000
+@@ -1299,3 +1299,33 @@
+         assert_eq!(store.restore_bytes(*oid).unwrap(), body.as_bytes(), "bit-exact after repack+compact");
+     }
+ }
++
++#[test]
++fn checks_run_marker_and_candidates() {
++    use gitmind_core::{checks, native, store::ChunkStore};
++    let r = Repo::new();
++    let dir = tempfile::tempdir().unwrap();
++    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
++
++    r.write("run.sh", "exit 0\n");
++    let a = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "passing").unwrap();
++    r.write("run.sh", "exit 1\n");
++    let b = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "broken").unwrap();
++
++    let cmd = vec!["sh".to_string(), "run.sh".to_string()];
++    let sa = checks::run(&store, &a.oid, &cmd).unwrap();
++    let sb = checks::run(&store, &b.oid, &cmd).unwrap();
++    assert!(sa.ok, "commit A should pass");
++    assert!(!sb.ok && sb.code == 1, "commit B should fail with code 1");
++
++    // cached + markers
++    assert!(checks::get(&store, &a.oid).unwrap().unwrap().ok);
++    assert_eq!(checks::marker(checks::get(&store, &a.oid).unwrap().as_ref()), "✓");
++    assert_eq!(checks::marker(checks::get(&store, &b.oid).unwrap().as_ref()), "✗");
++    assert_eq!(checks::marker(None), "·");
++
++    // candidates lists only the green commit
++    let cands = checks::candidates(&store).unwrap();
++    assert!(cands.iter().any(|c| c.commit == a.oid), "A is a candidate");
++    assert!(!cands.iter().any(|c| c.commit == b.oid), "B is not a candidate");
++}
+diff -ruN a/crates/gui/src/main.rs b/crates/gui/src/main.rs
+--- a/crates/gui/src/main.rs	2026-06-27 11:59:14.368505825 +0000
++++ b/crates/gui/src/main.rs	2026-06-27 11:59:14.373771474 +0000
+@@ -88,6 +88,9 @@
+     native_log_json: qt_method!(fn(&self, n: u32) -> QString),
+     native_status_json: qt_method!(fn(&self) -> QString),
+ 
++    run_check: qt_method!(fn(&self, commit: QString, cmd: QString) -> QString),
++    checks_json: qt_method!(fn(&self) -> QString),
++
+     apps_json: qt_method!(fn(&self) -> QString),
+     app_use: qt_method!(fn(&self, name: QString, label: QString) -> QString),
+     app_desktop: qt_method!(fn(&self, name: QString, label: QString, terminal: bool) -> QString),
+@@ -451,7 +454,12 @@
+             match gitmind_core::portage::native_commit(&store, &oid) {
+                 Ok(meta) => {
+                     let subject = meta.message.lines().next().unwrap_or("").to_string();
+-                    items.push(json!({"oid": oid, "subject": subject}));
++                    let st = gitmind_core::checks::get(&store, &oid).ok().flatten();
++                    let mark = gitmind_core::checks::marker(st.as_ref());
++                    items.push(json!({
++                        "oid": oid, "subject": subject, "check": mark,
++                        "checked": st.is_some(), "ok": st.map(|s| s.ok),
++                    }));
+                     cur = meta.parents.first().cloned();
+                     count += 1;
+                 }
+@@ -472,6 +480,37 @@
+                 QString::from(json!({"ok": true, "items": items}).to_string())
+             }
+             Err(e) => err_json(&e),
++        }
++    }
++
++    fn run_check(&self, commit: QString, cmd: QString) -> QString {
++        use gitmind_core::checks;
++        let store = match gstore() { Ok(s) => s, Err(e) => return err_json(&e) };
++        let cmd_s = cmd.to_string();
++        let parts: Vec<String> = if cmd_s.trim().is_empty() {
++            checks::default_cmd()
++        } else {
++            cmd_s.split_whitespace().map(|s| s.to_string()).collect()
++        };
++        match checks::run(&store, &commit.to_string(), &parts) {
++            Ok(st) => QString::from(json!({"ok": true, "passed": st.ok, "code": st.code, "duration_ms": st.duration_ms}).to_string()),
++            Err(e) => err_json(&e),
++        }
++    }
++
++    fn checks_json(&self) -> QString {
++        let store = match gstore() { Ok(s) => s, Err(e) => return err_json(&e) };
++        match store.list_checks() {
++            Ok(rows) => {
++                let items: Vec<_> = rows.iter().filter_map(|(commit, bytes)| {
++                    serde_json::from_slice::<gitmind_core::checks::CheckStatus>(bytes).ok().map(|s| json!({
++                        "commit": commit, "ok": s.ok, "code": s.code,
++                        "duration_ms": s.duration_ms, "ran_at": s.ran_at,
++                    }))
++                }).collect();
++                QString::from(json!({"ok": true, "items": items}).to_string())
++            }
++            Err(e) => err_json(&e),
+         }
+     }
+ 
