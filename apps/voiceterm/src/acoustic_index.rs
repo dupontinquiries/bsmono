@@ -564,11 +564,7 @@ pub fn record_hit(speaker_id: &str, unix_ms: u64) {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64).unwrap_or(0)
-}
+fn now_ms() -> u64 { core_kit::time::now_millis() }
 
 fn db_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;

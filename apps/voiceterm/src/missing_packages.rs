@@ -344,9 +344,7 @@ pub fn revision() -> u64 {
     REVISION.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn epoch_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn epoch_secs() -> u64 { core_kit::time::now_secs() }
 
 /// Pattern-match the output for known missing-package signals.
 /// Returns (ecosystem, name) pairs. Conservative — false positives

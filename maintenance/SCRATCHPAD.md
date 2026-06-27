@@ -741,3 +741,22 @@ NEXT (build/integration/deploy roadmap):
 - flatpak.sh: resolve runtime=tbd (av1tuner, gitmind), wire flatpak-cargo-generator.
 - deploy.sh --run once fleet addresses + mode decided per app.
 - follow-up repoints (voiceterm voice.rs hallucination; unendlich RNG; now_ms/hex sweep).
+
+---
+## Wire voiceterm onto kits + fix loop-trimmer at source  (this session)
+
+[FIX] voice-kit trim_hallucination_loop had an EXCLUSIVE loop bound
+0..(len - window*3) → a shingle repeating exactly 3× and filling the whole string
+(len == window*3 → 0..0 empty) was never caught. Fixed to inclusive (0..=) + added
+an exact-fill test ("go left go left go left" → "go left"). voice-kit 10 tests green.
+This is the latent voiceterm bug, fixed at SOURCE so every consumer gets it.
+
+[REPOINT] voiceterm fully onto kits: trim_hallucination_loop → voice-kit (inherits
+the fix); ALL ~19 named time helpers (now_ms/now_secs/epoch_secs + i64 variants
+across acoustic_index/audit_log/decision_cache/llm_cache/log/log_summary/mail/
+mail_drafts/mail_session/missing_packages/phonetic/scroll_signals/system_info/
+term_blocks/token_stats/util/web_summary/workspaces/voice) → core_kit::time wrappers.
+Added core-kit + voice-kit deps; cleaned dead `use std::time::{SystemTime,UNIX_EPOCH}`.
+20 files, net -97 lines. Verified via harness crate (wrapper shapes cargo-check clean
+vs core-kit + voice-kit); voiceterm itself is Qt-blocked in-sandbox. Inline non-fn
+time uses in audit_log:617 / phonetic:84 left (not extractable as simple wrappers).
