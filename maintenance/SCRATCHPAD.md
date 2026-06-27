@@ -474,3 +474,52 @@ network seam); SenderChain epoch mgmt + seal_sender_key fan-out onto the snapcor
 cluster roster (announce co-members = seal-to set); a higher Channel/Group over
 the mailbox. Then snapclone ADOPTS share-kit (epoch-gated cutover; group-feed
 namespace = byte-compat keys).
+
+---
+## kitfinder + the next-kit findings  (this session)
+
+[TOOL] **tools/kitfinder** — zero-dep structural clone miner (Algorithm 1, token
+level). Lex Rust → extract fn bodies → SEMI-BLIND normalize (blind locals to
+V0/V1…; KEEP types/variants/consts (uppercase), call/macro/path segments, field/
+method names; literals→STR/NUM/CHR) → intern → (a) exact Type-2 clustering on the
+normalized seq, (b) MinHash(32)+LSH(8×4) near-dup ≥0.75, (c) cross-crate mass
+aggregation. Crate identity = nearest Cargo.toml. Ran on the whole repo in 10s:
+2045 files / ~666K LOC / 82 crates / 25,334 fns ≥28 tok → 887 exact clone classes
+(105K dup tokens; 314 cross-crate / 43K tok) + 4010 near edges.
+
+[FINDINGS — ranked]
+1. **bo-controller ↔ bo-mux = 27,008 shared tokens** (the single biggest mass):
+   estimate_fundamental, lock_phase_to_noise, pull_output, goertzel_mag, drone_/
+   passby_canceller — DSP duplicated across the two bo-suite crates.
+2. Cross-app AUDIO primitives near-dup: rms/compute_rms (bo-controller, voiceterm,
+   snapclone-audio), goertzel (bo-suite), fundamental est. → the primitives under
+   #1 also recur in voiceterm + snapclone-audio.
+3. CONFIRMED PENDING REPOINTS (tool validates prior lifts): crypto-kit ↔
+   snapclone-crypto 4,813 tok; ct_eq across gpu-gemm/voiceterm/**net-kit**; json
+   escape across bo-controller/bot-arena/voiceterm/**net-kit**. The kits are right;
+   the apps just haven't adopted them.
+4. Cross-CUTTING tiny utils ("thousand cuts", broadest reach):
+   - TIME/clock: now_unix/unix_now/now_secs/now_ms/now_nanos/epoch — 30+ copies
+     across 8+ crates (ambient-learner, bo-controller, gitmind, logscope×N,
+     voiceterm, av1tuner, bot-arena, snapclone-face). NOT in any kit yet.
+   - ESCAPING: esc/unesc/html/xml/qml/path/json/toml escapers across unendlich,
+     voiceterm, bo-suite, bot-arena, snapclone-vcard, net-kit. net-kit already has
+     percent+json → EXTEND net-kit + repoint.
+   - HEX: reimplemented in netserve, share-kit::keys, crypto-kit, kitfinder.
+   - GGUF param-estimate-from-name across bot-arena/logscope/voiceterm (the 3 LLM
+     apps); splitmix/lcg RNG (unendlich ×35, also snapcore/kitfinder).
+
+[DECISION — next big kit] **audio-kit** is the recommendation: it captures the
+LARGEST single duplication in the repo (27K tok bo-controller↔bo-mux DSP core:
+RMS, Goertzel tone detect, fundamental-freq estimation, phase-locked cancellation,
+filters) AND extends cross-app (voiceterm separation/rms, snapclone-audio rms). A
+coherent, dependency-free DSP-primitives crate; bo-suite's cancellers become
+consumers. PARALLEL track = **core-kit** (time + hex + fold escaping into
+net-kit) — the broadest-reach thousand-cuts layer. Both are now data-justified,
+not guessed. Awaiting greenlight on which to build first.
+
+[META] kitfinder now does for us automatically what the hand-survey did for
+net-kit/share-kit — and it re-derived those same signals (ct_eq, json escape,
+crypto dup) plus surfaced new ones (audio, time). The doc's Algorithm 2 (call
+graph + community detection) + the AI-reviewer layer (name + draft each
+extraction) are the future build-out.
