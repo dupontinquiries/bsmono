@@ -1637,32 +1637,12 @@ fn battery_ok_for_background() -> bool {
 /// a pre-filter before fingerprint storage. Previously private.
 #[cfg(feature = "voice")]
 pub fn is_sane_transcription(text: &str) -> bool {
-    let t = text.trim();
-    let len = t.chars().count();
-    if len < 2 || len > 120 { return false; }
-    // Repetition check: if the same word appears >50% of the time, it's
-    // probably a hallucination loop.
-    let words: Vec<&str> = t.split_whitespace().collect();
-    if words.len() >= 4 {
-        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for w in &words { *counts.entry(*w).or_insert(0) += 1; }
-        let max_count = counts.values().max().copied().unwrap_or(0);
-        if max_count * 2 > words.len() { return false; }
-    }
-    // Known hallucination phrases. These are common enough across
-    // whisper outputs that filtering them isn't going to lose much.
-    let lower = t.to_lowercase();
-    let bad_phrases = [
-        "thank you for watching", "thanks for watching",
-        "subscribe to", "like and subscribe",
-        "see you next time", "see you in the next video",
-        "don't forget to subscribe",
-        "[music]", "[silence]", "[blank_audio]",
-    ];
-    for p in &bad_phrases {
-        if lower.contains(p) { return false; }
-    }
-    true
+    // Consolidated into voice-kit. The length bound (2..=120), the >50%
+    // single-word repetition rule, and the bad-phrase list all live in one
+    // place now (voice_kit::hallucination), so every consumer shares the same
+    // filter and a fix lands once. Behavior is identical to the prior inline
+    // copy — voice-kit's BAD_PHRASES is the same list.
+    voice_kit::hallucination::looks_like_speech(text)
 }
 
 // v0.1.209: stub for builds without the voice feature. Same shape,
