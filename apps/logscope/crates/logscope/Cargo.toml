@@ -11,6 +11,7 @@ name = "logscope-filter"
 path = "src/bin/filter.rs"
 
 [dependencies]
+core-kit = { path = "../../../../shared/core-kit" }
 # GTK4 + Adwaita (GUI only — filter binary uses a separate minimal set)
 gtk4 = { version = "0.9", features = ["v4_12"], optional = true }
 libadwaita = { version = "0.7", features = ["v1_4"], optional = true }

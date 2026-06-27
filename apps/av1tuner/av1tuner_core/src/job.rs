@@ -139,11 +139,8 @@ pub fn derive_state_dir(output: &Path) -> PathBuf {
 }
 
 fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs()
+    }
 
 /// Wrapping convenience type combining a JobState with its on-disk chunks.
 pub struct Job {

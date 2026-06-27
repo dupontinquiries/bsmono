@@ -8,6 +8,7 @@ name = "api_explorer"
 path = "examples/api_explorer.rs"
 
 [dependencies]
+core-kit = { path = "../../../shared/core-kit" }
 audio-kit = { path = "../../../shared/audio-kit" }
 qmetaobject = "0.2"
 reqwest = { version = "0.11", features = ["json"] }
