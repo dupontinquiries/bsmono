@@ -54,7 +54,7 @@ GroupVoiceCapture::GroupVoiceCapture(QObject *parent)
     if (cs.value(QStringLiteral("audio/micConditioner"), true).toBool()) {
         m_conditioner = sc_mic_conditioner_new(
             kSampleRate,
-            cs.value(QStringLiteral("audio/micGainDb"),      9.0f).toFloat(),
+            cs.value(QStringLiteral("audio/micGainDb"),      15.0f).toFloat(),
             cs.value(QStringLiteral("audio/micThresholdDb"), -12.0f).toFloat(),
             cs.value(QStringLiteral("audio/micRatio"),       1.5f).toFloat(),
             cs.value(QStringLiteral("audio/micAttackMs"),    0.0f).toFloat(),

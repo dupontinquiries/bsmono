@@ -327,6 +327,10 @@ pub fn smart_default_assignments(
 
 #[cfg(test)]
 mod tests {
+    // These test names embed channel codes (L, R, FL, FR, LCR) whose
+    // uppercase is meaningful — `..._stereo_gets_L_R` reads as a spec.
+    // Keep them readable rather than snake-casing the channel letters.
+    #![allow(non_snake_case)]
     use super::*;
 
     fn claim(node: &str, ch: &str, spk: &str, cost: u32) -> Claim {

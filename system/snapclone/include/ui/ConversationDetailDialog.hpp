@@ -108,6 +108,10 @@ public slots:
     /// it's safe to forward all of a peer's payloads here.
     void deliverNetworkPayload(const SnapClone::Core::UserId &sender,
                                const QByteArray &payload);
+    /// V32.49: feed ring-window audio (captured before accept) as ordered
+    /// pre-roll, so an accepted call plays the head of the message.
+    void primeVoicePreroll(const SnapClone::Core::UserId &sender,
+                           const QList<QByteArray> &payloads);
 
     /// V32.40+: begin the voice call programmatically — used when accepting an
     /// incoming call so the thread opens already in-call. No-op if the voice

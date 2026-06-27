@@ -235,6 +235,16 @@ void GroupVoiceCoordinator::onVoiceFrameReceived(const QString &senderId, const 
 #endif
 }
 
+void GroupVoiceCoordinator::enqueuePreroll(const QString &senderId, const QByteArray &wireFrame)
+{
+#ifdef SC_VOICE_CODEC
+    if (m_receiver) m_receiver->enqueuePreroll(senderId, wireFrame);
+#else
+    Q_UNUSED(senderId);
+    Q_UNUSED(wireFrame);
+#endif
+}
+
 void GroupVoiceCoordinator::onPeerFloorAssert(const QString &holder, quint64 claimTs)
 {
 #ifdef SC_VOICE_CORE

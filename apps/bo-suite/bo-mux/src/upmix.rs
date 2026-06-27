@@ -119,6 +119,23 @@ pub struct Surround51 {
     pub lfe: f32, pub sl: f32, pub sr: f32,
 }
 
+/// One frame of quadraphonic (4.0) output: front pair + rear pair, no
+/// center, no LFE. This is the classic quad layout and the natural target
+/// for a four-speaker mesh fed a stereo source. The rears carry the
+/// decorrelated, Haas-delayed difference (side) signal so the field opens
+/// up behind the listener without the rears just echoing the fronts.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quad40 {
+    pub fl: f32, pub fr: f32, pub rl: f32, pub rr: f32,
+}
+
+/// One frame of quad + a derived sub: 4.1. The LFE is the low-passed mono
+/// sum, for a mesh that has four satellites plus a sub-capable speaker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quad41 {
+    pub fl: f32, pub fr: f32, pub rl: f32, pub rr: f32, pub lfe: f32,
+}
+
 impl Upmixer {
     pub fn new(sample_rate: f32) -> Self {
         let haas_samples = (0.015 * sample_rate) as usize;          // 15ms
@@ -153,6 +170,56 @@ impl Upmixer {
         let sl = self.sl_ap.process(self.sl_delay.process(s)) * 0.9;
         let sr = self.sr_ap.process(self.sr_delay.process(s)) * 0.9;
         Surround51 { fl: l, fr: r, c, lfe, sl, sr }
+    }
+
+    /// Process one stereo pair into a quadraphonic (4.0) frame.
+    ///
+    /// Quad has no center: the front pair passes through unchanged (the
+    /// mixing engineer's phantom center is preserved between FL/FR), and
+    /// the rears carry the decorrelated, Haas-delayed side signal — the
+    /// same rear derivation as the 5.1 path, so a stereo source gains a
+    /// wide, diffuse rear field on a four-speaker mesh. No LFE here (see
+    /// `process_quad41` for the sub-capable variant).
+    ///
+    /// Inputs are sanitized to keep the output finite even if the decoder
+    /// hands us NaN/Inf (the front pass-through would otherwise leak it).
+    #[inline]
+    pub fn process_quad(&mut self, l: f32, r: f32) -> Quad40 {
+        let l = if l.is_finite() { l } else { 0.0 };
+        let r = if r.is_finite() { r } else { 0.0 };
+        let s = (l - r) * 0.5;
+        let rl = self.sl_ap.process(self.sl_delay.process(s)) * 0.9;
+        let rr = self.sr_ap.process(self.sr_delay.process(s)) * 0.9;
+        Quad40 { fl: l, fr: r, rl, rr }
+    }
+
+    /// Quad + derived LFE (4.1) for a mesh with a sub-capable speaker.
+    /// Identical to `process_quad` plus the low-passed mono sum on LFE
+    /// (respecting `lfe_enabled`). Sharing the rear filters with the other
+    /// process methods is fine because a given Upmixer instance is only
+    /// ever driven through ONE of them per stream.
+    #[inline]
+    pub fn process_quad41(&mut self, l: f32, r: f32) -> Quad41 {
+        let q = self.process_quad(l, r);
+        let l = if l.is_finite() { l } else { 0.0 };
+        let r = if r.is_finite() { r } else { 0.0 };
+        let lfe = if self.lfe_enabled {
+            self.lfe_lp.process((l + r) * 0.5) * 0.7
+        } else { 0.0 };
+        Quad41 { fl: q.fl, fr: q.fr, rl: q.rl, rr: q.rr, lfe }
+    }
+
+    /// Derive a single LFE (sub) sample from a stereo pair, independent of
+    /// the full upmix. Basic LFE synthesis for a mesh where one speaker is
+    /// the sub: low-pass the mono sum (120 Hz one-pole) and trim. Honors
+    /// `lfe_enabled`. Pure per-sample; call it alongside passing the
+    /// fronts/rears through untouched.
+    #[inline]
+    pub fn lfe_sample(&mut self, l: f32, r: f32) -> f32 {
+        if !self.lfe_enabled { return 0.0; }
+        let l = if l.is_finite() { l } else { 0.0 };
+        let r = if r.is_finite() { r } else { 0.0 };
+        self.lfe_lp.process((l + r) * 0.5) * 0.7
     }
 }
 
@@ -204,6 +271,75 @@ mod tests {
             last = up.process(1.0, -1.0);
         }
         assert!(last.sl.abs() > 1e-3 || last.sr.abs() > 1e-3);
+    }
+
+    #[test]
+    fn quad_fronts_pass_through_no_center() {
+        let mut up = Upmixer::new(48000.0);
+        let f = up.process_quad(0.3, -0.7);
+        // Fronts are verbatim; there's no center channel in quad at all.
+        assert_eq!(f.fl, 0.3);
+        assert_eq!(f.fr, -0.7);
+        // First sample: rears come from a still-empty delay line → 0.
+        assert!(f.rl.abs() < 1e-6 && f.rr.abs() < 1e-6);
+    }
+
+    #[test]
+    fn quad_rears_emerge_from_side_after_delay() {
+        let mut up = Upmixer::new(48000.0);
+        // Pure antiphase = max side content; after the Haas delay the
+        // rears should carry it.
+        let mut last = up.process_quad(1.0, -1.0);
+        for _ in 0..(0.025 * 48000.0) as usize {
+            last = up.process_quad(1.0, -1.0);
+        }
+        assert!(last.rl.abs() > 1e-3 || last.rr.abs() > 1e-3,
+            "rears should carry the decorrelated side signal");
+    }
+
+    #[test]
+    fn quad_mono_source_has_quiet_rears() {
+        let mut up = Upmixer::new(48000.0);
+        // Identical L/R = no side content = nothing to steer to the rears.
+        let mut last = up.process_quad(0.5, 0.5);
+        for _ in 0..2400 { last = up.process_quad(0.5, 0.5); }
+        assert!(last.rl.abs() < 1e-4 && last.rr.abs() < 1e-4,
+            "a mono source has no side signal, so rears stay quiet");
+    }
+
+    #[test]
+    fn lfe_sample_is_low_passed_and_disables() {
+        let mut up = Upmixer::new(48000.0);
+        // A DC-ish (low freq) sum passes; settle the one-pole then check.
+        let mut v = 0.0;
+        for _ in 0..2000 { v = up.lfe_sample(1.0, 1.0); }
+        assert!(v > 0.0, "low-frequency content should reach the LFE");
+        // Disable → silent.
+        up.lfe_enabled = false;
+        assert_eq!(up.lfe_sample(1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn quad41_lfe_matches_enabled_flag() {
+        let mut up = Upmixer::new(48000.0);
+        let mut f = up.process_quad41(0.8, 0.8);
+        for _ in 0..2000 { f = up.process_quad41(0.8, 0.8); }
+        assert!(f.lfe.abs() > 0.0, "4.1 should derive a sub from the sum");
+        up.lfe_enabled = false;
+        let f2 = up.process_quad41(0.8, 0.8);
+        assert_eq!(f2.lfe, 0.0);
+    }
+
+    #[test]
+    fn quad_defends_against_nan_inputs() {
+        let mut up = Upmixer::new(48000.0);
+        for (l, r) in [(f32::NAN, 0.5), (0.5, f32::NAN), (f32::NAN, f32::NAN)] {
+            let f = up.process_quad(l, r);
+            assert!(f.fl.is_finite() && f.fr.is_finite());
+            assert!(f.rl.is_finite() && f.rr.is_finite());
+            let f41 = up.process_quad41(l, r);
+            assert!(f41.lfe.is_finite());
+        }
     }
 
     #[test]

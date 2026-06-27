@@ -7,6 +7,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <deque>
 
 class QAudioSink;
 class QIODevice;
@@ -46,6 +47,9 @@ public Q_SLOTS:
     void start();                                    // open the sink + start play-out
     void stop();                                     // stop + flush
     void onVoiceFrame(const QString &senderId, const QByteArray &wireFrame);  // ← channel (already opened)
+    // V32.49: queue ring-window audio captured before accept; played in order
+    // ahead of the live jitter so the head of an accepted message isn.t lost.
+    void enqueuePreroll(const QString &senderId, const QByteArray &wireFrame);
 
     // Enable/disable playback obfuscation (private tier). The channel turns this
     // on when the security mode becomes Private, seeding from the session key so
@@ -75,6 +79,7 @@ private:
     void clearStreams();
 
     std::unordered_map<std::string, PeerStream> m_streams; // keyed by sender id
+    std::unordered_map<std::string, std::deque<QByteArray>> m_preroll; // per-peer pre-roll FIFO
     Obfuscator *m_obfuscator = nullptr; // playback obfuscation (private tier; null = off)
     HarshGuard *m_harshGuard = nullptr; // V32.48: painful-sound ducker (null = off)
     OutputAgc  *m_outputAgc  = nullptr; // play-out loudness normalizer (null = off)

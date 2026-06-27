@@ -42,6 +42,9 @@ public Q_SLOTS:
     /// caller's normal dispatch. Malformed-but-ours packets are consumed
     /// (return true) and dropped.
     bool onPayloadFromPeer(const Core::UserId &sender, const QByteArray &payload);
+    // V32.49: replay ring-window audio captured before accept as ordered
+    // pre-roll (bypasses the live jitter so the message head isn.t dropped).
+    void flushPreroll(const Core::UserId &sender, const QList<QByteArray> &payloads);
 
 Q_SIGNALS:
     /// One per peer for each outbound voice/floor packet. Wire to

@@ -29,6 +29,170 @@ EXPLICIT PER-SCENE OVERRIDES the user asked for (do NOT propagate to other scene
 - ATLANTIS: self-enclosing (excluded from generic shell); banners; perimeter soffit.
 
 
+## 2026-06-22 (pass 63) — hall-routing makes Atlantis a STRAND + strand_aspect metric
+
+Continued harness-driven. Key result: the user's "not aligned with the hallways" is about strand SHAPE (follow the
+corridor) more than literal clipping. Added:
+- HALL ROUTING (chat.rs, Atlantis-only): compress the strand laterally (z*0.42) so it runs DOWN the hall axis (x)
+  as a strand instead of ballooning into the rotunda. Top-down it now reads as a left-right band with the side
+  regions at the hall ends.
+- New harness metric STRAND_ASPECT (x-extent / z-extent): >2 = strand, ~1 = blob. Atlantis went blob(~1) ->
+  strand(2.78) with routing. So the harness now captures the alignment goal, not just clipping.
+- TRADEOFF (measured + accepted): routing RAISES obj_clip slightly (69%->72%) because Atlantis HALLWAYS are
+  themselves colonnades — the central lane is columned, so a tighter strand packs onto those columns. The clip
+  metric and the alignment goal diverge here; alignment (the stated concern) wins.
+
+NEXT (now precisely scoped by the harness):
+1. CLEAR A CENTRAL LANE in Atlantis: drop colonnade columns within ~±4u of the x-axis so the routed strand sits in
+   a genuinely open corridor -> strand_aspect stays high AND obj_clip drops. (Then the flex handles the rest.)
+   Verify both metrics with geom_check.py.
+2. CAMERA spline (Catmull-Rom through nodes, clamped to the mind-palace AABB).
+3. Then freecam, perf, UI overlay, whisper STT.
+
+Harness usage recap: LOGSCOPE_GEOM_DUMP=1 -> /tmp/scene_geom_<theme>.json; `python3 tools/geom_check.py --all`.
+Metrics: below_floor, above_ceiling, obj_clip, out_bounds, spine_axis, strand_aspect.
+
+## 2026-06-22 (pass 62) — harness-driven obstacle-avoidance experiment (BIG diagnostic)
+
+Built on the geom self-check harness to actually fix the Atlantis graph<->scene clip. Findings (all MEASURED):
+- TUNING is a dead end: clear/breathe/height knobs leave Atlantis obj_clip ~71% (no-breathe = WORSE 83%, tight
+  lane = WORSE 91%). Don't pursue tuning.
+- OBSTACLE-AVOIDANCE FLEX added (chat.rs, cached per (node-count, env)): extract mid-size solid object AABBs via
+  with_env, push each node out of overlaps along the smaller x/z penetration (z-biased to keep the time axis),
+  clamped near its spine spot. The harness shows it MOVES ~284/412 Atlantis nodes but obj_clip stays ~69% — they
+  just re-clip. Tightening obstacles to SUBSTANTIAL solids (vy>1.5, footprint>0.4) cut Atlantis 4639->472
+  obstacles, but clip held. Conclusion: the Atlantis ROTUNDA is genuinely too dense for local avoidance — the
+  graph is a BLOB filling it, not a strand. Other scenes are already clean: Old Library 5 obstacles/0% clip,
+  Archive 28/1%, Reading Room 128/1.2%. **Atlantis is the lone outlier.**
+- The flex is kept as a FOUNDATION (sound primitive, cached, doesn't scatter, no-op on clean scenes). It only
+  pays off once the graph is ROUTED out of the dense rotunda.
+- Harness obstacle filter tightened to match (substantial solids), so obj_clip now measures meaningful clipping.
+
+THE REAL FIX (next, now precisely targeted by the harness):
+1. ROUTE the Atlantis strand along the OPEN HALL AXIS instead of ballooning into the rotunda: spread the graph
+   long on x (down the colonnade gaps / hall openings) and NARROW on z (stay in the central lane), so it threads
+   the open corridor rather than filling the furnished rotunda. Then the existing flex cleans up residual column
+   overlaps. Verify obj_clip drop with geom_check.py. (This is scene-aware layout, the "scene flex" the user wants.)
+2. CAMERA spline (Catmull-Rom through nodes, clamped to the mind-palace AABB) for smooth bounded traversal.
+3. Then freecam, perf, UI overlay, whisper STT.
+
+## 2026-06-22 (pass 61) — feedback: scene dropdown, graph floor-lift, Mistfall pool, mega example
+
+- SCENE-SELECT DROPDOWN in scene-view (ScenePreview::ui): an egui ComboBox (top-left overlay) over theme::PALETTES;
+  on pick -> theme::install_palette, the scene rebuilds from theme::active() next frame. Verified switching works.
+- GRAPH "INTO THE GROUND" fix: replaced the Atlantis-only q.y+=1.9 hack with a general FLOOR-CLEARING lift in
+  chat.rs — compute the graph's min y and lift the whole strand so its lowest node sits ~-1.6 (clear of typical
+  floors ~-3.2), ONLY ever lifting up (open scenes unaffected). Atlantis strand now floats above the floor.
+- MISTFALL water: the -5.8 disc (radius ~78) read as a high frame-filling SEA-horizon; made it a low contained
+  POOL (-6.3, radius 22*ms, alpha 104) + deep bed -6.8/24*ms. (Stalactites hang at y 5-13, nowhere near it — the
+  "water at the stalactites" was the sea-horizon perspective.)
+- MEGA example: examples/ladder/AA-mega-spine.logscope (180 turns + branches/widening -> 359 nodes ≈ 2.5x the
+  marathon) to stress BIGGER rooms. scene-view now DEFAULTS to it (override via LOGSCOPE_CONVO).
+- 259 tests pass.
+
+STILL OPEN — the architectural core the user keeps flagging:
+1. GRAPH<->SCENE ALIGNMENT ("graph matching not finalized"): the strand should run ALONG the hallways/corridors
+   (Atlantis x-halls, Old Library aisles) and FLEX around shelves/objects, not cluster in the rotunda. Needs the
+   layout to take scene structure (hall bearings, walkable lanes, object positions) as input — thread these into
+   spatial::flow (or a post-pass) so the spine follows the main axis + branches follow door bearings + nodes avoid
+   object footprints. This subsumes the per-object avoidance note.
+2. CAMERA too stiff / ricochets: replace the segment-to-segment pan with a smooth spline (Catmull-Rom through the
+   node positions) clamped to the room bounds (mind-palace AABB) — traverse the graph smoothly without overshoot.
+   Then: freecam, perf, UI overlay, whisper STT.
+
+## 2026-06-22 (pass 60) — feedback batch: Wayland ghosting, Mistfall water, Forest, Treehouse critters
+
+User feedback batch. Done:
+- WAYLAND GHOSTING: app windows behind logscope showed through on KWin/Wayland. Cause: window framebuffer
+  presented with alpha<1 where the scene/UI didn't paint opaque (renderer clears offscreen to alpha 0). Fix:
+  override eframe App::clear_color to force alpha 1.0 (LogscopeApp + ScenePreview) + .with_transparent(false) on
+  both viewports. (Verify on device.)
+- MISTFALL water: surface -5.2 -> -5.8 and alpha 172 -> 132 (more translucent) so the depth bed + low objects
+  read instead of being occluded.
+- FOREST: ground litter + hero trees + tall-thin trees now CONFORM to the displaced terrain (was flat yf -> sank
+  under raised ground = "grass under terrain"). Upper-canopy leaves shrunk: tall-thin high crowns 1.0-1.5 ->
+  0.55-0.85; hero canopy puffs 1.5 -> 1.15.
+- TREEHOUSE critters reworked: rabbits + cats now on the FOREST FLOOR (y=-8) not perched on decks; hanging
+  creatures now dangle from procedural ROPES dropped from the tree canopy ABOVE the walk (not platform rails);
+  bridge-walkers kept (rabbits/cats riding the plank sway) + a NEW traverse pose: a hanging creature CROSSES a
+  bridge gripping the handrail rope, feet skimming the plank.
+- 258 tests pass + the known offline network flake (normal).
+
+STILL OPEN (next): RINGS the user wants gone — 212/215 in Atlantis are door/column parts, NOT rings; need the
+user to say which SCENE. MANSION GARDEN — keep working. READING ROOM double-floor "colosseum" shape — keep
+working (user will keep giving feedback). Then the TODO backlog (flythrough/freecam, perf, UI overlay, whisper STT).
+
+## 2026-06-22 (pass 59) — space out centerpieces + glow-pool grounding (per user)
+
+User: "space out the centerpieces more" + keep pushing the maps. Done:
+- SPACING: pushed satellites well clear of the central piece across all four maps. Old Library 6.5+i*0.6 ->
+  10.5+i*2.4 (deep into the diagonal gaps); Reading Room 5.2*rs -> (7.0+i*0.3)*rs (out toward the colonnade);
+  Archive nave step depth*1.6/N -> (2*depth-3)/N (spread down the FULL nave) + wider px alternation (±3.6);
+  Mistfall rad (4.5+h*4) -> (7.0+h*5) and height spread ±4 -> ±5 (still fog-readable).
+- GLOW POOLS: each Old Library lectern now drops a soft emissive disc (0.10, tinted to its tome) — grounds it as
+  a lit "station of thought"; reads great at night. (Archive keeps its contact shadows; Reading Room rug + Mistfall
+  water left clean.)
+- 259 tests pass.
+
+NEXT (still maps, per user, before TODO/backlog): possible per-OBJECT graph avoidance now that centerpieces are
+multiple + spread (thread positions into the layout); centerpiece FORM variety (not just scaled clones);
+Atlantis hall junction (needs user pinpoint). THEN flythrough/freecam, perf, UI overlay, whisper STT.
+
+## 2026-06-22 (pass 58) — multi-centerpiece extended to Mistfall / Archive / Reading Room
+
+Applied the Old-Library multi-centerpiece pattern (N = clamp(nodes/22, 1, 5); main at native spot + satellites
+placed clear of structure; per-station seed variation) to the remaining single-centerpiece maps. Verified big
+(marathon) vs small (lru-fill) via LOGSCOPE_CONVO:
+- MISTFALL: one portal ring -> a vertical ARCHIPELAGO of standing portals; satellites at varied angle/height/size
+  (rad (4.5+h*4)*(1+(ms-1)*0.5), kept near so they read through the fog), hue from a 5-colour palette, varied
+  amp/phase. (Subtle in the moody scene but present.)
+- ARCHIVE: one lectern at the far end -> lecterns stepping DOWN the nave (lz = depth-1.6 - i*(depth*1.6/N)),
+  alternating gently off the central aisle, emissive varied per station + contact shadows.
+- READING ROOM: one central table -> central + satellite tables in the diagonal gaps (rad 5.2*rs), smaller,
+  emissive varied per station — sits on the (colour-salience-driven) rug.
+- 259 tests pass.
+
+NEXT: Atlantis hall junction (needs user pinpoint), then flythrough/freecam, perf, UI overlay panels, whisper STT.
+The multi-centerpiece + content-driven-colour patterns are now the template for "scene reacts to the conversation".
+
+## 2026-06-22 (pass 57) — procedural: multi-centerpiece scaling (Old Library) + Atlantis big-chat repro
+
+Found scene-view can load any conversation via LOGSCOPE_CONVO (default examples/ladder/99-fullspine-marathon =
+big chat; examples/02-lru-fill = tiny) — so big-vs-small is now reproducible/verifiable.
+- MULTI-CENTERPIECE (per user "port single centerpiece -> multi by graph size"): Old Library's single lectern is
+  now N = clamp(nodes/22, 1, 5) lecterns. Main at the heart + satellites in the DIAGONAL gaps between the four
+  bookshelf corridors (never block an aisle), each smaller. Each lectern VARIES by a per-station seed (tome glow
+  hue from a 5-tint palette + emissive 0.45..0.67 + page count) so they read as distinct "stations of thought"
+  ("more envparams to distinguish by surrounding context"). Verified: marathon -> several glowing tomes; lru-fill
+  -> one. 259 tests pass. Pattern is reusable for Reading Room (table), Archive (lectern), Mistfall (portal).
+- ATLANTIS halls: reproduced the big chat (marathon) top-down + oblique. The side WINGS actually sit ~near the
+  graph reach (dist ~32 vs ext ~34), so it's NOT a gross wing-distance cap. The specific "don't line up" is likely
+  the hallway<->rotunda junction or the two x-axis halls' collinearity — needs the user to point at the exact
+  spot (or diagnose in the other chat). Deferred rather than edit blindly.
+
+NEXT: apply multi-centerpiece to Reading Room / Archive / Mistfall; get Atlantis misalignment specifics; then
+flythrough/freecam, perf, UI overlay, whisper STT.
+
+## 2026-06-22 (pass 56) — procedural-gen polish: graph breathing/force model + remove concentric rings (per user)
+
+Tagged handoff-2026-06-22 (user will patch/continue in another chat). Roadmap from user: more procedural gen now,
+then flythrough cam (graph-tied) + freecam, perf, UI overlay panels, voice STT (whisper, maybe another Claude).
+- BREATHING-ROOM FORCE MODEL in spatial::flow(): after the time/sibling placement, a gentle relaxation — z/y-only
+  node repulsion (radius ~2u, so it de-clumps crowding turns WITHOUT exploding the flow line; x/time stays anchored
+  so reading order is preserved) + soft center-clearing (push nodes out of the central zone where a scene's
+  centerpiece sits) → the conversation flows AROUND objects. Knobs: LOGSCOPE_TUNE_BREATHE (default 1.0),
+  LOGSCOPE_TUNE_CLEAR (central radius, default 4.5). Spatial tests (separation invariants) still pass.
+- REMOVED the 3 concentric floor TERRACES from shared enclose() (the "brief's nested rings"): confirmed via
+  LOGSCOPE_DEBUG_LABELS they were big origin-centred nested annuli (radii 260/350/439 in a large Slate) dominating
+  the floor — the "215/249/lower-200s concentrics" the user flagged (indices shift with chat size). Floor disc +
+  central platform remain; floor now reads clean. (Oculus rim torus was already gone.)
+- 259 tests pass.
+
+NEXT (still procedural, per user): Atlantis perimeter HALLS don't line up on bigger chats (hall_dims/wing
+placement vs large graphs) — fix alignment; single-CENTERPIECE rooms -> MULTI-centerpiece scaled by graph size;
+add more EnvParams so scenes distinguish visually by surrounding context. Then flythrough/freecam, perf, UI, STT.
+True per-OBJECT graph avoidance (vs current center-clearing) is a later upgrade (needs object positions in layout).
+
 ## 2026-06-20 (pass 55) — CONTENT-DRIVEN colour: Reading Room rug reacts to the conversation (per user)
 
 User: mute the rug colours and only show them when the chat mentions "colour", scaling up with use — mixing raw

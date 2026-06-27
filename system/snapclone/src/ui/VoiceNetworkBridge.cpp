@@ -63,4 +63,16 @@ bool VoiceNetworkBridge::onPayloadFromPeer(const Core::UserId &sender,
     return true;
 }
 
+void VoiceNetworkBridge::flushPreroll(const Core::UserId &sender,
+                                      const QList<QByteArray> &payloads)
+{
+    if (!m_coord) return;
+    for (const QByteArray &payload : payloads) {
+        if (!VW::isVoicePacket(payload)) continue;
+        const VW::Decoded d = VW::decode(payload);
+        if (!d.ok || d.kind != VW::Kind::VoiceFrame) continue;
+        m_coord->enqueuePreroll(sender.value, d.frame);
+    }
+}
+
 } // namespace SnapClone::UI

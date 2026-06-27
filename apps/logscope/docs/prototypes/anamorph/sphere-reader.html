@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Sphere Reader — scroll to rotate &amp; reveal</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#9aa}
+  #c{display:block;width:100vw;height:100vh;touch-action:none}
+  #hud{position:fixed;left:14px;top:12px;font-size:12px;line-height:1.5;opacity:.7;pointer-events:none;text-shadow:0 0 6px #000}
+  #hud b{color:#cde}
+  #hint{position:fixed;left:0;right:0;bottom:14px;text-align:center;font-size:12px;opacity:.55;pointer-events:none}
+  #prog{position:fixed;right:14px;top:0;bottom:0;width:3px}
+  #prog i{position:absolute;right:0;width:3px;background:#2cf;border-radius:2px;box-shadow:0 0 8px #2cf}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <div><b>scroll</b> / drag&nbsp;↕ — rotate spheres through the light beam</div>
+  <div id="st"></div>
+</div>
+<div id="hint">each detent rotates a paragraph into the beam &amp; coalesces it from the crystal · keep scrolling to advance spheres</div>
+<div id="prog"><i id="progbar"></i></div>
+<script>
+"use strict";
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let DPR = Math.min(2, window.devicePixelRatio||1), Wd=0, Ht=0;
+function resize(){ Wd=cv.clientWidth; Ht=cv.clientHeight; cv.width=Wd*DPR; cv.height=Ht*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); }
+window.addEventListener('resize', resize);
+
+// ---- conversation: each message = a sphere; each sphere holds several paragraphs (pages) ----
+const MESSAGES = [
+  { role:"you", paras:["How do I tail a log file in Rust without re-reading the whole thing each poll?"] },
+  { role:"asst", paras:[
+      "Use std::io with a seek cursor and remember the byte offset between polls.",
+      "Watch the inode; when it changes, the file was rotated, so reopen the path.",
+      "If the file shrinks below your offset, it was truncated — reset the offset to zero." ] },
+  { role:"you", paras:["What about memory on huge files, and bursts of writes?"] },
+  { role:"asst", paras:[
+      "Stream line by line instead of buffering the whole file, so memory stays bounded.",
+      "Debounce change events: coalesce a burst of writes into a single read pass." ] },
+];
+
+const TAU = Math.PI*2;
+const COALESCE_POW = 7;          // clarity sharpness: higher = tighter reveal window per page
+const FACET_N = 300;             // body points per sphere
+const FACET_BEAMS = 260;         // connecting light beams per sphere
+const rand = (s=>()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return ((s>>>0)/4294967296);})(0x9e3779b9>>>0);
+
+// rasterize text -> normalized stroke points in [-1,1] (y up), aspect preserved
+const tcan = document.createElement('canvas'), tctx = tcan.getContext('2d');
+function textPoints(text, wrap=22){
+  const px=42, lh=px*1.28;
+  // wrap
+  const words=text.split(/\s+/); let lines=[], cur="";
+  for(const w of words){ if(cur && (cur.length+w.length+1)>wrap){lines.push(cur);cur="";} cur=cur?cur+" "+w:w; }
+  if(cur)lines.push(cur);
+  tcan.width=900; tcan.height=Math.max(120,lines.length*lh+px);
+  tctx.clearRect(0,0,tcan.width,tcan.height);
+  tctx.fillStyle="#fff"; tctx.font=`700 ${px}px ui-monospace,Menlo,Consolas,monospace`; tctx.textBaseline="alphabetic";
+  let maxw=0; lines.forEach(l=>maxw=Math.max(maxw,tctx.measureText(l).width));
+  lines.forEach((l,i)=>tctx.fillText(l, 4, px+i*lh));
+  const W=tcan.width,H=tcan.height, img=tctx.getImageData(0,0,W,H).data;
+  // sample
+  const pts=[]; const step=2;
+  for(let y=0;y<H;y+=step) for(let x=0;x<W;x+=step){ if(img[(y*W+x)*4+3]>128) pts.push([x,y]); }
+  // bbox + normalize (preserve aspect; fit into [-1,1] disk-ish)
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for(const p of pts){mnx=Math.min(mnx,p[0]);mny=Math.min(mny,p[1]);mxx=Math.max(mxx,p[0]);mxy=Math.max(mxy,p[1]);}
+  const half=Math.max(mxx-mnx,mxy-mny)/2, cx=(mnx+mxx)/2, cy=(mny+mxy)/2, s=0.86/half;
+  return pts.map(p=>[ (p[0]-cx)*s, -(p[1]-cy)*s ]);
+}
+
+// rotation helpers
+function rotY(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0]*c+p[2]*s, p[1], -p[0]*s+p[2]*c];}
+function rotX(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0], p[1]*c-p[2]*s, p[1]*s+p[2]*c];}
+function hue(h){h=((h%1)+1)%1;const k=n=>{const t=(n+h*6)%6;return Math.max(0,Math.min(1,Math.min(t,4-t)));};return [k(5),k(3),k(1)];}
+
+// build per-sphere geometry
+function buildSphere(msg){
+  const P = msg.paras.length;
+  // body facets (points in the ball) + a few connecting beams
+  const facet=[]; for(let i=0;i<FACET_N;i++){ let x,y,z; do{x=rand()*2-1;y=rand()*2-1;z=rand()*2-1;}while(x*x+y*y+z*z>1); facet.push([x,y,z]); }
+  const beams=[]; for(let i=0;i<FACET_BEAMS;i++){ const a=(rand()*FACET_N)|0; let b=(rand()*FACET_N)|0; beams.push([a,b]); }
+  // pages: paragraph i at local longitude phi_i around the equator; text built upright in that plane
+  const pages = msg.paras.map((para,i)=>{
+    const phi = i*(TAU/P);                              // local reveal longitude
+    const tp = textPoints(para, P<=1?26:20);
+    const home=[], scat=[];
+    for(const [nx,ny] of tp){
+      // place in plane at longitude phi (rotate the flat glyph point about Y by phi), slight depth 0
+      home.push(rotY([nx, ny, 0], phi));
+      // scatter target: random in ball (disperses into the body)
+      let x,y,z; do{x=rand()*2-1;y=rand()*2-1;z=rand()*2-1;}while(x*x+y*y+z*z>1); scat.push([x,y,z]);
+    }
+    return {phi, home, scat};
+  });
+  return {P, facet, beams, pages, role:msg.role};
+}
+const SPH = MESSAGES.map(buildSphere);
+const TOTAL_DETENTS = SPH.reduce((a,s)=>a+s.P,0);    // global page-steps
+
+// ---- scroll/drive state ----
+let gTarget=0, g=0;                                   // global page-position (continuous)
+const maxG = TOTAL_DETENTS-1;
+function addScroll(d){ gTarget = Math.max(0, Math.min(maxG, gTarget + d)); }
+cv.addEventListener('wheel', e=>{ e.preventDefault(); addScroll(e.deltaY*0.0016); }, {passive:false});
+let dragging=false, lastY=0;
+cv.addEventListener('pointerdown', e=>{dragging=true;lastY=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove', e=>{ if(dragging){ addScroll((lastY-e.clientY)*0.006); lastY=e.clientY; } });
+cv.addEventListener('pointerup', ()=>dragging=false);
+window.addEventListener('keydown',e=>{ if(e.key==='ArrowDown')addScroll(0.25); if(e.key==='ArrowUp')addScroll(-0.25); });
+
+// map global g -> active sphere index + that sphere's spin
+function activeOf(gg){ let acc=0; for(let i=0;i<SPH.length;i++){ if(gg < acc+SPH[i].P) return {idx:i, local: gg-acc}; acc+=SPH[i].P; } return {idx:SPH.length-1, local:SPH[SPH.length-1].P-1}; }
+
+function draw(){
+  // ease toward target (detent-glide + a little breathing)
+  g += (gTarget - g)*0.12;
+  const t = performance.now()*0.001;
+  ctx.clearRect(0,0,Wd,Ht);
+
+  const {idx:activeIdx, local} = activeOf(g);
+  const cx=Wd*0.5, cy=Ht*0.46;
+  const Ract = Math.min(Wd,Ht)*0.36;                  // active sphere radius
+  const spacing = Ract*2.35;
+
+  // light beam (god-ray cone) onto the active slot
+  const bg = ctx.createLinearGradient(cx-80, cy-Ract*2.2, cx+80, cy+Ract*1.4);
+  bg.addColorStop(0,"rgba(120,200,255,0.10)"); bg.addColorStop(0.5,"rgba(120,200,255,0.05)"); bg.addColorStop(1,"rgba(0,0,0,0)");
+  ctx.save(); ctx.beginPath(); ctx.moveTo(cx-Ract*0.5,cy-Ract*2.4); ctx.lineTo(cx+Ract*0.5,cy-Ract*2.4);
+  ctx.lineTo(cx+Ract*1.25,cy+Ract*1.5); ctx.lineTo(cx-Ract*1.25,cy+Ract*1.5); ctx.closePath();
+  ctx.fillStyle=bg; ctx.fill(); ctx.restore();
+
+  // global float position of spheres in the conveyor (active centered)
+  const gp = g; // continuous
+  // determine fractional centered-sphere position for smooth slide
+  // cumulative center positions: sphere i centered when g == (sum P[0..i-1] + something). Use per-sphere center g.
+  let centers=[], acc=0; for(let i=0;i<SPH.length;i++){ centers.push(acc + (SPH[i].P-1)/2); acc+=SPH[i].P; }
+  // interpolate a continuous "conveyor index" from g
+  let convIndex = activeIdx + (SPH[activeIdx].P>1 ? (local-(SPH[activeIdx].P-1)/2)/Math.max(1,SPH[activeIdx].P) : 0);
+
+  // draw spheres: active large & full, neighbours smaller & dim (LOD)
+  for(let i=0;i<SPH.length;i++){
+    const rel = i - activeIdx - (local/Math.max(1,SPH[activeIdx].P) - 0.5)*0 ; // simple
+    const off = (i - (activeIdx + (local)/Math.max(1,SPH[activeIdx].P)))*spacing;
+    const sx = cx + off;
+    if(sx < -Ract*1.5 || sx > Wd+Ract*1.5) continue;
+    const dist = Math.abs(sx-cx)/spacing;
+    const isActive = (i===activeIdx);
+    const R = Ract*(isActive?1: Math.max(0.5,0.85-dist*0.18));
+    const yaw = isActive ? -local*(TAU/SPH[i].P) : (i*0.7 + t*0.05);  // active spins through its pages
+    const pitch = 0.12*Math.sin(t*0.5 + i);
+    const breath = 1 + 0.025*Math.sin(t*1.3 + i);
+    renderSphere(SPH[i], sx, cy, R*breath, yaw, pitch, isActive, isActive?1:0.5);
+    // role tag
+    ctx.fillStyle = isActive?"rgba(180,210,230,0.8)":"rgba(120,140,150,0.4)";
+    ctx.font="11px ui-monospace,monospace"; ctx.textAlign="center";
+    ctx.fillText(SPH[i].role==="you"?"you":"assistant", sx, cy+R*1.18);
+  }
+
+  // hud
+  document.getElementById('st').innerHTML =
+    `sphere <b>${activeIdx+1}/${SPH.length}</b> · page <b>${(Math.round(local)+1)}/${SPH[activeIdx].P}</b> · ${SPH[activeIdx].role}`;
+  const pb=document.getElementById('progbar'); pb.style.top=(g/maxG*100)+"%"; pb.style.height="6%";
+
+  requestAnimationFrame(draw);
+}
+
+function renderSphere(S, cx, cy, R, yaw, pitch, full, alpha){
+  const scale=R, proj=p=>{ let q=rotY(p,yaw); q=rotX(q,pitch); return [cx+q[0]*scale, cy-q[1]*scale, q[2]]; };
+  // facet beams (dim hue body) — the connecting light beams
+  ctx.lineWidth=1;
+  const bn = full?S.beams.length:Math.min(60,S.beams.length);
+  for(let i=0;i<bn;i++){ const [a,b]=S.beams[i]; const A=proj(S.facet[a]), B=proj(S.facet[b]);
+    const depth=(A[2]+1)/2, h=0.55+0.22*S.facet[a][1], c=hue(h), w=(0.10+0.10*depth)*alpha;
+    ctx.strokeStyle=`rgba(${c[0]*255|0},${c[1]*255|0},${c[2]*255|0},${w})`;
+    ctx.beginPath(); ctx.moveTo(A[0],A[1]); ctx.lineTo(B[0],B[1]); ctx.stroke();
+  }
+  // facet points
+  const fn = full?S.facet.length:Math.min(90,S.facet.length);
+  for(let i=0;i<fn;i++){ const A=proj(S.facet[i]); const depth=(A[2]+1)/2; const c=hue(0.55+0.22*S.facet[i][1]);
+    const a=(0.14+0.16*depth)*alpha; ctx.fillStyle=`rgba(${c[0]*255|0},${c[1]*255|0},${c[2]*255|0},${a})`;
+    ctx.fillRect(A[0]-0.8,A[1]-0.8,1.6,1.6);
+  }
+  // surface text: each page coalesces by alignment of its (rotated) axis with the viewer (+z)
+  if(full){
+    for(const pg of S.pages){
+      const axis = rotY([0,0,1], yaw + pg.phi);          // page axis after sphere yaw
+      const c = Math.max(0, axis[2]);                    // dot with viewer +z
+      const coh = Math.pow(c, COALESCE_POW);             // coalescence amount
+      if(coh < 0.01) continue;
+      for(let k=0;k<pg.home.length;k++){
+        const h=pg.home[k], s=pg.scat[k];
+        const lp=[ s[0]+(h[0]-s[0])*coh, s[1]+(h[1]-s[1])*coh, s[2]+(h[2]-s[2])*coh ];
+        const A=proj(lp); const depth=(A[2]+1)/2;
+        const b=(0.10+0.9*coh)*(0.5+0.5*depth);
+        // colour: body hue when dispersed -> white as it coalesces
+        const bh=hue(0.55+0.22*lp[1]); const r=bh[0]+(1-bh[0])*coh, gg=bh[1]+(1-bh[1])*coh, bb=bh[2]+(1-bh[2])*coh;
+        ctx.fillStyle=`rgba(${r*255|0},${gg*255|0},${bb*255|0},${Math.min(1,b)})`;
+        const sz= coh>0.5?1.7:1.3; ctx.fillRect(A[0]-sz/2,A[1]-sz/2,sz,sz);
+      }
+    }
+  }
+  // rim
+  ctx.strokeStyle=`rgba(150,170,185,${0.35*alpha})`; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.arc(cx,cy,R,0,TAU); ctx.stroke();
+}
+
+resize(); requestAnimationFrame(draw);
+</script>
+</body>
+</html>

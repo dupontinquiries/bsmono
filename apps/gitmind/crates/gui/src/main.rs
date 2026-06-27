@@ -36,6 +36,7 @@ qrc!(register_qml,
         "qml/Timeline.qml",
         "qml/Branches.qml",
         "qml/PeekViewer.qml",
+        "qml/Apps.qml",
     },
 );
 
@@ -86,6 +87,15 @@ struct Backend {
     native_commit: qt_method!(fn(&self, message: QString) -> QString),
     native_log_json: qt_method!(fn(&self, n: u32) -> QString),
     native_status_json: qt_method!(fn(&self) -> QString),
+
+    run_check: qt_method!(fn(&self, commit: QString, cmd: QString) -> QString),
+    checks_json: qt_method!(fn(&self) -> QString),
+
+    apps_json: qt_method!(fn(&self) -> QString),
+    app_use: qt_method!(fn(&self, name: QString, label: QString) -> QString),
+    app_desktop: qt_method!(fn(&self, name: QString, label: QString, terminal: bool) -> QString),
+    app_remove: qt_method!(fn(&self, name: QString, label: QString) -> QString),
+    app_install: qt_method!(fn(&self, name: QString, path: QString, label: QString, commit: QString) -> QString),
 
     session: WatchSession,
 }
@@ -444,7 +454,12 @@ impl Backend {
             match gitmind_core::portage::native_commit(&store, &oid) {
                 Ok(meta) => {
                     let subject = meta.message.lines().next().unwrap_or("").to_string();
-                    items.push(json!({"oid": oid, "subject": subject}));
+                    let st = gitmind_core::checks::get(&store, &oid).ok().flatten();
+                    let mark = gitmind_core::checks::marker(st.as_ref());
+                    items.push(json!({
+                        "oid": oid, "subject": subject, "check": mark,
+                        "checked": st.is_some(), "ok": st.map(|s| s.ok),
+                    }));
                     cur = meta.parents.first().cloned();
                     count += 1;
                 }
@@ -464,6 +479,87 @@ impl Backend {
                     .collect();
                 QString::from(json!({"ok": true, "items": items}).to_string())
             }
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn run_check(&self, commit: QString, cmd: QString) -> QString {
+        use gitmind_core::checks;
+        let store = match gstore() { Ok(s) => s, Err(e) => return err_json(&e) };
+        let cmd_s = cmd.to_string();
+        let parts: Vec<String> = if cmd_s.trim().is_empty() {
+            checks::default_cmd()
+        } else {
+            cmd_s.split_whitespace().map(|s| s.to_string()).collect()
+        };
+        match checks::run(&store, &commit.to_string(), &parts) {
+            Ok(st) => QString::from(json!({"ok": true, "passed": st.ok, "code": st.code, "duration_ms": st.duration_ms}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn checks_json(&self) -> QString {
+        let store = match gstore() { Ok(s) => s, Err(e) => return err_json(&e) };
+        match store.list_checks() {
+            Ok(rows) => {
+                let items: Vec<_> = rows.iter().filter_map(|(commit, bytes)| {
+                    serde_json::from_slice::<gitmind_core::checks::CheckStatus>(bytes).ok().map(|s| json!({
+                        "commit": commit, "ok": s.ok, "code": s.code,
+                        "duration_ms": s.duration_ms, "ran_at": s.ran_at,
+                    }))
+                }).collect();
+                QString::from(json!({"ok": true, "items": items}).to_string())
+            }
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn apps_json(&self) -> QString {
+        use gitmind_core::binpin;
+        let apps: Vec<_> = binpin::list_apps().into_iter().map(|name| {
+            let m = binpin::load_manifest(&name);
+            let versions: Vec<_> = m.versions.iter().map(|v| json!({
+                "label": v.label, "commit": v.commit, "target": v.target,
+                "installed": v.installed, "path": v.path,
+                "current": m.current.as_deref() == Some(&v.label),
+            })).collect();
+            json!({"name": name, "current": m.current, "versions": versions})
+        }).collect();
+        QString::from(json!({"ok": true, "apps": apps}).to_string())
+    }
+
+    fn app_use(&self, name: QString, label: QString) -> QString {
+        use gitmind_core::binpin;
+        match binpin::use_version(&name.to_string(), &label.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn app_desktop(&self, name: QString, label: QString, terminal: bool) -> QString {
+        use gitmind_core::binpin;
+        match binpin::write_desktop(&name.to_string(), &label.to_string(), terminal, None) {
+            Ok(p) => QString::from(json!({"ok": true, "path": p.to_string_lossy()}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn app_remove(&self, name: QString, label: QString) -> QString {
+        use gitmind_core::binpin;
+        match binpin::remove(&name.to_string(), &label.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    fn app_install(&self, name: QString, path: QString, label: QString, commit: QString) -> QString {
+        use gitmind_core::{binpin, varcache};
+        let bytes = match std::fs::read(path.to_string()) { Ok(b) => b, Err(e) => return err_json(&e.to_string()) };
+        let store = match varcache::open_var_store() { Ok(s) => s, Err(e) => return err_json(&e) };
+        let commit = commit.to_string();
+        let commit = if commit.is_empty() { "manual".to_string() } else { commit };
+        match binpin::install(&store, &name.to_string(), &label.to_string(), &commit, "host", &bytes, true) {
+            Ok(v) => QString::from(json!({"ok": true, "path": v.path, "oid": v.oid}).to_string()),
             Err(e) => err_json(&e),
         }
     }
@@ -495,19 +591,16 @@ impl Backend {
 
     fn merge(&self, branch: QString) -> QString {
         use gitmind_core::native::MergeOutcome;
+        let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
         let store = match gstore() { Ok(s) => s, Err(e) => return err_json(&e) };
         let (name, email) = identity();
-        match native::merge(&store, &branch.to_string(), &name, &email) {
+        match native::merge_into_worktree(&store, &branch.to_string(), r.root(), &name, &email) {
             Ok(MergeOutcome::UpToDate) =>
                 QString::from(json!({"ok": true, "outcome": "uptodate"}).to_string()),
-            Ok(MergeOutcome::FastForward { new_tip }) => {
-                sync_worktree(&store);
-                QString::from(json!({"ok": true, "outcome": "fastforward", "new_tip": new_tip}).to_string())
-            }
-            Ok(MergeOutcome::Merged { commit }) => {
-                sync_worktree(&store);
-                QString::from(json!({"ok": true, "outcome": "merged", "commit": commit}).to_string())
-            }
+            Ok(MergeOutcome::FastForward { new_tip }) =>
+                QString::from(json!({"ok": true, "outcome": "fastforward", "new_tip": new_tip}).to_string()),
+            Ok(MergeOutcome::Merged { commit }) =>
+                QString::from(json!({"ok": true, "outcome": "merged", "commit": commit}).to_string()),
             Ok(MergeOutcome::Conflicts(paths)) =>
                 QString::from(json!({"ok": true, "outcome": "conflicts", "paths": paths}).to_string()),
             Err(e) => err_json(&e),

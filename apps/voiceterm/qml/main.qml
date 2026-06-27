@@ -6383,7 +6383,18 @@ ApplicationWindow {
                             // small/narrow, while continuously-redrawing apps (top)
                             // papered over it. Re-fitting on metric change keeps the
                             // grid and the render in lockstep.
-                            onCharWChanged: _trs.restart(); onCharHChanged: _trs.restart()
+                            // v0.1.878: a dynamic text-size change (calibration
+                            // completing, font-size/zoom change, DPI shift) updates
+                            // charW/charH, but the cursor caches its position in
+                            // fallbackX/fallbackY (measure() reassigns them, breaking
+                            // the bindings) and only recomputes on cursor-move/output
+                            // signals. Without re-measuring here, the cursor holds a
+                            // STALE position computed from the OLD metrics until the
+                            // next keystroke — a static assumption not tracking the
+                            // dynamic size. Re-resize the pty grid AND reposition the
+                            // cursor on every metric change.
+                            onCharWChanged: { _trs.restart(); termCursor.measure() }
+                            onCharHChanged: { _trs.restart(); termCursor.measure() }
                             Timer { id: _trs; interval: 200; onTriggered: {
                                 if (!backend || termScreen.width < 50 || termScreen.height < 50) return
                                 // Subtract anchor margins (2px top + 2px bottom = 4px),
@@ -7368,7 +7379,7 @@ ApplicationWindow {
                                     NumberAnimation { to: 0.7; duration: 600; easing.type: Easing.InOutQuad }
                                 }
                                 // Plain-grid fallback positioning, used until we get a real layout from TextEdit
-                                property real fallbackX: 2 + (backend?backend.term_cursor_col:0) * termScreen.charW
+                                property real fallbackX: termRowsHost.x + 2 + (backend?backend.term_cursor_col:0) * termScreen.charW
                                 // v0.1.126: defensive clamp. If a transient
                                 // mismatch (resize race, calibration update,
                                 // stale term_cursor_row) ever produces a row
@@ -7384,7 +7395,7 @@ ApplicationWindow {
                                         ? termRowsHost._rowCount - 1 : 23
                                     if (r > maxR) r = maxR
                                     if (r < 0) r = 0
-                                    return 2 + r * termScreen.charH + termScreen.cursorYOffset
+                                    return termRowsHost.y + 2 + r * termScreen.charH + termScreen.cursorYOffset
                                 }
                                 x: fallbackX
                                 y: fallbackY
@@ -7428,13 +7439,13 @@ ApplicationWindow {
                                 Timer { id: _cursorRecalc; interval: 16; onTriggered: termCursor.measure() }
                                 function measure() {
                                     if (!backend) return
-                                    fallbackX = 2 + backend.term_cursor_col * termScreen.charW
+                                    fallbackX = termRowsHost.x + 2 + backend.term_cursor_col * termScreen.charW
                                     var r = backend.term_cursor_row
                                     var maxR = termRowsHost._rowCount > 0
                                         ? termRowsHost._rowCount - 1 : 23
                                     if (r > maxR) r = maxR
                                     if (r < 0) r = 0
-                                    fallbackY = 2 + r * termScreen.charH + termScreen.cursorYOffset
+                                    fallbackY = termRowsHost.y + 2 + r * termScreen.charH + termScreen.cursorYOffset
                                     // v0.1.563: alignment diagnostic. The cursor x
                                     // is col*charW, which drifts if charW is even
                                     // slightly off the real glyph advance — the
@@ -8898,6 +8909,15 @@ ApplicationWindow {
                                     delegate: Rectangle {
                                         id: paneCell
                                         property bool focused: index === 0  // ws_pane_rects puts focused first
+                                        // v0.1.879: refresh web-pane content on (re)focus. _webTick
+                                        // previously bumped only after an async web FETCH (line in
+                                        // _paneFetchPollTimer), so internal web2qml:// pages (drafts,
+                                        // sessions, mail, …) never re-rendered when their underlying
+                                        // data changed and you came back to them. Re-evaluating
+                                        // paneWebSrc on focus picks up those changes; render_pane_qml
+                                        // is content-addressed, so unchanged pages cost a hash and no
+                                        // Loader reload.
+                                        onFocusedChanged: if (focused && typeof paneSplitLayer !== "undefined") paneSplitLayer._webTick++
                                         // v0.1.771: capture the pane id in the
                                         // OUTER delegate. The inner per-row
                                         // Repeater's model is an integer

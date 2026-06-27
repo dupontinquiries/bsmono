@@ -21,3 +21,5 @@ __pycache__/
 # new ones. (Pre-existing assets/shaders/*.spv stay tracked until the shader
 # build pipeline is wired to compile-on-build; see KITS_AND_BOUNDARIES / build-wiring.)
 *.spv
+**/target/
+node_modules/

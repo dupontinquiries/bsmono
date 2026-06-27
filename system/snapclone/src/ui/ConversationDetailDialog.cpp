@@ -32,6 +32,8 @@
 #include <QHBoxLayout>
 #include <QPushButton>
 #include <QLineEdit>
+#include <QColor>
+#include <cmath>
 #include <QFrame>
 #include <QMouseEvent>
 #include <QDateTime>
@@ -481,6 +483,14 @@ void ConversationDetailDialog::deliverNetworkPayload(const Core::UserId &sender,
     pokeAutoDismiss();
 }
 
+void ConversationDetailDialog::primeVoicePreroll(const Core::UserId &sender,
+                                                 const QList<QByteArray> &payloads)
+{
+    // Ordered pre-roll: the receiver plays these ahead of the live jitter, so
+    // the head of an accepted message isn't lost to the jitter's drop-oldest cap.
+    if (m_voiceBridge) m_voiceBridge->flushPreroll(sender, payloads);
+}
+
 void ConversationDetailDialog::hideEvent(QHideEvent *e)
 {
     // Leaving the screen ends an in-progress call (releases the floor + closes
@@ -488,6 +498,35 @@ void ConversationDetailDialog::hideEvent(QHideEvent *e)
     if (m_voiceCoord && m_voiceCoord->inCall()) setVoiceCallActive(false);
     MobileDialog::hideEvent(e);
 }
+
+namespace {
+// WCAG-style relative luminance + contrast ratio, used to keep chat-bubble text
+// legible in every theme regardless of how the accent/card tokens are set.
+double srgbLuminance(const QColor &c)
+{
+    auto lin = [](int v) {
+        const double s = v / 255.0;
+        return s <= 0.03928 ? s / 12.92 : std::pow((s + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * lin(c.red()) + 0.7152 * lin(c.green()) + 0.0722 * lin(c.blue());
+}
+double contrastRatio(const QColor &a, const QColor &b)
+{
+    const double la = srgbLuminance(a), lb = srgbLuminance(b);
+    const double hi = std::max(la, lb), lo = std::min(la, lb);
+    return (hi + 0.05) / (lo + 0.05);
+}
+// Pick whichever palette text token actually contrasts with this bubble's bg.
+QString contrastingText(const QString &bgHex)
+{
+    const QColor bg(bgHex);
+    const QColor primary(QString::fromLatin1(Theme::TEXT_PRIMARY()));
+    const QColor inverse(QString::fromLatin1(Theme::TEXT_INVERSE()));
+    return contrastRatio(bg, primary) >= contrastRatio(bg, inverse)
+        ? QString::fromLatin1(Theme::TEXT_PRIMARY())
+        : QString::fromLatin1(Theme::TEXT_INVERSE());
+}
+} // namespace
 
 void ConversationDetailDialog::appendSnapCard(const Core::Snap &snap)
 {
@@ -509,9 +548,10 @@ void ConversationDetailDialog::appendSnapCard(const Core::Snap &snap)
     const QString bg = outbound
         ? QLatin1String(Theme::ACCENT_SOFT())
         : QLatin1String(Theme::BG_CARD());
-    const QString fg = outbound
-        ? QLatin1String(Theme::TEXT_PRIMARY())
-        : QLatin1String(Theme::TEXT_PRIMARY());
+    // Text colour is chosen per-bubble for legible contrast against its own
+    // background, so neither outbound (accent) nor inbound (card) washes out in
+    // any theme.
+    const QString fg = contrastingText(bg);
     card->setStyleSheet(QStringLiteral(
         "background: %1; color: %2;"
         "border-radius: 14px; padding: 10px 14px;")

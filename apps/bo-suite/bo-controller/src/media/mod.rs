@@ -60,6 +60,9 @@ pub enum MediaResult {
     Page { context: String, json: String, offset: i64, total: i64 },
     /// BPM band counts JSON: [{label, lo, hi, count}, ...]
     BpmBandCounts(String),
+    /// Confirmed star rating for a track after a SetTrackRating write, so
+    /// the UI can reconcile its optimistic update.
+    TrackRating { track_id: i64, rating: i64 },
     /// Resume state for the home card.
     ResumeState(smart_cards::ResumeState),
     /// Current track BPM + camelot for the now-playing HUD chip.

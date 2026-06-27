@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Resonance Pearl — beams tune until the text locks on</title>
+<style>
+  html,body{margin:0;height:100%;background:#04050a;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#9aa}
+  #c{display:block;width:100vw;height:100vh;touch-action:none}
+  #hud{position:fixed;left:14px;top:12px;font-size:12px;line-height:1.5;opacity:.8;pointer-events:none;text-shadow:0 0 6px #000}
+  #hud b{color:#cde}
+  #panel{position:fixed;right:14px;top:12px;background:rgba(10,14,18,.72);border:1px solid #223;border-radius:8px;padding:10px 12px;font-size:11px;width:194px}
+  #panel h4{margin:0 0 6px;color:#bdf;font-weight:600;letter-spacing:.04em}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{width:70px;color:#9bd}
+  .row input{flex:1}
+  #hint{position:fixed;left:0;right:0;bottom:12px;text-align:center;font-size:12px;opacity:.55;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div>entry beams modulate · at a block's <b>resonance</b> its cells light up and <b>stay on</b> (stable)</div><div id="st"></div></div>
+<div id="panel">
+  <h4>RESONANCE</h4>
+  <div class="row"><label>tune</label><input id="lTune" type="range" min="0" max="3" step="0.001" value="0.0"></div>
+  <div class="row"><label>drift</label><input id="lDrift" type="range" min="0" max="0.4" step="0.005" value="0.10"></div>
+  <div class="row"><label>lock</label><input id="lLock" type="range" min="0" max="1" step="0.01" value="0.6"></div>
+  <div class="row"><label>persistence</label><input id="lPer" type="range" min="0.90" max="0.999" step="0.001" value="0.985"></div>
+  <div class="row"><label>width</label><input id="lW" type="range" min="0.05" max="0.4" step="0.01" value="0.16"></div>
+  <div class="row"><label>glow</label><input id="lGlow" type="range" min="0.4" max="2" step="0.01" value="1.0"></div>
+</div>
+<div id="hint">drag / scroll / let it drift — tune the beams; when they resonate with a block it locks on and holds, then releases to the next</div>
+<script>
+"use strict";
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let DPR=Math.min(2,window.devicePixelRatio||1),Wd=0,Ht=0;
+function resize(){Wd=cv.clientWidth||innerWidth||800;Ht=cv.clientHeight||innerHeight||600;cv.width=Wd*DPR;cv.height=Ht*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',resize);
+const lever=id=>parseFloat(document.getElementById(id).value);
+
+const BLOCKS=[
+  "Keep a seek cursor; remember the byte offset.",
+  "On inode change, reopen the path.",
+  "If it shrinks, reset the offset to zero.",
+  "Stream lines so memory stays bounded.",
+];
+const N=BLOCKS.length, RANGE=N-1;            // resonant tune values = 0,1,2,3
+const TAU=Math.PI*2, rand=(s=>()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return (s>>>0)/4294967296;})(0x9b1c3>>>0);
+function rotY(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0]*c+p[2]*s,p[1],-p[0]*s+p[2]*c];}
+function rotX(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0],p[1]*c-p[2]*s,p[1]*s+p[2]*c];}
+
+const tcan=document.createElement('canvas'),tctx=tcan.getContext('2d');
+function glyphPoints(text,wrap){
+  const px=46,lh=px*1.26,words=text.split(/\s+/);let lines=[],cur="";
+  for(const w of words){if(cur&&cur.length+w.length+1>wrap){lines.push(cur);cur="";}cur=cur?cur+" "+w:w;} if(cur)lines.push(cur);
+  tcan.width=1000;tcan.height=Math.max(120,lines.length*lh+px);tctx.clearRect(0,0,tcan.width,tcan.height);
+  tctx.fillStyle="#fff";tctx.font=`700 ${px}px ui-monospace,monospace`;tctx.textBaseline="alphabetic";
+  lines.forEach((l,i)=>tctx.fillText(l,6,px+i*lh));
+  const W=tcan.width,H=tcan.height,d=tctx.getImageData(0,0,W,H).data,pts=[];
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for(let y=0;y<H;y+=2)for(let x=0;x<W;x+=2)if(d[(y*W+x)*4+3]>128){pts.push([x,y]);mnx=Math.min(mnx,x);mny=Math.min(mny,y);mxx=Math.max(mxx,x);mxy=Math.max(mxy,y);}
+  const w=mxx-mnx,cx=(mnx+mxx)/2,cy=(mny+mxy)/2,s=1.55/w,out=[];
+  for(let i=0;i<pts.length;i++) if(rand()<0.6) out.push([(pts[i][0]-cx)*s,-(pts[i][1]-cy)*s]);
+  return out;
+}
+// BACTERIA: cells in the pearl. Text cells sit at upright glyph positions (front, slight depth) and share
+// their block's resonant tune phi. Background cells fill the pearl with random positions + random phi.
+const CELL=[];
+BLOCKS.forEach((t,bi)=>{ for(const [x,y] of glyphPoints(t,24)){
+  CELL.push({p:[x, y*0.62, (rand()*2-1)*0.18], phi:bi, txt:1, L:0}); }});
+for(let i=0;i<560;i++){let x,y,z;do{x=rand()*2-1;y=rand()*2-1;z=rand()*2-1;}while(x*x+y*y+z*z>1);
+  CELL.push({p:[x,y,z], phi:rand()*RANGE, txt:0, L:0});}
+
+function makeSprite(rgb){const s=document.createElement('canvas');s.width=s.height=48;const g=s.getContext('2d');
+  const rg=g.createRadialGradient(24,24,0,24,24,24);rg.addColorStop(0,`rgba(${rgb[0]},${rgb[1]},${rgb[2]},1)`);rg.addColorStop(0.45,`rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.45)`);rg.addColorStop(1,`rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+  g.fillStyle=rg;g.fillRect(0,0,48,48);return s;}
+const S_WHITE=makeSprite([255,255,255]),S_WARM=makeSprite([255,210,150]),S_COOL=makeSprite([90,140,230]);
+function spr(img,x,y,sz,a){if(a<0.012||sz<=0.4)return;ctx.globalAlpha=Math.min(1,a);ctx.drawImage(img,x-sz/2,y-sz/2,sz,sz);}
+
+let tune=0, scrollV=0, drag=false, ly=0;
+cv.addEventListener('pointerdown',e=>{drag=true;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{if(drag){scrollV+=(e.clientY-ly)*0.004;ly=e.clientY;}});
+cv.addEventListener('pointerup',()=>drag=false);
+cv.addEventListener('wheel',e=>{e.preventDefault();scrollV+=e.deltaY*0.0014;},{passive:false});
+
+function draw(){
+  if(!Wd||!Ht){resize();if(!Wd||!Ht){requestAnimationFrame(draw);return;}}
+  const t=performance.now()*0.001, dt=1/60;
+  const DRIFT=lever('lDrift'),LOCK=lever('lLock'),PER=lever('lPer'),W=lever('lW'),GLOW=lever('lGlow');
+  // entry-beam tune modulates: manual (slider+scroll) + slow drift, with a RESONANCE LOCK that dwells on each block
+  let target=lever('lTune')+scrollV;
+  // auto drift, slowed near a resonance (dwell = stability)
+  const nearest=Math.max(0,Math.min(RANGE,Math.round(tune)));
+  const closeness=Math.exp(-((tune-nearest)*(tune-nearest))/(0.12*0.12));
+  tune+=DRIFT*dt*(1-0.92*LOCK*closeness) + (target-tune)*0.04;     // drift dwells; slider/scroll can pull
+  // gentle resonance pull toward nearest (lock)
+  tune+=(nearest-tune)*LOCK*closeness*0.06;
+  tune=Math.max(-0.2,Math.min(RANGE+0.2,tune)); if(tune>RANGE+0.15){tune=-0.15;} if(tune<-0.15){tune=RANGE+0.15;}
+
+  ctx.globalAlpha=1;ctx.fillStyle="#04050a";ctx.fillRect(0,0,Wd,Ht);
+  const cx=Wd*0.5,cy=Ht*0.5,R=Math.min(Wd,Ht)*0.4;
+  let rg=ctx.createRadialGradient(cx-R*0.2,cy-R*0.2,R*0.05,cx,cy,R);
+  rg.addColorStop(0,"rgba(30,40,68,0.18)");rg.addColorStop(0.7,"rgba(12,16,30,0.08)");rg.addColorStop(1,"rgba(4,5,10,0)");
+  ctx.fillStyle=rg;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.fill();
+
+  // entry beams: a few beams entering, their angle modulated by tune (the slowly modulating drive)
+  ctx.save();ctx.globalCompositeOperation="lighter";
+  for(let k=0;k<5;k++){ const a=(-0.7+0.35*k) + 0.25*Math.sin(tune*2.1+k); // swing with tune
+    const dx=Math.cos(a),dy=Math.sin(a); const x0=cx-dx*R*2.0-dy*R*0.0, y0=cy- dy*R*2.0;
+    const g=ctx.createLinearGradient(x0,y0,cx,cy); g.addColorStop(0,"rgba(150,205,255,0)");g.addColorStop(1,"rgba(160,210,255,0.10)");
+    ctx.strokeStyle=g;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(x0,y0);ctx.lineTo(cx- dx*R*0.2,cy- dy*R*0.2);ctx.stroke(); }
+  ctx.restore();
+
+  // gentle 3D wobble so it reads as a pearl with depth (small, keeps text upright/legible)
+  const wob=0.12*Math.sin(t*0.25), wobp=0.06*Math.sin(t*0.21+1);
+  const proj=p=>{const q=rotX(rotY(p,wob),wobp);return [cx+q[0]*R,cy-q[1]*R,q[2]];};
+
+  ctx.save();ctx.globalCompositeOperation="lighter";
+  let lit=0,total=0;
+  for(const c of CELL){
+    // resonance excitation: peaks when tune == this cell's phi
+    const d=tune-c.phi, E=Math.exp(-(d*d)/(2*W*W));
+    c.L = Math.min(1.4, c.L*PER + E*(c.txt?0.10:0.045));   // latch + slow decay = "light up and stay on"
+    const P=proj(c.p); const dep=(P[2]+1)/2;
+    const baseTwinkle = c.txt?0.0:(0.04+0.05*Math.sin(t*1.7+c.phi*9));   // living background
+    const L=c.L;
+    if(c.txt){ total++; if(L>0.5) lit++; }
+    // dim ambient presence (cool) so the pearl is always alive
+    spr(S_COOL, P[0],P[1], (2.0+3.5*dep), (0.04+0.14*dep + baseTwinkle)*GLOW*(1-0.6*Math.min(1,L)));
+    // lit cell: warms then whitens as it locks on (stable)
+    if(L>0.04){
+      spr(S_WARM, P[0],P[1], (2.4+4.0*dep)*(0.7+0.4*L), (0.10+0.5*L)*GLOW*(0.5+0.5*dep));
+      if(L>0.6) spr(S_WHITE, P[0],P[1], (2.0+3.0*dep)*0.8, (L-0.5)*1.4*GLOW);   // crisp white text core when stable
+    }
+  }
+  ctx.restore();ctx.globalAlpha=1;
+  ctx.strokeStyle="rgba(150,170,190,0.18)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.stroke();
+
+  const res=Math.max(0,1-Math.abs(tune-nearest)/0.5);
+  const stable= total?lit/total:0;
+  document.getElementById('st').innerHTML=`tuning <b>${tune.toFixed(2)}</b> · block <b>${nearest+1}/${N}</b> · resonance ${(res*100|0)}% · locked ${(stable*100|0)}% — “${BLOCKS[nearest]}”`;
+  requestAnimationFrame(draw);
+}
+resize();requestAnimationFrame(draw);
+</script>
+</body>
+</html>

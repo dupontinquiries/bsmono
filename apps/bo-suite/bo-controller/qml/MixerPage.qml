@@ -215,6 +215,86 @@ Item {
                 }
             }
 
+            // ── Spatializer (stereo width) ────────────────────────
+            //
+            // Scales the Side component of the mixer's M/S stage: a
+            // single, musical "how wide is the stereo image" control that
+            // sits naturally on top of the existing decomposition.
+            //   mono ─────────── normal ─────────── wide
+            //    0.0               1.0               2.0
+            // Centered content (vocals/bass/kick, which live in Mid) is
+            // unaffected at any setting.
+            Rectangle {
+                width: parent.width
+                height: 92
+                radius: 12
+                color: Bo.surface
+                border.color: Bo.hairline
+                border.width: 1
+
+                Column {
+                    anchors.fill: parent
+                    anchors.margins: Bo.gapMD
+                    spacing: 8
+
+                    Row {
+                        width: parent.width
+                        Text {
+                            text: "SPATIALIZER"
+                            color: Bo.silver
+                            font.pixelSize: 9
+                            font.weight: Font.DemiBold
+                            font.letterSpacing: 0.8
+                        }
+                        Item { width: parent.width - 200; height: 1 }
+                        Text {
+                            // Live readout: mono / normal / wide + factor.
+                            text: {
+                                var w = qtobj.mix_width
+                                var tag = w < 0.05 ? "mono"
+                                        : Math.abs(w - 1.0) < 0.05 ? "normal"
+                                        : w > 1.0 ? "wide" : "narrow"
+                                return tag + "  ·  " + w.toFixed(2) + "×"
+                            }
+                            color: Bo.bone
+                            font.pixelSize: 10
+                            font.weight: Font.DemiBold
+                        }
+                    }
+
+                    Row {
+                        width: parent.width
+                        spacing: 8
+                        Text {
+                            text: "🔇"
+                            font.pixelSize: 12
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                        Slider {
+                            id: widthSlider
+                            width: parent.width - 60
+                            anchors.verticalCenter: parent.verticalCenter
+                            from: 0.0; to: 2.0
+                            value: qtobj.mix_width
+                            onMoved: qtobj.set_mixer_value("spatial", "width", value)
+                            // Snap-to-center detent at 1.0 so "normal" is
+                            // easy to find.
+                            onPressedChanged: {
+                                if (!pressed && Math.abs(value - 1.0) < 0.06) {
+                                    value = 1.0
+                                    qtobj.set_mixer_value("spatial", "width", 1.0)
+                                }
+                            }
+                        }
+                        Text {
+                            text: "🔊"
+                            font.pixelSize: 12
+                            anchors.verticalCenter: parent.verticalCenter
+                        }
+                    }
+                }
+            }
+
             // ── Offline file processor ────────────────────────────
             //
             // Process a WAV file through the current mixer settings and

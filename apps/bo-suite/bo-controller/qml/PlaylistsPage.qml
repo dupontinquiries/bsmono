@@ -252,6 +252,16 @@ Item {
                             elide: Text.ElideRight
                             width: parent.width
                         }
+                        // Fallback subtitle so a description-less row isn't
+                        // visually empty: a plain track count.
+                        Text {
+                            visible: !(modelData.description && modelData.description.length > 0)
+                            text: modelData.track_count === 1
+                                ? "1 track" : (modelData.track_count + " tracks")
+                            color: Bo.slate
+                            font.pixelSize: Bo.captionSize
+                            width: parent.width
+                        }
                     }
                 }
 
