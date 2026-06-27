@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Beam Reader — light guided into the bloom</title>
+<style>
+  html,body{margin:0;height:100%;background:#03040a;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#9aa}
+  #c{display:block;width:100vw;height:100vh;touch-action:none}
+  #hud{position:fixed;left:14px;top:12px;font-size:12px;line-height:1.5;opacity:.78;pointer-events:none;text-shadow:0 0 6px #000}
+  #hud b{color:#cde}
+  #tag{position:fixed;left:14px;bottom:12px;font-size:11px;opacity:.5}
+  #panel{position:fixed;right:14px;top:12px;background:rgba(10,14,18,.72);border:1px solid #223;border-radius:8px;padding:10px 12px;font-size:11px;width:196px}
+  #panel h4{margin:0 0 6px;color:#bdf;font-weight:600;letter-spacing:.04em}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{width:70px;color:#9bd}
+  .row input{flex:1}
+  #hint{position:fixed;left:0;right:0;bottom:12px;text-align:center;font-size:12px;opacity:.55;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div>a flickering source · beams <b>refract toward the letters</b> &amp; bloom where they pile up</div><div id="st"></div></div>
+<div id="tag">version: <b>beam-reader-physical</b></div>
+<div id="panel">
+  <h4>LIGHT</h4>
+  <div class="row"><label>refract</label><input id="lRef" type="range" min="0.02" max="0.5" step="0.005" value="0.18"></div>
+  <div class="row"><label>flow</label><input id="lFlow" type="range" min="0" max="2.5" step="0.05" value="1.3"></div>
+  <div class="row"><label>flicker</label><input id="lFlick" type="range" min="0" max="1" step="0.01" value="0.35"></div>
+  <div class="row"><label>breathe</label><input id="lBr" type="range" min="0" max="1" step="0.01" value="0.4"></div>
+  <div class="row"><label>thickness</label><input id="lTh" type="range" min="0.4" max="2.0" step="0.05" value="0.7"></div>
+  <div class="row"><label>dispersion</label><input id="lDisp" type="range" min="0" max="1" step="0.01" value="0.4"></div>
+  <div class="row"><label>absorb</label><input id="lAbs" type="range" min="0.002" max="0.03" step="0.001" value="0.012"></div>
+</div>
+<div id="hint">scroll to change the block — the beams reroute and re-bloom into the new text · let the source flicker breathe the lines</div>
+<script>
+"use strict";
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let DPR=Math.min(2,window.devicePixelRatio||1),Wd=0,Ht=0;
+function resize(){Wd=cv.clientWidth||innerWidth||800;Ht=cv.clientHeight||innerHeight||600;cv.width=Wd*DPR;cv.height=Ht*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+addEventListener('resize',resize);
+const lever=id=>parseFloat(document.getElementById(id).value);
+
+const BLOCKS=[
+  "Keep a seek cursor; remember the byte offset.",
+  "On inode change, reopen the path.",
+  "If it shrinks, reset the offset to zero.",
+  "Stream lines so memory stays bounded.",
+];
+const TAU=Math.PI*2, rnd=(s=>()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return (s>>>0)/4294967296;})(0x33aa55>>>0);
+
+// ---- guidance field: from each block's glyph, a vector field that pulls/flows beams onto the letters ----
+const G=170, tcan=document.createElement('canvas'),tctx=tcan.getContext('2d');
+function buildField(text,wrap){
+  const px=44,lh=px*1.24,words=text.split(/\s+/);let lines=[],cur="";
+  for(const w of words){if(cur&&cur.length+w.length+1>wrap){lines.push(cur);cur="";}cur=cur?cur+" "+w:w;} if(cur)lines.push(cur);
+  tcan.width=980;tcan.height=Math.max(150,lines.length*lh+px);tctx.clearRect(0,0,tcan.width,tcan.height);
+  tctx.fillStyle="#fff";tctx.font=`700 ${px}px ui-monospace,monospace`;tctx.textBaseline="alphabetic";
+  lines.forEach((l,i)=>tctx.fillText(l,6,px+i*lh));
+  const W=tcan.width,H=tcan.height,d=tctx.getImageData(0,0,W,H).data;
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(d[(y*W+x)*4+3]>128){if(x<mnx)mnx=x;if(x>mxx)mxx=x;if(y<mny)mny=y;if(y>mxy)mxy=y;}
+  const half=Math.max(mxx-mnx,mxy-mny)/2,cxp=(mnx+mxx)/2,cyp=(mny+mxy)/2,sc=half/0.86;
+  const cov=new Float32Array(G*G);
+  for(let gy=0;gy<G;gy++)for(let gx=0;gx<G;gx++){const nx=gx/G*2-1,ny=-(gy/G*2-1);const sx=Math.round(cxp+nx*sc),sy=Math.round(cyp-ny*sc);
+    cov[gy*G+gx]=(sx>=0&&sy>=0&&sx<W&&sy<H&&d[(sy*W+sx)*4+3]>128)?1:0;}
+  // blur -> smooth potential whose uphill points toward the strokes
+  let bl=new Float32Array(G*G);
+  for(let pass=0;pass<2;pass++){const src=pass?bl.slice():cov;for(let y=0;y<G;y++)for(let x=0;x<G;x++){let s=0,n=0;
+    for(let dy=-2;dy<=2;dy++)for(let dx=-2;dx<=2;dx++){const xx=x+dx,yy=y+dy;if(xx>=0&&yy>=0&&xx<G&&yy<G){s+=src[yy*G+xx];n++;}}bl[y*G+x]=s/n;}}
+  const FX=new Float32Array(G*G),FY=new Float32Array(G*G);
+  for(let y=1;y<G-1;y++)for(let x=1;x<G-1;x++){const i=y*G+x;
+    FX[i]=bl[i+1]-bl[i-1];             // toward higher coverage = toward strokes (field x right)
+    FY[i]=-(bl[(y+1)*G+x]-bl[(y-1)*G+x]); }   // field y up
+  return {cov,bl,FX,FY};
+}
+const FIELDS=BLOCKS.map((t)=>buildField(t,24));
+function sample(F,x,y){const gx=((x*0.5+0.5)*G)|0,gy=((0.5-y*0.5)*G)|0;
+  if(gx<1||gy<1||gx>=G-1||gy>=G-1)return [0,0,0]; const i=gy*G+gx; return [F.FX[i],F.FY[i],F.bl[i]];}
+
+// ---- beams: particles emitted from a flickering source, refracted by the field, blooming on the letters ----
+const NP=2200;
+const P=new Array(NP);
+function spawn(p){ p.x=-1.15+rnd()*0.05; p.y=(rnd()*2-1)*0.95; p.vx=0.9+rnd()*0.3; p.vy=(rnd()*2-1)*0.25;
+  p.life=0.4+rnd()*0.8; p.ch=(rnd()*3)|0; p.br=0.6+rnd()*0.5; }
+for(let i=0;i<NP;i++){P[i]={};spawn(P[i]);}
+
+let active=0, scrollAcc=0;
+cv.addEventListener('wheel',e=>{e.preventDefault();scrollAcc+=e.deltaY*0.01;const n=Math.round(scrollAcc/3);active=((n%BLOCKS.length)+BLOCKS.length)%BLOCKS.length;},{passive:false});
+let drag=false,ly=0;
+cv.addEventListener('pointerdown',e=>{drag=true;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{if(drag){scrollAcc+=(ly-e.clientY)*0.02;ly=e.clientY;const n=Math.round(scrollAcc/3);active=((n%BLOCKS.length)+BLOCKS.length)%BLOCKS.length;}});
+cv.addEventListener('pointerup',()=>drag=false);
+
+const CH=[[1,0.45,0.4],[0.5,1,0.6],[0.5,0.65,1]];
+let lastT=performance.now();
+function draw(){
+  if(!Wd||!Ht){resize();if(!Wd||!Ht){requestAnimationFrame(draw);return;}}
+  const now=performance.now(),t=now*0.001; let dt=(now-lastT)/1000; lastT=now; dt=Math.min(0.05,dt);
+  const REF=lever('lRef'),FLOW=lever('lFlow'),FLICK=lever('lFlick'),BR=lever('lBr'),TH=lever('lTh'),DISP=lever('lDisp'),ABS=lever('lAbs');
+  const F=FIELDS[active];
+  const cx=Wd*0.5,cy=Ht*0.5,R=Math.min(Wd,Ht)*0.4;
+
+  // fade previous frame slightly (soft trails / glow) rather than hard clear
+  ctx.globalCompositeOperation="source-over";ctx.globalAlpha=1;
+  ctx.fillStyle="rgba(3,4,10,0.32)";ctx.fillRect(0,0,Wd,Ht);
+
+  // pearl body
+  let rg=ctx.createRadialGradient(cx-R*0.25,cy-R*0.25,R*0.05,cx,cy,R);
+  rg.addColorStop(0,"rgba(26,34,60,0.10)");rg.addColorStop(1,"rgba(4,5,10,0)");
+  ctx.fillStyle=rg;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.fill();
+
+  // flickering light source on the left + a couple of visible input beams with play
+  const flick=1+FLICK*(Math.sin(t*23.0)*0.4+Math.sin(t*7.3)*0.35+ (rnd()-0.5)*0.5);
+  const breath=1+BR*0.5*Math.sin(t*1.6);
+  const srcJit=FLICK*0.10*Math.sin(t*11.0);
+  const sx0=cx-R*1.3, sy0=cy + srcJit*R;
+  ctx.globalCompositeOperation="lighter";
+  for(let k=0;k<4;k++){const yy=sy0+(k-1.5)*R*0.18; const g=ctx.createLinearGradient(sx0,yy,cx,cy);
+    g.addColorStop(0,`rgba(170,210,255,${0.10*flick})`);g.addColorStop(1,"rgba(170,210,255,0)");
+    ctx.strokeStyle=g;ctx.lineWidth=1.2;ctx.beginPath();ctx.moveTo(sx0,yy);ctx.lineTo(cx-R*0.2,cy);ctx.stroke();}
+
+  // advance + draw beams
+  ctx.globalCompositeOperation="lighter";
+  const refr=REF*breath;
+  for(let i=0;i<NP;i++){
+    const p=P[i];
+    const [fx,fy,cov]=sample(F,p.x,p.y);
+    // refraction toward strokes + flow along them (tangent); dispersion bends channels differently
+    const disp=1+(p.ch-1)*DISP*0.5;
+    const tx=-fy, ty=fx;                       // tangent (flow along the letter)
+    let dx=fx*refr*disp + tx*FLOW*cov*0.05;
+    let dy=fy*refr*disp + ty*FLOW*cov*0.05;
+    p.vx+=dx; p.vy+=dy;
+    p.vx*=0.86; p.vy*=0.86;                     // damping (settles onto strokes)
+    const ox=p.x, oy=p.y;
+    p.x+=p.vx*dt*3.2; p.y+=p.vy*dt*3.2;
+    // boundary reflection (stay inside the pearl)
+    const rr=p.x*p.x+p.y*p.y; if(rr>1){const inv=1/Math.sqrt(rr);const nx=p.x*inv,ny=p.y*inv;const vdotn=p.vx*nx+p.vy*ny;p.vx-=2*vdotn*nx;p.vy-=2*vdotn*ny;p.x=nx*0.98;p.y=ny*0.98;}
+    p.life-=ABS*(1+2*cov*0)+0.006; if(p.life<=0){spawn(p);continue;}
+    // draw thin segment, brighter & whiter where it's settled on a stroke (the bloom)
+    const onStroke=Math.min(1,cov*1.6);
+    const X0=cx+ox*R,Y0=cy-oy*R,X1=cx+p.x*R,Y1=cy-p.y*R;
+    const c=CH[p.ch]; const w=onStroke;          // white core on strokes
+    const r=c[0]+(1-c[0])*w, g=c[1]+(1-c[1])*w, b=c[2]+(1-c[2])*w;
+    const a=(0.05+0.5*onStroke)*p.br*flick*Math.min(1,p.life*1.4);
+    ctx.lineWidth=(0.5+TH*(0.5+1.2*onStroke));   // tight lines; a touch wider where blooming
+    ctx.strokeStyle=`rgba(${r*255|0},${g*255|0},${b*255|0},${Math.min(1,a)})`;
+    ctx.beginPath();ctx.moveTo(X0,Y0);ctx.lineTo(X1,Y1);ctx.stroke();
+  }
+  ctx.globalCompositeOperation="source-over";ctx.globalAlpha=1;
+  ctx.strokeStyle="rgba(150,170,190,0.16)";ctx.lineWidth=1;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.stroke();
+  document.getElementById('st').innerHTML=`block <b>${active+1}/${BLOCKS.length}</b> — “${BLOCKS[active]}”`;
+  requestAnimationFrame(draw);
+}
+resize();requestAnimationFrame(draw);
+</script>
+</body>
+</html>

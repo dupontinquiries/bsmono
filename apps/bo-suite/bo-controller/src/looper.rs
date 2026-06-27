@@ -184,6 +184,66 @@ pub fn read_wav(path: &Path) -> Result<SoundBuffer, String> {
     Ok(SoundBuffer { samples_lr, sample_rate: spec.sample_rate })
 }
 
+/// Decode any supported audio file to a float SoundBuffer. WAV is read
+/// directly (fast, no subprocess); everything else — Opus, mp3, flac,
+/// m4a/aac, ogg vorbis — is decoded to a temporary 16-bit PCM WAV via
+/// ffmpeg (already a hard dependency for playback) and then read with the
+/// existing WAV path. This lets the soundscape workshop accept compressed
+/// sources (notably .opus, which is what it *outputs*, so a rendered loop
+/// can be re-fed as input) rather than WAV only.
+///
+/// The temp file is created in the system temp dir and removed before
+/// returning, regardless of success, so we never leak large PCM scratch
+/// files. ffmpeg is invoked with explicit stereo s16 output so the WAV
+/// reader's fast path always applies.
+pub fn read_audio(path: &Path) -> Result<SoundBuffer, String> {
+    let is_wav = path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("wav"))
+        .unwrap_or(false);
+    if is_wav {
+        return read_wav(path);
+    }
+    if !path.exists() {
+        return Err(format!("input not found: {}", path.display()));
+    }
+
+    // Decode to a temp WAV via ffmpeg. Unique-ish name from pid + nanos to
+    // avoid collisions between concurrent renders.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!(
+        "bo_looper_decode_{}_{}.wav", std::process::id(), nanos));
+
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-v", "error",
+            "-y",                       // overwrite temp if it somehow exists
+            "-i", &path.to_string_lossy(),
+            "-ac", "2",                 // force stereo
+            "-c:a", "pcm_s16le",        // 16-bit PCM → read_wav fast path
+            "-f", "wav",
+        ])
+        .arg(&tmp)
+        .status();
+
+    let decoded = match status {
+        Ok(s) if s.success() => read_wav(&tmp),
+        Ok(s) => Err(format!(
+            "ffmpeg failed to decode {} (exit {:?}); is the file a valid \
+             audio file?", path.display(), s.code())),
+        Err(e) => Err(format!(
+            "could not run ffmpeg to decode {}: {} (ffmpeg is required for \
+             non-WAV input)", path.display(), e)),
+    };
+
+    // Always clean up the scratch file.
+    let _ = std::fs::remove_file(&tmp);
+    decoded
+}
+
 /// Write the looped audio as an OggOpus file. Opus is the right
 /// format for soundscapes: typical bitrates of 96–128 kbps give
 /// perceptually-transparent quality on ambient loops, and the

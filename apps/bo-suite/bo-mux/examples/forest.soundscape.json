@@ -60,7 +60,8 @@
       "interval_ms": [
         2000,
         3500
-      ]
+      ],
+      "timing_jitter": 0.45
     },
     {
       "name": "wind",

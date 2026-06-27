@@ -1042,9 +1042,13 @@ impl KeyboardView {
                         hit
                     }
                 };
-                debug!(
-                    "drag begin: source behavior = {:?} (at kb-frame {:.1}, {:.1}, mode={:?})",
-                    behavior, kx, ky, dispatch_mode
+                info!(
+                    "drag begin: behavior={:?} mode={:?} swipe_typing={} \
+                     at kb-frame ({:.1}, {:.1})",
+                    behavior,
+                    dispatch_mode,
+                    crate::gestures::swipe::swipe_typing_enabled(),
+                    kx, ky
                 );
                 behavior_for_begin.set(behavior);
 
@@ -4719,7 +4723,7 @@ fn dispatch_swipe_source(
     }
 
     let boundary = LetterBoundary::from_hitboxes(boxes);
-    let segments = if let Some(ref b) = boundary {
+    let mut segments = if let Some(ref b) = boundary {
         segment_path(path, b)
     } else {
         // No keys → no boundary. Treat the whole path as one segment.
@@ -4729,6 +4733,31 @@ fn dispatch_swipe_source(
         }]
     };
 
+    // segment_path can legitimately return ZERO segments for a
+    // non-empty path: if the final segment's points are all outside
+    // the letter boundary, its trailing-outside-trim empties the
+    // segment and pushes nothing. That happens when the whole path
+    // lies outside the letter region — a swipe grazing below the
+    // bottom row, starting in the bottom-padding strip, or shifted
+    // out of the region by a stale compute_bounds offset. Dropping
+    // the gesture there is the "trail shows but nothing types"
+    // failure. Fall back to the whole path as one segment so the
+    // recognizer still runs; pivots_to_word snaps each pivot to the
+    // nearest swipe-target key regardless of being a few px outside.
+    if segments.is_empty() && !path.is_empty() {
+        tracing::warn!(
+            "segment_path returned no segments for a {}-point path \
+             (path likely entirely outside the letter boundary). \
+             Falling back to whole-path single segment so the \
+             recognizer still runs.",
+            path.len()
+        );
+        segments.push(crate::gestures::boundary::PathSegment {
+            points: path.to_vec(),
+            crossed_into: None,
+        });
+    }
+
     if segments.len() > 1 {
         info!("springboard: path segmented into {} words", segments.len());
     }
@@ -4736,18 +4765,35 @@ fn dispatch_swipe_source(
     let dispatch_mode_seg = current_layout.borrow().style.dispatch_mode();
     let mut accumulated = String::new();
 
-    for (i, seg) in segments.iter().enumerate() {
-        // In experimental modes (which shouldn't normally reach
-        // SwipeSource, but just in case), only the first segment is
-        // processed and through dispatch_cardinal_swipe.
-        if dispatch_mode_seg.uses_cardinal_dispatch() {
-            if i == 0 {
-                info!("swipe-source: cardinal-style fallback dispatch (segment {})", i + 1);
-                dispatch_cardinal_swipe(&seg.points, boxes, engine);
-            }
-            break;
-        }
+    // We are inside dispatch_swipe_source, which is reached ONLY from
+    // the SwipeSource dispatch arm. A gesture is categorized as
+    // SwipeSource at drag_begin only in Standard mode (cardinal /
+    // stenotype modes downgrade SwipeSource → Normal during
+    // classification). So by construction the recognizer pipeline is
+    // the correct path here.
+    //
+    // Previously the loop re-derived dispatch_mode from current_layout
+    // and, if it looked cardinal, routed the FIRST segment to
+    // dispatch_cardinal_swipe and broke. That re-derivation is
+    // redundant with the categorization already done at drag_begin —
+    // and actively harmful if current_layout's style is stale at
+    // drag_end (a state bug): a valid swipe-typing gesture gets
+    // misrouted to cardinal dispatch, which finds no gesture map on
+    // letter keys and drops it silently (trail shows, nothing types).
+    // Trust the resolved category instead. If the layout mode
+    // disagrees, that's a state bug worth surfacing — warn once, but
+    // still run the recognizer so the user gets their word.
+    if dispatch_mode_seg.uses_cardinal_dispatch() {
+        tracing::warn!(
+            "swipe-source dispatch reached with cardinal-mode layout \
+             (style reports cardinal dispatch, but gesture was \
+             categorized SwipeSource at drag_begin). current_layout \
+             may be stale. Running the recognizer anyway rather than \
+             dropping the gesture."
+        );
+    }
 
+    for (i, seg) in segments.iter().enumerate() {
         refresh_recognizer_positions(boxes, recognizer);
         let avg_v = crate::gestures::swipe::path_avg_velocity(&seg.points);
 

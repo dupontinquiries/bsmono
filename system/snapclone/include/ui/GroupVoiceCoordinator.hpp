@@ -84,6 +84,7 @@ public:
 public Q_SLOTS:
     // ── inbound transport (the network channel calls these) ──
     void onVoiceFrameReceived(const QString &senderId, const QByteArray &wireFrame);
+    void enqueuePreroll(const QString &senderId, const QByteArray &wireFrame);
     void onPeerFloorAssert(const QString &holder, quint64 claimTs);
     void onPeerFloorRelease(const QString &holder);
 

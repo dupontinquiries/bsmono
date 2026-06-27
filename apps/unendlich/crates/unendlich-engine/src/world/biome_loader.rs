@@ -322,6 +322,11 @@ impl BiomeRegistry {
             return Err(BiomeLoadError::Io(format!("path does not exist: {}", root.display())));
         }
         let mut count = 0;
+        // Collect every .json path first, then load in SORTED order. read_dir order is not
+        // guaranteed across filesystems, so without this the winner of an ID collision was
+        // nondeterministic between machines. Sorted by full path, later namespaces (e.g.
+        // `unendlich/`) deterministically win over earlier ones (e.g. `legacy/`) on a clash.
+        let mut files: Vec<PathBuf> = Vec::new();
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
@@ -336,11 +341,18 @@ impl BiomeRegistry {
                 if path.is_dir() {
                     stack.push(path);
                 } else if path.extension().map_or(false, |x| x == "json") {
-                    match Self::load_file(&path) {
-                        Ok(b) => { self.insert(b); count += 1; }
-                        Err(e) => log::warn!("{}", e),
-                    }
+                    files.push(path);
                 }
+            }
+        }
+        files.sort();
+        for path in files {
+            match Self::load_file(&path) {
+                Ok(b) => {
+                    self.insert(b);
+                    count += 1;
+                }
+                Err(e) => log::warn!("{}", e),
             }
         }
         Ok(count)
@@ -446,6 +458,39 @@ mod tests {
         // Middle ground.
         let b = r.best_fit(0.6, 0.5).unwrap();
         assert_eq!(b.id, "temperate");
+    }
+
+    // Regression (r470): two namespaces defining the same _id must resolve deterministically —
+    // sorted path order means the later namespace (e.g. `unendlich/`) wins, regardless of the
+    // filesystem's read_dir order. Guards against the legacy/ duplicate-biome bug recurring.
+    #[test]
+    fn load_directory_is_deterministic_on_id_collision() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("legacy")).unwrap();
+        fs::create_dir_all(root.join("unendlich")).unwrap();
+        fs::write(
+            root.join("legacy/x.json"),
+            r#"{"type":"minecraft:biome","_id":"unendlich:dup","temperature":0.1,"downfall":0.1}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("unendlich/x.json"),
+            r#"{"type":"minecraft:biome","_id":"unendlich:dup","temperature":0.9,"downfall":0.9}"#,
+        )
+        .unwrap();
+        let mut r = BiomeRegistry::empty();
+        let n = r.load_directory(root).unwrap();
+        assert_eq!(n, 2, "both files are loaded (one then replaced)");
+        // After dedup only the winner remains; it must be unendlich/ (sorted last).
+        let b = r.best_fit(0.5, 0.5).unwrap();
+        assert_eq!(b.id, "unendlich:dup");
+        assert!(
+            (b.temperature - 0.9).abs() < 1e-9,
+            "unendlich/ (sorted last) must win the collision; got temp {}",
+            b.temperature
+        );
     }
 
     #[test]

@@ -418,6 +418,8 @@ mod link_graph;
 mod mail_json;   mod mail_error;  mod mail_crypto; mod mail_secure;
 mod mail_proton; mod mail_account; mod mail_session;
 mod mail_intent; mod mail_panes;  mod mail_login;  mod mail_notify; mod mail;
+mod mail_drafts; // v0.1.878: local (crypto-free) draft store
+mod peer_mail; // v0.1.879: device-as-provider public-key messaging groundwork
 
 // v0.1.246 (PA3 of phoneme alignment + tiered reading model arc).
 // Bundled IPA phoneme transcriptions for manpage paragraphs.
@@ -2435,6 +2437,14 @@ struct Backend {
     mail_remove_account: qt_method!(fn(&mut self, id: QString)),
     mail_register_email: qt_method!(fn(&mut self, phrase: QString) -> QString),
     mail_open_settings: qt_method!(fn(&mut self) -> QString),
+    // v0.1.878: local draft + compose wiring. Drafts are crypto-free
+    // (local files); send paths report honest "not wired yet" status.
+    mail_open_compose: qt_method!(fn(&mut self) -> QString),
+    mail_open_drafts: qt_method!(fn(&mut self) -> QString),
+    mail_open_draft: qt_method!(fn(&mut self, id: QString) -> QString),
+    mail_save_draft: qt_method!(fn(&mut self, to: QString, subject: QString, body: QString) -> QString),
+    mail_send: qt_method!(fn(&mut self, to: QString, subject: QString, body: QString) -> QString),
+    mail_send_draft: qt_method!(fn(&mut self, id: QString) -> QString),
     pane_voice_dispatch: qt_method!(fn(&mut self, text: QString) -> QString),
     /// v0.1.686: save the editor buffer back to the note file. Returns true
     /// on success. The editor's "done" calls this so edits persist (they were
@@ -3786,6 +3796,12 @@ impl Default for Backend {
             mail_remove_account: Default::default(),
             mail_register_email: Default::default(),
             mail_open_settings: Default::default(),
+            mail_open_compose: Default::default(),
+            mail_open_drafts: Default::default(),
+            mail_open_draft: Default::default(),
+            mail_save_draft: Default::default(),
+            mail_send: Default::default(),
+            mail_send_draft: Default::default(),
             voice_target_pane_id: Default::default(),
             voice_broadcast_toggle: Default::default(),
             voice_broadcast_clear: Default::default(),
@@ -4543,6 +4559,45 @@ impl Backend {
                 .and_then(|h| h.accounts().ok())
                 .unwrap_or_default();
             return Some(crate::mail_login::accounts_settings_qml(&ps, &accounts));
+        }
+        // v0.1.878: local drafts list. Crypto-free — reads the on-disk
+        // draft store, newest-first. Edit/Send buttons call mail_open_draft
+        // / mail_send_draft (defined; send reports the honest "not wired"
+        // status). Empty store renders the pane's "no drafts" state.
+        if url == "web2qml://mail/drafts" {
+            let ps = crate::mail_panes::PaneStyle::from_render_style(&sty);
+            let rows: Vec<crate::mail_panes::DraftRow> =
+                match crate::mail_drafts::DraftStore::open_default() {
+                    Ok(store) => store.list().iter().map(|d| d.to_row()).collect(),
+                    Err(_) => Vec::new(),
+                };
+            return Some(crate::mail_panes::draft_pane_qml(&ps, &rows));
+        }
+        // v0.1.878: compose pane. Reachable as a fresh form, or pre-filled
+        // from a saved draft via `?draft=<id>` (mail_open_draft builds that
+        // URL). Save draft works locally now; Send reports the honest
+        // sign-in-pending status.
+        if url == "web2qml://mail/compose" || url.starts_with("web2qml://mail/compose?") {
+            let ps = crate::mail_panes::PaneStyle::from_render_style(&sty);
+            // Parse an optional ?draft=<id> query and load that draft.
+            let draft_id = url
+                .split_once("?draft=")
+                .map(|(_, rest)| rest.split('&').next().unwrap_or("").to_string());
+            let loaded = draft_id.and_then(|id| {
+                crate::mail_drafts::DraftStore::open_default()
+                    .ok()
+                    .and_then(|s| s.get(id.trim()))
+            });
+            let qml = match loaded {
+                Some(d) => crate::mail_panes::compose_pane_qml(
+                    &ps,
+                    Some(&d.to),
+                    Some(&d.subject),
+                    Some(&d.body),
+                ),
+                None => crate::mail_panes::compose_pane_qml(&ps, None, None, None),
+            };
+            return Some(qml);
         }
         // v0.1.857: local markdown FILES render in panes too. The fetch path
         // already routes downloaded .md through the markdown pipeline, but that
@@ -6636,6 +6691,65 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
     fn mail_open_settings(&mut self) -> QString {
         let _ = self.mail_hub_get();
         self.open_web_pane(QString::from("web2qml://mail/settings"))
+    }
+
+    /// v0.1.878: open the compose pane (fresh, empty form).
+    fn mail_open_compose(&mut self) -> QString {
+        self.open_web_pane(QString::from("web2qml://mail/compose"))
+    }
+
+    /// v0.1.878: open the local drafts list.
+    fn mail_open_drafts(&mut self) -> QString {
+        self.open_web_pane(QString::from("web2qml://mail/drafts"))
+    }
+
+    /// v0.1.878: open the compose pane pre-filled from a saved draft.
+    /// The draft id rides in the URL query so the route is stateless.
+    fn mail_open_draft(&mut self, id: QString) -> QString {
+        let id = id.to_string();
+        let id = id.trim();
+        if id.is_empty() {
+            return QString::from("err\tNo draft selected");
+        }
+        self.open_web_pane(QString::from(
+            format!("web2qml://mail/compose?draft={}", id).as_str(),
+        ))
+    }
+
+    /// v0.1.878: save the compose fields as a LOCAL draft. No account,
+    /// network, or crypto required — drafts are local working copies.
+    /// Returns a `status\tdetail` wire for the compose pane's status line.
+    fn mail_save_draft(&mut self, to: QString, subject: QString, body: QString) -> QString {
+        let (to, subject, body) = (to.to_string(), subject.to_string(), body.to_string());
+        if to.trim().is_empty() && subject.trim().is_empty() && body.trim().is_empty() {
+            return QString::from("err\tNothing to save — the draft is empty");
+        }
+        match crate::mail_drafts::DraftStore::open_default() {
+            Ok(store) => match store.save(None, &to, &subject, &body) {
+                Ok(_) => QString::from("ok\tDraft saved"),
+                Err(e) => QString::from(format!("err\tCouldn't save draft: {}", e).as_str()),
+            },
+            Err(e) => QString::from(format!("err\tCouldn't open draft store: {}", e).as_str()),
+        }
+    }
+
+    /// v0.1.878: send a composed message. Sending needs the SRP login +
+    /// SMTP seams, which aren't wired yet — report that honestly so the
+    /// Send button gives feedback instead of calling a dead method. The
+    /// user can still Save draft (local) in the meantime.
+    fn mail_send(&mut self, _to: QString, _subject: QString, _body: QString) -> QString {
+        QString::from(
+            "err\tSending isn't available yet — account sign-in is still being wired up. \
+             You can Save draft to keep this locally.",
+        )
+    }
+
+    /// v0.1.878: send an existing draft. Same gating as mail_send.
+    fn mail_send_draft(&mut self, _id: QString) -> QString {
+        QString::from(
+            "err\tSending isn't available yet — account sign-in is still being wired up. \
+             Your draft is saved locally.",
+        )
     }
 
     /// The routing heart: dispatch a finished utterance per gate + broadcast set +
@@ -9474,6 +9588,20 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
                 suggestions.extend(cmds);
                 // re-rank the merged set by score desc (build()'s cross-source
                 // rank doesn't see the appended commands), then re-cap.
+                suggestions.sort_by(|a, b| b.score.cmp(&a.score));
+                suggestions.truncate(12);
+            }
+        }
+
+        // v0.1.877: built-in manpage docs (web2qml://man/<name>). These
+        // weren't offered before — INTERNAL_PAGES lists only a few routes
+        // and the ManPage kind is for shell-command man pages. Surface the
+        // registered docs (welcome, mail, …) as Internal navigations.
+        {
+            let man_names = manpages::list_names();
+            let mans = search_suggest::suggest_manpages(&q, &man_names, 5);
+            if !mans.is_empty() {
+                suggestions.extend(mans);
                 suggestions.sort_by(|a, b| b.score.cmp(&a.score));
                 suggestions.truncate(12);
             }

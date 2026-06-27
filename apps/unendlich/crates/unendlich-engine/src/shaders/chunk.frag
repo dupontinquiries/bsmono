@@ -373,6 +373,15 @@ float fbm2(vec3 p) {
 #ifndef CHUNK_DYNAMIC_LIGHTS
 #define CHUNK_DYNAMIC_LIGHTS 1 // 0 = sun + ambient only, skip the point-light loop
 #endif
+#ifndef CHUNK_COLOR_GRADE
+#define CHUNK_COLOR_GRADE 1  // r465: final vibrance + contrast grade (0 = neutral tonemap output)
+#endif
+#ifndef CHUNK_SNOW_SPARKLE
+#define CHUNK_SNOW_SPARKLE 1 // r466: twinkling pinpoint glints on snow/ice (0 = matte snow)
+#endif
+#ifndef CHUNK_WATER_GLITTER
+#define CHUNK_WATER_GLITTER 1 // r472: sun-glitter sparkle path on water (0 = single smooth glint blob)
+#endif
 #ifndef CHUNK_SHADOWS
 #define CHUNK_SHADOWS 1      // 0 = skip shadow-map PCF (fully lit)
 #endif
@@ -642,12 +651,21 @@ void main() {
     // UNENDLICH_SNOW (r358): altitude snow caps. ubo.sky_color.w = snow-line
     // altitude (0 = feature off). Above the line, blend albedo toward snow white
     // over a soft band; up-facing faces hold more snow than steep sides.
+    float snow_factor = 0.0; // r466: how snow/ice-like this surface is (drives the sparkle below)
     if (ubo.sky_color.w > 0.5) {
         float snow_line = ubo.sky_color.w;
         float band      = 6.0;
         float s = smoothstep(snow_line - band, snow_line + band, v_world_pos.y);
         s *= mix(0.2, 1.0, clamp(normal.y, 0.0, 1.0)); // tops snowier than sides
         albedo = mix(albedo, vec3(0.92, 0.95, 1.0), s);
+        snow_factor = s;
+    }
+    // r466: also treat intrinsically snow/ice-coloured blocks (bright, faintly blue) as sparkly —
+    // catches SnowBlock/Ice surfaces (e.g. tundra, frozen ocean) independent of the altitude cap.
+    {
+        float bright = min(min(albedo.r, albedo.g), albedo.b);
+        float icy = smoothstep(0.78, 0.93, bright) * step(albedo.r, albedo.b + 0.04);
+        snow_factor = max(snow_factor, icy);
     }
 
     // ─── PBR shading (r68-01): Cook-Torrance direct + hemi ambient ──────
@@ -705,6 +723,22 @@ void main() {
     // Keep a faint floor so deep-shadow faces never crush to pure black
     // (matches the old `max(lighting, 0.15)` intent).
     color = max(color, albedo * 0.12);
+
+    // r466: snow/ice SPARKLE — sparse twinkling pinpoint glints. A high-frequency world-space hash
+    // makes scattered ~1/8-block cells glint; each twinkles on its own phase, brightest when the
+    // surface faces the camera and the sun is up. Cheap (one hash + a few ALU), gated on snow_factor.
+#if CHUNK_SNOW_SPARKLE
+    if (snow_factor > 0.02) {
+        vec3  cell   = floor(v_world_pos * 8.0);
+        float h      = hash13(cell);
+        float phase  = ubo.atmos_params.w * 6.2831853 * (0.6 + 0.8 * h) + h * 50.0;
+        float twinkle = 0.5 + 0.5 * sin(phase);
+        float pinpoint = smoothstep(0.90, 1.0, h) * twinkle;       // only the top ~10% of cells
+        float facing   = pow(max(dot(normal, view_dir), 0.0), 1.5);
+        float sun_up   = clamp(ubo.sun_dir.w, 0.0, 1.0);
+        color += vec3(1.0, 1.0, 1.06) * (pinpoint * facing * snow_factor * sun_up * 0.7);
+    }
+#endif
 
     // ─── Material-specific overlays ─────────────────────────────────────
     float humidity = ubo.atmos_params.y;
@@ -803,6 +837,22 @@ void main() {
         vec3  reflection = mix(ubo.sky_color.rgb * 0.80, ubo.sky_color.rgb * 1.10, up_r);
         float glint      = pow(max(dot(refl_dir, to_sun), 0.0), 200.0) * sun_power;
         reflection      += ubo.sun_color.rgb * glint;
+#if CHUNK_WATER_GLITTER
+        // r472: sun-glitter path — break the single specular blob into a shimmering field of
+        // micro-glints. Near the sun's mirror direction, two scrolling world-space hashes gate a
+        // much sharper lobe per-fragment, so the reflection scatters into the sparkly "glitter
+        // path" real water shows. Rides the wave normal (refl_dir already uses N), so it travels
+        // with the swell; costs ~nothing away from the highlight because `align` gates it out.
+        float align = max(dot(refl_dir, to_sun), 0.0);
+        if (align > 0.5 && sun_power > 0.01) {
+            vec2  guv     = v_world_pos.xz;
+            float s1      = hash12(guv * 6.0  + vec2(w_time * 0.8, -w_time * 0.6));
+            float s2      = hash12(guv * 17.0 + vec2(-w_time * 1.3, w_time * 1.1));
+            float facets  = smoothstep(0.62, 1.0, s1 * 0.6 + s2 * 0.4);
+            float sparkle = pow(align, 700.0) * facets;
+            reflection   += ubo.sun_color.rgb * sparkle * 1.2 * sun_power;
+        }
+#endif
 
         // Refraction: no scene sample available, so an analytic body colour
         // attenuated by Beer-Lambert over a path length. r431: use the sim's REAL water depth
@@ -1402,6 +1452,19 @@ void main() {
 
     // ─── Tone mapping & color grading ───────────────────────────────────
     color = aces_film(color);
+
+    // r465: final colour grade — gentle vibrance + contrast for more "pop" across the whole frame.
+    // Conservative + cheap (a handful of ALU ops; mobile-friendly). Vibrance is luminance-weighted so
+    // already-vivid pixels don't blow out to neon; contrast is a mild S-curve about mid-grey.
+#if CHUNK_COLOR_GRADE
+    {
+        float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+        float chroma = max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
+        float vib = 0.16 * (1.0 - chroma);            // boost dull pixels more than saturated ones
+        color = mix(vec3(luma), color, 1.0 + vib);    // saturate
+        color = clamp(mix(vec3(0.5), color, 1.055), 0.0, 1.0); // subtle contrast
+    }
+#endif
     color = filmic_contrast(color, 0.08);
 
     // ─── Vignette (proper screen-space) ─────────────────────────────────

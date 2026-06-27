@@ -422,3 +422,359 @@ bo-mux 300/300; media 52/52.
   already surfaces the daemon's battery message ("battery low (12%) …").
 
 bo-mux 312/312.
+
+## 2026-06-21 — Stage surround explainer (docs only)
+
+- Added docs/STAGE_SURROUND_VS_STEREO.md explaining the "phenomenal"
+  surround the user heard on the Beosound Stage playing Billie Jean. Root
+  cause from the logs: every `bluetooth: play` line uses `ffmpeg -f wav`
+  (2.0 PCM stereo, no -ac/-af/pan flags) to the A2DP sink, so bo-controller
+  does a pure stereo passthrough. The surround is the STAGE's own DSP
+  upmixing 2.0 → spatial. Billie Jean pops because it's a famously wide
+  mix (lots of side content for the upmixer). Doc covers the mid/side
+  mechanism, why it's content-dependent, a stereo-vs-spatial comparison
+  table, and how to keep it (clean delivery + Stage listening mode).
+- Log-confirmed wins from prior sessions: bt_volume_active_sink (volume
+  succeeds once bluez_output sink exists; only the pre-sink attempt failed)
+  and duration_ffprobe_fallback (Serenitas now seeks with dur=207, was 0).
+
+No code change; bo-mux 312/312 unchanged.
+
+## 2026-06-21 (pm2) — soundscape timing humanization
+
+- **Per-layer timing jitter** — the scheduler advanced triggers on a
+  fixed `step` grid and rolled a fixed probability each step, so sparse
+  events (birds, drips, gulls) landed on a rigid lattice that reads as
+  mechanical under careful listening. Added Layer/LayerConfig
+  `timing_jitter` [0,1]: each fired onset is nudged within ±(jitter·step/2),
+  clamped to the state window, drawn from the seeded RNG so the schedule
+  stays deterministic (mesh-sync + rollback preserved). Both return paths
+  already sort by at_ms, so jittered events stay ordered. Default 0 =
+  exact prior grid (existing scenes bit-for-bit unchanged).
+  Tests: timing_jitter_zero_is_exact_prior_grid,
+  timing_jitter_changes_onsets_but_stays_deterministic,
+  timing_jitter_keeps_events_sorted_and_in_window.
+- Applied to discrete/sparse layers only (trigger_prob < 1.0, where grid
+  timing is audible): forest birds(45%); forest_immersive leaves(50%),
+  brook_far(30%), brook_mid(25%); ocean_quad gulls(50%), whale(40%).
+  Continuous beds (trigger_prob 1.0) keep exact timing. All 8 scenes
+  load+compile.
+
+bo-mux 315/315.
+
+## 2026-06-21 (pm3) — missing tracks + playback overlap
+
+- **Missing tracks ROOT CAUSE (parser)** — filenames with no " - "
+  separator (e.g. "Serenitas.opus", "blinkun x jeremih.opus") parsed with
+  an empty artist segment → NO track_artists row → invisible everywhere,
+  since the library is browsed only by artist/album/tag. Parser now falls
+  back to "Unknown Artist" so every track is reachable. Tests:
+  no_separator_gets_unknown_artist, empty_filename_still_gets_artist,
+  real_artist_not_overwritten_by_fallback.
+- **All-tracks view (belt-and-suspenders)** — added catalog::all_tracks_page
+  (FROM tracks + COALESCE'd artist, no inner join, so nothing is ever
+  filtered out), wired through MediaCmd::LoadAllTracksPage → worker →
+  Page{context:"all_tracks"} → load_all_tracks_page qt_method. Tests:
+  all_tracks_includes_tracks_with_no_artist, all_tracks_pagination_bounds.
+  (QML "All Tracks" tab still TODO; backend ready.)
+- **Playback overlap (driver)** — a decode pipe is ffmpeg|paplay but only
+  paplay's pid is tracked, so stop() orphaned ffmpeg (the "224" spam) and
+  rapid replay/seek bursts stacked overlapping pairs → doubled audio.
+  Added reap_orphan_audio_children() (pkill --parent <our_pid> ffmpeg/
+  paplay, same proven sweep driver_stop uses) called before every BT /
+  Local / MultiRoom play. Verified safe: bo-muxd is a separate systemd
+  process (not our child), so soundscape audio is untouched.
+
+Media modules: 57/57 isolated. bo-mux 315/315.
+
+## 2026-06-21 (pm4) — rustcheck tool + bugs it surfaced
+
+User supplied `rustcheck` (AI-centric Rust checker: Tier-0 static + scoped
+`cargo check`, separates your-code errors from env/dep BLOCKED). Stashed at
+/tmp/tools/rustcheck for future sessions.
+
+Findings:
+- Confirmed bo-controller's own code type-checks cleanly up to the Qt
+  boundary; the build BLOCKED is purely qttypes' build script needing
+  qmake (env), NOT our code. Validates the medcheck-isolation strategy.
+- bo-mux: full `cargo check --tests --deny-warnings` → after fixes, ZERO
+  errors/warnings.
+- **Real fix surfaced by --deny-warnings --tests:** the
+  passby_canceller test `fsm_eventually_returns_to_quiet_on_stationary_tone`
+  had a dead `saw_quiet_after_peak` (assigned, never read) — so it silently
+  asserted nothing about return-to-quiet. Wired it into the assertion;
+  discovered the full Peak→Recede→Quiet cycle needs ~33s (PEAK_MAX_MS 8s +
+  RECEDE_MAX_MS 25s) but the probe is 15s, so the correct assertion is
+  "progressed past Peak (Recede/Quiet)" — now actually verified, was a
+  no-op before.
+- Silenced intentional non_snake_case channel-code test names in
+  protocol.rs with a scoped #![allow] so real warnings aren't buried.
+- Added [features] analysis=[] to the /tmp/medcheck stub crate so its
+  cfg(feature="analysis") matches the real bo-controller manifest (kills a
+  false-positive unexpected_cfgs warning).
+
+bo-mux 315/315; media 57/57 isolated.
+
+## 2026-06-21 (pm5) — multi-speaker playbar UX
+
+- **Per-device head track (multi-speaker "what's playing where")** —
+  QueueDeviceSummary gained head_title (title of the lowest-ord queued
+  track per device, via correlated subquery in library::queue_devices).
+  The BottomTransportBar per-device strip now shows `[▶] host · "title"
+  [count]` so you can see WHAT each speaker is set to play, not just how
+  many items are queued — directly addresses the "different streams /
+  track ids per speaker" ask. Title elided (max 96px), hidden when empty;
+  chip width now driven by chipRow.implicitWidth. Test extended:
+  queue_devices_lists_only_non_empty asserts head_title.
+- **Resume race fix (play/pause)** — resuming from a paused position did
+  play_track(id) THEN Qt.callLater(seek_to(from)) — two spawns, racy. Now
+  a single seek_to(from) when there's a remembered position (it replays
+  the loaded path from offset directly); play_track only as the from-zero
+  fallback. One spawn, no callLater race.
+- Verified via rustcheck: bo-controller own code type-checks clean (no
+  errors/warnings) up to the Qt boundary; media 57/57; bo-mux 315/315.
+
+Per-device VOLUME display deferred — backend tracks only a single
+last_known_volume for the active device + transient shadows, so true
+per-device volume would need a device→volume map threaded through the
+driver/volume-routing layer (larger change, noted for later).
+
+## 2026-06-21 (pm6) — per-device volume memory
+
+- **Each speaker remembers its own volume** — the multi-speaker
+  "different volumes per device" piece, done the tractable way: persist
+  the active device's confirmed volume to settings_store under
+  "device_volume:<url>" (on every authoritative Volume result, sane
+  non-zero only — a 0 is usually a shadow/ducking artifact). On device
+  switch, select_device / select_device_with_product call a new
+  restore_device_volume() that loads that value into the slider DISPLAY
+  (1..100 guard). Display-only: never pushed to the device, so selecting a
+  speaker can't cause a surprise volume jump; a live probe still overrides
+  with the authoritative value if the device reports one. This makes
+  "Stage at 30, headphones at 60" survive switching back and forth, even
+  for BT sinks that don't report volume reliably. Safety preserved:
+  safety_check_done resets on switch + high-volume relocks, so restore
+  never bypasses the per-product ceiling.
+- Verified: rustcheck → bo-controller own code type-checks clean (no
+  errors/warnings) to the Qt boundary; guard logic unit-checked standalone;
+  bo-mux 315/315; media 57/57.
+
+Per-device volume is now remembered; DISPLAYING all devices' volumes
+simultaneously in the strip would still need volume threaded into
+queue_devices_json (deferred — the restore-on-switch covers the main UX).
+
+## 2026-06-21 (pm7) — per-device volume in the strip (full multi-speaker view)
+
+- **Volume now shown per device in the playbar strip** — closes the
+  multi-speaker picture: each chip shows host · "head track" · 🔊vol ·
+  count. enrich_queue_devices_with_volume() runs on the main thread when
+  QueueDevices arrives (settings_store isn't reachable from the worker),
+  injecting each device's remembered volume (device_volume:<url>), or the
+  LIVE volume for the active device, or -1 when unknown. Best-effort:
+  malformed JSON returns unchanged so the strip never blanks. QML chip
+  binds the active device's volume to live qtobj.volume so it tracks the
+  slider without backend churn; inactive devices show their remembered
+  level. Hidden when -1.
+- Verified: rustcheck → bo-controller own code clean (no errors/warnings)
+  to Qt boundary; enrichment logic unit-checked standalone (active=live,
+  inactive=stored, unknown=-1, malformed=unchanged); QML 104/104 braces;
+  bo-mux 315/315.
+
+Multi-speaker UX now complete across the three axes the user asked for:
+different STREAMS (head_title per chip), different TRACK IDS (per-device
+queues, already there), different VOLUMES (remembered + restored on switch
++ shown per chip).
+
+## 2026-06-21 (pm8) — inline per-device volume stepper
+
+- **Tap −/+ on a strip chip to adjust that speaker's volume** without
+  leaving the playbar. New qt_method set_device_volume(url, v): if url is
+  the active device it routes through the normal safe set_volume_api
+  (safety ceiling + rate limit + clamp all preserved — thin pre-router,
+  not a bypass); if it's a different device it promotes that device to
+  active first (we can't safely route volume through an unselected
+  device's driver / unknown ceiling). QML: the −/+ steppers render only on
+  the ACTIVE chip (honest about the architecture); inactive chips show
+  their remembered level read-only. The stepper's MouseAreas sit above the
+  chip's select MouseArea (chip select given z:-1) so a tap on −/+ adjusts
+  volume instead of switching the queue view. ±5 per tap, clamped 0..100.
+- Verified: rustcheck → bo-controller own code clean (no errors/warnings)
+  to Qt boundary; routing logic unit-checked standalone (active→set,
+  inactive→promote, empty→no-op); QML 109/109 braces; bo-mux 315/315.
+
+## 2026-06-21 (pm9) — quad + LFE synthesis from stereo (multi-speaker mesh)
+
+- **Quadraphonic + basic LFE upmix** — the existing upmix.rs Upmixer only
+  produced full 5.1 (with a center channel) and wasn't reachable. Added
+  the 4-speaker-mesh targets the user asked for:
+  * Quad40 / Quad41 frames + Upmixer::process_quad / process_quad41 —
+    fronts pass through (phantom center preserved, NO discrete center),
+    rears = decorrelated Haas-delayed side signal, optional low-passed
+    mono-sum LFE (4.1). Shares the rear filters (one stream → one method).
+  * Upmixer::lfe_sample(l,r) — standalone basic LFE: 120 Hz one-pole on
+    the mono sum, ×0.7 trim, honors lfe_enabled. For a mesh where one node
+    is the sub and the rest pass full-range.
+  * mux::pick_channels_quad — maps a Quad41 frame to requested channels
+    (FL/FR/RL/RR/LFE + SL/SR/BL/BR aliases); unknown channels → silence.
+  * mux::upmix_stereo_wav_channel — the bridge that makes it USABLE
+    through the existing per-channel file server (chan_server): takes a
+    16-bit stereo WAV, synthesizes one named channel via the upmixer,
+    returns mono WAV. So "/ch/RL" of a stereo source derives rear-left on
+    the fly. Stereo+16-bit guarded; absent channels degrade to silent WAV.
+- All NaN/Inf-sanitized end to end. Tests: quad fronts-passthrough/no-
+  center, rears emerge after Haas delay, mono source → quiet rears, LFE
+  low-pass + disable, 4.1 LFE flag, quad NaN defense, pick_channels_quad
+  aliases+silence, upmix_stereo_wav_channel round-trip (FL passthrough, RL
+  length, non-stereo reject, absent-channel silence).
+
+bo-mux 323/323 (was 315); rustcheck clean deny-warnings+tests.
+
+## 2026-06-21 (pm10) — Opus (+compressed) input for the soundscape workshop
+
+- **Workshop accepts compressed audio, not just WAV** — the Loop Studio
+  read only 16-bit PCM WAV (looper::read_wav). Added looper::read_audio(),
+  a dispatcher: .wav → read_wav directly; anything else (.opus, .mp3,
+  .flac, .m4a, .ogg) → decode to a temp 16-bit stereo WAV via ffmpeg
+  (already a hard dep), read that, delete the temp. Notably this means a
+  rendered .loop.opus can be re-fed as input (the workshop's own output
+  format is now also a valid input). media_worker render path switched
+  read_wav → read_audio. Temp scratch file is always cleaned up.
+- UI updated: input label "INPUT WAV" → "INPUT AUDIO"; placeholder shows
+  ".opus, .mp3, .flac…"; help text + header comment list accepted formats.
+- Verified REAL end-to-end: generated a stereo libopus file and decoded it
+  through read_audio's exact ffmpeg invocation → correct 2ch/48k/16-bit
+  PCM (192000 bytes = 1.0s). rustcheck: looper own-code clean to Qt
+  boundary; QML 146/146 braces; bo-mux 323/323; media 57/57.
+
+## 2026-06-21 (pm11) — spatializer: mixer stereo-width + per-stem placement
+
+Two spatializer additions, on the two separation layers:
+
+- **Mixer stereo-width (M/S spatializer)** — realtime_mixer already
+  decomposes to Mid/Side for its EQ, so width is a near-free spatial
+  control: added `width` to MixerParams (serde default 1.0, MAX_WIDTH 2.0),
+  applied to the Side component after EQ before L/R re-encode. width 1.0 =
+  bit-identical passthrough, 0 = mono (phase-safe), >1 = wider. NaN-guarded
+  → unity. Wired mix_width qt_property + set_mixer_value("spatial","width")
+  + reset/startup init + both MixerParams literals (snapshot + offline file
+  proc). QML: a SPATIALIZER slider card (0..2, snap-to-center detent at 1.0,
+  live mono/normal/wide readout). 6 in-tree DSP tests (unity passthrough,
+  zero→mono, >1 widens side, mono-source unchanged, NaN→unity) — can't run
+  in sandbox (Qt-blocked binary, no lib target) but the identical math is
+  validated by a standalone rustc harness.
+
+- **Per-stem stereo placement (separation spatializer)** — channel_routing
+  mixed separated stems (drums/voice/piano/synth) into MONO virtual
+  channels (gain only). Added StereoStemChannel: each StemPlacement has a
+  pan (-1..+1) via equal_power_pan() (constant-loudness law, -3 dB center),
+  producing interleaved stereo so a 4-stem separation spreads across the
+  field (default_stage: rhythm center, piano left, synth right). Channel-
+  wide `width` post-scales the placed field via the same M/S trick. Pure
+  DSP (no Qt). 6 in-tree tests + standalone DSP validation (equal-power
+  constant loudness, hard pans land correct side, center equal L/R, width
+  0 → mono).
+
+Verified: rustcheck → bo-controller own-code clean (no errors/warnings) to
+Qt boundary on all three files; both spatializer DSPs validated standalone;
+QML 43/43 braces; bo-mux 323/323.
+
+## 2026-06-21 (pm12) — fix: bad width insertion in reset_clears_filter_state test
+
+The pm11 brace-matching script that added `width: 1.0` to test MixerParams
+literals misfired on ONE literal (reset_clears_filter_state) that used a
+top-level `..Default::default()` instead of explicit speaker/instrumental
+fields — it appended `width: 1.0,` AFTER the `..Default::default()`, which
+is invalid Rust (struct-update must be last). Removed the redundant line
+(the `..Default::default()` already supplies width=1.0). Verified by a
+token scan that no other literal has `..Default::default()` followed by a
+field. This was a compile error surfaced by the user's real Qt build (the
+sandbox can't compile bo-controller past the qttypes Qt boundary, so the
+in-tree test literals never got type-checked here — a known limitation;
+the script edit should have been audited more carefully).
+
+## 2026-06-21 (pm13) — All Tracks tab (UI half of the missing-tracks fix)
+
+- **New AllTracksPage.qml + nav tab** — the backend load_all_tracks_page
+  (catalog::all_tracks_page → MediaCmd::LoadAllTracksPage → worker →
+  Page{context:"all_tracks"} → page_json) had no UI. Added a flat, title-
+  ordered, paginated (100/page, near-bottom prefetch) list of EVERY track,
+  modeled on SearchPage's delegate (title · artist · album, with #/+/▶
+  actions: tag, queue_push, play_now; row tap = enqueue_or_play). Because
+  all_tracks_page selects FROM tracks with no track_artists join, files
+  that parsed with no artist (the "Serenitas.opus" class) are finally
+  reachable in the UI, not just via the Unknown Artist fallback bucket.
+  Empty-state + live "N tracks" count. Stale-page guard: only accepts the
+  page whose offset == current accumulator length (same pattern as the A→Z
+  artist view), and filters page_json by context so it ignores other
+  pages' results.
+- Wired into the SwipeView + PageBar dots model in lockstep, inserted
+  after Albums: Library · Playlists · Queue · Artists · Albums · All
+  Tracks · Tags · Search · History.
+- Verified: QML braces AllTracksPage 36/36, volume_knobs 417/417; page/
+  SwipeView order aligned; TrackSummary serializes id/title/primary_artist/
+  album as the delegate expects; play/queue methods exist; all Bo.* tokens
+  + window.tagEditor valid. all_tracks backend tests 2/2; bo-mux 323/323.
+
+## 2026-06-21 (pm13) — playlist drag-to-reorder + list polish
+
+- **Drag-to-reorder in PlaylistDetailPage** — the code's own TODO ("drag-
+  to-reorder is a future enhancement"). Added a ≡ drag handle on each
+  track row: press and slide, the list rearranges LIVE under the finger
+  (local trackList spliced as the pointer crosses row boundaries, mapped
+  via mapToItem into the ListView content space so it's stable against the
+  ListView's own delegate positioning; pitch accounts for row height +
+  spacing), and the final position commits once on release via
+  reorder_playlist(playlist_id, track_id, index). The up/down arrows stay
+  as a single-step fallback. Dragged row gets a lifted look (accent
+  border, raised z); a `displaced` Transition eases neighbours. The
+  release uses the stable track_id so the commit is correct regardless of
+  how the live reorder shuffled indices; the backend reorder is absolute-
+  ord + transactional, and the republished JSON reconciles the optimistic
+  local state. Drag index/splice math validated standalone in JS (move
+  down, move up, clamp both ends, no-op same-slot).
+- **PlaylistsPage polish** — a description-less playlist row showed an
+  empty subtitle line; now falls back to a plain "N tracks" subtitle so
+  rows are visually consistent.
+
+NOTE: playlist total-duration was considered but the tracks table stores
+no duration column (duration is resolved at playback via lofty/ffprobe),
+so it'd need a schema change + backfill — out of scope for a UI pass.
+
+QML only this round; braces 69/69 + 48/48; bo-mux 323/323 (unregressed).
+
+## 2026-06-21 (pm14) — abstract queue policy + track ratings
+
+- **Queue policy abstraction (stack / replace / sync / midgap-layer)** —
+  new pure queue_policy.rs makes enqueue INTENT a first-class EnqueueMode
+  enum and turns (mode, PlaybackState) into an explicit Vec<QueueAction>
+  plan. No Qt/IO/globals → fully unit-tested in isolation (9/9). Modes:
+  Stack (append), Replace (clear+play), Synchronize (time-aligned overlay
+  layer), MidgapLayer (bed underneath at current playhead). Invariants:
+  idle → every mode just plays; layered modes never touch the linear queue
+  nor stop the top track. Wired enqueue_with_mode qt_method (executor only;
+  all decisions live in the policy). Stack/Replace fully functional now;
+  sync/midgap report honestly that they need the layered player (concurrent
+  decoders — not yet on the controller's single-player path; policy is
+  ready for it). Persisted default via enqueue_mode property + set_enqueue_
+  mode (settings_store, validated through from_tag).
+- **Track ratings (0–5 stars) with durable FS-independent persistence** —
+  schema v5 adds tracks.rating + a path-keyed track_rating_by_path mirror
+  (same durability pattern as tags: survives rescans / id churn).
+  catalog::set_track_rating/track_rating/relink_ratings_by_path; scanner
+  calls the relink after each walk. MediaCmd::SetTrackRating →
+  MediaResult::TrackRating → last_rated_track/value qt_props +
+  set_track_rating qt_method. rating added to TrackSummary (name-based
+  column read, defaults 0 so narrower SELECTs don't break) and selected in
+  tracks_in_playlist. New reusable StarRating.qml (tap to set, tap current
+  top star to clear, optimistic + backend reconcile via rating_changed);
+  shown in playlist track rows. Tests: rating clamp/get/path-mirror +
+  relink-after-id-change (media now 59/59).
+
+Verified: rustcheck → bo-controller own-code clean (no errors/warnings) to
+Qt boundary across all touched files; queue_policy 9/9; media 59/59;
+bo-mux 323/323; QML braces balanced.
+
+NOTE: enqueue-mode picker UI (long-press menu on track rows) + FS-metadata
+write-back of ratings via lofty are the remaining follow-ons. The mode
+plumbing + persisted default are in place; sync/midgap await the layered
+player.

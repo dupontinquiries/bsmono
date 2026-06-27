@@ -188,3 +188,28 @@ staged) as a prerequisite so the surface layer is its own geometry.
 
 ## Dragon spawn density (operator note, r441)
 Some seeds spawn far too many dragons for playable gameplay. Add a spawn-density cap / per-region budget.
+
+## FUTURE IDEA — pretrained mob "brains" via evolved simvectors (operator, r464)
+Goal: when the player first sees a mob, it should ALREADY be competently adapted to its environment —
+not start learning from scratch. Approach to explore:
+- Give each mob a compact "brain" parameter vector (a "simvector" — weights/policy params for the
+  existing fauna FSM / perception / forage / predator-prey systems, or a tiny controller net).
+- Run an OFFLINE/background evolutionary sim (genetics already exists: sim/genetics, popdyn, predation,
+  forage_sim, ecology_population): evaluate simvectors in a fast headless world per biome/niche, select
+  for survival/feeding/evasion fitness, and breed. This is "brain evolution" — GA over controller params.
+- Persist the best simvector per (species, biome/habitat) as a PRETRAINED prior. At spawn (see r462
+  fauna_roster::pick_for_biome) seed the mob's brain from that prior (+ small mutation for individual
+  variation), so it's "smart within its environment as soon as the player sees them."
+- Ties to: fauna_roster (species/habitat), genetics (genome→phenotype), the §3b per-species FSM work,
+  and ai_budget (cheap inference at runtime). Headless eval can reuse the flatten-test harness pattern.
+- Open questions: brain representation (FSM-param vector vs tiny net), fitness function per niche, how
+  much to evolve offline vs cache, save format for priors, runtime cost of seeding at spawn.
+
+## WATER PHYSICS — next steps (r464 thinking)
+- Quench steam puff: inject into smoke_field at the quenched metal cell (map world→smoke-grid local) so the
+  hot-metal/water interaction is VISIBLE. Reuse the FireSource/step_smoke path.
+- Real-field water tint (r459 follow-up): feed actual climate/erosion (per-chunk uniform or mesher-baked) to the
+  chunk.frag tint instead of position proxies + the 0.15 erosion default.
+- Buoyancy/pressure pass for submerged bodies; hydrostatic push on entities by depth.
+- Hot metal/lava → water: extend water_react so a SUBMERGED hot-metal cell heats and boils the adjacent water
+  column (couple sim::hot_metal temp into the existing boil/steam path).

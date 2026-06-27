@@ -111,6 +111,7 @@ pub mod popgen;
 pub mod senses;
 pub mod landscape_memory;
 pub mod feeding;
+pub mod hot_metal;
 pub mod popdyn;
 pub mod forage_memory;
 pub mod forage_sim;

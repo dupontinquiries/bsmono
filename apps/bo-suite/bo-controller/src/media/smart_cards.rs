@@ -116,6 +116,7 @@ pub fn compatible_with(
         camelot: r.get(6)?,
         key_text: r.get(7)?,
         primary_artist: r.get(8)?,
+        rating: r.get::<_, i64>("rating").unwrap_or(0),
     });
 
     if seed_bpm.is_some() {

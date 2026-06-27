@@ -839,6 +839,10 @@ fn gpu_dispatcher_loop(
         // by record count) but good enough for the FPS-log "near"
         // line to track GPU-mesh trends.
         let per_chunk_us = if batch.is_empty() { 0 } else { dispatch_us / batch.len() as u64 };
+        // r463 (T1 triage): catch the catastrophic mesh hitches seen in log-r462 (near max=889ms).
+        if dispatch_us > 100_000 {
+            log::warn!("[mesh-stall] octree dispatch {}ms for {} chunks ({}us/chunk) — investigate this chunk batch", dispatch_us / 1000, batch.len(), per_chunk_us);
+        }
         for _ in &batch {
             mesher_timer.record(LodLevel::Near, per_chunk_us);
         }
@@ -1050,6 +1054,10 @@ fn octree_gpu_dispatcher_loop(
         let dispatch_us = t0.elapsed().as_micros() as u64;
 
         let per_chunk_us = if batch.is_empty() { 0 } else { dispatch_us / batch.len() as u64 };
+        // r463 (T1 triage): catch the catastrophic mesh hitches seen in log-r462 (near max=889ms).
+        if dispatch_us > 100_000 {
+            log::warn!("[mesh-stall] octree dispatch {}ms for {} chunks ({}us/chunk) — investigate this chunk batch", dispatch_us / 1000, batch.len(), per_chunk_us);
+        }
         for _ in &batch {
             mesher_timer.record(LodLevel::Near, per_chunk_us);
         }

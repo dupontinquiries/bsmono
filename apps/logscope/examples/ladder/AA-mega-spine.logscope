@@ -1,0 +1,226 @@
+# AA-mega-spine (MEGA) — a deliberately large spine (~180 builds) with periodic branches + widening,
+# to stress the BIGGER rooms (map_radius, multi-centerpiece counts, hall lengths). Generated.
+#
+> Build r116 — batch shader mini
+> Build r117 — vectorize crafting
+> Build r118 — seed grass instancing
+> Build r119 — fold inventory
+> Build r120 — inline audio bus
+> Build r121 — inline faction sim
+> Build r122 — simplify ai director
+> Build r123 — cache skybox
+> Build r124 — refactor lod system
+> Build r125 — batch kv bench
+> Build r126 — benchmark collision
+> Build r127 — parallelize survival bending
+:goto 8
+> alt — explore terrain erosion for r128
+> Build r129 — prune grass instancing
+> Build r130 — prune perf threading
+> Build r131 — cache economy
+> Build r132 — deepen inventory
+> Build r133 — stabilize post fx
+> Build r134 — parallelize particle field
+:3fa 2
+> Build r135 — harden kv bench
+> Build r136 — simplify fanout explore
+> Build r137 — harden crafting
+> Build r138 — inline faction sim
+> Build r139 — batch faction sim
+:goto 9
+> alt — explore save load for r140
+> Build r141 — benchmark pickup stress
+> Build r142 — document terrain erosion
+> Build r143 — tune particle field
+> Build r144 — refactor terrain erosion
+> Build r145 — harden multimodel
+> Build r146 — seed parser fill
+> Build r147 — tune weather
+> Build r148 — prune sort generics
+> Build r149 — benchmark ai director
+> Build r150 — document parser fill
+> Build r151 — batch survival bending
+:goto 11
+> alt — explore sort generics for r152
+> Build r153 — fold menu egui
+:3fa 2
+> Build r154 — seed menu egui
+> Build r155 — stream faction sim
+> Build r156 — harden nav mesh
+> Build r157 — simplify fanout explore
+> Build r158 — parallelize ai director
+> Build r159 — vectorize pick ranking
+> Build r160 — seed save load
+> Build r161 — inline survival bending
+> Build r162 — seed skybox
+> Build r163 — seed economy
+:goto 17
+> alt — explore menu egui for r164
+> Build r165 — refactor grass instancing
+> Build r166 — batch post fx
+> Build r167 — vectorize pick ranking
+> Build r168 — batch economy
+> Build r169 — tune multimodel
+> Build r170 — deepen pick ranking
+> Build r171 — harden economy
+:3fa 2
+> Build r172 — deepen kv bench
+> Build r173 — document ai director
+> Build r174 — seed particle field
+> Build r175 — stream lod system
+:goto 16
+> alt — explore lru cache for r176
+> Build r177 — prune ai director
+> Build r178 — widen kv bench
+> Build r179 — cache worldgen
+> Build r180 — widen faction sim
+> Build r181 — prune menu egui
+> Build r182 — inline kv bench
+> Build r183 — deepen menu egui
+> Build r184 — simplify fanout explore
+> Build r185 — prune ai director
+> Build r186 — parallelize sort generics
+> Build r187 — widen terrain erosion
+:goto 34
+> alt — explore early features for r188
+> Build r189 — simplify collision
+> Build r190 — parallelize faction sim
+:3fa 2
+> Build r191 — stabilize shader mini
+> Build r192 — vectorize particle field
+> Build r193 — benchmark survival bending
+> Build r194 — wire save load
+> Build r195 — document dialogue tree
+> Build r196 — batch perf threading
+> Build r197 — wire fanout explore
+> Build r198 — document lod system
+> Build r199 — tune multimodel
+:goto 29
+> alt — explore kv bench for r200
+> Build r201 — tune cave gen
+> Build r202 — profile survival bending
+> Build r203 — parallelize lru cache
+> Build r204 — tune perf threading
+> Build r205 — inline inventory
+> Build r206 — profile survival bending
+> Build r207 — harden sort generics
+> Build r208 — batch cave gen
+:3fa 2
+> Build r209 — stream nav mesh
+> Build r210 — benchmark lru cache
+> Build r211 — document lru cache
+:goto 77
+> alt — explore kv bench for r212
+> Build r213 — batch post fx
+> Build r214 — prune fog volume
+> Build r215 — cache parser fill
+> Build r216 — seed water sim
+> Build r217 — tune lod system
+> Build r218 — simplify grass instancing
+> Build r219 — fold worldgen
+# --- mid-run re-seed (context break) ---
+> Build r220 — deepen fanout explore
+> Build r221 — cache input remap
+> Build r222 — harden parser fill
+> Build r223 — simplify terrain erosion
+:goto 25
+> alt — explore nav mesh for r224
+> Build r225 — benchmark multimodel
+> Build r226 — wire particle field
+> Build r227 — inline kv bench
+:3fa 2
+> Build r228 — deepen save load
+> Build r229 — vectorize day cycle
+> Build r230 — refactor terrain erosion
+> Build r231 — batch lru cache
+> Build r232 — cache water sim
+> Build r233 — widen weather
+> Build r234 — vectorize skybox
+> Build r235 — benchmark menu egui
+:goto 7
+> alt — explore crafting for r236
+> Build r237 — profile weather
+> Build r238 — refactor pickup stress
+> Build r239 — batch faction sim
+> Build r240 — stabilize economy
+> Build r241 — stream early features
+> Build r242 — vectorize post fx
+> Build r243 — benchmark skybox
+> Build r244 — stabilize perf threading
+> Build r245 — parallelize survival bending
+:3fa 2
+> Build r246 — inline perf threading
+> Build r247 — batch quest graph
+:goto 94
+> alt — explore fog volume for r248
+> Build r249 — document texture atlas
+> Build r250 — inline ai director
+> Build r251 — prune terrain erosion
+> Build r252 — wire collision
+> Build r253 — stream kv bench
+> Build r254 — profile terrain erosion
+> Build r255 — parallelize survival bending
+> Build r256 — seed economy
+> Build r257 — refactor day cycle
+> Build r258 — vectorize crafting
+> Build r259 — profile fog volume
+:goto 14
+> alt — explore inventory for r260
+> Build r261 — stream faction sim
+> Build r262 — batch fanout explore
+> Build r263 — vectorize worldgen
+> Build r264 — harden skybox
+:3fa 2
+> Build r265 — stream faction sim
+> Build r266 — document menu egui
+> Build r267 — benchmark day cycle
+> Build r268 — harden cave gen
+> Build r269 — document kv bench
+> Build r270 — profile sort generics
+> Build r271 — fold survival bending
+:goto 39
+> alt — explore early features for r272
+> Build r273 — widen dialogue tree
+> Build r274 — benchmark collision
+> Build r275 — batch ai director
+> Build r276 — profile early features
+> Build r277 — parallelize lod system
+> Build r278 — parallelize economy
+> Build r279 — fold input remap
+> Build r280 — deepen pickup stress
+> Build r281 — fold economy
+> Build r282 — fold audio bus
+:3fa 2
+> Build r283 — wire faction sim
+:goto 66
+> alt — explore worldgen for r284
+> Build r285 — inline survival bending
+> Build r286 — stabilize kv bench
+> Build r287 — simplify day cycle
+> Build r288 — stream lru cache
+> Build r289 — fold day cycle
+> Build r290 — prune pickup stress
+> Build r291 — widen multimodel
+> Build r292 — tune weather
+> Build r293 — cache save load
+> Build r294 — harden skybox
+> Build r295 — benchmark terrain erosion
+:goto 95
+> alt — explore fanout explore for r296
+> Build r297 — batch pickup stress
+> Build r298 — inline skybox
+> Build r299 — benchmark inventory
+> Build r300 — wire dialogue tree
+> Build r301 — harden day cycle
+:3fa 2
+> Build r302 — stream skybox
+> Build r303 — wire sort generics
+> Build r304 — widen dialogue tree
+> Build r305 — inline sort generics
+> Build r306 — inline pickup stress
+> Build r307 — widen crafting
+:goto 37
+> alt — explore weather for r308
+> Build r309 — stream sort generics
+> Build r310 — benchmark texture atlas
+> Build r311 — parallelize crafting

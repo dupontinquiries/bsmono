@@ -29,7 +29,7 @@ pub fn textures_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("UNENDLICH_TEXTURES").map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+        std::env::var("UNENDLICH_TEXTURES").map(|v| v != "0" && !v.is_empty()).unwrap_or(true)
     })
 }
 

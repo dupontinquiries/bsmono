@@ -62,6 +62,10 @@ pub struct LayerConfig {
     pub swell_period_ms: Millis,
     #[serde(default)]
     pub swell_depth: f32,
+    /// Timing humanization 0..1 (fraction of inter-trigger step). See
+    /// soundscape::Layer::timing_jitter. Default 0 = exact grid timing.
+    #[serde(default)]
+    pub timing_jitter: f32,
 }
 
 /// Per-state layer weighting. Same shape as runtime SceneState but
@@ -324,6 +328,7 @@ pub fn compile(cfg: &SoundscapeConfig) -> Result<(Soundscape, HashMap<String, Re
             spread,
             swell_period_ms: lc.swell_period_ms,
             swell_depth: lc.swell_depth,
+            timing_jitter: lc.timing_jitter,
         }
     }).collect();
 
@@ -434,6 +439,7 @@ pub fn example_forest_5_1() -> SoundscapeConfig {
                 // Wind breathes: a ~45 s rise-and-fall swell, +/-25% gain.
                 swell_period_ms: 45000,
                 swell_depth: 0.25,
+                timing_jitter: 0.0,
             },
             LayerConfig {
                 name: "birds".to_string(),
@@ -451,6 +457,7 @@ pub fn example_forest_5_1() -> SoundscapeConfig {
                 duration_ms: Some(2500),
                 swell_period_ms: 0,
                 swell_depth: 0.0,
+                timing_jitter: 0.0,
             },
             LayerConfig {
                 name: "creek".to_string(),
@@ -468,6 +475,7 @@ pub fn example_forest_5_1() -> SoundscapeConfig {
                 duration_ms: Some(20000),
                 swell_period_ms: 0,
                 swell_depth: 0.0,
+                timing_jitter: 0.0,
             },
             LayerConfig {
                 name: "subharmonic".to_string(),
@@ -485,6 +493,7 @@ pub fn example_forest_5_1() -> SoundscapeConfig {
                 duration_ms: Some(40000),
                 swell_period_ms: 0,
                 swell_depth: 0.0,
+                timing_jitter: 0.0,
             },
         ],
         states: vec![

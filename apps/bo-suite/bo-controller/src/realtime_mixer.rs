@@ -88,11 +88,34 @@ impl Default for GroupParams {
 pub struct MixerParams {
     pub speaker:      GroupParams,
     pub instrumental: GroupParams,
+    /// Stereo width / spatializer, applied to the Side (S) component
+    /// after EQ. The mixer already decomposes to Mid/Side, so width is a
+    /// natural, near-free spatial control:
+    ///   * 1.0  → unchanged (the default; bit-identical to no spatializer)
+    ///   * >1.0 → wider — boosts the difference signal, pushing panned
+    ///            content further out (caps at MAX_WIDTH to stay sane)
+    ///   * 0.0  → mono — collapses to the center, fully phase-safe
+    /// Because width only scales S, a mono source (S≈0) is unaffected, and
+    /// the M (center: vocals/bass/kick) stays anchored at any width.
+    #[serde(default = "default_width")]
+    pub width: f32,
 }
+
+/// serde default so older saved configs (no `width`) load as 1.0 = off.
+fn default_width() -> f32 { 1.0 }
+
+/// Width is clamped to this range: 0 (mono) … 2.0 (double-wide). Beyond
+/// ~2× the side boost starts to sound phasey and hollow on most material,
+/// and risks clipping on re-encode, so we cap it.
+pub const MAX_WIDTH: f32 = 2.0;
 
 impl Default for MixerParams {
     fn default() -> Self {
-        Self { speaker: GroupParams::default(), instrumental: GroupParams::default() }
+        Self {
+            speaker: GroupParams::default(),
+            instrumental: GroupParams::default(),
+            width: 1.0,
+        }
     }
 }
 
@@ -408,6 +431,14 @@ impl RealtimeMixer {
         // 3. Volume per channel.
         let m_out = m_eq * self.params.speaker.volume;
         let s_out = s_eq * self.params.instrumental.volume;
+        // 3b. Spatializer: scale the Side component by the width factor.
+        //     width 1.0 is a no-op; >1 widens, 0 collapses to mono. Only
+        //     S is touched, so center content (M) stays put and a mono
+        //     source (S≈0) is unaffected. Clamped to [0, MAX_WIDTH].
+        let width = if self.params.width.is_finite() {
+            self.params.width.clamp(0.0, MAX_WIDTH)
+        } else { 1.0 };
+        let s_out = s_out * width;
         // 4. Re-encode to L/R. Inverse of step 1: L = M+S, R = M-S.
         let out_l = m_out + s_out;
         let out_r = m_out - s_out;
@@ -591,6 +622,77 @@ mod tests {
     }
 
     #[test]
+    fn width_unity_is_passthrough() {
+        // width 1.0 with flat EQ must be bit-identical to the input —
+        // the spatializer is genuinely off at its default.
+        let mut mixer = RealtimeMixer::new(48_000.0);
+        mixer.set_params(MixerParams { width: 1.0, ..Default::default() });
+        for (l, r) in [(0.3_f32, -0.7_f32), (0.5, 0.2), (-0.9, 0.9)] {
+            let (ol, or) = mixer.process(l, r);
+            assert!(approx_eq(ol, l, 1e-6) && approx_eq(or, r, 1e-6),
+                "unity width changed ({},{}) → ({},{})", l, r, ol, or);
+        }
+    }
+
+    #[test]
+    fn width_zero_collapses_to_mono() {
+        // width 0 → L and R become identical (the mid/center), the side
+        // is fully removed.
+        let mut mixer = RealtimeMixer::new(48_000.0);
+        mixer.set_params(MixerParams { width: 0.0, ..Default::default() });
+        let (ol, or) = mixer.process(0.8, -0.2);
+        assert!(approx_eq(ol, or, 1e-6), "width 0 should be mono: {} vs {}", ol, or);
+        // The mono value is the mid = (L+R)/2.
+        assert!(approx_eq(ol, 0.3, 1e-6), "mono should be (L+R)/2, got {}", ol);
+    }
+
+    #[test]
+    fn width_greater_than_one_widens_side() {
+        // A wider setting must increase the difference (L−R) relative to
+        // unity, since width scales the side component.
+        let inl = 0.6_f32; let inr = 0.1_f32;
+        let side_unity = {
+            let mut m = RealtimeMixer::new(48_000.0);
+            m.set_params(MixerParams { width: 1.0, ..Default::default() });
+            let (l, r) = m.process(inl, inr);
+            (l - r).abs()
+        };
+        let side_wide = {
+            let mut m = RealtimeMixer::new(48_000.0);
+            m.set_params(MixerParams { width: 1.8, ..Default::default() });
+            let (l, r) = m.process(inl, inr);
+            (l - r).abs()
+        };
+        assert!(side_wide > side_unity * 1.5,
+            "width 1.8 should widen the side: unity={} wide={}", side_unity, side_wide);
+    }
+
+    #[test]
+    fn width_leaves_mono_source_unchanged() {
+        // A centered (mono) source has no side content, so ANY width
+        // setting leaves it identical — widening silence is still silence.
+        for w in [0.0_f32, 1.0, 2.0] {
+            let mut m = RealtimeMixer::new(48_000.0);
+            m.set_params(MixerParams { width: w, ..Default::default() });
+            let (ol, or) = m.process(0.5, 0.5);   // L == R
+            assert!(approx_eq(ol, 0.5, 1e-6) && approx_eq(or, 0.5, 1e-6),
+                "mono source changed at width {}: ({},{})", w, ol, or);
+        }
+    }
+
+    #[test]
+    fn width_nan_is_treated_as_unity() {
+        // A corrupt (NaN) width must not poison the output — it falls
+        // back to unity, leaving the signal intact.
+        let mut m = RealtimeMixer::new(48_000.0);
+        m.set_params(MixerParams { width: f32::NAN, ..Default::default() });
+        let (ol, or) = m.process(0.4, -0.6);
+        assert!(ol.is_finite() && or.is_finite());
+        assert!(approx_eq(ol, 0.4, 1e-6) && approx_eq(or, -0.6, 1e-6),
+            "NaN width should pass through as unity, got ({},{})", ol, or);
+    }
+
+    #[test]
     fn biquad_peaking_zero_gain_is_identity() {
         // A peaking filter with 0 dB gain should pass the signal
         // through unchanged at all frequencies.
@@ -690,6 +792,7 @@ mod tests {
         mixer.set_params(MixerParams {
             speaker:      GroupParams { volume: 0.0, ..Default::default() },
             instrumental: GroupParams { volume: 1.0, ..Default::default() },
+            width: 1.0,
         });
         let mut buf: Vec<(f32, f32)> = (0..512).map(|i| {
             let t = i as f32 / 48_000.0;
@@ -712,6 +815,7 @@ mod tests {
         mixer.set_params(MixerParams {
             speaker:      GroupParams { volume: 1.0, ..Default::default() },
             instrumental: GroupParams { volume: 0.0, ..Default::default() },
+            width: 1.0,
         });
         let mut buf: Vec<(f32, f32)> = (0..512).map(|i| {
             let t = i as f32 / 48_000.0;
@@ -732,6 +836,7 @@ mod tests {
         mixer.set_params(MixerParams {
             speaker:      GroupParams { volume: 0.5, ..Default::default() },
             instrumental: GroupParams { volume: 1.0, ..Default::default() },
+            width: 1.0,
         });
         // Pure centered signal → halving speaker vol should halve output.
         let (lo, ro) = mixer.process(1.0, 1.0);
@@ -753,6 +858,7 @@ mod tests {
                 low_gain_db: 4.0, mid_gain_db: -4.0, high_gain_db: 6.0,
                 volume: 0.9,
             },
+            width: 1.0,
         });
         // 5 seconds of audio at 48k.
         let n = 48_000 * 5;
@@ -790,6 +896,7 @@ mod tests {
                     low_gain_db: -g, mid_gain_db: g, high_gain_db: -g * 0.5,
                     volume: 0.8,
                 },
+                width: 1.0,
             });
             for i in 0..480 {
                 let t = (step * 480 + i) as f32 / 48_000.0;
@@ -915,6 +1022,7 @@ mod tests {
                 mid_gain_db: 9.0, ..Default::default()
             },
             instrumental: GroupParams::default(),
+            width: 1.0,
         });
         let boosted_spk = mixer.speaker_response_db(SPK_MID_HZ);
         let boosted_ins = mixer.instrumental_response_db(SPK_MID_HZ);
@@ -934,6 +1042,7 @@ mod tests {
         mixer.set_params(MixerParams {
             speaker: GroupParams { volume: 0.5, ..Default::default() },
             instrumental: GroupParams::default(),
+            width: 1.0,
         });
         let halved = mixer.speaker_response_db(1000.0);
         // 20 log10 (0.5) ≈ -6.02
@@ -981,6 +1090,7 @@ mod tests {
                 low_gain_db: 3.0, mid_gain_db: 0.0, high_gain_db: 3.0,
                 volume: 0.9,
             },
+            width: 1.0,
         };
         let n = process_file_through_mixer(
             &tmp_in, &tmp_out, params, 96, |_| {}).unwrap();
@@ -1164,6 +1274,7 @@ mod tests {
                 low_gain_db: g(state), mid_gain_db: g(state),
                 high_gain_db: g(state), volume: v(state),
             },
+            width: 1.0,
         }
     }
 
