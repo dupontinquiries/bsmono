@@ -8,7 +8,6 @@ use parking_lot::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,8 +356,5 @@ impl VoiceService {
 /// Current epoch seconds. Falls back to 0 on clock skew (system
 /// time before UNIX epoch — shouldn't happen in practice).
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs()
+    }

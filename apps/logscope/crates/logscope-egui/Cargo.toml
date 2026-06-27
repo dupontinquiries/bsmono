@@ -5,6 +5,7 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
+core-kit = { path = "../../../../shared/core-kit" }
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
 # Asahi driver's max_color_attachments=5). glow sidesteps it.
 eframe = { optional = true, version = "0.34", default-features = false, features = [

@@ -328,11 +328,8 @@ fn default_path() -> PathBuf {
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs() as i64
+    }
 
 fn effective_count(entry: &CountedEntry, now: i64) -> f64 {
     let age = (now - entry.last_seen).max(0) as f64;

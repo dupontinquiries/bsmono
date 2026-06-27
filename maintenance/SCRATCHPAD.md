@@ -784,3 +784,27 @@ I/O (no phone/network). Logic is unit-tested; Qt wiring follows the existing
 Backend pattern exactly. User builds `cargo build -p gitmind-gui` on-device.
 [NOTE] discover/push/deploy are synchronous → the UI blocks during them (scan
 ~1-2s, build longer). Async (qt_signal from a worker thread) is a future polish.
+
+---
+## Kit-adoption sweep (this session)
+
+[voiceterm] voice.rs is_sane_transcription → voice_kit::hallucination::looks_like_speech.
+voice-kit's BAD_PHRASES is byte-identical to voiceterm's inline list and the length (2..=120)
++ >50% repetition rules match → EXACT behavior (verified on 8 branch-boundary cases). voiceterm
+rustcheck clean. Completes voiceterm's adoption of voice-kit's hallucination module.
+
+[core-kit::time sweep across 5 apps] Repointed 11 genuine epoch duplicates (the SystemTime::now()
+.duration_since(UNIX_EPOCH)…unwrap_or(0) pattern) to core_kit::time wrappers:
+  rusty-board ×4 (adaptive_dictionary, ngram, readiness, service)
+  bo-suite ×2 (scanner, library) · logscope ×2 (chatdump, providers)
+  av1tuner ×1 (job) · ambient-learner ×2 (screen_temp_hints, pin_store)
+i64 callers cast (core_kit::time::now_secs() as i64); now_ms bridged to now_millis. 6 crates
+gained the core-kit dep (depth-correct paths ../../ … ../../../../). 4 orphaned SystemTime/
+UNIX_EPOCH imports removed (scanner/library keep theirs — still used elsewhere).
+CRITICAL — 2 MONOTONIC helpers deliberately LEFT ALONE: rusty-board swipe.rs now_ms()
+(process_start().elapsed()) and bo-suite bt_respect.rs now_secs(&self) (session_start.elapsed())
+are Instant-based, not epoch — routing them to the wall clock would silently change meaning.
+All 5 apps rustcheck clean; wrapper targets verified against core-kit.
+
+[NOT swept] hex dup in bo-suite (1 file) — minor, deferred. peek dedup (gitmind/crates/peek ==
+tools/peek) left intentionally: deduping breaks apps-are-standalone.
