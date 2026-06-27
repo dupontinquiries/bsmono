@@ -23,20 +23,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Unix time in whole seconds, or 0 if the clock is before the
 /// epoch (shouldn't happen; matches the prior `.unwrap_or(0)`).
-pub fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+pub fn epoch_secs() -> u64 { core_kit::time::now_secs() }
 
 /// i64 variant (system_info stored timestamps as i64).
-pub fn epoch_secs_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+pub fn epoch_secs_i64() -> i64 { core_kit::time::now_secs() as i64 }
 
 /// FNV-1a 64-bit hash of a string. Tiny, dependency-free, good
 /// distribution. Used for content-addressed cache keys and stable

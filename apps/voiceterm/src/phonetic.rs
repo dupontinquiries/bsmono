@@ -240,9 +240,7 @@ fn db() -> &'static Mutex<Vec<Fingerprint>> {
     FP_DB.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn now_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn now_secs() -> u64 { core_kit::time::now_secs() }
 
 /// Add a fingerprint to the in-memory db. Allows up to MAX_PER_LABEL recordings
 /// of the same phrase. When over cap, drops the oldest with the lowest match_count.

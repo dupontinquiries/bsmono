@@ -64,9 +64,7 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn epoch_secs() -> u64 {
-    crate::util::epoch_secs()
-}
+fn epoch_secs() -> u64 { core_kit::time::now_secs() }
 
 /// Record a confirmed action: user spoke `text`, it parsed to intent kind `kind`,
 /// and they confirmed (executed) the action.

@@ -237,12 +237,7 @@ impl SessionManager {
 
 /// Seconds since the Unix epoch (saturating to 0 before 1970, which never
 /// happens in practice).
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+fn now_secs() -> u64 { core_kit::time::now_secs() }
 
 #[cfg(test)]
 mod tests {
