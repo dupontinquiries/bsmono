@@ -1,0 +1,14 @@
+[package]
+name = "share-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The opinionated shared MAILBOX, the layer above snapcore (DHT-as-host) + crypto-kit (group sealing). A two-layer content-addressed store — per-epoch feed buckets of pointers + content-addressed sealed blobs — generalized by an app-supplied namespace (snapclone groups, unendlich sessions). Durability scales with mailbox population."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+snapcore = { path = "../snapcore" }
+crypto-kit = { path = "../crypto-kit" }
+sha2 = "0.10"

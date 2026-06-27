@@ -424,3 +424,53 @@ NEXT (net-kit growth, mapped not built): http SERVER side (lift netserve serve/
 handle + photosync sync_server); generic UDP transport (abstract enlist's
 UdpTransport over encode/decode); then the Transport-trait question as a design
 item. THEN share-kit on top of snapcore+crypto-kit+net-kit.
+
+---
+## net-kit grows (encode/decode org + http server) + share-kit v0.1  (this session)
+
+[CODE] net-kit additions — still zero-dep, **22 tests --offline**:
+  - wire.rs: **Record** {tag, fields} + **to_line/parse** + the **Wire** trait
+    (to_record/from_record → encode/decode free). The "basic organization of
+    encode/decode": every line message is a TAG + esc'd fields; apps impl two
+    record methods instead of hand-rolling a format!/split match (the shape the
+    logscope Msg codec writes by hand). wire = TEXT line protocols; binary blobs
+    (share-kit) get their own framing.
+  - http.rs: SERVER side lifted from netserve — ServerRequest{method,path,query,
+    headers,body}+parse/header/token(Bearer|X-Api-Key)/query_param; ServerResponse
+    {status,reason,content_type,body}+text/json/to_wire; read_request (blocking
+    seam) + serve(listener,handler) accept loop (IO seam). Auth = handler's job via
+    auth::Keyring + req.token(). net-kit::http is now client+server.
+[DECISION] kept the "net-kit" name (it IS the plumbing crate; no rename). http
+lives in net-kit alongside the client. Server is single-threaded (one conn at a
+time) — thread at the call site for concurrency; netserve's Arc+thread-per-conn is
+the app-level pattern, not baked into the kit.
+
+[CODE] **shared/share-kit** v0.1 — the MAILBOX over snapcore+crypto-kit. Deps:
+snapcore(path)+crypto-kit(path)+sha2. **7 tests --offline** (crypto deps cached).
+  - keys.rs: content_hash(blob)=hex SHA-256 (64-hex); feed_key(ns,id,epoch)=
+    NodeId(SHA-256("{ns}:{id}:{epoch}")[..20]); blob_key(ch)=NodeId(SHA-256(
+    "blob:{ch}")[..20]). The "one layer up" hashing snapcore's store comment names.
+    BYTE-COMPAT with snapclone "group-feed:<g>:<e>" via namespace="group-feed".
+  - mailbox.rs: **Lifetime**{Durable,Ephemeral}+ttl_secs(30d/5m)+replicate();
+    **Backend** trait(put/get) + impl for snapcore::Store (local/test backing; the
+    networked DHT = production seam, not unit-tested); **Posting**{sender,key_index,
+    ciphertext}+to/from_bytes (binary length-prefixed — ciphertext is bytes, NOT
+    wire text); **Mailbox**{namespace,id}+post(seal→blob@blob_key + pointer→feed_
+    key)+fetch(poll feed→fetch blobs)+fetch_open(resolve MK via keyfn→open).
+  - **DHT-AS-HOST TWO-LAYER REALIZED**: per-epoch feed bucket (multi-value
+    pointers) + content-addressed blob swarm. Durability = population.
+  - HEADLINE TEST post_then_read_recovers_plaintext_for_a_fresh_reader: sender
+    export_root@idx0 (the distributed sender key) → next_message_key→(0,mk0) → post;
+    a FRESH reader holding only mailbox id + root0 does SenderChain::from_root(root0)
+    .message_key_for(0)→mk0 → opens "hello world". Proves feed→blob→open + content-
+    addressing + the epoch-root→per-message-key derivation end to end.
+  - next_epoch_feed_is_empty_until_posted: epoch in the feed key ⇒ rekey to epoch+1
+    starts empty (removed member computing the epoch+1 key string reads nothing).
+
+NEXT (share-kit growth, mapped not built): the NETWORKED Backend (iterative
+lookup_value + store-to-closest over a Transport) replacing local-Store; cluster
+replication wiring (snapcore::cluster::replicate_to_cluster for Durable = the
+network seam); SenderChain epoch mgmt + seal_sender_key fan-out onto the snapcore
+cluster roster (announce co-members = seal-to set); a higher Channel/Group over
+the mailbox. Then snapclone ADOPTS share-kit (epoch-gated cutover; group-feed
+namespace = byte-compat keys).

@@ -123,3 +123,196 @@ mod tests {
         assert_eq!(r.body, "body");
     }
 }
+
+// ── server side: parse an incoming request, build a response, serve a socket ────
+//
+// Lifted from netserve's HTTP/1.1 server (the LAN control plane). The parser and
+// builder are PURE and tested; the accept/read loop is the IO seam. Auth is the
+// handler's job via [`crate::auth::Keyring`] and [`ServerRequest::token`].
+
+use std::net::TcpListener;
+
+/// An incoming request, parsed server-side: method, path (query split off),
+/// headers, body. The mirror of [`Request`] (client-side).
+pub struct ServerRequest {
+    pub method: String,
+    pub path: String,
+    pub query: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl ServerRequest {
+    /// Parse one request's raw bytes (head + body split on the blank line).
+    pub fn parse(raw: &[u8]) -> Option<ServerRequest> {
+        let sep = find_subslice(raw, b"\r\n\r\n")?;
+        let head = std::str::from_utf8(&raw[..sep]).ok()?;
+        let body = raw[sep + 4..].to_vec();
+        let mut lines = head.split("\r\n");
+        let mut start = lines.next()?.split_whitespace();
+        let method = start.next()?.to_string();
+        let target = start.next()?;
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target.to_string(), String::new()),
+        };
+        let headers = lines
+            .filter_map(|l| l.split_once(": ").map(|(k, v)| (k.to_string(), v.to_string())))
+            .collect();
+        Some(ServerRequest { method, path, query, headers, body })
+    }
+
+    /// A header value by name (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// A bearer token: `Authorization: Bearer <t>`, or an `X-Api-Key` header.
+    pub fn token(&self) -> Option<&str> {
+        self.header("authorization")
+            .and_then(|a| a.strip_prefix("Bearer "))
+            .or_else(|| self.header("x-api-key"))
+    }
+
+    /// A `name=value` query parameter.
+    pub fn query_param(&self, name: &str) -> Option<&str> {
+        self.query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == name).then_some(v)
+        })
+    }
+}
+
+/// A response to build server-side.
+pub struct ServerResponse {
+    pub status: u16,
+    pub reason: String,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+impl ServerResponse {
+    pub fn text(status: u16, reason: &str, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.to_string(),
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: body.into().into_bytes(),
+        }
+    }
+    pub fn json(status: u16, reason: &str, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            reason: reason.to_string(),
+            content_type: "application/json".to_string(),
+            body: body.into().into_bytes(),
+        }
+    }
+    /// Serialize to the raw HTTP/1.1 response bytes.
+    pub fn to_wire(&self) -> Vec<u8> {
+        let head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            self.status,
+            self.reason,
+            self.content_type,
+            self.body.len()
+        );
+        let mut out = head.into_bytes();
+        out.extend_from_slice(&self.body);
+        out
+    }
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Read one full request off a stream: headers to the blank line, then the
+/// `Content-Length` body. The blocking read seam.
+pub fn read_request(stream: &mut impl Read) -> Option<ServerRequest> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = stream.read(&mut chunk).ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(p) = find_subslice(&buf, b"\r\n\r\n") {
+            let head = std::str::from_utf8(&buf[..p]).ok()?;
+            let clen = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(": ")?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while buf.len() < p + 4 + clen {
+                let n = stream.read(&mut chunk).ok()?;
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            break;
+        }
+    }
+    ServerRequest::parse(&buf)
+}
+
+/// Serve forever on `listener`: read each request, call `handler`, write its
+/// response. Single-threaded (one connection at a time) — the simplest correct
+/// server; thread the handler at the call site for concurrency. IO seam.
+pub fn serve(listener: TcpListener, mut handler: impl FnMut(&ServerRequest) -> ServerResponse) {
+    for stream in listener.incoming().flatten() {
+        let mut stream = stream;
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+        if let Some(req) = read_request(&mut stream) {
+            let resp = handler(&req);
+            let _ = stream.write_all(&resp.to_wire());
+        }
+        let _ = stream.flush();
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn parses_method_path_query_headers_body_and_token() {
+        let raw = b"POST /generate?max=64 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer s3cret\r\nContent-Length: 5\r\n\r\nhello";
+        let r = ServerRequest::parse(raw).unwrap();
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.path, "/generate");
+        assert_eq!(r.query_param("max"), Some("64"));
+        assert_eq!(r.header("host"), Some("x"));
+        assert_eq!(r.token(), Some("s3cret"));
+        assert_eq!(r.body, b"hello");
+    }
+
+    #[test]
+    fn response_wire_has_status_line_and_content_length() {
+        let wire = ServerResponse::json(404, "Not Found", "{\"e\":1}").to_wire();
+        let s = String::from_utf8(wire).unwrap();
+        assert!(s.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(s.contains("Content-Type: application/json\r\n"));
+        let (head, body) = s.split_once("\r\n\r\n").unwrap();
+        let cl: usize = head.lines().find_map(|l| l.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
+        assert_eq!(cl, body.len());
+    }
+
+    #[test]
+    fn auth_via_keyring_rejects_then_accepts() {
+        let keys = crate::auth::Keyring::new(vec!["good".into()]);
+        let ok = ServerRequest::parse(b"GET /x HTTP/1.1\r\nX-Api-Key: good\r\n\r\n").unwrap();
+        assert!(keys.accepts(ok.token().unwrap_or("").as_bytes()));
+        let bad = ServerRequest::parse(b"GET /x HTTP/1.1\r\n\r\n").unwrap();
+        assert!(!keys.accepts(bad.token().unwrap_or("").as_bytes()));
+    }
+}
