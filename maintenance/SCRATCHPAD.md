@@ -598,3 +598,40 @@ level::rms + pitch. Modest but real — rusty-board joins the audio-kit consumer
 pivots = deliberate letter stops). Symptom not yet specified — need the failure
 mode before diving. Candidate future: a voice-kit shared by rusty-board + voiceterm
 (both whisper voice apps).
+
+---
+## voice-kit v0.1 + kitfinder bundle export + swipe breadcrumb  (this session)
+
+[CODE] **shared/voice-kit** v0.1 — zero-dep whisper-voice TEXT+MODEL layer, **10
+tests --offline**. The pure logic rusty-board (voice keyboard) + voiceterm/web2qml
+both apply AROUND whisper. Sits beside audio-kit (the SIGNAL layer); whisper-rs
+binding + mic capture stay in the apps.
+  - hallucination.rs = the UNION (rusty-board's hallucination.rs even credits
+    voiceterm's filler_words.rs): is_hallucination (canonical-list exact match) +
+    strip_trailing_artifacts ([BLANK_AUDIO]-off-the-end) from RUSTY-BOARD; +
+    trim_hallucination_loop (repeated-shingle collapse) + looks_like_speech
+    (length/repetition/bad-phrase gate) from VOICETERM. Merged lists. NOTE: the
+    lifted loop-trimmer has a faithful quirk — exclusive bound `0..(len-window*3)`
+    means a shingle repeating exactly 3× and filling the whole string isn't caught
+    (needs one extra token); kept as-is (lift fidelity), tests match.
+  - model.rs = ggml resolution generalized from rusty-board model_path.rs: MODEL_
+    CANDIDATES (quantized .gguf > .bin > fp16, base>tiny) + find_model_in(dirs,env)
+    (app supplies dirs) + Variant::from_filename (size/.en/quant parse).
+[DECISION] voice-kit is ZERO-DEP for v0.1 (text+fs only). A future VAD gate is the
+one place it'd gain an audio-kit dep (rms threshold + hangover).
+[CONSUMERS] rusty-board src/voice/ + voiceterm src/voice.rs (both working great in
+latest per user) → repoint to voice-kit. Future: VAD gate over audio-kit::level.
+
+[EXPORT] **kitfinder.bundle** built (standalone git bundle: Cargo.toml + main.rs +
+README incl. a "hunt a multi-world bug" section) → handed to the user to pass to
+the sister unendlich conversation. The README explains: run kitfinder on unendlich,
+near-dup families surface a diverged copy of per-world logic (the bug often lives
+in the 0.8–0.95-similar odd-one-out). Presented via outputs.
+
+[BREADCRUMB] patches/rusty-board-swipe-regression.NOTES.md — swipe worked in an
+EARLY iteration (strong core), broke from perf+leniency+features, never recovered.
+Good core believed between commits 876a0fa..7d3efea (rusty-board-git.zip uploaded;
+apps/rusty-board = latest broken HEAD; the 17 range-commits don't touch swipe.rs/
+recognizer.rs by name → inspect the whole gestures/ at the endpoints). FUTURE:
+recover core via bisect/diff; reusable primitive = a swipe/touch-kit (path→keys→
+words). NOT active now.

@@ -1,0 +1,11 @@
+[package]
+name = "voice-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared whisper-voice post-processing + model resolution for the monorepo: filtering whisper hallucinations (silence-phrases, [BLANK_AUDIO] artifacts, repeated-shingle loops) and resolving/identifying ggml models. The pure text + model layer that rusty-board (voice keyboard) and voiceterm/web2qml (voice terminal) both apply around whisper; the signal-level math lives in audio-kit. Zero-dependency."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
