@@ -214,11 +214,7 @@ impl Default for Separator {
     fn default() -> Self { Self::new() }
 }
 
-fn compute_rms(audio: &[f32]) -> f32 {
-    if audio.is_empty() { return 0.0; }
-    let sum_sq: f32 = audio.iter().map(|&s| s * s).sum();
-    (sum_sq / audio.len() as f32).sqrt()
-}
+fn compute_rms(audio: &[f32]) -> f32 { audio_kit::level::rms(audio) }
 
 /// Match profile against registered speakers at the per-chunk threshold.
 ///

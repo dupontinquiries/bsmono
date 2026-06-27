@@ -674,3 +674,32 @@ net-kit; html/xml/toml/path=general text) → needs a where-does-it-live decisio
 not a quick build. App repoints are the remaining payoff but un-verifiable in
 sandbox (stale apps, heavy deps). voiceterm loop-trimmer off-by-one (found earlier)
 is a fix-at-source-when-repointing item.
+
+---
+## App→kit repoints — first apps onto the kits  (this session)
+
+Synced all apps to sister-latest (commit 1), then repointed the clean kit
+consumers (commit 2). The 5 repoint-target files were byte-identical sister↔
+monorepo (the sister conversations worked elsewhere — spatializers, swipe, biomes),
+so the repoints are correct against what the user builds.
+
+[REPOINTS — verified via standalone harness crates, `cargo check` green vs the kits]
+  - bo-suite `audio_features.rs` (bo-mux + bo-controller, byte-identical) → SHIM:
+    `pub use audio_kit::goertzel::{spectrogram, spectrogram_at_freqs, SpectrogramConfig};`
+    + `engine_timbre_score` kept local (built programmatically from the existing fn,
+    `use audio_kit::goertzel::goertzel as goertzel_mag;` injected → zero body changes).
+    This is the headline: the 27K-token audio_features duplicate audio-kit absorbed.
+  - bo-controller `podcast_diar.rs` rms + voiceterm `separation.rs` compute_rms →
+    1-line wrappers over `audio_kit::level::rms` (name kept, call sites unchanged).
+  - rusty-board `voice/hallucination.rs` → SHIM:
+    `pub use voice_kit::hallucination::{is_hallucination, strip_trailing_artifacts};`
+    (callers in ui/window.rs unchanged; voice-kit's fns ARE rusty-board's, behavior-preserving).
+  - Cargo deps added: audio-kit to bo-mux/bo-controller/voiceterm; voice-kit to rusty-board.
+
+[CAN'T verify in-sandbox] full app builds (Qt/GTK). Harness crates prove the kit-
+integration surface compiles; user builds+runs the apps via GUI to confirm the rest.
+
+[FOLLOW-UP repoints] voiceterm `voice.rs` hallucination fns (embedded in the big
+file, not a module → place to fix the loop-trimmer off-by-one at source); unendlich
+worldgen RNG → core_kit::rng (opt-in, changes sequence); the scattered now_ms/hex
+app copies → core-kit. Plus the only-in-monorepo reconcile (SISTER_STATUS.md).

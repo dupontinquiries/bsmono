@@ -4,6 +4,7 @@ version = "0.1.879"
 edition = "2021"
 
 [dependencies]
+audio-kit = { path = "../../shared/audio-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }
