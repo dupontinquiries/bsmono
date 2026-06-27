@@ -18,6 +18,18 @@ Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
 
 All build & test `--offline` (crypto-kit/share-kit need the cached crates.io deps).
 
+## App repoints (the payoff) — STATUS
+
+- [x] bo-suite audio_features.rs (both copies) → audio-kit shim (+ engine_timbre_score local).
+- [x] bo-controller podcast_diar rms + voiceterm separation rms → audio_kit::level::rms.
+- [x] rusty-board voice/hallucination.rs → voice-kit shim.
+- [x] Verified: standalone harness crates cargo-check green vs the kits.
+- [ ] User builds + runs all apps via GUI to confirm full builds (Qt/GTK, not sandbox-buildable).
+- [ ] voiceterm voice.rs hallucination fns → voice-kit (embedded; + fix loop-trimmer off-by-one at source).
+- [ ] unendlich worldgen RNG → core_kit::rng (opt-in — changes sequence).
+- [ ] scattered now_ms / hex app copies → core-kit (follow-up sweep).
+- [ ] reconcile only-in-monorepo dead files in synced apps (see maintenance/SISTER_STATUS.md).
+
 ## In-flight / next on the kits
 
 - [x] core-kit dogfooded: share-kit hex → core_kit::hex (first kit-to-kit dep, verified).

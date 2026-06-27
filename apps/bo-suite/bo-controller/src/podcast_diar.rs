@@ -107,11 +107,7 @@ pub fn resample_linear(signal: &[f32], src_sr: u32, dst_sr: u32) -> Vec<f32> {
 }
 
 /// RMS of a frame.
-fn rms(frame: &[f32]) -> f32 {
-    if frame.is_empty() { return 0.0; }
-    let sum: f32 = frame.iter().map(|&s| s * s).sum();
-    (sum / frame.len() as f32).sqrt()
-}
+fn rms(frame: &[f32]) -> f32 { audio_kit::level::rms(frame) }
 
 /// Zero-crossing rate of a frame: fraction of consecutive samples
 /// that have opposite signs. Voiced speech sits in a moderate range;
