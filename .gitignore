@@ -23,3 +23,5 @@ __pycache__/
 *.spv
 **/target/
 node_modules/
+*-linux-x64
+*-linux-aarch64
