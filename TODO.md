@@ -12,6 +12,7 @@ Living checklist. Companion to `maintenance/SCRATCHPAD.md` (design log) and
 | crypto-kit | PQ-hybrid + sign + AEAD + group ratchet/seal | ✅ built, 36 tests |
 | net-kit | transport plumbing: auth / wire / json / http (client+server) | ✅ built, 22 tests |
 | share-kit | the MAILBOX over snapcore + crypto-kit (DHT-as-host two-layer) | ✅ v0.1, 7 tests |
+| audio-kit | DSP primitives: level / goertzel+spectrogram / pitch / window / gen | ✅ v0.1, 25 tests |
 
 All build & test `--offline` (crypto-kit/share-kit need the cached crates.io deps).
 
@@ -33,6 +34,13 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
       hand-rolled HTTP + percent-codec → net-kit; snapclone-crypto/group →
       crypto-kit; snapclone groups → share-kit (epoch-gated cutover; feed
       `namespace="group-feed"` gives byte-compatible keys).
+
+- [ ] **audio-kit consumers** (the payoff): repoint bo-suite `audio_features`
+      → audio-kit (delete both copies); voiceterm/snapclone-audio `rms`; wire
+      logscope voice-reaction level/voicing gate; unendlich synthesis on `gen`.
+- [ ] **bo-dsp split** (app-local, NOT a kit): bo-suite's drone/passby cancellers
+      (~27K tok beyond audio_features, bo-controller↔bo-mux) are STRATEGIES — pull
+      into a bo-internal shared crate/module that consumes audio-kit primitives.
 
 ## patches/ (sister-session rendezvous)
 

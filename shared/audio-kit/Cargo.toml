@@ -1,0 +1,11 @@
+[package]
+name = "audio-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared DSP primitives for the monorepo: signal level (RMS/peak/dB), the Goertzel magnitude + a Goertzel-based narrow-band spectrogram, fundamental-frequency (pitch) estimation, analysis windows, and tone/noise generators. Zero-dependency (std + f32 math). The leaf audio building blocks beneath each app's strategies — rusty-board (bo-suite) cancellers/masker, voiceterm/web2qml separation + voice features, logscope voice reactions, unendlich game-audio synthesis."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
