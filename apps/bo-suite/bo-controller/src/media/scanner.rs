@@ -578,8 +578,8 @@ pub fn analyze_pending(
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
-}
+        core_kit::time::now_secs() as i64
+    }
 
 #[cfg(test)]
 mod tests {

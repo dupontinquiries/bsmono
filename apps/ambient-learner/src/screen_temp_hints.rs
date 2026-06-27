@@ -42,7 +42,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -197,11 +196,8 @@ fn parse_hint_file(path: &Path) -> Option<ResolutionHint> {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs() as i64
+    }
 
 /// Decide the grid resolution to publish at, given:
 ///   * `n_sensors`: how many sensors we have point readings for

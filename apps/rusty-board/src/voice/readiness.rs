@@ -34,7 +34,6 @@
 //! so steady-state idle keyboards don't hold the model or poll fast.
 
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Readiness state. Ordered by "hotness" so we can compare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,11 +181,8 @@ impl VoiceReadinessFsm {
 
 /// Current epoch seconds.
 fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs()
+    }
 
 /// Process-wide singleton.
 pub fn global() -> &'static VoiceReadinessFsm {

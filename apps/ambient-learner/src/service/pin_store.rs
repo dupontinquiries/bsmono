@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -170,11 +170,8 @@ fn pins_equivalent(a: &MapPin, b: &MapPin) -> bool {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+        core_kit::time::now_secs() as i64
+    }
 
 /// Used internally by tests.
 #[allow(dead_code)]
