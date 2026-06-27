@@ -65,7 +65,7 @@ pub fn trim_hallucination_loop(s: &str) -> String {
         if window * 3 > words.len() {
             break;
         }
-        for start in 0..(words.len() - window * 3) {
+        for start in 0..=(words.len() - window * 3) {
             let first = &words[start..start + window];
             let mut runs = 1;
             let mut pos = start + window;
@@ -239,6 +239,9 @@ mod tests {
         );
         // loop whose shingle carries a comma → comma stripped from the kept copy
         assert_eq!(trim_hallucination_loop("stop now, stop now, stop now, end here"), "stop now");
+        // exact-fill: shingle repeating exactly 3x and filling the whole string —
+        // the off-by-one case; only caught with an inclusive loop bound.
+        assert_eq!(trim_hallucination_loop("go left go left go left"), "go left");
         // no clear loop → unchanged
         assert_eq!(
             trim_hallucination_loop("the quick brown fox jumps over"),

@@ -849,9 +849,7 @@ fn extract_action(text: &str) -> Option<String> {
 
 // ─── Date parsing ──────────────────────────────────────────────────
 
-fn epoch_secs() -> i64 {
-    crate::util::epoch_secs_i64()
-}
+fn epoch_secs() -> i64 { core_kit::time::now_secs() as i64 }
 
 fn days_since_epoch() -> i64 {
     epoch_secs() / 86400

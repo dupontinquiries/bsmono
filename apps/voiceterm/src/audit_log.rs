@@ -264,11 +264,7 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+fn now_ms() -> u64 { core_kit::time::now_millis() }
 
 /// Compute SHA-256 of a string, return lowercase hex.
 ///
