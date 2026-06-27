@@ -760,3 +760,27 @@ Added core-kit + voice-kit deps; cleaned dead `use std::time::{SystemTime,UNIX_E
 20 files, net -97 lines. Verified via harness crate (wrapper shapes cargo-check clean
 vs core-kit + voice-kit); voiceterm itself is Qt-blocked in-sandbox. Inline non-fn
 time uses in audit_log:617 / phonetic:84 left (not extractable as simple wrappers).
+
+---
+## GUI deploy cockpit  (this session)
+
+Goal (user): build the gin GUI on laptop + phone, and from the GUI discover SSH
+devices → push the monorepo to a picked folder → get a .desktop launcher on
+Plasma Mobile. The GUI already had the back half (app_install/app_desktop via
+gitmind_core::binpin::write_desktop); added the front half.
+
+[NEW] apps/gitmind/crates/gui/src/deploy.rs — pure std (no Qt), 7 unit tests:
+local_subnet24 (UDP-route trick), scan_ssh (threaded /24 port-22), list_remote_dirs
+(ssh cd+pwd+ls, returns absolute pwd + subdirs), push_repo (rsync -az --exclude
+target/), remote_deploy_cmd/deploy_app (ssh: cargo build → gin import → gin app
+install --use --desktop). Command builders split out so they're asserted without
+network.
+[WIRED] Backend gains 4 qt_methods (discover_devices/list_remote_dirs/push_repo/
+deploy_app) wrapping deploy::*; Deploy.qml is the touch UI (discover → device list
+→ folder picker → push + build/launcher); registered in qrc!, added to main.qml
+SwipeView + tab bar. gui crate rustcheck CLEAN.
+[CAN'T VERIFY HERE] the Qt build (no Qt6 in sandbox) + the actual ssh/rsync/scan
+I/O (no phone/network). Logic is unit-tested; Qt wiring follows the existing
+Backend pattern exactly. User builds `cargo build -p gitmind-gui` on-device.
+[NOTE] discover/push/deploy are synchronous → the UI blocks during them (scan
+~1-2s, build longer). Async (qt_signal from a worker thread) is a future polish.
