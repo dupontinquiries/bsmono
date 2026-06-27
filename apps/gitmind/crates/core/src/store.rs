@@ -58,6 +58,8 @@ const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("blobs");
 // ref name → git oid so branches/tags survive too.
 const OBJECTS: TableDefinition<&str, &[u8]> = TableDefinition::new("objects");
 const REFS: TableDefinition<&str, &str> = TableDefinition::new("refs");
+/// Per-commit build/check status, JSON-encoded, keyed by commit oid.
+const CHECKS: TableDefinition<&str, &[u8]> = TableDefinition::new("checks");
 
 /// git object kinds, as stored in the OBJECTS table.
 pub const KIND_COMMIT: u8 = 1;
@@ -126,8 +128,49 @@ pub struct IngestReport {
     pub media: MediaKind,
 }
 
+/// Outcome of a delta repack pass.
+#[derive(Clone, Debug)]
+pub struct RepackReport {
+    pub chunks_scanned: usize,
+    pub chunks_deltified: usize,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+}
+
 pub struct ChunkStore {
     db: Database,
+}
+
+/// Decode a stored chunk value. Plain chunks are a bare zstd frame (first
+/// byte 0x28). A delta chunk is tagged `'D'` and stores
+/// `'D' || base_oid(32) || u32_le len || zstd(raw, dict = base raw)`; we
+/// reconstruct the base (recursively, depth-guarded) and zstd-decode against
+/// it. This is how cross-file similarity becomes storage savings. `get`
+/// returns a base chunk's stored (still-encoded) value by oid.
+fn decode_chunk(
+    value: &[u8],
+    get: &dyn Fn(&[u8]) -> Result<Option<Vec<u8>>, String>,
+    depth: u8,
+) -> Result<Vec<u8>, String> {
+    if value.first() == Some(&b'D') {
+        if depth > 16 {
+            return Err("delta chain too deep".into());
+        }
+        if value.len() < 37 {
+            return Err("corrupt delta chunk".into());
+        }
+        let base_oid = &value[1..33];
+        let len = u32::from_le_bytes(value[33..37].try_into().unwrap()) as usize;
+        let payload = &value[37..];
+        let base_comp = get(base_oid)?.ok_or("missing delta base chunk")?;
+        let base_raw = decode_chunk(&base_comp, get, depth + 1)?;
+        zstd::bulk::Decompressor::with_dictionary(&base_raw)
+            .map_err(|e| e.to_string())?
+            .decompress(payload, len)
+            .map_err(|e| format!("undelta: {e}"))
+    } else {
+        zstd::decode_all(value).map_err(|e| format!("unzstd: {e}"))
+    }
 }
 
 impl ChunkStore {
@@ -143,6 +186,7 @@ impl ChunkStore {
             { w.open_table(BLOBS).map_err(|e| e.to_string())?; }
             { w.open_table(OBJECTS).map_err(|e| e.to_string())?; }
             { w.open_table(REFS).map_err(|e| e.to_string())?; }
+            { w.open_table(CHECKS).map_err(|e| e.to_string())?; }
             w.commit().map_err(|e| e.to_string())?;
         }
         Ok(ChunkStore { db })
@@ -230,13 +274,19 @@ impl ChunkStore {
         drop(raw);
 
         let chunks = r.open_table(CHUNKS).map_err(|e| e.to_string())?;
+        let get = |oid: &[u8]| -> Result<Option<Vec<u8>>, String> {
+            Ok(chunks
+                .get(oid)
+                .map_err(|e| e.to_string())?
+                .map(|g| g.value().to_vec()))
+        };
         let mut written: u64 = 0;
         for coid in &manifest.chunks {
             let comp = chunks
                 .get(coid.0.as_slice())
                 .map_err(|e| e.to_string())?
                 .ok_or_else(|| format!("missing chunk {}", coid.short()))?;
-            let data = zstd::decode_all(comp.value()).map_err(|e| format!("unzstd: {e}"))?;
+            let data = decode_chunk(comp.value(), &get, 0)?;
             writer.write_all(&data).map_err(|e| e.to_string())?;
             written += data.len() as u64;
         }
@@ -249,6 +299,105 @@ impl ChunkStore {
         let mut buf = Vec::new();
         self.restore(blob_oid, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Compact the underlying redb file, reclaiming pages freed by repack/
+    /// overwrites/deletes. redb grows in pages and doesn't shrink the file in
+    /// place, so this is what actually returns disk to the OS. Returns whether
+    /// compaction moved anything.
+    pub fn compact(&mut self) -> Result<bool, String> {
+        self.db.compact().map_err(|e| format!("compact: {e}"))
+    }
+
+    /// Offline cross-file delta repack. Groups near-identical chunks (cheap
+    /// length+prefix buckets), picks the largest in each group as a base, and
+    /// re-encodes the rest in place as zstd-dictionary deltas when that saves
+    /// at least `min_gain` (0.0–1.0) of the chunk's stored size. Bases stay
+    /// plain, so delta depth is 1 and restore cost stays bounded. Oids are
+    /// unchanged — this is pure storage compression. Returns before/after
+    /// stored-byte totals.
+    pub fn repack(&self, min_gain: f64) -> Result<RepackReport, String> {
+        use std::collections::HashMap;
+        // 1. Snapshot every chunk (oid, stored bytes, decoded raw, is_delta).
+        let mut all: Vec<(Vec<u8>, usize, Vec<u8>, bool)> = Vec::new();
+        {
+            let r = self.db.begin_read().map_err(|e| e.to_string())?;
+            let chunks = r.open_table(CHUNKS).map_err(|e| e.to_string())?;
+            let get = |oid: &[u8]| -> Result<Option<Vec<u8>>, String> {
+                Ok(chunks.get(oid).map_err(|e| e.to_string())?.map(|g| g.value().to_vec()))
+            };
+            for item in chunks.iter().map_err(|e| e.to_string())? {
+                let (k, v) = item.map_err(|e| e.to_string())?;
+                let oid = k.value().to_vec();
+                let comp = v.value().to_vec();
+                let is_delta = comp.first() == Some(&b'D');
+                let raw = decode_chunk(&comp, &get, 0)?;
+                all.push((oid, comp.len(), raw, is_delta));
+            }
+        }
+        let bytes_before: u64 = all.iter().map(|(_, c, _, _)| *c as u64).sum();
+        let scanned = all.len();
+
+        // 2. Bucket plain chunks by (length band, leading bytes).
+        let mut buckets: HashMap<(usize, [u8; 12]), Vec<usize>> = HashMap::new();
+        for (i, (_, _, raw, is_delta)) in all.iter().enumerate() {
+            if *is_delta {
+                continue;
+            }
+            let mut pre = [0u8; 12];
+            let n = raw.len().min(12);
+            pre[..n].copy_from_slice(&raw[..n]);
+            buckets.entry((raw.len() / 256, pre)).or_default().push(i);
+        }
+
+        // 3. Within each bucket, delta members against the largest one.
+        let mut reencode: Vec<(usize, Vec<u8>)> = Vec::new();
+        for idxs in buckets.values() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            let base_i = *idxs.iter().max_by_key(|&&i| all[i].2.len()).unwrap();
+            let base_raw = all[base_i].2.clone();
+            let mut comp = zstd::bulk::Compressor::with_dictionary(ZSTD_LEVEL, &base_raw)
+                .map_err(|e| e.to_string())?;
+            for &i in idxs {
+                if i == base_i {
+                    continue;
+                }
+                let payload = comp.compress(&all[i].2).map_err(|e| format!("delta zstd: {e}"))?;
+                let new_size = 1 + 32 + 4 + payload.len();
+                if (new_size as f64) < (all[i].1 as f64) * (1.0 - min_gain) {
+                    let mut val = Vec::with_capacity(new_size);
+                    val.push(b'D');
+                    val.extend_from_slice(&all[base_i].0);
+                    val.extend_from_slice(&(all[i].2.len() as u32).to_le_bytes());
+                    val.extend_from_slice(&payload);
+                    reencode.push((i, val));
+                }
+            }
+        }
+
+        // 4. Commit the re-encodes.
+        let deltified = reencode.len();
+        let mut saved: u64 = 0;
+        if !reencode.is_empty() {
+            let w = self.db.begin_write().map_err(|e| e.to_string())?;
+            {
+                let mut t = w.open_table(CHUNKS).map_err(|e| e.to_string())?;
+                for (i, val) in &reencode {
+                    saved += all[*i].1.saturating_sub(val.len()) as u64;
+                    t.insert(all[*i].0.as_slice(), val.as_slice()).map_err(|e| e.to_string())?;
+                }
+            }
+            w.commit().map_err(|e| e.to_string())?;
+        }
+
+        Ok(RepackReport {
+            chunks_scanned: scanned,
+            chunks_deltified: deltified,
+            bytes_before,
+            bytes_after: bytes_before - saved,
+        })
     }
 
     /// Record a native git object: its git oid → (kind, the BLAKE3 blob oid
@@ -330,6 +479,33 @@ impl ChunkStore {
         for row in t.iter().map_err(|e| e.to_string())? {
             let (k, v) = row.map_err(|e| e.to_string())?;
             out.push((k.value().to_string(), v.value().to_string()));
+        }
+        Ok(out)
+    }
+
+    /// Record a commit's build/check status (JSON bytes), keyed by commit oid.
+    pub fn put_check(&self, commit: &str, json: &[u8]) -> Result<(), String> {
+        let w = self.db.begin_write().map_err(|e| e.to_string())?;
+        {
+            let mut t = w.open_table(CHECKS).map_err(|e| e.to_string())?;
+            t.insert(commit, json).map_err(|e| e.to_string())?;
+        }
+        w.commit().map_err(|e| e.to_string())
+    }
+
+    pub fn get_check(&self, commit: &str) -> Result<Option<Vec<u8>>, String> {
+        let r = self.db.begin_read().map_err(|e| e.to_string())?;
+        let t = r.open_table(CHECKS).map_err(|e| e.to_string())?;
+        Ok(t.get(commit).map_err(|e| e.to_string())?.map(|v| v.value().to_vec()))
+    }
+
+    pub fn list_checks(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let r = self.db.begin_read().map_err(|e| e.to_string())?;
+        let t = r.open_table(CHECKS).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for row in t.iter().map_err(|e| e.to_string())? {
+            let (k, v) = row.map_err(|e| e.to_string())?;
+            out.push((k.value().to_string(), v.value().to_vec()));
         }
         Ok(out)
     }

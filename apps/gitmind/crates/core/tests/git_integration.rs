@@ -968,3 +968,364 @@ fn native_merge_three_way_and_conflict_and_ff() {
         o => panic!("expected FastForward, got {o:?}"),
     }
 }
+
+#[test]
+fn native_merge_conflict_markers_then_resolve() {
+    use gitmind_core::native::{self, MergeOutcome};
+    use gitmind_core::store::ChunkStore;
+
+    let r = Repo::new();
+    r.write("a.txt", "base\n");
+    r.write("b.txt", "B\n");
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "base").unwrap();
+
+    native::branch_create(&store, "feature", None).unwrap();
+    native::checkout(&store, "feature", r.path()).unwrap();
+    r.write("a.txt", "feature side\n");
+    let feat = native::commit_worktree(&store, r.path(), "feature", "Ada", "ada@x", "feat").unwrap();
+
+    native::checkout(&store, "main", r.path()).unwrap();
+    r.write("a.txt", "main side\n");
+    native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "mainwork").unwrap();
+
+    // Merge with worktree materialization → conflict markers written.
+    let out = native::merge_into_worktree(&store, "feature", r.path(), "Ada", "ada@x").unwrap();
+    match out {
+        MergeOutcome::Conflicts(paths) => assert_eq!(paths, vec!["a.txt".to_string()]),
+        o => panic!("expected Conflicts, got {o:?}"),
+    }
+    let conflicted = std::fs::read_to_string(r.path().join("a.txt")).unwrap();
+    assert!(conflicted.contains("<<<<<<< ours") && conflicted.contains("main side")
+            && conflicted.contains("=======") && conflicted.contains("feature side")
+            && conflicted.contains(">>>>>>> theirs"), "markers: {conflicted}");
+    assert_eq!(native::merge_head(&store).unwrap(), Some(feat.oid.clone()), "MERGE_HEAD recorded");
+
+    // Resolve and finish: commit_worktree makes a two-parent merge commit.
+    r.write("a.txt", "resolved\n");
+    let mc = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "Merge feature").unwrap();
+    let meta = gitmind_core::portage::native_commit(&store, &mc.oid).unwrap();
+    assert_eq!(meta.parents.len(), 2, "merge commit has two parents");
+    assert!(native::merge_head(&store).unwrap().is_none(), "MERGE_HEAD cleared after commit");
+
+    native::checkout(&store, "main", r.path()).unwrap();
+    assert_eq!(std::fs::read_to_string(r.path().join("a.txt")).unwrap(), "resolved\n");
+}
+
+#[test]
+fn native_cherry_pick_conflict_markers_then_resolve() {
+    use gitmind_core::native::{self, PickOutcome};
+    use gitmind_core::store::ChunkStore;
+
+    let r = Repo::new();
+    r.write("a.txt", "base\n");
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "base").unwrap();
+
+    native::branch_create(&store, "feature", None).unwrap();
+    native::checkout(&store, "feature", r.path()).unwrap();
+    r.write("a.txt", "feature\n");
+    let feat = native::commit_worktree(&store, r.path(), "feature", "Ada", "ada@x", "feat").unwrap();
+
+    native::checkout(&store, "main", r.path()).unwrap();
+    r.write("a.txt", "main\n");
+    native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "mainwork").unwrap();
+
+    // Cherry-pick the feature commit → conflict, markers written.
+    match native::cherry_pick_into_worktree(&store, &feat.oid, r.path(), "Ada", "ada@x").unwrap() {
+        PickOutcome::Conflicts(p) => assert_eq!(p, vec!["a.txt".to_string()]),
+        o => panic!("expected Conflicts, got {o:?}"),
+    }
+    let txt = std::fs::read_to_string(r.path().join("a.txt")).unwrap();
+    assert!(txt.contains("<<<<<<< ours") && txt.contains("main") && txt.contains("feature"));
+
+    // Resolve → ordinary single-parent commit (cherry-pick, not a merge).
+    r.write("a.txt", "resolved\n");
+    let c = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "feat (resolved)").unwrap();
+    let meta = gitmind_core::portage::native_commit(&store, &c.oid).unwrap();
+    assert_eq!(meta.parents.len(), 1, "cherry-pick resolve is single-parent");
+}
+
+#[test]
+fn native_rebase_continue_and_abort() {
+    use gitmind_core::native::{self, RebaseOutcome};
+    use gitmind_core::store::ChunkStore;
+
+    let setup = || {
+        let r = Repo::new();
+        r.write("a.txt", "base\n");
+        let dir = tempfile::tempdir().unwrap();
+        let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+        native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "base").unwrap();
+        native::branch_create(&store, "feature", None).unwrap();
+        native::checkout(&store, "feature", r.path()).unwrap();
+        r.write("a.txt", "feature1\n");
+        let f1 = native::commit_worktree(&store, r.path(), "feature", "Ada", "ada@x", "f1").unwrap();
+        native::checkout(&store, "main", r.path()).unwrap();
+        r.write("a.txt", "main1\n");
+        native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "m1").unwrap();
+        (r, dir, store, f1)
+    };
+
+    // ---- continue ----
+    {
+        let (r, _dir, store, f1) = setup();
+        match native::rebase_into_worktree(&store, "feature", "main", r.path(), "Ada", "ada@x").unwrap() {
+            RebaseOutcome::Conflicts { paths, .. } => assert_eq!(paths, vec!["a.txt".to_string()]),
+            o => panic!("expected Conflicts, got {o:?}"),
+        }
+        assert!(native::rebase_status(&store).unwrap().is_some(), "rebase paused");
+        // resolve and continue
+        r.write("a.txt", "rebased-resolved\n");
+        match native::rebase_continue(&store, r.path(), "Ada", "ada@x").unwrap() {
+            RebaseOutcome::Rebased { commits, .. } => assert_eq!(commits, 0, "remaining after the conflicted one"),
+            o => panic!("expected Rebased, got {o:?}"),
+        }
+        assert!(native::rebase_status(&store).unwrap().is_none(), "rebase state cleared");
+        // feature now sits on top of main with resolved content
+        native::checkout(&store, "feature", r.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(r.path().join("a.txt")).unwrap(), "rebased-resolved\n");
+        let _ = f1;
+    }
+
+    // ---- abort ----
+    {
+        let (r, _dir, store, f1) = setup();
+        native::rebase_into_worktree(&store, "feature", "main", r.path(), "Ada", "ada@x").unwrap();
+        native::rebase_abort(&store, r.path()).unwrap();
+        assert!(native::rebase_status(&store).unwrap().is_none(), "state cleared after abort");
+        // feature tip restored to original f1
+        let tip = native::branch_list(&store).unwrap().into_iter()
+            .find(|b| b.name == "feature").unwrap().oid;
+        assert_eq!(tip, f1.oid, "branch restored to original tip");
+    }
+}
+
+#[test]
+fn native_spread_file_and_tree() {
+    use gitmind_core::native;
+    use gitmind_core::store::ChunkStore;
+
+    let r = Repo::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    r.write("song.txt", "v1 lyrics\n");
+    let c1 = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "v1").unwrap();
+    r.write("song.txt", "v2 lyrics\n");
+    let c2 = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "v2").unwrap();
+    r.write("song.txt", "v3 lyrics\n");
+    let c3 = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "v3").unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let revs = vec![
+        ("head01".to_string(), c3.oid.clone()),
+        ("head02".to_string(), c2.oid.clone()),
+        ("head03".to_string(), c1.oid.clone()),
+    ];
+    let written = native::spread_file(&store, "song.txt", &revs, out.path()).unwrap();
+    assert_eq!(written, vec!["head01--song.txt", "head02--song.txt", "head03--song.txt"]);
+    assert_eq!(std::fs::read_to_string(out.path().join("head01--song.txt")).unwrap(), "v3 lyrics\n");
+    assert_eq!(std::fs::read_to_string(out.path().join("head03--song.txt")).unwrap(), "v1 lyrics\n");
+
+    // tree mode: each rev's whole tree under its own subdir.
+    let out2 = tempfile::tempdir().unwrap();
+    let dirs = native::spread_tree(&store, &revs, out2.path()).unwrap();
+    assert_eq!(dirs.len(), 3);
+    assert_eq!(std::fs::read_to_string(out2.path().join("head02").join("song.txt")).unwrap(), "v2 lyrics\n");
+}
+
+#[test]
+fn store_repack_cross_file_delta_roundtrip() {
+    use gitmind_core::store::ChunkStore;
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+
+    // 40 near-identical ~8KB "files" (single chunk each: under CDC_MIN=16KB),
+    // sharing a 12-byte header and length band so they bucket together.
+    let mut items = Vec::new();
+    for i in 0..40 {
+        let mut body = format!("COMMON_HEADER_BLOCK v{i}\n");
+        for line in 0..400 {
+            body.push_str(&format!("line {line} value {}\n", (line + i) % 7));
+        }
+        let rep = store.ingest(&format!("f{i}.txt"), body.as_bytes()).unwrap();
+        items.push((rep.blob_oid, body));
+    }
+    // correct before repack
+    for (oid, body) in &items {
+        assert_eq!(store.restore_bytes(*oid).unwrap(), body.as_bytes());
+    }
+    let r = store.repack(0.05).unwrap();
+    assert!(r.chunks_deltified > 0, "expected some chunks deltified, got {}", r.chunks_deltified);
+    assert!(r.bytes_after < r.bytes_before, "expected savings: {} -> {}", r.bytes_before, r.bytes_after);
+    // bit-exact after repack
+    for (oid, body) in &items {
+        assert_eq!(store.restore_bytes(*oid).unwrap(), body.as_bytes(), "restore mismatch after repack");
+    }
+    // second repack must not corrupt (bases stay plain; deltas left alone)
+    store.repack(0.05).unwrap();
+    for (oid, body) in &items {
+        assert_eq!(store.restore_bytes(*oid).unwrap(), body.as_bytes(), "restore mismatch after 2nd repack");
+    }
+}
+
+#[test]
+fn varcache_stash_restore_and_cross_project_dedup() {
+    use gitmind_core::{store::ChunkStore, varcache};
+    let sdir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(sdir.path().join("var.redb")).unwrap();
+
+    // "Project A" build cache.
+    let a = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(a.path().join("deps")).unwrap();
+    std::fs::write(a.path().join("deps/serde.rlib"), vec![7u8; 50_000]).unwrap();
+    std::fs::write(a.path().join("deps/app.rlib"), b"project-A-only").unwrap();
+    let tree_a = varcache::stash(&store, a.path()).unwrap();
+    let after_a = store.list_blobs().unwrap().len();
+
+    // "Project B" shares the same serde build, different app.
+    let b = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(b.path().join("deps")).unwrap();
+    std::fs::write(b.path().join("deps/serde.rlib"), vec![7u8; 50_000]).unwrap(); // identical
+    std::fs::write(b.path().join("deps/app.rlib"), b"project-B-different").unwrap();
+    let tree_b = varcache::stash(&store, b.path()).unwrap();
+    let after_b = store.list_blobs().unwrap().len();
+
+    assert_ne!(tree_a, tree_b, "different projects, different trees");
+    // B added only its unique app blob + 2 tree objects; the 50KB serde
+    // dependency dedup'd (no new big blob).
+    assert!(after_b - after_a <= 3, "shared dep should dedup (added {} blobs)", after_b - after_a);
+
+    // Re-stashing content identical to A adds nothing at all (pure dedup).
+    let a2 = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(a2.path().join("deps")).unwrap();
+    std::fs::write(a2.path().join("deps/serde.rlib"), vec![7u8; 50_000]).unwrap();
+    std::fs::write(a2.path().join("deps/app.rlib"), b"project-A-only").unwrap();
+    let before = store.list_blobs().unwrap().len();
+    let tree_a2 = varcache::stash(&store, a2.path()).unwrap();
+    assert_eq!(tree_a2, tree_a, "identical content → identical tree oid");
+    assert_eq!(store.list_blobs().unwrap().len(), before, "identical re-stash adds zero blobs");
+
+    // restore B elsewhere, bit-exact
+    let out = tempfile::tempdir().unwrap();
+    varcache::restore(&store, &tree_b, out.path()).unwrap();
+    assert_eq!(std::fs::read(out.path().join("deps/serde.rlib")).unwrap(), vec![7u8; 50_000]);
+    assert_eq!(std::fs::read(out.path().join("deps/app.rlib")).unwrap(), b"project-B-different");
+
+    // pin/list/unpin
+    varcache::pin(&store, "projB", &tree_b).unwrap();
+    assert_eq!(varcache::pins(&store).unwrap(), vec![("projB".to_string(), tree_b.clone())]);
+    varcache::unpin(&store, "projB").unwrap();
+    assert!(varcache::pins(&store).unwrap().is_empty());
+}
+
+#[test]
+fn binpin_install_switch_desktop_dedup() {
+    use gitmind_core::{binpin, store::ChunkStore};
+    let tmp = tempfile::tempdir().unwrap();
+    std::env::set_var("GITMIND_BIN", tmp.path().join("bin"));
+    std::env::set_var("GITMIND_APPS", tmp.path().join("apps"));
+    std::env::set_var("GITMIND_DESKTOP", tmp.path().join("desktop"));
+    let store = ChunkStore::open(tmp.path().join("s.redb")).unwrap();
+
+    let v1 = binpin::install(&store, "myapp", "head01", "commitAAAAAA", "host", b"#!/bin/sh\necho v1\n", false).unwrap();
+    binpin::install(&store, "myapp", "head02", "commitBBBBBB", "host", b"#!/bin/sh\necho v2\n", false).unwrap();
+    // Identical bytes under a new label dedup to the same content oid.
+    let v3 = binpin::install(&store, "myapp", "head03", "commitCCCCCC", "host", b"#!/bin/sh\necho v1\n", false).unwrap();
+    assert_eq!(v3.oid, v1.oid, "identical binary should dedup to one stored blob");
+
+    // First install became current; switching relinks atomically.
+    assert_eq!(binpin::load_manifest("myapp").current.as_deref(), Some("head01"));
+    binpin::use_version("myapp", "head02").unwrap();
+    let link = tmp.path().join("bin").join("myapp");
+    assert_eq!(std::fs::read_link(&link).unwrap(), std::path::PathBuf::from("myapp@head02"));
+
+    // .desktop generation for GNOME pinning.
+    let dp = binpin::write_desktop("myapp", "head02", false, None).unwrap();
+    let txt = std::fs::read_to_string(&dp).unwrap();
+    assert!(txt.contains("Name=myapp @ head02"), "{txt}");
+    assert!(txt.contains("X-GitMind-Commit=commitBBBBBB"));
+    assert!(txt.contains("Terminal=false"));
+
+    assert_eq!(binpin::list_apps(), vec!["myapp".to_string()]);
+    assert!(binpin::version_path("myapp", "head03").is_some());
+
+    // Removing the current version clears the symlink + manifest current.
+    binpin::remove("myapp", "head02").unwrap();
+    assert!(binpin::version_path("myapp", "head02").is_none());
+    assert!(binpin::load_manifest("myapp").current.is_none());
+
+    for k in ["GITMIND_BIN", "GITMIND_APPS", "GITMIND_DESKTOP"] { std::env::remove_var(k); }
+}
+
+#[test]
+fn binpin_build_from_commit_stub() {
+    use gitmind_core::{binpin, native, store::ChunkStore};
+    let r = Repo::new();
+    r.write("src.txt", "source\n");
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+    let c = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "src").unwrap();
+
+    // Stand-in for `cargo build`: a shell command that emits an artifact.
+    let work = tempfile::tempdir().unwrap();
+    let cmd = vec![
+        "sh".to_string(), "-c".to_string(),
+        "mkdir -p target/release && printf 'BINARY-BYTES' > target/release/app".to_string(),
+    ];
+    let bytes = binpin::build_from_commit(&store, &c.oid, work.path(), &cmd, "target/release/app").unwrap();
+    assert_eq!(bytes, b"BINARY-BYTES");
+    // The commit's source was materialized before building.
+    assert_eq!(std::fs::read_to_string(work.path().join("src.txt")).unwrap(), "source\n");
+}
+
+#[test]
+fn store_repack_then_compact() {
+    use gitmind_core::store::ChunkStore;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.redb");
+    let mut store = ChunkStore::open(&path).unwrap();
+    let mut oids = Vec::new();
+    for i in 0..30 {
+        let mut body = format!("HDR_BLOCK v{i}\n");
+        for l in 0..400 { body.push_str(&format!("line {l} value {}\n", (l + i) % 5)); }
+        oids.push((store.ingest(&format!("f{i}"), body.as_bytes()).unwrap().blob_oid, body));
+    }
+    store.repack(0.05).unwrap();
+    store.compact().unwrap(); // must succeed and not corrupt
+    for (oid, body) in &oids {
+        assert_eq!(store.restore_bytes(*oid).unwrap(), body.as_bytes(), "bit-exact after repack+compact");
+    }
+}
+
+#[test]
+fn checks_run_marker_and_candidates() {
+    use gitmind_core::{checks, native, store::ChunkStore};
+    let r = Repo::new();
+    let dir = tempfile::tempdir().unwrap();
+    let store = ChunkStore::open(dir.path().join("s.redb")).unwrap();
+
+    r.write("run.sh", "exit 0\n");
+    let a = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "passing").unwrap();
+    r.write("run.sh", "exit 1\n");
+    let b = native::commit_worktree(&store, r.path(), "main", "Ada", "ada@x", "broken").unwrap();
+
+    let cmd = vec!["sh".to_string(), "run.sh".to_string()];
+    let sa = checks::run(&store, &a.oid, &cmd).unwrap();
+    let sb = checks::run(&store, &b.oid, &cmd).unwrap();
+    assert!(sa.ok, "commit A should pass");
+    assert!(!sb.ok && sb.code == 1, "commit B should fail with code 1");
+
+    // cached + markers
+    assert!(checks::get(&store, &a.oid).unwrap().unwrap().ok);
+    assert_eq!(checks::marker(checks::get(&store, &a.oid).unwrap().as_ref()), "✓");
+    assert_eq!(checks::marker(checks::get(&store, &b.oid).unwrap().as_ref()), "✗");
+    assert_eq!(checks::marker(None), "·");
+
+    // candidates lists only the green commit
+    let cands = checks::candidates(&store).unwrap();
+    assert!(cands.iter().any(|c| c.commit == a.oid), "A is a candidate");
+    assert!(!cands.iter().any(|c| c.commit == b.oid), "B is not a candidate");
+}

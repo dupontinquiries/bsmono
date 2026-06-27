@@ -95,6 +95,10 @@ pub enum MediaCmd {
     LoadArtistsPage { offset: i64, limit: i64 },
     LoadRecentPage  { offset: i64, limit: i64 },
     LoadByArtistPage { artist_id: i64, offset: i64, limit: i64 },
+    /// Every track in the library, paginated, ordered by title. Backs the
+    /// "All Tracks" view so no track is ever unreachable regardless of how
+    /// its filename parsed (missing-tracks fix).
+    LoadAllTracksPage { offset: i64, limit: i64 },
 
     /// Drill-down list views
     LoadByArtist(i64),
@@ -154,6 +158,8 @@ pub enum MediaCmd {
     RemoveTrackFromPlaylist { playlist_id: i64, track_id: i64 },
     /// Move a track to position `new_ord` in the playlist. Reply: PlaylistTracks.
     ReorderPlaylist { playlist_id: i64, track_id: i64, new_ord: i64 },
+    /// Set a track's 0–5 star rating (durably, path-mirrored).
+    SetTrackRating { track_id: i64, rating: i64 },
     /// List all playlists with track counts. Reply: PlaylistsList.
     ListPlaylists,
     /// Load all tracks in a playlist in order. Reply: PlaylistTracks.
@@ -387,6 +393,22 @@ pub fn run(
                 }
             }
 
+            MediaCmd::LoadAllTracksPage { offset, limit } => {
+                match catalog::all_tracks_page(&conn, offset, limit) {
+                    Ok((page, total)) => {
+                        let _ = tx.send(ResultMessage::Page {
+                            context: "all_tracks".to_string(),
+                            json: serde_json::to_string(&page).unwrap_or_default(),
+                            offset, total,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(ResultMessage::Error(format!(
+                            "LoadAllTracksPage failed: {}", e)));
+                    }
+                }
+            }
+
             MediaCmd::LoadByArtist(id) => {
                 if let Ok(list) = catalog::by_artist_id(&conn, id) {
                     let _ = tx.send(ResultMessage::TrackList {
@@ -595,6 +617,17 @@ pub fn run(
                 }
                 publish_playlist_tracks(&conn, &tx, playlist_id);
             }
+            MediaCmd::SetTrackRating { track_id, rating } => {
+                if let Err(e) = catalog::set_track_rating(&mut conn, track_id, rating) {
+                    let _ = tx.send(ResultMessage::Error(
+                        format!("set_track_rating: {}", e)));
+                } else {
+                    // Echo the confirmed rating back so the UI can update
+                    // optimistically-then-confirmed.
+                    let r = catalog::track_rating(&conn, track_id).unwrap_or(0);
+                    let _ = tx.send(ResultMessage::TrackRating { track_id, rating: r });
+                }
+            }
             MediaCmd::ListPlaylists => {
                 publish_playlists(&conn, &tx);
             }
@@ -666,8 +699,8 @@ pub fn run(
                 let tx_progress = tx.clone();
                 let result = (|| -> Result<crate::looper::LoopResult, String> {
                     let path = std::path::PathBuf::from(&input_path);
-                    eprintln!("looper: reading WAV {}", path.display());
-                    let buf = crate::looper::read_wav(&path)?;
+                    eprintln!("looper: reading audio {}", path.display());
+                    let buf = crate::looper::read_audio(&path)?;
                     eprintln!("looper: decoded {} samples @ {} Hz ({:.1}s)",
                               buf.n_samples(), buf.sample_rate, buf.duration_seconds());
                     let params = crate::looper::LoopParams {
@@ -986,6 +1019,14 @@ fn do_walk_and_parse(
              (tags survive rescans now)", n),
         Ok(_) => {}
         Err(e) => eprintln!("scanner: tag relink failed: {}", e),
+    }
+    // Same idea for star ratings: replay the path-keyed rating mirror onto
+    // any tracks that came back with a fresh id and a zeroed rating.
+    match catalog::relink_ratings_by_path(conn) {
+        Ok(n) if n > 0 => eprintln!(
+            "scanner: re-linked {} track rating(s) from path-keyed store", n),
+        Ok(_) => {}
+        Err(e) => eprintln!("scanner: rating relink failed: {}", e),
     }
     // ── Publish derived lists ──
     //

@@ -38,6 +38,7 @@ mod media;
 mod mux_bridge;
 mod noise_adaptive_gain;
 mod playback_modes;
+mod queue_policy;
 mod lyrics_transcriber;
 mod spectral_masker;
 mod volume_safety;
@@ -712,6 +713,10 @@ struct QtState {
     load_recent_page: qt_method!(fn(&mut self, offset: i32, limit: i32)),
     /// Same, for a specific artist's tracks.
     load_by_artist_page: qt_method!(fn(&mut self, artist_id: i32, offset: i32, limit: i32)),
+    /// Every track in the library (the "All Tracks" view), paginated and
+    /// title-ordered. Guarantees no track is unreachable regardless of
+    /// metadata — backs the missing-tracks fix.
+    load_all_tracks_page: qt_method!(fn(&mut self, offset: i32, limit: i32)),
 
     // ── Albums (browse-by-album view) ─────────────────────────────
     //
@@ -870,6 +875,9 @@ struct QtState {
     mix_ins_mid:   qt_property!(f32; NOTIFY mixer_changed),
     mix_ins_high:  qt_property!(f32; NOTIFY mixer_changed),
     mix_ins_vol:   qt_property!(f32; NOTIFY mixer_changed),
+    /// Stereo width / spatializer, 0.0 (mono) … 2.0 (double-wide), default
+    /// 1.0 (off). Scales the Side component in the mixer's M/S stage.
+    mix_width:     qt_property!(f32; NOTIFY mixer_changed),
     mixer_changed: qt_signal!(),
 
     /// Apply a single slider change. `channel` is "spk" or "ins";
@@ -1097,6 +1105,14 @@ struct QtState {
     remove_track_from_playlist: qt_method!(fn(&mut self, playlist_id: i64, track_id: i64)),
     /// Reorder: move track to new position.
     reorder_playlist: qt_method!(fn(&mut self, playlist_id: i64, track_id: i64, new_ord: i64)),
+    /// Set a track's 0–5 star rating. Persists durably (path-mirrored);
+    /// the confirmed value comes back via last_rated_track/last_rated_value.
+    set_track_rating: qt_method!(fn(&mut self, track_id: i64, rating: i64)),
+    /// Last track whose rating was confirmed by the worker, and its value,
+    /// so a rating widget can reconcile its optimistic state.
+    last_rated_track: qt_property!(i64; NOTIFY rating_changed),
+    last_rated_value: qt_property!(i64; NOTIFY rating_changed),
+    rating_changed: qt_signal!(),
 
     /// Push current track or any track to the queue.
     queue_push: qt_method!(fn(&mut self, track_id: i64)),
@@ -1174,6 +1190,11 @@ struct QtState {
     // Methods called from QML
     refresh_volume: qt_method!(fn(&mut self)),
     set_volume_api: qt_method!(fn(&mut self, v: i32)),
+    /// Inline per-device volume from the playbar strip. If `url` is the
+    /// active device, this is the normal safe volume path. If it's a
+    /// different device, we promote it to active first (so volume routes
+    /// through the right driver with the right safety ceiling), then set.
+    set_device_volume: qt_method!(fn(&mut self, url: String, v: i32)),
     refresh_mute: qt_method!(fn(&mut self)),
     toggle_mute: qt_method!(fn(&mut self)),
     refresh_product_info: qt_method!(fn(&mut self)),
@@ -1344,6 +1365,18 @@ struct QtState {
     /// playing, fall through to play_track as the natural-feeling
     /// behavior. See fn enqueue_or_play for the decision.
     enqueue_or_play: qt_method!(fn(&mut self, track_id: i32)),
+    /// Mode-aware enqueue. `mode` is a queue_policy::EnqueueMode tag:
+    /// "stack", "replace", "sync", or "midgap". The policy turns the mode
+    /// + current playback state into a concrete action plan which this
+    /// executes. Stack/Replace use the linear queue; sync/midgap are
+    /// layered (executed when the multi-layer player lands — for now they
+    /// report back via last_play_status).
+    enqueue_with_mode: qt_method!(fn(&mut self, track_id: i32, mode: String)),
+    /// The user's chosen default add-behaviour ("stack" / "replace" /
+    /// "sync" / "midgap"). Persisted; drives the plain enqueue gesture.
+    enqueue_mode: qt_property!(QString; NOTIFY enqueue_mode_changed),
+    enqueue_mode_changed: qt_signal!(),
+    set_enqueue_mode: qt_method!(fn(&mut self, mode: String)),
     /// Double-tap semantics: "play now and resume". Push the
     /// currently-playing track onto the front of the queue
     /// (position 0) so it'll play next, then play the requested
@@ -2161,6 +2194,36 @@ impl QtState {
         }
     }
 
+    /// Inline per-device volume from the playbar strip. Volume can only be
+    /// safely routed through the active device's driver (with that
+    /// device's product-specific safety ceiling). So:
+    ///   * url == active: set directly via the normal safe path.
+    ///   * url != active: this device has no bound driver here, and we
+    ///     don't know its product ceiling — promote it to active first
+    ///     (one tap selects + sets), then apply on the next interaction.
+    ///     We DON'T blindly fire volume at an unselected device, which
+    ///     could hit the wrong sink or bypass its ceiling.
+    /// Either way the value still passes through set_volume_api's safety,
+    /// rate-limit and clamp logic — this is a thin pre-router, not a
+    /// bypass.
+    fn set_device_volume(&mut self, url: String, v: i32) {
+        if url.is_empty() { return; }
+        if url == self.active_url {
+            self.set_volume_api(v);
+        } else {
+            // Promote to active so the right driver + ceiling apply, then
+            // the user's next nudge (or this same value, re-sent by QML
+            // after the select settles) lands on the correct device. We
+            // intentionally do NOT set volume in the same call: selecting
+            // rebuilds the driver asynchronously, and firing volume before
+            // that completes would race the driver rebuild.
+            self.select_device(url);
+            self.last_play_status =
+                "Tap volume again — switched to this speaker first".to_string();
+            self.play_status_changed();
+        }
+    }
+
     /// Unlock the unsafe-volume ceiling for the current session. Future
     /// volume requests above ≈95 dB will be sent to the device. Resets
     /// to locked when the user picks a different device.
@@ -2559,6 +2622,68 @@ impl QtState {
         });
     }
 
+    /// Restore the active device's last-known volume from the persistent
+    /// store into the display state. Display-only: it updates the slider/
+    /// badge but does NOT push to the device, so selecting a speaker never
+    /// causes a surprise volume jump. A live volume probe overrides this
+    /// if the device reports an authoritative value. Per-device memory is
+    /// what makes "Stage at 30, headphones at 60" survive switching back
+    /// and forth, even for BT sinks that don't report volume reliably.
+    fn restore_device_volume(&mut self) {
+        if self.active_url.is_empty() { return; }
+        let vkey = format!("device_volume:{}", self.active_url);
+        if let Some(v_str) = settings_store::get_str(&vkey) {
+            if let Ok(v) = v_str.parse::<i32>() {
+                if v > 0 && v <= 100 {
+                    self.volume = v;
+                    self.last_known_volume = v;
+                    self.volume_changed();
+                    eprintln!("device_memory: restored volume {} for {}",
+                              v, self.active_url);
+                }
+            }
+        }
+    }
+
+    /// Add each device's remembered volume (from settings_store) to the
+    /// worker's queue-devices JSON, so the per-device strip can display
+    /// volume alongside the head track + count. Devices with no stored
+    /// volume get `volume: -1` (the strip then hides the volume chip).
+    /// Best-effort: on any parse error the original JSON is returned
+    /// unchanged, so a malformed payload never blanks the strip.
+    fn enrich_queue_devices_with_volume(&self, json: &str) -> String {
+        let mut val: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => return json.to_string(),
+        };
+        if let Some(arr) = val.as_array_mut() {
+            for dev in arr.iter_mut() {
+                let url = dev.get("device_url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let vol = if url.is_empty() {
+                    -1
+                } else if url == self.active_url && self.volume > 0 {
+                    // The active device's live volume is fresher than the
+                    // last persisted value.
+                    self.volume
+                } else {
+                    let vkey = format!("device_volume:{}", url);
+                    settings_store::get_str(&vkey)
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .filter(|v| *v > 0 && *v <= 100)
+                        .unwrap_or(-1)
+                };
+                if let Some(obj) = dev.as_object_mut() {
+                    obj.insert("volume".to_string(),
+                               serde_json::Value::from(vol));
+                }
+            }
+        }
+        serde_json::to_string(&val).unwrap_or_else(|_| json.to_string())
+    }
+
     /// Switch the active device, then refresh all of its state.
     fn select_device(&mut self, url: String) {
         if url.is_empty() || url == self.active_url { return; }
@@ -2615,6 +2740,8 @@ impl QtState {
                 self.active_url, self.device_firmware_label);
         }
         self.device_firmware_changed();
+        // Restore this device's last-known volume (display-only).
+        self.restore_device_volume();
         // Reset the driver binding to the empty state. The next
         // restore_device_sink_binding call below will reload the
         // user's persisted choice for this device, OR the firmware
@@ -2710,6 +2837,9 @@ impl QtState {
                 self.active_url, self.device_firmware_label);
         }
         self.device_firmware_changed();
+        // Restore this device's last-known volume (display-only; the live
+        // probe overrides if the device reports an authoritative value).
+        self.restore_device_volume();
         // Reset + restore the driver binding for the newly-selected
         // device (same as select_device's flow).
         self.active_bt_mac = String::new();
@@ -3206,6 +3336,12 @@ impl QtState {
             offset: offset as i64, limit: limit as i64,
         });
     }
+    fn load_all_tracks_page(&mut self, offset: i32, limit: i32) {
+        self.observe_action(anticipator::ActionKind::OpenLibrary);
+        self.send_media(media::MediaCmd::LoadAllTracksPage {
+            offset: offset as i64, limit: limit as i64,
+        });
+    }
     fn record_play(&mut self, track_id: i32) {
         self.send_media(media::MediaCmd::RecordPlay(track_id as i64));
     }
@@ -3425,6 +3561,69 @@ impl QtState {
             self.play_track(track_id);
         }
     }
+
+    /// Persist the user's default enqueue mode. Validated through
+    /// EnqueueMode::from_tag so a bad value can't be stored.
+    fn set_enqueue_mode(&mut self, mode: String) {
+        let m = queue_policy::EnqueueMode::from_tag(&mode);
+        self.enqueue_mode = m.as_tag().into();
+        let _ = settings_store::set_str("enqueue_mode", m.as_tag());
+        self.enqueue_mode_changed();
+    }
+
+
+    /// Mode-aware enqueue. Builds the current PlaybackState, asks the
+    /// queue_policy for an action plan, then executes it. The policy holds
+    /// all the behavioural decisions; this method is just the executor, so
+    /// adding or altering a mode never touches branching logic here.
+    fn enqueue_with_mode(&mut self, track_id: i32, mode: String) {
+        use queue_policy::{EnqueueMode, PlaybackState, QueueAction, plan};
+        let mode = EnqueueMode::from_tag(&mode);
+        let state = PlaybackState {
+            is_playing: self.np_playing,
+            is_paused: !self.np_playing && self.last_played_track_id != 0,
+            position_ms: (self.np_position_sec as i64).max(0) * 1000,
+        };
+        let actions = plan(mode, track_id as i64, state);
+        let dev = self.active_url.clone();
+        for action in actions {
+            match action {
+                QueueAction::ClearQueue => {
+                    self.send_media(media::MediaCmd::QueueClear { device_url: dev.clone() });
+                }
+                QueueAction::PushBack(tid) => {
+                    self.send_media(media::MediaCmd::QueuePush {
+                        track_id: tid, device_url: dev.clone() });
+                    self.last_play_status = format!("added track {} to queue", tid);
+                    self.play_status_changed();
+                }
+                QueueAction::InsertAt(tid, at) => {
+                    self.send_media(media::MediaCmd::QueueInsert {
+                        track_id: tid, device_url: dev.clone(), at });
+                }
+                QueueAction::PlayNow(tid) => {
+                    self.play_track(tid as i32);
+                }
+                QueueAction::AddSyncLayer(tid, _paused) => {
+                    // Layered playback (concurrent decoders) isn't wired on
+                    // the controller's single-player path yet; the policy +
+                    // plan are ready for when it lands. Be honest in the UI
+                    // rather than silently appending.
+                    eprintln!("enqueue_with_mode: sync layer for {} requested (no layered player yet)", tid);
+                    self.last_play_status =
+                        "Synced overlay needs the layered player (coming soon)".to_string();
+                    self.play_status_changed();
+                }
+                QueueAction::AddUnderlayLayer(tid, off_ms) => {
+                    eprintln!("enqueue_with_mode: midgap underlay for {} at {}ms requested (no layered player yet)", tid, off_ms);
+                    self.last_play_status =
+                        "Underneath layer needs the layered player (coming soon)".to_string();
+                    self.play_status_changed();
+                }
+            }
+        }
+    }
+
 
     /// Double-tap on a track. "Play this RIGHT NOW, don't lose my
     /// place." Pushes the currently-playing track to position 0 of
@@ -5199,6 +5398,9 @@ impl QtState {
     fn reorder_playlist(&mut self, playlist_id: i64, track_id: i64, new_ord: i64) {
         self.send_media(media::MediaCmd::ReorderPlaylist { playlist_id, track_id, new_ord });
     }
+    fn set_track_rating(&mut self, track_id: i64, rating: i64) {
+        self.send_media(media::MediaCmd::SetTrackRating { track_id, rating });
+    }
 
     // Queue methods route to the active device URL. Empty active_url
     // means "global queue" — useful for organizing before a device is
@@ -5331,6 +5533,8 @@ impl QtState {
             ("ins", "mid")  => self.mix_ins_mid  = v.max(-12.0).min(12.0),
             ("ins", "high") => self.mix_ins_high = v.max(-12.0).min(12.0),
             ("ins", "vol")  => self.mix_ins_vol  = value.max(0.0).min(2.0),
+            // Spatializer width: 0 (mono) … 2.0 (double-wide).
+            ("spatial", "width") => self.mix_width = value.max(0.0).min(2.0),
             _ => {
                 eprintln!("set_mixer_value: unknown ({}, {})", channel, band);
                 return;
@@ -5345,6 +5549,7 @@ impl QtState {
         self.mix_spk_high = 0.0; self.mix_spk_vol = 1.0;
         self.mix_ins_low = 0.0; self.mix_ins_mid = 0.0;
         self.mix_ins_high = 0.0; self.mix_ins_vol = 1.0;
+        self.mix_width = 1.0;
         self.apply_mixer_params();
         self.mixer_changed();
     }
@@ -5399,6 +5604,7 @@ impl QtState {
                 high_gain_db: self.mix_ins_high,
                 volume:       self.mix_ins_vol,
             },
+            width: self.mix_width,
         }
     }
 
@@ -6034,6 +6240,7 @@ impl QtState {
                 high_gain_db: self.mix_ins_high,
                 volume:       self.mix_ins_vol,
             },
+            width: self.mix_width,
         };
         if let Ok(mut m) = self.mixer.write() {
             m.set_params(params);
@@ -7302,6 +7509,15 @@ impl QtState {
                         volume_safety::approx_db_at(&pid, self.volume) as f64;
                     self.volume_is_loud = self.volume > volume_safety::loud_threshold(&pid);
                     self.last_known_volume = self.volume;
+                    // Persist this device's volume so switching away and
+                    // back restores ITS level, not whatever the previously-
+                    // active device was at. Keyed per device URL. Only
+                    // persist sane values (>0) — a 0 is usually a shadow/
+                    // ducking artifact, not a level the user chose.
+                    if !self.active_url.is_empty() && self.volume > 0 {
+                        let vkey = format!("device_volume:{}", self.active_url);
+                        let _ = settings_store::set_str(&vkey, &self.volume.to_string());
+                    }
                     // Re-anchor the gesture filter to the authoritative
                     // device value. This keeps a sane baseline if the
                     // volume changed via physical buttons on the speaker,
@@ -8005,6 +8221,13 @@ impl QtState {
             media::MediaResult::BpmBandCounts(_json) => {
                 // Reserved for the BPM-band browse UI (Turn 3).
             }
+            media::MediaResult::TrackRating { track_id, rating } => {
+                // Confirmed rating write — expose for the rating widget to
+                // reconcile its optimistic state.
+                self.last_rated_track = track_id;
+                self.last_rated_value = rating;
+                self.rating_changed();
+            }
             media::MediaResult::ScanProgress(p) => {
                 self.scan_phase = format!("{:?}", p.phase);
                 self.scan_done = p.done as i32;
@@ -8595,8 +8818,14 @@ impl QtState {
                 self.queue_changed();
             }
             media::MediaResult::QueueDevices(json) => {
-                if self.queue_devices_json != json {
-                    self.queue_devices_json = json;
+                // Enrich the worker's per-device list with each device's
+                // remembered volume (from settings_store, only reachable on
+                // this thread) so the playbar strip can show the full
+                // multi-speaker picture: host · "track" · vol · count. The
+                // worker can't do this — volume lives outside the media DB.
+                let enriched = self.enrich_queue_devices_with_volume(&json);
+                if self.queue_devices_json != enriched {
+                    self.queue_devices_json = enriched;
                     self.queue_devices_changed();
                 }
             }
@@ -10349,7 +10578,7 @@ fn set_products_from_file(pinned: &mut QObjectPinned<QtState>) {
                  loop_studio_rename=on; prune_orphans=on; \
                  albums_alpha_fallback=on; playbar_title_clip=on; \
                  ss_no_repeat=on; ss_center_downmix=on; ss_fsm_continuity=on; ss_spatial_spread=on; anc_freq_taper=on; \
-                 scene_metadata=on; scene_picker_rich=on; seek_log_fix=on; spaces_connections_target_fix=on; rng_high_bits=on; relink_txn=on; scene_picker_offline=on; ui_bottom_padding=on; scroll_strength=on; scene_bootstrap_heal=on; search_clear_count=on; theme_toast=on; toggle_press_feedback=on; ss_swell=on; bt_volume_active_sink=on; duration_ffprobe_fallback=on; battery_aware=on; duck_silence_skip=on; power_status=on");
+                 scene_metadata=on; scene_picker_rich=on; seek_log_fix=on; spaces_connections_target_fix=on; rng_high_bits=on; relink_txn=on; scene_picker_offline=on; ui_bottom_padding=on; scroll_strength=on; scene_bootstrap_heal=on; search_clear_count=on; theme_toast=on; toggle_press_feedback=on; ss_swell=on; bt_volume_active_sink=on; duration_ffprobe_fallback=on; battery_aware=on; duck_silence_skip=on; power_status=on; ss_timing_jitter=on; unknown_artist_fallback=on; all_tracks_view=on; all_tracks_tab=on; play_orphan_reap=on; per_device_head_title=on; resume_single_seek=on; per_device_volume_memory=on; per_device_volume_strip=on; inline_device_volume_stepper=on; quad_lfe_synthesis=on; workshop_opus_input=on; mixer_spatializer_width=on; stem_stereo_placement=on; playlist_drag_reorder=on; queue_policy_modes=on; track_ratings=on");
 
             // Device-memory banner: dump every persisted firmware
             // classification so the user can verify the per-device
@@ -10872,6 +11101,11 @@ fn main() {
     state.mix_spk_high = 0.0; state.mix_spk_vol  = 1.0;
     state.mix_ins_low  = 0.0; state.mix_ins_mid  = 0.0;
     state.mix_ins_high = 0.0; state.mix_ins_vol  = 1.0;
+    state.mix_width    = 1.0;   // spatializer off by default (unity width)
+    // Restore the persisted default enqueue mode (Stack if unset/invalid).
+    state.enqueue_mode = queue_policy::EnqueueMode::from_tag(
+        &settings_store::get_str("enqueue_mode").unwrap_or_default()
+    ).as_tag().into();
     // Publish the band centers so the QML can label sliders without
     // hardcoding the principle (kept DRY with realtime_mixer.rs).
     state.mixer_band_centers_json = serde_json::json!({

@@ -673,3 +673,143 @@ branch, cherry-pick, rebase, merge, patch, apply — all git-free, with
 export-native bridging to a real `.git`.
 
 Test count: 88 default (core 58 unit + 27 integration, peek 3) + fanotify.
+
+## Conflict resolution: markers + MERGE_HEAD (this iteration)
+
+Merge/cherry-pick/rebase previously just stopped on conflict. Now there's a
+real resolve flow for merge:
+
+- `three_way` was factored out (shared by `merge` and the new
+  `merge_into_worktree`).
+- `merge_into_worktree(theirs, dir)` materializes the result in the working
+  tree: clean files written directly, and each conflicting file written with
+  `<<<<<<< ours / ======= / >>>>>>> theirs` markers. It records MERGE_HEAD
+  (the other tip) in the store and leaves HEAD unmoved.
+- `commit_worktree` is now merge-aware: when MERGE_HEAD is set it makes a
+  two-parent merge commit from the resolved worktree and clears MERGE_HEAD.
+- `native-status` reports "merge in progress"; `merge_head()` exposes the state.
+
+CLI `gin merge` now writes markers and guides the user to resolve + commit;
+the GUI Backend `merge` uses the same path. Verified live and in tests: a
+conflicting merge writes markers, status shows the in-progress state, and
+editing the file + `native-commit` finishes it as a two-parent merge commit.
+
+Also: validated the working tree against an uploaded older build — no
+corruption (44 files static-clean, zero merge-marker/null-byte/IO litter, 89
+tests pass). The earlier breakage was confined to the output filesystem.
+
+Test count: 89 default (core 58 unit + 28 integration, peek 3) + fanotify.
+
+## Cherry-pick & rebase conflict resolution (this iteration)
+
+`apply_commit_delta` now returns per-file conflict detail, feeding a shared
+worktree conflict writer (clean files + `<<<<<<< / ======= / >>>>>>>` markers).
+
+- **Cherry-pick**: `cherry_pick_into_worktree` writes markers on conflict and
+  returns Conflicts; the user resolves and runs an ordinary `native-commit`
+  (single-parent — it's a cherry-pick, not a merge). CLI `gin cherry-pick`.
+- **Rebase**: a real pause/continue/abort state machine. `rebase_into_worktree`
+  replays commits, and on conflict writes markers + persists REBASE_* state
+  (branch, onto, current commit, remaining todo, original tip). `rebase_continue`
+  commits the resolved worktree as the paused step and replays the rest;
+  `rebase_abort` restores the branch + worktree to the original tip. CLI:
+  `gin rebase <onto>`, `gin rebase --continue`, `gin rebase --abort`.
+- `native-status` reports merge/rebase-in-progress; `materialize_commit` syncs
+  the worktree to a commit without detaching HEAD (also fixed the clean-merge
+  path that previously detached).
+
+Tests: cherry-pick conflict→markers→single-parent resolve; rebase
+conflict→continue (correct replayed history) and conflict→abort (branch
+restored). Verified live with `gin` end-to-end. A patch file of this turn's
+diff is included.
+
+Test count: 91 default (core 58 unit + 30 integration, peek 3) + fanotify.
+
+## Spread: multi-version side-by-side materialization (this iteration)
+
+`spread_file(path, revs, into)` writes a chosen path from several commits as
+`{label}--{basename}` so versions sit together for native viewers (images,
+audio, kdenlive, code). `spread_tree(revs, into)` materializes each rev's
+whole tree into `into/{label}/` (worktree-style, for projects whose files
+reference one another). CLI: `gin spread <path> [--last N|--revs a,b|--branches]
+[--into dir] [--label index|oid|branch] [--tree]`. Verified live and in tests.
+
+## Cross-file delta compression + the `.var` system cache (this iteration)
+
+**Delta repack (storage compression).** Chunk-level dedup already shares
+identical chunks across files; `ChunkStore::repack(min_gain)` adds delta-coding
+for *near-identical* chunks. It buckets plain chunks by (length band, 12-byte
+prefix), picks the largest per bucket as a base, and re-encodes the rest in
+place as zstd-dictionary deltas (`'D' || base_oid || len || payload`) when that
+saves ≥ min_gain. Bases stay plain, so delta depth is 1 and restore stays
+cheap; oids are unchanged (pure storage optimization). `restore` is now
+delta-aware via a small decode helper. CLI: `gin repack`. Round-trip + savings
+proven in tests (a near-identical file set deltifies and restores bit-exact,
+and repack is safe to re-run).
+
+**`.var` system-wide build cache (`varcache`).** Instead of `.gitignore`-ing a
+`target/` (and losing it) or committing it (and exploding the repo), `gin var
+stash target` ingests it as a content-addressed native tree into ONE shared
+store (`$GITMIND_VAR`, default `~/.cache/gitmind/var.redb`). Because it's
+content-addressed and system-wide, the same dependency build across projects
+dedups to a single copy; the repo commits only a tiny `.var/<name>` pointer
+(a tree oid). `gin var restore <name> --into target` reconstructs it. Pinning
+(`refs/pins/<name>`) marks a stash to survive a future gc. Verified: an
+identical re-stash adds zero blobs, a shared 50KB dep across two projects isn't
+re-stored, and restore is bit-exact.
+
+Caveat: redb preallocates pages, so the on-disk file size won't visibly shrink
+without a compaction pass — the meaningful figures are repack's reported stored
+bytes and the dedup blob counts. gc/eviction for the var store (keep
+pinned + reachable, drop the rest) is the natural next step.
+
+Test count: 94 default (core 58 unit + 33 integration, peek 3) + fanotify.
+
+## Version-pinned binaries + .desktop pins (`binpin`) — this iteration
+
+Replaces the rsync-to-`~/.local/bin` + GNOME-Pins workflow with a managed one.
+Each version is content-addressed into the shared var store (a binary unchanged
+between commits is stored once), recorded in a per-app JSON manifest (the commit
+log of which build is which), materialized to `~/.local/bin/{app}@{label}`, and
+exposed as a `.desktop` entry for the GNOME grid / favorites. A `current`
+symlink (`~/.local/bin/{app}`) makes swapping the active version one atomic
+relink. All dirs are env-overridable (GITMIND_BIN/APPS/DESKTOP).
+
+`build_from_commit` materializes a commit's tree and runs a build command
+(default `cargo build --release [--target T]`), capturing the artifact — the
+hook for cross-building (cargo/cross/zig). CLI: `gin app install|build|use|list|
+log|run|desktop|remove`. GUI: an Apps tab (tap a version to switch, "pin" writes
+the .desktop, × removes) via Backend `apps_json`/`app_use`/`app_desktop`/
+`app_remove`/`app_install`. Tested: install/dedup/switch/desktop/remove and
+build-from-commit (stub builder), all live-verified through `gin`.
+
+Cross-build caveat: the build/cross invocation is wired but real toolchains
+aren't exercised in the sandbox.
+
+## var gc + compaction; repack-on-stash — this iteration
+
+`ChunkStore::compact()` wraps redb's compaction so the file actually shrinks
+after repack/overwrites (previously the on-disk size never dropped). `gin var
+gc` repacks then compacts (live: 3.7MB → 2.8MB). `gin var stash --repack`
+delta-compresses build caches on the way in. True reachability-based eviction
+(drop unpinned stashes; keep refs/pins/* + app blobs) is the remaining gc step.
+
+Test count: 97 default (core 58 unit + 36 integration, peek 3) + fanotify.
+
+## Per-commit build/check status (`checks`) — this iteration
+
+Turns the log into "what's green and worth testing". `checks::run(commit, cmd)`
+materializes a commit's tree into a temp worktree, runs a check command
+(default `cargo check --quiet`), and caches the verdict (ok/code/duration/when/
+cmd) in the store's new CHECKS table keyed by commit oid. `native-log` shows a
+marker per commit — ✓ builds, ✗ broken, · unchecked — so good test/run/pin
+candidates pop out. CLI: `gin check [commit] [--last N] [--cmd "…"]` and `gin
+check --candidates` (list green commits). Results are cached, re-run on demand.
+
+Note the check runs each commit's OWN materialized tree, not the live worktree,
+so it reflects the historical state. GUI plumbing is in place — `native_log_json`
+carries the marker, and Backend `run_check`/`checks_json` expose run + map — the
+remaining GUI piece is a native-log QML view that renders the dots. Real `cargo
+check` runs aren't exercised in the sandbox (verified with stub commands).
+
+Test count: 98 default (core 58 unit + 37 integration, peek 3) + fanotify.

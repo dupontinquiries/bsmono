@@ -251,7 +251,8 @@ pub fn tracks_in_playlist(conn: &Connection, playlist_id: i64) -> rusqlite::Resu
                   WHERE ta.track_id = t.id AND ta.role = 'primary'
                   ORDER BY ta.ord ASC LIMIT 1),
                 ''
-            ) AS primary_artist
+            ) AS primary_artist,
+            t.rating AS rating
         FROM playlist_tracks pt
         JOIN tracks t ON t.id = pt.track_id
         LEFT JOIN track_overrides ov ON ov.track_id = t.id
@@ -269,6 +270,7 @@ pub fn tracks_in_playlist(conn: &Connection, playlist_id: i64) -> rusqlite::Resu
             camelot: r.get(6)?,
             key_text: r.get(7)?,
             primary_artist: r.get(8)?,
+            rating: r.get::<_, i64>("rating").unwrap_or(0),
         })
     })?;
     rows.collect()
@@ -425,6 +427,12 @@ pub fn queue_list(conn: &Connection, device_url: &str) -> rusqlite::Result<Vec<Q
 pub struct QueueDeviceSummary {
     pub device_url: String,
     pub item_count: u32,
+    /// Title of the track at the head of this device's queue (what it's
+    /// about to play / is playing). Lets the per-device strip show WHAT
+    /// each speaker is set to, not just how many items are queued — the
+    /// multi-speaker "different streams per device" view. Empty if the
+    /// head track has no resolvable title.
+    pub head_title: String,
 }
 
 /// All devices that currently have queued items, ordered by item
@@ -432,16 +440,26 @@ pub struct QueueDeviceSummary {
 /// Empty queues are omitted from the list.
 pub fn queue_devices(conn: &Connection) -> rusqlite::Result<Vec<QueueDeviceSummary>> {
     let mut stmt = conn.prepare(r#"
-        SELECT device_url, COUNT(*) AS n
-        FROM play_queue
-        GROUP BY device_url
+        SELECT q.device_url,
+               COUNT(*) AS n,
+               COALESCE((
+                   SELECT t.title
+                   FROM play_queue q2
+                   JOIN tracks t ON t.id = q2.track_id
+                   WHERE q2.device_url = q.device_url
+                   ORDER BY q2.ord ASC
+                   LIMIT 1
+               ), '') AS head_title
+        FROM play_queue q
+        GROUP BY q.device_url
         HAVING n > 0
-        ORDER BY n DESC, device_url ASC
+        ORDER BY n DESC, q.device_url ASC
     "#)?;
     let rows = stmt.query_map([], |r| {
         Ok(QueueDeviceSummary {
             device_url: r.get(0)?,
             item_count: r.get::<_, i64>(1)? as u32,
+            head_title: r.get(2)?,
         })
     })?;
     rows.collect()
@@ -628,6 +646,7 @@ pub fn tracks_by_tag(conn: &Connection, tag_id: i64, limit: usize) -> rusqlite::
             camelot: r.get(6)?,
             key_text: r.get(7)?,
             primary_artist: r.get(8)?,
+            rating: r.get::<_, i64>("rating").unwrap_or(0),
         })
     })?;
     rows.collect()
@@ -1180,6 +1199,7 @@ pub fn search_advanced(conn: &Connection, query: &str, limit: usize) -> rusqlite
             camelot: r.get(6)?,
             key_text: r.get(7)?,
             primary_artist: r.get(8)?,
+            rating: r.get::<_, i64>("rating").unwrap_or(0),
         })
     })?;
     let mut all: Vec<TrackSummary> = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1269,6 +1289,77 @@ mod tests {
         conn.execute("UPDATE tracks SET search=?1 WHERE id=?2",
                      params![blob, tid]).expect("blob");
         tid
+    }
+
+    #[test]
+    fn rating_set_get_clamp_and_persist_by_path() {
+        let mut conn = fresh_conn();
+        let tid = insert_test_track(&conn, "RatedSong", "Artist");
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 0);
+        catalog::set_track_rating(&mut conn, tid, 4).unwrap();
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 4);
+        catalog::set_track_rating(&mut conn, tid, 99).unwrap();
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 5);
+        catalog::set_track_rating(&mut conn, tid, -3).unwrap();
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 0);
+        catalog::set_track_rating(&mut conn, tid, 3).unwrap();
+        let mirrored: i64 = conn.query_row(
+            "SELECT rating FROM track_rating_by_path WHERE path = '/test/RatedSong.mp3'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(mirrored, 3);
+    }
+
+    #[test]
+    fn rating_relinks_after_id_change() {
+        let mut conn = fresh_conn();
+        let tid = insert_test_track(&conn, "Persistent", "Artist");
+        catalog::set_track_rating(&mut conn, tid, 5).unwrap();
+        conn.execute("UPDATE tracks SET rating = 0 WHERE id = ?1", params![tid]).unwrap();
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 0);
+        let n = catalog::relink_ratings_by_path(&conn).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(catalog::track_rating(&conn, tid).unwrap(), 5);
+        let n2 = catalog::relink_ratings_by_path(&conn).unwrap();
+        assert_eq!(n2, 0);
+    }
+
+
+    #[test]
+    fn all_tracks_includes_tracks_with_no_artist() {
+        // A track with NO track_artists link must still appear in
+        // all_tracks_page — the belt-and-suspenders guarantee that no
+        // track is ever unreachable (the "missing tracks" bug).
+        let conn = fresh_conn();
+        // One track WITH an artist (via the helper)...
+        insert_test_track(&conn, "Has Artist", "Some Artist");
+        // ...and one WITHOUT any artist link at all.
+        catalog::upsert_path(&conn, "/test/orphan.mp3", 100, 100).unwrap();
+        let orphan_id: i64 = conn.query_row(
+            "SELECT id FROM tracks WHERE path=?1",
+            params!["/test/orphan.mp3"], |r| r.get(0)).unwrap();
+        conn.execute("UPDATE tracks SET title=?1 WHERE id=?2",
+                     params!["Orphan Track", orphan_id]).unwrap();
+
+        let (rows, total) = catalog::all_tracks_page(&conn, 0, 100).unwrap();
+        assert_eq!(total, 2, "both tracks counted");
+        let titles: Vec<&str> = rows.iter().map(|t| t.title.as_str()).collect();
+        assert!(titles.contains(&"Has Artist"));
+        assert!(titles.contains(&"Orphan Track"),
+            "a track with no artist link must still be reachable");
+        // The orphan's artist should COALESCE to the sentinel.
+        let orphan = rows.iter().find(|t| t.title == "Orphan Track").unwrap();
+        assert_eq!(orphan.primary_artist, "Unknown Artist");
+    }
+
+    #[test]
+    fn all_tracks_pagination_bounds() {
+        let conn = fresh_conn();
+        for i in 0..5 { insert_test_track(&conn, &format!("T{}", i), "A"); }
+        let (page1, total) = catalog::all_tracks_page(&conn, 0, 2).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(page1.len(), 2);
+        let (page3, _) = catalog::all_tracks_page(&conn, 4, 2).unwrap();
+        assert_eq!(page3.len(), 1, "last page has the remainder");
     }
 
     #[test]
@@ -1438,6 +1529,12 @@ mod tests {
         assert_eq!(devs[0].item_count, 3);
         assert_eq!(devs[1].device_url, "http://emerge");
         assert_eq!(devs[1].item_count, 1);
+        // head_title reflects the track at the head (lowest ord) of each
+        // device's queue — so the per-device strip can show WHAT each
+        // speaker is set to play, not just a count. Stage's head is t1
+        // ("A"), Emerge's head is also t1 ("A").
+        assert_eq!(devs[0].head_title, "A", "stage head should be first pushed");
+        assert_eq!(devs[1].head_title, "A", "emerge head is its only track");
     }
 
     #[test]

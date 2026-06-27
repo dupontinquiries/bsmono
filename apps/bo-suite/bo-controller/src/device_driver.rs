@@ -562,6 +562,11 @@ impl BluetoothDriver {
         // it stacks. Without this, repeated plays of different
         // files would all play simultaneously.
         let _ = self.stop().await;
+        // stop() only kills the tracked paplay pid; the decode pipe also
+        // has an ffmpeg process (untracked) and a rapid replay/seek burst
+        // can leave orphaned pairs writing to the sink (doubled audio +
+        // the "ffmpeg exited 224" noise). Sweep our own orphans first.
+        reap_orphan_audio_children();
 
         // Best-effort: ensure the BT link is up. Failure here isn't
         // fatal — paplay may still succeed if the system audio
@@ -791,6 +796,28 @@ impl BluetoothDriver {
 ///   * Misclassification is recoverable — paplay errors quickly and
 ///     the next play attempt can be told the right thing
 ///   * 99% of files have correct extensions in practice
+/// Kill any orphaned `ffmpeg`/`paplay` children of THIS process. Used as
+/// a belt-and-suspenders cleanup before starting a new BT playback. The
+/// normal stop() kills the tracked paplay pid, but a decode pipe is two
+/// processes (ffmpeg | paplay) and only paplay's pid is tracked, so a
+/// rapid replay/seek burst can leave ffmpeg (or a half-spawned pair)
+/// still running and writing to the sink — producing doubled/overlapping
+/// audio and the stray "ffmpeg exited with 224" lines. `pkill --parent
+/// <our_pid>` scopes strictly to our own children so unrelated system
+/// audio is never touched. Best-effort; "nothing to kill" is the common
+/// and fine case.
+fn reap_orphan_audio_children() {
+    let our_pid = std::process::id().to_string();
+    for binary in ["paplay", "ffmpeg"] {
+        let _ = std::process::Command::new("pkill")
+            .args(["--parent", &our_pid, binary])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
 pub fn is_paplay_native_format(path: &Path) -> bool {
     let ext = path.extension()
         .and_then(|e| e.to_str())
@@ -996,6 +1023,7 @@ impl LocalDriver {
     ) -> Result<(), DriverError>
     {
         let _ = self.stop().await;
+        reap_orphan_audio_children();
 
         let path_str = path.to_string_lossy().to_string();
         let needs_decode = !is_paplay_native_format(path);
@@ -1310,6 +1338,7 @@ impl MultiRoomDriver {
     ) -> Result<(), DriverError>
     {
         let _ = self.stop().await;
+        reap_orphan_audio_children();
         let path_str = path.to_string_lossy().to_string();
         let needs_decode = !is_paplay_native_format(path);
         eprintln!("multiroom: play {} → sink={} ({} speakers, needs_decode={})",

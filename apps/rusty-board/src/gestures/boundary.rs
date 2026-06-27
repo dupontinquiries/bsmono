@@ -354,6 +354,50 @@ mod tests {
     }
 
     #[test]
+    fn segment_path_empty_when_whole_path_above_region() {
+        // A path that lies entirely ABOVE the letter region (Top
+        // edge) produces zero segments. Top is the ONLY non-
+        // springboard edge (is_springboard_space is false only for
+        // Top), so the final segment's edge never commits and the
+        // trailing-outside trim empties the only segment. This is the
+        // condition dispatch_swipe_source's empty-segments fallback
+        // exists to handle — e.g. a swipe shifted above the letters by
+        // a stale compute_bounds offset. If segment_path ever STOPS
+        // returning empty here, the fallback becomes dead code and
+        // this test should be revisited.
+        let b = LetterBoundary {
+            left: 0.0,
+            right: 300.0,
+            top: 100.0,
+            bottom: 300.0,
+        };
+        // Whole path sits ABOVE the region (y < 100).
+        let path = vec![pt(50.0, 20.0), pt(90.0, 30.0), pt(130.0, 40.0)];
+        let segs = segment_path(&path, &b);
+        assert!(
+            segs.is_empty(),
+            "expected zero segments for an all-above (Top-edge) path, got {}",
+            segs.len()
+        );
+    }
+
+    #[test]
+    fn segment_path_keeps_path_that_ends_inside() {
+        // Sanity counter-test: a path that starts outside but ENDS
+        // inside the region keeps its points (the final segment ends
+        // inside, so the trailing-outside trim stops immediately).
+        let b = LetterBoundary {
+            left: 100.0,
+            right: 300.0,
+            top: 0.0,
+            bottom: 200.0,
+        };
+        let path = vec![pt(20.0, 50.0), pt(120.0, 60.0), pt(150.0, 70.0)];
+        let segs = segment_path(&path, &b);
+        assert!(!segs.is_empty(), "path ending inside should yield a segment");
+    }
+
+    #[test]
     fn boundary_from_grid() {
         let boxes = vec![
             hb(0.0, 0.0, 30.0, 30.0),

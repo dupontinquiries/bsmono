@@ -80,7 +80,8 @@
       ],
       "duration_ms": 1500,
       "swell_period_ms": 40000,
-      "swell_depth": 0.2
+      "swell_depth": 0.2,
+      "timing_jitter": 0.5
     },
     {
       "name": "whale_distant",
@@ -113,7 +114,8 @@
         60000,
         180000
       ],
-      "duration_ms": 25000
+      "duration_ms": 25000,
+      "timing_jitter": 0.4
     }
   ],
   "states": [

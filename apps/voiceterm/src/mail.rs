@@ -672,7 +672,7 @@ impl MailHub {
         style: &crate::mail_panes::PaneStyle,
         to: Option<&str>,
     ) -> String {
-        crate::mail_panes::compose_pane_qml(style, to)
+        crate::mail_panes::compose_pane_qml(style, to, None, None)
     }
 
     /// Build the attachments pane for one or more messages, using the merge

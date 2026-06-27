@@ -1245,12 +1245,15 @@ void InboxWidget::acceptIncomingCall()
     if (it != m_conversations.end() && !it->otherDisplayName.isEmpty())
         name = it->otherDisplayName;
 
-    // Open the thread already in-call, then replay everything buffered while the
-    // ring was up so the opening floor-assert + first frames aren't lost. The
-    // call (receiver) is started inside openConversationWith before this flush.
+    // Open the thread already in-call, then hand everything buffered while the
+    // ring was up to the receiver as ORDERED PRE-ROLL. Previously this dumped
+    // each frame straight into the live jitter in a tight loop — but the jitter
+    // is sized for live audio and drops the oldest beyond ~1s, so the head of
+    // the message (the first 1-2s) was discarded. Pre-roll plays it in order,
+    // ahead of live, before the jitter sees it. The call is started inside
+    // openConversationWith before this hand-off.
     if (auto *dlg = openConversationWith(caller, name, /*startInCall=*/true)) {
-        for (const auto &pkt : m_ringBuffer)
-            dlg->deliverNetworkPayload(caller, pkt);
+        dlg->primeVoicePreroll(caller, m_ringBuffer);
     }
     m_ringBuffer.clear();
     m_ringPeer = Core::UserId{};
@@ -1375,6 +1378,30 @@ void InboxWidget::openSnapById(const Core::SnapId &snapId)
                 }
                 m_openViewers.remove(snapIdStr);
             });
+
+    // V32.45+: feed player — let the viewer scrub the ordered incoming
+    // image/text feed with ◀/▶ rather than only showing the tapped snap.
+    // (Video snaps have their own viewer and are excluded here.)
+    {
+        QList<Core::Snap> feed;
+        for (const auto &s : m_snaps) {
+            if (s.senderId.value == m_selfId.value) continue;        // outbound
+            if (s.viewed && s.id.value != snapIdStr) continue;       // already opened
+            if (s.mediaType != Core::MediaType::Image &&
+                s.mediaType != Core::MediaType::Text) continue;
+            feed.append(s);
+        }
+        std::sort(feed.begin(), feed.end(),
+                  [](const Core::Snap &a, const Core::Snap &b) { return a.sentAt > b.sentAt; });
+        int startIdx = -1;
+        for (int k = 0; k < feed.size(); ++k)
+            if (feed[k].id.value == snapIdStr) { startIdx = k; break; }
+        if (startIdx >= 0 && feed.size() > 1) {
+            connect(viewer, &SnapViewerDialog::snapViewed,
+                    this, [this](const Core::SnapId &id) { emit snapOpened(id); });
+            viewer->setPlaylist(feed, startIdx);
+        }
+    }
 
     viewer->open();
 }

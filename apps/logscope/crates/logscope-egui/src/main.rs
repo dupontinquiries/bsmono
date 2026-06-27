@@ -7,7 +7,8 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([720.0, 480.0])
-            .with_title("Logscope"),
+            .with_title("Logscope")
+            .with_transparent(false),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };

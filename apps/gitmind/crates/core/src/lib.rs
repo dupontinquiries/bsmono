@@ -55,6 +55,9 @@ pub mod watch_session;
 pub mod diff;
 pub mod gitobj;
 pub mod native;
+pub mod varcache;
+pub mod binpin;
+pub mod checks;
 
 // Re-exports for the common path so frontends import one place.
 pub use backend::{RepoBackend, GitCli, RepoStatus};

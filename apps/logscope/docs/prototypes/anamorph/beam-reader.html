@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Pearl Reader — the beams are the text</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;color:#9aa}
+  #c{display:block;width:100vw;height:100vh;touch-action:none}
+  #hud{position:fixed;left:14px;top:12px;font-size:12px;line-height:1.5;opacity:.75;pointer-events:none;text-shadow:0 0 6px #000}
+  #hud b{color:#cde}
+  #panel{position:fixed;right:14px;top:12px;background:rgba(10,14,18,.7);border:1px solid #223;border-radius:8px;padding:10px 12px;font-size:11px;width:188px}
+  #panel h4{margin:0 0 6px;color:#bdf;font-weight:600;letter-spacing:.04em}
+  .row{display:flex;align-items:center;gap:8px;margin:6px 0}
+  .row label{width:60px;color:#9bd}
+  .row input{flex:1}
+  .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;vertical-align:middle}
+  #hint{position:fixed;left:0;right:0;bottom:12px;text-align:center;font-size:12px;opacity:.55;pointer-events:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div><b>scroll</b> / drag ↕ — rotate the pearl until the beam refracts the text to your eye</div><div id="st"></div></div>
+<div id="panel">
+  <h4>BEAM LEVERS</h4>
+  <div class="row"><label><span class="sw" style="background:#fff"></span>text</label><input id="lW" type="range" min="0" max="1.6" step="0.01" value="1.15"></div>
+  <div class="row"><label><span class="sw" style="background:#fec"></span>diffuse</label><input id="lD" type="range" min="0" max="2.5" step="0.01" value="1.3"></div>
+  <div class="row"><label><span class="sw" style="background:linear-gradient(90deg,#f33,#3f3,#39f)"></span>split</label><input id="lS" type="range" min="0" max="1.5" step="0.01" value="0.5"></div>
+  <div class="row"><label><span class="sw" style="background:#7df"></span>rebound</label><input id="lR" type="range" min="0" max="1.5" step="0.01" value="0.4"></div>
+  <div class="row"><label><span class="sw" style="background:#444"></span>blocked</label><input id="lB" type="range" min="0" max="1.5" step="0.01" value="0.35"></div>
+  <div class="row"><label><span class="sw" style="background:#a6f"></span>cracks</label><input id="lC" type="range" min="0" max="1.5" step="0.01" value="0.6"></div>
+  <div class="row"><label>reveal</label><input id="lP" type="range" min="1" max="12" step="0.5" value="5"></div>
+</div>
+<div id="hint">the strong beams are clustered ON the letters; they glow &amp; diffuse into the body — a peek into the blurry pearl shows the inner shape is the text</div>
+<script>
+"use strict";
+const cv=document.getElementById('c'), ctx=cv.getContext('2d');
+let DPR=Math.min(2,window.devicePixelRatio||1),Wd=0,Ht=0;
+function resize(){Wd=cv.clientWidth||window.innerWidth||800;Ht=cv.clientHeight||window.innerHeight||600;cv.width=Wd*DPR;cv.height=Ht*DPR;ctx.setTransform(DPR,0,0,DPR,0,0);}
+window.addEventListener('resize',resize);
+const lever=id=>parseFloat(document.getElementById(id).value);
+
+const MESSAGES=[
+  {role:"you", paras:["How do I tail a log without re-reading it each poll?"]},
+  {role:"asst",paras:["Keep a seek cursor and remember the byte offset between polls.","Watch the inode; on change the file rotated, so reopen the path.","If it shrinks below your offset it was truncated, reset to zero."]},
+  {role:"you", paras:["What about memory and write bursts?"]},
+  {role:"asst",paras:["Stream lines instead of buffering, so memory stays bounded.","Debounce events so a burst of writes is one read pass."]},
+];
+const TAU=Math.PI*2, rand=(s=>()=>{s^=s<<13;s^=s>>>17;s^=s<<5;return (s>>>0)/4294967296;})(0x2f6b1d>>>0);
+const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+const norm=v=>{const l=Math.hypot(v[0],v[1],v[2])||1;return [v[0]/l,v[1]/l,v[2]/l];};
+const Ldir=norm([-0.38,0.86,0.55]), Vdir=[0,0,1], Hv=norm([Ldir[0]+Vdir[0],Ldir[1]+Vdir[1],Ldir[2]+Vdir[2]]);
+function rotY(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0]*c+p[2]*s,p[1],-p[0]*s+p[2]*c];}
+function rotX(p,a){const c=Math.cos(a),s=Math.sin(a);return [p[0],p[1]*c-p[2]*s,p[1]*s+p[2]*c];}
+function hue(h){h=((h%1)+1)%1;const k=n=>{const t=(n+h*6)%6;return Math.max(0,Math.min(1,Math.min(t,4-t)));};return [k(5),k(3),k(1)];}
+
+const tcan=document.createElement('canvas'), tctx=tcan.getContext('2d');
+function glyphPoints(text,wrap){
+  const px=46,lh=px*1.28,words=text.split(/\s+/);let lines=[],cur="";
+  for(const w of words){if(cur&&cur.length+w.length+1>wrap){lines.push(cur);cur="";}cur=cur?cur+" "+w:w;} if(cur)lines.push(cur);
+  tcan.width=920;tcan.height=Math.max(140,lines.length*lh+px);tctx.clearRect(0,0,tcan.width,tcan.height);
+  tctx.fillStyle="#fff";tctx.font=`700 ${px}px ui-monospace,monospace`;tctx.textBaseline="alphabetic";
+  lines.forEach((l,i)=>tctx.fillText(l,6,px+i*lh));
+  const W=tcan.width,H=tcan.height,d=tctx.getImageData(0,0,W,H).data,pts=[];
+  let mnx=1e9,mny=1e9,mxx=-1e9,mxy=-1e9;
+  for(let y=0;y<H;y+=2)for(let x=0;x<W;x+=2)if(d[(y*W+x)*4+3]>128){pts.push([x,y]);mnx=Math.min(mnx,x);mny=Math.min(mny,y);mxx=Math.max(mxx,x);mxy=Math.max(mxy,y);}
+  const half=Math.max(mxx-mnx,mxy-mny)/2,cx=(mnx+mxx)/2,cy=(mny+mxy)/2,s=0.9/half;
+  return pts.map(p=>[(p[0]-cx)*s,-(p[1]-cy)*s]);
+}
+// ALIGNMENT OPTIMIZATION: cluster stroke points (grid-bin) -> strong nodes on the letters, connect adjacent
+// clusters into beams that TRACE the letterforms. The beams ARE the text (not noise around a glow).
+function clusterBeams(pts){
+  const cell=0.05, map=new Map();
+  for(const [x,y] of pts){ const k=Math.round(x/cell)+","+Math.round(y/cell);
+    let m=map.get(k); if(!m){m=[0,0,0];map.set(k,m);} m[0]+=x;m[1]+=y;m[2]++; }
+  const nodes=[...map.values()].map(m=>[m[0]/m[2],m[1]/m[2]]);
+  const edges=[]; const r2=(cell*1.7)**2;
+  for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){
+    const dx=nodes[i][0]-nodes[j][0],dy=nodes[i][1]-nodes[j][1]; if(dx*dx+dy*dy<r2) edges.push([i,j]); }
+  return {nodes,edges};
+}
+
+const BODY_N=300, BODY_K=4;
+function buildSphere(msg){
+  const P=msg.paras.length;
+  const facet=[]; for(let i=0;i<BODY_N;i++){let x,y,z;do{x=rand()*2-1;y=rand()*2-1;z=rand()*2-1;}while(x*x+y*y+z*z>1);facet.push([x,y,z]);}
+  const bEdges=[];
+  for(let i=0;i<BODY_N;i++){const d=[];for(let j=0;j<BODY_N;j++)if(j!==i){const dx=facet[i][0]-facet[j][0],dy=facet[i][1]-facet[j][1],dz=facet[i][2]-facet[j][2];d.push([dx*dx+dy*dy+dz*dz,j]);}
+    d.sort((a,b)=>a[0]-b[0]);for(let k=0;k<BODY_K;k++){const j=d[k][1];if(i<j)bEdges.push([i,j]);}}
+  const btype=new Uint8Array(bEdges.length),bend=[];
+  for(let e=0;e<bEdges.length;e++){btype[e]=(rand()*3)|0;bend.push([(rand()*2-1)*0.16,(rand()*2-1)*0.16,(rand()*2-1)*0.16]);}
+  const pages=msg.paras.map((para,i)=>{
+    const phi=i*(TAU/P);
+    const {nodes,edges}=clusterBeams(glyphPoints(para, P<=1?22:16));
+    const tnode=nodes.map(n=>rotY([n[0],n[1],(rand()*2-1)*0.08],phi));
+    return {phi,tnode,tedges:edges,nrm:rotY(Hv,phi)};
+  });
+  const chunks=[];for(let i=0;i<14;i++){chunks.push([(rand()*BODY_N)|0,(rand()*BODY_N)|0,(rand()*BODY_N)|0,0.5+0.4*rand()]);}
+  return {P,facet,bEdges,btype,bend,pages,chunks,role:msg.role};
+}
+const SPH=MESSAGES.map(buildSphere);
+const TOTAL=SPH.reduce((a,s)=>a+s.P,0);
+
+let gTarget=0,g=0; const maxG=TOTAL-1;
+const addScroll=d=>gTarget=Math.max(0,Math.min(maxG,gTarget+d));
+cv.addEventListener('wheel',e=>{e.preventDefault();addScroll(e.deltaY*0.0016);},{passive:false});
+let drag=false,ly=0;
+cv.addEventListener('pointerdown',e=>{drag=true;ly=e.clientY;cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove',e=>{if(drag){addScroll((ly-e.clientY)*0.006);ly=e.clientY;}});
+cv.addEventListener('pointerup',()=>drag=false);
+addEventListener('keydown',e=>{if(e.key==='ArrowDown')addScroll(0.3);if(e.key==='ArrowUp')addScroll(-0.3);});
+function activeOf(gg){let acc=0;for(let i=0;i<SPH.length;i++){if(gg<acc+SPH[i].P)return {idx:i,local:gg-acc};acc+=SPH[i].P;}return {idx:SPH.length-1,local:SPH.at(-1).P-1};}
+function aLine(a,b,col,al,w){if(al<0.008)return;ctx.strokeStyle=`rgba(${col[0]*255|0},${col[1]*255|0},${col[2]*255|0},${Math.min(1,al)})`;ctx.lineWidth=w||1;ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();}
+
+function renderSphere(S,cx,cy,R,yaw,pitch,full,alpha){
+  if(!(R>0)||!isFinite(cx)||!isFinite(cy))return;
+  const proj=p=>{let q=rotX(rotY(p,yaw),pitch);return [cx+q[0]*R,cy-q[1]*R,q[2]];};
+  const LW=lever('lW'),LS=lever('lS'),LR=lever('lR'),LB=lever('lB'),LC=lever('lC'),LD=lever('lD'),POW=lever('lP');
+  const pg=ctx.createRadialGradient(cx-R*0.3,cy-R*0.3,R*0.1,cx,cy,R);
+  pg.addColorStop(0,`rgba(60,70,90,${0.10*alpha})`);pg.addColorStop(1,`rgba(10,14,22,${0.02*alpha})`);
+  ctx.fillStyle=pg;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.fill();
+
+  ctx.lineWidth=1; const step=full?1:5;
+  for(let e=0;e<S.bEdges.length;e+=step){
+    const a=S.facet[S.bEdges[e][0]],b=S.facet[S.bEdges[e][1]];const A=proj(a),B=proj(b);const depth=(A[2]+B[2])*0.25+0.5;
+    const ml=norm([(a[0]+b[0])/2,(a[1]+b[1])/2,(a[2]+b[2])/2]);const Nb=rotX(rotY(ml,yaw),pitch);
+    const spark=Math.pow(Math.max(0,dot(Nb,Hv)),2.2);const amt=alpha*(0.16+0.95*spark)*(0.5+0.5*depth);
+    if(amt<0.015)continue;const t=S.btype[e];
+    if(t===0){const dx=(B[1]-A[1]),dy=-(B[0]-A[0]),L=Math.hypot(dx,dy)||1,ox=dx/L*2,oy=dy/L*2;
+      aLine([A[0]-ox,A[1]-oy],[B[0]-ox,B[1]-oy],[1,.15,.15],amt*0.5*LS);aLine(A,B,[.2,1,.3],amt*0.5*LS);aLine([A[0]+ox,A[1]+oy],[B[0]+ox,B[1]+oy],[.3,.45,1],amt*0.5*LS);}
+    else if(t===1){const bd=S.bend[e];const M=proj([(a[0]+b[0])/2+bd[0],(a[1]+b[1])/2+bd[1],(a[2]+b[2])/2+bd[2]]);const c=hue(0.5+0.25*a[1]);aLine(A,M,c,amt*0.7*LR);aLine(M,B,c,amt*0.7*LR);}
+    else{const c=hue(0.55+0.2*a[1]),M=[(A[0]+B[0])/2,(A[1]+B[1])/2];aLine(A,[A[0]*.7+M[0]*.3,A[1]*.7+M[1]*.3],c,amt*0.3*LB);aLine([B[0]*.7+M[0]*.3,B[1]*.7+M[1]*.3],B,c,amt*0.3*LB);}
+  }
+  if(LC>0.01){ctx.save();ctx.globalCompositeOperation="lighter";
+    for(const[a,b,c,hh] of S.chunks){const A=proj(S.facet[a]),B=proj(S.facet[b]),C=proj(S.facet[c]);const dep=(A[2]+B[2]+C[2])/3*0.5+0.5;
+      const col=hue(hh);ctx.fillStyle=`rgba(${col[0]*255|0},${col[1]*255|0},${col[2]*255|0},${0.045*LC*alpha*(0.4+dep)})`;
+      ctx.beginPath();ctx.moveTo(A[0],A[1]);ctx.lineTo(B[0],B[1]);ctx.lineTo(C[0],C[1]);ctx.closePath();ctx.fill();}ctx.restore();}
+
+  if(!full){ctx.strokeStyle=`rgba(150,170,185,${0.3*alpha})`;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.stroke();return;}
+
+  const ap=Math.round(g-(()=>{let a=0;for(let i=0;i<activeOf(g).idx;i++)a+=SPH[i].P;return a;})());
+  const page=(ap>=0&&ap<S.P)?S.pages[ap]:null;
+  if(page){
+    const Nface=rotX(rotY(page.nrm,yaw),pitch);
+    const cohC=[0,0,0];for(let ci=0;ci<3;ci++){const off=(ci-1)*0.05;const Hc=norm([Hv[0]+off,Hv[1],Hv[2]-off*0.3]);cohC[ci]=Math.pow(Math.max(0,dot(Nface,Hc)),POW);}
+    const coh=(cohC[0]+cohC[1]+cohC[2])/3;
+    if(coh>0.01){
+      ctx.save();ctx.globalCompositeOperation="lighter";ctx.lineCap="round";
+      const sep=(1-coh)*R*0.05;
+      const wc=Math.min(cohC[0],cohC[1],cohC[2]);
+      for(const [ia,ib] of page.tedges){
+        const A=proj(page.tnode[ia]),B=proj(page.tnode[ib]);const depth=(A[2]+B[2])*0.25+0.5;
+        aLine(A,B,[1,1,1], coh*0.15*LD*(0.5+0.5*depth), 7*coh*LD+1);          // diffuse glow into body
+        if(coh<0.92){
+          aLine([A[0]+sep,A[1]-sep*0.4],[B[0]+sep,B[1]-sep*0.4],[1,.2,.2],cohC[0]*0.5*LW,1.5);
+          aLine([A[0]-sep,A[1]+sep*0.4],[B[0]-sep,B[1]+sep*0.4],[.3,.5,1],cohC[2]*0.5*LW,1.5);
+        }
+        aLine(A,B,[1,1,1], (0.35*coh+0.8*wc)*LW*(0.6+0.5*depth), 1.6);        // legible core at projection angle
+      }
+      ctx.restore();ctx.lineCap="butt";
+    }
+  }
+  ctx.strokeStyle=`rgba(150,170,185,${0.3*alpha})`;ctx.beginPath();ctx.arc(cx,cy,R,0,TAU);ctx.stroke();
+}
+
+function draw(){
+  if(!Wd||!Ht){resize();if(!Wd||!Ht){requestAnimationFrame(draw);return;}}
+  g+=(gTarget-g)*0.12;const t=performance.now()*0.001;ctx.clearRect(0,0,Wd,Ht);
+  const {idx:activeIdx,local}=activeOf(g);
+  const cx=Wd*0.5,cy=Ht*0.47,Ract=Math.min(Wd,Ht)*0.37,spacing=Ract*2.4;
+  const bx=cx-Ldir[0]*Ract*2.6,by=cy+Ldir[1]*Ract*2.6;
+  const gr=ctx.createLinearGradient(bx,by,cx,cy);gr.addColorStop(0,"rgba(160,215,255,0)");gr.addColorStop(.7,"rgba(160,215,255,0.045)");gr.addColorStop(1,"rgba(185,225,255,0.13)");
+  ctx.save();ctx.strokeStyle=gr;ctx.lineCap="round";ctx.lineWidth=Ract*0.7;ctx.beginPath();ctx.moveTo(bx,by);ctx.lineTo(cx,cy);ctx.stroke();ctx.restore();
+
+  for(let i=0;i<SPH.length;i++){
+    const off=(i-(activeIdx+local/Math.max(1,SPH[activeIdx].P)))*spacing;const sx=cx+off;
+    if(sx<-Ract*1.6||sx>Wd+Ract*1.6)continue;
+    const dist=spacing>0?Math.abs(sx-cx)/spacing:0,isA=(i===activeIdx);
+    const R=Ract*(isA?1:Math.max(0.5,0.82-dist*0.16));
+    const yaw=isA?-local*(TAU/SPH[i].P):(i*0.7+t*0.04);
+    const pitch=0.10*Math.sin(t*0.5+i),breath=1+0.02*Math.sin(t*1.3+i);
+    renderSphere(SPH[i],sx,cy,R*breath,yaw,pitch,isA,isA?1:0.4);
+    ctx.fillStyle=isA?"rgba(180,210,230,.8)":"rgba(120,140,150,.4)";ctx.font="11px ui-monospace,monospace";ctx.textAlign="center";
+    ctx.fillText(SPH[i].role==="you"?"you":"assistant",sx,cy+R*1.16);
+  }
+  document.getElementById('st').innerHTML=`sphere <b>${activeIdx+1}/${SPH.length}</b> · page <b>${Math.round(local)+1}/${SPH[activeIdx].P}</b>`;
+  requestAnimationFrame(draw);
+}
+resize();requestAnimationFrame(draw);
+</script>
+</body>
+</html>

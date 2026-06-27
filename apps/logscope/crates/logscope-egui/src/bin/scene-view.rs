@@ -10,7 +10,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])
-            .with_title("Logscope · Scene"),
+            .with_title("Logscope · Scene")
+            .with_transparent(false),
         renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
