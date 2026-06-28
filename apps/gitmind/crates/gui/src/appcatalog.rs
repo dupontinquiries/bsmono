@@ -182,41 +182,6 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
-// ───────────── cross-build + ship seam (see maintenance/DISTRIBUTION.md) ─────────────
-//
-// Not wired into the GUI yet — these are the tested building blocks the server-side
-// "build this app for that target and ship the binary" step will use. The actual
-// `cross build` + binary transfer run on the server (needs `cross` + the target's
-// std, which the sandbox lacks), but the command + path construction is pure here.
-
-/// Target triples the fleet builds for. Both devices are aarch64; the musl target
-/// is the portable one (Alpine/postmarketOS), gnu for the glibc workstation.
-pub const BUILD_TARGETS: [&str; 2] = [
-    "aarch64-unknown-linux-musl",
-    "aarch64-unknown-linux-gnu",
-];
-
-/// `cross build` argv for `app` targeting `triple`. Uses `cross` (which the Asahi
-/// box has) so the server can build for a target it isn't running. Pure — tested.
-pub fn cross_build_argv(app: &str, triple: &str) -> Vec<String> {
-    vec![
-        "cross".into(), "build".into(), "--release".into(),
-        "--target".into(), triple.into(),
-        "-p".into(), app.into(),
-    ]
-}
-
-/// Where a built binary lands on the receiving device: `~/.local/bin` (on PATH for
-/// most setups, no root needed). Pure — tested.
-pub fn install_dir(home: &str) -> String {
-    format!("{}/.local/bin", home.trim_end_matches('/'))
-}
-
-/// Path of the freshly built binary inside the build tree. Pure — tested.
-pub fn built_binary_path(app: &str, triple: &str) -> String {
-    format!("target/{triple}/release/{app}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,19 +249,5 @@ mod tests {
         assert_eq!(human_size(512), "512B");
         assert_eq!(human_size(2048), "2.0K");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0M");
-    }
-
-    #[test]
-    fn cross_build_and_ship_seam() {
-        let a = cross_build_argv("voiceterm", "aarch64-unknown-linux-musl");
-        assert_eq!(a[0], "cross");
-        assert!(a.contains(&"--target".into()) && a.contains(&"aarch64-unknown-linux-musl".into()));
-        assert_eq!(a.last().unwrap(), "voiceterm");
-        assert_eq!(install_dir("/home/kesslerd/"), "/home/kesslerd/.local/bin");
-        assert_eq!(
-            built_binary_path("voiceterm", "aarch64-unknown-linux-musl"),
-            "target/aarch64-unknown-linux-musl/release/voiceterm"
-        );
-        assert!(BUILD_TARGETS.iter().all(|t| t.starts_with("aarch64-")));
     }
 }
