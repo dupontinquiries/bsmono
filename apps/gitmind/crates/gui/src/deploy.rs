@@ -12,6 +12,34 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+/// SSH options applied to *every* ssh / rsync / git-over-ssh call the GUI makes,
+/// so a connection can never block a worker (or the UI) thread on an interactive
+/// prompt — which was freezing the GUI:
+///   `BatchMode=yes`                    → never prompt for a password (fail fast).
+///   `ConnectTimeout=8`                 → never hang on an unreachable host.
+///   `StrictHostKeyChecking=accept-new` → trust a *new* host's key automatically,
+///       writing it to the shared `~/.ssh/known_hosts`, while still refusing a key
+///       that has *changed*. This is what lets the GUI manage host-key trust
+///       without a terminal prompt (no more known_hosts split between the two).
+pub const SSH_OPTS: [&str; 6] = [
+    "-o", "BatchMode=yes",
+    "-o", "ConnectTimeout=8",
+    "-o", "StrictHostKeyChecking=accept-new",
+];
+
+/// `ssh <SSH_OPTS> user@host <remote_cmd>` as an argv (no shell).
+fn ssh_argv(user: &str, host: &str, remote_cmd: &str) -> Vec<String> {
+    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    a.push(format!("{user}@{host}"));
+    a.push(remote_cmd.to_string());
+    a
+}
+
+/// The ssh command (with opts) as one string, for rsync `-e` / `GIT_SSH_COMMAND`.
+fn ssh_command_str() -> String {
+    format!("ssh {}", SSH_OPTS.join(" "))
+}
+
 /// One discovered host on the LAN with TCP 22 reachable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Device {
@@ -112,10 +140,7 @@ pub fn shell_quote(s: &str) -> String {
 pub fn list_remote_argv(user: &str, host: &str, path: &str) -> Vec<String> {
     let p = path.trim();
     let target = if p.is_empty() || p == "~" { "$HOME".to_string() } else { shell_quote(p) };
-    vec![
-        format!("{user}@{host}"),
-        format!("cd {target} 2>/dev/null && pwd && ls -1Ap"),
-    ]
+    ssh_argv(user, host, &format!("cd {target} 2>/dev/null && pwd && ls -1Ap"))
 }
 
 /// List subdirectories of `path` on the device (over SSH) for the folder picker.
@@ -157,6 +182,8 @@ pub fn push_argv(repo: &str, user: &str, host: &str, dir: &str) -> Vec<String> {
     vec![
         "-az".into(),
         "--delete".into(),
+        "-e".into(),
+        ssh_command_str(),
         "--exclude".into(),
         "target/".into(),
         "--exclude".into(),
@@ -174,7 +201,7 @@ pub fn push_argv(repo: &str, user: &str, host: &str, dir: &str) -> Vec<String> {
 pub fn push_repo(repo: &str, user: &str, host: &str, dir: &str) -> Result<String, String> {
     // ensure the destination exists first (rsync won't mkdir -p the final dir reliably)
     let _ = Command::new("ssh")
-        .args([&format!("{user}@{host}"), &format!("mkdir -p -- {}", shell_quote(dir))])
+        .args(ssh_argv(user, host, &format!("mkdir -p -- {}", shell_quote(dir))))
         .status();
     let status = Command::new("rsync")
         .args(push_argv(repo, user, host, dir))
@@ -205,7 +232,7 @@ pub fn remote_deploy_cmd(dir: &str, app: &str) -> String {
 pub fn deploy_app(user: &str, host: &str, dir: &str, app: &str) -> Result<String, String> {
     let cmd = remote_deploy_cmd(dir, app);
     let status = Command::new("ssh")
-        .args([&format!("{user}@{host}"), &cmd])
+        .args(ssh_argv(user, host, &cmd))
         .status()
         .map_err(|e| format!("ssh failed: {e}"))?;
     if status.success() {
@@ -213,6 +240,95 @@ pub fn deploy_app(user: &str, host: &str, dir: &str, app: &str) -> Result<String
     } else {
         Err(format!("remote build/install failed (exit {:?})", status.code()))
     }
+}
+
+// ───────────────────────── host-key trust ─────────────────────────
+
+/// Is `host` already in `~/.ssh/known_hosts`? Fast + local (`ssh-keygen -F`), so
+/// it's safe to call straight from the UI thread to render a trust badge.
+pub fn host_trusted(host: &str) -> bool {
+    let h = host.trim();
+    if h.is_empty() {
+        return false;
+    }
+    Command::new("ssh-keygen")
+        .args(["-F", h])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// Drop comment (`#…`) and blank lines from `ssh-keyscan` output, leaving only the
+/// host-key lines we append to known_hosts. Pure — unit-tested.
+fn filter_scanned_keys(scan: &str) -> String {
+    scan.lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.is_empty() && !t.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Pull the fingerprint field (e.g. `SHA256:…`) out of `ssh-keygen -lf -` output.
+/// Pure — unit-tested.
+fn parse_fingerprint(out: &str) -> Option<String> {
+    out.lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .map(|s| s.to_string())
+}
+
+/// Fetch the fingerprint of the keys `ssh-keyscan` returned (for display), by
+/// piping them through `ssh-keygen -lf -`.
+fn fingerprint_of(keys: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new("ssh-keygen")
+        .args(["-lf", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(keys.as_bytes()).ok()?; // dropped here → EOF
+    let out = child.wait_with_output().ok()?;
+    parse_fingerprint(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Trust `host`'s SSH key by fetching it (`ssh-keyscan`, bounded by its own
+/// timeout so this can't hang) and appending it to the shared `~/.ssh/known_hosts`
+/// — the GUI's "trust this key" action. Returns the fingerprint that was trusted.
+/// Doing this in one place (the GUI, one known_hosts) is what avoids the lock /
+/// split you get from accepting keys in the terminal *and* the GUI separately.
+pub fn trust_host(host: &str) -> Result<String, String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given".into());
+    }
+    if host_trusted(h) {
+        return Ok(format!("{h} is already trusted"));
+    }
+    let scan = Command::new("ssh-keyscan")
+        .args(["-T", "6", h])
+        .output()
+        .map_err(|e| format!("ssh-keyscan failed: {e}"))?;
+    let keys = filter_scanned_keys(&String::from_utf8_lossy(&scan.stdout));
+    if keys.trim().is_empty() {
+        return Err(format!("no SSH key returned for {h} (unreachable, or no sshd there?)"));
+    }
+    let fp = fingerprint_of(&keys).unwrap_or_else(|| "key".to_string());
+    let home = std::env::var("HOME").map_err(|_| "no $HOME set".to_string())?;
+    let ssh_dir = format!("{home}/.ssh");
+    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create {ssh_dir}: {e}"))?;
+    let known = format!("{ssh_dir}/known_hosts");
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&known)
+        .map_err(|e| format!("open {known}: {e}"))?;
+    writeln!(f, "{}", keys.trim_end()).map_err(|e| format!("write {known}: {e}"))?;
+    Ok(format!("trusted {h} ({fp})"))
 }
 
 // ───────────────────────── background jobs ─────────────────────────
@@ -303,11 +419,14 @@ mod tests {
     #[test]
     fn list_remote_argv_quotes_and_resolves_home() {
         let a = list_remote_argv("user", "fp5.local", "/home/user/my repo");
-        assert_eq!(a[0], "user@fp5.local");
-        assert!(a[1].contains("'/home/user/my repo'"), "path must be quoted: {}", a[1]);
-        assert!(a[1].contains("pwd && ls"), "must emit pwd then listing");
+        assert!(a.iter().any(|x| x == "user@fp5.local"), "target present: {a:?}");
+        assert!(a.iter().any(|x| x.contains("'/home/user/my repo'")), "path must be quoted: {a:?}");
+        assert!(a.iter().any(|x| x.contains("pwd && ls")), "must emit pwd then listing");
+        // and it must be non-interactive so a prompt can't freeze the picker
+        assert!(a.windows(2).any(|w| w[0] == "-o" && w[1] == "BatchMode=yes"), "BatchMode set: {a:?}");
+        assert!(a.contains(&"StrictHostKeyChecking=accept-new".to_string()), "auto-trusts new hosts");
         let h = list_remote_argv("user", "fp5.local", "");
-        assert!(h[1].contains("$HOME"), "empty path -> $HOME: {}", h[1]);
+        assert!(h.iter().any(|x| x.contains("$HOME")), "empty path -> $HOME: {h:?}");
     }
 
     #[test]
@@ -316,6 +435,29 @@ mod tests {
         assert!(a.contains(&"target/".to_string()), "must exclude target/");
         assert!(a.iter().any(|x| x == "/home/user/monorepo/"), "src keeps one trailing slash");
         assert!(a.iter().any(|x| x == "user@fp5.local:/home/user/dst/"), "dest formatted");
+        // rsync must use the same non-interactive ssh
+        assert!(
+            a.windows(2).any(|w| w[0] == "-e" && w[1].starts_with("ssh ") && w[1].contains("BatchMode=yes")),
+            "rsync -e ssh must be non-interactive: {a:?}"
+        );
+    }
+
+    #[test]
+    fn scan_filtering_and_fingerprint_parsing() {
+        let scan = "# fp5.local:22 SSH-2.0-OpenSSH_9\nfp5.local ssh-ed25519 AAAAC3Nz\n\n# fp5.local:22 SSH-2.0\nfp5.local ssh-rsa AAAAB3Nz\n";
+        let k = filter_scanned_keys(scan);
+        assert_eq!(k, "fp5.local ssh-ed25519 AAAAC3Nz\nfp5.local ssh-rsa AAAAB3Nz", "comments/blanks dropped");
+        let fp_line = "256 SHA256:n0tAr3alF1ngerPr1nt fp5.local (ED25519)";
+        assert_eq!(parse_fingerprint(fp_line).as_deref(), Some("SHA256:n0tAr3alF1ngerPr1nt"));
+        assert_eq!(parse_fingerprint("").as_deref(), None);
+    }
+
+    #[test]
+    fn unknown_host_is_not_trusted_and_empty_host_rejected() {
+        // a host that can't be in known_hosts -> ssh-keygen -F finds nothing
+        assert!(!host_trusted("definitely.not.a.real.host.invalid"));
+        assert!(!host_trusted("   "));
+        assert!(trust_host("").is_err(), "empty host -> error, no network");
     }
 
     #[test]

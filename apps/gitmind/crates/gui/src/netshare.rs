@@ -182,7 +182,13 @@ pub fn install_card(name: &str, provider: &str, dest: &str) -> Result<String, St
     }
     let safe_name = name.replace(['/', '\\'], "_");
     let target = format!("{}/{}", dest.trim_end_matches('/'), safe_name);
+    // Same non-interactive ssh the deploy paths use, so the clone can't hang on a
+    // host-key/password prompt (a new peer's key is auto-trusted into known_hosts).
     let status = Command::new("git")
+        .env(
+            "GIT_SSH_COMMAND",
+            "ssh -o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new",
+        )
         .args(["clone", provider, &target])
         .status()
         .map_err(|e| format!("git clone: {e}"))?;
