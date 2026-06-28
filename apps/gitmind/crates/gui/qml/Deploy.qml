@@ -19,13 +19,15 @@ Item {
     property string app: "voiceterm"
     property string note: ""
     property bool busy: false
+    property string jobKind: ""   // which async job is in flight: discover|push|deploy
 
+    // Slow ops run on a worker thread in the backend; we kick them off and let the
+    // poller pick up the result, so the UI stays live and the spinner animates.
     function discover() {
-        busy = true; note = "scanning the LAN for SSH…"
-        var r = JSON.parse(backend.discover_devices(root.subnet))
-        busy = false
-        if (r.ok) { devices = r.devices; note = devices.length + " device(s) on " + r.subnet + ".0/24" }
-        else { devices = []; note = "error: " + r.error }
+        var r = JSON.parse(backend.start_discover(root.subnet))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "discover"; root.note = "scanning the LAN for SSH…"
+        poller.start()
     }
     function selectDevice(ip, host) {
         selHost = ip; selName = (host && host.length) ? host : ip
@@ -39,14 +41,42 @@ Item {
     }
     function parentOf(p) { var i = p.lastIndexOf("/"); return i > 0 ? p.substring(0, i) : "/" }
     function pushHere() {
-        busy = true; note = "pushing the monorepo to " + curPath + "…"
-        var r = JSON.parse(backend.push_repo(root.user, root.selHost, root.curPath))
-        busy = false; note = r.ok ? r.msg : ("error: " + r.error)
+        var r = JSON.parse(backend.start_push(root.user, root.selHost, root.curPath))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "push"; root.note = "pushing the monorepo to " + root.curPath + "…"
+        poller.start()
     }
     function deployHere() {
-        busy = true; note = "building " + app + " on " + selName + " — this can take a while…"
-        var r = JSON.parse(backend.deploy_app(root.user, root.selHost, root.curPath, root.app))
-        busy = false; note = r.ok ? ("✓ " + r.msg) : ("error: " + r.error)
+        var r = JSON.parse(backend.start_deploy(root.user, root.selHost, root.curPath, root.app))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "deploy"
+        root.note = "building " + root.app + " on " + root.selName + " — this can take a while…"
+        poller.start()
+    }
+    function applyJobResult(res) {
+        if (root.jobKind === "discover") {
+            root.devices = res.ok ? (res.devices || []) : []
+            root.note = res.ok ? (root.devices.length + " device(s) on " + res.subnet + ".0/24")
+                               : ("error: " + res.error)
+        } else if (root.jobKind === "push") {
+            root.note = res.ok ? res.msg : ("error: " + res.error)
+        } else if (root.jobKind === "deploy") {
+            root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
+        }
+        root.jobKind = ""
+    }
+
+    // Poll the backend's background job; when it reports done, dispatch the result.
+    Timer {
+        id: poller
+        interval: 250; repeat: true; running: false
+        onTriggered: {
+            var j = JSON.parse(backend.poll_job())
+            if (!j.done) return
+            poller.stop(); root.busy = false
+            var res = (j.result && j.result.length) ? JSON.parse(j.result) : { ok: false, error: "no result" }
+            root.applyJobResult(res)
+        }
     }
 
     Flickable {
@@ -63,6 +93,11 @@ Item {
             Row {
                 spacing: 8
                 Label { text: "deploy"; color: "#cdd6f4"; font.pixelSize: 18; font.bold: true }
+                BusyIndicator {
+                    running: root.busy; visible: root.busy
+                    implicitWidth: 22; implicitHeight: 22
+                    anchors.verticalCenter: parent.verticalCenter
+                }
             }
             Label {
                 width: col.width
