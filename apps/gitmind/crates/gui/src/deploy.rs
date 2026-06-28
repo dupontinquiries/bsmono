@@ -190,6 +190,29 @@ pub fn remote_capture(user: &str, host: &str, cmd: &str) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// `scp <hardened opts> user@host:<remote> <local>` argv — pull a file (the built
+/// binary) from the server to this device. Reuses SSH_OPTS so the same defence-in-
+/// depth (no agent/tunnel) applies. Pure — unit-tested.
+pub fn scp_pull_argv(user: &str, host: &str, remote: &str, local: &str) -> Vec<String> {
+    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    a.push(format!("{user}@{host}:{remote}"));
+    a.push(local.to_string());
+    a
+}
+
+/// Pull a remote file to a local path over scp. On-device.
+pub fn scp_pull(user: &str, host: &str, remote: &str, local: &str) -> Result<(), String> {
+    let st = Command::new("scp")
+        .args(scp_pull_argv(user, host, remote, local))
+        .status()
+        .map_err(|e| format!("scp: {e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("scp failed (exit {:?}) fetching {remote}", st.code()))
+    }
+}
+
 /// Parse `ls -1Ap` output into directory names. Pure — unit-tested.
 pub fn parse_dir_listing(stdout: &str) -> Vec<String> {
     stdout
@@ -814,6 +837,11 @@ mod tests {
         let joined = SSH_OPTS.join(" ");
         assert!(joined.contains("ForwardAgent=no"), "no agent forwarding: {joined}");
         assert!(joined.contains("ClearAllForwardings=yes"), "drop tunnels: {joined}");
+        // scp reuses the same hardened opts
+        let s = scp_pull_argv("kesslerd", "192.168.1.7", "target/x/release/app", "/tmp/app");
+        assert!(s.contains(&"ForwardAgent=no".to_string()));
+        assert_eq!(s[s.len() - 2], "kesslerd@192.168.1.7:target/x/release/app");
+        assert_eq!(s[s.len() - 1], "/tmp/app");
     }
 
     #[test]

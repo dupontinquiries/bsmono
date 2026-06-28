@@ -29,32 +29,53 @@ log into GUI                                  log into GUI
 
 ## What's built now (verifiable)
 
-`appcatalog.rs` — the recognition + metadata foundation, all unit-tested:
-- `scan_dir` / `parse_app_listing` — recognise real repos (Cargo.toml and/or .git),
-  not arbitrary folders. The Deploy tab now badges recognised apps (📦) and the
-  listing is limited to what's a real app when you ask for info.
-- `app_info_local` / `parse_app_details` — the catalog metadata: **name, crate
-  count, on-disk size, README excerpt** (exactly the fields the client shows).
-- `remote_listing_cmd` / `remote_details_cmd` — the SSH-side shell that produces the
-  same data from the server; `deploy::remote_capture` runs them; the parsers are
-  tested, the SSH execution is on-device.
-- **Build-and-ship seam** (`cross_build_argv`, `install_dir`, `built_binary_path`,
-  `BUILD_TARGETS`) — tested command/path construction for the next step.
+`appcatalog.rs` — recognition + metadata (name, crate count, size, README), local
+and over SSH; the Deploy tab badges recognised apps (📦) and shows their info.
+
+`buildflags.rs` — the customizable build knobs, all unit-tested:
+- `scan_cargo_features` — an app's `[features]` + its `default` set.
+- `scan_cmake_options` — `option(NAME "help" ON/OFF)` from CMakeLists.txt.
+- `arch_default_features` — the repo's **per-architecture** default set (see the
+  metadata convention below), falling back to `[features] default`.
+- `cargo_build_argv` / `cmake_configure_argv` — the cross-build command from a chosen
+  flag set; `built_binary_path` / `install_dir` for delivery.
+
+`install_app` (main.rs, async job) — wires the **cargo** path end to end: cross-build
+on the server → pull the binary → install. Delivery follows the chosen route:
+- **default — stage via /tmp**: `scp` the binary to `/tmp/<app>`, then `cp` into
+  `~/.local/bin`. The `/tmp` copy stays, so a bad build/binary is easy to inspect.
+- **direct**: `scp` straight into `~/.local/bin`.
+Build output (incl. errors) is captured and returned to the client, so a failed
+cross-build shows up in the GUI instead of vanishing.
+
+The Deploy tab's installer panel exposes all of the above: pick a target (musl/gnu),
+the repo's per-arch default features come pre-ticked, toggle from there, choose the
+delivery route, install.
+
+### Per-architecture default-features convention
+
+In an app's Cargo.toml:
+
+```toml
+[package.metadata.gitmind]
+default-features-musl = ["small", "no-x11"]
+default-features-gnu  = ["full"]
+```
+
+Whichever matches the target's libc is pre-enabled for the client; absent that, the
+plain `[features] default` set is used.
 
 ## What's next (on-device, not yet wired)
 
-1. **Build-type picker + build**: client picks a `BUILD_TARGETS` triple, server runs
-   `cross_build_argv` (the Asahi box has `cross` + the aarch64 musl/gnu std; the
-   sandbox has neither, so this only runs on the real machine).
-2. **Ship the binary**: scp `built_binary_path` → the client's `install_dir(home)`
-   over the ssh seam that already exists (`SSH_OPTS`, host-key trust, key auth). Or
-   drop in `/tmp` and let the client `cp` it (avoids writing another device's bin dir
-   directly).
-3. **Dependencies / "package manager" niceties**: an app can declare what it needs
+1. **CMake builds**: options are scanned + exposed today, and `cmake_configure_argv`
+   builds the `-D…` command, but cross-compiling CMake needs a per-target toolchain
+   file — that's an on-device prerequisite, so the CMake *build* (vs flag exposure)
+   is the remaining piece for C++ apps.
+2. **Dependencies / "package manager" niceties**: an app declares what it needs
    (toolkits, runtime libs, sibling apps); the server resolves + reports them before
-   install, so this becomes a personal mirror/package manager with gitmind's
-   content-addressed history underneath. This is where `sharekit` (see SHARING.md)
-   and the `dht://` provider plug in for discovery without typing `host:port`.
+   install. With gitmind's content-addressed history underneath this becomes a
+   personal mirror/package manager. `sharekit` + `dht://` (see SHARING.md) plug in
+   here for discovery without typing `host:port`.
 
 ## Security note
 
