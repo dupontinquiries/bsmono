@@ -896,3 +896,32 @@ field (install uses the provider URL's embedded whoami; clone covered by accept-
 SANDBOX has NO ssh/ssh-keygen/ssh-keyscan/rsync (only git) → spawn-failure path returns false/err
 (no panic); real ssh I/O is on-device. deploy 10 tests (was 8: +scan-filter/fingerprint, +unknown-
 host-not-trusted) PASS; netshare 4 PASS; gui rustcheck CLEAN; Deploy.qml balanced. gui logic = 15 tests.
+
+── ssh edge cases through the GUI: async browse + classified errors + key-setup wizard ──
+SYMPTOMS (GUI live, browsing the *advertiser* from the other end): CursorHandle.qml:65
+"target undefined" typeerror on tapping browse + no password/file UI. ROOT: list_remote_dirs
+was the one op still SYNCHRONOUS → tapping browse froze the UI thread mid-touch (up to
+ConnectTimeout) → Qt's touch cursor-handle tore down (that typeerror); and with BatchMode=yes
+ssh now *fails fast* on missing key auth between the two devices, but the GUI swallowed the
+error instead of saying "auth".
+[deploy.rs] ssh_error_reason(stderr)->auth|hostkey|unreachable|other (pure, tested). untrust_host
+(ssh-keygen -R) + retrust_host = untrust+trust (clears a stale/changed key — the accept-new case
+that WON'T auto-resolve). ensure_local_pubkey (reuse id_ed25519/rsa/ecdsa or generate ed25519
+-N "" -C gitmind-fleet). setup_key(user,host,password): ensure key → install pubkey into remote
+authorized_keys via PASSWORD auth fed through SSH_ASKPASS (temp 0700 helper echoing $GM_SSH_PW,
+SSH_ASKPASS_REQUIRE=force; GUI has no TTY so ssh uses it) → passwordless after. setup_key_argv
+forces PubkeyAuthentication=no + PreferredAuthentications=password + accept-new (pure, tested).
+ASKPASS_BODY const tested. Password NEVER written to disk (env on the child only; helper just
+echoes it); cleared from QML on success.
+[main.rs] start_browse (async; result {ok,path,dirs} or {ok:false,error,reason}), start_retrust,
+start_setup_key — all via the shared Job + poll_job.
+[Deploy.qml] browse() now async (kills the freeze→handle-teardown). applyJobResult handles
+browse/retrust/setupkey; on browse failure sets lastReason + a human hint() and auto-reveals the
+setup row when reason=auth. AUTO-RETRY browse after a successful trust/retrust/setupkey. Connection
+block: trust / re-trust / "set up SSH key" buttons + a password field (echo Password) → install_key.
+selectDevice resets curPath/dirs/lastReason/sshpass/showSetup.
+SANDBOX has no ssh/keygen/keyscan → setup_key/retrust I/O is on-device; pure logic (reason class,
+argv, askpass body, no-network guards) IS tested: deploy 12 tests PASS (+ssh_errors_classify,
++key_setup_argv), netshare 4, gui rustcheck CLEAN, Deploy.qml balanced. gui logic = 17 tests.
+NOTE: CursorHandle.qml is a Qt-internal touch artifact (can't patch); async browse stops it firing
+on browse; any residual is benign console noise.

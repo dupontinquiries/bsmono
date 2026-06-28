@@ -331,6 +331,161 @@ pub fn trust_host(host: &str) -> Result<String, String> {
     Ok(format!("trusted {h} ({fp})"))
 }
 
+/// Remove every `~/.ssh/known_hosts` entry for `host` (`ssh-keygen -R`). Used by
+/// re-trust to clear a stale / conflicting key before re-adding the current one.
+pub fn untrust_host(host: &str) -> Result<(), String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host".into());
+    }
+    // `-R` exits 0 even when there was nothing to remove; only a real error fails.
+    let out = Command::new("ssh-keygen")
+        .args(["-R", h])
+        .output()
+        .map_err(|e| format!("ssh-keygen -R: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Clear `host`'s known_hosts entry and re-fetch its current key. Fixes a host
+/// whose key changed or got into a bad state (e.g. the terminal/GUI split) — the
+/// case `StrictHostKeyChecking=accept-new` deliberately *won't* auto-resolve.
+pub fn retrust_host(host: &str) -> Result<String, String> {
+    untrust_host(host)?;
+    Ok(format!("re-{}", trust_host(host)?))
+}
+
+// ───────────────────────── ssh auth + key setup ─────────────────────────
+
+/// Coarse classification of an ssh failure so the GUI can offer the right fix:
+///   "auth"        — login/key rejected → offer "set up SSH key"
+///   "hostkey"     — known_hosts conflict → offer "re-trust key"
+///   "unreachable" — DNS / timeout / refused → nothing to fix here
+///   "other"       — anything else (show the raw message)
+/// Pure — unit-tested.
+pub fn ssh_error_reason(stderr: &str) -> &'static str {
+    let s = stderr.to_lowercase();
+    if s.contains("permission denied")
+        || s.contains("authentication failed")
+        || s.contains("no more authentication methods")
+    {
+        "auth"
+    } else if s.contains("host key verification failed")
+        || s.contains("remote host identification has changed")
+    {
+        "hostkey"
+    } else if s.contains("could not resolve")
+        || s.contains("name or service not known")
+        || s.contains("timed out")
+        || s.contains("connection refused")
+        || s.contains("no route to host")
+    {
+        "unreachable"
+    } else {
+        "other"
+    }
+}
+
+/// The local public key, generating an ed25519 keypair (no passphrase) if the
+/// user has none yet. Returns the *public* key text to install on a device.
+pub fn ensure_local_pubkey() -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "no $HOME set".to_string())?;
+    let ssh_dir = format!("{home}/.ssh");
+    std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create {ssh_dir}: {e}"))?;
+    for name in ["id_ed25519", "id_rsa", "id_ecdsa"] {
+        let pubp = format!("{ssh_dir}/{name}.pub");
+        if std::path::Path::new(&pubp).exists() {
+            return std::fs::read_to_string(&pubp).map_err(|e| format!("read {pubp}: {e}"));
+        }
+    }
+    let keyp = format!("{ssh_dir}/id_ed25519");
+    let st = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "gitmind-fleet", "-f", &keyp])
+        .status()
+        .map_err(|e| format!("ssh-keygen: {e}"))?;
+    if !st.success() {
+        return Err("ssh-keygen could not create a key".into());
+    }
+    std::fs::read_to_string(format!("{keyp}.pub")).map_err(|e| format!("read new pubkey: {e}"))
+}
+
+/// Body of the temporary SSH_ASKPASS helper: echo the password the GUI put in the
+/// `GM_SSH_PW` env var, so ssh can read it without a TTY. Constant — unit-tested.
+const ASKPASS_BODY: &str = "#!/bin/sh\nprintf '%s\\n' \"$GM_SSH_PW\"\n";
+
+/// ssh argv (without the trailing remote command) used to install a key via
+/// *password* auth: force password (the key isn't on the device yet) and
+/// auto-trust the host key. Pure — unit-tested.
+fn setup_key_argv(user: &str, host: &str) -> Vec<String> {
+    vec![
+        "-o".into(), "PubkeyAuthentication=no".into(),
+        "-o".into(), "PreferredAuthentications=password".into(),
+        "-o".into(), "ConnectTimeout=8".into(),
+        "-o".into(), "StrictHostKeyChecking=accept-new".into(),
+        format!("{user}@{host}"),
+    ]
+}
+
+/// Install our public key into `user@host`'s `authorized_keys` using password auth,
+/// fed non-interactively through SSH_ASKPASS (the GUI has no TTY). This is the
+/// "set up SSH key" wizard: you enter the device password *once*, then every later
+/// connection is passwordless (BatchMode key auth works). Returns a status note.
+pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, String> {
+    if user.trim().is_empty() || host.trim().is_empty() {
+        return Err("user and host are required".into());
+    }
+    if password.is_empty() {
+        return Err("enter the device password to install the key".into());
+    }
+    let pubkey = ensure_local_pubkey()?;
+    // temp askpass helper (0700, current pid in the name, removed after)
+    let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
+    std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod askpass: {e}"))?;
+    }
+    let remote = "umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && echo gitmind-key-installed";
+    let spawned = Command::new("ssh")
+        .env("GM_SSH_PW", password)
+        .env("SSH_ASKPASS", &script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()))
+        .args(setup_key_argv(user, host))
+        .arg(remote)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = (|| -> Result<String, String> {
+        let mut child = spawned.map_err(|e| format!("ssh: {e}"))?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .ok_or("ssh stdin unavailable")?
+            .write_all(pubkey.as_bytes())
+            .map_err(|e| format!("send key: {e}"))?;
+        let out = child.wait_with_output().map_err(|e| format!("ssh wait: {e}"))?;
+        if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("gitmind-key-installed") {
+            Ok(format!("installed your key on {user}@{host} — connections are passwordless now"))
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            match ssh_error_reason(&err) {
+                "auth" => Err(format!("password rejected for {user}@{host}")),
+                _ if err.trim().is_empty() => Err("key install failed".into()),
+                _ => Err(err.trim().to_string()),
+            }
+        }
+    })();
+    let _ = std::fs::remove_file(&script); // best-effort cleanup, even on error
+    result
+}
+
 // ───────────────────────── background jobs ─────────────────────────
 
 /// Shared state for one background deploy job (discover / push / deploy).
@@ -458,6 +613,33 @@ mod tests {
         assert!(!host_trusted("definitely.not.a.real.host.invalid"));
         assert!(!host_trusted("   "));
         assert!(trust_host("").is_err(), "empty host -> error, no network");
+        assert!(untrust_host("").is_err(), "empty host -> error");
+    }
+
+    #[test]
+    fn ssh_errors_classify_into_actionable_reasons() {
+        assert_eq!(ssh_error_reason("kesslerd@fp5: Permission denied (publickey,password)."), "auth");
+        assert_eq!(ssh_error_reason("Authentication failed."), "auth");
+        assert_eq!(ssh_error_reason("Host key verification failed."), "hostkey");
+        assert_eq!(ssh_error_reason("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"), "hostkey");
+        assert_eq!(ssh_error_reason("ssh: connect to host fp5 port 22: Connection refused"), "unreachable");
+        assert_eq!(ssh_error_reason("ssh: Could not resolve hostname fp5"), "unreachable");
+        assert_eq!(ssh_error_reason("Operation timed out"), "unreachable");
+        assert_eq!(ssh_error_reason("some other thing went wrong"), "other");
+    }
+
+    #[test]
+    fn key_setup_argv_forces_password_and_autotrusts() {
+        let a = setup_key_argv("kesslerd", "fp5.local");
+        assert!(a.windows(2).any(|w| w[0] == "-o" && w[1] == "PubkeyAuthentication=no"), "force password: {a:?}");
+        assert!(a.contains(&"PreferredAuthentications=password".to_string()));
+        assert!(a.contains(&"StrictHostKeyChecking=accept-new".to_string()), "still auto-trust the host key");
+        assert_eq!(a.last().unwrap(), "kesslerd@fp5.local", "target is last");
+        // the askpass helper reads the password the GUI exports
+        assert!(ASKPASS_BODY.contains("GM_SSH_PW"));
+        // no-network guards
+        assert!(setup_key("", "h", "pw").is_err());
+        assert!(setup_key("u", "h", "").is_err(), "no password -> error before any ssh");
     }
 
     #[test]
