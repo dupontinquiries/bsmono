@@ -81,12 +81,21 @@ ApplicationWindow {
                     untracked: modelData.untracked
                     onStageRequested: { backend.stage(modelData.path); win.refresh() }
                     onUnstageRequested: { backend.unstage(modelData.path); win.refresh() }
-                    onPeekRequested: { viewer.open(modelData.path); pages.currentIndex = 3 }
+                    onPeekRequested: { files.openPath(modelData.path); pages.currentIndex = 3 }
                 }
-                Label {
+                Column {
                     anchors.centerIn: parent
+                    spacing: 6
                     visible: win.status.ok && win.status.files.length === 0
-                    text: "clean"; color: "#8a93a6"
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "working tree clean"; color: "#8a93a6"
+                    }
+                    Label {
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        text: "browse the repo in Files · history in Timeline"
+                        color: "#5b6477"; font.pixelSize: 11
+                    }
                 }
             }
         }
@@ -97,8 +106,8 @@ ApplicationWindow {
         // ── Branches: native VCS, touch-first ────────────────────────
         Branches { id: branches }
 
-        // ── File viewer (peek) ───────────────────────────────────────
-        PeekViewer { id: viewer }
+        // ── Files: browse the working tree + view files (peek) ───────
+        Files { id: files }
 
         // ── Apps: version-pinned binaries ────────────────────────────
         Apps { id: apps }
@@ -114,7 +123,7 @@ ApplicationWindow {
         TabButton { text: "status" }
         TabButton { text: "timeline" }
         TabButton { text: "branches" }
-        TabButton { text: "view" }
+        TabButton { text: "files" }
         TabButton { text: "apps" }
         TabButton { text: "deploy" }
     }
