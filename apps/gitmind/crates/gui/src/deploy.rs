@@ -21,10 +21,20 @@ use std::time::Duration;
 ///       writing it to the shared `~/.ssh/known_hosts`, while still refusing a key
 ///       that has *changed*. This is what lets the GUI manage host-key trust
 ///       without a terminal prompt (no more known_hosts split between the two).
-pub const SSH_OPTS: [&str; 6] = [
+///
+/// Defence in depth: we also refuse to forward our agent or carry any port
+/// forwardings outbound, so that if a device we connect to is compromised it can't
+/// ride our connection (agent hijack / tunnel) to reach the rest of the fleet.
+///   `ForwardAgent=no`        → never expose our keys' agent to the remote.
+///   `ClearAllForwardings=yes`→ drop any -L/-R/-D tunnels even if configured.
+///   `ControlMaster=no`       → no shared control socket a local attacker could reuse.
+pub const SSH_OPTS: [&str; 12] = [
     "-o", "BatchMode=yes",
     "-o", "ConnectTimeout=8",
     "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ForwardAgent=no",
+    "-o", "ClearAllForwardings=yes",
+    "-o", "ControlMaster=no",
 ];
 
 /// `ssh <SSH_OPTS> user@host <remote_cmd>` as an argv (no shell).
@@ -159,6 +169,25 @@ pub fn list_remote_dirs(user: &str, host: &str, path: &str) -> Result<(String, V
     let pwd = lines.next().unwrap_or("").trim().to_string();
     let dirs = parse_dir_listing(&lines.collect::<Vec<_>>().join("\n"));
     Ok((pwd, dirs))
+}
+
+/// Run an arbitrary remote shell command over SSH and capture stdout. Used by the
+/// app catalog (listing + details) so the catalog logic stays std-only/testable
+/// while the SSH execution lives here. On-device.
+pub fn remote_capture(user: &str, host: &str, cmd: &str) -> Result<String, String> {
+    let out = Command::new("ssh")
+        .args(ssh_argv(user, host, cmd))
+        .output()
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        return Err(if msg.trim().is_empty() {
+            "ssh: remote command failed".into()
+        } else {
+            msg.trim().to_string()
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parse `ls -1Ap` output into directory names. Pure — unit-tested.
@@ -521,6 +550,43 @@ fn setup_key_argv(user: &str, host: &str) -> Vec<String> {
     ]
 }
 
+/// Derive the /24 the fleet lives on from a target IPv4 (e.g. `192.168.1.7` →
+/// `192.168.1.0/24`), or `None` if `host` isn't a dotted IPv4 (a hostname, etc.).
+/// Pure — unit-tested.
+pub fn lan_cidr_from_ip(host: &str) -> Option<String> {
+    let h = host.trim();
+    let octs: Vec<&str> = h.split('.').collect();
+    if octs.len() != 4 {
+        return None;
+    }
+    for o in &octs {
+        let n: u16 = o.parse().ok()?;
+        if n > 255 || o.is_empty() {
+            return None;
+        }
+    }
+    Some(format!("{}.{}.{}.0/24", octs[0], octs[1], octs[2]))
+}
+
+/// `authorized_keys` option prefix applied to the key we install — defence in
+/// depth so a *stolen* fleet key can't be used to pivot:
+///   `restrict`     → no port/agent/X11 forwarding, no PTY, no user-rc (this is the
+///                    bit that stops "tunnel into all trusted devices").
+///   `from="<cidr>"`→ the key only works from the local /24 (a remote attacker off
+///                    the LAN can't use it at all), added when the host is an IP.
+/// Pure — unit-tested.
+pub fn authorized_keys_options(host: &str) -> String {
+    match lan_cidr_from_ip(host) {
+        Some(cidr) => format!("restrict,from=\"{cidr}\""),
+        None => "restrict".to_string(),
+    }
+}
+
+/// Build the single `authorized_keys` line: `<options> <pubkey>`. Pure — tested.
+fn restricted_key_line(options: &str, pubkey: &str) -> String {
+    format!("{} {}\n", options, pubkey.trim())
+}
+
 /// Install our public key into `user@host`'s `authorized_keys` using password auth,
 /// fed non-interactively through SSH_ASKPASS (the GUI has no TTY). This is the
 /// "set up SSH key" wizard: you enter the device password *once*, then every later
@@ -533,6 +599,9 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
         return Err("enter the device password to install the key".into());
     }
     let pubkey = ensure_local_pubkey()?;
+    // Defence in depth: install the key with restrictions so it can't be used to
+    // pivot if the device is later compromised (see authorized_keys_options).
+    let key_line = restricted_key_line(&authorized_keys_options(host), &pubkey);
     // temp askpass helper (0700, current pid in the name, removed after)
     let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
     std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
@@ -560,7 +629,7 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
             .stdin
             .take()
             .ok_or("ssh stdin unavailable")?
-            .write_all(pubkey.as_bytes())
+            .write_all(key_line.as_bytes())
             .map_err(|e| format!("send key: {e}"))?;
         let out = child.wait_with_output().map_err(|e| format!("ssh wait: {e}"))?;
         if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("gitmind-key-installed") {
@@ -737,6 +806,29 @@ mod tests {
         // no-network guards
         assert!(setup_key("", "h", "pw").is_err());
         assert!(setup_key("u", "h", "").is_err(), "no password -> error before any ssh");
+    }
+
+    #[test]
+    fn outbound_ssh_refuses_agent_and_tunnels() {
+        // the flags that stop a compromised peer pivoting through our connection
+        let joined = SSH_OPTS.join(" ");
+        assert!(joined.contains("ForwardAgent=no"), "no agent forwarding: {joined}");
+        assert!(joined.contains("ClearAllForwardings=yes"), "drop tunnels: {joined}");
+    }
+
+    #[test]
+    fn installed_keys_are_restricted_and_lan_pinned() {
+        assert_eq!(lan_cidr_from_ip("192.168.1.7").as_deref(), Some("192.168.1.0/24"));
+        assert_eq!(lan_cidr_from_ip("10.0.0.42").as_deref(), Some("10.0.0.0/24"));
+        assert_eq!(lan_cidr_from_ip("fp5.local"), None, "hostname -> no from= pin");
+        assert_eq!(lan_cidr_from_ip("192.168.1.999"), None, "bad octet -> none");
+        // IP target: restrict + from=; hostname target: restrict only
+        assert_eq!(authorized_keys_options("192.168.1.7"), "restrict,from=\"192.168.1.0/24\"");
+        assert_eq!(authorized_keys_options("fp5.local"), "restrict");
+        // the installed line carries the options ahead of the key, one line
+        let line = restricted_key_line("restrict,from=\"192.168.1.0/24\"", "ssh-ed25519 AAAAC3xyz gitmind-fleet\n");
+        assert!(line.starts_with("restrict,from=\"192.168.1.0/24\" ssh-ed25519 "));
+        assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
     }
 
     #[test]
