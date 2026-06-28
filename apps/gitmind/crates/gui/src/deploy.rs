@@ -215,6 +215,59 @@ pub fn deploy_app(user: &str, host: &str, dir: &str, app: &str) -> Result<String
     }
 }
 
+// ───────────────────────── background jobs ─────────────────────────
+
+/// Shared state for one background deploy job (discover / push / deploy).
+///
+/// The slow operations — a /24 scan, an rsync, a remote build — must not run on
+/// the GUI thread or the whole window freezes. The Backend spawns a worker thread
+/// that calls [`Job::finish`] when done; the QML side polls [`Job::poll`] on a
+/// timer, so the UI stays live and the busy indicator can actually animate.
+#[derive(Default)]
+pub struct Job {
+    inner: Mutex<JobInner>,
+}
+
+#[derive(Default, Clone)]
+struct JobInner {
+    running: bool,
+    kind: String,
+    done: bool,
+    result: String,
+}
+
+impl Job {
+    /// Claim the job for `kind`. Returns false if one is already running, so the
+    /// caller can refuse to start a second concurrent operation.
+    pub fn start(&self, kind: &str) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        if g.running {
+            return false;
+        }
+        *g = JobInner { running: true, kind: kind.to_string(), done: false, result: String::new() };
+        true
+    }
+
+    /// Worker thread reports the finished JSON result.
+    pub fn finish(&self, result: String) {
+        let mut g = self.inner.lock().unwrap();
+        g.running = false;
+        g.done = true;
+        g.result = result;
+    }
+
+    /// GUI poll → (running, done, kind, result). When `done`, the state is
+    /// consumed (reset to idle) so a result is delivered to the UI exactly once.
+    pub fn poll(&self) -> (bool, bool, String, String) {
+        let mut g = self.inner.lock().unwrap();
+        let out = (g.running, g.done, g.kind.clone(), g.result.clone());
+        if g.done {
+            *g = JobInner::default();
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +329,43 @@ mod tests {
         let g = remote_deploy_cmd("/repo", "gin");
         assert!(g.contains("cd /repo/apps/gitmind"));
         assert!(g.contains("--bin gin"));
+    }
+
+    #[test]
+    fn job_runs_async_and_delivers_result_once() {
+        use std::sync::Arc;
+        use std::time::Duration;
+        let job = Arc::new(Job::default());
+        // idle to start
+        let (r, d, _, _) = job.poll();
+        assert!(!r && !d, "starts idle");
+        // claim it; a second claim is refused while running
+        assert!(job.start("discover"), "first claim wins");
+        assert!(!job.start("push"), "second claim refused while a job runs");
+        // worker finishes off-thread
+        let j2 = Arc::clone(&job);
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            j2.finish(r#"{"ok":true}"#.to_string());
+        });
+        // poll until done — `running` stays true until the worker finishes
+        let mut got = None;
+        for _ in 0..400 {
+            let (running, done, kind, result) = job.poll();
+            if done {
+                got = Some((kind, result));
+                break;
+            }
+            assert!(running, "running until the worker finishes");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.join().unwrap();
+        let (kind, result) = got.expect("job should finish");
+        assert_eq!(kind, "discover");
+        assert_eq!(result, r#"{"ok":true}"#);
+        // consumed: idle again, and ready for the next job
+        let (r2, d2, _, _) = job.poll();
+        assert!(!r2 && !d2, "idle after the result is consumed");
+        assert!(job.start("push"), "can start a new job after consume");
     }
 }

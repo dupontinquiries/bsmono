@@ -101,12 +101,16 @@ struct Backend {
     app_install: qt_method!(fn(&self, name: QString, path: QString, label: QString, commit: QString) -> QString),
 
     // ── deploy: discover SSH devices, browse + push the repo, remote build + .desktop ──
-    discover_devices: qt_method!(fn(&self, subnet: QString) -> QString),
+    // The slow ops run off-thread (see impls); the QML drives them via poll_job().
+    start_discover: qt_method!(fn(&self, subnet: QString) -> QString),
     list_remote_dirs: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
-    push_repo: qt_method!(fn(&self, user: QString, host: QString, dir: QString) -> QString),
-    deploy_app: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
+    start_push: qt_method!(fn(&self, user: QString, host: QString, dir: QString) -> QString),
+    start_deploy: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
+    poll_job: qt_method!(fn(&self) -> QString),
 
     session: WatchSession,
+    // Shared state for the one in-flight background deploy job.
+    job: std::sync::Arc<deploy::Job>,
 }
 
 /// Open the repo from the process working directory (the GUI may be launched
@@ -625,24 +629,38 @@ impl Backend {
     }
 
     // ── deploy ───────────────────────────────────────────────────────────
-    /// Scan the LAN for hosts with SSH open. `subnet` empty = auto-detect /24.
-    /// Synchronous: blocks ~1–2s while the /24 is probed (64 threads, 300ms each).
-    fn discover_devices(&self, subnet: QString) -> QString {
-        let prefix = subnet.to_string();
-        let prefix = if prefix.trim().is_empty() {
-            match deploy::local_subnet24() {
-                Some(p) => p,
-                None => return err_json("could not detect the local subnet — type one like 192.168.1"),
-            }
-        } else { prefix.trim().to_string() };
-        let devices = deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
-        let arr: Vec<_> = devices.iter()
-            .map(|d| json!({"ip": d.ip, "hostname": d.hostname}))
-            .collect();
-        QString::from(json!({"ok": true, "subnet": prefix, "devices": arr}).to_string())
+    // The slow operations run on a worker thread so the GUI never freezes. Each
+    // `start_*` claims the shared Job, spawns the work, and returns immediately;
+    // the QML polls `poll_job()` on a timer and renders the result when it lands.
+
+    /// Start an LAN scan for SSH hosts on a worker thread. `subnet` empty =
+    /// auto-detect the local /24. Returns immediately; poll for the device list.
+    fn start_discover(&self, subnet: QString) -> QString {
+        if !self.job.start("discover") {
+            return err_json("a deploy job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        let subnet = subnet.to_string();
+        std::thread::spawn(move || {
+            let prefix = if subnet.trim().is_empty() {
+                deploy::local_subnet24().unwrap_or_default()
+            } else {
+                subnet.trim().to_string()
+            };
+            let result = if prefix.is_empty() {
+                json!({"ok": false, "error": "could not detect the local subnet — type one like 192.168.1"}).to_string()
+            } else {
+                let devices = deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
+                let arr: Vec<_> = devices.iter().map(|d| json!({"ip": d.ip, "hostname": d.hostname})).collect();
+                json!({"ok": true, "subnet": prefix, "devices": arr}).to_string()
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "discover"}).to_string())
     }
 
     /// List subdirectories of `path` on the device — drives the folder picker.
+    /// Stays synchronous: a single `ssh ls` is quick and keeps navigation simple.
     fn list_remote_dirs(&self, user: QString, host: QString, path: QString) -> QString {
         match deploy::list_remote_dirs(&user.to_string(), &host.to_string(), &path.to_string()) {
             Ok((pwd, dirs)) => QString::from(json!({"ok": true, "path": pwd, "dirs": dirs}).to_string()),
@@ -650,22 +668,48 @@ impl Backend {
         }
     }
 
-    /// rsync the monorepo working tree (this repo) to `dir` on the device.
-    fn push_repo(&self, user: QString, host: QString, dir: QString) -> QString {
+    /// Start an rsync of the monorepo working tree to `dir` on the device, on a
+    /// worker thread. Returns immediately; poll for the result.
+    fn start_push(&self, user: QString, host: QString, dir: QString) -> QString {
         let root = match repo() { Ok(r) => r.root().to_string_lossy().into_owned(), Err(e) => return err_json(&e) };
-        match deploy::push_repo(&root, &user.to_string(), &host.to_string(), &dir.to_string()) {
-            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
-            Err(e) => err_json(&e),
+        if !self.job.start("push") {
+            return err_json("a deploy job is already running");
         }
+        let job = std::sync::Arc::clone(&self.job);
+        let (u, h, d) = (user.to_string(), host.to_string(), dir.to_string());
+        std::thread::spawn(move || {
+            let result = match deploy::push_repo(&root, &u, &h, &d) {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "push"}).to_string())
     }
 
-    /// On the device: build `app` from the pushed tree and install it with a
-    /// .desktop launcher (shows up on Plasma Mobile). Blocks for the remote build.
-    fn deploy_app(&self, user: QString, host: QString, dir: QString, app: QString) -> QString {
-        match deploy::deploy_app(&user.to_string(), &host.to_string(), &dir.to_string(), &app.to_string()) {
-            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
-            Err(e) => err_json(&e),
+    /// Start a remote build + `gin app install --desktop` on a worker thread, so
+    /// the (possibly long) build doesn't freeze the UI. Returns immediately.
+    fn start_deploy(&self, user: QString, host: QString, dir: QString, app: QString) -> QString {
+        if !self.job.start("deploy") {
+            return err_json("a deploy job is already running");
         }
+        let job = std::sync::Arc::clone(&self.job);
+        let (u, h, d, a) = (user.to_string(), host.to_string(), dir.to_string(), app.to_string());
+        std::thread::spawn(move || {
+            let result = match deploy::deploy_app(&u, &h, &d, &a) {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "deploy"}).to_string())
+    }
+
+    /// The GUI polls this on a timer → {running, done, kind, result}. The result
+    /// JSON is delivered exactly once (the job resets to idle after a done poll).
+    fn poll_job(&self) -> QString {
+        let (running, done, kind, result) = self.job.poll();
+        QString::from(json!({"running": running, "done": done, "kind": kind, "result": result}).to_string())
     }
 }
 

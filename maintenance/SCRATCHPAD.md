@@ -808,3 +808,24 @@ All 5 apps rustcheck clean; wrapper targets verified against core-kit.
 
 [NOT swept] hex dup in bo-suite (1 file) — minor, deferred. peek dedup (gitmind/crates/peek ==
 tools/peek) left intentionally: deduping breaks apps-are-standalone.
+
+---
+## GUI deploy cockpit — async polish (this session)
+
+discover/push/deploy were synchronous → the GUI froze for their duration (scan
+1-2s, remote build longer). Made them async, worker-thread + poll:
+[deploy.rs] added Job (Mutex<JobInner>: running/kind/done/result) with start()
+(claims it; refuses a 2nd concurrent job), finish() (worker reports JSON result),
+poll() (GUI reads; consumes the done result so it's delivered exactly once). New
+8th unit test drives the full claim → off-thread finish → poll-once → idle cycle.
+[main.rs] discover_devices/push_repo/deploy_app → start_discover/start_push/
+start_deploy: each claims the Job, spawns a worker (captures Arc<Job> + owned
+Strings, never self), returns immediately. New poll_job() qt_method; new field
+job: Arc<deploy::Job>. list_remote_dirs stays sync (one quick ssh ls).
+[Deploy.qml] start_* + a 250ms repeat Timer (poller) that polls poll_job and, on
+done, dispatches via applyJobResult (renamed from onJobDone to dodge QML's
+on<Signal> handler-naming rule). Added an animated BusyIndicator (works now the
+UI thread is free); action buttons stay disabled while busy.
+gui crate rustcheck CLEAN; QML balanced 58/58·60/60; deploy module 8/8.
+[edge, noted] a panicking worker would leave the Job running=true (UI stuck busy)
+— the ops are I/O-returns-Result so low risk; wrap in catch_unwind if it shows up.
