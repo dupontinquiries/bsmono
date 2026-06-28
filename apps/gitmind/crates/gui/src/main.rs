@@ -31,6 +31,7 @@ use gitmind_core::watch_session::WatchSession;
 mod deploy;
 mod browse;
 mod netshare;
+mod bttransfer;
 
 qrc!(register_qml,
     "/" {
@@ -122,6 +123,15 @@ struct Backend {
     start_retrust: qt_method!(fn(&self, host: QString) -> QString),
     start_browse: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
+    // two-sided fingerprint matching: show this device's key, preview a peer's key,
+    // and trust exactly the key the user compared on screen.
+    local_fingerprint: qt_method!(fn(&self) -> QString),
+    start_preview: qt_method!(fn(&self, host: QString) -> QString),
+    trust_previewed_key: qt_method!(fn(&self, host: QString, keys: QString) -> QString),
+    // bluetooth file send (OBEX) + a bundle helper to give it something to send.
+    bluetooth_devices: qt_method!(fn(&self) -> QString),
+    start_bluetooth_send: qt_method!(fn(&self, addr: QString, file: QString) -> QString),
+    make_bundle: qt_method!(fn(&self, dest: QString) -> QString),
 
     // ── network: advertise this repo's card, look up + install a peer's ──
     advertise_start: qt_method!(fn(&self, port: QString) -> QString),
@@ -849,6 +859,112 @@ impl Backend {
             job.finish(result);
         });
         QString::from(json!({"ok": true, "started": "setupkey"}).to_string())
+    }
+
+    // ── two-sided fingerprint matching ───────────────────────────────────
+    /// This device's own key fingerprints (host key for connection identity, plus
+    /// the identity key it installs), with randomart — so the *other* device can
+    /// compare what it sees against this screen.
+    fn local_fingerprint(&self) -> QString {
+        let one = |pubkey: Option<String>| -> serde_json::Value {
+            match pubkey.and_then(|k| deploy::key_fingerprint_art(&k)) {
+                Some((fp, typ, art)) => json!({"present": true, "fingerprint": fp, "type": typ, "art": art}),
+                None => json!({"present": false}),
+            }
+        };
+        QString::from(json!({
+            "ok": true,
+            "host": one(deploy::local_host_pubkey()),
+            "identity": one(deploy::local_identity_pubkey()),
+        }).to_string())
+    }
+
+    /// Fetch a peer's host key (no write) and return its fingerprint + randomart for
+    /// on-screen comparison; `keys` is the exact bytes to trust once confirmed.
+    /// Async — ssh-keyscan does a network round-trip.
+    fn start_preview(&self, host: QString) -> QString {
+        let h = host.to_string();
+        if h.trim().is_empty() {
+            return err_json("no host to preview");
+        }
+        if !self.job.start("preview") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = match deploy::fetch_peer_key(&h) {
+                Ok(keys) => match deploy::key_fingerprint_art(&keys) {
+                    Some((fp, typ, art)) => json!({"ok": true, "fingerprint": fp, "type": typ, "art": art, "keys": keys}).to_string(),
+                    None => json!({"ok": true, "fingerprint": "(install ssh-keygen to show)", "type": "", "art": "", "keys": keys}).to_string(),
+                },
+                Err(e) => json!({"ok": false, "error": e, "reason": deploy::ssh_error_reason(&e)}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "preview"}).to_string())
+    }
+
+    /// Trust exactly the key bytes the user just compared on screen (from a preview).
+    /// Local write only — no network — so it's synchronous.
+    fn trust_previewed_key(&self, host: QString, keys: QString) -> QString {
+        match deploy::write_known_host(&host.to_string(), &keys.to_string()) {
+            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    // ── bluetooth file send (OBEX) ───────────────────────────────────────
+    /// Paired / known Bluetooth devices to send a file to.
+    fn bluetooth_devices(&self) -> QString {
+        match bttransfer::bt_devices() {
+            Ok(devs) => {
+                let list: Vec<_> = devs.into_iter().map(|d| json!({"addr": d.addr, "name": d.name})).collect();
+                QString::from(json!({"ok": true, "devices": list}).to_string())
+            }
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Send `file` (e.g. the repo bundle) to a Bluetooth device over OBEX push, on
+    /// the worker thread (transfers are slow). Poll poll_job for the result.
+    fn start_bluetooth_send(&self, addr: QString, file: QString) -> QString {
+        let (a, f) = (addr.to_string(), file.to_string());
+        if a.trim().is_empty() || f.trim().is_empty() {
+            return err_json("pick a device and a file");
+        }
+        if !self.job.start("btsend") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = match bttransfer::bt_send(&a, &f) {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "btsend"}).to_string())
+    }
+
+    /// Bundle the whole repo to `dest` (`git bundle create --all`) so it can be
+    /// handed to a device over Bluetooth (or any sneakernet) and cloned there.
+    fn make_bundle(&self, dest: QString) -> QString {
+        let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
+        let root = r.root().to_string_lossy().into_owned();
+        let out = dest.to_string();
+        let out = if out.trim().is_empty() {
+            format!("{}/monorepo.bundle", std::env::temp_dir().to_string_lossy())
+        } else {
+            out
+        };
+        let st = std::process::Command::new("git")
+            .args(["-C", &root, "bundle", "create", &out, "--all"])
+            .status();
+        match st {
+            Ok(s) if s.success() => QString::from(json!({"ok": true, "path": out}).to_string()),
+            Ok(s) => err_json(&format!("git bundle exited {:?}", s.code())),
+            Err(e) => err_json(&format!("git bundle: {e}")),
+        }
     }
 
     // ── network ──────────────────────────────────────────────────────────

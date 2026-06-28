@@ -308,6 +308,17 @@ pub fn trust_host(host: &str) -> Result<String, String> {
     if host_trusted(h) {
         return Ok(format!("{h} is already trusted"));
     }
+    let keys = fetch_peer_key(h)?;
+    write_known_host(h, &keys)
+}
+
+/// Fetch a peer's host key **without** writing it — for fingerprint preview /
+/// two-sided matching. Returns the raw `known_hosts` line(s). On-device.
+pub fn fetch_peer_key(host: &str) -> Result<String, String> {
+    let h = host.trim();
+    if h.is_empty() {
+        return Err("no host given".into());
+    }
     let scan = Command::new("ssh-keyscan")
         .args(["-T", "6", h])
         .output()
@@ -316,7 +327,17 @@ pub fn trust_host(host: &str) -> Result<String, String> {
     if keys.trim().is_empty() {
         return Err(format!("no SSH key returned for {h} (unreachable, or no sshd there?)"));
     }
-    let fp = fingerprint_of(&keys).unwrap_or_else(|| "key".to_string());
+    Ok(keys)
+}
+
+/// Append already-fetched key line(s) to `~/.ssh/known_hosts`. Used by both the
+/// auto-trust path and "matched — trust" (where these are exactly the bytes whose
+/// fingerprint the user just compared against the other device's screen).
+pub fn write_known_host(host: &str, key_lines: &str) -> Result<String, String> {
+    let h = host.trim();
+    if h.is_empty() || key_lines.trim().is_empty() {
+        return Err("nothing to trust".into());
+    }
     let home = std::env::var("HOME").map_err(|_| "no $HOME set".to_string())?;
     let ssh_dir = format!("{home}/.ssh");
     std::fs::create_dir_all(&ssh_dir).map_err(|e| format!("create {ssh_dir}: {e}"))?;
@@ -327,8 +348,79 @@ pub fn trust_host(host: &str) -> Result<String, String> {
         .append(true)
         .open(&known)
         .map_err(|e| format!("open {known}: {e}"))?;
-    writeln!(f, "{}", keys.trim_end()).map_err(|e| format!("write {known}: {e}"))?;
+    writeln!(f, "{}", key_lines.trim_end()).map_err(|e| format!("write {known}: {e}"))?;
+    let fp = fingerprint_of(key_lines).unwrap_or_else(|| "key".to_string());
     Ok(format!("trusted {h} ({fp})"))
+}
+
+// ──────────────────── key fingerprints (two-sided matching) ────────────────────
+
+/// Parse an `ssh-keygen -l` summary line, e.g.
+///   `256 SHA256:Zl3p… comment (ED25519)`
+/// into (fingerprint, keytype). Pure — unit-tested.
+pub fn parse_key_summary(line: &str) -> Option<(String, String)> {
+    let mut it = line.split_whitespace();
+    let _bits = it.next()?;
+    let fp = it.next()?.to_string();
+    let typ = line
+        .rsplit('(')
+        .next()
+        .map(|t| t.trim_end_matches(')').trim().to_string())?;
+    if fp.is_empty() || typ.is_empty() || typ == line {
+        return None;
+    }
+    Some((fp, typ))
+}
+
+/// Run public-key text through `ssh-keygen -lv -` → (fingerprint, keytype,
+/// randomart). The ASCII "randomart" box exists for exactly this: comparing the
+/// same key by eye on two screens. On-device (shells out).
+pub fn key_fingerprint_art(pubkey: &str) -> Option<(String, String, String)> {
+    use std::io::Write;
+    let mut child = Command::new("ssh-keygen")
+        .args(["-lv", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(pubkey.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let (fp, typ) = parse_key_summary(lines.next()?)?;
+    let art = lines.collect::<Vec<_>>().join("\n");
+    Some((fp, typ, art))
+}
+
+/// This machine's SSH **host** public key (prefer ed25519), so the GUI can show
+/// "this device's key" for a peer to match on screen.
+pub fn local_host_pubkey() -> Option<String> {
+    for p in [
+        "/etc/ssh/ssh_host_ed25519_key.pub",
+        "/etc/ssh/ssh_host_ecdsa_key.pub",
+        "/etc/ssh/ssh_host_rsa_key.pub",
+    ] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// This user's SSH **identity** public key (the one `setup_key` installs), if any.
+pub fn local_identity_pubkey() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    for n in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+        if let Ok(s) = std::fs::read_to_string(format!("{home}/.ssh/{n}.pub")) {
+            if !s.trim().is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
 }
 
 /// Remove every `~/.ssh/known_hosts` entry for `host` (`ssh-keygen -R`). Used by
@@ -605,6 +697,11 @@ mod tests {
         let fp_line = "256 SHA256:n0tAr3alF1ngerPr1nt fp5.local (ED25519)";
         assert_eq!(parse_fingerprint(fp_line).as_deref(), Some("SHA256:n0tAr3alF1ngerPr1nt"));
         assert_eq!(parse_fingerprint("").as_deref(), None);
+        // the richer summary parse used for two-sided matching display
+        let (fp, typ) = parse_key_summary(fp_line).expect("summary parses");
+        assert_eq!(fp, "SHA256:n0tAr3alF1ngerPr1nt");
+        assert_eq!(typ, "ED25519");
+        assert_eq!(parse_key_summary("garbage with no parens"), None);
     }
 
     #[test]
