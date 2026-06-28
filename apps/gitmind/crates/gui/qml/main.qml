@@ -114,6 +114,9 @@ ApplicationWindow {
 
         // ── Deploy: discover devices, push the repo, make a launcher ──
         Deploy { id: deploy }
+
+        // ── Network: advertise, look up + install a peer's repo over HTTP ──
+        Network { id: network }
     }
 
     footer: TabBar {
@@ -126,6 +129,7 @@ ApplicationWindow {
         TabButton { text: "files" }
         TabButton { text: "apps" }
         TabButton { text: "deploy" }
+        TabButton { text: "network" }
     }
 
     // Drain checkpoints the background watcher recorded; update the timeline
