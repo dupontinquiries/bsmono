@@ -13,13 +13,21 @@ Item {
     property var devices: []
     property string selHost: ""   // IP we ssh to
     property string selName: ""   // hostname for display
-    property string user: "user"
+    property string user: "user"  // defaulted to the real login name on load
+    property bool hostTrusted: false   // is selHost's key in known_hosts?
     property string curPath: ""   // resolved absolute folder on the device
     property var dirs: []
     property string app: "voiceterm"
     property string note: ""
     property bool busy: false
-    property string jobKind: ""   // which async job is in flight: discover|push|deploy
+    property string jobKind: ""   // which async job is in flight: discover|push|deploy|trust
+
+    // Default the SSH user to whoami so we never ssh as the literal "user" (which
+    // hit a password prompt and froze the GUI).
+    Component.onCompleted: {
+        var r = JSON.parse(backend.current_user())
+        if (r.user && r.user.length) root.user = r.user
+    }
 
     // Slow ops run on a worker thread in the backend; we kick them off and let the
     // poller pick up the result, so the UI stays live and the spinner animates.
@@ -31,7 +39,20 @@ Item {
     }
     function selectDevice(ip, host) {
         selHost = ip; selName = (host && host.length) ? host : ip
+        refreshTrust()
         browse("")
+    }
+    function refreshTrust() {
+        if (selHost.length === 0) { hostTrusted = false; return }
+        var r = JSON.parse(backend.host_trusted(selHost))
+        hostTrusted = !!r.trusted
+    }
+    function trustHost() {
+        if (selHost.length === 0) return
+        var r = JSON.parse(backend.start_trust(selHost))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "trust"; root.note = "fetching + trusting " + root.selName + "'s key…"
+        poller.start()
     }
     function browse(path) {
         if (selHost.length === 0) return
@@ -62,6 +83,9 @@ Item {
             root.note = res.ok ? res.msg : ("error: " + res.error)
         } else if (root.jobKind === "deploy") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
+        } else if (root.jobKind === "trust") {
+            root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
+            root.refreshTrust()
         }
         root.jobKind = ""
     }
@@ -148,6 +172,24 @@ Item {
                     Label { text: "user"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
                     TextField { width: 140; text: root.user; onTextChanged: root.user = text }
                     Button { text: "browse"; onClicked: root.browse("") }
+                }
+                // host-key trust — handled here so it lands in the one shared
+                // known_hosts (no terminal/GUI split). New hosts are auto-trusted
+                // on first connect too; this lets you do it explicitly + see status.
+                Row {
+                    width: parent.width; spacing: 8
+                    Label {
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.hostTrusted ? "🔒 key trusted" : "key not trusted yet"
+                        color: root.hostTrusted ? "#56d364" : "#f9e2af"
+                        font.pixelSize: 13
+                    }
+                    Button {
+                        text: root.busy ? "…" : "trust key"
+                        visible: !root.hostTrusted
+                        enabled: !root.busy
+                        onClicked: root.trustHost()
+                    }
                 }
                 Label {
                     width: parent.width
