@@ -848,3 +848,28 @@ status panel's peek action now routes to files.openPath(). "view" tab → "files
 PeekViewer.qml left in tree but no longer instantiated (folded into Files).
 Empty clean-status now signposts the Files + Timeline tabs.
 gui crate rustcheck CLEAN; browse+deploy modules = 9 tests. Qt build on-device.
+
+---
+## GUI network lookup + install — the Network tab (this session)
+
+User: "add network lookup and installing to the GUI." Used the pieces gitmind
+already had: announce::ProjectCard (content-addressed payload: name, refs, ssh
+provider, name_key) + net-kit::http (serve + roundtrip) — the transport the
+announce.rs comment anticipated ("DHT/hosting later"). net-kit is pure-std (core-
+kit only); added as a gui dep (../../../../shared/net-kit).
+[netshare.rs] Advertiser (stoppable serve state: stop AtomicBool + addr Mutex);
+card_for_repo(root,user,host) → card with repo name + git for-each-ref refs +
+ssh://user@host<abs> provider; serve_loop (non-blocking accept of GET /card until
+should_stop); lookup_peer(addr) → GET+parse a peer's card; install_card → git
+clone the ssh provider. 4 unit tests (card build, GET request, install validation,
+advertiser state) against the REAL announce + net-kit.
+[main.rs] net-kit dep; advertiser: Arc<netshare::Advertiser> field; advertise_
+start/stop/status + lookup_peer (sync, 4s) + start_install (async — reuses the
+deploy worker Job + poll_job). bind() happens synchronously in advertise_start so
+port-in-use errors surface; the serve thread runs serve_loop then adv.end().
+[Network.qml] advertise toggle (shows serving host:port), look up a peer by addr →
+renders the card (name/desc/refs/provider), install → start_install + the 250ms
+poller (busy spinner). 7th tab.
+gui crate rustcheck CLEAN; gui logic = 13 tests (deploy 8 + browse 1 + netshare 4).
+Live serve/GET/clone = on-device. [note] 7 tabs now — could fold deploy+network
+into a "fleet" tab if crowded.
