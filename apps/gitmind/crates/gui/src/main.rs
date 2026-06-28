@@ -119,6 +119,9 @@ struct Backend {
     current_user: qt_method!(fn(&self) -> QString),
     host_trusted: qt_method!(fn(&self, host: QString) -> QString),
     start_trust: qt_method!(fn(&self, host: QString) -> QString),
+    start_retrust: qt_method!(fn(&self, host: QString) -> QString),
+    start_browse: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
 
     // ── network: advertise this repo's card, look up + install a peer's ──
     advertise_start: qt_method!(fn(&self, port: QString) -> QString),
@@ -778,6 +781,74 @@ impl Backend {
             job.finish(result);
         });
         QString::from(json!({"ok": true, "started": "trust"}).to_string())
+    }
+
+    /// Re-trust `host`: clear its (possibly stale) known_hosts entry and re-fetch
+    /// the current key. For the "host key changed / messed up" case. Async.
+    fn start_retrust(&self, host: QString) -> QString {
+        let h = host.to_string();
+        if h.trim().is_empty() {
+            return err_json("no host to re-trust");
+        }
+        if !self.job.start("retrust") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = match deploy::retrust_host(&h) {
+                Ok(msg) => json!({"ok": true, "msg": msg, "host": h}).to_string(),
+                Err(e) => json!({"ok": false, "error": e, "host": h}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "retrust"}).to_string())
+    }
+
+    /// Browse a device's filesystem (folder picker) on the worker thread, so a slow
+    /// or failing ssh can't freeze the UI. On failure the result carries a `reason`
+    /// ("auth"/"hostkey"/"unreachable") the GUI uses to offer the right fix.
+    fn start_browse(&self, user: QString, host: QString, path: QString) -> QString {
+        if !self.job.start("browse") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        let (u, h, p) = (user.to_string(), host.to_string(), path.to_string());
+        std::thread::spawn(move || {
+            let result = match deploy::list_remote_dirs(&u, &h, &p) {
+                Ok((resolved, dirs)) => json!({"ok": true, "path": resolved, "dirs": dirs}).to_string(),
+                Err(e) => {
+                    let reason = deploy::ssh_error_reason(&e);
+                    json!({"ok": false, "error": e, "reason": reason}).to_string()
+                }
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "browse"}).to_string())
+    }
+
+    /// Install our SSH key on `user@host` using the device password (entered once),
+    /// so connections become passwordless. Runs on the worker thread (it does a
+    /// password-auth ssh round-trip). Returns immediately; poll for the result.
+    fn start_setup_key(&self, user: QString, host: QString, password: QString) -> QString {
+        let (u, h, pw) = (user.to_string(), host.to_string(), password.to_string());
+        if u.trim().is_empty() || h.trim().is_empty() {
+            return err_json("pick a device first");
+        }
+        if pw.is_empty() {
+            return err_json("enter the device password");
+        }
+        if !self.job.start("setupkey") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = match deploy::setup_key(&u, &h, &pw) {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "setupkey"}).to_string())
     }
 
     // ── network ──────────────────────────────────────────────────────────
