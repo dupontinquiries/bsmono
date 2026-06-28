@@ -16,8 +16,17 @@ Item {
     property string user: "user"  // defaulted to the real login name on load
     property bool hostTrusted: false   // is selHost's key in known_hosts?
     property string curPath: ""   // resolved absolute folder on the device
-    property var dirs: []
+    property var entries: []      // folder contents: [{name, app, cargo, git}]
     property string app: "voiceterm"
+    // selected app's metadata (the catalog info)
+    property string appPath: ""
+    property int appCrates: 0
+    property string appSize: ""
+    property string appReadme: ""
+    property bool showAppInfo: false
+    // confirmation dialog
+    property string confirmAction: "" // "push" | "deploy"
+    property string confirmPath: ""
     property string note: ""
     property bool busy: false
     property string jobKind: ""   // in-flight job: discover|browse|push|deploy|trust|retrust|setupkey
@@ -48,8 +57,9 @@ Item {
     }
     function selectDevice(ip, host) {
         selHost = ip; selName = (host && host.length) ? host : ip
-        curPath = ""; dirs = []; lastReason = ""; showSetup = false; sshpass = ""
+        curPath = ""; entries = []; lastReason = ""; showSetup = false; sshpass = ""
         showPreview = false; previewKeys = ""
+        showAppInfo = false; appPath = ""
         refreshTrust()
         browse("")
     }
@@ -105,6 +115,23 @@ Item {
         poller.start()
     }
     function parentOf(p) { var i = p.lastIndexOf("/"); return i > 0 ? p.substring(0, i) : "/" }
+    // Fetch a recognised app's metadata (crate count, size, README) and show it.
+    function showAppDetails(name) {
+        var path = root.curPath + "/" + name
+        var r = JSON.parse(backend.app_details(root.user, root.selHost, path))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.appPath = path; root.appCrates = r.crate_count
+        root.appSize = r.size; root.appReadme = r.readme; root.showAppInfo = true
+    }
+    // Confirmations: open a dialog showing the full (untruncated) path first.
+    function askConfirm(action, path) {
+        root.confirmAction = action; root.confirmPath = path; confirmDialog.open()
+    }
+    function doConfirm() {
+        confirmDialog.close()
+        if (root.confirmAction === "push") root.pushHere()
+        else if (root.confirmAction === "deploy") root.deployHere()
+    }
     function pushHere() {
         var r = JSON.parse(backend.start_push(root.user, root.selHost, root.curPath))
         if (!r.ok) { root.note = "error: " + r.error; return }
@@ -125,7 +152,7 @@ Item {
                                : ("error: " + res.error)
         } else if (root.jobKind === "browse") {
             if (res.ok) {
-                root.curPath = res.path; root.dirs = res.dirs
+                root.curPath = res.path; root.entries = res.entries || []
                 root.lastReason = ""; root.note = ""
             } else {
                 root.lastReason = res.reason || "other"
@@ -368,12 +395,54 @@ Item {
                         TapHandler { onTapped: root.browse(root.parentOf(root.curPath)) }
                     }
                     Repeater {
-                        model: root.dirs
+                        model: root.entries
                         delegate: Rectangle {
-                            width: col.width; height: 36; radius: 6; color: "#171c2b"; border.color: "#2a3350"
-                            Label { anchors.verticalCenter: parent.verticalCenter; x: 10; text: "▸ " + modelData; color: "#cdd6f4" }
-                            TapHandler { onTapped: root.browse(root.curPath + "/" + modelData) }
+                            width: col.width; height: 40; radius: 6
+                            color: modelData.app ? "#1b2335" : "#171c2b"
+                            border.color: modelData.app ? "#3a4566" : "#2a3350"
+                            Label {
+                                anchors.verticalCenter: parent.verticalCenter; x: 10
+                                text: (modelData.app ? "📦 " : "▸ ") + modelData.name
+                                color: modelData.app ? "#cdd6f4" : "#a6adc8"
+                            }
+                            // recognised app → little "app info" pill on the right
+                            Rectangle {
+                                visible: modelData.app
+                                anchors.verticalCenter: parent.verticalCenter
+                                anchors.right: parent.right; anchors.rightMargin: 8
+                                width: infoLbl.width + 16; height: 24; radius: 12
+                                color: "#2a3350"
+                                Label { id: infoLbl; anchors.centerIn: parent; text: "app info"; color: "#7aa2f7"; font.pixelSize: 11 }
+                                TapHandler { onTapped: root.showAppDetails(modelData.name) }
+                            }
+                            // tapping the row navigates in (works for repos too)
+                            TapHandler { onTapped: root.browse(root.curPath + "/" + modelData.name) }
                         }
+                    }
+                }
+                // ── recognised-app metadata panel (name/crates/size/README) ──
+                Rectangle {
+                    width: parent.width; visible: root.showAppInfo
+                    radius: 8; color: "#171c2b"; border.color: "#7aa2f7"
+                    height: appInfoCol.height + 16
+                    Column {
+                        id: appInfoCol
+                        x: 10; y: 8; width: parent.width - 20; spacing: 4
+                        Label {
+                            text: root.appPath.substring(root.appPath.lastIndexOf("/") + 1)
+                            color: "#cdd6f4"; font.bold: true; font.pixelSize: 15
+                        }
+                        Label {
+                            text: root.appCrates + " crate(s) · " + root.appSize
+                            color: "#8a93a6"; font.pixelSize: 12
+                        }
+                        Label {
+                            width: parent.width; visible: root.appReadme.length > 0
+                            text: root.appReadme
+                            color: "#a6adc8"; font.pixelSize: 11; wrapMode: Text.WrapAnywhere
+                            maximumLineCount: 6; elide: Text.ElideRight
+                        }
+                        Label { text: "dismiss"; color: "#5b6477"; font.pixelSize: 11; TapHandler { onTapped: root.showAppInfo = false } }
                     }
                 }
             }
@@ -385,9 +454,9 @@ Item {
                 Label { text: "3 · push + launch"; color: "#7aa2f7"; font.bold: true }
                 Button {
                     width: parent.width
-                    text: "push monorepo → " + root.curPath
+                    text: "push monorepo here…"
                     enabled: !root.busy
-                    onClicked: root.pushHere()
+                    onClicked: root.askConfirm("push", root.curPath)
                 }
                 Row {
                     width: parent.width; spacing: 8
@@ -397,12 +466,49 @@ Item {
                         text: root.app
                         onTextChanged: root.app = text
                     }
-                    Button { id: depBtn; text: "build + launcher"; enabled: !root.busy; onClicked: root.deployHere() }
+                    Button { id: depBtn; text: "build + launcher…"; enabled: !root.busy; onClicked: root.askConfirm("deploy", root.curPath) }
                 }
                 Label {
                     width: parent.width
                     text: "builds the app on the device and writes a .desktop launcher (shows on Plasma Mobile). The device needs rust + the app's toolkit (apk add)."
                     color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+            }
+        }
+    }
+
+    // Confirmation wizard — shows the full target path (wraps, never truncated on
+    // mobile) before a push or build runs.
+    Dialog {
+        id: confirmDialog
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(root.width - 32, 420)
+        modal: true
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAccepted: root.doConfirm()
+        background: Rectangle { color: "#0f1320"; border.color: "#2a3350"; radius: 10 }
+        contentItem: Column {
+            spacing: 10
+            Label {
+                text: root.confirmAction === "push" ? "Push monorepo?" : "Build + install?"
+                color: "#cdd6f4"; font.bold: true; font.pixelSize: 16
+            }
+            Label {
+                width: parent.width
+                text: root.confirmAction === "push"
+                    ? ("rsync the whole monorepo onto " + root.selName + " at:")
+                    : ("build “" + root.app + "” on " + root.selName + " from this folder, then add a launcher:")
+                color: "#a6adc8"; wrapMode: Text.WordWrap; font.pixelSize: 12
+            }
+            Rectangle {
+                width: parent.width; radius: 6; color: "#171c2b"; border.color: "#2a3350"
+                height: pathLbl.height + 16
+                Label {
+                    id: pathLbl
+                    x: 8; y: 8; width: parent.width - 16
+                    text: root.confirmPath.length ? root.confirmPath : "(home)"
+                    color: "#7aa2f7"; font.family: "monospace"; font.pixelSize: 12
+                    wrapMode: Text.WrapAnywhere
                 }
             }
         }

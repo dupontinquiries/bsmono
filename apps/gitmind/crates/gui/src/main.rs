@@ -32,6 +32,7 @@ mod deploy;
 mod browse;
 mod netshare;
 mod bttransfer;
+mod appcatalog;
 
 qrc!(register_qml,
     "/" {
@@ -122,6 +123,7 @@ struct Backend {
     start_trust: qt_method!(fn(&self, host: QString) -> QString),
     start_retrust: qt_method!(fn(&self, host: QString) -> QString),
     start_browse: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    app_details: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
     // two-sided fingerprint matching: show this device's key, preview a peer's key,
     // and trust exactly the key the user compared on screen.
@@ -824,8 +826,19 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         let (u, h, p) = (user.to_string(), host.to_string(), path.to_string());
         std::thread::spawn(move || {
-            let result = match deploy::list_remote_dirs(&u, &h, &p) {
-                Ok((resolved, dirs)) => json!({"ok": true, "path": resolved, "dirs": dirs}).to_string(),
+            let target = if p.trim().is_empty() || p == "~" { "$HOME".to_string() } else { deploy::shell_quote(&p) };
+            let cmd = appcatalog::remote_listing_cmd(&target);
+            let result = match deploy::remote_capture(&u, &h, &cmd) {
+                Ok(text) => {
+                    let mut lines = text.lines();
+                    let pwd = lines.next().unwrap_or("").trim().to_string();
+                    let body = lines.collect::<Vec<_>>().join("\n");
+                    let entries: Vec<_> = appcatalog::parse_app_listing(&body)
+                        .into_iter()
+                        .map(|e| json!({"name": e.name, "app": e.is_app(), "cargo": e.is_cargo, "git": e.is_git}))
+                        .collect();
+                    json!({"ok": true, "path": pwd, "entries": entries}).to_string()
+                }
                 Err(e) => {
                     let reason = deploy::ssh_error_reason(&e);
                     json!({"ok": false, "error": e, "reason": reason}).to_string()
@@ -834,6 +847,28 @@ impl Backend {
             job.finish(result);
         });
         QString::from(json!({"ok": true, "started": "browse"}).to_string())
+    }
+
+    /// Metadata for one recognised app on the device (crate count, size, README),
+    /// gathered over SSH. Synchronous but quick (a single remote command).
+    fn app_details(&self, user: QString, host: QString, path: QString) -> QString {
+        let (u, h, p) = (user.to_string(), host.to_string(), path.to_string());
+        if p.trim().is_empty() {
+            return err_json("no app path");
+        }
+        let cmd = appcatalog::remote_details_cmd(&deploy::shell_quote(&p));
+        match deploy::remote_capture(&u, &h, &cmd) {
+            Ok(text) => {
+                let d = appcatalog::parse_app_details(&text);
+                QString::from(json!({
+                    "ok": true,
+                    "crate_count": d.crate_count,
+                    "size": d.size_human,
+                    "readme": d.readme_excerpt,
+                }).to_string())
+            }
+            Err(e) => err_json(&e),
+        }
     }
 
     /// Install our SSH key on `user@host` using the device password (entered once),
