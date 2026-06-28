@@ -177,8 +177,17 @@ pub fn lookup_peer(addr: &str, timeout: Duration) -> Result<ProjectCard, String>
 /// `git clone` a card's first ssh:// provider into `dest`/<name>. Pre-checked so
 /// only ssh providers are attempted (http/dht providers come later).
 pub fn install_card(name: &str, provider: &str, dest: &str) -> Result<String, String> {
+    // Transport seam (see maintenance/SHARING.md): providers are scheme-prefixed
+    // URLs. ssh:// is wired today; bt:// (Bluetooth OBEX) and dht:// (opendht /
+    // snapclone device IDs) are reserved for when sharekit lands.
+    if provider.starts_with("bt://") {
+        return Err("bt:// providers aren't wired yet — use the Bluetooth send panel to push a bundle for now".into());
+    }
+    if provider.starts_with("dht://") {
+        return Err("dht:// providers aren't wired yet (coming with sharekit + opendht device IDs)".into());
+    }
     if !provider.starts_with("ssh://") {
-        return Err(format!("only ssh:// providers are supported yet (got '{provider}')"));
+        return Err(format!("unsupported provider scheme: '{provider}' (expected ssh://)"));
     }
     let safe_name = name.replace(['/', '\\'], "_");
     let target = format!("{}/{}", dest.trim_end_matches('/'), safe_name);
