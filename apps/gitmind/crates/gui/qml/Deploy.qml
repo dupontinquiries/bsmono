@@ -24,6 +24,12 @@ Item {
     property string lastReason: ""// why the last ssh op failed: auth|hostkey|unreachable|other
     property string sshpass: ""   // one-time device password for key setup (not stored)
     property bool showSetup: false// reveal the password + "set up SSH key" row
+    // fingerprint preview (two-sided matching): the peer key we fetched to compare
+    property bool showPreview: false
+    property string previewFp: ""
+    property string previewType: ""
+    property string previewArt: ""
+    property string previewKeys: ""// exact bytes to trust once the user confirms a match
 
     // Default the SSH user to whoami so we never ssh as the literal "user" (which
     // hit a password prompt and froze the GUI).
@@ -43,6 +49,7 @@ Item {
     function selectDevice(ip, host) {
         selHost = ip; selName = (host && host.length) ? host : ip
         curPath = ""; dirs = []; lastReason = ""; showSetup = false; sshpass = ""
+        showPreview = false; previewKeys = ""
         refreshTrust()
         browse("")
     }
@@ -64,6 +71,22 @@ Item {
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.busy = true; root.jobKind = "retrust"; root.note = "clearing + re-fetching " + root.selName + "'s key…"
         poller.start()
+    }
+    // Two-sided matching: fetch the peer's key and show its fingerprint + randomart
+    // so you can compare it against what that device shows for itself (Network tab).
+    function verifyKey() {
+        if (selHost.length === 0) return
+        var r = JSON.parse(backend.start_preview(selHost))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "preview"; root.note = "fetching " + root.selName + "'s key to compare…"
+        poller.start()
+    }
+    function confirmTrust() {
+        if (selHost.length === 0 || root.previewKeys.length === 0) return
+        var r = JSON.parse(backend.trust_previewed_key(selHost, root.previewKeys))
+        root.showPreview = false
+        if (r.ok) { root.note = "✓ " + r.msg; root.refreshTrust(); root.previewKeys = ""; root.browse("") }
+        else { root.note = "error: " + r.error }
     }
     // Browse runs on the worker thread now: a slow/failed ssh used to block the UI
     // here (freezing mid-tap, which is what tore down the cursor handle).
@@ -121,6 +144,14 @@ Item {
             root.refreshTrust(); root.jobKind = ""
             root.note = res.ok ? ("✓ " + res.msg + " — retrying…") : ("error: " + res.error)
             if (res.ok && root.selHost.length) { root.lastReason = ""; root.browse(""); return }
+        } else if (root.jobKind === "preview") {
+            if (res.ok) {
+                root.previewFp = res.fingerprint; root.previewType = res.type
+                root.previewArt = res.art; root.previewKeys = res.keys
+                root.showPreview = true; root.note = ""
+            } else {
+                root.note = root.hint(res.reason, res.error)
+            }
         } else if (root.jobKind === "setupkey") {
             root.jobKind = ""
             if (res.ok) {
@@ -243,6 +274,11 @@ Item {
                         onClicked: root.trustHost()
                     }
                     Button {
+                        // fetch + show the key's fingerprint to compare on both screens
+                        text: "verify key"; enabled: !root.busy
+                        onClicked: root.verifyKey()
+                    }
+                    Button {
                         // fixes a changed/stale key (the "messed up from before" case)
                         text: "re-trust"; enabled: !root.busy
                         onClicked: root.retrust()
@@ -278,6 +314,43 @@ Item {
                             text: root.busy ? "…" : "install my key"
                             enabled: !root.busy && root.sshpass.length > 0
                             onClicked: root.setupKey()
+                        }
+                    }
+                }
+                // ── fingerprint comparison panel (two-sided matching) ────
+                // Compare this against what the device shows on its Network tab
+                // ("this device's key"). Same fingerprint + same randomart = safe.
+                Rectangle {
+                    width: parent.width; visible: root.showPreview
+                    radius: 8; color: "#171c2b"; border.color: "#7aa2f7"
+                    height: previewCol.height + 16
+                    Column {
+                        id: previewCol
+                        x: 10; y: 8; width: parent.width - 20; spacing: 6
+                        Label {
+                            text: "key received from " + root.selName
+                            color: "#7aa2f7"; font.bold: true
+                        }
+                        Label {
+                            width: parent.width
+                            text: root.previewFp + (root.previewType.length ? ("  (" + root.previewType + ")") : "")
+                            color: "#cdd6f4"; font.pixelSize: 13; wrapMode: Text.WrapAnywhere
+                            font.family: "monospace"
+                        }
+                        Label {
+                            width: parent.width; visible: root.previewArt.length > 0
+                            text: root.previewArt
+                            color: "#8a93a6"; font.family: "monospace"; font.pixelSize: 11
+                        }
+                        Label {
+                            width: parent.width
+                            text: "Does this match what " + root.selName + " shows for itself? If yes, trust it."
+                            color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                        }
+                        Row {
+                            spacing: 8
+                            Button { text: "✓ matches — trust"; enabled: !root.busy; onClicked: root.confirmTrust() }
+                            Button { text: "dismiss"; onClicked: { root.showPreview = false; root.previewKeys = "" } }
                         }
                     }
                 }

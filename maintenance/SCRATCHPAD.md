@@ -925,3 +925,37 @@ argv, askpass body, no-network guards) IS tested: deploy 12 tests PASS (+ssh_err
 +key_setup_argv), netshare 4, gui rustcheck CLEAN, Deploy.qml balanced. gui logic = 17 tests.
 NOTE: CursorHandle.qml is a Qt-internal touch artifact (can't patch); async browse stops it firing
 on browse; any residual is benign console noise.
+
+── two-sided fingerprint matching + bluetooth send + transport seam ──
+USER asks: (1) on-screen two-sided public-key matching [BUILD now], (2) bluetooth file
+transfer [BUILD, on-device], (3) eventual snapclone/DHT device IDs + sharekit wrapping
+gitmind code [DESIGN seam + note, not built].
+[deploy.rs] refactored trust_host → fetch_peer_key (scan, no write) + write_known_host
+(append given bytes). NEW for matching: parse_key_summary (pure: "256 SHA256:x c (ED25519)"
+→ (fp,type)), key_fingerprint_art (ssh-keygen -lv - → fp+type+RANDOMART; on-device),
+local_host_pubkey (/etc/ssh/ssh_host_*_key.pub), local_identity_pubkey (~/.ssh/id_*.pub).
+[bttransfer.rs NEW] parse_bt_devices (bluetoothctl "Device AA:BB.. name", skips Controller/junk,
+6-byte addr check), bt_push_command(tool,addr,file) for bt-obex|obexftp|bluetooth-sendto (pure),
+BT_TOOLS, bt_devices/detect_bt_tool/bt_send (on-device). 3 tests.
+[netshare.rs] install_card now SCHEME-AWARE: ssh:// wired; bt://, dht:// → clear "not wired yet"
+(transport seam). 
+[main.rs] +mod bttransfer. Methods: local_fingerprint()->{host,identity:{present,fingerprint,
+type,art}} (sync, local), start_preview(host) (async; {ok,fingerprint,type,art,keys}),
+trust_previewed_key(host,keys) (sync write of EXACT compared bytes), bluetooth_devices(),
+start_bluetooth_send(addr,file) (async, kind btsend), make_bundle(dest) (git bundle create --all
+→ path; default /tmp).
+[Deploy.qml] "verify key" btn → start_preview → preview panel (Rectangle, monospace fp+randomart)
+→ "✓ matches — trust" calls trust_previewed_key then browse(""). applyJobResult +preview branch
+(WATCH: had a missing `}` closing the preview else-if before setupkey — fixed; QML now {107}=).
+selectDevice resets preview state.
+[Network.qml] "this device's key" block (local_fingerprint on load → fp+randomart, advertiser side
+of matching). "send over Bluetooth" block: refresh devices → tappable list → file field +
+"bundle repo" (make_bundle) + send (start_bluetooth_send). +btsend in applyJobResult.
+[maintenance/SHARING.md NEW] transport roadmap: provider schemes (ssh wired, bt/dht reserved),
+what exists now, where sharekit fits (extract netshare ProjectCard+transport into shared/sharekit,
+opendht device IDs → dht://, snapclone transport, bt:// provider), verification reality.
+HOW MATCHING WORKS: device A Network tab shows "this device's key" SHA256+randomart; device B
+Deploy tab "verify key" fetches A's key, shows received SHA256+randomart; user compares both
+screens; if match → "matches — trust" writes exactly those bytes. Closes the TOFU/MITM gap accept-new
+leaves. SANDBOX has no ssh/bluetooth/radio → keyscan/keygen/OBEX I/O on-device; pure logic tested:
+deploy 12, netshare 4, bttransfer 3, gui rustcheck CLEAN, both QML balanced. gui logic = 19 tests.
