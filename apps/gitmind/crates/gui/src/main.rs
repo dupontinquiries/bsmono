@@ -29,6 +29,7 @@ use gitmind_core::watch_session::WatchSession;
 
 // Embed the QML into the binary so the shipped GUI has no external files.
 mod deploy;
+mod browse;
 
 qrc!(register_qml,
     "/" {
@@ -40,6 +41,7 @@ qrc!(register_qml,
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
         "qml/Deploy.qml",
+        "qml/Files.qml",
     },
 );
 
@@ -99,6 +101,9 @@ struct Backend {
     app_desktop: qt_method!(fn(&self, name: QString, label: QString, terminal: bool) -> QString),
     app_remove: qt_method!(fn(&self, name: QString, label: QString) -> QString),
     app_install: qt_method!(fn(&self, name: QString, path: QString, label: QString, commit: QString) -> QString),
+
+    // ── files: browse the repo working tree ──
+    list_dir: qt_method!(fn(&self, subpath: QString) -> QString),
 
     // ── deploy: discover SSH devices, browse + push the repo, remote build + .desktop ──
     // The slow ops run off-thread (see impls); the QML drives them via poll_job().
@@ -624,6 +629,18 @@ impl Backend {
         let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
         match native::apply_patch_to_dir(&text.to_string(), r.root()) {
             Ok(n) => QString::from(json!({"ok": true, "applied": n}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// List one directory of the repo working tree for the Files browser.
+    /// `subpath` is repo-relative (empty = root). Skips .git/target/node_modules.
+    fn list_dir(&self, subpath: QString) -> QString {
+        let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
+        match browse::list_repo_dir(r.root(), &subpath.to_string()) {
+            Ok((rel, dirs, files)) => {
+                QString::from(json!({"ok": true, "path": rel, "dirs": dirs, "files": files}).to_string())
+            }
             Err(e) => err_json(&e),
         }
     }

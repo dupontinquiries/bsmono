@@ -829,3 +829,22 @@ UI thread is free); action buttons stay disabled while busy.
 gui crate rustcheck CLEAN; QML balanced 58/58·60/60; deploy module 8/8.
 [edge, noted] a panicking worker would leave the Job running=true (UI stuck busy)
 — the ops are I/O-returns-Result so low risk; wrap in catch_unwind if it shows up.
+
+---
+## GUI file browser — the Files tab (this session)
+
+User built gitmind-gui on-device; on a clean repo the GUI showed nothing
+browsable (status="clean", and the only file-view path was peeking a *changed*
+file — none exist when clean). The "view" tab could render a file but had no
+listing to pick from. Added a real browser:
+[browse.rs] list_repo_dir(root, subpath) — lists one working-tree dir, skips
+.git/target/node_modules, sorts, refuses path escapes (canonicalize + starts_with).
+1 unit test (sort/skip/descend/escape).
+[main.rs] mod browse; new list_dir qt_method wrapping it; Files.qml in qrc.
+[Files.qml] ONE tab that browses (tap folder=descend, ‹..=up) and views (tap
+file → peek_file with the spec field; ‹back returns), toggled by selectedFile.
+Replaced the bare PeekViewer tab AT THE SAME INDEX (3) so nothing else shifts;
+status panel's peek action now routes to files.openPath(). "view" tab → "files".
+PeekViewer.qml left in tree but no longer instantiated (folded into Files).
+Empty clean-status now signposts the Files + Timeline tabs.
+gui crate rustcheck CLEAN; browse+deploy modules = 9 tests. Qt build on-device.
