@@ -20,7 +20,10 @@ Item {
     property string app: "voiceterm"
     property string note: ""
     property bool busy: false
-    property string jobKind: ""   // which async job is in flight: discover|push|deploy|trust
+    property string jobKind: ""   // in-flight job: discover|browse|push|deploy|trust|retrust|setupkey
+    property string lastReason: ""// why the last ssh op failed: auth|hostkey|unreachable|other
+    property string sshpass: ""   // one-time device password for key setup (not stored)
+    property bool showSetup: false// reveal the password + "set up SSH key" row
 
     // Default the SSH user to whoami so we never ssh as the literal "user" (which
     // hit a password prompt and froze the GUI).
@@ -39,6 +42,7 @@ Item {
     }
     function selectDevice(ip, host) {
         selHost = ip; selName = (host && host.length) ? host : ip
+        curPath = ""; dirs = []; lastReason = ""; showSetup = false; sshpass = ""
         refreshTrust()
         browse("")
     }
@@ -54,11 +58,28 @@ Item {
         root.busy = true; root.jobKind = "trust"; root.note = "fetching + trusting " + root.selName + "'s key…"
         poller.start()
     }
+    function retrust() {
+        if (selHost.length === 0) return
+        var r = JSON.parse(backend.start_retrust(selHost))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "retrust"; root.note = "clearing + re-fetching " + root.selName + "'s key…"
+        poller.start()
+    }
+    // Browse runs on the worker thread now: a slow/failed ssh used to block the UI
+    // here (freezing mid-tap, which is what tore down the cursor handle).
     function browse(path) {
         if (selHost.length === 0) return
-        var r = JSON.parse(backend.list_remote_dirs(root.user, root.selHost, path))
-        if (r.ok) { curPath = r.path; dirs = r.dirs }
-        else { note = "error: " + r.error }
+        var r = JSON.parse(backend.start_browse(root.user, root.selHost, path))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "browse"; root.note = "listing " + root.selName + "…"
+        poller.start()
+    }
+    function setupKey() {
+        if (selHost.length === 0) return
+        var r = JSON.parse(backend.start_setup_key(root.user, root.selHost, root.sshpass))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "setupkey"; root.note = "installing your key on " + root.selName + "…"
+        poller.start()
     }
     function parentOf(p) { var i = p.lastIndexOf("/"); return i > 0 ? p.substring(0, i) : "/" }
     function pushHere() {
@@ -79,15 +100,48 @@ Item {
             root.devices = res.ok ? (res.devices || []) : []
             root.note = res.ok ? (root.devices.length + " device(s) on " + res.subnet + ".0/24")
                                : ("error: " + res.error)
+        } else if (root.jobKind === "browse") {
+            if (res.ok) {
+                root.curPath = res.path; root.dirs = res.dirs
+                root.lastReason = ""; root.note = ""
+            } else {
+                root.lastReason = res.reason || "other"
+                root.note = root.hint(res.reason, res.error)
+                if (res.reason === "auth") root.showSetup = true
+            }
         } else if (root.jobKind === "push") {
             root.note = res.ok ? res.msg : ("error: " + res.error)
         } else if (root.jobKind === "deploy") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
         } else if (root.jobKind === "trust") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
-            root.refreshTrust()
+            root.jobKind = ""; root.refreshTrust()
+            if (res.ok && root.selHost.length) { root.browse(""); return }
+        } else if (root.jobKind === "retrust") {
+            root.refreshTrust(); root.jobKind = ""
+            root.note = res.ok ? ("✓ " + res.msg + " — retrying…") : ("error: " + res.error)
+            if (res.ok && root.selHost.length) { root.lastReason = ""; root.browse(""); return }
+        } else if (root.jobKind === "setupkey") {
+            root.jobKind = ""
+            if (res.ok) {
+                root.sshpass = ""; root.showSetup = false; root.lastReason = ""
+                root.note = "✓ " + res.msg + " — retrying…"
+                if (root.selHost.length) { root.browse(""); return }
+            } else {
+                root.note = "error: " + res.error
+            }
         }
         root.jobKind = ""
+    }
+    // Turn a failure reason into an actionable line.
+    function hint(reason, raw) {
+        if (reason === "auth")
+            return "can't log in to " + root.selName + " — no SSH key yet. Enter the device password below to set one up (just once)."
+        if (reason === "hostkey")
+            return root.selName + "'s host key doesn't match what's trusted (often a leftover from before). Tap “re-trust key”."
+        if (reason === "unreachable")
+            return "couldn't reach " + root.selName + " — check it's on and sshd is running."
+        return "error: " + raw
     }
 
     // Poll the backend's background job; when it reports done, dispatch the result.
@@ -173,22 +227,58 @@ Item {
                     TextField { width: 140; text: root.user; onTextChanged: root.user = text }
                     Button { text: "browse"; onClicked: root.browse("") }
                 }
-                // host-key trust — handled here so it lands in the one shared
-                // known_hosts (no terminal/GUI split). New hosts are auto-trusted
-                // on first connect too; this lets you do it explicitly + see status.
+                // ── connection: host-key trust + passwordless setup ──────
+                // All of this lands in the one shared known_hosts / authorized_keys
+                // so nothing has to be done in a terminal (which caused the splits).
                 Row {
                     width: parent.width; spacing: 8
                     Label {
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.hostTrusted ? "🔒 key trusted" : "key not trusted yet"
+                        text: root.hostTrusted ? "🔒 key trusted" : "host key not trusted yet"
                         color: root.hostTrusted ? "#56d364" : "#f9e2af"
                         font.pixelSize: 13
                     }
                     Button {
-                        text: root.busy ? "…" : "trust key"
-                        visible: !root.hostTrusted
-                        enabled: !root.busy
+                        text: "trust key"; visible: !root.hostTrusted; enabled: !root.busy
                         onClicked: root.trustHost()
+                    }
+                    Button {
+                        // fixes a changed/stale key (the "messed up from before" case)
+                        text: "re-trust"; enabled: !root.busy
+                        onClicked: root.retrust()
+                    }
+                    Button {
+                        text: root.showSetup ? "hide setup" : "set up SSH key"
+                        enabled: !root.busy
+                        onClicked: root.showSetup = !root.showSetup
+                    }
+                }
+                // password + install-key, shown on demand or auto-revealed when a
+                // browse fails on auth. Enter the device password once → passwordless.
+                Column {
+                    width: parent.width; spacing: 6
+                    visible: root.showSetup
+                    Label {
+                        width: parent.width
+                        text: "Installs your SSH key on " + root.user + "@" + root.selName + " using the device password (used once, never stored). After this, connecting needs no password."
+                        color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                    }
+                    Row {
+                        width: parent.width; spacing: 8
+                        TextField {
+                            id: pwField
+                            width: parent.width - setupBtn.width - 8
+                            placeholderText: "device password for " + root.user + "@" + root.selName
+                            echoMode: TextInput.Password
+                            text: root.sshpass
+                            onTextChanged: root.sshpass = text
+                        }
+                        Button {
+                            id: setupBtn
+                            text: root.busy ? "…" : "install my key"
+                            enabled: !root.busy && root.sshpass.length > 0
+                            onClicked: root.setupKey()
+                        }
                     }
                 }
                 Label {
