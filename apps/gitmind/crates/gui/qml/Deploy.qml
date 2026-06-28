@@ -24,6 +24,18 @@ Item {
     property string appSize: ""
     property string appReadme: ""
     property bool showAppInfo: false
+    // build + install configurator
+    property bool instOpen: false
+    property string instApp: ""
+    property string instPath: ""
+    property string instTarget: ""
+    property var instTargets: []
+    property var instFeatures: []     // [{name, on}]
+    property var instCmake: []        // [{name, on, help}]
+    property var instDefaults: ({})   // { triple: [feature...] }
+    property bool instStageTmp: true
+    property bool instIsCargo: false
+    property bool instIsCmake: false
     // confirmation dialog
     property string confirmAction: "" // "push" | "deploy"
     property string confirmPath: ""
@@ -59,7 +71,7 @@ Item {
         selHost = ip; selName = (host && host.length) ? host : ip
         curPath = ""; entries = []; lastReason = ""; showSetup = false; sshpass = ""
         showPreview = false; previewKeys = ""
-        showAppInfo = false; appPath = ""
+        showAppInfo = false; appPath = ""; instOpen = false
         refreshTrust()
         browse("")
     }
@@ -123,6 +135,50 @@ Item {
         root.appPath = path; root.appCrates = r.crate_count
         root.appSize = r.size; root.appReadme = r.readme; root.showAppInfo = true
     }
+    // Open the build + install configurator for the selected app.
+    function openInstaller() {
+        if (root.appPath.length === 0) return
+        var r = JSON.parse(backend.app_build_options(root.user, root.selHost, root.appPath))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.instPath = root.appPath
+        root.instApp = root.appPath.substring(root.appPath.lastIndexOf("/") + 1)
+        root.instTargets = r.targets || []
+        root.instDefaults = r.defaults_by_target || ({})
+        root.instCmake = r.cmake_options || []
+        root.instIsCargo = r.is_cargo; root.instIsCmake = r.is_cmake
+        root._allFeatures = r.features || []
+        root.instTarget = (root.instTargets.length ? root.instTargets[0] : "")
+        root.applyDefaultsForTarget(root.instTarget)
+        root.instOpen = true
+    }
+    property var _allFeatures: []
+    function applyDefaultsForTarget(triple) {
+        root.instTarget = triple
+        var defs = root.instDefaults[triple] || []
+        var arr = []
+        for (var i = 0; i < root._allFeatures.length; i++) {
+            var n = root._allFeatures[i]
+            arr.push({ name: n, on: defs.indexOf(n) >= 0 })
+        }
+        root.instFeatures = arr   // reassign so the Repeater rebuilds with fresh state
+    }
+    function chosenFeatures() {
+        var out = []
+        for (var i = 0; i < root.instFeatures.length; i++)
+            if (root.instFeatures[i].on) out.push(root.instFeatures[i].name)
+        return out.join(",")
+    }
+    function runInstall() {
+        var feats = root.chosenFeatures()
+        var noDefault = root.instFeatures.length > 0   // ticked set is authoritative
+        var r = JSON.parse(backend.install_app(root.user, root.selHost, root.instPath,
+                    root.instApp, root.instTarget, feats, noDefault, root.instStageTmp))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.instOpen = false
+        root.busy = true; root.jobKind = "install"
+        root.note = "cross-building " + root.instApp + " for " + root.instTarget + " — this can take a while…"
+        poller.start()
+    }
     // Confirmations: open a dialog showing the full (untruncated) path first.
     function askConfirm(action, path) {
         root.confirmAction = action; root.confirmPath = path; confirmDialog.open()
@@ -163,6 +219,8 @@ Item {
             root.note = res.ok ? res.msg : ("error: " + res.error)
         } else if (root.jobKind === "deploy") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
+        } else if (root.jobKind === "install") {
+            root.note = res.ok ? ("✓ " + res.msg) : ("✗ " + res.error)
         } else if (root.jobKind === "trust") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
             root.jobKind = ""; root.refreshTrust()
@@ -442,7 +500,111 @@ Item {
                             color: "#a6adc8"; font.pixelSize: 11; wrapMode: Text.WrapAnywhere
                             maximumLineCount: 6; elide: Text.ElideRight
                         }
-                        Label { text: "dismiss"; color: "#5b6477"; font.pixelSize: 11; TapHandler { onTapped: root.showAppInfo = false } }
+                        Row {
+                            spacing: 10
+                            Button { text: "build + install…"; enabled: !root.busy; onClicked: root.openInstaller() }
+                            Label { text: "dismiss"; color: "#5b6477"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter; TapHandler { onTapped: root.showAppInfo = false } }
+                        }
+                    }
+                }
+                // ── build + install configurator (flags exposed to client) ──
+                Rectangle {
+                    width: parent.width; visible: root.instOpen
+                    radius: 8; color: "#171c2b"; border.color: "#7aa2f7"
+                    height: instCol.height + 16
+                    Column {
+                        id: instCol
+                        x: 10; y: 8; width: parent.width - 20; spacing: 8
+                        Label { text: "build + install " + root.instApp; color: "#cdd6f4"; font.bold: true; font.pixelSize: 15 }
+                        Row {
+                            width: parent.width; spacing: 8
+                            Label { text: "package"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                            TextField {
+                                width: parent.width - 90
+                                text: root.instApp; onTextChanged: root.instApp = text
+                            }
+                        }
+                        // target architecture picker
+                        Label { text: "target"; color: "#7aa2f7"; font.pixelSize: 12 }
+                        Row {
+                            spacing: 8
+                            Repeater {
+                                model: root.instTargets
+                                delegate: Rectangle {
+                                    height: 30; radius: 15; width: tlbl.width + 22
+                                    color: modelData === root.instTarget ? "#2a3350" : "#1b2335"
+                                    border.color: modelData === root.instTarget ? "#7aa2f7" : "#3a4566"
+                                    Label {
+                                        id: tlbl; anchors.centerIn: parent
+                                        text: modelData.indexOf("musl") >= 0 ? "musl" : (modelData.indexOf("gnu") >= 0 ? "gnu" : modelData)
+                                        color: "#cdd6f4"; font.pixelSize: 12
+                                    }
+                                    TapHandler { onTapped: root.applyDefaultsForTarget(modelData) }
+                                }
+                            }
+                        }
+                        Label {
+                            text: root.instTarget; color: "#5b6477"; font.pixelSize: 10
+                        }
+                        // cargo features (repo defaults for this target pre-ticked)
+                        Label {
+                            text: "features"; color: "#7aa2f7"; font.pixelSize: 12
+                            visible: root.instIsCargo && root.instFeatures.length > 0
+                        }
+                        Repeater {
+                            model: root.instFeatures
+                            delegate: CheckBox {
+                                text: modelData.name; checked: modelData.on
+                                onToggled: root.instFeatures[index].on = checked
+                                contentItem: Label { text: modelData.name; color: "#cdd6f4"; leftPadding: parent.indicator.width + 6; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+                        Label {
+                            visible: root.instIsCargo && root.instFeatures.length === 0
+                            text: "(no cargo features declared — builds with defaults)"
+                            color: "#5b6477"; font.pixelSize: 11
+                        }
+                        // cmake options (scanned + exposed; cross-build needs a toolchain)
+                        Label {
+                            text: "CMake options"; color: "#7aa2f7"; font.pixelSize: 12
+                            visible: root.instCmake.length > 0
+                        }
+                        Repeater {
+                            model: root.instCmake
+                            delegate: CheckBox {
+                                text: modelData.name; checked: modelData.on
+                                onToggled: root.instCmake[index].on = checked
+                                contentItem: Label { text: modelData.name + (modelData.help.length ? ("  — " + modelData.help) : ""); color: "#cdd6f4"; leftPadding: parent.indicator.width + 6; verticalAlignment: Text.AlignVCenter; wrapMode: Text.WordWrap; width: instCol.width - 40 }
+                            }
+                        }
+                        Label {
+                            visible: root.instIsCmake && !root.instIsCargo
+                            width: parent.width
+                            text: "CMake cross-build needs a per-target toolchain file — options are exposed here; wiring is on-device (see DISTRIBUTION.md)."
+                            color: "#f9e2af"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                        }
+                        // delivery
+                        Row {
+                            spacing: 8
+                            CheckBox {
+                                checked: root.instStageTmp; onToggled: root.instStageTmp = checked
+                                contentItem: Label { text: "stage via /tmp (easier to debug)"; color: "#cdd6f4"; leftPadding: parent.indicator.width + 6; verticalAlignment: Text.AlignVCenter }
+                            }
+                        }
+                        Label {
+                            width: parent.width
+                            text: "→ ~/.local/bin/" + root.instApp + (root.instStageTmp ? "   (via /tmp/" + root.instApp + ")" : "   (direct)")
+                            color: "#56d364"; font.pixelSize: 11; font.family: "monospace"; wrapMode: Text.WrapAnywhere
+                        }
+                        Row {
+                            spacing: 8
+                            Button {
+                                text: "download + install"
+                                enabled: !root.busy && root.instIsCargo
+                                onClicked: root.runInstall()
+                            }
+                            Button { text: "cancel"; onClicked: root.instOpen = false }
+                        }
                     }
                 }
             }

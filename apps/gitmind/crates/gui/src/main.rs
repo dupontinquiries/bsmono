@@ -33,6 +33,7 @@ mod browse;
 mod netshare;
 mod bttransfer;
 mod appcatalog;
+mod buildflags;
 
 qrc!(register_qml,
     "/" {
@@ -124,6 +125,9 @@ struct Backend {
     start_retrust: qt_method!(fn(&self, host: QString) -> QString),
     start_browse: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
     app_details: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    // build-flag customization + the cross-build → ship pipeline
+    app_build_options: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
     // two-sided fingerprint matching: show this device's key, preview a peer's key,
     // and trust exactly the key the user compared on screen.
@@ -158,6 +162,16 @@ fn repo() -> Result<GitCli, String> {
 
 fn err_json(e: &str) -> QString {
     QString::from(json!({"ok": false, "error": e}).to_string())
+}
+
+/// Mark a freshly-installed binary executable (best-effort; Unix perms).
+fn set_executable(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        let _ = std::fs::set_permissions(path, perms);
+    }
 }
 
 /// Open (or create) the native store for the current repo.
@@ -869,6 +883,85 @@ impl Backend {
             }
             Err(e) => err_json(&e),
         }
+    }
+
+    /// Scan an app's customizable build flags over SSH — cargo `[features]` and
+    /// CMake `option(...)` — and report the repo's default-on set **per target**.
+    fn app_build_options(&self, user: QString, host: QString, path: QString) -> QString {
+        let (u, h, p) = (user.to_string(), host.to_string(), path.to_string());
+        if p.trim().is_empty() {
+            return err_json("no app path");
+        }
+        let q = deploy::shell_quote(&p);
+        let cargo = deploy::remote_capture(&u, &h, &format!("cat {q}/Cargo.toml 2>/dev/null")).unwrap_or_default();
+        let cmake = deploy::remote_capture(&u, &h, &format!("cat {q}/CMakeLists.txt 2>/dev/null")).unwrap_or_default();
+        let feats = buildflags::scan_cargo_features(&cargo);
+        let defaults: serde_json::Map<String, serde_json::Value> = buildflags::BUILD_TARGETS
+            .iter()
+            .map(|t| (t.to_string(), json!(buildflags::arch_default_features(&cargo, t))))
+            .collect();
+        let cmake_opts: Vec<_> = buildflags::scan_cmake_options(&cmake)
+            .into_iter()
+            .map(|o| json!({"name": o.name, "on": o.default_on, "help": o.help}))
+            .collect();
+        QString::from(json!({
+            "ok": true,
+            "targets": buildflags::BUILD_TARGETS,
+            "features": feats.all,
+            "defaults_by_target": defaults,
+            "cmake_options": cmake_opts,
+            "is_cargo": !cargo.trim().is_empty(),
+            "is_cmake": !cmake.trim().is_empty(),
+        }).to_string())
+    }
+
+    /// Cross-build `app` from `path` for `triple` with the chosen feature set, then
+    /// deliver the binary to this device. Default route: scp to `/tmp/<app>` then
+    /// `cp` into `~/.local/bin` (the /tmp copy stays for inspection if something
+    /// goes wrong); `stage_tmp=false` scps straight into `~/.local/bin`. Async — a
+    /// cross build is slow; poll_job for the outcome (build errors come back here).
+    fn install_app(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString {
+        let (u, h, p) = (user.to_string(), host.to_string(), path.to_string());
+        let (app, triple) = (app.to_string(), triple.to_string());
+        let feats: Vec<String> = features.to_string().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if app.trim().is_empty() || triple.trim().is_empty() || p.trim().is_empty() {
+            return err_json("app, target and path are required");
+        }
+        if !self.job.start("install") {
+            return err_json("a job is already running");
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = (|| -> Result<String, String> {
+                // 1 · cross build on the server
+                let argv = buildflags::cargo_build_argv(&app, &triple, &feats, no_default);
+                let build_cmd = format!("cd {} && {}", deploy::shell_quote(&p), argv.join(" "));
+                deploy::remote_capture(&u, &h, &build_cmd).map_err(|e| format!("build failed:\n{e}"))?;
+                // 2 · pull the binary
+                let remote_bin = format!("{}/{}", p.trim_end_matches('/'), buildflags::built_binary_path(&app, &triple));
+                let bindir = buildflags::install_dir(&home);
+                let _ = std::fs::create_dir_all(&bindir);
+                let dest = format!("{bindir}/{app}");
+                if stage_tmp {
+                    let staged = format!("/tmp/{app}");
+                    deploy::scp_pull(&u, &h, &remote_bin, &staged)?;
+                    std::fs::copy(&staged, &dest).map_err(|e| format!("cp {staged} -> {dest}: {e}"))?;
+                    set_executable(&dest);
+                    Ok(format!("installed {app} ({triple}) → {dest}  (staged at {staged})"))
+                } else {
+                    deploy::scp_pull(&u, &h, &remote_bin, &dest)?;
+                    set_executable(&dest);
+                    Ok(format!("installed {app} ({triple}) → {dest}"))
+                }
+            })();
+            let payload = match result {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "install"}).to_string())
     }
 
     /// Install our SSH key on `user@host` using the device password (entered once),

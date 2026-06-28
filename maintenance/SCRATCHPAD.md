@@ -991,3 +991,37 @@ selectDevice resets entries/appPath/showAppInfo. Deploy.qml {129}= balanced, all
 dependency resolution = "gitmind package manager"). ties to sharekit/dht.
 SANDBOX: ssh/cross/radio absent → key-install/cross-build/scp on-device; pure logic tested:
 deploy 14, appcatalog 6, netshare 4, bt 3, rustcheck CLEAN, both QML balanced. gui logic = 27 tests.
+
+── build-flag customization + wired cross-build→ship (/tmp staging) ──
+USER (confirming pipeline direction): (A) scan default build flags + enable customization
+via CMake options + cargo feature scanning, expose to client with repo defaults
+PER-ARCHITECTURE enabled; (B) delivery = stage via /tmp (errors easier) else direct.
+[buildflags.rs NEW] scan_cargo_features(toml)→CargoFeatures{all,default} (hand-parsed [features],
+single-line). read_section_array + arch_default_features(toml,triple): per-arch convention
+[package.metadata.gitmind] default-features-musl/-gnu = [...] (matched by triple libc substring)
+ELSE [features] default. scan_cmake_options(text)→Vec<CmakeOption{name,default_on,help}> (option(
+NAME "help" ON/OFF)). cargo_build_argv(app,triple,features,no_default) (cross build + --features/
+--no-default-features). cmake_configure_argv(build_dir,opts,toolchain) (-D + toolchain seam).
+built_binary_path/install_dir (MOVED here from appcatalog). BUILD_TARGETS[aarch64 musl/gnu].
+6 tests. (appcatalog seam removed → 5 tests.)
+[deploy.rs] scp_pull_argv(user,host,remote,local) reuses SSH_OPTS (same anti-pivot) + scp_pull
+(on-device). deploy 14 (scp assertion folded into outbound-ssh test).
+[main.rs] +mod buildflags. app_build_options(user,host,path): cat Cargo.toml+CMakeLists over ssh →
+{targets,features,defaults_by_target:{triple:[feat]},cmake_options,is_cargo,is_cmake}. install_app(
+user,host,path,app,triple,features,no_default,stage_tmp) ASYNC job: (1) remote_capture "cd path &&
+cross build … -p app" (build errors returned to client), (2) scp_pull binary→/tmp/<app> (or direct),
+(3) std::fs::copy /tmp→~/.local/bin + set_executable. stage_tmp default true (/tmp copy stays for
+debugging). +set_executable free fn (0o755).
+[Deploy.qml] installer configurator (instOpen): openInstaller→app_build_options→populate; target
+picker (musl/gnu pills) → applyDefaultsForTarget re-ticks per-arch defaults (reassigns instFeatures
+array so Repeater rebuilds); cargo feature CheckBoxes (pre-ticked per arch); cmake option CheckBoxes
+(exposed; build needs toolchain, yellow note if pure-cmake → install disabled); stage-via-/tmp toggle
++ live "→ ~/.local/bin/<app> (via /tmp/…)" dest; "download + install" → runInstall (no_default=
+features.length>0, ticked set authoritative) → install_app job. applyJobResult +install branch.
+"build + install…" button added to app-info panel. Deploy.qml {175}= balanced, all backend.* resolve.
+[DISTRIBUTION.md] updated: flags scanning + per-arch convention + /tmp staging (default) vs direct +
+cargo path WIRED; remaining on-device = cmake cross-build (toolchain file) + dependency resolution.
+SANDBOX: no cross/ssh/scp → cross-build+scp+cp on-device; pure logic tested: deploy 14, buildflags 6,
+appcatalog 5, netshare 4, bttransfer 3 = 32 gui tests; rustcheck CLEAN; Deploy.qml balanced.
+HOW PER-ARCH DEFAULTS WORK: app_build_options returns defaults_by_target; QML pre-ticks the matching
+target's set; user toggles; build sends exactly the ticked features with --no-default-features.
