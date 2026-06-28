@@ -15,6 +15,42 @@ Item {
     property string note: ""
     property bool busy: false
     property string jobKind: ""
+    // this device's own key (advertiser side of two-sided matching)
+    property bool myKeyPresent: false
+    property string myKeyFp: ""
+    property string myKeyType: ""
+    property string myKeyArt: ""
+    // bluetooth send
+    property var btDevices: []
+    property string btAddr: ""
+    property string btName: ""
+    property string btFile: ""
+
+    function loadFingerprint() {
+        var r = JSON.parse(backend.local_fingerprint())
+        if (r.ok && r.host && r.host.present) {
+            root.myKeyPresent = true; root.myKeyFp = r.host.fingerprint
+            root.myKeyType = r.host.type; root.myKeyArt = r.host.art
+        } else { root.myKeyPresent = false }
+    }
+    function loadBtDevices() {
+        var r = JSON.parse(backend.bluetooth_devices())
+        if (r.ok) { root.btDevices = r.devices; root.note = r.devices.length + " paired Bluetooth device(s)" }
+        else { root.btDevices = []; root.note = "error: " + r.error }
+    }
+    function makeBundle() {
+        var r = JSON.parse(backend.make_bundle(""))
+        if (r.ok) { root.btFile = r.path; root.note = "bundled the repo → " + r.path }
+        else { root.note = "error: " + r.error }
+    }
+    function btSend() {
+        if (root.btAddr.length === 0 || root.btFile.length === 0) { root.note = "pick a device and a file"; return }
+        var r = JSON.parse(backend.start_bluetooth_send(root.btAddr, root.btFile))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "btsend"
+        root.note = "sending " + root.btFile + " to " + (root.btName.length ? root.btName : root.btAddr) + "…"
+        poller.start()
+    }
 
     function refreshAdvertise() {
         var s = JSON.parse(backend.advertise_status())
@@ -45,9 +81,10 @@ Item {
     }
     function applyJobResult(res) {
         if (root.jobKind === "install") root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
+        else if (root.jobKind === "btsend") root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
         root.jobKind = ""
     }
-    Component.onCompleted: refreshAdvertise()
+    Component.onCompleted: { refreshAdvertise(); loadFingerprint() }
 
     Timer {
         id: poller
@@ -102,6 +139,25 @@ Item {
                     width: parent.width
                     text: root.serving ? ("serving on " + root.serveAddr) : "not advertising"
                     color: root.serving ? "#56d364" : "#8a93a6"; font.pixelSize: 12
+                }
+            }
+
+            // ── this device's key (for two-sided matching) ───────────────
+            // The peer connecting to you taps "verify key" on its Deploy tab and
+            // compares what it sees against this. Same fingerprint = same device.
+            Column {
+                width: col.width; spacing: 6
+                visible: root.myKeyPresent
+                Label { text: "this device's key"; color: "#7aa2f7"; font.bold: true }
+                Label {
+                    width: parent.width
+                    text: root.myKeyFp + (root.myKeyType.length ? ("  (" + root.myKeyType + ")") : "")
+                    color: "#cdd6f4"; font.pixelSize: 13; font.family: "monospace"; wrapMode: Text.WrapAnywhere
+                }
+                Label {
+                    width: parent.width; visible: root.myKeyArt.length > 0
+                    text: root.myKeyArt
+                    color: "#8a93a6"; font.family: "monospace"; font.pixelSize: 11
                 }
             }
 
@@ -163,6 +219,51 @@ Item {
                 Label {
                     width: parent.width
                     text: "clones the repo from its ssh:// provider into that folder (git clone over ssh — you need ssh access to the peer)."
+                    color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+            }
+
+            // ── send a file over Bluetooth (OBEX) ────────────────────────
+            // A no-LAN way to hand the repo bundle to a paired device.
+            Column {
+                width: col.width; spacing: 6
+                Row {
+                    width: parent.width; spacing: 8
+                    Label { text: "send over Bluetooth"; color: "#7aa2f7"; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                    Button { text: "refresh devices"; enabled: !root.busy; onClicked: root.loadBtDevices() }
+                }
+                Repeater {
+                    model: root.btDevices
+                    delegate: Rectangle {
+                        width: col.width; height: 40; radius: 6
+                        color: modelData.addr === root.btAddr ? "#2a3350" : "#171c2b"
+                        border.color: modelData.addr === root.btAddr ? "#7aa2f7" : "#2a3350"
+                        Column {
+                            anchors.verticalCenter: parent.verticalCenter; x: 10
+                            Label { text: (modelData.name && modelData.name.length) ? modelData.name : modelData.addr; color: "#cdd6f4"; font.pixelSize: 13 }
+                            Label { text: modelData.addr; color: "#5b6477"; font.pixelSize: 11 }
+                        }
+                        TapHandler { onTapped: { root.btAddr = modelData.addr; root.btName = modelData.name } }
+                    }
+                }
+                Row {
+                    width: parent.width; spacing: 8
+                    TextField {
+                        width: parent.width - bundleBtn.width - 8
+                        placeholderText: "file to send (tap “bundle repo” for the monorepo)"
+                        text: root.btFile; onTextChanged: root.btFile = text
+                    }
+                    Button { id: bundleBtn; text: "bundle repo"; enabled: !root.busy; onClicked: root.makeBundle() }
+                }
+                Button {
+                    width: parent.width
+                    text: root.btAddr.length ? ("send to " + (root.btName.length ? root.btName : root.btAddr)) : "pick a device above"
+                    enabled: !root.busy && root.btAddr.length > 0 && root.btFile.length > 0
+                    onClicked: root.btSend()
+                }
+                Label {
+                    width: parent.width
+                    text: "OBEX push — the device must be paired and accepting files. Needs bluez-tools (bt-obex) or obexftp on this end."
                     color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
                 }
             }
