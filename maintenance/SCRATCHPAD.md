@@ -959,3 +959,35 @@ Deploy tab "verify key" fetches A's key, shows received SHA256+randomart; user c
 screens; if match → "matches — trust" writes exactly those bytes. Closes the TOFU/MITM gap accept-new
 leaves. SANDBOX has no ssh/bluetooth/radio → keyscan/keygen/OBEX I/O on-device; pure logic tested:
 deploy 12, netshare 4, bttransfer 3, gui rustcheck CLEAN, both QML balanced. gui logic = 19 tests.
+
+── defense-in-depth ssh + confirm dialog + app-catalog foundation ──
+THREE asks. (1) defense-in-depth so a compromised device can't tunnel into all trusted
+devices; (2) push+launch confirm dialog showing full path (was truncated on mobile);
+(3) redesign push+launch → pull-based app distributor (broken now). Built 1+2 fully, built
+3's verifiable FOUNDATION + designed the build-ship pipeline.
+[deploy.rs] SSH_OPTS += ForwardAgent=no, ClearAllForwardings=yes, ControlMaster=no (outbound
+anti-pivot — stops agent hijack/tunnels when WE connect to a maybe-compromised peer). NEW pure:
+lan_cidr_from_ip (192.168.1.7→192.168.1.0/24; hostname→None), authorized_keys_options(host)
+→ "restrict,from=\"<cidr>\"" (IP) or "restrict" (hostname); restricted_key_line(opts,pubkey).
+setup_key now installs the RESTRICTED line (restrict = no port/agent/X11 fwd, no pty; from= pins
+to LAN /24 so a stolen key won't work off-LAN). +remote_capture(user,host,cmd) generic ssh stdout
+(keeps deploy.rs std-only; main.rs glues it to appcatalog). deploy 14 tests (+2).
+[appcatalog.rs NEW] recognized-repo scan + metadata. AppEntry{name,is_cargo,is_git}.is_app();
+AppDetails{crate_count,size_human,readme_excerpt}. remote_listing_cmd (per-subdir "<flags>\tname",
+c=Cargo.toml g=.git) + parse_app_listing; remote_details_cmd (CRATES:/SIZE:/READMESTART..END) +
+parse_app_details; LOCAL scan_dir + app_info_local (tested w/ temp dir); human_size. SEAM (tested,
+NOT wired): cross_build_argv(app,triple)=["cross","build","--release","--target",t,"-p",app],
+install_dir(home)=~/.local/bin, built_binary_path, BUILD_TARGETS[aarch64 musl/gnu]. 6 tests.
+[main.rs] +mod appcatalog. start_browse now returns {entries:[{name,app,cargo,git}]} (was dirs)
+via remote_capture+remote_listing_cmd+parse_app_listing. +app_details(user,host,path) sync ssh →
+{crate_count,size,readme}.
+[Deploy.qml] dirs→entries; listing badges recognized apps (📦) + "app info" pill → showAppDetails
+→ metadata panel (name/crates/size/README). push+launch buttons → askConfirm → Dialog (centered,
+modal, monospace WrapAnywhere full path — fixes mobile truncation) → doConfirm → push/deploy.
+selectDevice resets entries/appPath/showAppInfo. Deploy.qml {129}= balanced, all backend.* resolve.
+[maintenance/DISTRIBUTION.md NEW] the pull-based distributor flow (browse recognized apps → app info
+→ pick build target → server cross-builds → ship binary to ~/.local/bin or /tmp+cp), what's built
+(catalog+metadata+seam, tested) vs on-device next (build-type picker, cross build, scp binary,
+dependency resolution = "gitmind package manager"). ties to sharekit/dht.
+SANDBOX: ssh/cross/radio absent → key-install/cross-build/scp on-device; pure logic tested:
+deploy 14, appcatalog 6, netshare 4, bt 3, rustcheck CLEAN, both QML balanced. gui logic = 27 tests.
