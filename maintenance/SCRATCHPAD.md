@@ -873,3 +873,26 @@ poller (busy spinner). 7th tab.
 gui crate rustcheck CLEAN; gui logic = 13 tests (deploy 8 + browse 1 + netshare 4).
 Live serve/GET/clone = on-device. [note] 7 tabs now — could fold deploy+network
 into a "fleet" tab if crowded.
+
+── ssh: non-interactive + host-key trust through the GUI (fixes live-on-device freeze) ──
+PROBLEM (GUI live on phone+workstation): user="user" assumption + first-connect host-key
+prompt made `ssh user@host` block on input the GUI has no TTY for → worker/UI froze; and
+accepting keys in the terminal vs GUI split known_hosts (locks).
+[deploy.rs] SSH_OPTS = [-o BatchMode=yes -o ConnectTimeout=8 -o StrictHostKeyChecking=accept-new]
+applied to EVERY ssh/rsync/git-ssh call: list_remote_argv (via ssh_argv helper), push mkdir
+(ssh_argv), rsync (-e ssh_command_str()), deploy_app (ssh_argv). BatchMode = no password hang;
+ConnectTimeout = no unreachable hang; accept-new = auto-trust NEW host keys into the shared
+~/.ssh/known_hosts (still rejects CHANGED keys) → GUI manages trust, no terminal split.
++ host_trusted(host)->bool (ssh-keygen -F, fast/local) and trust_host(host)->Result<fp> (ssh-keyscan
+-T 6 → append to known_hosts; pure helpers filter_scanned_keys/parse_fingerprint unit-tested).
+[netshare.rs] install_card git clone got .env("GIT_SSH_COMMAND", same opts inline) — no
+cross-ref to deploy::SSH_OPTS (keeps the standalone test harness independent).
+[main.rs] current_user()->{user} (whoami), host_trusted(host)->{trusted}, start_trust(host) (async
+via the SHARED Job, kind "trust" — keyscan does I/O so off-thread; poll_job delivers it).
+[Deploy.qml] Component.onCompleted defaults root.user from backend.current_user(); device section
+shows a 🔒trusted / "key not trusted" badge + a "trust key" button (start_trust + the existing
+250ms poller; applyJobResult handles kind "trust" → refreshTrust()). Network.qml needs no user
+field (install uses the provider URL's embedded whoami; clone covered by accept-new).
+SANDBOX has NO ssh/ssh-keygen/ssh-keyscan/rsync (only git) → spawn-failure path returns false/err
+(no panic); real ssh I/O is on-device. deploy 10 tests (was 8: +scan-filter/fingerprint, +unknown-
+host-not-trusted) PASS; netshare 4 PASS; gui rustcheck CLEAN; Deploy.qml balanced. gui logic = 15 tests.

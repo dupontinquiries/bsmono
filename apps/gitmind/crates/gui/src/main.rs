@@ -114,6 +114,11 @@ struct Backend {
     start_push: qt_method!(fn(&self, user: QString, host: QString, dir: QString) -> QString),
     start_deploy: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
     poll_job: qt_method!(fn(&self) -> QString),
+    // SSH identity + host-key trust, surfaced so the GUI never assumes a username
+    // and never trusts a key in the terminal behind the GUI's back.
+    current_user: qt_method!(fn(&self) -> QString),
+    host_trusted: qt_method!(fn(&self, host: QString) -> QString),
+    start_trust: qt_method!(fn(&self, host: QString) -> QString),
 
     // ── network: advertise this repo's card, look up + install a peer's ──
     advertise_start: qt_method!(fn(&self, port: QString) -> QString),
@@ -738,6 +743,41 @@ impl Backend {
     fn poll_job(&self) -> QString {
         let (running, done, kind, result) = self.job.poll();
         QString::from(json!({"running": running, "done": done, "kind": kind, "result": result}).to_string())
+    }
+
+    /// The local login name, so the deploy/network tabs can default the SSH user
+    /// to *you* instead of the literal "user" (which froze the GUI on a password
+    /// prompt when it was wrong).
+    fn current_user(&self) -> QString {
+        QString::from(json!({"user": netshare::current_user()}).to_string())
+    }
+
+    /// Whether `host` is already in `~/.ssh/known_hosts`. Fast + local, so the GUI
+    /// can render a trust badge without blocking.
+    fn host_trusted(&self, host: QString) -> QString {
+        QString::from(json!({"trusted": deploy::host_trusted(&host.to_string())}).to_string())
+    }
+
+    /// Trust `host`'s SSH key (fetch + append to known_hosts) on the shared worker
+    /// thread — `ssh-keyscan` does a brief network round-trip, so it runs off the
+    /// UI thread and reports via poll_job (kind "trust"). Returns immediately.
+    fn start_trust(&self, host: QString) -> QString {
+        let h = host.to_string();
+        if h.trim().is_empty() {
+            return err_json("no host to trust");
+        }
+        if !self.job.start("trust") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = match deploy::trust_host(&h) {
+                Ok(msg) => json!({"ok": true, "msg": msg, "host": h}).to_string(),
+                Err(e) => json!({"ok": false, "error": e, "host": h}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "trust"}).to_string())
     }
 
     // ── network ──────────────────────────────────────────────────────────
