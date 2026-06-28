@@ -30,6 +30,7 @@ use gitmind_core::watch_session::WatchSession;
 // Embed the QML into the binary so the shipped GUI has no external files.
 mod deploy;
 mod browse;
+mod netshare;
 
 qrc!(register_qml,
     "/" {
@@ -42,6 +43,7 @@ qrc!(register_qml,
         "qml/Apps.qml",
         "qml/Deploy.qml",
         "qml/Files.qml",
+        "qml/Network.qml",
     },
 );
 
@@ -113,9 +115,18 @@ struct Backend {
     start_deploy: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
     poll_job: qt_method!(fn(&self) -> QString),
 
+    // ── network: advertise this repo's card, look up + install a peer's ──
+    advertise_start: qt_method!(fn(&self, port: QString) -> QString),
+    advertise_stop: qt_method!(fn(&self) -> QString),
+    advertise_status: qt_method!(fn(&self) -> QString),
+    lookup_peer: qt_method!(fn(&self, addr: QString) -> QString),
+    start_install: qt_method!(fn(&self, name: QString, provider: QString, dest: QString) -> QString),
+
     session: WatchSession,
     // Shared state for the one in-flight background deploy job.
     job: std::sync::Arc<deploy::Job>,
+    // HTTP advertiser state (serving this repo's card to peers).
+    advertiser: std::sync::Arc<netshare::Advertiser>,
 }
 
 /// Open the repo from the process working directory (the GUI may be launched
@@ -727,6 +738,79 @@ impl Backend {
     fn poll_job(&self) -> QString {
         let (running, done, kind, result) = self.job.poll();
         QString::from(json!({"running": running, "done": done, "kind": kind, "result": result}).to_string())
+    }
+
+    // ── network ──────────────────────────────────────────────────────────
+    /// Start advertising this repo's card over HTTP on `port` (default 9876), so
+    /// peers can look it up and clone it from the ssh provider in the card.
+    fn advertise_start(&self, port: QString) -> QString {
+        if self.advertiser.is_serving() {
+            return err_json("already advertising — stop it first");
+        }
+        let port: u16 = port.to_string().trim().parse().unwrap_or(9876);
+        let r = match repo() { Ok(r) => r, Err(e) => return err_json(&e) };
+        let ip = netshare::local_ip().unwrap_or_else(|| "127.0.0.1".into());
+        let card = match netshare::card_for_repo(r.root(), &netshare::current_user(), &ip) {
+            Ok(c) => c,
+            Err(e) => return err_json(&e),
+        };
+        let card_json = String::from_utf8_lossy(&card.to_bytes()).into_owned();
+        let listener = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+            Ok(l) => l,
+            Err(e) => return err_json(&format!("bind port {port}: {e}")),
+        };
+        let addr = format!("{ip}:{port}");
+        self.advertiser.begin(addr.clone());
+        let adv = std::sync::Arc::clone(&self.advertiser);
+        std::thread::spawn(move || {
+            let _ = netshare::serve_loop(listener, card_json, adv.clone());
+            adv.end();
+        });
+        QString::from(json!({"ok": true, "addr": addr, "name": card.name}).to_string())
+    }
+
+    /// Stop advertising.
+    fn advertise_stop(&self) -> QString {
+        self.advertiser.end();
+        QString::from(json!({"ok": true}).to_string())
+    }
+
+    /// Whether we're advertising, and at what address.
+    fn advertise_status(&self) -> QString {
+        QString::from(json!({"serving": self.advertiser.is_serving(), "addr": self.advertiser.addr()}).to_string())
+    }
+
+    /// Look up a peer's advertised card at `addr` ("host:port") over HTTP.
+    fn lookup_peer(&self, addr: QString) -> QString {
+        match netshare::lookup_peer(&addr.to_string(), std::time::Duration::from_secs(4)) {
+            Ok(card) => QString::from(json!({
+                "ok": true,
+                "name": card.name,
+                "description": card.description,
+                "providers": card.providers,
+                "refs": card.refs.len(),
+                "id": card.id().to_hex(),
+            }).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Install (git clone) a card's provider into `dest`, on the shared worker
+    /// thread (clones can be slow). Poll poll_job for the result.
+    fn start_install(&self, name: QString, provider: QString, dest: QString) -> QString {
+        if !self.job.start("install") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        let (n, p, d) = (name.to_string(), provider.to_string(), dest.to_string());
+        std::thread::spawn(move || {
+            let result = match netshare::install_card(&n, &p, &d) {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "started": "install"}).to_string())
     }
 }
 

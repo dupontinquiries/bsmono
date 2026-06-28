@@ -18,6 +18,7 @@ cstr = "0.2"
 serde_json = "1"
 gitmind-core = { path = "../core" }
 peek = { path = "../peek" }
+net-kit = { path = "../../../../shared/net-kit" }
 
 [features]
 # Build the GUI with the privileged PID-attributing watcher available.
