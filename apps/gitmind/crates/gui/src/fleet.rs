@@ -36,23 +36,35 @@ fn config_file(name: &str) -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".config/gitmind").join(name))
 }
 
-/// The configured remote build repo (where the source lives on the build host), or
-/// empty if unset. Persisted so the app-store "build on desktop" path is set once.
-pub fn build_repo() -> String {
+/// Remembered remote build repo paths, most-recent first (for the picker dropdown).
+pub fn build_repos() -> Vec<String> {
     config_file("build-repo")
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
         .unwrap_or_default()
 }
 
-/// Persist the remote build repo path.
+/// The most-recently-used remote build repo (where the source lives on the build
+/// host), or empty if unset.
+pub fn build_repo() -> String {
+    build_repos().into_iter().next().unwrap_or_default()
+}
+
+/// Remember a remote build repo path: move it to the front, dedupe, cap the history.
 pub fn set_build_repo(path: &str) -> Result<(), String> {
-    let p = path.trim();
+    let p = path.trim().to_string();
+    if p.is_empty() {
+        return Ok(());
+    }
+    let mut hist = build_repos();
+    hist.retain(|x| x != &p);
+    hist.insert(0, p);
+    hist.truncate(8);
     let f = config_file("build-repo").ok_or("no $HOME set")?;
     if let Some(dir) = f.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    std::fs::write(&f, format!("{p}\n")).map_err(|e| format!("write {}: {e}", f.display()))
+    std::fs::write(&f, format!("{}\n", hist.join("\n"))).map_err(|e| format!("write {}: {e}", f.display()))
 }
 
 /// The configured fleet user (or the default). Managed by the GUI, not hardcoded.
@@ -183,10 +195,13 @@ mod tests {
         set_fleet_user("fleetbot").unwrap();
         assert_eq!(fleet_user(), "fleetbot");
         assert!(set_fleet_user("Bad Name").is_err());
-        // build repo persists independently
+        // build repo persists as a most-recent-first history
         assert_eq!(build_repo(), "", "empty when unset");
         set_build_repo("/home/kesslerd/Code/monorepo").unwrap();
+        set_build_repo("/home/kesslerd/other").unwrap();
+        set_build_repo("/home/kesslerd/Code/monorepo").unwrap(); // re-pick → moves to front, no dup
         assert_eq!(build_repo(), "/home/kesslerd/Code/monorepo");
+        assert_eq!(build_repos(), vec!["/home/kesslerd/Code/monorepo".to_string(), "/home/kesslerd/other".to_string()]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
