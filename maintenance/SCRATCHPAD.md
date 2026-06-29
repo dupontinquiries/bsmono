@@ -1025,3 +1025,43 @@ SANDBOX: no cross/ssh/scp → cross-build+scp+cp on-device; pure logic tested: d
 appcatalog 5, netshare 4, bttransfer 3 = 32 gui tests; rustcheck CLEAN; Deploy.qml balanced.
 HOW PER-ARCH DEFAULTS WORK: app_build_options returns defaults_by_target; QML pre-ticks the matching
 target's set; user toggles; build sends exactly the ticked features with --no-default-features.
+
+── one connection UI + Deploy|Install toggle + managed fleet user ──
+USER insight: the Deploy tab conflated two opposite-direction use cases — push
+(desktop→device) and fetch/install (phone←desktop). Want ONE shared connection UI
+with a Deploy|Install toggle (not two functions mashed together / not an 8th tab).
+Also: stop defaulting the ssh user to whoami(kesslerd); use a GUI-managed dedicated
+fleet user/group if that's good linux practice (it is — service account).
+[DESIGN] Deploy.qml → Fleet.qml (qrc + main.qml: tab "deploy"→"fleet", Fleet{id:fleet}).
+The file already held BOTH flows (push controls + the install configurator from last
+turn) — so the fix is a `mode` toggle ("deploy"|"install", default deploy) + gating,
+not a file split. Connection panel (discover/trust/fingerprint/key-setup) is shared.
+[fleet.rs NEW, 5 tests] FLEET_USER_DEFAULT="gitmind". valid_username (injection guard:
+lowercase-start [a-z0-9_-] ≤32). fleet_user()/set_fleet_user() persist ~/.config/gitmind/
+fleet-user. base64_encode (std alphabet, known-vector tested). provision_user_script(user,
+key_line): portable useradd[Fedora]/adduser[Alpine] + ~/.ssh + key SINGLE-QUOTED (from="
+..." double-quotes safe) + echo gitmind-fleet-user-ready. provision_remote_command(b64):
+sudo -S sh -c "$(printf %s 'b64' | base64 -d)" (quote-safe transport).
+[deploy.rs] restricted_key_line made pub. +ssh_sudo_run(admin,host,password,remote_cmd,
+stdin_data): ssh via password-askpass (no TTY) + write stdin to remote cmd (sudo -S password).
+14 tests unchanged.
+[main.rs] +mod fleet. fleet_user()→{user:fleet_user, admin:whoami}. set_fleet_user(name).
+start_provision_fleet_user(admin,host,password) ASYNC job kind "provision" → free fn
+provision_fleet_user: ensure_local_pubkey + restricted_key_line(authorized_keys_options) +
+fleet::provision_user_script + base64 + provision_remote_command → deploy::ssh_sudo_run
+(stdin=password) → check "gitmind-fleet-user-ready". rustcheck CLEAN.
+[Fleet.qml] mode toggle (⬆Deploy/⬇Install pills); Component.onCompleted reads fleet_user()
+(user=fleet_user, adminUser=whoami) NOT current_user. mode-aware section-2 header; "as user"
+field + "save"(saveFleetUser→set_fleet_user) + fleet-user hint. Setup col +divider +provision
+block ("sudo as" adminUser + "create fleet user"→provisionFleetUser). applyJobResult +provision
+branch (clears sshpass/showProvision + refreshTrust). selectDevice resets showProvision.
+GATING: push section visible curPath>0 && mode==="deploy"; "build + install…" button + installer
+configurator visible only mode==="install". Fleet.qml {196}= balanced, all backend.* resolve.
+[main.qml] tab "deploy"→"fleet"; Fleet{id:fleet}; comment updated. Balanced.
+[FLEET-USER.md NEW] why dedicated user (isolation/least-privilege/no-surprise-default), how
+managed + provisioned, bootstrap order (provision-first OR install-key-for-existing), restricted-
+key tie-in, note Network ssh:// provider still uses login name (follow-up).
+VERIFIED: fleet 5, deploy 14, buildflags 6, appcatalog 5, netshare 4, bttransfer 3 = 37 gui tests;
+rustcheck CLEAN; Fleet/main/Network.qml balanced; no stale Deploy.qml refs. ON-DEVICE: useradd/
+adduser/sudo/ssh/scp/cross-build — provisioning may need per-distro tweaks; bootstrap needs the
+fleet user to exist before connecting AS it (provision first).

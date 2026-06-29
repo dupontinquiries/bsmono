@@ -112,8 +112,8 @@ ApplicationWindow {
         // ── Apps: version-pinned binaries ────────────────────────────
         Apps { id: apps }
 
-        // ── Deploy: discover devices, push the repo, make a launcher ──
-        Deploy { id: deploy }
+        // ── Fleet: connect to a device, then Deploy (push) or Install (fetch) ──
+        Fleet  { id: fleet }
 
         // ── Network: advertise, look up + install a peer's repo over HTTP ──
         Network { id: network }
@@ -128,7 +128,7 @@ ApplicationWindow {
         TabButton { text: "branches" }
         TabButton { text: "files" }
         TabButton { text: "apps" }
-        TabButton { text: "deploy" }
+        TabButton { text: "fleet" }
         TabButton { text: "network" }
     }
 
