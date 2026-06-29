@@ -241,6 +241,142 @@ pub fn rsync_pull(user: &str, host: &str, remote: &str, local: &str) -> Result<(
     }
 }
 
+/// A parsed authorized_keys entry. `managed` = installed by gitmind (carries an
+/// expiry-time); `expired` = its expiry-time is in the past.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuthKey {
+    pub options: String,
+    pub key_type: String,
+    pub key_b64: String,
+    pub comment: String,
+    pub expiry: String,
+    pub managed: bool,
+    pub expired: bool,
+}
+
+impl AuthKey {
+    /// A short, human identifier: the comment if present, else a tail of the key.
+    pub fn id(&self) -> String {
+        if !self.comment.trim().is_empty() {
+            self.comment.trim().to_string()
+        } else {
+            let n = self.key_b64.len();
+            format!("…{}", &self.key_b64[n.saturating_sub(12)..])
+        }
+    }
+}
+
+fn is_key_type(tok: &str) -> bool {
+    tok.starts_with("ssh-") || tok.starts_with("ecdsa-") || tok.starts_with("sk-")
+}
+
+fn extract_expiry(options: &str) -> String {
+    options.find("expiry-time=\"").map(|i| {
+        let rest = &options[i + "expiry-time=\"".len()..];
+        rest.split('"').next().unwrap_or("").to_string()
+    }).unwrap_or_default()
+}
+
+/// Parse an authorized_keys file. `now_stamp` is the current time as YYYYMMDDHHMMSS
+/// (from key_expiry_time(now, 0)) for the expired check. Pure — unit-tested.
+pub fn parse_authorized_keys(text: &str, now_stamp: &str) -> Vec<AuthKey> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let toks: Vec<&str> = l.split_whitespace().collect();
+        let (options, rest) = if !toks.is_empty() && is_key_type(toks[0]) {
+            (String::new(), &toks[..])
+        } else if toks.len() >= 2 {
+            (toks[0].to_string(), &toks[1..])
+        } else {
+            continue;
+        };
+        if rest.len() < 2 {
+            continue;
+        }
+        let key_type = rest[0].to_string();
+        let key_b64 = rest[1].to_string();
+        let comment = rest[2..].join(" ");
+        let expiry = extract_expiry(&options);
+        let managed = !expiry.is_empty();
+        let expired = managed && expiry.as_str() < now_stamp;
+        out.push(AuthKey { options, key_type, key_b64, comment, expiry, managed, expired });
+    }
+    out
+}
+
+/// Clean an authorized_keys file: drop gitmind-managed entries that are expired or are
+/// older duplicates of the same key (keeping the newest expiry), leaving every other
+/// line untouched. Returns the cleaned text + how many lines were removed. Pure.
+pub fn dedupe_authorized_keys(text: &str, now_stamp: &str) -> (String, usize) {
+    let entries = parse_authorized_keys(text, now_stamp);
+    let mut best: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for e in &entries {
+        if e.managed && !e.expired {
+            best.entry(e.key_b64.clone())
+                .and_modify(|cur| { if e.expiry.as_str() > cur.as_str() { *cur = e.expiry.clone(); } })
+                .or_insert_with(|| e.expiry.clone());
+        }
+    }
+    let mut kept_blob: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = String::new();
+    let mut removed = 0usize;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let parsed = parse_authorized_keys(line, now_stamp);
+        let keep = match parsed.first() {
+            None => true,
+            Some(e) if !e.managed => true,
+            Some(e) if e.expired => false,
+            Some(e) => {
+                let is_best = best.get(&e.key_b64).map(|b| b == &e.expiry).unwrap_or(false);
+                if is_best && !kept_blob.contains(&e.key_b64) {
+                    kept_blob.insert(e.key_b64.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            removed += 1;
+        }
+    }
+    (out, removed)
+}
+
+/// Run a remote command feeding `stdin` to it (e.g. writing a file via `cat >`). On-device.
+pub fn remote_feed(user: &str, host: &str, cmd: &str, stdin: &str) -> Result<String, String> {
+    use std::io::Write;
+    let mut child = Command::new("ssh")
+        .args(ssh_argv(user, host, cmd))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh: {e}"))?;
+    if let Some(si) = child.stdin.as_mut() {
+        si.write_all(stdin.as_bytes()).map_err(|e| format!("write: {e}"))?;
+    }
+    let out = child.wait_with_output().map_err(|e| format!("ssh: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// `scp <hardened opts> <local> user@host:<remote>` argv — push a file (a freshly
 /// built binary) out to a device. Pure — unit-tested.
 pub fn scp_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
@@ -1072,5 +1208,27 @@ mod tests {
         let (r2, d2, _, _) = job.poll();
         assert!(!r2 && !d2, "idle after the result is consumed");
         assert!(job.start("push"), "can start a new job after consume");
+    }
+
+    #[test]
+    fn authorized_keys_parse_and_dedupe() {
+        let now = "20260629000000";
+        let user_key = "ssh-ed25519 AAAAuserKEY me@laptop";
+        let expired = "expiry-time=\"20260101000000\",restrict ssh-ed25519 AAAAoldKEY gitmind";
+        let live_old = "expiry-time=\"20260701000000\",restrict ssh-ed25519 AAAAdupKEY gitmind";
+        let live_new = "expiry-time=\"20260706000000\",restrict ssh-ed25519 AAAAdupKEY gitmind";
+        let text = format!("# comment\n{user_key}\n{expired}\n{live_old}\n{live_new}\n");
+        let parsed = parse_authorized_keys(&text, now);
+        assert_eq!(parsed.len(), 4);
+        assert!(!parsed[0].managed, "user key not managed");
+        assert!(parsed[1].managed && parsed[1].expired, "old gitmind key expired");
+        assert_eq!(parsed[3].id(), "gitmind");
+        // cleanup drops the expired one + the older duplicate; keeps user key, comment, newest
+        let (clean, removed) = dedupe_authorized_keys(&text, now);
+        assert_eq!(removed, 2, "expired + older dup removed");
+        assert!(clean.contains(user_key), "user key untouched");
+        assert!(clean.contains("# comment"), "comments preserved");
+        assert!(clean.contains("20260706000000") && !clean.contains("20260701000000"), "kept newest dup only");
+        assert!(!clean.contains("20260101000000"), "expired gone");
     }
 }
