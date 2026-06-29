@@ -20,6 +20,7 @@ path = "src/bin/gin.rs"
 
 [dependencies]
 gitmind-core = { path = "../core" }
+cockpit = { path = "../cockpit" }
 libc = "0.2"
 
 [features]

@@ -94,6 +94,7 @@ pub fn run() -> i32 {
         "patch" => cmd_patch(rest),
         "apply" => cmd_apply(rest),
         "zip" => cmd_zip(rest),
+        "fleet" => cmd_fleet(rest),
         "bridge" => cmd_bridge(rest),
         "watch" => cmd_watch(rest),
         "bundle" => match rest.first() {
@@ -1319,4 +1320,129 @@ fn iso_now() -> String {
     let mon = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mon <= 2 { y + 1 } else { y };
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mon, d, h, m, s)
+}
+
+// ── fleet: cockpit operations shared with the GUI (import / build / apply / merge / reclaim) ──
+
+fn cmd_fleet(rest: &[String]) -> i32 {
+    use cockpit::flow;
+    let sub = match rest.first() {
+        Some(s) => s.as_str(),
+        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim> ..."),
+    };
+    let args = &rest[1..];
+    let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+
+    match sub {
+        "import" => {
+            let zip = match pos.first() {
+                Some(z) => z.as_str(),
+                None => return err("usage: gitmind fleet import <zip> [--run] [--save <dir>] [--init gitmind|git|none] [--base <dir>]"),
+            };
+            let imp = match flow::import(zip) { Ok(i) => i, Err(e) => return err(&e) };
+            println!("crate: {} {}", imp.app, if imp.is_bin { "(binary)" } else { "(library)" });
+            if !imp.description.is_empty() { println!("  {}", imp.description); }
+            println!("  extracted to {}", imp.dir.display());
+            if imp.has_git {
+                println!("  carries {} history → `gitmind fleet merge {} <repo>`",
+                    if imp.has_gitmind { "gitmind" } else { "git" }, zip);
+            }
+            let mut run_from = imp.crate_path.clone();
+            if let Some(dest) = opt(args, "--save") {
+                let init = opt(args, "--init").unwrap_or("gitmind");
+                let base = opt(args, "--base").unwrap_or(dest);
+                match flow::place(&imp.crate_path, dest, base, init) {
+                    Ok(p) => { println!("saved to {}{}", p.display(), if init != "none" { format!(" ({init} initialized)") } else { String::new() }); run_from = p; }
+                    Err(e) => return err(&e),
+                }
+            }
+            if flag(args, "--run") {
+                if !imp.is_bin { return err("library crate — nothing to run"); }
+                match flow::build_and_run(&run_from, &imp.app) {
+                    Ok(b) => println!("launched: {}", b.display()),
+                    Err(e) => return err(&e),
+                }
+            }
+            0
+        }
+        "build" => {
+            let path = match pos.first() {
+                Some(p) => std::path::PathBuf::from(p),
+                None => return err("usage: gitmind fleet build <crate-path> [app] [--target T]"),
+            };
+            let toml = std::fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
+            let app = pos.get(1).map(|s| s.to_string())
+                .or_else(|| cockpit::buildflags::crate_name(&toml))
+                .unwrap_or_else(|| "app".into());
+            let target = opt(args, "--target").map(|s| s.to_string()).unwrap_or_default();
+            match cockpit::build_locally(&app, &path, &target, &[], false) {
+                Ok((bin, size)) => { println!("built {} ({})", bin.display(), cockpit::appcatalog::human_size(size)); 0 }
+                Err(e) => err(&e),
+            }
+        }
+        "apply" => {
+            let (zip, repo) = match (pos.first(), pos.get(1)) {
+                (Some(z), Some(r)) => (z.as_str(), r.as_str()),
+                _ => return err("usage: gitmind fleet apply <zip> <repo> [--mirror]"),
+            };
+            let imp = match flow::import(zip) { Ok(i) => i, Err(e) => return err(&e) };
+            let name = std::path::Path::new(zip).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match flow::apply_overlay(&imp.crate_path, repo, flag(args, "--mirror"), &name) {
+                Ok(r) => {
+                    if let Some(m) = r.noop_msg { println!("{m}"); return 0; }
+                    println!("applied on branch {} — {}", r.branch, r.shortstat);
+                    for (st, p) in &r.files { println!("  {st}  {p}"); }
+                    println!("review: git -C {repo} diff {}..{}", r.base, r.branch);
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "merge" => {
+            let (zip, repo) = match (pos.first(), pos.get(1)) {
+                (Some(z), Some(r)) => (z.as_str(), r.as_str()),
+                _ => return err("usage: gitmind fleet merge <zip> <repo> [--strategy <id>]"),
+            };
+            let imp = match flow::import(zip) { Ok(i) => i, Err(e) => return err(&e) };
+            let zip_repo = match &imp.zip_repo {
+                Some(p) => p.display().to_string(),
+                None => return err("the zip has no git history — use `gitmind fleet apply` instead"),
+            };
+            let ex = match flow::explore(&zip_repo, repo) { Ok(e) => e, Err(e) => return err(&e) };
+            println!("into {}{}", ex.target_branch, if ex.related { "" } else { " (unrelated histories)" });
+            for t in &ex.trials {
+                println!("  {} {:<22} {}{}",
+                    if t.ok { "✓" } else { "✗" }, t.label, t.summary,
+                    if t.recommended { "  [recommended]" } else { "" });
+            }
+            if let Some(id) = opt(args, "--strategy") {
+                match ex.trials.iter().find(|t| t.id == id && t.ok) {
+                    Some(t) => match flow::land_merge(&ex.workspace.display().to_string(), &t.branch, repo, id) {
+                        Ok(b) => { println!("landed on branch {b} — review and merge it"); 0 }
+                        Err(e) => err(&e),
+                    },
+                    None => err(&format!("no clean strategy '{id}' (try one marked ✓)")),
+                }
+            } else {
+                println!("pick one with --strategy <id>");
+                0
+            }
+        }
+        "reclaim" => {
+            let root = match pos.first() {
+                Some(p) => std::path::PathBuf::from(p),
+                None => return err("usage: gitmind fleet reclaim <repo-root> [--apply]"),
+            };
+            if flag(args, "--apply") {
+                let (n, freed) = flow::reclaim_apply(&root);
+                println!("reclaimed {} from {n} dir(s)", cockpit::appcatalog::human_size(freed));
+            } else {
+                let scan = flow::reclaim_scan(&root);
+                for (p, b) in &scan.items { println!("  {:>10}  {p}", cockpit::appcatalog::human_size(*b)); }
+                println!("{} reclaimable in {} dir(s) — add --apply to remove", cockpit::appcatalog::human_size(scan.total_bytes), scan.items.len());
+            }
+            0
+        }
+        other => err(&format!("unknown fleet command: {other}")),
+    }
 }

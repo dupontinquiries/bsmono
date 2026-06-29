@@ -27,20 +27,11 @@ use gitmind_core::store::ChunkStore;
 use gitmind_core::watch::WatchPolicy;
 use gitmind_core::watch_session::WatchSession;
 
-// Embed the QML into the binary so the shipped GUI has no external files.
-mod deploy;
-mod browse;
-mod netshare;
-mod bttransfer;
-mod appcatalog;
-mod buildflags;
-mod fleet;
-mod preview;
-mod installer;
-mod reclaim;
-mod importer;
-mod places;
-mod merge;
+// Cockpit operations live in the shared, Qt-free `cockpit` crate so the GUI and CLI
+// share one implementation. Bring its modules + helpers into scope unqualified so the
+// Backend methods below read exactly as before.
+use cockpit::{appcatalog, browse, bttransfer, buildflags, deploy, fleet, installer, netshare, places, preview};
+use cockpit::{app_oid, build_locally, native_triple_local, now_stamp, provision_fleet_user, set_executable, tool_path_env};
 
 qrc!(register_qml,
     "/" {
@@ -209,194 +200,6 @@ fn repo() -> Result<GitCli, String> {
 
 fn err_json(e: &str) -> QString {
     QString::from(json!({"ok": false, "error": e}).to_string())
-}
-
-/// The commit oid of the last change touching an app's directory — the seed for its
-/// tile colour + warp. Empty if not in a git repo or git isn't available.
-fn app_oid(root: &std::path::Path, dir: &std::path::Path) -> String {
-    std::process::Command::new("git")
-        .arg("-C").arg(root)
-        .args(["log", "-1", "--format=%H", "--"])
-        .arg(dir)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
-}
-
-/// Resolve the cargo binary even when the GUI was launched from a desktop launcher
-/// (whose PATH usually omits ~/.cargo/bin): honour $CARGO, then ~/.cargo/bin/cargo,
-/// then fall back to the name.
-fn cargo_bin() -> String {
-    if let Ok(c) = std::env::var("CARGO") {
-        if !c.trim().is_empty() {
-            return c;
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let cand = format!("{home}/.cargo/bin/cargo");
-        if std::path::Path::new(&cand).is_file() {
-            return cand;
-        }
-    }
-    "cargo".to_string()
-}
-
-/// A PATH that includes ~/.cargo/bin and the standard locations, so a build (and its
-/// rustc/linker subprocesses, or Xvfb/ImageMagick) resolves even from a launcher.
-fn tool_path_env() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let cur = std::env::var("PATH").unwrap_or_default();
-    format!("{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin{}", if cur.is_empty() { String::new() } else { format!(":{cur}") })
-}
-
-/// This device's native target triple, normalized to the GUI vocabulary (e.g. Alpine's
-/// `aarch64-alpine-linux-musl` → `aarch64-unknown-linux-musl`). Read from rustc; falls
-/// back to an Alpine check only if rustc isn't reachable.
-fn native_triple_local() -> String {
-    std::process::Command::new("rustc")
-        .arg("-vV")
-        .env("PATH", tool_path_env())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| buildflags::host_triple_from_rustc(&String::from_utf8_lossy(&o.stdout)))
-        .map(|h| buildflags::normalize_native(&h))
-        .unwrap_or_else(|| {
-            let libc = if std::path::Path::new("/etc/alpine-release").exists() { "musl" } else { "gnu" };
-            format!("aarch64-unknown-linux-{libc}")
-        })
-}
-
-/// Walk up from `start` to the gitmind repo root — the directory containing a
-/// `.gitmind` marker. None if not under a gitmind-managed repo.
-fn gitmind_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut cur = Some(start);
-    while let Some(d) = cur {
-        if d.join(".gitmind").exists() {
-            return Some(d.to_path_buf());
-        }
-        cur = d.parent();
-    }
-    None
-}
-
-/// Shared cargo target dir for gitmind-managed repos — one cache so deps build once
-/// across every clone (tmpN…) instead of a multi-GB target/ tree per repo. target/ is
-/// gitignored, so redirecting builds here is safe and reclaims that space.
-fn shared_target_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.cache/gitmind/cargo-target")
-}
-
-/// Where cargo writes the binary for `app` built in `app_dir`. `cargo_target` is the
-/// value passed to `--target` ("" for native, no triple subdir). `target_dir_env` is
-/// an optional CARGO_TARGET_DIR override (shared cache) — applied to the metadata
-/// query too so the resolved path matches where cargo actually wrote.
-fn resolve_binary(cargo: &str, app_dir: &std::path::Path, cargo_target: &str, app: &str, target_dir_env: Option<&str>) -> std::path::PathBuf {
-    let mut cmd = std::process::Command::new(cargo);
-    cmd.args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(app_dir)
-        .env("PATH", tool_path_env());
-    if let Some(td) = target_dir_env {
-        cmd.env("CARGO_TARGET_DIR", td);
-    }
-    let target_dir = cmd
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| buildflags::parse_target_directory(&String::from_utf8_lossy(&o.stdout)))
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| app_dir.join("target"));
-    let dir = if cargo_target.trim().is_empty() {
-        target_dir.join("release")
-    } else {
-        target_dir.join(cargo_target).join("release")
-    };
-    dir.join(app)
-}
-
-/// Build `app` in `app_dir` for `target` and return the binary path + byte size.
-/// Native build (no --target) when the libc matches this device; cross otherwise.
-/// gitmind repos share the cargo target cache. Used by both build and push.
-fn build_locally(app: &str, app_dir: &std::path::Path, target: &str, feats: &[String], no_default: bool) -> Result<(std::path::PathBuf, u64), String> {
-    let cargo = cargo_bin();
-    let native = native_triple_local();
-    let cargo_target = if buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
-    let shared = gitmind_root(app_dir).map(|_| shared_target_dir());
-    let argv = buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
-    let mut cmd = std::process::Command::new(&cargo);
-    cmd.args(&argv[1..]).current_dir(app_dir).env("PATH", tool_path_env());
-    if let Some(td) = &shared {
-        let _ = std::fs::create_dir_all(td);
-        cmd.env("CARGO_TARGET_DIR", td);
-    }
-    match cmd.output() {
-        Ok(o) if o.status.success() => {
-            let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, shared.as_deref());
-            let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
-            Ok((bin, size))
-        }
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-            "couldn't find cargo. Install Rust, or launch gitmind-gui from a shell where cargo is on PATH (it lives in ~/.cargo/bin).".to_string()
-        ),
-        Err(e) => Err(format!("couldn't run the build: {e}")),
-    }
-}
-
-/// Append any missing lines to a directory's .gitignore (creating it if needed).
-fn ensure_gitignore(dir: &std::path::Path, lines: &[&str]) {
-    let path = dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut out = existing.clone();
-    for line in lines {
-        let present = existing.lines().any(|l| l.trim() == *line);
-        if !present {
-            if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    if out != existing {
-        let _ = std::fs::write(&path, out);
-    }
-}
-
-/// Current time as an OpenSSH expiry-time stamp (YYYYMMDDHHMMSS), for the expired check.
-fn now_stamp() -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    deploy::key_expiry_time(now, 0)
-}
-
-/// Mark a freshly-installed binary executable (best-effort; Unix perms).
-fn set_executable(path: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(path) {
-        let mut perms = meta.permissions();
-        perms.set_mode(perms.mode() | 0o755);
-        let _ = std::fs::set_permissions(path, perms);
-    }
-}
-
-/// Create the fleet user on a device and install the restricted key into it, over
-/// ssh as the sudo-capable `admin` account. On-device (useradd/adduser + sudo).
-fn provision_fleet_user(admin: &str, host: &str, password: &str) -> Result<String, String> {
-    let user = fleet::fleet_user();
-    let pubkey = deploy::ensure_local_pubkey()?;
-    let key_line = deploy::restricted_key_line(&deploy::authorized_keys_options(host), &pubkey);
-    let script = fleet::provision_user_script(&user, &key_line);
-    let remote = fleet::provision_remote_command(&fleet::base64_encode(script.as_bytes()));
-    let out = deploy::ssh_sudo_run(admin, host, password, &remote, &format!("{password}\n"))?;
-    if out.contains("gitmind-fleet-user-ready") {
-        Ok(format!("created fleet user '{user}' on {host} — set the user to '{user}' to connect"))
-    } else {
-        Err("provisioning didn't confirm — does that account have sudo rights?".into())
-    }
 }
 
 /// Open (or create) the native store for the current repo.
@@ -1501,17 +1304,13 @@ impl Backend {
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let keep = std::path::PathBuf::from(shared_target_dir());
-            let dirs = reclaim::find_reclaimable(&root, &keep);
-            let mut total = 0u64;
-            let items: Vec<_> = dirs.iter().map(|p| {
-                let bytes = reclaim::dir_size(p);
-                total += bytes;
-                json!({"path": p.display().to_string(), "bytes": bytes, "size": appcatalog::human_size(bytes)})
-            }).collect();
+            let scan = cockpit::flow::reclaim_scan(&root);
+            let items: Vec<_> = scan.items.iter().map(|(path, bytes)|
+                json!({"path": path, "bytes": bytes, "size": appcatalog::human_size(*bytes)})
+            ).collect();
             job.finish(json!({
                 "ok": true, "items": items, "count": items.len(),
-                "total_bytes": total, "total": appcatalog::human_size(total)
+                "total_bytes": scan.total_bytes, "total": appcatalog::human_size(scan.total_bytes)
             }).to_string());
         });
         QString::from(json!({"ok": true, "started": "rscan"}).to_string())
@@ -1526,20 +1325,7 @@ impl Backend {
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let keep = std::path::PathBuf::from(shared_target_dir());
-            let dirs = reclaim::find_reclaimable(&root, &keep);
-            let mut freed = 0u64;
-            let mut count = 0usize;
-            for p in dirs {
-                if !reclaim::is_safe_target(&p, &root, &keep) {
-                    continue; // guard: never delete anything that fails re-validation
-                }
-                let bytes = reclaim::dir_size(&p);
-                if std::fs::remove_dir_all(&p).is_ok() {
-                    freed += bytes;
-                    count += 1;
-                }
-            }
+            let (count, freed) = cockpit::flow::reclaim_apply(&root);
             job.finish(json!({
                 "ok": true, "count": count, "freed_bytes": freed, "freed": appcatalog::human_size(freed)
             }).to_string());
@@ -1552,62 +1338,21 @@ impl Backend {
     /// job "import" → {dir, crate_path, app, is_bin}.
     fn import_zip(&self, zip: QString) -> QString {
         let raw = zip.to_string();
-        let path = raw.strip_prefix("file://").unwrap_or(&raw).to_string();
-        if path.trim().is_empty() {
-            return err_json("no file chosen");
-        }
-        if !std::path::Path::new(&path).is_file() {
-            return err_json(&format!("not a file: {path}"));
-        }
         if !self.job.start("import") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let dir = importer::import_dir();
-            let script = importer::extract_command(&path, &dir.display().to_string());
-            let out = std::process::Command::new("sh").arg("-c").arg(&script)
-                .env("PATH", tool_path_env())
-                .output();
-            match out {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
-                    let msg = if err.contains("GITMIND_NO_UNZIP") {
-                        "no zip extractor found — install unzip (or bsdtar / python3)".to_string()
-                    } else {
-                        format!("couldn't extract the zip: {}", err.trim())
-                    };
-                    job.finish(json!({"ok": false, "error": msg}).to_string());
-                    return;
-                }
-                Err(e) => {
-                    job.finish(json!({"ok": false, "error": format!("couldn't run the extractor: {e}")}).to_string());
-                    return;
-                }
-            }
-            match importer::find_crate_root(&dir) {
-                Some(crate_path) => {
-                    let toml = std::fs::read_to_string(crate_path.join("Cargo.toml")).unwrap_or_default();
-                    let app = buildflags::crate_name(&toml).unwrap_or_else(|| "app".to_string());
-                    let is_bin = crate_path.join("src/main.rs").is_file()
-                        || crate_path.join("src/bin").is_dir()
-                        || buildflags::declares_binary(&toml);
-                    let zip_repo = importer::find_repo_root(&dir);
-                    job.finish(json!({
-                        "ok": true, "dir": dir.display().to_string(),
-                        "crate_path": crate_path.display().to_string(),
-                        "app": app, "is_bin": is_bin,
-                        "description": buildflags::package_description(&toml).unwrap_or_default(),
-                        "has_git": zip_repo.is_some(),
-                        "zip_repo": zip_repo.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
-                        "has_gitmind": zip_repo.as_ref().map(|p| p.join(".gitmind").exists()).unwrap_or(false),
-                    }).to_string());
-                }
-                None => {
-                    let _ = std::fs::remove_dir_all(&dir);
-                    job.finish(json!({"ok": false, "error": "no Cargo.toml found in the zip"}).to_string());
-                }
+            match cockpit::flow::import(&raw) {
+                Ok(i) => job.finish(json!({
+                    "ok": true, "dir": i.dir.display().to_string(),
+                    "crate_path": i.crate_path.display().to_string(),
+                    "app": i.app, "is_bin": i.is_bin, "description": i.description,
+                    "has_git": i.has_git,
+                    "zip_repo": i.zip_repo.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                    "has_gitmind": i.has_gitmind,
+                }).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
         });
         QString::from(json!({"ok": true, "started": "import"}).to_string())
@@ -1627,20 +1372,9 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
             let dir = std::path::PathBuf::from(&crate_path);
-            let native = native_triple_local();
-            match build_locally(&app, &dir, &native, &[], false) {
-                Ok((bin, _)) => {
-                    // launch detached — for a GUI app this opens its window
-                    match std::process::Command::new(&bin)
-                        .current_dir(&dir)
-                        .env("PATH", tool_path_env())
-                        .spawn()
-                    {
-                        Ok(_) => job.finish(json!({"ok": true, "app": app, "binary": bin.display().to_string()}).to_string()),
-                        Err(e) => job.finish(json!({"ok": false, "stage": "run", "error": format!("built, but couldn't launch: {e}")}).to_string()),
-                    }
-                }
-                Err(e) => job.finish(json!({"ok": false, "stage": "build", "error": e}).to_string()),
+            match cockpit::flow::build_and_run(&dir, &app) {
+                Ok(bin) => job.finish(json!({"ok": true, "app": app, "binary": bin.display().to_string()}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
         });
         QString::from(json!({"ok": true, "started": "buildrun"}).to_string())
@@ -1688,67 +1422,16 @@ impl Backend {
         if crate_path.trim().is_empty() {
             return err_json("import an app first");
         }
-        let home = std::env::var("HOME").unwrap_or_default();
-        let dest = places::expand_home(dest_raw.trim(), &home);
-        if dest.is_empty() {
-            return err_json("choose a destination");
-        }
-        let src = std::path::PathBuf::from(&crate_path);
-        if !src.is_dir() {
-            return err_json("the imported files are no longer there — re-import");
-        }
-        let dpath = std::path::PathBuf::from(&dest);
-        if dpath.exists() {
-            return err_json(&format!("{} already exists — pick another name", dest));
-        }
         if !self.job.start("place") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            // the temp import root, so we can clean it up afterward
-            let temp_root = {
-                let mut found = None;
-                let mut p: Option<&std::path::Path> = Some(src.as_path());
-                while let Some(cur) = p {
-                    if cur.file_name().map(|n| n.to_string_lossy().starts_with("gitmind-import-")).unwrap_or(false) {
-                        found = Some(cur.to_path_buf());
-                        break;
-                    }
-                    p = cur.parent();
-                }
-                found
-            };
-            // move into place (mv handles cross-filesystem)
-            if let Some(parent) = dpath.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    job.finish(json!({"ok": false, "error": format!("create {}: {e}", parent.display())}).to_string());
-                    return;
-                }
+            let src = std::path::PathBuf::from(&crate_path);
+            match cockpit::flow::place(&src, &dest_raw, &base, &init) {
+                Ok(p) => job.finish(json!({"ok": true, "path": p.display().to_string(), "init": init}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
-            let mv = std::process::Command::new("mv").arg(&src).arg(&dpath)
-                .env("PATH", tool_path_env()).output();
-            match mv {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => { job.finish(json!({"ok": false, "error": format!("move failed: {}", String::from_utf8_lossy(&o.stderr).trim())}).to_string()); return; }
-                Err(e) => { job.finish(json!({"ok": false, "error": format!("move failed: {e}")}).to_string()); return; }
-            }
-            // initialize
-            let gitmind = init == "gitmind";
-            if init == "git" || gitmind {
-                let _ = std::process::Command::new("git").args(["init", "-q"])
-                    .current_dir(&dpath).env("PATH", tool_path_env()).status();
-                ensure_gitignore(&dpath, &places::gitignore_lines(gitmind));
-                if gitmind {
-                    let gmdir = dpath.join(".gitmind");
-                    let _ = std::fs::create_dir_all(&gmdir);
-                    let _ = std::fs::write(gmdir.join("config.toml"), places::gitmind_config_toml());
-                }
-            }
-            // remember the base + tidy the temp wrapper
-            let _ = places::set_repos_base(&base);
-            if let Some(tr) = temp_root { if tr != dpath { let _ = std::fs::remove_dir_all(&tr); } }
-            job.finish(json!({"ok": true, "path": dpath.display().to_string(), "init": init}).to_string());
         });
         QString::from(json!({"ok": true, "started": "place"}).to_string())
     }
@@ -1795,90 +1478,27 @@ impl Backend {
     /// clean working tree. Async job "apply" → {branch, base, shortstat, files}.
     fn apply_to_repo(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString {
         let crate_path = crate_path.to_string();
-        let home = std::env::var("HOME").unwrap_or_default();
-        let target = places::expand_home(target.to_string().trim(), &home);
+        let target = target.to_string();
         let mirror = mode.to_string() == "mirror";
         let zipname = zipname.to_string();
         if crate_path.trim().is_empty() { return err_json("import an app first"); }
-        if target.trim().is_empty() { return err_json("pick a repo to update"); }
-        let tpath = std::path::PathBuf::from(&target);
-        if !tpath.join(".git").exists() {
-            return err_json("that folder isn't a git repo — use \"New project\", or pick a git repo");
-        }
-        if !std::path::Path::new(&crate_path).is_dir() {
-            return err_json("the imported files are no longer there — re-import");
-        }
         if !self.job.start("apply") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let git = |args: &[&str]| -> (bool, String, String) {
-                match std::process::Command::new("git").args(args).current_dir(&tpath)
-                    .env("PATH", tool_path_env()).output() {
-                    Ok(o) => (o.status.success(),
-                              String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                              String::from_utf8_lossy(&o.stderr).trim().to_string()),
-                    Err(e) => (false, String::new(), e.to_string()),
+            let src = std::path::PathBuf::from(&crate_path);
+            match cockpit::flow::apply_overlay(&src, &target, mirror, &zipname) {
+                Ok(r) if r.noop_msg.is_some() => job.finish(json!({"ok": true, "changes": 0, "base": r.base, "msg": r.noop_msg}).to_string()),
+                Ok(r) => {
+                    let files: Vec<_> = r.files.iter().map(|(st, p)| json!({"status": st, "path": p})).collect();
+                    job.finish(json!({
+                        "ok": true, "changes": r.changes, "branch": r.branch, "base": r.base,
+                        "shortstat": r.shortstat, "mirror": r.mirror, "files": files,
+                    }).to_string());
                 }
-            };
-            // require a clean tree so we never mix the user's work with the import
-            let (ok, dirty, err) = git(&["status", "--porcelain"]);
-            if !ok { job.finish(json!({"ok": false, "error": format!("git status failed: {err}")}).to_string()); return; }
-            if !dirty.is_empty() {
-                job.finish(json!({"ok": false, "error": "the repo has uncommitted changes — commit or stash them first"}).to_string());
-                return;
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
-            let (_, base, _) = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
-            let branch = format!("gitmind-import-{}", now_stamp());
-            let (okb, _, errb) = git(&["checkout", "-b", &branch]);
-            if !okb { job.finish(json!({"ok": false, "error": format!("couldn't create branch: {errb}")}).to_string()); return; }
-            // overlay the extracted files
-            let script = importer::overlay_command(&crate_path, &target, mirror);
-            let ov = std::process::Command::new("sh").arg("-c").arg(&script)
-                .env("PATH", tool_path_env()).output();
-            let ov_ok = match ov {
-                Ok(o) if o.status.success() => true,
-                Ok(o) => {
-                    let blob = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
-                    let msg = if blob.contains("GITMIND_NO_RSYNC") {
-                        "rsync is required to update an existing repo — install it (apk add rsync)".to_string()
-                    } else { format!("overlay failed: {}", blob.trim()) };
-                    // roll back the branch
-                    let _ = git(&["checkout", &base]);
-                    let _ = git(&["branch", "-D", &branch]);
-                    job.finish(json!({"ok": false, "error": msg}).to_string());
-                    false
-                }
-                Err(e) => {
-                    let _ = git(&["checkout", &base]);
-                    let _ = git(&["branch", "-D", &branch]);
-                    job.finish(json!({"ok": false, "error": format!("overlay failed: {e}")}).to_string());
-                    false
-                }
-            };
-            if !ov_ok { return; }
-            git(&["add", "-A"]);
-            let (_, shortstat, _) = git(&["diff", "--cached", "--shortstat"]);
-            if shortstat.is_empty() {
-                // nothing changed — undo the branch, leave the repo as we found it
-                let _ = git(&["checkout", &base]);
-                let _ = git(&["branch", "-D", &branch]);
-                job.finish(json!({"ok": true, "changes": 0, "base": base, "msg": "no changes — the zip matches the repo"}).to_string());
-                return;
-            }
-            let (_, namestat, _) = git(&["diff", "--cached", "--name-status"]);
-            let files: Vec<_> = namestat.lines().take(60).filter_map(|l| {
-                let mut it = l.split('\t');
-                let st = it.next()?; let path = it.next()?;
-                Some(json!({"status": st, "path": path}))
-            }).collect();
-            let msg = if zipname.is_empty() { "import from zip".to_string() } else { format!("import from {zipname}") };
-            git(&["commit", "-q", "-m", &msg]);
-            job.finish(json!({
-                "ok": true, "changes": files.len(), "branch": branch, "base": base,
-                "shortstat": shortstat, "mirror": mirror, "files": files,
-            }).to_string());
         });
         QString::from(json!({"ok": true, "started": "apply"}).to_string())
     }
@@ -1889,24 +1509,13 @@ impl Backend {
     /// Async job "explore" → ranked trials + the workspace holding the result branches.
     fn explore_merge(&self, zip_repo: QString, target: QString) -> QString {
         let zip_repo = zip_repo.to_string();
-        let home = std::env::var("HOME").unwrap_or_default();
-        let target = places::expand_home(target.to_string().trim(), &home);
-        if zip_repo.trim().is_empty() { return err_json("import a repo first"); }
-        if target.trim().is_empty() { return err_json("pick a repo to merge into"); }
-        if !std::path::Path::new(&target).join(".git").exists() {
-            return err_json("that folder isn't a git repo");
-        }
-        if !std::path::Path::new(&zip_repo).join(".git").exists() {
-            return err_json("the zip doesn't contain a git repo — use \"Update existing\" instead");
-        }
+        let target = target.to_string();
         if !self.job.start("explore") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let ws = std::env::temp_dir().join(format!("gitmind-merge-{}-{}", std::process::id(), now_stamp()));
-            let path_env = tool_path_env();
-            match merge::run_exploration(std::path::Path::new(&target), std::path::Path::new(&zip_repo), &ws, &path_env) {
+            match cockpit::flow::explore(&zip_repo, &target) {
                 Ok(ex) => {
                     let trials: Vec<_> = ex.trials.iter().map(|t| json!({
                         "id": t.id, "label": t.label, "ok": t.ok, "conflicts": t.conflicts,
@@ -1919,10 +1528,7 @@ impl Backend {
                         "trials": trials,
                     }).to_string());
                 }
-                Err(e) => {
-                    let _ = std::fs::remove_dir_all(&ws);
-                    job.finish(json!({"ok": false, "error": e}).to_string());
-                }
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
         });
         QString::from(json!({"ok": true, "started": "explore"}).to_string())
@@ -1934,32 +1540,16 @@ impl Backend {
     fn apply_merge(&self, workspace: QString, branch: QString, target: QString, strategy: QString) -> QString {
         let workspace = workspace.to_string();
         let branch = branch.to_string();
-        let home = std::env::var("HOME").unwrap_or_default();
-        let target = places::expand_home(target.to_string().trim(), &home);
+        let target = target.to_string();
         let strategy = strategy.to_string();
-        if workspace.is_empty() || branch.is_empty() { return err_json("explore first, then pick a strategy"); }
         if !self.job.start("merge") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let newbranch = format!("gitmind-merge-{}-{}", strategy, now_stamp());
-            let spec = format!("{branch}:{newbranch}");
-            let out = std::process::Command::new("git")
-                .args(["fetch", "--quiet", &workspace, &spec])
-                .current_dir(&target).env("PATH", tool_path_env()).output();
-            match out {
-                Ok(o) if o.status.success() => {
-                    // tidy our throwaway workspace (the gitmind-merge-* temp dir)
-                    if let Some(ws_root) = std::path::Path::new(&workspace).parent() {
-                        if ws_root.file_name().map(|n| n.to_string_lossy().starts_with("gitmind-merge-")).unwrap_or(false) {
-                            let _ = std::fs::remove_dir_all(ws_root);
-                        }
-                    }
-                    job.finish(json!({"ok": true, "branch": newbranch}).to_string());
-                }
-                Ok(o) => job.finish(json!({"ok": false, "error": format!("couldn't land the branch: {}", String::from_utf8_lossy(&o.stderr).trim())}).to_string()),
-                Err(e) => job.finish(json!({"ok": false, "error": format!("git fetch: {e}")}).to_string()),
+            match cockpit::flow::land_merge(&workspace, &branch, &target, &strategy) {
+                Ok(b) => job.finish(json!({"ok": true, "branch": b}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
             }
         });
         QString::from(json!({"ok": true, "started": "merge"}).to_string())
