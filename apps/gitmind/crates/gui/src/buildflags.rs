@@ -182,11 +182,17 @@ pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
 /// adds `--no-default-features` (so the chosen set is exactly what's built). Uses
 /// plain `cargo` with `--target` (no container needed); the target's std must be
 /// installed (`rustup target add <triple>`). Pure — unit-tested.
+/// `cargo build` argv. An empty `triple` means a **native** build (no `--target`, so
+/// no rustup target/linker is needed — the host toolchain builds for itself); a
+/// non-empty triple cross-builds for that target. Pure — unit-tested.
 pub fn cargo_build_argv(app: &str, triple: &str, features: &[String], no_default: bool) -> Vec<String> {
-    let mut a: Vec<String> = ["cargo", "build", "--release", "--target", triple, "-p", app]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let mut a: Vec<String> = vec!["cargo".into(), "build".into(), "--release".into()];
+    if !triple.trim().is_empty() {
+        a.push("--target".into());
+        a.push(triple.to_string());
+    }
+    a.push("-p".into());
+    a.push(app.to_string());
     if no_default {
         a.push("--no-default-features".into());
     }
@@ -195,6 +201,25 @@ pub fn cargo_build_argv(app: &str, triple: &str, features: &[String], no_default
         a.push(features.join(","));
     }
     a
+}
+
+/// The libc family of a target triple: "musl" or "gnu". Pure.
+pub fn target_libc(triple: &str) -> &'static str {
+    if triple.contains("musl") { "musl" } else { "gnu" }
+}
+
+/// Normalize a rustc host triple to the GUI's target vocabulary, mapping vendor
+/// triples like `aarch64-alpine-linux-musl` to `aarch64-unknown-linux-musl` so the
+/// "this device" pill matches and the libc is unambiguous. Pure — unit-tested.
+pub fn normalize_native(host_triple: &str) -> String {
+    let arch = host_triple.split('-').next().unwrap_or("aarch64");
+    format!("{arch}-unknown-linux-{}", target_libc(host_triple))
+}
+
+/// True when building `requested` on a host whose native triple is `native` needs no
+/// cross toolchain (same libc family). Pure — unit-tested.
+pub fn is_native_build(requested: &str, native: &str) -> bool {
+    target_libc(requested) == target_libc(native)
 }
 
 /// `cmake -S . -B <build_dir> -D…` argv for configuring a CMake app for a target.
@@ -277,6 +302,27 @@ pub fn install_dir(home: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_build_omits_target() {
+        // native → no --target (works on Alpine/musl and Fedora/gnu without rustup targets)
+        let n = cargo_build_argv("gitmind", "", &[], false);
+        assert!(!n.contains(&"--target".to_string()), "native build has no --target: {n:?}");
+        assert_eq!(n[n.iter().position(|x| x == "-p").unwrap() + 1], "gitmind");
+        // cross → --target present
+        let c = cargo_build_argv("gitmind", "aarch64-unknown-linux-musl", &[], false);
+        assert!(c.windows(2).any(|w| w[0] == "--target" && w[1] == "aarch64-unknown-linux-musl"));
+    }
+
+    #[test]
+    fn triple_normalization_and_native_check() {
+        assert_eq!(normalize_native("aarch64-alpine-linux-musl"), "aarch64-unknown-linux-musl");
+        assert_eq!(normalize_native("aarch64-unknown-linux-gnu"), "aarch64-unknown-linux-gnu");
+        assert_eq!(target_libc("aarch64-alpine-linux-musl"), "musl");
+        // phone (musl native) building musl = native; building gnu = cross
+        assert!(is_native_build("aarch64-unknown-linux-musl", "aarch64-alpine-linux-musl"));
+        assert!(!is_native_build("aarch64-unknown-linux-gnu", "aarch64-alpine-linux-musl"));
+    }
 
     #[test]
     fn host_triple_and_binary_detection() {
