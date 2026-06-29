@@ -76,6 +76,38 @@ pub fn scan_cargo_features(toml: &str) -> CargoFeatures {
     out
 }
 
+/// Read a scalar string `key = "value"` from a named section header. Pure.
+fn read_section_string(toml: &str, header: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in toml.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_section = t == header;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some((k, rhs)) = t.split_once('=') {
+            if k.trim().trim_matches('"') == key {
+                return Some(rhs.trim().trim_matches('"').trim_matches('\'').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The crate's own name from `[package] name` — the app's real name, not its folder.
+/// Pure — unit-tested.
+pub fn crate_name(toml: &str) -> Option<String> {
+    read_section_string(toml, "[package]", "name").filter(|s| !s.is_empty())
+}
+
+/// The crate's `[package] description`, if any. Pure — unit-tested.
+pub fn package_description(toml: &str) -> Option<String> {
+    read_section_string(toml, "[package]", "description").filter(|s| !s.is_empty())
+}
+
 /// Read `key = [...]` from a named section header (e.g. `[package.metadata.gitmind]`).
 fn read_section_array(toml: &str, header: &str, key: &str) -> Option<Vec<String>> {
     let mut in_section = false;
@@ -213,6 +245,16 @@ gpu = []
 simd = []
 logging = []
 "#;
+
+    #[test]
+    fn reads_crate_name_and_description() {
+        let toml = "[package]\nname = \"av1-tuner\"\nversion = \"0.2.0\"\ndescription = \"Tunes AV1 encodes\"\n\n[features]\ndefault = []\n";
+        assert_eq!(crate_name(toml).as_deref(), Some("av1-tuner"));
+        assert_eq!(package_description(toml).as_deref(), Some("Tunes AV1 encodes"));
+        // a virtual workspace (no [package]) has no crate name
+        assert_eq!(crate_name("[workspace]\nmembers = [\"a\"]\n"), None);
+        assert_eq!(package_description("[package]\nname = \"x\"\n"), None);
+    }
 
     #[test]
     fn scans_cargo_features_and_default() {
