@@ -606,7 +606,7 @@ pub fn authorized_keys_options(host: &str) -> String {
 }
 
 /// Build the single `authorized_keys` line: `<options> <pubkey>`. Pure — tested.
-fn restricted_key_line(options: &str, pubkey: &str) -> String {
+pub fn restricted_key_line(options: &str, pubkey: &str) -> String {
     format!("{} {}\n", options, pubkey.trim())
 }
 
@@ -667,6 +667,61 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
         }
     })();
     let _ = std::fs::remove_file(&script); // best-effort cleanup, even on error
+    result
+}
+
+/// ssh to `admin@host` with *password* auth (via SSH_ASKPASS, no TTY), run
+/// `remote_cmd`, and write `stdin_data` to that command's stdin — used to run
+/// `sudo -S …` non-interactively (the sudo password arrives on stdin while the ssh
+/// password arrives via askpass; for a personal account they're the same string).
+/// Returns stdout on success. On-device.
+pub fn ssh_sudo_run(admin: &str, host: &str, password: &str, remote_cmd: &str, stdin_data: &str) -> Result<String, String> {
+    if admin.trim().is_empty() || host.trim().is_empty() {
+        return Err("admin and host are required".into());
+    }
+    if password.is_empty() {
+        return Err("a password is required".into());
+    }
+    let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
+    std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("chmod askpass: {e}"))?;
+    }
+    let spawned = Command::new("ssh")
+        .env("GM_SSH_PW", password)
+        .env("SSH_ASKPASS", &script)
+        .env("SSH_ASKPASS_REQUIRE", "force")
+        .env("DISPLAY", std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()))
+        .args(setup_key_argv(admin, host))
+        .arg(remote_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    let result = (|| -> Result<String, String> {
+        let mut child = spawned.map_err(|e| format!("ssh: {e}"))?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .ok_or("ssh stdin unavailable")?
+            .write_all(stdin_data.as_bytes())
+            .map_err(|e| format!("send stdin: {e}"))?;
+        let out = child.wait_with_output().map_err(|e| format!("ssh wait: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            match ssh_error_reason(&err) {
+                "auth" => Err(format!("password rejected for {admin}@{host}")),
+                _ if err.trim().is_empty() => Err("remote command failed".into()),
+                _ => Err(err.trim().to_string()),
+            }
+        }
+    })();
+    let _ = std::fs::remove_file(&script);
     result
 }
 

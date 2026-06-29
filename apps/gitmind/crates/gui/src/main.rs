@@ -34,6 +34,7 @@ mod netshare;
 mod bttransfer;
 mod appcatalog;
 mod buildflags;
+mod fleet;
 
 qrc!(register_qml,
     "/" {
@@ -44,7 +45,7 @@ qrc!(register_qml,
         "qml/Branches.qml",
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
-        "qml/Deploy.qml",
+        "qml/Fleet.qml",
         "qml/Files.qml",
         "qml/Network.qml",
     },
@@ -120,6 +121,10 @@ struct Backend {
     // SSH identity + host-key trust, surfaced so the GUI never assumes a username
     // and never trusts a key in the terminal behind the GUI's back.
     current_user: qt_method!(fn(&self) -> QString),
+    // managed fleet user (a dedicated service account, not your login)
+    fleet_user: qt_method!(fn(&self) -> QString),
+    set_fleet_user: qt_method!(fn(&self, name: QString) -> QString),
+    start_provision_fleet_user: qt_method!(fn(&self, admin: QString, host: QString, password: QString) -> QString),
     host_trusted: qt_method!(fn(&self, host: QString) -> QString),
     start_trust: qt_method!(fn(&self, host: QString) -> QString),
     start_retrust: qt_method!(fn(&self, host: QString) -> QString),
@@ -171,6 +176,22 @@ fn set_executable(path: &str) {
         let mut perms = meta.permissions();
         perms.set_mode(perms.mode() | 0o755);
         let _ = std::fs::set_permissions(path, perms);
+    }
+}
+
+/// Create the fleet user on a device and install the restricted key into it, over
+/// ssh as the sudo-capable `admin` account. On-device (useradd/adduser + sudo).
+fn provision_fleet_user(admin: &str, host: &str, password: &str) -> Result<String, String> {
+    let user = fleet::fleet_user();
+    let pubkey = deploy::ensure_local_pubkey()?;
+    let key_line = deploy::restricted_key_line(&deploy::authorized_keys_options(host), &pubkey);
+    let script = fleet::provision_user_script(&user, &key_line);
+    let remote = fleet::provision_remote_command(&fleet::base64_encode(script.as_bytes()));
+    let out = deploy::ssh_sudo_run(admin, host, password, &remote, &format!("{password}\n"))?;
+    if out.contains("gitmind-fleet-user-ready") {
+        Ok(format!("created fleet user '{user}' on {host} — set the user to '{user}' to connect"))
+    } else {
+        Err("provisioning didn't confirm — does that account have sudo rights?".into())
     }
 }
 
@@ -779,6 +800,47 @@ impl Backend {
     /// prompt when it was wrong).
     fn current_user(&self) -> QString {
         QString::from(json!({"user": netshare::current_user()}).to_string())
+    }
+
+    /// The GUI-managed fleet user (default `gitmind`) — what the fleet connects as,
+    /// instead of your personal login. `admin` for provisioning still uses your own
+    /// account once (it needs sudo to create the user).
+    fn fleet_user(&self) -> QString {
+        QString::from(json!({"user": fleet::fleet_user(), "admin": netshare::current_user()}).to_string())
+    }
+
+    fn set_fleet_user(&self, name: QString) -> QString {
+        match fleet::set_fleet_user(&name.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true, "user": name.to_string()}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// One-time: create the fleet user on `host` and install the restricted key into
+    /// it, over ssh as your sudo-capable `admin` account (key auth; the sudo password
+    /// is fed in). Async — useradd + key install run on the device. Poll for the
+    /// result (kind "provision").
+    fn start_provision_fleet_user(&self, admin: QString, host: QString, password: QString) -> QString {
+        let (a, h, pw) = (admin.to_string(), host.to_string(), password.to_string());
+        if a.trim().is_empty() || h.trim().is_empty() {
+            return err_json("admin account and host are required");
+        }
+        if pw.is_empty() {
+            return err_json("enter the device's sudo password to create the fleet user");
+        }
+        if !self.job.start("provision") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let result = provision_fleet_user(&a, &h, &pw);
+            let payload = match result {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "provision"}).to_string())
     }
 
     /// Whether `host` is already in `~/.ssh/known_hosts`. Fast + local, so the GUI

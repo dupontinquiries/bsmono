@@ -45,6 +45,12 @@ Item {
     property string lastReason: ""// why the last ssh op failed: auth|hostkey|unreachable|other
     property string sshpass: ""   // one-time device password for key setup (not stored)
     property bool showSetup: false// reveal the password + "set up SSH key" row
+
+    // Direction toggle: "deploy" (push from here) vs "install" (fetch to here).
+    property string mode: "deploy"
+    // Managed fleet user: connect as this dedicated account, not your login.
+    property string adminUser: ""   // your sudo account, used once to provision
+    property bool showProvision: false
     // fingerprint preview (two-sided matching): the peer key we fetched to compare
     property bool showPreview: false
     property string previewFp: ""
@@ -52,11 +58,12 @@ Item {
     property string previewArt: ""
     property string previewKeys: ""// exact bytes to trust once the user confirms a match
 
-    // Default the SSH user to whoami so we never ssh as the literal "user" (which
-    // hit a password prompt and froze the GUI).
+    // Connect as the managed fleet user (default "gitmind"), not your personal
+    // login. The admin account (whoami) is kept for the one-time provisioning step.
     Component.onCompleted: {
-        var r = JSON.parse(backend.current_user())
+        var r = JSON.parse(backend.fleet_user())
         if (r.user && r.user.length) root.user = r.user
+        if (r.admin && r.admin.length) root.adminUser = r.admin
     }
 
     // Slow ops run on a worker thread in the backend; we kick them off and let the
@@ -71,7 +78,7 @@ Item {
         selHost = ip; selName = (host && host.length) ? host : ip
         curPath = ""; entries = []; lastReason = ""; showSetup = false; sshpass = ""
         showPreview = false; previewKeys = ""
-        showAppInfo = false; appPath = ""; instOpen = false
+        showAppInfo = false; appPath = ""; instOpen = false; showProvision = false
         refreshTrust()
         browse("")
     }
@@ -125,6 +132,19 @@ Item {
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.busy = true; root.jobKind = "setupkey"; root.note = "installing your key on " + root.selName + "…"
         poller.start()
+    }
+    // One-time: create the dedicated fleet user on the device (needs your sudo pw).
+    function provisionFleetUser() {
+        if (selHost.length === 0) return
+        var r = JSON.parse(backend.start_provision_fleet_user(root.adminUser, root.selHost, root.sshpass))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.busy = true; root.jobKind = "provision"
+        root.note = "creating fleet user '" + root.user + "' on " + root.selName + "…"
+        poller.start()
+    }
+    function saveFleetUser() {
+        var r = JSON.parse(backend.set_fleet_user(root.user))
+        root.note = r.ok ? ("fleet user set to " + r.user) : ("error: " + r.error)
     }
     function parentOf(p) { var i = p.lastIndexOf("/"); return i > 0 ? p.substring(0, i) : "/" }
     // Fetch a recognised app's metadata (crate count, size, README) and show it.
@@ -246,6 +266,14 @@ Item {
             } else {
                 root.note = "error: " + res.error
             }
+        } else if (root.jobKind === "provision") {
+            root.jobKind = ""
+            if (res.ok) {
+                root.sshpass = ""; root.showProvision = false
+                root.note = "✓ " + res.msg; root.refreshTrust()
+            } else {
+                root.note = "✗ " + res.error
+            }
         }
         root.jobKind = ""
     }
@@ -332,16 +360,46 @@ Item {
                 }
             }
 
-            // ── 2 · pick a folder ────────────────────────────────────────
+            // ── 2 · connect + choose direction ───────────────────────────
             Column {
                 width: col.width; spacing: 6
                 visible: root.selHost.length > 0
-                Label { text: "2 · pick a folder on " + root.selName; color: "#7aa2f7"; font.bold: true }
+                // direction toggle — same connection, opposite data flow
+                Row {
+                    spacing: 0
+                    Rectangle {
+                        width: 110; height: 34
+                        color: root.mode === "deploy" ? "#2a3350" : "#1b2335"
+                        border.color: "#3a4566"
+                        Label { anchors.centerIn: parent; text: "⬆ Deploy"; color: root.mode === "deploy" ? "#cdd6f4" : "#8a93a6" }
+                        TapHandler { onTapped: root.mode = "deploy" }
+                    }
+                    Rectangle {
+                        width: 110; height: 34
+                        color: root.mode === "install" ? "#2a3350" : "#1b2335"
+                        border.color: "#3a4566"
+                        Label { anchors.centerIn: parent; text: "⬇ Install"; color: root.mode === "install" ? "#cdd6f4" : "#8a93a6" }
+                        TapHandler { onTapped: root.mode = "install" }
+                    }
+                }
+                Label {
+                    width: parent.width
+                    text: root.mode === "deploy"
+                        ? ("push the monorepo / a launcher to " + root.selName)
+                        : ("fetch + install an app from " + root.selName + " into ~/.local/bin")
+                    color: "#7aa2f7"; font.bold: true; wrapMode: Text.WordWrap
+                }
                 Row {
                     width: parent.width; spacing: 8
-                    Label { text: "user"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
-                    TextField { width: 140; text: root.user; onTextChanged: root.user = text }
+                    Label { text: "as user"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                    TextField { width: 130; text: root.user; onTextChanged: root.user = text }
+                    Button { text: "save"; enabled: !root.busy; onClicked: root.saveFleetUser() }
                     Button { text: "browse"; onClicked: root.browse("") }
+                }
+                Label {
+                    width: parent.width
+                    text: "connecting as the managed fleet user (not your login). “save” remembers it."
+                    color: "#5b6477"; font.pixelSize: 10; wrapMode: Text.WordWrap
                 }
                 // ── connection: host-key trust + passwordless setup ──────
                 // All of this lands in the one shared known_hosts / authorized_keys
@@ -399,6 +457,23 @@ Item {
                             text: root.busy ? "…" : "install my key"
                             enabled: !root.busy && root.sshpass.length > 0
                             onClicked: root.setupKey()
+                        }
+                    }
+                    // dedicated fleet user — provision once (needs sudo on the device)
+                    Rectangle { width: parent.width; height: 1; color: "#2a3350" }
+                    Label {
+                        width: parent.width
+                        text: "Or create a dedicated '" + root.user + "' user on the device (good practice — isolates fleet access from your login). Needs your sudo password once."
+                        color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                    }
+                    Row {
+                        width: parent.width; spacing: 8
+                        Label { text: "sudo as"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                        TextField { width: 120; text: root.adminUser; onTextChanged: root.adminUser = text }
+                        Button {
+                            text: root.busy ? "…" : "create fleet user"
+                            enabled: !root.busy && root.sshpass.length > 0 && root.adminUser.length > 0
+                            onClicked: root.provisionFleetUser()
                         }
                     }
                 }
@@ -502,14 +577,14 @@ Item {
                         }
                         Row {
                             spacing: 10
-                            Button { text: "build + install…"; enabled: !root.busy; onClicked: root.openInstaller() }
+                            Button { text: "build + install…"; visible: root.mode === "install"; enabled: !root.busy; onClicked: root.openInstaller() }
                             Label { text: "dismiss"; color: "#5b6477"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter; TapHandler { onTapped: root.showAppInfo = false } }
                         }
                     }
                 }
                 // ── build + install configurator (flags exposed to client) ──
                 Rectangle {
-                    width: parent.width; visible: root.instOpen
+                    width: parent.width; visible: root.instOpen && root.mode === "install"
                     radius: 8; color: "#171c2b"; border.color: "#7aa2f7"
                     height: instCol.height + 16
                     Column {
@@ -609,11 +684,11 @@ Item {
                 }
             }
 
-            // ── 3 · push + launch ────────────────────────────────────────
+            // ── push + launch (Deploy mode) ──────────────────────────────
             Column {
                 width: col.width; spacing: 6
-                visible: root.curPath.length > 0
-                Label { text: "3 · push + launch"; color: "#7aa2f7"; font.bold: true }
+                visible: root.curPath.length > 0 && root.mode === "deploy"
+                Label { text: "push + launch"; color: "#7aa2f7"; font.bold: true }
                 Button {
                     width: parent.width
                     text: "push monorepo here…"
