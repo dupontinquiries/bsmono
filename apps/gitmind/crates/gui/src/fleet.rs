@@ -31,7 +31,7 @@ fn config_path() -> Option<PathBuf> {
     config_file("fleet-user")
 }
 
-fn config_file(name: &str) -> Option<PathBuf> {
+pub fn config_file(name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     Some(PathBuf::from(home).join(".config/gitmind").join(name))
 }
