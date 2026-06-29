@@ -247,6 +247,21 @@ pub fn json_string_field(blob: &str, key: &str) -> Option<String> {
     None
 }
 
+/// The host triple from `rustc -vV` output (the `host:` line) — the authoritative
+/// native target, instead of guessing libc from loader files. Pure — unit-tested.
+pub fn host_triple_from_rustc(vv: &str) -> Option<String> {
+    vv.lines()
+        .find_map(|l| l.trim().strip_prefix("host:"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Whether a Cargo.toml declares an explicit `[[bin]]` target. (A crate is also a
+/// binary if it has src/main.rs, checked separately on disk.) Pure — unit-tested.
+pub fn declares_binary(cargo_toml: &str) -> bool {
+    cargo_toml.lines().any(|l| l.trim() == "[[bin]]")
+}
+
 /// The cargo target directory (absolute) from `cargo metadata --format-version 1`.
 /// Correct for both standalone crates and workspace members, so the built binary is
 /// found wherever cargo actually writes it in a monorepo. Pure — unit-tested.
@@ -262,6 +277,16 @@ pub fn install_dir(home: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_triple_and_binary_detection() {
+        let vv = "rustc 1.96.0\nbinary: rustc\nhost: aarch64-unknown-linux-gnu\nrelease: 1.96.0\n";
+        assert_eq!(host_triple_from_rustc(vv).as_deref(), Some("aarch64-unknown-linux-gnu"));
+        assert_eq!(host_triple_from_rustc("no host line here"), None);
+        // a lib-only crate declares no [[bin]]
+        assert!(!declares_binary("[package]\nname = \"share-kit\"\n[lib]\n"));
+        assert!(declares_binary("[package]\nname = \"x\"\n[[bin]]\nname = \"x\"\npath = \"src/m.rs\"\n"));
+    }
 
     #[test]
     fn target_directory_from_metadata() {
