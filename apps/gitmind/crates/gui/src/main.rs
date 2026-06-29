@@ -225,10 +225,29 @@ fn tool_path_env() -> String {
     format!("{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin{}", if cur.is_empty() { String::new() } else { format!(":{cur}") })
 }
 
-/// Where cargo writes the binary for `app` built in `app_dir` for `triple`. Uses
-/// `cargo metadata` target_directory, so it's correct whether the crate is standalone
-/// or a workspace member deep in a monorepo; falls back to <app_dir>/target.
-fn resolve_binary(cargo: &str, app_dir: &std::path::Path, triple: &str, app: &str) -> std::path::PathBuf {
+/// This device's native target triple, normalized to the GUI vocabulary (e.g. Alpine's
+/// `aarch64-alpine-linux-musl` → `aarch64-unknown-linux-musl`). Read from rustc; falls
+/// back to an Alpine check only if rustc isn't reachable.
+fn native_triple_local() -> String {
+    std::process::Command::new("rustc")
+        .arg("-vV")
+        .env("PATH", tool_path_env())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| buildflags::host_triple_from_rustc(&String::from_utf8_lossy(&o.stdout)))
+        .map(|h| buildflags::normalize_native(&h))
+        .unwrap_or_else(|| {
+            let libc = if std::path::Path::new("/etc/alpine-release").exists() { "musl" } else { "gnu" };
+            format!("aarch64-unknown-linux-{libc}")
+        })
+}
+
+/// Where cargo writes the binary for `app` built in `app_dir`. `cargo_target` is the
+/// value passed to `--target` ("" for a native build, which lands in target/release
+/// with no triple subdir). Uses `cargo metadata` target_directory so it's correct in
+/// any monorepo layout.
+fn resolve_binary(cargo: &str, app_dir: &std::path::Path, cargo_target: &str, app: &str) -> std::path::PathBuf {
     let target_dir = std::process::Command::new(cargo)
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(app_dir)
@@ -239,7 +258,12 @@ fn resolve_binary(cargo: &str, app_dir: &std::path::Path, triple: &str, app: &st
         .and_then(|o| buildflags::parse_target_directory(&String::from_utf8_lossy(&o.stdout)))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| app_dir.join("target"));
-    target_dir.join(triple).join("release").join(app)
+    let dir = if cargo_target.trim().is_empty() {
+        target_dir.join("release")
+    } else {
+        target_dir.join(cargo_target).join("release")
+    };
+    dir.join(app)
 }
 
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
@@ -1079,21 +1103,7 @@ impl Backend {
     /// The triple that matches *this* device's libc, so a store install defaults to a
     /// binary that actually runs here (musl on Alpine/postmarketOS, gnu on glibc).
     fn local_target(&self) -> QString {
-        // authoritative: rustc's own host triple (don't guess libc from loader files,
-        // which misfire when a musl loader is merely installed alongside glibc)
-        let from_rustc = std::process::Command::new("rustc")
-            .arg("-vV")
-            .env("PATH", tool_path_env())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| buildflags::host_triple_from_rustc(&String::from_utf8_lossy(&o.stdout)));
-        let triple = from_rustc.unwrap_or_else(|| {
-            // fallback only if rustc isn't reachable: musl userland (Alpine) vs glibc
-            let musl = std::path::Path::new("/etc/alpine-release").exists();
-            if musl { "aarch64-unknown-linux-musl".to_string() } else { "aarch64-unknown-linux-gnu".to_string() }
-        });
-        QString::from(json!({"target": triple}).to_string())
+        QString::from(json!({"target": native_triple_local()}).to_string())
     }
 
     /// The app pages: every buildable repo gitmind manages here, **named by its
@@ -1126,37 +1136,39 @@ impl Backend {
                 }
                 let cargo = dir.join("Cargo.toml");
                 let cmake = dir.join("CMakeLists.txt");
-                let (name, desc, is_cargo) = if cargo.is_file() {
+                let (name, desc, is_cargo, is_bin) = if cargo.is_file() {
                     let txt = std::fs::read_to_string(&cargo).unwrap_or_default();
                     match buildflags::crate_name(&txt) {
                         Some(n) => {
-                            // only list crates that actually produce a binary — skip
-                            // library-only kits (e.g. share-kit) that have no app to install
+                            // keep libraries (kits) too, but mark them — they build to an
+                            // .rlib (for dynamic linking / shared deps) with no app to install
                             let has_bin = dir.join("src/main.rs").is_file()
                                 || dir.join("src/bin").is_dir()
                                 || buildflags::declares_binary(&txt);
-                            if !has_bin { continue; }
-                            (n, buildflags::package_description(&txt).unwrap_or_default(), true)
+                            (n, buildflags::package_description(&txt).unwrap_or_default(), true, has_bin)
                         }
                         None => continue,
                     }
                 } else if cmake.is_file() {
-                    (dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(), String::new(), false)
+                    (dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(), String::new(), false, true)
                 } else {
                     continue;
                 };
                 // per-app commit oid → the tile's identity colour; cached shot if any
                 let oid = app_oid(&root, &dir);
                 let rel = dir.strip_prefix(&root).unwrap_or(&dir).to_string_lossy().to_string();
+                let group = rel.split('/').next().filter(|s| !s.is_empty() && *s != name).unwrap_or("root").to_string();
                 let shot = preview::shot_path(&name, &oid);
                 let shot_str = if shot.is_file() { shot.display().to_string() } else { String::new() };
                 apps.push(json!({
                     "name": name,
                     "path": dir.display().to_string(),
                     "rel": rel,
+                    "group": group,
                     "description": desc,
                     "is_cargo": is_cargo,
                     "is_cmake": cmake.is_file(),
+                    "is_bin": is_bin,
                     "oid": oid,
                     "shot": shot_str,
                 }));
@@ -1212,7 +1224,11 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
             let cargo = cargo_bin();
-            let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
+            // build natively (no --target) when the requested libc matches this device,
+            // so no rustup target/linker is needed; otherwise cross-build for it
+            let native = native_triple_local();
+            let cargo_target = if buildflags::is_native_build(&target, &native) { String::new() } else { target.clone() };
+            let argv = buildflags::cargo_build_argv(&app, &cargo_target, &feats, no_default);
             // build IN the app's own directory — works for standalone crates and
             // workspace members alike (no assumption of a root-workspace member)
             let out = std::process::Command::new(&cargo)
@@ -1222,7 +1238,7 @@ impl Backend {
                 .output();
             let payload = match out {
                 Ok(o) if o.status.success() => {
-                    let bin = resolve_binary(&cargo, &app_dir, &target, &app);
+                    let bin = resolve_binary(&cargo, &app_dir, &cargo_target, &app);
                     let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
                     json!({
                         "ok": true, "app": app, "target": target,
@@ -1328,11 +1344,17 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
             let no_default = !feats.is_empty();
-            let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
-            // the app's directory on the build host (repo root + its subpath)
             let base = repo.trim_end_matches('/');
             let app_dir = if rel.trim().is_empty() { base.to_string() } else { format!("{base}/{}", rel.trim_matches('/')) };
             let path_export = "export PATH=\"$HOME/.cargo/bin:$PATH\"";
+            // decide native vs cross on the BUILD HOST (query its rustc host triple)
+            let host_native = deploy::remote_capture(&user, &host, &format!("{path_export} && rustc -vV"))
+                .ok()
+                .and_then(|o| buildflags::host_triple_from_rustc(&o))
+                .map(|h| buildflags::normalize_native(&h))
+                .unwrap_or_else(|| "aarch64-unknown-linux-gnu".to_string());
+            let cargo_target = if buildflags::is_native_build(&target, &host_native) { String::new() } else { target.clone() };
+            let argv = buildflags::cargo_build_argv(&app, &cargo_target, &feats, no_default);
             // 1) build in the app's directory (cargo error comes back as the ssh stderr)
             let remote_cmd = format!("cd {} && {} && {}", deploy::shell_quote(&app_dir), path_export, argv.join(" "));
             if let Err(e) = deploy::remote_capture(&user, &host, &remote_cmd) {
@@ -1345,7 +1367,12 @@ impl Backend {
                 .ok()
                 .and_then(|m| buildflags::parse_target_directory(&m))
                 .unwrap_or_else(|| format!("{app_dir}/target"));
-            let remote_bin = format!("{}/{}/release/{}", target_dir.trim_end_matches('/'), target, app);
+            let td = target_dir.trim_end_matches('/');
+            let remote_bin = if cargo_target.is_empty() {
+                format!("{td}/release/{app}")
+            } else {
+                format!("{td}/{cargo_target}/release/{app}")
+            };
             // 3) pull the freshly-built binary into /tmp staging (rsync, scp fallback)
             let staged = format!("/tmp/{app}");
             if let Err(e) = deploy::rsync_pull(&user, &host, &remote_bin, &staged) {
@@ -1355,9 +1382,11 @@ impl Backend {
                 job.finish(json!({"ok": false, "stage": "fetch", "error": hint}).to_string());
                 return;
             }
-            // 3) install into the active user's ~/.local/bin (gitmind delivered → active user owns)
+            // 4) install: native to this device → ~/.local/bin + launcher; otherwise a
+            //    per-target dir (it can't run here — it's for another device / emulator)
             let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
-            let bindir = installer::bin_dir(&home);
+            let native_here = buildflags::is_native_build(&target, &native_triple_local());
+            let bindir = installer::install_dir(&home, &target, native_here);
             let _ = std::fs::create_dir_all(&bindir);
             let dest = format!("{bindir}/{app}");
             if let Err(e) = std::fs::copy(&staged, &dest) {
@@ -1366,17 +1395,18 @@ impl Backend {
             }
             set_executable(&dest);
             let _ = std::fs::remove_file(&staged);
-            // 4) .desktop launcher (icon = cached screenshot if we have one)
-            let appdir = installer::desktop_dir(&home);
-            let _ = std::fs::create_dir_all(&appdir);
-            let entry = installer::desktop_entry(&app, &dest, &icon);
-            let desktop = format!("{appdir}/{app}.desktop");
-            let launcher = match std::fs::write(&desktop, entry) {
-                Ok(()) => desktop,
-                Err(_) => String::new(),
+            // 5) .desktop launcher — only for a binary that runs on this device
+            let launcher = if native_here {
+                let appdir = installer::desktop_dir(&home);
+                let _ = std::fs::create_dir_all(&appdir);
+                let entry = installer::desktop_entry(&app, &dest, &icon);
+                let desktop = format!("{appdir}/{app}.desktop");
+                match std::fs::write(&desktop, entry) { Ok(()) => desktop, Err(_) => String::new() }
+            } else {
+                String::new()
             };
             job.finish(json!({
-                "ok": true, "app": app, "binary": dest, "launcher": launcher
+                "ok": true, "app": app, "binary": dest, "launcher": launcher, "native": native_here
             }).to_string());
         });
         QString::from(json!({"ok": true, "started": "rinstall"}).to_string())
