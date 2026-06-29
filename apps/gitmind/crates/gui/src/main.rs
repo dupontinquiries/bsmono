@@ -135,6 +135,12 @@ struct Backend {
     // app-store catalog + this device's native target
     store_catalog: qt_method!(fn(&self, user: QString, host: QString, root: QString) -> QString),
     local_target: qt_method!(fn(&self) -> QString),
+    // app pages over gitmind's managed repos: list local buildable crates, scan a
+    // crate's flags, build it (with status), send only the built binary to a device.
+    local_apps: qt_method!(fn(&self) -> QString),
+    local_build_options: qt_method!(fn(&self, path: QString) -> QString),
+    build_app: qt_method!(fn(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString),
+    send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
     // two-sided fingerprint matching: show this device's key, preview a peer's key,
@@ -1017,6 +1023,161 @@ impl Backend {
             "aarch64-unknown-linux-gnu"
         };
         QString::from(json!({"target": triple}).to_string())
+    }
+
+    /// The app pages: every buildable repo gitmind manages here, **named by its
+    /// crate** (not its folder). Local — reads Cargo.toml/CMakeLists straight from
+    /// the working tree, no ssh, no remote browsing.
+    fn local_apps(&self) -> QString {
+        let root = match repo() {
+            Ok(r) => r.root().to_path_buf(),
+            Err(e) => return err_json(&e),
+        };
+        // candidate dirs: the repo root's children, plus the usual member folders'.
+        let mut roots = vec![root.clone()];
+        for sub in ["apps", "crates", "shared", "tools"] {
+            let p = root.join(sub);
+            if p.is_dir() {
+                roots.push(p);
+            }
+        }
+        let mut apps: Vec<serde_json::Value> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for base in &roots {
+            let rd = match std::fs::read_dir(base) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for ent in rd.flatten() {
+                let dir = ent.path();
+                if !dir.is_dir() || !seen.insert(dir.clone()) {
+                    continue;
+                }
+                let cargo = dir.join("Cargo.toml");
+                let cmake = dir.join("CMakeLists.txt");
+                if cargo.is_file() {
+                    let txt = std::fs::read_to_string(&cargo).unwrap_or_default();
+                    if let Some(name) = buildflags::crate_name(&txt) {
+                        apps.push(json!({
+                            "name": name,
+                            "path": dir.display().to_string(),
+                            "description": buildflags::package_description(&txt).unwrap_or_default(),
+                            "is_cargo": true,
+                            "is_cmake": cmake.is_file(),
+                        }));
+                    }
+                } else if cmake.is_file() {
+                    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                    apps.push(json!({
+                        "name": name, "path": dir.display().to_string(),
+                        "description": "", "is_cargo": false, "is_cmake": true,
+                    }));
+                }
+            }
+        }
+        apps.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+        QString::from(json!({"ok": true, "apps": apps}).to_string())
+    }
+
+    /// Scan a local crate's customizable flags (cargo features + CMake options) with
+    /// the repo's per-target defaults. Local twin of app_build_options.
+    fn local_build_options(&self, path: QString) -> QString {
+        let p = std::path::PathBuf::from(path.to_string());
+        let cargo = std::fs::read_to_string(p.join("Cargo.toml")).unwrap_or_default();
+        let cmake = std::fs::read_to_string(p.join("CMakeLists.txt")).unwrap_or_default();
+        let feats = buildflags::scan_cargo_features(&cargo);
+        let defaults: serde_json::Map<String, serde_json::Value> = buildflags::BUILD_TARGETS
+            .iter()
+            .map(|t| (t.to_string(), json!(buildflags::arch_default_features(&cargo, t))))
+            .collect();
+        let cmake_opts: Vec<_> = buildflags::scan_cmake_options(&cmake)
+            .into_iter()
+            .map(|o| json!({"name": o.name, "on": o.default_on, "help": o.help}))
+            .collect();
+        QString::from(json!({
+            "ok": true,
+            "targets": buildflags::BUILD_TARGETS,
+            "features": feats.all,
+            "defaults_by_target": defaults,
+            "cmake_options": cmake_opts,
+            "is_cargo": !cargo.trim().is_empty(),
+            "is_cmake": !cmake.trim().is_empty(),
+        }).to_string())
+    }
+
+    /// Build `app` (a crate) for `target` from the working tree, locally. Async — a
+    /// cross build is slow; poll_job for the result, which carries the build status:
+    /// the binary path + size on success, or the compiler output on failure.
+    fn build_app(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString {
+        let (app, target) = (app.to_string(), target.to_string());
+        let feats: Vec<String> = features.to_string().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if app.trim().is_empty() || target.trim().is_empty() {
+            return err_json("app and target are required");
+        }
+        let root = match repo() {
+            Ok(r) => r.root().to_path_buf(),
+            Err(e) => return err_json(&e),
+        };
+        if !self.job.start("build") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
+            let out = std::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .current_dir(&root)
+                .output();
+            let payload = match out {
+                Ok(o) if o.status.success() => {
+                    let bin = root.join(buildflags::built_binary_path(&app, &target));
+                    let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+                    json!({
+                        "ok": true, "app": app, "target": target,
+                        "binary": bin.display().to_string(),
+                        "size": appcatalog::human_size(size),
+                    }).to_string()
+                }
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stderr);
+                    json!({"ok": false, "error": err.trim()}).to_string()
+                }
+                Err(e) => json!({"ok": false, "error": format!("couldn't run the build: {e}")}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "build"}).to_string())
+    }
+
+    /// Send a freshly-built binary to a device — and only the binary. Drops it into
+    /// `dest` (default `~/.local/bin/<name>`) over scp and marks it executable.
+    /// Async — poll_job for the result.
+    fn send_binary(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString {
+        let (b, u, h, d) = (binary.to_string(), user.to_string(), host.to_string(), dest.to_string());
+        if b.trim().is_empty() {
+            return err_json("build the app first — there's no binary to send yet");
+        }
+        if u.trim().is_empty() || h.trim().is_empty() {
+            return err_json("choose a device to send to");
+        }
+        if !self.job.start("send") {
+            return err_json("a job is already running");
+        }
+        let name = b.rsplit('/').next().unwrap_or("app").to_string();
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let dest = if d.trim().is_empty() { format!(".local/bin/{name}") } else { d };
+            let result = deploy::scp_push(&b, &u, &h, &dest).map(|()| {
+                let _ = deploy::remote_capture(&u, &h, &format!("chmod +x {}", deploy::shell_quote(&dest)));
+                format!("sent {name} → {h}:{dest}")
+            });
+            let payload = match result {
+                Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "send"}).to_string())
     }
 
     /// Cross-build `app` from `path` for `triple` with the chosen feature set, then

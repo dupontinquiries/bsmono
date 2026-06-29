@@ -1097,3 +1097,36 @@ rustcheck CLEAN; Fleet/main/Network balanced. ON-DEVICE: the catalog shell (du/g
 build, scp — store renders from one round-trip; libc detection assumes aarch64 (both devices are).
 DESIGN NOTE: store = Install only (browse a catalog, get apps); Deploy stays the push flow. The
 look/interaction gap between "cards you install" and "folders you push to" is the clarity win.
+
+── CORRECTION: app pages over local repos (build status → send binary) ──
+USER (4th redirect, frustrated): the GUI was meant to be a BRIDGE to local repos with
+Cargo.toml/CMakeLists, offering each as an APP PAGE on top of gitmind's repo management;
+NAMES from the cargo CRATE (not folder); flow = build → build STATUS → on completion,
+only the BINARY is sent (xfer). MY ERROR across prior turns: sourced "apps" by sshing +
+browsing a remote filesystem, added deploy/install toggles + a remote store — all wrong
+SOURCE + wrong framing. FIX: local-first app pages.
+[buildflags.rs +1 test=7] read_section_string + crate_name([package] name) + package_description.
+[deploy.rs] scp_push_argv/scp_push (local→user@host:remote, reuses SSH_OPTS + mkdir -p). 14 tests
+(push assertion folded into outbound-ssh test).
+[main.rs] local_apps(): scan repo root + apps/crates/shared/tools children for Cargo.toml(crate_name
++desc) / CMakeLists → [{name=CRATE,path,description,is_cargo,is_cmake}] sorted; LOCAL, no ssh.
+local_build_options(path): local twin of app_build_options (reads local Cargo.toml/CMakeLists →
+features+per-arch defaults+cmake opts). build_app(app,target,features,no_default) ASYNC job "build":
+runs cargo_build_argv LOCALLY (current_dir=repo root) → on success {binary=root/target/<t>/release/
+<crate>, size}; on fail {error=stderr} (= the build STATUS). send_binary(binary,user,host,dest)
+ASYNC "send": scp_push binary → ~/.local/bin/<name> (default) + chmod +x; ONLY the binary moves.
+local_target() unchanged (musl vs glibc).
+[Fleet.qml REWRITTEN 876→462] App list (local_apps cards: crate name + desc) → tap → APP PAGE:
+crate header, target pills (default native), collapsible feature options, [Build] → live build
+STATUS panel (⏳building / ✓ built+size+path / ✗ error output), then [Send the binary] panel
+(dimmed until built) = device picker (scan LAN/select/trust + fleet-user save + install-key/
+provision) + Send → status. Reuses connection fns. poller dispatches discover/trust/setupkey/
+provision/build/send. {131}= balanced, all backend.* resolve.
+DROPPED from UI: deploy/install toggle, remote folder browser, remote app store, push-monorepo /
+build-launcher. Backend methods now unused by QML (store_catalog, install_app, app_details,
+app_build_options, start_browse, start_push, start_deploy, list_remote_dirs) LEFT IN (qt_method
+registered, rustcheck clean) — prune next pass.
+VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet 5 = 40 tests;
+rustcheck CLEAN; Fleet/main/Network balanced. ON-DEVICE: cross build (local, needs `cross`), scp.
+MODEL NOW: apps = local buildable crates; build locally w/ status; send only the binary. This is
+the desktop-push direction; phone-initiated fetch = future layer (phone asks desktop to build+send).
