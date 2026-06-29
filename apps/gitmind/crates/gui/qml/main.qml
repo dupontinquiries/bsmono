@@ -115,6 +115,9 @@ ApplicationWindow {
         // ── Fleet: connect to a device, then Deploy (push) or Install (fetch) ──
         Fleet  { id: fleet }
 
+        // ── Import: pick a .zip, build + run a Rust app ──
+        Import { id: importp }
+
         // ── Push: build here, install on a device (desktop → phone) ──
         Push   { id: push }
 
@@ -135,6 +138,7 @@ ApplicationWindow {
         TabButton { text: "files" }
         TabButton { text: "apps" }
         TabButton { text: "fleet" }
+        TabButton { text: "import" }
         TabButton { text: "push" }
         TabButton { text: "settings" }
         TabButton { text: "network" }
