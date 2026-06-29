@@ -1199,3 +1199,24 @@ VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet
 installer 2 = 45; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced. ON-DEVICE: remote cargo build,
 rsync (scp fallback), cp, .desktop — needs cargo+target on desktop, ssh as gitmind, source repo on
 BOTH (phone browses, desktop builds). Push-vs-pull: chose pull; desktop-push variant addable.
+
+── fix: monorepo subpaths — build in the app's own dir, find binary via metadata ──
+USER: apps in big monorepos build from the TOP dir (e.g. tmp11) and look for Cargo.toml there;
+apps live at apps/{gitmind,…} with their own Cargo.toml → "could not find Cargo.toml in tmp11".
+CAUSE: build_app ran cargo with current_dir=repo root + `-p <name>` (assumes a root-workspace member)
+and computed the binary as root/target/<t>/release/<app>. Wrong for standalone subdir crates.
+FIX: build IN the app's directory. build_app gains a `path` param (the subdir) → current_dir(path).
+Binary located via cargo metadata `target_directory` (correct for standalone crates AND workspace
+members — workspace member → workspace target, standalone → its own target), fallback <app_dir>/target.
+[buildflags.rs +2] json_string_field(blob,key) (std-only substring extractor, handles \" \\, null) +
+parse_target_directory(meta). 8 tests.
+[main.rs] resolve_binary(cargo,app_dir,triple,app): cargo metadata --no-deps in app_dir → target_dir →
+target_dir/<triple>/release/<app>. local_apps +`rel` (path relative to repo root). build_app(app,PATH,
+target,feats,nodefault) cd's into PATH. remote_install(app,REL,target,…): app_dir = repo/rel; remote
+`cd <app_dir> && cargo build`; remote binary located via remote `cargo metadata` in app_dir → target_dir
+(workspace-aware on the build host too). (legacy unused install_app still uses built_binary_path — dead
+code, left for the prune backlog.)
+[Fleet.qml] +selRel (from app.rel in openApp). doBuild passes selPath; doRemoteInstall passes selRel.
+VERIFIED: buildflags 8; deploy 14, appcatalog 7, netshare 4, bttransfer 3, fleet 5, preview 3,
+installer 2 = 46; rustcheck CLEAN; Fleet/MonoTile/main balanced; all backend.* resolve. ON-DEVICE:
+cargo build + metadata in the subdir (local), and over ssh in repo/rel (remote).

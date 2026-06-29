@@ -221,6 +221,39 @@ pub fn built_binary_path(app: &str, triple: &str) -> String {
     format!("target/{triple}/release/{app}")
 }
 
+/// Extract a top-level JSON string value by key from a one-line JSON blob (e.g. the
+/// `target_directory` from `cargo metadata`). Minimal + std-only; handles `\"`/`\\`
+/// escapes, returns None for null/absent. Pure — unit-tested.
+pub fn json_string_field(blob: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let mut i = blob.find(&pat)? + pat.len();
+    let b = blob.as_bytes();
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') { i += 1; }
+    if i >= b.len() || b[i] != b':' { return None; }
+    i += 1;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') { i += 1; }
+    let rest = &blob[i..];
+    if rest.starts_with("null") { return None; }
+    let rest = rest.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => { if let Some(n) = chars.next() { out.push(n); } }
+            '"' => return Some(out),
+            _ => out.push(c),
+        }
+    }
+    None
+}
+
+/// The cargo target directory (absolute) from `cargo metadata --format-version 1`.
+/// Correct for both standalone crates and workspace members, so the built binary is
+/// found wherever cargo actually writes it in a monorepo. Pure — unit-tested.
+pub fn parse_target_directory(metadata: &str) -> Option<String> {
+    json_string_field(metadata, "target_directory")
+}
+
 /// Where a built binary lands on the receiving device. Pure — tested.
 pub fn install_dir(home: &str) -> String {
     format!("{}/.local/bin", home.trim_end_matches('/'))
@@ -229,6 +262,17 @@ pub fn install_dir(home: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_directory_from_metadata() {
+        // workspace member → workspace target; standalone subdir crate → its own target
+        let ws = r#"{"packages":[{"name":"gitmind"}],"target_directory":"/tmp11/target","version":1}"#;
+        assert_eq!(parse_target_directory(ws).as_deref(), Some("/tmp11/target"));
+        let sub = r#"{"workspace_root":"/tmp11/apps/av1tuner","target_directory":"/tmp11/apps/av1tuner/target"}"#;
+        assert_eq!(parse_target_directory(sub).as_deref(), Some("/tmp11/apps/av1tuner/target"));
+        assert_eq!(parse_target_directory(r#"{"target_directory":null}"#), None);
+        assert_eq!(parse_target_directory(r#"{"other":1}"#), None);
+    }
 
     const CARGO: &str = r#"
 [package]
