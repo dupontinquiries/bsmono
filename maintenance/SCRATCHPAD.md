@@ -1130,3 +1130,28 @@ VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet
 rustcheck CLEAN; Fleet/main/Network balanced. ON-DEVICE: cross build (local, needs `cross`), scp.
 MODEL NOW: apps = local buildable crates; build locally w/ status; send only the binary. This is
 the desktop-push direction; phone-initiated fetch = future layer (phone asks desktop to build+send).
+
+── app tiles: screenshot capture + hash-monogram fallback ──
+USER: "pick sane defaults and implement". DEFAULTS CHOSEN: (1) screenshots auto-grabbed
+after a successful build (best-effort, bounded, blank-frame guard) + manual re-grab;
+(2) monogram seeded from each app's OWN per-app commit oid (per-app colour); tile priority
+= screenshot if grabbed else hash monogram (flat letter avatar removed).
+[preview.rs NEW, 3 tests] cache_dir ~/.cache/gitmind/shots. shot_path(app,oid) keyed app-<oid10>.png.
+capture_script(binary,out): Xvfb offscreen 1000x1000 → run binary QT_QPA_PLATFORM=xcb </dev/null →
+0.5+1s settle → import -window root → blank guard (convert %[fx:standard_deviation] < 0.02 via awk →
+rm + noshot) → echo shot:<path>|noshot; always kills app+Xvfb; binary/out single-quoted. parse_capture
+reads trailing shot:. ALL on-device (Xvfb+imagemagick); pure parts tested.
+[main.rs] +mod preview. local_apps now adds per app: oid (app_oid = git -C root log -1 --format=%H --
+<dir>) + shot (shot_path if cached file exists). capture_preview(app,oid,binary) ASYNC job "shot":
+mkdir cache, run capture_script via sh -c LOCALLY, parse_capture → {ok,shot:path|""}. app_oid free fn.
+rustcheck CLEAN.
+[MonoTile.qml NEW] Canvas: monogram (1 letter single-word / 2 initials hyphenated) from appName;
+hue+warp from oid (FNV seed → mulberry32 prng); 2 alpha echoes + crisp front; hsl→rgb helper (Canvas-
+safe), "bold" weight. qrc registered.
+[Fleet.qml] state +selOid/selShot/shotVer. openApp sets them. list card + app-page header: Image
+(file://shot) if shot else MonoTile(appName,oid). build success → auto capturePreview(); "shot" result
+→ selShot=res.shot, shotVer++ (cache-bust). re-grab button (visible when built). BusyIndicator while
+grabbing. Flat letter avatar removed. {140}= balanced, MonoTile balanced, all backend.* resolve.
+VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet 5, preview 3 = 43
+tests; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced. ON-DEVICE: Xvfb launch/grab (needs
+xvfb+imagemagick; per-distro tuning, window-vs-root crop, 1s timing); monogram is pure QML (no deps).
