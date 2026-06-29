@@ -1065,3 +1065,35 @@ VERIFIED: fleet 5, deploy 14, buildflags 6, appcatalog 5, netshare 4, bttransfer
 rustcheck CLEAN; Fleet/main/Network.qml balanced; no stale Deploy.qml refs. ON-DEVICE: useradd/
 adduser/sudo/ssh/scp/cross-build — provisioning may need per-distro tweaks; bootstrap needs the
 fleet user to exist before connecting AS it (provision first).
+
+── app store: Install mode becomes a real storefront ──
+USER: still confused by the Fleet UX; wants to try an "app store feel". ROOT CAUSE:
+Deploy and Install both rendered as "browse folders → do a thing", so they looked
+identical and felt interchangeable. FIX: make Install a card-based app store (looks/
+behaves nothing like the deploy folder-push), so the two directions are visually +
+interactionally distinct → confusion resolved at the root, not skinned.
+[appcatalog.rs +2 tests=7] CatalogEntry{name,size,description}. remote_catalog_cmd(root):
+ONE ssh call — for each app subdir of root (Cargo.toml||.git) prints name\tsize(du -sh)\t
+blurb(Cargo.toml ^description, README first prose line fallback); root ''|~ → $HOME, ~/* 
+expanded; tab-sep. parse_catalog(body) splitn(3,'\t'), drops blank-name lines.
+[main.rs] store_catalog(user,host,root): remote_capture(remote_catalog_cmd(shell_quote root)),
+first line=resolved pwd→base, parse rest → [{name,size,description,path=base/name}]. 
+local_target(): musl-loader fs check (/lib/ld-musl-aarch64.so.1 | libc.musl) → aarch64-musl
+else aarch64-gnu — so a store install defaults to a binary that runs on THIS device.
+rustcheck CLEAN.
+[Fleet.qml] store state (catalog, storeRoot="~", storeBase, storeLoaded, localTarget,
+installingApp). Component.onCompleted +local_target(). onModeChanged → auto loadCatalog when
+entering install on a connected device. loadCatalog()→store_catalog. installDefault(app)→
+install_app(path,name,localTarget,"",no_default=false,stage_tmp=true) — ONE-TAP: native target +
+repo default features + /tmp. openInstaller(path) now CARD-DRIVEN (param, defaults instTarget to
+localTarget if offered) = the "options" path (full target/feature/cmake control, reused). install
+branch clears installingApp. selectDevice resets store state.
+GATING: folder browser (path label + entries) + "browse" button now visible only mode==="deploy";
+new STORE section visible only mode==="install": "apps in <root>" field + refresh + per-app CARDS
+(letter avatar, name, size, 2-line blurb, [Install] one-tap + [options]→configurator). Empty/
+unloaded hints. Fleet.qml {225}= balanced, all backend.* resolve.
+VERIFIED: appcatalog 7, deploy 14, buildflags 6, netshare 4, bttransfer 3, fleet 5 = 39 gui tests;
+rustcheck CLEAN; Fleet/main/Network balanced. ON-DEVICE: the catalog shell (du/grep/sed), cross-
+build, scp — store renders from one round-trip; libc detection assumes aarch64 (both devices are).
+DESIGN NOTE: store = Install only (browse a catalog, get apps); Deploy stays the push flow. The
+look/interaction gap between "cards you install" and "folders you push to" is the clarity win.
