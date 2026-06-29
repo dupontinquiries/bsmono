@@ -100,6 +100,49 @@ pub fn parse_app_details(raw: &str) -> AppDetails {
     d
 }
 
+// ───────────────────────── store catalog (one round-trip) ─────────────────────────
+
+/// A storefront entry: an app's name, on-disk size, and a one-line blurb (the
+/// Cargo.toml `description`, falling back to the README's first prose line).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CatalogEntry {
+    pub name: String,
+    pub size: String,
+    pub description: String,
+}
+
+/// One shell command that lists every recognised app under `root` with its size and
+/// blurb — so the store renders from a single ssh call instead of one per app.
+/// `root` should be shell-safe (caller quotes); empty/`~` resolve to `$HOME`.
+pub fn remote_catalog_cmd(root: &str) -> String {
+    format!(
+        "r={root}; case \"$r\" in ''|'~') r=\"$HOME\";; '~/'*) r=\"$HOME/${{r#~/}}\";; esac; \
+         cd \"$r\" 2>/dev/null && pwd && for d in */; do n=${{d%/}}; [ -d \"$n\" ] || continue; \
+         [ -f \"$n/Cargo.toml\" ] || [ -d \"$n/.git\" ] || continue; \
+         sz=$(du -sh \"$n\" 2>/dev/null | cut -f1); \
+         ds=$(grep -m1 '^description' \"$n/Cargo.toml\" 2>/dev/null | sed -e 's/^description[^=]*= *//' -e 's/^\\\"//' -e 's/\\\"$//'); \
+         [ -n \"$ds\" ] || ds=$(grep -m1 '[A-Za-z]' \"$n/README\"* \"$n/readme\"* 2>/dev/null | sed -e 's/^#* *//'); \
+         printf '%s\\t%s\\t%s\\n' \"$n\" \"$sz\" \"$ds\"; done"
+    )
+}
+
+/// Parse `remote_catalog_cmd` output (after the pwd line) into store entries.
+/// Pure — unit-tested.
+pub fn parse_catalog(body: &str) -> Vec<CatalogEntry> {
+    body.lines()
+        .filter_map(|l| {
+            let mut parts = l.splitn(3, '\t');
+            let name = parts.next()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let size = parts.next().unwrap_or("").trim().to_string();
+            let description = parts.next().unwrap_or("").trim().to_string();
+            Some(CatalogEntry { name: name.to_string(), size, description })
+        })
+        .collect()
+}
+
 // ───────────────────────── local (own filesystem) ─────────────────────────
 
 /// Inventory `root`'s immediate subdirectories as app entries. Local — unit-tested.
@@ -249,5 +292,26 @@ mod tests {
         assert_eq!(human_size(512), "512B");
         assert_eq!(human_size(2048), "2.0K");
         assert_eq!(human_size(5 * 1024 * 1024), "5.0M");
+    }
+
+    #[test]
+    fn catalog_cmd_filters_apps_and_grabs_blurb() {
+        let c = remote_catalog_cmd("'/home/kesslerd/Code'");
+        assert!(c.contains("Cargo.toml") && c.contains(".git"), "recognises apps");
+        assert!(c.contains("du -sh") && c.contains("description"), "size + blurb");
+        assert!(c.contains("README"), "README fallback");
+    }
+
+    #[test]
+    fn parses_catalog_lines() {
+        let out = "voiceterm\t2.3M\tVoice-controlled terminal\n\
+                   av1tuner\t1.1M\t\n\
+                   \t\t\n\
+                   photosync\t8.0M\tSync photos over LAN";
+        let c = parse_catalog(out);
+        assert_eq!(c.len(), 3, "blank-name line dropped");
+        assert_eq!(c[0], CatalogEntry { name: "voiceterm".into(), size: "2.3M".into(), description: "Voice-controlled terminal".into() });
+        assert_eq!(c[1].description, "", "missing blurb tolerated");
+        assert_eq!(c[2].name, "photosync");
     }
 }
