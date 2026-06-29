@@ -28,8 +28,31 @@ pub fn valid_username(name: &str) -> bool {
 }
 
 fn config_path() -> Option<PathBuf> {
+    config_file("fleet-user")
+}
+
+fn config_file(name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/gitmind/fleet-user"))
+    Some(PathBuf::from(home).join(".config/gitmind").join(name))
+}
+
+/// The configured remote build repo (where the source lives on the build host), or
+/// empty if unset. Persisted so the app-store "build on desktop" path is set once.
+pub fn build_repo() -> String {
+    config_file("build-repo")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// Persist the remote build repo path.
+pub fn set_build_repo(path: &str) -> Result<(), String> {
+    let p = path.trim();
+    let f = config_file("build-repo").ok_or("no $HOME set")?;
+    if let Some(dir) = f.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(&f, format!("{p}\n")).map_err(|e| format!("write {}: {e}", f.display()))
 }
 
 /// The configured fleet user (or the default). Managed by the GUI, not hardcoded.
@@ -160,6 +183,10 @@ mod tests {
         set_fleet_user("fleetbot").unwrap();
         assert_eq!(fleet_user(), "fleetbot");
         assert!(set_fleet_user("Bad Name").is_err());
+        // build repo persists independently
+        assert_eq!(build_repo(), "", "empty when unset");
+        set_build_repo("/home/kesslerd/Code/monorepo").unwrap();
+        assert_eq!(build_repo(), "/home/kesslerd/Code/monorepo");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

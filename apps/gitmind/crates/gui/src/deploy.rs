@@ -213,6 +213,34 @@ pub fn scp_pull(user: &str, host: &str, remote: &str, local: &str) -> Result<(),
     }
 }
 
+/// `rsync -az -e "ssh <hardened opts>" user@host:<remote> <local>` argv — pull a file
+/// with rsync (resumable, delta-friendly for re-installs) over the same hardened ssh.
+/// The `-e` value is a single argv element rsync parses itself. Pure — unit-tested.
+pub fn rsync_pull_argv(user: &str, host: &str, remote: &str, local: &str) -> Vec<String> {
+    vec![
+        "-az".to_string(),
+        "-e".to_string(),
+        ssh_command_str(),
+        format!("{user}@{host}:{remote}"),
+        local.to_string(),
+    ]
+}
+
+/// Pull a remote file to a local path, preferring rsync for speed and falling back to
+/// scp when rsync isn't installed (common on a minimal Alpine phone). On-device.
+pub fn rsync_pull(user: &str, host: &str, remote: &str, local: &str) -> Result<(), String> {
+    match Command::new("rsync")
+        .args(rsync_pull_argv(user, host, remote, local))
+        .status()
+    {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => Err(format!("rsync failed (exit {:?}) fetching {remote}", st.code())),
+        // rsync not present → fall back to scp so the install still works
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => scp_pull(user, host, remote, local),
+        Err(e) => Err(format!("rsync: {e}")),
+    }
+}
+
 /// `scp <hardened opts> <local> user@host:<remote>` argv — push a file (a freshly
 /// built binary) out to a device. Pure — unit-tested.
 pub fn scp_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
@@ -929,6 +957,13 @@ mod tests {
         assert!(p.contains(&"ForwardAgent=no".to_string()));
         assert_eq!(p[p.len() - 2], "/repo/target/app");
         assert_eq!(p[p.len() - 1], "gitmind@192.168.1.9:/home/gitmind/.local/bin/app");
+        // rsync pull: -az, -e "ssh <opts>", then user@host:remote and local
+        let r = rsync_pull_argv("gitmind", "192.168.1.7", "/repo/target/x/release/app", "/tmp/app");
+        assert_eq!(r[0], "-az");
+        assert_eq!(r[1], "-e");
+        assert!(r[2].starts_with("ssh ") && r[2].contains("ForwardAgent=no"), "rsync -e carries hardened ssh: {}", r[2]);
+        assert_eq!(r[3], "gitmind@192.168.1.7:/repo/target/x/release/app");
+        assert_eq!(r[4], "/tmp/app");
     }
 
     #[test]
