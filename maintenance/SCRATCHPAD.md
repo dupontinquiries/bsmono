@@ -1220,3 +1220,28 @@ code, left for the prune backlog.)
 VERIFIED: buildflags 8; deploy 14, appcatalog 7, netshare 4, bttransfer 3, fleet 5, preview 3,
 installer 2 = 46; rustcheck CLEAN; Fleet/MonoTile/main balanced; all backend.* resolve. ON-DEVICE:
 cargo build + metadata in the subdir (local), and over ssh in repo/rel (remote).
+
+── fix: target detection, lib crates in store, repo path dropdown ──
+USER on-device: (1) desktop is glibc but GUI recommended musl (musl loader file present alongside
+glibc → false positive); (2) share-kit (a LIBRARY, libshare_kit.rlib, no bin) was listed + "installed"
+→ rsync exit 23 (no binary); (3) typing the remote repo path from memory is bad UX → want dropdown
++custom; (4) rustup installed but not on PATH (user env; cargo already surfaces "target may not be
+installed").
+FIXES:
+[A target] local_target now runs `rustc -vV` (PATH-augmented) → host_triple_from_rustc (the host: line)
+= authoritative native triple. Fallback (rustc unreachable): /etc/alpine-release → musl else gnu. NO
+more loader-file guessing. [buildflags host_triple_from_rustc, tested]
+[B lib filter] local_apps skips cargo crates with no binary: lists only if src/main.rs || src/bin/ ||
+declares_binary(Cargo.toml has [[bin]]). share-kit & other kits no longer appear as apps.
+[buildflags declares_binary, tested]
+[C repo dropdown] fleet build-repo is now a most-recent-first HISTORY: build_repos()/build_repo(first)/
+set_build_repo(prepend+dedupe+cap8). build_repo() method returns {repo, candidates=history+local repo
+root}. Fleet.qml: repo field is an editable ComboBox (model=repoCandidates, currentIndex 0, onEditText
+→repoField); openApp loads candidates + preserves a typed-but-unsaved path. [fleet 5 tests incl history]
+[D error] remote_install fetch-stage failure now appends a hint: "no binary at <path> — is <app> a
+library crate, or did the build target a different libc than <target>?".
+VERIFIED: buildflags 9, fleet 5, deploy 14, appcatalog 7, netshare 4, bttransfer 3, preview 3,
+installer 2 = 47; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced; all backend.* resolve.
+NOTE: user's rustup-not-on-PATH is an env issue (rustup target add needs rustup reachable); cargo's own
+"target may not be installed" message already guides. Native target now defaults correctly so the
+common (this-device) build needs no rustup target add at all.
