@@ -36,6 +36,13 @@ Item {
     property bool instStageTmp: true
     property bool instIsCargo: false
     property bool instIsCmake: false
+    // app store state
+    property var catalog: []          // [{name, size, description, path}]
+    property string storeRoot: "~"    // where apps live on the source device
+    property string storeBase: ""     // resolved root (from the catalog call)
+    property bool storeLoaded: false
+    property string localTarget: ""   // this device's native triple
+    property string installingApp: "" // path currently being installed
     // confirmation dialog
     property string confirmAction: "" // "push" | "deploy"
     property string confirmPath: ""
@@ -64,6 +71,12 @@ Item {
         var r = JSON.parse(backend.fleet_user())
         if (r.user && r.user.length) root.user = r.user
         if (r.admin && r.admin.length) root.adminUser = r.admin
+        var t = JSON.parse(backend.local_target())
+        if (t.target) root.localTarget = t.target
+    }
+    // Entering the store for the first time on a device → load its catalog.
+    onModeChanged: {
+        if (mode === "install" && selHost.length > 0 && !storeLoaded) loadCatalog()
     }
 
     // Slow ops run on a worker thread in the backend; we kick them off and let the
@@ -79,6 +92,7 @@ Item {
         curPath = ""; entries = []; lastReason = ""; showSetup = false; sshpass = ""
         showPreview = false; previewKeys = ""
         showAppInfo = false; appPath = ""; instOpen = false; showProvision = false
+        storeLoaded = false; catalog = []; installingApp = ""
         refreshTrust()
         browse("")
     }
@@ -155,21 +169,45 @@ Item {
         root.appPath = path; root.appCrates = r.crate_count
         root.appSize = r.size; root.appReadme = r.readme; root.showAppInfo = true
     }
-    // Open the build + install configurator for the selected app.
-    function openInstaller() {
-        if (root.appPath.length === 0) return
-        var r = JSON.parse(backend.app_build_options(root.user, root.selHost, root.appPath))
+    // Open the build + install configurator ("options") for an app at `path`.
+    function openInstaller(path) {
+        var p = (path && path.length) ? path : root.appPath
+        if (p.length === 0) return
+        var r = JSON.parse(backend.app_build_options(root.user, root.selHost, p))
         if (!r.ok) { root.note = "error: " + r.error; return }
-        root.instPath = root.appPath
-        root.instApp = root.appPath.substring(root.appPath.lastIndexOf("/") + 1)
+        root.instPath = p
+        root.instApp = p.substring(p.lastIndexOf("/") + 1)
         root.instTargets = r.targets || []
         root.instDefaults = r.defaults_by_target || ({})
         root.instCmake = r.cmake_options || []
         root.instIsCargo = r.is_cargo; root.instIsCmake = r.is_cmake
         root._allFeatures = r.features || []
-        root.instTarget = (root.instTargets.length ? root.instTargets[0] : "")
+        // default the configurator to THIS device's native target if it's offered
+        var t = root.localTarget
+        root.instTarget = (root.instTargets.indexOf(t) >= 0) ? t
+                          : (root.instTargets.length ? root.instTargets[0] : "")
         root.applyDefaultsForTarget(root.instTarget)
         root.instOpen = true
+    }
+    // ── app store ────────────────────────────────────────────────────────
+    function loadCatalog() {
+        if (root.selHost.length === 0) return
+        var r = JSON.parse(backend.store_catalog(root.user, root.selHost, root.storeRoot))
+        if (!r.ok) { root.note = "error: " + r.error; root.storeLoaded = true; return }
+        root.catalog = r.apps || []; root.storeBase = r.root || ""; root.storeLoaded = true
+        root.note = root.catalog.length ? "" : "no apps found under " + (r.root || root.storeRoot)
+    }
+    // One-tap install: this device's native target, the repo's default features,
+    // staged via /tmp. The "options" path handles anything fancier.
+    function installDefault(app) {
+        var tgt = root.localTarget.length ? root.localTarget : "aarch64-unknown-linux-musl"
+        var r = JSON.parse(backend.install_app(root.user, root.selHost, app.path,
+                    app.name, tgt, "", false, true))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.installingApp = app.path
+        root.busy = true; root.jobKind = "install"
+        root.note = "installing " + app.name + " (" + tgt + ") — building, this can take a while…"
+        poller.start()
     }
     property var _allFeatures: []
     function applyDefaultsForTarget(triple) {
@@ -240,6 +278,7 @@ Item {
         } else if (root.jobKind === "deploy") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
         } else if (root.jobKind === "install") {
+            root.installingApp = ""
             root.note = res.ok ? ("✓ " + res.msg) : ("✗ " + res.error)
         } else if (root.jobKind === "trust") {
             root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
@@ -394,7 +433,7 @@ Item {
                     Label { text: "as user"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
                     TextField { width: 130; text: root.user; onTextChanged: root.user = text }
                     Button { text: "save"; enabled: !root.busy; onClicked: root.saveFleetUser() }
-                    Button { text: "browse"; onClicked: root.browse("") }
+                    Button { text: "browse"; visible: root.mode === "deploy"; onClicked: root.browse("") }
                 }
                 Label {
                     width: parent.width
@@ -516,12 +555,13 @@ Item {
                 }
                 Label {
                     width: parent.width
+                    visible: root.mode === "deploy"
                     text: root.curPath.length ? root.curPath : "(tap browse to start at home)"
                     color: "#cdd6f4"; wrapMode: Text.WrapAnywhere
                 }
                 Column {
                     width: parent.width; spacing: 4
-                    visible: root.curPath.length > 0
+                    visible: root.curPath.length > 0 && root.mode === "deploy"
                     Rectangle {
                         width: col.width; height: 36; radius: 6; color: "#171c2b"; border.color: "#2a3350"
                         Label { anchors.verticalCenter: parent.verticalCenter; x: 10; text: "‹ .."; color: "#8a93a6" }
@@ -550,6 +590,89 @@ Item {
                             }
                             // tapping the row navigates in (works for repos too)
                             TapHandler { onTapped: root.browse(root.curPath + "/" + modelData.name) }
+                        }
+                    }
+                }
+                // ── app store (Install mode) ─────────────────────────────────
+                Column {
+                    width: parent.width; spacing: 8
+                    visible: root.mode === "install"
+                    Row {
+                        width: parent.width; spacing: 8
+                        Label { text: "apps in"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                        TextField {
+                            width: parent.width - refreshBtn.width - 70
+                            text: root.storeRoot; placeholderText: "folder on the device (~ = home)"
+                            onTextChanged: root.storeRoot = text
+                            onAccepted: root.loadCatalog()
+                        }
+                        Button { id: refreshBtn; text: root.busy ? "…" : "refresh"; enabled: !root.busy; onClicked: root.loadCatalog() }
+                    }
+                    Label {
+                        width: parent.width
+                        visible: !root.storeLoaded
+                        text: "Tap refresh to see the apps available on " + root.selName + "."
+                        color: "#5b6477"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                    }
+                    Label {
+                        width: parent.width
+                        visible: root.storeLoaded && root.catalog.length === 0
+                        text: "No apps found here. Point “apps in” at where your projects live (e.g. ~/Code)."
+                        color: "#5b6477"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                    }
+                    // the storefront — one card per recognised app
+                    Repeater {
+                        model: root.catalog
+                        delegate: Rectangle {
+                            width: col.width; radius: 10
+                            color: "#1b2335"; border.color: "#3a4566"
+                            height: cardCol.height + 20
+                            Column {
+                                id: cardCol
+                                x: 12; y: 10; width: parent.width - 24; spacing: 6
+                                Row {
+                                    width: parent.width; spacing: 10
+                                    // letter avatar
+                                    Rectangle {
+                                        width: 38; height: 38; radius: 10
+                                        color: "#2a3350"; border.color: "#7aa2f7"
+                                        Label {
+                                            anchors.centerIn: parent
+                                            text: modelData.name.substring(0, 1).toUpperCase()
+                                            color: "#7aa2f7"; font.bold: true; font.pixelSize: 18
+                                        }
+                                    }
+                                    Column {
+                                        width: parent.width - 48; spacing: 1
+                                        Row {
+                                            width: parent.width
+                                            Label { text: modelData.name; color: "#cdd6f4"; font.bold: true; font.pixelSize: 15; width: parent.width - szLbl.width; elide: Text.ElideRight }
+                                            Label { id: szLbl; text: modelData.size; color: "#5b6477"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                                        }
+                                        Label {
+                                            width: parent.width
+                                            text: modelData.description.length ? modelData.description : "no description"
+                                            color: "#8a93a6"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                                            maximumLineCount: 2; elide: Text.ElideRight
+                                        }
+                                    }
+                                }
+                                Row {
+                                    width: parent.width; spacing: 8
+                                    layoutDirection: Qt.RightToLeft
+                                    Button {
+                                        text: root.installingApp === modelData.path ? "installing…" : "Install"
+                                        enabled: !root.busy
+                                        onClicked: root.installDefault(modelData)
+                                    }
+                                    Rectangle {
+                                        width: optLbl.width + 22; height: 34; radius: 8
+                                        color: "#171c2b"; border.color: "#2a3350"
+                                        Label { id: optLbl; anchors.centerIn: parent; text: "options"; color: "#7aa2f7"; font.pixelSize: 12 }
+                                        TapHandler { onTapped: root.openInstaller(modelData.path) }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

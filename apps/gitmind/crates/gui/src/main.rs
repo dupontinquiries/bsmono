@@ -132,6 +132,9 @@ struct Backend {
     app_details: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
     // build-flag customization + the cross-build → ship pipeline
     app_build_options: qt_method!(fn(&self, user: QString, host: QString, path: QString) -> QString),
+    // app-store catalog + this device's native target
+    store_catalog: qt_method!(fn(&self, user: QString, host: QString, root: QString) -> QString),
+    local_target: qt_method!(fn(&self) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
     // two-sided fingerprint matching: show this device's key, preview a peer's key,
@@ -975,6 +978,45 @@ impl Backend {
             "is_cargo": !cargo.trim().is_empty(),
             "is_cmake": !cmake.trim().is_empty(),
         }).to_string())
+    }
+
+    /// The app-store catalog: every recognised app under `root` on the source device,
+    /// with size + blurb, from a single ssh round-trip. Returns each app's resolved
+    /// path so the installer can act on it directly.
+    fn store_catalog(&self, user: QString, host: QString, root: QString) -> QString {
+        let (u, h, root) = (user.to_string(), host.to_string(), root.to_string());
+        let q = deploy::shell_quote(if root.trim().is_empty() { "~" } else { &root });
+        let raw = match deploy::remote_capture(&u, &h, &appcatalog::remote_catalog_cmd(&q)) {
+            Ok(s) => s,
+            Err(e) => return err_json(&e),
+        };
+        // first line is the resolved root (pwd); the rest are catalog rows
+        let mut lines = raw.lines();
+        let base = lines.next().unwrap_or("").trim().to_string();
+        let body: String = lines.collect::<Vec<_>>().join("\n");
+        let apps: Vec<_> = appcatalog::parse_catalog(&body)
+            .into_iter()
+            .map(|e| json!({
+                "name": e.name,
+                "size": e.size,
+                "description": e.description,
+                "path": format!("{}/{}", base.trim_end_matches('/'), e.name),
+            }))
+            .collect();
+        QString::from(json!({"ok": true, "root": base, "apps": apps}).to_string())
+    }
+
+    /// The triple that matches *this* device's libc, so a store install defaults to a
+    /// binary that actually runs here (musl on Alpine/postmarketOS, gnu on glibc).
+    fn local_target(&self) -> QString {
+        let musl = std::path::Path::new("/lib/ld-musl-aarch64.so.1").exists()
+            || std::path::Path::new("/lib/libc.musl-aarch64.so.1").exists();
+        let triple = if musl {
+            "aarch64-unknown-linux-musl"
+        } else {
+            "aarch64-unknown-linux-gnu"
+        };
+        QString::from(json!({"target": triple}).to_string())
     }
 
     /// Cross-build `app` from `path` for `triple` with the chosen feature set, then
