@@ -653,10 +653,41 @@ pub fn lan_cidr_from_ip(host: &str) -> Option<String> {
 ///   `from="<cidr>"`→ the key only works from the local /24 (a remote attacker off
 ///                    the LAN can't use it at all), added when the host is an IP.
 /// Pure — unit-tested.
-pub fn authorized_keys_options(host: &str) -> String {
-    match lan_cidr_from_ip(host) {
+/// Default lifetime for an installed access key. Keys carry an `expiry-time` so a
+/// leaked/forgotten key stops working on its own; re-running "install my key" renews it.
+pub const KEY_EXPIRY_DAYS: u64 = 7;
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// A unix time `days` ahead as an OpenSSH `expiry-time` stamp "YYYYMMDDHHMMSS" (UTC).
+/// Pure — unit-tested.
+pub fn key_expiry_time(now_unix: u64, days: u64) -> String {
+    let secs = now_unix + days * 86400;
+    let z = (secs / 86400) as i64;
+    let tod = secs % 86400;
+    let (y, m, d) = civil_from_days(z);
+    format!("{:04}{:02}{:02}{:02}{:02}{:02}", y, m, d, tod / 3600, (tod % 3600) / 60, tod % 60)
+}
+
+pub fn authorized_keys_options(host: &str, expiry: Option<&str>) -> String {
+    let base = match lan_cidr_from_ip(host) {
         Some(cidr) => format!("restrict,from=\"{cidr}\""),
         None => "restrict".to_string(),
+    };
+    match expiry {
+        Some(exp) => format!("expiry-time=\"{exp}\",{base}"),
+        None => base,
     }
 }
 
@@ -677,9 +708,14 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
         return Err("enter the device password to install the key".into());
     }
     let pubkey = ensure_local_pubkey()?;
-    // Defence in depth: install the key with restrictions so it can't be used to
-    // pivot if the device is later compromised (see authorized_keys_options).
-    let key_line = restricted_key_line(&authorized_keys_options(host), &pubkey);
+    // Defence in depth: install the key restricted (no pivot if the device is later
+    // compromised) AND with a weekly expiry so a stale key dies on its own.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expiry = key_expiry_time(now, KEY_EXPIRY_DAYS);
+    let key_line = restricted_key_line(&authorized_keys_options(host, Some(&expiry)), &pubkey);
     // temp askpass helper (0700, current pid in the name, removed after)
     let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
     std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
@@ -973,8 +1009,14 @@ mod tests {
         assert_eq!(lan_cidr_from_ip("fp5.local"), None, "hostname -> no from= pin");
         assert_eq!(lan_cidr_from_ip("192.168.1.999"), None, "bad octet -> none");
         // IP target: restrict + from=; hostname target: restrict only
-        assert_eq!(authorized_keys_options("192.168.1.7"), "restrict,from=\"192.168.1.0/24\"");
-        assert_eq!(authorized_keys_options("fp5.local"), "restrict");
+        assert_eq!(authorized_keys_options("192.168.1.7", None), "restrict,from=\"192.168.1.0/24\"");
+        assert_eq!(authorized_keys_options("fp5.local", None), "restrict");
+        // with an expiry, expiry-time leads the option list
+        assert_eq!(authorized_keys_options("fp5.local", Some("20260706000000")), "expiry-time=\"20260706000000\",restrict");
+        // key expiry stamp is YYYYMMDDHHMMSS in UTC, `days` ahead
+        assert_eq!(key_expiry_time(0, 0), "19700101000000");
+        assert_eq!(key_expiry_time(0, 7), "19700108000000");
+        assert_eq!(key_expiry_time(1_700_000_000, 0), "20231114221320");
         // the installed line carries the options ahead of the key, one line
         let line = restricted_key_line("restrict,from=\"192.168.1.0/24\"", "ssh-ed25519 AAAAC3xyz gitmind-fleet\n");
         assert!(line.starts_with("restrict,from=\"192.168.1.0/24\" ssh-ed25519 "));
