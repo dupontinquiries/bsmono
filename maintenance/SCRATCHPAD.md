@@ -1299,3 +1299,27 @@ DEFERRED (told user, planned): (E) dedicated desktop→phone PUSH page [reuse se
 (F) key SETTINGS page: list managed keys (id/host/expiry), de-dupe/cleanup authorized_keys, last-
 accessed + network-seen (needs sshd log parsing or a wtmp/last read on-device). (G) reclaim: rm in-repo
 target/ dirs now that builds go to the shared cache.
+
+── desktop → phone Push page ──
+USER (chose next): a dedicated page for putting binaries on phones from the desktop, like the fetch UX.
+[backend] build_locally(app,dir,target,feats,nodefault)→(bin,size) EXTRACTED from build_app (build_app
+now calls it; push reuses it — no dup). push_install(app,path,target,features,host,user) ASYNC "push":
+build_locally (cross to device libc if needed) → deploy::scp_push bin → host:/tmp/<app> → remote_capture
+installer::push_install_script(app,false) (mkdir ~/.local/bin + ~/.local/share/applications; mv /tmp →
+bin; chmod; write <app>.desktop with $HOME-expanded Exec via unquoted heredoc; echo gitmind-pushed).
+installer::push_install_script(app,has_icon) pure+tested (icon path moves /tmp/<app>.icon → cache when
+has_icon). remote_target(host,user)→device native triple (rustc -vV → normalize) so push defaults to the
+device's libc. [installer 4, all 51 tests]
+[shared, no dup] qml/applib.js (.pragma library): fuzzy/filterApps/targetLibc. Fleet now delegates its
+fuzzy/filterApps/targetLibc to App.* (logic lives once). MonoTile reused.
+[Push.qml NEW tab] own state+poller (discover/trust/setupkey/push). Compact device picker (discover/
+select/trust/install-key — NO provision; simpler than Fleet's). selectDevice auto-detects target via
+remote_target. app search+list (App.filterApps, kind app) → tap selects → "for <libc>" pills + "Build &
+push" (enabled when app+trusted host). main.qml: new "push" tab between fleet + network. qrc: Push.qml,
+applib.js.
+VERIFIED: installer 4, deploy 14, buildflags 11, fleet 5, appcatalog 7, netshare 4, bttransfer 3,
+preview 3 = 51; rustcheck CLEAN; Fleet/Push/MonoTile/main/Network balanced; all backend.* resolve.
+ON-DEVICE: build (cross musl from gnu desktop needs the musl target+linker), scp_push, remote install
+script. Connect as the device's run-user. NOTE/TRADEOFF: Push has its own compact device picker (markup
+overlaps Fleet's) — extracting a shared stateful DevicePicker.qml deferred (riskier untested); filter
+logic IS shared via applib.js. Still DEFERRED: key settings/cleanup page; reclaim in-repo target/ dirs.

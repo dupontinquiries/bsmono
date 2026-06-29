@@ -41,6 +41,39 @@ pub fn desktop_entry(name: &str, exec: &str, icon: &str) -> String {
     s
 }
 
+/// Shell script run ON THE TARGET to install a binary that was pushed to /tmp: move it
+/// into the target user's ~/.local/bin, mark it executable, and write a .desktop
+/// launcher. `$HOME` expands on the target (unquoted heredoc). If `has_icon`, the icon
+/// was pushed to /tmp too and is moved into the per-user cache. Pure — unit-tested.
+pub fn push_install_script(app: &str, has_icon: bool) -> String {
+    let (icon_mv, icon_line) = if has_icon {
+        (
+            format!("mkdir -p \"$HOME/.cache/gitmind/shots\"\nmv /tmp/{app}.icon \"$HOME/.cache/gitmind/shots/{app}.png\"\n"),
+            format!("Icon=$HOME/.cache/gitmind/shots/{app}.png\n"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    format!(
+        "set -e\n\
+         mkdir -p \"$HOME/.local/bin\" \"$HOME/.local/share/applications\"\n\
+         mv /tmp/{app} \"$HOME/.local/bin/{app}\"\n\
+         chmod +x \"$HOME/.local/bin/{app}\"\n\
+         {icon_mv}\
+         cat > \"$HOME/.local/share/applications/{app}.desktop\" <<DESK\n\
+         [Desktop Entry]\n\
+         Type=Application\n\
+         Name={app}\n\
+         Comment=Pushed by gitmind fleet\n\
+         Exec=$HOME/.local/bin/{app}\n\
+         {icon_line}\
+         Terminal=false\n\
+         Categories=Utility;\n\
+         DESK\n\
+         echo gitmind-pushed"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,6 +82,19 @@ mod tests {
     fn paths_under_local() {
         assert_eq!(bin_dir("/home/user/"), "/home/user/.local/bin");
         assert_eq!(desktop_dir("/home/user"), "/home/user/.local/share/applications");
+    }
+
+    #[test]
+    fn push_install_script_installs_and_launches() {
+        let s = push_install_script("peek", false);
+        assert!(s.contains("mv /tmp/peek \"$HOME/.local/bin/peek\""), "moves into ~/.local/bin");
+        assert!(s.contains("chmod +x"), "executable");
+        assert!(s.contains("[Desktop Entry]") && s.contains("Exec=$HOME/.local/bin/peek"), "launcher");
+        assert!(!s.contains("Icon="), "no icon when none pushed");
+        assert!(s.contains("echo gitmind-pushed"), "completion marker");
+        // with icon → moved into the cache + referenced
+        let si = push_install_script("peek", true);
+        assert!(si.contains("mv /tmp/peek.icon") && si.contains("Icon=$HOME/.cache/gitmind/shots/peek.png"));
     }
 
     #[test]
