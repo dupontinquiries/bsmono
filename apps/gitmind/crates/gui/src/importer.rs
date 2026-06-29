@@ -60,6 +60,20 @@ pub fn find_crate_root(dir: &Path) -> Option<PathBuf> {
     found.into_iter().min_by_key(|p| p.components().count())
 }
 
+/// Shell that overlays the extracted files (`src`) onto an existing repo (`dst`) with
+/// rsync, always protecting the repo's own .git/.gitmind. `mirror` adds --delete so the
+/// repo ends up matching the zip exactly (files the zip dropped are removed too). Prints
+/// GITMIND_NO_RSYNC if rsync is missing. Pure — unit-tested.
+pub fn overlay_command(src: &str, dst: &str, mirror: bool) -> String {
+    let s = q(src);
+    let d = q(dst);
+    let del = if mirror { " --delete" } else { "" };
+    format!(
+        "if ! command -v rsync >/dev/null 2>&1; then echo GITMIND_NO_RSYNC; exit 3; fi\n\
+         rsync -a{del} --exclude='.git' --exclude='.gitmind' {s}/ {d}/"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +101,15 @@ mod tests {
         assert!(root.ends_with("myapp-1.0"), "picks the top-level crate, not the vendored one: {root:?}");
         assert!(find_crate_root(&base.join("nope")).is_none());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn overlay_protects_git_and_can_mirror() {
+        let o = overlay_command("/tmp/extract", "/home/me/Code/app", false);
+        assert!(o.contains("rsync -a --exclude='.git' --exclude='.gitmind' '/tmp/extract'/ '/home/me/Code/app'/"));
+        assert!(!o.contains("--delete"), "overlay never deletes");
+        assert!(o.contains("GITMIND_NO_RSYNC"), "clear error when rsync absent");
+        let m = overlay_command("/tmp/extract", "/dst", true);
+        assert!(m.contains("rsync -a --delete --exclude='.git'"), "mirror deletes, still protects .git");
     }
 }

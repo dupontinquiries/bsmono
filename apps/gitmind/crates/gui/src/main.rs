@@ -165,6 +165,8 @@ struct Backend {
     import_dest: qt_method!(fn(&self, crate_path: QString, base: QString) -> QString),
     add_repos_base: qt_method!(fn(&self, path: QString) -> QString),
     place_app: qt_method!(fn(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString),
+    local_repos: qt_method!(fn(&self) -> QString),
+    apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -1742,6 +1744,136 @@ impl Backend {
             job.finish(json!({"ok": true, "path": dpath.display().to_string(), "init": init}).to_string());
         });
         QString::from(json!({"ok": true, "started": "place"}).to_string())
+    }
+
+    /// Discover git/gitmind repos under $HOME (for the "update an existing repo" target
+    /// picker). Async job "lrepos".
+    fn local_repos(&self) -> QString {
+        if !self.job.start("lrepos") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let cmd = "find \"$HOME\" -maxdepth 6 \\( -name .git -o -name .gitmind \\) 2>/dev/null | head -200";
+            let out = std::process::Command::new("sh").arg("-c").arg(cmd)
+                .env("PATH", tool_path_env()).output();
+            let mut roots: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(o) = out {
+                for line in String::from_utf8_lossy(&o.stdout).lines() {
+                    let l = line.trim();
+                    if l.is_empty() { continue; }
+                    let p = std::path::Path::new(l);
+                    if let Some(root) = p.parent() {
+                        let r = root.to_path_buf();
+                        if !roots.contains(&r) { roots.push(r); }
+                    }
+                }
+            }
+            roots.sort();
+            let repos: Vec<_> = roots.iter().map(|r| json!({
+                "path": r.display().to_string(),
+                "name": r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                "gitmind": r.join(".gitmind").exists(),
+                "git": r.join(".git").exists(),
+            })).collect();
+            job.finish(json!({"ok": true, "repos": repos, "count": repos.len()}).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "lrepos"}).to_string())
+    }
+
+    /// Apply an imported zip onto an existing git repo as a reviewable change: on a
+    /// fresh branch (so nothing is overwritten in place), rsync the extracted files over
+    /// the working tree (protecting .git/.gitmind), then commit. `mode` is "overlay"
+    /// (add/modify only) or "mirror" (also delete files the zip dropped). Requires a
+    /// clean working tree. Async job "apply" → {branch, base, shortstat, files}.
+    fn apply_to_repo(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString {
+        let crate_path = crate_path.to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let target = places::expand_home(target.to_string().trim(), &home);
+        let mirror = mode.to_string() == "mirror";
+        let zipname = zipname.to_string();
+        if crate_path.trim().is_empty() { return err_json("import an app first"); }
+        if target.trim().is_empty() { return err_json("pick a repo to update"); }
+        let tpath = std::path::PathBuf::from(&target);
+        if !tpath.join(".git").exists() {
+            return err_json("that folder isn't a git repo — use \"New project\", or pick a git repo");
+        }
+        if !std::path::Path::new(&crate_path).is_dir() {
+            return err_json("the imported files are no longer there — re-import");
+        }
+        if !self.job.start("apply") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let git = |args: &[&str]| -> (bool, String, String) {
+                match std::process::Command::new("git").args(args).current_dir(&tpath)
+                    .env("PATH", tool_path_env()).output() {
+                    Ok(o) => (o.status.success(),
+                              String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                              String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                    Err(e) => (false, String::new(), e.to_string()),
+                }
+            };
+            // require a clean tree so we never mix the user's work with the import
+            let (ok, dirty, err) = git(&["status", "--porcelain"]);
+            if !ok { job.finish(json!({"ok": false, "error": format!("git status failed: {err}")}).to_string()); return; }
+            if !dirty.is_empty() {
+                job.finish(json!({"ok": false, "error": "the repo has uncommitted changes — commit or stash them first"}).to_string());
+                return;
+            }
+            let (_, base, _) = git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+            let branch = format!("gitmind-import-{}", now_stamp());
+            let (okb, _, errb) = git(&["checkout", "-b", &branch]);
+            if !okb { job.finish(json!({"ok": false, "error": format!("couldn't create branch: {errb}")}).to_string()); return; }
+            // overlay the extracted files
+            let script = importer::overlay_command(&crate_path, &target, mirror);
+            let ov = std::process::Command::new("sh").arg("-c").arg(&script)
+                .env("PATH", tool_path_env()).output();
+            let ov_ok = match ov {
+                Ok(o) if o.status.success() => true,
+                Ok(o) => {
+                    let blob = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
+                    let msg = if blob.contains("GITMIND_NO_RSYNC") {
+                        "rsync is required to update an existing repo — install it (apk add rsync)".to_string()
+                    } else { format!("overlay failed: {}", blob.trim()) };
+                    // roll back the branch
+                    let _ = git(&["checkout", &base]);
+                    let _ = git(&["branch", "-D", &branch]);
+                    job.finish(json!({"ok": false, "error": msg}).to_string());
+                    false
+                }
+                Err(e) => {
+                    let _ = git(&["checkout", &base]);
+                    let _ = git(&["branch", "-D", &branch]);
+                    job.finish(json!({"ok": false, "error": format!("overlay failed: {e}")}).to_string());
+                    false
+                }
+            };
+            if !ov_ok { return; }
+            git(&["add", "-A"]);
+            let (_, shortstat, _) = git(&["diff", "--cached", "--shortstat"]);
+            if shortstat.is_empty() {
+                // nothing changed — undo the branch, leave the repo as we found it
+                let _ = git(&["checkout", &base]);
+                let _ = git(&["branch", "-D", &branch]);
+                job.finish(json!({"ok": true, "changes": 0, "base": base, "msg": "no changes — the zip matches the repo"}).to_string());
+                return;
+            }
+            let (_, namestat, _) = git(&["diff", "--cached", "--name-status"]);
+            let files: Vec<_> = namestat.lines().take(60).filter_map(|l| {
+                let mut it = l.split('\t');
+                let st = it.next()?; let path = it.next()?;
+                Some(json!({"status": st, "path": path}))
+            }).collect();
+            let msg = if zipname.is_empty() { "import from zip".to_string() } else { format!("import from {zipname}") };
+            git(&["commit", "-q", "-m", &msg]);
+            job.finish(json!({
+                "ok": true, "changes": files.len(), "branch": branch, "base": base,
+                "shortstat": shortstat, "mirror": mirror, "files": files,
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "apply"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {

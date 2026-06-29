@@ -1,6 +1,9 @@
-// Import — take a .zip of a Rust app, extract it to a fresh temp dir, then either run
-// it once (ephemeral) or save it into your repos area (~/Code/<lang>/<name> by default,
-// path configurable) initialized with gitmind or plain git — then build and launch.
+// Import — take a .zip of a Rust app and either:
+//   • New project: extract to your repos area (~/Code/<lang>/<name>), init git/gitmind,
+//     build + run; or
+//   • Update existing: overlay the zip onto an existing git repo as a reviewable change
+//     on a fresh branch (nothing overwritten in place; layout drift + edits show as a
+//     diff you commit/merge yourself).
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Dialogs
@@ -10,8 +13,9 @@ Item {
     property string importState: "idle"  // idle | importing | found | failed
     property string buildState: "idle"   // idle | building | ran | failed
     property string app: ""
-    property string cratePath: ""         // current crate dir (temp, or placed path)
+    property string cratePath: ""
     property string dir: ""
+    property string zipName: ""
     property string desc: ""
     property bool isBin: true
     property string binary: ""
@@ -20,19 +24,31 @@ Item {
     property string jobKind: ""
     property string note: ""
 
-    // save destination
+    property string mode: "new"           // new | update
+
+    // new-project destination
     property var bases: []
     property string base: ""
     property string lang: ""
     property string dest: ""
-    property string initMode: "gitmind"   // gitmind | git | none
+    property string initMode: "gitmind"
     property bool placed: false
     property bool runAfterPlace: false
 
+    // update-existing
+    property var repos: []
+    property bool reposLoaded: false
+    property string targetRepo: ""
+    property string applyMode: "overlay"  // overlay | mirror
+    property var applyResult: null
+
     function importZip(url) {
-        var r = JSON.parse(backend.import_zip(url.toString()))
+        var s = url.toString()
+        root.zipName = s.replace(/^.*\//, "")
+        var r = JSON.parse(backend.import_zip(s))
         if (!r.ok) { root.importState = "failed"; root.note = "✗ " + r.error; return }
-        root.importState = "importing"; root.note = ""; root.buildState = "idle"; root.placed = false
+        root.importState = "importing"; root.note = ""; root.buildState = "idle"
+        root.placed = false; root.applyResult = null
         root.busy = true; root.jobKind = "import"; poller.start()
     }
     function loadBases() {
@@ -47,6 +63,12 @@ Item {
         var r = JSON.parse(backend.import_dest(root.cratePath, root.base))
         if (r.ok) { root.dest = r.dest; root.lang = r.lang }
     }
+    function loadRepos() {
+        if (root.reposLoaded || root.busy) return
+        var r = JSON.parse(backend.local_repos())
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.busy = true; root.jobKind = "lrepos"; poller.start()
+    }
     function buildAndRun() {
         if (root.cratePath.length === 0) { root.note = "import an app first"; return }
         var r = JSON.parse(backend.build_run(root.cratePath, root.app))
@@ -60,6 +82,13 @@ Item {
         if (!r.ok) { root.note = "✗ " + r.error; return }
         root.runAfterPlace = thenRun; root.note = ""
         root.busy = true; root.jobKind = "place"; poller.start()
+    }
+    function applyToRepo() {
+        if (root.targetRepo.length === 0) { root.note = "pick a repo to update"; return }
+        var r = JSON.parse(backend.apply_to_repo(root.cratePath, root.targetRepo, root.applyMode, root.zipName))
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.applyResult = null; root.note = ""
+        root.busy = true; root.jobKind = "apply"; poller.start()
     }
 
     Timer {
@@ -81,6 +110,20 @@ Item {
                     root.placed = true; root.cratePath = res.path; root.dir = res.path
                     root.note = "✓ saved to " + res.path + (res.init !== "none" ? ("  (" + res.init + " initialized)") : "")
                     if (root.runAfterPlace && root.isBin) root.buildAndRun()
+                } else { root.note = "✗ " + res.error }
+            } else if (k === "lrepos") {
+                root.repos = res.ok ? (res.repos || []) : []
+                root.reposLoaded = true
+                if (root.targetRepo.length === 0) {
+                    for (var i = 0; i < root.repos.length; i++) {
+                        if (root.repos[i].name.toLowerCase() === root.app.toLowerCase()) { root.targetRepo = root.repos[i].path; break }
+                    }
+                }
+            } else if (k === "apply") {
+                if (res.ok) {
+                    root.applyResult = res
+                    root.note = (res.changes === 0) ? "✓ " + res.msg
+                        : "✓ applied on branch " + res.branch + " — " + res.shortstat
                 } else { root.note = "✗ " + res.error }
             } else if (k === "buildrun") {
                 if (res.ok) { root.buildState = "ran"; root.binary = res.binary; root.note = "✓ launched " + root.app + (root.placed ? " from " + root.dir : "") }
@@ -106,7 +149,7 @@ Item {
             Label { text: "Import & run"; color: "#cdd6f4"; font.bold: true; font.pixelSize: 20 }
             Label {
                 width: parent.width
-                text: "Pick a .zip with a Rust app. gitmind extracts it to a fresh temp folder, finds the crate, and either runs it once or saves it into your repos area — initialized with gitmind or git — then builds and launches it."
+                text: "Pick a .zip with a Rust app. Start a new project from it, or apply it onto an existing repo as a reviewable branch."
                 color: "#5b6477"; font.pixelSize: 12; wrapMode: Text.WordWrap
             }
             Label {
@@ -143,69 +186,154 @@ Item {
                         text: root.desc; color: "#8a93a6"; font.pixelSize: 12; wrapMode: Text.WordWrap
                     }
                     Label {
-                        width: parent.width; visible: !root.placed
+                        width: parent.width
                         text: "extracted to " + root.dir; color: "#5b6477"; font.pixelSize: 10; font.family: "monospace"
                         elide: Text.ElideMiddle
                     }
 
-                    Rectangle { width: parent.width; height: 1; color: "#2a3350" }
-
-                    Label { text: "Initialize as"; color: "#8a93a6"; font.pixelSize: 12 }
+                    // New vs Update
                     Row {
                         spacing: 8
                         Repeater {
-                            model: [["gitmind", "gitmind + git"], ["git", "git only"], ["none", "none"]]
+                            model: [["new", "New project"], ["update", "Update existing repo"]]
                             delegate: Rectangle {
-                                height: 30; radius: 15; width: il.width + 22
-                                color: modelData[0] === root.initMode ? "#2a3350" : "#1b2335"
-                                border.color: modelData[0] === root.initMode ? "#7aa2f7" : "#3a4566"
-                                Label { id: il; anchors.centerIn: parent; text: modelData[1]; color: "#cdd6f4"; font.pixelSize: 12 }
-                                TapHandler { onTapped: root.initMode = modelData[0] }
+                                height: 32; radius: 16; width: ml.width + 24
+                                color: modelData[0] === root.mode ? "#23304d" : "#1b2335"
+                                border.color: modelData[0] === root.mode ? "#7aa2f7" : "#3a4566"
+                                Label { id: ml; anchors.centerIn: parent; text: modelData[1]; color: "#cdd6f4"; font.pixelSize: 13 }
+                                TapHandler { onTapped: { root.mode = modelData[0]; if (modelData[0] === "update") root.loadRepos() } }
                             }
                         }
                     }
+                    Rectangle { width: parent.width; height: 1; color: "#2a3350" }
 
-                    Label { text: "Save in"; color: "#8a93a6"; font.pixelSize: 12 }
-                    ComboBox {
-                        id: baseBox; width: parent.width; editable: true
-                        model: root.bases
-                        Component.onCompleted: editText = root.base
-                        onActivated: { root.base = currentText; root.recomputeDest() }
-                        onAccepted: { root.base = editText; root.recomputeDest() }
-                    }
-                    Label {
-                        width: parent.width; color: "#5b6477"; font.pixelSize: 11
-                        text: "language folder: " + (root.lang.length ? root.lang : "…") + " · type a new path above to create one"
-                    }
-                    TextField {
-                        id: destField; width: parent.width
-                        placeholderText: "destination path"
-                        text: root.dest
-                        onTextEdited: root.dest = text
+                    // ───────── NEW PROJECT ─────────
+                    Column {
+                        width: parent.width; spacing: 8; visible: root.mode === "new"
+                        Label { text: "Initialize as"; color: "#8a93a6"; font.pixelSize: 12 }
+                        Row {
+                            spacing: 8
+                            Repeater {
+                                model: [["gitmind", "gitmind + git"], ["git", "git only"], ["none", "none"]]
+                                delegate: Rectangle {
+                                    height: 30; radius: 15; width: il.width + 22
+                                    color: modelData[0] === root.initMode ? "#2a3350" : "#1b2335"
+                                    border.color: modelData[0] === root.initMode ? "#7aa2f7" : "#3a4566"
+                                    Label { id: il; anchors.centerIn: parent; text: modelData[1]; color: "#cdd6f4"; font.pixelSize: 12 }
+                                    TapHandler { onTapped: root.initMode = modelData[0] }
+                                }
+                            }
+                        }
+                        Label { text: "Save in"; color: "#8a93a6"; font.pixelSize: 12 }
+                        ComboBox {
+                            id: baseBox; width: parent.width; editable: true
+                            model: root.bases
+                            Component.onCompleted: editText = root.base
+                            onActivated: { root.base = currentText; root.recomputeDest() }
+                            onAccepted: { root.base = editText; root.recomputeDest() }
+                        }
+                        Label {
+                            width: parent.width; color: "#5b6477"; font.pixelSize: 11
+                            text: "language folder: " + (root.lang.length ? root.lang : "…") + " · type a new path above to create one"
+                        }
+                        TextField {
+                            id: destField; width: parent.width
+                            placeholderText: "destination path"
+                            text: root.dest
+                            onTextEdited: root.dest = text
+                        }
+                        Row {
+                            spacing: 8
+                            Button {
+                                text: root.jobKind === "place" ? "saving…" : (root.jobKind === "buildrun" ? "building…" : "Save & run")
+                                enabled: !root.busy && root.dest.length > 0
+                                onClicked: root.saveProject(true)
+                            }
+                            Button {
+                                text: "Save only"; enabled: !root.busy && root.dest.length > 0 && !root.placed
+                                onClicked: root.saveProject(false)
+                            }
+                            Button {
+                                text: "Run once"; enabled: !root.busy && root.isBin && !root.placed
+                                onClicked: root.buildAndRun()
+                            }
+                        }
+                        Label {
+                            width: parent.width; visible: !root.isBin
+                            text: "This is a library crate — nothing to launch, but you can still save it."
+                            color: "#f9e2af"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                        }
                     }
 
-                    Row {
-                        spacing: 8
-                        Button {
-                            text: root.jobKind === "place" ? "saving…" : (root.jobKind === "buildrun" ? "building…" : "Save & run")
-                            enabled: !root.busy && root.dest.length > 0
-                            onClicked: root.saveProject(true)
+                    // ───────── UPDATE EXISTING ─────────
+                    Column {
+                        width: parent.width; spacing: 8; visible: root.mode === "update"
+                        Label {
+                            width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                            text: "Applies the zip onto a clean git repo on a new branch (gitmind-import-…). Nothing is overwritten in place — review the diff and merge it yourself."
+                        }
+                        Label { text: root.jobKind === "lrepos" ? "Repo (scanning…)" : "Repo to update"; color: "#8a93a6"; font.pixelSize: 12 }
+                        ComboBox {
+                            id: repoBox; width: parent.width
+                            model: root.repos; textRole: "name"; valueRole: "path"
+                            onActivated: root.targetRepo = currentValue
+                        }
+                        TextField {
+                            width: parent.width; placeholderText: "repo path"
+                            text: root.targetRepo; onTextEdited: root.targetRepo = text
+                        }
+                        Label { text: "How to apply"; color: "#8a93a6"; font.pixelSize: 12 }
+                        Row {
+                            spacing: 8
+                            Repeater {
+                                model: [["overlay", "overlay (add + update)"], ["mirror", "mirror (match zip exactly)"]]
+                                delegate: Rectangle {
+                                    height: 30; radius: 15; width: al.width + 22
+                                    color: modelData[0] === root.applyMode ? "#2a3350" : "#1b2335"
+                                    border.color: modelData[0] === root.applyMode ? "#7aa2f7" : "#3a4566"
+                                    Label { id: al; anchors.centerIn: parent; text: modelData[1]; color: "#cdd6f4"; font.pixelSize: 12 }
+                                    TapHandler { onTapped: root.applyMode = modelData[0] }
+                                }
+                            }
+                        }
+                        Label {
+                            width: parent.width; visible: root.applyMode === "mirror"
+                            text: "Mirror also deletes files the zip dropped. It's on a branch so committed history is safe, but untracked files would be lost."
+                            color: "#f9e2af"; font.pixelSize: 11; wrapMode: Text.WordWrap
                         }
                         Button {
-                            text: "Save only"
-                            enabled: !root.busy && root.dest.length > 0 && !root.placed
-                            onClicked: root.saveProject(false)
+                            text: root.jobKind === "apply" ? "applying…" : "Apply to a branch"
+                            enabled: !root.busy && root.targetRepo.length > 0
+                            onClicked: root.applyToRepo()
                         }
-                        Button {
-                            text: "Run once"
-                            enabled: !root.busy && root.isBin && !root.placed
-                            onClicked: root.buildAndRun()
+
+                        // result
+                        Rectangle {
+                            width: parent.width; radius: 8; color: "#0f1320"; border.color: "#2a3350"
+                            visible: root.applyResult !== null && root.applyResult.ok && root.applyResult.changes > 0
+                            height: ar.height + 16
+                            Column {
+                                id: ar
+                                x: 10; y: 8; width: parent.width - 20; spacing: 4
+                                Label {
+                                    width: parent.width; color: "#56d364"; font.pixelSize: 12; font.bold: true
+                                    text: root.applyResult ? (root.applyResult.shortstat || "") : ""
+                                }
+                                Label {
+                                    width: parent.width; color: "#8a93a6"; font.pixelSize: 11; font.family: "monospace"; wrapMode: Text.WrapAnywhere
+                                    text: root.applyResult ? ("review: git -C " + root.targetRepo + " diff " + root.applyResult.base + ".." + root.applyResult.branch) : ""
+                                }
+                                Repeater {
+                                    model: root.applyResult ? root.applyResult.files : []
+                                    delegate: Label {
+                                        width: ar.width
+                                        text: modelData.status + "  " + modelData.path
+                                        color: modelData.status.indexOf("D") === 0 ? "#f7768e" : (modelData.status.indexOf("A") === 0 ? "#56d364" : "#a6adc8")
+                                        font.pixelSize: 11; font.family: "monospace"; elide: Text.ElideMiddle
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Label {
-                        width: parent.width; visible: !root.isBin
-                        text: "This is a library crate — nothing to launch, but you can still save it."
-                        color: "#f9e2af"; font.pixelSize: 11; wrapMode: Text.WordWrap
                     }
                 }
             }
@@ -225,7 +353,6 @@ Item {
                     }
                 }
             }
-
             Label {
                 width: parent.width; visible: root.buildState === "ran"
                 text: "Running: " + root.binary
