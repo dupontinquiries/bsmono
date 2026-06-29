@@ -115,6 +115,9 @@ ApplicationWindow {
         // ── Fleet: connect to a device, then Deploy (push) or Install (fetch) ──
         Fleet  { id: fleet }
 
+        // ── Push: build here, install on a device (desktop → phone) ──
+        Push   { id: push }
+
         // ── Network: advertise, look up + install a peer's repo over HTTP ──
         Network { id: network }
     }
@@ -129,6 +132,7 @@ ApplicationWindow {
         TabButton { text: "files" }
         TabButton { text: "apps" }
         TabButton { text: "fleet" }
+        TabButton { text: "push" }
         TabButton { text: "network" }
     }
 
