@@ -12,6 +12,17 @@ pub fn desktop_dir(home: &str) -> String {
     format!("{}/.local/share/applications", home.trim_end_matches('/'))
 }
 
+/// Where an installed binary goes: native binaries to ~/.local/bin (on PATH, runnable);
+/// non-native (cross) binaries to a per-target dir under ~/.local/lib/gitmind, since
+/// they can't run on this device directly (they're for another device or an emulator).
+pub fn install_dir(home: &str, triple: &str, native: bool) -> String {
+    if native {
+        bin_dir(home)
+    } else {
+        format!("{}/.local/lib/gitmind/{}", home.trim_end_matches('/'), triple)
+    }
+}
+
 /// The `.desktop` launcher entry. `icon` may be an absolute image path (e.g. the
 /// cached screenshot) or empty to omit it. Pure — unit-tested.
 pub fn desktop_entry(name: &str, exec: &str, icon: &str) -> String {
@@ -38,6 +49,12 @@ mod tests {
     fn paths_under_local() {
         assert_eq!(bin_dir("/home/user/"), "/home/user/.local/bin");
         assert_eq!(desktop_dir("/home/user"), "/home/user/.local/share/applications");
+    }
+
+    #[test]
+    fn install_dir_splits_native_and_emulator() {
+        assert_eq!(install_dir("/home/u", "aarch64-unknown-linux-musl", true), "/home/u/.local/bin");
+        assert_eq!(install_dir("/home/u", "aarch64-unknown-linux-gnu", false), "/home/u/.local/lib/gitmind/aarch64-unknown-linux-gnu");
     }
 
     #[test]
