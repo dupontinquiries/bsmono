@@ -48,6 +48,8 @@ qrc!(register_qml,
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
         "qml/Fleet.qml",
+        "qml/Push.qml",
+        "qml/applib.js",
         "qml/MonoTile.qml",
         "qml/Files.qml",
         "qml/Network.qml",
@@ -146,8 +148,10 @@ struct Backend {
     capture_preview: qt_method!(fn(&self, app: QString, oid: QString, binary: QString) -> QString),
     build_repo: qt_method!(fn(&self) -> QString),
     remote_repo_candidates: qt_method!(fn(&self, host: QString, user: QString) -> QString),
+    remote_target: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
+    push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
     send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
@@ -290,6 +294,35 @@ fn resolve_binary(cargo: &str, app_dir: &std::path::Path, cargo_target: &str, ap
         target_dir.join(cargo_target).join("release")
     };
     dir.join(app)
+}
+
+/// Build `app` in `app_dir` for `target` and return the binary path + byte size.
+/// Native build (no --target) when the libc matches this device; cross otherwise.
+/// gitmind repos share the cargo target cache. Used by both build and push.
+fn build_locally(app: &str, app_dir: &std::path::Path, target: &str, feats: &[String], no_default: bool) -> Result<(std::path::PathBuf, u64), String> {
+    let cargo = cargo_bin();
+    let native = native_triple_local();
+    let cargo_target = if buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
+    let shared = gitmind_root(app_dir).map(|_| shared_target_dir());
+    let argv = buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
+    let mut cmd = std::process::Command::new(&cargo);
+    cmd.args(&argv[1..]).current_dir(app_dir).env("PATH", tool_path_env());
+    if let Some(td) = &shared {
+        let _ = std::fs::create_dir_all(td);
+        cmd.env("CARGO_TARGET_DIR", td);
+    }
+    match cmd.output() {
+        Ok(o) if o.status.success() => {
+            let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, shared.as_deref());
+            let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+            Ok((bin, size))
+        }
+        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
+            "couldn't find cargo. Install Rust, or launch gitmind-gui from a shell where cargo is on PATH (it lives in ~/.cargo/bin).".to_string()
+        ),
+        Err(e) => Err(format!("couldn't run the build: {e}")),
+    }
 }
 
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
@@ -1249,42 +1282,13 @@ impl Backend {
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let cargo = cargo_bin();
-            // build natively (no --target) when the requested libc matches this device,
-            // so no rustup target/linker is needed; otherwise cross-build for it
-            let native = native_triple_local();
-            let cargo_target = if buildflags::is_native_build(&target, &native) { String::new() } else { target.clone() };
-            // gitmind repos share one cargo target cache (dedup across clones)
-            let shared = gitmind_root(&app_dir).map(|_| shared_target_dir());
-            let argv = buildflags::cargo_build_argv(&app, &cargo_target, &feats, no_default);
-            // build IN the app's own directory — works for standalone crates and
-            // workspace members alike (no assumption of a root-workspace member)
-            let mut cmd = std::process::Command::new(&cargo);
-            cmd.args(&argv[1..]).current_dir(&app_dir).env("PATH", tool_path_env());
-            if let Some(td) = &shared {
-                let _ = std::fs::create_dir_all(td);
-                cmd.env("CARGO_TARGET_DIR", td);
-            }
-            let out = cmd.output();
-            let payload = match out {
-                Ok(o) if o.status.success() => {
-                    let bin = resolve_binary(&cargo, &app_dir, &cargo_target, &app, shared.as_deref());
-                    let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
-                    json!({
-                        "ok": true, "app": app, "target": target,
-                        "binary": bin.display().to_string(),
-                        "size": appcatalog::human_size(size),
-                    }).to_string()
-                }
-                Ok(o) => {
-                    let err = String::from_utf8_lossy(&o.stderr);
-                    json!({"ok": false, "error": err.trim()}).to_string()
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({
-                    "ok": false,
-                    "error": "couldn't find cargo. Install Rust, or launch gitmind-gui from a shell where cargo is on PATH (it lives in ~/.cargo/bin)."
+            let payload = match build_locally(&app, &app_dir, &target, &feats, no_default) {
+                Ok((bin, size)) => json!({
+                    "ok": true, "app": app, "target": target,
+                    "binary": bin.display().to_string(),
+                    "size": appcatalog::human_size(size),
                 }).to_string(),
-                Err(e) => json!({"ok": false, "error": format!("couldn't run the build: {e}")}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
             };
             job.finish(payload);
         });
@@ -1352,6 +1356,25 @@ impl Backend {
                     })
                     .collect();
                 QString::from(json!({"ok": true, "candidates": dirs}).to_string())
+            }
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// A device's native target triple (normalized) — so a push can default to the
+    /// destination's libc instead of guessing.
+    fn remote_target(&self, host: QString, user: QString) -> QString {
+        let (host, user) = (host.to_string(), user.to_string());
+        if host.is_empty() || user.is_empty() {
+            return QString::from(json!({"ok": true, "target": ""}).to_string());
+        }
+        let cmd = "export PATH=\"$HOME/.cargo/bin:$PATH\" && rustc -vV";
+        match deploy::remote_capture(&user, &host, cmd) {
+            Ok(o) => {
+                let t = buildflags::host_triple_from_rustc(&o)
+                    .map(|h| buildflags::normalize_native(&h))
+                    .unwrap_or_default();
+                QString::from(json!({"ok": true, "target": t}).to_string())
             }
             Err(e) => err_json(&e),
         }
@@ -1458,6 +1481,52 @@ impl Backend {
             }).to_string());
         });
         QString::from(json!({"ok": true, "started": "rinstall"}).to_string())
+    }
+
+    /// Desktop → phone: build the app HERE for the destination device's target, push the
+    /// binary, and install it there (~/.local/bin + a .desktop launcher) so it shows up
+    /// in the phone's launcher. Connect as the account that will run the app on the
+    /// device. Poll for the "push" result.
+    fn push_install(&self, app: QString, path: QString, target: QString, features: QString,
+                    host: QString, user: QString) -> QString {
+        let app = app.to_string();
+        let path = path.to_string();
+        let target = target.to_string();
+        let host = host.to_string();
+        let user = user.to_string();
+        let feats: Vec<String> = features.to_string()
+            .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if app.is_empty() || host.is_empty() || user.is_empty() {
+            return err_json("choose an app and a device");
+        }
+        let app_dir = if path.trim().is_empty() {
+            match repo() { Ok(r) => r.root().to_path_buf(), Err(e) => return err_json(&e) }
+        } else {
+            std::path::PathBuf::from(&path)
+        };
+        if !self.job.start("push") {
+            return err_json("a job is already running");
+        }
+        let no_default = !feats.is_empty();
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            // 1) build here for the device's target (cross if its libc differs from ours)
+            let bin = match build_locally(&app, &app_dir, &target, &feats, no_default) {
+                Ok((b, _)) => b,
+                Err(e) => { job.finish(json!({"ok": false, "stage": "build", "error": e}).to_string()); return; }
+            };
+            // 2) push the binary to the device's /tmp staging
+            if let Err(e) = deploy::scp_push(&bin.display().to_string(), &user, &host, &format!("/tmp/{app}")) {
+                job.finish(json!({"ok": false, "stage": "push", "error": e}).to_string());
+                return;
+            }
+            // 3) install on the device: ~/.local/bin + .desktop launcher
+            match deploy::remote_capture(&user, &host, &installer::push_install_script(&app, false)) {
+                Ok(_) => job.finish(json!({"ok": true, "app": app, "host": host}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "stage": "install", "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "push"}).to_string())
     }
 
     /// Send a freshly-built binary to a device — and only the binary. Drops it into
