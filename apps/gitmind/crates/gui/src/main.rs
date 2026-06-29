@@ -40,6 +40,7 @@ mod installer;
 mod reclaim;
 mod importer;
 mod places;
+mod merge;
 
 qrc!(register_qml,
     "/" {
@@ -167,6 +168,8 @@ struct Backend {
     place_app: qt_method!(fn(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString),
     local_repos: qt_method!(fn(&self) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
+    explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
+    apply_merge: qt_method!(fn(&self, workspace: QString, branch: QString, target: QString, strategy: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -1590,11 +1593,15 @@ impl Backend {
                     let is_bin = crate_path.join("src/main.rs").is_file()
                         || crate_path.join("src/bin").is_dir()
                         || buildflags::declares_binary(&toml);
+                    let zip_repo = importer::find_repo_root(&dir);
                     job.finish(json!({
                         "ok": true, "dir": dir.display().to_string(),
                         "crate_path": crate_path.display().to_string(),
                         "app": app, "is_bin": is_bin,
                         "description": buildflags::package_description(&toml).unwrap_or_default(),
+                        "has_git": zip_repo.is_some(),
+                        "zip_repo": zip_repo.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+                        "has_gitmind": zip_repo.as_ref().map(|p| p.join(".gitmind").exists()).unwrap_or(false),
                     }).to_string());
                 }
                 None => {
@@ -1874,6 +1881,88 @@ impl Backend {
             }).to_string());
         });
         QString::from(json!({"ok": true, "started": "apply"}).to_string())
+    }
+
+    /// The zip carries its own git history (possibly different authors). Explore how to
+    /// integrate it into `target` by trying a matrix of merge/rebase strategies, each in
+    /// an isolated worktree inside a throwaway workspace — the real repo is untouched.
+    /// Async job "explore" → ranked trials + the workspace holding the result branches.
+    fn explore_merge(&self, zip_repo: QString, target: QString) -> QString {
+        let zip_repo = zip_repo.to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let target = places::expand_home(target.to_string().trim(), &home);
+        if zip_repo.trim().is_empty() { return err_json("import a repo first"); }
+        if target.trim().is_empty() { return err_json("pick a repo to merge into"); }
+        if !std::path::Path::new(&target).join(".git").exists() {
+            return err_json("that folder isn't a git repo");
+        }
+        if !std::path::Path::new(&zip_repo).join(".git").exists() {
+            return err_json("the zip doesn't contain a git repo — use \"Update existing\" instead");
+        }
+        if !self.job.start("explore") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let ws = std::env::temp_dir().join(format!("gitmind-merge-{}-{}", std::process::id(), now_stamp()));
+            let path_env = tool_path_env();
+            match merge::run_exploration(std::path::Path::new(&target), std::path::Path::new(&zip_repo), &ws, &path_env) {
+                Ok(ex) => {
+                    let trials: Vec<_> = ex.trials.iter().map(|t| json!({
+                        "id": t.id, "label": t.label, "ok": t.ok, "conflicts": t.conflicts,
+                        "commits": t.commits, "summary": t.summary, "branch": t.branch,
+                        "recommended": t.recommended,
+                    })).collect();
+                    job.finish(json!({
+                        "ok": true, "workspace": ex.workspace.display().to_string(),
+                        "target_branch": ex.target_branch, "related": ex.related,
+                        "trials": trials,
+                    }).to_string());
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_dir_all(&ws);
+                    job.finish(json!({"ok": false, "error": e}).to_string());
+                }
+            }
+        });
+        QString::from(json!({"ok": true, "started": "explore"}).to_string())
+    }
+
+    /// Land a chosen exploration result into the real `target` repo as a new branch by
+    /// fetching it from the workspace (the real branches are untouched; review + merge
+    /// yourself). Async job "merge". Cleans up the workspace afterward.
+    fn apply_merge(&self, workspace: QString, branch: QString, target: QString, strategy: QString) -> QString {
+        let workspace = workspace.to_string();
+        let branch = branch.to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let target = places::expand_home(target.to_string().trim(), &home);
+        let strategy = strategy.to_string();
+        if workspace.is_empty() || branch.is_empty() { return err_json("explore first, then pick a strategy"); }
+        if !self.job.start("merge") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let newbranch = format!("gitmind-merge-{}-{}", strategy, now_stamp());
+            let spec = format!("{branch}:{newbranch}");
+            let out = std::process::Command::new("git")
+                .args(["fetch", "--quiet", &workspace, &spec])
+                .current_dir(&target).env("PATH", tool_path_env()).output();
+            match out {
+                Ok(o) if o.status.success() => {
+                    // tidy our throwaway workspace (the gitmind-merge-* temp dir)
+                    if let Some(ws_root) = std::path::Path::new(&workspace).parent() {
+                        if ws_root.file_name().map(|n| n.to_string_lossy().starts_with("gitmind-merge-")).unwrap_or(false) {
+                            let _ = std::fs::remove_dir_all(ws_root);
+                        }
+                    }
+                    job.finish(json!({"ok": true, "branch": newbranch}).to_string());
+                }
+                Ok(o) => job.finish(json!({"ok": false, "error": format!("couldn't land the branch: {}", String::from_utf8_lossy(&o.stderr).trim())}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": format!("git fetch: {e}")}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "merge"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
