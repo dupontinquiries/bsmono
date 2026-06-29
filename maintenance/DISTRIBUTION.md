@@ -103,3 +103,16 @@ The installed-key restrictions from the defence-in-depth work (`restrict` +
 `from="<lan/24>"`, no agent/port forwarding outbound) apply to every ssh hop the
 distributor makes, so a compromised device can't ride the install path to the rest
 of the fleet.
+
+## Remote build (offload to the desktop)
+When the phone shouldn't build locally (slow, or no toolchain), pick "build on:
+desktop". The phone (active user) connects to the build host as the `gitmind` fleet
+user and:
+  1. runs `cargo build --release --target <triple> -p <app>` in the host's repo
+     (PATH augmented with ~/.cargo/bin; a cargo error returns as the ssh stderr);
+  2. rsync-pulls `target/<triple>/release/<app>` into `/tmp/<app>` (scp fallback);
+  3. `cp`s `/tmp/<app>` → the active user's `~/.local/bin/<app>` (+chmod);
+  4. writes `~/.local/share/applications/<app>.desktop` (Icon = cached screenshot).
+Set the host's repo path once (persisted at ~/.config/gitmind/build-repo). The
+source repo must exist on BOTH devices — the phone browses it, the desktop builds it.
+Direction is phone-pull (reuses the connection); a desktop-push variant could be added.
