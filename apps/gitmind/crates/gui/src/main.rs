@@ -39,6 +39,7 @@ mod preview;
 mod installer;
 mod reclaim;
 mod importer;
+mod places;
 
 qrc!(register_qml,
     "/" {
@@ -160,6 +161,10 @@ struct Backend {
     reclaim: qt_method!(fn(&self) -> QString),
     import_zip: qt_method!(fn(&self, zip: QString) -> QString),
     build_run: qt_method!(fn(&self, crate_path: QString, app: QString) -> QString),
+    repos_bases: qt_method!(fn(&self) -> QString),
+    import_dest: qt_method!(fn(&self, crate_path: QString, base: QString) -> QString),
+    add_repos_base: qt_method!(fn(&self, path: QString) -> QString),
+    place_app: qt_method!(fn(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -333,6 +338,24 @@ fn build_locally(app: &str, app_dir: &std::path::Path, target: &str, feats: &[St
             "couldn't find cargo. Install Rust, or launch gitmind-gui from a shell where cargo is on PATH (it lives in ~/.cargo/bin).".to_string()
         ),
         Err(e) => Err(format!("couldn't run the build: {e}")),
+    }
+}
+
+/// Append any missing lines to a directory's .gitignore (creating it if needed).
+fn ensure_gitignore(dir: &std::path::Path, lines: &[&str]) {
+    let path = dir.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut out = existing.clone();
+    for line in lines {
+        let present = existing.lines().any(|l| l.trim() == *line);
+        if !present {
+            if !out.is_empty() && !out.ends_with('\n') { out.push('\n'); }
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if out != existing {
+        let _ = std::fs::write(&path, out);
     }
 }
 
@@ -1612,6 +1635,113 @@ impl Backend {
             }
         });
         QString::from(json!({"ok": true, "started": "buildrun"}).to_string())
+    }
+
+    /// The remembered repos bases (most-recent first; ~/Code always present).
+    fn repos_bases(&self) -> QString {
+        QString::from(json!({
+            "ok": true,
+            "default": places::default_repos_base(),
+            "bases": places::repos_bases(),
+        }).to_string())
+    }
+
+    /// Suggested destination for an imported crate under `base`: <base>/<lang>/<name>.
+    fn import_dest(&self, crate_path: QString, base: QString) -> QString {
+        let crate_path = std::path::PathBuf::from(crate_path.to_string());
+        let base = base.to_string();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let lang = places::detect_lang(&crate_path);
+        let toml = std::fs::read_to_string(crate_path.join("Cargo.toml")).unwrap_or_default();
+        let name = buildflags::crate_name(&toml)
+            .or_else(|| crate_path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "app".to_string());
+        let dest = places::suggested_dest(&base, lang, &name, &home);
+        QString::from(json!({"ok": true, "dest": dest.display().to_string(), "lang": lang}).to_string())
+    }
+
+    /// Remember a (possibly new) repos base for the picker. The directory is created
+    /// when a project is actually placed there.
+    fn add_repos_base(&self, path: QString) -> QString {
+        match places::set_repos_base(&path.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true, "bases": places::repos_bases()}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Move an imported crate from its temp dir to `dest`, optionally initializing it
+    /// with git or gitmind, and remember `base`. Async job "place" → {path}.
+    fn place_app(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString {
+        let crate_path = crate_path.to_string();
+        let dest_raw = dest.to_string();
+        let base = base.to_string();
+        let init = init.to_string();
+        if crate_path.trim().is_empty() {
+            return err_json("import an app first");
+        }
+        let home = std::env::var("HOME").unwrap_or_default();
+        let dest = places::expand_home(dest_raw.trim(), &home);
+        if dest.is_empty() {
+            return err_json("choose a destination");
+        }
+        let src = std::path::PathBuf::from(&crate_path);
+        if !src.is_dir() {
+            return err_json("the imported files are no longer there — re-import");
+        }
+        let dpath = std::path::PathBuf::from(&dest);
+        if dpath.exists() {
+            return err_json(&format!("{} already exists — pick another name", dest));
+        }
+        if !self.job.start("place") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            // the temp import root, so we can clean it up afterward
+            let temp_root = {
+                let mut found = None;
+                let mut p: Option<&std::path::Path> = Some(src.as_path());
+                while let Some(cur) = p {
+                    if cur.file_name().map(|n| n.to_string_lossy().starts_with("gitmind-import-")).unwrap_or(false) {
+                        found = Some(cur.to_path_buf());
+                        break;
+                    }
+                    p = cur.parent();
+                }
+                found
+            };
+            // move into place (mv handles cross-filesystem)
+            if let Some(parent) = dpath.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    job.finish(json!({"ok": false, "error": format!("create {}: {e}", parent.display())}).to_string());
+                    return;
+                }
+            }
+            let mv = std::process::Command::new("mv").arg(&src).arg(&dpath)
+                .env("PATH", tool_path_env()).output();
+            match mv {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => { job.finish(json!({"ok": false, "error": format!("move failed: {}", String::from_utf8_lossy(&o.stderr).trim())}).to_string()); return; }
+                Err(e) => { job.finish(json!({"ok": false, "error": format!("move failed: {e}")}).to_string()); return; }
+            }
+            // initialize
+            let gitmind = init == "gitmind";
+            if init == "git" || gitmind {
+                let _ = std::process::Command::new("git").args(["init", "-q"])
+                    .current_dir(&dpath).env("PATH", tool_path_env()).status();
+                ensure_gitignore(&dpath, &places::gitignore_lines(gitmind));
+                if gitmind {
+                    let gmdir = dpath.join(".gitmind");
+                    let _ = std::fs::create_dir_all(&gmdir);
+                    let _ = std::fs::write(gmdir.join("config.toml"), places::gitmind_config_toml());
+                }
+            }
+            // remember the base + tidy the temp wrapper
+            let _ = places::set_repos_base(&base);
+            if let Some(tr) = temp_root { if tr != dpath { let _ = std::fs::remove_dir_all(&tr); } }
+            job.finish(json!({"ok": true, "path": dpath.display().to_string(), "init": init}).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "place"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
