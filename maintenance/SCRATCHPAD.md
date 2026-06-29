@@ -1168,3 +1168,34 @@ bin:/bin:$PATH) so cargo + rustc/linker subprocs resolve from a launcher. NotFou
 import/convert). buildflags test now asserts argv[0]=="cargo". DISTRIBUTION.md cross→cargo.
 VERIFIED: buildflags 7; rustcheck CLEAN. (Other module tests unchanged.) Native-arch build is now the
 zero-setup path; cross-libc target still needs its std (+ musl linker) installed on-device.
+
+── remote build: offload the build to the desktop, install here (app-store feel) ──
+USER: phone requests → desktop cross-builds → rsync binary to /tmp → cp to ~/.local/bin (gitmind
+→ active user) → .desktop launcher; "feels like an app store." DIRECTION CHOSEN: phone-PULL (phone GUI
+as active user ssh's to desktop as gitmind fleet user, builds remotely, rsync-pulls to /tmp, installs
+to active user's ~/.local/bin, writes .desktop). Cleaner than desktop-push, reuses the existing
+connection, matches "requested by my phone." gitmind = remote build identity on the desktop; active
+user = phone GUI user; /tmp = the handoff.
+[installer.rs NEW, 2 tests] bin_dir/desktop_dir(home)→~/.local/{bin,share/applications}. desktop_entry
+(name,exec,icon)→.desktop text (Icon line only if icon non-empty).
+[deploy.rs +rsync, 14 tests] rsync_pull_argv(user,host,remote,local)→[-az,-e,ssh+SSH_OPTS,user@host:
+remote,local]. rsync_pull: try rsync; ENOENT → scp_pull fallback (Alpine phone may lack rsync).
+[fleet.rs build_repo, 5 tests] config_path generalized → config_file(name). build_repo()/set_build_repo
+persisted ~/.config/gitmind/build-repo.
+[main.rs] +mod installer. build_repo/set_build_repo methods. remote_install(app,target,features,host,
+user,repo,icon) ASYNC "rinstall": (1) remote_capture ssh "cd <repo> && export PATH=$HOME/.cargo/bin:
+$PATH && <cargo_build_argv joined>" — cargo error returns as ssh stderr (NO 2>&1). (2) rsync_pull repo/
+built_binary_path → /tmp/<app>. (3) fs::copy /tmp→bin_dir/<app> + set_executable + rm /tmp. (4) write
+desktop_entry → desktop_dir/<app>.desktop (icon=selShot if any). returns {app,binary,launcher} or
+{stage,error}. no_default = features non-empty. rustcheck CLEAN.
+[Fleet.qml] state +buildHere(true)/repoField/rinstallState/rinstallStage. openApp loads build_repo.
+doRemoteInstall (saves repo, calls remote_install, job "rinstall") + saveBuildRepo. applyResult
+"rinstall" branch. UI: "build on: [this device|desktop]" toggle. Local Build button gated buildHere.
+Panel 2 repurposed both modes: buildHere→"Send the binary" (after build); !buildHere→"Build on the
+desktop" (repo field + host picker reused + "Build & install" → enabled when host trusted + repo set).
+device picker (discover/trust/fleet-user) now shared by both modes (visible when !buildHere || built).
+{160}= balanced; all backend.* resolve.
+VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet 5, preview 3,
+installer 2 = 45; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced. ON-DEVICE: remote cargo build,
+rsync (scp fallback), cp, .desktop — needs cargo+target on desktop, ssh as gitmind, source repo on
+BOTH (phone browses, desktop builds). Push-vs-pull: chose pull; desktop-push variant addable.
