@@ -15,6 +15,9 @@ Item {
     property string selApp: ""        // selected crate name ("" = showing the list)
     property string selPath: ""
     property string selDesc: ""
+    property string selOid: ""
+    property string selShot: ""
+    property int shotVer: 0
     property bool selIsCargo: false
     property bool selIsCmake: false
 
@@ -66,6 +69,7 @@ Item {
     function openApp(app) {
         root.selApp = app.name; root.selPath = app.path; root.selDesc = app.description
         root.selIsCargo = app.is_cargo; root.selIsCmake = app.is_cmake
+        root.selOid = app.oid || ""; root.selShot = app.shot || ""
         root.buildState = "idle"; root.builtBinary = ""; root.buildError = ""
         root.sendState = "idle"; root.optionsOpen = false; root.note = ""
         root.target = root.localTarget
@@ -75,6 +79,13 @@ Item {
             root.defaultsByTarget = o.defaults_by_target || ({})
             root.applyDefaults(root.target)
         } else { root.allFeatures = []; root.features = [] }
+    }
+    // Grab a tile screenshot of the just-built app (auto after build, or on demand).
+    function capturePreview() {
+        if (root.builtBinary.length === 0) return
+        var r = JSON.parse(backend.capture_preview(root.selApp, root.selOid, root.builtBinary))
+        if (!r.ok) { root.note = "preview: " + r.error; return }
+        root.busy = true; root.jobKind = "shot"; poller.start()
     }
     function backToList() { root.selApp = ""; root.note = "" }
     function applyDefaults(t) {
@@ -167,8 +178,13 @@ Item {
         } else if (k === "build") {
             if (res.ok) {
                 root.buildState = "built"; root.builtBinary = res.binary; root.builtSize = res.size; root.note = ""
+                root.capturePreview()
             } else {
                 root.buildState = "failed"; root.buildError = res.error; root.note = ""
+            }
+        } else if (k === "shot") {
+            if (res.ok && res.shot && res.shot.length) {
+                root.selShot = res.shot; root.shotVer++
             }
         } else if (k === "send") {
             if (res.ok) { root.sendState = "sent"; root.note = "✓ " + res.msg }
@@ -214,9 +230,17 @@ Item {
                             x: 12; y: 10; width: parent.width - 24; spacing: 4
                             Row {
                                 width: parent.width; spacing: 10
-                                Rectangle {
-                                    width: 38; height: 38; radius: 10; color: "#2a3350"; border.color: "#7aa2f7"
-                                    Label { anchors.centerIn: parent; text: modelData.name.substring(0,1).toUpperCase(); color: "#7aa2f7"; font.bold: true; font.pixelSize: 18 }
+                                Item {
+                                    width: 40; height: 40
+                                    Image {
+                                        anchors.fill: parent; visible: modelData.shot.length > 0
+                                        source: modelData.shot.length ? "file://" + modelData.shot : ""
+                                        fillMode: Image.PreserveAspectCrop; cache: false; asynchronous: true
+                                    }
+                                    MonoTile {
+                                        anchors.fill: parent; visible: modelData.shot.length === 0
+                                        appName: modelData.name; oid: modelData.oid
+                                    }
                                 }
                                 Column {
                                     width: parent.width - 48; spacing: 1
@@ -247,12 +271,21 @@ Item {
                 }
                 Row {
                     width: parent.width; spacing: 12
-                    Rectangle {
-                        width: 52; height: 52; radius: 14; color: "#2a3350"; border.color: "#7aa2f7"
-                        Label { anchors.centerIn: parent; text: root.selApp.substring(0,1).toUpperCase(); color: "#7aa2f7"; font.bold: true; font.pixelSize: 24 }
+                    Item {
+                        width: 58; height: 58
+                        Image {
+                            anchors.fill: parent; visible: root.selShot.length > 0
+                            source: root.selShot.length ? "file://" + root.selShot + "?v=" + root.shotVer : ""
+                            fillMode: Image.PreserveAspectCrop; cache: false; asynchronous: true
+                        }
+                        MonoTile {
+                            anchors.fill: parent; visible: root.selShot.length === 0
+                            appName: root.selApp; oid: root.selOid
+                        }
+                        BusyIndicator { anchors.centerIn: parent; running: root.jobKind === "shot"; visible: running; width: 28; height: 28 }
                     }
                     Column {
-                        width: parent.width - 64; spacing: 2
+                        width: parent.width - 70; spacing: 2
                         Label { text: root.selApp; color: "#cdd6f4"; font.bold: true; font.pixelSize: 20 }
                         Label {
                             width: parent.width
@@ -305,10 +338,19 @@ Item {
                             }
                         }
                         // build button + status
-                        Button {
-                            text: root.buildState === "building" ? "building…" : (root.buildState === "built" ? "rebuild" : "Build")
-                            enabled: !root.busy && root.selIsCargo
-                            onClicked: root.doBuild()
+                        Row {
+                            spacing: 8
+                            Button {
+                                text: root.buildState === "building" ? "building…" : (root.buildState === "built" ? "rebuild" : "Build")
+                                enabled: !root.busy && root.selIsCargo
+                                onClicked: root.doBuild()
+                            }
+                            Button {
+                                text: root.jobKind === "shot" ? "grabbing…" : "re-grab preview"
+                                visible: root.buildState === "built"
+                                enabled: !root.busy
+                                onClicked: root.capturePreview()
+                            }
                         }
                         Label {
                             width: parent.width; visible: !root.selIsCargo

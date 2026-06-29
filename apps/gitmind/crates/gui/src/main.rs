@@ -35,6 +35,7 @@ mod bttransfer;
 mod appcatalog;
 mod buildflags;
 mod fleet;
+mod preview;
 
 qrc!(register_qml,
     "/" {
@@ -46,6 +47,7 @@ qrc!(register_qml,
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
         "qml/Fleet.qml",
+        "qml/MonoTile.qml",
         "qml/Files.qml",
         "qml/Network.qml",
     },
@@ -140,6 +142,7 @@ struct Backend {
     local_apps: qt_method!(fn(&self) -> QString),
     local_build_options: qt_method!(fn(&self, path: QString) -> QString),
     build_app: qt_method!(fn(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString),
+    capture_preview: qt_method!(fn(&self, app: QString, oid: QString, binary: QString) -> QString),
     send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
@@ -176,6 +179,20 @@ fn repo() -> Result<GitCli, String> {
 
 fn err_json(e: &str) -> QString {
     QString::from(json!({"ok": false, "error": e}).to_string())
+}
+
+/// The commit oid of the last change touching an app's directory — the seed for its
+/// tile colour + warp. Empty if not in a git repo or git isn't available.
+fn app_oid(root: &std::path::Path, dir: &std::path::Path) -> String {
+    std::process::Command::new("git")
+        .arg("-C").arg(root)
+        .args(["log", "-1", "--format=%H", "--"])
+        .arg(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
@@ -1055,24 +1072,30 @@ impl Backend {
                 }
                 let cargo = dir.join("Cargo.toml");
                 let cmake = dir.join("CMakeLists.txt");
-                if cargo.is_file() {
+                let (name, desc, is_cargo) = if cargo.is_file() {
                     let txt = std::fs::read_to_string(&cargo).unwrap_or_default();
-                    if let Some(name) = buildflags::crate_name(&txt) {
-                        apps.push(json!({
-                            "name": name,
-                            "path": dir.display().to_string(),
-                            "description": buildflags::package_description(&txt).unwrap_or_default(),
-                            "is_cargo": true,
-                            "is_cmake": cmake.is_file(),
-                        }));
+                    match buildflags::crate_name(&txt) {
+                        Some(n) => (n, buildflags::package_description(&txt).unwrap_or_default(), true),
+                        None => continue,
                     }
                 } else if cmake.is_file() {
-                    let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
-                    apps.push(json!({
-                        "name": name, "path": dir.display().to_string(),
-                        "description": "", "is_cargo": false, "is_cmake": true,
-                    }));
-                }
+                    (dir.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string(), String::new(), false)
+                } else {
+                    continue;
+                };
+                // per-app commit oid → the tile's identity colour; cached shot if any
+                let oid = app_oid(&root, &dir);
+                let shot = preview::shot_path(&name, &oid);
+                let shot_str = if shot.is_file() { shot.display().to_string() } else { String::new() };
+                apps.push(json!({
+                    "name": name,
+                    "path": dir.display().to_string(),
+                    "description": desc,
+                    "is_cargo": is_cargo,
+                    "is_cmake": cmake.is_file(),
+                    "oid": oid,
+                    "shot": shot_str,
+                }));
             }
         }
         apps.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
@@ -1147,6 +1170,39 @@ impl Backend {
             job.finish(payload);
         });
         QString::from(json!({"ok": true, "started": "build"}).to_string())
+    }
+
+    /// Grab a tile screenshot of a freshly-built app: launch it offscreen, let it
+    /// settle, capture a 1000x1000 square (or report no GUI). Local + best-effort —
+    /// poll for the result (kind "shot"); a headless app comes back without an image
+    /// and the GUI keeps the hash monogram.
+    fn capture_preview(&self, app: QString, oid: QString, binary: QString) -> QString {
+        let (app, oid, bin) = (app.to_string(), oid.to_string(), binary.to_string());
+        if bin.trim().is_empty() {
+            return err_json("build the app first");
+        }
+        if !self.job.start("shot") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let out = preview::shot_path(&app, &oid);
+            let _ = std::fs::create_dir_all(out.parent().unwrap_or(std::path::Path::new("/tmp")));
+            let script = preview::capture_script(&bin, &out.display().to_string());
+            let res = std::process::Command::new("sh").arg("-c").arg(&script).output();
+            let payload = match res {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout);
+                    match preview::parse_capture(&stdout) {
+                        Some(path) => json!({"ok": true, "app": app, "shot": path}).to_string(),
+                        None => json!({"ok": true, "app": app, "shot": ""}).to_string(),
+                    }
+                }
+                Err(e) => json!({"ok": false, "error": format!("couldn't capture: {e}")}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "shot"}).to_string())
     }
 
     /// Send a freshly-built binary to a device — and only the binary. Drops it into
