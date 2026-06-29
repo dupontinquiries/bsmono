@@ -213,6 +213,33 @@ pub fn scp_pull(user: &str, host: &str, remote: &str, local: &str) -> Result<(),
     }
 }
 
+/// `scp <hardened opts> <local> user@host:<remote>` argv — push a file (a freshly
+/// built binary) out to a device. Pure — unit-tested.
+pub fn scp_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
+    let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
+    a.push(local.to_string());
+    a.push(format!("{user}@{host}:{remote}"));
+    a
+}
+
+/// Push a local file to a device over scp, creating the destination dir first.
+/// On-device.
+pub fn scp_push(local: &str, user: &str, host: &str, remote: &str) -> Result<(), String> {
+    if let Some(dir) = remote.rsplit_once('/').map(|(d, _)| d) {
+        // best-effort: ensure the target directory exists
+        let _ = remote_capture(user, host, &format!("mkdir -p {}", shell_quote(dir)));
+    }
+    let st = Command::new("scp")
+        .args(scp_push_argv(local, user, host, remote))
+        .status()
+        .map_err(|e| format!("scp: {e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("scp failed (exit {:?}) sending to {host}", st.code()))
+    }
+}
+
 /// Parse `ls -1Ap` output into directory names. Pure — unit-tested.
 pub fn parse_dir_listing(stdout: &str) -> Vec<String> {
     stdout
@@ -897,6 +924,11 @@ mod tests {
         assert!(s.contains(&"ForwardAgent=no".to_string()));
         assert_eq!(s[s.len() - 2], "kesslerd@192.168.1.7:target/x/release/app");
         assert_eq!(s[s.len() - 1], "/tmp/app");
+        // push is the same, reversed (local then user@host:remote)
+        let p = scp_push_argv("/repo/target/app", "gitmind", "192.168.1.9", "/home/gitmind/.local/bin/app");
+        assert!(p.contains(&"ForwardAgent=no".to_string()));
+        assert_eq!(p[p.len() - 2], "/repo/target/app");
+        assert_eq!(p[p.len() - 1], "gitmind@192.168.1.9:/home/gitmind/.local/bin/app");
     }
 
     #[test]
