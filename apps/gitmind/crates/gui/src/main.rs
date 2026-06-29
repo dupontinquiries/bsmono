@@ -38,6 +38,7 @@ mod fleet;
 mod preview;
 mod installer;
 mod reclaim;
+mod importer;
 
 qrc!(register_qml,
     "/" {
@@ -49,6 +50,7 @@ qrc!(register_qml,
         "qml/PeekViewer.qml",
         "qml/Apps.qml",
         "qml/Fleet.qml",
+        "qml/Import.qml",
         "qml/Push.qml",
         "qml/Settings.qml",
         "qml/DevicePicker.qml",
@@ -156,6 +158,8 @@ struct Backend {
     cleanup_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     reclaimable: qt_method!(fn(&self) -> QString),
     reclaim: qt_method!(fn(&self) -> QString),
+    import_zip: qt_method!(fn(&self, zip: QString) -> QString),
+    build_run: qt_method!(fn(&self, crate_path: QString, app: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -1513,6 +1517,101 @@ impl Backend {
             }).to_string());
         });
         QString::from(json!({"ok": true, "started": "reclaim"}).to_string())
+    }
+
+    /// Import a Rust app from a .zip: extract it into a fresh temp dir and find the
+    /// crate to build. `zip` may be a file:// URL (from the picker) or a path. Async
+    /// job "import" → {dir, crate_path, app, is_bin}.
+    fn import_zip(&self, zip: QString) -> QString {
+        let raw = zip.to_string();
+        let path = raw.strip_prefix("file://").unwrap_or(&raw).to_string();
+        if path.trim().is_empty() {
+            return err_json("no file chosen");
+        }
+        if !std::path::Path::new(&path).is_file() {
+            return err_json(&format!("not a file: {path}"));
+        }
+        if !self.job.start("import") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let dir = importer::import_dir();
+            let script = importer::extract_command(&path, &dir.display().to_string());
+            let out = std::process::Command::new("sh").arg("-c").arg(&script)
+                .env("PATH", tool_path_env())
+                .output();
+            match out {
+                Ok(o) if o.status.success() => {}
+                Ok(o) => {
+                    let err = String::from_utf8_lossy(&o.stdout) + String::from_utf8_lossy(&o.stderr);
+                    let msg = if err.contains("GITMIND_NO_UNZIP") {
+                        "no zip extractor found — install unzip (or bsdtar / python3)".to_string()
+                    } else {
+                        format!("couldn't extract the zip: {}", err.trim())
+                    };
+                    job.finish(json!({"ok": false, "error": msg}).to_string());
+                    return;
+                }
+                Err(e) => {
+                    job.finish(json!({"ok": false, "error": format!("couldn't run the extractor: {e}")}).to_string());
+                    return;
+                }
+            }
+            match importer::find_crate_root(&dir) {
+                Some(crate_path) => {
+                    let toml = std::fs::read_to_string(crate_path.join("Cargo.toml")).unwrap_or_default();
+                    let app = buildflags::crate_name(&toml).unwrap_or_else(|| "app".to_string());
+                    let is_bin = crate_path.join("src/main.rs").is_file()
+                        || crate_path.join("src/bin").is_dir()
+                        || buildflags::declares_binary(&toml);
+                    job.finish(json!({
+                        "ok": true, "dir": dir.display().to_string(),
+                        "crate_path": crate_path.display().to_string(),
+                        "app": app, "is_bin": is_bin,
+                        "description": buildflags::package_description(&toml).unwrap_or_default(),
+                    }).to_string());
+                }
+                None => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    job.finish(json!({"ok": false, "error": "no Cargo.toml found in the zip"}).to_string());
+                }
+            }
+        });
+        QString::from(json!({"ok": true, "started": "import"}).to_string())
+    }
+
+    /// Build the imported crate (natively, for this device) and launch it. Async job
+    /// "buildrun" → on success the app is spawned detached and {binary} returned.
+    fn build_run(&self, crate_path: QString, app: QString) -> QString {
+        let crate_path = crate_path.to_string();
+        let app = app.to_string();
+        if crate_path.trim().is_empty() || app.trim().is_empty() {
+            return err_json("import an app first");
+        }
+        if !self.job.start("buildrun") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let dir = std::path::PathBuf::from(&crate_path);
+            let native = native_triple_local();
+            match build_locally(&app, &dir, &native, &[], false) {
+                Ok((bin, _)) => {
+                    // launch detached — for a GUI app this opens its window
+                    match std::process::Command::new(&bin)
+                        .current_dir(&dir)
+                        .env("PATH", tool_path_env())
+                        .spawn()
+                    {
+                        Ok(_) => job.finish(json!({"ok": true, "app": app, "binary": bin.display().to_string()}).to_string()),
+                        Err(e) => job.finish(json!({"ok": false, "stage": "run", "error": format!("built, but couldn't launch: {e}")}).to_string()),
+                    }
+                }
+                Err(e) => job.finish(json!({"ok": false, "stage": "build", "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "buildrun"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {

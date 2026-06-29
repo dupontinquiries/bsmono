@@ -1365,3 +1365,32 @@ balanced; backend.* resolve. SCOPE: scans the CURRENT repo root (handles its per
 voiceterm's 1.9G); other tmpN clones reclaimed when opened in them (all-repos-under-$HOME = future).
 ALL 3 follow-ups from the cache/discovery/expiry turn now DONE (push page, keys/settings, reclaim).
 Still deferred: per-key last-accessed + network-seen (needs sshd VERBOSE/lastlog parsing).
+
+── import a .zip → build → launch a Rust app (file picker) ──
+USER: pick a .zip via GUI file picker → extract to a brand-new temp dir → build + launch the Rust app.
+Checked status: feature did NOT exist (no zip/extract/filedialog/launch anywhere) → built from scratch.
+[importer.rs NEW, 2 tests] import_dir()→unique /tmp/gitmind-import-<pid>-<nanos>. extract_command(zip,
+dir)→sh chain: unzip -o -q → bsdtar -xf → python3 -m zipfile -e (first available), else echo
+GITMIND_NO_UNZIP+exit 1; single-quoted (space-safe). find_crate_root(dir)→shallowest dir with a
+Cargo.toml (zips usually wrap the project in one folder; min by path-component count, depth≤6, skips
+hidden, doesn't descend into a found crate). NO zip crate dep — shells out, consistent with ssh/scp/
+cargo pattern.
+[main.rs] +mod importer. import_zip(zip) async "import": strip file:// (picker gives a url); is_file
+guard; mkdir import_dir; run extract_command via sh w/ PATH; GITMIND_NO_UNZIP→"install unzip" msg;
+find_crate_root→read crate_name + is_bin (src/main.rs||src/bin||[[bin]]) + description→{dir,crate_path,
+app,is_bin,description}; no Cargo.toml→error + rm dir. build_run(crate_path,app) async "buildrun":
+build_locally(native_triple_local) → spawn binary DETACHED (current_dir=crate, PATH env) → {app,binary}
+| {stage:build|run,error}. Imported crate has no .gitmind → build_locally builds to the crate's OWN
+temp target/ (not shared cache). rustcheck CLEAN.
+[Import.qml NEW tab] import QtQuick.Dialogs; FileDialog (nameFilters *.zip) → importZip(selectedFile.
+toString()) → job "import" → found-crate card (app/desc/dir + "library—no app to run" badge if !is_bin)
+→ "Build & run" → build_run job "buildrun" → build-error card (monospace) | "Running: <binary>". Own
+poller (import/buildrun). main.qml: Import{id:importp} at index 6; "import" TabButton. qrc Import.qml.
+TABS now 10: status/timeline/branches/files/apps/fleet/import/push/settings/network (page order == tab
+order; currentIndex refs line84=3 files + line133 passthrough still valid).
+VERIFIED: importer 2, deploy 15, installer 4, buildflags 11, fleet 5, reclaim 2, appcatalog 7, netshare
+4, bttransfer 3, preview 3 = 56; rustcheck CLEAN; Import/Fleet/Push/Settings/DevicePicker/MonoTile/main/
+Network balanced; backend.* in Import resolve; 10 pages == 10 tabs.
+ON-DEVICE CAVEATS: extraction needs unzip|bsdtar|python3 (clear error otherwise); build needs cargo;
+launch needs a display (GUI app opens its window — gitmind-gui already runs under one so the child
+inherits it). CLI apps that exit immediately won't show much (spawned detached, not waited).
