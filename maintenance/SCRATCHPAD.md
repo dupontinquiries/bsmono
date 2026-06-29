@@ -1394,3 +1394,30 @@ Network balanced; backend.* in Import resolve; 10 pages == 10 tabs.
 ON-DEVICE CAVEATS: extraction needs unzip|bsdtar|python3 (clear error otherwise); build needs cargo;
 launch needs a display (GUI app opens its window — gitmind-gui already runs under one so the child
 inherits it). CLI apps that exit immediately won't show much (spawned detached, not waited).
+
+── import: save to a configurable repos location + git/gitmind init ──
+USER: import should ALSO ask init-with-gitmind-or-git + WHERE to place (always-available repos location,
+default ~/Code/{lang}/..., specify + create new paths).
+[places.rs NEW, 3 tests] default_repos_base()=~/Code. repos_bases() reads ~/.config/gitmind/repos-base
+(most-recent first) + ALWAYS includes ~/Code. set_repos_base = push_history (prepend+dedupe+cap8).
+push_history(list,item,cap) PURE. expand_home(path,home) PURE (~→home). sanitize_name PURE (safe dir
+name, ""→"app"). detect_lang(dir)→rust|cmake|go|node|python|other (by manifest file). suggested_dest(
+base,lang,name,home)=expand_home(base)/lang/sanitize(name) PURE. gitmind_config_toml()→[gitmind] marker
+content. gitignore_lines(gitmind)→/target/ (+ /.gitmind/store.redb if gitmind). [fleet.rs] config_file
+made pub (reused by places — NO dup).
+[main.rs] +mod places. +ensure_gitignore(dir,lines) free fn (append missing). repos_bases()→{default,
+bases}. import_dest(crate_path,base)→{dest,lang} (reads crate name from Cargo.toml, detect_lang). add_
+repos_base(path)→set_repos_base→{bases}. place_app(crate_path,dest,base,init) async "place": expand ~;
+refuse if dest exists (no clobber); mkdir parent; `mv` (cross-fs); init: git→git init -q + gitignore;
+gitmind→+.gitmind/config.toml + gitignore store; remember base; rm the gitmind-import- temp wrapper →
+{path,init}. rustcheck CLEAN.
+[Import.qml] found-card extended: "Initialize as" pills (gitmind+git | git only | none, default gitmind);
+"Save in" editable ComboBox (model=repos_bases, default ~/Code, type a new path to create); lang-folder
+hint; editable destination TextField (prefilled <base>/<lang>/<name> via import_dest, recomputes on base
+change). Buttons: Save & run (place→chain build_run on NEW path), Save only, Run once (ephemeral from
+temp). Poller +place: on ok cratePath=res.path, placed=true, auto build_run if runAfterPlace. Placing
+with gitmind makes it a .gitmind repo → future builds use shared cache.
+VERIFIED: places 3, importer 2, deploy 15, installer 4, buildflags 11, fleet 5, reclaim 2, appcatalog 7,
+netshare 4, bttransfer 3, preview 3 = 59; rustcheck CLEAN; all 8 QML balanced; Import backend.* (6)
+resolve. ON-DEVICE: mv/git need to be on PATH (tool_path_env covers ~/.cargo/bin:/usr/local/bin:/usr/
+bin:/bin); ~/Code created on first place.
