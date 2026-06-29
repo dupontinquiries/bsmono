@@ -1155,3 +1155,16 @@ grabbing. Flat letter avatar removed. {140}= balanced, MonoTile balanced, all ba
 VERIFIED: deploy 14, buildflags 7, appcatalog 7, netshare 4, bttransfer 3, fleet 5, preview 3 = 43
 tests; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced. ON-DEVICE: Xvfb launch/grab (needs
 xvfb+imagemagick; per-distro tuning, window-vs-root crop, 1s timing); monogram is pure QML (no deps).
+
+── fix: build failed with ENOENT (os error 2) ──
+USER on-device: "no such file or directory os error 2 when trying to build". CAUSE: build_app
+ran Command::new("cross") — cross (a) needs Docker/Podman (unviable on the phone) and (b) lives in
+~/.cargo/bin which a Plasma-LAUNCHER-spawned GUI's minimal PATH omits → ENOENT on argv[0].
+FIX: cargo_build_argv "cross"→"cargo" (plain cargo --target, no container; native target just works,
+other libc needs `rustup target add`). build_app: resolve cargo via cargo_bin() ($CARGO →
+~/.cargo/bin/cargo → "cargo") + run with env PATH=tool_path_env() (~/.cargo/bin:/usr/local/bin:/usr/
+bin:/bin:$PATH) so cargo + rustc/linker subprocs resolve from a launcher. NotFound → clear message
+("install Rust / launch where cargo is on PATH"). capture_preview sh -c also gets tool_path_env (Xvfb/
+import/convert). buildflags test now asserts argv[0]=="cargo". DISTRIBUTION.md cross→cargo.
+VERIFIED: buildflags 7; rustcheck CLEAN. (Other module tests unchanged.) Native-arch build is now the
+zero-setup path; cross-libc target still needs its std (+ musl linker) installed on-device.
