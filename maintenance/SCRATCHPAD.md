@@ -1482,3 +1482,42 @@ appcatalog 7, netshare 4, bttransfer 3, preview 3 = 64; rustcheck CLEAN; all 8 Q
 backend.* (10) resolve. ON-DEVICE: needs git (worktree); explore is read-only on real repo (works on a
 --local clone); apply only fetches a branch in (never moves your branches). gitmind-store merge NOT done
 (unneeded — regenerates from git).
+
+── shared cockpit lib: GUI + CLI share one implementation (CLI gets fleet capabilities) ──
+USER: "make sure the cli has the capabilities that the gui is by letting them share libraries."
+DECISION: extract every Qt-free GUI module + the orchestration glue into a new `cockpit` lib crate;
+GUI and CLI both depend on it. Lib + CLI are Qt-free → buildable AND testable in the sandbox (unlike the
+GUI), a big verification win.
+WHAT MOVED (git mv, history preserved): 13 modules gui/src → cockpit/src (appcatalog, browse, bttransfer,
+buildflags, deploy, fleet, importer, installer, merge, netshare, places, preview, reclaim). Only cross-ref
+places→crate::fleet (still valid inside cockpit). fleet::config_file made pub.
+NEW cockpit::ops (was free fns in gui main.rs): app_oid, cargo_bin, tool_path_env, native_triple_local,
+gitmind_root, shared_target_dir, resolve_binary, build_locally, ensure_gitignore, now_stamp,
+set_executable, provision_fleet_user. They call crate::buildflags/deploy/fleet. `pub use ops::*`.
+  ** REAL COMPILE CAUGHT A LATENT BUG rustcheck missed: provision_fleet_user called
+     authorized_keys_options(host) with ONE arg, but the keys-page work had changed it to (host, expiry).
+     Never caught because the GUI can't compile here (no Qt). Fixed: passes Some(weekly expiry). **
+NEW cockpit::flow (frontend-agnostic orchestration returning plain structs, no Qt/JSON/threads):
+import(zip)->Import; build_and_run(crate,app)->PathBuf; place(crate,dest,base,init)->PathBuf;
+apply_overlay(crate,target,mirror,zipname)->ApplyResult; explore(zip_repo,target)->merge::Exploration;
+land_merge(ws,branch,target,strategy)->String; reclaim_scan(root)->ReclaimScan; reclaim_apply(root)->(n,freed).
+GUI REWIRE: main.rs drops `mod X;` (13) + the moved free-fn defs; adds `use cockpit::{...modules}` +
+`use cockpit::{...helpers}` so call-sites read unchanged. KEPT in gui (store/Qt-specific): repo(), err_json
+(QString), gstore(), identity(), sync_worktree(). gui Cargo.toml: +cockpit, −net-kit (now transitive).
+The 8 Backend methods (reclaimable/reclaim/import_zip/build_run/place_app/apply_to_repo/explore_merge/
+apply_merge) now DELEGATE to cockpit::flow — same JSON keys for QML, zero orchestration duplication.
+Trimmed now-unused gui imports (importer/merge/reclaim modules; ensure_gitignore/shared_target_dir helpers).
+CLI: +cockpit dep; new `gitmind fleet <import|build|apply|merge|reclaim>` group (cli/src/lib.rs cmd_fleet),
+all over cockpit::flow:
+  fleet import <zip> [--run|--save <dir> --init gitmind|git|none --base <dir>]
+  fleet build <crate-path> [app] [--target T]
+  fleet apply <zip> <repo> [--mirror]            (overlay onto a branch, prints diffstat + review cmd)
+  fleet merge <zip> <repo> [--strategy <id>]     (explore ranked strategies; --strategy lands one)
+  fleet reclaim <repo-root> [--apply]
+WORKSPACE: cockpit added to members AND default-members (Qt-free → `cargo build` includes it).
+VERIFIED IN SANDBOX: `cargo build -p cockpit` clean; `cargo test -p cockpit` = 65 passed (one real compile of
+the whole module set — supersedes the per-module stub harnesses); `cargo check -p gitmind-cli --lib` clean
+(typechecks cmd_fleet against cockpit); rustcheck gui + cockpit CLEAN. NOT runnable here: the cli BINARY link
+Bus-errors / ENOSPC — ENVIRONMENTAL (huge static bin via gitmind-core zip/zstd/lzma), not a code error;
+`cargo check` proves the code. GUI still unbuildable w/o Qt (rustcheck only) — flow delegation keeps exact
+JSON keys so QML is unaffected; on-device build confirms.
