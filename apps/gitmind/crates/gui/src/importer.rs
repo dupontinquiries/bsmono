@@ -60,6 +60,33 @@ pub fn find_crate_root(dir: &Path) -> Option<PathBuf> {
     found.into_iter().min_by_key(|p| p.components().count())
 }
 
+/// Find the shallowest directory in an extracted tree that is itself a git repo (has a
+/// .git). Some zips carry their own history; this locates it. Pure — unit-tested.
+pub fn find_repo_root(dir: &Path) -> Option<PathBuf> {
+    fn walk(dir: &Path, depth: u32) -> Option<PathBuf> {
+        if depth > 6 {
+            return None;
+        }
+        if dir.join(".git").exists() {
+            return Some(dir.to_path_buf());
+        }
+        let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .filter(|p| !p.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false))
+            .collect();
+        subs.sort();
+        for s in subs {
+            if let Some(found) = walk(&s, depth + 1) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(dir, 0)
+}
+
 /// Shell that overlays the extracted files (`src`) onto an existing repo (`dst`) with
 /// rsync, always protecting the repo's own .git/.gitmind. `mirror` adds --delete so the
 /// repo ends up matching the zip exactly (files the zip dropped are removed too). Prints
@@ -111,5 +138,20 @@ mod tests {
         assert!(o.contains("GITMIND_NO_RSYNC"), "clear error when rsync absent");
         let m = overlay_command("/tmp/extract", "/dst", true);
         assert!(m.contains("rsync -a --delete --exclude='.git'"), "mirror deletes, still protects .git");
+    }
+
+    #[test]
+    fn detects_a_repo_inside_the_zip() {
+        let base = std::env::temp_dir().join(format!("gm-imprepo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("proj/.git")).unwrap();
+        fs::write(base.join("proj/Cargo.toml"), "x").unwrap();
+        assert!(find_repo_root(&base).unwrap().ends_with("proj"));
+        let plain = std::env::temp_dir().join(format!("gm-norepo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&plain);
+        fs::create_dir_all(plain.join("src")).unwrap();
+        assert!(find_repo_root(&plain).is_none(), "no .git → no repo");
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&plain);
     }
 }

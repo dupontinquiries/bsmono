@@ -1449,3 +1449,36 @@ VERIFIED: importer 3, places 3, deploy 15, installer 4, buildflags 11, fleet 5, 
 netshare 4, bttransfer 3, preview 3 = 60; rustcheck CLEAN; all 8 QML balanced; Import backend.* (8)
 resolve. ON-DEVICE: rsync REQUIRED for update mode (clear error otherwise); target must be a clean git
 repo; leaves repo checked out on the import branch (reports base to return to).
+
+── import: "Merge histories" mode (zip is a git repo → explore strategies) ──
+USER: zip may CONTAIN a .git/.gitmind with different authors. Bring its history in as a branch (not
+flattened onto first commit); try several auto-merge/rebase options in a SAFE tmp workspace; rank.
+KEY INSIGHT: gitmind store regenerates from git history → merging the GIT side suffices; .gitmind catches
+up. So this is a git-history explorer.
+[merge.rs NEW, 3 tests incl. 2 REAL git integration tests] Strategy{id,label,rebase,x_option(ours|
+theirs),allow_unrelated}. strategies(related)→matrix (related: merge/merge-theirs/merge-ours/rebase/
+rebase-theirs; unrelated: merge-unrelated[-theirs/-ours]+rebase). rank(trials) PURE: clean-first then
+fewest-conflicts; recommends clean plain "merge" else first clean else least-conflict. run_exploration(
+target,zip_repo,ws,path_env): git clone --local target→ws/repo; fetch zip HEAD→gmzip ref; related=merge-
+base exists; per strategy: `worktree add --detach` at (target_branch | gmzip for rebase) → run merge/
+rebase [-X opt][--allow-unrelated] → conflicts=diff --diff-filter=U count → ok→`branch -f gm-<id>`
+(persists in shared object store) else abort → worktree remove. Identity via `-c user.name/email` so
+commit-creating ops never fail on unconfigured env. REAL TESTS: divergent non-overlapping edits by
+Alice/Bob → clean merge, zip commit counted, gm-merge branch persisted; same-line edit → plain merge
+conflicts but merge-theirs clean.
+[importer.rs +1 test=4] find_repo_root(dir)→shallowest dir w/ .git (depth≤6, skip hidden). import_zip
+now reports has_git/zip_repo/has_gitmind.
+[main.rs] +mod merge. explore_merge(zip_repo,target) async "explore": guards (both git repos) →
+run_exploration in /tmp/gitmind-merge-<pid>-<ts> → {workspace,target_branch,related,trials[]}. apply_
+merge(workspace,branch,target,strategy) async "merge": `git -C target fetch <workspace> gm-<id>:gitmind-
+merge-<strategy>-<ts>` (lands result branch in REAL repo; main untouched) → cleanup ws (guarded to
+gitmind-merge- dir). rustcheck CLEAN.
+[Import.qml] mode toggle now New/Update/Merge (Merge pill only if hasGit). SHARED repo picker for update+
+merge (de-dup). Merge block: "Explore strategies"→explore; per-trial cards ranked (recommended green
+badge, summary, conflict count) + "Land as branch" (clean only)→apply_merge. has-git/has-gitmind badge on
+found-card.
+VERIFIED: merge 3, importer 4, places 3, deploy 15, installer 4, buildflags 11, fleet 5, reclaim 2,
+appcatalog 7, netshare 4, bttransfer 3, preview 3 = 64; rustcheck CLEAN; all 8 QML balanced; Import
+backend.* (10) resolve. ON-DEVICE: needs git (worktree); explore is read-only on real repo (works on a
+--local clone); apply only fetches a branch in (never moves your branches). gitmind-store merge NOT done
+(unneeded — regenerates from git).
