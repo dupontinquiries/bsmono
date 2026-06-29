@@ -11,9 +11,9 @@ the compiler error) → **Send the binary** to a chosen+trusted device (scp into
 `~/.local/bin`, marked executable).
 
 Backend: `local_apps` (scan the working tree, crate names from `[package] name`),
-`local_build_options` (per-app flags + per-arch defaults), `build_app` (local cross
+`local_build_options` (per-app flags + per-arch defaults), `build_app` (local cargo
 build, async, status carries the binary path+size or the error), `send_binary` (scp
-push, binary only). The cross build + scp run on-device; parsing + command
+push, binary only). The build (plain cargo) + scp run on-device; parsing + command
 construction are unit-tested.
 
 ---
@@ -41,7 +41,7 @@ log into GUI                                  log into GUI
   ├─ "download + install" ──┐                    │
   │   pick a build target   │                    │
   │                         └──────────────────▶ cross_build_argv(app, triple)
-  │                                              → cross build --release --target …
+  │                                              → cargo build --release --target …
   │                                              │
   └─ binary lands in ~/.local/bin  ◀───────────  ship to install_dir(home)
       (or /tmp then the device cp's it)           (scp over the existing ssh seam)
