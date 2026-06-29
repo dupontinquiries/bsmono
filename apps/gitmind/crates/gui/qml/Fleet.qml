@@ -11,8 +11,12 @@ Item {
     id: root
 
     // ── app pages (local, from gitmind's repos) ──────────────────────────
-    property var apps: []             // [{name, path, description, is_cargo, is_cmake}]
+    property var apps: []             // [{name, path, description, is_cargo, is_cmake, is_bin, group}]
+    property string search: ""        // fuzzy filter text
+    property string kindFilter: "all" // all | app | lib
+    property var shownApps: filterApps(apps, search, kindFilter)
     property string selApp: ""        // selected crate name ("" = showing the list)
+    property bool selIsBin: true
     property string selPath: ""
     property string selDesc: ""
     property string selRel: ""
@@ -66,6 +70,29 @@ Item {
     }
 
     // ── app list / page ──────────────────────────────────────────────────
+    // fuzzy filter over name/description/group; kind = all|app|lib
+    function fuzzy(hay, needle) {
+        var j = 0
+        for (var i = 0; i < hay.length && j < needle.length; i++) if (hay[i] === needle[j]) j++
+        return j === needle.length
+    }
+    function filterApps(list, q, kind) {
+        var ql = (q || "").toLowerCase().trim()
+        var out = []
+        for (var i = 0; i < list.length; i++) {
+            var a = list[i]
+            if (kind === "app" && !a.is_bin) continue
+            if (kind === "lib" && a.is_bin) continue
+            if (ql.length) {
+                var hay = (a.name + " " + (a.description || "") + " " + (a.group || "")).toLowerCase()
+                if (hay.indexOf(ql) === -1 && !fuzzy(hay, ql)) continue
+            }
+            out.push(a)
+        }
+        return out
+    }
+    function targetLibc(t) { return (t.indexOf("musl") !== -1) ? "musl" : "gnu" }
+
     function loadApps() {
         var r = JSON.parse(backend.local_apps())
         if (!r.ok) { root.note = "error: " + r.error; return }
@@ -74,7 +101,7 @@ Item {
     }
     function openApp(app) {
         root.selApp = app.name; root.selPath = app.path; root.selDesc = app.description
-        root.selRel = app.rel || ""
+        root.selRel = app.rel || ""; root.selIsBin = (app.is_bin !== false)
         root.selIsCargo = app.is_cargo; root.selIsCmake = app.is_cmake
         root.selOid = app.oid || ""; root.selShot = app.shot || ""
         root.buildState = "idle"; root.builtBinary = ""; root.buildError = ""
@@ -255,8 +282,31 @@ Item {
                     text: "Buildable repos gitmind manages here. Tap one to build it and send the binary to a device."
                     color: "#5b6477"; font.pixelSize: 12; wrapMode: Text.WordWrap
                 }
+                // search + kind filter
+                TextField {
+                    width: parent.width
+                    placeholderText: "search apps…"
+                    text: root.search; onTextChanged: root.search = text
+                }
+                Row {
+                    spacing: 8
+                    Repeater {
+                        model: [{ k: "all", t: "All" }, { k: "app", t: "Apps" }, { k: "lib", t: "Kits" }]
+                        delegate: Rectangle {
+                            height: 28; radius: 14; width: kfl.width + 22
+                            color: modelData.k === root.kindFilter ? "#2a3350" : "#1b2335"
+                            border.color: modelData.k === root.kindFilter ? "#7aa2f7" : "#3a4566"
+                            Label { id: kfl; anchors.centerIn: parent; text: modelData.t; color: "#cdd6f4"; font.pixelSize: 12 }
+                            TapHandler { onTapped: root.kindFilter = modelData.k }
+                        }
+                    }
+                }
+                Label {
+                    width: parent.width; visible: root.shownApps.length === 0
+                    text: "No matches."; color: "#5b6477"; font.pixelSize: 12
+                }
                 Repeater {
-                    model: root.apps
+                    model: root.shownApps
                     delegate: Rectangle {
                         width: col.width; radius: 10; color: "#1b2335"; border.color: "#3a4566"
                         height: cardC.height + 20
@@ -279,7 +329,21 @@ Item {
                                 }
                                 Column {
                                     width: parent.width - 48; spacing: 1
-                                    Label { text: modelData.name; color: "#cdd6f4"; font.bold: true; font.pixelSize: 15 }
+                                    Row {
+                                        width: parent.width; spacing: 6
+                                        Label { text: modelData.name; color: "#cdd6f4"; font.bold: true; font.pixelSize: 15 }
+                                        Rectangle {
+                                            visible: modelData.is_bin === false
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            height: 16; radius: 8; width: kb.width + 12; color: "#2a3350"
+                                            Label { id: kb; anchors.centerIn: parent; text: "kit"; color: "#a6adc8"; font.pixelSize: 10 }
+                                        }
+                                        Label {
+                                            visible: modelData.group && modelData.group.length && modelData.group !== "root"
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            text: modelData.group; color: "#5b6477"; font.pixelSize: 11
+                                        }
+                                    }
                                     Label {
                                         width: parent.width
                                         text: modelData.description.length ? modelData.description
@@ -372,6 +436,26 @@ Item {
                                 }
                             }
                         }
+                        // cross-target warning: chosen libc differs from this device's
+                        Rectangle {
+                            width: parent.width; radius: 8; color: "#2a2416"; border.color: "#f9e2af"
+                            visible: root.buildHere && root.targetLibc(root.target) !== root.targetLibc(root.localTarget)
+                            height: xtC.height + 16
+                            Column {
+                                id: xtC
+                                x: 10; y: 8; width: parent.width - 20; spacing: 6
+                                Label {
+                                    width: parent.width; color: "#f9e2af"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                                    text: "This targets " + root.targetLibc(root.target) + ", but this device is " + root.targetLibc(root.localTarget)
+                                          + ". It needs the cross target + linker, won't run here (it installs to an emulator folder), and is meant for another device."
+                                }
+                                Button {
+                                    text: "use " + root.targetShort(root.localTarget) + " (this device)"
+                                    enabled: !root.busy
+                                    onClicked: root.applyDefaults(root.localTarget)
+                                }
+                            }
+                        }
                         // optional flags
                         Label {
                             text: root.optionsOpen ? "▾ options" : "▸ options"
@@ -441,12 +525,27 @@ Item {
                     }
                 }
 
-                // ── 2 · install: send a local build, or build on the desktop ───
+                // ── 2 · install (binaries only) ───────────────────────────────
+                Rectangle {
+                    width: parent.width; radius: 10; color: "#171c2b"; border.color: "#2a3350"
+                    visible: !root.selIsBin
+                    height: kitC.height + 20
+                    Column {
+                        id: kitC
+                        x: 12; y: 10; width: parent.width - 24; spacing: 6
+                        Label { text: "Library (kit)"; color: "#7aa2f7"; font.bold: true }
+                        Label {
+                            width: parent.width; wrapMode: Text.WordWrap; color: "#8a93a6"; font.pixelSize: 12
+                            text: "This crate builds to an .rlib for other crates to link against — there's no binary to install or launch. Build it here to make it available as a dependency."
+                        }
+                    }
+                }
                 Rectangle {
                     width: parent.width; radius: 10
                     color: "#171c2b"
                     border.color: (!root.buildHere || root.buildState === "built") ? "#7aa2f7" : "#2a3350"
                     height: sendC.height + 20
+                    visible: root.selIsBin
                     opacity: (root.buildHere && root.buildState !== "built") ? 0.5 : 1.0
                     Column {
                         id: sendC

@@ -1245,3 +1245,30 @@ installer 2 = 47; rustcheck CLEAN; Fleet/MonoTile/main/Network balanced; all bac
 NOTE: user's rustup-not-on-PATH is an env issue (rustup target add needs rustup reachable); cargo's own
 "target may not be installed" message already guides. Native target now defaults correctly so the
 common (this-device) build needs no rustup target add at all.
+
+── native musl builds, kit separation, search/filter, cross→emulator dir ──
+USER on-device: phone rustc host = aarch64-ALPINE-linux-musl (vendor triple!), desktop = aarch64-
+unknown-linux-gnu. KEY INSIGHT: passing --target aarch64-unknown-linux-musl on Alpine FAILS (that
+rustup target isn't installed; musl is the NATIVE host) → that's why musl wouldn't compile. Also: want
+kits buildable but separated; suggest switching target when device libc mismatches + install cross
+binaries to a separate emulator dir; want grouping metadata + GUI filter + fuzzy search.
+FIXES:
+[buildflags, 11 tests] cargo_build_argv("" triple) → NATIVE build, NO --target (works on Alpine musl +
+Fedora gnu without rustup targets). target_libc(triple)→musl|gnu. normalize_native(host)→aarch64-
+unknown-linux-{libc} (alpine→unknown). is_native_build(req,native)=same libc.
+[main.rs] native_triple_local() = rustc -vV host → normalize (fallback /etc/alpine-release). local_target
+returns it (pill matches now). build_app: cargo_target = "" if native else triple; resolve_binary(cargo,
+dir, cargo_target, app) → native lands in target/release (NO triple subdir), cross in target/<triple>/
+release. remote_install: query BUILD HOST rustc host → decide native/cross THERE (desktop gnu building
+musl = cross → --target); install dir on THIS device via is_native_build(target, native_triple_local):
+native→~/.local/bin + .desktop; non-native→installer::install_dir = ~/.local/lib/gitmind/<triple>
+(emulator, NO launcher). local_apps: include libs (is_bin flag, was skipping) + group (rel first seg).
+[installer.rs, 3 tests] install_dir(home,triple,native).
+[Fleet.qml] search TextField + kind pills (All/Apps/Kits) → shownApps=filterApps(apps,search,kind)
+(substring OR subsequence fuzzy over name/desc/group). "kit" badge + group label on cards. cross-target
+warning banner (target libc ≠ device libc) with "use <native>" switch button. Panel-2 gated to selIsBin;
+libs show a "Library (kit)" note (build only, no install). selIsBin from app.is_bin.
+VERIFIED: buildflags 11, installer 3, fleet 5, deploy 14, appcatalog 7, netshare 4, bttransfer 3,
+preview 3 = 50; rustcheck CLEAN; QML balanced; backend.* resolve.
+DEFERRED (told user): richer faceted filters (size after build, author/email, GUI-vs-CLI, feature) +
+gitmind ProjectCard grouping schema — this turn does kind/group/search foundation.
