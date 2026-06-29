@@ -1,3 +1,23 @@
+# App distribution — the model
+
+The GUI is a layer on top of gitmind's repo management. It reads the repos that have
+a Cargo.toml or CMakeLists, lists each as an **app page named by its crate**, builds
+it on demand showing a live **build status**, and on a successful build sends **only
+the compiled binary** to a device. Source never leaves; the binary is the artifact.
+
+Flow per app: pick the app → choose a target (defaults to this device's native
+triple) → optional feature/option flags → **Build** (status: building → built+size, or
+the compiler error) → **Send the binary** to a chosen+trusted device (scp into
+`~/.local/bin`, marked executable).
+
+Backend: `local_apps` (scan the working tree, crate names from `[package] name`),
+`local_build_options` (per-app flags + per-arch defaults), `build_app` (local cross
+build, async, status carries the binary path+size or the error), `send_binary` (scp
+push, binary only). The cross build + scp run on-device; parsing + command
+construction are unit-tested.
+
+---
+
 # App distribution — the "gitmind package manager" direction
 
 This captures the redesign of "push + launch" into a pull-based app distributor: a
