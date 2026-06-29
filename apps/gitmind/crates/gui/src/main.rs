@@ -36,6 +36,7 @@ mod appcatalog;
 mod buildflags;
 mod fleet;
 mod preview;
+mod installer;
 
 qrc!(register_qml,
     "/" {
@@ -143,6 +144,9 @@ struct Backend {
     local_build_options: qt_method!(fn(&self, path: QString) -> QString),
     build_app: qt_method!(fn(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString),
     capture_preview: qt_method!(fn(&self, app: QString, oid: QString, binary: QString) -> QString),
+    build_repo: qt_method!(fn(&self) -> QString),
+    set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
+    remote_install: qt_method!(fn(&self, app: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
@@ -1236,6 +1240,90 @@ impl Backend {
             job.finish(payload);
         });
         QString::from(json!({"ok": true, "started": "shot"}).to_string())
+    }
+
+    /// The persisted remote build repo path (where the source lives on the build host).
+    fn build_repo(&self) -> QString {
+        QString::from(json!({"ok": true, "repo": fleet::build_repo()}).to_string())
+    }
+
+    fn set_build_repo(&self, path: QString) -> QString {
+        match fleet::set_build_repo(&path.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// The app-store "build on the desktop" path. The phone, as the active user, asks
+    /// the build host (the `gitmind` fleet user on the desktop) to cargo-build the
+    /// crate for the chosen target, rsyncs the binary into /tmp staging, installs it
+    /// into the active user's ~/.local/bin, and writes a .desktop launcher — so a tap
+    /// here yields a built, installed, launchable app. Poll for the "rinstall" result.
+    fn remote_install(&self, app: QString, target: QString, features: QString,
+                      host: QString, user: QString, repo: QString, icon: QString) -> QString {
+        let app = app.to_string();
+        let target = target.to_string();
+        let host = host.to_string();
+        let user = user.to_string();
+        let repo = repo.to_string();
+        let icon = icon.to_string();
+        let feats: Vec<String> = features.to_string()
+            .split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if app.is_empty() || host.is_empty() || user.is_empty() {
+            return err_json("pick a build host first");
+        }
+        if repo.trim().is_empty() {
+            return err_json("set the repo path on the build host");
+        }
+        if !self.job.start("rinstall") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let no_default = !feats.is_empty();
+            let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
+            // 1) build on the desktop (cargo error comes back as the ssh stderr)
+            let remote_cmd = format!(
+                "cd {} && export PATH=\"$HOME/.cargo/bin:$PATH\" && {}",
+                deploy::shell_quote(&repo),
+                argv.join(" ")
+            );
+            if let Err(e) = deploy::remote_capture(&user, &host, &remote_cmd) {
+                job.finish(json!({"ok": false, "stage": "build", "error": e}).to_string());
+                return;
+            }
+            // 2) pull the freshly-built binary into /tmp staging (rsync, scp fallback)
+            let remote_bin = format!("{}/{}", repo.trim_end_matches('/'), buildflags::built_binary_path(&app, &target));
+            let staged = format!("/tmp/{app}");
+            if let Err(e) = deploy::rsync_pull(&user, &host, &remote_bin, &staged) {
+                job.finish(json!({"ok": false, "stage": "fetch", "error": e}).to_string());
+                return;
+            }
+            // 3) install into the active user's ~/.local/bin (gitmind delivered → active user owns)
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home".into());
+            let bindir = installer::bin_dir(&home);
+            let _ = std::fs::create_dir_all(&bindir);
+            let dest = format!("{bindir}/{app}");
+            if let Err(e) = std::fs::copy(&staged, &dest) {
+                job.finish(json!({"ok": false, "stage": "install", "error": format!("copy to {dest}: {e}")}).to_string());
+                return;
+            }
+            set_executable(&dest);
+            let _ = std::fs::remove_file(&staged);
+            // 4) .desktop launcher (icon = cached screenshot if we have one)
+            let appdir = installer::desktop_dir(&home);
+            let _ = std::fs::create_dir_all(&appdir);
+            let entry = installer::desktop_entry(&app, &dest, &icon);
+            let desktop = format!("{appdir}/{app}.desktop");
+            let launcher = match std::fs::write(&desktop, entry) {
+                Ok(()) => desktop,
+                Err(_) => String::new(),
+            };
+            job.finish(json!({
+                "ok": true, "app": app, "binary": dest, "launcher": launcher
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "rinstall"}).to_string())
     }
 
     /// Send a freshly-built binary to a device — and only the binary. Drops it into

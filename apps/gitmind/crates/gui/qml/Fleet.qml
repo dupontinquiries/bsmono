@@ -44,6 +44,10 @@ Item {
     property bool setupOpen: false
     property string sshpass: ""
     property string sendState: "idle"  // idle | sending | sent | failed
+    property bool buildHere: true      // false = build on the desktop, fetch + install here
+    property string repoField: ""      // remote repo path on the build host
+    property string rinstallState: "idle" // idle | working | done | failed
+    property string rinstallStage: ""
 
     // ── job plumbing ─────────────────────────────────────────────────────
     property bool busy: false
@@ -72,6 +76,8 @@ Item {
         root.selOid = app.oid || ""; root.selShot = app.shot || ""
         root.buildState = "idle"; root.builtBinary = ""; root.buildError = ""
         root.sendState = "idle"; root.optionsOpen = false; root.note = ""
+        root.rinstallState = "idle"; root.rinstallStage = ""
+        root.repoField = JSON.parse(backend.build_repo()).repo || ""
         root.target = root.localTarget
         var o = JSON.parse(backend.local_build_options(app.path))
         if (o.ok) {
@@ -151,6 +157,22 @@ Item {
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.sendState = "sending"; root.busy = true; root.jobKind = "send"; poller.start()
     }
+    function saveBuildRepo() {
+        var r = JSON.parse(backend.set_build_repo(root.repoField))
+        root.note = r.ok ? "build repo saved" : ("error: " + r.error)
+    }
+    // Build on the desktop, fetch the binary here, install it + a launcher.
+    function doRemoteInstall() {
+        if (root.selHost.length === 0) { root.note = "choose a build host first"; return }
+        if (root.repoField.trim().length === 0) { root.note = "set the repo path on the build host"; return }
+        root.saveBuildRepo()
+        var r = JSON.parse(backend.remote_install(
+            root.selApp, root.target, root.chosenFeatures(),
+            root.selHost, root.user, root.repoField, root.selShot))
+        if (!r.ok) { root.note = "error: " + r.error; return }
+        root.rinstallState = "working"; root.rinstallStage = "building on " + root.selName
+        root.busy = true; root.jobKind = "rinstall"; root.note = ""; poller.start()
+    }
 
     // ── job poller ───────────────────────────────────────────────────────
     Timer {
@@ -189,6 +211,14 @@ Item {
         } else if (k === "send") {
             if (res.ok) { root.sendState = "sent"; root.note = "✓ " + res.msg }
             else { root.sendState = "failed"; root.note = "✗ " + res.error }
+        } else if (k === "rinstall") {
+            if (res.ok) {
+                root.rinstallState = "done"
+                root.note = "✓ installed " + res.app + " → " + res.binary + (res.launcher.length ? "  (+ launcher)" : "")
+            } else {
+                root.rinstallState = "failed"
+                root.note = "✗ " + (res.stage ? res.stage + ": " : "") + res.error
+            }
         }
     }
 
@@ -303,6 +333,21 @@ Item {
                         id: buildC
                         x: 12; y: 10; width: parent.width - 24; spacing: 8
                         Label { text: "Build"; color: "#7aa2f7"; font.bold: true }
+                        // where to build: this device, or offload to the desktop
+                        Row {
+                            spacing: 8
+                            Label { text: "build on"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                            Repeater {
+                                model: [{ k: true, t: "this device" }, { k: false, t: "desktop (remote)" }]
+                                delegate: Rectangle {
+                                    height: 30; radius: 15; width: bl.width + 24
+                                    color: modelData.k === root.buildHere ? "#2a3350" : "#1b2335"
+                                    border.color: modelData.k === root.buildHere ? "#7aa2f7" : "#3a4566"
+                                    Label { id: bl; anchors.centerIn: parent; text: modelData.t; color: "#cdd6f4"; font.pixelSize: 12 }
+                                    TapHandler { onTapped: root.buildHere = modelData.k }
+                                }
+                            }
+                        }
                         // target
                         Row {
                             spacing: 8
@@ -340,6 +385,7 @@ Item {
                         // build button + status
                         Row {
                             spacing: 8
+                            visible: root.buildHere
                             Button {
                                 text: root.buildState === "building" ? "building…" : (root.buildState === "built" ? "rebuild" : "Build")
                                 enabled: !root.busy && root.selIsCargo
@@ -390,30 +436,49 @@ Item {
                     }
                 }
 
-                // ── 2 · send the binary (only after a successful build) ───
+                // ── 2 · install: send a local build, or build on the desktop ───
                 Rectangle {
                     width: parent.width; radius: 10
-                    color: "#171c2b"; border.color: root.buildState === "built" ? "#7aa2f7" : "#2a3350"
+                    color: "#171c2b"
+                    border.color: (!root.buildHere || root.buildState === "built") ? "#7aa2f7" : "#2a3350"
                     height: sendC.height + 20
-                    opacity: root.buildState === "built" ? 1.0 : 0.5
+                    opacity: (root.buildHere && root.buildState !== "built") ? 0.5 : 1.0
                     Column {
                         id: sendC
                         x: 12; y: 10; width: parent.width - 24; spacing: 8
-                        Label { text: "Send the binary"; color: "#7aa2f7"; font.bold: true }
                         Label {
-                            width: parent.width; visible: root.buildState !== "built"
+                            text: root.buildHere ? "Send the binary" : "Build on the desktop"
+                            color: "#7aa2f7"; font.bold: true
+                        }
+                        Label {
+                            width: parent.width; visible: root.buildHere && root.buildState !== "built"
                             text: "Build succeeds first, then the binary can be sent."
                             color: "#5b6477"; font.pixelSize: 12; wrapMode: Text.WordWrap
+                        }
+                        Label {
+                            width: parent.width; visible: !root.buildHere
+                            text: "The desktop cross-builds for " + root.targetShort(root.target) + ", the binary is fetched to /tmp, then installed to this device's ~/.local/bin with a launcher entry."
+                            color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                        }
+                        // repo path on the build host (remote mode only)
+                        Row {
+                            width: parent.width; spacing: 8; visible: !root.buildHere
+                            Label { text: "repo"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
+                            TextField {
+                                width: parent.width - 110
+                                placeholderText: "/home/kesslerd/Code/monorepo"
+                                text: root.repoField; onTextChanged: root.repoField = text
+                            }
                         }
                         // device choice
                         Column {
                             width: parent.width; spacing: 8
-                            visible: root.buildState === "built"
+                            visible: (!root.buildHere) || (root.buildState === "built")
                             Row {
                                 width: parent.width; spacing: 8
                                 Label {
                                     anchors.verticalCenter: parent.verticalCenter
-                                    text: root.selHost.length ? ("to: " + root.selName + (root.hostTrusted ? "  🔒" : "")) : "no device chosen"
+                                    text: root.selHost.length ? ((root.buildHere ? "to: " : "host: ") + root.selName + (root.hostTrusted ? "  🔒" : "")) : (root.buildHere ? "no device chosen" : "no build host chosen")
                                     color: root.selHost.length ? "#cdd6f4" : "#8a93a6"
                                     width: parent.width - dscBtn.width - sndBtn.width - 16
                                     elide: Text.ElideRight
@@ -421,14 +486,20 @@ Item {
                                 Button { id: dscBtn; text: root.connectOpen ? "hide" : "choose…"; onClicked: root.connectOpen = !root.connectOpen }
                                 Button {
                                     id: sndBtn
-                                    text: root.sendState === "sending" ? "sending…" : (root.sendState === "sent" ? "sent ✓" : "Send")
-                                    enabled: !root.busy && root.selHost.length > 0
-                                    onClicked: root.doSend()
+                                    text: root.buildHere
+                                          ? (root.sendState === "sending" ? "sending…" : (root.sendState === "sent" ? "sent ✓" : "Send"))
+                                          : (root.rinstallState === "working" ? "working…" : (root.rinstallState === "done" ? "installed ✓" : "Build & install"))
+                                    enabled: root.buildHere
+                                             ? (!root.busy && root.selHost.length > 0)
+                                             : (!root.busy && root.selHost.length > 0 && root.hostTrusted && root.repoField.trim().length > 0)
+                                    onClicked: root.buildHere ? root.doSend() : root.doRemoteInstall()
                                 }
                             }
                             Label {
                                 width: parent.width
-                                text: "→ " + root.user + "@" + (root.selName.length ? root.selName : "device") + ":~/.local/bin/" + root.selApp
+                                text: root.buildHere
+                                      ? ("→ " + root.user + "@" + (root.selName.length ? root.selName : "device") + ":~/.local/bin/" + root.selApp)
+                                      : ("→ builds on " + (root.selName.length ? root.selName : "host") + ", installs here: ~/.local/bin/" + root.selApp + " + launcher")
                                 color: "#56d364"; font.pixelSize: 11; font.family: "monospace"; wrapMode: Text.WrapAnywhere
                                 visible: root.selHost.length > 0
                             }
