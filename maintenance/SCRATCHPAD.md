@@ -1272,3 +1272,30 @@ VERIFIED: buildflags 11, installer 3, fleet 5, deploy 14, appcatalog 7, netshare
 preview 3 = 50; rustcheck CLEAN; QML balanced; backend.* resolve.
 DEFERRED (told user): richer faceted filters (size after build, author/email, GUI-vs-CLI, feature) +
 gitmind ProjectCard grouping schema — this turn does kind/group/search foundation.
+
+── shared target cache, remote repo discovery (peek install bug), weekly key expiry ──
+USER: (BUG) installing peek on phone → "zsh cd no such dir /home/USER/Code/.../tmp13/tools/peek" on
+the desktop — the dropdown offered the PHONE's local repo root (/home/user/...) but the desktop is
+/home/kesslerd/...; build cd failed, nothing rsynced. (FEAT) dedup target/ to a shared cache for repos
+with .gitmind. (FEAT) weekly key expiry + settings/cleanup page. (FEAT) a desktop→phone push page.
+.gitmind ALREADY EXISTS as a directory marker in the repo; target/ already gitignored.
+FIXES THIS TURN:
+[BUG] build_repo() NO LONGER adds the local repo root (it's the phone's path, wrong on the host). New
+remote_repo_candidates(host,user): ssh `find $HOME -maxdepth 6 -name .gitmind | head -50` → strip
+/.gitmind → real HOST repo roots. Fleet.qml selectDevice → discoverRemoteRepos() merges them into the
+dropdown (when !buildHere). Hint now says connect as the account that OWNS the source (needs repo+cargo)
+— gitmind fleet user has an empty home, so build host should be your desktop user (kesslerd).
+[shared cache] gitmind_root(dir) walks up to a `.gitmind` marker. shared_target_dir = ~/.cache/gitmind/
+cargo-target. build_app sets CARGO_TARGET_DIR there for gitmind repos (deps build once across tmpN
+clones). resolve_binary takes target_dir_env (sets it on the metadata query too → resolved path matches).
+remote_install exports CARGO_TARGET_DIR=$HOME/.cache/gitmind/cargo-target on the build host.
+[key expiry, deploy 14] KEY_EXPIRY_DAYS=7. key_expiry_time(now,days)→YYYYMMDDHHMMSS (civil-from-days,
+tested incl 1700000000→20231114221320). authorized_keys_options(host, Option<expiry>) prepends
+expiry-time="…". setup_key installs a 7-day key (renew by re-running install). NOTE: re-install appends
+(cat >>) → expired dup lines accumulate; cleanup is the deferred settings page.
+VERIFIED: deploy 14, buildflags 11, fleet 5, installer 3, appcatalog 7, netshare 4, bttransfer 3,
+preview 3 = 50; rustcheck CLEAN; QML balanced; backend.* resolve.
+DEFERRED (told user, planned): (E) dedicated desktop→phone PUSH page [reuse send flow + app picker].
+(F) key SETTINGS page: list managed keys (id/host/expiry), de-dupe/cleanup authorized_keys, last-
+accessed + network-seen (needs sshd log parsing or a wtmp/last read on-device). (G) reclaim: rm in-repo
+target/ dirs now that builds go to the shared cache.

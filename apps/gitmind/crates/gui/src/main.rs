@@ -145,6 +145,7 @@ struct Backend {
     build_app: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, no_default: bool) -> QString),
     capture_preview: qt_method!(fn(&self, app: QString, oid: QString, binary: QString) -> QString),
     build_repo: qt_method!(fn(&self) -> QString),
+    remote_repo_candidates: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
@@ -243,15 +244,40 @@ fn native_triple_local() -> String {
         })
 }
 
+/// Walk up from `start` to the gitmind repo root — the directory containing a
+/// `.gitmind` marker. None if not under a gitmind-managed repo.
+fn gitmind_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut cur = Some(start);
+    while let Some(d) = cur {
+        if d.join(".gitmind").exists() {
+            return Some(d.to_path_buf());
+        }
+        cur = d.parent();
+    }
+    None
+}
+
+/// Shared cargo target dir for gitmind-managed repos — one cache so deps build once
+/// across every clone (tmpN…) instead of a multi-GB target/ tree per repo. target/ is
+/// gitignored, so redirecting builds here is safe and reclaims that space.
+fn shared_target_dir() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    format!("{home}/.cache/gitmind/cargo-target")
+}
+
 /// Where cargo writes the binary for `app` built in `app_dir`. `cargo_target` is the
-/// value passed to `--target` ("" for a native build, which lands in target/release
-/// with no triple subdir). Uses `cargo metadata` target_directory so it's correct in
-/// any monorepo layout.
-fn resolve_binary(cargo: &str, app_dir: &std::path::Path, cargo_target: &str, app: &str) -> std::path::PathBuf {
-    let target_dir = std::process::Command::new(cargo)
-        .args(["metadata", "--no-deps", "--format-version", "1"])
+/// value passed to `--target` ("" for native, no triple subdir). `target_dir_env` is
+/// an optional CARGO_TARGET_DIR override (shared cache) — applied to the metadata
+/// query too so the resolved path matches where cargo actually wrote.
+fn resolve_binary(cargo: &str, app_dir: &std::path::Path, cargo_target: &str, app: &str, target_dir_env: Option<&str>) -> std::path::PathBuf {
+    let mut cmd = std::process::Command::new(cargo);
+    cmd.args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(app_dir)
-        .env("PATH", tool_path_env())
+        .env("PATH", tool_path_env());
+    if let Some(td) = target_dir_env {
+        cmd.env("CARGO_TARGET_DIR", td);
+    }
+    let target_dir = cmd
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -1228,17 +1254,21 @@ impl Backend {
             // so no rustup target/linker is needed; otherwise cross-build for it
             let native = native_triple_local();
             let cargo_target = if buildflags::is_native_build(&target, &native) { String::new() } else { target.clone() };
+            // gitmind repos share one cargo target cache (dedup across clones)
+            let shared = gitmind_root(&app_dir).map(|_| shared_target_dir());
             let argv = buildflags::cargo_build_argv(&app, &cargo_target, &feats, no_default);
             // build IN the app's own directory — works for standalone crates and
             // workspace members alike (no assumption of a root-workspace member)
-            let out = std::process::Command::new(&cargo)
-                .args(&argv[1..])
-                .current_dir(&app_dir)
-                .env("PATH", tool_path_env())
-                .output();
+            let mut cmd = std::process::Command::new(&cargo);
+            cmd.args(&argv[1..]).current_dir(&app_dir).env("PATH", tool_path_env());
+            if let Some(td) = &shared {
+                let _ = std::fs::create_dir_all(td);
+                cmd.env("CARGO_TARGET_DIR", td);
+            }
+            let out = cmd.output();
             let payload = match out {
                 Ok(o) if o.status.success() => {
-                    let bin = resolve_binary(&cargo, &app_dir, &cargo_target, &app);
+                    let bin = resolve_binary(&cargo, &app_dir, &cargo_target, &app, shared.as_deref());
                     let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
                     json!({
                         "ok": true, "app": app, "target": target,
@@ -1296,17 +1326,35 @@ impl Backend {
         QString::from(json!({"ok": true, "started": "shot"}).to_string())
     }
 
-    /// The persisted remote build repo + candidate paths for the picker (remembered
-    /// history, plus the local repo root as a starting guess if layouts mirror).
+    /// The persisted remote build repo + remembered candidate paths for the picker.
+    /// (We do NOT add the local repo root here — on a remote build host the path lives
+    /// under a different user's home; real host paths come from remote_repo_candidates.)
     fn build_repo(&self) -> QString {
-        let mut candidates = fleet::build_repos();
-        if let Ok(r) = repo() {
-            let root = r.root().display().to_string();
-            if !candidates.iter().any(|c| c == &root) {
-                candidates.push(root);
-            }
+        QString::from(json!({"ok": true, "repo": fleet::build_repo(), "candidates": fleet::build_repos()}).to_string())
+    }
+
+    /// Discover gitmind repos ON THE BUILD HOST (dirs holding a `.gitmind` marker under
+    /// the connection user's home) so the picker offers real host paths, not the phone's.
+    fn remote_repo_candidates(&self, host: QString, user: QString) -> QString {
+        let (host, user) = (host.to_string(), user.to_string());
+        if host.is_empty() || user.is_empty() {
+            return QString::from(json!({"ok": true, "candidates": []}).to_string());
         }
-        QString::from(json!({"ok": true, "repo": fleet::build_repo(), "candidates": candidates}).to_string())
+        // portable (busybox-safe) find; strip the trailing /.gitmind to get repo roots
+        let cmd = "find \"$HOME\" -maxdepth 6 -name .gitmind 2>/dev/null | head -50";
+        match deploy::remote_capture(&user, &host, cmd) {
+            Ok(out) => {
+                let dirs: Vec<String> = out
+                    .lines()
+                    .filter_map(|l| {
+                        let l = l.trim();
+                        if l.is_empty() { None } else { Some(l.trim_end_matches("/.gitmind").trim_end_matches("/.gitmind/").to_string()) }
+                    })
+                    .collect();
+                QString::from(json!({"ok": true, "candidates": dirs}).to_string())
+            }
+            Err(e) => err_json(&e),
+        }
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
@@ -1346,7 +1394,7 @@ impl Backend {
             let no_default = !feats.is_empty();
             let base = repo.trim_end_matches('/');
             let app_dir = if rel.trim().is_empty() { base.to_string() } else { format!("{base}/{}", rel.trim_matches('/')) };
-            let path_export = "export PATH=\"$HOME/.cargo/bin:$PATH\"";
+            let path_export = "export PATH=\"$HOME/.cargo/bin:$PATH\" && export CARGO_TARGET_DIR=\"$HOME/.cache/gitmind/cargo-target\"";
             // decide native vs cross on the BUILD HOST (query its rustc host triple)
             let host_native = deploy::remote_capture(&user, &host, &format!("{path_export} && rustc -vV"))
                 .ok()
