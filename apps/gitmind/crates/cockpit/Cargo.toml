@@ -1,0 +1,18 @@
+# cockpit — the Qt-free library of "fleet cockpit" operations (build, deploy, import,
+# place, merge, reclaim, keys, app-catalog, previews). Shared by every frontend so the
+# GUI and CLI have identical capabilities over one implementation, per the workspace's
+# "pure core + thin wiring" philosophy.
+[package]
+name = "cockpit"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cockpit"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1"
+gitmind-core = { path = "../core" }
+peek = { path = "../peek" }
+net-kit = { path = "../../../../shared/net-kit" }
