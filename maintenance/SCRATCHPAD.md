@@ -1421,3 +1421,31 @@ VERIFIED: places 3, importer 2, deploy 15, installer 4, buildflags 11, fleet 5, 
 netshare 4, bttransfer 3, preview 3 = 59; rustcheck CLEAN; all 8 QML balanced; Import backend.* (6)
 resolve. ON-DEVICE: mv/git need to be on PATH (tool_path_env covers ~/.cargo/bin:/usr/local/bin:/usr/
 bin:/bin); ~/Code created on first place.
+
+── import: "Update existing repo" mode (overlay zip onto a branch) ──
+USER: handle non-fresh imports — a zip that's a modified/diverged version of an EXISTING repo (different
+layout, changes applied). GUI path to reconcile, diverging from the new-project UI we built.
+APPROACH: git-native + safe. Overlay the zip onto the target repo ON A FRESH BRANCH (nothing overwritten
+in place), commit it, surface the diffstat — user reviews/merges in their own tools. Recoverable because
+it's all git.
+[importer.rs +1 test=3] overlay_command(src,dst,mirror) PURE: `if ! command -v rsync; then echo
+GITMIND_NO_RSYNC; exit 3; fi` + `rsync -a [--delete if mirror] --exclude='.git' --exclude='.gitmind'
+src/ dst/`. ALWAYS protects repo .git/.gitmind; mirror adds --delete (match zip exactly).
+[main.rs] local_repos() async "lrepos": find $HOME -maxdepth 6 ( -name .git -o -name .gitmind ) → repo
+roots → [{path,name,gitmind,git}] sorted. apply_to_repo(crate_path,target,mode,zipname) async "apply":
+expand ~; require target/.git; REQUIRE CLEAN tree (git status --porcelain empty, else "commit or stash
+first"); base=current branch; git checkout -b gitmind-import-<now_stamp>; run overlay_command via sh
+(GITMIND_NO_RSYNC→"apk add rsync"; on any fail → checkout base + branch -D + error); git add -A; if
+diff --cached --shortstat empty → undo branch, "no changes — zip matches repo"; else parse
+--name-status (cap 60, {status,path}) + commit -q -m "import from <zip>" → {branch,base,shortstat,
+mirror,files}. rustcheck CLEAN.
+[Import.qml] found-card: New-vs-Update pill toggle. NEW block = prior init/save UI (visible mode==new).
+UPDATE block (visible mode==update): repo ComboBox (textRole name, valueRole path; from local_repos,
+loadRepos on first switch; preselects repo whose name==app) + editable repo-path TextField; overlay/
+mirror pills (+mirror warning re untracked); "Apply to a branch" → apply_to_repo; result card =
+shortstat (green) + "review: git -C <repo> diff base..branch" + name-status file list (A green/D red/M
+muted). zipName captured from picker url basename. Poller +lrepos +apply.
+VERIFIED: importer 3, places 3, deploy 15, installer 4, buildflags 11, fleet 5, reclaim 2, appcatalog 7,
+netshare 4, bttransfer 3, preview 3 = 60; rustcheck CLEAN; all 8 QML balanced; Import backend.* (8)
+resolve. ON-DEVICE: rsync REQUIRED for update mode (clear error otherwise); target must be a clean git
+repo; leaves repo checked out on the import branch (reports base to return to).
