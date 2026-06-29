@@ -142,11 +142,11 @@ struct Backend {
     // crate's flags, build it (with status), send only the built binary to a device.
     local_apps: qt_method!(fn(&self) -> QString),
     local_build_options: qt_method!(fn(&self, path: QString) -> QString),
-    build_app: qt_method!(fn(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString),
+    build_app: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, no_default: bool) -> QString),
     capture_preview: qt_method!(fn(&self, app: QString, oid: QString, binary: QString) -> QString),
     build_repo: qt_method!(fn(&self) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
-    remote_install: qt_method!(fn(&self, app: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
+    remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     send_binary: qt_method!(fn(&self, binary: QString, user: QString, host: QString, dest: QString) -> QString),
     install_app: qt_method!(fn(&self, user: QString, host: QString, path: QString, app: QString, triple: QString, features: QString, no_default: bool, stage_tmp: bool) -> QString),
     start_setup_key: qt_method!(fn(&self, user: QString, host: QString, password: QString) -> QString),
@@ -223,6 +223,23 @@ fn tool_path_env() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let cur = std::env::var("PATH").unwrap_or_default();
     format!("{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin{}", if cur.is_empty() { String::new() } else { format!(":{cur}") })
+}
+
+/// Where cargo writes the binary for `app` built in `app_dir` for `triple`. Uses
+/// `cargo metadata` target_directory, so it's correct whether the crate is standalone
+/// or a workspace member deep in a monorepo; falls back to <app_dir>/target.
+fn resolve_binary(cargo: &str, app_dir: &std::path::Path, triple: &str, app: &str) -> std::path::PathBuf {
+    let target_dir = std::process::Command::new(cargo)
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(app_dir)
+        .env("PATH", tool_path_env())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| buildflags::parse_target_directory(&String::from_utf8_lossy(&o.stdout)))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| app_dir.join("target"));
+    target_dir.join(triple).join("release").join(app)
 }
 
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
@@ -1115,11 +1132,13 @@ impl Backend {
                 };
                 // per-app commit oid → the tile's identity colour; cached shot if any
                 let oid = app_oid(&root, &dir);
+                let rel = dir.strip_prefix(&root).unwrap_or(&dir).to_string_lossy().to_string();
                 let shot = preview::shot_path(&name, &oid);
                 let shot_str = if shot.is_file() { shot.display().to_string() } else { String::new() };
                 apps.push(json!({
                     "name": name,
                     "path": dir.display().to_string(),
+                    "rel": rel,
                     "description": desc,
                     "is_cargo": is_cargo,
                     "is_cmake": cmake.is_file(),
@@ -1161,30 +1180,34 @@ impl Backend {
     /// Build `app` (a crate) for `target` from the working tree, locally. Async — a
     /// cross build is slow; poll_job for the result, which carries the build status:
     /// the binary path + size on success, or the compiler output on failure.
-    fn build_app(&self, app: QString, target: QString, features: QString, no_default: bool) -> QString {
-        let (app, target) = (app.to_string(), target.to_string());
+    fn build_app(&self, app: QString, path: QString, target: QString, features: QString, no_default: bool) -> QString {
+        let (app, path, target) = (app.to_string(), path.to_string(), target.to_string());
         let feats: Vec<String> = features.to_string().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
         if app.trim().is_empty() || target.trim().is_empty() {
             return err_json("app and target are required");
         }
-        let root = match repo() {
-            Ok(r) => r.root().to_path_buf(),
-            Err(e) => return err_json(&e),
+        let app_dir = if path.trim().is_empty() {
+            match repo() { Ok(r) => r.root().to_path_buf(), Err(e) => return err_json(&e) }
+        } else {
+            std::path::PathBuf::from(&path)
         };
         if !self.job.start("build") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
+            let cargo = cargo_bin();
             let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
-            let out = std::process::Command::new(cargo_bin())
+            // build IN the app's own directory — works for standalone crates and
+            // workspace members alike (no assumption of a root-workspace member)
+            let out = std::process::Command::new(&cargo)
                 .args(&argv[1..])
-                .current_dir(&root)
+                .current_dir(&app_dir)
                 .env("PATH", tool_path_env())
                 .output();
             let payload = match out {
                 Ok(o) if o.status.success() => {
-                    let bin = root.join(buildflags::built_binary_path(&app, &target));
+                    let bin = resolve_binary(&cargo, &app_dir, &target, &app);
                     let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
                     json!({
                         "ok": true, "app": app, "target": target,
@@ -1259,9 +1282,10 @@ impl Backend {
     /// crate for the chosen target, rsyncs the binary into /tmp staging, installs it
     /// into the active user's ~/.local/bin, and writes a .desktop launcher — so a tap
     /// here yields a built, installed, launchable app. Poll for the "rinstall" result.
-    fn remote_install(&self, app: QString, target: QString, features: QString,
+    fn remote_install(&self, app: QString, rel: QString, target: QString, features: QString,
                       host: QString, user: QString, repo: QString, icon: QString) -> QString {
         let app = app.to_string();
+        let rel = rel.to_string();
         let target = target.to_string();
         let host = host.to_string();
         let user = user.to_string();
@@ -1282,18 +1306,24 @@ impl Backend {
         std::thread::spawn(move || {
             let no_default = !feats.is_empty();
             let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
-            // 1) build on the desktop (cargo error comes back as the ssh stderr)
-            let remote_cmd = format!(
-                "cd {} && export PATH=\"$HOME/.cargo/bin:$PATH\" && {}",
-                deploy::shell_quote(&repo),
-                argv.join(" ")
-            );
+            // the app's directory on the build host (repo root + its subpath)
+            let base = repo.trim_end_matches('/');
+            let app_dir = if rel.trim().is_empty() { base.to_string() } else { format!("{base}/{}", rel.trim_matches('/')) };
+            let path_export = "export PATH=\"$HOME/.cargo/bin:$PATH\"";
+            // 1) build in the app's directory (cargo error comes back as the ssh stderr)
+            let remote_cmd = format!("cd {} && {} && {}", deploy::shell_quote(&app_dir), path_export, argv.join(" "));
             if let Err(e) = deploy::remote_capture(&user, &host, &remote_cmd) {
                 job.finish(json!({"ok": false, "stage": "build", "error": e}).to_string());
                 return;
             }
-            // 2) pull the freshly-built binary into /tmp staging (rsync, scp fallback)
-            let remote_bin = format!("{}/{}", repo.trim_end_matches('/'), buildflags::built_binary_path(&app, &target));
+            // 2) ask the build host where cargo put the binary (workspace-aware)
+            let meta_cmd = format!("cd {} && {} && cargo metadata --no-deps --format-version 1", deploy::shell_quote(&app_dir), path_export);
+            let target_dir = deploy::remote_capture(&user, &host, &meta_cmd)
+                .ok()
+                .and_then(|m| buildflags::parse_target_directory(&m))
+                .unwrap_or_else(|| format!("{app_dir}/target"));
+            let remote_bin = format!("{}/{}/release/{}", target_dir.trim_end_matches('/'), target, app);
+            // 3) pull the freshly-built binary into /tmp staging (rsync, scp fallback)
             let staged = format!("/tmp/{app}");
             if let Err(e) = deploy::rsync_pull(&user, &host, &remote_bin, &staged) {
                 job.finish(json!({"ok": false, "stage": "fetch", "error": e}).to_string());
