@@ -47,6 +47,7 @@ Item {
     property string sendState: "idle"  // idle | sending | sent | failed
     property bool buildHere: true      // false = build on the desktop, fetch + install here
     property string repoField: ""      // remote repo path on the build host
+    property var repoCandidates: []    // remembered paths + local repo root, for the picker
     property string rinstallState: "idle" // idle | working | done | failed
     property string rinstallStage: ""
 
@@ -79,7 +80,9 @@ Item {
         root.buildState = "idle"; root.builtBinary = ""; root.buildError = ""
         root.sendState = "idle"; root.optionsOpen = false; root.note = ""
         root.rinstallState = "idle"; root.rinstallStage = ""
-        root.repoField = JSON.parse(backend.build_repo()).repo || ""
+        var br = JSON.parse(backend.build_repo())
+        root.repoCandidates = br.candidates || []
+        if (root.repoField.length === 0) root.repoField = br.repo || ""
         root.target = root.localTarget
         var o = JSON.parse(backend.local_build_options(app.path))
         if (o.ok) {
@@ -462,14 +465,18 @@ Item {
                             text: "The desktop cross-builds for " + root.targetShort(root.target) + ", the binary is fetched to /tmp, then installed to this device's ~/.local/bin with a launcher entry."
                             color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
                         }
-                        // repo path on the build host (remote mode only)
+                        // repo path on the build host (remote mode only) — pick a
+                        // remembered path or type a custom one
                         Row {
                             width: parent.width; spacing: 8; visible: !root.buildHere
                             Label { text: "repo"; color: "#8a93a6"; anchors.verticalCenter: parent.verticalCenter }
-                            TextField {
-                                width: parent.width - 110
-                                placeholderText: "/home/kesslerd/Code/monorepo"
-                                text: root.repoField; onTextChanged: root.repoField = text
+                            ComboBox {
+                                id: repoBox
+                                width: parent.width - 70
+                                editable: true
+                                model: root.repoCandidates
+                                currentIndex: root.repoCandidates.length > 0 ? 0 : -1
+                                onEditTextChanged: root.repoField = editText
                             }
                         }
                         // device choice

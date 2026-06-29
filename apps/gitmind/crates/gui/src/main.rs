@@ -1079,13 +1079,20 @@ impl Backend {
     /// The triple that matches *this* device's libc, so a store install defaults to a
     /// binary that actually runs here (musl on Alpine/postmarketOS, gnu on glibc).
     fn local_target(&self) -> QString {
-        let musl = std::path::Path::new("/lib/ld-musl-aarch64.so.1").exists()
-            || std::path::Path::new("/lib/libc.musl-aarch64.so.1").exists();
-        let triple = if musl {
-            "aarch64-unknown-linux-musl"
-        } else {
-            "aarch64-unknown-linux-gnu"
-        };
+        // authoritative: rustc's own host triple (don't guess libc from loader files,
+        // which misfire when a musl loader is merely installed alongside glibc)
+        let from_rustc = std::process::Command::new("rustc")
+            .arg("-vV")
+            .env("PATH", tool_path_env())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| buildflags::host_triple_from_rustc(&String::from_utf8_lossy(&o.stdout)));
+        let triple = from_rustc.unwrap_or_else(|| {
+            // fallback only if rustc isn't reachable: musl userland (Alpine) vs glibc
+            let musl = std::path::Path::new("/etc/alpine-release").exists();
+            if musl { "aarch64-unknown-linux-musl".to_string() } else { "aarch64-unknown-linux-gnu".to_string() }
+        });
         QString::from(json!({"target": triple}).to_string())
     }
 
@@ -1122,7 +1129,15 @@ impl Backend {
                 let (name, desc, is_cargo) = if cargo.is_file() {
                     let txt = std::fs::read_to_string(&cargo).unwrap_or_default();
                     match buildflags::crate_name(&txt) {
-                        Some(n) => (n, buildflags::package_description(&txt).unwrap_or_default(), true),
+                        Some(n) => {
+                            // only list crates that actually produce a binary — skip
+                            // library-only kits (e.g. share-kit) that have no app to install
+                            let has_bin = dir.join("src/main.rs").is_file()
+                                || dir.join("src/bin").is_dir()
+                                || buildflags::declares_binary(&txt);
+                            if !has_bin { continue; }
+                            (n, buildflags::package_description(&txt).unwrap_or_default(), true)
+                        }
                         None => continue,
                     }
                 } else if cmake.is_file() {
@@ -1265,9 +1280,17 @@ impl Backend {
         QString::from(json!({"ok": true, "started": "shot"}).to_string())
     }
 
-    /// The persisted remote build repo path (where the source lives on the build host).
+    /// The persisted remote build repo + candidate paths for the picker (remembered
+    /// history, plus the local repo root as a starting guess if layouts mirror).
     fn build_repo(&self) -> QString {
-        QString::from(json!({"ok": true, "repo": fleet::build_repo()}).to_string())
+        let mut candidates = fleet::build_repos();
+        if let Ok(r) = repo() {
+            let root = r.root().display().to_string();
+            if !candidates.iter().any(|c| c == &root) {
+                candidates.push(root);
+            }
+        }
+        QString::from(json!({"ok": true, "repo": fleet::build_repo(), "candidates": candidates}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
@@ -1326,7 +1349,10 @@ impl Backend {
             // 3) pull the freshly-built binary into /tmp staging (rsync, scp fallback)
             let staged = format!("/tmp/{app}");
             if let Err(e) = deploy::rsync_pull(&user, &host, &remote_bin, &staged) {
-                job.finish(json!({"ok": false, "stage": "fetch", "error": e}).to_string());
+                let hint = format!(
+                    "{e}\n(no binary at {remote_bin} — is {app} a library crate, or did the build target a different libc than {target}?)"
+                );
+                job.finish(json!({"ok": false, "stage": "fetch", "error": hint}).to_string());
                 return;
             }
             // 3) install into the active user's ~/.local/bin (gitmind delivered → active user owns)
