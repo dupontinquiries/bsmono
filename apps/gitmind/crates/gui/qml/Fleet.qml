@@ -15,6 +15,7 @@ Item {
     property string selApp: ""        // selected crate name ("" = showing the list)
     property string selPath: ""
     property string selDesc: ""
+    property string selRel: ""
     property string selOid: ""
     property string selShot: ""
     property int shotVer: 0
@@ -72,6 +73,7 @@ Item {
     }
     function openApp(app) {
         root.selApp = app.name; root.selPath = app.path; root.selDesc = app.description
+        root.selRel = app.rel || ""
         root.selIsCargo = app.is_cargo; root.selIsCmake = app.is_cmake
         root.selOid = app.oid || ""; root.selShot = app.shot || ""
         root.buildState = "idle"; root.builtBinary = ""; root.buildError = ""
@@ -112,7 +114,7 @@ Item {
 
     function doBuild() {
         var noDefault = root.features.length > 0
-        var r = JSON.parse(backend.build_app(root.selApp, root.target, root.chosenFeatures(), noDefault))
+        var r = JSON.parse(backend.build_app(root.selApp, root.selPath, root.target, root.chosenFeatures(), noDefault))
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.buildState = "building"; root.busy = true; root.jobKind = "build"; root.note = ""
         poller.start()
@@ -167,7 +169,7 @@ Item {
         if (root.repoField.trim().length === 0) { root.note = "set the repo path on the build host"; return }
         root.saveBuildRepo()
         var r = JSON.parse(backend.remote_install(
-            root.selApp, root.target, root.chosenFeatures(),
+            root.selApp, root.selRel, root.target, root.chosenFeatures(),
             root.selHost, root.user, root.repoField, root.selShot))
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.rinstallState = "working"; root.rinstallStage = "building on " + root.selName
