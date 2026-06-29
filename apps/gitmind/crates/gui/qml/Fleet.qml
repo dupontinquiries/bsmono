@@ -159,6 +159,17 @@ Item {
     function selectDevice(ip, host) {
         root.selHost = ip; root.selName = (host && host.length) ? host : ip; root.sendState = "idle"
         refreshTrust()
+        if (!root.buildHere) root.discoverRemoteRepos()
+    }
+    // ask the build host where its gitmind repos live (real host paths for the picker)
+    function discoverRemoteRepos() {
+        if (root.selHost.length === 0) return
+        var r = JSON.parse(backend.remote_repo_candidates(root.selHost, root.user))
+        if (!r.ok) return
+        var merged = (r.candidates || []).slice()
+        for (var i = 0; i < root.repoCandidates.length; i++)
+            if (merged.indexOf(root.repoCandidates[i]) === -1) merged.push(root.repoCandidates[i])
+        root.repoCandidates = merged
     }
     function refreshTrust() {
         if (root.selHost.length === 0) return
@@ -561,7 +572,7 @@ Item {
                         }
                         Label {
                             width: parent.width; visible: !root.buildHere
-                            text: "The desktop cross-builds for " + root.targetShort(root.target) + ", the binary is fetched to /tmp, then installed to this device's ~/.local/bin with a launcher entry."
+                            text: "Connect as the account on the desktop that owns the source (it needs the repo + cargo). The desktop builds for " + root.targetShort(root.target) + ", the binary is fetched to /tmp, then installed here. Repos with a .gitmind marker on the host appear below."
                             color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
                         }
                         // repo path on the build host (remote mode only) — pick a
