@@ -118,8 +118,8 @@ ApplicationWindow {
         // ── Push: build here, install on a device (desktop → phone) ──
         Push   { id: push }
 
-        // ── Keys: view + clean up access keys on a device ──
-        Keys   { id: keys }
+        // ── Settings: reclaim disk + manage access keys ──
+        Settings { id: settings }
 
         // ── Network: advertise, look up + install a peer's repo over HTTP ──
         Network { id: network }
@@ -136,7 +136,7 @@ ApplicationWindow {
         TabButton { text: "apps" }
         TabButton { text: "fleet" }
         TabButton { text: "push" }
-        TabButton { text: "keys" }
+        TabButton { text: "settings" }
         TabButton { text: "network" }
     }
 

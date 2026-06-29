@@ -1344,3 +1344,24 @@ VERIFIED: deploy 15, installer 4, buildflags 11, fleet 5, appcatalog 7, netshare
 preview 3 = 52; rustcheck CLEAN; Fleet/Push/Keys/DevicePicker/MonoTile/main/Network balanced; backend.*
 resolve. DEFERRED: last-accessed + network-seen per key (needs sshd VERBOSE log parsing or lastlog on-
 device — note in UI later). reclaim in-repo target/ dirs (the 3rd item) still TODO.
+
+── reclaim in-repo target/ dirs + Settings page (Keys→Settings) ──
+USER (3rd of 3): reclaim the per-crate target/ dirs now that builds go to the shared cache.
+[reclaim.rs NEW, 2 tests] dir_size(path) recursive byte sum. looks_like_build_target = dir named
+"target" + sibling Cargo.toml/CMakeLists + NOT the shared cache (keep). find_reclaimable(root,keep)
+walks root, skips hidden (.git/.gitmind), doesn't descend into a found target. is_safe_target re-
+validates before delete. Tested vs a temp tree (real target found+sized; no-manifest "target" ignored;
+hidden skipped; shared cache never reclaimed).
+[main.rs] +mod reclaim. reclaimable() async "rscan" → find+size → {items:[{path,bytes,size}],count,
+total}. reclaim() async "reclaim" → re-find, is_safe_target gate per dir, remove_dir_all, sum → {count,
+freed}. root = repo root; keep = shared_target_dir(). rustcheck CLEAN.
+[Settings.qml] Keys.qml RENAMED → Settings.qml (consolidates, avoids 10th tab). Two cards: "Reclaim disk
+space" (rescan + list path/size + total + "reclaim <total>" button; scans on load) and "Access keys"
+(the prior Keys content: DevicePicker + key list + cleanup). One poller handles rscan/reclaim/keys/
+keyclean. main.qml: tab "keys"→"settings", Keys{}→Settings{}. qrc Keys.qml→Settings.qml.
+VERIFIED: reclaim 2, deploy 15, installer 4, buildflags 11, fleet 5, appcatalog 7, netshare 4,
+bttransfer 3, preview 3 = 54; rustcheck CLEAN; Fleet/Push/Settings/DevicePicker/MonoTile/main/Network
+balanced; backend.* resolve. SCOPE: scans the CURRENT repo root (handles its per-crate targets, e.g.
+voiceterm's 1.9G); other tmpN clones reclaimed when opened in them (all-repos-under-$HOME = future).
+ALL 3 follow-ups from the cache/discovery/expiry turn now DONE (push page, keys/settings, reclaim).
+Still deferred: per-key last-accessed + network-seen (needs sshd VERBOSE/lastlog parsing).

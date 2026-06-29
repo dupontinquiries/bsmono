@@ -37,6 +37,7 @@ mod buildflags;
 mod fleet;
 mod preview;
 mod installer;
+mod reclaim;
 
 qrc!(register_qml,
     "/" {
@@ -49,7 +50,7 @@ qrc!(register_qml,
         "qml/Apps.qml",
         "qml/Fleet.qml",
         "qml/Push.qml",
-        "qml/Keys.qml",
+        "qml/Settings.qml",
         "qml/DevicePicker.qml",
         "qml/applib.js",
         "qml/MonoTile.qml",
@@ -153,6 +154,8 @@ struct Backend {
     remote_target: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     list_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     cleanup_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
+    reclaimable: qt_method!(fn(&self) -> QString),
+    reclaim: qt_method!(fn(&self) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -1455,6 +1458,61 @@ impl Backend {
             }
         });
         QString::from(json!({"ok": true, "started": "keyclean"}).to_string())
+    }
+
+    /// Scan this repo for reclaimable per-crate `target/` dirs (dead weight now that
+    /// builds go to the shared cache). Async job "rscan" → list + total size.
+    fn reclaimable(&self) -> QString {
+        let root = match repo() { Ok(r) => r.root().to_path_buf(), Err(e) => return err_json(&e) };
+        if !self.job.start("rscan") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let keep = std::path::PathBuf::from(shared_target_dir());
+            let dirs = reclaim::find_reclaimable(&root, &keep);
+            let mut total = 0u64;
+            let items: Vec<_> = dirs.iter().map(|p| {
+                let bytes = reclaim::dir_size(p);
+                total += bytes;
+                json!({"path": p.display().to_string(), "bytes": bytes, "size": appcatalog::human_size(bytes)})
+            }).collect();
+            job.finish(json!({
+                "ok": true, "items": items, "count": items.len(),
+                "total_bytes": total, "total": appcatalog::human_size(total)
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "rscan"}).to_string())
+    }
+
+    /// Delete the reclaimable `target/` dirs (re-validated before each removal; the
+    /// shared cache and your non-build dirs are never touched). Async job "reclaim".
+    fn reclaim(&self) -> QString {
+        let root = match repo() { Ok(r) => r.root().to_path_buf(), Err(e) => return err_json(&e) };
+        if !self.job.start("reclaim") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let keep = std::path::PathBuf::from(shared_target_dir());
+            let dirs = reclaim::find_reclaimable(&root, &keep);
+            let mut freed = 0u64;
+            let mut count = 0usize;
+            for p in dirs {
+                if !reclaim::is_safe_target(&p, &root, &keep) {
+                    continue; // guard: never delete anything that fails re-validation
+                }
+                let bytes = reclaim::dir_size(&p);
+                if std::fs::remove_dir_all(&p).is_ok() {
+                    freed += bytes;
+                    count += 1;
+                }
+            }
+            job.finish(json!({
+                "ok": true, "count": count, "freed_bytes": freed, "freed": appcatalog::human_size(freed)
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "reclaim"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
