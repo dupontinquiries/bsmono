@@ -178,11 +178,12 @@ pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
     out
 }
 
-/// `cross build` argv for `app`/`triple` with a chosen feature set. `no_default`
-/// adds `--no-default-features` (so the chosen set is exactly what's built).
-/// Pure — unit-tested.
+/// `cargo build` argv for `app`/`triple` with a chosen feature set. `no_default`
+/// adds `--no-default-features` (so the chosen set is exactly what's built). Uses
+/// plain `cargo` with `--target` (no container needed); the target's std must be
+/// installed (`rustup target add <triple>`). Pure — unit-tested.
 pub fn cargo_build_argv(app: &str, triple: &str, features: &[String], no_default: bool) -> Vec<String> {
-    let mut a: Vec<String> = ["cross", "build", "--release", "--target", triple, "-p", app]
+    let mut a: Vec<String> = ["cargo", "build", "--release", "--target", triple, "-p", app]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -294,6 +295,7 @@ logging = []
     #[test]
     fn cargo_build_argv_honours_features() {
         let a = cargo_build_argv("av1tuner", "aarch64-unknown-linux-musl", &["small".into()], true);
+        assert_eq!(a[0], "cargo", "plain cargo, no container");
         assert!(a.contains(&"--no-default-features".into()));
         assert!(a.windows(2).any(|w| w[0] == "--features" && w[1] == "small"));
         assert_eq!(a[a.iter().position(|x| x == "-p").unwrap() + 1], "av1tuner");

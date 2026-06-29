@@ -195,6 +195,32 @@ fn app_oid(root: &std::path::Path, dir: &std::path::Path) -> String {
         .unwrap_or_default()
 }
 
+/// Resolve the cargo binary even when the GUI was launched from a desktop launcher
+/// (whose PATH usually omits ~/.cargo/bin): honour $CARGO, then ~/.cargo/bin/cargo,
+/// then fall back to the name.
+fn cargo_bin() -> String {
+    if let Ok(c) = std::env::var("CARGO") {
+        if !c.trim().is_empty() {
+            return c;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cand = format!("{home}/.cargo/bin/cargo");
+        if std::path::Path::new(&cand).is_file() {
+            return cand;
+        }
+    }
+    "cargo".to_string()
+}
+
+/// A PATH that includes ~/.cargo/bin and the standard locations, so a build (and its
+/// rustc/linker subprocesses, or Xvfb/ImageMagick) resolves even from a launcher.
+fn tool_path_env() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cur = std::env::var("PATH").unwrap_or_default();
+    format!("{home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin{}", if cur.is_empty() { String::new() } else { format!(":{cur}") })
+}
+
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
 fn set_executable(path: &str) {
     use std::os::unix::fs::PermissionsExt;
@@ -1147,9 +1173,10 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
             let argv = buildflags::cargo_build_argv(&app, &target, &feats, no_default);
-            let out = std::process::Command::new(&argv[0])
+            let out = std::process::Command::new(cargo_bin())
                 .args(&argv[1..])
                 .current_dir(&root)
+                .env("PATH", tool_path_env())
                 .output();
             let payload = match out {
                 Ok(o) if o.status.success() => {
@@ -1165,6 +1192,10 @@ impl Backend {
                     let err = String::from_utf8_lossy(&o.stderr);
                     json!({"ok": false, "error": err.trim()}).to_string()
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => json!({
+                    "ok": false,
+                    "error": "couldn't find cargo. Install Rust, or launch gitmind-gui from a shell where cargo is on PATH (it lives in ~/.cargo/bin)."
+                }).to_string(),
                 Err(e) => json!({"ok": false, "error": format!("couldn't run the build: {e}")}).to_string(),
             };
             job.finish(payload);
@@ -1189,7 +1220,9 @@ impl Backend {
             let out = preview::shot_path(&app, &oid);
             let _ = std::fs::create_dir_all(out.parent().unwrap_or(std::path::Path::new("/tmp")));
             let script = preview::capture_script(&bin, &out.display().to_string());
-            let res = std::process::Command::new("sh").arg("-c").arg(&script).output();
+            let res = std::process::Command::new("sh").arg("-c").arg(&script)
+                .env("PATH", tool_path_env())
+                .output();
             let payload = match res {
                 Ok(o) => {
                     let stdout = String::from_utf8_lossy(&o.stdout);
