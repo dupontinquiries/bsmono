@@ -1323,3 +1323,24 @@ ON-DEVICE: build (cross musl from gnu desktop needs the musl target+linker), scp
 script. Connect as the device's run-user. NOTE/TRADEOFF: Push has its own compact device picker (markup
 overlaps Fleet's) — extracting a shared stateful DevicePicker.qml deferred (riskier untested); filter
 logic IS shared via applib.js. Still DEFERRED: key settings/cleanup page; reclaim in-repo target/ dirs.
+
+── key settings + cleanup page (Keys tab) + shared DevicePicker ──
+USER (next of 3): settings page for key viewing/id/cleanup (lastaccessed+network-seen wanted too).
+[deploy.rs, 15 tests] AuthKey{options,key_type,key_b64,comment,expiry,managed,expired}+id(). parse_
+authorized_keys(text, now_stamp YYYYMMDDHHMMSS) — managed = has expiry-time; expired = expiry<now
+(lexicographic, fixed-width). dedupe_authorized_keys(text,now)→(cleaned,removed): NEVER touches non-
+managed (your own) keys or comments; drops expired managed + older dup of same key blob (keeps newest
+expiry, once). remote_feed(user,host,cmd,stdin) — ssh with piped stdin (write-back).
+[main.rs] now_stamp() free fn. list_keys(host,user) async "keys" → cat ~/.ssh/authorized_keys → parse →
+[{id,type,managed,expired,expiry,from}]. cleanup_keys(host,user) async "keyclean" → read → dedupe →
+remote_feed `umask 077; cat > authorized_keys.gm && mv …` (atomic) → {removed}. rustcheck CLEAN.
+[DevicePicker.qml NEW shared] self-contained: discover/select/trust/install-key + own poller; props
+user/selHost/selName/hostTrusted + selected() signal. Push REFACTORED to use it (removed its inline
+picker — de-dup); Fleet keeps its richer picker (has provision). [Keys.qml NEW tab] DevicePicker +
+onSelected→listKeys; refresh + "clean up expired+duplicates" buttons; key cards with yours/expired/LAN-
+only badges + expiry (fmt YYYY-MM-DD HH:MM). main.qml: "keys" tab (status/timeline/branches/files/apps/
+fleet/push/keys/network = 9). qrc: Keys.qml, DevicePicker.qml.
+VERIFIED: deploy 15, installer 4, buildflags 11, fleet 5, appcatalog 7, netshare 4, bttransfer 3,
+preview 3 = 52; rustcheck CLEAN; Fleet/Push/Keys/DevicePicker/MonoTile/main/Network balanced; backend.*
+resolve. DEFERRED: last-accessed + network-seen per key (needs sshd VERBOSE log parsing or lastlog on-
+device — note in UI later). reclaim in-repo target/ dirs (the 3rd item) still TODO.

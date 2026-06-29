@@ -49,6 +49,8 @@ qrc!(register_qml,
         "qml/Apps.qml",
         "qml/Fleet.qml",
         "qml/Push.qml",
+        "qml/Keys.qml",
+        "qml/DevicePicker.qml",
         "qml/applib.js",
         "qml/MonoTile.qml",
         "qml/Files.qml",
@@ -149,6 +151,8 @@ struct Backend {
     build_repo: qt_method!(fn(&self) -> QString),
     remote_repo_candidates: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     remote_target: qt_method!(fn(&self, host: QString, user: QString) -> QString),
+    list_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
+    cleanup_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     set_build_repo: qt_method!(fn(&self, path: QString) -> QString),
     remote_install: qt_method!(fn(&self, app: QString, rel: QString, target: QString, features: QString, host: QString, user: QString, repo: QString, icon: QString) -> QString),
     push_install: qt_method!(fn(&self, app: QString, path: QString, target: QString, features: QString, host: QString, user: QString) -> QString),
@@ -323,6 +327,15 @@ fn build_locally(app: &str, app_dir: &std::path::Path, target: &str, feats: &[St
         ),
         Err(e) => Err(format!("couldn't run the build: {e}")),
     }
+}
+
+/// Current time as an OpenSSH expiry-time stamp (YYYYMMDDHHMMSS), for the expired check.
+fn now_stamp() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    deploy::key_expiry_time(now, 0)
 }
 
 /// Mark a freshly-installed binary executable (best-effort; Unix perms).
@@ -1378,6 +1391,70 @@ impl Backend {
             }
             Err(e) => err_json(&e),
         }
+    }
+
+    /// List the access keys installed on a device, flagging which gitmind manages and
+    /// which have expired. Async job "keys".
+    fn list_keys(&self, host: QString, user: QString) -> QString {
+        let (host, user) = (host.to_string(), user.to_string());
+        if host.is_empty() || user.is_empty() {
+            return err_json("pick a device first");
+        }
+        if !self.job.start("keys") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let payload = match deploy::remote_capture(&user, &host, "cat ~/.ssh/authorized_keys 2>/dev/null") {
+                Ok(text) => {
+                    let now = now_stamp();
+                    let keys: Vec<_> = deploy::parse_authorized_keys(&text, &now).iter().map(|k| json!({
+                        "id": k.id(),
+                        "type": k.key_type,
+                        "managed": k.managed,
+                        "expired": k.expired,
+                        "expiry": k.expiry,
+                        "from": k.options.contains("from="),
+                    })).collect();
+                    json!({"ok": true, "host": host, "keys": keys}).to_string()
+                }
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(payload);
+        });
+        QString::from(json!({"ok": true, "started": "keys"}).to_string())
+    }
+
+    /// Remove expired + duplicate gitmind-managed keys from a device's authorized_keys
+    /// (your own keys are never touched), writing back atomically. Async job "keyclean".
+    fn cleanup_keys(&self, host: QString, user: QString) -> QString {
+        let (host, user) = (host.to_string(), user.to_string());
+        if host.is_empty() || user.is_empty() {
+            return err_json("pick a device first");
+        }
+        if !self.job.start("keyclean") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let text = match deploy::remote_capture(&user, &host, "cat ~/.ssh/authorized_keys 2>/dev/null") {
+                Ok(t) => t,
+                Err(e) => { job.finish(json!({"ok": false, "error": e}).to_string()); return; }
+            };
+            let now = now_stamp();
+            let (cleaned, removed) = deploy::dedupe_authorized_keys(&text, &now);
+            if removed == 0 {
+                job.finish(json!({"ok": true, "removed": 0, "msg": "nothing to clean"}).to_string());
+                return;
+            }
+            // write back atomically (temp + mv), umask-protected
+            let cmd = "umask 077; mkdir -p ~/.ssh && cat > ~/.ssh/authorized_keys.gm && mv ~/.ssh/authorized_keys.gm ~/.ssh/authorized_keys && echo gitmind-keys-cleaned";
+            match deploy::remote_feed(&user, &host, cmd, &cleaned) {
+                Ok(_) => job.finish(json!({"ok": true, "removed": removed}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "keyclean"}).to_string())
     }
 
     fn set_build_repo(&self, path: QString) -> QString {
