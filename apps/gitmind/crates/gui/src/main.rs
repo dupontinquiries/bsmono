@@ -158,6 +158,8 @@ struct Backend {
     add_repos_base: qt_method!(fn(&self, path: QString) -> QString),
     place_app: qt_method!(fn(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString),
     local_repos: qt_method!(fn(&self) -> QString),
+    duplicates: qt_method!(fn(&self) -> QString),
+    build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
     apply_merge: qt_method!(fn(&self, workspace: QString, branch: QString, target: QString, strategy: QString) -> QString),
@@ -1444,31 +1446,47 @@ impl Backend {
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let cmd = "find \"$HOME\" -maxdepth 6 \\( -name .git -o -name .gitmind \\) 2>/dev/null | head -200";
-            let out = std::process::Command::new("sh").arg("-c").arg(cmd)
-                .env("PATH", tool_path_env()).output();
-            let mut roots: Vec<std::path::PathBuf> = Vec::new();
-            if let Ok(o) = out {
-                for line in String::from_utf8_lossy(&o.stdout).lines() {
-                    let l = line.trim();
-                    if l.is_empty() { continue; }
-                    let p = std::path::Path::new(l);
-                    if let Some(root) = p.parent() {
-                        let r = root.to_path_buf();
-                        if !roots.contains(&r) { roots.push(r); }
-                    }
-                }
-            }
-            roots.sort();
-            let repos: Vec<_> = roots.iter().map(|r| json!({
-                "path": r.display().to_string(),
-                "name": r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-                "gitmind": r.join(".gitmind").exists(),
-                "git": r.join(".git").exists(),
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let repos: Vec<_> = cockpit::flow::discover_repos(std::path::Path::new(&home)).iter().map(|r| json!({
+                "path": r.path, "name": r.name, "gitmind": r.gitmind, "git": r.git, "key": r.key,
             })).collect();
             job.finish(json!({"ok": true, "repos": repos, "count": repos.len()}).to_string());
         });
         QString::from(json!({"ok": true, "started": "lrepos"}).to_string())
+    }
+
+    /// Projects that exist in more than one workspace under $HOME, grouped by identity
+    /// (git root commit, shared across clones). Async job "dupes" → groups with a
+    /// suggested canonical copy and the shared build dir.
+    fn duplicates(&self) -> QString {
+        if !self.job.start("dupes") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            let bases = places::repos_bases();
+            let path_env = tool_path_env();
+            let groups: Vec<_> = cockpit::flow::duplicates(std::path::Path::new(&home)).iter().map(|g| {
+                let canon = cockpit::identity::canonical(&g.paths, &bases).to_string();
+                let build_dir = cockpit::build_dir_for(std::path::Path::new(&canon), &path_env).display().to_string();
+                json!({"key": g.key, "name": g.name, "paths": g.paths, "canonical": canon, "build_dir": build_dir})
+            }).collect();
+            job.finish(json!({"ok": true, "groups": groups, "count": groups.len()}).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "dupes"}).to_string())
+    }
+
+    /// Get (empty arg) or set the build base — where all builds go so they never spill
+    /// target/ into the repos. Default ~/.var/gitmind/build, fallback /tmp/gitmind/build.
+    fn build_dir(&self, set: QString) -> QString {
+        let set = set.to_string();
+        if !set.trim().is_empty() {
+            if let Err(e) = cockpit::set_build_base(&set) {
+                return err_json(&e);
+            }
+        }
+        QString::from(json!({"ok": true, "base": cockpit::build_base().display().to_string()}).to_string())
     }
 
     /// Apply an imported zip onto an existing git repo as a reviewable change: on a

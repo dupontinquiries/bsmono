@@ -11,6 +11,7 @@ pub mod buildflags;
 pub mod deploy;
 pub mod fleet;
 pub mod flow;
+pub mod identity;
 pub mod importer;
 pub mod installer;
 pub mod merge;

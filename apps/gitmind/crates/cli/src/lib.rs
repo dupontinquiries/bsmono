@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim> ..."),
+        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim|dedup|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1442,6 +1442,39 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 println!("{} reclaimable in {} dir(s) — add --apply to remove", cockpit::appcatalog::human_size(scan.total_bytes), scan.items.len());
             }
             0
+        }
+        "dedup" => {
+            let root = pos.first().map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+            let groups = flow::duplicates(&root);
+            if groups.is_empty() {
+                println!("no duplicate projects under {}", root.display());
+                return 0;
+            }
+            let bases = cockpit::places::repos_bases();
+            let path_env = cockpit::tool_path_env();
+            println!("{} project(s) exist in more than one place:\n", groups.len());
+            for g in &groups {
+                let canon = cockpit::identity::canonical(&g.paths, &bases);
+                println!("{}  ({} copies, key {})", g.name, g.paths.len(), g.key);
+                for p in &g.paths {
+                    println!("  {} {}", if p == canon { "● canonical" } else { "○ duplicate" }, p);
+                }
+                let slug_dir = cockpit::build_dir_for(std::path::Path::new(canon), &path_env);
+                println!("  → all copies build into {}\n", slug_dir.display());
+            }
+            0
+        }
+        "build-dir" => {
+            if let Some(p) = pos.first() {
+                match cockpit::set_build_base(p) {
+                    Ok(()) => { println!("build base set to {}", cockpit::build_base().display()); 0 }
+                    Err(e) => err(&e),
+                }
+            } else {
+                println!("{}", cockpit::build_base().display());
+                0
+            }
         }
         other => err(&format!("unknown fleet command: {other}")),
     }
