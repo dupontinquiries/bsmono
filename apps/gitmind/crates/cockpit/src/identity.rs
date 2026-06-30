@@ -101,6 +101,56 @@ pub fn group_duplicates(entries: Vec<(String, String, String)>) -> Vec<DupGroup>
         .collect()
 }
 
+/// How one copy of a project relates to another, by git ancestry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Relation {
+    pub relation: String, // "same" | "ahead" (a newer) | "behind" (a older) | "diverged" | "unrelated"
+    pub a_ahead: usize,   // commits in a not in b
+    pub b_ahead: usize,   // commits in b not in a
+}
+
+fn git_ok(cwd: &Path, path_env: &str, args: &[&str]) -> bool {
+    Command::new("git").args(args).current_dir(cwd).env("PATH", path_env)
+        .output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+fn git1(cwd: &Path, path_env: &str, args: &[&str]) -> String {
+    git_lines(cwd, path_env, args).into_iter().next().unwrap_or_default()
+}
+
+/// Compare two copies of the same project by history, in a throwaway bare clone of `a`
+/// with `b`'s tip fetched in, so neither real repo is touched. "ahead" means `a` is newer
+/// (contains b's history plus more); "behind" the reverse; "diverged" means each has
+/// commits the other lacks (a merge is needed to roll them together).
+pub fn relate(a: &Path, b: &Path, path_env: &str) -> Relation {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos()).unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("gm-rel-{}-{}", std::process::id(), nanos));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let unknown = Relation { relation: "unrelated".into(), a_ahead: 0, b_ahead: 0 };
+    if !git_ok(Path::new("/"), path_env, &["clone", "--bare", "--quiet", "--local", &a.display().to_string(), &tmp.display().to_string()]) {
+        return unknown;
+    }
+    let a_head = git1(&tmp, path_env, &["rev-parse", "HEAD"]);
+    let fetched = git_ok(&tmp, path_env, &["fetch", "--no-tags", "--quiet", &b.display().to_string(), "HEAD:refs/gmother"]);
+    let b_head = if fetched { git1(&tmp, path_env, &["rev-parse", "refs/gmother"]) } else { String::new() };
+    let result = if a_head.is_empty() || b_head.is_empty() {
+        unknown
+    } else if a_head == b_head {
+        Relation { relation: "same".into(), a_ahead: 0, b_ahead: 0 }
+    } else {
+        let a_ahead: usize = git1(&tmp, path_env, &["rev-list", "--count", &format!("refs/gmother..{a_head}")]).parse().unwrap_or(0);
+        let b_ahead: usize = git1(&tmp, path_env, &["rev-list", "--count", &format!("{a_head}..refs/gmother")]).parse().unwrap_or(0);
+        let b_anc = git_ok(&tmp, path_env, &["merge-base", "--is-ancestor", &b_head, &a_head]);
+        let a_anc = git_ok(&tmp, path_env, &["merge-base", "--is-ancestor", &a_head, &b_head]);
+        let has_base = git_ok(&tmp, path_env, &["merge-base", &a_head, &b_head]);
+        let relation = if b_anc { "ahead" } else if a_anc { "behind" } else if has_base { "diverged" } else { "unrelated" };
+        Relation { relation: relation.into(), a_ahead, b_ahead }
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
 /// Pick the canonical copy among duplicates: one under a known repos base if possible,
 /// else the shallowest path, else the first. Pure.
 pub fn canonical<'a>(paths: &'a [String], bases: &[String]) -> &'a str {
@@ -172,5 +222,40 @@ mod tests {
         assert_eq!(canonical(&groups[0].paths, &bases), "/home/u/Code/proj", "prefer a copy under a repos base");
         // no base match → shallowest path (fewer components): /tmp/scratch/proj
         assert_eq!(canonical(&groups[0].paths, &[]), "/tmp/scratch/proj");
+    }
+
+    #[test]
+    fn relate_classifies_newer_older_and_diverged() {
+        let base = std::env::temp_dir().join(format!("gm-rel-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let old = base.join("old");
+        let new = base.join("new");
+        fs::create_dir_all(&old).unwrap();
+        run(&old, &["init", "-q"]);
+        fs::write(old.join("f"), "1\n").unwrap();
+        run(&old, &["add", "-A"]); run(&old, &["commit", "-qm", "base"]);
+        // new = clone of old, then old stays put, new gets ahead
+        run(&base, &["clone", "-q", &old.display().to_string(), &new.display().to_string()]);
+        fs::write(new.join("g"), "2\n").unwrap();
+        run(&new, &["add", "-A"]); run(&new, &["commit", "-qm", "more"]);
+
+        let path = std::env::var("PATH").unwrap_or_default();
+        // old vs new: old is behind (new is newer)
+        let r = relate(&old, &new, &path);
+        assert_eq!(r.relation, "behind", "old copy is behind the newer one");
+        assert_eq!(r.b_ahead, 1, "new has one extra commit");
+        // new vs old: new is ahead
+        assert_eq!(relate(&new, &old, &path).relation, "ahead");
+        // identical copy → same
+        let twin = base.join("twin");
+        run(&base, &["clone", "-q", &new.display().to_string(), &twin.display().to_string()]);
+        assert_eq!(relate(&new, &twin, &path).relation, "same");
+        // both commit different things → diverged (each has a unique commit)
+        fs::write(new.join("n2"), "n\n").unwrap();
+        run(&new, &["add", "-A"]); run(&new, &["commit", "-qm", "new work"]);
+        fs::write(twin.join("h"), "3\n").unwrap();
+        run(&twin, &["add", "-A"]); run(&twin, &["commit", "-qm", "twin work"]);
+        assert_eq!(relate(&new, &twin, &path).relation, "diverged", "both have unique commits");
+        let _ = fs::remove_dir_all(&base);
     }
 }

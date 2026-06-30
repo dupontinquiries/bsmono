@@ -30,6 +30,10 @@ Item {
         note = r.ok ? ("removed " + name + "@" + label) : ("error: " + r.error)
         reload()
     }
+    function runApp(name) {
+        var r = JSON.parse(backend.run_local(name, ""))
+        note = r.ok ? ("▶ " + r.msg) : ("error: " + r.error)
+    }
 
     Component.onCompleted: reload()
 
@@ -57,9 +61,19 @@ Item {
                 width: appList.width
                 spacing: 4
 
-                Label {
-                    text: modelData.name + "  (current: " + (modelData.current ? modelData.current : "—") + ")"
-                    color: "#cdd6f4"; font.bold: true
+                Row {
+                    width: appList.width; spacing: 8
+                    Label {
+                        text: modelData.name + "  (current: " + (modelData.current ? modelData.current : "—") + ")"
+                        color: "#cdd6f4"; font.bold: true
+                        width: parent.width - runBtn.width - 8; elide: Text.ElideRight
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    Button {
+                        id: runBtn; text: "▶ run"
+                        enabled: modelData.current !== null && modelData.current !== undefined && modelData.current !== ""
+                        onClicked: root.runApp(modelData.name)
+                    }
                 }
 
                 Repeater {

@@ -17,6 +17,12 @@ Item {
     property string selOid: ""
     property string target: "aarch64-unknown-linux-musl"
 
+    // build features (cargo [features]) for the selected app
+    property var features: []
+    property var defaultsByTarget: ({})
+    property var chosen: []
+    property bool isCargo: false
+
     property bool busy: false
     property string jobKind: ""
     property string pushState: "idle" // idle | working | done | failed
@@ -31,17 +37,42 @@ Item {
     function pickApp(a) {
         root.selApp = a.name; root.selPath = a.path; root.selOid = a.oid || ""
         root.pushState = "idle"; root.note = ""
+        root.loadOptions()
+    }
+    function loadOptions() {
+        root.features = []; root.chosen = []; root.defaultsByTarget = ({}); root.isCargo = false
+        if (root.selPath.length === 0) return
+        var r = JSON.parse(backend.local_build_options(root.selPath))
+        if (!r.ok) return
+        root.features = r.features || []
+        root.defaultsByTarget = r.defaults_by_target || ({})
+        root.isCargo = r.is_cargo === true
+        root.applyDefaults()
+    }
+    function applyDefaults() {
+        var d = root.defaultsByTarget[root.target]
+        root.chosen = d ? d.slice() : []
+    }
+    function toggleFeature(f) {
+        var c = root.chosen.slice()
+        var i = c.indexOf(f)
+        if (i >= 0) c.splice(i, 1); else c.push(f)
+        root.chosen = c
+    }
+    function setTarget(t) {
+        root.target = t
+        root.applyDefaults()
     }
     // when a device is chosen, default the build target to its libc
     function detectTarget() {
         if (picker.selHost.length === 0) return
         var t = JSON.parse(backend.remote_target(picker.selHost, picker.user))
-        if (t.ok && t.target && t.target.length) root.target = t.target
+        if (t.ok && t.target && t.target.length) { root.target = t.target; root.applyDefaults() }
     }
     function doPush() {
         if (root.selApp.length === 0) { root.note = "pick an app first"; return }
         if (picker.selHost.length === 0) { root.note = "pick a device first"; return }
-        var r = JSON.parse(backend.push_install(root.selApp, root.selPath, root.target, "", picker.selHost, picker.user))
+        var r = JSON.parse(backend.push_install(root.selApp, root.selPath, root.target, root.chosen.join(","), picker.selHost, picker.user))
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.pushState = "working"; root.busy = true; root.jobKind = "push"; root.note = ""; poller.start()
     }
@@ -150,8 +181,32 @@ Item {
                                 color: modelData === root.target ? "#2a3350" : "#1b2335"
                                 border.color: modelData === root.target ? "#7aa2f7" : "#3a4566"
                                 Label { id: tl; anchors.centerIn: parent; text: App.targetLibc(modelData); color: "#cdd6f4"; font.pixelSize: 12 }
-                                TapHandler { onTapped: root.target = modelData }
+                                TapHandler { onTapped: root.setTarget(modelData) }
                             }
+                        }
+                    }
+                    // cargo feature toggles, defaulted to the chosen target's default set
+                    Column {
+                        width: parent.width; spacing: 6
+                        visible: root.isCargo && root.features.length > 0
+                        Label { text: "features"; color: "#8a93a6"; font.pixelSize: 12 }
+                        Flow {
+                            width: parent.width; spacing: 6
+                            Repeater {
+                                model: root.features
+                                delegate: Rectangle {
+                                    height: 28; radius: 14; width: fl.width + 20
+                                    property bool on: root.chosen.indexOf(modelData) >= 0
+                                    color: on ? "#2a3350" : "#1b2335"
+                                    border.color: on ? "#7aa2f7" : "#3a4566"
+                                    Label { id: fl; anchors.centerIn: parent; text: modelData; color: on ? "#cdd6f4" : "#8a93a6"; font.pixelSize: 12 }
+                                    TapHandler { onTapped: root.toggleFeature(modelData) }
+                                }
+                            }
+                        }
+                        Label {
+                            width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                            text: root.chosen.length ? ("building with: " + root.chosen.join(", ")) : "no features (—no-default-features)"
                         }
                     }
                     Button {

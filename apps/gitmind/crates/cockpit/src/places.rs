@@ -46,6 +46,51 @@ pub fn push_history(mut list: Vec<String>, item: &str, cap: usize) -> Vec<String
     list
 }
 
+/// The folders gitmind scans for repos/duplicates. Defaults to $HOME; add a mounted drive
+/// or a specific project area to scope discovery (and keep an external disk's copies in
+/// view). Always includes $HOME so nothing local is missed.
+pub fn scan_roots() -> Vec<String> {
+    let mut roots: Vec<String> = crate::fleet::config_file("scan-roots")
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && !roots.iter().any(|x| x == &home) {
+            roots.insert(0, home);
+        }
+    }
+    roots
+}
+
+/// Add a scan root (e.g. an external drive's mountpoint). $HOME stays implicit.
+pub fn add_scan_root(path: &str) -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let p = expand_home(path.trim(), &home);
+    if p.is_empty() { return Ok(()); }
+    let existing: Vec<String> = crate::fleet::config_file("scan-roots")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    let hist = push_history(existing, &p, 12);
+    let f = crate::fleet::config_file("scan-roots").ok_or("no $HOME set")?;
+    if let Some(dir) = f.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    std::fs::write(&f, format!("{}\n", hist.join("\n"))).map_err(|e| e.to_string())
+}
+
+/// Remove a scan root.
+pub fn remove_scan_root(path: &str) -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let p = expand_home(path.trim(), &home);
+    let existing: Vec<String> = crate::fleet::config_file("scan-roots")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .map(|s| s.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+        .unwrap_or_default();
+    let kept: Vec<String> = existing.into_iter().filter(|x| x != &p).collect();
+    let f = crate::fleet::config_file("scan-roots").ok_or("no $HOME set")?;
+    if let Some(dir) = f.parent() { std::fs::create_dir_all(dir).map_err(|e| e.to_string())?; }
+    std::fs::write(&f, format!("{}\n", kept.join("\n"))).map_err(|e| e.to_string())
+}
+
 /// Expand a leading ~ to `home`. Pure.
 pub fn expand_home(path: &str, home: &str) -> String {
     if path == "~" {

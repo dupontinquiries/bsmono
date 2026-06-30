@@ -298,3 +298,133 @@ pub fn reclaim_apply(root: &Path) -> (usize, u64) {
     }
     (count, freed)
 }
+
+// ── add an imported/built app to the local apps list, runnable from the GUI/CLI ──
+
+/// An app added to the local catalog.
+pub struct Installed {
+    pub name: String,
+    pub label: String,
+    pub path: String,
+    pub run_args: String,
+}
+
+fn run_args_path() -> Option<PathBuf> {
+    std::env::var("HOME").ok().filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(format!("{h}/.config/gitmind/run-args.json")))
+}
+
+/// The saved launch flags for a local app (empty if none).
+pub fn run_args(name: &str) -> String {
+    let Some(p) = run_args_path() else { return String::new() };
+    let Ok(text) = std::fs::read_to_string(&p) else { return String::new() };
+    serde_json::from_str::<serde_json::Value>(&text).ok()
+        .and_then(|v| v.get(name).and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// Remember the launch flags for a local app.
+pub fn set_run_args(name: &str, args: &str) -> Result<(), String> {
+    let p = run_args_path().ok_or_else(|| "no HOME".to_string())?;
+    if let Some(dir) = p.parent() { let _ = std::fs::create_dir_all(dir); }
+    let mut map: serde_json::Map<String, serde_json::Value> = std::fs::read_to_string(&p).ok()
+        .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    map.insert(name.to_string(), serde_json::Value::String(args.to_string()));
+    std::fs::write(&p, serde_json::to_string_pretty(&map).unwrap_or_default()).map_err(|e| e.to_string())
+}
+
+/// Install a built binary into the local app catalog (var store + manifest + .desktop) and
+/// remember any launch flags. The app then appears in the apps list and runs locally.
+pub fn add_to_apps(bin: &Path, name: &str, commit: &str, run_args: &str) -> Result<Installed, String> {
+    let bytes = std::fs::read(bin).map_err(|e| format!("read binary: {e}"))?;
+    let store = gitmind_core::varcache::open_var_store()?;
+    let label = format!("import-{}", crate::ops::now_stamp());
+    let commit = if commit.trim().is_empty() { "import" } else { commit };
+    let v = gitmind_core::binpin::install(&store, name, &label, commit, "host", &bytes, true)?;
+    let _ = gitmind_core::binpin::write_desktop(name, &label, false, None);
+    set_run_args(name, run_args)?;
+    Ok(Installed { name: name.into(), label, path: v.path, run_args: run_args.into() })
+}
+
+/// Build an imported crate natively, then add it to the local apps list with launch flags.
+pub fn build_and_add(crate_path: &Path, app: &str, run_args: &str) -> Result<Installed, String> {
+    let native = native_triple_local();
+    let (bin, _) = build_locally(app, crate_path, &native, &[], false).map_err(|e| format!("build: {e}"))?;
+    add_to_apps(&bin, app, "import", run_args)
+}
+
+/// Launch a locally-installed app (its current pinned version) with its saved flags plus
+/// any extra args, detached. Returns a short status.
+pub fn run_local(name: &str, extra: &str) -> Result<String, String> {
+    let bin = gitmind_core::binpin::bin_dir().join(name);
+    if !bin.exists() {
+        return Err(format!("{name} isn't installed locally — add it to your apps first"));
+    }
+    let mut argv: Vec<String> = run_args(name).split_whitespace().map(|s| s.to_string()).collect();
+    argv.extend(extra.split_whitespace().map(|s| s.to_string()));
+    std::process::Command::new(&bin).args(&argv).env("PATH", tool_path_env())
+        .spawn().map_err(|e| format!("couldn't launch {name}: {e}"))?;
+    Ok(format!("launched {name}{}", if argv.is_empty() { String::new() } else { format!(" {}", argv.join(" ")) }))
+}
+
+// ── folder-scoped discovery + comparing duplicate copies ──
+
+/// Discover repos across several scan roots (e.g. $HOME plus a mounted drive), one entry
+/// per repo, deduped by path.
+pub fn discover_scoped(roots: &[String]) -> Vec<Repo> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for root in roots {
+        if root.trim().is_empty() { continue; }
+        for r in discover_repos(Path::new(root)) {
+            if seen.insert(r.path.clone()) { out.push(r); }
+        }
+    }
+    out
+}
+
+/// Duplicate projects across the configured scan roots ($HOME + any added drives).
+pub fn duplicates_all() -> Vec<crate::identity::DupGroup> {
+    let roots = crate::places::scan_roots();
+    let entries = discover_scoped(&roots).into_iter().map(|r| (r.path, r.key, r.name)).collect();
+    crate::identity::group_duplicates(entries)
+}
+
+/// One copy within a duplicate group, relative to the newest copy.
+pub struct CopyStatus {
+    pub path: String,
+    pub role: String,  // "newest" | "older" | "same" | "diverged" | "newer" | "unrelated"
+    pub behind: usize, // commits this copy is missing vs the newest
+    pub ahead: usize,  // commits this copy has that the newest lacks (diverged)
+}
+
+fn commit_count(repo: &str, path_env: &str) -> usize {
+    std::process::Command::new("git").args(["rev-list", "--count", "HEAD"]).current_dir(repo)
+        .env("PATH", path_env).output().ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// For a set of copies of one project, pick the newest (most commits) and classify each
+/// other copy against it: older (a clean fast-forward away), identical, or diverged (needs
+/// a merge to roll together). Returns (newest_path, statuses).
+pub fn compare_group(paths: &[String]) -> (String, Vec<CopyStatus>) {
+    let pe = crate::ops::tool_path_env();
+    let newest = paths.iter().max_by_key(|p| commit_count(p, &pe)).cloned().unwrap_or_default();
+    let statuses = paths.iter().map(|p| {
+        if *p == newest {
+            return CopyStatus { path: p.clone(), role: "newest".into(), behind: 0, ahead: 0 };
+        }
+        let r = crate::identity::relate(Path::new(&newest), Path::new(p), &pe);
+        let (role, behind, ahead) = match r.relation.as_str() {
+            "ahead" => ("older", r.a_ahead, 0),
+            "same" => ("same", 0, 0),
+            "diverged" => ("diverged", r.a_ahead, r.b_ahead),
+            "behind" => ("newer", 0, r.b_ahead),
+            _ => ("unrelated", 0, 0),
+        };
+        CopyStatus { path: p.clone(), role: role.into(), behind, ahead }
+    }).collect();
+    (newest, statuses)
+}

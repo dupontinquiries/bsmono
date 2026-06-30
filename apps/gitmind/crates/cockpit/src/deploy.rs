@@ -386,21 +386,63 @@ pub fn scp_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<S
     a
 }
 
-/// Push a local file to a device over scp, creating the destination dir first.
-/// On-device.
+/// Same as `scp_push_argv` but forces the legacy SCP transfer protocol (`-O`). Modern
+/// scp speaks SFTP by default, which fails on devices without the sftp-server subsystem
+/// (common on minimal Alpine / postmarketOS) — the legacy protocol needs no subsystem.
+pub fn scp_push_argv_legacy(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
+    let mut a = vec!["-O".to_string()];
+    a.extend(scp_push_argv(local, user, host, remote));
+    a
+}
+
+/// `rsync -az -e "ssh <opts>" <local> user@host:<remote>` argv — push over rsync, which
+/// runs its own protocol over the ssh channel and so needs no sftp-server either.
+pub fn rsync_push_argv(local: &str, user: &str, host: &str, remote: &str) -> Vec<String> {
+    vec![
+        "-az".to_string(),
+        "-e".to_string(),
+        ssh_command_str(),
+        local.to_string(),
+        format!("{user}@{host}:{remote}"),
+    ]
+}
+
+/// Push a local file to a device, robust against minimal sshd setups. ssh (the mkdir)
+/// can succeed while plain scp dies with 255 because the device has no sftp-server, so we
+/// try, in order: rsync over ssh, then `scp -O` (legacy protocol), then plain scp — and
+/// report an actionable error if every transport fails. On-device.
 pub fn scp_push(local: &str, user: &str, host: &str, remote: &str) -> Result<(), String> {
     if let Some(dir) = remote.rsplit_once('/').map(|(d, _)| d) {
-        // best-effort: ensure the target directory exists
+        // best-effort: ensure the target directory exists (also proves ssh auth works)
         let _ = remote_capture(user, host, &format!("mkdir -p {}", shell_quote(dir)));
     }
-    let st = Command::new("scp")
-        .args(scp_push_argv(local, user, host, remote))
-        .status()
-        .map_err(|e| format!("scp: {e}"))?;
-    if st.success() {
-        Ok(())
-    } else {
-        Err(format!("scp failed (exit {:?}) sending to {host}", st.code()))
+    let mut errs: Vec<String> = Vec::new();
+    // 1) rsync over ssh — fastest, no sftp-server needed
+    match Command::new("rsync").args(rsync_push_argv(local, user, host, remote)).status() {
+        Ok(st) if st.success() => return Ok(()),
+        Ok(st) => errs.push(format!("rsync exit {:?}", st.code())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // rsync not installed — fine
+        Err(e) => errs.push(format!("rsync: {e}")),
+    }
+    // 2) scp with the legacy protocol — works when sftp-server is absent
+    match Command::new("scp").args(scp_push_argv_legacy(local, user, host, remote)).status() {
+        Ok(st) if st.success() => return Ok(()),
+        Ok(st) => errs.push(format!("scp -O exit {:?}", st.code())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err("scp isn't installed on this device".into()),
+        Err(e) => errs.push(format!("scp -O: {e}")),
+    }
+    // 3) plain scp (oldest fallback)
+    match Command::new("scp").args(scp_push_argv(local, user, host, remote)).status() {
+        Ok(st) if st.success() => Ok(()),
+        Ok(st) => {
+            let code = st.code();
+            if code == Some(255) {
+                Err(format!("couldn't reach {user}@{host} — check the device is on, the gitmind key is installed, and ssh works; some minimal devices also disable scp/sftp (gitmind already tried rsync and scp -O)"))
+            } else {
+                Err(format!("transfer to {host} failed (scp exit {:?}; tried: {})", code, errs.join(", ")))
+            }
+        }
+        Err(e) => Err(format!("scp: {e} (tried: {})", errs.join(", "))),
     }
 }
 
@@ -1129,6 +1171,16 @@ mod tests {
         assert!(p.contains(&"ForwardAgent=no".to_string()));
         assert_eq!(p[p.len() - 2], "/repo/target/app");
         assert_eq!(p[p.len() - 1], "gitmind@192.168.1.9:/home/gitmind/.local/bin/app");
+        // legacy push forces the old SCP protocol so it works without sftp-server
+        let pl = scp_push_argv_legacy("/repo/target/app", "gitmind", "192.168.1.9", "/home/gitmind/.local/bin/app");
+        assert_eq!(pl[0], "-O", "legacy scp leads with -O");
+        assert_eq!(pl[pl.len() - 1], "gitmind@192.168.1.9:/home/gitmind/.local/bin/app");
+        // rsync push: -az, -e "ssh <opts>", then local and user@host:remote
+        let rp = rsync_push_argv("/repo/target/app", "gitmind", "192.168.1.9", "/home/gitmind/.local/bin/app");
+        assert_eq!(rp[0], "-az");
+        assert!(rp[2].starts_with("ssh ") && rp[2].contains("ClearAllForwardings=yes"));
+        assert_eq!(rp[rp.len() - 2], "/repo/target/app");
+        assert_eq!(rp[rp.len() - 1], "gitmind@192.168.1.9:/home/gitmind/.local/bin/app");
         // rsync pull: -az, -e "ssh <opts>", then user@host:remote and local
         let r = rsync_pull_argv("gitmind", "192.168.1.7", "/repo/target/x/release/app", "/tmp/app");
         assert_eq!(r[0], "-az");

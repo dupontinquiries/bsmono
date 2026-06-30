@@ -159,6 +159,11 @@ struct Backend {
     place_app: qt_method!(fn(&self, crate_path: QString, dest: QString, base: QString, init: QString) -> QString),
     local_repos: qt_method!(fn(&self) -> QString),
     duplicates: qt_method!(fn(&self) -> QString),
+    scan_roots: qt_method!(fn(&self) -> QString),
+    add_scan_root: qt_method!(fn(&self, path: QString) -> QString),
+    remove_scan_root: qt_method!(fn(&self, path: QString) -> QString),
+    add_app: qt_method!(fn(&self, crate_path: QString, app: QString, flags: QString) -> QString),
+    run_local: qt_method!(fn(&self, name: QString, extra: QString) -> QString),
     build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
@@ -1455,26 +1460,82 @@ impl Backend {
         QString::from(json!({"ok": true, "started": "lrepos"}).to_string())
     }
 
-    /// Projects that exist in more than one workspace under $HOME, grouped by identity
-    /// (git root commit, shared across clones). Async job "dupes" → groups with a
-    /// suggested canonical copy and the shared build dir.
+    /// Projects that exist in more than one workspace across the configured scan roots
+    /// ($HOME + any added drives), grouped by identity (git root commit). Each copy is
+    /// classified against the newest: older (fast-forward away), identical, or diverged
+    /// (needs a merge to roll up). Async job "dupes".
     fn duplicates(&self) -> QString {
         if !self.job.start("dupes") {
             return err_json("a job is already running");
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             let bases = places::repos_bases();
             let path_env = tool_path_env();
-            let groups: Vec<_> = cockpit::flow::duplicates(std::path::Path::new(&home)).iter().map(|g| {
+            let groups: Vec<_> = cockpit::flow::duplicates_all().iter().map(|g| {
+                let (newest, statuses) = cockpit::flow::compare_group(&g.paths);
                 let canon = cockpit::identity::canonical(&g.paths, &bases).to_string();
-                let build_dir = cockpit::build_dir_for(std::path::Path::new(&canon), &path_env).display().to_string();
-                json!({"key": g.key, "name": g.name, "paths": g.paths, "canonical": canon, "build_dir": build_dir})
+                let build_dir = cockpit::build_dir_for(std::path::Path::new(&newest), &path_env).display().to_string();
+                let copies: Vec<_> = statuses.iter().map(|s| json!({
+                    "path": s.path, "role": s.role, "behind": s.behind, "ahead": s.ahead,
+                })).collect();
+                json!({"key": g.key, "name": g.name, "paths": g.paths, "canonical": canon,
+                       "newest": newest, "build_dir": build_dir, "copies": copies})
             }).collect();
             job.finish(json!({"ok": true, "groups": groups, "count": groups.len()}).to_string());
         });
         QString::from(json!({"ok": true, "started": "dupes"}).to_string())
+    }
+
+    /// The folders gitmind scans for repos/duplicates ($HOME plus any added drives).
+    fn scan_roots(&self) -> QString {
+        QString::from(json!({"ok": true, "roots": places::scan_roots()}).to_string())
+    }
+
+    /// Add a folder (e.g. a mounted external drive) to the scan scope.
+    fn add_scan_root(&self, path: QString) -> QString {
+        match places::add_scan_root(&path.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true, "roots": places::scan_roots()}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Remove a folder from the scan scope.
+    fn remove_scan_root(&self, path: QString) -> QString {
+        match places::remove_scan_root(&path.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true, "roots": places::scan_roots()}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Build an imported crate and add it to the local apps list with optional launch
+    /// flags, so it shows in Apps and runs locally. Async job "addapp".
+    fn add_app(&self, crate_path: QString, app: QString, flags: QString) -> QString {
+        let crate_path = crate_path.to_string();
+        let app = app.to_string();
+        let flags = flags.to_string();
+        if crate_path.trim().is_empty() || app.trim().is_empty() {
+            return err_json("import an app first");
+        }
+        if !self.job.start("addapp") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            match cockpit::flow::build_and_add(std::path::Path::new(&crate_path), &app, &flags) {
+                Ok(i) => job.finish(json!({"ok": true, "name": i.name, "label": i.label, "path": i.path, "run_args": i.run_args}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "addapp"}).to_string())
+    }
+
+    /// Launch a locally-installed app with its saved flags plus any extra args.
+    fn run_local(&self, name: QString, extra: QString) -> QString {
+        match cockpit::flow::run_local(&name.to_string(), &extra.to_string()) {
+            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
+            Err(e) => err_json(&e),
+        }
     }
 
     /// Get (empty arg) or set the build base — where all builds go so they never spill

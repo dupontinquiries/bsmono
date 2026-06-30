@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim|dedup|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim|dedup|scope|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1444,26 +1444,60 @@ fn cmd_fleet(rest: &[String]) -> i32 {
             0
         }
         "dedup" => {
-            let root = pos.first().map(std::path::PathBuf::from)
-                .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
-            let groups = flow::duplicates(&root);
+            let groups = match opt(args, "--root") {
+                Some(r) => flow::duplicates(std::path::Path::new(r)),
+                None => flow::duplicates_all(), // $HOME + any added scan roots
+            };
             if groups.is_empty() {
-                println!("no duplicate projects under {}", root.display());
+                println!("no duplicate projects found");
                 return 0;
             }
             let bases = cockpit::places::repos_bases();
             let path_env = cockpit::tool_path_env();
             println!("{} project(s) exist in more than one place:\n", groups.len());
             for g in &groups {
+                let (newest, statuses) = flow::compare_group(&g.paths);
                 let canon = cockpit::identity::canonical(&g.paths, &bases);
                 println!("{}  ({} copies, key {})", g.name, g.paths.len(), g.key);
-                for p in &g.paths {
-                    println!("  {} {}", if p == canon { "● canonical" } else { "○ duplicate" }, p);
+                for s in &statuses {
+                    let tag = match s.role.as_str() {
+                        "newest" => "● newest".to_string(),
+                        "older" => format!("↑ {} behind — fast-forward into newest", s.behind),
+                        "same" => "= identical".to_string(),
+                        "diverged" => format!("⇄ diverged (+{} / -{}) — roll up with: gitmind fleet merge", s.ahead, s.behind),
+                        "newer" => "▲ newer than the rest".to_string(),
+                        _ => "? unrelated".to_string(),
+                    };
+                    println!("  {:<8} {}", if *s.path == newest { "[keep]" } else { "" }, s.path);
+                    println!("           {tag}");
                 }
-                let slug_dir = cockpit::build_dir_for(std::path::Path::new(canon), &path_env);
+                if canon != newest {
+                    println!("  (canonical by location: {canon})");
+                }
+                let slug_dir = cockpit::build_dir_for(std::path::Path::new(&newest), &path_env);
                 println!("  → all copies build into {}\n", slug_dir.display());
             }
             0
+        }
+        "scope" => {
+            match pos.first().map(|s| s.as_str()) {
+                Some("add") => match pos.get(1) {
+                    Some(d) => match cockpit::places::add_scan_root(d) {
+                        Ok(()) => { println!("scanning {} now includes {d}", "for duplicates"); 0 }
+                        Err(e) => err(&e),
+                    },
+                    None => err("usage: gitmind fleet scope add <dir>"),
+                },
+                Some("rm") | Some("remove") => match pos.get(1) {
+                    Some(d) => match cockpit::places::remove_scan_root(d) { Ok(()) => { println!("removed {d}"); 0 } Err(e) => err(&e) },
+                    None => err("usage: gitmind fleet scope rm <dir>"),
+                },
+                _ => {
+                    println!("scan roots (folders gitmind looks in for repos + duplicates):");
+                    for r in cockpit::places::scan_roots() { println!("  {r}"); }
+                    0
+                }
+            }
         }
         "build-dir" => {
             if let Some(p) = pos.first() {
