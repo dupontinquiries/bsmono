@@ -40,6 +40,7 @@ Item {
     property string initMode: "gitmind"
     property bool placed: false
     property bool runAfterPlace: false
+    property string runFlags: ""
 
     // shared target repo (update + merge)
     property var repos: []
@@ -88,6 +89,13 @@ Item {
         if (!r.ok) { root.note = "✗ " + r.error; return }
         root.buildState = "building"; root.buildError = ""; root.note = ""
         root.busy = true; root.jobKind = "buildrun"; poller.start()
+    }
+    function addToApps() {
+        if (root.cratePath.length === 0) { root.note = "import an app first"; return }
+        var r = JSON.parse(backend.add_app(root.cratePath, root.app, root.runFlags))
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.buildError = ""; root.note = ""
+        root.busy = true; root.jobKind = "addapp"; poller.start()
     }
     function saveProject(thenRun) {
         if (root.dest.length === 0) { root.note = "choose a destination"; return }
@@ -163,6 +171,9 @@ Item {
                 else { root.note = "✗ " + res.error }
             } else if (k === "buildrun") {
                 if (res.ok) { root.buildState = "ran"; root.binary = res.binary; root.note = "✓ launched " + root.app + (root.placed ? " from " + root.dir : "") }
+                else { root.buildState = "failed"; root.buildError = res.error; root.note = "" }
+            } else if (k === "addapp") {
+                if (res.ok) { root.note = "✓ added " + res.name + " to your apps — find it on the Apps tab" + (res.run_args && res.run_args.length ? (" (flags: " + res.run_args + ")") : "") }
                 else { root.buildState = "failed"; root.buildError = res.error; root.note = "" }
             }
         }
@@ -270,6 +281,15 @@ Item {
                             Button { text: root.jobKind === "place" ? "saving…" : (root.jobKind === "buildrun" ? "building…" : "Save & run"); enabled: !root.busy && root.dest.length > 0; onClicked: root.saveProject(true) }
                             Button { text: "Save only"; enabled: !root.busy && root.dest.length > 0 && !root.placed; onClicked: root.saveProject(false) }
                             Button { text: "Run once"; enabled: !root.busy && root.isBin && !root.placed; onClicked: root.buildAndRun() }
+                        }
+                        // add the built app to the local apps list, runnable from the Apps tab with flags
+                        Column {
+                            width: parent.width; spacing: 6; visible: root.isBin
+                            Rectangle { width: parent.width; height: 1; color: "#2a3350" }
+                            Label { text: "Add to my apps"; color: "#8a93a6"; font.pixelSize: 12 }
+                            TextField { width: parent.width; placeholderText: "launch flags (optional), e.g. --verbose --port 8080"; text: root.runFlags; onTextEdited: root.runFlags = text }
+                            Button { text: root.jobKind === "addapp" ? "adding…" : "Add to my apps"; enabled: !root.busy; onClicked: root.addToApps() }
+                            Label { width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap; text: "Installs the built binary into your apps list (with a launcher) so you can run it locally any time." }
                         }
                     }
 

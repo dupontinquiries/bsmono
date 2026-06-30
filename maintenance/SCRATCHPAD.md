@@ -1555,3 +1555,36 @@ VERIFIED: cockpit 67 tests (was 65; +2 identity incl. real-git clone-dedup); `ca
 clean; `cargo check -p gitmind-cli --lib` clean (dedup/build-dir typecheck); rustcheck gui+cockpit CLEAN;
 Settings+Import QML balanced, Settings backend.* (7) resolve. On-device confirms GUI (no Qt here).
 EFFECT: builds default to ~/.var/gitmind/build/<crate>-<rootkey>; reclaim still clears old in-repo target/.
+
+── scp 255 fix · push feature toggles · import→apps · dedup robustness (relate) + folder scoping ──
+[A — scp exit 255] ROOT CAUSE: minimal sshd (Alpine/postmarketOS phone) lacks the sftp-server subsystem;
+modern scp defaults to SFTP → ssh (the mkdir) works but scp dies 255. FIX deploy.rs scp_push now tries
+rsync-over-ssh → `scp -O` (legacy proto, no subsystem) → plain scp, with an actionable 255 message.
+New argv: rsync_push_argv, scp_push_argv_legacy (leads with -O). Errors accumulated (no dead assigns).
+Tests extended (outbound_ssh_refuses_agent_and_tunnels asserts -O + rsync push argv).
+[B — features in build & push] push_install already took features+no_default → it was a UI gap.
+Push.qml: loadOptions()→local_build_options(selPath) → feature pills defaulted to target's default set
+(defaultsByTarget[target]); setTarget re-defaults; doPush passes chosen.join(","). isCargo-gated Flow of pills.
+[C — import → local apps with flags] cockpit::flow: add_to_apps(bin,name,commit,run_args) → gitmind_core::
+binpin::install + write_desktop + set_run_args; build_and_add(crate,app,flags)=build native then add;
+run_local(name,extra)=spawn bin_dir()/name with saved+extra args. run-args side-store ~/.config/gitmind/
+run-args.json (binpin has no args field). GUI: add_app(crate,app,flags) async "addapp", run_local(name,extra)
+sync. Import.qml: "Add to my apps" + flags TextField (isBin). Apps.qml: "▶ run" button per app → run_local.
+[D — dedup robustness + scoping] identity::relate(a,b,path_env)→Relation{relation:same|ahead|behind|
+diverged|unrelated, a_ahead,b_ahead} via THROWAWAY BARE CLONE of a + fetch b HEAD→refs/gmother + merge-base
+--is-ancestor both ways (neither real repo touched). REAL-GIT TEST: clone+diverge→behind/ahead/same/diverged.
+places: scan_roots() (config scan-roots, $HOME always implicit first), add_scan_root/remove_scan_root (mirror
+repos_bases). flow: discover_scoped(roots) (union, dedupe by path), duplicates_all()=over scan_roots,
+compare_group(paths)→(newest=most commits, Vec<CopyStatus{path,role:newest|older|same|diverged|newer,behind,
+ahead}>) relating each copy to newest. CLI fleet dedup → duplicates_all (or --root) + compare_group output
+(● newest / ↑N behind fast-forward / ⇄ diverged → fleet merge); fleet scope add|rm|list. GUI: duplicates()
+now uses duplicates_all + compare_group (groups carry newest/copies[role,behind,ahead]); scan_roots()/
+add_scan_root/remove_scan_root methods. Settings dedup card: scan-folders list (+add a drive / −remove,
+$HOME locked at index 0) + per-copy relation (● newest / ↑N behind / ⇄ diverged "roll up: Import→Merge").
+DESIGN NOTE: detection+classification only — NO auto-delete/auto-overwrite of copies; diverged routes to the
+Merge-histories explorer; "roll up older→newer" for strict-ancestor is a fast-forward (safe) — left as a
+guarded preview action for a follow-up (didn't silently reconcile files).
+VERIFIED: cockpit 68 tests (+1 relate; deploy argv test extended); cargo test/build -p cockpit clean; cargo
+check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; QML Import/Settings/Push/Apps balanced +
+backend.* resolve (Import 11, Settings 10, Push 5, Apps 5). On-device confirms GUI build (no Qt here) + the
+scp path (no ssh target here).

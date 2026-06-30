@@ -24,8 +24,9 @@ Item {
     property var dupeGroups: []
     property bool dupesScanned: false
     property string buildBase: ""
+    property var scanRoots: []
 
-    Component.onCompleted: { root.scanReclaim(); root.loadBuildBase() }
+    Component.onCompleted: { root.scanReclaim(); root.loadBuildBase(); root.loadScanRoots() }
 
     // ── reclaim ──
     function scanReclaim() {
@@ -96,6 +97,19 @@ Item {
         var r = JSON.parse(backend.build_dir(p))
         if (r.ok) { root.buildBase = r.base; root.note = "✓ builds now go to " + r.base }
         else root.note = "✗ " + r.error
+    }
+    function loadScanRoots() {
+        var r = JSON.parse(backend.scan_roots())
+        if (r.ok) root.scanRoots = r.roots || []
+    }
+    function addScanRoot(p) {
+        if (!p || p.length === 0) return
+        var r = JSON.parse(backend.add_scan_root(p))
+        if (r.ok) { root.scanRoots = r.roots || []; root.note = "✓ now scanning " + p } else root.note = "✗ " + r.error
+    }
+    function removeScanRoot(p) {
+        var r = JSON.parse(backend.remove_scan_root(p))
+        if (r.ok) root.scanRoots = r.roots || []
     }
 
     function fmtExpiry(s) {
@@ -180,6 +194,21 @@ Item {
                         Button { text: "set"; enabled: !root.busy && bbField.text.length > 0; onClicked: root.setBuildBase(bbField.text) }
                     }
                     Button { text: root.jobKind === "dupes" ? "scanning…" : "find duplicates"; enabled: !root.busy; onClicked: root.scanDupes() }
+                    // folder scope — add a mounted drive so its copies are seen too
+                    Label { text: "scan folders"; color: "#8a93a6"; font.pixelSize: 12 }
+                    Repeater {
+                        model: root.scanRoots
+                        delegate: Row {
+                            width: dpC.width; spacing: 6
+                            Label { text: modelData; color: "#a6adc8"; font.pixelSize: 11; font.family: "monospace"; width: dpC.width - 60; elide: Text.ElideMiddle; anchors.verticalCenter: parent.verticalCenter }
+                            Button { text: "−"; width: 32; enabled: index > 0; onClicked: root.removeScanRoot(modelData) }
+                        }
+                    }
+                    Row {
+                        spacing: 8
+                        TextField { id: srField; width: dpC.width - 80; placeholderText: "/run/media/you/Drive  (add a plugged-in disk)" }
+                        Button { text: "add"; enabled: srField.text.length > 0; onClicked: { root.addScanRoot(srField.text); srField.text = "" } }
+                    }
                     Label {
                         width: parent.width; visible: root.dupesScanned && root.dupeGroups.length === 0 && !root.busy
                         text: "No duplicates — every project lives in one place."; color: "#56d364"; font.pixelSize: 12
@@ -196,17 +225,26 @@ Item {
                                 x: 10; y: 8; width: parent.width - 20; spacing: 4
                                 Label { text: grpRect.grp.name + "  ·  " + grpRect.grp.paths.length + " copies"; color: "#cdd6f4"; font.bold: true; font.pixelSize: 13 }
                                 Repeater {
-                                    model: grpRect.grp.paths
-                                    delegate: Row {
-                                        width: dg.width; spacing: 6
-                                        Label {
-                                            text: modelData === grpRect.grp.canonical ? "● keep" : "○ dup"
-                                            color: modelData === grpRect.grp.canonical ? "#56d364" : "#5b6477"
-                                            font.pixelSize: 10; width: 48
+                                    model: grpRect.grp.copies
+                                    delegate: Column {
+                                        width: dg.width; spacing: 1
+                                        Row {
+                                            width: dg.width; spacing: 6
+                                            Label {
+                                                text: modelData.role === "newest" ? "● newest"
+                                                    : modelData.role === "older" ? ("↑ " + modelData.behind + " behind")
+                                                    : modelData.role === "diverged" ? "⇄ diverged"
+                                                    : modelData.role === "same" ? "= same" : modelData.role
+                                                color: modelData.role === "newest" ? "#56d364"
+                                                    : modelData.role === "diverged" ? "#f9e2af" : "#8a93a6"
+                                                font.pixelSize: 10; width: 88
+                                            }
+                                            Label { text: modelData.path; color: "#8a93a6"; font.pixelSize: 11; font.family: "monospace"; width: dg.width - 94; elide: Text.ElideLeft }
                                         }
                                         Label {
-                                            text: modelData; color: "#8a93a6"; font.pixelSize: 11; font.family: "monospace"
-                                            width: dg.width - 54; elide: Text.ElideLeft
+                                            visible: modelData.role === "diverged"
+                                            text: "    roll up: Import → Merge histories (this copy has +" + modelData.ahead + " / −" + modelData.behind + ")"
+                                            color: "#5b6477"; font.pixelSize: 10; width: dg.width; wrapMode: Text.WordWrap
                                         }
                                     }
                                 }
