@@ -223,6 +223,50 @@ pub fn land_merge(workspace: &str, branch: &str, target: &str, strategy: &str) -
     Ok(newbranch)
 }
 
+/// A discovered repo workspace.
+pub struct Repo {
+    pub path: String,
+    pub name: String,
+    pub git: bool,
+    pub gitmind: bool,
+    pub key: String,
+}
+
+/// Walk up to 6 levels under `root` for git/gitmind workspaces, one entry per repo root,
+/// each tagged with its project identity key (shared across copies of the same project).
+pub fn discover_repos(root: &Path) -> Vec<Repo> {
+    let path_env = crate::ops::tool_path_env();
+    let cmd = "find \"$GMROOT\" -maxdepth 6 \\( -name .git -o -name .gitmind \\) 2>/dev/null | head -300";
+    let out = std::process::Command::new("sh").arg("-c").arg(cmd)
+        .env("GMROOT", root).env("PATH", &path_env).output();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(o) = out {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let l = line.trim();
+            if l.is_empty() { continue; }
+            if let Some(parent) = Path::new(l).parent() {
+                let p = parent.to_path_buf();
+                if !roots.contains(&p) { roots.push(p); }
+            }
+        }
+    }
+    roots.sort();
+    roots.iter().map(|r| Repo {
+        path: r.display().to_string(),
+        name: r.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        git: r.join(".git").exists(),
+        gitmind: r.join(".gitmind").exists(),
+        key: crate::identity::project_key(r, &path_env),
+    }).collect()
+}
+
+/// Find projects that exist in more than one workspace under `root`, grouped by identity.
+pub fn duplicates(root: &Path) -> Vec<crate::identity::DupGroup> {
+    let entries = discover_repos(root).into_iter()
+        .map(|r| (r.path, r.key, r.name)).collect();
+    crate::identity::group_duplicates(entries)
+}
+
 /// Reclaimable per-crate target dirs under `root`.
 pub struct ReclaimScan {
     pub items: Vec<(String, u64)>, // (path, bytes)
@@ -230,7 +274,7 @@ pub struct ReclaimScan {
 }
 
 pub fn reclaim_scan(root: &Path) -> ReclaimScan {
-    let keep = PathBuf::from(crate::ops::shared_target_dir());
+    let keep = crate::ops::build_base();
     let dirs = reclaim::find_reclaimable(root, &keep);
     let mut total = 0u64;
     let items = dirs.iter().map(|p| {
@@ -243,7 +287,7 @@ pub fn reclaim_scan(root: &Path) -> ReclaimScan {
 
 /// Delete the reclaimable target dirs (re-validated per dir). Returns (count, freed).
 pub fn reclaim_apply(root: &Path) -> (usize, u64) {
-    let keep = PathBuf::from(crate::ops::shared_target_dir());
+    let keep = crate::ops::build_base();
     let mut freed = 0u64;
     let mut count = 0usize;
     for p in reclaim::find_reclaimable(root, &keep) {
