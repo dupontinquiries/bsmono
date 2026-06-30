@@ -1521,3 +1521,37 @@ the whole module set — supersedes the per-module stub harnesses); `cargo check
 Bus-errors / ENOSPC — ENVIRONMENTAL (huge static bin via gitmind-core zip/zstd/lzma), not a code error;
 `cargo check` proves the code. GUI still unbuildable w/o Qt (rustcheck only) — flow delegation keeps exact
 JSON keys so QML is unaffected; on-device build confirms.
+
+── dedup duplicate projects across workspaces + one build dir per project (no spill) ──
+USER: same project in multiple git/gitmind workspaces should be recognized as one; and builds should go to
+ONE place (~/.var/gitmind or /tmp), not spill target/ across every copy.
+KEY INSIGHT: the same key solves both. A git repo's ROOT COMMIT(s) are identical in every clone (even after
+branches diverge) → use them as project identity AND as the build-dir key, so all copies of a project build
+into one dir and duplicates are detectable by shared key.
+[cockpit::identity NEW, 2 tests incl. real-git] root_commits(repo,path_env)=`rev-list --max-parents=0 HEAD`
+sorted/deduped (shared by all clones). project_key(repo,path_env)=short(first root) → fallback gitmind id
+(.gitmind/config.toml `id=`) → fallback FNV-1a hex of canonical path. build_slug=`<crate>-<key>`
+(places::sanitize_name). group_duplicates(entries:(path,key,name))→Vec<DupGroup{key,name,paths}> only keys
+with >1 copy, PURE. canonical(paths,bases)→prefer a copy under a repos base, else shallowest path, PURE.
+REAL TEST: a clone that then diverges (a/b commit different files) shares project_key with origin; unrelated
+repo differs; build_slug starts "proj-".
+[cockpit::ops] REPLACED shared_target_dir (single ~/.cache cache, gitmind-only) WITH:
+build_base()=override ~/.config/gitmind/build-base, else ~/.var/gitmind/build, else /tmp/gitmind/build.
+set_build_base(p). build_dir_for(app_dir,path_env)=build_base()/build_slug. build_locally NOW ALWAYS sets
+CARGO_TARGET_DIR=build_dir_for(...) (create; FALLBACK /tmp/gitmind/build/<slug> if ~/.var unwritable) — every
+build (gitmind repo or not, even /tmp imports) lands in the per-project dir → no target/ spilled into repos,
+copies build once. resolve_binary already takes the target-dir override. gitmind_root now unused internally
+(kept pub).
+[cockpit::flow] discover_repos(root)→Vec<Repo{path,name,git,gitmind,key}> (find -maxdepth 6 .git/.gitmind via
+$GMROOT env, one per root, tagged with project_key). duplicates(root)=discover+group_duplicates. reclaim_scan/
+apply keep=build_base() (was shared_target_dir).
+[CLI] fleet dedup [<root=$HOME>] → groups, ● canonical / ○ duplicate, "all copies build into <dir>".
+fleet build-dir [<path>] → show/set build base. usage updated.
+[GUI] local_repos REFACTORED to flow::discover_repos (de-dups the find logic, exposes key). NEW methods:
+duplicates() async "dupes"→groups{name,paths,canonical,build_dir}; build_dir(set)→get/set base.
+Settings.qml: new "Duplicate projects" card — build-location field (set), "find duplicates", per-group list
+(● keep / ○ dup) + shared build dir. Component.onCompleted also loadBuildBase().
+VERIFIED: cockpit 67 tests (was 65; +2 identity incl. real-git clone-dedup); `cargo test/build -p cockpit`
+clean; `cargo check -p gitmind-cli --lib` clean (dedup/build-dir typecheck); rustcheck gui+cockpit CLEAN;
+Settings+Import QML balanced, Settings backend.* (7) resolve. On-device confirms GUI (no Qt here).
+EFFECT: builds default to ~/.var/gitmind/build/<crate>-<rootkey>; reclaim still clears old in-repo target/.
