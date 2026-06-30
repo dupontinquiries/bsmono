@@ -75,11 +75,39 @@ pub fn gitmind_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
-/// Shared cargo target dir for gitmind-managed repos — one cache so deps build once
-/// across every clone instead of a multi-GB target/ tree per repo.
-pub fn shared_target_dir() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    format!("{home}/.cache/gitmind/cargo-target")
+/// The base directory all builds go into, so they never spill `target/` trees across the
+/// repos themselves. Override with ~/.config/gitmind/build-base; otherwise ~/.var/gitmind/
+/// build, falling back to /tmp/gitmind/build when there's no usable HOME.
+pub fn build_base() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            let cfg = PathBuf::from(format!("{home}/.config/gitmind/build-base"));
+            if let Ok(s) = std::fs::read_to_string(&cfg) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return PathBuf::from(crate::places::expand_home(t, &home));
+                }
+            }
+            return PathBuf::from(format!("{home}/.var/gitmind/build"));
+        }
+    }
+    PathBuf::from("/tmp/gitmind/build")
+}
+
+/// Remember a build base for next time (created lazily when a build runs).
+pub fn set_build_base(path: &str) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|_| "no HOME".to_string())?;
+    let dir = PathBuf::from(format!("{home}/.config/gitmind"));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let want = crate::places::expand_home(path.trim(), &home);
+    std::fs::write(dir.join("build-base"), format!("{want}\n")).map_err(|e| e.to_string())
+}
+
+/// The per-project build directory: `<build_base>/<crate>-<project-key>`. Every copy of a
+/// project resolves to the same directory (keyed by git root identity), so duplicates
+/// build once instead of each spilling their own multi-GB target/.
+pub fn build_dir_for(app_dir: &Path, path_env: &str) -> PathBuf {
+    build_base().join(crate::identity::build_slug(app_dir, path_env))
 }
 
 /// Where cargo writes the binary for `app` built in `app_dir`. `cargo_target` is the
@@ -114,18 +142,24 @@ pub fn resolve_binary(cargo: &str, app_dir: &Path, cargo_target: &str, app: &str
 pub fn build_locally(app: &str, app_dir: &Path, target: &str, feats: &[String], no_default: bool) -> Result<(PathBuf, u64), String> {
     let cargo = cargo_bin();
     let native = native_triple_local();
+    let path_env = tool_path_env();
     let cargo_target = if crate::buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
-    let shared = gitmind_root(app_dir).map(|_| shared_target_dir());
+    // one canonical build dir per project identity — no target/ spilled into the repo, and
+    // every copy of the project shares it. Fall back to /tmp if ~/.var isn't writable.
+    let want = build_dir_for(app_dir, &path_env);
+    let build_dir = if std::fs::create_dir_all(&want).is_ok() {
+        want
+    } else {
+        let fb = PathBuf::from("/tmp/gitmind/build").join(crate::identity::build_slug(app_dir, &path_env));
+        let _ = std::fs::create_dir_all(&fb);
+        fb
+    };
     let argv = crate::buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
     let mut cmd = std::process::Command::new(&cargo);
-    cmd.args(&argv[1..]).current_dir(app_dir).env("PATH", tool_path_env());
-    if let Some(td) = &shared {
-        let _ = std::fs::create_dir_all(td);
-        cmd.env("CARGO_TARGET_DIR", td);
-    }
+    cmd.args(&argv[1..]).current_dir(app_dir).env("PATH", &path_env).env("CARGO_TARGET_DIR", &build_dir);
     match cmd.output() {
         Ok(o) if o.status.success() => {
-            let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, shared.as_deref());
+            let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, Some(&build_dir.display().to_string()));
             let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
             Ok((bin, size))
         }
