@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|build|apply|merge|reclaim|dedup|scope|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|build|apply|merge|rollup|reclaim|dedup|scope|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1416,16 +1416,88 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                     if t.recommended { "  [recommended]" } else { "" });
             }
             if let Some(id) = opt(args, "--strategy") {
-                match ex.trials.iter().find(|t| t.id == id && t.ok) {
-                    Some(t) => match flow::land_merge(&ex.workspace.display().to_string(), &t.branch, repo, id) {
+                let t = match ex.trials.iter().find(|t| t.id == id && t.ok) {
+                    Some(t) => t,
+                    None => return err(&format!("no clean strategy '{id}' (try one marked ✓)")),
+                };
+                if flag(args, "--preview") {
+                    match flow::merge_preview(&ex.workspace.display().to_string(), &ex.target_branch, &t.branch) {
+                        Ok(p) => {
+                            println!("\npreview of '{id}' ({}):", p.shortstat);
+                            for (oid, subj) in &p.commits { println!("  {oid}  {subj}"); }
+                            for (st, path) in &p.files { println!("  {st}  {path}"); }
+                            println!("\nnothing landed — re-run with --strategy {id} (no --preview) to land it");
+                            0
+                        }
+                        Err(e) => err(&e),
+                    }
+                } else {
+                    match flow::land_merge(&ex.workspace.display().to_string(), &t.branch, repo, id) {
                         Ok(b) => { println!("landed on branch {b} — review and merge it"); 0 }
                         Err(e) => err(&e),
-                    },
-                    None => err(&format!("no clean strategy '{id}' (try one marked ✓)")),
+                    }
                 }
             } else {
-                println!("pick one with --strategy <id>");
+                println!("pick one with --strategy <id> (add --preview to see the diff first)");
                 0
+            }
+        }
+        "rollup" => {
+            let (older, newer) = match (pos.first(), pos.get(1)) {
+                (Some(a), Some(b)) => (a.as_str(), b.as_str()),
+                _ => return err("usage: gitmind fleet rollup <older-copy> <newer-copy> [--apply]  (or --strategy <id> [--preview|--apply] when diverged)"),
+            };
+            let pv = flow::rollup_preview(std::path::Path::new(older), std::path::Path::new(newer));
+            match pv.relation.as_str() {
+                "same" => { println!("already identical — nothing to roll up"); 0 }
+                "ahead" => err("the first copy is newer than the second — swap the order"),
+                "behind" => {
+                    println!("{older}\n  is {} commit(s) behind {newer} — a clean fast-forward:", pv.behind);
+                    for (oid, subj) in &pv.incoming { println!("  {oid}  {subj}"); }
+                    for (st, path) in &pv.files { println!("  {st}  {path}"); }
+                    if flag(args, "--apply") {
+                        match flow::rollup_apply(std::path::Path::new(older), std::path::Path::new(newer)) {
+                            Ok(m) => { println!("\n{m}"); 0 }
+                            Err(e) => err(&e),
+                        }
+                    } else {
+                        println!("\nadd --apply to fast-forward this copy in place (nothing is deleted)");
+                        0
+                    }
+                }
+                "diverged" => {
+                    println!("{older} and {newer} have diverged (each has unique commits) — a merge is needed.");
+                    let ex = match flow::explore(older, newer) { Ok(e) => e, Err(e) => return err(&e) };
+                    for t in &ex.trials {
+                        println!("  {} {:<22} {}{}", if t.ok { "✓" } else { "✗" }, t.label, t.summary,
+                            if t.recommended { "  [recommended]" } else { "" });
+                    }
+                    if let Some(id) = opt(args, "--strategy") {
+                        let t = match ex.trials.iter().find(|t| t.id == id && t.ok) {
+                            Some(t) => t, None => return err(&format!("no clean strategy '{id}'")),
+                        };
+                        if flag(args, "--apply") {
+                            match flow::land_merge(&ex.workspace.display().to_string(), &t.branch, newer, id) {
+                                Ok(b) => { println!("landed on branch {b} in {newer} — review and merge it"); 0 }
+                                Err(e) => err(&e),
+                            }
+                        } else {
+                            match flow::merge_preview(&ex.workspace.display().to_string(), &ex.target_branch, &t.branch) {
+                                Ok(p) => {
+                                    println!("\npreview of '{id}' ({}):", p.shortstat);
+                                    for (st, path) in &p.files { println!("  {st}  {path}"); }
+                                    println!("\nadd --apply to land it as a branch in {newer}");
+                                    0
+                                }
+                                Err(e) => err(&e),
+                            }
+                        }
+                    } else {
+                        println!("pick a strategy: --strategy <id> [--apply]");
+                        0
+                    }
+                }
+                _ => err("these copies don't share history — not the same project"),
             }
         }
         "reclaim" => {
