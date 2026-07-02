@@ -1362,6 +1362,7 @@ impl Backend {
                     "ok": true, "dir": i.dir.display().to_string(),
                     "crate_path": i.crate_path.display().to_string(),
                     "app": i.app, "is_bin": i.is_bin, "description": i.description,
+                    "system": i.system,
                     "has_git": i.has_git,
                     "zip_repo": i.zip_repo.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                     "has_gitmind": i.has_gitmind,
