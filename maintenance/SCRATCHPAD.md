@@ -1639,3 +1639,35 @@ Timer poller) + delete. binpin write_desktop → Plasma Kickoff/grid on mobile A
 VERIFIED: cockpit 72 tests (+1 suite round-trip); cargo test/build -p cockpit clean; cargo check -p
 gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced; Apps backend.* (10) resolve; all.json
 shape valid (28 apps). On-device confirms GUI build + actual multi-app install (no Qt here).
+
+── buildsystem abstraction: import zip now handles Python/pygame (+ Go/Node/CMake/Make) ──
+USER: add python pygame support to import-zip via a smart abstraction giving common build systems the right
+treatment; python "binary" compiling unfamiliar but somewhat possible.
+APPROACH: Python isn't compiled — realistic path = venv + pip install deps + a launcher script. Framed as an
+abstraction over build systems.
+[cockpit::buildsystem NEW, 2 tests incl. REAL python build] Kind{Cargo,Python,Node,Go,CMake,Make}+label().
+Detected{kind,root,name,description,runnable,entry}. Built{run,args,install,bytes}. detect(dir)=shallowest
+project by priority Cargo>Python>Go>Node>CMake>Make (shallowest_with walk, skip .git/target/node_modules/
+.venv/build/vendor/__pycache__). Python detect: dir with requirements.txt|pyproject|setup.py|Pipfile OR
+main.py|app.py|game.py|run.py|__main__.py OR a .py importing pygame; entry pick order + __main__ guard +
+single-.py; name from pyproject or dir. build(d,target,pe): Cargo→ops::build_locally (bin); Python→build_
+python; Go→`go build -o .gitmind-bin/<name>`; Node→npm install + node/npm start launcher; CMake→cmake -S -B
+build + --build + find_executable; Make→make + find_executable. build_python: python3 -m venv .venv; deps via
+requirements.txt else `pip install .` (pyproject/setup) else scan_imports (STDLIB+local excluded, pip_name
+map cv2→opencv-python etc.) → pip install; write .gitmind-run.sh launcher (cd root; exec venv/python entry);
+Built{run=venv/python,args=[entry],install=launcher}. pip-fail hint mentions Alpine sdl2-dev pkgs.
+find_executable: exec-bit, skip .o/.a/.so, prefer name match. TESTS: detect cargo+python(+entry+pygame desc);
+scan_imports keeps pygame drops os; REAL build of a stdlib-only main.py → venv created + launcher runs prints
+"launched-ok". (pygame pip install verified manually: venv+pip pygame 2.6.1 from pypi OK in sandbox.)
+[flow] Import +system field. import() now buildsystem::detect (any system) not find_crate_root → err lists
+supported systems. build_and_run/build_and_add → buildsystem::detect+build; run built.run+args in root; add
+installs built.install (launcher for interpreted → binpin + .desktop → runs venv python). Signatures
+unchanged (app param now _app, uses detected name).
+[GUI] import_zip JSON +system; Import.qml: system badge on found-card (blue). is_bin=runnable drives the
+Add-to-apps/run buttons for any system.
+[CLI] fleet build routed through buildsystem::detect+build (prints kind + run line); fleet import --run/--save
+already multi-system via flow.
+VERIFIED: cockpit 74 tests (+2 buildsystem, one a real venv build); cargo test/build -p cockpit clean (no
+warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced; Import
+backend.* resolve. On-device: python needs python3-venv; pygame on Alpine needs sdl2-dev headers (error hints
+this). Go/Node/CMake/Make detected+conventional-command (best-effort; untested here — no toolchains in sandbox).
