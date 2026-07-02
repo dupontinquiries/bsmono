@@ -1615,3 +1615,27 @@ Poller handles rupv/ruapply/explore/rumerge; closeRollup() + rescan on apply. On
 VERIFIED: cockpit 71 tests (+3); cargo test/build -p cockpit clean; cargo check -p gitmind-cli --lib clean;
 rustcheck gui+cockpit CLEAN; all 10 QML balanced; Settings backend.* (15) resolve. On-device confirms GUI +
 the ff/merge on real repos (no ssh target / Qt here).
+
+── app suites: bundle + install many apps via GUI (Plasma mobile+desktop) ──
+USER: package apps as suites to install multiple apps via the GUI on Plasma mobile+desktop; make a bundle
+with sane defaults for all current apps.
+[cockpit::suite NEW, 1 test] SuiteApp{name,path,features:Vec,no_default,target("" = native),run_flags},
+Suite{name,description,apps}. Hand-rolled serde_json (no new deps): to_value/to_json/parse. Persistence in
+~/.config/gitmind/suites/<name>.json: suite_path, list_suites, load_suite, save_suite, delete_suite.
+SuiteApp::simple(name,path)=sane default (native, default features, no flags). TEST: JSON round-trip.
+[cockpit::flow] default_suite(root)=walk maxdepth 8 for Cargo.toml (skip target/vendor/node_modules), keep
+binary crates (main.rs|bin/|[[bin]]) with a [package] name, dedupe by name, sort → Suite "all". create_
+default_suite(root)=default_suite+save (err if empty). install_suite_app(app)=build_locally(native or pinned
+target, features, no_default)+add_to_apps(bin,name,"suite",run_flags) → binpin store + .desktop launcher.
+install_suite(suite)=per-app results (never aborts).
+[CLI] fleet suite list|show <name>|create [--root]|install <name> [--only a,b]|rm <name> [<app>]. install
+prints [n/N] per app + "launchers added to your app grid".
+[GUI] methods suites() (list+embedded apps), create_default_suite() async "mksuite", install_suite_app(name,
+path,features,target,flags) async "sapp", delete_suite(name). Apps.qml: new "suites" card at top — create
+"all", per-suite install-all (drives per-app: iterate apps calling install_suite_app, progress n/N via a
+Timer poller) + delete. binpin write_desktop → Plasma Kickoff/grid on mobile AND desktop.
+[BUNDLE] maintenance/suites/all.json = 28 binary crates of THIS repo, sane defaults, repo-relative paths
+(reference/template; on-device `fleet suite create` regenerates with absolute paths). + suites/README.md.
+VERIFIED: cockpit 72 tests (+1 suite round-trip); cargo test/build -p cockpit clean; cargo check -p
+gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced; Apps backend.* (10) resolve; all.json
+shape valid (28 apps). On-device confirms GUI build + actual multi-app install (no Qt here).

@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|build|apply|merge|rollup|reclaim|dedup|scope|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|build|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1569,6 +1569,68 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                     for r in cockpit::places::scan_roots() { println!("  {r}"); }
                     0
                 }
+            }
+        }
+        "suite" => {
+            use cockpit::suite;
+            match pos.first().map(|s| s.as_str()) {
+                Some("list") | None => {
+                    let suites = suite::list_suites();
+                    if suites.is_empty() { println!("no suites yet — create one with: gitmind fleet suite create"); return 0; }
+                    for s in suites { println!("{:<16} {} app(s)   {}", s.name, s.apps.len(), s.description); }
+                    0
+                }
+                Some("show") => match pos.get(1).and_then(|n| suite::load_suite(n)) {
+                    Some(s) => {
+                        println!("{} — {}", s.name, s.description);
+                        for a in &s.apps {
+                            let feat = if a.features.is_empty() { String::new() } else { format!("  [{}]", a.features.join(",")) };
+                            let tgt = if a.target.is_empty() { "native".into() } else { a.target.clone() };
+                            println!("  {:<24} {}  ({}){}", a.name, a.path, tgt, feat);
+                        }
+                        0
+                    }
+                    None => err("no such suite (try: gitmind fleet suite list)"),
+                },
+                Some("create") => {
+                    let root = opt(args, "--root").map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())));
+                    match flow::create_default_suite(&root) {
+                        Ok(s) => { println!("created suite '{}' with {} app(s) — install with: gitmind fleet suite install {}", s.name, s.apps.len(), s.name); 0 }
+                        Err(e) => err(&e),
+                    }
+                }
+                Some("install") => {
+                    let s = match pos.get(1).and_then(|n| suite::load_suite(n)) { Some(s) => s, None => return err("no such suite") };
+                    let only: Option<Vec<&str>> = opt(args, "--only").map(|s| s.split(',').collect());
+                    let apps: Vec<_> = s.apps.iter().filter(|a| only.as_ref().map(|o| o.contains(&a.name.as_str())).unwrap_or(true)).collect();
+                    println!("installing {} app(s) from '{}':", apps.len(), s.name);
+                    let mut ok = 0;
+                    for (i, a) in apps.iter().enumerate() {
+                        print!("  [{}/{}] {} … ", i + 1, apps.len(), a.name);
+                        use std::io::Write; let _ = std::io::stdout().flush();
+                        match flow::install_suite_app(a) {
+                            Ok(inst) => { println!("✓ @{}", inst.label); ok += 1; }
+                            Err(e) => println!("✗ {e}"),
+                        }
+                    }
+                    println!("{ok}/{} installed — launchers added to your app grid", apps.len());
+                    if ok == apps.len() { 0 } else { 1 }
+                }
+                Some("rm") | Some("remove") => {
+                    let name = match pos.get(1) { Some(n) => n, None => return err("usage: gitmind fleet suite rm <name> [<app>]") };
+                    match pos.get(2) {
+                        Some(app) => {
+                            let mut s = match suite::load_suite(name) { Some(s) => s, None => return err("no such suite") };
+                            let before = s.apps.len();
+                            s.apps.retain(|a| a.name.as_str() != app.as_str());
+                            if s.apps.len() == before { return err(&format!("'{app}' isn't in {name}")); }
+                            match suite::save_suite(&s) { Ok(()) => { println!("removed {app} from {name}"); 0 } Err(e) => err(&e) }
+                        }
+                        None => match suite::delete_suite(name) { Ok(()) => { println!("deleted suite {name}"); 0 } Err(e) => err(&e) },
+                    }
+                }
+                Some(other) => err(&format!("unknown suite command: {other} (list|show|create|install|rm)")),
             }
         }
         "build-dir" => {
