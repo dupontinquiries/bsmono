@@ -12,9 +12,47 @@ Item {
     property var apps: []
     property string note: ""
 
+    // suites
+    property var suites: []
+    property bool busy: false
+    property string jobKind: ""
+    property var installQueue: []
+    property int installIdx: 0
+    property int installOk: 0
+    property int installTotal: 0
+    property string installingSuite: ""
+
     function reload() {
         var r = JSON.parse(backend.apps_json())
         apps = r.ok ? (r.apps || []) : []
+    }
+    function loadSuites() {
+        var r = JSON.parse(backend.suites())
+        root.suites = r.ok ? (r.suites || []) : []
+    }
+    function makeDefaultSuite() {
+        var r = JSON.parse(backend.create_default_suite())
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.busy = true; root.jobKind = "mksuite"; root.note = "scanning for apps…"; suitePoller.start()
+    }
+    function deleteSuite(name) {
+        JSON.parse(backend.delete_suite(name)); root.loadSuites()
+    }
+    function installSuite(s) {
+        if (root.busy) return
+        root.installQueue = s.apps || []; root.installIdx = 0; root.installOk = 0
+        root.installTotal = root.installQueue.length; root.installingSuite = s.name
+        root.installNext()
+    }
+    function installNext() {
+        if (root.installIdx >= root.installQueue.length) {
+            root.note = "✓ " + root.installingSuite + ": installed " + root.installOk + "/" + root.installTotal + " — launchers added to your app grid"
+            root.installingSuite = ""; root.busy = false; root.reload(); return
+        }
+        var a = root.installQueue[root.installIdx]
+        var r = JSON.parse(backend.install_suite_app(a.name, a.path, a.features || "", a.target || "", a.run_flags || ""))
+        if (!r.ok) { root.note = "✗ " + r.error; root.installingSuite = ""; root.busy = false; return }
+        root.busy = true; root.jobKind = "sapp"; suitePoller.start()
     }
     function useVersion(name, label) {
         var r = JSON.parse(backend.app_use(name, label))
@@ -35,7 +73,28 @@ Item {
         note = r.ok ? ("▶ " + r.msg) : ("error: " + r.error)
     }
 
-    Component.onCompleted: reload()
+    Timer {
+        id: suitePoller; interval: 350; repeat: true; running: false
+        onTriggered: {
+            var j = JSON.parse(backend.poll_job())
+            if (!j.done) return
+            suitePoller.stop()
+            var res = (j.result && j.result.length) ? JSON.parse(j.result) : { ok: false, error: "no result" }
+            var k = root.jobKind; root.jobKind = ""
+            if (k === "mksuite") {
+                root.busy = false
+                if (res.ok) { root.note = "✓ created suite '" + res.name + "' with " + res.count + " apps"; root.loadSuites() }
+                else root.note = "✗ " + res.error
+            } else if (k === "sapp") {
+                if (res.ok) root.installOk += 1
+                root.note = "installing " + root.installingSuite + " — " + (root.installIdx + 1) + "/" + root.installTotal + (res.ok ? "" : (" (✗ " + res.name + ")"))
+                root.installIdx += 1
+                root.installNext()
+            }
+        }
+    }
+
+    Component.onCompleted: { reload(); loadSuites() }
 
     Column {
         anchors.fill: parent
@@ -48,6 +107,62 @@ Item {
             Button { text: "⟳"; onClicked: root.reload() }
         }
         Label { text: root.note; color: "#8a93a6"; visible: root.note.length > 0; wrapMode: Text.WrapAnywhere; width: parent.width }
+
+        // ── suites: install a whole bundle of apps at once ──
+        Rectangle {
+            width: parent.width; radius: 10; color: "#171c2b"; border.color: "#2a3350"
+            height: suiteCol.height + 20
+            Column {
+                id: suiteCol
+                x: 12; y: 10; width: parent.width - 24; spacing: 8
+                Row {
+                    width: parent.width; spacing: 8
+                    Label { text: "suites"; color: "#7aa2f7"; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                    Item { width: parent.width - 260; height: 1 }
+                    Button { text: root.jobKind === "mksuite" ? "scanning…" : "create \"all\""; enabled: !root.busy; onClicked: root.makeDefaultSuite() }
+                }
+                Label {
+                    width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                    text: "A suite installs many apps at once — each is built for this device and gets a launcher in your app grid (Plasma Mobile or desktop)."
+                }
+                Repeater {
+                    model: root.suites
+                    delegate: Rectangle {
+                        width: suiteCol.width; radius: 8; color: "#0f1320"; border.color: "#3a4566"
+                        height: sc.height + 14
+                        Column {
+                            id: sc
+                            x: 10; y: 7; width: parent.width - 20; spacing: 4
+                            Row {
+                                width: parent.width; spacing: 8
+                                Column {
+                                    width: parent.width - instBtn.width - delBtn.width - 16
+                                    Label { text: modelData.name + "  ·  " + (modelData.apps ? modelData.apps.length : 0) + " apps"; color: "#cdd6f4"; font.bold: true; font.pixelSize: 13 }
+                                    Label { text: modelData.description; color: "#8a93a6"; font.pixelSize: 11; width: parent.width; elide: Text.ElideRight }
+                                }
+                                Button {
+                                    id: instBtn
+                                    text: (root.installingSuite === modelData.name) ? (root.installIdx + "/" + root.installTotal) : "install all"
+                                    enabled: !root.busy; anchors.verticalCenter: parent.verticalCenter
+                                    onClicked: root.installSuite(modelData)
+                                }
+                                Button { id: delBtn; text: "×"; enabled: !root.busy; anchors.verticalCenter: parent.verticalCenter; onClicked: root.deleteSuite(modelData.name) }
+                            }
+                            Label {
+                                visible: root.installingSuite === modelData.name
+                                width: parent.width; color: "#f9e2af"; font.pixelSize: 11
+                                text: "building & installing… " + (root.installIdx + 1) + "/" + root.installTotal
+                            }
+                        }
+                    }
+                }
+                Label {
+                    visible: root.suites.length === 0
+                    width: parent.width; color: "#5b6477"; font.pixelSize: 12
+                    text: "No suites yet — tap \"create all\" to bundle every app on this machine with sane defaults."
+                }
+            }
+        }
 
         ListView {
             id: appList
