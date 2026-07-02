@@ -66,7 +66,7 @@ pub fn build_and_run(crate_path: &Path, _app: &str) -> Result<PathBuf, String> {
     let proj = crate::buildsystem::detect(crate_path).ok_or("couldn't tell what kind of project this is")?;
     let pe = tool_path_env();
     let target = native_triple_local();
-    let built = crate::buildsystem::build(&proj, &target, &pe)?;
+    let built = crate::buildsystem::build(&proj, &target, &[], &pe)?;
     std::process::Command::new(&built.run).args(&built.args).current_dir(&proj.root).env("PATH", &pe)
         .spawn().map_err(|e| format!("built, but couldn't launch: {e}"))?;
     Ok(built.install)
@@ -355,7 +355,7 @@ pub fn build_and_add(crate_path: &Path, _app: &str, run_args: &str) -> Result<In
     let proj = crate::buildsystem::detect(crate_path).ok_or("couldn't tell what kind of project this is")?;
     let pe = tool_path_env();
     let target = native_triple_local();
-    let built = crate::buildsystem::build(&proj, &target, &pe)?;
+    let built = crate::buildsystem::build(&proj, &target, &[], &pe)?;
     add_to_apps(&built.install, &proj.name, "import", run_args)
 }
 
@@ -631,6 +631,29 @@ mod tests {
         assert!(pv.commits.iter().any(|(_, s)| s == "feature work"), "preview shows the incoming commit");
         let _ = fs::remove_dir_all(&base);
     }
+
+    #[test]
+    fn imports_a_json_bundle_and_scans_downloads() {
+        let base = std::env::temp_dir().join(format!("gm-dl-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        // a suite json bundle
+        let suite = crate::suite::Suite {
+            name: "mini".into(), description: "two apps".into(),
+            apps: vec![crate::suite::SuiteApp::simple("a", "/x/a"), crate::suite::SuiteApp::simple("b", "/x/b")],
+        };
+        let bundle = base.join("mini.json");
+        fs::write(&bundle, suite.to_json()).unwrap();
+        let loaded = import_bundle(&bundle.display().to_string()).expect("bundle loads");
+        assert_eq!(loaded.apps.len(), 2);
+        assert_eq!(loaded.name, "mini");
+        // a plain zip file (content irrelevant here) shows up as an app
+        fs::write(base.join("game.zip"), b"PK\x03\x04").unwrap();
+        let items = scan_downloads(&base);
+        assert!(items.iter().any(|i| i.kind == "bundle" && i.name == "mini" && i.apps == 2), "json bundle detected");
+        assert!(items.iter().any(|i| i.kind == "app" && i.name == "game"), "zip detected as an app");
+        let _ = fs::remove_dir_all(&base);
+    }
 }
 
 // ── suites: bundle multiple apps and install them together ──
@@ -700,4 +723,118 @@ pub fn create_default_suite(root: &Path) -> Result<crate::suite::Suite, String> 
     }
     crate::suite::save_suite(&s)?;
     Ok(s)
+}
+
+// ── Downloads scanning + bundle import ──
+
+/// The user's Downloads folder.
+pub fn downloads_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(format!("{home}/Downloads"))
+}
+
+fn installed_names() -> std::collections::BTreeSet<String> {
+    gitmind_core::binpin::list_apps().into_iter().collect()
+}
+
+/// Load a suite bundle: either a suite JSON directly, or a .zip containing a
+/// `gitmind-suite.json` manifest (a portable bundle — the app paths are resolved inside
+/// the extracted copy so the bundled code is what gets built).
+pub fn import_bundle(path: &str) -> Result<crate::suite::Suite, String> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    if path.ends_with(".json") {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read: {e}"))?;
+        return crate::suite::Suite::parse(&text).ok_or_else(|| "that JSON isn't a gitmind suite".to_string());
+    }
+    // a zip bundle: extract and find the manifest
+    let dir = importer::import_dir();
+    let script = importer::extract_command(path, &dir.display().to_string());
+    let out = std::process::Command::new("sh").arg("-c").arg(&script)
+        .env("PATH", tool_path_env()).output().map_err(|e| format!("extract: {e}"))?;
+    if !out.status.success() {
+        return Err("couldn't extract the bundle".into());
+    }
+    let manifest = find_shallowest(&dir, &["gitmind-suite.json", "suite.json"])
+        .ok_or("no gitmind-suite.json found in the bundle")?;
+    let mut suite = crate::suite::Suite::parse(&std::fs::read_to_string(&manifest).unwrap_or_default())
+        .ok_or("the bundle manifest is malformed")?;
+    let base = manifest.parent().unwrap_or(&dir).to_path_buf();
+    for app in &mut suite.apps {
+        let p = Path::new(&app.path);
+        if p.is_relative() { app.path = base.join(p).display().to_string(); }
+    }
+    Ok(suite)
+}
+
+fn find_shallowest(dir: &Path, names: &[&str]) -> Option<PathBuf> {
+    fn walk(dir: &Path, names: &[&str], depth: u32) -> Option<PathBuf> {
+        if depth > 4 { return None; }
+        for n in names { let c = dir.join(n); if c.is_file() { return Some(c); } }
+        let mut subs: Vec<PathBuf> = std::fs::read_dir(dir).ok()?.flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false)).map(|e| e.path()).collect();
+        subs.sort();
+        for s in subs { if let Some(f) = walk(&s, names, depth + 1) { return Some(f); } }
+        None
+    }
+    walk(dir, names, 0)
+}
+
+/// A .zip or bundle sitting in Downloads that can be installed into the apps list.
+pub struct DownloadItem {
+    pub path: String,
+    pub name: String,
+    pub kind: String,   // "app" | "bundle"
+    pub apps: usize,    // for bundles
+    pub installed: bool,
+}
+
+/// Scan a folder (top level) for importable zips and suite bundles.
+pub fn scan_downloads(dir: &Path) -> Vec<DownloadItem> {
+    let installed = installed_names();
+    let mut items = Vec::new();
+    let Ok(rd) = std::fs::read_dir(dir) else { return items };
+    for e in rd.flatten() {
+        let p = e.path();
+        let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
+        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        if ext == "zip" {
+            if let Some(s) = zip_bundle_manifest(&p) {
+                items.push(DownloadItem { path: p.display().to_string(), name: s.0, kind: "bundle".into(), apps: s.1, installed: false });
+            } else {
+                items.push(DownloadItem { path: p.display().to_string(), name: stem.clone(), kind: "app".into(), apps: 0, installed: installed.contains(&stem) });
+            }
+        } else if ext == "json" {
+            if let Ok(t) = std::fs::read_to_string(&p) {
+                if let Some(s) = crate::suite::Suite::parse(&t) {
+                    items.push(DownloadItem { path: p.display().to_string(), name: s.name.clone(), kind: "bundle".into(), apps: s.apps.len(), installed: false });
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.name.cmp(&b.name));
+    items
+}
+
+/// Cheaply peek whether a zip is a bundle (contains a suite manifest) via `unzip -l`.
+/// Returns (suite name best-effort, app count) if so.
+fn zip_bundle_manifest(zip: &Path) -> Option<(String, usize)> {
+    let out = std::process::Command::new("unzip").arg("-l").arg(zip)
+        .env("PATH", tool_path_env()).output().ok()?;
+    if !out.status.success() { return None; }
+    let listing = String::from_utf8_lossy(&out.stdout);
+    if listing.contains("gitmind-suite.json") || listing.contains("suite.json") {
+        let stem = zip.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        Some((stem, 0))
+    } else {
+        None
+    }
+}
+
+/// Import a zipped app and add it to the local apps list (installs a new version — an
+/// update — if an app of the same name already exists).
+pub fn install_zip_app(zip: &str) -> Result<(Installed, bool), String> {
+    let imp = import(zip)?;
+    let was_installed = installed_names().contains(&imp.app);
+    let inst = build_and_add(&imp.crate_path, &imp.app, "")?;
+    Ok((inst, was_installed))
 }

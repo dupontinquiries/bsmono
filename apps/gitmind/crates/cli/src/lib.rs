@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|build|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|downloads|suite-install|build|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1363,7 +1363,39 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                     Err(e) => return err(&e),
                 }
             }
+            if flag(args, "--add") {
+                match flow::build_and_add(&run_from, &imp.app, "") {
+                    Ok(i) => println!("added {} to your apps @{}", i.name, i.label),
+                    Err(e) => return err(&e),
+                }
+            }
             0
+        }
+        "downloads" => {
+            let items = flow::scan_downloads(&flow::downloads_dir());
+            if items.is_empty() { println!("nothing importable in {}", flow::downloads_dir().display()); return 0; }
+            for it in &items {
+                let tag = if it.kind == "bundle" { format!("bundle · {} apps", it.apps) } else if it.installed { "app · installed (update)".into() } else { "app".to_string() };
+                println!("  [{tag}]  {}\n           {}", it.name, it.path);
+            }
+            println!("install: gitmind fleet import <path> --add   |   bundle: gitmind fleet suite-install <path>");
+            0
+        }
+        "suite-install" => {
+            let path = match pos.first() { Some(p) => p.as_str(), None => return err("usage: gitmind fleet suite-install <bundle.json|.zip>") };
+            let suite = match flow::import_bundle(path) { Ok(s) => s, Err(e) => return err(&e) };
+            println!("installing bundle '{}' ({} apps):", suite.name, suite.apps.len());
+            let mut ok = 0;
+            for (i, a) in suite.apps.iter().enumerate() {
+                print!("  [{}/{}] {} … ", i + 1, suite.apps.len(), a.name);
+                use std::io::Write; let _ = std::io::stdout().flush();
+                match flow::install_suite_app(a) {
+                    Ok(inst) => { println!("✓ @{}", inst.label); ok += 1; }
+                    Err(e) => println!("✗ {e}"),
+                }
+            }
+            println!("{ok}/{} installed", suite.apps.len());
+            if ok == suite.apps.len() { 0 } else { 1 }
         }
         "build" => {
             let path = match pos.first() {
@@ -1375,8 +1407,14 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 None => return err("couldn't tell what kind of project this is (Rust, Python, Node, Go, CMake, Make)"),
             };
             let target = opt(args, "--target").map(|s| s.to_string()).unwrap_or_default();
+            let options: Vec<String> = opt(args, "--features").map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
             println!("{} — {}", proj.name, proj.kind.label());
-            match cockpit::buildsystem::build(&proj, &target, &cockpit::tool_path_env()) {
+            let opts = cockpit::buildsystem::options_for(&proj);
+            if !opts.is_empty() {
+                let names: Vec<String> = opts.iter().map(|o| format!("{}{}", o.name, if o.default { "*" } else { "" })).collect();
+                println!("options: {}  (* = default; pass --features a,b)", names.join(", "));
+            }
+            match cockpit::buildsystem::build(&proj, &target, &options, &cockpit::tool_path_env()) {
                 Ok(b) => {
                     println!("built {} ({})", b.install.display(), cockpit::appcatalog::human_size(b.bytes));
                     if !b.args.is_empty() { println!("run: {} {}", b.run.display(), b.args.join(" ")); }

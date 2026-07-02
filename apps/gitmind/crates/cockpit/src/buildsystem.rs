@@ -264,18 +264,82 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     }
 }
 
-/// Build a detected project for `target` (only meaningful for Cargo) and return how to run
-/// it plus a single file to install.
-pub fn build(d: &Detected, target: &str, path_env: &str) -> Result<Built, String> {
+/// A toggleable build option: a cargo feature or a CMake `option()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuildOption {
+    pub name: String,
+    pub default: bool,
+    pub description: String,
+}
+
+/// The build options a project exposes (cargo features, CMake options), so a frontend can
+/// present them as toggles. Empty for systems without a flag concept.
+pub fn options_for(d: &Detected) -> Vec<BuildOption> {
     match d.kind {
         Kind::Cargo => {
-            let (bin, bytes) = crate::ops::build_locally(&d.name, &d.root, target, &[], false)?;
+            let toml = std::fs::read_to_string(d.root.join("Cargo.toml")).unwrap_or_default();
+            let f = crate::buildflags::scan_cargo_features(&toml);
+            f.all.iter().map(|n| BuildOption { name: n.clone(), default: f.default.contains(n), description: String::new() }).collect()
+        }
+        Kind::CMake => cmake_options(&std::fs::read_to_string(d.root.join("CMakeLists.txt")).unwrap_or_default()),
+        _ => vec![],
+    }
+}
+
+/// Parse `option(NAME "description" DEFAULT)` declarations from a CMakeLists.txt. Pure.
+pub fn cmake_options(text: &str) -> Vec<BuildOption> {
+    let mut out = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("option") {
+        let i = from + rel;
+        from = i + 6;
+        // require the next non-space char to be '('
+        let after = text[i + 6..].trim_start();
+        if !after.starts_with('(') { continue; }
+        let open = i + 6 + (text[i + 6..].len() - after.len());
+        let Some(close_rel) = text[open..].find(')') else { continue };
+        let inner = &text[open + 1..open + close_rel];
+        let toks = cmake_tokens(inner);
+        if let Some(name) = toks.first() {
+            if name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) {
+                let description = toks.get(1).cloned().unwrap_or_default();
+                let default = toks.get(2).map(|d| matches!(d.to_ascii_uppercase().as_str(), "ON" | "TRUE" | "YES" | "1")).unwrap_or(false);
+                out.push(BuildOption { name: name.clone(), default, description });
+            }
+        }
+        from = open + close_rel + 1;
+    }
+    out
+}
+
+fn cmake_tokens(s: &str) -> Vec<String> {
+    let mut toks = Vec::new();
+    let mut cur = String::new();
+    let mut in_q = false;
+    for c in s.chars() {
+        match c {
+            '"' => { if in_q { toks.push(std::mem::take(&mut cur)); in_q = false; } else { in_q = true; } }
+            c if c.is_whitespace() && !in_q => { if !cur.is_empty() { toks.push(std::mem::take(&mut cur)); } }
+            c => cur.push(c),
+        }
+    }
+    if !cur.is_empty() { toks.push(cur); }
+    toks
+}
+
+/// Build a detected project for `target` with `options` (cargo features / CMake -D flags;
+/// ignored by systems without them) and return how to run it plus a single file to install.
+pub fn build(d: &Detected, target: &str, options: &[String], path_env: &str) -> Result<Built, String> {
+    match d.kind {
+        Kind::Cargo => {
+            let (bin, bytes) = crate::ops::build_locally(&d.name, &d.root, target, options, !options.is_empty())?;
             Ok(Built { run: bin.clone(), args: vec![], install: bin, bytes })
         }
         Kind::Python => build_python(d, path_env),
         Kind::Go => build_go(d, path_env),
         Kind::Node => build_node(d, path_env),
-        Kind::CMake => build_cmake(d, path_env),
+        Kind::CMake => build_cmake(d, options, path_env),
         Kind::Make => build_make(d, path_env),
     }
 }
@@ -347,10 +411,15 @@ fn build_node(d: &Detected, path_env: &str) -> Result<Built, String> {
     Ok(Built { run: PathBuf::from(exec), args, install: launcher, bytes })
 }
 
-fn build_cmake(d: &Detected, path_env: &str) -> Result<Built, String> {
+fn build_cmake(d: &Detected, options: &[String], path_env: &str) -> Result<Built, String> {
     let root = &d.root;
     let build = root.join("build");
-    run(Command::new("cmake").args(["-S", ".", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"]).current_dir(root).env("PATH", path_env))
+    let mut cfg: Vec<String> = vec!["-S".into(), ".".into(), "-B".into(), "build".into(), "-DCMAKE_BUILD_TYPE=Release".into()];
+    for o in options {
+        // "NAME" → -DNAME=ON ; "NAME=VALUE" → -DNAME=VALUE
+        cfg.push(if o.contains('=') { format!("-D{o}") } else { format!("-D{o}=ON") });
+    }
+    run(Command::new("cmake").args(&cfg).current_dir(root).env("PATH", path_env))
         .map_err(|e| format!("cmake configure failed: {e}"))?;
     run(Command::new("cmake").args(["--build", "build", "--config", "Release"]).current_dir(root).env("PATH", path_env))
         .map_err(|e| format!("cmake build failed: {e}"))?;
@@ -438,12 +507,49 @@ mod tests {
         let d = detect(&base).unwrap();
         assert_eq!(d.kind, Kind::Python);
         let path = std::env::var("PATH").unwrap_or_default();
-        let built = build(&d, "", &path).expect("python build");
+        let built = build(&d, "", &[], &path).expect("python build");
         assert!(built.install.ends_with(".gitmind-run.sh"), "produces a launcher script");
         assert!(root.join(".venv/bin/python").exists(), "venv was created");
         // running the launcher actually runs the app
         let out = Command::new("sh").arg(&built.install).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("launched-ok"), "launcher runs the entrypoint");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn finds_cmake_options() {
+        let txt = "cmake_minimum_required(VERSION 3.10)\n\
+                   project(hello C)\n\
+                   option(WITH_EXTRA \"enable extra\" ON)\n\
+                   OPTION (FAST_MATH \"fast math\" OFF)\n\
+                   add_executable(hello main.c)\n";
+        let opts = cmake_options(txt);
+        assert_eq!(opts.len(), 2, "both options found (case/space-insensitive)");
+        assert_eq!(opts[0].name, "WITH_EXTRA");
+        assert!(opts[0].default && opts[0].description == "enable extra");
+        assert_eq!(opts[1].name, "FAST_MATH");
+        assert!(!opts[1].default);
+    }
+
+    #[test]
+    fn builds_a_real_cmake_project_with_a_flag() {
+        // needs cmake + a C compiler; skip cleanly if cmake isn't present
+        let path = std::env::var("PATH").unwrap_or_default();
+        let has_cmake = path.split(':').any(|d| std::path::Path::new(d).join("cmake").exists());
+        if !has_cmake { eprintln!("skipping: cmake not on PATH"); return; }
+        let base = std::env::temp_dir().join(format!("gm-cm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("hello");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("CMakeLists.txt"),
+            "cmake_minimum_required(VERSION 3.10)\nproject(hello C)\noption(WITH_EXTRA \"x\" OFF)\nadd_executable(hello main.c)\n").unwrap();
+        fs::write(root.join("main.c"), "#include <stdio.h>\nint main(){printf(\"cmake-hello\\n\");return 0;}\n").unwrap();
+        let d = detect(&base).unwrap();
+        assert_eq!(d.kind, Kind::CMake);
+        assert_eq!(options_for(&d).len(), 1, "flag finding surfaces the option");
+        let built = build(&d, "", &["WITH_EXTRA".to_string()], &path).expect("cmake build");
+        let out = Command::new(&built.run).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("cmake-hello"), "the built binary runs");
         let _ = fs::remove_dir_all(&base);
     }
 }
