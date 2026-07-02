@@ -626,3 +626,72 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 }
+
+// ── suites: bundle multiple apps and install them together ──
+
+/// Generate a default "all" suite by scanning `root` for binary crates, one entry each
+/// with sane defaults (native build, default features, no flags). Deduped by crate name.
+pub fn default_suite(root: &Path) -> crate::suite::Suite {
+    let pe = crate::ops::tool_path_env();
+    let cmd = "find \"$GMROOT\" -maxdepth 8 -name Cargo.toml \
+               -not -path '*/target/*' -not -path '*/vendor/*' -not -path '*/node_modules/*' \
+               2>/dev/null | head -400";
+    let out = std::process::Command::new("sh").arg("-c").arg(cmd)
+        .env("GMROOT", root).env("PATH", &pe).output();
+    let mut apps: Vec<crate::suite::SuiteApp> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Ok(o) = out {
+        let mut tomls: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+        tomls.sort();
+        for toml_path in tomls {
+            let dir = match Path::new(&toml_path).parent() { Some(d) => d.to_path_buf(), None => continue };
+            let toml = std::fs::read_to_string(&toml_path).unwrap_or_default();
+            let is_bin = dir.join("src/main.rs").is_file() || dir.join("src/bin").is_dir() || buildflags::declares_binary(&toml);
+            if !is_bin { continue; }
+            let name = match buildflags::crate_name(&toml) { Some(n) => n, None => continue }; // skip virtual/workspace manifests
+            if seen.insert(name.clone()) {
+                apps.push(crate::suite::SuiteApp::simple(&name, &dir.display().to_string()));
+            }
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    crate::suite::Suite {
+        name: "all".into(),
+        description: format!("All {} apps — native build, default features", apps.len()),
+        apps,
+    }
+}
+
+/// Result of installing one app from a suite.
+pub struct SuiteAppResult {
+    pub name: String,
+    pub ok: bool,
+    pub message: String,
+}
+
+/// Build one suite app for this device and add it to the local apps list (+ .desktop
+/// launcher). Native target unless the app pins one.
+pub fn install_suite_app(app: &crate::suite::SuiteApp) -> Result<Installed, String> {
+    let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
+    let (bin, _) = build_locally(&app.name, Path::new(&app.path), &target, &app.features, app.no_default)
+        .map_err(|e| format!("build: {e}"))?;
+    add_to_apps(&bin, &app.name, "suite", &app.run_flags)
+}
+
+/// Install every app in a suite, collecting a per-app result (never aborts on one failure).
+pub fn install_suite(suite: &crate::suite::Suite) -> Vec<SuiteAppResult> {
+    suite.apps.iter().map(|a| match install_suite_app(a) {
+        Ok(i) => SuiteAppResult { name: a.name.clone(), ok: true, message: format!("installed @{}", i.label) },
+        Err(e) => SuiteAppResult { name: a.name.clone(), ok: false, message: e },
+    }).collect()
+}
+
+/// Generate the default suite from `root` and save it, returning it.
+pub fn create_default_suite(root: &Path) -> Result<crate::suite::Suite, String> {
+    let s = default_suite(root);
+    if s.apps.is_empty() {
+        return Err("no buildable apps found — check the folder".into());
+    }
+    crate::suite::save_suite(&s)?;
+    Ok(s)
+}

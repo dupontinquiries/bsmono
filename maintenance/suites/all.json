@@ -1,0 +1,230 @@
+{
+  "name": "all",
+  "description": "All 28 apps \u2014 native build, default features",
+  "apps": [
+    {
+      "name": "ambient-learner",
+      "path": "apps/ambient-learner",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "anamorph",
+      "path": "apps/logscope/docs/prototypes/anamorph",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "av1tuner_app",
+      "path": "apps/av1tuner/av1tuner_app",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bo-controller",
+      "path": "apps/bo-suite/bo-controller",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bo-mux",
+      "path": "apps/bo-suite/bo-mux",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bot-arena",
+      "path": "apps/bot-arena",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "burn-probe",
+      "path": "apps/logscope/burn-probe",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "camera-bridge",
+      "path": "system/snapclone/camera-bridge",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "drift-playground",
+      "path": "tools/drift/playground",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "gitmind-cli",
+      "path": "apps/gitmind/crates/cli",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "gitmind-gui",
+      "path": "apps/gitmind/crates/gui",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "gitmind-sim",
+      "path": "apps/gitmind/crates/sim",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "gpu-gemm",
+      "path": "apps/logscope/crates/gpu-gemm",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "kitfinder",
+      "path": "tools/kitfinder",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "layout_tool",
+      "path": "apps/voiceterm/tools/layout_tool",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "logscope",
+      "path": "apps/logscope/crates/logscope",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "logscope-egui",
+      "path": "apps/logscope/crates/logscope-egui",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "peek",
+      "path": "tools/peek",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "photosync-system",
+      "path": "system/photosync",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "rusty-board",
+      "path": "apps/rusty-board",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "snapclone-databus",
+      "path": "system/snapclone/rust/snapclone-databus",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "snapclone-microdht",
+      "path": "system/snapclone/rust/snapclone-microdht",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "snapclone-videosrc",
+      "path": "system/snapclone/rust/snapclone-videosrc",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "unendlich-analyze",
+      "path": "apps/unendlich/crates/unendlich-analyze",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "unendlich-dash",
+      "path": "apps/unendlich/crates/unendlich-dash",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "unendlich-engine",
+      "path": "apps/unendlich/crates/unendlich-engine",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "unendlich-launcher",
+      "path": "apps/unendlich/crates/unendlich-launcher",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "web2qml",
+      "path": "apps/voiceterm",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}

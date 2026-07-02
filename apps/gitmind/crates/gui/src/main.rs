@@ -167,6 +167,10 @@ struct Backend {
     rollup_preview: qt_method!(fn(&self, older: QString, newer: QString) -> QString),
     rollup_apply: qt_method!(fn(&self, older: QString, newer: QString) -> QString),
     merge_preview: qt_method!(fn(&self, workspace: QString, target_branch: QString, branch: QString) -> QString),
+    suites: qt_method!(fn(&self) -> QString),
+    create_default_suite: qt_method!(fn(&self) -> QString),
+    install_suite_app: qt_method!(fn(&self, name: QString, path: QString, features: QString, target: QString, flags: QString) -> QString),
+    delete_suite: qt_method!(fn(&self, name: QString) -> QString),
     build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
@@ -1589,6 +1593,70 @@ impl Backend {
                 let files: Vec<_> = p.files.iter().map(|(st, f)| json!({"status": st, "path": f})).collect();
                 QString::from(json!({"ok": true, "shortstat": p.shortstat, "commits": commits, "files": files}).to_string())
             }
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// All saved app suites, apps embedded so the UI can install them one by one.
+    fn suites(&self) -> QString {
+        let suites: Vec<_> = cockpit::suite::list_suites().iter().map(|s| {
+            let apps: Vec<_> = s.apps.iter().map(|a| json!({
+                "name": a.name, "path": a.path, "features": a.features.join(","),
+                "no_default": a.no_default, "target": a.target, "run_flags": a.run_flags,
+            })).collect();
+            json!({"name": s.name, "description": s.description, "apps": apps})
+        }).collect();
+        QString::from(json!({"ok": true, "suites": suites}).to_string())
+    }
+
+    /// Scan $HOME for binary crates and save a default "all" suite with sane defaults.
+    /// Async job "mksuite".
+    fn create_default_suite(&self) -> QString {
+        if !self.job.start("mksuite") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            match cockpit::flow::create_default_suite(std::path::Path::new(&home)) {
+                Ok(s) => job.finish(json!({"ok": true, "name": s.name, "count": s.apps.len()}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "mksuite"}).to_string())
+    }
+
+    /// Build one suite app for this device and add it to the apps list (+ launcher).
+    /// Async job "sapp" — the UI calls this per app to show progress.
+    fn install_suite_app(&self, name: QString, path: QString, features: QString, target: QString, flags: QString) -> QString {
+        let app = cockpit::suite::SuiteApp {
+            name: name.to_string(),
+            path: path.to_string(),
+            features: features.to_string().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            no_default: !features.to_string().trim().is_empty(),
+            target: target.to_string(),
+            run_flags: flags.to_string(),
+        };
+        if app.name.trim().is_empty() || app.path.trim().is_empty() {
+            return err_json("missing app name or path");
+        }
+        if !self.job.start("sapp") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            match cockpit::flow::install_suite_app(&app) {
+                Ok(i) => job.finish(json!({"ok": true, "name": app.name, "label": i.label}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "name": app.name, "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "sapp"}).to_string())
+    }
+
+    /// Delete a saved suite.
+    fn delete_suite(&self, name: QString) -> QString {
+        match cockpit::suite::delete_suite(&name.to_string()) {
+            Ok(()) => QString::from(json!({"ok": true}).to_string()),
             Err(e) => err_json(&e),
         }
     }
