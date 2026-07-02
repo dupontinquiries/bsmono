@@ -164,6 +164,9 @@ struct Backend {
     remove_scan_root: qt_method!(fn(&self, path: QString) -> QString),
     add_app: qt_method!(fn(&self, crate_path: QString, app: QString, flags: QString) -> QString),
     run_local: qt_method!(fn(&self, name: QString, extra: QString) -> QString),
+    rollup_preview: qt_method!(fn(&self, older: QString, newer: QString) -> QString),
+    rollup_apply: qt_method!(fn(&self, older: QString, newer: QString) -> QString),
+    merge_preview: qt_method!(fn(&self, workspace: QString, target_branch: QString, branch: QString) -> QString),
     build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
@@ -1534,6 +1537,58 @@ impl Backend {
     fn run_local(&self, name: QString, extra: QString) -> QString {
         match cockpit::flow::run_local(&name.to_string(), &extra.to_string()) {
             Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Preview fast-forwarding an older copy up to a newer one — the incoming commits and
+    /// files, computed in a throwaway clone (nothing touched). Async job "rupv".
+    fn rollup_preview(&self, older: QString, newer: QString) -> QString {
+        let older = older.to_string();
+        let newer = newer.to_string();
+        if !self.job.start("rupv") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let p = cockpit::flow::rollup_preview(std::path::Path::new(&older), std::path::Path::new(&newer));
+            let incoming: Vec<_> = p.incoming.iter().map(|(o, s)| json!({"oid": o, "subject": s})).collect();
+            let files: Vec<_> = p.files.iter().map(|(st, f)| json!({"status": st, "path": f})).collect();
+            job.finish(json!({
+                "ok": true, "older": older, "relation": p.relation, "can_fast_forward": p.can_fast_forward,
+                "behind": p.behind, "ahead": p.ahead, "incoming": incoming, "files": files,
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "rupv"}).to_string())
+    }
+
+    /// Fast-forward a strict-older copy in place (guarded: clean tree + strict ancestor,
+    /// `--ff-only`, no deletion). Async job "ruapply".
+    fn rollup_apply(&self, older: QString, newer: QString) -> QString {
+        let older = older.to_string();
+        let newer = newer.to_string();
+        if !self.job.start("ruapply") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            match cockpit::flow::rollup_apply(std::path::Path::new(&older), std::path::Path::new(&newer)) {
+                Ok(msg) => job.finish(json!({"ok": true, "msg": msg, "older": older}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e, "older": older}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "ruapply"}).to_string())
+    }
+
+    /// What a chosen merge strategy would change vs the target — read-only, from the
+    /// exploration workspace. Synchronous (a quick diff).
+    fn merge_preview(&self, workspace: QString, target_branch: QString, branch: QString) -> QString {
+        match cockpit::flow::merge_preview(&workspace.to_string(), &target_branch.to_string(), &branch.to_string()) {
+            Ok(p) => {
+                let commits: Vec<_> = p.commits.iter().map(|(o, s)| json!({"oid": o, "subject": s})).collect();
+                let files: Vec<_> = p.files.iter().map(|(st, f)| json!({"status": st, "path": f})).collect();
+                QString::from(json!({"ok": true, "shortstat": p.shortstat, "commits": commits, "files": files}).to_string())
+            }
             Err(e) => err_json(&e),
         }
     }
