@@ -18,6 +18,7 @@ Item {
     property string zipName: ""
     property string desc: ""
     property bool isBin: true
+    property string system: ""
     property string binary: ""
     property string buildError: ""
     property bool busy: false
@@ -136,7 +137,7 @@ Item {
             if (k === "import") {
                 if (res.ok) {
                     root.importState = "found"; root.app = res.app; root.cratePath = res.crate_path
-                    root.dir = res.dir; root.desc = res.description || ""; root.isBin = (res.is_bin !== false)
+                    root.dir = res.dir; root.desc = res.description || ""; root.isBin = (res.is_bin !== false); root.system = res.system || ""
                     root.hasGit = (res.has_git === true); root.hasGitmind = (res.has_gitmind === true)
                     root.zipRepo = res.zip_repo || ""; root.mode = "new"
                     root.loadBases()
@@ -221,6 +222,11 @@ Item {
                     Row {
                         spacing: 8
                         Label { text: root.app; color: "#cdd6f4"; font.bold: true; font.pixelSize: 17 }
+                        Rectangle {
+                            visible: root.system.length > 0; anchors.verticalCenter: parent.verticalCenter
+                            height: 16; radius: 8; width: sysb.width + 12; color: "#1b2b3a"
+                            Label { id: sysb; anchors.centerIn: parent; text: root.system; color: "#7aa2f7"; font.pixelSize: 10 }
+                        }
                         Rectangle {
                             visible: root.hasGit; anchors.verticalCenter: parent.verticalCenter
                             height: 16; radius: 8; width: gb.width + 12; color: "#16271b"

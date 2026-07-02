@@ -1368,15 +1368,20 @@ fn cmd_fleet(rest: &[String]) -> i32 {
         "build" => {
             let path = match pos.first() {
                 Some(p) => std::path::PathBuf::from(p),
-                None => return err("usage: gitmind fleet build <crate-path> [app] [--target T]"),
+                None => return err("usage: gitmind fleet build <project-path> [--target T]"),
             };
-            let toml = std::fs::read_to_string(path.join("Cargo.toml")).unwrap_or_default();
-            let app = pos.get(1).map(|s| s.to_string())
-                .or_else(|| cockpit::buildflags::crate_name(&toml))
-                .unwrap_or_else(|| "app".into());
+            let proj = match cockpit::buildsystem::detect(&path) {
+                Some(p) => p,
+                None => return err("couldn't tell what kind of project this is (Rust, Python, Node, Go, CMake, Make)"),
+            };
             let target = opt(args, "--target").map(|s| s.to_string()).unwrap_or_default();
-            match cockpit::build_locally(&app, &path, &target, &[], false) {
-                Ok((bin, size)) => { println!("built {} ({})", bin.display(), cockpit::appcatalog::human_size(size)); 0 }
+            println!("{} — {}", proj.name, proj.kind.label());
+            match cockpit::buildsystem::build(&proj, &target, &cockpit::tool_path_env()) {
+                Ok(b) => {
+                    println!("built {} ({})", b.install.display(), cockpit::appcatalog::human_size(b.bytes));
+                    if !b.args.is_empty() { println!("run: {} {}", b.run.display(), b.args.join(" ")); }
+                    0
+                }
                 Err(e) => err(&e),
             }
         }

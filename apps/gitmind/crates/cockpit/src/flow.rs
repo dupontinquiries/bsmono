@@ -13,6 +13,7 @@ pub struct Import {
     pub app: String,
     pub is_bin: bool,
     pub description: String,
+    pub system: String,
     pub has_git: bool,
     pub zip_repo: Option<PathBuf>,
     pub has_gitmind: bool,
@@ -41,32 +42,34 @@ pub fn import(zip: &str) -> Result<Import, String> {
             format!("couldn't extract the zip: {}", blob.trim())
         });
     }
-    let crate_path = importer::find_crate_root(&dir).ok_or_else(|| {
+    let proj = crate::buildsystem::detect(&dir).ok_or_else(|| {
         let _ = std::fs::remove_dir_all(&dir);
-        "no Cargo.toml found in the zip".to_string()
+        "no supported project found in the zip (looked for Rust, Python, Node, Go, CMake, Make)".to_string()
     })?;
-    let toml = std::fs::read_to_string(crate_path.join("Cargo.toml")).unwrap_or_default();
-    let app = buildflags::crate_name(&toml).unwrap_or_else(|| "app".into());
-    let is_bin = crate_path.join("src/main.rs").is_file()
-        || crate_path.join("src/bin").is_dir()
-        || buildflags::declares_binary(&toml);
     let zip_repo = importer::find_repo_root(&dir);
     Ok(Import {
         has_git: zip_repo.is_some(),
         has_gitmind: zip_repo.as_ref().map(|p| p.join(".gitmind").exists()).unwrap_or(false),
         zip_repo,
-        description: buildflags::package_description(&toml).unwrap_or_default(),
-        dir, crate_path, app, is_bin,
+        system: proj.kind.label().to_string(),
+        app: proj.name,
+        is_bin: proj.runnable,
+        description: proj.description,
+        crate_path: proj.root,
+        dir,
     })
 }
 
-/// Build a crate natively for this device and launch it detached. Returns the binary.
-pub fn build_and_run(crate_path: &Path, app: &str) -> Result<PathBuf, String> {
-    let native = native_triple_local();
-    let (bin, _) = build_locally(app, crate_path, &native, &[], false).map_err(|e| format!("build: {e}"))?;
-    std::process::Command::new(&bin).current_dir(crate_path).env("PATH", tool_path_env())
+/// Build an imported project (any supported build system) for this device and launch it
+/// detached. Returns the runnable artifact.
+pub fn build_and_run(crate_path: &Path, _app: &str) -> Result<PathBuf, String> {
+    let proj = crate::buildsystem::detect(crate_path).ok_or("couldn't tell what kind of project this is")?;
+    let pe = tool_path_env();
+    let target = native_triple_local();
+    let built = crate::buildsystem::build(&proj, &target, &pe)?;
+    std::process::Command::new(&built.run).args(&built.args).current_dir(&proj.root).env("PATH", &pe)
         .spawn().map_err(|e| format!("built, but couldn't launch: {e}"))?;
-    Ok(bin)
+    Ok(built.install)
 }
 
 /// Move an imported crate to `dest`, optionally git/gitmind-initialize it, and remember
@@ -346,11 +349,14 @@ pub fn add_to_apps(bin: &Path, name: &str, commit: &str, run_args: &str) -> Resu
     Ok(Installed { name: name.into(), label, path: v.path, run_args: run_args.into() })
 }
 
-/// Build an imported crate natively, then add it to the local apps list with launch flags.
-pub fn build_and_add(crate_path: &Path, app: &str, run_args: &str) -> Result<Installed, String> {
-    let native = native_triple_local();
-    let (bin, _) = build_locally(app, crate_path, &native, &[], false).map_err(|e| format!("build: {e}"))?;
-    add_to_apps(&bin, app, "import", run_args)
+/// Build an imported project (any supported build system) natively, then add it to the
+/// local apps list with launch flags.
+pub fn build_and_add(crate_path: &Path, _app: &str, run_args: &str) -> Result<Installed, String> {
+    let proj = crate::buildsystem::detect(crate_path).ok_or("couldn't tell what kind of project this is")?;
+    let pe = tool_path_env();
+    let target = native_triple_local();
+    let built = crate::buildsystem::build(&proj, &target, &pe)?;
+    add_to_apps(&built.install, &proj.name, "import", run_args)
 }
 
 /// Launch a locally-installed app (its current pinned version) with its saved flags plus
