@@ -1588,3 +1588,30 @@ VERIFIED: cockpit 68 tests (+1 relate; deploy argv test extended); cargo test/bu
 check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; QML Import/Settings/Push/Apps balanced +
 backend.* resolve (Import 11, Settings 10, Push 5, Apps 5). On-device confirms GUI build (no Qt here) + the
 scp path (no ssh target here).
+
+── guarded roll-up (fast-forward strict-older copy) + merge preview (no autodelete) ──
+USER: "no autodelete of folders; guarded rollup and merge previews."
+PRINCIPLE: detection→preview→explicit apply. Fast-forward is inherently safe (--ff-only can't lose commits,
+only advances a strict-older copy in place). Previews run READ-ONLY in throwaway clones. Nothing deleted.
+[cockpit::flow, +3 real-git tests] rollup_preview(older,newer)→RollupPreview{relation,can_fast_forward
+(behind|same),behind,ahead,incoming:[(short_oid,subject)],files:[(status,path)]} via throwaway BARE clone of
+older + fetch newer HEAD→refs/gmn + log/diff a_head..gmn (older untouched). rollup_apply(older,newer): guard
+clean tree + relate must be "behind" (diverged/ahead/unrelated REFUSED) → git fetch newer HEAD + `git merge
+--ff-only FETCH_HEAD` (in place, no merge commit, no deletion) → "fast-forwarded N commit(s)". merge_preview(
+workspace,target_branch,branch)→MergePreview{shortstat,commits,files} = diff/log target..gm-<id> in the
+exploration workspace (read-only). Helpers git_at/parse_commits(%h\x1f%s)/parse_namestatus.
+TESTS: older strict-ancestor→preview lists incoming+files, apply ff's older to == newer HEAD, file appears in
+older, no delete; diverged→rollup_apply Err (refused); merge_preview after run_exploration shows the
+introduced file+commit.
+[CLI] fleet rollup <older> <newer> [--apply] (behind→ff preview/apply; diverged→explore+strategies, --strategy
+<id> [--apply] previews else lands into newer as a branch); fleet merge gained --preview (show diff for a
+strategy without landing). usage adds rollup.
+[GUI] methods rollup_preview(async "rupv"), rollup_apply(async "ruapply"), merge_preview(sync). Diverged reuses
+explore_merge(copy,newest)+apply_merge(ws,branch,newest,id). Settings dedup card: per non-newest copy a "roll
+up"/"close" button → inline panel: OLDER shows incoming commits + "fast-forward this copy" (guarded); DIVERGED
+shows explored strategies, each with "preview" (merge_preview diff) + "land" (apply_merge → branch in newest).
+Poller handles rupv/ruapply/explore/rumerge; closeRollup() + rescan on apply. One panel open at a time
+(rollupPath). Still NO delete anywhere.
+VERIFIED: cockpit 71 tests (+3); cargo test/build -p cockpit clean; cargo check -p gitmind-cli --lib clean;
+rustcheck gui+cockpit CLEAN; all 10 QML balanced; Settings backend.* (15) resolve. On-device confirms GUI +
+the ff/merge on real repos (no ssh target / Qt here).
