@@ -428,3 +428,201 @@ pub fn compare_group(paths: &[String]) -> (String, Vec<CopyStatus>) {
     }).collect();
     (newest, statuses)
 }
+
+// ── guarded roll-up (fast-forward a strict-older copy) + merge preview ──
+
+fn git_at(cwd: &Path, path_env: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new("git").args(args).current_dir(cwd).env("PATH", path_env).output() {
+        Ok(o) => (o.status.success(), String::from_utf8_lossy(&o.stdout).trim().to_string()),
+        Err(_) => (false, String::new()),
+    }
+}
+
+fn parse_commits(raw: &str) -> Vec<(String, String)> {
+    raw.lines().filter_map(|l| {
+        let mut it = l.splitn(2, '\u{1f}');
+        Some((it.next()?.to_string(), it.next().unwrap_or("").to_string()))
+    }).collect()
+}
+
+fn parse_namestatus(raw: &str) -> Vec<(String, String)> {
+    raw.lines().take(200).filter_map(|l| {
+        let mut it = l.split('\t');
+        Some((it.next()?.to_string(), it.next()?.to_string()))
+    }).collect()
+}
+
+/// What fast-forwarding `older` up to `newer` would bring in — computed in a throwaway
+/// bare clone, so nothing is touched. `can_fast_forward` is true only when `older` is a
+/// strict ancestor of `newer` (a clean, lossless advance).
+pub struct RollupPreview {
+    pub relation: String,
+    pub can_fast_forward: bool,
+    pub behind: usize,
+    pub ahead: usize,
+    pub incoming: Vec<(String, String)>, // (short oid, subject)
+    pub files: Vec<(String, String)>,    // (status, path)
+}
+
+pub fn rollup_preview(older: &Path, newer: &Path) -> RollupPreview {
+    let pe = crate::ops::tool_path_env();
+    let rel = crate::identity::relate(older, newer, &pe);
+    let can_ff = rel.relation == "behind" || rel.relation == "same";
+    // gather the incoming commits + file changes in a throwaway bare clone of older
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("gm-rollup-{}-{}", std::process::id(), nanos));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mut incoming = Vec::new();
+    let mut files = Vec::new();
+    if git_at(Path::new("/"), &pe, &["clone", "--bare", "--quiet", "--local", &older.display().to_string(), &tmp.display().to_string()]).0 {
+        let (_, a_head) = git_at(&tmp, &pe, &["rev-parse", "HEAD"]);
+        if git_at(&tmp, &pe, &["fetch", "--no-tags", "--quiet", &newer.display().to_string(), "HEAD:refs/gmn"]).0 && !a_head.is_empty() {
+            let range = format!("{a_head}..refs/gmn");
+            let (_, log) = git_at(&tmp, &pe, &["log", "--format=%h%x1f%s", &range]);
+            incoming = parse_commits(&log);
+            let (_, ns) = git_at(&tmp, &pe, &["diff", "--name-status", &range]);
+            files = parse_namestatus(&ns);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+    RollupPreview { relation: rel.relation, can_fast_forward: can_ff, behind: rel.b_ahead, ahead: rel.a_ahead, incoming, files }
+}
+
+/// Roll a strict-older copy up to the newer one by fast-forwarding it in place. Guarded:
+/// the copy must have a clean working tree and be a strict ancestor of `newer`, so this
+/// can only *advance* it — it never rewrites history, never merges, and never deletes the
+/// folder. Diverged copies are refused (use the merge preview instead).
+pub fn rollup_apply(older: &Path, newer: &Path) -> Result<String, String> {
+    let pe = crate::ops::tool_path_env();
+    if !older.join(".git").exists() { return Err("that copy isn't a git repo".into()); }
+    let (ok, dirty) = git_at(older, &pe, &["status", "--porcelain"]);
+    if !ok { return Err("couldn't read the copy's status".into()); }
+    if !dirty.is_empty() { return Err("that copy has uncommitted changes — commit or stash them first".into()); }
+    let rel = crate::identity::relate(older, newer, &pe);
+    match rel.relation.as_str() {
+        "same" => return Ok("already up to date".into()),
+        "behind" => {}
+        "diverged" => return Err("these have diverged — preview a merge instead of a fast-forward".into()),
+        "ahead" => return Err("this copy is newer than the other — nothing to roll up".into()),
+        _ => return Err("these don't share history".into()),
+    }
+    // bring the newer tip in and fast-forward the current branch (safe: --ff-only)
+    if !git_at(older, &pe, &["fetch", "--no-tags", "--quiet", &newer.display().to_string(), "HEAD"]).0 {
+        return Err("couldn't read the newer copy".into());
+    }
+    let (ff_ok, _) = git_at(older, &pe, &["merge", "--ff-only", "FETCH_HEAD"]);
+    if !ff_ok {
+        return Err("couldn't fast-forward (the copy may have local commits) — preview a merge instead".into());
+    }
+    Ok(format!("fast-forwarded {} commit(s) — this copy now matches the newer one", rel.b_ahead))
+}
+
+/// What a chosen exploration strategy would change, relative to the target branch —
+/// read-only, from the throwaway workspace the exploration built.
+pub struct MergePreview {
+    pub shortstat: String,
+    pub commits: Vec<(String, String)>,
+    pub files: Vec<(String, String)>,
+}
+
+pub fn merge_preview(workspace: &str, target_branch: &str, branch: &str) -> Result<MergePreview, String> {
+    let pe = crate::ops::tool_path_env();
+    let ws = Path::new(workspace);
+    if !ws.exists() { return Err("that preview has expired — explore again".into()); }
+    let range = format!("{target_branch}..{branch}");
+    let (ok, shortstat) = git_at(ws, &pe, &["diff", "--shortstat", &range]);
+    if !ok { return Err("couldn't read the preview".into()); }
+    let (_, log) = git_at(ws, &pe, &["log", "--format=%h%x1f%s", &range]);
+    let (_, ns) = git_at(ws, &pe, &["diff", "--name-status", &range]);
+    Ok(MergePreview {
+        shortstat: if shortstat.is_empty() { "no file changes".into() } else { shortstat },
+        commits: parse_commits(&log),
+        files: parse_namestatus(&ns),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn g(repo: &Path, args: &[&str]) {
+        let mut full: Vec<&str> = vec!["-c", "user.name=T", "-c", "user.email=t@t"];
+        full.extend_from_slice(args);
+        let o = std::process::Command::new("git").args(&full).current_dir(repo).output().unwrap();
+        assert!(o.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+    }
+
+    #[test]
+    fn rollup_previews_then_fast_forwards_a_strict_older_copy() {
+        let base = std::env::temp_dir().join(format!("gm-ru-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let newer = base.join("newer");
+        fs::create_dir_all(&newer).unwrap();
+        g(&newer, &["init", "-q"]);
+        fs::write(newer.join("f"), "1\n").unwrap();
+        g(&newer, &["add", "-A"]); g(&newer, &["commit", "-qm", "base"]);
+        // older = clone at base, then newer advances
+        let older = base.join("older");
+        g(&base, &["clone", "-q", &newer.display().to_string(), &older.display().to_string()]);
+        fs::write(newer.join("g"), "2\n").unwrap();
+        g(&newer, &["add", "-A"]); g(&newer, &["commit", "-qm", "add g"]);
+
+        let pv = rollup_preview(&older, &newer);
+        assert!(pv.can_fast_forward, "older is a strict ancestor → ff possible ({})", pv.relation);
+        assert_eq!(pv.behind, 1, "older is one commit behind");
+        assert!(pv.incoming.iter().any(|(_, s)| s == "add g"), "preview lists the incoming commit");
+        assert!(pv.files.iter().any(|(_, p)| p == "g"), "preview lists the new file");
+
+        // apply the fast-forward — older now matches newer, in place, nothing deleted
+        let msg = rollup_apply(&older, &newer).expect("ff applies");
+        assert!(msg.contains("matches"), "{msg}");
+        assert!(older.join("g").exists(), "the incoming file is now present in the older copy");
+        let a = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&older).output().unwrap();
+        let b = std::process::Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&newer).output().unwrap();
+        assert_eq!(a.stdout, b.stdout, "heads match after fast-forward");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn diverged_copies_refuse_fast_forward() {
+        let base = std::env::temp_dir().join(format!("gm-ru2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let a = base.join("a");
+        fs::create_dir_all(&a).unwrap();
+        g(&a, &["init", "-q"]);
+        fs::write(a.join("f"), "1\n").unwrap();
+        g(&a, &["add", "-A"]); g(&a, &["commit", "-qm", "base"]);
+        let b = base.join("b");
+        g(&base, &["clone", "-q", &a.display().to_string(), &b.display().to_string()]);
+        // both diverge
+        fs::write(a.join("x"), "a\n").unwrap(); g(&a, &["add", "-A"]); g(&a, &["commit", "-qm", "a work"]);
+        fs::write(b.join("y"), "b\n").unwrap(); g(&b, &["add", "-A"]); g(&b, &["commit", "-qm", "b work"]);
+        assert!(rollup_apply(&a, &b).is_err(), "diverged → fast-forward refused, no data touched");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_preview_shows_what_a_strategy_changes() {
+        let base = std::env::temp_dir().join(format!("gm-mp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let target = base.join("target");
+        let other = base.join("other");
+        fs::create_dir_all(&target).unwrap();
+        g(&target, &["init", "-q"]);
+        fs::write(target.join("f"), "base\n").unwrap();
+        g(&target, &["add", "-A"]); g(&target, &["commit", "-qm", "base"]);
+        g(&base, &["clone", "-q", &target.display().to_string(), &other.display().to_string()]);
+        fs::write(other.join("feature"), "new\n").unwrap();
+        g(&other, &["add", "-A"]); g(&other, &["commit", "-qm", "feature work"]);
+
+        let ws = base.join("ws");
+        let pe = std::env::var("PATH").unwrap_or_default();
+        let ex = crate::merge::run_exploration(&target, &other, &ws, &pe).expect("explore");
+        let win = ex.trials.iter().find(|t| t.ok).expect("a clean strategy");
+        let pv = merge_preview(&ex.workspace.display().to_string(), &ex.target_branch, &win.branch).expect("preview");
+        assert!(pv.files.iter().any(|(_, p)| p == "feature"), "preview shows the file the merge introduces");
+        assert!(pv.commits.iter().any(|(_, s)| s == "feature work"), "preview shows the incoming commit");
+        let _ = fs::remove_dir_all(&base);
+    }
+}
