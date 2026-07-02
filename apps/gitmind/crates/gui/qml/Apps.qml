@@ -22,9 +22,30 @@ Item {
     property int installTotal: 0
     property string installingSuite: ""
 
+    // Downloads inbox
+    property var downloads: []
+    property string downloadsDir: ""
+
     function reload() {
         var r = JSON.parse(backend.apps_json())
         apps = r.ok ? (r.apps || []) : []
+    }
+    function loadDownloads() {
+        var r = JSON.parse(backend.downloads())
+        root.downloads = r.ok ? (r.items || []) : []
+        root.downloadsDir = r.dir || ""
+    }
+    function installZip(path) {
+        if (root.busy) return
+        var r = JSON.parse(backend.install_zip_app(path))
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.busy = true; root.jobKind = "zipapp"; root.note = "building…"; suitePoller.start()
+    }
+    function installBundle(path) {
+        if (root.busy) return
+        var r = JSON.parse(backend.import_bundle(path))
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.installSuite(r)   // r has {name, apps} — reuse the suite installer
     }
     function loadSuites() {
         var r = JSON.parse(backend.suites())
@@ -90,11 +111,15 @@ Item {
                 root.note = "installing " + root.installingSuite + " — " + (root.installIdx + 1) + "/" + root.installTotal + (res.ok ? "" : (" (✗ " + res.name + ")"))
                 root.installIdx += 1
                 root.installNext()
+            } else if (k === "zipapp") {
+                root.busy = false
+                if (res.ok) { root.note = (res.updated ? "✓ updated " : "✓ installed ") + res.name + " @" + res.label; root.reload(); root.loadDownloads() }
+                else root.note = "✗ " + res.error
             }
         }
     }
 
-    Component.onCompleted: { reload(); loadSuites() }
+    Component.onCompleted: { reload(); loadSuites(); loadDownloads() }
 
     Column {
         anchors.fill: parent
@@ -107,6 +132,53 @@ Item {
             Button { text: "⟳"; onClicked: root.reload() }
         }
         Label { text: root.note; color: "#8a93a6"; visible: root.note.length > 0; wrapMode: Text.WrapAnywhere; width: parent.width }
+
+        // ── from Downloads: zips & bundles ready to install/update ──
+        Rectangle {
+            visible: root.downloads.length > 0
+            width: parent.width; radius: 10; color: "#171c2b"; border.color: "#3a4566"
+            height: dlCol.height + 20
+            Column {
+                id: dlCol
+                x: 12; y: 10; width: parent.width - 24; spacing: 8
+                Row {
+                    width: parent.width; spacing: 8
+                    Label { text: "from Downloads"; color: "#56d364"; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                    Item { width: parent.width - 200; height: 1 }
+                    Button { text: "⟳"; enabled: !root.busy; onClicked: root.loadDownloads() }
+                }
+                Repeater {
+                    model: root.downloads
+                    delegate: Rectangle {
+                        width: dlCol.width; radius: 8; color: "#0f1320"; border.color: "#2a3350"
+                        height: 44
+                        Row {
+                            anchors.fill: parent; anchors.margins: 8; spacing: 8
+                            Rectangle {
+                                anchors.verticalCenter: parent.verticalCenter
+                                height: 16; radius: 8; width: kb.width + 12
+                                color: modelData.kind === "bundle" ? "#2a2340" : "#1b2b3a"
+                                Label { id: kb; anchors.centerIn: parent; text: modelData.kind === "bundle" ? "bundle" : "app"; color: modelData.kind === "bundle" ? "#c9a3ff" : "#7aa2f7"; font.pixelSize: 10 }
+                            }
+                            Column {
+                                width: parent.width - 200
+                                anchors.verticalCenter: parent.verticalCenter
+                                Label { text: modelData.name + (modelData.kind === "bundle" && modelData.apps ? ("  ·  " + modelData.apps + " apps") : ""); color: "#cdd6f4"; font.pixelSize: 13; width: parent.width; elide: Text.ElideRight }
+                                Label { text: modelData.path; color: "#5b6477"; font.pixelSize: 10; font.family: "monospace"; width: parent.width; elide: Text.ElideMiddle }
+                            }
+                            Button {
+                                anchors.verticalCenter: parent.verticalCenter
+                                enabled: !root.busy
+                                text: modelData.kind === "bundle" ? "install all"
+                                    : (modelData.installed ? "update" : "install")
+                                onClicked: modelData.kind === "bundle" ? root.installBundle(modelData.path) : root.installZip(modelData.path)
+                            }
+                        }
+                    }
+                }
+                Label { text: root.downloadsDir; color: "#5b6477"; font.pixelSize: 10; font.family: "monospace"; width: parent.width; elide: Text.ElideMiddle }
+            }
+        }
 
         // ── suites: install a whole bundle of apps at once ──
         Rectangle {

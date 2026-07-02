@@ -1671,3 +1671,31 @@ VERIFIED: cockpit 74 tests (+2 buildsystem, one a real venv build); cargo test/b
 warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced; Import
 backend.* resolve. On-device: python needs python3-venv; pygame on Alpine needs sdl2-dev headers (error hints
 this). Go/Node/CMake/Make detected+conventional-command (best-effort; untested here — no toolchains in sandbox).
+
+── Downloads inbox + bundles + update-on-import + CMake flag finding ──
+USER: update apps via import zip; import bundle support; or auto-roll into apps page by scanning ~/Downloads
+for zips+bundles. Also CMake build + flag finding (verify).
+[CMake — verified, cmake installed via pip in sandbox] buildsystem::build signature now (d,target,OPTIONS,pe).
+options_for(d): Cargo→scan_cargo_features, CMake→cmake_options. cmake_options(text) parses `option(NAME "desc"
+ON|OFF)` (case/space-insensitive, quote-aware cmake_tokens) → BuildOption{name,default,description}. PURE +
+test. build_cmake applies options as -D<NAME>=ON (or -D<NAME=VALUE> if '=' present). REAL TEST: tiny C
+CMakeLists+main.c → detect CMake, options_for finds the option, build with a flag → binary runs "cmake-hello".
+Cargo build now uses options as features (no_default=!empty). CLI fleet build: --features + prints options
+(* = default). flow build_and_run/build_and_add pass &[] (default build).
+[Bundles] flow::import_bundle(path): .json → suite::parse; .zip → extract + find gitmind-suite.json|suite.json
+(find_shallowest) + rewrite relative app paths to the extraction (portable bundle = code + manifest in a zip).
+[Downloads inbox] flow::scan_downloads(dir)→Vec<DownloadItem{path,name,kind:app|bundle,apps,installed}>:
+top-level *.zip (bundle if unzip -l shows a suite manifest, else app; installed=binpin::list_apps contains
+stem) + *.json that parse as a Suite. downloads_dir()=~/Downloads. install_zip_app(zip)=import+build_and_add
+→ (Installed, was_installed) — binpin versions by name so re-import = UPDATE automatically.
+[GUI] methods downloads(), install_zip_app(path) async "zipapp", import_bundle(path) sync→{name,apps}.
+Apps.qml "from Downloads" section (auto-loaded): app→install/update button (install_zip_app), bundle→"install
+all" (import_bundle→installSuite loop). ⟳ refresh. app/bundle badges. Update label when name already installed.
+[CLI] fleet downloads (list inbox), fleet suite-install <bundle.json|.zip> (install a bundle), fleet import
+--add (add imported app to apps list).
+TESTS: flow imports_a_json_bundle_and_scans_downloads (bundle parse + scan classifies json-bundle & zip-app);
+buildsystem finds_cmake_options + builds_a_real_cmake_project_with_a_flag.
+VERIFIED: cockpit 77 tests (+3: 2 cmake, 1 bundle/downloads; restored merge_preview after an accidental swap);
+cargo test/build -p cockpit clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit
+CLEAN; Apps QML balanced + backend.* (13) resolve. On-device: unzip needed to classify zip bundles (else
+treated as app — import_bundle still works on open). cmake via pip (or system) for CMake apps.
