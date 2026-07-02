@@ -171,6 +171,9 @@ struct Backend {
     create_default_suite: qt_method!(fn(&self) -> QString),
     install_suite_app: qt_method!(fn(&self, name: QString, path: QString, features: QString, target: QString, flags: QString) -> QString),
     delete_suite: qt_method!(fn(&self, name: QString) -> QString),
+    downloads: qt_method!(fn(&self) -> QString),
+    install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
+    import_bundle: qt_method!(fn(&self, path: QString) -> QString),
     build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
@@ -1658,6 +1661,46 @@ impl Backend {
     fn delete_suite(&self, name: QString) -> QString {
         match cockpit::suite::delete_suite(&name.to_string()) {
             Ok(()) => QString::from(json!({"ok": true}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Zips and bundles sitting in ~/Downloads that can be installed into the apps list.
+    fn downloads(&self) -> QString {
+        let items: Vec<_> = cockpit::flow::scan_downloads(&cockpit::flow::downloads_dir()).iter().map(|d| json!({
+            "path": d.path, "name": d.name, "kind": d.kind, "apps": d.apps, "installed": d.installed,
+        })).collect();
+        QString::from(json!({"ok": true, "items": items, "dir": cockpit::flow::downloads_dir().display().to_string()}).to_string())
+    }
+
+    /// Import a zipped app and add it to the apps list — installs a new version (an
+    /// update) if an app of the same name already exists. Async job "zipapp".
+    fn install_zip_app(&self, path: QString) -> QString {
+        let path = path.to_string();
+        if !self.job.start("zipapp") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            match cockpit::flow::install_zip_app(&path) {
+                Ok((i, updated)) => job.finish(json!({"ok": true, "name": i.name, "label": i.label, "updated": updated}).to_string()),
+                Err(e) => job.finish(json!({"ok": false, "error": e}).to_string()),
+            }
+        });
+        QString::from(json!({"ok": true, "started": "zipapp"}).to_string())
+    }
+
+    /// Load a bundle (a suite .json, or a .zip containing a suite manifest) into a suite
+    /// the UI can then install app-by-app. Synchronous (extract is quick).
+    fn import_bundle(&self, path: QString) -> QString {
+        match cockpit::flow::import_bundle(&path.to_string()) {
+            Ok(s) => {
+                let apps: Vec<_> = s.apps.iter().map(|a| json!({
+                    "name": a.name, "path": a.path, "features": a.features.join(","),
+                    "no_default": a.no_default, "target": a.target, "run_flags": a.run_flags,
+                })).collect();
+                QString::from(json!({"ok": true, "name": s.name, "description": s.description, "apps": apps}).to_string())
+            }
             Err(e) => err_json(&e),
         }
     }
