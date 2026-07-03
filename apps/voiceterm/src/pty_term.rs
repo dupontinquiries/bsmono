@@ -182,6 +182,16 @@ pub struct TermGrid {
     /// A future per-row cache (dirty-rect arc stage c) renders only
     /// rows in this range; until then it's tracked but unused.
     dirty_rows: Option<(usize, usize)>,
+    /// v0.1.892 (dirty-rect arc stage c): per-visible-row cache of the
+    /// native renderer's packed run encoding. `term_screen_runs` repacks
+    /// the WHOLE screen every frame; with this cache it repacks only the
+    /// rows that actually changed and reuses cached strings for the rest.
+    /// Correct by construction: entries are invalidated in `mark_row_dirty`
+    /// / `mark_all_dirty`, the same hooks the existing render-gating trusts,
+    /// and every content change (scrollback shift, resize, alt-screen swap,
+    /// cell write) already routes through one of them. Indexed by visible
+    /// row; `None` = needs recompute. Lazily (re)sized to `rows`.
+    row_pack_cache: Vec<Option<String>>,
     pub cursor_row: usize,
     pub cursor_col: usize,
     scroll_top: usize,
@@ -226,6 +236,11 @@ pub struct TermGrid {
     pub lines_emitted: u64,
     // OSC state
     pub title: String,
+    /// v0.1.883: exit code from the most recent OSC 133 `D;<code>` shell-
+    /// integration marker (the previous command's status). Drained by the
+    /// main thread when a block closes, to surface ✓/✗ in notifications.
+    /// `None` until a `D` marker with a numeric code is seen.
+    pub osc133_exit: Option<i32>,
     pub cursor_shape: u8,
     pub bracketed_paste: bool,
     pub app_cursor: bool,
@@ -272,6 +287,29 @@ fn translate_charset(c: char, cs: Charset) -> char {
 }
 
 impl TermGrid {
+    /// v0.1.896: rough resident size of this grid's cell storage — visible
+    /// grid + alt screen + scrollback. Counts allocated capacity (not len)
+    /// so it reflects what's actually held. For the mem-footprint log only.
+    pub fn approx_mem_bytes(&self) -> usize {
+        let cell = std::mem::size_of::<Cell>();
+        let row_hdr = std::mem::size_of::<Vec<Cell>>();
+        let count = |rows: &Vec<Vec<Cell>>| -> usize {
+            rows.iter().map(|r| r.capacity() * cell + row_hdr).sum::<usize>()
+                + rows.capacity().saturating_sub(rows.len()) * row_hdr
+        };
+        let mut bytes = count(&self.cells) + count(&self.scrollback);
+        if let Some(alt) = &self.alt_cells {
+            bytes += count(alt);
+        }
+        bytes
+    }
+
+    /// v0.1.896: number of rows currently held in scrollback (the unbounded-
+    /// growth axis worth watching in the footprint log).
+    pub fn scrollback_rows(&self) -> usize {
+        self.scrollback.len()
+    }
+
     pub fn new(cols: usize, rows: usize) -> Self {
         // Default tab stops every 8 columns
         let mut tab_stops = vec![false; cols.max(1)];
@@ -284,6 +322,7 @@ impl TermGrid {
             // start dirty so the initial screen renders once.
             dirty: true,
             dirty_rows: None,
+            row_pack_cache: Vec::new(),
             cursor_row: 0, cursor_col: 0,
             scroll_top: 0, scroll_bot: rows.saturating_sub(1),
             saved_row: 0, saved_col: 0,
@@ -303,7 +342,7 @@ impl TermGrid {
             mouse_mode: 0,
             mouse_protocol: 0,
             scrollback: Vec::new(), scrollback_pos: 0, lines_emitted: 0,
-            title: String::new(), cursor_shape: 0,
+            title: String::new(), osc133_exit: None, cursor_shape: 0,
             bracketed_paste: false, app_cursor: false,
             app_keypad: false, cursor_visible: true,
             response_buf: Vec::new(),
@@ -512,6 +551,10 @@ impl TermGrid {
             Some((lo, hi)) => (lo.min(row), hi.max(row)),
             None => (row, row),
         });
+        // v0.1.892: drop this row's packed cache so it repacks next frame.
+        if let Some(slot) = self.row_pack_cache.get_mut(row) {
+            *slot = None;
+        }
     }
 
     /// v0.1.494: mark EVERY row changed — the conservative fallback
@@ -521,6 +564,10 @@ impl TermGrid {
         self.dirty = true;
         let last = self.rows.saturating_sub(1);
         self.dirty_rows = Some((0, last));
+        // v0.1.892: blow away the whole packed cache — every row may differ.
+        // Cleared (not None-filled) so the accessor re-sizes to the current
+        // `rows` lazily, which also covers a resize that changed the count.
+        self.row_pack_cache.clear();
     }
 
     /// v0.1.494: take the dirty-row range and clear it (range form of
@@ -726,6 +773,52 @@ impl TermGrid {
                 "{:02x}{:02x}{:02x}\u{1f}{:02x}{:02x}{:02x}\u{1f}{}\u{1f}",
                 r.fg[0], r.fg[1], r.fg[2], r.bg[0], r.bg[1], r.bg[2], r.flags));
             out.push_str(&r.text);
+        }
+        out
+    }
+
+    /// v0.1.892 (dirty-rect arc stage c): cached form of `row_runs_packed`.
+    /// Returns the packed encoding for visible row `idx`, recomputing only on a
+    /// cache miss (after the row was marked dirty) and reusing the cached string
+    /// otherwise. The cache is invalidated wherever the grid marks rows dirty,
+    /// so a hit is guaranteed to match a fresh `row_runs_packed(idx)` — see the
+    /// `row_pack_cache` field docs. Requires `&mut self` to populate the cache;
+    /// `term_screen_runs` holds the grid lock mutably, so this is on the hot
+    /// path. Out-of-range rows return "".
+    pub fn row_runs_packed_cached(&mut self, idx: usize) -> &str {
+        // Lazily (re)size to the current row count — also covers a resize that
+        // changed `rows` (mark_all_dirty clears the vec, so len != rows here).
+        if self.row_pack_cache.len() != self.rows {
+            self.row_pack_cache = vec![None; self.rows];
+        }
+        if idx >= self.rows {
+            return "";
+        }
+        if self.row_pack_cache[idx].is_none() {
+            let packed = self.row_runs_packed(idx);
+            self.row_pack_cache[idx] = Some(packed);
+        }
+        self.row_pack_cache[idx].as_deref().unwrap_or("")
+    }
+
+    /// v0.1.902: whole-screen packed-runs wire format, assembled from the
+    /// per-row cache (`row_runs_packed_cached`). Extracted out of
+    /// `main.rs`'s `term_screen_runs` so the READER thread can build this
+    /// off the UI thread (see `RenderSnapshot::runs`) instead of the UI
+    /// thread `try_lock`-ing the grid on every poll tick — the exact
+    /// "should be snapshot-backed" migration flagged since v0.1.786.
+    /// Header: 2 chars (`alt_screen_active`, `cursor_visible`) + 0x1c, then
+    /// rows separated by 0x1d, matching `term_screen_runs`'s prior inline
+    /// assembly exactly (verified: `screen_runs_header_and_rows_match_prior_format`).
+    pub fn screen_runs_packed(&mut self) -> String {
+        let rows = self.rows;
+        let mut out = String::with_capacity(rows * 24 + 3);
+        out.push(if self.alt_screen_active() { '1' } else { '0' });
+        out.push(if self.cursor_visible { '1' } else { '0' });
+        out.push('\u{1c}');
+        for r in 0..rows {
+            if r > 0 { out.push('\u{1d}'); }
+            out.push_str(self.row_runs_packed_cached(r));
         }
         out
     }
@@ -1678,12 +1771,37 @@ impl vte::Perform for TermGrid {
             }
             // OSC 52: clipboard — we can't access system clipboard from here but log it
             b"52" => {}
+            // v0.1.883: OSC 133 shell integration (FinalTerm/iTerm2). The
+            // `D;<code>` marker reports the previous command's exit status;
+            // capture it so notifications can show ✓/✗. A/B/C lifecycle
+            // markers carry no code and are ignored here.
+            b"133" => {
+                if let Some(code) = parse_osc133_exit(&params[1..]) {
+                    self.osc133_exit = Some(code);
+                }
+            }
             _ => {}
         }
     }
     fn hook(&mut self, _params: &vte::Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn unhook(&mut self) {}
     fn put(&mut self, _byte: u8) {}
+}
+
+/// Parse the params of an OSC 133 shell-integration sequence (the slice
+/// AFTER the leading `"133"`). Returns `Some(code)` only for a command-
+/// finished marker `D;<code>` with a numeric exit code; returns `None`
+/// for the A/B/C lifecycle markers, for a bare `D` with no code, and for
+/// anything unparseable. OSC params are `;`-split by the VTE parser, so
+/// `OSC 133 ; D ; 0` arrives as params `[b"133", b"D", b"0"]` and `rest`
+/// here is `[b"D", b"0"]`.
+fn parse_osc133_exit(rest: &[&[u8]]) -> Option<i32> {
+    let marker = rest.first().copied()?;
+    if marker != b"D".as_slice() {
+        return None;
+    }
+    let code = rest.get(1).copied()?;
+    std::str::from_utf8(code).ok()?.trim().parse::<i32>().ok()
 }
 
 /// Map 24-bit RGB to nearest 256-color index
@@ -1707,6 +1825,13 @@ fn rgb_to_256(r: u8, g: u8, b: u8) -> u8 {
 #[derive(Default)]
 pub struct RenderSnapshot {
     pub html: String,
+    /// v0.1.902: packed-runs wire format for the native Canvas renderer
+    /// (see `TermGrid::screen_runs_packed`), built off the UI thread
+    /// exactly like `html` above. Empty when native rendering is off
+    /// (`WEB2QML_HTML_TERM=1`) — mirrors how `html` is empty when native
+    /// IS on. `term_screen_runs` reads this via a cheap Arc::clone instead
+    /// of locking the grid on the UI thread.
+    pub runs: String,
     pub cursor_row: i32,
     pub cursor_col: i32,
     pub scrollback_len: i32,
@@ -1918,7 +2043,13 @@ impl PtyTerminal {
                                 // v0.1.788: native renderer is default → skip the
                                 // HTML build entirely (the Canvas paints from the
                                 // grid). WEB2QML_HTML_TERM=1 restores it.
-                                let html = if native_render() { String::new() } else { g.render_html() };
+                                let native = native_render();
+                                let html = if native { String::new() } else { g.render_html() };
+                                // v0.1.902: mirror image of the html gate above —
+                                // build the packed-runs snapshot off-thread when
+                                // native IS on, so term_screen_runs (called every
+                                // UI poll tick) never has to lock the grid itself.
+                                let runs = if native { g.screen_runs_packed() } else { String::new() };
                                 if let Some(rt0) = rt0 {
                                     let dt = rt0.elapsed();
                                     if dt.as_micros() > 500 {
@@ -1927,6 +2058,7 @@ impl PtyTerminal {
                                 }
                                 Some(RenderSnapshot {
                                     html,
+                                    runs,
                                     cursor_row: g.cursor_row as i32,
                                     cursor_col: g.cursor_col as i32,
                                     scrollback_len: g.scrollback_len() as i32,
@@ -1981,9 +2113,18 @@ impl PtyTerminal {
     pub fn republish(&self) {
         let mut g = match self.grid.lock() { Ok(g) => g, Err(_) => return };
         g.dirty = false; // we're rendering now; clear so reader doesn't double
-        let html = g.render_html();
+        // v0.1.902: this was unconditionally building `html` even when native
+        // rendering is on (wasted work — the Canvas never reads it), and never
+        // built `runs` at all, so a scroll/resize (the two callers of
+        // `republish`, which mutate the grid OUTSIDE the reader thread's byte
+        // path) left the native snapshot stale until the next PTY output burst
+        // triggered a reader-thread render. Mirror the reader thread's gating.
+        let native = native_render();
+        let html = if native { String::new() } else { g.render_html() };
+        let runs = if native { g.screen_runs_packed() } else { String::new() };
         let snap = RenderSnapshot {
             html,
+            runs,
             cursor_row: g.cursor_row as i32,
             cursor_col: g.cursor_col as i32,
             scrollback_len: g.scrollback_len() as i32,
@@ -2034,6 +2175,19 @@ impl PtyTerminal {
             self.write_bytes(&bytes);
         }
     }
+    /// v0.1.883: take (and clear) any exit code the reader thread
+    /// captured from an OSC 133 `D;<code>` marker since the last call.
+    /// Non-blocking: uses `try_lock` so the UI tick never stalls on the
+    /// reader during a parsing burst — the code persists on the grid
+    /// until taken, so a contended tick just defers it one frame.
+    /// Returns `None` when there's no pending code (the common case for
+    /// shells without OSC 133 integration).
+    pub fn take_osc133_exit(&self) -> Option<i32> {
+        match self.grid.try_lock() {
+            Ok(mut g) => g.osc133_exit.take(),
+            Err(_) => None,
+        }
+    }
     pub fn get_screen_text(&self) -> String { self.grid.lock().unwrap().render_html() }
     /// Plain-text render of current screen (no scrollback, no HTML)
     pub fn render_text(&self) -> String {
@@ -2079,6 +2233,20 @@ impl PtyTerminal {
     /// per resize.
     pub fn visible_rows(&self) -> usize {
         self.grid.lock().unwrap().visible_rows()
+    }
+
+    /// v0.1.896: rough resident size of this terminal — grid+scrollback cells
+    /// plus the output-tap buffer. Uses `try_lock` so the mem-logger never
+    /// blocks the reader thread; whatever it can't sample this tick counts 0.
+    pub fn approx_mem_bytes(&self) -> usize {
+        let grid = self.grid.try_lock().map(|g| g.approx_mem_bytes()).unwrap_or(0);
+        let tap = self.output_tap.try_lock().map(|t| t.capacity()).unwrap_or(0);
+        grid + tap
+    }
+
+    /// v0.1.896: scrollback row count, for the footprint breakdown.
+    pub fn scrollback_rows(&self) -> usize {
+        self.grid.try_lock().map(|g| g.scrollback_rows()).unwrap_or(0)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) {
@@ -2420,6 +2588,88 @@ mod search_tests {
         assert!(TermGrid::render_row_runs(&vec![cc(' ',256,256,0); 8], dfg, dbg).is_empty());
     }
 
+    // v0.1.892 (dirty-rect arc stage c): the per-row packed cache must be
+    // byte-identical to a fresh render — that invariant is what makes it safe
+    // to reuse cached rows on the native draw path without visual drift.
+    #[test]
+    fn packed_cache_matches_fresh_render() {
+        let mut g = grid_with_rows(&["hello world", "second line", "third  row"], 12);
+        let fresh: Vec<String> = (0..g.rows).map(|r| g.row_runs_packed(r)).collect();
+        // first read (miss → compute) and second read (hit) both match fresh
+        for r in 0..g.rows {
+            assert_eq!(g.row_runs_packed_cached(r), fresh[r], "miss row {r}");
+        }
+        for r in 0..g.rows {
+            assert_eq!(g.row_runs_packed_cached(r), fresh[r], "hit row {r}");
+        }
+    }
+
+    #[test]
+    fn packed_cache_hit_then_invalidate() {
+        let mut g = grid_with_rows(&["aaa", "bbb"], 3);
+        let before = g.row_runs_packed_cached(0).to_string();
+        // Mutate row 0 WITHOUT marking it dirty → the accessor must still serve
+        // the cached value (proves it's actually caching, not recomputing).
+        g.cells[0][0] = Cell { ch: 'Z', ..Cell::default() };
+        assert_eq!(g.row_runs_packed_cached(0), before, "stale read should be a cache hit");
+        // mark_row_dirty invalidates → recompute, and it matches a fresh render.
+        g.mark_row_dirty(0);
+        let after = g.row_runs_packed_cached(0).to_string();
+        assert_ne!(after, before, "invalidated cache must recompute");
+        assert_eq!(after, g.row_runs_packed(0), "recompute must equal fresh render");
+    }
+
+    // v0.1.902: screen_runs_packed replaces the inline whole-screen assembly
+    // that used to live in main.rs's term_screen_runs (2-char header + 0x1c +
+    // rows joined by 0x1d). Pin the exact wire format so moving the assembly
+    // off the UI thread (into the reader thread / republish snapshot build)
+    // can't silently drift from what the QML Canvas parser expects.
+    #[test]
+    fn screen_runs_packed_matches_prior_inline_format() {
+        let mut g = grid_with_rows(&["hello world", "second line"], 12);
+        g.cursor_visible = true;
+        let whole = g.screen_runs_packed();
+        // Header: 2 chars + 0x1c separator.
+        let hsep = whole.find('\u{1c}').expect("must contain header separator");
+        let header = &whole[..hsep];
+        assert_eq!(header.chars().count(), 2, "header must be exactly 2 chars");
+        assert_eq!(&header[1..2], "1", "cursor_visible=true must encode as '1'");
+        // Body: rows joined by 0x1d, each row byte-identical to the cached
+        // per-row accessor (the same one the old inline loop called).
+        let body = &whole[hsep + '\u{1c}'.len_utf8()..];
+        let rows: Vec<&str> = body.split('\u{1d}').collect();
+        assert_eq!(rows.len(), g.rows);
+        for (r, row) in rows.iter().enumerate() {
+            assert_eq!(*row, g.row_runs_packed_cached(r), "row {r} mismatch");
+        }
+    }
+
+    #[test]
+    fn screen_runs_packed_alt_screen_bit() {
+        let mut g = grid_with_rows(&["x"], 3);
+        assert_eq!(&g.screen_runs_packed()[..1], "0", "alt screen inactive → '0'");
+        g.enter_alt();
+        assert_eq!(&g.screen_runs_packed()[..1], "1", "alt screen active → '1'");
+    }
+
+    #[test]
+    fn packed_cache_mark_all_dirty_clears_every_row() {
+        let mut g = grid_with_rows(&["one", "two", "six"], 3);
+        for r in 0..g.rows { let _ = g.row_runs_packed_cached(r); } // warm the cache
+        for r in 0..g.rows { g.cells[r][0] = Cell { ch: 'X', ..Cell::default() }; }
+        g.mark_all_dirty();
+        for r in 0..g.rows {
+            let cached = g.row_runs_packed_cached(r).to_string();
+            assert_eq!(cached, g.row_runs_packed(r), "row {r} stale after mark_all_dirty");
+        }
+    }
+
+    #[test]
+    fn packed_cache_out_of_range_is_empty_and_safe() {
+        let mut g = grid_with_rows(&["x"], 1);
+        assert_eq!(g.row_runs_packed_cached(99), ""); // no panic, empty
+    }
+
     #[test]
     fn empty_query_returns_no_matches() {
         let g = grid_with_rows(&["hello world"], 80);
@@ -2534,6 +2784,36 @@ mod search_tests {
         for &b in b"\x1b[99n" { parser.advance(&mut g, b); }
         assert!(g.response_buf.is_empty(),
             "unsupported DSR param should not reply");
+    }
+
+    #[test]
+    fn osc133_exit_parse() {
+        // D;<code> → the exit code; non-D markers and bare D → None.
+        assert_eq!(parse_osc133_exit(&[b"D", b"0"]), Some(0));
+        assert_eq!(parse_osc133_exit(&[b"D", b"1"]), Some(1));
+        assert_eq!(parse_osc133_exit(&[b"D", b"130"]), Some(130));
+        assert_eq!(parse_osc133_exit(&[b"D"]), None, "bare D has no code");
+        assert_eq!(parse_osc133_exit(&[b"A"]), None, "prompt-start marker");
+        assert_eq!(parse_osc133_exit(&[b"B"]), None);
+        assert_eq!(parse_osc133_exit(&[b"C"]), None, "output-start marker");
+        assert_eq!(parse_osc133_exit(&[b"D", b"abc"]), None, "non-numeric");
+        assert_eq!(parse_osc133_exit(&[]), None);
+        // Extra params after the code are ignored; the code still reads.
+        assert_eq!(parse_osc133_exit(&[b"D", b"2", b"foo=bar"]), Some(2));
+    }
+
+    #[test]
+    fn osc133_d_marker_captured_on_grid() {
+        // End-to-end through the VTE parser: OSC 133;D;1 ST sets
+        // osc133_exit on the grid; an A marker leaves it untouched.
+        let mut g = grid_with_rows(&["x"], 80);
+        let mut parser = vte::Parser::new();
+        for &b in b"\x1b]133;D;1\x07" { parser.advance(&mut g, b); }
+        assert_eq!(g.osc133_exit, Some(1));
+        // A subsequent prompt-start marker must NOT clobber the captured
+        // code (it's drained by the main thread, not reset here).
+        for &b in b"\x1b]133;A\x07" { parser.advance(&mut g, b); }
+        assert_eq!(g.osc133_exit, Some(1), "A marker must not reset exit");
     }
 }
 

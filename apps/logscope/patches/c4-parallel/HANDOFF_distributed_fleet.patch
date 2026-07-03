@@ -1,0 +1,2796 @@
+diff --git a/crates/logscope-egui/src/bridge.rs b/crates/logscope-egui/src/bridge.rs
+new file mode 100644
+index 0000000..3f25e23
+--- /dev/null
++++ b/crates/logscope-egui/src/bridge.rs
+@@ -0,0 +1,154 @@
++//! bridge.rs — connect the conversation-graph work to the distributed dispatcher.
++//!
++//! Two shapes the app already produces, turned into `dispatch::Task`s and folded back:
++//!   • decompose: a skeleton with `todo!()` holes → one task per hole (payload = its subtask prompt);
++//!     the members' replies → `extract_body` each → `assemble` back into the finished artifact.
++//!   • fan-out: one prompt → K identical tasks (the `:fa` "K candidates" pattern, spread across machines);
++//!     the K replies come back for the existing best-of selection.
++//!
++//! These are pure data transforms (`find_holes`/`subtask_prompt`/`extract_body`/`assemble`) — no IO,
++//! fully unit-tested. Between the two halves the caller drives a `dispatch::Dispatcher` over any
++//! `Transport`/`Executor`; folding the finished artifact (or the candidates) back into the conversation
++//! graph is the thin gui step. No kernels.
++#![allow(dead_code)]
++
++use crate::decompose::{assemble, extract_body, find_holes, subtask_prompt, Hole};
++use crate::dispatch::Task;
++use std::collections::HashMap;
++
++/// Decompose a skeleton into one task per hole. Returns the tasks (task id = hole index) and the holes,
++/// which `assemble_results` needs to splice the replies back. Empty when the skeleton has no holes.
++pub fn tasks_from_skeleton(skeleton: &str) -> (Vec<Task>, Vec<Hole>) {
++    let holes = find_holes(skeleton);
++    let tasks = holes.iter().enumerate()
++        .map(|(i, h)| Task { id: i as u64, payload: subtask_prompt(skeleton, h) })
++        .collect();
++    (tasks, holes)
++}
++
++/// Fold the members' replies into the finished artifact: each hole's reply (`results[hole index]`) goes
++/// through `extract_body` to become its fill, then all are `assemble`d into the skeleton. `None` if any
++/// hole has no reply (the run is incomplete — e.g. a task was abandoned).
++pub fn assemble_results(skeleton: &str, holes: &[Hole], results: &HashMap<u64, String>) -> Option<String> {
++    let mut fills = Vec::with_capacity(holes.len());
++    for (i, h) in holes.iter().enumerate() {
++        let reply = results.get(&(i as u64))?;
++        fills.push((h.clone(), extract_body(reply)));
++    }
++    Some(assemble(skeleton, &fills))
++}
++
++/// Fan one prompt into `k` identical tasks — the `:fa` K-candidates pattern, distributed across members.
++pub fn tasks_fanout(prompt: &str, k: usize) -> Vec<Task> {
++    (0..k as u64).map(|id| Task { id, payload: prompt.to_string() }).collect()
++}
++
++/// Collect fan-out replies in candidate order (0..k), each through `extract_body`. Missing candidates are
++/// skipped (a member may have failed past its retries), so the result may be shorter than `k`.
++pub fn collect_fanout(k: usize, results: &HashMap<u64, String>) -> Vec<String> {
++    (0..k as u64).filter_map(|id| results.get(&id).map(|r| extract_body(r))).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const SKEL: &str = "impl C {\n  fn a() -> u32 { todo!() }\n  fn b() -> u32 { todo!() }\n}";
++
++    #[test]
++    fn tasks_from_skeleton_one_per_hole() {
++        let (tasks, holes) = tasks_from_skeleton(SKEL);
++        assert_eq!(tasks.len(), 2);
++        assert_eq!(holes.len(), 2);
++        assert_eq!(tasks[0].id, 0);
++        assert_eq!(tasks[1].id, 1);
++        assert!(!tasks[0].payload.is_empty(), "payload is the subtask prompt");
++    }
++
++    #[test]
++    fn assemble_results_folds_replies_into_artifact() {
++        let (_tasks, holes) = tasks_from_skeleton(SKEL);
++        let mut results = HashMap::new();
++        results.insert(0u64, "```rust\n7\n```".to_string()); // fenced reply
++        results.insert(1u64, "9".to_string());               // bare reply
++        let art = assemble_results(SKEL, &holes, &results).expect("complete");
++        assert!(!art.contains("todo!()"), "all holes filled: {art}");
++        assert!(art.contains('7') && art.contains('9'));
++    }
++
++    #[test]
++    fn assemble_results_incomplete_returns_none() {
++        let (_t, holes) = tasks_from_skeleton(SKEL);
++        let mut results = HashMap::new();
++        results.insert(0u64, "7".to_string()); // hole 1 missing
++        assert!(assemble_results(SKEL, &holes, &results).is_none());
++    }
++
++    #[test]
++    fn fanout_makes_k_identical_tasks_and_collects_in_order() {
++        let tasks = tasks_fanout("write a haiku", 3);
++        assert_eq!(tasks.len(), 3);
++        assert!(tasks.iter().all(|t| t.payload == "write a haiku"));
++        assert_eq!(tasks.iter().map(|t| t.id).collect::<Vec<_>>(), vec![0, 1, 2]);
++        let mut results = HashMap::new();
++        results.insert(0u64, "first".to_string());
++        results.insert(2u64, "third".to_string()); // candidate 1 missing (member failed)
++        assert_eq!(collect_fanout(3, &results), vec!["first".to_string(), "third".to_string()]);
++    }
++
++    // minimal in-memory transport (mirrors dispatch's loopback) for the end-to-end test
++    use crate::dispatch::{Dispatcher, Executor, Worker};
++    use crate::enlist::{Msg, PeerId, Transport};
++    use std::cell::RefCell;
++    use std::rc::Rc;
++
++    struct Bus { inbox: HashMap<PeerId, Vec<(PeerId, Msg)>>, peers: Vec<PeerId> }
++    struct Loop { me: PeerId, bus: Rc<RefCell<Bus>> }
++    impl Transport for Loop {
++        fn broadcast(&mut self, m: &Msg) {
++            let peers = self.bus.borrow().peers.clone();
++            let mut b = self.bus.borrow_mut();
++            for p in peers { if p != self.me { b.inbox.entry(p).or_default().push((self.me.clone(), m.clone())); } }
++        }
++        fn send(&mut self, to: &PeerId, m: &Msg) {
++            self.bus.borrow_mut().inbox.entry(to.clone()).or_default().push((self.me.clone(), m.clone()));
++        }
++        fn recv(&mut self) -> Vec<(PeerId, Msg)> {
++            self.bus.borrow_mut().inbox.get_mut(&self.me).map(std::mem::take).unwrap_or_default()
++        }
++    }
++    // every assigned hole comes back filled with a fenced "42"
++    struct Fill42;
++    impl Executor for Fill42 {
++        fn run(&mut self, _task: u64, _payload: &str) -> Result<String, String> { Ok("```rust\n42\n```".to_string()) }
++    }
++
++    #[test]
++    fn distributed_decompose_roundtrip_assembles_artifact() {
++        // skeleton → tasks → dispatch across two members (mock ollama) → results → assemble
++        let (tasks, holes) = tasks_from_skeleton(SKEL);
++        let cid = "c:1".to_string();
++        let mids = ["m0:1", "m1:1"];
++        let bus = Rc::new(RefCell::new(Bus {
++            inbox: HashMap::new(),
++            peers: std::iter::once(cid.clone()).chain(mids.iter().map(|s| s.to_string())).collect(),
++        }));
++        let mut ct = Loop { me: cid.clone(), bus: bus.clone() };
++        let members: Vec<(PeerId, u32)> = mids.iter().map(|m| (m.to_string(), 1)).collect();
++        let mut disp = Dispatcher::new(&cid, &members, tasks, 1);
++        let mut workers: Vec<(Worker, Loop, Fill42)> = mids.iter()
++            .map(|id| (Worker::new(id), Loop { me: id.to_string(), bus: bus.clone() }, Fill42)).collect();
++
++        disp.dispatch(&mut ct);
++        for _ in 0..10 {
++            for (w, wt, ex) in workers.iter_mut() { w.work(wt, ex); }
++            disp.pump(&mut ct);
++            disp.dispatch(&mut ct);
++            if disp.is_complete() { break; }
++        }
++        assert!(disp.is_complete(), "all holes dispatched and returned");
++        let art = assemble_results(SKEL, &holes, disp.results()).expect("artifact assembled");
++        assert!(!art.contains("todo!()"));
++        assert_eq!(art.matches("42").count(), 2, "both holes filled with the remote output");
++    }
++}
+diff --git a/crates/logscope-egui/src/devloop.rs b/crates/logscope-egui/src/devloop.rs
+index df9b23a..04dfd0f 100644
+--- a/crates/logscope-egui/src/devloop.rs
++++ b/crates/logscope-egui/src/devloop.rs
+@@ -19,13 +19,14 @@
+ //!   * Pure decisions (`pick_winner`, `should_continue`) are free functions with unit tests; `run()` is
+ //!     the IO-driving shell around them.
+ //!
+-//! STATUS: scaffold. The phase sequence and control flow are real; spots that need live wiring to the
+-//! app's generation path and the mount Workspace internals are marked `SEAM:`. Not yet registered in
+-//! lib.rs — add `mod devloop;` once the seams are filled against the live signatures.
++//! STATUS: registered and unit-tested. The phase sequence and control flow are real; `run` decomposes →
++//! resolves each subtask (fan/verify/pick/retry) → assembles the artifact. The mount/ship IO shell
++//! (`run_mounted`, owning a real `mount::Workspace`) is the remaining `SEAM:` — it does git/FS IO that the
++//! mock tests can't cover, so it's wired separately from this pure, testable core.
+ #![allow(dead_code)]
+ 
+-use crate::bestregion::{best_region, Verdict};
+-use std::path::{Path, PathBuf};
++use crate::bestregion::Verdict;
++use std::path::PathBuf;
+ 
+ /// Where the loop is right now — emit through a callback so the UI/cards can render progress without
+ /// devloop knowing anything about egui.
+@@ -72,8 +73,11 @@ pub trait Verifier {
+ }
+ 
+ /// A `Verifier` over the real sandbox: scaffolds the files into a cargo project under `root` and
+-/// builds them in isolation. (Wiring shown; relies on `sandbox::verify_files`.)
++/// builds them in isolation. Gui-gated like `crate::sandbox` (bubblewrap/cargo); the pure orchestration
++/// core below builds on every tier and is exercised with mock verifiers in tests.
++#[cfg(feature = "gui")]
+ pub struct SandboxVerifier { pub name: String, pub root: PathBuf, pub allow_net: bool }
++#[cfg(feature = "gui")]
+ impl Verifier for SandboxVerifier {
+     fn check(&mut self, files: &[(String, String)]) -> (Verdict, String) {
+         match crate::sandbox::verify_files(&self.name, files, &self.root, self.allow_net) {
+@@ -83,6 +87,27 @@ impl Verifier for SandboxVerifier {
+     }
+ }
+ 
++/// A `Verifier` that judges a candidate IN the mounted workspace: it overlays the candidate files into
++/// `ws_dir` and builds+tests the WHOLE real project in a bubblewrap mirror (`sandbox::verify`), so a fill
++/// is graded in its true module/dependency context — unlike `SandboxVerifier`, which scaffolds a toy
++/// crate from the files alone. Used by `run_mounted`; gui-gated like `crate::sandbox`/`crate::mount`.
++#[cfg(feature = "gui")]
++pub struct WorkspaceVerifier { pub ws_dir: PathBuf, pub allow_net: bool }
++#[cfg(feature = "gui")]
++impl Verifier for WorkspaceVerifier {
++    fn check(&mut self, files: &[(String, String)]) -> (Verdict, String) {
++        for (p, c) in files {
++            let dst = self.ws_dir.join(p);
++            if let Some(parent) = dst.parent() { let _ = std::fs::create_dir_all(parent); }
++            if std::fs::write(&dst, c).is_err() { return (Verdict::None, format!("could not write {p} into workspace")); }
++        }
++        match crate::sandbox::verify(&crate::sandbox::VerifySpec::cargo_test(self.ws_dir.clone()).with_net(self.allow_net)) {
++            Ok(r) => (if r.passed { Verdict::Pass } else { Verdict::Fail }, r.output),
++            Err(e) => (Verdict::None, format!("verifier error: {e}")),
++        }
++    }
++}
++
+ #[derive(Clone, Debug)]
+ pub struct SubtaskOutcome {
+     pub index: usize,
+@@ -109,7 +134,11 @@ impl Report {
+ /// equals the earliest wins (FIFO, like the worker pool's admission). None if nothing is usable.
+ pub fn pick_winner(graded: &[(usize, Verdict)]) -> Option<usize> {
+     fn rank(v: Verdict) -> u8 { match v { Verdict::Pass => 3, Verdict::Partial => 2, Verdict::Fail => 1, Verdict::None => 0 } }
+-    graded.iter().filter(|(_, v)| rank(*v) >= 2).max_by_key(|(_, v)| rank(*v)).map(|&(i, _)| i)
++    // highest rank wins; tie broken by earliest index (max_by_key returns the LAST max on ties, so bias
++    // the key toward lower indices with -(i))
++    graded.iter().filter(|(_, v)| rank(*v) >= 2)
++        .max_by_key(|(i, v)| (rank(*v), -(*i as i64)))
++        .map(|&(i, _)| i)
+ }
+ 
+ /// Keep retrying a failed subtask while rounds remain. (Separated so the budget policy is testable and
+@@ -125,7 +154,7 @@ pub fn should_continue(round: usize, cfg: &Config, last: Verdict) -> bool {
+ /// this is the unit-testable core of the loop.
+ fn resolve_subtask<G: Generator, V: Verifier>(
+     index: usize, prompt: &str, base_files: &[(String, String)], target: &str,
+-    cfg: &Config, gen: &mut G, ver: &mut V, mut on: impl FnMut(Phase),
++    assemble_into: impl Fn(&str) -> String, cfg: &Config, gen: &mut G, ver: &mut V, mut on: impl FnMut(Phase),
+ ) -> SubtaskOutcome {
+     let mut feedback: Option<String> = None;
+     let mut last = Verdict::None;
+@@ -137,10 +166,13 @@ fn resolve_subtask<G: Generator, V: Verifier>(
+         let mut outputs: Vec<String> = Vec::new();
+         for (ci, code) in cands.iter().enumerate() {
+             on(Phase::Verifying { subtask: index, candidate: ci });
+-            // SEAM: place `code` into the target file of a COPY of base_files before verifying.
++            // Verify the candidate IN CONTEXT: `assemble_into` splices it into the target file (the
++            // skeleton with prior winners filled, this hole = `code`, others still todo!()) so a real
++            // build sees a valid file, not a bare function body.
++            let content = assemble_into(code);
+             let mut files = base_files.to_vec();
+-            if let Some(slot) = files.iter_mut().find(|(p, _)| p == target) { slot.1 = code.clone(); }
+-            else { files.push((target.to_string(), code.clone())); }
++            if let Some(slot) = files.iter_mut().find(|(p, _)| p == target) { slot.1 = content; }
++            else { files.push((target.to_string(), content)); }
+             let (v, out) = ver.check(&files);
+             graded.push((ci, v));
+             outputs.push(out);
+@@ -174,29 +206,96 @@ pub fn run<G: Generator, V: Verifier>(
+     on(Phase::Decomposed { subtasks: holes.len() });
+ 
+     let mut report = Report::default();
+-    let mut files = base_files;
++    let files = base_files; // the target file holds the whole skeleton; candidates are spliced per-hole
++    let mut winners: Vec<(usize, String)> = Vec::new(); // (hole index, winning body) — fills accepted so far
+     for (i, hole) in holes.iter().enumerate() {
+         let prompt = crate::decompose::subtask_prompt(skeleton, hole);
+         let target = target_of(i);
+-        let outcome = resolve_subtask(i, &prompt, &files, &target, cfg, gen, ver, &mut on);
+-        if let Some(fill) = &outcome.fill {
+-            // accept the winning fill into the working set so later subtasks build on it
+-            if let Some(slot) = files.iter_mut().find(|(p, _)| *p == target) { slot.1 = fill.clone(); }
+-            else { files.push((target.clone(), fill.clone())); }
+-        } else {
+-            on(Phase::GaveUp { reason: format!("subtask {i} unresolved after {} rounds", outcome.rounds_used) });
+-        }
++        // verification context = skeleton with prior winners + this candidate spliced (other holes stay todo!())
++        let prior: Vec<(crate::decompose::Hole, String)> =
++            winners.iter().map(|(j, b)| (holes[*j].clone(), b.clone())).collect();
++        let this_hole = hole.clone();
++        let assemble_into = |cand: &str| {
++            let mut f = prior.clone();
++            f.push((this_hole.clone(), cand.to_string()));
++            crate::decompose::assemble(skeleton, &f)
++        };
++        let outcome = resolve_subtask(i, &prompt, &files, &target, assemble_into, cfg, gen, ver, &mut on);
++        if let Some(body) = &outcome.fill { winners.push((i, body.clone())); }
++        else { on(Phase::GaveUp { reason: format!("subtask {i} unresolved after {} rounds", outcome.rounds_used) }); }
+         report.outcomes.push(outcome);
+     }
+ 
+-    // SEAM: stitch via `decompose::assemble(skeleton, fills)` (and `merge::stitch_partial` when folding
+-    // into an existing file), then `mount::bundle` to emit the patch into cfg.out_dir.
+-    let done = report.outcomes.iter().filter(|o| o.verdict == Verdict::Pass).count();
++    // Stitch the winning fills back into the skeleton — the context-split subtasks reassembled into one
++    // artifact. `report.merged` is set only when every hole resolved (a complete, compilable artifact);
++    // partial folding (merge::stitch_partial) and shipping a patch (mount::bundle into cfg.out_dir) live
++    // in the `run_mounted` IO shell. [SEAM: ship]
++    let fills: Vec<(crate::decompose::Hole, String)> = holes.iter().zip(&report.outcomes)
++        .filter_map(|(h, o)| o.fill.clone().map(|f| (h.clone(), f)))
++        .collect();
++    let done = fills.len();
++    if done == holes.len() && !holes.is_empty() {
++        report.merged = Some(crate::decompose::assemble(skeleton, &fills));
++    }
+     on(Phase::Merged { subtasks_done: done });
+-    let _ = (&cfg.out_dir, &skeleton, best_region as fn(&[Option<usize>], &[Verdict], usize, f64) -> _);
+     report
+ }
+ 
++/// The IO shell around `run`: bring an existing project into an isolated `/tmp/logscope/{uuid}` scratch,
++/// fill it there, and ship a reviewable patch — the user's tree is never touched. `make_verifier` builds
++/// the `Verifier` from the freshly-created scratch dir (production: `WorkspaceVerifier`; tests: a mock),
++/// since the verifier needs `ws.dir` which only exists after `isolate`. Gui-gated (real git + sandbox).
++#[cfg(feature = "gui")]
++pub fn run_mounted<G: Generator, V: Verifier>(
++    project: &std::path::Path, skeleton_rel: &str, cfg: &Config,
++    gen: &mut G, make_verifier: impl FnOnce(&std::path::Path) -> V, mut on: impl FnMut(Phase),
++) -> std::io::Result<Report> {
++    on(Phase::Mounting(project.display().to_string()));
++    let mount = crate::mount::detect(project)?;
++    let ws = crate::mount::isolate(&mount, &cfg.scratch_root)?;   // mirror + clean git baseline in scratch
++    let base = read_tree(&ws.dir)?;                                // seed base_files from the scratch tree
++    let skeleton = base.iter().find(|(p, _)| p == skeleton_rel).map(|(_, c)| c.clone())
++        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound,
++            format!("skeleton '{skeleton_rel}' not found in mounted project")))?;
++    let mut ver = make_verifier(&ws.dir);
++    let target = skeleton_rel.to_string();
++    let mut report = run(&skeleton, base, |_| target.clone(), cfg, gen, &mut ver, &mut on);
++    if let Some(merged) = report.merged.clone() {
++        std::fs::write(ws.dir.join(skeleton_rel), merged)?;       // land the result in the SCRATCH only
++        crate::mount::snapshot(&ws, &format!("devloop: filled {skeleton_rel}"))?;
++        let arts = crate::mount::bundle(&ws, &cfg.out_dir)?;       // .bundle + .patch for review
++        on(Phase::Shipped { patch: arts.patch.clone() });
++        report.patch = Some(arts.patch);
++    } else {
++        on(Phase::GaveUp { reason: "no complete artifact to ship".into() });
++    }
++    Ok(report)
++}
++
++/// Collect the UTF-8 text files under `dir` as `(relpath, content)`, skipping `.git/` and `target/`.
++/// Relpaths use `/` separators to match `skeleton_rel`.
++#[cfg(feature = "gui")]
++fn read_tree(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
++    fn walk(root: &std::path::Path, cur: &std::path::Path, out: &mut Vec<(String, String)>) -> std::io::Result<()> {
++        for ent in std::fs::read_dir(cur)? {
++            let ent = ent?;
++            let name = ent.file_name();
++            if name == ".git" || name == "target" { continue; }
++            let p = ent.path();
++            if p.is_dir() { walk(root, &p, out)?; }
++            else if let Ok(rel) = p.strip_prefix(root) {
++                if let Ok(text) = std::fs::read_to_string(&p) {     // skip binaries (non-UTF-8) silently
++                    out.push((rel.to_string_lossy().replace('\\', "/"), text));
++                }
++            }
++        }
++        Ok(())
++    }
++    let mut out = Vec::new();
++    walk(dir, dir, &mut out)?;
++    Ok(out)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -243,7 +342,7 @@ mod tests {
+         let cfg = Config { candidates: 2, max_rounds: 3, ..Config::default() };
+         let mut phases = Vec::new();
+         let o = resolve_subtask(0, "fill it", &[("lib.rs".into(), String::new())], "lib.rs",
+-                                &cfg, &mut gen, &mut ver, |p| phases.push(p));
++                                |c| c.to_string(), &cfg, &mut gen, &mut ver, |p| phases.push(p));
+         assert_eq!(o.verdict, Verdict::Pass);
+         assert_eq!(o.rounds_used, 2, "took one retry");
+         assert!(o.fill.unwrap().contains("OK"));
+@@ -255,9 +354,55 @@ mod tests {
+         let mut gen = CannedGen { by_round: vec![vec!["bad".into()]; 5], round: 0 };
+         let mut ver = KeywordVer;
+         let cfg = Config { candidates: 1, max_rounds: 2, ..Config::default() };
+-        let o = resolve_subtask(0, "x", &[], "lib.rs", &cfg, &mut gen, &mut ver, |_| {});
++        let o = resolve_subtask(0, "x", &[], "lib.rs", |c| c.to_string(), &cfg, &mut gen, &mut ver, |_| {});
+         assert_eq!(o.verdict, Verdict::Fail);
+         assert!(o.fill.is_none());
+         assert_eq!(o.rounds_used, 2);
+     }
++
++    #[test]
++    fn run_assembles_passing_fills_into_artifact() {
++        // Two todo!() holes; each subtask's first candidate passes (contains "OK") → the merged artifact
++        // has both holes filled and no todo!() left. Exercises decompose → resolve_subtask → assemble.
++        let skeleton = "impl C {\n  fn a() -> u32 { todo!() }\n  fn b() -> u32 { todo!() }\n}";
++        let mut gen = CannedGen { by_round: vec![
++            vec!["7 /*OK*/".into()],   // subtask 0 (round counter is shared across subtasks)
++            vec!["9 /*OK*/".into()],   // subtask 1
++        ], round: 0 };
++        let mut ver = KeywordVer;
++        let cfg = Config { candidates: 1, max_rounds: 2, ..Config::default() };
++        let report = run(skeleton, vec![("lib.rs".into(), skeleton.into())], |_| "lib.rs".into(),
++                         &cfg, &mut gen, &mut ver, |_| {});
++        assert!(report.all_passed(), "both subtasks should pass");
++        let merged = report.merged.expect("complete artifact assembled");
++        assert!(!merged.contains("todo!()"), "all holes filled: {merged}");
++        assert!(merged.contains("7 /*OK*/") && merged.contains("9 /*OK*/"));
++    }
++
++    #[cfg(feature = "gui")]
++    #[test]
++    fn run_mounted_isolates_and_ships_without_touching_source() {
++        // Real git + FS (like mount.rs's roundtrip test); generation/verification mocked (no model, no
++        // cargo). Asserts a patch is produced AND the user's source tree is untouched (the fill only ever
++        // lands in the scratch). Requires `git` on PATH.
++        let tmp = std::env::temp_dir().join(format!("devloop-it-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&tmp);
++        let proj = tmp.join("proj");
++        std::fs::create_dir_all(proj.join("src")).unwrap();
++        std::fs::write(proj.join("Cargo.toml"), "[package]\nname = \"p\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
++        std::fs::write(proj.join("src/lib.rs"), "pub fn answer() -> u32 { todo!() }\n").unwrap();
++
++        let mut gen = CannedGen { by_round: vec![vec!["42 // OK".into()]], round: 0 };
++        let cfg = Config { scratch_root: tmp.join("scratch"), out_dir: tmp.join("out"),
++                           candidates: 1, max_rounds: 2, allow_net: false };
++        let report = run_mounted(&proj, "src/lib.rs", &cfg, &mut gen, |_| KeywordVer, |_| {})
++            .expect("mounted run");
++
++        assert!(report.all_passed(), "the single hole should fill");
++        assert!(report.patch.expect("a patch was shipped").exists(), "patch artifact exists on disk");
++        // isolation guarantee: the ORIGINAL project file still has its hole.
++        assert!(std::fs::read_to_string(proj.join("src/lib.rs")).unwrap().contains("todo!()"),
++                "source tree must not be mutated");
++        let _ = std::fs::remove_dir_all(&tmp);
++    }
+ }
+diff --git a/crates/logscope-egui/src/dispatch.rs b/crates/logscope-egui/src/dispatch.rs
+new file mode 100644
+index 0000000..6c00d8d
+--- /dev/null
++++ b/crates/logscope-egui/src/dispatch.rs
+@@ -0,0 +1,304 @@
++//! dispatch.rs — fan a project's work across the joined fleet.
++//!
++//! `enlist.rs` gets up to [`crate::enlist::MAX_FLEET`] machines to `Ready`; this is the next step: hand
++//! each member slices of the project, collect their results, and reassign a slice if a member fails or
++//! drops. It reuses the `enlist` wire (`Msg::{Assign,Result,Failed}`) and `Transport`, so the same LAN
++//! bus carries both join and work traffic.
++//!
++//! A "slice" is an opaque [`Task`] — an id + a `payload` string the caller fills however it likes (a
++//! serialized `gpu_kernels::FleetRequest`, a devloop subtask prompt, an ollama request). The scheduler
++//! never interprets the payload; the member side runs it through the [`Executor`] seam (real impl: run
++//! the slice locally via `run_fleet_trie` or an ollama call; tests use a mock). Pure scheduler + mocked
++//! seam, unit-tested like the rest of the crate. No GUI, no kernels.
++#![allow(dead_code)]
++
++use crate::enlist::{Msg, PeerId, Transport};
++use std::collections::{HashMap, VecDeque};
++
++/// One unit of work. `payload` is opaque to the scheduler.
++#[derive(Clone, Debug)]
++pub struct Task { pub id: u64, pub payload: String }
++
++/// The member side: run an assigned slice, producing output or an error (which triggers a reassign).
++pub trait Executor {
++    fn run(&mut self, task: u64, payload: &str) -> Result<String, String>;
++}
++
++// ── coordinator-side scheduler ──────────────────────────────────────────────────────────────────--
++
++/// Greedy capacity-aware scheduler over the joined members. Tracks free slots per member, a queue of
++/// pending tasks, in-flight assignments, completed outputs, and per-task retry counts; on failure (or a
++/// re-queued drop) a task goes back to the queue until `max_retries` is exhausted.
++pub struct Dispatcher {
++    coordinator: PeerId,
++    free: HashMap<PeerId, u32>,        // member -> currently-free slots
++    payload: HashMap<u64, String>,     // task id -> payload (kept so a task can be reassigned)
++    pending: VecDeque<u64>,            // queued task ids
++    inflight: HashMap<u64, (PeerId, u64)>, // task id -> (assignee, lease start time)
++    done: HashMap<u64, String>,        // task id -> output
++    retries: HashMap<u64, u32>,        // task id -> attempts already failed
++    abandoned: Vec<u64>,               // tasks that exhausted retries
++    max_retries: u32,
++}
++
++impl Dispatcher {
++    pub fn new(coordinator: &str, members: &[(PeerId, u32)], tasks: Vec<Task>, max_retries: u32) -> Self {
++        let mut payload = HashMap::new();
++        let mut pending = VecDeque::new();
++        for t in tasks { pending.push_back(t.id); payload.insert(t.id, t.payload); }
++        Self {
++            coordinator: coordinator.into(),
++            free: members.iter().cloned().collect(),
++            payload, pending, inflight: HashMap::new(), done: HashMap::new(),
++            retries: HashMap::new(), abandoned: Vec::new(), max_retries,
++        }
++    }
++
++    /// Assign as many queued tasks as there is free capacity, most-free member first (spreads load).
++    /// Returns the `Assign` messages to send. Ties broken by peer id for determinism. `now` stamps each
++    /// assignment's lease (see `sweep`).
++    pub fn assign_at(&mut self, now: u64) -> Vec<Msg> {
++        let mut out = Vec::new();
++        while !self.pending.is_empty() {
++            let pick = self.free.iter().filter(|(_, &s)| s > 0)
++                .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
++                .map(|(p, _)| p.clone());
++            let Some(member) = pick else { break };
++            let task = self.pending.pop_front().unwrap();
++            *self.free.get_mut(&member).unwrap() -= 1;
++            self.inflight.insert(task, (member.clone(), now));
++            let payload = self.payload.get(&task).cloned().unwrap_or_default();
++            out.push(Msg::Assign { coordinator: self.coordinator.clone(), peer: member, task, payload });
++        }
++        out
++    }
++
++    /// Assign without lease tracking (timeouts disabled).
++    pub fn assign(&mut self) -> Vec<Msg> { self.assign_at(0) }
++
++    /// A member finished a task: record the output and free its slot. Backfill with `assign` afterward.
++    pub fn on_result(&mut self, peer: &PeerId, task: u64, output: String) {
++        match self.inflight.get(&task) { Some((p, _)) if p == peer => {}, _ => return } // stale / not the assignee
++        self.inflight.remove(&task);
++        self.done.insert(task, output);
++        if let Some(s) = self.free.get_mut(peer) { *s += 1; }
++    }
++
++    /// A member failed a task: free its slot and requeue the task, unless it has exhausted `max_retries`.
++    pub fn on_failed(&mut self, peer: &PeerId, task: u64, _reason: &str) {
++        match self.inflight.get(&task) { Some((p, _)) if p == peer => {}, _ => return }
++        self.inflight.remove(&task);
++        if let Some(s) = self.free.get_mut(peer) { *s += 1; }
++        let n = self.retries.entry(task).or_insert(0);
++        *n += 1;
++        if *n > self.max_retries { self.abandoned.push(task); } else { self.pending.push_back(task); }
++    }
++
++    /// A member dropped out of the fleet: free it and requeue whatever it had in flight.
++    pub fn drop_member(&mut self, peer: &PeerId) {
++        self.free.remove(peer);
++        let lost: Vec<u64> = self.inflight.iter().filter(|(_, (m, _))| m == peer).map(|(t, _)| *t).collect();
++        for t in lost { self.inflight.remove(&t); self.pending.push_back(t); }
++    }
++
++    /// Reclaim in-flight tasks unanswered for longer than `lease` (a dropped `Assign` or a silently-dead
++    /// member): free the slot and requeue, counting it against `max_retries` like a failure. Returns how
++    /// many were reclaimed; call `assign_at` afterward to re-send them.
++    pub fn sweep(&mut self, now: u64, lease: u64) -> usize {
++        let stale: Vec<(u64, PeerId)> = self.inflight.iter()
++            .filter(|(_, (_, sent))| now.saturating_sub(*sent) > lease)
++            .map(|(t, (m, _))| (*t, m.clone())).collect();
++        for (task, member) in &stale {
++            self.inflight.remove(task);
++            if let Some(s) = self.free.get_mut(member) { *s += 1; }
++            let n = self.retries.entry(*task).or_insert(0);
++            *n += 1;
++            if *n > self.max_retries { self.abandoned.push(*task); } else { self.pending.push_back(*task); }
++        }
++        stale.len()
++    }
++
++    pub fn is_complete(&self) -> bool { self.pending.is_empty() && self.inflight.is_empty() }
++    pub fn results(&self) -> &HashMap<u64, String> { &self.done }
++    pub fn abandoned(&self) -> &[u64] { &self.abandoned }
++
++    // transport glue -------------------------------------------------------------------------------
++
++    /// Assign what we can and send it (`now` stamps the leases).
++    pub fn dispatch_at<T: Transport>(&mut self, t: &mut T, now: u64) {
++        for a in self.assign_at(now) {
++            if let Msg::Assign { peer: ref p, .. } = a { t.send(p, &a); }
++        }
++    }
++
++    /// Assign and send without lease tracking.
++    pub fn dispatch<T: Transport>(&mut self, t: &mut T) { self.dispatch_at(t, 0); }
++
++    /// Drain inbound results/failures and apply them. Call `dispatch` afterward to backfill.
++    pub fn pump<T: Transport>(&mut self, t: &mut T) {
++        for (_from, msg) in t.recv() {
++            match msg {
++                Msg::Result { peer, task, output } => self.on_result(&peer, task, output),
++                Msg::Failed { peer, task, reason } => self.on_failed(&peer, task, &reason),
++                _ => {}
++            }
++        }
++    }
++}
++
++// ── member-side worker ─────────────────────────────────────────────────────────────────────────--
++
++/// A joined machine doing work: drains `Assign`s addressed to it, runs each through the `Executor`, and
++/// replies `Result`/`Failed` to the coordinator named in the assignment.
++pub struct Worker { pub id: PeerId }
++
++impl Worker {
++    pub fn new(id: &str) -> Self { Self { id: id.into() } }
++
++    pub fn work<T: Transport, E: Executor>(&mut self, t: &mut T, ex: &mut E) {
++        for (_from, msg) in t.recv() {
++            if let Msg::Assign { coordinator, peer, task, payload } = msg {
++                if peer != self.id { continue; }
++                let reply = match ex.run(task, &payload) {
++                    Ok(output) => Msg::Result { peer: self.id.clone(), task, output },
++                    Err(reason) => Msg::Failed { peer: self.id.clone(), task, reason },
++                };
++                t.send(&coordinator, &reply);
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::rc::Rc;
++    use std::cell::RefCell;
++
++    fn tasks(n: u64) -> Vec<Task> { (0..n).map(|i| Task { id: i, payload: format!("p{i}") }).collect() }
++
++    #[test]
++    fn assign_spreads_across_members_by_free_slots() {
++        // members a:1, b:3 free → first three assignments should favor b (more slots), then a.
++        let mut d = Dispatcher::new("c", &[("a".into(), 1), ("b".into(), 3)], tasks(4), 2);
++        let msgs = d.assign();
++        assert_eq!(msgs.len(), 4, "all capacity used (1+3)");
++        let to_b = msgs.iter().filter(|m| matches!(m, Msg::Assign { peer, .. } if peer == "b")).count();
++        let to_a = msgs.iter().filter(|m| matches!(m, Msg::Assign { peer, .. } if peer == "a")).count();
++        assert_eq!((to_a, to_b), (1, 3));
++        // capacity now exhausted: nothing more goes out until a slot frees
++        assert!(d.assign().is_empty());
++    }
++
++    #[test]
++    fn result_frees_slot_and_backfills() {
++        let mut d = Dispatcher::new("c", &[("a".into(), 1)], tasks(2), 2);
++        let first = d.assign();
++        assert_eq!(first.len(), 1);                 // one slot → one task
++        assert!(d.assign().is_empty());             // blocked
++        d.on_result(&"a".into(), 0, "out0".into()); // a frees up
++        let second = d.assign();
++        assert_eq!(second.len(), 1);                // backfilled with the remaining task
++        d.on_result(&"a".into(), 1, "out1".into());
++        assert!(d.is_complete());
++        assert_eq!(d.results().len(), 2);
++    }
++
++    #[test]
++    fn failure_requeues_until_retries_exhausted() {
++        let mut d = Dispatcher::new("c", &[("a".into(), 1)], tasks(1), 1); // max_retries=1
++        d.assign();
++        d.on_failed(&"a".into(), 0, "boom");        // attempt 1 failed → requeued
++        assert!(!d.is_complete());
++        let again = d.assign();
++        assert_eq!(again.len(), 1);
++        d.on_failed(&"a".into(), 0, "boom again");  // attempt 2 failed → exhausted
++        assert!(d.is_complete(), "no longer pending/inflight");
++        assert_eq!(d.abandoned(), &[0]);
++        assert!(d.results().is_empty());
++    }
++
++    #[test]
++    fn sweep_reclaims_unanswered_assignments() {
++        let mut d = Dispatcher::new("c", &[("a".into(), 1)], tasks(1), 2);
++        d.assign_at(100);                          // task 0 → a, leased at t=100
++        assert!(d.assign_at(105).is_empty());      // a is busy
++        assert_eq!(d.sweep(120, 30), 0);           // 120-100 = 20 ≤ 30 → still within lease
++        assert_eq!(d.sweep(150, 30), 1);           // 150-100 = 50 > 30 → reclaimed
++        assert!(!d.is_complete());                 // task requeued
++        let re = d.assign_at(160);
++        assert_eq!(re.len(), 1, "slot freed, task reassigned");
++        d.on_result(&"a".into(), 0, "ok".into());  // a healthy reply settles it
++        assert!(d.is_complete());
++        assert!(d.abandoned().is_empty());
++    }
++
++    #[test]
++    fn dropped_member_requeues_its_inflight_work() {
++        let mut d = Dispatcher::new("c", &[("a".into(), 1), ("b".into(), 1)], tasks(2), 2);
++        d.assign();                                 // a and b each take one
++        d.drop_member(&"a".into());                 // a vanishes mid-task
++        d.on_result(&"b".into(), 1, "out1".into()); // b finishes its task (id 1, since b sorts after a → got task 1? order below)
++        // a's task is requeued; only b remains to run it
++        let re = d.assign();
++        assert_eq!(re.len(), 1);
++        if let Msg::Assign { peer, .. } = &re[0] { assert_eq!(peer, "b"); }
++    }
++
++    // minimal in-memory transport (mirrors enlist's loopback) for the end-to-end test
++    struct Bus { inbox: HashMap<PeerId, Vec<(PeerId, Msg)>>, peers: Vec<PeerId> }
++    struct Loop { me: PeerId, bus: Rc<RefCell<Bus>> }
++    impl Transport for Loop {
++        fn broadcast(&mut self, m: &Msg) {
++            let peers = self.bus.borrow().peers.clone();
++            let mut b = self.bus.borrow_mut();
++            for p in peers { if p != self.me { b.inbox.entry(p).or_default().push((self.me.clone(), m.clone())); } }
++        }
++        fn send(&mut self, to: &PeerId, m: &Msg) {
++            self.bus.borrow_mut().inbox.entry(to.clone()).or_default().push((self.me.clone(), m.clone()));
++        }
++        fn recv(&mut self) -> Vec<(PeerId, Msg)> {
++            self.bus.borrow_mut().inbox.get_mut(&self.me).map(std::mem::take).unwrap_or_default()
++        }
++    }
++
++    // executor that fails the FIRST (global) attempt at task 2, then succeeds — shared across workers so
++    // the retry succeeds no matter which member it lands on (one failure total, deterministic).
++    #[derive(Clone)]
++    struct FlakyOnce { seen: Rc<RefCell<std::collections::HashSet<u64>>> }
++    impl Executor for FlakyOnce {
++        fn run(&mut self, task: u64, payload: &str) -> Result<String, String> {
++            if task == 2 && self.seen.borrow_mut().insert(2) { Err("transient".into()) }
++            else { Ok(format!("ran:{payload}")) }
++        }
++    }
++
++    #[test]
++    fn loopback_dispatch_completes_all_tasks_over_transport() {
++        let cid = "coord:1".to_string();
++        let mids: Vec<PeerId> = (0..3).map(|i| format!("m{i}:1")).collect();
++        let bus = Rc::new(RefCell::new(Bus {
++            inbox: HashMap::new(),
++            peers: std::iter::once(cid.clone()).chain(mids.clone()).collect(),
++        }));
++        let mut ct = Loop { me: cid.clone(), bus: bus.clone() };
++        let members: Vec<(PeerId, u32)> = mids.iter().map(|m| (m.clone(), 2)).collect();
++        let mut disp = Dispatcher::new(&cid, &members, tasks(6), 2);
++        let flaky = FlakyOnce { seen: Rc::new(RefCell::new(std::collections::HashSet::new())) };
++        let mut workers: Vec<(Worker, Loop, FlakyOnce)> = mids.iter()
++            .map(|id| (Worker::new(id), Loop { me: id.clone(), bus: bus.clone() }, flaky.clone()))
++            .collect();
++
++        // pump until complete (bounded so a bug can't hang the test)
++        disp.dispatch(&mut ct);
++        for _ in 0..20 {
++            for (w, wt, ex) in workers.iter_mut() { w.work(wt, ex); }
++            disp.pump(&mut ct);
++            disp.dispatch(&mut ct);
++            if disp.is_complete() { break; }
++        }
++        assert!(disp.is_complete(), "all tasks settled");
++        assert_eq!(disp.results().len(), 6, "every task produced output (the one failure was retried)");
++        assert!(disp.abandoned().is_empty());
++    }
++}
+diff --git a/crates/logscope-egui/src/enlist.rs b/crates/logscope-egui/src/enlist.rs
+new file mode 100644
+index 0000000..57da43b
+--- /dev/null
++++ b/crates/logscope-egui/src/enlist.rs
+@@ -0,0 +1,597 @@
++//! enlist.rs — the "broadcast then await an invite" join protocol for multi-MACHINE fan-out.
++//!
++//! FLEET.md / `gpu_kernels::run_fleet` is the SINGLE-box fleet: many `Session`s sharing one resident
++//! model on one GPU. This is the layer above it: separate MACHINES — each running an ollama API or a
++//! logscope backend (`netserve`) — discover a project opening, broadcast their availability, and await
++//! an invite, up to a hard cap of [`MAX_FLEET`] machines, before work is distributed across them.
++//!
++//! Shape (one round, tied together by a `nonce`):
++//! ```text
++//!   coordinator                              available machines (≤ many)
++//!   ───────────                              ─────────────────────────────
++//!   Opening{project,want,nonce} ──broadcast──▶  on_opening → Available{peer,cap,nonce} ──broadcast──▶
++//!   gather Available (dedup) ◀───────────────
++//!   select_invitees (rank, cap at want≤MAX_FLEET)
++//!   Invite{peer,project,nonce}  ──direct────▶  on_invite → Accept{peer} | Decline{peer,reason}
++//!   on_accept → member ; on_decline → promote next-best offer
++//!   members == want ⇒ Ready (fan work out across members)
++//! ```
++//!
++//! Like the rest of the crate (devloop, sandbox), the protocol + decisions are PURE and unit-tested;
++//! the datagram/HTTP IO sits behind the [`Transport`] seam (real impl over `netserve` LAN HTTP or a UDP
++//! broadcast; tests drive the handshake directly or via an in-memory transport). No GUI, no kernels.
++#![allow(dead_code)]
++
++/// Hard ceiling on machines that can join one project's fleet.
++pub const MAX_FLEET: usize = 10;
++
++/// A machine address / identity — typically `host:port` of its `netserve`/ollama endpoint.
++pub type PeerId = String;
++
++/// What a machine brings to the fleet: backend family, the models it can serve, and how many concurrent
++/// workers (sessions) it offers. Kept as plain data (a `kind` string, not `backend::BackendKind`) so the
++/// protocol stays frontend-free and decoupled from the engine crate.
++#[derive(Clone, Debug, PartialEq, Eq, Default)]
++pub struct Capability {
++    pub kind: String,          // "ollama" | "wgpu" | "llamacpp" | …
++    pub models: Vec<String>,   // model names this machine can serve
++    pub slots: u32,            // concurrent workers it offers
++}
++impl Capability {
++    pub fn new(kind: &str, models: &[&str], slots: u32) -> Self {
++        Self { kind: kind.into(), models: models.iter().map(|s| s.to_string()).collect(), slots }
++    }
++}
++
++/// The wire messages. Transport-agnostic; serialize however the `Transport` impl prefers.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Msg {
++    /// Coordinator broadcasts a project opening and how many machines it wants.
++    Opening { project: String, coordinator: PeerId, want: usize, nonce: u64 },
++    /// A machine broadcasts that it is available for the round (and then awaits an invite).
++    Available { peer: PeerId, cap: Capability, nonce: u64 },
++    /// Coordinator invites one specific available machine.
++    Invite { coordinator: PeerId, peer: PeerId, project: String, nonce: u64 },
++    /// A machine accepts an invite — it has joined the fleet.
++    Accept { peer: PeerId, project: String },
++    /// A machine declines an invite (e.g. it filled up in the meantime).
++    Decline { peer: PeerId, reason: String },
++    /// Coordinator assigns a unit of work (an opaque `payload`) to a joined member.
++    Assign { coordinator: PeerId, peer: PeerId, task: u64, payload: String },
++    /// A member returns a completed task's output.
++    Result { peer: PeerId, task: u64, output: String },
++    /// A member could not complete a task (it will be requeued / reassigned).
++    Failed { peer: PeerId, task: u64, reason: String },
++}
++
++/// Rank available offers and return up to `min(want, MAX_FLEET)` peers to invite: most `slots` first,
++/// then most models, then earliest-arrived (the input order is the arrival order — a stable tiebreak so
++/// the choice is deterministic and testable). Pure.
++pub fn select_invitees(offers: &[(PeerId, Capability)], want: usize) -> Vec<PeerId> {
++    let cap = want.min(MAX_FLEET);
++    let mut idx: Vec<usize> = (0..offers.len()).collect();
++    idx.sort_by(|&a, &b| {
++        let (ca, cb) = (&offers[a].1, &offers[b].1);
++        cb.slots.cmp(&ca.slots)
++            .then_with(|| cb.models.len().cmp(&ca.models.len()))
++            .then_with(|| a.cmp(&b)) // FIFO by arrival index
++    });
++    idx.into_iter().take(cap).map(|i| offers[i].0.clone()).collect()
++}
++
++// ── coordinator ──────────────────────────────────────────────────────────────────────────────────
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Phase { Announcing, Gathering, Inviting, Ready }
++
++/// The project owner. Drives: broadcast an opening → gather availability → invite up to `want` machines
++/// → track accepts, promoting the next-best offer when an invitee declines.
++#[derive(Clone, Debug)]
++pub struct Coordinator {
++    pub project: String,
++    pub id: PeerId,
++    pub want: usize,                       // clamped to MAX_FLEET at construction
++    nonce: u64,
++    phase: Phase,
++    offers: Vec<(PeerId, Capability)>,     // gathered availability, dedup by peer (arrival order kept)
++    invited: Vec<PeerId>,                  // invited, awaiting a reply
++    members: Vec<PeerId>,                  // accepted — the live fleet
++    declined: Vec<PeerId>,
++}
++
++impl Coordinator {
++    pub fn new(project: &str, id: &str, want: usize, nonce: u64) -> Self {
++        Self { project: project.into(), id: id.into(), want: want.min(MAX_FLEET), nonce,
++               phase: Phase::Announcing, offers: Vec::new(), invited: Vec::new(),
++               members: Vec::new(), declined: Vec::new() }
++    }
++
++    /// Broadcast the opening; moves to `Gathering`.
++    pub fn opening(&mut self) -> Msg {
++        self.phase = Phase::Gathering;
++        Msg::Opening { project: self.project.clone(), coordinator: self.id.clone(), want: self.want, nonce: self.nonce }
++    }
++
++    /// Record an `Available` broadcast. Ignores the wrong nonce, self, and duplicates (latest cap wins).
++    pub fn on_available(&mut self, peer: &PeerId, cap: &Capability, nonce: u64) {
++        if nonce != self.nonce || peer == &self.id { return; }
++        if cap.slots == 0 { return; }
++        if let Some(slot) = self.offers.iter_mut().find(|(p, _)| p == peer) { slot.1 = cap.clone(); }
++        else { self.offers.push((peer.clone(), cap.clone())); }
++    }
++
++    /// Close gathering and emit invites to the selected machines; moves to `Inviting`.
++    pub fn invite(&mut self) -> Vec<Msg> {
++        let picks = select_invitees(&self.offers, self.want);
++        self.invited = picks.clone();
++        self.phase = Phase::Inviting;
++        picks.into_iter().map(|peer| self.invite_msg(peer)).collect()
++    }
++
++    fn invite_msg(&self, peer: PeerId) -> Msg {
++        Msg::Invite { coordinator: self.id.clone(), peer, project: self.project.clone(), nonce: self.nonce }
++    }
++
++    /// An invited machine accepted — it joins the fleet.
++    pub fn on_accept(&mut self, peer: &PeerId) {
++        if !self.invited.iter().any(|p| p == peer) || self.members.iter().any(|p| p == peer) { return; }
++        self.invited.retain(|p| p != peer);
++        self.members.push(peer.clone());
++        if self.members.len() >= self.want { self.phase = Phase::Ready; }
++    }
++
++    /// An invited machine declined — drop it and promote the best not-yet-tried offer, if room remains.
++    /// Returns the replacement `Invite` to send, when one is available.
++    pub fn on_decline(&mut self, peer: &PeerId, _reason: &str) -> Option<Msg> {
++        self.invited.retain(|p| p != peer);
++        if !self.declined.iter().any(|p| p == peer) { self.declined.push(peer.clone()); }
++        if self.members.len() + self.invited.len() >= self.want { return None; }
++        let next = self.best_untried()?;
++        self.invited.push(next.clone());
++        Some(self.invite_msg(next))
++    }
++
++    /// Best offer not already invited / a member / declined (same ranking as `select_invitees`).
++    fn best_untried(&self) -> Option<PeerId> {
++        let pool: Vec<(PeerId, Capability)> = self.offers.iter()
++            .filter(|(p, _)| !self.invited.contains(p) && !self.members.contains(p) && !self.declined.contains(p))
++            .cloned().collect();
++        select_invitees(&pool, 1).into_iter().next()
++    }
++
++    pub fn phase(&self) -> Phase { self.phase }
++    pub fn members(&self) -> &[PeerId] { &self.members }
++    pub fn is_full(&self) -> bool { self.members.len() >= self.want || self.members.len() >= MAX_FLEET }
++}
++
++// ── worker (an available machine) ───────────────────────────────────────────────────────────────--
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum WorkerState { Idle, Offered { project: String, nonce: u64 }, Joined { project: String } }
++
++/// An available machine: hears an opening, broadcasts availability, awaits an invite, and accepts while
++/// it still has free slots. `used` tracks slots already committed to other projects this round.
++#[derive(Clone, Debug)]
++pub struct Worker {
++    pub id: PeerId,
++    pub cap: Capability,
++    used: u32,
++    state: WorkerState,
++}
++
++impl Worker {
++    pub fn new(id: &str, cap: Capability) -> Self {
++        Self { id: id.into(), cap, used: 0, state: WorkerState::Idle }
++    }
++
++    fn available(&self) -> bool { self.used < self.cap.slots }
++
++    /// React to an opening: if idle and not full, broadcast availability and await an invite.
++    pub fn on_opening(&mut self, project: &str, nonce: u64) -> Option<Msg> {
++        if self.state != WorkerState::Idle || !self.available() { return None; }
++        self.state = WorkerState::Offered { project: project.into(), nonce };
++        Some(Msg::Available { peer: self.id.clone(), cap: self.cap.clone(), nonce })
++    }
++
++    /// React to an invite: accept if it matches the offer we're awaiting and we still have a slot,
++    /// otherwise decline. Accepting commits one slot.
++    pub fn on_invite(&mut self, project: &str, nonce: u64) -> Msg {
++        let matches = matches!(&self.state, WorkerState::Offered { project: p, nonce: n } if p == project && *n == nonce);
++        if matches && self.available() {
++            self.used += 1;
++            self.state = WorkerState::Joined { project: project.into() };
++            Msg::Accept { peer: self.id.clone(), project: project.into() }
++        } else {
++            let reason = if !self.available() { "no free slots" } else { "stale invite" };
++            Msg::Decline { peer: self.id.clone(), reason: reason.into() }
++        }
++    }
++
++    pub fn is_joined(&self) -> bool { matches!(self.state, WorkerState::Joined { .. }) }
++    pub fn state(&self) -> &WorkerState { &self.state }
++}
++
++// ── transport seam (real IO lives here; tests use an in-memory impl) ───────────────────────────────
++
++/// The datagram/HTTP seam. Real impls: a UDP broadcast socket for `Opening`/`Available`, direct
++/// `netserve` HTTP POSTs for `Invite`/`Accept`/`Decline`. Kept tiny so the protocol above stays pure.
++pub trait Transport {
++    /// Send to every reachable peer (UDP broadcast / the known LAN list).
++    fn broadcast(&mut self, msg: &Msg);
++    /// Send directly to one peer.
++    fn send(&mut self, to: &PeerId, msg: &Msg);
++    /// Drain any inbound messages (non-blocking), tagged with the sender.
++    fn recv(&mut self) -> Vec<(PeerId, Msg)>;
++}
++
++// ── wire codec (dependency-free text lines, one datagram each) ─────────────────────────────────────
++
++fn esc(s: &str) -> String {
++    let mut o = String::with_capacity(s.len());
++    for c in s.chars() {
++        match c { '%' => o.push_str("%25"), '\t' => o.push_str("%09"), '\n' => o.push_str("%0A"), ',' => o.push_str("%2C"), _ => o.push(c) }
++    }
++    o
++}
++fn unesc(s: &str) -> String {
++    let mut o = String::with_capacity(s.len());
++    let mut it = s.chars().peekable();
++    while let Some(c) = it.next() {
++        if c == '%' {
++            let h: String = it.clone().take(2).collect();
++            if h.len() == 2 { if let Ok(b) = u8::from_str_radix(&h, 16) { o.push(b as char); it.next(); it.next(); continue; } }
++        }
++        o.push(c);
++    }
++    o
++}
++
++/// Serialize a message to a single tab-delimited line (string fields percent-escaped). Pairs with [`decode`].
++pub fn encode(m: &Msg) -> String {
++    match m {
++        Msg::Opening { project, coordinator, want, nonce } =>
++            format!("OPEN\t{}\t{}\t{}\t{}", esc(project), esc(coordinator), want, nonce),
++        Msg::Available { peer, cap, nonce } =>
++            format!("AVAIL\t{}\t{}\t{}\t{}\t{}", esc(peer), esc(&cap.kind),
++                    cap.models.iter().map(|s| esc(s)).collect::<Vec<_>>().join(","), cap.slots, nonce),
++        Msg::Invite { coordinator, peer, project, nonce } =>
++            format!("INVITE\t{}\t{}\t{}\t{}", esc(coordinator), esc(peer), esc(project), nonce),
++        Msg::Accept { peer, project } => format!("ACCEPT\t{}\t{}", esc(peer), esc(project)),
++        Msg::Decline { peer, reason } => format!("DECLINE\t{}\t{}", esc(peer), esc(reason)),
++        Msg::Assign { coordinator, peer, task, payload } =>
++            format!("ASSIGN\t{}\t{}\t{}\t{}", esc(coordinator), esc(peer), task, esc(payload)),
++        Msg::Result { peer, task, output } => format!("RESULT\t{}\t{}\t{}", esc(peer), task, esc(output)),
++        Msg::Failed { peer, task, reason } => format!("FAILED\t{}\t{}\t{}", esc(peer), task, esc(reason)),
++    }
++}
++
++/// Parse a line produced by [`encode`]. Returns `None` on a malformed/unknown line.
++pub fn decode(line: &str) -> Option<Msg> {
++    let f: Vec<&str> = line.trim_end_matches(['\r', '\n']).split('\t').collect();
++    match f.as_slice() {
++        ["OPEN", project, coordinator, want, nonce] =>
++            Some(Msg::Opening { project: unesc(project), coordinator: unesc(coordinator), want: want.parse().ok()?, nonce: nonce.parse().ok()? }),
++        ["AVAIL", peer, kind, models, slots, nonce] =>
++            Some(Msg::Available { peer: unesc(peer), nonce: nonce.parse().ok()?,
++                cap: Capability { kind: unesc(kind), slots: slots.parse().ok()?,
++                    models: if models.is_empty() { Vec::new() } else { models.split(',').map(unesc).collect() } } }),
++        ["INVITE", coordinator, peer, project, nonce] =>
++            Some(Msg::Invite { coordinator: unesc(coordinator), peer: unesc(peer), project: unesc(project), nonce: nonce.parse().ok()? }),
++        ["ACCEPT", peer, project] => Some(Msg::Accept { peer: unesc(peer), project: unesc(project) }),
++        ["DECLINE", peer, reason] => Some(Msg::Decline { peer: unesc(peer), reason: unesc(reason) }),
++        ["ASSIGN", coordinator, peer, task, payload] =>
++            Some(Msg::Assign { coordinator: unesc(coordinator), peer: unesc(peer), task: task.parse().ok()?, payload: unesc(payload) }),
++        ["RESULT", peer, task, output] => Some(Msg::Result { peer: unesc(peer), task: task.parse().ok()?, output: unesc(output) }),
++        ["FAILED", peer, task, reason] => Some(Msg::Failed { peer: unesc(peer), task: task.parse().ok()?, reason: unesc(reason) }),
++        _ => None,
++    }
++}
++
++// ── shared-token auth (LAN bearer token, mirrors netserve.rs's posture) ─────────────────────────────
++//
++// Authenticates senders so a stray box on the LAN can't inject an Accept/Assign; it does NOT encrypt or
++// resist replay — run on a trusted LAN or an SSH tunnel, exactly like netserve. Empty token = open.
++
++/// Constant-time byte equality (no early-out), so a timing observer can't recover the token byte by byte.
++pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
++    if a.len() != b.len() { return false; }
++    let mut diff = 0u8;
++    for (x, y) in a.iter().zip(b) { diff |= x ^ y; }
++    diff == 0
++}
++
++/// Prefix an encoded line with the shared token: `"<token>\t<line>"`.
++pub fn frame(token: &str, line: &str) -> String { format!("{token}\t{line}") }
++
++/// Verify (constant-time) and strip the token, returning the inner line — or `None` if it doesn't match.
++pub fn unframe(token: &str, framed: &str) -> Option<String> {
++    let (tok, rest) = framed.split_once('\t')?;
++    if ct_eq(tok.as_bytes(), token.as_bytes()) { Some(rest.to_string()) } else { None }
++}
++
++// ── transport-driving glue (thin: protocol above, IO below) ────────────────────────────────────────
++
++impl Coordinator {
++    /// Broadcast the opening over `t`.
++    pub fn open<T: Transport>(&mut self, t: &mut T) { let m = self.opening(); t.broadcast(&m); }
++
++    /// Drain inbound availability/replies, applying each to the state machine and sending a promotion
++    /// invite when an invitee declines. Call repeatedly until `phase() == Ready` (or a timeout elapses).
++    pub fn pump<T: Transport>(&mut self, t: &mut T) {
++        for (_from, msg) in t.recv() {
++            match msg {
++                Msg::Available { peer, cap, nonce } => self.on_available(&peer, &cap, nonce),
++                Msg::Accept { peer, .. } => self.on_accept(&peer),
++                Msg::Decline { peer, reason } => {
++                    if let Some(inv) = self.on_decline(&peer, &reason) {
++                        if let Msg::Invite { peer: ref p, .. } = inv { t.send(p, &inv); }
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++
++    /// Select from the gathered offers and send the invites.
++    pub fn close_and_invite<T: Transport>(&mut self, t: &mut T) {
++        for inv in self.invite() {
++            if let Msg::Invite { peer: ref p, .. } = inv { t.send(p, &inv); }
++        }
++    }
++}
++
++impl Worker {
++    /// Drain inbound: broadcast availability in response to an opening, and accept/decline an invite
++    /// addressed to us — replying to the coordinator named in the invite. Call repeatedly.
++    pub fn serve<T: Transport>(&mut self, t: &mut T) {
++        for (_from, msg) in t.recv() {
++            match msg {
++                Msg::Opening { project, nonce, .. } => {
++                    if let Some(av) = self.on_opening(&project, nonce) { t.broadcast(&av); }
++                }
++                Msg::Invite { coordinator, peer, project, nonce } if peer == self.id => {
++                    let reply = self.on_invite(&project, nonce);
++                    t.send(&coordinator, &reply);
++                }
++                _ => {}
++            }
++        }
++    }
++}
++
++// ── real LAN transport over UDP (integration-tested on boxes) ───────────────────────────────────────
++
++/// `broadcast` sends to the subnet broadcast address; `send` is a unicast datagram to the peer's
++/// `host:port` (a `PeerId` is exactly that). One `encode`d line per datagram. Best-effort: no acks or
++/// retransmit yet — for a lossy LAN the coordinator simply re-broadcasts the opening and re-pumps, and
++/// unanswered invites are re-issued on the next `close_and_invite`. (Acked delivery is the next step.)
++pub struct UdpTransport { sock: std::net::UdpSocket, bcast: std::net::SocketAddr, token: String }
++
++impl UdpTransport {
++    /// Bind to `addr` (e.g. "0.0.0.0:48710") and target `broadcast` (e.g. "255.255.255.255:48710").
++    pub fn bind(addr: &str, broadcast: &str) -> std::io::Result<Self> {
++        let sock = std::net::UdpSocket::bind(addr)?;
++        sock.set_broadcast(true)?;
++        sock.set_nonblocking(true)?;
++        let bcast = broadcast.parse()
++            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad broadcast address"))?;
++        Ok(Self { sock, bcast, token: String::new() })
++    }
++
++    /// Require a shared token on every datagram (sent framed, verified+stripped on receipt).
++    pub fn with_token(mut self, token: &str) -> Self { self.token = token.into(); self }
++}
++
++impl Transport for UdpTransport {
++    fn broadcast(&mut self, m: &Msg) { let _ = self.sock.send_to(frame(&self.token, &encode(m)).as_bytes(), self.bcast); }
++    fn send(&mut self, to: &PeerId, m: &Msg) {
++        if let Ok(addr) = to.parse::<std::net::SocketAddr>() {
++            let _ = self.sock.send_to(frame(&self.token, &encode(m)).as_bytes(), addr);
++        }
++    }
++    fn recv(&mut self) -> Vec<(PeerId, Msg)> {
++        let mut out = Vec::new();
++        let mut buf = [0u8; 64 * 1024];
++        loop {
++            match self.sock.recv_from(&mut buf) {
++                Ok((n, from)) => {
++                    if let Ok(s) = std::str::from_utf8(&buf[..n]) {
++                        // drop anything that fails the token check before parsing
++                        if let Some(line) = unframe(&self.token, s) {
++                            if let Some(m) = decode(&line) { out.push((from.to_string(), m)); }
++                        }
++                    }
++                }
++                Err(_) => break, // WouldBlock (drained) or a transient error — stop draining this tick
++            }
++        }
++        out
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn cap(kind: &str, n_models: usize, slots: u32) -> Capability {
++        Capability { kind: kind.into(), models: (0..n_models).map(|i| format!("m{i}")).collect(), slots }
++    }
++
++    #[test]
++    fn select_ranks_by_slots_then_models_and_caps_at_max_fleet() {
++        let offers: Vec<(PeerId, Capability)> = (0..15)
++            .map(|i| (format!("p{i:02}"), cap("ollama", i % 3, (i % 5) as u32 + 1))).collect();
++        let picks = select_invitees(&offers, 100);
++        assert_eq!(picks.len(), MAX_FLEET, "capped at the fleet ceiling regardless of want");
++        // first pick has the max slots present (5)
++        let top = &offers.iter().find(|(p, _)| p == &picks[0]).unwrap().1;
++        assert_eq!(top.slots, 5);
++    }
++
++    #[test]
++    fn want_is_clamped_to_max_fleet() {
++        let c = Coordinator::new("proj", "coord", 50, 1);
++        assert_eq!(c.want, MAX_FLEET);
++    }
++
++    #[test]
++    fn full_handshake_reaches_target_and_goes_ready() {
++        let mut coord = Coordinator::new("build", "coord:7000", 3, 42);
++        let opening = coord.opening();
++        let (project, nonce) = match &opening {
++            Msg::Opening { project, nonce, .. } => (project.clone(), *nonce), _ => unreachable!(),
++        };
++        // five machines hear the opening and broadcast availability
++        let mut workers: Vec<Worker> = (0..5)
++            .map(|i| Worker::new(&format!("box{i}:7000"), cap("wgpu", 2, (i + 1) as u32))).collect();
++        for w in workers.iter_mut() {
++            if let Some(Msg::Available { peer, cap, nonce }) = w.on_opening(&project, nonce) {
++                coord.on_available(&peer, &cap, nonce);
++            }
++        }
++        assert_eq!(coord.phase(), Phase::Gathering);
++        // coordinator invites the top 3 (most slots: box4, box3, box2)
++        let invites = coord.invite();
++        assert_eq!(invites.len(), 3);
++        assert_eq!(coord.phase(), Phase::Inviting);
++        for inv in invites {
++            if let Msg::Invite { peer, project: pj, nonce: nn, .. } = inv {
++                let w = workers.iter_mut().find(|w| w.id == peer).unwrap();
++                match w.on_invite(&pj, nn) {
++                    Msg::Accept { peer, .. } => coord.on_accept(&peer),
++                    Msg::Decline { peer, reason } => { coord.on_decline(&peer, &reason); }
++                    _ => unreachable!(),
++                }
++            }
++        }
++        assert_eq!(coord.members().len(), 3);
++        assert_eq!(coord.phase(), Phase::Ready);
++        assert!(coord.is_full());
++        // the three highest-slot boxes joined
++        assert!(coord.members().contains(&"box4:7000".to_string()));
++        assert!(coord.members().contains(&"box3:7000".to_string()));
++        assert!(coord.members().contains(&"box2:7000".to_string()));
++    }
++
++    #[test]
++    fn decline_promotes_the_next_best_offer() {
++        let mut coord = Coordinator::new("p", "c", 2, 7);
++        // four offers with distinct slot counts so ranking is unambiguous
++        for (id, slots) in [("a", 4u32), ("b", 3), ("d", 2), ("e", 1)] {
++            coord.on_available(&id.to_string(), &cap("ollama", 1, slots), 7);
++        }
++        let invites = coord.invite();                       // invites a (4 slots) and b (3 slots)
++        assert_eq!(invites.len(), 2);
++        coord.on_accept(&"a".to_string());                  // a joins
++        // b declines → coordinator should promote d (next best, 2 slots)
++        let promote = coord.on_decline(&"b".to_string(), "busy");
++        match promote { Some(Msg::Invite { peer, .. }) => assert_eq!(peer, "d"), other => panic!("{other:?}") }
++        coord.on_accept(&"d".to_string());
++        assert_eq!(coord.members(), &["a".to_string(), "d".to_string()]);
++        assert_eq!(coord.phase(), Phase::Ready);
++    }
++
++    #[test]
++    fn worker_declines_when_out_of_slots() {
++        // one slot, already used → not available: offers nothing, and a (stale) invite is declined
++        let mut w = Worker::new("box:7000", cap("wgpu", 1, 1));
++        assert!(w.on_opening("p", 1).is_some());            // first offer ok
++        match w.on_invite("p", 1) { Msg::Accept { .. } => {}, m => panic!("{m:?}") }
++        assert!(w.is_joined());
++        // a second opening for the same box now finds no free slot
++        assert!(w.on_opening("p2", 2).is_none(), "no slots left to offer");
++    }
++
++    #[test]
++    fn stale_or_mismatched_invite_is_declined() {
++        let mut w = Worker::new("box:7000", cap("ollama", 1, 4));
++        w.on_opening("alpha", 10);
++        // wrong project
++        assert!(matches!(w.on_invite("beta", 10), Msg::Decline { .. }));
++        // wrong nonce
++        assert!(matches!(w.on_invite("alpha", 11), Msg::Decline { .. }));
++        // correct → accept
++        assert!(matches!(w.on_invite("alpha", 10), Msg::Accept { .. }));
++    }
++
++    #[test]
++    fn codec_roundtrips_all_messages() {
++        // fields carry the escaped characters (tab, comma, percent, newline) to exercise esc/unesc
++        let msgs = vec![
++            Msg::Opening { project: "a\tb,c%x\n".into(), coordinator: "c:1".into(), want: 7, nonce: 99 },
++            Msg::Available { peer: "box:1".into(), nonce: 99,
++                cap: Capability { kind: "ollama".into(), models: vec!["llama3,8b".into(), "q\tr".into()], slots: 4 } },
++            Msg::Available { peer: "empty:1".into(), nonce: 1, cap: Capability { kind: "wgpu".into(), models: vec![], slots: 1 } },
++            Msg::Invite { coordinator: "c:1".into(), peer: "box:1".into(), project: "p".into(), nonce: 99 },
++            Msg::Accept { peer: "box:1".into(), project: "p".into() },
++            Msg::Decline { peer: "box:1".into(), reason: "no free slots".into() },
++            Msg::Assign { coordinator: "c:1".into(), peer: "box:1".into(), task: 5, payload: "tokens\t1,2,3".into() },
++            Msg::Result { peer: "box:1".into(), task: 5, output: "done\nlines".into() },
++            Msg::Failed { peer: "box:1".into(), task: 5, reason: "oom".into() },
++        ];
++        for m in msgs { assert_eq!(decode(&encode(&m)), Some(m.clone()), "roundtrip {m:?}"); }
++        assert_eq!(decode("GARBAGE\tx"), None);
++    }
++
++    #[test]
++    fn auth_frames_roundtrip_and_reject_bad_token() {
++        let line = encode(&Msg::Accept { peer: "b:1".into(), project: "p".into() });
++        let f = frame("s3cret", &line);
++        assert_eq!(unframe("s3cret", &f).as_deref(), Some(line.as_str()), "right token strips back to the line");
++        assert_eq!(unframe("wrong", &f), None, "wrong token rejected");
++        assert!(ct_eq(b"abc", b"abc"));
++        assert!(!ct_eq(b"abc", b"abd") && !ct_eq(b"ab", b"abc"));
++        // empty token = open (no auth)
++        assert_eq!(unframe("", &frame("", &line)).as_deref(), Some(line.as_str()));
++    }
++
++    // In-memory transport: a shared bus delivering broadcasts to all peers and unicasts to one.
++    struct Bus { inbox: std::collections::HashMap<PeerId, Vec<(PeerId, Msg)>>, peers: Vec<PeerId> }
++    struct Loop { me: PeerId, bus: std::rc::Rc<std::cell::RefCell<Bus>> }
++    impl Transport for Loop {
++        fn broadcast(&mut self, m: &Msg) {
++            let peers = self.bus.borrow().peers.clone();
++            let mut b = self.bus.borrow_mut();
++            for p in peers { if p != self.me { b.inbox.entry(p).or_default().push((self.me.clone(), m.clone())); } }
++        }
++        fn send(&mut self, to: &PeerId, m: &Msg) {
++            self.bus.borrow_mut().inbox.entry(to.clone()).or_default().push((self.me.clone(), m.clone()));
++        }
++        fn recv(&mut self) -> Vec<(PeerId, Msg)> {
++            self.bus.borrow_mut().inbox.get_mut(&self.me).map(std::mem::take).unwrap_or_default()
++        }
++    }
++
++    #[test]
++    fn loopback_handshake_over_transport_reaches_ready() {
++        // 1 coordinator + 5 machines on one in-memory bus, driven entirely through the Transport seam
++        // (open → serve → pump → invite → serve → pump). The three highest-slot boxes should join.
++        use std::{rc::Rc, cell::RefCell};
++        let cid = "coord:1".to_string();
++        let wids: Vec<PeerId> = (0..5).map(|i| format!("box{i}:1")).collect();
++        let bus = Rc::new(RefCell::new(Bus {
++            inbox: std::collections::HashMap::new(),
++            peers: std::iter::once(cid.clone()).chain(wids.clone()).collect(),
++        }));
++        let mut ct = Loop { me: cid.clone(), bus: bus.clone() };
++        let mut coord = Coordinator::new("build", &cid, 3, 42);
++        let mut workers: Vec<(Worker, Loop)> = wids.iter().enumerate()
++            .map(|(i, id)| (Worker::new(id, cap("wgpu", 2, (i + 1) as u32)), Loop { me: id.clone(), bus: bus.clone() }))
++            .collect();
++
++        coord.open(&mut ct);                                  // broadcast opening
++        for (w, wt) in workers.iter_mut() { w.serve(wt); }    // each broadcasts availability
++        coord.pump(&mut ct);                                  // gather offers
++        coord.close_and_invite(&mut ct);                      // invite top 3
++        for (w, wt) in workers.iter_mut() { w.serve(wt); }    // invited boxes accept
++        coord.pump(&mut ct);                                  // collect accepts
++
++        assert_eq!(coord.phase(), Phase::Ready);
++        assert_eq!(coord.members().len(), 3);
++        assert!(coord.members().contains(&"box4:1".to_string()));
++        assert!(coord.members().contains(&"box3:1".to_string()));
++        assert!(coord.members().contains(&"box2:1".to_string()));
++        let joined = workers.iter().filter(|(w, _)| w.is_joined()).count();
++        assert_eq!(joined, 3);
++    }
++}
+diff --git a/crates/logscope-egui/src/explain.rs b/crates/logscope-egui/src/explain.rs
+new file mode 100644
+index 0000000..89ec971
+--- /dev/null
++++ b/crates/logscope-egui/src/explain.rs
+@@ -0,0 +1,251 @@
++//! explain.rs — the layer that makes logscope feel like a conversational explanation of a codebase.
++//!
++//! Everything else in this stack is *generic* orchestration over opaque prompts. This module grounds it
++//! in code: a question plus the relevant [`CodeRef`]s (a file/symbol/snippet — supplied by the GUI side
++//! from `ast::extract` + `retrieval`, the seam) becomes a set of code-anchored **explanation lanes**, each
++//! a tight prompt a small model can answer *given the snippet*, covering a different facet (what it does,
++//! how it works, what it touches, where it breaks, how it's tested, why it's built this way, and what
++//! you'll probably ask next). The lanes run on the fleet (`dispatch`/`bridge`); [`assemble`] folds the
++//! results into an [`Explanation`] — a conversational lead, ordered detail sections, and anticipated
++//! follow-ups — ready to render as conversation-graph nodes.
++//!
++//! Pure + unit-tested. Seams: upstream retrieval/AST produce the `CodeRef`s; downstream the fleet runs the
++//! tasks and the GUI renders the `Explanation` into `convograph`.
++#![allow(dead_code)]
++
++use crate::dispatch::Task;
++use std::collections::HashMap;
++
++/// Symbol kind — mirrors `ast::Kind` (which is gui-gated) so the GUI adapter maps 1:1.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SymKind { Fn, Struct, Enum, Trait, Impl, Mod, Const, Static, TypeAlias, Other }
++impl SymKind {
++    pub fn noun(self) -> &'static str {
++        match self {
++            SymKind::Fn => "function", SymKind::Struct => "struct", SymKind::Enum => "enum",
++            SymKind::Trait => "trait", SymKind::Impl => "impl block", SymKind::Mod => "module",
++            SymKind::Const => "constant", SymKind::Static => "static", SymKind::TypeAlias => "type alias",
++            SymKind::Other => "item",
++        }
++    }
++}
++
++/// A grounded reference to a piece of code — the unit the explanation is anchored to.
++#[derive(Clone, Debug)]
++pub struct CodeRef {
++    pub file: String,
++    pub symbol: Option<String>,
++    pub kind: SymKind,
++    pub snippet: String, // the code body, used as model context (may be large; trimmed per lane)
++    pub line: u32,       // 1-based start line, for citation
++}
++impl CodeRef {
++    fn label(&self) -> String {
++        match &self.symbol {
++            Some(s) => format!("`{}` ({} in {}:{})", s, self.kind.noun(), self.file, self.line),
++            None => format!("{} ({})", self.file, self.kind.noun()),
++        }
++    }
++}
++
++/// The explanation angles, in conversational priority order (lower = comes first in the answer).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Facet { Overview, Walkthrough, DataFlow, Dependencies, Callers, EdgeCases, Tests, Rationale, Followups }
++impl Facet {
++    fn priority(self) -> u8 {
++        match self {
++            Facet::Overview => 0, Facet::Walkthrough => 1, Facet::DataFlow => 2, Facet::Dependencies => 3,
++            Facet::Callers => 4, Facet::EdgeCases => 5, Facet::Tests => 6, Facet::Rationale => 7,
++            Facet::Followups => 8,
++        }
++    }
++    pub fn heading(self) -> &'static str {
++        match self {
++            Facet::Overview => "Overview", Facet::Walkthrough => "How it works",
++            Facet::DataFlow => "Data flow", Facet::Dependencies => "Depends on",
++            Facet::Callers => "Used by", Facet::EdgeCases => "Edge cases & failure modes",
++            Facet::Tests => "Testing", Facet::Rationale => "Why it's built this way",
++            Facet::Followups => "You might next ask",
++        }
++    }
++    /// A sensible conversational default: lead, mechanism, then the things people ask next.
++    pub fn default_set() -> Vec<Facet> {
++        vec![Facet::Overview, Facet::Walkthrough, Facet::EdgeCases, Facet::Dependencies, Facet::Followups]
++    }
++}
++
++#[derive(Clone, Debug)]
++pub struct ExplainConfig {
++    pub facets: Vec<Facet>,
++    pub max_lanes: usize,
++    pub snippet_budget: usize, // max chars of snippet inlined per prompt
++}
++impl Default for ExplainConfig {
++    fn default() -> Self { Self { facets: Facet::default_set(), max_lanes: 24, snippet_budget: 1200 } }
++}
++
++/// One grounded explanation prompt: a facet applied to a specific code reference.
++#[derive(Clone, Debug)]
++pub struct ExplainLane { pub id: u64, pub facet: Facet, pub target_idx: usize, pub prompt: String }
++
++/// Build the grounded prompt for `facet` over `cref`, with the question for context and the snippet
++/// trimmed to `budget`. Tight and small-model-friendly: one focused ask plus the code.
++fn prompt_for(question: &str, cref: &CodeRef, facet: Facet, budget: usize) -> String {
++    let label = cref.label();
++    let ask = match facet {
++        Facet::Overview => format!("In 2–3 plain, conversational sentences, what does {label} do and why does it exist?"),
++        Facet::Walkthrough => format!("Walk through how {label} works, step by step, in plain language. Keep it tight."),
++        Facet::DataFlow => format!("Trace the data through {label}: the inputs, the transformations, and what comes out."),
++        Facet::Dependencies => format!("What does {label} call or depend on, and why? Name the key ones only."),
++        Facet::Callers => format!("What kinds of code would call {label}, and for what? (Call sites may not be shown.)"),
++        Facet::EdgeCases => format!("What are the edge cases, error paths, and failure modes in {label} that matter?"),
++        Facet::Tests => format!("How would you test {label}? What behaviour needs coverage and what's tricky?"),
++        Facet::Rationale => format!("Why might {label} be written this way? Note any non-obvious design choices."),
++        Facet::Followups => format!("After understanding {label}, what are the 3 questions someone is most likely to ask next? One per line, no preamble."),
++    };
++    let snippet = trim_chars(cref.snippet.trim(), budget);
++    if snippet.is_empty() { ask } else { format!("{ask}\n\n```\n{snippet}\n```") }
++}
++
++fn trim_chars(s: &str, budget: usize) -> String {
++    if s.chars().count() <= budget { return s.to_string(); }
++    let mut out: String = s.chars().take(budget.saturating_sub(1)).collect();
++    out.push('…');
++    out
++}
++
++/// Generate the explanation lanes for `question` grounded in `refs`. Facet-major (breadth first): every
++/// ref's Overview before any deep dive, so a tight budget still explains the whole picture before
++/// drilling in. Capped at `cfg.max_lanes`; ids assigned 0..n.
++pub fn explanation_lanes(question: &str, refs: &[CodeRef], cfg: &ExplainConfig) -> Vec<ExplainLane> {
++    let mut lanes = Vec::new();
++    if refs.is_empty() { return lanes; }
++    for &facet in &cfg.facets {
++        for (idx, cref) in refs.iter().enumerate() {
++            if lanes.len() >= cfg.max_lanes { return lanes; }
++            lanes.push(ExplainLane {
++                id: lanes.len() as u64, facet, target_idx: idx,
++                prompt: prompt_for(question, cref, facet, cfg.snippet_budget),
++            });
++        }
++    }
++    lanes
++}
++
++/// Lanes → fleet tasks (payload = the grounded prompt).
++pub fn tasks(lanes: &[ExplainLane]) -> Vec<Task> {
++    lanes.iter().map(|l| Task { id: l.id, payload: l.prompt.clone() }).collect()
++}
++
++/// One answered facet, anchored to its code reference.
++#[derive(Clone, Debug)]
++pub struct Section { pub facet: Facet, pub target: CodeRef, pub body: String }
++
++/// The assembled, conversational explanation.
++#[derive(Debug, Default)]
++pub struct Explanation {
++    pub question: String,
++    pub overview: String,        // the lead (joined Overview facets)
++    pub sections: Vec<Section>,  // detail, ordered by conversational priority then file
++    pub follow_ups: Vec<String>, // anticipated next questions (from the Followups facet)
++}
++
++/// Fold the fleet's results (task id → output) back into a coherent explanation: Overview becomes the
++/// lead, Followups becomes the anticipated next questions, and the remaining facets become detail
++/// sections ordered the way a person would explain it (mechanism before nitpicks).
++pub fn assemble(question: &str, lanes: &[ExplainLane], refs: &[CodeRef], results: &HashMap<u64, String>) -> Explanation {
++    let mut overview_parts = Vec::new();
++    let mut follow_ups = Vec::new();
++    let mut sections = Vec::new();
++    for l in lanes {
++        let Some(out) = results.get(&l.id) else { continue };
++        let out = out.trim();
++        if out.is_empty() { continue; }
++        match l.facet {
++            Facet::Overview => overview_parts.push(out.to_string()),
++            Facet::Followups => follow_ups.extend(out.lines().map(|s| s.trim_start_matches(['-', '*', ' ']).to_string()).filter(|s| !s.is_empty())),
++            _ => sections.push(Section { facet: l.facet, target: refs[l.target_idx].clone(), body: out.to_string() }),
++        }
++    }
++    // conversational order: by facet priority, then by file/line for stability
++    sections.sort_by(|a, b| a.facet.priority().cmp(&b.facet.priority())
++        .then(a.target.file.cmp(&b.target.file)).then(a.target.line.cmp(&b.target.line)));
++    Explanation { question: question.to_string(), overview: overview_parts.join("\n\n"), sections, follow_ups }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn refs() -> Vec<CodeRef> {
++        vec![
++            CodeRef { file: "src/parse.rs".into(), symbol: Some("parse_csv".into()), kind: SymKind::Fn,
++                      snippet: "fn parse_csv(s: &str) -> Vec<Row> { /* … */ }".into(), line: 12 },
++            CodeRef { file: "src/model.rs".into(), symbol: Some("Row".into()), kind: SymKind::Struct,
++                      snippet: "struct Row { region: String, n: u64 }".into(), line: 3 },
++        ]
++    }
++
++    #[test]
++    fn lanes_are_grounded_and_breadth_first() {
++        let cfg = ExplainConfig { facets: vec![Facet::Overview, Facet::EdgeCases], max_lanes: 24, snippet_budget: 1200 };
++        let lanes = explanation_lanes("how does csv parsing work?", &refs(), &cfg);
++        assert_eq!(lanes.len(), 4, "2 facets × 2 refs");
++        // facet-major: both Overviews first
++        assert_eq!(lanes[0].facet, Facet::Overview);
++        assert_eq!(lanes[1].facet, Facet::Overview);
++        assert_eq!(lanes[2].facet, Facet::EdgeCases);
++        // grounded: prompt names the symbol/file and inlines the snippet
++        assert!(lanes[0].prompt.contains("parse_csv") && lanes[0].prompt.contains("src/parse.rs"));
++        assert!(lanes[0].prompt.contains("```") && lanes[0].prompt.contains("fn parse_csv"));
++    }
++
++    #[test]
++    fn budget_caps_and_snippet_is_trimmed() {
++        let big = CodeRef { file: "f.rs".into(), symbol: Some("g".into()), kind: SymKind::Fn,
++                            snippet: "x".repeat(5000), line: 1 };
++        let cfg = ExplainConfig { facets: Facet::default_set(), max_lanes: 3, snippet_budget: 100 };
++        let lanes = explanation_lanes("q", std::slice::from_ref(&big), &cfg);
++        assert_eq!(lanes.len(), 3, "capped at max_lanes");
++        let body = &lanes[0].prompt;
++        assert!(body.contains('…') && body.chars().count() < 300, "snippet trimmed to budget");
++    }
++
++    #[test]
++    fn tasks_carry_the_grounded_prompts() {
++        let lanes = explanation_lanes("q", &refs(), &ExplainConfig::default());
++        let ts = tasks(&lanes);
++        assert_eq!(ts.len(), lanes.len());
++        assert!(ts.iter().zip(&lanes).all(|(t, l)| t.id == l.id && t.payload == l.prompt));
++    }
++
++    #[test]
++    fn assemble_builds_lead_sections_and_followups() {
++        let cfg = ExplainConfig { facets: vec![Facet::Overview, Facet::EdgeCases, Facet::Followups], max_lanes: 24, snippet_budget: 1200 };
++        let r = refs();
++        let lanes = explanation_lanes("explain parsing", &r, &cfg);
++        // mock fleet outputs keyed by lane id
++        let mut results = HashMap::new();
++        for l in &lanes {
++            let out = match l.facet {
++                Facet::Overview => format!("{} reads text into rows.", r[l.target_idx].symbol.clone().unwrap()),
++                Facet::EdgeCases => "Empty input and ragged rows are the risks.".to_string(),
++                Facet::Followups => "How are errors reported?\nIs it streaming?".to_string(),
++                _ => String::new(),
++            };
++            results.insert(l.id, out);
++        }
++        let ex = assemble("explain parsing", &lanes, &r, &results);
++        assert!(ex.overview.contains("parse_csv") && ex.overview.contains("Row"), "lead joins both overviews");
++        assert!(ex.sections.iter().all(|s| s.facet == Facet::EdgeCases), "non-lead/non-followup facets become sections");
++        assert_eq!(ex.sections.len(), 2);
++        assert!(ex.follow_ups.contains(&"How are errors reported?".to_string()));
++        // overview sorts ahead of edge cases by priority (it's pulled out as the lead, sections start at EdgeCases)
++        assert_eq!(ex.sections[0].facet, Facet::EdgeCases);
++    }
++
++    #[test]
++    fn no_refs_no_lanes() {
++        assert!(explanation_lanes("q", &[], &ExplainConfig::default()).is_empty());
++    }
++}
+diff --git a/crates/logscope-egui/src/lib.rs b/crates/logscope-egui/src/lib.rs
+index 5485392..bd5628a 100644
+--- a/crates/logscope-egui/src/lib.rs
++++ b/crates/logscope-egui/src/lib.rs
+@@ -14,6 +14,17 @@ pub mod genguard;
+ #[allow(dead_code)] pub mod bestregion;
+ #[allow(dead_code)] pub mod kvtree;
+ #[allow(dead_code)] pub mod decompose;
++#[allow(dead_code)] pub mod devloop;
++#[allow(dead_code)] pub mod enlist;
++#[allow(dead_code)] pub mod dispatch;
++#[allow(dead_code)] pub mod ollama;
++#[allow(dead_code)] pub mod bridge;
++#[allow(dead_code)] pub mod localexec;
++#[allow(dead_code)] pub mod speculate;
++#[allow(dead_code)] pub mod voicefan;
++#[allow(dead_code)] pub mod voice_ingest;
++#[allow(dead_code)] pub mod reaction;
++#[allow(dead_code)] pub mod explain;
+ #[allow(dead_code)] pub mod quest;
+ #[allow(dead_code)] pub mod verdict;
+ #[allow(dead_code)] pub mod script;
+diff --git a/crates/logscope-egui/src/localexec.rs b/crates/logscope-egui/src/localexec.rs
+new file mode 100644
+index 0000000..0aafd37
+--- /dev/null
++++ b/crates/logscope-egui/src/localexec.rs
+@@ -0,0 +1,72 @@
++//! localexec.rs — the logscope-native `dispatch::Executor`: run an assigned slice on a local engine
++//! `Backend` (the wgpu/Burn engine or llama.cpp) rather than shelling to an external server. This is the
++//! on-box counterpart to `ollama::OllamaExecutor`, for fleet members running the engine directly.
++//!
++//! It's a thin adapter over the crate's existing `backend::Backend` trait — which already owns the loaded
++//! model, tokenizer, and sampler and streams tokens — so it carries no engine wiring of its own and is
++//! unit-testable with a mock backend (no GPU, no features). A real member builds one from its loaded
++//! `WgpuEngine`/`LlamaCpp` backend; the GPU decode path is exercised on a box. No kernels here.
++#![allow(dead_code)]
++
++use crate::backend::Backend;
++use crate::dispatch::Executor;
++use logscope::llm_backend::GenParams;
++
++/// Wraps a loaded engine `Backend` plus a `GenParams` template. Each assigned slice's `payload` is the
++/// prompt; `run` generates the full reply (accumulating the streamed tokens) and returns it trimmed.
++pub struct BackendExecutor<B: Backend> {
++    pub backend: B,
++    pub params: GenParams,
++}
++
++impl<B: Backend> BackendExecutor<B> {
++    pub fn new(backend: B, params: GenParams) -> Self { Self { backend, params } }
++}
++
++impl<B: Backend> Executor for BackendExecutor<B> {
++    fn run(&mut self, _task: u64, payload: &str) -> Result<String, String> {
++        if !self.backend.loaded() { return Err("logscope backend has no model loaded".into()); }
++        let mut out = String::new();
++        let never_cancel = || false;
++        // collect the streamed tokens; never cancel (dispatch handles timeouts at the scheduler layer)
++        self.backend.generate(payload, &self.params, &never_cancel, &mut |tok| { out.push_str(tok); true })?;
++        Ok(out.trim().to_string())
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// A CPU mock of the `Backend` trait — streams "ran:<prompt>" in two chunks, no model or GPU needed.
++    struct EchoBackend { loaded: bool, fail: bool }
++    impl Backend for EchoBackend {
++        fn name(&self) -> &'static str { "echo" }
++        fn loaded(&self) -> bool { self.loaded }
++        fn load(&mut self, _path: &str, _p: &GenParams) -> Result<(), String> { self.loaded = true; Ok(()) }
++        fn generate(&mut self, prompt: &str, _p: &GenParams, _cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
++            if self.fail { return Err("decode failed".into()); }
++            on("ran:");      // two chunks → exercises token accumulation
++            on(prompt);
++            Ok(2)
++        }
++    }
++
++    #[test]
++    fn forwards_prompt_and_collects_streamed_reply() {
++        let mut ex = BackendExecutor::new(EchoBackend { loaded: true, fail: false }, GenParams::default());
++        assert_eq!(ex.run(7, "hello").unwrap(), "ran:hello");
++    }
++
++    #[test]
++    fn errors_when_no_model_loaded() {
++        let mut ex = BackendExecutor::new(EchoBackend { loaded: false, fail: false }, GenParams::default());
++        assert!(ex.run(0, "x").unwrap_err().contains("no model loaded"));
++    }
++
++    #[test]
++    fn propagates_backend_error() {
++        let mut ex = BackendExecutor::new(EchoBackend { loaded: true, fail: true }, GenParams::default());
++        assert!(ex.run(0, "x").unwrap_err().contains("decode failed"));
++    }
++}
+diff --git a/crates/logscope-egui/src/ollama.rs b/crates/logscope-egui/src/ollama.rs
+new file mode 100644
+index 0000000..0a04513
+--- /dev/null
++++ b/crates/logscope-egui/src/ollama.rs
+@@ -0,0 +1,192 @@
++//! ollama.rs — a dependency-free ollama HTTP client that implements [`crate::dispatch::Executor`], so a
++//! joined fleet member can run an assigned slice against a local or remote ollama server.
++//!
++//! A slice's `payload` is the prompt; the executor is configured with the server `host` ("ip:port"), the
++//! `model`, and a token budget. `run` POSTs to `/api/generate` (non-streaming) and returns the generated
++//! text. The request builder and the JSON response parser are PURE and unit-tested; only `http_roundtrip`
++//! touches a socket (integration-tested on a box with ollama running). std-only, like `netserve.rs`.
++#![allow(dead_code)]
++
++use crate::dispatch::Executor;
++use std::io::{Read, Write};
++use std::net::TcpStream;
++use std::time::Duration;
++
++/// Runs slices against an ollama server. `host` is "ip:port" (default ollama is 127.0.0.1:11434).
++pub struct OllamaExecutor {
++    pub host: String,
++    pub model: String,
++    pub num_predict: u32,
++    pub timeout: Duration,
++}
++
++impl OllamaExecutor {
++    pub fn new(host: &str, model: &str, num_predict: u32) -> Self {
++        Self { host: host.into(), model: model.into(), num_predict, timeout: Duration::from_secs(120) }
++    }
++    pub fn with_timeout(mut self, t: Duration) -> Self { self.timeout = t; self }
++}
++
++impl Executor for OllamaExecutor {
++    fn run(&mut self, _task: u64, payload: &str) -> Result<String, String> {
++        let req = build_request(&self.host, &self.model, payload, self.num_predict);
++        let raw = http_roundtrip(&self.host, &req, self.timeout).map_err(|e| format!("io: {e}"))?;
++        parse_response(&raw)
++    }
++}
++
++// ── pure: request building ──────────────────────────────────────────────────────────────────────--
++
++/// Build the raw HTTP/1.1 request for ollama's non-streaming `/api/generate`.
++pub fn build_request(host: &str, model: &str, prompt: &str, num_predict: u32) -> String {
++    let body = format!(
++        "{{\"model\":\"{}\",\"prompt\":\"{}\",\"stream\":false,\"options\":{{\"num_predict\":{}}}}}",
++        json_escape(model), json_escape(prompt), num_predict);
++    format!(
++        "POST /api/generate HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
++         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
++        body.len())
++}
++
++/// JSON-escape a string for embedding in a request body.
++pub fn json_escape(s: &str) -> String {
++    let mut o = String::with_capacity(s.len() + 2);
++    for c in s.chars() {
++        match c {
++            '"' => o.push_str("\\\""),
++            '\\' => o.push_str("\\\\"),
++            '\n' => o.push_str("\\n"),
++            '\r' => o.push_str("\\r"),
++            '\t' => o.push_str("\\t"),
++            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
++            c => o.push(c),
++        }
++    }
++    o
++}
++
++// ── pure: response parsing ──────────────────────────────────────────────────────────────────────--
++
++/// Pull the generated text out of ollama's JSON reply (the top-level `"response"` field), or surface its
++/// `"error"` field if the server returned one.
++pub fn parse_response(raw: &str) -> Result<String, String> {
++    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(raw);
++    if let Some(err) = find_string_field(body, "error") { return Err(format!("ollama error: {err}")); }
++    find_string_field(body, "response").ok_or_else(|| "ollama reply had no 'response' field".to_string())
++}
++
++/// Targeted extractor for a top-level JSON string field. Scans the object reading whole string tokens, so
++/// the key is never matched inside another field's value; returns the (unescaped) value of the first
++/// `"key": "..."` it finds. Not a full JSON parser — enough for ollama's flat reply shape.
++fn find_string_field(json: &str, key: &str) -> Option<String> {
++    let c: Vec<char> = json.chars().collect();
++    let mut i = 0;
++    while i < c.len() {
++        if c[i] == '"' {
++            let (s, next) = read_json_string(&c, i)?;
++            let mut j = next;
++            while j < c.len() && c[j].is_whitespace() { j += 1; }
++            if j < c.len() && c[j] == ':' {            // this string was an object key
++                j += 1;
++                while j < c.len() && c[j].is_whitespace() { j += 1; }
++                if s == key {
++                    return if j < c.len() && c[j] == '"' { read_json_string(&c, j).map(|(v, _)| v) } else { None };
++                }
++                i = j;                                 // skip to the value; it'll be scanned next
++            } else {
++                i = next;                              // string was a value/element
++            }
++        } else {
++            i += 1;
++        }
++    }
++    None
++}
++
++/// Read a JSON string literal starting at the opening quote `c[i]`; returns (unescaped, index-after-close).
++fn read_json_string(c: &[char], mut i: usize) -> Option<(String, usize)> {
++    if c.get(i) != Some(&'"') { return None; }
++    i += 1;
++    let mut out = String::new();
++    while i < c.len() {
++        match c[i] {
++            '"' => return Some((out, i + 1)),
++            '\\' => {
++                i += 1;
++                match c.get(i)? {
++                    '"' => out.push('"'), '\\' => out.push('\\'), '/' => out.push('/'),
++                    'n' => out.push('\n'), 'r' => out.push('\r'), 't' => out.push('\t'),
++                    'b' => out.push('\u{8}'), 'f' => out.push('\u{C}'),
++                    'u' => {
++                        let h: String = c.get(i + 1..i + 5)?.iter().collect();
++                        let cp = u32::from_str_radix(&h, 16).ok()?;
++                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
++                        i += 4;
++                    }
++                    _ => return None,
++                }
++                i += 1;
++            }
++            ch => { out.push(ch); i += 1; }
++        }
++    }
++    None
++}
++
++// ── integration seam: the socket round-trip ────────────────────────────────────────────────────--
++
++fn http_roundtrip(host: &str, req: &str, timeout: Duration) -> std::io::Result<String> {
++    let mut stream = TcpStream::connect(host)?;
++    stream.set_read_timeout(Some(timeout))?;
++    stream.set_write_timeout(Some(timeout))?;
++    stream.write_all(req.as_bytes())?;
++    let mut buf = String::new();
++    stream.read_to_string(&mut buf)?;
++    Ok(buf)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn request_has_method_path_and_correct_content_length() {
++        let req = build_request("10.0.0.5:11434", "qwen2", "hi \"there\"\n", 64);
++        assert!(req.starts_with("POST /api/generate HTTP/1.1\r\n"));
++        assert!(req.contains("Host: 10.0.0.5:11434\r\n"));
++        assert!(req.contains("Content-Type: application/json\r\n"));
++        // body is everything after the blank line; Content-Length must equal its byte length
++        let (head, body) = req.split_once("\r\n\r\n").unwrap();
++        let cl: usize = head.lines().find_map(|l| l.strip_prefix("Content-Length: ")).unwrap().parse().unwrap();
++        assert_eq!(cl, body.len());
++        assert!(body.contains("\"num_predict\":64"));
++        assert!(body.contains("\\\"there\\\"") && body.contains("hi \\\"there\\\"\\n"), "prompt JSON-escaped: {body}");
++    }
++
++    #[test]
++    fn json_escape_covers_specials() {
++        assert_eq!(json_escape("a\"b\\c\nd\te"), "a\\\"b\\\\c\\nd\\te");
++        assert_eq!(json_escape("\u{1}"), "\\u0001");
++    }
++
++    #[test]
++    fn parse_extracts_response_field() {
++        // "model" string precedes "response"; the parser must not be fooled by it, and must unescape.
++        let body = r#"{"model":"qwen2","created_at":"t","response":"hello\nworld \"q\"","done":true}"#;
++        let raw = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{body}");
++        assert_eq!(parse_response(&raw).unwrap(), "hello\nworld \"q\"");
++    }
++
++    #[test]
++    fn parse_surfaces_error_field() {
++        let body = r#"{"error":"model 'zzz' not found"}"#;
++        assert!(parse_response(body).unwrap_err().contains("not found"));
++    }
++
++    #[test]
++    fn extractor_not_fooled_by_key_inside_a_value() {
++        // the literal text "response": appears INSIDE another field's string value
++        let body = r#"{"note":"see response: nothing","response":"real"}"#;
++        assert_eq!(find_string_field(body, "response").as_deref(), Some("real"));
++    }
++}
+diff --git a/crates/logscope-egui/src/reaction.rs b/crates/logscope-egui/src/reaction.rs
+new file mode 100644
+index 0000000..984100a
+--- /dev/null
++++ b/crates/logscope-egui/src/reaction.rs
+@@ -0,0 +1,252 @@
++//! reaction.rs — steer or stop an in-flight generation from live speech.
++//!
++//! While the model is generating, the speaker stack keeps transcribing. This module classifies those
++//! fragments into a [`Reaction`] — `Interrupt` (stop), `Steer` (stop and redirect), `AddContext` (let it
++//! run, queue an addendum), `Affirm` (keep going), or `Ignore` (backchannel/noise) — and debounces them
++//! through a [`Reactor`] so a jittery whisper partial can't fire a false cancel. When the Reactor commits
++//! a cancelling reaction it raises a [`CancelFlag`]; the `cancel: &dyn Fn() -> bool` closure already on
++//! `backend::Backend::generate` reads that flag, so generation stops mid-token.
++//!
++//! `classify` and `Reactor` are pure and unit-tested. The seams are upstream (the same whisper + speaker
++//! attribution that feeds `voice_ingest`) and the one-line `cancel` closure handed to `generate`. Feed the
++//! Reactor only the *driving* speaker's fragments (gate on `speakers::is_allowed`) so a bystander can't
++//! hijack the generation. Classification is heuristic — cues, not NLU.
++#![allow(dead_code)]
++
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++
++/// What the live speech is asking of the in-flight generation.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Reaction {
++    Ignore,
++    Affirm,
++    AddContext(String), // continue, but fold this in afterward
++    Steer(String),      // stop and redirect to this
++    Interrupt,          // stop
++}
++
++impl Reaction {
++    fn kind(&self) -> u8 {
++        match self { Reaction::Ignore => 0, Reaction::Affirm => 1, Reaction::AddContext(_) => 2,
++                     Reaction::Steer(_) => 3, Reaction::Interrupt => 4 }
++    }
++    /// Does this reaction stop the current generation?
++    pub fn is_cancel(&self) -> bool { matches!(self, Reaction::Interrupt | Reaction::Steer(_)) }
++}
++
++/// Classify one transcript fragment. Order of precedence: interrupt → steer → add-context → affirm →
++/// ignore (so "stop" cancels, but "no, use postgres" redirects rather than merely stopping).
++pub fn classify(fragment: &str) -> Reaction {
++    let f = fragment.trim().to_lowercase();
++    if f.is_empty() { return Reaction::Ignore; }
++
++    if is_interrupt(&f) { return Reaction::Interrupt; }
++
++    // strip leading discourse fillers ("wait, …", "no …", "okay …") to find the real intent, remembering
++    // whether a negation was among them (negation + restated content = a steer).
++    let (core, negated) = strip_leading_fillers(&f);
++    if core.is_empty() {
++        return if is_affirm(&f) { Reaction::Affirm } else if negated { Reaction::Interrupt } else { Reaction::Ignore };
++    }
++    if negated && is_backchannel(&core) { return Reaction::Ignore; } // "no problem", "no worries"
++
++    if let Some(t) = match_prefix(&core, STEER_PREFIXES) { if !t.is_empty() { return Reaction::Steer(t); } }
++    if negated { return Reaction::Steer(core); } // "no — use the other dataset"
++    if let Some(t) = match_prefix(&core, ADD_PREFIXES) { if !t.is_empty() { return Reaction::AddContext(t); } }
++    if is_affirm(&core) { return Reaction::Affirm; }
++    Reaction::Ignore
++}
++
++const STEER_PREFIXES: &[&str] = &["actually", "instead", "rather", "i meant", "make it", "change it to",
++                                  "change that to", "switch to", "let's do", "do it as"];
++const ADD_PREFIXES: &[&str] = &["also", "and also", "plus", "make sure", "don't forget", "dont forget",
++                                "oh and", "and make", "include", "add", "as well as"];
++
++fn is_interrupt(f: &str) -> bool {
++    matches!(f, "no" | "no no" | "nope" | "stop" | "cancel" | "wait" | "halt" | "abort" | "no stop")
++        || f.starts_with("never mind") || f.starts_with("nevermind")
++        || f.starts_with("scratch that") || f.starts_with("hold on") || f.starts_with("stop stop")
++}
++
++fn strip_leading_fillers(f: &str) -> (String, bool) {
++    const FILLERS: &[&str] = &["no", "nope", "not that", "wait", "okay", "ok", "um", "uh", "so",
++                               "well", "hey", "yeah", "like", "hmm", "i mean"];
++    let mut s = f.trim();
++    let mut negated = false;
++    loop {
++        let mut advanced = false;
++        for w in FILLERS {
++            if s == *w || s.starts_with(&format!("{w} ")) || s.starts_with(&format!("{w},")) {
++                if matches!(*w, "no" | "nope" | "not that") { negated = true; }
++                s = s[w.len()..].trim_start_matches([',', ' ']);
++                advanced = true;
++                break;
++            }
++        }
++        if !advanced { return (s.to_string(), negated); }
++    }
++}
++
++fn match_prefix(core: &str, prefixes: &[&str]) -> Option<String> {
++    for p in prefixes {
++        if core == *p { return Some(String::new()); }
++        if let Some(rest) = core.strip_prefix(&format!("{p} ")) { return Some(rest.trim().to_string()); }
++    }
++    None
++}
++
++fn is_affirm(f: &str) -> bool {
++    const AFFIRM: &[&str] = &["yes", "yeah", "yep", "good", "perfect", "great", "exactly", "right",
++                              "correct", "continue", "keep going", "go on", "sounds good", "looks good",
++                              "nice", "cool", "okay", "ok"];
++    AFFIRM.iter().any(|a| f == *a || f.starts_with(&format!("{a} ")) || f.starts_with(&format!("{a},")))
++}
++
++fn is_backchannel(f: &str) -> bool {
++    const BC: &[&str] = &["problem", "worries", "thanks", "thank you", "idea", "big deal", "biggie"];
++    BC.iter().any(|b| f == *b || f.starts_with(&format!("{b} ")))
++}
++
++/// Debounces classified fragments into one committed reaction. A `stable` (endpoint) fragment commits
++/// immediately; volatile partials must agree `threshold` times in a row first. Only active between
++/// [`begin`](Reactor::begin) and [`end`](Reactor::end) (i.e. while a generation is in flight).
++pub struct Reactor {
++    armed: bool,
++    threshold: u32,
++    pending_kind: u8,
++    pending_count: u32,
++    committed: Option<Reaction>,
++    flag: CancelFlag,
++}
++
++impl Reactor {
++    pub fn new(threshold: u32) -> Self {
++        Self { armed: false, threshold: threshold.max(1), pending_kind: 0, pending_count: 0,
++               committed: None, flag: CancelFlag::new() }
++    }
++    /// A shareable cancel flag to hand to `Backend::generate` (`let f = reactor.cancel_flag(); … cancel:
++    /// &|| f.is_cancelled()`). Raised automatically when a cancelling reaction commits.
++    pub fn cancel_flag(&self) -> CancelFlag { self.flag.clone() }
++
++    /// Generation started — arm and clear prior state.
++    pub fn begin(&mut self) { self.armed = true; self.reset(); }
++    /// Generation finished/aborted — disarm and clear (also lowers the cancel flag for the next run).
++    pub fn end(&mut self) { self.armed = false; self.reset(); }
++    fn reset(&mut self) { self.pending_kind = 0; self.pending_count = 0; self.committed = None; self.flag.lower(); }
++
++    /// Observe a fragment. Returns the reaction if this observation *commits* one.
++    pub fn observe(&mut self, fragment: &str, stable: bool) -> Option<Reaction> {
++        if !self.armed || self.committed.is_some() { return None; }
++        let r = classify(fragment);
++        if matches!(r, Reaction::Ignore) { return None; } // backchannel doesn't disturb the pending tally
++        if stable { return self.commit(r); }
++        if r.kind() == self.pending_kind { self.pending_count += 1; }
++        else { self.pending_kind = r.kind(); self.pending_count = 1; }
++        if self.pending_count >= self.threshold { self.commit(r) } else { None }
++    }
++    fn commit(&mut self, r: Reaction) -> Option<Reaction> {
++        if r.is_cancel() { self.flag.cancel(); }
++        self.committed = Some(r.clone());
++        Some(r)
++    }
++
++    pub fn committed(&self) -> Option<&Reaction> { self.committed.as_ref() }
++    /// True once a cancelling reaction has committed (mirrors the raised cancel flag).
++    pub fn should_cancel(&self) -> bool { self.committed.as_ref().is_some_and(|r| r.is_cancel()) }
++    /// Consume the committed reaction (re-opens observation for the rest of the turn).
++    pub fn take(&mut self) -> Option<Reaction> {
++        self.pending_kind = 0; self.pending_count = 0;
++        self.committed.take()
++    }
++}
++
++/// A shareable, thread-safe cancel flag. The `cancel` closure on `Backend::generate` reads
++/// [`is_cancelled`](CancelFlag::is_cancelled); the voice side raises it via the [`Reactor`].
++#[derive(Clone, Default)]
++pub struct CancelFlag(Arc<AtomicBool>);
++impl CancelFlag {
++    pub fn new() -> Self { Self::default() }
++    pub fn cancel(&self) { self.0.store(true, Ordering::SeqCst); }
++    pub fn lower(&self) { self.0.store(false, Ordering::SeqCst); }
++    pub fn is_cancelled(&self) -> bool { self.0.load(Ordering::SeqCst) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn classify_buckets_common_cues() {
++        assert_eq!(classify("stop"), Reaction::Interrupt);
++        assert_eq!(classify("no"), Reaction::Interrupt);
++        assert_eq!(classify("never mind that"), Reaction::Interrupt);
++        assert_eq!(classify("actually use postgres instead"), Reaction::Steer("use postgres instead".into()));
++        assert_eq!(classify("no, use the other dataset"), Reaction::Steer("use the other dataset".into()));
++        assert_eq!(classify("wait, make it async"), Reaction::Steer("async".into()));
++        assert_eq!(classify("also include unit tests"), Reaction::AddContext("include unit tests".into()));
++        assert_eq!(classify("make sure it handles empty input"), Reaction::AddContext("it handles empty input".into()));
++        assert_eq!(classify("yeah perfect"), Reaction::Affirm);
++        assert_eq!(classify("keep going"), Reaction::Affirm);
++        assert_eq!(classify("no problem"), Reaction::Ignore);     // backchannel, not a steer
++        assert_eq!(classify("the weather is nice today"), Reaction::Ignore);
++    }
++
++    #[test]
++    fn steer_and_interrupt_cancel_addcontext_and_affirm_do_not() {
++        assert!(classify("stop").is_cancel());
++        assert!(classify("no, switch to the cached path").is_cancel());
++        assert!(!classify("also add logging").is_cancel());
++        assert!(!classify("yes good").is_cancel());
++    }
++
++    #[test]
++    fn reactor_debounces_volatile_partials() {
++        let mut r = Reactor::new(2);
++        r.begin();
++        assert_eq!(r.observe("stop", false), None, "one jittery partial isn't enough");
++        assert_eq!(r.observe("stop", false), Some(Reaction::Interrupt), "two in a row commits");
++        assert!(r.should_cancel());
++    }
++
++    #[test]
++    fn reactor_commits_immediately_on_stable_endpoint() {
++        let mut r = Reactor::new(3);
++        r.begin();
++        assert_eq!(r.observe("no, use the parquet files", true), Some(Reaction::Steer("use the parquet files".into())));
++        assert!(r.should_cancel());
++    }
++
++    #[test]
++    fn reactor_inert_until_armed_and_after_end() {
++        let mut r = Reactor::new(1);
++        assert_eq!(r.observe("stop", true), None, "not armed → ignored");
++        r.begin();
++        assert_eq!(r.observe("stop", true), Some(Reaction::Interrupt));
++        r.end();
++        assert!(!r.should_cancel(), "end() clears the decision and lowers the flag");
++    }
++
++    #[test]
++    fn cancel_flag_drives_the_generate_hook() {
++        let mut r = Reactor::new(1);
++        let flag = r.cancel_flag();
++        let cancel = || flag.is_cancelled(); // this is what Backend::generate polls
++        assert!(!cancel());
++        r.begin();
++        r.observe("stop", true);
++        assert!(cancel(), "voice interrupt raises the flag generate() is watching");
++        r.end();
++        assert!(!cancel(), "next generation starts clean");
++    }
++
++    #[test]
++    fn addcontext_commits_without_cancelling() {
++        let mut r = Reactor::new(1);
++        r.begin();
++        let got = r.observe("also make sure to handle timezones", true);
++        assert_eq!(got, Some(Reaction::AddContext("make sure to handle timezones".into())));
++        assert!(!r.should_cancel(), "additive context lets generation continue");
++        assert!(!r.cancel_flag().is_cancelled());
++    }
++}
+diff --git a/crates/logscope-egui/src/speculate.rs b/crates/logscope-egui/src/speculate.rs
+new file mode 100644
+index 0000000..1e7202f
+--- /dev/null
++++ b/crates/logscope-egui/src/speculate.rs
+@@ -0,0 +1,211 @@
++//! speculate.rs — "aggressive coordinator" mode: while the user is still forming a request, fan out
++//! background INVESTIGATION LANES that anticipate what they'll need, so that when the real request lands
++//! there are already-thought-through leads with context to draw on. Like a person working out what you
++//! probably want as you start talking.
++//!
++//! A *lane* is a tight, small-model-friendly prompt derived from the in-progress context by a fixed
++//! ruleset (one template per [`LaneKind`]). Lanes become `dispatch::Task`s (`tasks_from_lanes`) run on
++//! spare fleet capacity by a cheap-model `Executor` — that dispatch is the IO seam, reusing the existing
++//! machinery. Completed lanes land in a [`LeadCache`]; when the user's actual request arrives,
++//! [`LeadCache::match_leads`] surfaces the relevant pre-computed results.
++//!
++//! Everything here — the ruleset, lane generation with guardrails, the cache, and relevance matching —
++//! is pure and unit-tested. No GUI, no kernels.
++#![allow(dead_code)]
++
++use crate::dispatch::Task;
++use std::collections::HashSet;
++
++/// The tight ruleset. Each kind is one anticipation strategy with its own prompt template.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum LaneKind {
++    /// Questions whose answers would most change how to help.
++    Clarify,
++    /// The concrete sub-tasks the request will likely break into.
++    Decompose,
++    /// Specific facts / current values worth looking up now.
++    Precheck,
++    /// The most likely follow-up questions.
++    Anticipate,
++}
++
++impl LaneKind {
++    pub fn label(self) -> &'static str {
++        match self { LaneKind::Clarify => "clarify", LaneKind::Decompose => "decompose",
++                     LaneKind::Precheck => "precheck", LaneKind::Anticipate => "anticipate" }
++    }
++    /// The default lane set, in priority order.
++    pub fn all() -> Vec<LaneKind> { vec![LaneKind::Clarify, LaneKind::Decompose, LaneKind::Precheck, LaneKind::Anticipate] }
++}
++
++/// One background investigation: a small-model-friendly prompt of a given kind.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Lane { pub id: u64, pub kind: LaneKind, pub prompt: String }
++
++/// How aggressively to speculate.
++#[derive(Clone, Debug)]
++pub struct SpecConfig {
++    pub aggressive: bool,        // master switch — off ⇒ no lanes
++    pub max_lanes: usize,        // cap on concurrent investigation lanes
++    pub min_context_chars: usize,// don't speculate on near-empty context (nothing to anticipate yet)
++    pub kinds: Vec<LaneKind>,    // which strategies to run, in order
++}
++impl Default for SpecConfig {
++    fn default() -> Self { Self { aggressive: false, max_lanes: 4, min_context_chars: 12, kinds: LaneKind::all() } }
++}
++
++/// The ruleset: render a tight, bounded, small-model-runnable prompt for `kind` over `ctx`. The prompts
++/// ask for short, line-delimited output with no preamble — cheap for a small model and easy to parse.
++fn prompt_for(kind: LaneKind, ctx: &str) -> String {
++    match kind {
++        LaneKind::Clarify =>
++            format!("A user just started with: \"{ctx}\".\nList up to 3 short clarifying questions whose answers would most change how to help. One per line, no preamble."),
++        LaneKind::Decompose =>
++            format!("A user is likely about to ask for help with: \"{ctx}\".\nList up to 4 concrete sub-tasks it will break into. One per line, terse, no preamble."),
++        LaneKind::Precheck =>
++            format!("For the request hinted by: \"{ctx}\".\nList up to 3 specific facts or current values worth looking up now. One per line, no preamble."),
++        LaneKind::Anticipate =>
++            format!("After: \"{ctx}\".\nGive the 3 most likely follow-up questions the user will ask. One per line, no preamble."),
++    }
++}
++
++/// Generate the investigation lanes for the current `context`. Returns empty when speculation is off, the
++/// context is too thin to anticipate anything, or no kinds are configured. Caps at `max_lanes` and
++/// de-duplicates identical prompts; lane ids are assigned 0..n in priority order.
++pub fn investigation_lanes(context: &str, cfg: &SpecConfig) -> Vec<Lane> {
++    let ctx = context.trim();
++    if !cfg.aggressive || ctx.chars().count() < cfg.min_context_chars { return Vec::new(); }
++    let mut lanes = Vec::new();
++    let mut seen = HashSet::new();
++    for &kind in &cfg.kinds {
++        if lanes.len() >= cfg.max_lanes { break; }
++        let prompt = prompt_for(kind, ctx);
++        if seen.insert(prompt.clone()) {
++            lanes.push(Lane { id: lanes.len() as u64, kind, prompt });
++        }
++    }
++    lanes
++}
++
++/// Turn lanes into dispatch tasks (payload = the lane prompt). Route the resulting tasks to a Dispatcher
++/// seeded with cheap-model members so they run on spare capacity without blocking the main request.
++pub fn tasks_from_lanes(lanes: &[Lane]) -> Vec<Task> {
++    lanes.iter().map(|l| Task { id: l.id, payload: l.prompt.clone() }).collect()
++}
++
++/// A completed investigation lane's result.
++#[derive(Clone, Debug)]
++pub struct Lead { pub kind: LaneKind, pub prompt: String, pub output: String }
++
++/// Holds the leads produced by background lanes and surfaces the ones relevant to the arriving request.
++#[derive(Default)]
++pub struct LeadCache { leads: Vec<Lead> }
++
++impl LeadCache {
++    pub fn new() -> Self { Self::default() }
++
++    /// Record a completed lane's output (pair the lane that produced it with its `dispatch` result).
++    pub fn insert(&mut self, lane: &Lane, output: String) {
++        self.leads.push(Lead { kind: lane.kind, prompt: lane.prompt.clone(), output });
++    }
++    /// Convenience: fold a whole `dispatch` result map back into the cache, matching task ids to lanes.
++    pub fn absorb(&mut self, lanes: &[Lane], results: &std::collections::HashMap<u64, String>) {
++        for l in lanes {
++            if let Some(out) = results.get(&l.id) { self.insert(l, out.clone()); }
++        }
++    }
++
++    pub fn len(&self) -> usize { self.leads.len() }
++    pub fn is_empty(&self) -> bool { self.leads.is_empty() }
++
++    /// Surface the leads relevant to the now-arrived `request`, strongest first, by keyword overlap with
++    /// each lead's output. `min_overlap` drops weak matches (use 1 to keep any overlap).
++    pub fn match_leads(&self, request: &str, min_overlap: usize) -> Vec<&Lead> {
++        let req = keywords(request);
++        let mut scored: Vec<(usize, &Lead)> = self.leads.iter()
++            .map(|l| (overlap(&req, &keywords(&l.output)), l))
++            .filter(|(s, _)| *s >= min_overlap)
++            .collect();
++        scored.sort_by(|a, b| b.0.cmp(&a.0));
++        scored.into_iter().map(|(_, l)| l).collect()
++    }
++}
++
++/// Content words (lowercased, length ≥ 4 to skip most stopwords/short tokens) for crude overlap scoring,
++/// with a light plural fold (trailing `s`, but not `ss`) so `region`/`regions`, `lead`/`leads` match.
++fn keywords(s: &str) -> HashSet<String> {
++    s.to_lowercase()
++        .split(|c: char| !c.is_alphanumeric())
++        .filter(|w| w.len() >= 4)
++        .map(|w| if w.len() > 4 && w.ends_with('s') && !w.ends_with("ss") { w[..w.len() - 1].to_string() } else { w.to_string() })
++        .collect()
++}
++fn overlap(a: &HashSet<String>, b: &HashSet<String>) -> usize { a.intersection(b).count() }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const CTX: &str = "i need to parse a large csv and compute stats per region";
++
++    fn aggressive(max: usize, kinds: Vec<LaneKind>) -> SpecConfig {
++        SpecConfig { aggressive: true, max_lanes: max, min_context_chars: 12, kinds }
++    }
++
++    #[test]
++    fn no_lanes_unless_aggressive_with_enough_context() {
++        assert!(investigation_lanes(CTX, &SpecConfig::default()).is_empty(), "off by default");
++        assert!(investigation_lanes("hi", &aggressive(4, LaneKind::all())).is_empty(), "context too thin");
++        assert!(!investigation_lanes(CTX, &aggressive(4, LaneKind::all())).is_empty(), "fires when aggressive + enough context");
++    }
++
++    #[test]
++    fn lanes_respect_kinds_order_and_cap() {
++        let lanes = investigation_lanes(CTX, &aggressive(2, LaneKind::all()));
++        assert_eq!(lanes.len(), 2, "capped at max_lanes");
++        assert_eq!(lanes[0].kind, LaneKind::Clarify);
++        assert_eq!(lanes[1].kind, LaneKind::Decompose);
++        assert_eq!(lanes.iter().map(|l| l.id).collect::<Vec<_>>(), vec![0, 1]);
++        assert!(lanes.iter().all(|l| l.prompt.contains("csv")), "each prompt carries the context");
++    }
++
++    #[test]
++    fn lanes_become_tasks_with_prompt_payloads() {
++        let lanes = investigation_lanes(CTX, &aggressive(3, LaneKind::all()));
++        let tasks = tasks_from_lanes(&lanes);
++        assert_eq!(tasks.len(), lanes.len());
++        for (t, l) in tasks.iter().zip(&lanes) {
++            assert_eq!(t.id, l.id);
++            assert_eq!(t.payload, l.prompt);
++        }
++    }
++
++    #[test]
++    fn lead_cache_surfaces_relevant_leads_first() {
++        let lanes = investigation_lanes(CTX, &aggressive(4, LaneKind::all()));
++        let mut cache = LeadCache::new();
++        // mock outputs that would come back from the background lanes
++        cache.insert(&lanes[0], "Which regions matter? What statistics — mean, median? How large is the csv?".into()); // clarify
++        cache.insert(&lanes[2], "Look up the available memory and the disk path of the data.".into());                 // precheck
++
++        // the real request arrives — should rank the clarify lead (median/region overlap) first
++        let hits = cache.match_leads("compute the median stats per region from the csv", 2);
++        assert_eq!(hits.len(), 1, "only the strongly-overlapping lead clears the threshold");
++        assert_eq!(hits[0].kind, LaneKind::Clarify);
++
++        // a memory/disk query surfaces the precheck lead instead
++        let mem = cache.match_leads("how much memory and disk space is available", 1);
++        assert_eq!(mem[0].kind, LaneKind::Precheck, "different request surfaces a different lead");
++    }
++
++    #[test]
++    fn absorb_folds_a_dispatch_result_map() {
++        let lanes = investigation_lanes(CTX, &aggressive(3, LaneKind::all()));
++        let mut results = std::collections::HashMap::new();
++        results.insert(0u64, "clarify output".to_string());
++        results.insert(2u64, "precheck output".to_string()); // lane 1 didn't finish
++        let mut cache = LeadCache::new();
++        cache.absorb(&lanes, &results);
++        assert_eq!(cache.len(), 2, "only finished lanes are cached");
++    }
++}
+diff --git a/crates/logscope-egui/src/voice_ingest.rs b/crates/logscope-egui/src/voice_ingest.rs
+new file mode 100644
+index 0000000..a2d7bf2
+--- /dev/null
++++ b/crates/logscope-egui/src/voice_ingest.rs
+@@ -0,0 +1,174 @@
++//! voice_ingest.rs — turn streaming whisper passes (attributed to a speaker) into clean, finalized
++//! [`voicefan::Utterance`]s ready to fan out.
++//!
++//! whisper-streaming hands back the FULL re-transcription on every pass (the tail is volatile until an
++//! endpoint), each pass tagged with whoever `speakers::identify()` matched. [`Transcriber`] holds the
++//! latest full text for the current speaker-turn and finalizes one utterance when the turn ends — a
++//! speaker change, a `stable` endpoint pass, or an explicit `flush` (silence timeout). On finalize it
++//! applies a conservative speaker *claim* ("kessler here, open the report" → name `kessler`, text
++//! `open the report`) and drops sub-threshold noise. [`fan_budget`] sizes the fanout cap from spare fleet
++//! capacity and speaker count.
++//!
++//! Pure + unit-tested. The seams are upstream: mic capture, the whisper FFI, and `speakers::identify`
++//! voiceprint attribution (adapt voiceterm's `web2qml` for those). Claim detection here is deliberately
++//! minimal; production should resolve names against the registry (`speaker_claim::match_claim_to_registry`).
++#![allow(dead_code)]
++
++use crate::voicefan::{FanBudget, SpeakerId, Utterance};
++
++/// One streaming transcription pass from whisper + speaker attribution. `full_text` is the whole current
++/// re-transcription (not a delta); `stable` is true when whisper hit an endpoint / the text settled.
++#[derive(Clone, Debug)]
++pub struct Pass {
++    pub speaker: SpeakerId,
++    pub name: String,       // display name from attribution (a claim may override it)
++    pub full_text: String,  // whisper's full re-transcription this pass
++    pub stable: bool,       // endpoint reached → finalize the turn
++    pub t_ms: u64,
++}
++
++/// Coalesces passes into finalized utterances, one per speaker-turn.
++#[derive(Default)]
++pub struct Transcriber {
++    speaker: Option<SpeakerId>,
++    name: String,
++    text: String,
++    t_ms: u64,
++    min_chars: usize,
++}
++
++impl Transcriber {
++    pub fn new(min_chars: usize) -> Self { Self { min_chars, ..Default::default() } }
++
++    /// Feed one pass. Returns any utterances finalized by it (0, 1, or — speaker change *and* endpoint in
++    /// one pass — 2: the completed prior turn, then the new one).
++    pub fn push(&mut self, pass: Pass) -> Vec<Utterance> {
++        let mut out = Vec::new();
++        if self.speaker.as_ref().is_some_and(|s| *s != pass.speaker) {
++            if let Some(u) = self.flush() { out.push(u); } // turn handed off to a new speaker
++        }
++        if self.speaker.is_none() {
++            self.speaker = Some(pass.speaker.clone());
++            self.name = pass.name.clone();
++            self.t_ms = pass.t_ms;
++        }
++        self.text = pass.full_text;
++        if pass.stable {
++            if let Some(u) = self.flush() { out.push(u); }
++        }
++        out
++    }
++
++    /// Force-finalize the current turn (e.g. on a silence timeout). Returns it if it clears the threshold.
++    pub fn flush(&mut self) -> Option<Utterance> {
++        let text = std::mem::take(&mut self.text);
++        let speaker = self.speaker.take()?;
++        let name = std::mem::take(&mut self.name);
++        let t = self.t_ms;
++        let trimmed = text.trim();
++        let (final_name, final_text) = match parse_claim(trimmed) {
++            Some((claimed, remainder)) => (claimed, remainder),
++            None => (name, trimmed.to_string()),
++        };
++        if final_text.chars().count() < self.min_chars { return None; }
++        Some(Utterance { speaker, name: final_name, text: final_text, t_ms: t })
++    }
++}
++
++/// Conservative speaker-claim parse: only the low-false-positive anchors `"<name> here …"` and
++/// `"my name is <name> …"`. Returns `(name, remainder)`. Production should fuzzy-match the name against
++/// the speaker registry rather than trust the raw token.
++fn parse_claim(u: &str) -> Option<(String, String)> {
++    let words: Vec<&str> = u.split_whitespace().collect();
++    if words.len() < 2 { return None; }
++    let lw: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
++    const STOP: &[&str] = &["over", "right", "come", "look", "wait", "stop", "not", "get",
++                            "go", "in", "out", "up", "down", "back", "is", "are", "the", "a"];
++    // "<name> here ..."
++    if lw[1] == "here" {
++        let name = clean(words[0]);
++        if !name.is_empty() && !STOP.contains(&lw[0].as_str()) {
++            return Some((name, words.get(2..).map(|w| w.join(" ")).unwrap_or_default()));
++        }
++    }
++    // "my name is <name> ..."
++    if lw.len() >= 4 && lw[0] == "my" && lw[1] == "name" && lw[2] == "is" {
++        let name = clean(words[3]);
++        if !name.is_empty() { return Some((name, words.get(4..).map(|w| w.join(" ")).unwrap_or_default())); }
++    }
++    None
++}
++fn clean(w: &str) -> String { w.chars().filter(|c| c.is_alphanumeric()).collect() }
++
++/// Size the fanout cap: never plan more lanes than the fleet can run soon (`spare_slots`), and never more
++/// than `per_speaker_cap` per active speaker.
++pub fn fan_budget(spare_slots: usize, n_speakers: usize, per_speaker_cap: usize) -> FanBudget {
++    FanBudget { max_total_lanes: spare_slots.min(n_speakers.max(1) * per_speaker_cap) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn pass(spk: &str, text: &str, stable: bool) -> Pass {
++        Pass { speaker: spk.into(), name: spk.into(), full_text: text.into(), stable, t_ms: 0 }
++    }
++
++    #[test]
++    fn partials_coalesce_and_finalize_once_on_endpoint() {
++        let mut t = Transcriber::new(3);
++        assert!(t.push(pass("spk_a", "parse", false)).is_empty());
++        assert!(t.push(pass("spk_a", "parse the", false)).is_empty());
++        let out = t.push(pass("spk_a", "parse the csv file", true));
++        assert_eq!(out.len(), 1);
++        assert_eq!(out[0].text, "parse the csv file");
++        assert_eq!(out[0].speaker, "spk_a");
++    }
++
++    #[test]
++    fn speaker_change_finalizes_the_prior_turn() {
++        let mut t = Transcriber::new(3);
++        assert!(t.push(pass("spk_a", "open the terminal", false)).is_empty()); // not yet stable
++        let out = t.push(pass("spk_b", "no wait", false));                     // b takes over → a flushes
++        assert_eq!(out.len(), 1);
++        assert_eq!(out[0].speaker, "spk_a");
++        assert_eq!(out[0].text, "open the terminal");
++        // b's turn is still open
++        let fin = t.flush().unwrap();
++        assert_eq!(fin.speaker, "spk_b");
++    }
++
++    #[test]
++    fn claim_renames_speaker_and_strips_prefix() {
++        let mut t = Transcriber::new(3);
++        let out = t.push(pass("spk_1", "kessler here open the report", true));
++        assert_eq!(out.len(), 1);
++        assert_eq!(out[0].name, "kessler");
++        assert_eq!(out[0].text, "open the report");
++        assert_eq!(out[0].speaker, "spk_1", "durable id is untouched; only the display name changes");
++    }
++
++    #[test]
++    fn claim_does_not_misfire_on_ordinary_speech() {
++        // "over here ..." starts with a stopword, "i'm going ..." isn't an anchored pattern
++        assert_eq!(parse_claim("over here is the file"), None);
++        assert_eq!(parse_claim("i'm going to parse the csv"), None);
++        assert_eq!(parse_claim("parse the csv per region"), None);
++    }
++
++    #[test]
++    fn short_or_empty_turns_are_dropped() {
++        let mut t = Transcriber::new(4);
++        assert!(t.push(pass("spk_a", "ok", true)).is_empty(), "too short");
++        // a pure introduction with no command (empty remainder after the claim) is dropped too
++        assert!(t.push(pass("spk_a", "my name is alice", true)).is_empty());
++    }
++
++    #[test]
++    fn fan_budget_caps_by_slots_and_speakers() {
++        assert_eq!(fan_budget(8, 3, 2).max_total_lanes, 6);  // 3×2 < 8
++        assert_eq!(fan_budget(4, 3, 2).max_total_lanes, 4);  // slots bind
++        assert_eq!(fan_budget(10, 1, 4).max_total_lanes, 4); // one speaker, capped per-speaker
++        assert_eq!(fan_budget(0, 5, 4).max_total_lanes, 0);  // no spare capacity → no fanout
++    }
++}
+diff --git a/crates/logscope-egui/src/voicefan.rs b/crates/logscope-egui/src/voicefan.rs
+new file mode 100644
+index 0000000..e77fefb
+--- /dev/null
++++ b/crates/logscope-egui/src/voicefan.rs
+@@ -0,0 +1,227 @@
++//! voicefan.rs — turn live multi-SPEAKER speech into large conversation-tree fanouts.
++//!
++//! Upstream (the voiceterm speaker stack + whisper — the IO seam) attributes each transcribed utterance
++//! to a speaker via voiceprint `identify`, producing an [`Utterance`] (`speaker` id, display `name`,
++//! `text`, timestamp). This module expands each utterance into investigation branches through the
++//! `speculate` ruleset (clarify / decompose / precheck / anticipate), tags every branch with its
++//! originating speaker so results land under that speaker's node, and bounds the whole thing with a
++//! [`FanBudget`] — interleaving branches round-robin across speakers so one talker can't hog the fanout
++//! (the same balanced-fan-in idea as voiceterm's `mic_scheduler`). Branches carry `dispatch::Task`s for
++//! the fleet to run; [`fold`] regroups the completed outputs into a per-speaker tree.
++//!
++//! Pure + unit-tested. The seams are upstream (whisper transcription + speaker attribution) and
++//! downstream (the fleet `Dispatcher` and inserting the folded nodes into the real conversation graph).
++#![allow(dead_code)]
++
++use crate::dispatch::Task;
++use crate::speculate::{investigation_lanes, Lane, LaneKind, SpecConfig};
++use std::collections::HashMap;
++
++pub type SpeakerId = String;
++
++/// A speaker-attributed transcript fragment — what whisper + the speaker stack emit per utterance.
++#[derive(Clone, Debug)]
++pub struct Utterance {
++    pub speaker: SpeakerId, // durable speaker id ("spk_…")
++    pub name: String,       // display name (mutable upstream)
++    pub text: String,       // the transcribed utterance
++    pub t_ms: u64,          // capture timestamp
++}
++
++/// Bounds the fanout so "large" stays affordable. `max_total_lanes` caps total branches across all
++/// speakers this round (size it from the fleet's spare capacity / `mic_scheduler` budget).
++#[derive(Clone, Debug)]
++pub struct FanBudget { pub max_total_lanes: usize }
++impl Default for FanBudget { fn default() -> Self { Self { max_total_lanes: 24 } } }
++
++/// One generated investigation branch, attributed to the speaker/utterance that seeded it.
++#[derive(Clone, Debug)]
++pub struct Branch { pub speaker: SpeakerId, pub utterance: usize, pub lane: Lane, pub task: Task }
++
++/// The planned fanout: branches across all speakers (task ids globally unique so one `Dispatcher` runs
++/// the whole batch).
++#[derive(Debug, Default)]
++pub struct Fanout { pub branches: Vec<Branch> }
++
++/// Expand a batch of speaker utterances into a large, fair, bounded fanout. Each utterance is turned into
++/// investigation lanes by `speculate`; branches are interleaved **round-robin across utterances** so the
++/// `max_total_lanes` cap is shared fairly rather than consumed by the first (chattiest) speaker.
++pub fn plan_fanout(utterances: &[Utterance], spec: &SpecConfig, budget: &FanBudget) -> Fanout {
++    let per: Vec<Vec<Lane>> = utterances.iter().map(|u| investigation_lanes(&u.text, spec)).collect();
++    let mut branches = Vec::new();
++    let mut next_id = 0u64;
++    let mut round = 0usize;
++    while branches.len() < budget.max_total_lanes {
++        let mut progressed = false;
++        for (i, lanes) in per.iter().enumerate() {
++            if branches.len() >= budget.max_total_lanes { break; }
++            if let Some(lane) = lanes.get(round) {
++                progressed = true;
++                let task = Task { id: next_id, payload: lane.prompt.clone() };
++                next_id += 1;
++                branches.push(Branch { speaker: utterances[i].speaker.clone(), utterance: i, lane: lane.clone(), task });
++            }
++        }
++        if !progressed { break; } // every utterance's lanes exhausted
++        round += 1;
++    }
++    Fanout { branches }
++}
++
++impl Fanout {
++    /// The dispatch tasks for the whole fanout (feed to a `Dispatcher`).
++    pub fn tasks(&self) -> Vec<Task> { self.branches.iter().map(|b| b.task.clone()).collect() }
++    pub fn len(&self) -> usize { self.branches.len() }
++    pub fn is_empty(&self) -> bool { self.branches.is_empty() }
++    /// Distinct speakers in first-seen order.
++    pub fn speakers(&self) -> Vec<SpeakerId> {
++        let mut seen = Vec::new();
++        for b in &self.branches { if !seen.contains(&b.speaker) { seen.push(b.speaker.clone()); } }
++        seen
++    }
++    /// How many branches each speaker got (id → count).
++    pub fn share(&self) -> HashMap<SpeakerId, usize> {
++        let mut m = HashMap::new();
++        for b in &self.branches { *m.entry(b.speaker.clone()).or_insert(0) += 1; }
++        m
++    }
++}
++
++/// A speaker's folded results: the (lane kind, output) leaves produced from their utterances.
++#[derive(Debug)]
++pub struct SpeakerNode { pub speaker: SpeakerId, pub leaves: Vec<(LaneKind, String)> }
++
++/// Regroup completed branch outputs (from the `Dispatcher`, keyed by task id) into a per-speaker tree,
++/// speakers in first-seen order. Branches with no result yet are skipped.
++pub fn fold(fanout: &Fanout, results: &HashMap<u64, String>) -> Vec<SpeakerNode> {
++    let mut order: Vec<SpeakerId> = Vec::new();
++    let mut map: HashMap<SpeakerId, Vec<(LaneKind, String)>> = HashMap::new();
++    for b in &fanout.branches {
++        if let Some(out) = results.get(&b.task.id) {
++            if !map.contains_key(&b.speaker) { order.push(b.speaker.clone()); }
++            map.entry(b.speaker.clone()).or_default().push((b.lane.kind, out.clone()));
++        }
++    }
++    order.into_iter().map(|s| SpeakerNode { leaves: map.remove(&s).unwrap_or_default(), speaker: s }).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn u(spk: &str, text: &str) -> Utterance {
++        Utterance { speaker: spk.into(), name: spk.into(), text: text.into(), t_ms: 0 }
++    }
++    fn spec() -> SpecConfig {
++        SpecConfig { aggressive: true, max_lanes: 4, min_context_chars: 8, kinds: LaneKind::all() }
++    }
++
++    #[test]
++    fn fans_each_speaker_out_and_tags_branches() {
++        let utts = vec![
++            u("spk_a", "parse a large csv and compute stats per region"),
++            u("spk_b", "then plot the regional totals as a bar chart"),
++        ];
++        let fan = plan_fanout(&utts, &spec(), &FanBudget { max_total_lanes: 24 });
++        assert_eq!(fan.len(), 8, "2 speakers × 4 lanes each");
++        assert_eq!(fan.speakers(), vec!["spk_a".to_string(), "spk_b".to_string()]);
++        // task ids are globally unique 0..n
++        let ids: Vec<u64> = fan.tasks().iter().map(|t| t.id).collect();
++        assert_eq!(ids, (0..8).collect::<Vec<_>>());
++        // every branch is attributed and its payload is the lane prompt
++        assert!(fan.branches.iter().all(|b| (b.speaker == "spk_a" || b.speaker == "spk_b") && b.task.payload == b.lane.prompt));
++    }
++
++    #[test]
++    fn budget_caps_and_shares_fairly_round_robin() {
++        let utts = vec![
++            u("spk_a", "parse a large csv and compute stats per region"),
++            u("spk_b", "then plot the regional totals as a bar chart"),
++        ];
++        let fan = plan_fanout(&utts, &spec(), &FanBudget { max_total_lanes: 5 });
++        assert_eq!(fan.len(), 5, "capped at the budget");
++        let share = fan.share();
++        // round-robin: a,b,a,b,a → 3 to the first speaker, 2 to the second (fair, not 5/0)
++        assert_eq!(share["spk_a"], 3);
++        assert_eq!(share["spk_b"], 2);
++    }
++
++    #[test]
++    fn nothing_to_fan_when_not_aggressive_or_thin() {
++        let utts = vec![u("spk_a", "hello there everyone")];
++        let off = SpecConfig { aggressive: false, ..spec() };
++        assert!(plan_fanout(&utts, &off, &FanBudget::default()).is_empty());
++        let thin = vec![u("spk_a", "hi")];
++        assert!(plan_fanout(&thin, &spec(), &FanBudget::default()).is_empty());
++    }
++
++    #[test]
++    fn fold_groups_outputs_into_per_speaker_tree() {
++        let utts = vec![
++            u("spk_a", "parse a large csv and compute stats per region"),
++            u("spk_b", "then plot the regional totals as a bar chart"),
++        ];
++        let fan = plan_fanout(&utts, &spec(), &FanBudget { max_total_lanes: 4 }); // a,b,a,b
++        // mock the fleet returning an output for every task
++        let results: HashMap<u64, String> = fan.tasks().iter().map(|t| (t.id, format!("lead#{}", t.id))).collect();
++        let tree = fold(&fan, &results);
++        assert_eq!(tree.len(), 2, "one node per speaker");
++        assert_eq!(tree[0].speaker, "spk_a");
++        assert_eq!(tree[0].leaves.len(), 2, "spk_a got 2 of the 4 branches");
++        assert_eq!(tree[1].leaves.len(), 2);
++        // first lane kind for each speaker is Clarify (speculate's first kind)
++        assert_eq!(tree[0].leaves[0].0, LaneKind::Clarify);
++    }
++
++    // ── end-to-end: speech batch → fanout → fleet (loopback) → fold into the tree ──
++    use crate::dispatch::{Dispatcher, Executor, Worker};
++    use crate::enlist::{Msg, PeerId, Transport};
++    use std::cell::RefCell;
++    use std::rc::Rc;
++
++    struct Bus { inbox: HashMap<PeerId, Vec<(PeerId, Msg)>>, peers: Vec<PeerId> }
++    struct Loop { me: PeerId, bus: Rc<RefCell<Bus>> }
++    impl Transport for Loop {
++        fn broadcast(&mut self, m: &Msg) {
++            let peers = self.bus.borrow().peers.clone();
++            let mut b = self.bus.borrow_mut();
++            for p in peers { if p != self.me { b.inbox.entry(p).or_default().push((self.me.clone(), m.clone())); } }
++        }
++        fn send(&mut self, to: &PeerId, m: &Msg) { self.bus.borrow_mut().inbox.entry(to.clone()).or_default().push((self.me.clone(), m.clone())); }
++        fn recv(&mut self) -> Vec<(PeerId, Msg)> { self.bus.borrow_mut().inbox.get_mut(&self.me).map(std::mem::take).unwrap_or_default() }
++    }
++    struct Echo; // a stand-in "small model" that answers each lane
++    impl Executor for Echo {
++        fn run(&mut self, task: u64, _payload: &str) -> Result<String, String> { Ok(format!("lead#{task}")) }
++    }
++
++    #[test]
++    fn end_to_end_speech_to_fanout_to_tree() {
++        let utts = vec![
++            u("spk_a", "parse a large csv and compute stats per region"),
++            u("spk_b", "then plot the regional totals as a bar chart"),
++        ];
++        let fan = plan_fanout(&utts, &spec(), &FanBudget { max_total_lanes: 24 }); // 8 branches
++        // run all branch tasks across two cheap-model members over the loopback bus
++        let cid = "c:1".to_string();
++        let mids = ["m0:1", "m1:1"];
++        let bus = Rc::new(RefCell::new(Bus { inbox: HashMap::new(),
++            peers: std::iter::once(cid.clone()).chain(mids.iter().map(|s| s.to_string())).collect() }));
++        let mut ct = Loop { me: cid.clone(), bus: bus.clone() };
++        let members: Vec<(PeerId, u32)> = mids.iter().map(|m| (m.to_string(), 4)).collect();
++        let mut disp = Dispatcher::new(&cid, &members, fan.tasks(), 1);
++        let mut workers: Vec<(Worker, Loop, Echo)> = mids.iter()
++            .map(|id| (Worker::new(id), Loop { me: id.to_string(), bus: bus.clone() }, Echo)).collect();
++        disp.dispatch(&mut ct);
++        for _ in 0..20 {
++            for (w, wt, ex) in workers.iter_mut() { w.work(wt, ex); }
++            disp.pump(&mut ct);
++            disp.dispatch(&mut ct);
++            if disp.is_complete() { break; }
++        }
++        assert!(disp.is_complete());
++        let tree = fold(&fan, disp.results());
++        assert_eq!(tree.len(), 2);
++        assert_eq!(tree[0].leaves.len() + tree[1].leaves.len(), 8, "every branch folded back under a speaker");
++    }
++}

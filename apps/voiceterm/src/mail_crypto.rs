@@ -409,17 +409,26 @@ mod real {
         }
     }
 
-    /// Proton's SRP. Implemented against `proton-srp` semantics: verify the
-    /// modulus signature, derive the SRP key with SHA-512, and produce the
-    /// client proof. TODO: pin Proton's modulus-verification key.
+    /// Proton's SRP. The surrounding auth flow in mail_proton.rs is fully
+    /// driven by this trait; this is the single Proton-specific integration
+    /// point left.
+    ///
+    /// v0.1.903: the intended implementation is the `proton-srp` crate
+    /// (ProtonMail's own pure-Rust SRP — the "safe path" named in
+    /// docs/design/email.md), NOT a hand-rolled port. It is not wired here
+    /// because `proton-srp` 0.8.x requires Rust edition 2024 (MSRV ~1.85)
+    /// while this project is on edition 2021; pulling it in needs a
+    /// toolchain bump first. See TODO_mail_srp_login.md for the full plan
+    /// and the exact wiring (behind a `mail-proton-srp` feature) so this
+    /// can drop in without a blind hand-port. Until then, return an error
+    /// that names the real blocker.
     pub struct ProtonSrp;
     impl Srp for ProtonSrp {
         fn compute(&self, _password: &[u8], _info: &SrpInfo) -> Result<SrpProofs> {
-            // Wire to proton-srp::SRPAuth here. Left as the single
-            // Proton-specific integration point; the surrounding auth
-            // flow in mail_proton.rs is fully driven by this trait.
             Err(MailError::Other(
-                "ProtonSrp: wire proton-srp crate here".into(),
+                "Proton SRP login isn't wired in this build yet (needs the \
+                 proton-srp crate + a toolchain bump — see TODO_mail_srp_login.md)"
+                    .into(),
             ))
         }
         fn verify_server(&self, proofs: &SrpProofs, server_proof_b64: &str) -> Result<()> {

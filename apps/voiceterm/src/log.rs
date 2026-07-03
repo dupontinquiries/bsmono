@@ -92,7 +92,9 @@ fn logs_dir() -> PathBuf {
 /// Seconds since the Unix epoch — a dependency-free timestamp for
 /// log lines. (We avoid pulling chrono into the hot path; a unix
 /// seconds prefix is enough to correlate across category files.)
-fn epoch_secs() -> u64 { core_kit::time::now_secs() }
+fn epoch_secs() -> u64 {
+    crate::util::epoch_secs()
+}
 
 /// Core entry point used by the `clog!` macro. ALWAYS echoes to
 /// stderr with the `[category]` prefix (matching the existing

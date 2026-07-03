@@ -157,8 +157,8 @@ fn visit(dir: &Path, depth: usize, out: &mut Vec<ChatDump>) {
 }
 
 fn now_secs() -> u64 {
-        core_kit::time::now_secs()
-    }
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("writing.tmp");

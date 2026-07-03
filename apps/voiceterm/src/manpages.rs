@@ -1396,6 +1396,22 @@ fn inline_to_richtext(s: &str, out: &mut String) {
             }
             // Unclosed backtick: emit literal.
         }
+        // Math passthrough (v0.1.891): `$…$` inline and `$$…$$` display math
+        // rendered as a distinguishable monospace span — a cheap pre-render
+        // until real typesetting (KaTeX) lands, so the user can at least SEE
+        // that something is math. The `$` delimiters are kept INSIDE the span
+        // so math reads as math rather than as inline code. Strict delimiter
+        // rules (see detect_math) avoid mangling currency like "$5 to $10".
+        if b == b'$' {
+            if let Some((span, after)) = detect_math(s, bytes, i) {
+                out.push_str("<span style=\"font-family:monospace\">");
+                push_plain_into_richtext(span, out); // span includes the $…$
+                out.push_str("</span>");
+                i = after;
+                continue;
+            }
+            // Not a math span (e.g. currency) — fall through to literal.
+        }
         // v0.1.402: strikethrough `~~text~~` (GFM). Mirrors
         // the bold detector — `~` delimiter, count=2. Qt's
         // RichText renders `<s>` as struck-through text.
@@ -1535,6 +1551,60 @@ fn inline_to_richtext(s: &str, out: &mut String) {
     }
 }
 
+/// Detect a math span starting at `bytes[i] == b'$'`. Returns the span text
+/// INCLUDING the `$`/`$$` delimiters (so it renders as visibly-math mono) plus
+/// the index just past the closing delimiter. Display math `$$…$$` is matched
+/// first (the doubled delimiter is unambiguous, never currency). Inline `$…$`
+/// uses strict open/close rules so currency ("$5 to $10", "save $3") isn't
+/// treated as math:
+///   - the opening `$` must be followed by a non-space, non-digit char
+///     (rejects "$ x$" and the "$5" currency lead-in),
+///   - the closing `$` must be preceded by a non-space char and not be
+///     followed by a digit (rejects the "$10" half of "$5 to $10"),
+///   - the span may not cross a newline.
+/// Slices land on the ASCII `$` positions, so multibyte content is safe.
+fn detect_math<'a>(s: &'a str, bytes: &[u8], i: usize) -> Option<(&'a str, usize)> {
+    // Display math: $$ … $$ (matched first; unambiguous).
+    if bytes.get(i + 1) == Some(&b'$') {
+        let content_start = i + 2;
+        let mut j = content_start;
+        while j + 1 < bytes.len() {
+            if bytes[j] == b'$' && bytes[j + 1] == b'$' {
+                if j > content_start {
+                    return Some((&s[i..j + 2], j + 2));
+                }
+                return None; // empty $$$$
+            }
+            if bytes[j] == b'\n' {
+                return None;
+            }
+            j += 1;
+        }
+        return None;
+    }
+    // Inline math: $ … $ (strict, currency-safe).
+    let open_next = *bytes.get(i + 1)?;
+    if open_next == b' ' || open_next == b'\t' || open_next.is_ascii_digit() {
+        return None;
+    }
+    let mut j = i + 1;
+    while j < bytes.len() {
+        match bytes[j] {
+            b'\n' => return None, // single-line only
+            b'$' => {
+                let prev = bytes[j - 1];
+                let next_is_digit = bytes.get(j + 1).map_or(false, |c| c.is_ascii_digit());
+                if prev != b' ' && prev != b'\t' && !next_is_digit {
+                    return Some((&s[i..j + 1], j + 1));
+                }
+                return None; // a `$` that fails the close rules → not math
+            }
+            _ => j += 1,
+        }
+    }
+    None
+}
+
 /// v0.1.215: push a plain-text string into a rich-text buffer with
 /// proper HTML escaping (so `<`, `>`, `&`, `"` don't break the
 /// resulting markup).
@@ -1633,6 +1703,17 @@ fn strip_inline_markup(s: &str) -> String {
             if end < bytes.len() {
                 out.push_str(&s[start..end]);
                 i = end + 1;
+                continue;
+            }
+        }
+        // Math passthrough (v0.1.891): strip the `$`/`$$` delimiters and keep
+        // the inner expression as plain text for read-aloud / titles ("$x^2$"
+        // → "x^2"). NOT recursed — math content (e.g. `a_b`) must not be
+        // re-parsed as markdown emphasis.
+        if b == b'$' {
+            if let Some((span, after)) = detect_math(s, bytes, i) {
+                out.push_str(span.trim_matches('$'));
+                i = after;
                 continue;
             }
         }
@@ -2203,6 +2284,20 @@ fn render_inline(s: &str, out: &mut String) {
                 escape_html_into(&s[i + 1..end], out);
                 out.push_str("</code>");
                 i = end + 1;
+                continue;
+            }
+        }
+
+        // Math passthrough (v0.1.891): mirror the QML richtext path so HTML
+        // output (tests + export) shows math as distinguishable mono too.
+        // `$…$` / `$$…$$` → <code> with the delimiters kept; same currency-safe
+        // rules (detect_math).
+        if b == b'$' {
+            if let Some((span, after)) = detect_math(s, bytes, i) {
+                out.push_str("<code>");
+                escape_html_into(span, out);
+                out.push_str("</code>");
+                i = after;
                 continue;
             }
         }
@@ -2889,6 +2984,81 @@ mod tests {
         // Nested markup inside strikethrough should resolve.
         assert!(out.contains("<s>"), "got: {}", out);
         assert!(out.contains("<b>and bold</b>"), "got: {}", out);
+    }
+
+    // v0.1.891: math passthrough — `$…$` / `$$…$$` → mono span (delimiters kept).
+    #[test]
+    fn inline_math_renders_as_mono_with_delimiters() {
+        let mut out = String::new();
+        inline_to_richtext("the area $\\pi r^2$ here", &mut out);
+        assert!(out.contains("<span style=\"font-family:monospace\">"), "got: {}", out);
+        // delimiters kept inside the span so it reads as math, not code
+        assert!(out.contains("$\\pi r^2$"), "math should keep its $…$: {}", out);
+    }
+
+    #[test]
+    fn display_math_renders_as_mono() {
+        let mut out = String::new();
+        inline_to_richtext("see $$E = mc^2$$ above", &mut out);
+        assert!(out.contains("<span style=\"font-family:monospace\">"), "got: {}", out);
+        assert!(out.contains("$$E = mc^2$$"), "got: {}", out);
+    }
+
+    #[test]
+    fn currency_is_not_treated_as_math() {
+        // The whole point of the strict delimiter rules: prices must survive.
+        for s in ["I paid $5 for it", "$5 to $10 range", "save $3 today",
+                  "from $1,000 to $2,000"] {
+            let mut out = String::new();
+            inline_to_richtext(s, &mut out);
+            assert!(!out.contains("font-family:monospace"),
+                "currency wrongly matched as math in {s:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn math_then_prose_and_two_spans() {
+        let mut out = String::new();
+        inline_to_richtext("$a$ and $b$ done", &mut out);
+        // two separate math spans
+        assert_eq!(out.matches("font-family:monospace").count(), 2, "got: {}", out);
+        assert!(out.contains("$a$") && out.contains("$b$"), "got: {}", out);
+    }
+
+    #[test]
+    fn math_edge_cases_dont_panic() {
+        // unclosed, empty, space-led, and multibyte content must be safe
+        for s in ["unclosed $x + 1", "empty $$$$ here", "$ x$ (space-led)",
+                  "café $µ_0$ value", "$a$5 (digit after close)"] {
+            let mut out = String::new();
+            inline_to_richtext(s, &mut out); // must not panic
+            let _ = out;
+        }
+        // the genuinely-valid multibyte one DOES render
+        let mut out = String::new();
+        inline_to_richtext("café $µ_0$ value", &mut out);
+        assert!(out.contains("$µ_0$"), "multibyte math should render: {}", out);
+    }
+
+    #[test]
+    fn render_inline_math_uses_code() {
+        // HTML path: math → <code> with delimiters kept; currency untouched.
+        let mut out = String::new();
+        render_inline("area $\\pi r^2$ here", &mut out);
+        assert!(out.contains("<code>$\\pi r^2$</code>"), "got: {}", out);
+        let mut out2 = String::new();
+        render_inline("I paid $5 and $10", &mut out2);
+        assert!(!out2.contains("<code>"), "currency must not be <code>: {}", out2);
+    }
+
+    #[test]
+    fn strip_inline_markup_drops_math_delimiters() {
+        // read-aloud/titles: keep the expression, drop the $; don't re-parse
+        // math content as markdown (a_b stays a_b, not <i>).
+        assert_eq!(strip_inline_markup("the $x^2$ term"), "the x^2 term");
+        assert_eq!(strip_inline_markup("display $$a_b$$ here"), "display a_b here");
+        // currency survives intact
+        assert_eq!(strip_inline_markup("paid $5 and $10"), "paid $5 and $10");
     }
 
     #[test]

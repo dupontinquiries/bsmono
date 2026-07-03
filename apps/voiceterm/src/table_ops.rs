@@ -694,6 +694,37 @@ Alice | 30 | 60000
     }
 
     #[test]
+    fn parse_single_column_table() {
+        // v0.1.882: a one-column table (a hypothesized failure mode in the
+        // "local tables not rendered" report). Must parse, 1 col, 2 rows.
+        let md = "| Item |\n|------|\n| apple |\n| pear |\n";
+        let t = parse_markdown_table(md).expect("single-column table should parse");
+        assert_eq!(t.n_cols(), 1);
+        assert_eq!(t.headers, vec!["Item"]);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[1], vec!["pear".to_string()]);
+    }
+
+    #[test]
+    fn parse_escaped_pipe_in_cell() {
+        // GFM: `\|` is a literal pipe inside a cell, not a column delimiter.
+        let md = "| expr | meaning |\n|---|---|\n| a \\| b | a or b |\n";
+        let t = parse_markdown_table(md).expect("escaped-pipe table should parse");
+        assert_eq!(t.n_cols(), 2, "escaped pipe must not split into a 3rd column");
+        assert_eq!(t.rows[0][0], "a | b", "the \\| un-escapes to a literal pipe");
+        assert_eq!(t.rows[0][1], "a or b");
+    }
+
+    #[test]
+    fn parse_inline_markup_cells_kept_verbatim_at_parse() {
+        // The parser preserves cell text verbatim (incl. *, `, [](); the
+        // inline_to_richtext pass at render time turns it into rich text).
+        let md = "| col |\n|---|\n| *bold* `code` [x](http://e.com) |\n";
+        let t = parse_markdown_table(md).expect("inline-markup cell should parse");
+        assert_eq!(t.rows[0][0], "*bold* `code` [x](http://e.com)");
+    }
+
+    #[test]
     fn show_keeps_only_listed_columns() {
         let t = fixture();
         let view = TableView { base: t, ops: vec![TableOp::Show(vec![0, 2])] };

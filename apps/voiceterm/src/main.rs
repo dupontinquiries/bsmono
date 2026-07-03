@@ -86,6 +86,7 @@ mod completion;
 mod completion_parse;
 mod path_fuzzy;
 mod sysmon;
+mod mem_footprint; // v0.1.896: process memory-footprint logging (WEB2QML_MEMLOG)
 mod search_suggest;
 // v0.1.601: pure resolver for referencing UI elements by position/
 // color/shape ("the red button on the right"). First consumer is a
@@ -174,6 +175,9 @@ mod zellij_voice;
 // v0.1.703: tmux + ssh voice control (siblings of zellij_voice). Pure + tested.
 mod tmux_voice;
 mod ssh_voice;
+// gitmind (`gin`) CLI voice control — checkpoint workflow by voice. Pure +
+// tested (gitmind_voice.rs); active when the cwd is a gitmind repo.
+mod gitmind_voice;
 // v0.1.704: word error rate scorer for the recorded-voice corpus harness.
 mod wer;
 // v0.1.708: repair Latin-1↔UTF-8 double-encoding in captured corpus text.
@@ -1051,6 +1055,14 @@ struct Backend {
     /// write time), so this can list/manage account files. Login/read need the
     /// SRP/PGP seams (report CryptoUnavailable until wired).
     mail_hub: Option<crate::mail::MailHub>,
+    /// v0.1.901: which saved account the mail panes (settings/compose/future
+    /// inbox) treat as "current" when more than one is on disk. Plain string
+    /// (an `AccountId`'s `.as_str()`), empty when unset. Persisted only for
+    /// the session — the accounts settings pane always shows *some* row as
+    /// active (the first account by default) so "multi-account" UI has a
+    /// concrete selection to point at even before per-account inbox
+    /// rendering lands (that still needs the SRP seam).
+    mail_active_account: String,
     term_ws: crate::terminal_workspace::TermWorkspace,
     layout_cache: LayoutCache,
     archive: Archive,
@@ -2107,6 +2119,12 @@ struct Backend {
     tmux_active: qt_method!(fn(&self) -> bool),
     tmux_translate: qt_method!(fn(&self, phrase: QString) -> QString),
     tmux_commands: qt_method!(fn(&self) -> QString),
+    /// gitmind (`gin`) CLI voice control — siblings of the tmux methods.
+    /// active = cwd is inside a gitmind repo; translate = phrase->`gin ...`
+    /// ("cmd\tconfirm\tquery"); commands = the help-overlay vocabulary.
+    gitmind_active: qt_method!(fn(&self) -> bool),
+    gitmind_translate: qt_method!(fn(&self, phrase: QString) -> QString),
+    gitmind_commands: qt_method!(fn(&self) -> QString),
     /// v0.1.703 (#3 ssh): parse a connect phrase, resolve the alias against
     /// ~/.ssh/config, return the ssh command line | "".
     ssh_connect: qt_method!(fn(&self, phrase: QString) -> QString),
@@ -2434,7 +2452,8 @@ struct Backend {
     pane_voice_dispatch_from: qt_method!(fn(&mut self, mic_source: QString, text: QString) -> QString),
     mail_open_login: qt_method!(fn(&mut self) -> QString),
     mail_login: qt_method!(fn(&mut self, user: QString, pass: QString, totp: QString, mbox: QString) -> QString),
-    mail_remove_account: qt_method!(fn(&mut self, id: QString)),
+    mail_remove_account: qt_method!(fn(&mut self, id: QString) -> QString),
+    mail_set_active_account: qt_method!(fn(&mut self, id: QString) -> QString),
     mail_register_email: qt_method!(fn(&mut self, phrase: QString) -> QString),
     mail_open_settings: qt_method!(fn(&mut self) -> QString),
     // v0.1.878: local draft + compose wiring. Drafts are crypto-free
@@ -2445,6 +2464,16 @@ struct Backend {
     mail_save_draft: qt_method!(fn(&mut self, to: QString, subject: QString, body: QString) -> QString),
     mail_send: qt_method!(fn(&mut self, to: QString, subject: QString, body: QString) -> QString),
     mail_send_draft: qt_method!(fn(&mut self, id: QString) -> QString),
+    // v0.1.881: peer messaging (device-as-provider) — identity, keyring
+    // contacts, and the peers pane. Contact management is crypto-free;
+    // the address needs the mail-crypto feature to mint an identity.
+    mail_open_peers: qt_method!(fn(&mut self) -> QString),
+    peer_my_address: qt_method!(fn(&mut self) -> QString),
+    peer_add_contact: qt_method!(fn(&mut self, handle: QString, pubkey_b64: QString) -> QString),
+    peer_list_contacts: qt_method!(fn(&self) -> QString),
+    peer_remove_contact: qt_method!(fn(&mut self, handle: QString) -> QString),
+    peer_seal_to: qt_method!(fn(&mut self, handle: QString, subject: QString, body: QString) -> QString),
+    peer_open_envelope: qt_method!(fn(&mut self, wire: QString) -> QString),
     pane_voice_dispatch: qt_method!(fn(&mut self, text: QString) -> QString),
     /// v0.1.686: save the editor buffer back to the note file. Returns true
     /// on success. The editor's "done" calls this so edits persist (they were
@@ -2726,6 +2755,8 @@ struct Backend {
     /// backlinks are the "web" — "what else points here?" — the
     /// navigation the user's [[wikilink]] notes depend on.
     manpage_backlinks: qt_method!(fn(&self, name: QString) -> QString),
+    manpage_graph_walkthrough: qt_method!(fn(&self) -> QString),
+    niftyplot_walkthrough: qt_method!(fn(&self, source: QString) -> QString),
     /// v0.1.486: the active voice-grammar label for the current
     /// context ("editor:helix" / "repl:gdb" / "shell" / "web"). For
     /// (a) a small live UI affordance showing which grammar is live,
@@ -2891,6 +2922,7 @@ struct Backend {
     /// = no matches. The caller uses abs_line to scroll to the
     /// match and col_start/col_end to highlight.
     term_search_scrollback: qt_method!(fn(&self, query: QString, case_sensitive: bool) -> QString),
+    mem_footprint_log: qt_method!(fn(&self) -> QString),
     /// v0.1.361: filesystem find mode. Kicks off an async
     /// ripgrep (or `grep -rIn` fallback) over the terminal's
     /// current working directory. Returns true if the search
@@ -2972,6 +3004,7 @@ struct Backend {
     render_pane_qml: qt_method!(fn(&mut self, url: QString) -> QString),
     /// v0.1.798: close a pane by id (for web panes, which aren't focusable).
     close_pane_id: qt_method!(fn(&mut self, id: f64) -> QString),
+    close_web_or_focused_pane: qt_method!(fn(&mut self) -> QString),
     /// True if the foreground program has enabled mouse reporting
     /// (modes 1000/1002/1003). When true, QML should send wheel
     /// events as mouse reports via term_send_wheel_report instead
@@ -3437,6 +3470,7 @@ impl Default for Backend {
             voice_routing: Default::default(),
             mic_bindings: Default::default(),
             mail_hub: None,
+            mail_active_account: String::new(),
             term_ws: crate::terminal_workspace::TermWorkspace::new(),
             layout_cache: LayoutCache::new(128),
             archive: Archive::new(),
@@ -3709,6 +3743,9 @@ impl Default for Backend {
             tmux_active: Default::default(),
             tmux_translate: Default::default(),
             tmux_commands: Default::default(),
+            gitmind_active: Default::default(),
+            gitmind_translate: Default::default(),
+            gitmind_commands: Default::default(),
             ssh_connect: Default::default(),
             run_capture: Default::default(),
             wer_score: Default::default(),
@@ -3794,6 +3831,7 @@ impl Default for Backend {
             mail_open_login: Default::default(),
             mail_login: Default::default(),
             mail_remove_account: Default::default(),
+            mail_set_active_account: Default::default(),
             mail_register_email: Default::default(),
             mail_open_settings: Default::default(),
             mail_open_compose: Default::default(),
@@ -3802,6 +3840,13 @@ impl Default for Backend {
             mail_save_draft: Default::default(),
             mail_send: Default::default(),
             mail_send_draft: Default::default(),
+            mail_open_peers: Default::default(),
+            peer_my_address: Default::default(),
+            peer_add_contact: Default::default(),
+            peer_list_contacts: Default::default(),
+            peer_remove_contact: Default::default(),
+            peer_seal_to: Default::default(),
+            peer_open_envelope: Default::default(),
             voice_target_pane_id: Default::default(),
             voice_broadcast_toggle: Default::default(),
             voice_broadcast_clear: Default::default(),
@@ -3868,6 +3913,8 @@ impl Default for Backend {
             repl_voice_active: Default::default(),
             voice_commands_available: Default::default(),
             manpage_backlinks: Default::default(),
+            manpage_graph_walkthrough: Default::default(),
+            niftyplot_walkthrough: Default::default(),
             current_grammar_label: Default::default(),
             voice_wake_word_pitch: Default::default(),
             voice_wake_bursts: Default::default(),
@@ -3910,6 +3957,7 @@ impl Default for Backend {
             summarize_focused_build: Default::default(),
             term_lines_emitted: Default::default(),
             term_search_scrollback: Default::default(),
+            mem_footprint_log: Default::default(),
             fs_find_start: Default::default(),
             fs_find_poll: Default::default(),
             fs_find_is_running: Default::default(),
@@ -3933,6 +3981,7 @@ impl Default for Backend {
             pane_fetch_poll: Default::default(),
             render_pane_qml: Default::default(),
             close_pane_id: Default::default(),
+            close_web_or_focused_pane: Default::default(),
             term_mouse_reporting: Default::default(),
             term_send_wheel_report: Default::default(),
             term_send_tap_report: Default::default(),
@@ -4558,7 +4607,34 @@ impl Backend {
                 .as_ref()
                 .and_then(|h| h.accounts().ok())
                 .unwrap_or_default();
-            return Some(crate::mail_login::accounts_settings_qml(&ps, &accounts));
+            // v0.1.901: mail_open_settings (&mut self) defaults
+            // mail_active_account to the first known account before opening
+            // this route; direct (address-bar) access with no prior open
+            // may still show no row marked active, which is fine — the
+            // "Use this account" button on any row fixes that immediately.
+            let active = self.mail_active_account.clone();
+            return Some(crate::mail_login::accounts_settings_qml(&ps, &accounts, &active));
+        }
+        // v0.1.881: peers pane — device address + contact keyring.
+        // Crypto-free except minting the identity (load_or_create returns
+        // Unavailable without the mail-crypto feature → address shows the
+        // "no identity" notice). Contact add/remove always work.
+        if url == "web2qml://mail/peers" {
+            let ps = crate::mail_panes::PaneStyle::from_render_style(&sty);
+            let my_addr = crate::peer_mail::Identity::load_or_create()
+                .ok()
+                .map(|id| id.public.to_b64());
+            let kr = crate::peer_mail::Keyring::load();
+            let contacts: Vec<(String, String)> = kr
+                .contacts
+                .iter()
+                .map(|c| (c.handle.clone(), c.key.to_b64()))
+                .collect();
+            return Some(crate::mail_panes::peers_pane_qml(
+                &ps,
+                my_addr.as_deref(),
+                &contacts,
+            ));
         }
         // v0.1.878: local drafts list. Crypto-free — reads the on-disk
         // draft store, newest-first. Edit/Send buttons call mail_open_draft
@@ -6621,38 +6697,109 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
     }
 
     /// v0.1.866: attempt a ProtonMail login. Returns a `status\tdetail` wire:
-    /// `ok\t<bridge_password>`, `totp` (2FA needed), or `err\t<message>`. Until the
-    /// SRP seam is wired this reports `err\tcrypto unavailable…`, so the form's
-    /// submit button is functional (and honest) rather than a dead/throwing call.
-    /// `totp` is captured for the 2FA second step (complete_login_totp), unused
-    /// until SRP lands.
+    /// `ok\t<bridge_password>`, `totp` (2FA needed), or `err\t<message>`.
+    ///
+    /// v0.1.903: pre-flight the two "sign-in can't work yet" conditions with
+    /// ACTIONABLE messages instead of letting the user hit a raw
+    /// `CryptoUnavailable` / "wire proton-srp here" error that reads as a
+    /// dead form. There are two distinct blockers (see
+    /// TODO_mail_srp_login.md), and the message now says which one the user
+    /// is hitting:
+    ///   1. build compiled without `mail-crypto` → SRP/PGP/sealing are inert
+    ///      stubs. Detected via `hub.crypto_available()`.
+    ///   2. built WITH `mail-crypto` but the Proton-specific SRP computation
+    ///      isn't wired (the `proton-srp` crate needs a newer toolchain than
+    ///      this project's edition-2021 floor — see the TODO). The login call
+    ///      still runs and surfaces the `ProtonSrp` error, now reworded.
+    /// `totp` is captured for the 2FA second step (complete_login_totp).
     fn mail_login(&mut self, user: QString, pass: QString, totp: QString, mbox: QString) -> QString {
         let _totp = totp.to_string();
         let user = user.to_string();
         let pass = pass.to_string();
         let mbox = mbox.to_string();
+        if user.trim().is_empty() || pass.is_empty() {
+            return QString::from("err\tEnter both your Proton address and password.");
+        }
         let mbox_opt = if mbox.trim().is_empty() { None } else { Some(mbox.as_str()) };
         let hub = match self.mail_hub_get() {
             Some(h) => h,
             None => return QString::from("err\tmail store unavailable"),
         };
+        // Blocker 1: no crypto compiled in at all.
+        if !hub.crypto_available() {
+            crate::clog!(
+                "mail",
+                "login blocked: built without mail-crypto feature (user={:?})",
+                user
+            );
+            return QString::from(
+                "err\tThis build can't sign in to Proton yet — it was compiled \
+                 without the mail-crypto feature, so the login crypto is inert. \
+                 Peer-to-peer messaging still works. See TODO_mail_srp_login.md.",
+            );
+        }
         match hub.login(&user, &pass, mbox_opt) {
             Ok(crate::mail::LoginOutcome::Complete(creds)) => {
+                crate::clog!("mail", "login ok (user={:?})", user);
                 QString::from(format!("ok\t{}", creds.bridge_password).as_str())
             }
             Ok(crate::mail::LoginOutcome::NeedsTotp(_)) => QString::from("totp"),
-            Err(e) => QString::from(format!("err\t{}", e).as_str()),
+            Err(e) => {
+                crate::clog!("mail", "login failed (user={:?}): {}", user, e);
+                QString::from(format!("err\t{}", e).as_str())
+            }
         }
     }
 
     /// v0.1.866: remove a saved account by id (the settings "Remove" button).
-    fn mail_remove_account(&mut self, id: QString) {
+    /// v0.1.901: now returns a `status\tdetail` wire (was `()`) so the
+    /// settings pane can show immediate feedback instead of the user having
+    /// to wait for the ~1.5s periodic pane refresh (or wonder, on failure,
+    /// why the row never went away). Also clears `mail_active_account` when
+    /// the removed account was the active one, and re-points it at whatever
+    /// account is now first, if any.
+    fn mail_remove_account(&mut self, id: QString) -> QString {
         let id = id.to_string();
-        if let Some(hub) = self.mail_hub_get() {
-            if let Err(e) = hub.remove_account(&crate::mail_account::AccountId::new(id.clone())) {
+        let hub = match self.mail_hub_get() {
+            Some(h) => h,
+            None => return QString::from("err\tmail store unavailable"),
+        };
+        match hub.remove_account(&crate::mail_account::AccountId::new(id.clone())) {
+            Ok(()) => {
+                crate::clog!("mail", "remove_account {:?} ok", id);
+                if self.mail_active_account == id {
+                    self.mail_active_account = self
+                        .mail_hub
+                        .as_ref()
+                        .and_then(|h| h.account_ids().ok())
+                        .and_then(|ids| ids.first().map(|a| a.as_str().to_string()))
+                        .unwrap_or_default();
+                }
+                QString::from("ok\tAccount removed")
+            }
+            Err(e) => {
                 crate::clog!("mail", "remove_account {:?} failed: {}", id, e);
+                QString::from(format!("err\tCouldn't remove account: {}", e).as_str())
             }
         }
+    }
+
+    /// v0.1.901: make `id` the "active" account for the mail panes (the
+    /// settings pane's "Use this account" button). Validates the id exists
+    /// before switching, so a stale/mistyped id can't silently blank the
+    /// selection. Returns a `status\tdetail` wire.
+    fn mail_set_active_account(&mut self, id: QString) -> QString {
+        let id = id.to_string();
+        let known = self
+            .mail_hub_get()
+            .and_then(|h| h.account_ids().ok())
+            .map(|ids| ids.iter().any(|a| a.as_str() == id))
+            .unwrap_or(false);
+        if !known {
+            return QString::from("err\tUnknown account");
+        }
+        self.mail_active_account = id;
+        QString::from("ok\tActive account switched")
     }
 
     /// v0.1.866: spoken/typed "add my email" / "register email" command. Returns a
@@ -6688,8 +6835,16 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
 
     /// v0.1.867: open the mail accounts settings pane (list + add/remove). Primes
     /// the hub first so the settings route can enumerate saved accounts.
+    /// v0.1.901: also defaults `mail_active_account` to the first known
+    /// account if nothing is selected yet (or the prior selection no longer
+    /// exists), so the pane always has a concrete "active" row to mark.
     fn mail_open_settings(&mut self) -> QString {
-        let _ = self.mail_hub_get();
+        let ids = self.mail_hub_get().and_then(|h| h.account_ids().ok()).unwrap_or_default();
+        let still_valid = ids.iter().any(|a| a.as_str() == self.mail_active_account);
+        if !still_valid {
+            self.mail_active_account =
+                ids.first().map(|a| a.as_str().to_string()).unwrap_or_default();
+        }
         self.open_web_pane(QString::from("web2qml://mail/settings"))
     }
 
@@ -6750,6 +6905,136 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
             "err\tSending isn't available yet — account sign-in is still being wired up. \
              Your draft is saved locally.",
         )
+    }
+
+    /// v0.1.881: open the peers pane (device address + contact keyring).
+    fn mail_open_peers(&mut self) -> QString {
+        self.open_web_pane(QString::from("web2qml://mail/peers"))
+    }
+
+    /// v0.1.881: this device's peer address (X25519 public key, base64).
+    /// Minting the identity needs the crypto feature; without it we report
+    /// honestly rather than fabricate a key. Wire: `ok\t<pubkey_b64>` or
+    /// `err\t<reason>`.
+    fn peer_my_address(&mut self) -> QString {
+        match crate::peer_mail::Identity::load_or_create() {
+            Ok(id) => QString::from(format!("ok\t{}", id.public.to_b64()).as_str()),
+            Err(crate::peer_mail::PeerError::Unavailable) => QString::from(
+                "err\tPeer identity needs the crypto build (mail-crypto feature) to mint a keypair.",
+            ),
+            Err(e) => QString::from(format!("err\t{}", e).as_str()),
+        }
+    }
+
+    /// v0.1.881: add (or update) a contact by handle + base64 public key.
+    /// Crypto-free — validates the key shape and stores it. Wire:
+    /// `ok\t<detail>` / `err\t<reason>`.
+    fn peer_add_contact(&mut self, handle: QString, pubkey_b64: QString) -> QString {
+        let handle = handle.to_string();
+        let handle = handle.trim();
+        if handle.is_empty() {
+            return QString::from("err\tA contact needs a handle");
+        }
+        let key = match crate::peer_mail::PublicKey::from_b64(&pubkey_b64.to_string()) {
+            Ok(k) => k,
+            Err(e) => return QString::from(format!("err\tInvalid public key: {}", e).as_str()),
+        };
+        let mut kr = crate::peer_mail::Keyring::load();
+        kr.upsert(handle, key);
+        match kr.save() {
+            Ok(()) => QString::from(format!("ok\tAdded {}", handle).as_str()),
+            Err(e) => QString::from(format!("err\tCouldn't save keyring: {}", e).as_str()),
+        }
+    }
+
+    /// v0.1.881: list contacts. Wire: one `handle\tpubkey_b64` per line.
+    fn peer_list_contacts(&self) -> QString {
+        QString::from(crate::peer_mail::Keyring::load().to_wire().as_str())
+    }
+
+    /// v0.1.881: remove a contact by handle. Wire: `ok\t…` / `err\t…`.
+    fn peer_remove_contact(&mut self, handle: QString) -> QString {
+        let handle = handle.to_string();
+        let handle = handle.trim();
+        if handle.is_empty() {
+            return QString::from("err\tNo handle given");
+        }
+        let mut kr = crate::peer_mail::Keyring::load();
+        if !kr.remove(handle) {
+            return QString::from(format!("err\tNo contact named {}", handle).as_str());
+        }
+        match kr.save() {
+            Ok(()) => QString::from(format!("ok\tRemoved {}", handle).as_str()),
+            Err(e) => QString::from(format!("err\tCouldn't save keyring: {}", e).as_str()),
+        }
+    }
+
+    /// v0.1.882: seal a message to a known contact. Looks up their public key,
+    /// loads our identity, and produces a transport-agnostic sealed envelope —
+    /// the wire blob the user can carry over any channel (the transport layer
+    /// is deferred by design). Needs the crypto build. Wire:
+    /// `ok\t<envelope_wire>` / `err\t<reason>`.
+    fn peer_seal_to(&mut self, handle: QString, subject: QString, body: QString) -> QString {
+        let handle = handle.to_string();
+        let handle = handle.trim();
+        let recipient = match crate::peer_mail::Keyring::load().lookup(handle) {
+            Some(k) => k,
+            None => return QString::from(format!("err\tNo contact named {}", handle).as_str()),
+        };
+        let id = match crate::peer_mail::Identity::load_or_create() {
+            Ok(id) => id,
+            Err(crate::peer_mail::PeerError::Unavailable) => {
+                return QString::from("err\tSealing needs the crypto build (mail-crypto feature).")
+            }
+            Err(e) => return QString::from(format!("err\t{}", e).as_str()),
+        };
+        let msg = crate::peer_mail::PeerMessage {
+            to: handle.to_string(),
+            subject: subject.to_string(),
+            body: body.to_string(),
+        };
+        match crate::peer_mail::seal(&recipient, &id.secret, &id.public, &msg) {
+            Ok(env) => QString::from(format!("ok\t{}", env.to_wire()).as_str()),
+            Err(crate::peer_mail::PeerError::Unavailable) => {
+                QString::from("err\tSealing needs the crypto build (mail-crypto feature).")
+            }
+            Err(e) => QString::from(format!("err\t{}", e).as_str()),
+        }
+    }
+
+    /// v0.1.882: open a sealed envelope addressed to us. Authenticates the
+    /// sender against the key the envelope carries and names them from the
+    /// keyring when known. Wire: `ok\t<from>\t<subject>\t<body>` /
+    /// `err\t<reason>`.
+    fn peer_open_envelope(&mut self, wire: QString) -> QString {
+        let env = match crate::peer_mail::Envelope::from_wire(&wire.to_string()) {
+            Ok(e) => e,
+            Err(e) => return QString::from(format!("err\tMalformed envelope: {}", e).as_str()),
+        };
+        let id = match crate::peer_mail::Identity::load_or_create() {
+            Ok(id) => id,
+            Err(crate::peer_mail::PeerError::Unavailable) => {
+                return QString::from("err\tOpening needs the crypto build (mail-crypto feature).")
+            }
+            Err(e) => return QString::from(format!("err\t{}", e).as_str()),
+        };
+        match crate::peer_mail::open(&env, &id.secret) {
+            Ok(msg) => {
+                let from = crate::peer_mail::Keyring::load()
+                    .handle_for(&env.sender)
+                    .unwrap_or_else(|| format!("unknown ({})", env.sender.fingerprint()));
+                // Tabs in fields would corrupt the wire; flatten them.
+                let subject = msg.subject.replace('\t', " ");
+                let body = msg.body.replace('\t', " ");
+                QString::from(format!("ok\t{}\t{}\t{}", from, subject, body).as_str())
+            }
+            Err(crate::peer_mail::PeerError::Unavailable) => {
+                QString::from("err\tOpening needs the crypto build (mail-crypto feature).")
+            }
+            Err(e) => {
+                QString::from(format!("err\tCouldn't open (not for us, or tampered): {}", e).as_str())
+            }
+        }
     }
 
     /// The routing heart: dispatch a finished utterance per gate + broadcast set +
@@ -7035,6 +7320,14 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
                 // needs &mut self and so must run AFTER this pty borrow ends.
                 self._debug_scan_pending.push_str(&s);
             }
+            // v0.1.883: drain any OSC 133 D;<code> exit status the reader
+            // captured while parsing this tick's bytes, and stash it on the
+            // block tracker. It's attached to the just-finished block when
+            // the NEXT command is submitted (see BlockTracker::submit_command),
+            // letting the long-command toast show ✓/✗ for OSC-133 shells.
+            if let Some(code) = pty.take_osc133_exit() {
+                self.block_tracker.note_exit_code(code);
+            }
             // v0.1.668: "why so slow" probe. Throttled to ~once/sec. Only
             // when a non-shell command has been running a few seconds do we
             // sample its wait-state; classification + the bubble offer happen
@@ -7227,19 +7520,20 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
             // Collect notifications first so we don't hold the
             // self.block_tracker borrow while emitting (signals
             // can re-enter via QML connections).
-            let mut to_notify: Vec<(String, i32)> = Vec::new();
-            while let Some((_id, cmd, dur_ms)) = self.block_tracker.pending_notifications.pop_front() {
+            let mut to_notify: Vec<(String, i32, i32)> = Vec::new();
+            while let Some((_id, cmd, dur_ms, exit)) = self.block_tracker.pending_notifications.pop_front() {
                 if self.long_command_threshold_secs <= 0 { continue; }
                 if dur_ms >= threshold_ms {
                     let secs = (dur_ms / 1000) as i32;
-                    to_notify.push((cmd, secs));
+                    // -1 = unknown (no OSC 133 shell integration); a real
+                    // code (0 = ✓, non-zero = ✗) when the shell reported one.
+                    to_notify.push((cmd, secs, exit.unwrap_or(-1)));
                 }
             }
-            for (cmd, secs) in to_notify {
-                crate::clog!("long-cmd", "{}s: {}", secs, cmd);
-                // exit_code = -1 (unknown) — see signal doc comment.
+            for (cmd, secs, code) in to_notify {
+                crate::clog!("long-cmd", "{}s (exit {}): {}", secs, code, cmd);
                 self.long_command_finished(
-                    QString::from(cmd.as_str()), secs, -1);
+                    QString::from(cmd.as_str()), secs, code);
             }
             // v0.1.406 (session arc — proactive suggestion):
             // a block just closed, so a command was just
@@ -7275,8 +7569,15 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
                 .or_else(|| self.block_tracker.current_cwd.clone())
                 .unwrap_or_default();
             let cwd_changed = live_cwd != self.last_git_check_cwd;
-            let block_closed = !pre_drain_was_empty;
-            if cwd_changed || block_closed {
+            // v0.1.885: on block-close, only refresh git status when the
+            // closed command could have mutated the working tree. Confirmed
+            // read-only commands (ls/cat/grep/...) can't change git state,
+            // so skipping them avoids a `git status` subprocess after the
+            // most common interactive commands. `take()` always runs so the
+            // flag resets each tick. cwd changes still refresh unconditionally
+            // (covers cd'ing into a different repo).
+            let mutating_close = self.block_tracker.take_git_relevant_close();
+            if cwd_changed || mutating_close {
                 self.last_git_check_cwd = live_cwd.clone();
                 git_status::request_refresh(&live_cwd);
                 // v0.1.804: record terminal dir changes into the location buffer.
@@ -11905,6 +12206,43 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
         QString::from(v.as_str())
     }
 
+    // ── gitmind (gin) CLI voice control ──
+    fn gitmind_active(&self) -> bool {
+        // Active when the shell's cwd (or an ancestor) holds a `.gitmind`
+        // repo marker — the dir `gin` scaffolds. Read the shell's cwd from
+        // /proc (same source the git-status badge uses), falling back to the
+        // process cwd. Cheap: a few stat()s up the tree.
+        let start = self.pty.as_ref()
+            .and_then(|p| p.shell_pid())
+            .and_then(|pid| std::fs::read_link(format!("/proc/{}/cwd", pid)).ok())
+            .or_else(|| std::env::current_dir().ok());
+        let mut dir = start;
+        while let Some(d) = dir {
+            if d.join(crate::gitmind_voice::REPO_MARKER).is_dir() {
+                return true;
+            }
+            dir = d.parent().map(|p| p.to_path_buf());
+        }
+        false
+    }
+    fn gitmind_translate(&self, phrase: QString) -> QString {
+        match crate::gitmind_voice::translate(&phrase.to_string()) {
+            Some(a) => {
+                let cmd = format!("gin {}", a.argv.join(" "));
+                QString::from(format!("{}\t{}\t{}", cmd,
+                    if a.confirm { 1 } else { 0 },
+                    if a.query { 1 } else { 0 }).as_str())
+            }
+            None => QString::from(""),
+        }
+    }
+    fn gitmind_commands(&self) -> QString {
+        let v = crate::gitmind_voice::commands().iter()
+            .map(|(l, e)| format!("{}\t{}", l, e))
+            .collect::<Vec<_>>().join("\n");
+        QString::from(v.as_str())
+    }
+
     // ── v0.1.703 ssh via voice ──
     fn ssh_connect(&self, phrase: QString) -> QString {
         let req = match crate::ssh_voice::parse(&phrase.to_string()) {
@@ -14604,6 +14942,66 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
         QString::from(graph.doc_json(&name.to_string()).as_str())
     }
 
+    /// v0.1.894: a centrality-ordered guided tour of the manpage corpus — the
+    /// graph-walkthrough foundation made live over the help pages. Returns
+    /// `{"order":[slug,...],"hubs":[{"slug":..,"degree":..}, ... up to 5]}`:
+    /// `order` is the walk (densest hub first, then its neighbourhood, then the
+    /// next cluster) for a "walk me through the docs" voice tour / replay, and
+    /// `hubs` surfaces the most-connected pages. The same `LinkGraph` primitive
+    /// drives the zettelkasten note web and the email attachment graph, so this
+    /// is the reusable spine, not a manpage-only feature.
+    fn manpage_graph_walkthrough(&self) -> QString {
+        let mut graph = link_graph::LinkGraph::new();
+        for n in manpages::list_names() {
+            if let Some(body) = manpages::get(n) {
+                graph.add_document(n, body);
+            }
+        }
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let hubs: Vec<String> = graph.centrality_ranking().into_iter().take(5)
+            .map(|(slug, deg)| format!("{{\"slug\":\"{}\",\"degree\":{}}}", esc(&slug), deg))
+            .collect();
+        let out = format!("{{\"order\":{},\"hubs\":[{}]}}",
+            graph.walkthrough_json(), hubs.join(","));
+        QString::from(out.as_str())
+    }
+
+    /// v0.1.895: a centrality-ordered guided tour of ANY niftyplot graph —
+    /// this is "graph walkthrough email integration" made live. Feed it an
+    /// inbox sender / attachment graph from `mail_panes`
+    /// (`sender_graph_niftyplot`, `attachment_graph_niftyplot`), a fenced
+    /// niftyplot block from a note, or any graph the canvas already renders,
+    /// and get back `{"order":[{"slug","label"}...],"hubs":[{"slug","label",
+    /// "degree"}...]}`: the walk visits the densest hub first then its
+    /// neighbourhood, so for an inbox it starts at "You" and steps out to each
+    /// correspondent. Pure over its input string, so it runs on note/terminal
+    /// graphs today and on the live inbox graph the moment that source exists.
+    fn niftyplot_walkthrough(&self, source: QString) -> QString {
+        let src = source.to_string();
+        let doc = crate::niftyplot::parse(&src);
+        // slug → display label, from the node declarations.
+        let mut labels: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for n in &doc.nodes {
+            let id = n.id.trim().trim_end_matches(':').trim();
+            let slug = link_graph::slugify(id);
+            if slug.is_empty() { continue; }
+            let label = n.label.clone().unwrap_or_else(|| id.to_string());
+            labels.entry(slug).or_insert(label);
+        }
+        let graph = link_graph::LinkGraph::from_niftyplot(&src);
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let lbl = |slug: &str| labels.get(slug).cloned().unwrap_or_else(|| slug.to_string());
+        let order: Vec<String> = graph.walkthrough().iter()
+            .map(|slug| format!("{{\"slug\":\"{}\",\"label\":\"{}\"}}", esc(slug), esc(&lbl(slug))))
+            .collect();
+        let hubs: Vec<String> = graph.centrality_ranking().into_iter().take(5)
+            .map(|(slug, deg)| format!("{{\"slug\":\"{}\",\"label\":\"{}\",\"degree\":{}}}",
+                esc(&slug), esc(&lbl(&slug)), deg))
+            .collect();
+        QString::from(format!("{{\"order\":[{}],\"hubs\":[{}]}}",
+            order.join(","), hubs.join(",")).as_str())
+    }
+
     /// v0.1.486: derive the active voice-grammar label for the
     /// current context. Composes the same signals voice_parse_intent
     /// uses (foreground command + last non-empty terminal line +
@@ -16339,6 +16737,60 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
         QString::from(out.as_str())
     }
 
+    /// v0.1.896: emit a process memory-footprint line for later analysis, and
+    /// return it (so a caller could also surface it in the UI). No-op —
+    /// returns "" — unless `WEB2QML_MEMLOG` is set, so the QML poll timer that
+    /// drives this is free in normal use. Route the line to a file with
+    /// `WEB2QML_LOG=mem`.
+    ///
+    /// The breakdown leads with the terminal subsystem (the thing we're
+    /// optimizing): main pty + every pane pty, with total scrollback rows and
+    /// approximate cell bytes. Other notable holders follow as counts —
+    /// cheap to gather, enough to spot which structure is growing run-over-run.
+    fn mem_footprint_log(&self) -> QString {
+        if !crate::mem_footprint::enabled() {
+            return QString::from("");
+        }
+        let pm = crate::mem_footprint::proc_mem().unwrap_or_default();
+        let mb = crate::mem_footprint::fmt_mb;
+
+        // Terminal subsystem: main pty + all pane ptys.
+        let mut pty_count = 0usize;
+        let mut scrollback_rows = 0usize;
+        let mut term_bytes = 0usize;
+        if let Some(p) = &self.pty {
+            pty_count += 1;
+            scrollback_rows += p.scrollback_rows();
+            term_bytes += p.approx_mem_bytes();
+        }
+        for p in self.pane_ptys.values() {
+            pty_count += 1;
+            scrollback_rows += p.scrollback_rows();
+            term_bytes += p.approx_mem_bytes();
+        }
+
+        // Other notable holders. Counts only where bytes would mean an O(n)
+        // walk of large strings — the mem logger should not itself allocate
+        // big buffers each tick. `audio` is O(1) (a flat Vec<f32>).
+        let page_cache_n = self.page_cache.len();
+        let archive_n = self.archive.entries.len();
+        let dec_n = crate::decision_cache::len();
+        let llm_n = crate::llm_cache::len();
+        let cmd_items: usize = self.cmd_collections.values().map(|v| v.len()).sum();
+        let audio_kb = (self.last_audio_buffer.capacity() * std::mem::size_of::<f32>()) / 1024;
+        let tabs_n = self._tabs.len();
+
+        let line = format!(
+            "rss={} hwm={} data={} vsz={} | ptys={} scrollback={}rows/{}KB \
+             page_cache={} archive={} caches(dec={},llm={}) cmd_items={} audio={}KB tabs={}",
+            mb(pm.vm_rss_kb), mb(pm.vm_hwm_kb), mb(pm.vm_data_kb), mb(pm.vm_size_kb),
+            pty_count, scrollback_rows, term_bytes / 1024,
+            page_cache_n, archive_n, dec_n, llm_n, cmd_items, audio_kb, tabs_n,
+        );
+        crate::clog!("mem", "{}", line);
+        QString::from(line.as_str())
+    }
+
     /// v0.1.361: kick off a filesystem find search in the
     /// terminal's current working directory. See `fs_find` module
     /// for the worker behavior. Returns true if the search was
@@ -16447,44 +16899,35 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
     }
 
     /// v0.1.786: whole visible screen as packed styled runs for the native
-    /// renderer. Non-blocking: if the reader thread holds the grid lock (output
-    /// burst) returns the "\u{1c}" sentinel, and the Canvas keeps its last frame
-    /// instead of flashing blank. FIRST CUT reads the grid directly under
-    /// try_lock; once native is the default this should be snapshot-backed like
-    /// render_html so the UI thread never touches the grid. Rows are separated
-    /// by 0x1d; within a row, runs/fields use the row_runs_packed encoding.
+    /// renderer. Rows are separated by 0x1d; within a row, runs/fields use
+    /// the row_runs_packed encoding.
+    ///
+    /// v0.1.902: now snapshot-backed (was the flagged "FIRST CUT" — see the
+    /// removed comment below this one in prior versions). This method used
+    /// to `try_lock` the grid directly on the UI thread on EVERY poll tick
+    /// (up to 20/sec while a terminal tab is visible), contending with the
+    /// reader thread for the same lock it holds during an output burst —
+    /// exactly the case where a fresh frame matters most, and exactly when
+    /// the try_lock was most likely to fail and fall back to a stale frame.
+    /// The reader thread (and `PtyTerminal::republish`, for grid mutations
+    /// outside the byte path like scroll/resize) now build the packed-runs
+    /// payload off the UI thread and publish it on `RenderSnapshot` right
+    /// alongside `html`/cursor/title — this is just a cheap Arc::clone read,
+    /// mirroring how `term_output` has worked since v0.1.490. Empty `runs`
+    /// (no snapshot published yet, e.g. the first frame before any output)
+    /// still returns the "\u{1c}" sentinel so the Canvas keeps waiting
+    /// rather than painting a blank screen.
     fn term_screen_runs(&self) -> QString {
-        if let Some(pty) = &self.pty {
-            let rows = pty.visible_rows();
-            match pty.grid.try_lock() {
-                Ok(g) => {
-                    // v0.1.852: read the alt-screen + cursor-visible flags from
-                    // THIS same lock and prepend them as a 2-char header
-                    // ("<alt><cvis>\u{1c}<rows…>"). The Canvas previously called
-                    // term_in_alt_screen() and term_cursor_visible() in its cursor
-                    // gate — each takes a SEPARATE blocking grid lock every paint,
-                    // which both stalled the paint thread during a TUI redraw
-                    // (Helix scroll jank) and could disagree with the frame being
-                    // drawn, painting our overlay cursor over a TUI's own one (the
-                    // misaligned gray block). One consistent read fixes both.
-                    let hdr = [
-                        if g.alt_screen_active() { '1' } else { '0' },
-                        if g.cursor_visible { '1' } else { '0' },
-                    ];
-                    let mut out = String::with_capacity(rows * 24 + 3);
-                    out.push(hdr[0]);
-                    out.push(hdr[1]);
-                    out.push('\u{1c}');
-                    for r in 0..rows {
-                        if r > 0 { out.push('\u{1d}'); }
-                        out.push_str(&g.row_runs_packed(r));
-                    }
-                    QString::from(out.as_str())
+        match &self.pty {
+            Some(pty) => {
+                let snap = pty.latest_snapshot();
+                if snap.runs.is_empty() {
+                    QString::from("\u{1c}")
+                } else {
+                    QString::from(snap.runs.as_str())
                 }
-                Err(_) => QString::from("\u{1c}"),
             }
-        } else {
-            QString::default()
+            None => QString::default(),
         }
     }
 
@@ -16724,7 +17167,15 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
         }
         let _ = self.term_ws.set_active_pane_web(&u);
         self.save_term_layout();
-        QString::from(self.term_ws.to_wire().as_str())
+        // v0.1.899: to_wire() doesn't encode pane url/kind, so the wire is
+        // unchanged when we only re-point the active pane — the caller's
+        // `termPaneStrip = <wire>` would be a no-op that never triggers a
+        // re-render. Emit term_strip_refreshed so QML force-recomputes the pane
+        // model (same path as an in-page link). We still return the wire for
+        // callers that assign it.
+        let wire = QString::from(self.term_ws.to_wire().as_str());
+        self.term_strip_refreshed(wire.clone());
+        wire
     }
 
     /// v0.1.823: navigate the ACTIVE pane to `url` from an in-page link click.
@@ -16764,6 +17215,19 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
         let pid = id as u64;
         if self.term_ws.close_pane_id(pid) {
             self.pane_ptys.remove(&pid);
+            self.save_term_layout();
+        }
+        QString::from(self.term_ws.to_wire().as_str())
+    }
+    /// v0.1.881: Ctrl+Shift+W. Prefer closing a web pane (the browser-tab-like
+    /// thing the user means) since web panes are never focused and the plain
+    /// "close pane" path only ever closes the focused terminal pane. Falls back
+    /// to the focused pane when no web pane is open.
+    fn close_web_or_focused_pane(&mut self) -> QString {
+        if let Some(pid) = self.term_ws.close_newest_web_pane() {
+            self.pane_ptys.remove(&pid);
+            self.save_term_layout();
+        } else if self.term_ws.close_pane().is_some() {
             self.save_term_layout();
         }
         QString::from(self.term_ws.to_wire().as_str())
@@ -17594,6 +18058,85 @@ Rectangle {{\nwidth: 220; height: 36; radius: 18\ncolor: _openExtSpaMa.containsM
                     "\x01CHORDOVERLAY\x01".to_string()),
                 score: 0.95,
                 reason: "open keybinding overlay".to_string(),
+            destructive: false,
+            }];
+            return self.cands_to_q(cands);
+        }
+
+        // v0.1.881: "take me to email" intents. mail_intent::parse (the rich
+        // OpenInbox/Compose parser) isn't wired into the voice flow, so phrases
+        // like "view my emails" used to fall through to the terminal command
+        // path. Route the clear "open the mail UI" phrasings to a sentinel that
+        // QML maps to mail_open_login() — which lands on the sign-in page when
+        // no account is connected. Kept as an explicit list (not a verb+noun
+        // heuristic) to avoid hijacking "open mail.txt" or compose/search.
+        let mail_open_phrases = [
+            "view my email", "view email", "view emails", "view my inbox",
+            "check my email", "check email", "check emails", "check my mail",
+            "check my inbox", "open my email", "open email", "open my mail",
+            "open my inbox", "open the inbox", "go to my email", "go to email",
+            "go to my inbox", "go to inbox", "sign into my email",
+            "sign in to my email", "sign into email", "sign in to email",
+            "show my email", "show my inbox", "see my email", "see my inbox",
+            "log into my email", "log in to my email", "log into email",
+            "add my email", "add an email account", "add email account",
+            "take me to my email", "take me to email", "my email inbox",
+        ];
+        if mail_open_phrases.iter().any(|p| lc_smart.contains(p)) {
+            let cands = vec![voice_intent::Candidate {
+                intent: voice_intent::Intent::TerminalCommand(
+                    "\x01MAIL\x01".to_string()),
+                score: 0.96,
+                reason: "open email (sign in)".to_string(),
+            destructive: false,
+            }];
+            return self.cands_to_q(cands);
+        }
+
+        // v0.1.882: compose / drafts mail sentinels — these panes work without
+        // any account or crypto (compose is local; drafts are local files), so
+        // they're useful even before sign-in is wired.
+        let compose_phrases = [
+            "compose email", "compose an email", "compose a message", "compose mail",
+            "write an email", "write email", "write a new email", "new email",
+            "new mail", "start an email", "draft a new email",
+        ];
+        if compose_phrases.iter().any(|p| lc_smart.contains(p)) {
+            let cands = vec![voice_intent::Candidate {
+                intent: voice_intent::Intent::TerminalCommand("\x01MAILCOMPOSE\x01".to_string()),
+                score: 0.96,
+                reason: "compose email".to_string(),
+            destructive: false,
+            }];
+            return self.cands_to_q(cands);
+        }
+        let draft_phrases = [
+            "my drafts", "show drafts", "open drafts", "show my drafts",
+            "open my drafts", "view drafts", "view my drafts", "email drafts",
+            "draft emails", "saved drafts", "show my email drafts",
+        ];
+        if draft_phrases.iter().any(|p| lc_smart.contains(p)) {
+            let cands = vec![voice_intent::Candidate {
+                intent: voice_intent::Intent::TerminalCommand("\x01MAILDRAFTS\x01".to_string()),
+                score: 0.96,
+                reason: "open drafts".to_string(),
+            destructive: false,
+            }];
+            return self.cands_to_q(cands);
+        }
+        // v0.1.897: peer contacts / in-house encrypted messaging. Routes to the
+        // Peers pane (address, contacts, seal/open). "peer" is distinctive
+        // enough that these don't collide with the Proton-mail phrases above.
+        let peer_phrases = [
+            "peer contacts", "my contacts", "open peers", "open peer", "show peers",
+            "show my contacts", "peer messaging", "encrypted message", "encrypted messaging",
+            "my peers", "open contacts", "show contacts", "message a peer", "peer address",
+        ];
+        if peer_phrases.iter().any(|p| lc_smart.contains(p)) {
+            let cands = vec![voice_intent::Candidate {
+                intent: voice_intent::Intent::TerminalCommand("\x01PEERS\x01".to_string()),
+                score: 0.96,
+                reason: "open peer contacts".to_string(),
             destructive: false,
             }];
             return self.cands_to_q(cands);

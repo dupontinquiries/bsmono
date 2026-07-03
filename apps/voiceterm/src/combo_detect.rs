@@ -303,6 +303,24 @@ pub fn proactive_suggestion(
         ..Default::default()
     };
     let all = detect_combos(entries, &cfg);
+    // v0.1.900: a workflow repeated N times spawns many overlapping
+    // sub-sequences — the rotation (B,A) at N-1, the 3-seq (A,B,A) at N-2, etc.
+    // — several of which land at exactly suggest_at and would fire a one-shot
+    // nudge for a workflow the user is already past. Key on the DEDUPLICATED
+    // command set (vocabulary): every such artifact shares the vocabulary of
+    // the parent workflow that occurs MORE than suggest_at times, while a
+    // genuinely new workflow (different commands) does not — so it still fires.
+    use std::collections::HashSet;
+    let vocab = |c: &ComboCandidate| -> Vec<String> {
+        let mut v = c.commands.clone();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let past_crossing: HashSet<Vec<String>> = all.iter()
+        .filter(|c| c.occurrences > suggest_at)
+        .map(|c| vocab(c))
+        .collect();
     // Among candidates at exactly the suggestion threshold,
     // non-destructive, positive score, pick the highest score.
     let mut best: Option<&ComboCandidate> = None;
@@ -310,6 +328,7 @@ pub fn proactive_suggestion(
         if c.occurrences != suggest_at { continue; }
         if c.has_destructive { continue; }
         if c.score <= 0.0 { continue; }
+        if past_crossing.contains(&vocab(c)) { continue; }
         match best {
             Some(b) if b.score >= c.score => {}
             _ => best = Some(c),

@@ -40,11 +40,24 @@ pub static GPU_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// bind groups / use push constants) or GPU-bound (→ fuse kernels / fewer dispatches).
 pub static GPU_SETUP_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static GPU_SYNC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Dims-uniform cache accounting: a MISS is a real `create_buffer_init` (an upload); a HIT reuses a
+/// cached buffer (the eliminated upload). Hits/(hits+misses) is the upload-churn reduction — a
+/// hardware-INDEPENDENT structural number, valid here on lavapipe.
+pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn dims_cache_hits() -> u64 { DIMS_HITS.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
+/// Buffer-pool accounting: a MISS is a real `create_buffer` (allocation churn — the other half of
+/// "upload locking"); a HIT recycles a same-size buffer freed by a dropped Tensor. Hardware-independent.
+pub static POOL_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POOL_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn pool_hits() -> u64 { POOL_HITS.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn pool_misses() -> u64 { POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
+pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
 
 /// Cached per-shader GPU objects: the bind-group layout and compiled compute
 /// pipeline. Building these is expensive (shader compilation), so they're created
@@ -81,6 +94,19 @@ pub struct Gpu {
     /// Raising this cuts submits/token (less overhead) but lengthens each submit (a shared GPU's display
     /// can stutter); `SubmitTuner` adapts it on live tokens. Tunable, env-pinnable (LOGSCOPE_FLUSH_EVERY).
     flush_every: std::sync::atomic::AtomicU32,
+    /// Content-keyed cache of the small per-dispatch `dims` UNIFORM buffers. The dims for a given op
+    /// (m,k,n,grid,…) are byte-identical every token, but `dispatch_with` used to `create_buffer_init`
+    /// a fresh one per dispatch — ~250–380 tiny buffer creations+uploads per token (the "upload locking"
+    /// that bottlenecks a high-bandwidth UMA GPU like the M2, where the kernel itself isn't the limiter).
+    /// Caching by byte content makes it a one-time cost: after warmup the bandwidth-heavy linears reuse
+    /// their dims buffer instead of re-uploading. Capped (no LRU): the recurring stable dims are all
+    /// inserted during warmup and hit forever; per-position (attention/RoPE) dims that vary each token
+    /// fill the rest and, once full, fall back to create-without-cache (i.e. never worse than before).
+    /// Bit-exact: identical bytes, identical binding — every `--gate-*` is unchanged.
+    dims_cache: Mutex<HashMap<Vec<u8>, std::sync::Arc<wgpu::Buffer>>>,
+    /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
+    pool: std::sync::Arc<BufferPool>,
+    arena: Mutex<Option<ResidentArena>>,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -116,6 +142,14 @@ fn env_prefill_tiled() -> bool {
     use std::sync::OnceLock;
     static T: OnceLock<bool> = OnceLock::new();
     *T.get_or_init(|| std::env::var("LOGSCOPE_PREFILL_TILED").is_ok())
+}
+/// Fused-QKV decode is now the DEFAULT (one wqkv matmul instead of three projections, −2 compute
+/// dispatches/layer — the dispatch-count lever on the ~210/token decode cost that dominates wall time
+/// on a launch-bound UMA GPU). Bit-exact to the separate path (--gate-qkv), so on by default; set
+/// LOGSCOPE_FUSED_QKV=0 to fall back to the separate-projection reference path. Read per-call (cheap,
+/// matches the original inline env check) so it can be toggled for the A/B equivalence gate.
+fn fused_qkv_enabled() -> bool {
+    std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
 /// LOGSCOPE_GEMM_TILE override for the prefill GEMM workgroup tile (manual A/B; read once, cached).
 fn env_gemm_tile() -> Option<u32> {
@@ -202,7 +236,7 @@ impl Gpu {
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every }
+        Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None) }
     }
 
     /// Generic compute dispatch. Convention: storage inputs at bindings 0..n
@@ -420,7 +454,39 @@ impl Gpu {
 // ── resident GPU tensors: keep intermediates on the device (no CPU round-trips) ──
 /// A tensor that lives in a GPU buffer. Ops consume resident tensors and produce
 /// resident tensors; only `download` copies back to the host.
-pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize }
+/// Size-keyed free-list of `STORAGE|COPY_SRC|COPY_DST` buffers. Every per-op output used to be a fresh
+/// `create_buffer` (~hundreds/token of allocation churn — the allocation half of "upload locking"); the
+/// pool recycles a buffer of the same byte size when a Tensor drops. Safe because wgpu auto-tracks
+/// WAR/WAW hazards on the same queue: a recycled buffer's new write pass is recorded AFTER the old read
+/// passes, so the GPU serializes them. Reuse hands back possibly-stale bytes, which is fine — the engine's
+/// kernels fully overwrite their output (validated by the multi-op equivalence gates). Per-size cap bounds
+/// memory. `wgpu::Buffer` is Arc-backed (Clone), so a clone in the free-list keeps the allocation alive.
+#[derive(Default)]
+struct BufferPool { free: Mutex<HashMap<u64, Vec<wgpu::Buffer>>> }
+
+/// Slab bump-allocator for resident weights (opt-in: LOGSCOPE_ARENA). Packs many weight tensors into a
+/// few large GPU buffers as offset views instead of thousands of separate buffer objects — fewer driver
+/// allocations + bind bindings, and on some drivers (Asahi) it dodges per-object VMA/count ceilings that
+/// reject a large model even when total memory would fit. Slabs are sized to the device's max buffer.
+struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64 }
+/// Clears the active arena when a load finishes (or unwinds) so the bump state never leaks into the next
+/// load; the slab buffers themselves stay alive via the weight tensors that cloned them.
+struct ArenaGuard<'a>(&'a Mutex<Option<ResidentArena>>);
+impl Drop for ArenaGuard<'_> { fn drop(&mut self) { *self.0.lock().unwrap() = None; } }
+
+pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)> }
+impl Drop for Tensor {
+    fn drop(&mut self) {
+        if let Some(pool) = &self.pool {
+            let size = (self.rows * self.cols * 4) as u64;
+            if size > 0 {
+                let mut free = pool.free.lock().unwrap();
+                let v = free.entry(size).or_default();
+                if v.len() < 64 { v.push(self.buf.clone()); } // cap per size → bounded memory
+            }
+        }
+    }
+}
 impl Tensor {
     pub fn len(&self) -> usize { self.rows * self.cols }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -494,20 +560,49 @@ impl Lin {
         };
         match &self.bias { Some(b) => gpu.add_bias_t(&out, b), None => out }
     }
+    /// apply(), then add `resid` — but for the unbiased quantized m=1 decode case the add is FOLDED
+    /// into the matmul epilogue (one dispatch instead of two). Falls back to apply()+add_t otherwise.
+    pub fn apply_add(&self, gpu: &Gpu, a: &Tensor, m: usize, resid: &Tensor) -> Tensor {
+        if m == 1 && self.bias.is_none() {
+            match &self.kind {
+                LinKind::Q8(q) => return gpu.linear_q8_0_add(a, q, resid),
+                LinKind::Q4(q) => return gpu.linear_q4_0_add(a, q, resid),
+                LinKind::F32(_) => {}
+            }
+        }
+        let out = self.apply(gpu, a, m);
+        gpu.add_t(&out, resid)
+    }
     pub fn is_quantized(&self) -> bool { matches!(self.kind, LinKind::Q8(_) | LinKind::Q4(_)) }
 }
 
 impl Gpu {
     pub fn upload(&self, data: &[f32], rows: usize, cols: usize) -> Tensor {
-        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("tensor"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST });
-        Tensor { buf, rows, cols }
+        // create_buffer + write_buffer (NOT create_buffer_init): if the GPU is out of memory this records
+        // a CATCHABLE OutOfMemory error, whereas create_buffer_init maps-on-create and its get_mapped_range
+        // on the failed buffer is a FATAL validation error that aborts the process. Load-time only (not the
+        // per-dispatch path), so no inference cost — and it lets a too-big load fail gracefully.
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"),
+            size: (bytes.len().max(4)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false });
+        if !bytes.is_empty() { self.queue.write_buffer(&buf, 0, bytes); }
+        Tensor { buf, rows, cols, pool: None, view: None }
     }
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"), size: (rows * cols * 4) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        Tensor { buf, rows, cols }
+        let size = (rows * cols * 4) as u64;
+        // Recycle a same-size buffer freed by a dropped Tensor, else allocate. Kills per-op alloc churn.
+        let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&size).and_then(|v| v.pop()) } else { None };
+        let buf = match recycled {
+            Some(b) => { POOL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); b }
+            None => {
+                POOL_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"), size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+            }
+        };
+        Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None }
     }
     pub fn download(&self, t: &Tensor) -> Vec<f32> {
         let bytes = (t.len() * 4) as u64;
@@ -580,11 +675,32 @@ impl Gpu {
     fn dispatch_with(&self, pipe: &Pipe, inputs: &[&Tensor], out: &Tensor, dims: &[u8], wg: (u32, u32, u32)) {
         let dev = &self.device;
         let t_setup = std::time::Instant::now();
-        let dbuf = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dims"), contents: dims, usage: wgpu::BufferUsages::UNIFORM });
+        // Reuse the dims UNIFORM buffer for this op's byte-identical (m,k,n,grid) instead of
+        // creating+uploading a fresh one every dispatch — the per-dispatch "upload locking" fix.
+        let dbuf = {
+            let mut cache = self.dims_cache.lock().unwrap();
+            if let Some(b) = cache.get(dims) {
+                DIMS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                b.clone()
+            } else {
+                DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let b = std::sync::Arc::new(dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dims"), contents: dims, usage: wgpu::BufferUsages::UNIFORM }));
+                // Cap growth: stable dims are inserted during warmup and hit forever; once full,
+                // varying per-position dims fall back to create-without-cache (never worse than before).
+                if cache.len() < 4096 { cache.insert(dims.to_vec(), b.clone()); }
+                b
+            }
+        };
         let n = inputs.len() as u32;
         let (bgl, pipeline) = (&pipe.0, &pipe.1);
         let mut bg_entries = Vec::new();
-        for (i, t) in inputs.iter().enumerate() { bg_entries.push(wgpu::BindGroupEntry { binding: i as u32, resource: t.buf.as_entire_binding() }); }
+        for (i, t) in inputs.iter().enumerate() {
+            let resource = match t.view {
+                None => t.buf.as_entire_binding(),
+                Some((off, len)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &t.buf, offset: off, size: std::num::NonZeroU64::new(len) }),
+            };
+            bg_entries.push(wgpu::BindGroupEntry { binding: i as u32, resource });
+        }
         bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out.buf.as_entire_binding() });
         bg_entries.push(wgpu::BindGroupEntry { binding: n + 1, resource: dbuf.as_entire_binding() });
         let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: bgl, entries: &bg_entries });
@@ -596,7 +712,7 @@ impl Gpu {
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
-            frame.keep.push(Box::new(bg)); frame.keep.push(Box::new(dbuf));
+            frame.keep.push(Box::new(bg)); // dims buf is cached (or kept alive by `bg` until flush) — no separate keep
             frame.passes += 1;
             // Bound submit duration so a shared GPU still services the display between chunks.
             if frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed) {
@@ -622,10 +738,46 @@ impl Gpu {
     }
     /// Upload raw u32 words as a resident storage buffer (used for packed int8 weights).
     pub fn upload_u32(&self, data: &[u32]) -> Tensor {
-        let buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("qw"),
-            contents: bytemuck::cast_slice(data),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST });
-        Tensor { buf, rows: 1, cols: data.len() }
+        let bytes: &[u8] = bytemuck::cast_slice(data);
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("qw"),
+            size: (bytes.len().max(4)) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false });
+        if !bytes.is_empty() { self.queue.write_buffer(&buf, 0, bytes); }
+        Tensor { buf, rows: 1, cols: data.len(), pool: None, view: None }
+    }
+    /// Resident-weight uploads: when an arena is active (LOGSCOPE_ARENA, set up by the loader) the bytes
+    /// are packed into a shared slab and returned as an offset view; otherwise a dedicated buffer (the
+    /// current behaviour). Used only for resident WEIGHTS — activations always get their own buffers.
+    fn upload_u32_resident(&self, data: &[u32]) -> Tensor {
+        if self.arena.lock().unwrap().is_some() { self.arena_place(bytemuck::cast_slice(data), 1, data.len()) }
+        else { self.upload_u32(data) }
+    }
+    fn upload_resident(&self, data: &[f32], rows: usize, cols: usize) -> Tensor {
+        if self.arena.lock().unwrap().is_some() { self.arena_place(bytemuck::cast_slice(data), rows, cols) }
+        else { self.upload(data, rows, cols) }
+    }
+    /// Append `bytes` to the resident arena (256-aligned), starting a new slab when the current one can't
+    /// hold it. Returns a view Tensor (buf = slab clone, view = Some(offset,len)). Caller guarantees the
+    /// arena is active.
+    fn arena_place(&self, bytes: &[u8], rows: usize, cols: usize) -> Tensor {
+        const ALIGN: u64 = 256;
+        let len = bytes.len() as u64;
+        let mut guard = self.arena.lock().unwrap();
+        let a = guard.as_mut().expect("arena active");
+        let mut off = a.used.next_multiple_of(ALIGN);
+        if a.slabs.is_empty() || off + len > a.slab_size {
+            let size = a.slab_size.max(len.next_multiple_of(ALIGN)); // size up for a rare oversized weight
+            let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            a.slabs.push(slab);
+            a.used = 0;
+            off = 0;
+        }
+        let slab = a.slabs.last().unwrap().clone();
+        self.queue.write_buffer(&slab, off, bytes);
+        a.used = off + len;
+        Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
     }
     /// Quantize a row-major [n,k] f32 weight into a resident int8 `QWeight`
     /// (symmetric per-32-block scales). `k` must be a multiple of 32.
@@ -633,21 +785,48 @@ impl Gpu {
         let kb = k / 32;
         let mut qs = vec![0f32; n * kb];
         let mut qbytes = vec![0i8; n * k];
-        for r in 0..n {
-            for b in 0..kb {
-                let mut amax = 0f32;
-                for j in 0..32 { amax = amax.max(w[r * k + b * 32 + j].abs()); }
-                let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-                qs[r * kb + b] = scale;
-                for j in 0..32 {
-                    let idx = r * k + b * 32 + j;
-                    qbytes[idx] = (w[idx] / scale).round().clamp(-127.0, 127.0) as i32 as i8;
-                }
+        // Per-row quantization is independent (per-row scales, disjoint output slices) — fan it out
+        // across all cores instead of one. Bit-exact to the sequential version (same per-row math).
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8).max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (ci, (qs_c, qb_c)) in qs.chunks_mut(rows_per * kb).zip(qbytes.chunks_mut(rows_per * k)).enumerate() {
+                s.spawn(move || {
+                    let r0 = ci * rows_per;
+                    for lr in 0..(qb_c.len() / k) {
+                        let r = r0 + lr;
+                        for b in 0..kb {
+                            let base = r * k + b * 32;
+                            let mut amax = 0f32;
+                            for j in 0..32 { amax = amax.max(w[base + j].abs()); }
+                            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                            qs_c[lr * kb + b] = scale;
+                            for j in 0..32 {
+                                qb_c[lr * k + b * 32 + j] = (w[base + j] / scale).round().clamp(-127.0, 127.0) as i32 as i8;
+                            }
+                        }
+                    }
+                });
             }
-        }
+        });
         let mut qw = vec![0u32; n * k / 4];
-        for i in 0..n * k { qw[i / 4] |= (qbytes[i] as u8 as u32) << ((i % 4) * 8); }
-        QWeight { qw: self.upload_u32(&qw), qs: self.upload(&qs, n, kb), n, k }
+        let wper = qw.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let qbytes = &qbytes;
+            for (ci, qw_c) in qw.chunks_mut(wper).enumerate() {
+                s.spawn(move || {
+                    let w0 = ci * wper;
+                    for (li, word) in qw_c.iter_mut().enumerate() {
+                        let i4 = (w0 + li) * 4;
+                        *word = (qbytes[i4] as u8 as u32)
+                            | ((qbytes[i4 + 1] as u8 as u32) << 8)
+                            | ((qbytes[i4 + 2] as u8 as u32) << 16)
+                            | ((qbytes[i4 + 3] as u8 as u32) << 24);
+                    }
+                });
+            }
+        });
+        QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
     }
 
     /// Load GGUF q8_0 bytes [n,k] DIRECTLY into the int8-resident `QWeight`, skipping the f32 dequant +
@@ -667,7 +846,7 @@ impl Gpu {
                 qw[idx / 4] |= (raw[off + 2 + j] as u8 as u32) << ((idx % 4) * 8);
             }
         }
-        QWeight { qw: self.upload_u32(&qw), qs: self.upload(&qs, n, kb), n, k }
+        QWeight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
     }
     /// Quantize f32 weights [n,k] to the resident 4-bit form (per 32-block f32 scale = amax/7, nibble =
     /// clamp(round(w/scale),−7,7)+8). 8 nibbles per u32. k must be a multiple of 32.
@@ -675,22 +854,46 @@ impl Gpu {
         let kb = k / 32;
         let mut qs = vec![0f32; n * kb];
         let mut nib = vec![0u8; n * k];
-        for r in 0..n {
-            for b in 0..kb {
-                let mut amax = 0f32;
-                for j in 0..32 { amax = amax.max(w[r * k + b * 32 + j].abs()); }
-                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-                qs[r * kb + b] = scale;
-                for j in 0..32 {
-                    let idx = r * k + b * 32 + j;
-                    let q = (w[idx] / scale).round().clamp(-7.0, 7.0) as i32;
-                    nib[idx] = (q + 8) as u8; // 1..=15, symmetric around 8
-                }
+        let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(8).max(1).min(n.max(1));
+        let rows_per = n.div_ceil(threads);
+        std::thread::scope(|s| {
+            for (ci, (qs_c, nb_c)) in qs.chunks_mut(rows_per * kb).zip(nib.chunks_mut(rows_per * k)).enumerate() {
+                s.spawn(move || {
+                    let r0 = ci * rows_per;
+                    for lr in 0..(nb_c.len() / k) {
+                        let r = r0 + lr;
+                        for b in 0..kb {
+                            let base = r * k + b * 32;
+                            let mut amax = 0f32;
+                            for j in 0..32 { amax = amax.max(w[base + j].abs()); }
+                            let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                            qs_c[lr * kb + b] = scale;
+                            for j in 0..32 {
+                                let q = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
+                                nb_c[lr * k + b * 32 + j] = (q + 8) as u8; // 1..=15, symmetric around 8
+                            }
+                        }
+                    }
+                });
             }
-        }
+        });
         let mut qw = vec![0u32; n * k / 8];
-        for i in 0..n * k { qw[i / 8] |= ((nib[i] & 0xF) as u32) << ((i % 8) * 4); }
-        Q4Weight { qw: self.upload_u32(&qw), qs: self.upload(&qs, n, kb), n, k }
+        let wper = qw.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let nib = &nib;
+            for (ci, qw_c) in qw.chunks_mut(wper).enumerate() {
+                s.spawn(move || {
+                    let w0 = ci * wper;
+                    for (li, word) in qw_c.iter_mut().enumerate() {
+                        let i8b = (w0 + li) * 8;
+                        let mut v = 0u32;
+                        for b in 0..8 { v |= ((nib[i8b + b] & 0xF) as u32) << (b * 4); }
+                        *word = v;
+                    }
+                });
+            }
+        });
+        Q4Weight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
     }
     /// Resident fused dequant+linear: C[m,n] = A[m,k] · dequant(W)ᵀ, weights int8.
     /// m=1 decode mat-vec with an explicit column tile (1 = classic one-workgroup-per-column;
@@ -710,6 +913,22 @@ impl Gpu {
             let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
             self.dispatch(MATVEC_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         }
+        out
+    }
+    /// Residual fold (m=1 decode): c = W·a + resid in one dispatch, folding the post-projection
+    /// residual add (wo/wdown) into the matmul epilogue — one fewer ADD launch/layer.
+    pub fn linear_q8_0_add(&self, a: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+        self.dispatch(MATVEC_Q8_0_ADD, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    pub fn linear_q4_0_add(&self, a: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+        self.dispatch(MATVEC_Q4_ADD, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
 
@@ -947,6 +1166,13 @@ impl Gpu {
             let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
             let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
             self.dispatch(MATVEC_Q4, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        } else if m <= 8 {
+            // small batch (speculative verify block / batched decode): read each weight nibble once,
+            // accumulate all m rows — keeps Q4's halved weight-bandwidth advantage instead of the
+            // strided LINEAR_Q4 re-reading weights per tile. Each row is bit-exact to the m=1 kernel.
+            let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+            let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+            self.dispatch(MATVEC_SMALL_Q4, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         } else {
             let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32];
             self.dispatch(LINEAR_Q4, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims),
@@ -956,11 +1182,12 @@ impl Gpu {
     }
     /// Build a resident linear from f32 weights [n,k]: int8 when `quantize` and k%32==0
     /// (the fused kernel needs whole 32-wide blocks), else full-precision f32.
-    fn make_lin(&self, w: &[f32], n: usize, k: usize, quantize: bool) -> Lin {
+    fn make_lin(&self, w: &[f32], n: usize, k: usize, quantize: bool, q4: bool) -> Lin {
         if quantize && k % 32 == 0 {
-            // LOGSCOPE_Q4_RESIDENT forces 4-bit residency (8× smaller than f32) — the lever for fitting a
-            // borderline model that won't fit int8. Validated bit-exact by --gate-q4resident.
-            if std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() { Lin::q4(self.quantize_q4_resident(w, n, k)) }
+            // q4 = 4-bit residency (8× smaller than f32, 2× smaller than int8) — the lever for fitting a
+            // model that won't fit int8. Chosen at load by memplan (or forced via LOGSCOPE_Q4_RESIDENT).
+            // Validated bit-exact by --gate-q4resident.
+            if q4 { Lin::q4(self.quantize_q4_resident(w, n, k)) }
             else { Lin::q8(self.quantize_q8_resident(w, n, k)) }
         } else { Lin::f32(self.upload(w, n, k)) }
     }
@@ -1384,6 +1611,106 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if(tid==0u){ c[col]=red[0]; }
 }"#;
 
+// Residual-fold variants: identical to MATVEC_Q8_0 / MATVEC_Q4 but write c[col]=dot+resid[col],
+// folding the post-projection residual add (wo/wdown) into the matmul epilogue — saves one ADD
+// dispatch/layer each on the launch-bound decode path. resid is binding(3); c/dims shift to 4/5.
+const MATVEC_Q8_0_ADD: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]+resid[col]; }
+}"#;
+
+const MATVEC_Q4_ADD: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/8u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]+resid[col]; }
+}"#;
+
+// Small-batch (2≤m≤8) Q4 mat-vec: one workgroup per output column, 64 threads split k, each weight
+// nibble read ONCE and accumulated across all m rows (the bandwidth-bound cost stays near m=1 instead
+// of riding the strided LINEAR_Q4, which re-reads the weights per tile). Mirrors MATVEC_SMALL_Q8_0; the
+// per-term arithmetic (a*scale*qv) matches MATVEC_Q4 exactly, so each row is BIT-EXACT to the m=1 kernel.
+// This is what lets Q4-resident (half the weight bytes of int8) compound with speculative/batched decode.
+const MATVEC_SMALL_Q4: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // up to 8 rows x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let m=d.m;
+  let wbase=col*(d.k/8u); let sbase=col*d.kb;
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);   // 0..15
+    let qv=f32(i32(nib)-8);                     // symmetric, weight read once
+    for(var r=0u;r<m;r=r+1u){ acc[r]=acc[r]+a[r*d.k+kk]*scale*qv; }
+    kk=kk+64u;
+  }
+  for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=acc[r]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=red[r*64u+tid]+red[r*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var r=0u;r<m;r=r+1u){ c[r*d.n+col]=red[r*64u]; } }
+}"#;
+
 const LINEAR_Q4: &str = r#"
 struct D { m:u32,n:u32,k:u32,kb:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
@@ -1409,7 +1736,6 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   }
   c[row*d.n+col]=acc;
 }"#;
-
 // Decode mat-vec, TILED: one workgroup computes `tile` (≤8) output columns, 64 threads split k.
 // Each thread reads each activation a[kk] ONCE and reuses it across all `tile` columns — so the
 // activation-reread bandwidth (which dominates the FFN mat-vecs, where the vector is far larger than
@@ -1760,7 +2086,51 @@ impl Gpu {
     /// Same, but keep the large projection weights resident as int8 (4× less weight
     /// bandwidth). Norm gains stay f32; any matrix whose inner dim isn't a multiple
     /// of 32 falls back to f32 automatically.
-    pub fn load_gguf_quantized(&self, bytes: &[u8]) -> Result<Model, String> { self.load_gguf_opt(bytes, true) }
+    /// Load quantized weights, preferring int8-resident; if the GPU can't allocate it (Asahi reports
+    /// ample system RAM but can't map it all — the "BO VMA" failure), auto-retry q4-resident (≈half).
+    /// If even q4 won't fit, return a clean error (NOT a panic) so the worker stays alive and the app can
+    /// fall back to the llama.cpp backend. Both attempts run inside an OOM error scope so the wgpu
+    /// allocation failure is captured instead of aborting the process.
+    pub fn load_gguf_quantized(&self, bytes: &[u8]) -> Result<Model, String> {
+        let forced_q4 = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
+        match self.try_load_resident(bytes)? {
+            Some(m) => return Ok(m),
+            None if forced_q4 => return Err(Self::too_big_msg(bytes.len())), // already q4 — can't shrink further
+            None => {}
+        }
+        // int8 attempt hit GPU OOM → free partials and retry at q4-resident.
+        self.pool.free.lock().unwrap().clear();
+        eprintln!("wgpu-engine: int8-resident exceeded the GPU's allocatable memory — retrying as q4-resident (≈half the footprint)…");
+        std::env::set_var("LOGSCOPE_Q4_RESIDENT", "1");
+        let r = self.try_load_resident(bytes);
+        std::env::remove_var("LOGSCOPE_Q4_RESIDENT");
+        match r? {
+            Some(m) => Ok(m),
+            None => Err(Self::too_big_msg(bytes.len())),
+        }
+    }
+    fn too_big_msg(file_bytes: usize) -> String {
+        let gib = file_bytes as f64 / (1u64 << 30) as f64;
+        format!(
+            "this ~{gib:.0} GiB model exceeds the GPU's allocatable memory even at q4-resident — too big for \
+             the wgpu engine on this GPU (its resident copy of the weights won't fit). Use the llama.cpp / \
+             ollama backend for this model (it mmaps weights into unified memory and fits where the wgpu \
+             engine can't), or run a smaller model."
+        )
+    }
+    /// Load inside an OutOfMemory error scope. Ok(Some) = loaded; Ok(None) = GPU OOM (captured, the
+    /// process is NOT aborted); Err = a genuine (non-OOM) load error.
+    fn try_load_resident(&self, bytes: &[u8]) -> Result<Option<Model>, String> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let res = self.load_gguf_opt(bytes, true);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let oom = pollster::block_on(scope.pop());
+        if oom.is_some() {
+            drop(res.ok()); // discard any partial/poisoned buffers from the failed attempt
+            return Ok(None);
+        }
+        res.map(Some)
+    }
     pub fn load_gguf_opt(&self, bytes: &[u8], q: bool) -> Result<Model, String> {
         let g = gguf::parse(bytes)?;
         // llama-family + Qwen2. Qwen2's only delta is a bias add on Q/K/V (loaded below, applied in
@@ -1787,20 +2157,28 @@ impl Gpu {
         // dims only, no dequant) and refuse gracefully WITH the number instead of OOMing mid-load.
         let vocab_est = vocab_meta.unwrap_or_else(|| g.tensor("token_embd.weight")
             .map(|t| (t.dims.iter().product::<u64>() as usize) / d).unwrap_or(0));
+        // Residency planning (memplan): prefer int8; auto-fall-back to q4 when int8 won't fit the budget;
+        // refuse (with a number) only when even q4 won't fit. LOGSCOPE_Q4_RESIDENT forces q4 regardless.
+        let mut auto_q4 = false;
         if vocab_est > 0 {
             if let Some(budget) = store::resident_budget_bytes() {
                 let shape = crate::memplan::ModelShape { d, ffn: h, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
-                let fmt = if q { crate::memplan::Residency::Int8 } else { crate::memplan::Residency::F32 };
-                let need = crate::memplan::resident_weight_bytes(&shape, fmt) + crate::memplan::kv_cache_bytes(&shape, 4096, 2);
-                if need > budget {
+                if q {
                     use crate::memplan::{Fit, Residency, gib, plan};
-                    let suggestion = match plan(&shape, budget, 4096, 2, 256 * (1 << 20)) {
-                        Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => format!(" It would fit at q4 (~{:.1} GiB), but q4-resident isn't implemented yet.", gib(weight_bytes)),
-                        Fit::Streaming { .. } => " Layer streaming (not yet implemented) could run it.".to_string(),
-                        _ => " Use the llama.cpp backend for a model this size.".to_string(),
-                    };
-                    return Err(format!("model needs ~{:.1} GiB {} resident + KV, but only ~{:.1} GiB is available \
-                        (set LOGSCOPE_MAX_RESIDENT_GB to override).{}", gib(need), fmt.label(), gib(budget), suggestion));
+                    match plan(&shape, budget, 4096, 2, 256 * (1 << 20)) {
+                        Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
+                        Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
+                            auto_q4 = true;
+                            eprintln!("loader: int8 won't fit ~{:.1} GiB budget → auto-selecting q4-resident (~{:.1} GiB)", gib(budget), gib(weight_bytes));
+                        }
+                        Fit::Resident { fmt: Residency::F32, .. } => {}
+                        Fit::Streaming { per_layer_bytes, .. } => return Err(format!("model won't fit even at q4 in the ~{:.1} GiB budget (largest layer ~{:.2} GiB); layer streaming (not yet implemented) or the llama.cpp backend is required (set LOGSCOPE_MAX_RESIDENT_GB to override).", gib(budget), gib(per_layer_bytes))),
+                        Fit::TooBig { min_needed } => return Err(format!("model won't fit at any quant — needs ~{:.1} GiB, only ~{:.1} GiB available (set LOGSCOPE_MAX_RESIDENT_GB to override).", gib(min_needed), gib(budget))),
+                    }
+                } else {
+                    use crate::memplan::{gib, kv_cache_bytes, resident_weight_bytes, Residency};
+                    let need = resident_weight_bytes(&shape, Residency::F32) + kv_cache_bytes(&shape, 4096, 2);
+                    if need > budget { return Err(format!("model needs ~{:.1} GiB f32 resident + KV, but only ~{:.1} GiB is available (load quantized, or set LOGSCOPE_MAX_RESIDENT_GB to override).", gib(need), gib(budget))); }
                 }
             }
         }
@@ -1817,7 +2195,18 @@ impl Gpu {
         let vocab = vocab_meta.unwrap_or(embed.len() / d);
         // Build a resident linear, preferring the DIRECT q8_0 → int8 path (no f32 round-trip) when the
         // source tensor is q8_0 and we want int8 residency; otherwise dequant-then-quantize as before.
-        let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
+        let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
+        // Optional arena packing: route resident weights into a few large slabs instead of one buffer
+        // per tensor. Guard clears the bump state when this load returns/unwinds (slabs persist via the
+        // weight tensors). Off by default — opt in with LOGSCOPE_ARENA (slab MiB via LOGSCOPE_ARENA_SLAB_MB).
+        let _arena_guard = if std::env::var("LOGSCOPE_ARENA").is_ok() {
+            let max_buf = self.device.limits().max_buffer_size;
+            let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
+                .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
+            eprintln!("wgpu-engine: arena ON — packing resident weights into ≤{} MiB slabs (fewer buffer objects)", slab >> 20);
+            *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0 });
+            Some(ArenaGuard(&self.arena))
+        } else { None };
         let lin = |name: &str, n: usize, k: usize, quantize: bool| -> Result<Lin, String> {
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             if quantize && !q4_mode && t.ggml_type == 8 && k % 32 == 0 {
@@ -1827,7 +2216,7 @@ impl Gpu {
                 if start + nbytes > bytes.len() { return Err(format!("tensor {name} out of range")); }
                 return Ok(Lin::q8(self.q8_0_to_resident(&bytes[start..start + nbytes], n, k)));
             }
-            Ok(self.make_lin(&fetch(name)?, n, k, quantize))
+            Ok(self.make_lin(&fetch(name)?, n, k, quantize, q4_mode))
         };
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
@@ -1847,7 +2236,7 @@ impl Gpu {
                 let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
-                let fused = self.make_lin(&qkv, d + 2 * kv, d, q);
+                let fused = self.make_lin(&qkv, d + 2 * kv, d, q, q4_mode);
                 if has_qkv_bias {
                     let mut b = Vec::with_capacity(d + 2 * kv);
                     b.extend_from_slice(&fbq); b.extend_from_slice(&fbk); b.extend_from_slice(&fbv);
@@ -1871,7 +2260,7 @@ impl Gpu {
                     let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
                     let mut gu = Vec::with_capacity(g.len() + u.len());
                     gu.extend_from_slice(&g); gu.extend_from_slice(&u);
-                    self.make_lin(&gu, 2 * h, d, q)
+                    self.make_lin(&gu, 2 * h, d, q, q4_mode)
                 },
                 wdown: lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)?,
             });
@@ -1882,7 +2271,7 @@ impl Gpu {
         let output = if g.tensor("output.weight").is_some() {
             lin("output.weight", vocab, d, q)?
         } else {
-            self.make_lin(&embed, vocab, d, q)
+            self.make_lin(&embed, vocab, d, q, q4_mode)
         };
         // RoPE frequency factors (llama3 long-context scaling). GGUF ships them as
         // `rope_freqs.weight` (length head_dim/2); absent → all 1.0 (plain RoPE).
@@ -2679,13 +3068,11 @@ impl Gpu {
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
         let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
     /// Fused-QKV counterpart of block_decode_q8 (int8 KV cache). Same slice-and-quantize: one wqkv
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
@@ -2694,28 +3081,28 @@ impl Gpu {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let q  = self.rope_mh_t(&self.slice_cols(&qkv, 0, d), ff, 1, d, base, pos, hd);
-        let kr = self.rope_mh_t(&self.slice_cols(&qkv, d, kv), ff, 1, kv, base, pos, hd);
+        // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
+        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
+        let q  = self.slice_cols(&qk, 0, d);
+        let kr = self.slice_cols(&qk, d, kv);
         let vr = self.slice_cols(&qkv, d + kv, kv);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
         let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
     /// One token through all layers using the int8 KV cache; returns logits [vocab].
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
-        let fused = std::env::var_os("LOGSCOPE_FUSED_QKV").is_some();
+        let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let l = &m.layers[li]; let (kq, ks, vq, vs) = (&c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li]);
             x = if fused { self.block_decode_q8_fused(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) }
@@ -2755,13 +3142,11 @@ impl Gpu {
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
     /// Extract columns [col_off, col_off+width) of a single-row [1, N] tensor as a fresh [1, width],
     /// via a buffer copy (a transfer, NOT a compute dispatch). Splits the fused QKV projection's
@@ -2773,25 +3158,24 @@ impl Gpu {
     }
     /// block_decode with the three Q/K/V projections fused into one wqkv matmul (one weight-bind, one
     /// dispatch instead of three). The packed [1, d+2kv] output is split by buffer copies — q and k are
-    /// sliced out and rope'd exactly as before; v is copied straight into the V-cache row with no
-    /// projection dispatch. Bit-exact to block_decode (--gate-qkv-e2e); saves 2 compute dispatches/layer.
+    /// rope'd together in ONE dispatch (they're contiguous and the q|k split lands on a head boundary,
+    /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
+    /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, d+2kv] — one matmul (was three)
-        let q  = self.rope_mh_t(&self.slice_cols(&qkv, 0, d), ff, 1, d, base, pos, hd);
-        let kr = self.rope_mh_t(&self.slice_cols(&qkv, d, kv), ff, 1, kv, base, pos, hd);
-        self.write_row(kc, &kr, pos, kv);
-        // v = qkv[.., d+kv .. d+2kv] copied directly into the V-cache row (the projection already produced it).
-        self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64);
+        // RoPE q and k in one pass: [0,d)=q heads, [d,d+kv)=k heads are contiguous and head-aligned.
+        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
+        let q = self.slice_cols(&qk, 0, d);
+        self.copy_buf(&qk, (d * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+        self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
     /// Per-row-position RoPE: each row uses its own absolute position from `pos`.
     pub fn rope_mh_rows(&self, x: &Tensor, ff: &Tensor, pos: &Tensor, t: usize, dm: usize, base: f32, head_dim: usize) -> Tensor {
@@ -2814,13 +3198,11 @@ impl Gpu {
         self.write_row(kc, &kr, slot, kv);
         self.write_row(vc, &vr, slot, kv);
         let attn = self.decode_attention_mh(&q, kc, vc, attend_len, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
 
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
@@ -2829,18 +3211,17 @@ impl Gpu {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let q  = self.rope_mh_t(&self.slice_cols(&qkv, 0, d), ff, 1, d, base, rope_pos, hd);
-        let kr = self.rope_mh_t(&self.slice_cols(&qkv, d, kv), ff, 1, kv, base, rope_pos, hd);
-        self.write_row(kc, &kr, slot, kv);
+        // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
+        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, rope_pos, hd);
+        let q  = self.slice_cols(&qk, 0, d);
+        self.copy_buf(&qk, (d * 4) as u64, kc, (slot * kv * 4) as u64, (kv * 4) as u64);   // roped k → slot
         self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (slot * kv * 4) as u64, (kv * 4) as u64);
         let attn = self.decode_attention_mh(&q, kc, vc, attend_len, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, 1);
-        let x2 = self.add_t(x, &o);
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
         let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, 1);
-        self.add_t(&x2, &down)
+        w.wdown.apply_add(self, &hmid, 1, &x2)
     }
     /// Streaming-window decode: keep `sink` attention-sink tokens (the first few, pinned)
     /// plus a ring of the last `window` tokens, bounding the KV cache to `sink+window` rows
@@ -2851,7 +3232,7 @@ impl Gpu {
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
-        let fused = std::env::var_os("LOGSCOPE_FUSED_QKV").is_some();
+        let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (l, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_at_fused(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) }
@@ -2865,7 +3246,7 @@ impl Gpu {
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
-        let fused = std::env::var_os("LOGSCOPE_FUSED_QKV").is_some();
+        let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) }
@@ -3350,7 +3731,7 @@ impl Gpu {
     /// device): runs the layers + final norm + output projection and returns logits [1, vocab] as a
     /// tensor — no begin_frame, no readback (caller owns the frame). Honors LOGSCOPE_FUSED_QKV.
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
-        let fused = std::env::var_os("LOGSCOPE_FUSED_QKV").is_some();
+        let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) }

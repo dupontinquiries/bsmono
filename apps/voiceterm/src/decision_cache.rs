@@ -97,7 +97,9 @@ fn normalize(utterance: &str) -> String {
     out.trim().to_string()
 }
 
-fn now_secs() -> u64 { core_kit::time::now_secs() }
+fn now_secs() -> u64 {
+    crate::util::epoch_secs()
+}
 
 /// Look up an utterance in the cache. Returns the entry if found,
 /// None otherwise. Cheap — single mutex lock + HashMap lookup.

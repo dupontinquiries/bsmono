@@ -218,10 +218,11 @@ pub struct OrbitCam {
     pub pitch: f32,  // rotation around camera x
     pub dist: f32,   // camera distance from target
     pub target: Vec3,
+    pub roll: f32,   // Dutch-angle tilt around the view axis (cinematic camera)
 }
 
 impl Default for OrbitCam {
-    fn default() -> Self { Self { yaw: 0.5, pitch: 0.42, dist: 15.0, target: Vec3::new(0.0, -3.0, 0.0) } }
+    fn default() -> Self { Self { yaw: 0.5, pitch: 0.42, dist: 15.0, target: Vec3::new(0.0, -3.0, 0.0), roll: 0.0 } }
 }
 
 impl OrbitCam {
@@ -259,7 +260,9 @@ impl OrbitCam {
         let depth = self.dist - z2;
         if depth <= 0.1 { return None; }
         let persp = scale / depth;
-        Some((cx + x1 * persp, cy - y2 * persp, depth))
+        let (mut ox, mut oy) = (x1 * persp, -y2 * persp); // screen offset from centre
+        if self.roll != 0.0 { let (cr, sr) = (self.roll.cos(), self.roll.sin()); let (rx, ry) = (ox * cr - oy * sr, ox * sr + oy * cr); ox = rx; oy = ry; } // Dutch tilt
+        Some((cx + ox, cy + oy, depth))
     }
 }
 

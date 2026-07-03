@@ -1008,6 +1008,15 @@ ApplicationWindow {
         onTriggered: _prof._setupOnce()
     }
 
+    // v0.1.896: memory-footprint poll. The backend method no-ops (returns "")
+    // unless WEB2QML_MEMLOG is set, so this 15s tick costs a single env check +
+    // early return in normal use; when enabled it emits a `[mem] …` line (route
+    // to a file with WEB2QML_LOG=mem) for the later optimization pass.
+    Timer {
+        id: _memFootprintTimer; interval: 15000; repeat: true; running: backend !== null
+        onTriggered: { if (backend && backend.mem_footprint_log) backend.mem_footprint_log() }
+    }
+
     // v0.1.383 (session arc, step 3 completion): when the
     // user navigates to web2qml://sessions, a background
     // worker generates the LLM summary asynchronously. This
@@ -1772,17 +1781,17 @@ ApplicationWindow {
     // Same SlidePopup schema as the tab menu, so it inherits the directional
     // gestures: split = drag up (down-split) / right (right-split); close =
     // drag down (close pane) / right (close tab). Center (1,1) is the mic;
-    // a release without sliding commits it (push-to-talk). copy/paste/clear/
-    // scroll are placeholders until their backend methods land.
+    // a release without sliding commits it (push-to-talk). v0.1.899: copy/
+    // paste/clear/scroll are now wired (see the onSelected dispatch below).
     readonly property var paneActionMenuModel: [
         { label: "\u229E",       id: "split",  gridX: 0, gridY: 0, splitDir: true },  // split
         { label: "\uFF0B",       id: "newtab", gridX: 1, gridY: 0 },                  // new tab
         { label: "\u2715",       id: "close",  gridX: 2, gridY: 0, closeDir: true },  // close
-        { label: "\u29C9",       id: "copy",   gridX: 0, gridY: 1 },                  // copy (soon)
+        { label: "\u29C9",       id: "copy",   gridX: 0, gridY: 1 },                  // copy selection
         { label: "\uD83C\uDFA4", id: "mic",    gridX: 1, gridY: 1 },                  // mic
-        { label: "\u2913",       id: "paste",  gridX: 2, gridY: 1 },                  // paste (soon)
-        { label: "\u2327",       id: "clear",  gridX: 0, gridY: 2 },                  // clear (soon)
-        { label: "\u2630",       id: "scroll", gridX: 1, gridY: 2 },                  // scroll (soon)
+        { label: "\u2913",       id: "paste",  gridX: 2, gridY: 1 },                  // paste
+        { label: "\u2327",       id: "clear",  gridX: 0, gridY: 2 },                  // clear (Ctrl+L)
+        { label: "\u2630",       id: "scroll", gridX: 1, gridY: 2 },                  // page up scrollback
         { label: "\u2318",       id: "cmds",   gridX: 2, gridY: 2 }                   // commands
     ]
 
@@ -2479,7 +2488,13 @@ ApplicationWindow {
     // to Qt.quit — quit remains on Ctrl+Q). In the browser it closes the active
     // tab. Matches the Ctrl+Shift+* pane-op family.
     Shortcut { sequence: "Ctrl+Shift+W"; onActivated: {
-        if (swipeView.currentIndex === 1) root._ws("close pane")
+        if (swipeView.currentIndex === 1) {
+            // v0.1.881: close a web pane if one's open (web panes are never
+            // focused, so the old "close pane" path could only ever close the
+            // focused terminal pane). Falls back to the focused pane.
+            if (backend && backend.close_web_or_focused_pane) root.termPaneStrip = backend.close_web_or_focused_pane()
+            else root._ws("close pane")
+        }
         else if (backend && backend.tab_close) backend.tab_close(backend.active_tab_index || 0)
     } }
     // v0.1.643: Ctrl+O opens the file picker to load a file in the web
@@ -2715,10 +2730,11 @@ ApplicationWindow {
         // card) from the unified undo buffer.
         onActivated: root.undoLocation()
     }
-    Shortcut { sequence: "Ctrl+Shift+P"  // chord-registry-skip
+    Shortcut { sequence: "Ctrl+Shift+N"  // chord-registry-skip
         // v0.1.798: open the current page (or a default) as a WEB PANE beside
-        // the terminal — splits right + marks the new pane web. Placeholder
-        // render for now; tap the \u2715 on the pane to close it.
+        // the terminal — splits right + marks the new pane web. v0.1.883: moved
+        // off Ctrl+Shift+P (which now opens the command palette — the two
+        // collided, so Qt fired neither). "N" = new web pane.
         onActivated: {
             if (!backend || !backend.open_web_pane) return
             root.termPaneStrip = backend.open_web_pane("")
@@ -2767,11 +2783,26 @@ ApplicationWindow {
     Shortcut { sequence: "Ctrl+,"
         onActivated: { settingsPopup.open() }
     }
-    Shortcut { sequence: "Ctrl+P"
+    Shortcut { sequence: "Ctrl+P"; context: Qt.ApplicationShortcut
         onActivated: {
-            // v0.1.819: the palette now lives on the (single) terminal page. Ctrl+P
-            // opens it from anywhere. NOTE: this takes Ctrl+P from the shell's
-            // readline (previous-command); use the Up arrow for history instead.
+            // v0.1.880: on the terminal tab, Ctrl+P belongs to the shell
+            // (readline previous-command) — forward 0x10 to the PTY instead
+            // of stealing it for the palette. Use Ctrl+Shift+P to open the
+            // palette from the terminal. On other tabs, Ctrl+P opens it.
+            if (tabBar.currentIndex === 1) {
+                if (backend) backend.pty_write_byte(0x10)
+                if (typeof termKeyArea !== "undefined") termKeyArea.forceActiveFocus()
+            } else if (typeof commandPalette !== "undefined") {
+                commandPalette.openPalette()
+            }
+        }
+    }
+    Shortcut { sequence: "Ctrl+Shift+P"; context: Qt.ApplicationShortcut
+        onActivated: {
+            // v0.1.880: terminal-safe command-palette opener. Ctrl+Shift+<key>
+            // is the app's shortcut namespace (cf. Ctrl+Shift+R/C/V) and never
+            // reaches the shell, so this opens the palette from anywhere —
+            // including the terminal — without conflicting with readline.
             if (typeof commandPalette !== "undefined") commandPalette.openPalette()
         }
     }
@@ -3275,7 +3306,9 @@ ApplicationWindow {
         { category: "Window",
           keys: "Ctrl+,", desc: "Open settings" },
         { category: "Window", context: "browser",
-          keys: "Ctrl+P", desc: "Open command palette (browser)" },
+          keys: "Ctrl+P", desc: "Open command palette (terminal tab forwards Ctrl+P to the shell)" },
+        { category: "Window",
+          keys: "Ctrl+Shift+P", desc: "Open command palette (terminal-safe, works anywhere)" },
         { category: "Window",
           keys: "Ctrl+Q", desc: "Quit" },
         { category: "Pane",
@@ -5930,6 +5963,9 @@ ApplicationWindow {
                             property real calibratedGlyphTopOffset: 0
                             property bool calibrated: false
                             property string calibrationStatus: "(uncalibrated)"
+                            // v0.1.882: off by default — see the gated [cursor-align]
+                            // log below. Flip to true to capture calibration numbers.
+                            property bool debugCursorAlign: false
                             // Auto-recalibrate when font size changes — the
                             // cached calibrated values are stale at that point
                             // and would throw alignment off.
@@ -7451,11 +7487,14 @@ ApplicationWindow {
                                     // slightly off the real glyph advance — the
                                     // error ACCUMULATES with column, so it shows
                                     // up on long lines (gdb banner, gdb prompts at
-                                    // high columns). Log the calibration state at
-                                    // high columns so a gdb session captures the
-                                    // actual numbers. Gated to col>=30 so it
-                                    // doesn't spam on every keystroke near col 0.
-                                    if (backend.term_cursor_col >= 30 && backend.log_message) {
+                                    // high columns). v0.1.882: alignment is fixed and
+                                    // verified (charW==calibCharW==advW in the field),
+                                    // so this is off by default — it round-tripped
+                                    // QML→Rust on every recompute past col 30 (common),
+                                    // which was real per-keystroke churn. Flip
+                                    // termScreen.debugCursorAlign to re-enable for a
+                                    // future calibration investigation.
+                                    if (termScreen.debugCursorAlign && backend.term_cursor_col >= 30 && backend.log_message) {
                                         backend.log_message("[cursor-align] col=" + backend.term_cursor_col
                                             + " charW=" + termScreen.charW.toFixed(3)
                                             + " calibrated=" + termScreen.calibrated
@@ -9170,6 +9209,41 @@ ApplicationWindow {
                                                     width: _paneWebFlick.width
                                                     asynchronous: true
                                                     source: paneCell.paneWebSrc
+                                                }
+                                                // v0.1.881: browser-style smooth wheel scroll. Each
+                                                // notch eases the content to a new target with a short
+                                                // animation (Chromium/Firefox feel), and rapid notches
+                                                // ACCUMULATE onto the in-flight target so fast scrolling
+                                                // stays continuous instead of restarting. Flickable's
+                                                // built-in wheel step was tiny; webScrollStep sets the
+                                                // per-notch throw (px at a full 120-unit notch). A
+                                                // WheelHandler (not a MouseArea) keeps taps/links live.
+                                                property real webScrollStep: 130
+                                                property real _webScrollTarget: 0
+                                                NumberAnimation {
+                                                    id: _webScrollAnim
+                                                    target: _paneWebFlick
+                                                    property: "contentY"
+                                                    duration: 180
+                                                    easing.type: Easing.OutCubic
+                                                }
+                                                WheelHandler {
+                                                    onWheel: function(ev) {
+                                                        if (ev.angleDelta.y === 0) return
+                                                        var maxY = Math.max(0, _paneWebFlick.contentHeight - _paneWebFlick.height)
+                                                        if (maxY <= 0) return
+                                                        // Base the next target on the in-flight target
+                                                        // when animating (accumulate), else current pos.
+                                                        var base = _webScrollAnim.running ? _paneWebFlick._webScrollTarget : _paneWebFlick.contentY
+                                                        // wheel up (angleDelta.y>0) reveals earlier content
+                                                        // → contentY decreases.
+                                                        var delta = (ev.angleDelta.y / 120) * _paneWebFlick.webScrollStep
+                                                        _paneWebFlick._webScrollTarget = Math.max(0, Math.min(base - delta, maxY))
+                                                        _webScrollAnim.stop()
+                                                        _webScrollAnim.from = _paneWebFlick.contentY
+                                                        _webScrollAnim.to = _paneWebFlick._webScrollTarget
+                                                        _webScrollAnim.start()
+                                                    }
                                                 }
                                                 // v0.1.833: voice scroll reaches this pane.
                                                 Connections {
@@ -11384,6 +11458,17 @@ ApplicationWindow {
         // workspace wire.
         function onTerm_strip_refreshed(wire) {
             if (wire && wire.length > 0) root.termPaneStrip = wire
+            // v0.1.899: a pane's url/kind change (open-in-current-pane, an
+            // in-page link) does NOT change to_wire() — it only encodes tab
+            // structure, not per-pane url/kind. So the assignment above is a
+            // no-op that never fires onTermPaneStripChanged, and the pane model
+            // keeps the stale url. Force the model to re-read ws_pane_rects (new
+            // url) and web panes to re-render; render_pane_qml is content-
+            // addressed, so unchanged panes cost a hash and no Loader reload.
+            if (typeof paneSplitLayer !== "undefined") {
+                paneSplitLayer._recompute()
+                paneSplitLayer._webTick++
+            }
         }
     }
 
@@ -18342,6 +18427,22 @@ ApplicationWindow {
         // v0.1.829: drains completed background per-pane web fetches, caches
         // them, and re-points termPaneStrip so the now-cached panes render.
         // Started by a web pane's empty-state when it kicks off a fetch; stops
+        // v0.1.881: periodic web-pane refresh. Web panes are never the focused
+        // pane (split_web restores focus to the prior pane), so the v0.1.879
+        // focus-bump never fired and internal web2qml:// pages (mail, drafts,
+        // sessions) only refreshed when the pane STRIP changed — i.e. "not
+        // until I split a pane." Bumping _webTick re-evaluates paneWebSrc;
+        // render_pane_qml is content-addressed, so an unchanged page yields the
+        // same file path and the Loader does NOT reload (no flicker) — only
+        // genuinely-changed pages re-render. Cheap enough to run continuously.
+        Timer {
+            interval: 1500
+            repeat: true
+            running: true
+            onTriggered: {
+                if (typeof paneSplitLayer !== "undefined") paneSplitLayer._webTick++
+            }
+        }
         // itself after a stretch with no results.
         Timer {
             id: _paneFetchPollTimer
@@ -19664,6 +19765,19 @@ ApplicationWindow {
             }
         }
 
+        // v0.1.899: force the pane model to re-read ws_pane_rects and web panes
+        // to re-render. Needed after any action that changes a pane's url/kind
+        // WITHOUT changing tab structure — to_wire() encodes only tab structure,
+        // so the termPaneStrip assignment can be a no-op that never fires
+        // onTermPaneStripChanged. render_pane_qml is content-addressed, so this
+        // is cheap for unchanged panes (a hash, no Loader reload).
+        function _forcePaneRerender() {
+            if (typeof paneSplitLayer !== "undefined") {
+                paneSplitLayer._recompute()
+                paneSplitLayer._webTick++
+            }
+        }
+
         function executeIntent() {
             // v0.1.866: "add my email" / "register email" — a global pre-login
             // command. Opens the Proton sign-in for a Proton address; denies a
@@ -19850,6 +19964,10 @@ ApplicationWindow {
                         if (displayCmd === "\x01FAVORITES\x01") displayCmd = "[favorites]"
                         else if (displayCmd === "\x01FILEPICKER\x01") displayCmd = "[file picker]"
                         else if (displayCmd === "\x01CHORDOVERLAY\x01") displayCmd = "[keybindings]"
+                        else if (displayCmd === "\x01MAIL\x01") displayCmd = "[email]"
+                        else if (displayCmd === "\x01MAILCOMPOSE\x01") displayCmd = "[compose]"
+                        else if (displayCmd === "\x01MAILDRAFTS\x01") displayCmd = "[drafts]"
+                        else if (displayCmd === "\x01PEERS\x01") displayCmd = "[peers]"
                         else if (displayCmd === "\x01GITBRANCH\x01") displayCmd = "[git branch]"
                         else if (displayCmd.indexOf("KEYS\x01") !== -1
                                  && displayCmd.indexOf("KEYS\x01") <= 1) {
@@ -20892,6 +21010,47 @@ no active speaker?", "warn")
                         filePickerDrawer.openAt(cwd)
                         break
                     }
+                    // v0.1.881: voice "view my email" / "check my email" /
+                    // "sign into my email" → open the mail UI. With no account
+                    // connected this lands on the sign-in page. mail_open_login
+                    // returns the pane strip (open_web_pane → workspace wire).
+                    if (intentParam === "\x01MAIL\x01") {
+                        if (backend && backend.mail_open_login) {
+                            var mstrip = backend.mail_open_login()
+                            tabBar.currentIndex = 1; swipeView.currentIndex = 1
+                            if (mstrip && mstrip.length > 0) root.termPaneStrip = mstrip
+                            _forcePaneRerender()
+                        }
+                        break
+                    }
+                    // v0.1.882: compose / drafts — local panes, no auth needed.
+                    if (intentParam === "\x01MAILCOMPOSE\x01") {
+                        if (backend && backend.mail_open_compose) {
+                            var cstrip = backend.mail_open_compose()
+                            tabBar.currentIndex = 1; swipeView.currentIndex = 1
+                            if (cstrip && cstrip.length > 0) root.termPaneStrip = cstrip
+                            _forcePaneRerender()
+                        }
+                        break
+                    }
+                    if (intentParam === "\x01MAILDRAFTS\x01") {
+                        if (backend && backend.mail_open_drafts) {
+                            var dstrip = backend.mail_open_drafts()
+                            tabBar.currentIndex = 1; swipeView.currentIndex = 1
+                            if (dstrip && dstrip.length > 0) root.termPaneStrip = dstrip
+                            _forcePaneRerender()
+                        }
+                        break
+                    }
+                    if (intentParam === "\x01PEERS\x01") {
+                        if (backend && backend.mail_open_peers) {
+                            var pstrip = backend.mail_open_peers()
+                            tabBar.currentIndex = 1; swipeView.currentIndex = 1
+                            if (pstrip && pstrip.length > 0) root.termPaneStrip = pstrip
+                            _forcePaneRerender()
+                        }
+                        break
+                    }
                     tabBar.currentIndex = 1; swipeView.currentIndex = 1
                     // Special TERM_KEYS sentinel from voice_parse_candidates
                     // means "send these bytes literally to the PTY without
@@ -21095,15 +21254,17 @@ no active speaker?", "warn")
                     // help" / "tmux commands" lists the voice vocabulary.
                     {
                         var hp = (recognizedText || intentParam || "").trim().toLowerCase()
-                        if (/^(what can i say|mux help|zellij help|zellij commands|tmux help|tmux commands|show commands)$/.test(hp)) {
+                        if (/^(what can i say|mux help|zellij help|zellij commands|tmux help|tmux commands|gitmind help|gitmind commands|gin help|gin commands|show commands)$/.test(hp)) {
                             var inZ = backend.zellij_active && backend.zellij_active()
                             var inT = backend.tmux_active && backend.tmux_active()
+                            var inG = backend.gitmind_active && backend.gitmind_active()
                             var vocab = inZ ? (backend.zellij_commands ? backend.zellij_commands() : "")
-                                : inT ? (backend.tmux_commands ? backend.tmux_commands() : "") : ""
+                                : inT ? (backend.tmux_commands ? backend.tmux_commands() : "")
+                                : inG ? (backend.gitmind_commands ? backend.gitmind_commands() : "") : ""
                             if (vocab.length > 0) {
                                 muxHelpOverlay.rows = vocab.split("\n").map(function(l){
                                     var pp = l.split("\t"); return { label: pp[0], hint: pp[1] || "" } })
-                                muxHelpOverlay.title = (inZ ? "zellij" : "tmux") + " voice commands"
+                                muxHelpOverlay.title = (inZ ? "zellij" : inT ? "tmux" : "gitmind") + " voice commands"
                                 muxHelpOverlay.open = true
                                 break
                             }
@@ -21125,6 +21286,27 @@ no active speaker?", "warn")
                         var tw = backend.tmux_translate(recognizedText || intentParam || "")
                         if (tw && tw.length > 0) {
                             _runMuxCommand(tw, "tmux")
+                            break
+                        }
+                    }
+                    // gitmind (gin) CLI: in a gitmind repo a phrase is tried as
+                    // a `gin` command. Unlike the mux query path, gin output is
+                    // shown in the terminal directly (it's not pane/tab JSON), so
+                    // we just run it — only the overwriting `extract` confirms.
+                    if (backend.gitmind_active && backend.gitmind_active()
+                        && backend.gitmind_translate) {
+                        var gw = backend.gitmind_translate(recognizedText || intentParam || "")
+                        if (gw && gw.length > 0) {
+                            var gp = gw.split("\t")
+                            var gcmd = gp[0]
+                            if (gp[1] === "1") { // confirm (restore/extract)
+                                _pendingZellijCmd = gcmd
+                                zellijConfirm.bodyText = "Run \u201c" + gcmd + "\u201d?"
+                                zellijConfirm.open()
+                            } else {
+                                backend.pty_write(gcmd + "\r")
+                                if (typeof toast !== "undefined") toast.show(gcmd, "info")
+                            }
                             break
                         }
                     }
@@ -31199,16 +31381,23 @@ no active speaker?", "warn")
             var u = linkSlidePopup.targetUrl
             if (u.length === 0) return
             if (optionId === "open") {
-                backend.nav(u)
+                // v0.1.880: open in the focused pane via the workspace
+                // infra (was backend.nav → the legacy single web view,
+                // which the pane-based UI no longer surfaces).
+                if (backend.open_web_here) root.termPaneStrip = backend.open_web_here(u)
+                else backend.nav(u)
             } else if (optionId === "read") {
-                // Same routing as the radial "Read" — nav, then the
-                // reading overlay engages (click-to-read default).
-                backend.nav(u)
+                // Same call as Open — the reading overlay engages off the
+                // loaded content, as it did on the legacy nav path.
+                if (backend.open_web_here) root.termPaneStrip = backend.open_web_here(u)
+                else backend.nav(u)
             } else if (optionId === "copy") {
                 if (backend.clipboard_set) backend.clipboard_set(u)
             } else if (optionId === "newtab") {
-                if (backend.tab_open_background) backend.tab_open_background(u)
-                else if (backend.tab_open) backend.tab_open(u)
+                // v0.1.880: open in a NEW workspace tab via the pane infra
+                // (was the legacy _tabs/tab_open browser-tab model).
+                if (backend.open_web_tab) root.termPaneStrip = backend.open_web_tab(u)
+                else if (backend.tab_open_background) backend.tab_open_background(u)
                 else backend.nav(u)
             }
         }
@@ -31313,6 +31502,41 @@ no active speaker?", "warn")
                 if (backend.ws_command) root.termPaneStrip = backend.ws_command(what2)
             } else if (optionId === "cmds") {
                 commandPalette.openPalette()
+            } else if (optionId === "copy") {
+                // v0.1.899: copy the terminal selection to the clipboard
+                // (mirrors the touch-row Copy button). No-op with nothing
+                // selected, with a nudge so the tap isn't silent.
+                var _cpTxt = ""
+                if (termScreen.selActive && backend.term_selection_text) {
+                    _cpTxt = backend.term_selection_text(
+                        termScreen.selStartRow, termScreen.selStartCol,
+                        termScreen.selEndRow, termScreen.selEndCol)
+                }
+                if (_cpTxt && _cpTxt.length > 0) {
+                    if (backend.clipboard_set) backend.clipboard_set(_cpTxt)
+                    if (typeof toast !== "undefined") toast.show("Copied " + _cpTxt.length + " chars")
+                } else if (typeof toast !== "undefined") {
+                    toast.show("Select text first, then Copy")
+                }
+            } else if (optionId === "paste") {
+                // v0.1.899: paste the system clipboard into the terminal
+                // (mirrors the touch-row Paste button; pty_paste normalizes
+                // line endings + brackets the paste).
+                if (backend.clipboard_get) {
+                    var _psTxt = backend.clipboard_get()
+                    if (_psTxt && _psTxt.length > 0 && backend.pty_paste) backend.pty_paste(_psTxt)
+                }
+            } else if (optionId === "clear") {
+                // v0.1.899: Ctrl+L (form feed) — clears the visible screen
+                // without wiping scrollback or command state; works in shells
+                // and full-screen TUIs alike.
+                if (backend.pty_write) backend.pty_write("\f")
+            } else if (optionId === "scroll") {
+                // v0.1.899: page up through scrollback (repeatable). Uses the
+                // visible row count for a PageUp-sized step, minus one row of
+                // overlap for context; the poll repaints the scrolled view.
+                var _pg = (termScreen.lastR && termScreen.lastR > 1) ? (termScreen.lastR - 1) : 10
+                if (backend.pty_scroll_back) backend.pty_scroll_back(_pg)
             } else if (typeof toast !== "undefined") {
                 toast.show(optionId + " \u2014 coming soon")
             }

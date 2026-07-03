@@ -279,6 +279,59 @@ pub fn parse(text: &str) -> Option<MailIntent> {
     None
 }
 
+/// v0.1.893: in-message-view navigation direction. Distinct from the
+/// command-level [`MailIntent`]s because these are recognized only when a mail
+/// *message* pane is the active voice context — the UI gates on focus before
+/// calling [`parse_message_nav`], so bare "next" / "back" / "close" are
+/// unambiguous there. The UI maps the direction onto its message-pane stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavDir {
+    /// Move to the next (older) message in the current list.
+    Next,
+    /// Move to the previous (newer) message.
+    Previous,
+    /// Leave the message view, return to the list it came from.
+    Back,
+    /// Close the current message pane entirely.
+    Close,
+}
+
+/// v0.1.893: parse an in-message-view navigation phrase. Returns `None` for
+/// anything that isn't navigation. Intended to be tried by the UI *only* while
+/// a message pane is focused, so terse forms work; ordering resolves the
+/// overlaps ("go back one" is Previous, bare "back" is Back-to-list).
+pub fn parse_message_nav(text: &str) -> Option<NavDir> {
+    let t = normalize(text);
+    if t.is_empty() {
+        return None;
+    }
+    // Close — explicit dismissal of the pane.
+    if t.contains("close") || t.contains("dismiss") || t.contains("get rid of") {
+        return Some(NavDir::Close);
+    }
+    // Previous — checked before the bare-"back" list rule so "back one" /
+    // "go back one" / "the one before" route to the prior message, not the list.
+    if t.contains("previous") || t.contains("prev") || t.contains("before")
+        || t.contains("back one") || t.contains("one back") || t.contains("go up")
+        || (t.contains("last") && (t.contains("message") || t.contains("email") || t.contains("one")))
+    {
+        return Some(NavDir::Previous);
+    }
+    // Next message.
+    if t.contains("next") || t.contains("following") || t.contains("go down")
+        || (t.contains("forward") && !t.contains("forward to") && !t.contains("forward it"))
+    {
+        return Some(NavDir::Next);
+    }
+    // Back to the list / inbox (bare "back" lands here).
+    if t.contains("back") || t.contains("return to") || t == "list"
+        || t.contains("the list") || t.contains("message list") || t.contains("inbox")
+    {
+        return Some(NavDir::Back);
+    }
+    None
+}
+
 /// Detect a mutating action verb in the phrase.
 fn detect_action(t: &str) -> Option<MailAction> {
     if t.contains("mark") && (t.contains("unread")) {
@@ -679,10 +732,31 @@ pub fn parse_register_email(text: &str) -> Option<Option<String>> {
         "connect my email", "connect email", "sign in to email", "log in to email",
         "set up my email", "set up email",
     ];
-    if !TRIGGERS.iter().any(|tr| t.contains(tr)) {
+    if !TRIGGERS.iter().any(|tr| t.contains(tr)) && !is_signin_command(&t) {
         return None;
     }
     Some(first_email(&t))
+}
+
+/// v0.1.893: recognize a spoken sign-in command aimed at email. The fixed
+/// TRIGGERS list above only caught the exact strings "sign in to email" /
+/// "log in to email", so natural phrasings ("sign into my email", "log in to
+/// proton", "sign me in to my mail") fell through. This matches a sign-in verb
+/// (tolerant of the spaced/unspaced and "in"/"into" forms) co-occurring with a
+/// mail-specific noun. "account" alone is deliberately NOT enough — "sign in to
+/// my account" shouldn't hijack a non-mail sign-in into the Proton form.
+fn is_signin_command(t: &str) -> bool {
+    let has_verb = t.contains("sign in") || t.contains("signin")
+        || t.contains("log in") || t.contains("login")
+        // "sign into"/"log into" already contain "sign in"/"log in"; listed
+        // for clarity of intent and to cover any normalization differences.
+        || t.contains("sign into") || t.contains("log into")
+        || t.contains("sign me in") || t.contains("log me in");
+    if !has_verb {
+        return false;
+    }
+    // Mail-specific noun ("mail" also covers "email"); Proton brand variants.
+    t.contains("mail") || t.contains("proton") || t.contains("inbox")
 }
 
 /// First email-looking token in a phrase: a word with a non-empty local part, an
@@ -726,6 +800,50 @@ mod tests {
         // not register commands → None (fall through)
         assert_eq!(parse_register_email("open my inbox"), None);
         assert_eq!(parse_register_email("what is the weather"), None);
+    }
+
+    // v0.1.893: natural sign-in phrasings the old exact-substring list missed.
+    #[test]
+    fn signin_command_phrasings() {
+        // verb + mail noun, tolerant of "my" / "into" / brand
+        assert_eq!(parse_register_email("sign in to my email"), Some(None));
+        assert_eq!(parse_register_email("sign into my email"), Some(None));
+        assert_eq!(parse_register_email("log in to proton"), Some(None));
+        assert_eq!(parse_register_email("log into my mail"), Some(None));
+        assert_eq!(parse_register_email("sign me in to my inbox"), Some(None));
+        // still extracts an address if spoken
+        assert_eq!(parse_register_email("log in to email alice@pm.me"),
+                   Some(Some("alice@pm.me".into())));
+        // a sign-in verb with NO mail noun must NOT hijack a generic sign-in
+        assert_eq!(parse_register_email("sign in to my bank account"), None);
+        assert_eq!(parse_register_email("log in"), None);
+    }
+
+    #[test]
+    fn message_nav_directions() {
+        use NavDir::*;
+        // next
+        assert_eq!(parse_message_nav("next"), Some(Next));
+        assert_eq!(parse_message_nav("next message"), Some(Next));
+        assert_eq!(parse_message_nav("show the following email"), Some(Next));
+        // previous (and the overlap with "back")
+        assert_eq!(parse_message_nav("previous"), Some(Previous));
+        assert_eq!(parse_message_nav("previous message"), Some(Previous));
+        assert_eq!(parse_message_nav("go back one"), Some(Previous));
+        assert_eq!(parse_message_nav("the one before"), Some(Previous));
+        assert_eq!(parse_message_nav("last message"), Some(Previous));
+        // back to list — bare "back" is the list, not the previous message
+        assert_eq!(parse_message_nav("back"), Some(Back));
+        assert_eq!(parse_message_nav("back to the list"), Some(Back));
+        assert_eq!(parse_message_nav("return to inbox"), Some(Back));
+        // close
+        assert_eq!(parse_message_nav("close"), Some(Close));
+        assert_eq!(parse_message_nav("close this message"), Some(Close));
+        assert_eq!(parse_message_nav("dismiss"), Some(Close));
+        // non-navigation
+        assert_eq!(parse_message_nav("compose a new email"), None);
+        assert_eq!(parse_message_nav("what time is it"), None);
+        assert_eq!(parse_message_nav(""), None);
     }
 
     fn sel(count: usize, from: Option<&str>, about: Option<&str>, when: Option<When>, all: bool) -> Selector {

@@ -49,10 +49,18 @@ def analyze(d):
     room_h = min(bhi[1] - floor_y, room_ext * 1.2)
 
     # OBSTACLES: solid mid-size objects the strand should weave AROUND (columns, shelves,
-    # centerpieces) — exclude room-spanning shells (floor/walls/dome) and floor-flat inlay.
+    # centerpieces) — exclude room-spanning shells (floor/walls/dome/balcony-rings/tiers). Those have huge AABBs but
+    # are hollow and CENTERED on the room (concentric), so the strand being *inside* them is correct, not a clip.
+    def is_shell(o):
+        cx = (o["lo"][0] + o["hi"][0]) / 2
+        cz = (o["lo"][2] + o["hi"][2]) / 2
+        h = hext(o)
+        return h > 12 and (cx * cx + cz * cz) ** 0.5 < h * 0.35
     obstacles = [o for o in objs
-                 if hext(o) < room_ext * 0.5 and vext(o) > 1.5
+                 if hext(o) < 14.0 and vext(o) > 1.5  # local solids only; bigger = terrace/platform/blob (terrain)
                  and min(o["hi"][0] - o["lo"][0], o["hi"][2] - o["lo"][2]) > 0.4
+                 and o["mat"] in (1, 2)  # HARD materials only (wood, stone). Foliage(moss=4), water(3), paper(0)
+                 and not is_shell(o)     # are soft/passable/decorative — the strand among leaves isn't a clip.
                  and o["lo"][1] < floor_y + room_h * 0.7]
 
     gy = [g["p"][1] for g in graph]

@@ -89,6 +89,15 @@ thread_local! { static TESS_MUL: std::cell::Cell<f32> = const { std::cell::Cell:
 pub fn set_tess_mul(m: f32) { TESS_MUL.with(|c| c.set(m.clamp(0.25, 6.0))); }
 #[inline] fn tess(base: usize, min: usize) -> usize { ((base as f32 * TESS_MUL.with(|c| c.get())).round() as usize).max(min) }
 
+/// LOD DETAIL abstraction — maps a feature's distance (from the scene centre, for baked scenes) to a detail
+/// factor in [floor, 1.0]: full detail within `near`, linearly thinning to `floor` by `far`. Lets callers stop
+/// hand-rolling `(0.95 - d/80).clamp(..)` formulas and keep the density falloff consistent across scenes.
+pub fn lod_detail(dist: f32, near: f32, far: f32, floor: f32) -> f32 {
+    if dist <= near { 1.0 }
+    else if dist >= far { floor }
+    else { (1.0 - (dist - near) / (far - near).max(1e-3) * (1.0 - floor)).clamp(floor, 1.0) }
+}
+
 /// A smooth UV sphere (vertex normals are radial). `segs` around, `rings` top-to-bottom.
 /// Parse a Wavefront **OBJ** into a `Mesh3` (positions `v`, optional normals `vn`, faces `f` with any of
 /// `v`, `v/vt`, `v//vn`, `v/vt/vn`, polygons triangulated as a fan). Missing normals are computed per face.
@@ -180,8 +189,54 @@ pub fn tube(a: Vec3, b: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
     Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
 }
 
-/// A faceted rock: a low-res sphere whose radius is perturbed by noise, rebuilt with per-FACE normals so it
-/// reads as chunky stone rather than a smooth ball.
+/// A tapered, gently CURVED branch (not a straight pillar): a multi-ring tube swept along a curve that bows in
+/// `side` (accelerating toward the tip) and wobbles with low-frequency noise for gnarl. Radius lerps r0→r1
+/// (taper). Returns (mesh, tip point, tip tangent) so children/twigs attach at the curved end with the right
+/// heading — this is what lets a tree bend and keep growing in the bent direction instead of standing straight.
+pub fn branch_curved(a: Vec3, dir: Vec3, len: f32, r0: f32, r1: f32, side: Vec3, bend: f32, seed: u32, color: Color32) -> (Mesh3, Vec3, Vec3) {
+    let dir = norm(dir);
+    // make `side` perpendicular to dir so the bow is purely lateral
+    let side = {
+        let s = sub(side, mul(dir, dot(side, dir)));
+        if dot(s, s) > 1e-5 { norm(s) } else { norm(cross(dir, v(0.0, 1.0, 0.2))) }
+    };
+    let wdir = cross(dir, side);
+    let rings = tess(7, 4);
+    let segs = tess(8, 4);
+    let (mut verts, mut norms, mut tris) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut cen, mut tan) = (Vec::with_capacity(rings + 1), Vec::with_capacity(rings + 1));
+    for i in 0..=rings {
+        let t = i as f32 / rings as f32;
+        let bow = t * t; // accelerating C-bend → the tip leans, base stays put
+        let wob = (hash3(i as i32, seed as i32, 1) - 0.5) * 0.10 * len * t; // gnarl grows toward the tip
+        let p = addv(addv(a, mul(dir, len * t)), addv(mul(side, bend * len * bow), mul(wdir, wob)));
+        cen.push(p);
+        tan.push(norm(addv(mul(dir, len), mul(side, bend * len * 2.0 * t)))); // d/dt of the centreline
+    }
+    for i in 0..=rings {
+        let t = i as f32 / rings as f32;
+        let r = r0 + (r1 - r0) * t;
+        let axis = tan[i];
+        let up = if axis.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+        let u = norm(cross(axis, up));
+        let w = cross(axis, u);
+        for j in 0..=segs {
+            let th = std::f32::consts::TAU * j as f32 / segs as f32;
+            let n = addv(mul(u, th.cos()), mul(w, th.sin()));
+            verts.push(addv(cen[i], mul(n, r))); norms.push(n);
+        }
+    }
+    let ring = segs + 1;
+    for i in 0..rings {
+        for j in 0..segs {
+            let a0 = (i * ring + j) as u32;
+            let b0 = ((i + 1) * ring + j) as u32;
+            tris.push([a0, b0, a0 + 1]);
+            tris.push([a0 + 1, b0, b0 + 1]);
+        }
+    }
+    (Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }, cen[rings], tan[rings])
+}
 pub fn rock(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
     let base = uv_sphere(center, r, 16, 12, color); // higher-res base (also scales with detail)
     let s = seed as f32 * 0.137;
@@ -847,8 +902,13 @@ pub fn paper_fold(center: Vec3, size: f32, rise: f32, color: Color32) -> Mesh3 {
 }
 
 pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
+    leaf_cluster_lod(center, r, seed, color, 1.0)
+}
+/// LOD variant of `leaf_cluster`: `detail` (≈0.15..1) scales the leaf COUNT so distant clusters cull down to a
+/// few blades while near ones stay dense. Blades are kept SMALL (subdivided foliage) rather than big flat cards.
+pub fn leaf_cluster_lod(center: Vec3, r: f32, seed: u32, color: Color32, detail: f32) -> Mesh3 {
     let (mut verts, mut norms, mut tris) = (Vec::new(), Vec::new(), Vec::new());
-    let leaves = tess(12, 7); // denser → reads as foliage (scales with detail)
+    let leaves = tess((((40.0 + r * 16.0).min(110.0)) * detail.clamp(0.15, 1.0)) as usize, 5); // MANY small blades; denser on big crowns to fill the canopy, culled far (LOD)
     // a flat leaf-blade silhouette in (along, across) local coords: pointed tip → rounded body → base
     const BLADE: [(f32, f32); 8] = [(1.0, 0.0), (0.6, 0.22), (0.2, 0.32), (-0.35, 0.30), (-0.95, 0.0), (-0.35, -0.30), (0.2, -0.32), (0.6, -0.22)];
     for k in 0..leaves {
@@ -861,7 +921,7 @@ pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
         let up = if dir.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
         let along = norm(cross(dir, up));   // long axis (tip→base)
         let across = cross(dir, along);     // short axis
-        let len = r * (0.42 + 0.22 * hash3(k, seed as i32, 4));
+        let len = (r * 0.10 * (0.8 + 0.4 * hash3(k, seed as i32, 4))).clamp(0.05, 0.30); // ABSOLUTE-capped small blades — big crowns get MANY small leaves, not few big cards
         let curl = len * (0.30 + 0.22 * hash3(k, seed as i32, 5)); // per-leaf cup depth
         let i = verts.len() as u32;
         // raised midrib centre (cup high point) — gives the blade a fold + a non-flat normal field
@@ -878,6 +938,20 @@ pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
         for j in 0..BLADE.len() as u32 {
             tris.push([i, i + 1 + j, i + 1 + ((j + 1) % BLADE.len() as u32)]);
         }
+        // PETIOLE — a thin tapered stem from the blade base back toward the cluster centre (the twig), so every
+        // leaf visibly ATTACHES to the stem instead of floating free. Part of the LOD loop ⇒ culls with distance.
+        let bb = addv(cpt, mul(along, -0.95 * len)); // pointed base of the blade silhouette
+        let tow = { let d = sub(center, cpt); let l = dot(d, d).sqrt(); if l > 1e-4 { mul(d, 1.0 / l) } else { mul(dir, -1.0) } };
+        let slen = (len * 1.8).min(rad * 0.6);
+        let stip = addv(bb, mul(tow, slen));
+        let sw = (len * 0.055).max(0.010);
+        let si = verts.len() as u32;
+        verts.push(addv(bb, mul(across, sw)));          norms.push(dir);
+        verts.push(addv(bb, mul(across, -sw)));         norms.push(dir);
+        verts.push(addv(stip, mul(across, sw * 0.55))); norms.push(dir);
+        verts.push(addv(stip, mul(across, -sw * 0.55)));norms.push(dir);
+        tris.push([si, si + 2, si + 1]);
+        tris.push([si + 1, si + 2, si + 3]);
     }
     Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
 }

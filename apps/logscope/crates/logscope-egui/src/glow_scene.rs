@@ -98,8 +98,9 @@ struct Targets {
 /// QUALITY (≤1). A GPU-fragment lever shared by every bin that renders through glow_scene. Cuts scene shading
 /// cost by rs². (Frame-update LOD lives in the caller; mesh-density LOD in scene3d::render_quality.)
 fn render_scale() -> f32 {
-    if let Ok(v) = std::env::var("LOGSCOPE_RENDER_SCALE") { if let Ok(f) = v.trim().parse::<f32>() { return f.clamp(0.4, 1.0); } }
-    std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.4, 1.0)
+    let p = crate::theme::power_mode(); // half/quarter power → render at half/quarter resolution (cost ∝ scale²)
+    if let Ok(v) = std::env::var("LOGSCOPE_RENDER_SCALE") { if let Ok(f) = v.trim().parse::<f32>() { return (f * p).clamp(0.22, 1.0); } }
+    (std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0) * p).clamp(0.22, 1.0)
 }
 unsafe fn color_tex(gl: &glow::Context, w: i32, h: i32) -> glow::Texture {
     let t = gl.create_texture().unwrap();
@@ -149,6 +150,12 @@ unsafe fn upload_array(gl: &glow::Context, data: &[u8], n: usize) -> glow::Textu
     gl.tex_parameter_i32(glow::TEXTURE_2D_ARRAY, glow::TEXTURE_MAG_FILTER, glow::LINEAR as i32);
     gl.tex_parameter_i32(glow::TEXTURE_2D_ARRAY, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
     gl.tex_parameter_i32(glow::TEXTURE_2D_ARRAY, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+    // ANISOTROPIC filtering — keeps textures crisp at grazing angles (ground planes, bark seen edge-on) where
+    // plain trilinear mipmapping over-blurs. Guarded by the extension ⇒ a safe no-op where unsupported.
+    if gl.supported_extensions().contains("GL_EXT_texture_filter_anisotropic") {
+        let aniso = gl.get_parameter_f32(0x84FF).clamp(1.0, 8.0); // MAX_TEXTURE_MAX_ANISOTROPY_EXT
+        gl.tex_parameter_f32(glow::TEXTURE_2D_ARRAY, 0x84FE, aniso); // TEXTURE_MAX_ANISOTROPY_EXT
+    }
     t
 }
 impl Targets {
@@ -204,14 +211,15 @@ impl Renderer {
         let godray = link(gl, version, gpuscene::SHADER_POST_VS, gpuscene::SHADER_GODRAY_FS, true);
         let composite = link(gl, version, gpuscene::SHADER_POST_VS, gpuscene::SHADER_COMPOSITE_FS, true);
         let shadow = link(gl, version, gpuscene::SHADOW_VS, gpuscene::SHADOW_FS, false);
-        let tex_n = crate::theme::detail(crate::theme::variant()).0; // current detail tier's texture resolution
+        let tex_n = crate::theme::detail(crate::theme::effective_variant()).0; // detail tier (POWER-capped) texture resolution
+        let bump_scale = crate::theme::detail(crate::theme::effective_variant()).2;
         Renderer {
             scene, bright, blur, godray, composite, shadow,
             vbo: gl.create_buffer().unwrap(),
             scene_vao: gl.create_vertex_array().unwrap(),
             empty_vao: gl.create_vertex_array().unwrap(),
             mat_tex: upload_array(gl, &crate::texgen::bake_layers(tex_n), tex_n),
-            nrm_tex: upload_array(gl, &crate::texgen::bake_normals(tex_n), tex_n),
+            nrm_tex: upload_array(gl, &crate::texgen::bake_normals(tex_n, bump_scale), tex_n),
             baked_tex: tex_n,
             targets: None,
         }
@@ -236,12 +244,13 @@ impl Renderer {
     unsafe fn paint(&mut self, gl: &glow::Context, intermediate_fbo: Option<glow::Framebuffer>, u: &Uniforms, verts: &[f32]) {
         if verts.is_empty() { return; }
         // live texture-detail: re-bake the material/normal arrays if the variant bumped the resolution
-        let tex_n = crate::theme::detail(crate::theme::variant()).0;
+        let tex_n = crate::theme::detail(crate::theme::effective_variant()).0;
+        let bump_scale = crate::theme::detail(crate::theme::effective_variant()).2;
         if tex_n != self.baked_tex {
             gl.delete_texture(self.mat_tex);
             gl.delete_texture(self.nrm_tex);
             self.mat_tex = upload_array(gl, &crate::texgen::bake_layers(tex_n), tex_n);
-            self.nrm_tex = upload_array(gl, &crate::texgen::bake_normals(tex_n), tex_n);
+            self.nrm_tex = upload_array(gl, &crate::texgen::bake_normals(tex_n, bump_scale), tex_n);
             self.baked_tex = tex_n;
         }
         let mut vp = [0i32; 4];

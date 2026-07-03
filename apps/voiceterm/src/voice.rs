@@ -1637,12 +1637,32 @@ fn battery_ok_for_background() -> bool {
 /// a pre-filter before fingerprint storage. Previously private.
 #[cfg(feature = "voice")]
 pub fn is_sane_transcription(text: &str) -> bool {
-    // Consolidated into voice-kit. The length bound (2..=120), the >50%
-    // single-word repetition rule, and the bad-phrase list all live in one
-    // place now (voice_kit::hallucination), so every consumer shares the same
-    // filter and a fix lands once. Behavior is identical to the prior inline
-    // copy — voice-kit's BAD_PHRASES is the same list.
-    voice_kit::hallucination::looks_like_speech(text)
+    let t = text.trim();
+    let len = t.chars().count();
+    if len < 2 || len > 120 { return false; }
+    // Repetition check: if the same word appears >50% of the time, it's
+    // probably a hallucination loop.
+    let words: Vec<&str> = t.split_whitespace().collect();
+    if words.len() >= 4 {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for w in &words { *counts.entry(*w).or_insert(0) += 1; }
+        let max_count = counts.values().max().copied().unwrap_or(0);
+        if max_count * 2 > words.len() { return false; }
+    }
+    // Known hallucination phrases. These are common enough across
+    // whisper outputs that filtering them isn't going to lose much.
+    let lower = t.to_lowercase();
+    let bad_phrases = [
+        "thank you for watching", "thanks for watching",
+        "subscribe to", "like and subscribe",
+        "see you next time", "see you in the next video",
+        "don't forget to subscribe",
+        "[music]", "[silence]", "[blank_audio]",
+    ];
+    for p in &bad_phrases {
+        if lower.contains(p) { return false; }
+    }
+    true
 }
 
 // v0.1.209: stub for builds without the voice feature. Same shape,
@@ -3538,7 +3558,42 @@ fn record_and_transcribe_inner() -> Result<(String, Vec<f32>), String> {
 /// Conservative: if we can't find a clear loop, return the input as-is.
 /// The loop must repeat at least 3 times to qualify (2 might be a
 /// natural rhetorical structure: "you can do this, do that").
-fn trim_hallucination_loop(s: &str) -> String { voice_kit::hallucination::trim_hallucination_loop(s) }
+fn trim_hallucination_loop(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() { return String::new(); }
+    let words: Vec<&str> = s.split_whitespace().collect();
+    if words.len() < 6 { return s.to_string(); }
+    // Try shingle sizes 1..=4. For each size, count how many
+    // consecutive identical shingles appear. If >= 3, truncate
+    // after the FIRST shingle (so "X X X" becomes "X").
+    for window in 1..=4 {
+        if window * 3 > words.len() { break; }
+        // Scan for runs of identical shingles starting from the
+        // beginning. Practically, hallucinations loop early in the
+        // output so we don't bother scanning later positions.
+        for start in 0..(words.len() - window * 3) {
+            let first_shingle = &words[start..start + window];
+            let mut runs = 1;
+            let mut pos = start + window;
+            while pos + window <= words.len()
+                && &words[pos..pos + window] == first_shingle {
+                runs += 1;
+                pos += window;
+            }
+            if runs >= 3 {
+                // Trim. Keep words[..start + window], discard rest.
+                let kept: Vec<&str> = words[..start + window].iter().copied().collect();
+                let trimmed = kept.join(" ");
+                crate::clog!("whisper", "trimmed hallucination loop ({}x repetition of '{}'): {:?} -> {:?}",
+                    runs, first_shingle.join(" "), s, trimmed);
+                // Also strip any trailing comma / punctuation we kept.
+                return trimmed.trim_end_matches(|c: char|
+                    c == ',' || c == '.' || c == ' ').to_string();
+            }
+        }
+    }
+    s.to_string()
+}
 
 /// Run transcription using whichever models are loaded (tiny, base, or both)
 /// and return the chosen text result.

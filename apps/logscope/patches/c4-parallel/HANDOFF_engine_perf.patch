@@ -1,0 +1,1926 @@
+diff --git a/crates/logscope/src/arch.rs b/crates/logscope/src/arch.rs
+new file mode 100644
+index 0000000..4bd1589
+--- /dev/null
++++ b/crates/logscope/src/arch.rs
+@@ -0,0 +1,233 @@
++//! arch.rs — model architecture detection & capability model.
++//!
++//! Reads a GGUF model's `general.architecture` plus its hyperparameters and produces a normalized
++//! [`ArchInfo`] the engine can act on — including the structural features that separate Qwen and DeepSeek
++//! from plain llama: grouped-query attention (GQA), mixture-of-experts FFN (MoE), DeepSeek's multi-head
++//! latent attention (MLA), QK-norm (Qwen3), and RoPE scaling. It then gives an honest verdict, via
++//! [`EngineCaps`], on whether the current engine has the kernels to run the model or which features are
++//! still missing — so "we support Qwen/DeepSeek" means something checkable rather than aspirational.
++//!
++//! The GGUF read is the seam (the loader fills [`Hparams`]); the classification and the support check are
++//! pure and unit-tested. This complements the engine's per-arch kernel wiring (gpu-gemm `archcfg`).
++#![allow(dead_code)]
++
++/// Model family, from `general.architecture`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Family { Llama, Qwen2, Qwen3, Gemma2, Phi3, DeepSeek2, Mixtral, Unknown }
++impl Family {
++    pub fn from_arch(s: &str) -> Family {
++        match s.trim().to_lowercase().as_str() {
++            "" | "llama" => Family::Llama,
++            "qwen2" => Family::Qwen2,
++            "qwen3" => Family::Qwen3,
++            "gemma" | "gemma2" => Family::Gemma2,
++            "phi3" => Family::Phi3,
++            "deepseek2" | "deepseek-v2" | "deepseek_v2" | "deepseek3" | "deepseek-v3" => Family::DeepSeek2,
++            "mixtral" => Family::Mixtral,
++            _ => Family::Unknown,
++        }
++    }
++}
++
++/// Raw hyperparameters read from the GGUF metadata (the loader fills these; defaults mean "absent").
++#[derive(Clone, Debug, Default)]
++pub struct Hparams {
++    pub n_layer: u32,
++    pub n_head: u32,
++    pub n_head_kv: u32,       // < n_head ⇒ grouped-query attention
++    pub n_embd: u32,
++    pub n_ff: u32,
++    pub n_expert: u32,        // > 0 ⇒ mixture of experts
++    pub n_expert_used: u32,   // active experts per token
++    pub rope_freq_base: f32,
++    pub rope_scale: f32,      // > 1.0 (or != 1.0) ⇒ context-extension scaling
++    pub kv_lora_rank: u32,    // > 0 ⇒ DeepSeek multi-head latent attention (compressed KV)
++    pub q_lora_rank: u32,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AttnKind {
++    Mha,                                   // full multi-head
++    Gqa { groups: u32 },                   // grouped-query (n_head / n_head_kv heads share each KV)
++    Mla { kv_lora_rank: u32, q_lora_rank: u32 }, // DeepSeek latent attention
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum FfnKind { Dense, Moe { experts: u32, used: u32 } }
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RopeKind { None, Standard, Scaled }
++
++/// A non-llama structural feature a model needs the engine to implement.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Feature { Gqa, Moe, Mla, QkNorm, RopeScaling, AttnQkvBias }
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Support { Full, Partial(Vec<Feature>), Unsupported(Vec<Feature>) }
++impl Support { pub fn is_runnable(&self) -> bool { matches!(self, Support::Full) } }
++
++/// The normalized view of a model's architecture.
++#[derive(Clone, Debug)]
++pub struct ArchInfo {
++    pub family: Family,
++    pub attention: AttnKind,
++    pub ffn: FfnKind,
++    pub qk_norm: bool,
++    pub rope: RopeKind,
++    pub features: Vec<Feature>, // everything beyond plain llama this model uses
++}
++
++/// Classify a model from its architecture string and hyperparameters.
++pub fn detect(arch: &str, hp: &Hparams) -> ArchInfo {
++    let family = Family::from_arch(arch);
++
++    let attention = if hp.kv_lora_rank > 0 {
++        AttnKind::Mla { kv_lora_rank: hp.kv_lora_rank, q_lora_rank: hp.q_lora_rank }
++    } else if hp.n_head_kv > 0 && hp.n_head_kv < hp.n_head {
++        AttnKind::Gqa { groups: hp.n_head / hp.n_head_kv.max(1) }
++    } else {
++        AttnKind::Mha
++    };
++
++    let ffn = if hp.n_expert > 0 {
++        FfnKind::Moe { experts: hp.n_expert, used: hp.n_expert_used.max(1) }
++    } else { FfnKind::Dense };
++
++    let qk_norm = matches!(family, Family::Qwen3);
++    let rope = if hp.rope_freq_base <= 0.0 { RopeKind::None }
++               else if hp.rope_scale != 0.0 && hp.rope_scale != 1.0 { RopeKind::Scaled }
++               else { RopeKind::Standard };
++
++    let mut features = Vec::new();
++    if matches!(attention, AttnKind::Gqa { .. }) { features.push(Feature::Gqa); }
++    if matches!(attention, AttnKind::Mla { .. }) { features.push(Feature::Mla); }
++    if matches!(ffn, FfnKind::Moe { .. }) { features.push(Feature::Moe); }
++    if qk_norm { features.push(Feature::QkNorm); }
++    if rope == RopeKind::Scaled { features.push(Feature::RopeScaling); }
++    if matches!(family, Family::Qwen2 | Family::Qwen3) { features.push(Feature::AttnQkvBias); }
++
++    ArchInfo { family, attention, ffn, qk_norm, rope, features }
++}
++
++/// What kernels the engine currently has. Flip a flag on once the corresponding kernel lands.
++#[derive(Clone, Copy, Debug)]
++pub struct EngineCaps {
++    pub gqa: bool,
++    pub attn_qkv_bias: bool,
++    pub rope_scaling: bool,
++    pub qk_norm: bool,
++    pub moe: bool,
++    pub mla: bool,
++}
++impl EngineCaps {
++    /// The current wgpu engine: llama-class (RMSNorm, SwiGLU, GQA, RoPE) plus Qwen2's QKV bias and basic
++    /// RoPE scaling. MoE, MLA, and Qwen3 QK-norm still need kernels.
++    pub fn current() -> Self {
++        Self { gqa: true, attn_qkv_bias: true, rope_scaling: true, qk_norm: false, moe: false, mla: false }
++    }
++    fn has(&self, f: Feature) -> bool {
++        match f {
++            Feature::Gqa => self.gqa,
++            Feature::AttnQkvBias => self.attn_qkv_bias,
++            Feature::RopeScaling => self.rope_scaling,
++            Feature::QkNorm => self.qk_norm,
++            Feature::Moe => self.moe,
++            Feature::Mla => self.mla,
++        }
++    }
++}
++
++/// Whether `caps` can run `info`. `Full` if every feature is covered; otherwise the missing features are
++/// reported. Missing a *core* feature (MoE or MLA — there's no fallback) is `Unsupported`; missing only
++/// refinements (e.g. QK-norm, RoPE scaling) is `Partial` (it will load and run, but not bit-exactly).
++pub fn support(info: &ArchInfo, caps: &EngineCaps) -> Support {
++    let missing: Vec<Feature> = info.features.iter().copied().filter(|f| !caps.has(*f)).collect();
++    if missing.is_empty() { return Support::Full; }
++    let core_missing = missing.iter().any(|f| matches!(f, Feature::Moe | Feature::Mla));
++    if core_missing { Support::Unsupported(missing) } else { Support::Partial(missing) }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn llama_7b() -> Hparams {
++        Hparams { n_layer: 32, n_head: 32, n_head_kv: 32, n_embd: 4096, n_ff: 11008,
++                  rope_freq_base: 10000.0, rope_scale: 1.0, ..Default::default() }
++    }
++
++    #[test]
++    fn plain_llama_is_mha_dense_and_fully_supported() {
++        let info = detect("llama", &llama_7b());
++        assert_eq!(info.attention, AttnKind::Mha);
++        assert_eq!(info.ffn, FfnKind::Dense);
++        assert!(info.features.is_empty());
++        assert_eq!(support(&info, &EngineCaps::current()), Support::Full);
++    }
++
++    #[test]
++    fn qwen2_gqa_is_detected_and_runnable() {
++        // Qwen2-7B: 28 heads, 4 KV heads ⇒ GQA groups 7, plus QKV bias
++        let hp = Hparams { n_layer: 28, n_head: 28, n_head_kv: 4, n_embd: 3584, n_ff: 18944,
++                           rope_freq_base: 1_000_000.0, rope_scale: 1.0, ..Default::default() };
++        let info = detect("qwen2", &hp);
++        assert_eq!(info.attention, AttnKind::Gqa { groups: 7 });
++        assert!(info.features.contains(&Feature::Gqa) && info.features.contains(&Feature::AttnQkvBias));
++        assert_eq!(support(&info, &EngineCaps::current()), Support::Full);
++    }
++
++    #[test]
++    fn qwen3_adds_qk_norm_as_a_partial_gap() {
++        let hp = Hparams { n_layer: 36, n_head: 32, n_head_kv: 8, n_embd: 4096, n_ff: 12288,
++                           rope_freq_base: 1_000_000.0, rope_scale: 1.0, ..Default::default() };
++        let info = detect("qwen3", &hp);
++        assert!(info.qk_norm);
++        // GQA + QKV bias are covered; only QK-norm is missing ⇒ Partial (runs, not bit-exact)
++        assert_eq!(support(&info, &EngineCaps::current()), Support::Partial(vec![Feature::QkNorm]));
++    }
++
++    #[test]
++    fn mixtral_moe_needs_the_expert_kernel() {
++        let hp = Hparams { n_layer: 32, n_head: 32, n_head_kv: 8, n_embd: 4096, n_ff: 14336,
++                           n_expert: 8, n_expert_used: 2, rope_freq_base: 1_000_000.0, rope_scale: 1.0, ..Default::default() };
++        let info = detect("mixtral", &hp);
++        assert_eq!(info.ffn, FfnKind::Moe { experts: 8, used: 2 });
++        match support(&info, &EngineCaps::current()) {
++            Support::Unsupported(m) => assert!(m.contains(&Feature::Moe)),
++            other => panic!("MoE without the kernel must be Unsupported, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn deepseek_v2_is_mla_plus_moe() {
++        // DeepSeek-V2: latent attention (kv_lora_rank) + a large MoE
++        let hp = Hparams { n_layer: 60, n_head: 128, n_head_kv: 128, n_embd: 5120, n_ff: 12288,
++                           n_expert: 160, n_expert_used: 6, kv_lora_rank: 512, q_lora_rank: 1536,
++                           rope_freq_base: 10000.0, rope_scale: 40.0, ..Default::default() };
++        let info = detect("deepseek2", &hp);
++        assert_eq!(info.attention, AttnKind::Mla { kv_lora_rank: 512, q_lora_rank: 1536 });
++        assert!(info.features.contains(&Feature::Mla) && info.features.contains(&Feature::Moe));
++        assert_eq!(info.rope, RopeKind::Scaled); // YaRN-style long context
++        // two core features missing ⇒ Unsupported, both reported
++        match support(&info, &EngineCaps::current()) {
++            Support::Unsupported(m) => { assert!(m.contains(&Feature::Mla) && m.contains(&Feature::Moe)); }
++            other => panic!("expected Unsupported, got {other:?}"),
++        }
++    }
++
++    #[test]
++    fn enabling_a_kernel_flips_support() {
++        let hp = Hparams { n_layer: 32, n_head: 32, n_head_kv: 8, n_embd: 4096, n_ff: 14336,
++                           n_expert: 8, n_expert_used: 2, rope_freq_base: 1e6, rope_scale: 1.0, ..Default::default() };
++        let info = detect("mixtral", &hp);
++        let caps = EngineCaps { moe: true, ..EngineCaps::current() }; // MoE kernel just landed
++        assert_eq!(support(&info, &caps), Support::Full);
++    }
++
++    #[test]
++    fn unknown_architecture_classifies_structurally() {
++        let info = detect("some_new_llm", &llama_7b());
++        assert_eq!(info.family, Family::Unknown);
++        assert_eq!(info.attention, AttnKind::Mha); // still readable from hparams
++    }
++}
+diff --git a/crates/logscope/src/batching.rs b/crates/logscope/src/batching.rs
+new file mode 100644
+index 0000000..69e92a1
+--- /dev/null
++++ b/crates/logscope/src/batching.rs
+@@ -0,0 +1,120 @@
++//! batching.rs — a continuous (in-flight) batching scheduler: the pure slot-admission logic that keeps the
++//! GPU full so total tokens/sec scales with concurrent requests.
++//!
++//! A batch-1 decode barely uses the GPU; decoding many sequences in one batched forward is far more
++//! efficient. Static batching wastes that by waiting for the whole batch to finish before starting the
++//! next. *Continuous* batching instead frees each sequence's KV-cache slot the moment it completes and
++//! admits a waiting request into it immediately, so the active batch stays as full as the work allows.
++//!
++//! This module owns the admission/eviction bookkeeping over a fixed pool of `capacity` slots (FCFS). The
++//! batched forward pass itself is the GPU seam — the engine decodes [`active`](Scheduler::active) each
++//! step, then calls [`complete`](Scheduler::complete) for any sequence that hit EOS / its token cap.
++#![allow(dead_code)]
++
++use std::collections::VecDeque;
++
++/// Fixed-capacity continuous-batching scheduler over request ids.
++pub struct Scheduler {
++    capacity: usize,
++    active: Vec<u64>,
++    waiting: VecDeque<u64>,
++    admitted_total: u64,
++    completed_total: u64,
++}
++
++impl Scheduler {
++    pub fn new(capacity: usize) -> Self {
++        Self { capacity: capacity.max(1), active: Vec::new(), waiting: VecDeque::new(),
++               admitted_total: 0, completed_total: 0 }
++    }
++
++    /// Enqueue a request (FCFS). It is admitted on the next [`admit`](Self::admit) call if a slot is free.
++    pub fn submit(&mut self, id: u64) { self.waiting.push_back(id); }
++
++    /// Fill every free slot from the waiting queue. Returns the ids newly admitted this call (the engine
++    /// must prefill their prompts before the next decode step). Call once per step, before decoding.
++    pub fn admit(&mut self) -> Vec<u64> {
++        let mut just_admitted = Vec::new();
++        while self.active.len() < self.capacity {
++            match self.waiting.pop_front() {
++                Some(id) => { self.active.push(id); self.admitted_total += 1; just_admitted.push(id); }
++                None => break,
++            }
++        }
++        just_admitted
++    }
++
++    /// Free a sequence's slot (it hit EOS or its token cap). A waiting request can take the slot at the
++    /// next `admit` — the continuous-batching win. Returns false if the id wasn't active.
++    pub fn complete(&mut self, id: u64) -> bool {
++        if let Some(pos) = self.active.iter().position(|&a| a == id) {
++            self.active.swap_remove(pos);
++            self.completed_total += 1;
++            true
++        } else { false }
++    }
++
++    /// The sequences to decode this step (the current batch).
++    pub fn active(&self) -> &[u64] { &self.active }
++    pub fn free_slots(&self) -> usize { self.capacity - self.active.len() }
++    pub fn waiting(&self) -> usize { self.waiting.len() }
++    pub fn capacity(&self) -> usize { self.capacity }
++    /// No work left anywhere.
++    pub fn is_idle(&self) -> bool { self.active.is_empty() && self.waiting.is_empty() }
++    /// Slot utilization this step, 0..=1 — what continuous batching is trying to keep near 1.
++    pub fn utilization(&self) -> f32 { self.active.len() as f32 / self.capacity as f32 }
++    pub fn admitted_total(&self) -> u64 { self.admitted_total }
++    pub fn completed_total(&self) -> u64 { self.completed_total }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn admits_up_to_capacity_and_queues_the_rest() {
++        let mut s = Scheduler::new(2);
++        for id in [1, 2, 3, 4] { s.submit(id); }
++        let admitted = s.admit();
++        assert_eq!(admitted, vec![1, 2]);
++        assert_eq!(s.active(), &[1, 2]);
++        assert_eq!(s.waiting(), 2);
++        assert_eq!(s.free_slots(), 0);
++        assert!((s.utilization() - 1.0).abs() < 1e-6);
++    }
++
++    #[test]
++    fn completing_a_sequence_admits_a_waiting_one_mid_flight() {
++        let mut s = Scheduler::new(2);
++        for id in [1, 2, 3] { s.submit(id); }
++        s.admit(); // [1, 2], 3 waits
++        assert!(s.complete(1)); // slot frees immediately
++        assert_eq!(s.free_slots(), 1);
++        let admitted = s.admit(); // 3 takes the freed slot — the continuous-batching win
++        assert_eq!(admitted, vec![3]);
++        assert!(s.active().contains(&3) && s.active().contains(&2));
++        assert_eq!(s.waiting(), 0);
++    }
++
++    #[test]
++    fn completing_unknown_id_is_a_noop() {
++        let mut s = Scheduler::new(2);
++        s.submit(1); s.admit();
++        assert!(!s.complete(99));
++        assert_eq!(s.active(), &[1]);
++    }
++
++    #[test]
++    fn drains_to_idle_and_tracks_totals() {
++        let mut s = Scheduler::new(2);
++        for id in [1, 2, 3] { s.submit(id); }
++        s.admit();
++        assert!(s.complete(1)); assert!(s.complete(2));
++        s.admit(); // 3
++        assert!(s.complete(3));
++        assert!(s.is_idle());
++        assert_eq!(s.admitted_total(), 3);
++        assert_eq!(s.completed_total(), 3);
++        assert!((s.utilization() - 0.0).abs() < 1e-6);
++    }
++}
+diff --git a/crates/logscope/src/dedup.rs b/crates/logscope/src/dedup.rs
+new file mode 100644
+index 0000000..b053caa
+--- /dev/null
++++ b/crates/logscope/src/dedup.rs
+@@ -0,0 +1,194 @@
++//! dedup.rs — cross-model file compression for the `~/models` folder via content-defined chunking (CDC)
++//! and content-addressed dedup.
++//!
++//! GGUF files in a models folder overlap heavily: quants of one base share vocab/embedding regions,
++//! finetunes share most of the base weights, and re-exports differ only in metadata. Fixed-size blocks
++//! miss this because one inserted byte shifts every later block; **content-defined** boundaries (cut where
++//! a rolling hash hits a pattern) keep identical regions aligned across files, so a [`Store`] keeps each
++//! unique chunk once and represents every model as a manifest of chunk hashes.
++//!
++//! Pure + unit-tested. The seam is just file I/O (read each model's bytes, write the chunk store); the
++//! chunking and dedup accounting are here. Chunk *identity* uses a fast 64-bit hash — fine for accounting
++//! and tests; a real store should use a cryptographic digest (BLAKE3/SHA-256) for collision safety.
++#![allow(dead_code)]
++
++use std::collections::HashMap;
++
++/// Gear table for the rolling hash, generated deterministically at compile time.
++const GEAR: [u64; 256] = {
++    let mut t = [0u64; 256];
++    let mut s: u64 = 0x2545_F491_4F6C_DD1D; // splitmix64 seed
++    let mut i = 0;
++    while i < 256 {
++        s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = s;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^= z >> 31;
++        t[i] = z;
++        i += 1;
++    }
++    t
++};
++
++/// Chunking parameters. Cut when the low `mask_bits` of the rolling hash are zero (average chunk ≈
++/// `2^mask_bits` bytes), clamped to `[min, max]`.
++#[derive(Clone, Copy, Debug)]
++pub struct ChunkCfg { pub min: usize, pub max: usize, pub mask_bits: u32 }
++impl Default for ChunkCfg {
++    fn default() -> Self { Self { min: 2048, max: 16384, mask_bits: 12 } } // ~4 KiB average
++}
++
++/// A chunk's position and content hash.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Chunk { pub offset: usize, pub len: usize, pub hash: u64 }
++
++fn fnv1a(bytes: &[u8]) -> u64 {
++    let mut h = 0xcbf2_9ce4_8422_2325u64;
++    for &b in bytes { h ^= b as u64; h = h.wrapping_mul(0x0000_0100_0000_01B3); }
++    h
++}
++
++/// Split `data` into content-defined chunks. Boundaries fall where the Gear rolling hash hits the mask,
++/// subject to `min`/`max`; identical regions in different files produce identical chunks (and hashes).
++pub fn chunk(data: &[u8], cfg: &ChunkCfg) -> Vec<Chunk> {
++    let mut out = Vec::new();
++    if data.is_empty() { return out; }
++    let mask = (1u64 << cfg.mask_bits.min(63)) - 1;
++    let (min, max) = (cfg.min.max(1), cfg.max.max(cfg.min.max(1)));
++    let mut start = 0usize;
++    let mut h = 0u64;
++    let mut i = 0usize;
++    while i < data.len() {
++        h = (h << 1).wrapping_add(GEAR[data[i] as usize]);
++        let len = i - start + 1;
++        let boundary = len >= min && (h & mask) == 0;
++        if boundary || len >= max {
++            out.push(Chunk { offset: start, len, hash: fnv1a(&data[start..start + len]) });
++            start = i + 1;
++            h = 0;
++        }
++        i += 1;
++    }
++    if start < data.len() {
++        out.push(Chunk { offset: start, len: data.len() - start, hash: fnv1a(&data[start..]) });
++    }
++    out
++}
++
++/// One model's representation in the store: an ordered list of chunk hashes (its "recipe").
++#[derive(Clone, Debug)]
++pub struct Manifest { pub name: String, pub chunks: Vec<u64> }
++
++/// A content-addressed chunk store with dedup accounting.
++#[derive(Default)]
++pub struct Store {
++    sizes: HashMap<u64, usize>, // unique chunk hash → its byte length (stored once)
++    logical: u64,               // total bytes across all added files
++}
++
++impl Store {
++    pub fn new() -> Self { Self::default() }
++
++    /// Add a model's bytes; returns its manifest. New chunks grow the store; chunks already present are
++    /// free (the dedup win).
++    pub fn add(&mut self, name: &str, data: &[u8], cfg: &ChunkCfg) -> Manifest {
++        let chunks = chunk(data, cfg);
++        let mut hashes = Vec::with_capacity(chunks.len());
++        for c in &chunks {
++            self.sizes.entry(c.hash).or_insert(c.len);
++            self.logical += c.len as u64;
++            hashes.push(c.hash);
++        }
++        Manifest { name: name.to_string(), chunks: hashes }
++    }
++
++    /// Bytes actually stored (sum of unique chunk lengths).
++    pub fn stored_bytes(&self) -> u64 { self.sizes.values().map(|&s| s as u64).sum() }
++    /// Bytes across all files as if stored independently.
++    pub fn logical_bytes(&self) -> u64 { self.logical }
++    pub fn unique_chunks(&self) -> usize { self.sizes.len() }
++    /// Compression ratio from cross-file dedup (1.0 = no sharing; higher = more shared).
++    pub fn dedup_ratio(&self) -> f32 {
++        let stored = self.stored_bytes();
++        if stored == 0 { 1.0 } else { self.logical as f32 / stored as f32 }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // a deterministic pseudo-random blob (stands in for model weights)
++    fn blob(seed: u64, n: usize) -> Vec<u8> {
++        let mut s = seed;
++        (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); (s >> 33) as u8 }).collect()
++    }
++
++    #[test]
++    fn chunking_is_deterministic_and_within_bounds() {
++        let data = blob(1, 200_000);
++        let cfg = ChunkCfg::default();
++        let a = chunk(&data, &cfg);
++        let b = chunk(&data, &cfg);
++        assert_eq!(a, b, "same bytes ⇒ same chunks");
++        assert!(a.len() > 1);
++        // every chunk respects max; all but the last respect min; offsets/lengths tile the file exactly
++        assert!(a.iter().all(|c| c.len <= cfg.max));
++        assert!(a[..a.len() - 1].iter().all(|c| c.len >= cfg.min));
++        let covered: usize = a.iter().map(|c| c.len).sum();
++        assert_eq!(covered, data.len());
++        assert_eq!(a[0].offset, 0);
++        for w in a.windows(2) { assert_eq!(w[1].offset, w[0].offset + w[0].len); }
++    }
++
++    #[test]
++    fn identical_files_dedupe_completely() {
++        let data = blob(7, 120_000);
++        let mut s = Store::new();
++        s.add("model-a.gguf", &data, &ChunkCfg::default());
++        let stored_after_first = s.stored_bytes();
++        s.add("model-a-copy.gguf", &data, &ChunkCfg::default());
++        assert_eq!(s.stored_bytes(), stored_after_first, "second identical file adds nothing");
++        assert_eq!(s.logical_bytes(), 2 * data.len() as u64);
++        assert!((s.dedup_ratio() - 2.0).abs() < 1e-3);
++    }
++
++    #[test]
++    fn files_sharing_a_base_dedupe_the_shared_region() {
++        // a base + finetune: same first 256 KiB of "weights", different tails (like a LoRA-merged model)
++        let base = blob(42, 262_144);
++        let mut a = base.clone(); a.extend(blob(100, 40_000));
++        let mut b = base.clone(); b.extend(blob(200, 40_000));
++        let cfg = ChunkCfg::default();
++        let mut s = Store::new();
++        s.add("base.gguf", &a, &cfg);
++        let before = s.stored_bytes();
++        s.add("finetune.gguf", &b, &cfg);
++        let added = s.stored_bytes() - before;
++        // only the differing tail (~40 KiB) plus a boundary chunk should be new — far less than the whole file
++        assert!(added < 60_000, "shared base should not be re-stored (added {added} bytes)");
++        assert!(s.dedup_ratio() > 1.5);
++    }
++
++    #[test]
++    fn a_byte_insertion_only_disturbs_local_chunks() {
++        // content-defined boundaries should re-sync after an edit, not invalidate the whole file
++        let data = blob(9, 150_000);
++        let mut edited = data.clone();
++        edited.insert(75_000, 0xAB); // single inserted byte mid-file
++        let cfg = ChunkCfg::default();
++        let mut s = Store::new();
++        s.add("orig", &data, &cfg);
++        let before = s.stored_bytes();
++        s.add("edited", &edited, &cfg);
++        let added = (s.stored_bytes() - before) as usize;
++        // re-sync means only a few chunks around the edit are new, not ~half the file
++        assert!(added < data.len() / 4, "CDC should re-sync (added {added} of {} bytes)", data.len());
++    }
++
++    #[test]
++    fn empty_input_makes_no_chunks() {
++        assert!(chunk(&[], &ChunkCfg::default()).is_empty());
++    }
++}
+diff --git a/crates/logscope/src/gemmplan.rs b/crates/logscope/src/gemmplan.rs
+new file mode 100644
+index 0000000..4a8449d
+--- /dev/null
++++ b/crates/logscope/src/gemmplan.rs
+@@ -0,0 +1,159 @@
++//! gemmplan.rs — pure dispatch planning for the GPU GEMM/attention kernels: output-tile grids, the
++//! >65535-workgroups-per-dimension fold, and split-K for skinny matrices.
++//!
++//! The kernels themselves are the GPU seam, but *how* the host launches them is pure arithmetic that
++//! directly affects throughput and correctness: too-small tiles waste memory bandwidth, and a workgroup
++//! count above the per-dimension cap (65535 on WebGPU/Vulkan) silently drops work unless it's folded into a
++//! 2-D/3-D grid (RULESET K3). Getting this right is a real llama-inference speedup lever; it's also exactly
++//! the kind of off-by-one that's miserable to debug on-device, so it's unit-tested here.
++#![allow(dead_code)]
++
++pub fn ceil_div(a: u32, b: u32) -> u32 { let b = b.max(1) as u64; ((a as u64 + b - 1) / b) as u32 }
++
++/// Per-dimension dispatch limits. `max_per_dim` is the hardware cap on workgroups in one dimension.
++#[derive(Clone, Copy, Debug)]
++pub struct Limits { pub max_per_dim: u32, pub max_invocations: u32 }
++impl Default for Limits {
++    fn default() -> Self { Self { max_per_dim: 65535, max_invocations: 256 } } // WebGPU baseline
++}
++
++/// A 3-D workgroup grid to dispatch.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Grid3 { pub x: u32, pub y: u32, pub z: u32 }
++impl Grid3 {
++    pub fn total(&self) -> u64 { self.x as u64 * self.y as u64 * self.z as u64 }
++    /// Reconstruct the flat workgroup id the kernel computes from its 3-D builtins (row-major in x).
++    pub fn linear(&self, x: u32, y: u32, z: u32) -> u64 {
++        (z as u64 * self.y as u64 + y as u64) * self.x as u64 + x as u64
++    }
++}
++
++/// Fold a flat workgroup `count` into a ≤3-D grid with every dimension ≤ `max_per_dim`, so dispatches above
++/// the per-dim cap still launch (K3). The grid may cover slightly more than `count` (the kernel must guard
++/// `linear_id >= count`); padding is kept minimal. `None` if it can't fit even in 3-D.
++pub fn fold_grid(count: u32, max_per_dim: u32) -> Option<Grid3> {
++    let max = max_per_dim.max(1);
++    if count <= max { return Some(Grid3 { x: count.max(1), y: 1, z: 1 }); }
++    let x = max;
++    let y = ceil_div(count, x);
++    if y <= max { return Some(Grid3 { x, y, z: 1 }); }
++    let y = max;
++    let xy = x as u64 * y as u64;
++    let z = ((count as u64 + xy - 1) / xy) as u32;
++    if z <= max { return Some(Grid3 { x, y, z }); }
++    None
++}
++
++/// Output-tile workgroup count for an M×N GEMM at `tile_m`×`tile_n` outputs per group.
++pub fn gemm_tile_groups(m: u32, n: u32, tile_m: u32, tile_n: u32) -> u32 {
++    ceil_div(m, tile_m) * ceil_div(n, tile_n)
++}
++
++/// Pick a split-K factor: when the output is small (few tiles) the GPU is underused, so split the K
++/// (contraction) dimension into independent partials that reduce afterward — more parallel groups. Returns
++/// 1 when there's already enough work or K is too small to split usefully.
++pub fn split_k(tile_groups: u32, k: u32, target_groups: u32, min_k_per_split: u32) -> u32 {
++    if tile_groups == 0 || tile_groups >= target_groups { return 1; }
++    let want = ceil_div(target_groups, tile_groups);          // factor that would reach the target
++    let by_k = (k / min_k_per_split.max(1)).max(1);           // don't make slivers smaller than this
++    want.min(by_k).max(1)
++}
++
++/// A full dispatch plan for one GEMM.
++#[derive(Clone, Copy, Debug)]
++pub struct GemmPlan { pub tiles_m: u32, pub tiles_n: u32, pub split_k: u32, pub grid: Grid3 }
++
++/// Plan an M×N×K GEMM: tile the output, optionally split K for occupancy, and fold the total group count
++/// (`tiles_m * tiles_n * split_k`) into a launchable grid.
++pub fn plan_gemm(m: u32, n: u32, k: u32, tile_m: u32, tile_n: u32, target_groups: u32, limits: &Limits) -> Option<GemmPlan> {
++    let tiles_m = ceil_div(m, tile_m);
++    let tiles_n = ceil_div(n, tile_n);
++    let base = tiles_m * tiles_n;
++    let sk = split_k(base, k, target_groups, tile_m.max(tile_n).max(16));
++    let grid = fold_grid(base * sk, limits.max_per_dim)?;
++    Some(GemmPlan { tiles_m, tiles_n, split_k: sk, grid })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn ceil_div_rounds_up() {
++        assert_eq!(ceil_div(0, 4), 0);
++        assert_eq!(ceil_div(1, 4), 1);
++        assert_eq!(ceil_div(8, 4), 2);
++        assert_eq!(ceil_div(9, 4), 3);
++    }
++
++    #[test]
++    fn small_counts_stay_one_dimensional() {
++        assert_eq!(fold_grid(1000, 65535), Some(Grid3 { x: 1000, y: 1, z: 1 }));
++    }
++
++    #[test]
++    fn large_counts_fold_and_cover_every_id() {
++        let count = 70_000u32; // > 65535 → must go 2-D
++        let g = fold_grid(count, 65535).unwrap();
++        assert!(g.x <= 65535 && g.y <= 65535 && g.z <= 65535);
++        assert!(g.total() >= count as u64, "grid must cover all work");
++        // the padding is small (less than one full extra row)
++        assert!(g.total() < count as u64 + g.x as u64);
++    }
++
++    #[test]
++    fn fold_is_a_bijection_up_to_count() {
++        // every workgroup id 0..count maps to a distinct in-range (x,y,z), and the kernel's linear()
++        // reproduces the id — i.e. no work is dropped or double-counted
++        let count = 200_000u32;
++        let g = fold_grid(count, 65535).unwrap();
++        let mut seen = std::collections::HashSet::new();
++        for id in 0..count as u64 {
++            let x = (id % g.x as u64) as u32;
++            let y = ((id / g.x as u64) % g.y as u64) as u32;
++            let z = (id / (g.x as u64 * g.y as u64)) as u32;
++            assert!(x < g.x && y < g.y && z < g.z);
++            assert_eq!(g.linear(x, y, z), id);
++            assert!(seen.insert(id));
++        }
++        assert_eq!(seen.len(), count as usize);
++    }
++
++    #[test]
++    fn huge_dispatch_uses_three_dimensions() {
++        // ~5.4e9 groups can't fit in 2-D (65535² ≈ 4.29e9) → needs z
++        let count = u32::MAX; // ceil(MAX/65535)=65536 > cap → must spill into z
++        let g = fold_grid(count, 65535).unwrap();
++        assert!(g.z > 1, "this dispatch can't fit in 2-D");
++        assert!(g.total() >= count as u64);
++        assert!(g.x <= 65535 && g.y <= 65535 && g.z <= 65535);
++    }
++
++    #[test]
++    fn split_k_kicks_in_only_when_underutilized() {
++        // a 1×1-tile GEMM with big K: few groups → split to reach the target
++        assert!(split_k(1, 8192, 64, 128) > 1);
++        // plenty of tiles already → no split
++        assert_eq!(split_k(256, 8192, 64, 128), 1);
++        // tiny K → don't split into slivers
++        assert_eq!(split_k(1, 64, 64, 128), 1);
++    }
++
++    #[test]
++    fn plan_gemm_tiles_and_folds() {
++        // a 4096×4096×4096 matmul at 64×64 tiles → 64×64 = 4096 groups, fits 1-D, no split needed
++        let p = plan_gemm(4096, 4096, 4096, 64, 64, 512, &Limits::default()).unwrap();
++        assert_eq!((p.tiles_m, p.tiles_n), (64, 64));
++        assert_eq!(p.split_k, 1);
++        assert_eq!(p.grid, Grid3 { x: 4096, y: 1, z: 1 });
++    }
++
++    #[test]
++    fn plan_gemm_splits_k_for_a_skinny_output() {
++        // tiny output (one tile) but large K → split K to fill the GPU
++        let p = plan_gemm(64, 64, 16384, 64, 64, 32, &Limits::default()).unwrap();
++        assert_eq!((p.tiles_m, p.tiles_n), (1, 1));
++        assert!(p.split_k > 1);
++        assert_eq!(p.grid.total(), p.split_k as u64); // 1 tile × split_k groups
++    }
++}
+diff --git a/crates/logscope/src/kvcache.rs b/crates/logscope/src/kvcache.rs
+new file mode 100644
+index 0000000..3cfe7bc
+--- /dev/null
++++ b/crates/logscope/src/kvcache.rs
+@@ -0,0 +1,210 @@
++//! kvcache.rs — paged KV-cache block allocation (PagedAttention-style): the pure bookkeeping that lets the
++//! engine pack many sequences into a fixed KV budget without reserving `max_len` each.
++//!
++//! Physical KV storage is divided into fixed-size **blocks** (`block_size` tokens of K/V each). Every
++//! sequence keeps a **block table** mapping its logical positions to physical blocks, and grows it one
++//! block at a time only when it crosses a block boundary — so memory tracks actual length, not the worst
++//! case, and uniform blocks mean no external fragmentation. Blocks are **ref-counted**: [`fork`](Paged::fork)
++//! shares a parent's blocks with a child (prefix sharing — e.g. the many fanout lanes off one prompt), and
++//! a write into a still-shared partial block triggers **copy-on-write** so the siblings stay isolated.
++//!
++//! This composes under `batching`: admit a request only when [`can_admit`](Paged::can_admit); `append` as
++//! it decodes; `free` on completion. The K/V tensor storage and the paged-attention kernel are the GPU
++//! seam (this module hands out block ids and says when to copy); the allocation logic is here and tested.
++#![allow(dead_code)]
++
++use std::collections::HashMap;
++
++pub type Block = u32; // physical block id
++pub type SeqId = u64;
++
++/// Blocks required to hold `tokens` tokens.
++pub fn blocks_for(tokens: usize, block_size: usize) -> usize {
++    let bs = block_size.max(1);
++    (tokens + bs - 1) / bs
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub struct Oom; // out of physical blocks
++
++/// A paged KV-cache allocator over a fixed pool of physical blocks.
++pub struct Paged {
++    block_size: usize,
++    free: Vec<Block>,
++    refcount: Vec<u16>,
++    tables: HashMap<SeqId, Vec<Block>>,
++    lengths: HashMap<SeqId, usize>,
++}
++
++impl Paged {
++    pub fn new(num_blocks: usize, block_size: usize) -> Self {
++        Self {
++            block_size: block_size.max(1),
++            free: (0..num_blocks as Block).rev().collect(), // pop() hands out 0,1,2,…
++            refcount: vec![0; num_blocks],
++            tables: HashMap::new(),
++            lengths: HashMap::new(),
++        }
++    }
++
++    pub fn block_size(&self) -> usize { self.block_size }
++    pub fn total_blocks(&self) -> usize { self.refcount.len() }
++    pub fn free_blocks(&self) -> usize { self.free.len() }
++    pub fn used_blocks(&self) -> usize { self.total_blocks() - self.free_blocks() }
++    pub fn block_table(&self, seq: SeqId) -> Option<&[Block]> { self.tables.get(&seq).map(|v| v.as_slice()) }
++    pub fn seq_len(&self, seq: SeqId) -> Option<usize> { self.lengths.get(&seq).copied() }
++    /// Could a fresh sequence of `n_tokens` be admitted right now?
++    pub fn can_admit(&self, n_tokens: usize) -> bool { self.free.len() >= blocks_for(n_tokens, self.block_size) }
++
++    fn alloc(&mut self) -> Option<Block> {
++        let b = self.free.pop()?;
++        self.refcount[b as usize] = 1;
++        Some(b)
++    }
++
++    /// Admit a new sequence and allocate blocks for its `n_prompt_tokens` prefill.
++    pub fn admit(&mut self, seq: SeqId, n_prompt_tokens: usize) -> Result<(), Oom> {
++        let need = blocks_for(n_prompt_tokens, self.block_size);
++        if self.free.len() < need { return Err(Oom); }
++        let table = (0..need).map(|_| self.alloc().unwrap()).collect();
++        self.tables.insert(seq, table);
++        self.lengths.insert(seq, n_prompt_tokens);
++        Ok(())
++    }
++
++    /// Extend `seq` by `n` tokens, allocating blocks as boundaries are crossed and copying-on-write the
++    /// current partial block if it is still shared. Atomic: if the blocks aren't available, nothing changes.
++    pub fn append(&mut self, seq: SeqId, n: usize) -> Result<(), Oom> {
++        let Some(&len) = self.lengths.get(&seq) else { return Err(Oom) };
++        let bs = self.block_size;
++        let table = self.tables.get(&seq).unwrap();
++        let growth = blocks_for(len + n, bs) - blocks_for(len, bs);
++        // a write into the existing partial last block needs COW if that block is still shared
++        let cow = if len % bs != 0 {
++            let last = *table.last().unwrap();
++            usize::from(self.refcount[last as usize] > 1)
++        } else { 0 };
++        if self.free.len() < growth + cow { return Err(Oom); }
++
++        let mut table = self.tables.get(&seq).unwrap().clone();
++        if cow == 1 {
++            let li = table.len() - 1;
++            let old = table[li];
++            let nb = self.alloc().unwrap(); // engine copies old→nb
++            self.refcount[old as usize] -= 1;
++            table[li] = nb;
++        }
++        for _ in 0..growth { let b = self.alloc().unwrap(); table.push(b); }
++        self.tables.insert(seq, table);
++        self.lengths.insert(seq, len + n);
++        Ok(())
++    }
++
++    /// Share `parent`'s current blocks with a new `child` (prefix sharing, no new blocks). Subsequent
++    /// writes copy-on-write so the two never corrupt each other.
++    pub fn fork(&mut self, child: SeqId, parent: SeqId) -> Result<(), Oom> {
++        let table = self.tables.get(&parent).ok_or(Oom)?.clone();
++        let len = self.lengths[&parent];
++        for &b in &table { self.refcount[b as usize] += 1; }
++        self.tables.insert(child, table);
++        self.lengths.insert(child, len);
++        Ok(())
++    }
++
++    /// Release a sequence; blocks whose refcount hits zero return to the free pool.
++    pub fn free(&mut self, seq: SeqId) {
++        if let Some(table) = self.tables.remove(&seq) {
++            self.lengths.remove(&seq);
++            for &b in &table {
++                let rc = &mut self.refcount[b as usize];
++                *rc = rc.saturating_sub(1);
++                if *rc == 0 { self.free.push(b); }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn blocks_for_is_ceil_div() {
++        assert_eq!(blocks_for(0, 4), 0);
++        assert_eq!(blocks_for(1, 4), 1);
++        assert_eq!(blocks_for(4, 4), 1);
++        assert_eq!(blocks_for(5, 4), 2);
++    }
++
++    #[test]
++    fn admit_allocates_prefill_blocks_and_can_oom() {
++        let mut p = Paged::new(3, 4); // 3 blocks × 4 tokens
++        assert!(p.admit(1, 6).is_ok()); // ceil(6/4)=2 blocks
++        assert_eq!(p.used_blocks(), 2);
++        assert_eq!(p.block_table(1).unwrap().len(), 2);
++        assert_eq!(p.admit(2, 9), Err(Oom)); // needs 3, only 1 free
++        assert!(p.admit(3, 4).is_ok());      // 1 block fits
++        assert_eq!(p.free_blocks(), 0);
++    }
++
++    #[test]
++    fn append_only_grows_on_block_boundaries() {
++        let mut p = Paged::new(8, 4);
++        p.admit(1, 1).unwrap();          // 1 block, len 1
++        let before = p.free_blocks();
++        p.append(1, 2).unwrap();         // len 1→3, still in block 0
++        assert_eq!(p.free_blocks(), before, "no new block within a block");
++        p.append(1, 2).unwrap();         // len 3→5, crosses into block 1
++        assert_eq!(p.free_blocks(), before - 1);
++        assert_eq!(p.block_table(1).unwrap().len(), 2);
++    }
++
++    #[test]
++    fn free_returns_blocks_to_the_pool() {
++        let mut p = Paged::new(4, 4);
++        p.admit(1, 8).unwrap(); // 2 blocks
++        assert_eq!(p.free_blocks(), 2);
++        p.free(1);
++        assert_eq!(p.free_blocks(), 4);
++        assert!(p.block_table(1).is_none());
++    }
++
++    #[test]
++    fn fork_shares_blocks_without_allocating() {
++        let mut p = Paged::new(8, 4);
++        p.admit(1, 6).unwrap();          // 2 blocks
++        let free_after_admit = p.free_blocks();
++        p.fork(2, 1).unwrap();
++        assert_eq!(p.free_blocks(), free_after_admit, "sharing allocates nothing");
++        assert_eq!(p.block_table(1), p.block_table(2), "child sees the same physical blocks");
++        assert_eq!(p.seq_len(2), Some(6));
++    }
++
++    #[test]
++    fn append_after_fork_copies_on_write() {
++        let mut p = Paged::new(8, 4);
++        p.admit(1, 2).unwrap();          // 1 partial block, len 2
++        p.fork(2, 1).unwrap();           // child shares it (refcount 2)
++        let free_before = p.free_blocks();
++        p.append(1, 1).unwrap();         // parent writes into the shared partial block → COW
++        assert_eq!(p.free_blocks(), free_before - 1, "COW consumed one block");
++        assert_ne!(p.block_table(1).unwrap()[0], p.block_table(2).unwrap()[0], "parent diverged onto its own copy");
++        assert_eq!(p.seq_len(1), Some(3));
++        assert_eq!(p.seq_len(2), Some(2), "child is untouched");
++        // freeing the child returns its (now unshared) original block
++        let f = p.free_blocks();
++        p.free(2);
++        assert_eq!(p.free_blocks(), f + 1);
++    }
++
++    #[test]
++    fn append_is_atomic_under_oom() {
++        let mut p = Paged::new(2, 4);
++        p.admit(1, 4).unwrap();          // 1 block exactly full, 1 free
++        // ask for 8 more tokens → needs 2 new blocks, only 1 free → Oom, no mutation
++        assert_eq!(p.append(1, 8), Err(Oom));
++        assert_eq!(p.seq_len(1), Some(4));
++        assert_eq!(p.block_table(1).unwrap().len(), 1);
++        assert_eq!(p.free_blocks(), 1);
++    }
++}
+diff --git a/crates/logscope/src/lib.rs b/crates/logscope/src/lib.rs
+index 1c41637..68f8ce5 100644
+--- a/crates/logscope/src/lib.rs
++++ b/crates/logscope/src/lib.rs
+@@ -16,3 +16,14 @@ pub mod providers;
+ pub mod llm_backend;
+ #[cfg(feature = "bloc")]
+ pub mod bloc_engine;
++#[allow(dead_code)] pub mod specdecode;
++#[allow(dead_code)] pub mod multimodal;
++#[allow(dead_code)] pub mod batching;
++#[allow(dead_code)] pub mod kvcache;
++#[allow(dead_code)] pub mod arch;
++#[allow(dead_code)] pub mod gemmplan;
++#[allow(dead_code)] pub mod dedup;
++#[allow(dead_code)] pub mod moe;
++#[allow(dead_code)] pub mod mla;
++#[allow(dead_code)] pub mod rope;
++#[allow(dead_code)] pub mod quantfmt;
+diff --git a/crates/logscope/src/mla.rs b/crates/logscope/src/mla.rs
+new file mode 100644
+index 0000000..fb8eb93
+--- /dev/null
++++ b/crates/logscope/src/mla.rs
+@@ -0,0 +1,113 @@
++//! mla.rs — DeepSeek multi-head latent attention (MLA): the pure dimension & projection planner.
++//!
++//! MLA's win is the KV cache: instead of storing full per-head K and V, it caches a single low-rank
++//! *latent* (plus a small decoupled-RoPE key shared across heads) and up-projects per head at attention
++//! time — shrinking the cache by an order of magnitude, which is exactly what lets `kvcache` pack long
++//! contexts. The attention/up-projection kernels are the GPU seam; the dims, the cache footprint, and the
++//! projection GEMM shapes (which feed `gemmplan`) are pure and unit-tested here.
++#![allow(dead_code)]
++
++/// MLA dimensions (read from the GGUF hparams). `q_lora_rank == 0` means Q is projected directly (no
++/// low-rank Q compression), as in smaller DeepSeek variants.
++#[derive(Clone, Copy, Debug)]
++pub struct MlaConfig {
++    pub d_model: u32,
++    pub n_head: u32,
++    pub qk_nope_head_dim: u32, // the non-RoPE part of each head's QK dim
++    pub qk_rope_head_dim: u32, // the decoupled RoPE part (carried separately, shared key)
++    pub v_head_dim: u32,
++    pub kv_lora_rank: u32,     // compressed KV latent width (what actually gets cached)
++    pub q_lora_rank: u32,      // compressed Q latent width (0 = none)
++}
++
++/// A projection GEMM: `out_features × in_features` weight applied to a token. Feed `(in, out)` to
++/// `gemmplan` as the matmul's K and N.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Proj { pub name: &'static str, pub in_features: u32, pub out_features: u32 }
++
++impl MlaConfig {
++    /// Full per-head QK dim (non-RoPE + RoPE parts).
++    pub fn qk_head_dim(&self) -> u32 { self.qk_nope_head_dim + self.qk_rope_head_dim }
++
++    /// Elements cached per token under MLA: the shared KV latent plus the one decoupled-RoPE key.
++    pub fn latent_cache_elems(&self) -> u32 { self.kv_lora_rank + self.qk_rope_head_dim }
++
++    /// Elements a plain MHA cache would store per token: every head's K and V.
++    pub fn mha_cache_elems(&self) -> u32 { self.n_head * (self.qk_head_dim() + self.v_head_dim) }
++
++    /// KV-cache shrink factor from MLA (MHA elements ÷ latent elements) — typically ~10–70× on DeepSeek.
++    pub fn cache_compression(&self) -> f32 {
++        let latent = self.latent_cache_elems().max(1);
++        self.mha_cache_elems() as f32 / latent as f32
++    }
++
++    /// Bytes cached per token under MLA at `dtype_bytes` per element.
++    pub fn latent_cache_bytes(&self, dtype_bytes: u32) -> u64 {
++        self.latent_cache_elems() as u64 * dtype_bytes as u64
++    }
++
++    /// The projection GEMMs MLA needs, in order. The engine plans each with `gemmplan`.
++    pub fn projections(&self) -> Vec<Proj> {
++        let qk = self.qk_head_dim();
++        let mut v = Vec::new();
++        if self.q_lora_rank > 0 {
++            v.push(Proj { name: "q_down", in_features: self.d_model, out_features: self.q_lora_rank });
++            v.push(Proj { name: "q_up", in_features: self.q_lora_rank, out_features: self.n_head * qk });
++        } else {
++            v.push(Proj { name: "q", in_features: self.d_model, out_features: self.n_head * qk });
++        }
++        // KV down-projection produces the cached latent + the decoupled RoPE key
++        v.push(Proj { name: "kv_down", in_features: self.d_model, out_features: self.kv_lora_rank + self.qk_rope_head_dim });
++        // KV up-projection expands the latent into per-head non-RoPE K and V
++        v.push(Proj { name: "kv_up", in_features: self.kv_lora_rank, out_features: self.n_head * (self.qk_nope_head_dim + self.v_head_dim) });
++        v.push(Proj { name: "o", in_features: self.n_head * self.v_head_dim, out_features: self.d_model });
++        v
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    // DeepSeek-V2-shaped dims
++    fn v2() -> MlaConfig {
++        MlaConfig { d_model: 5120, n_head: 128, qk_nope_head_dim: 128, qk_rope_head_dim: 64,
++                    v_head_dim: 128, kv_lora_rank: 512, q_lora_rank: 1536 }
++    }
++
++    #[test]
++    fn head_dim_and_cache_footprint() {
++        let c = v2();
++        assert_eq!(c.qk_head_dim(), 192);
++        assert_eq!(c.latent_cache_elems(), 576);            // 512 + 64
++        assert_eq!(c.mha_cache_elems(), 128 * (192 + 128)); // 40960
++    }
++
++    #[test]
++    fn mla_compresses_the_kv_cache_by_an_order_of_magnitude() {
++        let c = v2();
++        assert!((c.cache_compression() - 40960.0 / 576.0).abs() < 1e-3);
++        assert!(c.cache_compression() > 60.0, "MLA should shrink the cache dramatically");
++        // and in bytes (fp16) it's tiny vs a 40k-element MHA cache
++        assert_eq!(c.latent_cache_bytes(2), 576 * 2);
++    }
++
++    #[test]
++    fn projection_shapes_are_correct() {
++        let p = v2().projections();
++        let get = |n: &str| *p.iter().find(|x| x.name == n).unwrap();
++        assert_eq!(get("q_down"), Proj { name: "q_down", in_features: 5120, out_features: 1536 });
++        assert_eq!(get("q_up"), Proj { name: "q_up", in_features: 1536, out_features: 128 * 192 });
++        assert_eq!(get("kv_down"), Proj { name: "kv_down", in_features: 5120, out_features: 512 + 64 });
++        assert_eq!(get("kv_up"), Proj { name: "kv_up", in_features: 512, out_features: 128 * (128 + 128) });
++        assert_eq!(get("o"), Proj { name: "o", in_features: 128 * 128, out_features: 5120 });
++    }
++
++    #[test]
++    fn no_q_lora_projects_q_directly() {
++        let c = MlaConfig { q_lora_rank: 0, ..v2() };
++        let p = c.projections();
++        assert!(p.iter().any(|x| x.name == "q" && x.out_features == 128 * 192));
++        assert!(!p.iter().any(|x| x.name == "q_down"), "no Q compression ⇒ no q_down stage");
++    }
++}
+diff --git a/crates/logscope/src/moe.rs b/crates/logscope/src/moe.rs
+new file mode 100644
+index 0000000..fec639e
+--- /dev/null
++++ b/crates/logscope/src/moe.rs
+@@ -0,0 +1,134 @@
++//! moe.rs — mixture-of-experts routing: the pure gate/dispatch/combine bookkeeping that lets the engine
++//! run MoE FFNs (Mixtral, DeepSeek-V2/V3, Qwen-MoE).
++//!
++//! Per token, a gate scores the experts; the router picks the top-`k`, normalizes their combine weights,
++//! and the batch is permuted so each expert processes its assigned tokens in one grouped GEMM (the GPU
++//! seam). Afterwards the per-expert outputs are scattered back and summed by the gate weights. The
++//! selection, weighting, the per-expert token lists, and the weighted combine are pure and unit-tested.
++#![allow(dead_code)]
++
++/// How the gate logits become combine weights.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum GateNorm {
++    Softmax, // softmax over the chosen experts (Mixtral, DeepSeek-V2)
++    Sigmoid, // per-expert sigmoid then (optionally) normalize (DeepSeek-V3)
++}
++
++/// A chosen expert and its combine weight for one token.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Expert { pub id: u32, pub weight: f32 }
++
++/// Pick the top-`k` experts for one token and compute their combine weights. `renorm` rescales the chosen
++/// weights to sum to 1 (a no-op for `Softmax`, which already does; the usual choice for `Sigmoid`).
++pub fn route_token(logits: &[f32], k: usize, norm: GateNorm, renorm: bool) -> Vec<Expert> {
++    if logits.is_empty() { return Vec::new(); }
++    let k = k.clamp(1, logits.len());
++    // indices of the k largest logits (desc by logit, ties broken by lower index for determinism)
++    let mut idx: Vec<usize> = (0..logits.len()).collect();
++    idx.sort_by(|&a, &b| logits[b].partial_cmp(&logits[a]).unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b)));
++    let sel = &idx[..k];
++
++    let mut w: Vec<f32> = match norm {
++        GateNorm::Softmax => {
++            // softmax over the selected logits == softmax-over-all then renormalize the subset
++            let m = sel.iter().map(|&i| logits[i]).fold(f32::NEG_INFINITY, f32::max);
++            let exps: Vec<f32> = sel.iter().map(|&i| (logits[i] - m).exp()).collect();
++            let s: f32 = exps.iter().sum();
++            exps.iter().map(|&e| e / s).collect()
++        }
++        GateNorm::Sigmoid => sel.iter().map(|&i| 1.0 / (1.0 + (-logits[i]).exp())).collect(),
++    };
++    if renorm {
++        let s: f32 = w.iter().sum();
++        if s > 0.0 { for x in &mut w { *x /= s; } }
++    }
++    sel.iter().zip(w).map(|(&i, weight)| Expert { id: i as u32, weight }).collect()
++}
++
++/// A whole batch's routing: each token's chosen experts, and the inverse map expert → its token indices
++/// (the grouping the per-expert GEMM consumes).
++#[derive(Debug)]
++pub struct Plan { pub routes: Vec<Vec<Expert>>, pub per_expert: Vec<Vec<u32>> }
++
++/// Route a batch. `token_logits[t]` is token `t`'s gate logits over `n_expert` experts.
++pub fn plan(token_logits: &[&[f32]], n_expert: usize, k: usize, norm: GateNorm, renorm: bool) -> Plan {
++    let mut routes = Vec::with_capacity(token_logits.len());
++    let mut per_expert = vec![Vec::new(); n_expert];
++    for (t, logits) in token_logits.iter().enumerate() {
++        let r = route_token(logits, k, norm, renorm);
++        for e in &r { if (e.id as usize) < n_expert { per_expert[e.id as usize].push(t as u32); } }
++        routes.push(r);
++    }
++    Plan { routes, per_expert }
++}
++
++impl Plan {
++    /// Tokens assigned to each expert — the load distribution (uneven load is the MoE scheduling problem).
++    pub fn expert_load(&self) -> Vec<usize> { self.per_expert.iter().map(|v| v.len()).collect() }
++
++    /// Combine per-(token, expert) scalar outputs by the gate weights, one result per token. The real engine
++    /// does this over hidden vectors on the GPU; the weighting is identical, so this exercises that math.
++    pub fn combine_scalar(&self, expert_out: impl Fn(u32, u32) -> f32) -> Vec<f32> {
++        self.routes.iter().enumerate()
++            .map(|(t, experts)| experts.iter().map(|e| e.weight * expert_out(t as u32, e.id)).sum())
++            .collect()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-4 }
++
++    #[test]
++    fn top_k_softmax_picks_largest_and_weights_sum_to_one() {
++        let r = route_token(&[1.0, 3.0, 2.0, 0.0], 2, GateNorm::Softmax, true);
++        assert_eq!(r.iter().map(|e| e.id).collect::<Vec<_>>(), vec![1, 2]); // logits 3 and 2
++        let s: f32 = r.iter().map(|e| e.weight).sum();
++        assert!(approx(s, 1.0));
++        assert!(r[0].weight > r[1].weight, "the higher logit gets the larger weight");
++        // softmax([3,2]) = [e/(e+1), 1/(e+1)] ≈ [0.7311, 0.2689]
++        assert!(approx(r[0].weight, 0.7310586));
++    }
++
++    #[test]
++    fn k_at_least_one_and_capped_at_n() {
++        assert_eq!(route_token(&[0.1, 0.2, 0.3], 9, GateNorm::Softmax, true).len(), 3);
++        assert_eq!(route_token(&[0.1, 0.2, 0.3], 0, GateNorm::Softmax, true).len(), 1);
++        assert!(route_token(&[], 2, GateNorm::Softmax, true).is_empty());
++    }
++
++    #[test]
++    fn sigmoid_gating_normalizes_when_asked() {
++        let r = route_token(&[2.0, 1.0, -1.0], 2, GateNorm::Sigmoid, true);
++        assert_eq!(r.iter().map(|e| e.id).collect::<Vec<_>>(), vec![0, 1]);
++        assert!(approx(r.iter().map(|e| e.weight).sum(), 1.0));
++        // without renorm the weights are the raw sigmoids (don't sum to 1)
++        let raw = route_token(&[2.0, 1.0, -1.0], 2, GateNorm::Sigmoid, false);
++        assert!(!approx(raw.iter().map(|e| e.weight).sum(), 1.0));
++    }
++
++    #[test]
++    fn plan_groups_tokens_by_expert() {
++        // 3 tokens over 4 experts, top-1: clear argmaxes 2, 0, 2
++        let l0 = [0.0, 0.0, 9.0, 0.0];
++        let l1 = [9.0, 0.0, 0.0, 0.0];
++        let l2 = [0.0, 0.0, 9.0, 0.0];
++        let p = plan(&[&l0, &l1, &l2], 4, 1, GateNorm::Softmax, true);
++        assert_eq!(p.per_expert[2], vec![0, 2]);
++        assert_eq!(p.per_expert[0], vec![1]);
++        assert_eq!(p.expert_load(), vec![1, 0, 2, 0]);
++    }
++
++    #[test]
++    fn combine_is_the_gate_weighted_sum() {
++        // top-2 over 2 experts ⇒ both chosen; weights from softmax([1,0])
++        let p = plan(&[&[1.0, 0.0]], 2, 2, GateNorm::Softmax, true);
++        let w0 = p.routes[0].iter().find(|e| e.id == 0).unwrap().weight;
++        let w1 = p.routes[0].iter().find(|e| e.id == 1).unwrap().weight;
++        // expert e returns scalar (e+1) for the token; combine = w0*1 + w1*2
++        let out = p.combine_scalar(|_t, e| (e + 1) as f32);
++        assert!(approx(out[0], w0 * 1.0 + w1 * 2.0));
++    }
++}
+diff --git a/crates/logscope/src/multimodal.rs b/crates/logscope/src/multimodal.rs
+new file mode 100644
+index 0000000..53d68e5
+--- /dev/null
++++ b/crates/logscope/src/multimodal.rs
+@@ -0,0 +1,235 @@
++//! multimodal.rs — pure geometry + sequence assembly for vision-language input.
++//!
++//! Two pure pieces the engine needs to feed images to a language model: (1) how a source image tiles into
++//! vision patches and how many tokens it costs (LLaVA / AnyRes-style dynamic tiling), and (2) how the
++//! image placeholders in a prompt expand into vision-token *slots* interleaved with text tokens. The
++//! vision-encoder forward pass (pixels → patch embeddings) and the pixel resampling are the GPU/IO seam;
++//! the layout math that decides how many slots go where — and which the engine must fill with image
++//! embeddings vs. token embeddings — is here and unit-tested.
++#![allow(dead_code)]
++
++/// Vision preprocessing config. Defaults are a common CLIP-ViT/LLaVA setup: 336px tiles, 14px patches
++/// (→ 24×24 = 576 tokens/tile), up to 4 hi-res tiles plus a whole-image thumbnail.
++#[derive(Clone, Copy, Debug)]
++pub struct VisionConfig {
++    pub tile: u32,       // square tile edge, px
++    pub patch: u32,      // patch edge, px
++    pub max_tiles: u32,  // cap on hi-res tiles
++    pub thumbnail: bool, // also include one downscaled whole-image tile
++}
++impl Default for VisionConfig {
++    fn default() -> Self { Self { tile: 336, patch: 14, max_tiles: 4, thumbnail: true } }
++}
++
++/// Vision tokens produced per tile = (tile/patch)².
++pub fn tokens_per_tile(cfg: &VisionConfig) -> u32 {
++    let p = (cfg.tile / cfg.patch.max(1)).max(1);
++    p * p
++}
++
++/// Choose the tile grid `(cols, rows)` whose aspect ratio best matches the image, within `max_tiles`.
++/// Ties prefer more tiles (higher effective resolution).
++pub fn tile_grid(w: u32, h: u32, cfg: &VisionConfig) -> (u32, u32) {
++    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
++    let target = w / h;
++    let mut best = (1u32, 1u32);
++    let mut best_score = f32::INFINITY;
++    for c in 1..=cfg.max_tiles.max(1) {
++        for r in 1..=cfg.max_tiles.max(1) {
++            if c * r > cfg.max_tiles.max(1) { continue; }
++            let aspect_err = ((c as f32 / r as f32) / target).ln().abs(); // symmetric ratio distance
++            let score = aspect_err - 0.01 * (c * r) as f32;               // tie-break toward more tiles
++            if score < best_score { best_score = score; best = (c, r); }
++        }
++    }
++    best
++}
++
++/// Total vision tokens an image costs: the hi-res tiles plus an optional thumbnail tile.
++pub fn image_tokens(w: u32, h: u32, cfg: &VisionConfig) -> u32 {
++    let (c, r) = tile_grid(w, h, cfg);
++    let per = tokens_per_tile(cfg);
++    c * r * per + if cfg.thumbnail { per } else { 0 }
++}
++
++/// A prompt piece before image expansion.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Piece { Text(Vec<u32>), Image(usize) } // Image(i) marks where the i-th attached image goes
++
++/// A position in the assembled multimodal sequence.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Slot { Text(u32), Image { image: usize, idx: u32 } } // idx = which vision token of that image
++
++/// Expand each `Image(i)` marker into `image_tokens[i]` vision slots, interleaved with the text tokens, to
++/// produce the flat sequence the engine builds embeddings for: text slots get token embeddings, image
++/// slots get `image[i]`'s vision embedding at `idx`. A marker with no matching count expands to nothing.
++pub fn assemble(pieces: &[Piece], image_tokens: &[u32]) -> Vec<Slot> {
++    let mut out = Vec::new();
++    for p in pieces {
++        match p {
++            Piece::Text(ids) => out.extend(ids.iter().map(|&t| Slot::Text(t))),
++            Piece::Image(i) => {
++                let n = image_tokens.get(*i).copied().unwrap_or(0);
++                out.extend((0..n).map(|idx| Slot::Image { image: *i, idx }));
++            }
++        }
++    }
++    out
++}
++
++/// `(text_slots, image_slots)` in an assembled sequence.
++pub fn counts(slots: &[Slot]) -> (usize, usize) {
++    let img = slots.iter().filter(|s| matches!(s, Slot::Image { .. })).count();
++    (slots.len() - img, img)
++}
++
++/// Whether the assembled sequence fits a context window.
++pub fn fits(pieces: &[Piece], image_tokens: &[u32], n_ctx: usize) -> bool {
++    let text: usize = pieces.iter().map(|p| if let Piece::Text(t) = p { t.len() } else { 0 }).sum();
++    let imgs: usize = pieces.iter().filter_map(|p| if let Piece::Image(i) = p { image_tokens.get(*i).map(|n| *n as usize) } else { None }).sum();
++    text + imgs <= n_ctx
++}
++
++/// A parsed chat-string segment before tokenization.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum Segment { Text(String), Image(usize) }
++
++/// Split a chat string into text/image segments at `<image>` / `<image:N>` markers. A bare `<image>` is
++/// auto-numbered in order (0, 1, 2, …); `<image:N>` pins an explicit index (and does not advance the auto
++/// counter). Anything that isn't a well-formed marker (`<imagex>`, an unterminated `<image`) is kept as
++/// literal text. Adjacent text is coalesced.
++pub fn segment_prompt(s: &str) -> Vec<Segment> {
++    let mut out: Vec<Segment> = Vec::new();
++    let mut buf = String::new();
++    let mut auto = 0usize;
++    let mut rest = s;
++    while !rest.is_empty() {
++        let Some(pos) = rest.find("<image") else { buf.push_str(rest); break; };
++        buf.push_str(&rest[..pos]);
++        let tail = &rest[pos + "<image".len()..];
++        let idx = tail.find('>').and_then(|close| {
++            let inner = &tail[..close];
++            if inner.is_empty() { let i = auto; auto += 1; Some((i, close)) }
++            else { inner.strip_prefix(':').and_then(|n| n.trim().parse::<usize>().ok()).map(|n| (n, close)) }
++        });
++        match idx {
++            Some((i, close)) => {
++                if !buf.is_empty() { out.push(Segment::Text(std::mem::take(&mut buf))); }
++                out.push(Segment::Image(i));
++                rest = &tail[close + 1..];
++            }
++            None => { buf.push_str("<image"); rest = tail; } // not a marker → literal
++        }
++    }
++    if !buf.is_empty() { out.push(Segment::Text(buf)); }
++    out
++}
++
++/// The distinct image indices a prompt references, in first-seen order (use to check every attached image
++/// is actually placed, and that no marker points past the attachments).
++pub fn image_indices(segments: &[Segment]) -> Vec<usize> {
++    let mut seen = Vec::new();
++    for seg in segments { if let Segment::Image(i) = seg { if !seen.contains(i) { seen.push(*i); } } }
++    seen
++}
++
++/// Parse a chat string and tokenize its text spans (via the injected tokenizer — the real tokenizer is the
++/// seam) into the [`Piece`] stream that [`assemble`] consumes. This closes the multimodal input path:
++/// chat string → `Piece`s → (`image_tokens` per image) → `assemble` → `Slot`s.
++pub fn pieces_from_prompt(s: &str, tokenize: impl Fn(&str) -> Vec<u32>) -> Vec<Piece> {
++    segment_prompt(s).into_iter().map(|seg| match seg {
++        Segment::Text(t) => Piece::Text(tokenize(&t)),
++        Segment::Image(i) => Piece::Image(i),
++    }).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn tokens_per_tile_is_patch_grid_squared() {
++        assert_eq!(tokens_per_tile(&VisionConfig::default()), 24 * 24); // 336/14 = 24
++    }
++
++    #[test]
++    fn tile_grid_follows_aspect_ratio() {
++        let cfg = VisionConfig { tile: 336, patch: 14, max_tiles: 4, thumbnail: false };
++        assert_eq!(tile_grid(1600, 400, &cfg), (4, 1)); // wide → all columns
++        assert_eq!(tile_grid(400, 1600, &cfg), (1, 4)); // tall → all rows
++        assert_eq!(tile_grid(512, 512, &cfg), (2, 2));  // square → 2×2 (more res beats 1×1 on the tie)
++    }
++
++    #[test]
++    fn image_tokens_sum_tiles_and_thumbnail() {
++        let cfg = VisionConfig { tile: 336, patch: 14, max_tiles: 4, thumbnail: true };
++        // square → 2×2 tiles (=4) + 1 thumbnail = 5 tiles × 576
++        assert_eq!(image_tokens(512, 512, &cfg), 5 * 576);
++        let no_thumb = VisionConfig { thumbnail: false, ..cfg };
++        assert_eq!(image_tokens(512, 512, &no_thumb), 4 * 576);
++    }
++
++    #[test]
++    fn assemble_interleaves_image_slots_with_text() {
++        let pieces = vec![Piece::Text(vec![1, 2]), Piece::Image(0), Piece::Text(vec![3])];
++        let slots = assemble(&pieces, &[4]); // image 0 costs 4 vision tokens
++        assert_eq!(slots.len(), 7);
++        assert_eq!(slots[0], Slot::Text(1));
++        assert_eq!(slots[2], Slot::Image { image: 0, idx: 0 });
++        assert_eq!(slots[5], Slot::Image { image: 0, idx: 3 });
++        assert_eq!(slots[6], Slot::Text(3));
++        assert_eq!(counts(&slots), (3, 4));
++    }
++
++    #[test]
++    fn multiple_images_and_missing_counts() {
++        let pieces = vec![Piece::Image(0), Piece::Image(1), Piece::Image(2)];
++        let slots = assemble(&pieces, &[2, 3]); // image 2 has no count → expands to nothing
++        assert_eq!(counts(&slots), (0, 5));
++        assert!(slots.iter().any(|s| matches!(s, Slot::Image { image: 1, .. })));
++    }
++
++    #[test]
++    fn fits_accounts_for_image_tokens() {
++        let pieces = vec![Piece::Text(vec![0; 100]), Piece::Image(0)];
++        assert!(fits(&pieces, &[500], 1024));
++        assert!(!fits(&pieces, &[2000], 1024)); // image blows the context
++    }
++
++    #[test]
++    fn segment_prompt_auto_numbers_bare_markers() {
++        let segs = segment_prompt("look at <image> and <image>");
++        assert_eq!(segs, vec![
++            Segment::Text("look at ".into()), Segment::Image(0),
++            Segment::Text(" and ".into()), Segment::Image(1),
++        ]);
++    }
++
++    #[test]
++    fn segment_prompt_handles_explicit_indices_and_edges() {
++        // explicit indices, marker at start, and back-to-back markers
++        let segs = segment_prompt("<image:1><image:0>x");
++        assert_eq!(segs, vec![Segment::Image(1), Segment::Image(0), Segment::Text("x".into())]);
++        assert_eq!(image_indices(&segs), vec![1, 0]);
++    }
++
++    #[test]
++    fn non_markers_stay_literal() {
++        assert_eq!(segment_prompt("no images here"), vec![Segment::Text("no images here".into())]);
++        // unterminated / malformed markers are preserved as text (coalesced)
++        assert_eq!(segment_prompt("a <imagex> b"), vec![Segment::Text("a <imagex> b".into())]);
++        assert_eq!(segment_prompt("trailing <image"), vec![Segment::Text("trailing <image".into())]);
++    }
++
++    #[test]
++    fn prompt_adapter_feeds_assemble_end_to_end() {
++        // a toy tokenizer: one id per whitespace word (the id = word length)
++        let toks = |t: &str| t.split_whitespace().map(|w| w.len() as u32).collect::<Vec<_>>();
++        let pieces = pieces_from_prompt("describe <image> please", toks);
++        assert_eq!(pieces, vec![Piece::Text(vec![8]), Piece::Image(0), Piece::Text(vec![6])]);
++        // chat string → pieces → slots, with the image costing 3 vision tokens
++        let slots = assemble(&pieces, &[3]);
++        assert_eq!(counts(&slots), (2, 3));
++        assert_eq!(slots[1], Slot::Image { image: 0, idx: 0 });
++    }
++}
+diff --git a/crates/logscope/src/quantfmt.rs b/crates/logscope/src/quantfmt.rs
+new file mode 100644
+index 0000000..04882fc
+--- /dev/null
++++ b/crates/logscope/src/quantfmt.rs
+@@ -0,0 +1,97 @@
++//! quantfmt.rs — GGUF quantization-format layouts: block sizes and byte footprints for every ggml type.
++//!
++//! This is the *sizing* counterpart to the engine's dequantizer (which turns bytes into floats): given a
++//! `ggml_type`, what's its block shape and how many bytes does a tensor of N weights occupy? That's what
++//! memory planning, mmap offset math, and load-time validation need — including for quants the engine
++//! can't yet decode (you still must size them correctly to map the file). Objective facts (the published
++//! ggml block layouts), pure and unit-tested. `QK_K = 256` for K-quants, 32 for the legacy blocks.
++#![allow(dead_code)]
++
++/// A quant type's block shape.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Layout { pub name: &'static str, pub block_elems: u32, pub block_bytes: u32 }
++
++/// Layout for a `ggml_type` id, or `None` if unknown to this table.
++pub fn layout(ggml_type: u32) -> Option<Layout> {
++    let (name, be, bb) = match ggml_type {
++        0  => ("F32",  1, 4),
++        1  => ("F16",  1, 2),
++        2  => ("Q4_0", 32, 18),  // d(f16) + 16×2 nibbles
++        3  => ("Q4_1", 32, 20),  // d + m + 16
++        6  => ("Q5_0", 32, 22),  // d + qh(4) + 16
++        7  => ("Q5_1", 32, 24),  // d + m + qh(4) + 16
++        8  => ("Q8_0", 32, 34),  // d + 32×i8
++        9  => ("Q8_1", 32, 36),  // d + s + 32×i8
++        10 => ("Q2_K", 256, 84),
++        11 => ("Q3_K", 256, 110),
++        12 => ("Q4_K", 256, 144),
++        13 => ("Q5_K", 256, 176),
++        14 => ("Q6_K", 256, 210),
++        15 => ("Q8_K", 256, 292),
++        _  => return None,
++    };
++    Some(Layout { name, block_elems: be, block_bytes: bb })
++}
++
++/// Bytes a tensor of `n_elems` weights occupies in this quant. `None` if the type is unknown or the count
++/// isn't a whole number of blocks (GGUF tensors are always block-aligned per row).
++pub fn tensor_bytes(ggml_type: u32, n_elems: u64) -> Option<u64> {
++    let l = layout(ggml_type)?;
++    let be = l.block_elems as u64;
++    if n_elems % be != 0 { return None; }
++    Some(n_elems / be * l.block_bytes as u64)
++}
++
++/// Effective bits per weight (for reporting / comparing quant levels).
++pub fn bits_per_weight(ggml_type: u32) -> Option<f32> {
++    let l = layout(ggml_type)?;
++    Some(l.block_bytes as f32 * 8.0 / l.block_elems as f32)
++}
++
++/// Whether this id is a known quantized (block) format, as opposed to plain F32/F16 or unknown.
++pub fn is_quantized(ggml_type: u32) -> bool {
++    matches!(ggml_type, 2 | 3 | 6 | 7 | 8 | 9 | 10..=15)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn legacy_and_k_quant_block_sizes_match_ggml() {
++        assert_eq!(layout(0).unwrap().block_bytes, 4);   // F32
++        assert_eq!(layout(1).unwrap().block_bytes, 2);   // F16
++        assert_eq!(layout(2).unwrap(), Layout { name: "Q4_0", block_elems: 32, block_bytes: 18 });
++        assert_eq!(layout(8).unwrap().block_bytes, 34);  // Q8_0
++        assert_eq!(layout(12).unwrap().block_bytes, 144); // Q4_K
++        assert_eq!(layout(14).unwrap().block_bytes, 210); // Q6_K
++        assert!(layout(999).is_none());
++    }
++
++    #[test]
++    fn bits_per_weight_matches_published_numbers() {
++        let bpw = |t| (bits_per_weight(t).unwrap() * 1000.0).round() / 1000.0;
++        assert_eq!(bpw(2), 4.5);    // Q4_0 = 18·8/32
++        assert_eq!(bpw(8), 8.5);    // Q8_0
++        assert_eq!(bpw(12), 4.5);   // Q4_K
++        assert_eq!(bpw(14), 6.563); // Q6_K = 210·8/256
++        assert_eq!(bpw(0), 32.0);   // F32
++    }
++
++    #[test]
++    fn tensor_bytes_counts_whole_blocks() {
++        // a 4096×4096 Q4_0 weight: (4096·4096/32) blocks × 18 bytes
++        let n = 4096u64 * 4096;
++        assert_eq!(tensor_bytes(2, n), Some(n / 32 * 18));
++        // not block-aligned ⇒ None
++        assert_eq!(tensor_bytes(2, 40), None);
++        // F16 is per-element
++        assert_eq!(tensor_bytes(1, 1000), Some(2000));
++    }
++
++    #[test]
++    fn is_quantized_excludes_float_and_unknown() {
++        assert!(is_quantized(2) && is_quantized(12) && is_quantized(14));
++        assert!(!is_quantized(0) && !is_quantized(1) && !is_quantized(999));
++    }
++}
+diff --git a/crates/logscope/src/rope.rs b/crates/logscope/src/rope.rs
+new file mode 100644
+index 0000000..dbd64f4
+--- /dev/null
++++ b/crates/logscope/src/rope.rs
+@@ -0,0 +1,125 @@
++//! rope.rs — synthesize long-context RoPE scaling factors from GGUF metadata.
++//!
++//! The engine already *applies* per-dimension RoPE factors when a model bakes them into a
++//! `rope_freqs.weight` tensor (llama-3 style). Models that instead declare scaling through metadata —
++//! `rope_scaling.type` plus `factor` / `original_context_length` / `beta_fast` / `beta_slow` (Qwen2-YaRN,
++//! DeepSeek, Yi-200K) — ship no such tensor, so there's nothing for that path to apply. This module
++//! computes the equivalent per-dimension factor vector (linear or YaRN) from the metadata, matching
++//! llama.cpp's `rope_yarn` math, so the existing apply path covers those models too. It also returns
++//! YaRN's attention temperature (`mscale`). Pure; the rotary kernel itself is the seam.
++//!
++//! Note: `arch::Feature::RopeScaling` is exactly what this fills in — detection there, synthesis here.
++#![allow(dead_code)]
++
++use std::f32::consts::PI;
++
++/// Base RoPE inverse frequencies: `base^(-2i/head_dim)` for pair `i` in `0..head_dim/2`.
++pub fn inv_freq(head_dim: u32, base: f32) -> Vec<f32> {
++    let half = (head_dim / 2).max(1);
++    (0..half).map(|i| base.powf(-2.0 * i as f32 / head_dim as f32)).collect()
++}
++
++/// How a model declares its context scaling.
++#[derive(Clone, Copy, Debug)]
++pub enum Scaling {
++    None,
++    Linear { factor: f32 },
++    Yarn { factor: f32, orig_ctx: u32, beta_fast: f32, beta_slow: f32 },
++}
++
++/// The dimension at which `n_rot` full rotations fit in `orig_ctx` (llama.cpp `rope_yarn_corr_dim`).
++fn corr_dim(head_dim: u32, orig_ctx: u32, n_rot: f32, base: f32) -> f32 {
++    head_dim as f32 * (orig_ctx as f32 / (n_rot * 2.0 * PI)).ln() / (2.0 * base.ln())
++}
++
++fn corr_range(head_dim: u32, orig_ctx: u32, base: f32, beta_fast: f32, beta_slow: f32) -> (f32, f32) {
++    let lo = corr_dim(head_dim, orig_ctx, beta_fast, base).floor().max(0.0);
++    let max_pair = (head_dim / 2).saturating_sub(1) as f32;
++    let hi = corr_dim(head_dim, orig_ctx, beta_slow, base).ceil().min(max_pair);
++    (lo, hi)
++}
++
++/// Interpolation ↔ extrapolation ramp: 1 at high-frequency dims (keep, i.e. extrapolate), 0 at
++/// low-frequency dims (interpolate / scale), linear between the correction dims.
++fn ramp(low: f32, high: f32, i: u32) -> f32 {
++    let y = (i as f32 - low) / (high - low).max(1e-3);
++    1.0 - y.clamp(0.0, 1.0)
++}
++
++/// Per-dimension multiplicative factors for `inv_freq` — exactly what a `rope_freqs.weight` tensor would
++/// hold. `1.0` means unscaled (extrapolate); `1/factor` means fully interpolated.
++pub fn scaling_factors(head_dim: u32, base: f32, scaling: Scaling) -> Vec<f32> {
++    let half = (head_dim / 2).max(1) as usize;
++    match scaling {
++        Scaling::None => vec![1.0; half],
++        Scaling::Linear { factor } => vec![1.0 / factor.max(1e-6); half],
++        Scaling::Yarn { factor, orig_ctx, beta_fast, beta_slow } => {
++            let inv_scale = 1.0 / factor.max(1e-6);
++            let (lo, hi) = corr_range(head_dim, orig_ctx, base, beta_fast, beta_slow);
++            (0..half as u32).map(|i| {
++                let r = ramp(lo, hi, i);
++                inv_scale * (1.0 - r) + r // blend interp factor (1/factor) with extrap factor (1.0)
++            }).collect()
++        }
++    }
++}
++
++/// YaRN attention temperature, multiplying cos/sin (`1 + 0.1·ln(factor)`). `1.0` for non-YaRN.
++pub fn mscale(scaling: Scaling) -> f32 {
++    match scaling {
++        Scaling::Yarn { factor, .. } if factor > 1.0 => 1.0 + 0.1 * factor.ln(),
++        _ => 1.0,
++    }
++}
++
++/// Effective scaled inverse frequencies = `inv_freq · scaling_factors`.
++pub fn scaled_inv_freq(head_dim: u32, base: f32, scaling: Scaling) -> Vec<f32> {
++    inv_freq(head_dim, base).iter().zip(scaling_factors(head_dim, base, scaling)).map(|(a, b)| a * b).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn approx(a: f32, b: f32, eps: f32) -> bool { (a - b).abs() < eps }
++
++    #[test]
++    fn inv_freq_matches_the_definition() {
++        let f = inv_freq(4, 10000.0); // pairs i=0,1 → 10000^0, 10000^-0.5
++        assert!(approx(f[0], 1.0, 1e-6));
++        assert!(approx(f[1], 0.01, 1e-6));
++    }
++
++    #[test]
++    fn none_and_linear_are_uniform() {
++        assert_eq!(scaling_factors(8, 10000.0, Scaling::None), vec![1.0; 4]);
++        let lin = scaling_factors(8, 10000.0, Scaling::Linear { factor: 4.0 });
++        assert!(lin.iter().all(|&x| approx(x, 0.25, 1e-6)));
++        // scaled_inv_freq under linear == inv_freq / factor
++        let base = inv_freq(8, 10000.0);
++        let sif = scaled_inv_freq(8, 10000.0, Scaling::Linear { factor: 4.0 });
++        for (b, s) in base.iter().zip(&sif) { assert!(approx(*s, b / 4.0, 1e-6)); }
++    }
++
++    #[test]
++    fn yarn_interpolates_low_freqs_and_keeps_high_freqs() {
++        let (hd, base, factor) = (128u32, 10000.0f32, 4.0f32);
++        let f = scaling_factors(hd, base, Scaling::Yarn { factor, orig_ctx: 4096, beta_fast: 32.0, beta_slow: 1.0 });
++        assert_eq!(f.len(), 64);
++        // every factor lies between full interpolation (1/factor) and no scaling (1.0)
++        assert!(f.iter().all(|&x| x >= 0.25 - 1e-4 && x <= 1.0 + 1e-4));
++        // high-frequency dims (small i) are kept ≈ 1.0; low-frequency dims (large i) are scaled ≈ 1/factor
++        assert!(approx(f[0], 1.0, 1e-3));
++        assert!(approx(f[63], 0.25, 1e-3));
++        // and it's monotonically non-increasing across dimensions
++        assert!(f.windows(2).all(|w| w[0] >= w[1] - 1e-6));
++    }
++
++    #[test]
++    fn yarn_attention_temperature() {
++        assert!(approx(mscale(Scaling::Yarn { factor: 4.0, orig_ctx: 4096, beta_fast: 32.0, beta_slow: 1.0 }),
++                       1.0 + 0.1 * 4.0f32.ln(), 1e-6));
++        assert_eq!(mscale(Scaling::Linear { factor: 4.0 }), 1.0);
++        assert_eq!(mscale(Scaling::None), 1.0);
++    }
++}
+diff --git a/crates/logscope/src/specdecode.rs b/crates/logscope/src/specdecode.rs
+new file mode 100644
+index 0000000..53bf318
+--- /dev/null
++++ b/crates/logscope/src/specdecode.rs
+@@ -0,0 +1,221 @@
++//! specdecode.rs — speculative decoding: the pure verify/accept core that turns a draft model's guesses
++//! into committed tokens, plus throughput accounting and an adaptive speculation length.
++//!
++//! Speculative decoding raises tokens/sec by letting a small DRAFT model propose `k` tokens that the big
++//! TARGET model verifies in ONE batched forward pass: every accepted guess is a token the target didn't
++//! have to generate serially, so a single target pass can emit up to `k+1` tokens instead of one. The two
++//! model forward passes are the GPU seam (the engine runs the draft and the batched target verify); the
++//! accept rule, the bookkeeping, and the adaptive `k` are pure and unit-tested here.
++#![allow(dead_code)]
++
++/// Greedy speculative-decoding verification — lossless for greedy/argmax decoding.
++///
++/// * `draft`  — the `k` tokens the draft model proposed.
++/// * `target` — the target model's own argmax token at each of the `k+1` verification positions, where
++///   `target[i]` is what the target emits given the true prefix plus `draft[..i]`.
++///
++/// Accepts the longest matching prefix of `draft`, then appends exactly one target token: the correction
++/// at the first mismatch, or the bonus token `target[k]` when every draft token matched. The result is
++/// always `1..=k+1` tokens and is exactly what the target would have produced serially — `>1` is the
++/// speedup over batch-1 decode.
++pub fn verify_greedy(draft: &[u32], target: &[u32]) -> Vec<u32> {
++    assert_eq!(target.len(), draft.len() + 1, "target needs one argmax per draft position plus the bonus");
++    let mut out = Vec::with_capacity(target.len());
++    let mut i = 0;
++    while i < draft.len() && draft[i] == target[i] { out.push(draft[i]); i += 1; }
++    out.push(target[i]); // correction at the first mismatch, or the bonus token if i == draft.len()
++    out
++}
++
++/// One verification position for *sampled* speculative decoding: the draft token and the draft (`q`) and
++/// target (`p`) distributions at that position, over the same vocab indexing (each summing ~1).
++pub struct DraftPos<'a> { pub token: u32, pub q: &'a [f32], pub p: &'a [f32] }
++
++/// Lossless sampled speculative verification (the Leviathan/Chen rule) — the temperature>0 counterpart of
++/// [`verify_greedy`]. For each position accept the draft token with probability `min(1, p(x)/q(x))`; on the
++/// first rejection emit a token resampled from the normalized residual `(p - q)₊` and stop. If every draft
++/// token is accepted, emit a bonus token sampled from `bonus` (the target distribution at position k+1).
++/// The committed tokens are distributed exactly as if sampled from the target directly. `rand` supplies the
++/// uniform draws (injected for determinism): one per accept test, plus one per (re)sample.
++pub fn verify_sampled(positions: &[DraftPos], bonus: &[f32], rand: &mut dyn FnMut() -> f32) -> Vec<u32> {
++    let mut out = Vec::new();
++    for pos in positions {
++        let x = pos.token as usize;
++        let qx = pos.q.get(x).copied().unwrap_or(0.0);
++        let px = pos.p.get(x).copied().unwrap_or(0.0);
++        let accept = if qx <= 0.0 { 1.0 } else { (px / qx).min(1.0) };
++        if rand() < accept {
++            out.push(pos.token);
++        } else {
++            out.push(sample_residual(pos.p, pos.q, rand())); // resample from (p−q)₊
++            return out;
++        }
++    }
++    out.push(sample_categorical(bonus, rand())); // all accepted → bonus token from p_{k+1}
++    out
++}
++
++/// Inverse-CDF categorical sample from an unnormalized weight slice, using a uniform `u` in [0,1).
++fn sample_categorical(dist: &[f32], u: f32) -> u32 {
++    let sum: f32 = dist.iter().map(|w| w.max(0.0)).sum();
++    if sum <= 0.0 { return 0; }
++    let target = u * sum;
++    let mut acc = 0.0;
++    for (i, &w) in dist.iter().enumerate() { acc += w.max(0.0); if acc >= target { return i as u32; } }
++    (dist.len().saturating_sub(1)) as u32
++}
++
++/// Sample from the normalized residual `(p − q)₊`. Falls back to `p` if the residual is degenerate.
++fn sample_residual(p: &[f32], q: &[f32], u: f32) -> u32 {
++    let n = p.len().max(q.len());
++    let resid = |i: usize| (p.get(i).copied().unwrap_or(0.0) - q.get(i).copied().unwrap_or(0.0)).max(0.0);
++    let sum: f32 = (0..n).map(resid).sum();
++    if sum <= 0.0 { return sample_categorical(p, u); }
++    let target = u * sum;
++    let mut acc = 0.0;
++    for i in 0..n { acc += resid(i); if acc >= target { return i as u32; } }
++    (n.saturating_sub(1)) as u32
++}
++
++/// Running throughput counters for a speculative-decoding session.
++#[derive(Clone, Debug, Default)]
++pub struct SpecStats {
++    pub forward_passes: u64, // target forward passes (one per verified draft block)
++    pub committed: u64,      // tokens actually emitted
++    pub proposed: u64,       // draft tokens proposed
++    pub accepted: u64,       // draft tokens accepted (committed minus the one target token per pass)
++}
++impl SpecStats {
++    /// Record one verification step from the proposed count and the length `verify_greedy` returned.
++    pub fn record(&mut self, proposed: usize, committed_len: usize) {
++        self.forward_passes += 1;
++        self.proposed += proposed as u64;
++        self.committed += committed_len as u64;
++        self.accepted += committed_len.saturating_sub(1) as u64; // committed = accepted_draft + 1 target token
++    }
++    /// Fraction of proposed draft tokens accepted (0..=1). High ⇒ the draft tracks the target well.
++    pub fn acceptance_rate(&self) -> f32 {
++        if self.proposed == 0 { 0.0 } else { self.accepted as f32 / self.proposed as f32 }
++    }
++    /// Tokens committed per target forward pass — the throughput multiplier vs. serial decode (which is 1.0).
++    pub fn tokens_per_pass(&self) -> f32 {
++        if self.forward_passes == 0 { 0.0 } else { self.committed as f32 / self.forward_passes as f32 }
++    }
++}
++
++/// Adapts the speculation length `k` from recent acceptance: propose more when the draft is hitting,
++/// fewer when it's missing (a long draft that gets rejected wastes target compute).
++#[derive(Clone, Copy, Debug)]
++pub struct DraftPolicy { pub min: usize, pub max: usize, pub grow_above: f32, pub shrink_below: f32 }
++impl Default for DraftPolicy {
++    fn default() -> Self { Self { min: 1, max: 8, grow_above: 0.75, shrink_below: 0.40 } }
++}
++impl DraftPolicy {
++    pub fn next_len(&self, current: usize, accepted: usize, proposed: usize) -> usize {
++        let rate = if proposed == 0 { 0.0 } else { accepted as f32 / proposed as f32 };
++        let next = if rate >= self.grow_above { current + 1 }
++                   else if rate <= self.shrink_below { current.saturating_sub(1) }
++                   else { current };
++        next.clamp(self.min.max(1), self.max.max(self.min.max(1)))
++    }
++}
++
++/// Engine-facing driver: ask [`draft_len`](Self::draft_len) for how many tokens to propose, run the draft
++/// model, run the batched target verify, then [`commit`](Self::commit) the result — which records stats
++/// and adapts `k`. Deterministic; the model passes around it are the seam.
++pub struct SpecDecoder { k: usize, pub policy: DraftPolicy, pub stats: SpecStats }
++impl SpecDecoder {
++    pub fn new(policy: DraftPolicy) -> Self { Self { k: policy.min.max(1), policy, stats: SpecStats::default() } }
++    /// How many tokens the draft model should propose next.
++    pub fn draft_len(&self) -> usize { self.k }
++    /// Verify one draft block against the target's argmaxes, record throughput, adapt `k`, return the
++    /// committed tokens (accepted draft prefix + one target token).
++    pub fn commit(&mut self, draft: &[u32], target_argmax: &[u32]) -> Vec<u32> {
++        let committed = verify_greedy(draft, target_argmax);
++        self.stats.record(draft.len(), committed.len());
++        self.k = self.policy.next_len(self.k, committed.len() - 1, draft.len());
++        committed
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn accepts_full_draft_plus_bonus_token() {
++        // every guess right ⇒ k+1 tokens from one target pass (the max speedup)
++        assert_eq!(verify_greedy(&[5, 6, 7], &[5, 6, 7, 8]), vec![5, 6, 7, 8]);
++    }
++
++    #[test]
++    fn stops_at_first_mismatch_with_correction() {
++        // draft diverges at index 1 → keep the 5, replace with the target's 6, stop
++        assert_eq!(verify_greedy(&[5, 9, 7], &[5, 6, 7, 8]), vec![5, 6]);
++        // mismatch at index 0 → just the target's first token
++        assert_eq!(verify_greedy(&[1, 2], &[5, 6, 7]), vec![5]);
++    }
++
++    #[test]
++    fn empty_draft_degrades_to_one_token() {
++        assert_eq!(verify_greedy(&[], &[5]), vec![5]); // == ordinary batch-1 decode
++    }
++
++    #[test]
++    fn sampled_accepts_when_target_likes_the_draft_token() {
++        // p(x)/q(x) = 0.9/0.5 = 1.8 → accept for any draw; then bonus from p_{k+1}=[0,1] → token 1
++        let pos = [DraftPos { token: 0, q: &[0.5, 0.5], p: &[0.9, 0.1] }];
++        let mut draws = [0.99f32, 0.5].into_iter();
++        let out = verify_sampled(&pos, &[0.0, 1.0], &mut || draws.next().unwrap());
++        assert_eq!(out, vec![0, 1]);
++    }
++
++    #[test]
++    fn sampled_rejects_and_resamples_from_residual() {
++        // draft picked token 1 but target dislikes it: ratio = 0.1/0.9 ≈ 0.11; draw 0.5 > ratio → reject.
++        // residual (p−q)₊ = (0.8, 0) → resample must yield token 0.
++        let pos = [DraftPos { token: 1, q: &[0.1, 0.9], p: &[0.9, 0.1] }];
++        let mut draws = [0.5f32, 0.5].into_iter();
++        let out = verify_sampled(&pos, &[1.0, 0.0], &mut || draws.next().unwrap());
++        assert_eq!(out, vec![0], "rejection stops the block and emits the corrected token");
++    }
++
++    #[test]
++    fn categorical_inverse_cdf_picks_the_right_bucket() {
++        let d = [0.2f32, 0.3, 0.5];
++        assert_eq!(sample_categorical(&d, 0.0), 0);
++        assert_eq!(sample_categorical(&d, 0.25), 1); // 0.2 < 0.25 ≤ 0.5
++        assert_eq!(sample_categorical(&d, 0.60), 2); // 0.5 < 0.60 ≤ 1.0
++    }
++
++    #[test]
++    fn stats_track_acceptance_and_throughput() {
++        let mut s = SpecStats::default();
++        s.record(3, 4); // proposed 3, all accepted + bonus ⇒ committed 4
++        s.record(3, 2); // proposed 3, accepted 1 + correction ⇒ committed 2
++        assert_eq!(s.accepted, 4);          // 3 + 1
++        assert_eq!(s.proposed, 6);
++        assert!((s.acceptance_rate() - 4.0 / 6.0).abs() < 1e-6);
++        assert!((s.tokens_per_pass() - 3.0).abs() < 1e-6); // 6 committed / 2 passes
++    }
++
++    #[test]
++    fn policy_grows_when_hitting_and_shrinks_when_missing() {
++        let p = DraftPolicy::default();
++        assert_eq!(p.next_len(4, 4, 4), 5); // 100% accepted → grow
++        assert_eq!(p.next_len(4, 1, 4), 3); // 25% accepted → shrink
++        assert_eq!(p.next_len(4, 2, 4), 4); // 50% → hold
++        assert_eq!(p.next_len(8, 8, 8), 8); // already at max → clamp
++        assert_eq!(p.next_len(1, 0, 4), 1); // already at min → clamp
++    }
++
++    #[test]
++    fn decoder_drives_and_adapts() {
++        let mut d = SpecDecoder::new(DraftPolicy { min: 1, max: 6, grow_above: 0.75, shrink_below: 0.4 });
++        d.k = 3;
++        let committed = d.commit(&[10, 11, 12], &[10, 11, 12, 13]); // perfect block
++        assert_eq!(committed, vec![10, 11, 12, 13]);
++        assert_eq!(d.draft_len(), 4, "all accepted → propose one more next time");
++        assert!((d.stats.tokens_per_pass() - 4.0).abs() < 1e-6);
++    }
++}

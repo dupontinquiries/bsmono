@@ -281,6 +281,35 @@ impl Keyring {
         self.contacts.iter().find(|c| c.handle == handle).map(|c| c.key)
     }
 
+    /// v0.1.882: reverse lookup — the handle for a public key, if known.
+    /// Lets an opened envelope name its sender ("from alice") instead of
+    /// showing a raw key.
+    pub fn handle_for(&self, key: &PublicKey) -> Option<String> {
+        self.contacts.iter().find(|c| &c.key == key).map(|c| c.handle.clone())
+    }
+
+    /// Remove a contact by handle. Returns true if one was removed.
+    pub fn remove(&mut self, handle: &str) -> bool {
+        let before = self.contacts.len();
+        self.contacts.retain(|c| c.handle != handle);
+        self.contacts.len() != before
+    }
+
+    /// Serialize contacts for the UI: one `handle\tpublic_key_b64` per
+    /// line, sorted by handle for stable display.
+    pub fn to_wire(&self) -> String {
+        let mut rows: Vec<&Contact> = self.contacts.iter().collect();
+        rows.sort_by(|a, b| a.handle.cmp(&b.handle));
+        let mut out = String::new();
+        for c in rows {
+            out.push_str(&c.handle);
+            out.push('\t');
+            out.push_str(&c.key.to_b64());
+            out.push('\n');
+        }
+        out
+    }
+
     pub fn load() -> Keyring {
         match std::fs::read_to_string(Self::path()) {
             Ok(s) => Keyring::from_json(&s).unwrap_or_default(),
@@ -511,6 +540,43 @@ mod tests {
     }
 
     #[test]
+    fn from_wire_rejects_empty_and_whitespace() {
+        // peer_open_envelope feeds this untrusted pasted text; empty / blank
+        // input must return Err, never panic.
+        assert!(Envelope::from_wire("").is_err());
+        assert!(Envelope::from_wire("   \n\n  \t ").is_err());
+    }
+
+    #[test]
+    fn from_wire_rejects_bad_base64_in_each_field() {
+        let sender = key_a().to_b64();
+        let nonce = b64_encode(&[1u8; NONCE_LEN]);
+        let ct = b64_encode(&[2u8; 32]);
+        // garbage in the sender slot
+        assert!(Envelope::from_wire(&format!("w2qmsg/1\n@@@\n{}\n{}", nonce, ct)).is_err());
+        // garbage in the nonce slot
+        assert!(Envelope::from_wire(&format!("w2qmsg/1\n{}\n@@@\n{}", sender, ct)).is_err());
+        // garbage in the ciphertext slot
+        assert!(Envelope::from_wire(&format!("w2qmsg/1\n{}\n{}\n@@@", sender, nonce)).is_err());
+    }
+
+    #[test]
+    fn from_wire_tolerates_surrounding_and_header_whitespace() {
+        // Pasted blobs often carry stray leading/trailing whitespace and
+        // blank lines; a valid envelope inside must still parse. The header
+        // is trimmed independently, so trailing spaces after it are fine too.
+        let env = Envelope { sender: key_a(), nonce: vec![3u8; NONCE_LEN], ciphertext: vec![9u8; 40] };
+        let padded = format!("\n\n   {}  \n\n", env.to_wire());
+        assert_eq!(Envelope::from_wire(&padded).unwrap(), env);
+
+        let hdr_ws = format!(
+            "w2qmsg/1   \n{}\n{}\n{}",
+            key_a().to_b64(), b64_encode(&[3u8; NONCE_LEN]), b64_encode(&[9u8; 40])
+        );
+        assert!(Envelope::from_wire(&hdr_ws).is_ok());
+    }
+
+    #[test]
     fn keyring_json_roundtrip_and_upsert() {
         let mut kr = Keyring::default();
         kr.upsert("alice", PublicKey([1u8; KEY_LEN]));
@@ -524,6 +590,29 @@ mod tests {
         let back = Keyring::from_json(&kr.to_json()).unwrap();
         assert_eq!(back.contacts.len(), 2);
         assert_eq!(back.lookup("bob"), Some(PublicKey([2u8; KEY_LEN])));
+        // reverse lookup names a known sender
+        assert_eq!(back.handle_for(&PublicKey([2u8; KEY_LEN])), Some("bob".to_string()));
+        assert_eq!(back.handle_for(&PublicKey([254u8; KEY_LEN])), None);
+    }
+
+    #[test]
+    fn keyring_remove_and_wire() {
+        let mut kr = Keyring::default();
+        kr.upsert("bob", PublicKey([2u8; KEY_LEN]));
+        kr.upsert("alice", PublicKey([1u8; KEY_LEN]));
+        // to_wire is sorted by handle, one line each
+        let wire = kr.to_wire();
+        let lines: Vec<&str> = wire.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("alice\t"));
+        assert!(lines[1].starts_with("bob\t"));
+        // the b64 key round-trips from the wire
+        let key_b64 = lines[0].split('\t').nth(1).unwrap();
+        assert_eq!(PublicKey::from_b64(key_b64).unwrap(), PublicKey([1u8; KEY_LEN]));
+        // remove
+        assert!(kr.remove("alice"));
+        assert!(!kr.remove("alice")); // idempotent-ish: already gone
+        assert_eq!(kr.contacts.len(), 1);
     }
 
     #[cfg(not(feature = "mail-crypto"))]
@@ -552,6 +641,27 @@ mod tests {
             // The envelope is addressed-from Alice.
             assert_eq!(env.sender, a_pub);
             // Bob opens it.
+            let got = open(&env, &b_sec).unwrap();
+            assert_eq!(got, msg);
+        }
+
+        #[test]
+        fn sealed_message_survives_wire_roundtrip() {
+            // Exactly the compose → copy → paste → open path the UI drives:
+            // seal, serialize to the wire blob, parse it back, open. The
+            // separate wire test uses a fake envelope and the seal/open test
+            // skips the wire — this closes the gap between them.
+            let (a_sec, a_pub) = generate_keypair().unwrap();
+            let (b_sec, b_pub) = generate_keypair().unwrap();
+            let msg = PeerMessage {
+                to: b_pub.to_b64(),
+                subject: "wire trip".into(),
+                body: "seal \u{2192} to_wire \u{2192} from_wire \u{2192} open".into(),
+            };
+            let wire = seal(&b_pub, &a_sec, &a_pub, &msg).unwrap().to_wire();
+            let env = Envelope::from_wire(&wire).unwrap();
+            // Sender authenticity is preserved across serialization.
+            assert_eq!(env.sender, a_pub);
             let got = open(&env, &b_sec).unwrap();
             assert_eq!(got, msg);
         }
