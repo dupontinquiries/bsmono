@@ -1,0 +1,14 @@
+[package]
+name        = "snapclone-debounce"
+version     = "0.1.0"
+edition     = "2021"
+description = "Debounce/coalesce accumulators for SnapClone UI transitions: separate the INSTANT visual/animation layer from the COALESCED consequential layer (network priorities, usage stats, celebrations) so rapid swiping doesn't spam the underlying system. Leading+trailing debounce, coalesce-to-latest, settle detection. Pure timing/state logic, no I/O, no deps — the C++ side drives it with one timer."
+
+[lib]
+name       = "snapclone_debounce"
+crate-type = ["rlib"]
+
+# Pure std — deliberately NO snapclone-core dependency so this stays testable in
+# any toolchain (core pulls a transitive edition2024 dep this sandbox can't
+# build). This crate is pure timing/state arithmetic; it needs nothing.
+[dependencies]

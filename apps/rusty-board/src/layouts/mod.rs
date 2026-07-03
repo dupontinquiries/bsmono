@@ -1,5 +1,8 @@
 //! Keyboard layouts: loaded from JSON files in `resources/layouts/`.
 
+pub mod builder;
+pub mod io;
+
 use crate::keyboard::{Key, KeyAction, KeyGestures};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

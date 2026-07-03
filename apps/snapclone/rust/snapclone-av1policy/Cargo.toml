@@ -1,0 +1,12 @@
+[package]
+name        = "snapclone-av1policy"
+version     = "0.1.0"
+edition     = "2021"
+description = "AV1 encode-strategy policy for SnapClone: per-tier choice of constant-quality (CRF) vs bitrate rate-control, GOP length, hierarchical reference depth, and the I-frame/reference-frame quality bias that lets AV1 concentrate bits on frames that propagate. Pure decision logic; the C++ backends emit the actual SVT-AV1 / ffmpeg params. See docs/FACE_BANDWIDTH.md + the AV1 notes."
+
+[lib]
+name       = "snapclone_av1policy"
+crate-type = ["rlib"]
+
+# Pure std — this is strategy logic over a tier enum, no I/O, no deps.
+[dependencies]

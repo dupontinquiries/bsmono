@@ -22,6 +22,7 @@
 pub mod catalog;
 pub mod parser;
 pub mod tag_reader;
+pub mod tag_writer;
 pub mod scanner;
 pub mod smart_cards;
 pub mod key_detection;
@@ -63,6 +64,9 @@ pub enum MediaResult {
     /// Confirmed star rating for a track after a SetTrackRating write, so
     /// the UI can reconcile its optimistic update.
     TrackRating { track_id: i64, rating: i64 },
+    /// Outcome of a WriteTagsToFile request (writing tags to the actual
+    /// audio file). ok=false carries a human-readable failure reason.
+    TagWriteResult { track_id: i64, ok: bool, message: String },
     /// Resume state for the home card.
     ResumeState(smart_cards::ResumeState),
     /// Current track BPM + camelot for the now-playing HUD chip.

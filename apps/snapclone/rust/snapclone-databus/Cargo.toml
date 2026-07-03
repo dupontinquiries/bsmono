@@ -1,0 +1,31 @@
+[package]
+name        = "snapclone-databus"
+version     = "0.1.0"
+edition     = "2021"
+description = """
+Userspace IPC data bus for local geographic data sharing between apps.
+Any app can publish typed map points (weather, photos, snaps, sensors);
+subscribers receive live updates via Unix socket. No broker, no root.
+"""
+
+[lib]
+name       = "snapclone_databus"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "snapclone-bus"
+path = "src/main.rs"
+
+[dependencies]
+anyhow     = "1"
+chrono     = { version = "0.4", features = ["serde"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio      = { version = "1", features = ["net", "rt-multi-thread", "io-util", "sync", "time", "macros"] }
+tracing    = "0.1"
+tracing-subscriber = { version = "0.3", optional = true }
+uuid       = { version = "1", features = ["v4"] }
+
+[features]
+default  = []
+bin      = ["tracing-subscriber"]

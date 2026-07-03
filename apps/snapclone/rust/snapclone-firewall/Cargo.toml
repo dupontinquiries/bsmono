@@ -1,0 +1,14 @@
+[package]
+name = "snapclone-firewall"
+version = "0.1.0"
+edition = "2021"
+description = "Linux firewall detection and port-allow for SnapClone (firewalld/ufw/nftables/iptables)"
+
+[lib]
+name = "snapclone_firewall"
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow  = "1"
+tracing = "0.1"
+serde   = { version = "1", features = ["derive"] }

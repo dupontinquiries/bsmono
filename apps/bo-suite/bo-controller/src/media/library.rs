@@ -890,6 +890,14 @@ pub fn top_artists_by_plays(conn: &Connection, limit: usize) -> rusqlite::Result
 
 /// All artists alphabetically.
 pub fn all_artists_alpha(conn: &Connection) -> rusqlite::Result<Vec<ArtistDetail>> {
+    all_artists_alpha_base(conn)
+}
+
+/// Base (name-ordered) artist aggregation with play counts. Used by the
+/// unpaginated alpha list + the top-artists fallback. (The paginated
+/// ArtistsPage uses catalog::artists_with_counts_page_sorted, which sorts
+/// in SQL; this richer aggregation is for callers that want play totals.)
+fn all_artists_alpha_base(conn: &Connection) -> rusqlite::Result<Vec<ArtistDetail>> {
     let mut stmt = conn.prepare(r#"
         SELECT a.id, a.name,
                COUNT(DISTINCT ta.track_id) AS track_count,
@@ -985,6 +993,71 @@ pub fn top_albums_by_plays(conn: &Connection, limit: usize)
 /// Includes albums with zero plays (useful for "I haven't listened to
 /// X in a while" browsing). Matches `all_artists_alpha`'s ergonomics.
 pub fn all_albums_alpha(conn: &Connection)
+    -> rusqlite::Result<Vec<AlbumSummary>>
+{
+    all_albums_sorted(conn, AlbumSort::Title)
+}
+
+/// Sort modes for the albums browse list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlbumSort {
+    Title,
+    Artist,
+    Year,
+    MostPlayed,
+}
+
+impl AlbumSort {
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "artist" => AlbumSort::Artist,
+            "year"   => AlbumSort::Year,
+            "plays"  => AlbumSort::MostPlayed,
+            _         => AlbumSort::Title,
+        }
+    }
+    pub fn to_tag(self) -> &'static str {
+        match self {
+            AlbumSort::Title      => "title",
+            AlbumSort::Artist     => "artist",
+            AlbumSort::Year       => "year",
+            AlbumSort::MostPlayed => "plays",
+        }
+    }
+}
+
+/// All albums in a chosen order. The base query already returns every
+/// album with the fields we sort on, so we order in Rust (the album
+/// cardinality is small — a few hundred — so this is cheap and keeps the
+/// SQL single-purpose).
+pub fn all_albums_sorted(conn: &Connection, sort: AlbumSort)
+    -> rusqlite::Result<Vec<AlbumSummary>>
+{
+    let mut albums = all_albums_alpha_base(conn)?;
+    match sort {
+        AlbumSort::Title => {
+            // base query already title-ordered; keep as-is.
+        }
+        AlbumSort::Artist => albums.sort_by(|a, b| {
+            a.primary_artist.to_lowercase().cmp(&b.primary_artist.to_lowercase())
+                .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        }),
+        AlbumSort::Year => albums.sort_by(|a, b| {
+            // Newest first; albums with no year sink to the bottom.
+            b.year.unwrap_or(0).cmp(&a.year.unwrap_or(0))
+                .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        }),
+        AlbumSort::MostPlayed => albums.sort_by(|a, b| {
+            b.total_plays.cmp(&a.total_plays)
+                .then(a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+        }),
+    }
+    Ok(albums)
+}
+
+/// The base (title-ordered) album aggregation. Factored out so the sorted
+/// wrapper can reorder without duplicating the query.
+fn all_albums_alpha_base(conn: &Connection)
     -> rusqlite::Result<Vec<AlbumSummary>>
 {
     let mut stmt = conn.prepare(r#"
@@ -1236,8 +1309,11 @@ pub fn search_advanced(conn: &Connection, query: &str, limit: usize) -> rusqlite
 // ── Utilities ────────────────────────────────────────────────────────
 
 fn unix_now() -> i64 {
-        core_kit::time::now_secs() as i64
-    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1346,6 +1422,105 @@ mod tests {
         // The orphan's artist should COALESCE to the sentinel.
         let orphan = rows.iter().find(|t| t.title == "Orphan Track").unwrap();
         assert_eq!(orphan.primary_artist, "Unknown Artist");
+        // all_tracks_page must surface the rating column (defaults 0).
+        let has = rows.iter().find(|t| t.title == "Has Artist").unwrap();
+        assert_eq!(has.rating, 0, "unrated track reads 0 through all_tracks_page");
+    }
+
+    #[test]
+    fn all_tracks_page_surfaces_set_rating() {
+        let mut conn = fresh_conn();
+        let tid = insert_test_track(&conn, "Star Track", "Artist");
+        catalog::set_track_rating(&mut conn, tid, 4).unwrap();
+        let (rows, _) = catalog::all_tracks_page(&conn, 0, 100).unwrap();
+        let row = rows.iter().find(|t| t.id == tid).unwrap();
+        assert_eq!(row.rating, 4, "rating set should surface in the all-tracks list");
+    }
+
+    #[test]
+    fn artist_page_sort_modes_order_correctly() {
+        use catalog::ArtistPageSort;
+        let conn = fresh_conn();
+        // Beta: 2 tracks. Alpha: 1 track. Gamma: 3 tracks.
+        insert_test_track(&conn, "b1", "Beta");
+        insert_test_track(&conn, "b2", "Beta");
+        insert_test_track(&conn, "a1", "Alpha");
+        insert_test_track(&conn, "g1", "Gamma");
+        insert_test_track(&conn, "g2", "Gamma");
+        insert_test_track(&conn, "g3", "Gamma");
+
+        let names = |v: &[catalog::GroupCount]| v.iter().map(|a| a.name.clone()).collect::<Vec<_>>();
+        // Name: Alpha, Beta, Gamma.
+        let (n, total) = catalog::artists_with_counts_page_sorted(
+            &conn, 0, 100, ArtistPageSort::Name).unwrap();
+        assert_eq!(names(&n), vec!["Alpha", "Beta", "Gamma"]);
+        assert_eq!(total, 3);
+        // Track count desc: Gamma(3), Beta(2), Alpha(1).
+        let (t, _) = catalog::artists_with_counts_page_sorted(
+            &conn, 0, 100, ArtistPageSort::TrackCount).unwrap();
+        assert_eq!(names(&t), vec!["Gamma", "Beta", "Alpha"]);
+        // Tag fallback.
+        assert_eq!(ArtistPageSort::from_tag("zzz"), ArtistPageSort::Name);
+        assert_eq!(ArtistPageSort::from_tag("tracks"), ArtistPageSort::TrackCount);
+    }
+
+    #[test]
+    fn album_sort_modes_order_correctly() {
+        use catalog as _cat; // silence unused if any
+        let conn = fresh_conn();
+        // Three tracks → three albums with distinct year/plays/artist.
+        let t1 = insert_test_track(&conn, "s1", "Beta");
+        let t2 = insert_test_track(&conn, "s2", "Alpha");
+        let t3 = insert_test_track(&conn, "s3", "Gamma");
+        conn.execute("UPDATE tracks SET album='Zed', year=1999, play_count=1 WHERE id=?1", params![t1]).unwrap();
+        conn.execute("UPDATE tracks SET album='Mid', year=2020, play_count=9 WHERE id=?1", params![t2]).unwrap();
+        conn.execute("UPDATE tracks SET album='Ace', year=2010, play_count=5 WHERE id=?1", params![t3]).unwrap();
+
+        let titles = |v: &[AlbumSummary]| v.iter().map(|a| a.title.clone()).collect::<Vec<_>>();
+        // Title: Ace, Mid, Zed.
+        let t = all_albums_sorted(&conn, AlbumSort::Title).unwrap();
+        assert_eq!(titles(&t), vec!["Ace", "Mid", "Zed"]);
+        // Year (newest first): Mid(2020), Ace(2010), Zed(1999).
+        let y = all_albums_sorted(&conn, AlbumSort::Year).unwrap();
+        assert_eq!(titles(&y), vec!["Mid", "Ace", "Zed"]);
+        // Most played: Mid(9), Ace(5), Zed(1).
+        let p = all_albums_sorted(&conn, AlbumSort::MostPlayed).unwrap();
+        assert_eq!(titles(&p), vec!["Mid", "Ace", "Zed"]);
+        // Artist: Alpha(Mid), Beta(Zed), Gamma(Ace).
+        let ar = all_albums_sorted(&conn, AlbumSort::Artist).unwrap();
+        assert_eq!(titles(&ar), vec!["Mid", "Zed", "Ace"]);
+        // Tag fallback.
+        assert_eq!(AlbumSort::from_tag("zzz"), AlbumSort::Title);
+        assert_eq!(AlbumSort::from_tag("plays"), AlbumSort::MostPlayed);
+    }
+
+    #[test]
+    fn all_tracks_sort_modes_order_correctly() {
+        use catalog::TrackSort;
+        let mut conn = fresh_conn();
+        // Titles deliberately out of insertion order.
+        let _c = insert_test_track(&conn, "Charlie", "Zeta");
+        let a = insert_test_track(&conn, "Alpha", "Yankee");
+        let _b = insert_test_track(&conn, "Bravo", "Xray");
+        catalog::set_track_rating(&mut conn, a, 5).unwrap();
+
+        // Title sort: Alpha, Bravo, Charlie.
+        let (t, _) = catalog::all_tracks_page_sorted(&conn, 0, 100, TrackSort::Title).unwrap();
+        assert_eq!(t.iter().map(|x| x.title.as_str()).collect::<Vec<_>>(),
+                   vec!["Alpha", "Bravo", "Charlie"]);
+        // Artist sort: Xray(Bravo), Yankee(Alpha), Zeta(Charlie).
+        let (ar, _) = catalog::all_tracks_page_sorted(&conn, 0, 100, TrackSort::Artist).unwrap();
+        assert_eq!(ar.iter().map(|x| x.title.as_str()).collect::<Vec<_>>(),
+                   vec!["Bravo", "Alpha", "Charlie"]);
+        // Recently added: newest id first → Bravo, Alpha, Charlie.
+        let (rc, _) = catalog::all_tracks_page_sorted(&conn, 0, 100, TrackSort::RecentlyAdded).unwrap();
+        assert_eq!(rc.first().unwrap().title, "Bravo", "newest inserted first");
+        // Rating desc: Alpha (5) first.
+        let (rt, _) = catalog::all_tracks_page_sorted(&conn, 0, 100, TrackSort::RatingDesc).unwrap();
+        assert_eq!(rt.first().unwrap().title, "Alpha", "highest rated first");
+        // Tag parsing falls back to Title for garbage.
+        assert_eq!(TrackSort::from_tag("nonsense"), TrackSort::Title);
+        assert_eq!(TrackSort::from_tag("rating"), TrackSort::RatingDesc);
     }
 
     #[test]
@@ -2089,4 +2264,27 @@ mod tests {
         let recent = recently_added(&conn, 5).unwrap();
         assert_eq!(recent.len(), 5);
     }
+    #[test]
+    fn tag_and_artist_detail_queries_populate() {
+        // Regression for "tags/artists pages don't populate": both the
+        // by-artist and by-tag drill-down queries must return the attached
+        // tracks (the UI bug was a QML binding conflict, but lock the data
+        // layer down too).
+        let conn = fresh_conn();
+        let t1 = insert_test_track(&conn, "Song One", "The Band");
+        let t2 = insert_test_track(&conn, "Song Two", "The Band");
+        let aid: i64 = conn.query_row(
+            "SELECT artist_id FROM track_artists WHERE track_id=?1 LIMIT 1",
+            params![t1], |r| r.get(0)).unwrap();
+        assert_eq!(catalog::by_artist_id(&conn, aid).unwrap().len(), 2,
+                   "artist drill-down should return both tracks");
+
+        conn.execute("INSERT INTO tags (name, norm) VALUES ('chill','chill')", []).unwrap();
+        let tag_id: i64 = conn.query_row("SELECT id FROM tags WHERE name='chill'", [], |r| r.get(0)).unwrap();
+        conn.execute("INSERT INTO track_tags (track_id, tag_id) VALUES (?1,?2)", params![t1, tag_id]).unwrap();
+        conn.execute("INSERT INTO track_tags (track_id, tag_id) VALUES (?1,?2)", params![t2, tag_id]).unwrap();
+        assert_eq!(tracks_by_tag(&conn, tag_id, 500).unwrap().len(), 2,
+                   "tag drill-down should return both tracks");
+    }
+
 }

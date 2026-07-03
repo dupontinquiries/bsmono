@@ -1,0 +1,1 @@
+-- Migration v07_peer_locations (stub — copy from kMigrations[] in StorageManager.cpp)

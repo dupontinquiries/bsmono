@@ -260,6 +260,31 @@ pub(crate) fn clear_swipe_interrupted_by_focus_loss() {
         .store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Set when a long-press handler fires and commits to handling the
+/// current gesture. GTK's `GestureLongPress` fires at ~500ms while the
+/// finger is held, and the button's own click gesture STILL fires
+/// `clicked` on the subsequent release — so without this latch a
+/// long-press produces BOTH its action AND a normal tap (e.g. a
+/// long-press on space would also type a space; a long-press on
+/// backspace would fire synonym AND delete a character). The click
+/// handler consumes this latch (check-and-clear) and drops the tap
+/// when it's set. Cleared at drag_begin so it can't leak into the
+/// next gesture if a click somehow doesn't follow.
+static LONG_PRESS_FIRED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn note_long_press_fired() {
+    LONG_PRESS_FIRED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn take_long_press_fired() -> bool {
+    LONG_PRESS_FIRED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn clear_long_press_fired() {
+    LONG_PRESS_FIRED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Force-clear the active-swipe latch. Called on keyboard-show as a
 /// safety net: normally the drag `cancel` handler clears this when a
 /// gesture is interrupted by focus loss, but not every compositor
@@ -873,6 +898,23 @@ impl KeyboardView {
         // receiving overlay-frame coords (the un-translated ones).
         // That's a separate push from the tracker push.
         let kb_offset: Rc<Cell<(f64, f64)>> = Rc::new(Cell::new((0.0, 0.0)));
+        // Snapshot of HITBOX_GENERATION at drag_begin. If a layout
+        // rebuild fires mid-gesture (an engine StateChanged event
+        // swapping the page while the finger is down), the generation
+        // bumps and the widgets the path was drawn against no longer
+        // exist. drag_end compares against this to detect that race
+        // and abort rather than dispatch the path against a
+        // mismatched layout's hitboxes — the kind of state-churn
+        // scramble that makes cardinal/swipe gestures misfire after
+        // page switches.
+        let kb_gesture_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        // Min-dimension (px) of the cardinal source cell hit at
+        // drag_begin, used to scale the tap-eviction threshold in
+        // drag_update by the SAME factor the classifier uses at
+        // drag_end — keeping the click/cardinal double-fire interlock
+        // intact under keyboard scaling. A large default (1e9) means
+        // "no scaling" (factor clamps to 1.0) for non-cardinal drags.
+        let kb_source_cell_min: Rc<Cell<f64>> = Rc::new(Cell::new(1.0e9));
 
         // Begin
         {
@@ -885,6 +927,8 @@ impl KeyboardView {
             let cur_layout_begin = self.current_layout.clone();
             let behavior_for_begin = source_behavior.clone();
             let offset_for_begin = kb_offset.clone();
+            let gesture_gen_for_begin = kb_gesture_gen.clone();
+            let source_cell_min_for_begin = kb_source_cell_min.clone();
             let drag_drawing_begin = drag_drawing.clone();
             let drag_stroke_pts_begin = drag_stroke_pts.clone();
             let trail_for_begin = self.trail.clone();
@@ -898,6 +942,18 @@ impl KeyboardView {
                 // was abandoned without drag_end firing (rare but
                 // possible on grab revocation).
                 clear_swipe_interrupted_by_focus_loss();
+                // Also clear the long-press latch: drag_begin fires at
+                // touch-down, before this gesture's own ~500ms long-
+                // press could set it, so this only clears a stale set
+                // left by a prior gesture whose release-click never
+                // arrived. Prevents that staleness from suppressing
+                // this gesture's tap.
+                clear_long_press_fired();
+                // Snapshot the hitbox generation so drag_end can tell
+                // if a layout rebuild happened mid-gesture.
+                gesture_gen_for_begin.set(
+                    HITBOX_GENERATION.load(std::sync::atomic::Ordering::Relaxed),
+                );
                 // Capture keyboard_box's offset within overlay. Use
                 // compute_bounds because it accounts for margins,
                 // halign, and any future positioning quirks.
@@ -964,7 +1020,14 @@ impl KeyboardView {
                     dispatch_mode.suppresses_freeform_swipe();
                 let behavior = {
                     let boxes = hitboxes_begin.borrow();
+                    // Default: no scaling (large min → factor clamps to
+                    // 1.0). Overwritten below when a cell is hit.
+                    source_cell_min_for_begin.set(1.0e9);
                     let hit = boxes.iter().find(|b| b.contains(kx, ky)).map(|b| {
+                        // Record the hit cell's min-dimension so
+                        // drag_update can scale tap-eviction to match
+                        // the classifier's cell-scaled tap threshold.
+                        source_cell_min_for_begin.set(b.width.min(b.height));
                         let raw = b.key.behavior();
                         if suppress_freeform {
                             // Experimental modes (cardinal/steno) must
@@ -1153,6 +1216,7 @@ impl KeyboardView {
             let trail = self.trail.clone();
             let behavior_for_update = source_behavior.clone();
             let offset_for_update = kb_offset.clone();
+            let source_cell_min_for_update = kb_source_cell_min.clone();
             let drag_drawing_update = drag_drawing.clone();
             let drag_stroke_pts_update = drag_stroke_pts.clone();
             drag.connect_drag_update(move |gesture, dx, dy| {
@@ -1209,11 +1273,30 @@ impl KeyboardView {
                         // eviction. Negligible individually but the
                         // drag_update closure is one of the hottest
                         // paths in the keyboard.
-                        const TAP_EVICTION_PX: f64 = 12.0;
-                        const TAP_EVICTION_SQ: f64 =
-                            TAP_EVICTION_PX * TAP_EVICTION_PX;
+                        // Must equal the classifier's tap threshold
+                        // (cardinal.rs default tap_max_excursion_px =
+                        // 13.0), scaled by the SAME cell-relative
+                        // factor the classifier applies at drag_end —
+                        // otherwise scaling the classifier threshold
+                        // for small cells (voice-mode/compact) without
+                        // scaling eviction would reopen the double-fire
+                        // / dead-zone gap. Both read the same source
+                        // cell min captured at drag_begin.
+                        //   - excursion < T → no eviction (click
+                        //     fires the tap) AND classify returns Tap
+                        //     (dispatch early-returns): one fire, tap.
+                        //   - excursion ≥ T → eviction latches (click
+                        //     drops the tap) AND classify returns a
+                        //     direction (dispatch commits): one fire.
+                        const TAP_EVICTION_BASE_PX: f64 = 13.0;
+                        let evict_factor =
+                            crate::gestures::cardinal::cardinal_scale_factor(
+                                source_cell_min_for_update.get(),
+                            );
+                        let tap_eviction_px = TAP_EVICTION_BASE_PX * evict_factor;
+                        let tap_eviction_sq = tap_eviction_px * tap_eviction_px;
                         let dist_sq = dx * dx + dy * dy;
-                        if dist_sq >= TAP_EVICTION_SQ {
+                        if dist_sq >= tap_eviction_sq {
                             // Compute actual distance only for the
                             // log line. tracing's macros short-
                             // circuit if the level is filtered, so
@@ -1221,9 +1304,9 @@ impl KeyboardView {
                             // debug-build users see the readable
                             // pixel value.
                             debug!(
-                                "tap eviction: drag moved {:.1}px (>= {}px); \
+                                "tap eviction: drag moved {:.1}px (>= {:.1}px); \
                                  setting SWIPE_GESTURE_ACTIVE",
-                                dist_sq.sqrt(), TAP_EVICTION_PX
+                                dist_sq.sqrt(), tap_eviction_px
                             );
                             SWIPE_GESTURE_ACTIVE
                                 .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1280,6 +1363,7 @@ impl KeyboardView {
 
             let behavior_for_end = source_behavior.clone();
             let offset_for_end = kb_offset.clone();
+            let gesture_gen_for_end = kb_gesture_gen.clone();
             let drag_drawing_end = drag_drawing.clone();
             let drag_stroke_pts_end = drag_stroke_pts.clone();
             drag.connect_drag_end(move |_gesture, dx, dy| {
@@ -1313,6 +1397,39 @@ impl KeyboardView {
                     swipe.lock().cancel();
                     SWIPE_GESTURE_ACTIVE
                         .store(false, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+
+                // Mid-gesture layout-rebuild guard. HITBOX_GENERATION
+                // bumps whenever rebuild_view runs (a layout/page
+                // switch). If it changed since drag_begin, the widgets
+                // this path was drawn against were torn down and
+                // replaced mid-gesture — an engine StateChanged event
+                // (auto-cap, mode switch, a programmatic page swap)
+                // fired while the finger was down. The captured path
+                // is in the OLD layout's coordinate space; dispatching
+                // it against the NEW layout's hitboxes would map a
+                // cardinal swipe to the wrong cell or decode a
+                // swipe-word against a different key grid — exactly
+                // the kind of state-churn scramble that makes gestures
+                // misfire after page transitions. A clean drop is far
+                // safer than a mis-dispatch.
+                let gen_now =
+                    HITBOX_GENERATION.load(std::sync::atomic::Ordering::Relaxed);
+                if gen_now != gesture_gen_for_end.get() {
+                    tracing::warn!(
+                        "drag end: layout rebuilt mid-gesture (gen {} → {}); \
+                         aborting dispatch — path was drawn against a layout \
+                         that no longer exists.",
+                        gesture_gen_for_end.get(),
+                        gen_now
+                    );
+                    swipe.lock().cancel();
+                    trail.clear();
+                    SWIPE_GESTURE_ACTIVE
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    TAP_GENERATION
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
 
@@ -1358,31 +1475,37 @@ impl KeyboardView {
                 let mut tracker = swipe.lock();
 
                 if !tracker.is_significant_swipe(cfg_threshold) {
-                    debug!("Drag ended; not a significant swipe (total={:.1})", total);
-                    // Cardinal dead-zone recovery: if the source key was
-                    // Cardinal AND the user moved enough to evict the
-                    // tap (drag_update set SWIPE_GESTURE_ACTIVE on
-                    // crossing TAP_EVICTION_PX=12), but the total path
-                    // length didn't reach `cfg_threshold` (default 20),
-                    // we'd otherwise drop the gesture entirely — the
-                    // click was suppressed, and the swipe is below the
-                    // threshold for dispatch. That's the "steno swipes
-                    // not working" symptom: short directional flicks
-                    // on a steno cell exit click territory but don't
-                    // reach swipe territory.
-                    //
-                    // For Cardinal-behavior keys we have a classifier
-                    // that already handles tiny directional swipes
-                    // correctly (its FLICK branch covers exactly this
-                    // 12-20px zone). Let it decide. If the gesture is
-                    // actually tap-like, classify returns
-                    // CardinalGesture::Tap and dispatch_cardinal_swipe
-                    // early-returns without committing — equivalent to
-                    // the current drop behavior.
                     let behavior = behavior_for_end.get();
                     let was_evicted = SWIPE_GESTURE_ACTIVE
                         .load(std::sync::atomic::Ordering::Relaxed);
-                    if was_evicted && matches!(behavior, Some(ButtonBehavior::Cardinal)) {
+                    info!(
+                        "drag end: sub-threshold (total={:.1}, threshold={:.1}, \
+                         behavior={:?}, was_evicted={})",
+                        total, cfg_threshold, behavior, was_evicted
+                    );
+                    // Cardinal routing: send EVERY Cardinal-behavior
+                    // drag to the classifier, not just ones that
+                    // crossed the TAP_EVICTION latch (was_evicted).
+                    //
+                    // Why the change: the classifier (cardinal::classify)
+                    // is itself the authority on tap-vs-flick — its
+                    // TAP_MAX_EXCURSION_PX / FLICK_MIN gates decide. The
+                    // UI-layer `was_evicted` precondition was a second,
+                    // weaker gate that could veto a real flick: a short
+                    // deliberate directional flick that never crossed
+                    // the 12px cumulative TAP_EVICTION threshold in
+                    // drag_update (fast flick with sparse sampling, or
+                    // a near-miss on the eviction check) left
+                    // was_evicted=false, so the dead-zone recovery
+                    // skipped it and the gesture was cancelled SILENTLY
+                    // here. That's the "cardinal taps commit but swipes
+                    // don't, and nothing logs" symptom in the on-device
+                    // journal — dispatch_cardinal_swipe was never even
+                    // called. Now it always is for Cardinal keys; if
+                    // the path is genuinely a tap, classify returns Tap
+                    // and dispatch early-returns (the KeyWidget click
+                    // handler already fired the tap), so no double-fire.
+                    if matches!(behavior, Some(ButtonBehavior::Cardinal)) {
                         let raw_path = tracker.finish();
                         drop(tracker);
                         SWIPE_GESTURE_ACTIVE
@@ -1405,9 +1528,10 @@ impl KeyboardView {
                             &kb_box,
                             &overlay_end,
                         );
-                        debug!(
-                            "cardinal dead-zone recovery: path={} points, behavior=Cardinal",
-                            path.len()
+                        info!(
+                            "cardinal sub-threshold routing: path={} points \
+                             (was_evicted={}) → classifier",
+                            path.len(), was_evicted
                         );
                         dispatch_cardinal_swipe(&path, &boxes, &engine);
                         trail.fade_out();
@@ -1492,6 +1616,52 @@ impl KeyboardView {
                 // top-row cardinal north-swipe would match the
                 // digit-detection branch and produce "2" instead of
                 // running through dispatch_cardinal_swipe).
+                //
+                // ORDERING FIX: a Cardinal-behavior gesture that would
+                // genuinely resolve to a real direction (checked via
+                // `would_resolve_as_cardinal`, which mirrors
+                // dispatch_cardinal_swipe's own resolution exactly) is
+                // dispatched HERE, before any cross-cutting detector
+                // gets a chance to intercept it. Previously
+                // detect_minimize_fling and detect_bottom_pad_arrow
+                // ran unconditionally first — a fast/strong cardinal
+                // flick (e.g. a decisive N swipe) could be caught by
+                // the dismiss-fling heuristic and sent to the tray, or
+                // a bottom-row cardinal cell's swipe could be
+                // reinterpreted as arrow-key navigation, BEFORE the
+                // gesture was ever checked against the actual cardinal
+                // classifier. A resolvable gesture should never lose
+                // to a heuristic guess about what it might have been.
+                if matches!(behavior, Some(ButtonBehavior::Cardinal))
+                    && would_resolve_as_cardinal(&path, &boxes)
+                {
+                    info!(
+                        "drag end: path resolves as a real cardinal gesture — \
+                         dispatching directly, bypassing dismiss/arrow-nav \
+                         detectors."
+                    );
+                    dispatch_cardinal_swipe(&path, &boxes, &engine);
+                    trail.fade_out();
+                    return;
+                }
+
+                // NOTE: an equivalent early-priority check for
+                // SwipeSource (would_resolve_as_swipe_word below) was
+                // considered here but deliberately NOT wired in. Its
+                // bar — "does raw pivot-to-key decoding produce any
+                // non-empty string" — is too weak to be safe: nearly
+                // ANY fast flick starting near a letter key decodes to
+                // SOMETHING via pivots_to_word's unconditional
+                // nearest-key snapping, regardless of whether the
+                // gesture was actually meant as a word. Wiring it in
+                // here would make the bypass fire on nearly every
+                // letter-key-originated gesture, silently disabling
+                // flick-to-dismiss for standard/QWERTY layouts. A safe
+                // version needs the same precision the Cardinal
+                // predicate has (a real recognizer+dictionary preview
+                // that only returns true for paths that would actually
+                // commit a scored word) — left as a follow-up.
+
                 // BEFORE per-behavior dispatch: check for a "dismiss
                 // the keyboard" flick. This runs for ALL behaviors so
                 // cardinal/stenotype users can also flick-to-dismiss
@@ -2518,29 +2688,52 @@ fn rebuild_view(
     DESIRED_KEYBOARD_HEIGHT.store(desired_h, std::sync::atomic::Ordering::Relaxed);
     if let Some(root) = keyboard_box.root() {
         if let Some(win) = root.dynamic_cast_ref::<gtk4::Window>() {
-            // Always issue the set_default_height request — even when
-            // `default_height()` reports the same value we'd ask for.
-            // The cached `default_height()` is the LAST REQUESTED
-            // value, not what the compositor actually allocated. On
-            // some layer-shell setups (KWin on Plasma Mobile being
-            // the known one), a request for 107px can be ignored
-            // because the compositor was busy / didn't pick it up
-            // / clamped to some minimum. If we then check
-            // `default_height() == 107` and skip the update, the
-            // window stays at the old (taller) size forever. By
-            // re-issuing on every rebuild, the request goes out
-            // again and the compositor gets another chance to
-            // honor it.
+            // Compare against the window's ACTUAL allocated height
+            // (win.height() — the real rendered size, post-compositor-
+            // ack in steady state), not GTK's cached default_height()
+            // (which only tracks the last-REQUESTED value regardless
+            // of whether the compositor honored it).
             //
-            // GTK collapses no-op resizes internally, so this is
-            // free in the common case where the value didn't
-            // change.
-            let current_h = win.default_height();
-            debug!(
-                "rebuild_view: requesting window height {} (was {}, rows={})",
-                desired_h, current_h, row_count
-            );
-            win.set_default_height(desired_h);
+            // This fixes the "bunch of resizing calls" perf issue
+            // while preserving the correctness fix the old code was
+            // going for. The old code always called set_default_height
+            // unconditionally on every rebuild — including layout
+            // switches where the row count (and thus desired_h) is
+            // IDENTICAL to what's already showing: LANG-cycling on
+            // cardinal_grid_words, toggling Numbers↔Symbols (same row
+            // count), returning to a letter layout with the same
+            // height as the transient page it came from. Every one of
+            // those paid a full layer-shell resize negotiation round
+            // trip with the compositor for a size that wasn't
+            // changing — multiplied across every tap of ?123/123?/
+            // LANG/ABC during normal typing.
+            //
+            // Comparing against the actual allocation instead:
+            //   - actual == desired  → window is ALREADY correct,
+            //     skip the call entirely (the common case for
+            //     same-row-count transitions).
+            //   - actual != desired  → either a genuine height change
+            //     (row count differs) OR the compositor silently
+            //     dropped an earlier request (the KWin case the old
+            //     comment described) — either way, (re-)assert.
+            // This covers the correctness case at least as well as
+            // "always re-issue," because a dropped request BY
+            // DEFINITION leaves actual != desired, which we still
+            // catch and retry on the next rebuild.
+            let actual_h = win.height();
+            if actual_h != desired_h {
+                debug!(
+                    "rebuild_view: requesting window height {} (actual={}, rows={})",
+                    desired_h, actual_h, row_count
+                );
+                win.set_default_height(desired_h);
+            } else {
+                debug!(
+                    "rebuild_view: window already at height {} (rows={}); \
+                     skipping redundant resize request",
+                    desired_h, row_count
+                );
+            }
         }
     }
 }
@@ -3422,6 +3615,20 @@ fn build_row_static_with_pad(
                 );
                 return;
             }
+            // If a long-press already fired and handled this gesture,
+            // the click arriving now is the release-end of that same
+            // hold — drop it so we don't double-fire (long-press
+            // action + a normal tap). GestureLongPress fires at
+            // ~500ms while held with no movement, so SWIPE_GESTURE_
+            // ACTIVE above is false for it; this latch is the only
+            // thing that catches the long-press → click double-fire.
+            if take_long_press_fired() {
+                debug!(
+                    "Tap dropped (long-press already handled this gesture): {} ({:?})",
+                    k.label, k.action
+                );
+                return;
+            }
             // When the drawing canvas is open, taps anywhere on
             // the keyboard are meant as stroke starts (well, drag
             // starts — but a single tap is a degenerate stroke of
@@ -3561,6 +3768,9 @@ fn build_row_static_with_pad(
                     debug!("Long-press on space suppressed (swipe in progress)");
                     return;
                 }
+                // Latch so the release-click doesn't ALSO fire a space
+                // tap on top of whatever the long-press does below.
+                note_long_press_fired();
                 let canvas_open = crate::keyboard::character_draw::canvas_open();
                 let draw_mode_on = crate::keyboard::character_draw::draw_mode_enabled();
                 if canvas_open {
@@ -3698,7 +3908,9 @@ fn build_row_static_with_pad(
                 {
                     return;
                 }
-                // CRITICAL: cancel the running key-repeat before we
+                // Suppress the release-click so backspace doesn't
+                // delete an extra char on top of the Synonym request.
+                note_long_press_fired();
                 // peek_last_commit. The repeat timer fires at
                 // delay_ms (default 400ms) — long-press fires at
                 // GestureLongPress's default ~500ms — so by the
@@ -3768,6 +3980,7 @@ fn build_row_static_with_pad(
                 {
                     return;
                 }
+                note_long_press_fired();
                 debug!("Long-press on LLM key");
                 engine_for_long
                     .handle_input(EngineInput::KeyLongPress(key_for_long.clone()));
@@ -4953,11 +5166,20 @@ fn find_cardinal_source<'a>(
             let ny = start.y.clamp(b.y, b.y + b.height);
             let dx = start.x - nx;
             let dy = start.y - ny;
-            (b, (dx * dx + dy * dy).sqrt())
+            let dist = (dx * dx + dy * dy).sqrt();
+            // Scale the gap-tolerance by this cell's own size, same
+            // factor the classifier uses. A fixed-px tolerance is a
+            // bigger fraction of a small/compact cell's footprint
+            // than a full-size one, so scaling keeps "close enough to
+            // count" proportional rather than absolute.
+            let cell_min = b.width.min(b.height);
+            let factor = crate::gestures::cardinal::cardinal_scale_factor(cell_min);
+            let tolerance = NEAREST_CARDINAL_RECT_PX * factor;
+            (b, dist, tolerance)
         })
-        .filter(|(_, d)| *d <= NEAREST_CARDINAL_RECT_PX)
+        .filter(|(_, d, tol)| *d <= *tol)
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(b, _)| b)
+        .map(|(b, _, _)| b)
 }
 
 /// Translate a path into the source cell's local frame (cell center →
@@ -4978,21 +5200,31 @@ fn classify_cardinal_in_local_frame(
             timestamp_ms: p.timestamp_ms,
         })
         .collect();
-    let thresholds = if crate::gestures::cardinal::cardinal_lenient() {
+    let base = if crate::gestures::cardinal::cardinal_lenient() {
         CardinalThresholds::lenient()
     } else {
         CardinalThresholds::default()
     };
+    // Scale the absolute-pixel thresholds to the actual cell size so
+    // cardinal gestures behave the same on a scaled-down / compact /
+    // voice-mode keyboard as at full size. Uses the shared factor so
+    // the UI eviction check (which gates the click/cardinal interlock)
+    // scales identically.
+    let cell_min = source_box.width.min(source_box.height);
+    let factor = crate::gestures::cardinal::cardinal_scale_factor(cell_min);
+    let thresholds = base.scaled(factor);
     classify(&local_path, &thresholds)
 }
 
 /// Side-effect-free predicate: would `dispatch_cardinal_swipe` commit
-/// something for this path? Used by `classify_drag_gesture` so a valid
-/// cardinal gesture is categorized as `DragGesture::Cardinal` and
-/// cannot be overruled by an earlier cross-behavior detector
-/// (minimize-fling, bottom-pad arrow). Mirrors the dispatcher's
-/// resolution exactly via the shared helpers above, minus the engine
-/// dispatch and logging.
+/// something for this path? Called from the drag_end cascade BEFORE
+/// the cross-cutting dismiss-fling / bottom-pad-arrow detectors, so a
+/// gesture that genuinely resolves to a real cardinal/steno direction
+/// is dispatched immediately and can never be preempted by a heuristic
+/// guess about what it might have been instead. Mirrors the
+/// dispatcher's resolution exactly via the shared helpers above, minus
+/// the engine dispatch and logging — so the predicate and the real
+/// dispatch can never disagree about whether a path resolves.
 fn would_resolve_as_cardinal(
     path: &[crate::gestures::swipe::SwipePoint],
     boxes: &[KeyHitbox],
@@ -5076,14 +5308,49 @@ fn dispatch_cardinal_swipe(
     // Shared helper keeps this identical to the classifier predicate.
     let classified = classify_cardinal_in_local_frame(path, source_box);
 
+    // Compute raw max-excursion-from-start for diagnostics: the single
+    // most useful number for "why did my swipe register as a tap?"
+    // If this is small (< ~13px) the finger barely moved OR the
+    // coordinate frame compressed the path; if it's large but still
+    // classifies Tap, the classifier/thresholds are the suspect.
+    let max_excursion = path
+        .first()
+        .map(|s0| {
+            path.iter()
+                .map(|p| {
+                    let dx = p.x - s0.x;
+                    let dy = p.y - s0.y;
+                    (dx * dx + dy * dy).sqrt()
+                })
+                .fold(0.0_f64, f64::max)
+        })
+        .unwrap_or(0.0);
+    let cell_min = source_box.width.min(source_box.height);
+    let excursion_frac = if cell_min > 0.0 {
+        max_excursion / cell_min
+    } else {
+        0.0
+    };
+
     info!(
-        "cardinal swipe on '{}': classified as {:?}",
-        key.label, classified
+        "cardinal swipe on '{}': classified as {:?} | max_excursion={:.1}px \
+         cell={:.0}x{:.0} (excursion={:.0}% of cell) points={}",
+        key.label, classified, max_excursion,
+        source_box.width, source_box.height,
+        excursion_frac * 100.0, path.len()
     );
 
     if matches!(classified, CardinalGesture::Tap | CardinalGesture::Unrecognized) {
         // Tap is handled by the KeyWidget's own click handler; we'd
         // double-fire if we forwarded it here. Unrecognized → drop.
+        // info! (not silent) so the journal shows when a gesture the
+        // user intended as a swipe got classified tap-like — the
+        // signal that thresholds need tuning vs a routing problem.
+        info!(
+            "cardinal swipe on '{}': classified {:?} → no commit \
+             (handled as tap / unrecognized)",
+            key.label, classified
+        );
         return;
     }
 

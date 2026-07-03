@@ -1,0 +1,13 @@
+# cbindgen.toml — controls C header generation for snapclone-crypto.
+
+[parse]
+parse_deps = false
+
+[enum]
+# Prefix enum variants with the enum type name for C compatibility.
+# cbindgen default for C language generates "TypeName_VariantName".
+# Being explicit prevents version-to-version cbindgen behavior changes.
+rename_variants = "QualifiedScreamingSnakeCase"
+
+[export]
+# No items to exclude — the dht module was removed (DHT is now pure C++).

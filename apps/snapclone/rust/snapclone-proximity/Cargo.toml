@@ -1,0 +1,14 @@
+[package]
+name        = "snapclone-proximity"
+version     = "0.1.0"
+edition     = "2021"
+description = "RSSI ranging, smoothing, and gradient-following bearing estimation for BLE peer pointing / triangulation"
+license     = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# No deps. Pure f32 stdlib — path-loss distance model, EMA smoother,
+# and a gradient-following bearing estimator that fuses RSSI deltas with
+# compass heading. Keeps the binary small for FP5.

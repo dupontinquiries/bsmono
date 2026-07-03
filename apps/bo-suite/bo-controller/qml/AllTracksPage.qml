@@ -92,6 +92,57 @@ Item {
             }
         }
 
+        // Sort selector — changes order and reloads from page 0. Persisted
+        // server-side so the choice sticks across launches.
+        Flow {
+            width: parent.width
+            spacing: 4
+            Text {
+                text: "SORT"
+                color: Bo.slate
+                font.pixelSize: 9
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.0
+                height: 24
+                verticalAlignment: Text.AlignVCenter
+            }
+            Repeater {
+                model: [
+                    { tag: "title",  label: "Title"  },
+                    { tag: "artist", label: "Artist" },
+                    { tag: "album",  label: "Album"  },
+                    { tag: "recent", label: "Recent" },
+                    { tag: "rating", label: "Rating" }
+                ]
+                delegate: Rectangle {
+                    property bool sel: qtobj.all_tracks_sort === modelData.tag
+                    width: sortLabel.implicitWidth + 14
+                    height: 24
+                    radius: 12
+                    color: sel ? Qt.rgba(0.78, 0.63, 0.29, 0.25) : "transparent"
+                    border.color: sel ? Bo.accent : Bo.hairline
+                    border.width: sel ? 2 : 1
+                    Text {
+                        id: sortLabel
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        color: sel ? Bo.bone : Bo.silver
+                        font.pixelSize: 10
+                        font.weight: sel ? Font.DemiBold : Font.Normal
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (!parent.sel) {
+                                qtobj.set_all_tracks_sort(modelData.tag)
+                                root.refresh()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Empty state — only while we genuinely have nothing AND aren't
         // mid-load (so it doesn't flash on entry before the first page).
         Text {
@@ -108,6 +159,9 @@ Item {
             id: trackView
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             bottomMargin: Bo.bottomChromeHeight
             width: parent.width
             height: parent.height - 60
@@ -150,14 +204,25 @@ Item {
                             elide: Text.ElideRight
                             width: parent.width
                         }
-                        Text {
-                            text: (modelData.primary_artist || "Unknown Artist")
-                                + (modelData.album && modelData.album.length > 0
-                                       ? " · " + modelData.album : "")
-                            color: Bo.silver
-                            font.pixelSize: 10
-                            elide: Text.ElideRight
+                        Row {
+                            spacing: Bo.gapSM
                             width: parent.width
+                            Text {
+                                text: (modelData.primary_artist || "Unknown Artist")
+                                    + (modelData.album && modelData.album.length > 0
+                                           ? " · " + modelData.album : "")
+                                color: Bo.silver
+                                font.pixelSize: 10
+                                elide: Text.ElideRight
+                                width: Math.min(implicitWidth, parent.width - 76)
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            StarRating {
+                                trackId: modelData.id
+                                rating: modelData.rating || 0
+                                starSize: 11
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
                         }
                     }
 
@@ -211,6 +276,11 @@ Item {
                     // Tap = enqueue if something's playing, else play.
                     // The ▶ button forces instant play.
                     onClicked: qtobj.enqueue_or_play(modelData.id)
+                    // Long-press opens the edit sheet (title/artist/album/
+                    // year/rating) — the same dialog used elsewhere.
+                    onPressAndHold: {
+                        if (window.editDialog) window.editDialog.open(modelData)
+                    }
                 }
             }
         }

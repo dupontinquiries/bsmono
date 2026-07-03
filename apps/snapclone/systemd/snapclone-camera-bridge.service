@@ -1,0 +1,43 @@
+# ~/.config/systemd/user/snapclone-camera-bridge.service
+# Keeps camera-bridge alive in the background so the camera is always ready.
+# Survives screen-off on postmarketOS without relying on KDE PowerDevil.
+#
+# Install: systemctl --user enable --now snapclone-camera-bridge.service
+
+[Unit]
+Description=SnapClone Camera Bridge (PipeWire/GStreamer)
+Documentation=https://github.com/snapclone
+# Start after PipeWire is available
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+# Stop when the user session ends
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/camera-bridge
+Restart=on-failure
+RestartSec=3s
+# Prevent restart storm
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Resource limits — camera bridge is background, don't compete with UI
+Nice=10
+CPUSchedulingPolicy=idle
+# On systemd systems that support it, run with low I/O priority
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+
+# Environment
+Environment=RUST_LOG=warn
+Environment=GST_DEBUG=1
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+
+[Install]
+WantedBy=graphical-session.target

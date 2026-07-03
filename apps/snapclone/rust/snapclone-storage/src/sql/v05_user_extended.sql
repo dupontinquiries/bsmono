@@ -1,0 +1,1 @@
+-- Migration v05_user_extended (stub — copy from kMigrations[] in StorageManager.cpp)

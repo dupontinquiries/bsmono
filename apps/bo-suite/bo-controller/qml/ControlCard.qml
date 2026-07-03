@@ -31,7 +31,7 @@ Rectangle {
 
     Behavior on border.color { ColorAnimation { duration: Bo.base } }
 
-    implicitHeight: Bo.gapMD + labelText.height + Bo.gapSM + holder.childrenRect.height + Bo.gapMD
+    implicitHeight: Bo.gapMD + labelText.height + Bo.gapSM + holder.height + Bo.gapMD
     height: implicitHeight
     Behavior on implicitHeight {
         NumberAnimation { duration: Bo.base
@@ -76,7 +76,13 @@ Rectangle {
         anchors.leftMargin: Bo.gapMD
         anchors.rightMargin: Bo.gapMD
         anchors.topMargin: Bo.gapSM
-        height: childrenRect.height
+        // childrenRect.height covers plain Item/Column/Rectangle content;
+        // a ColumnLayout reports its size via implicitHeight instead (and
+        // childrenRect can read 0 for it), so take the max of both. This
+        // keeps the card tall enough for either content style and prevents
+        // the next card in the settings list from overlapping it.
+        height: Math.max(childrenRect.height,
+                         children.length > 0 ? (children[0].implicitHeight || 0) : 0)
     }
 
     // Entrance

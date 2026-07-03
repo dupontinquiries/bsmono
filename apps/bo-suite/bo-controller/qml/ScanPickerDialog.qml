@@ -10,9 +10,13 @@
 //   • A free-text field for a custom path.
 //
 // On Scan, sends JSON.stringify(selectedPaths) → qtobj.scan_with_roots(json).
+// A native folder picker (QtQuick.Dialogs FolderDialog) lets the user
+// browse to any location; the last-scanned root is remembered and used as
+// the picker's starting folder + a pre-filled custom path.
 
 import QtQuick 2.15
 import QtQuick.Controls 2.15
+import QtQuick.Dialogs
 import "."
 
 Item {
@@ -29,6 +33,26 @@ Item {
     property var selected: ({})
     property string customPath: ""
 
+    // Native OS folder picker. Opens at the last-scanned location (or the
+    // default) and writes the chosen directory back into the custom-path
+    // field. QtQuick.Dialogs FolderDialog is the Qt6-standard native picker.
+    FolderDialog {
+        id: folderDialog
+        title: "Choose a music folder to scan"
+        // currentFolder seeds the starting location; expects a file:// URL.
+        currentFolder: {
+            var p = qtobj.last_scan_root || ""
+            if (p.length > 0) return "file://" + p
+            return ""
+        }
+        onAccepted: {
+            // selectedFolder is a file:// URL → strip the scheme for the
+            // scanner, which takes plain filesystem paths.
+            var u = selectedFolder.toString()
+            root.customPath = u.replace(/^file:\/\//, "")
+        }
+    }
+
     function open() {
         // Pull fresh suggestions each open (HOME might be set lazily).
         var raw = qtobj.suggested_scan_roots()
@@ -40,7 +64,9 @@ Item {
             if (i === 0 && s.label === "Music") sel[s.path] = true
         }
         selected = sel
-        customPath = ""
+        // Pre-fill the custom path with the last-scanned location so a
+        // repeat scan is one tap, and so Browse opens somewhere useful.
+        customPath = qtobj.last_scan_root || ""
         opacity = 1
     }
     function close() { opacity = 0 }
@@ -190,36 +216,61 @@ Item {
                     font.letterSpacing: Bo.labelTracking
                     font.weight: Font.DemiBold
                 }
-                Rectangle {
+                Row {
                     width: parent.width
-                    height: 38
-                    radius: 8
-                    color: Bo.ink
-                    border.color: customInput.activeFocus ? root.accent : Bo.hairline
-                    border.width: 1
-                    Behavior on border.color { ColorAnimation { duration: Bo.quick } }
-                    TextInput {
-                        id: customInput
-                        anchors.fill: parent
-                        anchors.leftMargin: 10
-                        anchors.rightMargin: 10
-                        verticalAlignment: TextInput.AlignVCenter
-                        color: Bo.bone
-                        font.pixelSize: Bo.bodySize
-                        font.family: "monospace"
-                        selectByMouse: true
-                        clip: true
-                        text: root.customPath
-                        onTextChanged: root.customPath = text
+                    spacing: 6
+                    Rectangle {
+                        width: parent.width - browseBtn.width - 6
+                        height: 38
+                        radius: 8
+                        color: Bo.ink
+                        border.color: customInput.activeFocus ? root.accent : Bo.hairline
+                        border.width: 1
+                        Behavior on border.color { ColorAnimation { duration: Bo.quick } }
+                        TextInput {
+                            id: customInput
+                            anchors.fill: parent
+                            anchors.leftMargin: 10
+                            anchors.rightMargin: 10
+                            verticalAlignment: TextInput.AlignVCenter
+                            color: Bo.bone
+                            font.pixelSize: Bo.bodySize
+                            font.family: "monospace"
+                            selectByMouse: true
+                            clip: true
+                            text: root.customPath
+                            onTextChanged: root.customPath = text
+                        }
+                        Text {
+                            anchors.left: parent.left; anchors.leftMargin: 10
+                            anchors.verticalCenter: parent.verticalCenter
+                            visible: customInput.text.length === 0 && !customInput.activeFocus
+                            text: "/path/to/music"
+                            color: Bo.slate
+                            font.pixelSize: Bo.bodySize
+                            font.family: "monospace"
+                        }
                     }
-                    Text {
-                        anchors.left: parent.left; anchors.leftMargin: 10
-                        anchors.verticalCenter: parent.verticalCenter
-                        visible: customInput.text.length === 0 && !customInput.activeFocus
-                        text: "/path/to/music"
-                        color: Bo.slate
-                        font.pixelSize: Bo.bodySize
-                        font.family: "monospace"
+                    // Native folder picker trigger.
+                    Rectangle {
+                        id: browseBtn
+                        width: browseText.implicitWidth + 22
+                        height: 38
+                        radius: 8
+                        color: browseMa.pressed ? Bo.surfaceHi : Bo.graphite
+                        border.color: Bo.hairline; border.width: 1
+                        Text {
+                            id: browseText
+                            anchors.centerIn: parent
+                            text: "Browse…"
+                            color: root.accent
+                            font.pixelSize: Bo.bodySize
+                        }
+                        MouseArea {
+                            id: browseMa
+                            anchors.fill: parent
+                            onClicked: folderDialog.open()
+                        }
                     }
                 }
             }

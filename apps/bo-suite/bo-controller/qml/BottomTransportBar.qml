@@ -473,19 +473,20 @@ Item {
                             qtobj.driver_stop()
                             titleBlock.estimatedSec = resumeSec
                             titleBlock._pausedAtSec = resumeSec
+                            titleBlock._hasPaused = true
                         } else {
-                            // Resume. If we have a remembered position and
-                            // the same track is still loaded, seek_to alone
-                            // replays from that offset — one spawn, no race.
-                            // Only fall back to play_track (from 0) when
-                            // there's no position to resume to.
-                            var from = titleBlock._pausedAtSec || 0
-                            if (from > 0 && qtobj.last_played_track_id_qml > 0) {
-                                qtobj.seek_to(from)
+                            // Resume. If we have a remembered pause position
+                            // (even 0) and the track is still loaded, seek_to
+                            // replays from that offset in one spawn (no race).
+                            // Fall back to play_track only when there's no
+                            // remembered pause at all.
+                            if (titleBlock._hasPaused && qtobj.last_played_track_id_qml > 0) {
+                                qtobj.seek_to(titleBlock._pausedAtSec)
                             } else if (qtobj.last_played_track_id_qml > 0) {
                                 qtobj.play_track(qtobj.last_played_track_id_qml)
                             }
                             titleBlock._pausedAtSec = 0
+                            titleBlock._hasPaused = false
                         }
                     }
                 }
@@ -508,6 +509,32 @@ Item {
                     id: nextMa
                     anchors.fill: parent
                     onClicked: qtobj.transport("forward")
+                }
+            }
+
+            // Repeat — cycles Off → One → All. Works for any driver (it
+            // governs how the local queue auto-advance wraps). The glyph +
+            // tint reflect the current mode so it's readable at a glance.
+            Rectangle {
+                anchors.verticalCenter: parent.verticalCenter
+                width: 32; height: 32; radius: 16
+                property string rm: qtobj.repeat_mode_tag || "off"
+                color: repeatMa.pressed ? Bo.surfaceHi
+                     : rm !== "off" ? Bo.mix(Bo.surface, root.accent, 0.28)
+                     : "transparent"
+                border.color: rm !== "off" ? root.accent : Bo.hairline
+                border.width: 1
+                Text {
+                    anchors.centerIn: parent
+                    // ↻ for All, ↻₁ (with a subscript one) for One.
+                    text: parent.rm === "one" ? "↻₁" : "↻"
+                    color: parent.rm !== "off" ? root.accent : Bo.silver
+                    font.pixelSize: 13
+                }
+                MouseArea {
+                    id: repeatMa
+                    anchors.fill: parent
+                    onClicked: qtobj.repeat_mode_cycle()
                 }
             }
         }
@@ -591,12 +618,26 @@ Item {
             property bool scrubbing: false
             property real scrubSec: 0
             property real _pausedAtSec: 0
+            property bool _hasPaused: false
 
             Connections {
                 target: qtobj
                 function onNow_playing_changed() {
-                    if (!titleBlock.scrubbing) {
+                    // Re-seed the estimator from the backend's authoritative
+                    // position ONLY when playback (re)starts. On a pause
+                    // (np_playing → false) we must NOT clobber estimatedSec,
+                    // because the pause handler just captured it into
+                    // _pausedAtSec for resume; np_seek_pos may be 0/stale at
+                    // that moment and would wipe the remembered position.
+                    if (titleBlock.scrubbing) return
+                    if (qtobj.np_playing) {
                         titleBlock.estimatedSec = qtobj.np_seek_pos
+                        // A fresh play started elsewhere (a list tap, queue
+                        // advance) invalidates any remembered pause from a
+                        // prior track — clear it so the next pause/resume
+                        // doesn't seek to a stale offset.
+                        titleBlock._hasPaused = false
+                        titleBlock._pausedAtSec = 0
                     }
                 }
             }

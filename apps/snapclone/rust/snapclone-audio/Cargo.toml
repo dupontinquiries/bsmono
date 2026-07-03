@@ -1,0 +1,36 @@
+[package]
+name        = "snapclone-audio"
+version     = "0.1.0"
+edition     = "2021"
+description = "Classical (non-ML) voice-activity detection + speech-likelihood scoring for accessibility speech boost"
+license     = "MIT"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# VAD/capture are pure stdlib. The voice wire format uses serde + MessagePack
+# (compact `bin` payloads via serde_bytes). The Opus codec is OPTIONAL and
+# feature-gated: audiopus pulls/builds libopus, which needs a system libopus
+# (libopus-dev / opus-dev) or autotools+cmake to vendor — so it is off by
+# default (keeps `cargo test` buildable everywhere) and enabled with
+# `--features opus` for real device builds.
+serde       = { version = "1", features = ["derive"] }
+rmp-serde   = "=1.1.2"
+rmp         = "=0.8.14"
+serde_bytes = "0.11"
+audiopus    = { version = "0.2", optional = true }
+# Lightweight per-frame AEAD for the public (fast) voice tier. Pure Rust.
+chacha20poly1305 = "0.10"
+# Private-tier post-quantum hybrid handshake (X25519 + ML-KEM-768). Pure Rust;
+# ml-kem needs rustc >= 1.81.
+ml-kem       = "0.2"
+kem          = "=0.3.0-pre.0"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf         = "0.12"
+sha2         = "0.10"
+rand_core    = { version = "0.6", features = ["getrandom"] }
+
+[features]
+default = []
+opus    = ["dep:audiopus"]

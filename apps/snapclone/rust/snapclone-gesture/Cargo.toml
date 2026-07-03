@@ -1,0 +1,11 @@
+[package]
+name = "snapclone-gesture"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable two-tier scroll/swipe gesture model: small sustained scroll = sub-page detent, big fast swipe = page jump. Platform-free pure logic + C FFI."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

@@ -21,7 +21,145 @@ Item {
     id: root
     property int playlistId: -1
     property string playlistName: ""
+    property string playlistDescription: ""
     property color accent: "#C8A04B"
+
+    // Inline rename / edit-description overlay, wired to
+    // update_playlist_meta. Kept simple: two fields + Save/Cancel.
+    Rectangle {
+        id: renameDialog
+        anchors.fill: parent
+        color: "#000000AA"
+        opacity: 0
+        visible: opacity > 0
+        z: 400
+        Behavior on opacity { NumberAnimation { duration: Bo.quick } }
+
+        function open() {
+            renameName.text = root.playlistName
+            // Pull the current description from the playlists list (the
+            // page only receives name via its open signal).
+            var desc = ""
+            try {
+                var pls = JSON.parse(qtobj.playlists_json || "[]")
+                for (var i = 0; i < pls.length; ++i) {
+                    if (pls[i].id === root.playlistId) {
+                        desc = pls[i].description || ""
+                        break
+                    }
+                }
+            } catch (e) {}
+            root.playlistDescription = desc
+            renameDesc.text = desc
+            opacity = 1
+            renameName.forceActiveFocus()
+        }
+        function close() { opacity = 0 }
+        function save() {
+            var nm = renameName.text.trim()
+            if (nm.length === 0) return
+            qtobj.update_playlist_meta(root.playlistId, nm, renameDesc.text.trim())
+            root.playlistName = nm
+            root.playlistDescription = renameDesc.text.trim()
+            close()
+        }
+
+        MouseArea { anchors.fill: parent; onClicked: renameDialog.close() }
+
+        Rectangle {
+            width: Math.min(parent.width - Bo.gapLG * 2, 340)
+            anchors.centerIn: parent
+            height: renameCol.height + Bo.gapLG * 2
+            radius: Bo.cardRadius
+            color: Bo.surface
+            border.color: Bo.hairline; border.width: 1
+            MouseArea { anchors.fill: parent; onClicked: {} }
+
+            Column {
+                id: renameCol
+                anchors.centerIn: parent
+                width: parent.width - Bo.gapLG * 2
+                spacing: Bo.gapSM
+
+                Text {
+                    text: "Edit playlist"
+                    color: Bo.bone
+                    font.pixelSize: Bo.titleSize
+                    font.weight: Font.DemiBold
+                }
+                Rectangle {
+                    width: parent.width; height: 38; radius: 8
+                    color: Bo.ink
+                    border.color: renameName.activeFocus ? root.accent : Bo.hairline
+                    border.width: 1
+                    TextInput {
+                        id: renameName
+                        anchors.fill: parent
+                        anchors.leftMargin: 10; anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: Bo.bone
+                        font.pixelSize: Bo.bodySize
+                        selectByMouse: true; clip: true
+                        onAccepted: renameDialog.save()
+                    }
+                    Text {
+                        anchors.left: parent.left; anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: renameName.text.length === 0
+                        text: "Playlist name"; color: Bo.slate
+                        font.pixelSize: Bo.bodySize
+                    }
+                }
+                Rectangle {
+                    width: parent.width; height: 38; radius: 8
+                    color: Bo.ink
+                    border.color: renameDesc.activeFocus ? root.accent : Bo.hairline
+                    border.width: 1
+                    TextInput {
+                        id: renameDesc
+                        anchors.fill: parent
+                        anchors.leftMargin: 10; anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: Bo.bone
+                        font.pixelSize: Bo.bodySize
+                        selectByMouse: true; clip: true
+                        onAccepted: renameDialog.save()
+                    }
+                    Text {
+                        anchors.left: parent.left; anchors.leftMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: renameDesc.text.length === 0
+                        text: "Description (optional)"; color: Bo.slate
+                        font.pixelSize: Bo.bodySize
+                    }
+                }
+                Row {
+                    spacing: Bo.gapSM
+                    anchors.right: parent.right
+                    Rectangle {
+                        width: 74; height: 32; radius: 16
+                        color: rnCancelMa.pressed ? Bo.surfaceHi : "transparent"
+                        border.color: Bo.hairline; border.width: 1
+                        Text { anchors.centerIn: parent; text: "Cancel"
+                            color: Bo.silver; font.pixelSize: Bo.captionSize }
+                        MouseArea { id: rnCancelMa; anchors.fill: parent
+                            onClicked: renameDialog.close() }
+                    }
+                    Rectangle {
+                        width: 68; height: 32; radius: 16
+                        color: renameName.text.trim().length > 0
+                            ? root.accent : Bo.mix(Bo.surface, root.accent, 0.3)
+                        Text { anchors.centerIn: parent; text: "Save"
+                            color: Bo.graphite; font.pixelSize: Bo.captionSize
+                            font.weight: Font.DemiBold }
+                        MouseArea { anchors.fill: parent
+                            enabled: renameName.text.trim().length > 0
+                            onClicked: renameDialog.save() }
+                    }
+                }
+            }
+        }
+    }
     signal back()
 
     onPlaylistIdChanged: if (playlistId >= 0) qtobj.load_playlist_tracks(playlistId)
@@ -67,12 +205,31 @@ Item {
             Column {
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: 2
-                Text {
-                    text: root.playlistName.toUpperCase()
-                    color: Bo.bone
-                    font.pixelSize: Bo.bodySize
-                    font.weight: Font.DemiBold
-                    font.letterSpacing: 1.0
+                Row {
+                    spacing: Bo.gapSM
+                    Text {
+                        text: root.playlistName.toUpperCase()
+                        color: Bo.bone
+                        font.pixelSize: Bo.bodySize
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 1.0
+                        anchors.verticalCenter: parent.verticalCenter
+                    }
+                    // Rename / edit-description affordance (the header
+                    // comment long promised this; now wired to
+                    // update_playlist_meta).
+                    Rectangle {
+                        width: 22; height: 22; radius: 11
+                        color: renameMa.pressed ? Bo.surfaceHi : "transparent"
+                        anchors.verticalCenter: parent.verticalCenter
+                        Text { anchors.centerIn: parent; text: "✎"
+                            color: Bo.silver; font.pixelSize: 12 }
+                        MouseArea {
+                            id: renameMa
+                            anchors.fill: parent
+                            onClicked: renameDialog.open()
+                        }
+                    }
                 }
                 Text {
                     text: root.trackList.length + " tracks"
@@ -162,6 +319,11 @@ Item {
             clip: true
             model: root.trackList
             cacheBuffer: 240
+            flickDeceleration: Bo.flickDecel
+            maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             ScrollIndicator.vertical: ScrollIndicator {}
 
             // Ease repositioning when rows shift during a drag-reorder.
@@ -366,6 +528,9 @@ Item {
                     // their taps; this catches taps on the title area.
                     z: -1
                     onClicked: qtobj.enqueue_or_play(modelData.id)
+                    onPressAndHold: {
+                        if (window.editDialog) window.editDialog.open(modelData)
+                    }
                 }
             }
         }

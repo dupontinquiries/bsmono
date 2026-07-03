@@ -88,6 +88,34 @@ pub struct CardinalThresholds {
     pub hairpin_min_excursion_px: f64,
     pub hairpin_max_ms: u32,
     pub rotation_threshold_deg: f64,
+    /// Max excursion-from-start (px) for a path to count as a Tap. A
+    /// swipe must exceed this to be a directional gesture. MUST stay
+    /// equal to the UI-layer eviction threshold (`TAP_EVICTION_PX`)
+    /// so the click handler and the classifier agree on the tap/swipe
+    /// boundary — see the interlock note in keyboard_view. When the
+    /// thresholds are scaled for small cells, BOTH scale by the same
+    /// factor to preserve that equality.
+    pub tap_max_excursion_px: f64,
+}
+
+impl CardinalThresholds {
+    /// Scale all pixel thresholds by `factor`, leaving durations and
+    /// angles untouched. Used to adapt absolute-pixel thresholds to
+    /// the actual cell size, so cardinal gestures work the same on a
+    /// scaled-down / compact / voice-mode keyboard as at full size.
+    /// The factor is clamped by the caller.
+    pub fn scaled(self, factor: f64) -> Self {
+        Self {
+            tap_radius_px: self.tap_radius_px * factor,
+            hairpin_return_tolerance_px: self.hairpin_return_tolerance_px * factor,
+            hairpin_min_excursion_px: self.hairpin_min_excursion_px * factor,
+            tap_max_excursion_px: self.tap_max_excursion_px * factor,
+            // Durations and angle are scale-invariant.
+            tap_max_ms: self.tap_max_ms,
+            hairpin_max_ms: self.hairpin_max_ms,
+            rotation_threshold_deg: self.rotation_threshold_deg,
+        }
+    }
 }
 
 impl Default for CardinalThresholds {
@@ -99,6 +127,9 @@ impl Default for CardinalThresholds {
             hairpin_min_excursion_px: 60.0,
             hairpin_max_ms: 600,
             rotation_threshold_deg: 180.0,
+            // Matches UI-layer TAP_EVICTION_PX (13.0) — the interlock
+            // that prevents click/cardinal double-fire.
+            tap_max_excursion_px: 13.0,
         }
     }
 }
@@ -126,8 +157,45 @@ impl CardinalThresholds {
             // Rotation: 130° of accumulated arc is enough (vs 180°),
             // so a quick three-quarter loop counts as a full rotation.
             rotation_threshold_deg: 130.0,
+            // Keep equal to the eviction threshold; lenient mode
+            // doesn't change the tap/swipe boundary, only the
+            // hairpin/rotation generosity.
+            tap_max_excursion_px: 13.0,
         }
     }
+}
+
+/// Reference cell min-dimension (px) that the absolute thresholds were
+/// tuned against — roughly a full-size cardinal cell's height at scale
+/// 1.0. Cells smaller than this (voice-mode ½×, low height-scale,
+/// compact) scale the thresholds down proportionally; larger cells
+/// scale up a little. See `cardinal_scale_factor`.
+pub const REFERENCE_CELL_MIN_PX: f64 = 46.0;
+
+/// Map a source cell's min-dimension to a threshold scale factor.
+///
+/// The cardinal thresholds (tap/flick/hairpin excursions) are in
+/// absolute pixels, tuned for a full-size cell (~46px min dimension).
+/// On a scaled-down keyboard a cell can be ~23px tall, so a vertical
+/// swipe only travels ~11px — under the 13px tap threshold, and it
+/// misclassifies as a tap. Scaling the thresholds by the cell's actual
+/// size relative to the reference keeps the tap/swipe boundary at the
+/// same FRACTION of a cell regardless of keyboard scale.
+///
+/// Clamped to [0.6, 1.4]: enough to fix voice-mode/compact without
+/// letting the threshold collapse so far that sensor jitter registers
+/// as a swipe, and without inflating it so much on huge cells that
+/// real swipes get eaten as taps.
+///
+/// CRITICAL: the UI-layer tap-eviction check uses this SAME function
+/// with the SAME cell size, so the classifier's tap threshold and the
+/// eviction threshold scale identically and stay equal — preserving
+/// the interlock that prevents click/cardinal double-fire.
+pub fn cardinal_scale_factor(cell_min_px: f64) -> f64 {
+    if !(cell_min_px.is_finite() && cell_min_px > 0.0) {
+        return 1.0;
+    }
+    (cell_min_px / REFERENCE_CELL_MIN_PX).clamp(0.6, 1.4)
 }
 
 /// Process-wide lenient-swipe flag for cardinal gestures. Mirrors
@@ -276,13 +344,12 @@ pub fn classify(path: &[SwipePoint], thresholds: &CardinalThresholds) -> Cardina
     // max_excursion check captures "user didn't really move" more
     // robustly than total_length for jitter; total was redundant
     // for the recoil-flick rejection (max_excursion catches it).
-    const TAP_MAX_EXCURSION_PX: f64 = 13.0;
-    if max_excursion < TAP_MAX_EXCURSION_PX
+    if max_excursion < thresholds.tap_max_excursion_px
         && duration_ms < thresholds.tap_max_ms
     {
         debug!(
-            "cardinal classify: TAP (len={:.1}, dt={}ms, max_excursion={:.1})",
-            total_length, duration_ms, max_excursion
+            "cardinal classify: TAP (len={:.1}, dt={}ms, max_excursion={:.1}, tap_max={:.1})",
+            total_length, duration_ms, max_excursion, thresholds.tap_max_excursion_px
         );
         return CardinalGesture::Tap;
     }
@@ -440,8 +507,14 @@ pub fn classify(path: &[SwipePoint], thresholds: &CardinalThresholds) -> Cardina
     //     hairpin_max_ms easily, so the user gets a "best guess"
     //     direction rather than silence. Better UX: a wrong direction
     //     is correctable, silence isn't.
-    const FLICK_MIN_EXCURSION_PX: f64 = 13.0;
-    if max_excursion >= FLICK_MIN_EXCURSION_PX
+    //   - Now tied to `thresholds.tap_max_excursion_px` (default 13)
+    //     so it stays exactly equal to the Tap cutoff AND scales with
+    //     cell size: on a scaled-down cell both drop together, so a
+    //     short directional flick that clears the (scaled) Tap gate is
+    //     caught here as a FLICK rather than falling through to
+    //     Unrecognized.
+    let flick_min_excursion_px = thresholds.tap_max_excursion_px;
+    if max_excursion >= flick_min_excursion_px
         && duration_ms < thresholds.hairpin_max_ms
     {
         let (mx, my) = max_excursion_point(path, start);
@@ -723,6 +796,54 @@ mod tests {
 
     fn pt(x: f64, y: f64, ms: i64) -> SwipePoint {
         SwipePoint { x, y, timestamp_ms: ms }
+    }
+
+    #[test]
+    fn scale_factor_clamps_and_scales() {
+        // Reference cell → factor 1.0.
+        assert!((cardinal_scale_factor(REFERENCE_CELL_MIN_PX) - 1.0).abs() < 1e-9);
+        // Tiny cell clamps to the 0.6 floor (not below).
+        assert_eq!(cardinal_scale_factor(5.0), 0.6);
+        // Huge cell clamps to the 1.4 ceiling.
+        assert_eq!(cardinal_scale_factor(10_000.0), 1.4);
+        // Half-size cell → 0.5 raw, clamped up to 0.6.
+        assert_eq!(cardinal_scale_factor(REFERENCE_CELL_MIN_PX * 0.5), 0.6);
+        // Invalid input → 1.0 (no scaling).
+        assert_eq!(cardinal_scale_factor(0.0), 1.0);
+        assert_eq!(cardinal_scale_factor(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn small_cell_vertical_swipe_not_a_tap_when_scaled() {
+        // A ~11px vertical swipe: under the default 13px tap threshold
+        // it misclassifies as a Tap (the scaled-down-cardinal bug).
+        let path = vec![
+            pt(0.0, 0.0, 0),
+            pt(0.0, -5.0, 30),
+            pt(0.0, -11.0, 60),
+        ];
+        // Unscaled: classifies as Tap (excursion 11 < 13).
+        let base = CardinalThresholds::default();
+        assert_eq!(classify(&path, &base), CardinalGesture::Tap);
+        // Scaled for a small (~23px) cell → factor 0.6 → tap threshold
+        // 7.8px. Now the 11px swipe exceeds it and classifies as a
+        // real cardinal direction (N — upward).
+        let factor = cardinal_scale_factor(23.0);
+        let scaled = base.scaled(factor);
+        assert!(
+            matches!(classify(&path, &scaled), CardinalGesture::Cardinal(Direction::N)),
+            "expected Cardinal(N) under scaled thresholds, got {:?}",
+            classify(&path, &scaled)
+        );
+    }
+
+    #[test]
+    fn scaled_preserves_tap_for_genuine_tap() {
+        // A genuine tiny tap (3px) must stay a Tap even under the most
+        // aggressive downscale (floor 0.6 → 7.8px threshold).
+        let path = vec![pt(0.0, 0.0, 0), pt(2.0, 1.0, 40), pt(3.0, 1.0, 80)];
+        let scaled = CardinalThresholds::default().scaled(cardinal_scale_factor(23.0));
+        assert_eq!(classify(&path, &scaled), CardinalGesture::Tap);
     }
 
     #[test]
