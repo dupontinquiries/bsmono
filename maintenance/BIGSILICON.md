@@ -187,8 +187,20 @@ Built and tested this pass:
   trait (device + model I/O — can't run in the sandbox). On-device: implement it over
   voiceterm's whisper pool + voice-kit model resolution (models-kit `~/models`), feeding
   `transcript` messages to voiced.
-- **Remaining data:** back sharemd's Hub with share-kit for durability/federation; have apps
-  call `try_connect` before their own path.
+- **DONE (enabler):** `shared/bigsilicon-client` — one SDK for voiced/sharemd/coordd with
+  socket-first fallback baked in. `Voice::connect(app)` / `Share::connect()` /
+  `Coord::connect(app)` each return `None` when the daemon is down (→ app runs its own code);
+  inbound events arrive on a channel (`try_next`), so adoption is a few lines:
+  ```rust
+  if let Some(mut v) = Voice::connect("beatspace") {
+      v.register("play_track", Scope::Active, &["play","{track}"]).ok();
+      while let Some(ev) = v.try_next() { /* handle intent */ }
+  } // else: in-process fallback
+  ```
+  `Coord::next_directive()` returns a typed `(Resource, Directive)`. Tested (fallback +
+  typed directive push).
+- **Remaining data:** back sharemd's Hub with share-kit for durability/federation; adopt the
+  client in real apps (snapclone claims the call, voiceterm ducks, unendlich shares/pipes).
 - device-kit (PipeWire/v4l2) — snapclone's camera-bridge is the reference.
 - uikit adoption / Qt+GTK→egui ports (largest LOC lever).
 
@@ -264,4 +276,6 @@ works if widgets carry semantic labels — which is the real per-app work.
 - **DONE:** rusty-board egui port adopts a11y — `register_a11y` tags every key, `voice_key`
   drives focus/activation (voice "next"/"activate" types the focused key). The ported
   keyboard is now both touch-adaptive *and* voice-navigable. Test: `keyboard_is_voice_navigable`.
-- Remaining: the `register_with_voiced` one-call helper + TTS sink; then the other ports.
+- The `register_with_voiced` helper is now a 2-liner over the client: `for (e,p) in
+  a11y::standard_grammar() { voice.register(e, Scope::Always, &[p]); }`. Remaining: TTS sink;
+  then the other ports.
