@@ -178,7 +178,10 @@ Built and tested this pass:
 
 ### TODO — remaining backlog
 - config-kit / cli-kit adoption across the other ~10 apps (delete their local copies).
-- Bind ipc-kit sockets into real `voiced` + `sharemd` binaries; wire voiced's audio stage
-  (voice-kit + audio-kit + voiceterm's mic/whisper pool); back datashare with share-kit.
+- **DONE:** `apps/voiced` + `apps/sharemd` are runnable daemons (ipc-kit `serve_hub` with
+  addressed routing; integration-tested over real sockets). **Remaining:** wire voiced's
+  audio stage (voice-kit + audio-kit + voiceterm's mic/whisper pool) so real speech feeds
+  `intent`/`say`; back sharemd's Hub with share-kit for durability/federation; have apps
+  call `try_connect` before their own path.
 - device-kit (PipeWire/v4l2) — snapclone's camera-bridge is the reference.
 - uikit adoption / Qt+GTK→egui ports (largest LOC lever).
