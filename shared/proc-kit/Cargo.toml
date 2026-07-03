@@ -1,0 +1,9 @@
+[package]
+name = "proc-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Run subprocesses and capture output, with a privilege-escalation ladder (direct → sudo -n → doas) that ~7 crates hand-roll (pydeps system-deps, device-kit modprobe, packaging rpmbuild/abuild, deploy). One place for 'run this; if it needs root, escalate the way this host allows'. std-only."
+
+[lib]
+path = "src/lib.rs"
