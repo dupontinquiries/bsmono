@@ -1725,6 +1725,55 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 Some(other) => err(&format!("unknown group command: {other} (list|build)")),
             }
         }
+        "package" => {
+            let dir = match pos.first() {
+                Some(d) => std::path::PathBuf::from(d),
+                None => return err("usage: gitmind fleet package <dir> [--rpm|--apk] [--out <dir>]"),
+            };
+            let format = if flag(rest, "--apk") { flow::RepoFormat::Apk }
+                else if flag(rest, "--rpm") { flow::RepoFormat::Rpm }
+                else { flow::host_repo_format() };
+            let out = opt(rest, "--out").map(std::path::PathBuf::from).unwrap_or_else(|| dir.join("gitmind-pkg"));
+            println!("building {} package from {} …", format.as_str(), dir.display());
+            match flow::package_project(&dir, format, &out) {
+                Ok(o) => {
+                    match &o.artifact {
+                        Some(a) => println!("✓ {}\n  package: {}", o.message, a.display()),
+                        None => println!("• {}\n  spec/APKBUILD: {}", o.message, o.staged.manifest.display()),
+                    }
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "repo" => {
+            match pos.first().map(|s| s.as_str()) {
+                Some("add") => {
+                    let (Some(pkg), Some(to)) = (pos.get(1), opt(rest, "--to")) else {
+                        return err("usage: gitmind fleet repo add <pkg> --to <repo-dir> [--rpm|--apk]");
+                    };
+                    let format = if flag(rest, "--apk") { flow::RepoFormat::Apk } else { flow::RepoFormat::Rpm };
+                    match flow::repo_add(std::path::Path::new(pkg), std::path::Path::new(to), format) {
+                        Ok(msg) => { println!("{msg}"); 0 }
+                        Err(e) => err(&e),
+                    }
+                }
+                Some("serve") => {
+                    let dir = match pos.get(1) {
+                        Some(d) => std::path::PathBuf::from(d),
+                        None => return err("usage: gitmind fleet repo serve <repo-dir> [--port N] [--rpm|--apk]"),
+                    };
+                    let port: u16 = opt(rest, "--port").and_then(|p| p.parse().ok()).unwrap_or(8080);
+                    let format = if flag(rest, "--apk") { flow::RepoFormat::Apk } else { flow::RepoFormat::Rpm };
+                    let ip = cockpit::netshare::local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+                    let baseurl = format!("http://{ip}:{port}/");
+                    println!("{}", flow::repo_client_config(format, &baseurl, "gitmind"));
+                    println!("serving {} at {baseurl} (Ctrl-C to stop) …", dir.display());
+                    match flow::serve_repo(&dir, port) { Ok(()) => 0, Err(e) => err(&e) }
+                }
+                _ => err("usage: gitmind fleet repo <add|serve> …"),
+            }
+        }
         "build-dir" => {
             if let Some(p) = pos.first() {
                 match cockpit::set_build_base(p) {
