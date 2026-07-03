@@ -170,6 +170,58 @@ pub fn presence_key(app: &str) -> String {
     format!("presence/{app}")
 }
 
+impl Resource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Resource::Mic => "mic",
+            Resource::CallAudio => "call_audio",
+            Resource::Attention => "attention",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Resource> {
+        match s {
+            "mic" => Some(Resource::Mic),
+            "call_audio" => Some(Resource::CallAudio),
+            "attention" => Some(Resource::Attention),
+            _ => None,
+        }
+    }
+    /// All resources, for iterating when recomputing directives.
+    pub fn all() -> [Resource; 3] {
+        [Resource::Mic, Resource::CallAudio, Resource::Attention]
+    }
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Exclusive => "exclusive",
+            Mode::Duck => "duck",
+            Mode::Share => "share",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Mode> {
+        match s {
+            "exclusive" => Some(Mode::Exclusive),
+            "duck" => Some(Mode::Duck),
+            "share" => Some(Mode::Share),
+            _ => None,
+        }
+    }
+}
+
+impl Directive {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Directive::Own => "own",
+            Directive::Yield => "yield",
+            Directive::Duck => "duck",
+            Directive::Share => "share",
+            Directive::Idle => "idle",
+        }
+    }
+}
+
 impl Activity {
     pub fn as_str(self) -> &'static str {
         match self {
