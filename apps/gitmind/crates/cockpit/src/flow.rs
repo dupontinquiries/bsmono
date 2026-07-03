@@ -779,6 +779,295 @@ mod store_group_tests {
     }
 }
 
+// ── Packaging: build RPM/apk, publish a repo, host it ────────────────────────
+
+use crate::packaging::{self, PkgMeta};
+
+/// Target repository format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoFormat {
+    Rpm,
+    Apk,
+}
+
+impl RepoFormat {
+    pub fn parse(s: &str) -> Option<RepoFormat> {
+        match s.to_lowercase().as_str() {
+            "rpm" | "fedora" | "dnf" => Some(RepoFormat::Rpm),
+            "apk" | "alpine" | "postmarketos" | "pmos" => Some(RepoFormat::Apk),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RepoFormat::Rpm => "rpm",
+            RepoFormat::Apk => "apk",
+        }
+    }
+}
+
+/// A staged package tree ready to hand to the native build tool.
+#[derive(Debug, Clone)]
+pub struct Staged {
+    pub work_dir: std::path::PathBuf,
+    pub manifest: std::path::PathBuf, // the .spec or APKBUILD
+    pub program: String,
+    pub args: Vec<String>,
+    pub run_in: std::path::PathBuf, // cwd for the build command
+}
+
+fn crate_version(toml: &str) -> Option<String> {
+    for line in toml.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("version") {
+            if let Some(eq) = rest.trim_start().strip_prefix('=') {
+                let v = eq.trim().trim_matches('"');
+                if !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+        }
+        if t.starts_with("[") && !t.starts_with("[package]") {
+            break; // only the [package] section's version
+        }
+    }
+    None
+}
+
+/// Write the spec/APKBUILD + copy the package files into a build tree. Deterministic; does
+/// not invoke any native tool. `bin_dir_files` must already exist on disk.
+pub fn stage_package(meta: &PkgMeta, format: RepoFormat, out_dir: &std::path::Path) -> Result<Staged, String> {
+    match format {
+        RepoFormat::Rpm => {
+            let top = out_dir.join("rpmbuild");
+            for sub in ["SPECS", "SOURCES", "BUILD", "RPMS", "SRPMS"] {
+                std::fs::create_dir_all(top.join(sub)).map_err(|e| e.to_string())?;
+            }
+            // copy sources by basename
+            for f in &meta.files {
+                let base = f.src.file_name().ok_or("bad source file")?;
+                std::fs::copy(&f.src, top.join("SOURCES").join(base)).map_err(|e| format!("stage source: {e}"))?;
+            }
+            let spec = top.join("SPECS").join(format!("{}.spec", meta.name));
+            std::fs::write(&spec, packaging::rpm_spec(meta)).map_err(|e| e.to_string())?;
+            let (program, args) = packaging::rpmbuild_cmd(&spec, &top);
+            Ok(Staged { work_dir: top.clone(), manifest: spec, program, args, run_in: top })
+        }
+        RepoFormat::Apk => {
+            let dir = out_dir.join("apk").join(&meta.name);
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            for f in &meta.files {
+                let base = f.src.file_name().ok_or("bad source file")?;
+                std::fs::copy(&f.src, dir.join(base)).map_err(|e| format!("stage source: {e}"))?;
+            }
+            let manifest = dir.join("APKBUILD");
+            std::fs::write(&manifest, packaging::apkbuild(meta)).map_err(|e| e.to_string())?;
+            let (program, args) = packaging::abuild_cmd();
+            Ok(Staged { work_dir: dir.clone(), manifest, program, args, run_in: dir })
+        }
+    }
+}
+
+/// Outcome of a package build.
+#[derive(Debug, Clone)]
+pub struct PackageOutcome {
+    pub staged: Staged,
+    pub artifact: Option<std::path::PathBuf>, // the built .rpm/.apk if the native tool ran
+    pub built: bool,
+    pub message: String,
+}
+
+/// Build a project's binary, stage a package, and run the native packager on-device
+/// (best-effort — if the tool is absent, the staged tree + a hint are returned so the user
+/// can build it where the tools exist).
+pub fn package_project(app_dir: &std::path::Path, format: RepoFormat, out_dir: &std::path::Path) -> Result<PackageOutcome, String> {
+    // build the binary (any supported language)
+    let detected = crate::buildsystem::detect(app_dir).ok_or("no recognized build system in that directory")?;
+    let path_env = crate::ops::tool_path_env();
+    let built = crate::buildsystem::build(&detected, "", &[], &path_env)?;
+    let binary = built.install;
+
+    // metadata
+    let toml = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap_or_default();
+    let name = crate::buildflags::crate_name(&toml).unwrap_or_else(|| detected.name.clone());
+    let version = crate_version(&toml).unwrap_or_else(|| "0.1.0".to_string());
+    let arch = packaging::arch_for_triple(&crate::ops::native_triple_local());
+    let meta = PkgMeta::new(&name, &version, arch)
+        .with_summary(&detected.description)
+        .add_binary(&binary, &name);
+
+    let staged = stage_package(&meta, format, out_dir)?;
+
+    // run the native packager
+    match std::process::Command::new(&staged.program).args(&staged.args).current_dir(&staged.run_in).output() {
+        Ok(o) if o.status.success() => {
+            let artifact = newest_artifact(out_dir, format);
+            Ok(PackageOutcome { staged, artifact, built: true, message: format!("built {} package for {name} {version}", format.as_str()) })
+        }
+        Ok(o) => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            Ok(PackageOutcome { built: false, artifact: None, message: format!("{} failed: {}", staged.program, err.lines().last().unwrap_or("").trim()), staged })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(PackageOutcome {
+            message: format!("'{}' not found — staged the tree at {}; run it on a {} host", staged.program, staged.work_dir.display(), format.as_str()),
+            built: false,
+            artifact: None,
+            staged,
+        }),
+        Err(e) => Err(format!("running {}: {e}", staged.program)),
+    }
+}
+
+fn newest_artifact(dir: &std::path::Path, format: RepoFormat) -> Option<std::path::PathBuf> {
+    let ext = match format {
+        RepoFormat::Rpm => "rpm",
+        RepoFormat::Apk => "apk",
+    };
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    fn walk(dir: &std::path::Path, ext: &str, best: &mut Option<(std::time::SystemTime, std::path::PathBuf)>) {
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, ext, best);
+                } else if p.extension().and_then(|x| x.to_str()) == Some(ext) {
+                    if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                        if best.as_ref().map(|(t, _)| m > *t).unwrap_or(true) {
+                            *best = Some((m, p));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    walk(dir, ext, &mut best);
+    best.map(|(_, p)| p)
+}
+
+/// Publish a built package into a repo dir and regenerate its index (createrepo_c / apk
+/// index), best-effort on-device.
+pub fn repo_add(pkg: &std::path::Path, repo_dir: &std::path::Path, format: RepoFormat) -> Result<String, String> {
+    std::fs::create_dir_all(repo_dir).map_err(|e| e.to_string())?;
+    let base = pkg.file_name().ok_or("bad package path")?;
+    std::fs::copy(pkg, repo_dir.join(base)).map_err(|e| format!("copy into repo: {e}"))?;
+    let (program, args) = match format {
+        RepoFormat::Rpm => packaging::createrepo_cmd(repo_dir),
+        RepoFormat::Apk => packaging::apk_index_cmd(repo_dir),
+    };
+    match std::process::Command::new(&program).args(&args).output() {
+        Ok(o) if o.status.success() => Ok(format!("added {} and reindexed repo", base.to_string_lossy())),
+        Ok(o) => Err(format!("{program} failed: {}", String::from_utf8_lossy(&o.stderr).lines().last().unwrap_or("").trim())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(format!("copied {} into repo — run '{program}' on a {} host to index", base.to_string_lossy(), format.as_str())),
+        Err(e) => Err(format!("running {program}: {e}")),
+    }
+}
+
+/// The client configuration the user applies to install from a gitmind-hosted repo.
+pub fn repo_client_config(format: RepoFormat, baseurl: &str, repo_name: &str) -> String {
+    match format {
+        RepoFormat::Rpm => format!(
+            "# save as /etc/yum.repos.d/{repo_name}.repo, then: sudo dnf install <pkg>\n{}",
+            packaging::dnf_repo_file(repo_name, baseurl)
+        ),
+        RepoFormat::Apk => format!(
+            "# add the repo (unsigned): \n{}\n# or one-shot: {}",
+            format!("echo {} | sudo tee -a /etc/apk/repositories", packaging::apk_repo_line(baseurl)),
+            packaging::apk_add_cmd(baseurl, "<pkg>")
+        ),
+    }
+}
+
+/// Serve a repo directory over HTTP so dnf/apk can fetch from it. Minimal GET-only server;
+/// blocks. `port` 0 lets the OS choose (returns the bound addr via the callback).
+pub fn serve_repo(repo_dir: &std::path::Path, port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("0.0.0.0", port)).map_err(|e| e.to_string())?;
+    let root = repo_dir.to_path_buf();
+    for stream in listener.incoming() {
+        let Ok(mut s) = stream else { continue };
+        let root = root.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let target = req.split_whitespace().nth(1).unwrap_or("/");
+            let resp = match packaging::resolve_in_root(&root, target) {
+                Some(path) if path.is_file() => match std::fs::read(&path) {
+                    Ok(body) => {
+                        let ct = packaging::content_type(&path);
+                        let mut head = format!("HTTP/1.0 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+                        head.extend_from_slice(&body);
+                        head
+                    }
+                    Err(_) => b"HTTP/1.0 500 Internal Server Error\r\n\r\n".to_vec(),
+                },
+                _ => b"HTTP/1.0 404 Not Found\r\n\r\n".to_vec(),
+            };
+            let _ = s.write_all(&resp);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod packaging_flow_tests {
+    use super::*;
+    use crate::packaging::PkgMeta;
+
+    #[test]
+    fn crate_version_reads_package_section() {
+        assert_eq!(crate_version("[package]\nname = \"x\"\nversion = \"1.2.3\"\n").as_deref(), Some("1.2.3"));
+        // version in a later section is ignored
+        assert_eq!(crate_version("[package]\nname = \"x\"\n[dependencies]\nfoo = { version = \"9\" }\n"), None);
+    }
+
+    #[test]
+    fn repo_client_config_includes_baseurl() {
+        assert!(repo_client_config(RepoFormat::Rpm, "http://host:8080/", "fleet").contains("baseurl=http://host:8080/"));
+        assert!(repo_client_config(RepoFormat::Apk, "http://host:8080/", "fleet").contains("http://host:8080"));
+    }
+
+    #[test]
+    fn stage_rpm_and_apk_write_manifest_and_sources() {
+        let base = std::env::temp_dir().join(format!("gmpkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // a fake built binary
+        let bin = base.join("gitmind");
+        std::fs::write(&bin, b"\x7fELF fake").unwrap();
+        let meta = PkgMeta::new("gitmind", "0.3.0", "aarch64").add_binary(&bin, "gitmind");
+
+        // RPM
+        let rpm_out = base.join("rpm");
+        let staged = stage_package(&meta, RepoFormat::Rpm, &rpm_out).unwrap();
+        assert!(staged.manifest.ends_with("SPECS/gitmind.spec"));
+        assert!(std::fs::read_to_string(&staged.manifest).unwrap().contains("Version:        0.3.0"));
+        assert!(rpm_out.join("rpmbuild/SOURCES/gitmind").is_file(), "binary staged into SOURCES");
+        assert_eq!(staged.program, "rpmbuild");
+
+        // APK
+        let apk_out = base.join("apk");
+        let staged = stage_package(&meta, RepoFormat::Apk, &apk_out).unwrap();
+        assert!(staged.manifest.ends_with("APKBUILD"));
+        assert!(std::fs::read_to_string(&staged.manifest).unwrap().contains("pkgver=0.3.0"));
+        assert!(apk_out.join("apk/gitmind/gitmind").is_file(), "binary staged next to APKBUILD");
+        assert_eq!(staged.program, "abuild");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Guess the repo format for the current host from /etc/os-release (Alpine/postmarketOS →
+/// apk, otherwise rpm). Used as the default when the user doesn't pass --rpm/--apk.
+pub fn host_repo_format() -> RepoFormat {
+    let os = std::fs::read_to_string("/etc/os-release").unwrap_or_default().to_lowercase();
+    if os.contains("alpine") || os.contains("postmarketos") {
+        RepoFormat::Apk
+    } else {
+        RepoFormat::Rpm
+    }
+}
+
 // ── Downloads scanning + bundle import ──
 
 /// The user's Downloads folder.
