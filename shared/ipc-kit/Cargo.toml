@@ -1,0 +1,9 @@
+[package]
+name = "ipc-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local app<->daemon IPC over a Unix socket, with socket-first fallback: an app tries the shared daemon and, only if it's absent, runs its own code. Message framing reuses net-kit's percent-escaped line codec. Per-event listen scopes (Always/Active) let an app say which events it wants even when backgrounded. The common substrate under voiced (voice daemon) and the share daemon (cross-app data)."
+
+[dependencies]
+net-kit = { path = "../net-kit" }
