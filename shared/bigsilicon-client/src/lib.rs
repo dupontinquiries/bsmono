@@ -123,11 +123,95 @@ impl Share {
     pub fn subscribe(&mut self, ns: &str) -> std::io::Result<()> {
         self.0.send(&Message::new("sub", vec![ns.into()]))
     }
+    pub fn list(&mut self, ns: &str) -> std::io::Result<()> {
+        self.0.send(&Message::new("list", vec![ns.into()]))
+    }
     pub fn try_next(&self) -> Option<Message> {
         self.0.try_next()
     }
     pub fn events(&self) -> &Receiver<Message> {
         self.0.events()
+    }
+}
+
+/// Live cross-app settings over sharemd. Subscribes to the `settings` namespace, seeds from
+/// a snapshot, and keeps a [`Prefs`](settings_kit::Prefs) in sync: when the central settings
+/// app changes something, `poll()` picks it up and every app re-applies it — the gesture
+/// feel, palette, touch targets, etc. change live. An app layers its own overrides on top.
+pub struct Settings {
+    share: Share,
+    kv: std::collections::HashMap<String, String>,
+    prefs: settings_kit::Prefs,
+    overrides: Vec<(String, String)>,
+}
+
+impl Settings {
+    /// Connect, subscribe to `settings`, and request the current snapshot. `None` if sharemd
+    /// isn't running (the app falls back to compiled defaults).
+    pub fn connect() -> Option<Settings> {
+        let mut share = Share::connect()?;
+        share.subscribe(settings_kit::NAMESPACE).ok()?;
+        share.list(settings_kit::NAMESPACE).ok()?;
+        Some(Settings { share, kv: std::collections::HashMap::new(), prefs: settings_kit::Prefs::default(), overrides: Vec::new() })
+    }
+
+    /// This app's own overrides (its uniqueness), applied on top of the central settings.
+    pub fn with_overrides(mut self, overrides: Vec<(String, String)>) -> Settings {
+        self.overrides = overrides;
+        self.rebuild();
+        self
+    }
+
+    /// Publish a central setting change (used by the settings app). Fans out to every other
+    /// subscribed app via sharemd.
+    pub fn set(&mut self, key: &str, value: &str) -> std::io::Result<()> {
+        self.kv.insert(key.to_string(), value.to_string());
+        self.rebuild();
+        self.share.put(settings_kit::NAMESPACE, key, value)
+    }
+
+    /// Drain pending bus traffic and update prefs. Returns true if anything changed.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(m) = self.share.try_next() {
+            match m.verb.as_str() {
+                // a single key changed: event <ns> <key> [val]
+                "event" if m.args.first().map(|s| s.as_str()) == Some(settings_kit::NAMESPACE) => {
+                    if let Some(key) = m.args.get(1) {
+                        let val = m.args.get(2).cloned().unwrap_or_default();
+                        self.kv.insert(key.clone(), val);
+                        changed = true;
+                    }
+                }
+                // snapshot: listing <ns> k1 v1 k2 v2 …
+                "listing" if m.args.first().map(|s| s.as_str()) == Some(settings_kit::NAMESPACE) => {
+                    let mut i = 1;
+                    while i + 1 < m.args.len() {
+                        self.kv.insert(m.args[i].clone(), m.args[i + 1].clone());
+                        i += 2;
+                    }
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            self.rebuild();
+        }
+        changed
+    }
+
+    fn rebuild(&mut self) {
+        let mut kv: Vec<(String, String)> = self.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        kv.sort();
+        let mut p = settings_kit::Prefs::from_kv(&kv);
+        p.apply_kv(&self.overrides); // app overrides win
+        self.prefs = p;
+    }
+
+    /// The current effective preferences (central + this app's overrides).
+    pub fn prefs(&self) -> &settings_kit::Prefs {
+        &self.prefs
     }
 }
 
@@ -209,6 +293,70 @@ mod tests {
                 _ => vec![],
             }
         }
+    }
+
+    #[test]
+    fn settings_sync_live_across_apps() {
+        use std::collections::HashMap;
+        // a tiny sharemd stand-in: kv + per-namespace subscribers, fans out on put
+        #[derive(Default)]
+        struct SettingsHub {
+            kv: HashMap<String, String>,
+            subs: HashMap<String, Vec<ConnId>>,
+        }
+        impl Service for SettingsHub {
+            fn handle(&mut self, from: ConnId, msg: Message) -> Vec<(ConnId, Message)> {
+                let a = |i: usize| msg.args.get(i).cloned().unwrap_or_default();
+                match msg.verb.as_str() {
+                    "sub" => {
+                        self.subs.entry(a(0)).or_default().push(from);
+                        vec![(from, Message::verb("ok"))]
+                    }
+                    "put" => {
+                        let (ns, key, val) = (a(0), a(1), a(2));
+                        self.kv.insert(format!("{ns}/{key}"), val.clone());
+                        let mut out = vec![(from, Message::verb("ok"))];
+                        for &s in self.subs.get(&ns).into_iter().flatten() {
+                            if s != from {
+                                out.push((s, Message::new("event", vec![ns.clone(), key.clone(), val.clone()])));
+                            }
+                        }
+                        out
+                    }
+                    "list" => {
+                        let ns = a(0);
+                        let mut args = vec![ns.clone()];
+                        for (k, v) in &self.kv {
+                            if let Some(key) = k.strip_prefix(&format!("{ns}/")) {
+                                args.push(key.to_string());
+                                args.push(v.clone());
+                            }
+                        }
+                        vec![(from, Message::new("listing", args))]
+                    }
+                    _ => vec![],
+                }
+            }
+        }
+
+        let listener = bind("share").expect("bind");
+        std::thread::spawn(move || serve_hub(listener, SettingsHub::default()));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // the central settings app and a regular app
+        let mut central = Settings::connect().expect("central");
+        let mut app = Settings::connect().expect("app");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        central.poll();
+        app.poll();
+        assert_eq!(app.prefs().gesture.sensitivity, 1.0, "starts at default");
+
+        // update the touch gesture feel centrally …
+        central.set("gesture.sensitivity", "2.0").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        // … the other app picks it up live
+        assert!(app.poll());
+        assert_eq!(app.prefs().gesture.sensitivity, 2.0, "app updated from the central change");
     }
 
     #[test]
