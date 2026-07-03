@@ -99,6 +99,60 @@ Item {
             }
         }
 
+        // ── ADD-MODE SELECTOR ──────────────────────────────────────
+        //
+        // How a newly-added track behaves relative to what's playing:
+        //   Stack   — append to the queue (default, never interrupts)
+        //   Replace — clear the queue and play this now
+        //   Sync    — start it time-aligned over the current track
+        //   Under   — drop it underneath at the current playhead
+        // Stack/Replace work today; Sync/Under need the layered player
+        // (marked with a · and report status when chosen). The choice is
+        // persisted via set_enqueue_mode.
+        Row {
+            width: parent.width
+            spacing: 4
+            Text {
+                text: "ADD AS"
+                color: Bo.silver
+                font.pixelSize: 9
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.0
+                anchors.verticalCenter: parent.verticalCenter
+            }
+            Repeater {
+                model: [
+                    { tag: "stack",   label: "Stack",   ready: true  },
+                    { tag: "replace", label: "Replace", ready: true  },
+                    { tag: "sync",    label: "Sync",    ready: false },
+                    { tag: "midgap",  label: "Under",   ready: false }
+                ]
+                delegate: Rectangle {
+                    property bool selected: qtobj.enqueue_mode === modelData.tag
+                    width: modeLabel.implicitWidth + 16
+                    height: 26
+                    radius: 13
+                    color: selected ? Qt.rgba(0.78, 0.63, 0.29, 0.25) : "transparent"
+                    border.color: selected ? Bo.accent : Bo.hairline
+                    border.width: selected ? 2 : 1
+                    Text {
+                        id: modeLabel
+                        anchors.centerIn: parent
+                        // A trailing · flags modes that aren't live yet.
+                        text: modelData.label + (modelData.ready ? "" : " ·")
+                        color: selected ? Bo.bone
+                             : modelData.ready ? Bo.silver : Bo.slate
+                        font.pixelSize: 10
+                        font.weight: selected ? Font.DemiBold : Font.Normal
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: qtobj.set_enqueue_mode(modelData.tag)
+                    }
+                }
+            }
+        }
+
         // ── PER-DEVICE PICKER ──────────────────────────────────────
         //
         // Horizontally-scrollable strip listing every device that
@@ -116,7 +170,8 @@ Item {
             visible: root.queueDevices.length > 1
             contentWidth: deviceChipsRow.implicitWidth
             contentHeight: 28
-            boundsBehavior: Flickable.OvershootBounds
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
             flickableDirection: Flickable.HorizontalFlick
             clip: true
 
@@ -284,6 +339,9 @@ Item {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight

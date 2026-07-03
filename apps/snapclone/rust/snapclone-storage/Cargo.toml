@@ -1,0 +1,17 @@
+[package]
+name        = "snapclone-storage"
+version     = "0.1.0"
+edition     = "2021"
+description = "SQLite contact and snap persistence for SnapClone (Rust port)"
+
+[lib]
+name       = "snapclone_storage"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow    = "1"
+rusqlite  = { version = "0.31", features = ["bundled", "chrono"] }
+chrono    = { version = "0.4", features = ["serde"] }
+serde     = { version = "1", features = ["derive"] }
+tracing   = "0.1"
+uuid      = { version = "1", features = ["v4"] }

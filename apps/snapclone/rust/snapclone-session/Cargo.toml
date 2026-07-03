@@ -1,0 +1,18 @@
+[package]
+name        = "snapclone-session"
+version     = "0.1.0"
+edition     = "2021"
+description = "Transport selection and retry backoff for SnapClone peer sessions"
+
+[lib]
+name       = "snapclone_session"
+crate-type = ["rlib"]
+
+[dependencies]
+snapclone-peer     = { path = "../snapclone-peer" }
+snapclone-nat      = { path = "../snapclone-nat"  }
+snapclone-net-intel = { path = "../snapclone-net-intel" }
+anyhow  = "1"
+chrono  = { version = "0.4", features = ["serde"] }
+serde   = { version = "1", features = ["derive"] }
+tracing = "0.1"

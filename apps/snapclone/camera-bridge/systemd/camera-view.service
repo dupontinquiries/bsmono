@@ -1,0 +1,31 @@
+[Unit]
+Description=Fullscreen Camera View (transparent phone wallpaper)
+Documentation=https://gitlab.postmarketos.org
+After=pipewire.service camera-bridge.service graphical-session.target
+# camera-view reads from camera-bridge's virtual node — start bridge first
+Requires=camera-bridge.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=2
+
+# camera-view always reads from the virtual-face-cam node (written by
+# camera-bridge).  It never opens the physical camera.
+# Change the camera/viewport by reconfiguring camera-bridge, not camera-view.
+ExecStart=%h/.local/bin/camera-view --no-cursor
+
+# PW_SOURCE_NODE: which PipeWire node to read from.
+# Must match PW_SINK_NODE in camera-bridge's env file.
+Environment=PW_SOURCE_NODE=virtual-cam-rear
+Environment=CAMERA_ROTATION=0
+Environment=RUST_LOG=warn
+
+StartLimitIntervalSec=30
+StartLimitBurst=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical-session.target

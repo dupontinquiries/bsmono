@@ -1,0 +1,21 @@
+[package]
+name        = "snapclone-piggyback"
+version     = "0.1.0"
+edition     = "2021"
+description = "Multi-hop offline-gap-fill relay scaffolding for SnapClone snaps"
+
+[lib]
+name       = "snapclone_piggyback"
+crate-type = ["rlib"]
+
+[dependencies]
+serde     = { version = "1", features = ["derive"] }
+chrono    = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+byteorder = "1"
+# Signing infrastructure — real signing landed elsewhere; we re-import
+# the dep for type compatibility with verification chains.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+
+[features]
+default = []

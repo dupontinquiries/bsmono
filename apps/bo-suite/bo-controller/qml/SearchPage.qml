@@ -135,6 +135,9 @@ Item {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight
@@ -229,6 +232,9 @@ Item {
                     // Single tap while something is playing → queue it.
                     // The play_now (▶) button gives instant play.
                     onClicked: qtobj.enqueue_or_play(modelData.id)
+                    onPressAndHold: {
+                        if (window.editDialog) window.editDialog.open(modelData)
+                    }
                 }
             }
         }

@@ -1401,8 +1401,14 @@ Item {
                 accent: root.accent
 
                 ColumnLayout {
-                    anchors.fill: parent
-                    anchors.margins: 12
+                    // Was anchors.fill:parent, which creates a circular size
+                    // dependency inside ControlCard's holder (holder height =
+                    // childrenRect, child height = fill holder) — the card
+                    // then collapsed to near-zero height and the next card
+                    // (Overnight Standby) rendered on top of it. Bind width
+                    // to the holder and let this layout's own implicitHeight
+                    // drive the card height instead.
+                    width: parent.width
                     spacing: 10
 
                     RowLayout {

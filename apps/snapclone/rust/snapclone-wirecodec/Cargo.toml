@@ -1,0 +1,12 @@
+[package]
+name = "snapclone-wirecodec"
+version = "0.1.0"
+edition = "2021"
+description = "Content-aware wire compression for snap payloads: a 1-byte codec tag + deflate, applied only when the payload type is compressible AND the result is actually smaller. Never expands data. Pure-Rust (miniz_oxide), no C deps."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+miniz_oxide = "0.7"

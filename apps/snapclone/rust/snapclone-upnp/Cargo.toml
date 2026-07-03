@@ -1,0 +1,16 @@
+[package]
+name = "snapclone-upnp"
+version = "0.1.0"
+edition = "2021"
+description = "UPnP/SSDP IGD port mapping and NAT-PMP fallback"
+
+[lib]
+name = "snapclone_upnp"
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow  = "1"
+bytes   = "1"
+tokio   = { version = "1", features = ["net", "time", "rt"] }
+tracing = "0.1"
+quick-xml = "0.36"

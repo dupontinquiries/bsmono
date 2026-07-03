@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SnapClone
+GenericName=Snap Messenger
+Comment=Distributed ephemeral snap messenger — serverless, encrypted, peer-to-peer
+Exec=snapclone
+Icon=org.snapclone.SnapClone
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=snap;chat;camera;messenger;p2p;encrypted;
+StartupNotify=true
+StartupWMClass=SnapClone

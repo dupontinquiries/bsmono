@@ -20,6 +20,7 @@ use super::MediaResult as ResultMessage;
 use super::scanner;
 use lofty::file::AudioFile;
 use super::smart_cards;
+use super::tag_writer;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
@@ -92,13 +93,13 @@ pub enum MediaCmd {
     /// Limit should be small enough that the QML ListView's
     /// delegate creation cost stays bounded (50-200 is a reasonable
     /// range). Offset can be anywhere in [0, total).
-    LoadArtistsPage { offset: i64, limit: i64 },
+    LoadArtistsPage { offset: i64, limit: i64, sort: String },
     LoadRecentPage  { offset: i64, limit: i64 },
     LoadByArtistPage { artist_id: i64, offset: i64, limit: i64 },
     /// Every track in the library, paginated, ordered by title. Backs the
     /// "All Tracks" view so no track is ever unreachable regardless of how
     /// its filename parsed (missing-tracks fix).
-    LoadAllTracksPage { offset: i64, limit: i64 },
+    LoadAllTracksPage { offset: i64, limit: i64, sort: String },
 
     /// Drill-down list views
     LoadByArtist(i64),
@@ -160,6 +161,15 @@ pub enum MediaCmd {
     ReorderPlaylist { playlist_id: i64, track_id: i64, new_ord: i64 },
     /// Set a track's 0–5 star rating (durably, path-mirrored).
     SetTrackRating { track_id: i64, rating: i64 },
+    /// Write metadata edits into the actual audio file's tags (portable,
+    /// permanent). Distinct from SetOverride (which is a DB-only overlay).
+    WriteTagsToFile {
+        track_id: i64,
+        title:  Option<String>,
+        artist: Option<String>,
+        album:  Option<String>,
+        year:   Option<u32>,
+    },
     /// List all playlists with track counts. Reply: PlaylistsList.
     ListPlaylists,
     /// Load all tracks in a playlist in order. Reply: PlaylistTracks.
@@ -248,7 +258,7 @@ pub enum MediaCmd {
     /// Top albums by total play count. Reply: AlbumsList.
     LoadTopAlbums(usize),
     /// All albums alphabetical by title. Reply: AlbumsList.
-    LoadAllAlbumsAlpha,
+    LoadAllAlbumsAlpha { sort: String },
     /// Tracks belonging to a specific album. Reply: TrackList tagged
     /// "album:<title>:<primary_artist>".
     LoadTracksInAlbum { title: String, primary_artist: String },
@@ -347,8 +357,9 @@ pub fn run(
             //     limit=50 — concatenate into the existing model
             //   - On context change (different artist, sort flip):
             //     drop existing model, request offset=0 again
-            MediaCmd::LoadArtistsPage { offset, limit } => {
-                match catalog::artists_with_counts_page(&conn, offset, limit) {
+            MediaCmd::LoadArtistsPage { offset, limit, sort } => {
+                let sort = catalog::ArtistPageSort::from_tag(&sort);
+                match catalog::artists_with_counts_page_sorted(&conn, offset, limit, sort) {
                     Ok((page, total)) => {
                         let _ = tx.send(ResultMessage::Page {
                             context: "artists".into(),
@@ -393,8 +404,9 @@ pub fn run(
                 }
             }
 
-            MediaCmd::LoadAllTracksPage { offset, limit } => {
-                match catalog::all_tracks_page(&conn, offset, limit) {
+            MediaCmd::LoadAllTracksPage { offset, limit, sort } => {
+                let sort = catalog::TrackSort::from_tag(&sort);
+                match catalog::all_tracks_page_sorted(&conn, offset, limit, sort) {
                     Ok((page, total)) => {
                         let _ = tx.send(ResultMessage::Page {
                             context: "all_tracks".to_string(),
@@ -626,6 +638,35 @@ pub fn run(
                     // optimistically-then-confirmed.
                     let r = catalog::track_rating(&conn, track_id).unwrap_or(0);
                     let _ = tx.send(ResultMessage::TrackRating { track_id, rating: r });
+                }
+            }
+            MediaCmd::WriteTagsToFile { track_id, title, artist, album, year } => {
+                // Resolve the file path, then write the tags off the UI
+                // thread. Report success/failure via a status message.
+                let path: Option<String> = conn.query_row(
+                    "SELECT path FROM tracks WHERE id = ?1",
+                    rusqlite::params![track_id], |r| r.get(0)).ok();
+                match path {
+                    Some(p) => {
+                        let edit = tag_writer::TagEdit { title, artist, album, year };
+                        match tag_writer::write_tags(std::path::Path::new(&p), &edit) {
+                            Ok(()) => {
+                                let _ = tx.send(ResultMessage::TagWriteResult {
+                                    track_id, ok: true,
+                                    message: "Saved tags to file".to_string() });
+                            }
+                            Err(e) => {
+                                let _ = tx.send(ResultMessage::TagWriteResult {
+                                    track_id, ok: false,
+                                    message: format!("Couldn't write tags: {}", e) });
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = tx.send(ResultMessage::TagWriteResult {
+                            track_id, ok: false,
+                            message: "Track has no file path".to_string() });
+                    }
                 }
             }
             MediaCmd::ListPlaylists => {
@@ -954,8 +995,8 @@ pub fn run(
             MediaCmd::LoadTopAlbums(limit) => {
                 publish_top_albums(&conn, &tx, limit);
             }
-            MediaCmd::LoadAllAlbumsAlpha => {
-                publish_all_albums_alpha(&conn, &tx);
+            MediaCmd::LoadAllAlbumsAlpha { sort } => {
+                publish_all_albums_alpha(&conn, &tx, &sort);
             }
             MediaCmd::LoadTracksInAlbum { title, primary_artist } => {
                 // Track list for a specific (title, primary_artist) pair.
@@ -1248,8 +1289,9 @@ fn publish_top_albums(conn: &rusqlite::Connection, tx: &Sender<ResultMessage>, l
     }
 }
 
-fn publish_all_albums_alpha(conn: &rusqlite::Connection, tx: &Sender<ResultMessage>) {
-    if let Ok(list) = library::all_albums_alpha(conn) {
+fn publish_all_albums_alpha(conn: &rusqlite::Connection, tx: &Sender<ResultMessage>, sort: &str) {
+    let sort = library::AlbumSort::from_tag(sort);
+    if let Ok(list) = library::all_albums_sorted(conn, sort) {
         let _ = tx.send(ResultMessage::AlbumsList {
             context: "alpha".to_string(),
             json: album_summaries_to_json(&list),

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.snapclone.SnapClone</id>
+  <name>SnapClone</name>
+  <summary>Peer-to-peer encrypted photo messenger</summary>
+  <description>
+    <p>SnapClone is a privacy-first peer-to-peer photo and video messenger.
+       No central servers. Messages are end-to-end encrypted and ephemeral.</p>
+    <ul>
+      <li>Direct peer-to-peer connections via UDP hole-punching</li>
+      <li>DHT-based peer discovery — no registration required</li>
+      <li>Snaps auto-expire after the configured duration</li>
+      <li>Works on desktop Linux, postmarketOS, and PinePhone</li>
+    </ul>
+  </description>
+  <url type="homepage">https://github.com/snapclone</url>
+  <launchable type="desktop-id">org.snapclone.SnapClone.desktop</launchable>
+  <releases>
+    <release version="1.0.0" date="2025-01-01"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

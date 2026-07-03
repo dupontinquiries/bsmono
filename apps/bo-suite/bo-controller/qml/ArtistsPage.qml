@@ -136,10 +136,62 @@ Item {
             }
         }
 
+        // Sort chips — only meaningful in A→Z (full browse) mode; TOP is
+        // already play-ranked.
+        Flow {
+            width: parent.width
+            spacing: 4
+            visible: root.mode === "alpha"
+            Text {
+                text: "SORT"
+                color: Bo.slate
+                font.pixelSize: 9
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.0
+                height: 24
+                verticalAlignment: Text.AlignVCenter
+            }
+            Repeater {
+                model: [
+                    { tag: "name",   label: "Name"        },
+                    { tag: "tracks", label: "Track count" }
+                ]
+                delegate: Rectangle {
+                    property bool sel: qtobj.artist_sort === modelData.tag
+                    width: artSortLabel.implicitWidth + 14
+                    height: 24
+                    radius: 12
+                    color: sel ? Qt.rgba(0.78, 0.63, 0.29, 0.25) : "transparent"
+                    border.color: sel ? root.accent : Bo.hairline
+                    border.width: sel ? 2 : 1
+                    Text {
+                        id: artSortLabel
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        color: sel ? Bo.bone : Bo.silver
+                        font.pixelSize: 10
+                        font.weight: sel ? Font.DemiBold : Font.Normal
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (!parent.sel) {
+                                qtobj.set_artist_sort(modelData.tag)
+                                root.refresh()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         ListView {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight

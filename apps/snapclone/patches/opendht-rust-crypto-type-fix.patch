@@ -1,0 +1,11 @@
+--- crypto.rs.orig
++++ crypto.rs
+@@ -81,7 +81,7 @@ pub mod crypto {
+             Box::from_raw(dht_privatekey_import(
+                 dat.as_ptr(),
+                 dat.len(),
+-                password.as_ptr() as *const i8,
++                password.as_ptr(),
+             ))
+         }
+     }

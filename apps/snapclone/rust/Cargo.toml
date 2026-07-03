@@ -1,0 +1,60 @@
+[workspace]
+members = [
+    "snapclone-crypto",
+    "snapclone-mediashare",
+    "snapclone-saliency",
+    "snapclone-identity",
+    "snapclone-nat",
+    "snapclone-proto",
+    "snapclone-storage",
+    "snapclone-core",
+    "snapclone-dht",
+    "snapclone-ui-traits",
+    "snapclone-vcard",
+    "snapclone-wire",
+    "snapclone-gossip",
+    "snapclone-location",
+    "snapclone-theme",
+    "snapclone-network-diag",
+    "snapclone-firewall",
+    "snapclone-net-intel",
+    "snapclone-mailbox",
+    "snapclone-session",
+    "snapclone-databus",
+    "snapclone-peer",
+    "snapclone-relay",
+    "snapclone-upnp",
+
+    "snapclone-linkpreview",
+    "snapclone-landmark",
+    "snapclone-piggyback",
+    "snapclone-audio",
+    "snapclone-proximity",
+    "snapclone-face",
+    "snapclone-microdht",
+    "snapclone-group",
+    "snapclone-videosrc",
+    "snapclone-av1policy",
+    "snapclone-debounce",
+    "snapclone-coresched",
+    "snapclone-gesture",
+    "snapclone-menu",
+    "snapclone-composer",
+    "snapclone-gstpipeline",
+    "snapclone-wirecodec",
+    "snapclone-vqcodec",]
+# camera-bridge has its own [workspace] table — exclude it so cargo
+# does not try to absorb it into this workspace from the repo root.
+exclude = [
+    "../camera-bridge",
+]
+resolver = "2"
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+
+[profile.dev]
+opt-level = 1

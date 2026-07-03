@@ -778,3 +778,315 @@ NOTE: enqueue-mode picker UI (long-press menu on track rows) + FS-metadata
 write-back of ratings via lofty are the remaining follow-ons. The mode
 plumbing + persisted default are in place; sync/midgap await the layered
 player.
+
+## 2026-06-21 (pm15) — wire enqueue modes to the UI + ratings while browsing
+
+- **Enqueue-mode picker (queue page)** — an "ADD AS" segmented control
+  (Stack / Replace / Sync· / Under·) bound to qtobj.enqueue_mode, calling
+  set_enqueue_mode. The · flags the layered modes that aren't live yet.
+- **enqueue_or_play now honours the chosen mode** — refactored to delegate
+  to enqueue_with_mode using the persisted default, so the picker actually
+  changes what a track tap does. Kept the "tapping the currently-playing
+  track is a no-op" guard (don't queue a duplicate of what you're hearing)
+  before delegating; for "stack" the behaviour is otherwise identical to
+  before.
+- **Ratings while browsing** — added t.rating to all_tracks_page's SELECT
+  and a StarRating to the AllTracksPage rows (rate any track in the whole
+  library, not just within a playlist). Test all_tracks_page_surfaces_set_
+  rating locks in the round-trip (media now 60/60).
+
+Verified: rustcheck → controller own-code clean (no errors/warnings) to Qt
+boundary; media 60/60; bo-mux 323/323; QML braces balanced.
+
+## 2026-06-21 (pm16) — track metadata editing reach + rating in the edit sheet
+
+- **Edit dialog is now global + reachable everywhere** — EditTrackDialog
+  was instantiated deep in the page tree (id: editDialog) so window.
+  editDialog DIDN'T resolve from other pages; AlbumDetailPage's edit-open
+  was effectively broken. Moved it to window top-level (id: editDialogGlobal,
+  z:320) with `property alias editDialog`, matching the tagEditor pattern.
+- **Long-press to edit on every track list** — added onPressAndHold →
+  window.editDialog.open(modelData) to AllTracksPage, PlaylistDetailPage,
+  SearchPage, ArtistDetailPage, TagDetailPage (previously only AlbumDetail
+  could edit). Tap still plays/enqueues; long-press edits.
+- **Rating in the edit sheet** — added a RATING row (StarRating, 18px) to
+  EditTrackDialog; binds reactively to track.rating, applies immediately
+  via set_track_rating (separate persisted field from the title/artist/
+  album override payload).
+- **Bug fix:** StarRating.qml referenced Bo.* tokens but lacked `import
+  "."`, so the singleton wouldn't resolve and the component would fail to
+  load at runtime. Added the import.
+
+QML only; braces balanced across all 7 touched files; bo-mux 323/323.
+
+## 2026-06-21 (pm17) — metadata write-back to file tags (lofty)
+
+- **tag_writer.rs** — the write counterpart to tag_reader. write_tags(path,
+  TagEdit) writes title/artist/album/year back into the actual audio file's
+  tags via lofty 0.22 (save_to_path). Safety-first: reads the existing tag
+  and mutates only the specified fields (everything else — art, other
+  frames — preserved); Some("") clears a field, None leaves it; empty edit
+  is a no-op; missing file / unsupported container returns Err, never
+  panics. Rating intentionally NOT written to file (no portable home across
+  ID3 POPM / Vorbis RATING / MP4 atom — stays in the DB, already durable).
+- **Wired end to end** — MediaCmd::WriteTagsToFile (resolves path, writes
+  off the UI thread) → MediaResult::TagWriteResult{ok,message} →
+  write_track_tags_to_file qt_method + tag_write_status property. Distinct
+  from set_track_override (DB-only overlay): the file write is explicit and
+  permanent.
+- **UI** — EditTrackDialog gains a "TO FILE" button (alongside the DB SAVE)
+  + a result line; shared buildPayload() so DB-save and file-write never
+  drift.
+- **Verified REAL**: created a FLAC with ffmpeg (title "Old Title"), ran
+  the actual tag_writer, read back via lofty → "New Title"/"New Artist"
+  rewritten in the file. Plus 3 unit tests (empty no-op, missing-file
+  error, is_empty). rustcheck clean to Qt boundary; media+tags 67/67;
+  bo-mux 323/323; EditTrackDialog 46/46 braces.
+
+## 2026-06-21 (pm18) — layered-playback model (foundation for Sync/Under)
+
+- **layer_player.rs** — the pure, testable model the queue_policy
+  Synchronize/MidgapLayer modes were waiting on. LayerSet tracks concurrent
+  layers (Top / Overlay / Underlay), each with a stable id, gain, offset,
+  paused flag. Emits LayerActions (Spawn / Stop / StopAllExcept) for the
+  driver to execute — never does I/O itself, so it's verifiable in
+  isolation (9/9 tests). Roles: Top advances the queue + unity gain;
+  Overlay aligns from 0 at unity (mirrors paused); Underlay enters at the
+  top's playhead, ducked to 0.55. set_top replaces only the top; add_overlay/
+  add_underlay leave the top alone; collapse_to ends the whole mix for a
+  fresh single track. Mechanism documented: PulseAudio mixes streams to a
+  sink, so a 2nd ffmpeg|paplay pipe layers audio — the real work left is a
+  SELECTIVE reap (StopAllExcept) so layers don't kill each other.
+- **Wired into the controller** — QtState holds a LayerSet; play_track
+  collapse_to's it (a new top ends the old mix, pure bookkeeping — the
+  driver's own reap does the stopping); the Sync/Under enqueue arms now
+  drive add_overlay/add_underlay + execute_layer_action. The model + UI
+  state are exact; the one remaining concrete step is the driver hook that
+  spawns the 2nd concurrent decode pipe with offset/gain (can't validate
+  audio mixing in the sandbox, so it logs intent + status instead of
+  faking it).
+
+Verified: rustcheck → controller own-code clean (no errors/warnings) to Qt
+boundary; layer_player+queue_policy 18/18; media 67/67; bo-mux 323/323.
+
+## 2026-06-21 (pm19) — play/pause fix + add-to-playlist + playlist niceties
+
+- **Play/pause resume bug fixed** — onNow_playing_changed re-seeded
+  estimatedSec from np_seek_pos on EVERY now-playing change, including the
+  pause event, which clobbered the position the pause handler had just
+  captured (np_seek_pos is 0/stale at pause). Now it only re-seeds on
+  (re)start (np_playing == true). Also: the resume guard was `from > 0`,
+  so a track paused at/near 0s lost its position; replaced with an explicit
+  _hasPaused flag so paused-at-0 resumes correctly. A fresh play (list tap/
+  queue advance) clears _hasPaused so a stale offset from a prior track
+  can't leak into the next resume.
+- **Add-to-playlist UI** — add_track_to_playlist existed in the backend but
+  NO UI surfaced it. New global AddToPlaylistDialog (window.addToPlaylist):
+  lists playlists with track counts, tap to add (with ✓ confirmation),
+  Done to close. Reachable via a "+ LIST" button in the edit sheet (which
+  is itself reachable by long-press on any track row). Edit-dialog action
+  row converted Row → Flow so the now-5 buttons wrap on narrow widths.
+- **Playlist-create niceties** — name field auto-focuses when the create
+  form expands; Enter on either name or description submits (shared
+  createCard.submit(), used by both fields + the Create button so they
+  can't drift); name is trimmed.
+
+QML only; braces balanced across 5 files; bo-mux 323/323.
+
+## 2026-06-21 (pm20) — smooth scroll + friction-based fling rebound
+
+- **Consistent momentum scrolling everywhere** — the Bo.flickDecel(850) /
+  flickMaxVel(6000) tuning was applied unevenly: PlaylistDetailPage,
+  AddToPlaylistDialog, TagDetailPage had bare ListViews. Added the full
+  treatment (flickDeceleration, maximumFlickVelocity, OvershootBounds,
+  rebound) to those, and added OvershootBounds + rebound to the 7 lists
+  that already had the flick tuning but no overshoot/rebound.
+- **BoRebound.qml** — a reusable rebound Transition (used as `rebound:
+  BoRebound {}`) so a hard fling into a list end eases back with a damped
+  OutCubic settle instead of the default hard snap. OutCubic (not OutBack)
+  is deliberate: the content is already returning from an overshoot, so a
+  back-ease would add a second wobble; one clean decelerating settle reads
+  as friction. New Bo.reboundDur(420) token.
+- **ScrollView pages** (AlbumsPage, AlbumDetailPage, TagsPage use Flow in
+  a ScrollView) — tuned via Component.onCompleted on contentItem (the
+  internal Flickable) so they match the ListView feel.
+- **Dropped pixelAligned** — initially added it, then removed: pixel-
+  snapping trades sub-pixel smoothness for crispness, and the ask was
+  SMOOTH scroll, so sub-pixel wins.
+
+QML only; braces balanced across 16 files; bo-mux 323/323.
+
+## 2026-06-21 (pm21) — sortable all-tracks library list
+
+- **TrackSort backend** — new TrackSort enum (Title/Artist/Album/Recently
+  Added/RatingDesc) + from_tag/to_tag (unknown → Title) + order_clause
+  (fixed literals, injection-safe; every branch has a stable title+id
+  tiebreak for deterministic paging). all_tracks_page_sorted(conn,off,lim,
+  sort); all_tracks_page now delegates with Title. Primary-artist subquery
+  aliased `pa` so the Artist sort can order by it. Test all_tracks_sort_
+  modes_order_correctly verifies title/artist/recent/rating orders + the
+  garbage→Title fallback (media now 68/68).
+- **Wired through** — MediaCmd::LoadAllTracksPage gained a `sort` field;
+  worker maps it via from_tag → all_tracks_page_sorted. Persisted
+  all_tracks_sort qt_property + set_all_tracks_sort (settings_store,
+  validated through the enum) + startup restore. load_all_tracks_page reads
+  the persisted sort.
+- **UI** — a SORT chip strip (Title/Artist/Album/Recent/Rating) on
+  AllTracksPage as a Flow (wraps on narrow widths); tapping a chip persists
+  the sort and refresh()es from page 0. Selected chip highlighted in accent.
+
+Verified: rustcheck clean to Qt boundary; media 68/68; bo-mux 323/323;
+AllTracksPage braces 53/53.
+
+## 2026-06-21 (pm22) — sortable albums list (matching all-tracks)
+
+- **AlbumSort backend** — AlbumSort enum (Title/Artist/Year/MostPlayed) +
+  from_tag/to_tag. all_albums_sorted(conn, sort) reorders in Rust (album
+  cardinality is small, a few hundred; keeps the aggregation SQL single-
+  purpose). Factored the base title-ordered aggregation into all_albums_
+  alpha_base; all_albums_alpha delegates with Title. Year sorts newest-
+  first (no-year sinks); MostPlayed by total_plays; all with a title
+  tiebreak. Test album_sort_modes_order_correctly (media now 69/69).
+- **Wired through** — MediaCmd::LoadAllAlbumsAlpha gained a sort field;
+  publish_all_albums_alpha maps via from_tag. Persisted album_sort
+  qt_property + set_album_sort (settings_store) + startup restore;
+  load_all_albums_alpha reads it.
+- **UI** — SORT chip Flow on AlbumsPage (Title/Artist/Year/Most played),
+  visible only in ALPHA mode (the full-library browse; TOP is play-ranked
+  already). Mirrors the all-tracks sort UX.
+
+Verified: rustcheck clean to Qt boundary; media 69/69; bo-mux 323/323;
+AlbumsPage braces 53/53.
+
+## 2026-06-21 (pm23) — sortable artists list (completes browse-sort symmetry)
+
+- **ArtistPageSort** (catalog.rs) — the artists browse list is PAGINATED
+  (catalog::artists_with_counts_page), so unlike albums its sort must live
+  in SQL, not a Rust reorder. Added ArtistPageSort (Name / TrackCount) +
+  from_tag + injection-safe order_clause (Name → a.norm; TrackCount →
+  n DESC, a.norm tiebreak). artists_with_counts_page_sorted; the old
+  unpaged fn delegates with Name. Only Name + TrackCount because the paged
+  query has no play-count join (MostPlayed would need one — deferred).
+- **Wired through** — MediaCmd::LoadArtistsPage gained a sort field; the
+  handler maps via from_tag. Persisted artist_sort qt_property +
+  set_artist_sort + startup restore; load_artists_page reads it.
+- **UI** — SORT chips (Name / Track count) on ArtistsPage, visible only in
+  A→Z mode (TOP is play-ranked). Matches the all-tracks + albums sort UX.
+- **Cleanup** — initially built an ArtistSort + all_artists_sorted in
+  library.rs (Rust reorder) before realizing the page uses the catalog
+  paged query; removed that dead code (confirmed clean under
+  --deny-warnings) and kept all_artists_alpha_base.
+
+Verified: rustcheck clean (incl. --deny-warnings) to Qt boundary; media
+70/70; bo-mux 323/323; ArtistsPage braces 66/66.
+
+All three library browse lists (tracks / albums / artists) now sort with
+persisted, per-list preferences.
+
+## 2026-06-21 (pm24) — wire up forest & river soundscapes (missing clip beds)
+
+ROOT CAUSE: forest.soundscape.json + river_calm.soundscape.json (and
+forest_quiet / forest_immersive) were registered and bootstrapped into the
+scene dir, BUT they reference clip families that bootstrap_clips() never
+synthesized — so the layers were silent. The daemon only generated
+brown_pad / wind_soft / pink_pad / wave_break / gull / whale / wind_loop /
+bird_chirp / creek_loop / sub_pad. Missing: brook_close/mid/far (the
+water), wind_canopy, wind_distant, leaves_rustle (forest ambience).
+
+FIX (bo-muxd.rs bootstrap_clips): added ffmpeg synthesis for all six
+missing families × 8 variants (a..h) = 48 clips:
+  - brook_close/mid/far: white/pink/brown noise, highpass+lowpass band for
+    water, fast shallow tremolo for bubbling; distance shapes it (close
+    bright+present, mid rolled off, far dark+quiet+echo for depth).
+  - wind_canopy: bandpassed pink noise, brighter + more movement.
+  - wind_distant: lowpassed brown noise, darker + slower swell.
+  - leaves_rustle: short highpassed white-noise burst padded to ~4s so it
+    triggers as an occasional accent, not a continuous bed.
+
+VERIFIED REAL (ffmpeg in sandbox): generated all 48 clips with the exact
+filter strings from the code — 48 made, 0 failed; every filter valid. Then
+checked every clip each scene references against the synthesized set:
+forest (16), river_calm (24), forest_quiet (16), forest_immersive (48) →
+all clips now covered. bo-mux 323/323; all_example_scenes_load passes.
+
+## 2026-06-21 (pm25) — Chromium-lenient scrolling + native scan folder picker
+
+- **Lenient, desktop-style scrolling** — retuned the scroll feel across all
+  list/scroll pages to behave like a desktop browser: flickDecel 850→500
+  (coasts much further on a fling), flickMaxVel 6000→8000 (snappier fast
+  swipes), pressDelay 0 (content tracks the finger immediately, no press
+  lag), and boundsBehavior OvershootBounds → DragOverBounds (you can drag
+  past the edge, but a *flick* stops cleanly at the bound instead of
+  flinging into a big elastic overshoot — the lenient desktop feel). New
+  Bo.pressDelay + Bo.boundsLenient tokens; reboundDur 420→380. Applied to
+  all 11 ListView pages + the 3 ScrollView (contentItem) pages.
+- **Native folder picker for music scan** — ScanPickerDialog gains a
+  Browse… button next to the custom-path field that opens a QtQuick.Dialogs
+  FolderDialog (Qt6-standard native OS picker); the chosen folder's file://
+  URL is stripped to a plain path for the scanner.
+- **Last-scanned location remembered** — scan_with_roots persists the first
+  root to settings_store key "last_scan_root" (+ last_scan_root qt_property,
+  restored at startup). The picker pre-fills the custom path with it (repeat
+  scan = one tap) and the Browse dialog opens there (currentFolder).
+
+NOTE: QtQuick.Dialogs is a new QML module import for this project (only
+QtQuick + QtQuick.Controls were used before). It's Qt6-standard so should
+resolve, but it's the one thing here that needs the real Qt build to
+confirm — flagged for hands-on check.
+
+Verified: rustcheck clean to Qt boundary; bo-mux 323/323; braces balanced
+across all touched files.
+
+## 2026-06-21 (pm26) — fix tag/artist track population + standby card overlap
+
+BUG 1: Tags & Artists detail pages didn't populate tracks.
+- Root cause was NOT the backend: verified by-artist and by-tag queries
+  both return the attached tracks (added a diagnostic, then a permanent
+  regression test tag_and_artist_detail_queries_populate — media 71/71).
+- The bug was a QML binding/imperative CONFLICT: TagDetailPage and
+  ArtistDetailPage declared `property var trackList: { ...context check...
+  return JSON.parse }` (a binding) AND also assigned `root.trackList = ...`
+  in a Connections.onLibrary_changed handler. The first imperative
+  assignment breaks the declarative binding, after which it never
+  re-evaluates — so the list would show empty depending on load ordering.
+- Fix: made trackList a plain `property var trackList: []` with the
+  Connections handler as its SOLE writer (adoptIfMine() context-matches
+  then assigns). Also clear on id-change so stale tracks don't linger, and
+  adopt onVisibleChanged (the result can arrive before the page is shown,
+  so onLibrary_changed won't fire again).
+
+BUG 2: Overnight Standby card overlapped the Experimental Features card.
+- Root cause: the Experimental card's content was a `ColumnLayout {
+  anchors.fill: parent }` inside ControlCard's `holder` Item, whose height
+  = childrenRect.height. anchors.fill + childrenRect is a circular size
+  dependency → the card collapsed to ~0 height → the next card (standby)
+  drew on top of it.
+- Fix: experimental ColumnLayout now uses `width: parent.width` (own
+  implicitHeight drives height, no cycle). Hardened ControlCard.holder to
+  `height: max(childrenRect.height, children[0].implicitHeight)` so Layout-
+  based content (which reports size via implicitHeight, not childrenRect)
+  can never collapse a card again.
+
+Verified: media 71/71; bo-mux 323/323; braces balanced (ControlCard,
+SettingsPage, TagDetailPage, ArtistDetailPage).
+
+## 2026-06-21 (pm27) — wire two dormant backends to UI
+
+Audited for qt_methods with no QML caller; wired two high-value ones:
+
+- **Playlist rename / edit-description** — update_playlist_meta existed in
+  the backend (persists + republishes) but the PlaylistDetailPage header
+  comment long promised "editable in place" with NO actual UI. Added a ✎
+  button next to the playlist name that opens an inline edit overlay (name
+  + description fields, Save/Cancel, Enter-to-save). Wired to
+  update_playlist_meta; optimistically updates the header. The dialog pulls
+  the current description from playlists_json on open (the page only
+  receives the name through its open signal).
+- **Repeat button** — repeat_mode_cycle + repeat_mode_tag existed with no
+  transport-bar control. Added a repeat button to the transport cluster
+  that cycles Off → One → All; glyph (↻ / ↻₁) + accent tint reflect the
+  live mode. Sits inside controlCluster so the sink-chip width calc adapts
+  automatically.
+
+QML only; braces balanced (PlaylistDetailPage, BottomTransportBar);
+rustcheck clean; bo-mux 323/323.

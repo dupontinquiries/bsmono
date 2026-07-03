@@ -1,0 +1,17 @@
+[Desktop Entry]
+Name=Camera View
+GenericName=Transparent Camera Wallpaper
+Comment=Live camera feed as fullscreen wallpaper (transparent phone effect)
+# --camera shorthand: rear | ultrawide | front | tracking
+# ultrawide requires a multi-rear device (e.g. Fairphone 5). On single-rear
+# devices this Exec will fail because virtual-cam-rear-ultrawide is never
+# created; pick a different shorthand or set CAMERA_NODE before launching.
+Exec=camera-view --camera ultrawide --no-cursor
+Icon=camera-photo
+Type=Application
+Categories=Video;Utility;
+Keywords=camera;wallpaper;transparent;
+# Tells the compositor this is a background/wallpaper layer
+X-KDE-SubstituteUID=false
+StartupNotify=false
+NoDisplay=false
