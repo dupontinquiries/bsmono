@@ -35,6 +35,20 @@ Item {
     }
     function close() { opacity = 0; track = null }
 
+    // Build the metadata payload from the current field values. Shared by
+    // the DB-override SAVE and the write-to-file action so they never
+    // drift. A blank field is omitted (override) — for file writes the
+    // worker treats a missing key as "leave the file's value alone".
+    function buildPayload() {
+        var p = {}
+        if (titleField.text.trim().length  > 0) p.title  = titleField.text.trim()
+        if (artistField.text.trim().length > 0) p.artist = artistField.text.trim()
+        if (albumField.text.trim().length  > 0) p.album  = albumField.text.trim()
+        var y = parseInt(yearField.text)
+        if (!isNaN(y) && y > 0 && y < 4000) p.year = y
+        return p
+    }
+
     // Scrim — tap outside the sheet to dismiss.
     Rectangle {
         anchors.fill: parent
@@ -101,10 +115,42 @@ Item {
                 maximumLength: 4
             }
 
-            // Action row
+            // Rating — applies immediately (it's its own persisted field,
+            // not part of the title/artist/album override payload). Shown
+            // here so the edit sheet is the one place to manage a track.
             Row {
                 spacing: Bo.gapSM
-                anchors.right: parent.right
+                Text {
+                    text: "RATING"
+                    color: Bo.silver
+                    font.pixelSize: 10
+                    font.weight: Font.DemiBold
+                    font.letterSpacing: 0.8
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 56
+                }
+                StarRating {
+                    id: ratingStars
+                    trackId: (root.track && root.track.id !== undefined) ? root.track.id : -1
+                    rating: (root.track && root.track.rating) ? root.track.rating : 0
+                    starSize: 18
+                    anchors.verticalCenter: parent.verticalCenter
+                }
+            }
+
+            // Action row — a Flow so the buttons wrap to a second line on
+            // narrow dialogs rather than overflowing.
+            Flow {
+                width: parent.width
+                spacing: Bo.gapSM
+                ActionBtn {
+                    label: "+ LIST"; accent: root.accent; subtle: true
+                    onTapped: {
+                        // Hand the current track to the playlist picker.
+                        if (root.track && window.addToPlaylist)
+                            window.addToPlaylist.open(root.track)
+                    }
+                }
                 ActionBtn {
                     label: "CLEAR"; accent: root.accent; subtle: true
                     onTapped: {
@@ -122,17 +168,36 @@ Item {
                     label: "SAVE"; accent: root.accent
                     onTapped: {
                         if (root.track && root.track.id !== undefined) {
-                            var payload = {}
-                            if (titleField.text.trim().length  > 0) payload.title  = titleField.text.trim()
-                            if (artistField.text.trim().length > 0) payload.artist = artistField.text.trim()
-                            if (albumField.text.trim().length  > 0) payload.album  = albumField.text.trim()
-                            var y = parseInt(yearField.text)
-                            if (!isNaN(y) && y > 0 && y < 4000) payload.year = y
-                            qtobj.set_track_override(root.track.id, JSON.stringify(payload))
+                            qtobj.set_track_override(root.track.id,
+                                JSON.stringify(root.buildPayload()))
                         }
                         root.close()
                     }
                 }
+                ActionBtn {
+                    // Write the edits into the actual file's tags — portable
+                    // and permanent, unlike the DB-only SAVE above. Stays
+                    // open and shows the result so the user knows it landed
+                    // (or why it didn't, e.g. a read-only file).
+                    label: "TO FILE"; accent: root.accent; subtle: true
+                    onTapped: {
+                        if (root.track && root.track.id !== undefined) {
+                            qtobj.write_track_tags_to_file(root.track.id,
+                                JSON.stringify(root.buildPayload()))
+                        }
+                    }
+                }
+            }
+
+            // Tag-write outcome (only meaningful after TO FILE was tapped).
+            Text {
+                width: parent.width
+                visible: qtobj.tag_write_status.length > 0
+                text: qtobj.tag_write_status
+                color: Bo.silver
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+                horizontalAlignment: Text.AlignRight
             }
         }
     }

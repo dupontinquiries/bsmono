@@ -39,6 +39,7 @@ mod mux_bridge;
 mod noise_adaptive_gain;
 mod playback_modes;
 mod queue_policy;
+mod layer_player;
 mod lyrics_transcriber;
 mod spectral_masker;
 mod volume_safety;
@@ -717,6 +718,11 @@ struct QtState {
     /// title-ordered. Guarantees no track is unreachable regardless of
     /// metadata — backs the missing-tracks fix.
     load_all_tracks_page: qt_method!(fn(&mut self, offset: i32, limit: i32)),
+    /// Current sort for the all-tracks browse list: "title" / "artist" /
+    /// "album" / "recent" / "rating". Persisted; drives load_all_tracks_page.
+    all_tracks_sort: qt_property!(QString; NOTIFY all_tracks_sort_changed),
+    all_tracks_sort_changed: qt_signal!(),
+    set_all_tracks_sort: qt_method!(fn(&mut self, sort: String)),
 
     // ── Albums (browse-by-album view) ─────────────────────────────
     //
@@ -1108,6 +1114,13 @@ struct QtState {
     /// Set a track's 0–5 star rating. Persists durably (path-mirrored);
     /// the confirmed value comes back via last_rated_track/last_rated_value.
     set_track_rating: qt_method!(fn(&mut self, track_id: i64, rating: i64)),
+    /// Write metadata edits into the actual file's tags (portable +
+    /// permanent). JSON body shape matches set_track_override
+    /// (title/artist/album/year). Result lands in tag_write_status.
+    write_track_tags_to_file: qt_method!(fn(&mut self, track_id: i32, json: String)),
+    /// Last tag-write outcome message (success or error), for the UI.
+    tag_write_status: qt_property!(QString; NOTIFY tag_write_status_changed),
+    tag_write_status_changed: qt_signal!(),
     /// Last track whose rating was confirmed by the worker, and its value,
     /// so a rating widget can reconcile its optimistic state.
     last_rated_track: qt_property!(i64; NOTIFY rating_changed),
@@ -1150,10 +1163,18 @@ struct QtState {
     load_top_artists: qt_method!(fn(&mut self, limit: i32)),
     /// All artists alphabetical.
     load_all_artists_alpha: qt_method!(fn(&mut self)),
+    /// Artists browse sort: "name" / "plays" / "tracks". Persisted.
+    artist_sort: qt_property!(QString; NOTIFY artist_sort_changed),
+    artist_sort_changed: qt_signal!(),
+    set_artist_sort: qt_method!(fn(&mut self, sort: String)),
     /// Top albums by total play count.
     load_top_albums: qt_method!(fn(&mut self, limit: i32)),
     /// All albums alphabetical by title.
     load_all_albums_alpha: qt_method!(fn(&mut self)),
+    /// Albums browse sort: "title" / "artist" / "year" / "plays". Persisted.
+    album_sort: qt_property!(QString; NOTIFY album_sort_changed),
+    album_sort_changed: qt_signal!(),
+    set_album_sort: qt_method!(fn(&mut self, sort: String)),
     /// Open a specific album in the detail view. Populates the
     /// current_album_* properties asynchronously when the worker
     /// replies with the track list.
@@ -1284,6 +1305,10 @@ struct QtState {
     /// Suggested scan roots: ~/Music, ~/Documents, ~/Downloads — only
     /// those that actually exist. The dialog uses this to pre-tick boxes.
     suggested_scan_roots: qt_method!(fn(&mut self) -> String),
+    /// The most recently scanned root path (persisted). The scan picker
+    /// defaults to it and the native Browse dialog opens there.
+    last_scan_root: qt_property!(QString; NOTIFY last_scan_root_changed),
+    last_scan_root_changed: qt_signal!(),
     /// Open the system file picker (kdialog on KDE, zenity elsewhere)
     /// to pick an audio file. Returns the chosen path or empty string
     /// on cancel/no-picker. Synchronous — the qt_method blocks until
@@ -1829,6 +1854,10 @@ struct QtState {
     /// for playback. Used by `advance_queue_if_any` to find the
     /// just-ended track in the queue and pick the successor.
     last_played_track_id: i64,
+    /// Concurrent-playback layer model (queue_policy Synchronize/MidgapLayer
+    /// modes drive this). Pure bookkeeping; the driver mirrors its actions
+    /// into real decode pipes. Defaults to empty (single-player path).
+    layer_set: layer_player::LayerSet,
     last_played_path: String,
     /// Counter for the child-mode skip loop. Increments on each
     /// blacklisted track in a row; resets to 0 when we successfully
@@ -2877,6 +2906,15 @@ impl QtState {
     fn quick_scan(&mut self)      { self.send_media(media::MediaCmd::QuickScan); }
     fn scan_with_roots(&mut self, roots_json: String) {
         let roots: Vec<String> = serde_json::from_str(&roots_json).unwrap_or_default();
+        // Remember the most recently scanned root so the picker can default
+        // to it next time (and the Browse dialog can open there).
+        if let Some(first) = roots.first() {
+            if !first.trim().is_empty() {
+                self.last_scan_root = first.clone().into();
+                let _ = settings_store::set_str("last_scan_root", first);
+                self.last_scan_root_changed();
+            }
+        }
         self.send_media(media::MediaCmd::ScanWithRoots(roots));
     }
     fn suggested_scan_roots(&mut self) -> String {
@@ -3320,8 +3358,12 @@ impl QtState {
     /// Result lands via `page_json` after a brief async round-trip.
     fn load_artists_page(&mut self, offset: i32, limit: i32) {
         self.observe_action(anticipator::ActionKind::OpenLibrary);
+        let sort = {
+            let s = self.artist_sort.to_string();
+            if s.is_empty() { "name".to_string() } else { s }
+        };
         self.send_media(media::MediaCmd::LoadArtistsPage {
-            offset: offset as i64, limit: limit as i64,
+            offset: offset as i64, limit: limit as i64, sort,
         });
     }
     fn load_recent_page(&mut self, offset: i32, limit: i32) {
@@ -3338,9 +3380,22 @@ impl QtState {
     }
     fn load_all_tracks_page(&mut self, offset: i32, limit: i32) {
         self.observe_action(anticipator::ActionKind::OpenLibrary);
+        let sort = {
+            let s = self.all_tracks_sort.to_string();
+            if s.is_empty() { "title".to_string() } else { s }
+        };
         self.send_media(media::MediaCmd::LoadAllTracksPage {
-            offset: offset as i64, limit: limit as i64,
+            offset: offset as i64, limit: limit as i64, sort,
         });
+    }
+    /// Change the all-tracks sort and persist it. The caller (QML) reloads
+    /// page 0 after this so the new order takes effect.
+    fn set_all_tracks_sort(&mut self, sort: String) {
+        // Validate through the enum so only known tags persist.
+        let tag_str = media::catalog::TrackSort::from_tag(&sort).to_tag();
+        self.all_tracks_sort = tag_str.into();
+        let _ = settings_store::set_str("all_tracks_sort", tag_str);
+        self.all_tracks_sort_changed();
     }
     fn record_play(&mut self, track_id: i32) {
         self.send_media(media::MediaCmd::RecordPlay(track_id as i64));
@@ -3543,23 +3598,22 @@ impl QtState {
     /// play_track, which is correct behavior (we shouldn't queue
     /// when nothing's playing).
     fn enqueue_or_play(&mut self, track_id: i32) {
-        if self.np_playing && self.last_played_track_id != 0
-                            && self.last_played_track_id != track_id as i64 {
-            eprintln!("enqueue_or_play: queueing {} behind current {} on {}",
-                      track_id, self.last_played_track_id, self.active_url);
-            self.send_media(media::MediaCmd::QueuePush {
-                track_id: track_id as i64,
-                device_url: self.active_url.clone(),
-            });
-            // Surface a hint in last_play_status so the user can see
-            // their tap was registered (otherwise nothing visibly
-            // changes — easy to mistake for the tap being lost).
-            self.last_play_status = format!(
-                "queued track {} (will play after current ends)", track_id);
-            self.play_status_changed();
-        } else {
-            self.play_track(track_id);
+        // Tapping the track that's already playing is a no-op in the plain
+        // gesture (don't queue a duplicate of what you're hearing). The
+        // explicit mode methods can still re-add it if the user really
+        // wants to.
+        if self.np_playing && self.last_played_track_id == track_id as i64 {
+            return;
         }
+        // Delegate to the mode-aware path using the user's persisted
+        // default. For "stack" (the historical default) this matches the
+        // old behaviour: append when something's playing, else play.
+        let mode = if self.enqueue_mode.to_string().is_empty() {
+            "stack".to_string()
+        } else {
+            self.enqueue_mode.to_string()
+        };
+        self.enqueue_with_mode(track_id, mode);
     }
 
     /// Persist the user's default enqueue mode. Validated through
@@ -3569,6 +3623,44 @@ impl QtState {
         self.enqueue_mode = m.as_tag().into();
         let _ = settings_store::set_str("enqueue_mode", m.as_tag());
         self.enqueue_mode_changed();
+    }
+
+
+    /// Execute one LayerAction from the layer model. The Top layer routes
+    /// through the normal play path (the transport bar controls it). For
+    /// Overlay / Underlay, the model + UI state are now exact; the final
+    /// concrete step is spawning a SECOND concurrent decode pipe to the
+    /// same sink with the layer's offset and gain. PulseAudio mixes
+    /// streams to a sink, so this is mechanically possible — the driver
+    /// work is a selective reap (StopAllExcept) so the layers don't kill
+    /// each other. Until that driver hook lands, non-top spawns report
+    /// their intent honestly rather than silently doing nothing.
+    fn execute_layer_action(&mut self, action: layer_player::LayerAction) {
+        use layer_player::LayerAction;
+        match action {
+            LayerAction::Spawn { id, track_id, offset_ms, gain, paused } => {
+                // The Top layer (the first/only one) uses the normal play
+                // path. is_layered() is false for a lone top.
+                if !self.layer_set.is_layered() {
+                    self.play_track(track_id as i32);
+                    return;
+                }
+                eprintln!(
+                    "layer: spawn id={} track={} offset={}ms gain={:.2} paused={} \
+                     (concurrent pipe is the remaining driver hook)",
+                    id, track_id, offset_ms, gain, paused);
+                self.last_play_status = format!(
+                    "Layer queued (id {}, +{}ms) — concurrent playback lands with \
+                     the driver hook", id, offset_ms);
+                self.play_status_changed();
+            }
+            LayerAction::Stop { id } => {
+                eprintln!("layer: stop id={}", id);
+            }
+            LayerAction::StopAllExcept { id } => {
+                eprintln!("layer: stop all except id={}", id);
+            }
+        }
     }
 
 
@@ -3604,21 +3696,17 @@ impl QtState {
                 QueueAction::PlayNow(tid) => {
                     self.play_track(tid as i32);
                 }
-                QueueAction::AddSyncLayer(tid, _paused) => {
-                    // Layered playback (concurrent decoders) isn't wired on
-                    // the controller's single-player path yet; the policy +
-                    // plan are ready for when it lands. Be honest in the UI
-                    // rather than silently appending.
-                    eprintln!("enqueue_with_mode: sync layer for {} requested (no layered player yet)", tid);
-                    self.last_play_status =
-                        "Synced overlay needs the layered player (coming soon)".to_string();
-                    self.play_status_changed();
+                QueueAction::AddSyncLayer(tid, paused) => {
+                    // Record the overlay in the layer model and execute its
+                    // spawn intent. The model bookkeeping is exact; the
+                    // driver-level concurrent decode pipe is the remaining
+                    // step (see execute_layer_action).
+                    let acts = self.layer_set.add_overlay(tid, paused);
+                    for a in acts { self.execute_layer_action(a); }
                 }
                 QueueAction::AddUnderlayLayer(tid, off_ms) => {
-                    eprintln!("enqueue_with_mode: midgap underlay for {} at {}ms requested (no layered player yet)", tid, off_ms);
-                    self.last_play_status =
-                        "Underneath layer needs the layered player (coming soon)".to_string();
-                    self.play_status_changed();
+                    let acts = self.layer_set.add_underlay(tid, off_ms);
+                    for a in acts { self.execute_layer_action(a); }
                 }
             }
         }
@@ -3657,6 +3745,13 @@ impl QtState {
     /// via the media worker (async). When TrackForPlay comes back, the
     /// result handler completes the chain (expose + POST).
     fn play_track(&mut self, track_id: i32) {
+        // Keep the layer model's Top in sync with normal playback. A plain
+        // play of a new track collapses any prior layered mix to a single
+        // Top (the old overlays/underlays end when you start something new).
+        // Pure bookkeeping — we DON'T execute the returned actions, since
+        // play_track itself performs the spawn and the driver's own reap
+        // stops the previous pipes.
+        let _ = self.layer_set.collapse_to(track_id as i64);
         // Entry log — single line that captures EVERYTHING the
         // downstream dispatch decisions depend on, so logs from a
         // user reporting "playback not working" reveal which branch
@@ -5401,6 +5496,25 @@ impl QtState {
     fn set_track_rating(&mut self, track_id: i64, rating: i64) {
         self.send_media(media::MediaCmd::SetTrackRating { track_id, rating });
     }
+    fn write_track_tags_to_file(&mut self, track_id: i32, json: String) {
+        let v: serde_json::Value = serde_json::from_str(&json)
+            .unwrap_or(serde_json::json!({}));
+        // Include a field only if the JSON has it; an explicit empty string
+        // clears it (matching the edit dialog), so we map "" through as
+        // Some(""), and a missing key as None (leave file value untouched).
+        let field = |key: &str| -> Option<String> {
+            v.get(key).and_then(|x| x.as_str()).map(|s| s.trim().to_string())
+        };
+        let year = v.get("year").and_then(|x| x.as_i64())
+            .map(|y| if (0..4000).contains(&y) { y as u32 } else { 0 });
+        self.send_media(media::MediaCmd::WriteTagsToFile {
+            track_id: track_id as i64,
+            title:  field("title"),
+            artist: field("artist"),
+            album:  field("album"),
+            year,
+        });
+    }
 
     // Queue methods route to the active device URL. Empty active_url
     // means "global queue" — useful for organizing before a device is
@@ -6291,12 +6405,33 @@ impl QtState {
     fn load_all_artists_alpha(&mut self) {
         self.send_media(media::MediaCmd::LoadAllArtistsAlpha);
     }
+    fn set_artist_sort(&mut self, sort: String) {
+        // The artists browse list is paginated, so its sort lives in SQL
+        // (Name / Track count). Validate through ArtistPageSort.
+        let tag = match media::catalog::ArtistPageSort::from_tag(&sort) {
+            media::catalog::ArtistPageSort::TrackCount => "tracks",
+            media::catalog::ArtistPageSort::Name => "name",
+        };
+        self.artist_sort = tag.into();
+        let _ = settings_store::set_str("artist_sort", tag);
+        self.artist_sort_changed();
+    }
     fn load_top_albums(&mut self, limit: i32) {
         let limit = limit.max(1) as usize;
         self.send_media(media::MediaCmd::LoadTopAlbums(limit));
     }
     fn load_all_albums_alpha(&mut self) {
-        self.send_media(media::MediaCmd::LoadAllAlbumsAlpha);
+        let sort = {
+            let s = self.album_sort.to_string();
+            if s.is_empty() { "title".to_string() } else { s }
+        };
+        self.send_media(media::MediaCmd::LoadAllAlbumsAlpha { sort });
+    }
+    fn set_album_sort(&mut self, sort: String) {
+        let tag = media::library::AlbumSort::from_tag(&sort).to_tag();
+        self.album_sort = tag.into();
+        let _ = settings_store::set_str("album_sort", tag);
+        self.album_sort_changed();
     }
     /// Open an album detail view. Pre-fills the title + artist so
     /// the page header can render immediately, then asks the worker
@@ -8227,6 +8362,18 @@ impl QtState {
                 self.last_rated_track = track_id;
                 self.last_rated_value = rating;
                 self.rating_changed();
+            }
+            media::MediaResult::TagWriteResult { track_id, ok, message } => {
+                eprintln!("tag write for {}: ok={} ({})", track_id, ok, message);
+                self.tag_write_status = message.into();
+                self.tag_write_status_changed();
+                // A successful file write means the DB-override overlay is
+                // now redundant for those fields, but we leave it; a rescan
+                // will pick up the file's new tags. Trigger a library
+                // refresh so the UI reflects the change immediately.
+                if ok {
+                    self.send_media(media::MediaCmd::ListPlaylists);
+                }
             }
             media::MediaResult::ScanProgress(p) => {
                 self.scan_phase = format!("{:?}", p.phase);
@@ -10578,7 +10725,7 @@ fn set_products_from_file(pinned: &mut QObjectPinned<QtState>) {
                  loop_studio_rename=on; prune_orphans=on; \
                  albums_alpha_fallback=on; playbar_title_clip=on; \
                  ss_no_repeat=on; ss_center_downmix=on; ss_fsm_continuity=on; ss_spatial_spread=on; anc_freq_taper=on; \
-                 scene_metadata=on; scene_picker_rich=on; seek_log_fix=on; spaces_connections_target_fix=on; rng_high_bits=on; relink_txn=on; scene_picker_offline=on; ui_bottom_padding=on; scroll_strength=on; scene_bootstrap_heal=on; search_clear_count=on; theme_toast=on; toggle_press_feedback=on; ss_swell=on; bt_volume_active_sink=on; duration_ffprobe_fallback=on; battery_aware=on; duck_silence_skip=on; power_status=on; ss_timing_jitter=on; unknown_artist_fallback=on; all_tracks_view=on; all_tracks_tab=on; play_orphan_reap=on; per_device_head_title=on; resume_single_seek=on; per_device_volume_memory=on; per_device_volume_strip=on; inline_device_volume_stepper=on; quad_lfe_synthesis=on; workshop_opus_input=on; mixer_spatializer_width=on; stem_stereo_placement=on; playlist_drag_reorder=on; queue_policy_modes=on; track_ratings=on");
+                 scene_metadata=on; scene_picker_rich=on; seek_log_fix=on; spaces_connections_target_fix=on; rng_high_bits=on; relink_txn=on; scene_picker_offline=on; ui_bottom_padding=on; scroll_strength=on; scene_bootstrap_heal=on; search_clear_count=on; theme_toast=on; toggle_press_feedback=on; ss_swell=on; bt_volume_active_sink=on; duration_ffprobe_fallback=on; battery_aware=on; duck_silence_skip=on; power_status=on; ss_timing_jitter=on; unknown_artist_fallback=on; all_tracks_view=on; all_tracks_tab=on; play_orphan_reap=on; per_device_head_title=on; resume_single_seek=on; per_device_volume_memory=on; per_device_volume_strip=on; inline_device_volume_stepper=on; quad_lfe_synthesis=on; workshop_opus_input=on; mixer_spatializer_width=on; stem_stereo_placement=on; playlist_drag_reorder=on; queue_policy_modes=on; track_ratings=on; edit_dialog_global=on; edit_long_press=on; rating_in_edit=on; tag_write_back=on; layer_model=on; playpause_resume_fix=on; add_to_playlist_ui=on; playlist_create_enter=on; smooth_scroll_rebound=on; all_tracks_sort=on; album_sort=on; artist_sort=on; lenient_scroll=on; native_folder_picker=on; last_scan_root=on; tag_artist_populate_fix=on; standby_card_overlap_fix=on; playlist_rename_ui=on; repeat_button=on");
 
             // Device-memory banner: dump every persisted firmware
             // classification so the user can verify the per-device
@@ -11106,6 +11253,25 @@ fn main() {
     state.enqueue_mode = queue_policy::EnqueueMode::from_tag(
         &settings_store::get_str("enqueue_mode").unwrap_or_default()
     ).as_tag().into();
+    // Restore the all-tracks browse sort (Title if unset/invalid).
+    {
+        let s = settings_store::get_str("all_tracks_sort").unwrap_or_default();
+        state.all_tracks_sort = media::catalog::TrackSort::from_tag(&s).to_tag().into();
+    }
+    {
+        let s = settings_store::get_str("album_sort").unwrap_or_default();
+        state.album_sort = media::library::AlbumSort::from_tag(&s).to_tag().into();
+    }
+    {
+        let s = settings_store::get_str("artist_sort").unwrap_or_default();
+        state.artist_sort = match media::catalog::ArtistPageSort::from_tag(&s) {
+            media::catalog::ArtistPageSort::TrackCount => "tracks",
+            media::catalog::ArtistPageSort::Name => "name",
+        }.into();
+    }
+    // Last-scanned music location (empty until the first scan).
+    state.last_scan_root = settings_store::get_str("last_scan_root")
+        .unwrap_or_default().into();
     // Publish the band centers so the QML can label sliders without
     // hardcoding the principle (kept DRY with realtime_mixer.rs).
     state.mixer_band_centers_json = serde_json::json!({

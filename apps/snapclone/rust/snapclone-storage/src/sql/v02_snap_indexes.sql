@@ -1,0 +1,1 @@
+-- Migration v02_snap_indexes (stub — copy from kMigrations[] in StorageManager.cpp)

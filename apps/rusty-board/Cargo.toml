@@ -11,8 +11,6 @@ keywords = ["keyboard", "input-method", "gtk", "wayland", "voice"]
 categories = ["accessibility", "gui"]
 
 [dependencies]
-core-kit = { path = "../../shared/core-kit" }
-voice-kit = { path = "../../shared/voice-kit" }
 # GTK4 and Adwaita
 # All gtk-rs crates must be from the same release matrix; mixing causes
 # duplicate `links = "gtk-4"` errors at link time. The 0.10/0.21 matrix

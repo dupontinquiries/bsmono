@@ -1,0 +1,11 @@
+[package]
+name = "snapclone-menu"
+version = "0.1.0"
+edition = "2021"
+description = "Dynamic submenu model: given an entity (contact/group/mailbox) and its state, produce the ordered action descriptors a UI renders. Platform-free, tested, C FFI."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

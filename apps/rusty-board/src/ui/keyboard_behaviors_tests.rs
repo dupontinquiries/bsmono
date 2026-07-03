@@ -1799,6 +1799,66 @@ mod stress_tests {
         assert_eq!(count.get(), 10, "direct dispatch must fire all BS");
     }
 
+    #[test]
+    fn cardinal_north_flick_also_satisfies_strict_minimize_fling() {
+        // REGRESSION GUARD for the "would_resolve_as_cardinal was built
+        // but never wired into drag_end" bug. This test demonstrates
+        // the exact ambiguous path: a fast (2.5 px/ms), long (125px)
+        // decisive upward flick on a cardinal cell with a configured
+        // 'n' gesture satisfies BOTH:
+        //   (a) detect_minimize_fling's STRICT thresholds (term_vy <=
+        //       -2.0, dy <= -120, dominance >= 1.2) — the cardinal/
+        //       stenotype dismiss-fling gate, and
+        //   (b) would_resolve_as_cardinal (a real, configured N
+        //       direction on the source cell).
+        //
+        // Before the fix, drag_end ran detect_minimize_fling BEFORE
+        // any cardinal-resolution check, so this path would have sent
+        // the keyboard to the tray instead of committing the N
+        // direction — even though it's a textbook-clean cardinal
+        // swipe. The fix checks would_resolve_as_cardinal FIRST in
+        // drag_end (not tested directly here since it's inside a GTK
+        // closure), so a resolvable cardinal gesture always wins. This
+        // test pins the underlying ambiguity both predicates agree on,
+        // which is what makes the ordering the deciding factor.
+        let layout = Layout::default_cardinal_grid();
+        let boxes = build_hitboxes(&layout);
+        // Find a cell with a configured 'n' (north) gesture.
+        let source = boxes
+            .iter()
+            .find(|b| b.key.gestures.as_ref().and_then(|g| g.n.as_ref()).is_some())
+            .expect("cardinal_grid must have at least one key with an n gesture")
+            .clone();
+        let cx = source.x + source.width / 2.0;
+        let cy = source.y + source.height / 2.0;
+        // Fast, long, pure-vertical flick: 125px up in 50ms = 2.5 px/ms
+        // terminal velocity, well past both strict thresholds.
+        let path = synth_path(&[
+            (cx, cy, 0),
+            (cx, cy - 60.0, 25),
+            (cx, cy - 125.0, 50),
+        ]);
+
+        // (a) Satisfies strict minimize-fling.
+        let fling = super::super::detect_minimize_fling(
+            &path, &boxes, 0.0, -125.0, /* strict */ true,
+        );
+        assert!(
+            fling.is_some(),
+            "path must satisfy strict minimize-fling criteria (this is \
+             the ambiguity the fix resolves — if this assertion starts \
+             failing, the thresholds changed and this test needs new \
+             numbers, not deletion)"
+        );
+
+        // (b) ALSO resolves as a real cardinal gesture.
+        assert!(
+            super::super::would_resolve_as_cardinal(&path, &boxes),
+            "path must also resolve as a real cardinal N gesture — this \
+             is the case that must win over the fling detector"
+        );
+    }
+
     // ---- Minimize-fling boundary conditions ----
 
     #[test]
@@ -4332,8 +4392,8 @@ mod steno_dead_zone_fix_tests {
                 (dx * dx + dy * dy).sqrt()
             })
             .sum();
-        // Dead zone: total >= TAP_EVICTION_PX (12) AND total < swipe_threshold (20).
-        assert!(total >= 12.0, "total {} must >= TAP_EVICTION_PX (12)", total);
+        // Dead zone: total >= TAP_EVICTION_PX (13) AND total < swipe_threshold (20).
+        assert!(total >= 13.0, "total {} must >= TAP_EVICTION_PX (13)", total);
         // Note: this fixture deliberately falls in the 25-35px range
         // because path total counts all motion including the recoil
         // — so the user perceives a "short flick" even though the

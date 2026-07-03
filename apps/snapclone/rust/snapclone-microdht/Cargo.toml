@@ -1,0 +1,20 @@
+[package]
+name        = "snapclone-microdht"
+version     = "0.1.0"
+edition     = "2021"
+description = "A tiny, dependency-free DHT node for SnapClone beta testing. Stores sc-ID keyed endpoint values + connection-request mailbox entries over a small UDP text protocol, with TTL expiry and re-announce semantics that mirror the OpenDHT path. Lets a developer run a LOCAL test peer to exercise the app's DHT publish / lookup / mailbox flows without the real Jami DHT."
+
+# Pure std-lib ONLY (UDP, threads, a hand-rolled text protocol). No external
+# crates, so it builds offline with just `cargo build` and runs as a fully
+# self-contained test peer in any environment.
+
+[lib]
+name       = "snapclone_microdht"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "sc-microdht"
+path = "src/main.rs"
+
+[dependencies]
+# intentionally empty — std only

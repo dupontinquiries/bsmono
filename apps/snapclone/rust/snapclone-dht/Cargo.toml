@@ -1,0 +1,18 @@
+[package]
+name        = "snapclone-dht"
+version     = "0.1.0"
+edition     = "2021"
+description = "DHT peer identity, discovery, and address resolution for SnapClone"
+
+[lib]
+name       = "snapclone_dht"
+crate-type = ["rlib"]
+
+[dependencies]
+snapclone-identity = { path = "../snapclone-identity" }
+snapclone-nat      = { path = "../snapclone-nat"      }
+anyhow  = "1"
+chrono  = { version = "0.4", features = ["serde"] }
+serde   = { version = "1", features = ["derive"] }
+tokio   = { version = "1", features = ["net", "time", "rt"] }
+tracing = "0.1"

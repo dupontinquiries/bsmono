@@ -1339,7 +1339,8 @@ Window {
                         visible: libRoot.tagList.length > 0
                         contentWidth: tagChipsRow.implicitWidth
                         contentHeight: 28
-                        boundsBehavior: Flickable.OvershootBounds
+                        boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
                         flickableDirection: Flickable.HorizontalFlick
                         clip: true
 
@@ -1441,7 +1442,8 @@ Window {
                             clip: true
                             model: libRoot.trackList
                             cacheBuffer: 400
-                            boundsBehavior: Flickable.OvershootBounds
+                            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
                             flickDeceleration: 1800
 
                             delegate: TrackRow {
@@ -1503,7 +1505,8 @@ Window {
                             clip: true
                             model: libRoot.artistList
                             cacheBuffer: 400
-                            boundsBehavior: Flickable.OvershootBounds
+                            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
                             flickDeceleration: 1800
 
                             delegate: GroupRow {
@@ -1535,7 +1538,8 @@ Window {
                             clip: true
                             model: libRoot.tagList
                             cacheBuffer: 400
-                            boundsBehavior: Flickable.OvershootBounds
+                            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
                             flickDeceleration: 1800
 
                             delegate: GroupRow {
@@ -1559,13 +1563,6 @@ Window {
                             ScrollBar.vertical: ScrollBar { }
                         }
                     }
-                }
-
-                // Long-press a track row to open this edit dialog. Floats
-                // above the ListView at z:200.
-                EditTrackDialog {
-                    id: editDialog
-                    accent: window.accent
                 }
 
                 // Asks where to scan when Scan is tapped (see scanMouse above).
@@ -2221,6 +2218,24 @@ Window {
     }
     // Expose to other QML files via window.tagEditor.
     property alias tagEditor: tagEditorGlobal
+
+    // Track metadata editor (title/artist/album/year/rating). Top-level
+    // and aliased so any page can call window.editDialog.open(track) on a
+    // long-press. z:320 keeps it above the tag editor but under toasts.
+    EditTrackDialog {
+        id: editDialogGlobal
+        accent: window.accent
+        z: 320
+    }
+    property alias editDialog: editDialogGlobal
+
+    // Add-to-playlist picker — opened from the edit sheet or a row action.
+    AddToPlaylistDialog {
+        id: addToPlaylistGlobal
+        accent: window.accent
+        z: 340
+    }
+    property alias addToPlaylist: addToPlaylistGlobal
 
     // Bluetooth sink picker — modal dialog letting the user manually
     // pick which paired BT speaker is the audio output for the

@@ -1,0 +1,21 @@
+[package]
+name        = "snapclone-nat"
+version     = "0.1.0"
+edition     = "2021"
+description = "STUN, UDP hole-punching, and NAT traversal for SnapClone"
+
+[lib]
+name      = "snapclone_nat"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow     = "1"
+tokio      = { version = "1", features = ["net", "time", "rt", "macros"] }
+tracing    = "0.1"
+rand       = "0.8"
+bytes      = "1"
+
+[features]
+default = []
+# Enable cbindgen-compatible C FFI exports for Qt integration
+ffi = []

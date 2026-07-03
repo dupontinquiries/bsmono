@@ -161,14 +161,33 @@ QtObject {
     // 72 (bar) + 34 (device strip) + 12 (gap) + 6 (dots) + 40 (gap) + buffer
     readonly property int bottomChromeHeight: 172
 
-    // ── Scroll feel ─────────────────────────────────────────────────
-    // Default Flickable deceleration (1500) feels sticky on touch — a
-    // fling stops too soon, so long lists need many swipes. Lower
-    // deceleration lets a fling glide further; higher max velocity lets
-    // a fast swipe actually move fast. Apply these to page-level
-    // Flickables / ListViews for a stronger, more momentum-y scroll.
-    readonly property real flickDecel:   850     // was default 1500 (glides ~2x further)
-    readonly property real flickMaxVel:  6000    // was default 2500 (faster flings)
+    // ── Scroll feel (Chromium / desktop-style, lenient) ─────────────
+    // Goal: scrolling that doesn't fight the user. Desktop browsers glide
+    // a long way on a fling, respond instantly to a drag (no press delay),
+    // and don't rubber-band hard at the ends. We tune four things on each
+    // page-level Flickable / ListView:
+    //   flickDeceleration  — LOW so a fling coasts far (Chromium coasts a
+    //                        lot); default 1500 feels sticky.
+    //   maximumFlickVelocity — HIGH so a fast swipe actually moves fast.
+    //   boundsBehavior     — DragOverBounds (Bo.boundsLenient): you can
+    //                        drag past the edge, but a *flick* stops
+    //                        cleanly at the bound instead of flinging into
+    //                        a big elastic overshoot — the desktop feel.
+    //   pressDelay         — 0 (Bo.pressDelay): content tracks the finger
+    //                        immediately, no "press, then catch up" lag.
+    readonly property real flickDecel:   500     // was 850; coasts much further now
+    readonly property real flickMaxVel:  8000    // was 6000; snappier fast swipes
+    readonly property int  pressDelay:   0       // immediate drag response
+    // boundsBehavior value as an int the bindings can use without each
+    // file importing the Flickable enum name. Flickable.DragOverBounds = 1.
+    readonly property int  boundsLenient: 1      // Flickable.DragOverBounds
+
+    // Overshoot rebound. When a drag past the edge releases, the content
+    // eases back; a smooth decelerating settle reads as physical. Apply as
+    // a Flickable's `rebound:` transition for a consistent return.
+    readonly property int  reboundDur:   380
+    // Friction for a flick's tail. Higher pixel-alignment avoids the
+    // sub-pixel shimmer some long lists show as they glide to a stop.
 
     // ── Helpers ─────────────────────────────────────────────────────
     // Mix two colors (t in 0..1). QML has no built-in lerp for colors

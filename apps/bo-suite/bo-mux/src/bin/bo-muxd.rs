@@ -621,6 +621,84 @@ fn bootstrap_clips(dir: &std::path::Path) {
         filt: "afade=t=in:d=2,afade=t=out:st=6:d=2,volume=0.6".to_string(),
     });
 
+    // ── Brook / river water (forest + river_calm scenes) ────────────
+    // Water = mid/high filtered noise with fast, shallow tremolo for the
+    // "bubbling" texture. Distance shapes it: close is bright + present,
+    // mid is rolled off, far is dark + quiet with a touch of echo for
+    // depth. Each of the three distances gets 8 variants (a..h) so the
+    // scheduler can avoid back-to-back repeats.
+    for (i, v) in variants.iter().enumerate() {
+        // close: bright, 700..1400 Hz centre, lively tremolo.
+        let cf_c = 700 + i * 100;
+        jobs.push(Synth {
+            name: Box::leak(format!("brook_close_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=white:amplitude=0.5:duration=8:sample_rate=48000",
+            filt: format!(
+                "highpass=f=500,lowpass=f={},tremolo=f={:.1}:d=0.35,\
+                 afade=t=in:d=1.2,afade=t=out:st=6.8:d=1.2,volume=0.42",
+                cf_c, 7.0 + (i as f32) * 0.4),
+        });
+        // mid: rolled off, a little softer.
+        let lp_m = 1600 + i * 80;
+        jobs.push(Synth {
+            name: Box::leak(format!("brook_mid_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=pink:amplitude=0.5:duration=8:sample_rate=48000",
+            filt: format!(
+                "highpass=f=350,lowpass=f={},tremolo=f={:.1}:d=0.3,\
+                 afade=t=in:d=1.5,afade=t=out:st=6.5:d=1.5,volume=0.36",
+                lp_m, 5.5 + (i as f32) * 0.3),
+        });
+        // far: dark, quiet, with a short echo so it sits "behind" the mix.
+        let lp_f = 900 + i * 50;
+        jobs.push(Synth {
+            name: Box::leak(format!("brook_far_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=brown:amplitude=0.5:duration=8:sample_rate=48000",
+            filt: format!(
+                "highpass=f=250,lowpass=f={},aecho=0.8:0.6:30:0.2,\
+                 tremolo=f={:.1}:d=0.25,afade=t=in:d=2,afade=t=out:st=6:d=2,\
+                 volume=0.28", lp_f, 4.0 + (i as f32) * 0.2),
+        });
+    }
+
+    // ── Forest wind beds (forest + forest_quiet scenes) ─────────────
+    // wind_canopy = nearby leaves-in-wind (brighter, more movement);
+    // wind_distant = far treeline wind (darker, slower swell).
+    for (i, v) in variants.iter().enumerate() {
+        let bp_c = 700 + i * 120;
+        jobs.push(Synth {
+            name: Box::leak(format!("wind_canopy_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=pink:amplitude=0.6:duration=9:sample_rate=48000",
+            filt: format!(
+                "bandpass=f={}:width_type=h:w=900,tremolo=f={:.2}:d=0.6,\
+                 afade=t=in:d=2,afade=t=out:st=7:d=2,volume=0.5",
+                bp_c, 0.25 + (i as f32) * 0.05),
+        });
+        let lp_d = 500 + i * 60;
+        jobs.push(Synth {
+            name: Box::leak(format!("wind_distant_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=brown:amplitude=0.6:duration=10:sample_rate=48000",
+            filt: format!(
+                "lowpass=f={},tremolo=f={:.2}:d=0.5,afade=t=in:d=3,\
+                 afade=t=out:st=7:d=3,volume=0.42",
+                lp_d, 0.12 + (i as f32) * 0.03),
+        });
+    }
+
+    // ── Leaves rustle (forest scenes) ───────────────────────────────
+    // Short, sharp filtered-noise bursts padded out to a few seconds so
+    // they trigger as occasional accents rather than a continuous bed.
+    for (i, v) in variants.iter().enumerate() {
+        let hp = 1500 + i * 150;
+        jobs.push(Synth {
+            name: Box::leak(format!("leaves_rustle_{}.opus", v).into_boxed_str()),
+            src: "anoisesrc=color=white:amplitude=0.4:duration=0.7:sample_rate=48000",
+            filt: format!(
+                "highpass=f={},lowpass=f=8000,tremolo=f=18:d=0.7,\
+                 afade=t=in:d=0.08,afade=t=out:st=0.45:d=0.2,volume=0.3,\
+                 apad=pad_dur=3.5", hp),
+        });
+    }
+
     // Skip jobs whose target already exists.
     let pending: Vec<&Synth> = jobs.iter()
         .filter(|j| !dir.join(j.name).exists())

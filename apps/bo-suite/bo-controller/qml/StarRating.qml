@@ -1,4 +1,5 @@
 import QtQuick 2.15
+import "."
 
 // A compact, tappable 5-star rating control.
 //

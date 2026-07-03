@@ -1,0 +1,11 @@
+[package]
+name = "snapclone-composer"
+version = "0.1.0"
+edition = "2021"
+description = "Decision model for the group live-composer feed: given timestamped media over a 24h window, a scrub position, and voice-activity, decide which tiles are visible, which is active, and audio/playback state. Platform-free, tested, C FFI."
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]

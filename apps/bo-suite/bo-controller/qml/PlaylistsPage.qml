@@ -69,6 +69,15 @@ Item {
             color: Bo.surface
             border.color: Bo.hairline; border.width: 1
             property bool expanded: false
+            // Single source of truth for creating — used by the name/desc
+            // Enter keys and the Create button so they can't drift.
+            function submit() {
+                if (nameField.text.trim().length === 0) return
+                qtobj.create_playlist(nameField.text.trim(), descField.text.trim())
+                nameField.text = ""
+                descField.text = ""
+                createCard.expanded = false
+            }
             Behavior on height { NumberAnimation { duration: Bo.base; easing.type: Easing.OutCubic } }
 
             // Collapsed view
@@ -106,6 +115,10 @@ Item {
                     width: parent.width
                     placeholderText: "Playlist name"
                     color: Bo.bone
+                    // Focus the name field when the form expands so you can
+                    // type immediately, and submit on Enter when it's valid.
+                    focus: createCard.expanded
+                    onAccepted: createCard.submit()
                     background: Rectangle {
                         color: Bo.graphite
                         radius: 4
@@ -117,6 +130,9 @@ Item {
                     width: parent.width
                     placeholderText: "Description (optional)"
                     color: Bo.silver
+                    // Enter on the description also creates (the common
+                    // "fill both then hit return" flow).
+                    onAccepted: createCard.submit()
                     background: Rectangle {
                         color: Bo.graphite
                         radius: 4
@@ -158,12 +174,7 @@ Item {
                         MouseArea {
                             anchors.fill: parent
                             enabled: nameField.text.length > 0
-                            onClicked: {
-                                qtobj.create_playlist(nameField.text, descField.text)
-                                nameField.text = ""
-                                descField.text = ""
-                                createCard.expanded = false
-                            }
+                            onClicked: createCard.submit()
                         }
                     }
                 }
@@ -181,6 +192,9 @@ Item {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight

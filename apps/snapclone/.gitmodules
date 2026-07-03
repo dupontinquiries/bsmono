@@ -1,0 +1,4 @@
+[submodule "third_party/opendht"]
+	path = third_party/opendht
+	url = https://github.com/savoirfairelinux/opendht.git
+	branch = master

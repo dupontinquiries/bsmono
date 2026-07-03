@@ -1,0 +1,1 @@
+-- Migration v03_snap_recipients (stub — copy from kMigrations[] in StorageManager.cpp)

@@ -1,0 +1,19 @@
+[package]
+name        = "snapclone-videosrc"
+version     = "0.1.0"
+edition     = "2021"
+description = "Video source model for SnapClone: classifies PipeWire video sources (physical/USB/virtual cameras, screenshare) and answers whether a chosen SET of sources can capture SIMULTANEOUSLY (the check PiP was missing). See docs/PIP_AND_SCREENSHARE_DESIGN.md."
+
+[lib]
+name       = "snapclone_videosrc"
+crate-type = ["rlib"]
+
+# On-device diagnostic harness: runs the SAME gst-launch pipeline the app uses,
+# reads raw frames from fd, and reports real per-frame stats (true frame count,
+# fps, stride, layout validity) validated through the lib logic. Pure std.
+[[bin]]
+name = "sc-camdiag"
+path = "src/bin/sc_camdiag.rs"
+
+# Pure std — this is decision logic over enumerated sources, no I/O, no deps.
+[dependencies]
