@@ -191,3 +191,13 @@ Built and tested this pass:
   call `try_connect` before their own path.
 - device-kit (PipeWire/v4l2) — snapclone's camera-bridge is the reference.
 - uikit adoption / Qt+GTK→egui ports (largest LOC lever).
+
+### Port progress — rusty-board → egui (STARTED)
+- `apps/rusty-board/egui-frontend` (`rusty-board-egui`): the on-screen keyboard's UI ported
+  from GTK4 to egui on **uikit-egui + adaptive**. Renders keys sized by device class (taller
+  touch targets on the FP5, tighter on desktop), themed via snapclone-theme, with a pure
+  `hit_test` for headless layout tests. **Compiles against egui 0.29; 3 tests.** Proves the
+  port recipe for the other Qt/GTK apps (bot-arena, voiceterm, bo-suite, snapclone).
+- Remaining for rusty-board: split the crate into `rusty-board-core` (its already-GTK-free
+  `layouts` + `gestures` + `keyboard/engine.rs`) and drive this front-end from it; add the
+  eframe `main()` + text-injection into the compositor (the Wayland backend already exists).
