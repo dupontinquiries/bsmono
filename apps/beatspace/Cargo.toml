@@ -1,0 +1,65 @@
+[package]
+name = "beatspace"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the kBM3 mel-spectrogram GAN: train on your own audio, then drag through latent space and hear beats morph in realtime."
+
+[[bin]]
+name = "beatspace"
+path = "src/main.rs"
+
+[dependencies]
+# --- neural net (pure-Rust, CPU by default; see README for GPU) ---
+candle-core = "0.11"
+candle-nn   = "0.11"
+
+# --- GUI ---
+eframe = { version = "0.35", default-features = true }
+egui   = "0.35"
+
+# --- realtime audio out ---
+cpal = "0.18"
+
+# --- DSP ---
+rustfft = "6.4"
+hound   = "3.5"          # wav export of generated beats
+
+# --- audio decoding ---
+# symphonia handles wav / flac / mp3 / m4a / ogg-vorbis. It does NOT ship an
+# Opus codec, so .opus files go through the ogg + opus crates below.
+symphonia = { version = "0.6", default-features = false, features = [
+    "wav", "pcm", "flac", "mp3", "isomp4", "aac", "alac", "ogg", "vorbis",
+] }
+ogg  = "0.9"             # ogg container demux for .opus
+opus = "0.3"             # libopus codec  (needs system libopus + pkg-config)
+
+# --- misc ---
+anyhow = "1"
+crossbeam-channel = "0.5"
+clap   = { version = "4", features = ["derive"] }
+serde  = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand   = "0.8"
+rayon  = "1"
+
+# --- optional GPU compute backend (wgpu -> Vulkan/Metal/DX12) ---
+# Used by `--features gpu` to run batched generator inference on the GPU.
+# wgpu reaches the Apple GPU on Asahi via Vulkan (Mesa), and Metal/DX12/GL
+# elsewhere, so it works where candle's CUDA/Metal backends don't.
+wgpu     = { version = "27", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+# Enable one of these to train/generate on a GPU instead of CPU, e.g.
+#   cargo run --release --features cuda  -- train ...
+#   cargo run --release --features metal -- gui   ...
+[features]
+default = []
+cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal"]
+# Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).
+gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target
+
+# Model + data artifacts (can be large)
+/checkpoints
+/cache
+/data
+
+# Generated audio dumps
+*.wav
+
+# OS / editor cruft
+.DS_Store

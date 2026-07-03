@@ -1,0 +1,11 @@
+[package]
+name = "fao-cli"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "fao"
+path = "src/main.rs"
+
+[dependencies]
+fao-codec-v1 = { path = "../fao_codec_v1" }

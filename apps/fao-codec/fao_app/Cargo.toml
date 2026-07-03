@@ -1,0 +1,29 @@
+[package]
+name = "fao-app"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "fao-app"
+path = "src/main.rs"
+
+[features]
+default = []
+gpu = ["fao-codec-v1/gpu"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.7" }
+glib = "0.18"
+adw = { package = "libadwaita", version = "0.5" }
+fao-codec-v1 = { path = "../fao_codec_v1" }
+fao-codec-v2 = { path = "../fao_codec_v2" }
+zstd = "0.13"
+libc = "0.2"
+# Memory-mapped file access for large .fao files. With ~50GB clips the 
+# eager load path slurps the whole file into RAM, which works on 64GB+ 
+# systems but blows up smaller ones. memmap2 lets us hand the OS the 
+# file and read pages on demand. Smart loader chooses based on available 
+# memory at open time — see TranscodeState::load_fao for the logic.
+memmap2 = "0.9"
+serde_json = "1"
+gdk-pixbuf = "0.18"
