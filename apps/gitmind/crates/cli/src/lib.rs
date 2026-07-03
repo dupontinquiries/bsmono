@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|downloads|suite-install|build|clean|prepare|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|downloads|suite-install|build|clean|prepare|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir|unbreak-ssh> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1370,6 +1370,22 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 }
             }
             0
+        }
+        "unbreak-ssh" | "fix-ssh" => {
+            let (user, host) = match (pos.first(), pos.get(1)) {
+                (Some(u), Some(h)) => (u.as_str(), h.as_str()),
+                _ => {
+                    // also accept a single user@host argument
+                    match pos.first().and_then(|s| s.split_once('@')) {
+                        Some((u, h)) => (u, h),
+                        None => return err("usage: gitmind fleet unbreak-ssh <user> <host>   (or user@host)"),
+                    }
+                }
+            };
+            match cockpit::deploy::unbreak_ssh(user, host) {
+                Ok(m) => { println!("{m}"); 0 }
+                Err(e) => err(&e),
+            }
         }
         "downloads" => {
             let items = flow::scan_downloads(&flow::downloads_dir());

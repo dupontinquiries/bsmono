@@ -1752,3 +1752,24 @@ VERIFIED: cockpit 82 tests (+4: 3 pydeps, 1 real pygame build; 15s incl. wheel d
 cockpit clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck cockpit CLEAN. No GUI/CLI surface
 changes — the coverage is inside the build; on Alpine it will apk-add SDL2 dev + compile (best-effort, needs
 root/doas), else the error names the exact `apk add …`.
+
+── FIX: gitmind key install broke interactive ssh (PTY allocation request failed) ──
+USER BUG: `ssh user@192.168.2.223` → "PTY allocation request failed on channel 0" after a gitmind key install.
+ROOT CAUSE: deploy::setup_key (the "set up SSH key" wizard for user@host) installed the USER'S OWN DEFAULT key
+(ensure_local_pubkey→id_ed25519) into authorized_keys with authorized_keys_options = `...,restrict`. `restrict`
+IMPLIES `no-pty` → interactive ssh with that same key is refused a PTY. The restrict/expiry hardening belongs
+ONLY to the dedicated non-interactive fleet user (provision_fleet_user via restricted_key_line) — never an
+interactive account.
+FIX: deploy::plain_key_line(pubkey) = `<type> <b64> gitmind\n` (no restrict/no-pty/expiry, ssh-copy-id style,
+"gitmind" comment for pruning). setup_key now uses plain_key_line + a newline-safe remote append (ensures the
+file ends in \n before cat, so our line never fuses onto a prior key). authorized_keys_options/restricted_key_
+line UNCHANGED (still correct for the fleet user). RECOVERY: deploy::unrestrict_command() (backup + sed strip
+of any leading options token containing restrict/no-pty before a key) and deploy::unbreak_ssh(user,host)=
+remote_capture(unrestrict_command) — works over the degraded conn since key auth still succeeds (only PTY was
+refused, no forced command). CLI `fleet unbreak-ssh|fix-ssh <user> <host>|user@host`. GUI keys card:
+"restore SSH (PTY)" button → unbreak_ssh(selHost,user). TESTS: plain_key_line has no restrict/no-pty/expiry +
+==`ssh-ed25519 AAAAC3xyz gitmind\n`; unrestrict_command backs up + strips restrict. deploy 15t OK.
+MANUAL RECOVERY for the user (key still auths, no forced command → remote cmd works):
+  ssh user@192.168.2.223 'cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.gm-bak; sed -i -E "s/^[^ ]*restrict[^ ]* +(ssh-|ecdsa-|sk-)/\1/" ~/.ssh/authorized_keys && echo fixed'
+  then reconnect. (Or edit ~/.ssh/authorized_keys on the phone, remove the `expiry-time="...",restrict` prefix.)
+VERIFIED: cockpit 82 tests; cargo check -p gitmind-cli clean; rustcheck gui CLEAN; Settings balanced+resolve.
