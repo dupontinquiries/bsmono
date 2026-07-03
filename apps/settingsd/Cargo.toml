@@ -1,0 +1,16 @@
+[package]
+name = "settingsd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The settings daemon: serves the cross-app settings namespace over the 'settings' socket (datashare-core Hub for KV + pub-sub), persists every change to ~/.config/gitmind via config-kit so settings survive restarts, and seeds sane defaults on first run. The central settings app and every egui-kit app talk to it through bigsilicon-client."
+
+[[bin]]
+name = "settingsd"
+path = "src/main.rs"
+
+[dependencies]
+ipc-kit = { path = "../../shared/ipc-kit" }
+datashare-core = { path = "../../shared/datashare-core" }
+config-kit = { path = "../../shared/config-kit" }
+settings-kit = { path = "../../shared/settings-kit" }
