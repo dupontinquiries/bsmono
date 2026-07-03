@@ -155,3 +155,30 @@ directional, but the strong signals:
 Remaining to make the daemons real: bind ipc-kit sockets in a `voiced` and a `sharemd`
 binary, wire voiced's audio stage (voice-kit + audio-kit + voiceterm's mic/whisper pool),
 back datashare with share-kit, and have apps call `try_connect` before their own path.
+
+## Kits built (config/cli/gpu) + TODOs
+
+Built and tested this pass:
+- **cli-kit** — std-only arg parsing (flag / opt / opt_all / positionals / subcommand),
+  lifted from gitmind's CLI. **gitmind's CLI now consumes it** (first realized adoption).
+- **config-kit** — std-only XDG dirs + load/save + minimal `[section] key=value` parser.
+- **gpu-kit** — reduce wgpu boilerplate. v0.1 is the version-agnostic policy core (power
+  preference, sRGB, present-mode/MSAA/format selection over the app's capability lists),
+  tested. A `wgpu29`-feature context builder (`Gpu::headless`, `shader()`) wraps the
+  instance→adapter→device→queue dance.
+
+### TODO — GPU kit
+- The 7 wgpu apps span **wgpu 0.19 / 27 / 29** — align them (target 29) so the `wgpu29`
+  context builder is usable everywhere; until then the policy core is the portable part.
+- Compile-verify `gpu-kit[wgpu29]` on-device (can't build wgpu in the sandbox).
+- Extend the builder: surface creation + `configure(&Policy)` + resize; a small
+  render/compute pipeline helper; bind-group-layout shorthands. Reference the repeated
+  code in beatspace/src/gpu.rs, fao-codec/src/{gpu_pipeline,gpu_phase_corr,v8_gpu_rasterizer}.rs,
+  unendlich (world_renderer), bo-suite (surface config).
+
+### TODO — remaining backlog
+- config-kit / cli-kit adoption across the other ~10 apps (delete their local copies).
+- Bind ipc-kit sockets into real `voiced` + `sharemd` binaries; wire voiced's audio stage
+  (voice-kit + audio-kit + voiceterm's mic/whisper pool); back datashare with share-kit.
+- device-kit (PipeWire/v4l2) — snapclone's camera-bridge is the reference.
+- uikit adoption / Qt+GTK→egui ports (largest LOC lever).
