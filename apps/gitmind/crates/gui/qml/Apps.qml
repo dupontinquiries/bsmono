@@ -233,9 +233,9 @@ Item {
                     delegate: Rectangle {
                         width: groupCol.width; radius: 8; color: "#0f1320"
                         border.color: modelData.name === "bigsilicons-apps" ? "#b4a0ff" : "#3a2f57"
-                        height: gc.height + 14
+                        height: grpCard.height + 14
                         Column {
-                            id: gc
+                            id: grpCard
                             x: 10; y: 7; width: parent.width - 20; spacing: 4
                             Row {
                                 width: parent.width; spacing: 8
