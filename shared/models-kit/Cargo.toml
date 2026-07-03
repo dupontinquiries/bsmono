@@ -1,0 +1,9 @@
+[package]
+name = "models-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Canonical AI-model location for the monorepo: unifies every app's models under ~/models (override GITMIND_MODELS), with migration-aware search paths so voice-kit's find_model_in, voiceterm's model_download, beatspace's GAN weights, and snapclone's YOLO weights all resolve to one place. Zero-dependency (std only)."
+
+[lib]
+path = "src/lib.rs"

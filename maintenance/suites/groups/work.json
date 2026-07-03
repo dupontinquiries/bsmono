@@ -1,0 +1,46 @@
+{
+  "name": "group-work",
+  "description": "Development, comms & analysis tools",
+  "apps": [
+    {
+      "name": "gitmind",
+      "path": "apps/gitmind",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "logscope",
+      "path": "apps/logscope",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bot-arena",
+      "path": "apps/bot-arena",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "ambient-learner",
+      "path": "apps/ambient-learner",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "voiceterm",
+      "path": "apps/voiceterm",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}
