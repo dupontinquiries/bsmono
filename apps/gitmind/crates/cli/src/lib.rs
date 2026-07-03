@@ -1716,6 +1716,29 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 Some(other) => err(&format!("unknown suite command: {other} (list|show|create|install|rm)")),
             }
         }
+        "group" => {
+            match pos.first().map(|s| s.as_str()) {
+                Some("list") | None => {
+                    println!("BigSilicon app-store groups:");
+                    for g in flow::store_groups() {
+                        println!("  {:<18} {:>2} app(s)   {}", g.name, g.apps.len(), g.description);
+                    }
+                    println!("build one with: gitmind fleet group build <name>");
+                    0
+                }
+                Some("build") | Some("install") => {
+                    let name = match pos.get(1) { Some(n) => n, None => return err("usage: gitmind fleet group build <name>  (see: gitmind fleet group list)") };
+                    let g = match flow::group_by_name(name) { Some(g) => g, None => return err("no such group (try: gitmind fleet group list)") };
+                    println!("building {} app(s) from group '{}':", g.apps.len(), g.name);
+                    let results = flow::install_suite(&g);
+                    let ok = results.iter().filter(|r| r.ok).count();
+                    for r in &results { println!("  {} {:<24} {}", if r.ok { "✓" } else { "✗" }, r.name, r.message); }
+                    println!("{ok}/{} installed — launchers added to your app grid", results.len());
+                    if ok == results.len() { 0 } else { 1 }
+                }
+                Some(other) => err(&format!("unknown group command: {other} (list|build)")),
+            }
+        }
         "build-dir" => {
             if let Some(p) = pos.first() {
                 match cockpit::set_build_base(p) {
