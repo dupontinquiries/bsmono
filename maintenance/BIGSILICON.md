@@ -201,3 +201,34 @@ Built and tested this pass:
 - Remaining for rusty-board: split the crate into `rusty-board-core` (its already-GTK-free
   `layouts` + `gestures` + `keyboard/engine.rs`) and drive this front-end from it; add the
   eframe `main()` + text-injection into the compositor (the Wayland backend already exists).
+
+## TODO — cross-app call/activity coordination (scenario: in a snapclone call)
+
+When the user is in a snapclone voice call, other apps should react without hard-coding
+snapclone. The substrate is in place; `coord-core` is the arbitration brain.
+
+**Mechanism (uniform):**
+- **Presence** — each app publishes its [`Activity`] to `presence/<app>` on the data bus
+  (sharemd). snapclone publishes `voice_call`; subscribers react.
+- **Claims + arbitration** — apps make `Claim`s on shared `Resource`s (Mic, CallAudio,
+  Attention) with a `Mode` (Exclusive / Duck / Share). `coord-core::Arbiter` resolves a
+  `Directive` per app per resource: Own / Yield / Duck / Share. Mic claims flow through
+  voiced; CallAudio/Attention through sharemd.
+
+**The scenario, resolved (tested in coord-core):**
+- snapclone call → Exclusive claim on Mic + CallAudio (`VOICE_CALL`). Directive: Own.
+- **unendlich** → Share claim on CallAudio (`GAME_VOICE`): pipes call audio into the game;
+  snapclone keeps Own. unendlich also sends a *server invite* to the peer via share-kit's
+  mailbox (dhtmboxd), keyed off the call's peer identity.
+- **voiceterm** (user composing) → Duck claim on CallAudio (`DICTATION` ≥ `VOICE_CALL`, so
+  honoured): snapclone's directive becomes **Duck** → it mutes the call momentarily and
+  publishes a `busy` presence; voiceterm gets the floor. On release, snapclone resumes.
+- A low-priority ducker (e.g. background media) is **not** honoured against a live call.
+
+**Remaining wiring:**
+- Fold the `Arbiter` into a coordinator (either inside voiced for Mic + a small `coordd`,
+  or as a sharemd-hosted service) so claims/directives are pushed to apps over ipc-kit.
+- Each app: translate its own activity into claims, act on its directive (mute/show-busy/
+  pipe/invite), and publish presence. snapclone's busy notifier + mute hook; unendlich's
+  audio-pipe + invite; voiceterm's compose-duck.
+- Route the unendlich→peer invite through share-kit's mailbox.
