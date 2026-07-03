@@ -62,6 +62,17 @@ Item {
         // reuse the per-app suite installer so we get 3/16-style progress
         root.installSuite(g)
     }
+    // user@host of the device to install a whole group onto (desktop builds, phone runs)
+    property string groupDevice: ""
+    function installGroupToDevice(g) {
+        var at = root.groupDevice.indexOf("@")
+        if (at < 1 || at === root.groupDevice.length - 1) { root.note = "enter the device as user@host"; return }
+        var user = root.groupDevice.substring(0, at)
+        var host = root.groupDevice.substring(at + 1)
+        var r = JSON.parse(backend.build_group_remote(g.name, user, host, ""))
+        if (r.ok) { root.busy = true; root.jobKind = "buildgroup"; root.note = "building " + g.name + " here for " + host + "…"; suitePoller.start() }
+        else root.note = "✗ " + r.error
+    }
     function makeDefaultSuite() {
         var r = JSON.parse(backend.create_default_suite())
         if (!r.ok) { root.note = "✗ " + r.error; return }
@@ -126,6 +137,10 @@ Item {
                 root.busy = false
                 if (res.ok) { root.note = (res.updated ? "✓ updated " : "✓ installed ") + res.name + " @" + res.label; root.reload(); root.loadDownloads() }
                 else root.note = "✗ " + res.error
+            } else if (k === "buildgroup") {
+                root.busy = false
+                if (res.ok) root.note = "✓ built here + installed " + res.installed + "/" + res.total + " on " + (res.host || "device")
+                else root.note = "✗ " + (res.error || "remote install failed")
             }
         }
     }
@@ -206,7 +221,12 @@ Item {
                 }
                 Label {
                     width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
-                    text: "Curated groups share kits and build together. Tap a group to build & install every app in it for this device."
+                    text: "Curated groups share kits and build together. \"build all\" installs on this machine; set a device to build here and install on the phone."
+                }
+                TextField {
+                    width: parent.width; placeholderText: "install onto device — user@host (e.g. user@192.168.2.223)"
+                    text: root.groupDevice; onTextChanged: root.groupDevice = text
+                    color: "#cdd6f4"; font.pixelSize: 12
                 }
                 Repeater {
                     model: root.groups
@@ -220,7 +240,7 @@ Item {
                             Row {
                                 width: parent.width; spacing: 8
                                 Column {
-                                    width: parent.width - gBtn.width - 12
+                                    width: parent.width - gBtn.width - devBtn.width - 20
                                     Label {
                                         text: (modelData.name === "bigsilicons-apps" ? "BigSilicon apps" : modelData.name) + "  ·  " + (modelData.count || 0) + " apps"
                                         color: modelData.name === "bigsilicons-apps" ? "#b4a0ff" : "#cdd6f4"; font.bold: true; font.pixelSize: 13
@@ -232,6 +252,13 @@ Item {
                                     text: (root.installingSuite === modelData.name) ? (root.installIdx + "/" + root.installTotal) : "build all"
                                     enabled: !root.busy; anchors.verticalCenter: parent.verticalCenter
                                     onClicked: root.buildGroup(modelData)
+                                }
+                                Button {
+                                    id: devBtn
+                                    text: "→ device"
+                                    enabled: !root.busy && root.groupDevice.indexOf("@") > 0
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    onClicked: root.installGroupToDevice(modelData)
                                 }
                             }
                             Label {
