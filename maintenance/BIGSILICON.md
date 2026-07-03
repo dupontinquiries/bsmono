@@ -338,3 +338,30 @@ shared drop and as a cache of DHT results. Deploy integration: `reach` yields a
 `(user,host,port)` that scp_push/ssh use, so pushing a build to a phone on cellular resolves
 via the DHT advert instead of the LAN. Remaining: the snapcore UDP transport + a periodic
 advertise loop (publish self every ttl/2), and public-IP discovery (STUN/echo).
+
+## Peer connection broker — hand out streams, not DHT churn
+
+**Question:** can snapclone hand out ports/sockets to already-connected peers so apps stop
+each creating DHT entries, while keeping a reliable crypto handshake? **Yes** — and it's
+built + tested.
+
+- **`peermux-core`** (5 tests, real crypto via crypto-kit): a broker keeps **one
+  authenticated session per peer** (ephemeral X25519 key-agreement, each side's ephemeral
+  key signed by its long-term Ed25519 identity → the peer id *is* the verified key) and
+  **multiplexes app streams** over it. `Session::open_stream(service)` derives an isolated
+  per-stream key from the session secret via HKDF (`derive_session_key` with a per-stream
+  `info`) — **no new handshake, no new DHT item**. Proven: same session key both sides;
+  tampered handshake rejected; 3 streams over 1 handshake; the "mail" stream cannot open the
+  "photos" stream's sealed bytes (cryptographic isolation).
+
+**How it fits:** snapclone (or a small `connd`) is the broker. It holds the *single* DHT
+presence via `rendezvous` (one advert per device, not per app), maintains sessions to
+connected peers, and serves local apps over ipc-kit: an app calls
+`open_stream(peer, service)` (through bigsilicon-client) and gets a muxed, individually-keyed
+stream to an already-connected peer — falling back to its own path only if the broker is
+down. This removes both the per-app DHT churn *and* the per-app handshake, without weakening
+crypto: every stream is bound to the one authenticated session.
+
+**Remaining (on-device):** frame the muxed streams over the real peer link (net-kit
+transport), bridge each stream to a local socket/fd the app reads/writes (the "hand out a
+socket" part), and add session rekey/expiry. The security model and mux bookkeeping are done.
