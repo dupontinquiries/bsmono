@@ -1,0 +1,22 @@
+[package]
+name = "krapper"
+version = "0.2.0"
+edition = "2021"
+description = "Write rap to a hummed vibe. Stress-matched suggestions, hot-mic scratchpad."
+
+[dependencies]
+iced = { version = "0.13", features = ["canvas", "advanced", "tokio"] }
+cpal = "0.15"
+rand = "0.8"
+rfd = "0.14"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Path A deps (planned — see docs/path-a-plan.md):
+#   symphonia = { version = "0.5", features = ["opus", "ogg"] }   # .opus decode
+# [features]
+# aec = ["dep:webrtc-audio-processing"]                            # echo cancellation
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,25 @@
+[package]
+name = "fao-codec-lib"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "fao_codec"
+crate-type = ["lib", "staticlib", "cdylib"]
+
+[features]
+default = []
+gpu = ["wgpu", "pollster"]
+
+[dependencies]
+# Shared codec-agnostic primitives (DCT, quant, color, FrameTag, BitIO).
+# Extracted from this crate as part of the modularization. New code should 
+# prefer reaching primitives via this crate's re-exports.
+fao-codec-core = { path = "../fao_codec_core" }
+zstd = "0.13"
+# rustfft for phase_correlation module (camera motion estimation, used by v8 + v10).
+# Pure Rust, no system deps, ~150KB compiled.
+rustfft = "6.2"
+num-complex = "0.4"
+wgpu = { version = "0.19", optional = true }
+pollster = { version = "0.3", optional = true }

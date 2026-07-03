@@ -1,0 +1,9 @@
+[package]
+name = "fao-codec-core"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "fao_core"
+
+[dependencies]

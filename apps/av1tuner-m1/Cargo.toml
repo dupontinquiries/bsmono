@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "av1tuner_core",
+    "av1tuner_app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+
+[workspace.dependencies]
+# Core
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Async runtime (small footprint — only need spawn + channels)
+crossbeam-channel = "0.5"
+
+# Zip extraction for the "import videos from a zip" feature. Default 
+# features pull deflate + a few codecs; that's fine for reading zips.
+zip = "0.6"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# UI
+# eframe with both wgpu (preferred, Vulkan via honeykrisp on Asahi) 
+# and glow (OpenGL fallback). User can pick at runtime via env var:
+#   AV1TUNER_RENDERER=glow ./av1tuner
+# Default is wgpu.
+eframe = { version = "0.28", default-features = false, features = ["default_fonts", "wgpu", "glow"] }
+egui = "0.28"
+
+# Process management
+which = "6.0"
+
+# Native file dialogs (Linux/macOS/Windows). Wraps GTK/AppKit/Win32.
+rfd = "0.14"
