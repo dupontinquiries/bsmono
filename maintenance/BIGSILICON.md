@@ -225,9 +225,12 @@ snapclone. The substrate is in place; `coord-core` is the arbitration brain.
   publishes a `busy` presence; voiceterm gets the floor. On release, snapclone resumes.
 - A low-priority ducker (e.g. background media) is **not** honoured against a live call.
 
+**Wiring status:**
+- **DONE:** `apps/coordd` — the coordinator daemon serves the Arbiter over ipc-kit and
+  pushes `directive <resource> <state>` deltas to affected apps on every claim/release.
+  Integration-tested: snapclone gets `own`, voiceterm's duck pushes `duck` (mute), release
+  pushes `own` (resume). Presence relayed via an `activity`/`presence` message.
 **Remaining wiring:**
-- Fold the `Arbiter` into a coordinator (either inside voiced for Mic + a small `coordd`,
-  or as a sharemd-hosted service) so claims/directives are pushed to apps over ipc-kit.
 - Each app: translate its own activity into claims, act on its directive (mute/show-busy/
   pipe/invite), and publish presence. snapclone's busy notifier + mute hook; unendlich's
   audio-pipe + invite; voiceterm's compose-duck.

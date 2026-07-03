@@ -1,0 +1,14 @@
+[package]
+name = "coordd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The coordination daemon: binds the 'coord' Unix socket and serves coord-core's Arbiter to every app. Apps claim/release shared resources (mic, call audio, attention); coordd recomputes and PUSHES each app's Directive (Own/Yield/Duck/Share) whenever it changes — so a snapclone call mutes when voiceterm ducks, and resumes when it releases, with no app knowing about the others."
+
+[[bin]]
+name = "coordd"
+path = "src/main.rs"
+
+[dependencies]
+ipc-kit = { path = "../../shared/ipc-kit" }
+coord-core = { path = "../../shared/coord-core" }
