@@ -732,6 +732,53 @@ pub fn create_default_suite(root: &Path) -> Result<crate::suite::Suite, String> 
     Ok(s)
 }
 
+// ── BigSilicon app-store groups ──
+
+/// The curated app-store groups shown on the store page. Built in (not file-dependent) so
+/// the store works on a fresh device; `bigsilicons-apps` is the union — "build everything
+/// in one go". Paths are repo-relative `apps/<name>` (resolved against the gitmind root at
+/// build time by the same machinery suites use).
+pub fn store_groups() -> Vec<crate::suite::Suite> {
+    fn group(name: &str, desc: &str, apps: &[&str]) -> crate::suite::Suite {
+        crate::suite::Suite {
+            name: name.to_string(),
+            description: desc.to_string(),
+            apps: apps.iter().map(|a| crate::suite::SuiteApp::simple(a, &format!("apps/{a}"))).collect(),
+        }
+    }
+    let coding = ["gitmind", "logscope", "bot-arena"];
+    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "cybertron", "unendlich"];
+    let music = ["beatspace", "krapper", "bo-suite", "fao-codec"];
+    let work = ["voiceterm", "ambient-learner", "rusty-board"];
+    let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
+    vec![
+        group("coding", "Development & analysis tools", &coding),
+        group("media", "Video, camera, imaging & games", &media),
+        group("music", "Audio synthesis, codecs & music", &music),
+        group("work", "Productivity, comms & input", &work),
+        group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all),
+    ]
+}
+
+/// Look up one store group by name (for "build this group").
+pub fn group_by_name(name: &str) -> Option<crate::suite::Suite> {
+    store_groups().into_iter().find(|g| g.name == name)
+}
+
+#[cfg(test)]
+mod store_group_tests {
+    #[test]
+    fn bigsilicons_is_the_union_and_paths_are_app_relative() {
+        let groups = super::store_groups();
+        let all = super::group_by_name("bigsilicons-apps").expect("all group");
+        assert_eq!(all.apps.len(), 16, "every app is in the all group");
+        assert!(all.apps.iter().all(|a| a.path.starts_with("apps/")));
+        // the four categories partition into the union
+        let cat_total: usize = groups.iter().filter(|g| g.name != "bigsilicons-apps").map(|g| g.apps.len()).sum();
+        assert_eq!(cat_total, all.apps.len(), "categories cover exactly the all-group");
+    }
+}
+
 // ── Downloads scanning + bundle import ──
 
 /// The user's Downloads folder.

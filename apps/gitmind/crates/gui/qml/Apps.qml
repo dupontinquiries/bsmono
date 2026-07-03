@@ -22,6 +22,9 @@ Item {
     property int installTotal: 0
     property string installingSuite: ""
 
+    // BigSilicon app store groups
+    property var groups: []
+
     // Downloads inbox
     property var downloads: []
     property string downloadsDir: ""
@@ -50,6 +53,14 @@ Item {
     function loadSuites() {
         var r = JSON.parse(backend.suites())
         root.suites = r.ok ? (r.suites || []) : []
+    }
+    function loadGroups() {
+        var r = JSON.parse(backend.store_groups())
+        root.groups = r.ok ? (r.groups || []) : []
+    }
+    function buildGroup(g) {
+        // reuse the per-app suite installer so we get 3/16-style progress
+        root.installSuite(g)
     }
     function makeDefaultSuite() {
         var r = JSON.parse(backend.create_default_suite())
@@ -119,7 +130,7 @@ Item {
         }
     }
 
-    Component.onCompleted: { reload(); loadSuites(); loadDownloads() }
+    Component.onCompleted: { reload(); loadSuites(); loadDownloads(); loadGroups() }
 
     Column {
         anchors.fill: parent
@@ -177,6 +188,60 @@ Item {
                     }
                 }
                 Label { text: root.downloadsDir; color: "#5b6477"; font.pixelSize: 10; font.family: "monospace"; width: parent.width; elide: Text.ElideMiddle }
+            }
+        }
+
+        // ── BigSilicon app store: curated groups, "build all in one go" ──
+        Rectangle {
+            width: parent.width; radius: 10; color: "#171c2b"; border.color: "#3a2f57"
+            height: groupCol.height + 20
+            Column {
+                id: groupCol
+                x: 12; y: 10; width: parent.width - 24; spacing: 8
+                Row {
+                    width: parent.width; spacing: 8
+                    Label { text: "BigSilicon app store"; color: "#b4a0ff"; font.bold: true; anchors.verticalCenter: parent.verticalCenter }
+                    Item { width: parent.width - 260; height: 1 }
+                    Button { text: "⟳"; enabled: !root.busy; onClicked: root.loadGroups() }
+                }
+                Label {
+                    width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                    text: "Curated groups share kits and build together. Tap a group to build & install every app in it for this device."
+                }
+                Repeater {
+                    model: root.groups
+                    delegate: Rectangle {
+                        width: groupCol.width; radius: 8; color: "#0f1320"
+                        border.color: modelData.name === "bigsilicons-apps" ? "#b4a0ff" : "#3a2f57"
+                        height: gc.height + 14
+                        Column {
+                            id: gc
+                            x: 10; y: 7; width: parent.width - 20; spacing: 4
+                            Row {
+                                width: parent.width; spacing: 8
+                                Column {
+                                    width: parent.width - gBtn.width - 12
+                                    Label {
+                                        text: (modelData.name === "bigsilicons-apps" ? "BigSilicon apps" : modelData.name) + "  ·  " + (modelData.count || 0) + " apps"
+                                        color: modelData.name === "bigsilicons-apps" ? "#b4a0ff" : "#cdd6f4"; font.bold: true; font.pixelSize: 13
+                                    }
+                                    Label { text: modelData.description; color: "#8a93a6"; font.pixelSize: 11; width: parent.width; elide: Text.ElideRight }
+                                }
+                                Button {
+                                    id: gBtn
+                                    text: (root.installingSuite === modelData.name) ? (root.installIdx + "/" + root.installTotal) : "build all"
+                                    enabled: !root.busy; anchors.verticalCenter: parent.verticalCenter
+                                    onClicked: root.buildGroup(modelData)
+                                }
+                            }
+                            Label {
+                                visible: root.installingSuite === modelData.name
+                                width: parent.width; color: "#f9e2af"; font.pixelSize: 11
+                                text: "building & installing… " + (root.installIdx + 1) + "/" + root.installTotal
+                            }
+                        }
+                    }
+                }
             }
         }
 
