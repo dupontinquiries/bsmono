@@ -1,0 +1,14 @@
+[package]
+name = "sharemd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The cross-app data-share daemon: binds the 'share' Unix socket and serves datashare-core's namespaced key/value + pub-sub Hub to every app. Apps try this socket first (ipc-kit) and fall back to private state if it's down."
+
+[[bin]]
+name = "sharemd"
+path = "src/main.rs"
+
+[dependencies]
+ipc-kit = { path = "../../shared/ipc-kit" }
+datashare-core = { path = "../../shared/datashare-core" }
