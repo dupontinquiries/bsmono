@@ -1,0 +1,13 @@
+[package]
+name = "bigsilicon-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "One small client SDK for apps to use the BigSilicon daemons — voiced (voice intents), sharemd (cross-app data), coordd (resource arbitration) — each with socket-first fallback: connect returns None when the daemon isn't running, which is the app's cue to run its own code. All inbound (acks, replies, pushed events) arrive on a channel so an app polls without blocking its UI. Turns adoption from hand-written socket plumbing into a few lines."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ipc-kit = { path = "../ipc-kit" }
+coord-core = { path = "../coord-core" }
