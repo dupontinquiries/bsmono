@@ -26,3 +26,4 @@ uikit-gesture = { path = "../uikit-gesture" }
 # ("compatible with egui Color32::from_hex"); we consume it directly rather
 # than re-defining colors.
 snapclone-theme = { path = "../snapclone-theme" }
+settings-kit = { path = "../../../settings-kit" }

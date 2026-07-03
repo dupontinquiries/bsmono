@@ -138,6 +138,16 @@ impl Prefs {
 /// The data-bus namespace cross-app settings live under.
 pub const NAMESPACE: &str = "settings";
 
+/// The changed keys between two Prefs (for publishing only what the user touched).
+pub fn diff(old: &Prefs, new: &Prefs) -> Vec<(String, String)> {
+    let (o, n) = (old.to_kv(), new.to_kv());
+    n.into_iter()
+        .zip(o)
+        .filter(|((_, nv), (_, ov))| nv != ov)
+        .map(|((k, nv), _)| (k, nv))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,5 +194,18 @@ mod tests {
         let mut p = Prefs::default();
         p.apply_kv(&[("future.thing".into(), "x".into()), ("gesture.sensitivity".into(), "not-a-number".into())]);
         assert_eq!(p.gesture.sensitivity, 1.0, "bad value ignored, default kept");
+    }
+
+    #[test]
+    fn diff_emits_only_changed_keys() {
+        let old = Prefs::default();
+        let mut new = old.clone();
+        new.gesture.sensitivity = 1.8;
+        new.palette = "Nord".into();
+        let d = diff(&old, &new);
+        assert_eq!(d.len(), 2);
+        assert!(d.contains(&("gesture.sensitivity".to_string(), "1.8".to_string())));
+        assert!(d.contains(&("theme.palette".to_string(), "Nord".to_string())));
+        assert!(diff(&old, &old).is_empty());
     }
 }
