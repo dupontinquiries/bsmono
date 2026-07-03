@@ -1713,8 +1713,30 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                     0
                 }
                 Some("build") | Some("install") => {
-                    let name = match pos.get(1) { Some(n) => n, None => return err("usage: gitmind fleet group build <name>  (see: gitmind fleet group list)") };
+                    let name = match pos.get(1) { Some(n) => n, None => return err("usage: gitmind fleet group build <name> [--to user@host] [--target T]") };
                     let g = match flow::group_by_name(name) { Some(g) => g, None => return err("no such group (try: gitmind fleet group list)") };
+                    // --to user@host → build here, push+install each app on the phone
+                    if let Some(dest) = opt(rest, "--to") {
+                        let (user, host) = match dest.split_once('@') {
+                            Some((u, h)) if !u.is_empty() && !h.is_empty() => (u.to_string(), h.to_string()),
+                            _ => return err("--to expects user@host"),
+                        };
+                        // target: explicit, else detect the device's triple over ssh, else native
+                        let target = match opt(rest, "--target") {
+                            Some(t) => t.to_string(),
+                            None => cockpit::deploy::remote_capture(&user, &host, "export PATH=\"$HOME/.cargo/bin:$PATH\" && rustc -vV")
+                                .ok()
+                                .and_then(|o| cockpit::buildflags::host_triple_from_rustc(&o))
+                                .map(|h| cockpit::buildflags::normalize_native(&h))
+                                .unwrap_or_default(),
+                        };
+                        println!("building {} app(s) here for '{}' and installing on {host} …", g.apps.len(), if target.is_empty() { "native" } else { &target });
+                        let results = flow::install_group_remote(&g, &target, &user, &host);
+                        let ok = results.iter().filter(|r| r.ok).count();
+                        for r in &results { println!("  {} {:<24} {}", if r.ok { "✓" } else { "✗" }, r.name, r.message); }
+                        println!("{ok}/{} installed on {host}", results.len());
+                        return if ok == results.len() { 0 } else { 1 };
+                    }
                     println!("building {} app(s) from group '{}':", g.apps.len(), g.name);
                     let results = flow::install_suite(&g);
                     let ok = results.iter().filter(|r| r.ok).count();
