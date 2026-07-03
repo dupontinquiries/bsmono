@@ -1699,3 +1699,30 @@ VERIFIED: cockpit 77 tests (+3: 2 cmake, 1 bundle/downloads; restored merge_prev
 cargo test/build -p cockpit clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit
 CLEAN; Apps QML balanced + backend.* (13) resolve. On-device: unzip needed to classify zip bundles (else
 treated as app — import_bundle still works on open). cmake via pip (or system) for CMake apps.
+
+── cleanup: general build-artifact catalog + prepare-to-ingest (replaces Rust-only reclaim) ──
+USER: cleanup + prepare to ingest (clean junk in build artifacts etc.).
+[cockpit::artifacts NEW, 3 tests] REPLACES reclaim.rs (deleted; it only knew Rust target/). dir_size (moved).
+Junk{path,bytes,label}. dir_junk_label(dir,keep) validates per-system (never `keep`=build_base): target/
+(sibling Cargo.toml or CACHEDIR.TAG/.rustc_info.json)→"Rust target"; .venv|venv (pyvenv.cfg|bin/python)→
+"Python venv"; __pycache__|.pytest_cache|.mypy_cache|.ruff_cache→"Python cache"; node_modules→"Node modules";
+build (CMakeCache.txt)→"CMake build"; .gitmind-bin→"gitmind build output". JUNK_FILES .DS_Store/Thumbs.db→
+"OS junk". scan(root,keep)=walk (skip .git/.gitmind, don't descend into found junk), biggest-first. clean(
+root,keep)=re-validate each + remove → (count,freed). gitignore_lines(gitmind)=comprehensive (all systems +
+.gitmind-run.sh + store.redb if gitmind). TESTS: finds+labels junk across systems (source "build" w/o
+CMakeCache NOT junk; .git untouched; biggest-first); clean removes only validated junk (source/manifest
+untouched); gitignore covers every system. SINGLE SOURCE OF TRUTH: places::gitignore_lines now delegates to
+artifacts (removed the old Rust-only 2-line version + its test assertions kept via delegation).
+[flow] reclaim_scan now returns items (path,bytes,LABEL) via artifacts::scan; reclaim_apply=artifacts::clean.
+place() uses artifacts::gitignore_lines. NEW prepare_ingest(dir)->IngestPrep{system,cleaned,freed,ignored}:
+detect system + artifacts::clean + ensure_gitignore(comprehensive) — readies a project so a git add / gitmind
+ingest never swallows a venv/node_modules/target.
+[GUI] reclaimable json +kind(label). prepare_ingest(dir) async "prep" (blank dir → repo root). Settings
+reclaim card: description now lists all junk types; per-item kind column; NEW "prepare for ingest" button
+(cleans + gitignores the current repo) + "prep" poller ("cleaned N, freed X, +M gitignore rules").
+[CLI] fleet clean <dir> [--apply] (scan/remove all build junk, labeled); fleet prepare <dir> (clean +
+gitignore for ingest). fleet reclaim item print updated to 3-tuple.
+VERIFIED: cockpit 78 tests (reclaim.rs -2 removed, artifacts +3; net +1 vs 77); cargo test/build -p cockpit
+clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced;
+Settings backend.* (16) resolve. Safety: only validated regeneratable output ever deleted; source/manifests
+never touched; .git/.gitmind skipped; build_base never reclaimed.

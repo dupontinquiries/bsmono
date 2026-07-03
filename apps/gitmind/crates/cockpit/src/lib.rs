@@ -20,7 +20,7 @@ pub mod netshare;
 pub mod ops;
 pub mod places;
 pub mod preview;
-pub mod reclaim;
+pub mod artifacts;
 pub mod suite;
 
 pub use ops::*;

@@ -174,6 +174,7 @@ struct Backend {
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
+    prepare_ingest: qt_method!(fn(&self, dir: QString) -> QString),
     build_dir: qt_method!(fn(&self, set: QString) -> QString),
     apply_to_repo: qt_method!(fn(&self, crate_path: QString, target: QString, mode: QString, zipname: QString) -> QString),
     explore_merge: qt_method!(fn(&self, zip_repo: QString, target: QString) -> QString),
@@ -1322,8 +1323,8 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
             let scan = cockpit::flow::reclaim_scan(&root);
-            let items: Vec<_> = scan.items.iter().map(|(path, bytes)|
-                json!({"path": path, "bytes": bytes, "size": appcatalog::human_size(*bytes)})
+            let items: Vec<_> = scan.items.iter().map(|(path, bytes, label)|
+                json!({"path": path, "bytes": bytes, "size": appcatalog::human_size(*bytes), "kind": label})
             ).collect();
             job.finish(json!({
                 "ok": true, "items": items, "count": items.len(),
@@ -1703,6 +1704,30 @@ impl Backend {
             }
             Err(e) => err_json(&e),
         }
+    }
+
+    /// Clean regeneratable build junk from a project and make sure .gitignore excludes it,
+    /// so a git add / gitmind ingest stays clean. Async job "prep".
+    fn prepare_ingest(&self, dir: QString) -> QString {
+        let dir = dir.to_string();
+        let target = if dir.trim().is_empty() {
+            match repo() { Ok(r) => r.root().display().to_string(), Err(e) => return err_json(&e) }
+        } else {
+            let home = std::env::var("HOME").unwrap_or_default();
+            places::expand_home(dir.trim(), &home)
+        };
+        if !self.job.start("prep") {
+            return err_json("a job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let p = cockpit::flow::prepare_ingest(std::path::Path::new(&target));
+            job.finish(json!({
+                "ok": true, "system": p.system, "cleaned": p.cleaned, "freed": p.freed,
+                "freed_h": appcatalog::human_size(p.freed), "ignored": p.ignored,
+            }).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "prep"}).to_string())
     }
 
     /// Get (empty arg) or set the build base — where all builds go so they never spill

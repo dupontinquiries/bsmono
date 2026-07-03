@@ -48,6 +48,11 @@ Item {
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.busy = true; root.jobKind = "reclaim"; root.note = ""; poller.start()
     }
+    function prepareIngest() {
+        var r = JSON.parse(backend.prepare_ingest(""))
+        if (!r.ok) { root.note = "✗ " + r.error; return }
+        root.busy = true; root.jobKind = "prep"; root.note = "cleaning build junk…"; poller.start()
+    }
     // ── keys ──
     function listKeys() {
         if (picker.selHost.length === 0) { root.note = "pick a device first"; return }
@@ -79,6 +84,9 @@ Item {
                 if (res.ok) { root.note = "✓ reclaimed " + res.freed + " from " + res.count + " dir(s)" }
                 else root.note = "error: " + res.error
                 root.scanReclaim()
+            } else if (k === "prep") {
+                if (res.ok) { root.note = "✓ prepared (" + res.system + "): cleaned " + res.cleaned + " item(s), freed " + res.freed_h + ", +" + res.ignored + " gitignore rule(s)"; root.scanReclaim() }
+                else root.note = "✗ " + res.error
             } else if (k === "keys") {
                 root.keys = res.ok ? (res.keys || []) : []
                 if (!res.ok) root.note = "error: " + res.error
@@ -193,7 +201,7 @@ Item {
                     Label { text: "Reclaim disk space"; color: "#7aa2f7"; font.bold: true }
                     Label {
                         width: parent.width; color: "#8a93a6"; font.pixelSize: 12; wrapMode: Text.WordWrap
-                        text: "Per-crate target/ folders are dead weight now that builds share one cache. These are gitignored build output — safe to delete; cargo rebuilds into the shared cache."
+                        text: "Regeneratable build output — Rust target/, Python venvs & caches, node_modules, CMake build/, gitmind's own output — is dead weight. It's gitignored and rebuilds on demand, so it's safe to delete."
                     }
                     Row {
                         spacing: 8
@@ -203,6 +211,11 @@ Item {
                             enabled: !root.busy && root.reclaimItems.length > 0
                             onClicked: root.doReclaim()
                         }
+                        Button {
+                            text: root.jobKind === "prep" ? "preparing…" : "prepare for ingest"
+                            enabled: !root.busy
+                            onClicked: root.prepareIngest()
+                        }
                     }
                     Label {
                         width: parent.width; visible: root.scanned && root.reclaimItems.length === 0 && !root.busy
@@ -210,15 +223,16 @@ Item {
                     }
                     Label {
                         width: parent.width; visible: root.reclaimItems.length > 0
-                        text: root.reclaimItems.length + " folder(s) · " + root.reclaimTotal + " reclaimable"
+                        text: root.reclaimItems.length + " item(s) · " + root.reclaimTotal + " reclaimable"
                         color: "#cdd6f4"; font.pixelSize: 12; font.bold: true
                     }
                     Repeater {
                         model: root.reclaimItems
                         delegate: Row {
                             width: parent.width; spacing: 8
-                            Label { text: modelData.size; color: "#f9e2af"; font.pixelSize: 11; font.family: "monospace"; width: 70 }
-                            Label { text: modelData.path; color: "#8a93a6"; font.pixelSize: 11; font.family: "monospace"; width: parent.width - 80; elide: Text.ElideLeft }
+                            Label { text: modelData.size; color: "#f9e2af"; font.pixelSize: 11; font.family: "monospace"; width: 66 }
+                            Label { text: modelData.kind || ""; color: "#5b6477"; font.pixelSize: 10; width: 118; elide: Text.ElideRight }
+                            Label { text: modelData.path; color: "#8a93a6"; font.pixelSize: 11; font.family: "monospace"; width: parent.width - 200; elide: Text.ElideLeft }
                         }
                     }
                 }
