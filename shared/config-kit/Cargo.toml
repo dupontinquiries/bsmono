@@ -1,0 +1,9 @@
+[package]
+name = "config-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "std-only XDG base-directory resolution (config/data/cache/state), app-namespaced, plus load/save helpers and a minimal [section] key=value parser for the common case — the config plumbing ~10 apps each recompute (~/.config/<app>, create-dir-read-fallback). Apps keep the full toml crate for rich configs; this removes the boilerplate around it. Zero-dependency."
+
+[lib]
+path = "src/lib.rs"
