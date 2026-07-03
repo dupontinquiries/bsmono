@@ -178,10 +178,16 @@ Built and tested this pass:
 
 ### TODO — remaining backlog
 - config-kit / cli-kit adoption across the other ~10 apps (delete their local copies).
-- **DONE:** `apps/voiced` + `apps/sharemd` are runnable daemons (ipc-kit `serve_hub` with
-  addressed routing; integration-tested over real sockets). **Remaining:** wire voiced's
-  audio stage (voice-kit + audio-kit + voiceterm's mic/whisper pool) so real speech feeds
-  `intent`/`say`; back sharemd's Hub with share-kit for durability/federation; have apps
+- **DONE:** `apps/voiced` + `apps/sharemd` are runnable daemons (ipc-kit `serve_hub`).
+- **DONE:** voiced's audio-stage *brain* — voiced-core `grammar` turns transcribed text
+  into intents (voice-kit clean+hallucination gate → system phrases → per-app grammars
+  with `{slot}` capture, active app wins). Daemon `transcript` verb runs the full
+  clean→gate→match→route pipeline; integration-tested (hallucination dropped, slot routed).
+- **Remaining audio:** only the raw mic→whisper capture behind voiced-core's `Transcriber`
+  trait (device + model I/O — can't run in the sandbox). On-device: implement it over
+  voiceterm's whisper pool + voice-kit model resolution (models-kit `~/models`), feeding
+  `transcript` messages to voiced.
+- **Remaining data:** back sharemd's Hub with share-kit for durability/federation; have apps
   call `try_connect` before their own path.
 - device-kit (PipeWire/v4l2) — snapclone's camera-bridge is the reference.
 - uikit adoption / Qt+GTK→egui ports (largest LOC lever).
