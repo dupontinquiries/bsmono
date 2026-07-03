@@ -120,11 +120,73 @@ impl Hub {
         }
     }
 
+    /// A sorted snapshot of all key/values in a namespace (for persistence / inspection).
+    pub fn snapshot(&self, ns: &str) -> Vec<(String, String)> {
+        let mut entries: Vec<(String, String)> = self
+            .data
+            .get(ns)
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+        entries.sort();
+        entries
+    }
+
     fn fanout(&self, ns: &str, exclude: SubId, event: Op) -> Vec<(SubId, Op)> {
         self.subs
             .get(ns)
             .map(|subs| subs.iter().filter(|s| **s != exclude).map(|s| (*s, event.clone())).collect())
             .unwrap_or_default()
+    }
+}
+
+/// Wire mapping between ipc-kit `Message`s and datashare `Op`s — shared by the sharemd and
+/// settingsd daemons so the protocol lives in one place.
+pub mod wire {
+    use super::Op;
+    use ipc_kit::Message;
+
+    /// `Message` → `Op` (unknown verbs become `Op::Ok` no-ops).
+    pub fn to_op(m: &Message) -> Op {
+        let a = |i: usize| m.args.get(i).cloned().unwrap_or_default();
+        match m.verb.as_str() {
+            "put" => Op::Put { ns: a(0), key: a(1), val: a(2) },
+            "get" => Op::Get { ns: a(0), key: a(1) },
+            "del" => Op::Delete { ns: a(0), key: a(1) },
+            "list" => Op::List { ns: a(0) },
+            "sub" => Op::Sub { ns: a(0) },
+            _ => Op::Ok,
+        }
+    }
+
+    /// `Op` → `Message`. Optional values use arg-count: `value`/`event` with 2 args is `None`,
+    /// 3 args is `Some`.
+    pub fn to_msg(op: &Op) -> Message {
+        match op {
+            Op::Ok => Message::verb("ok"),
+            Op::Value { ns, key, val } => {
+                let mut args = vec![ns.clone(), key.clone()];
+                if let Some(v) = val {
+                    args.push(v.clone());
+                }
+                Message::new("value", args)
+            }
+            Op::Listing { ns, entries } => {
+                let mut args = vec![ns.clone()];
+                for (k, v) in entries {
+                    args.push(k.clone());
+                    args.push(v.clone());
+                }
+                Message::new("listing", args)
+            }
+            Op::Event { ns, key, val } => {
+                let mut args = vec![ns.clone(), key.clone()];
+                if let Some(v) = val {
+                    args.push(v.clone());
+                }
+                Message::new("event", args)
+            }
+            _ => Message::verb("ok"),
+        }
     }
 }
 

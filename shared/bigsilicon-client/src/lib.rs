@@ -114,6 +114,10 @@ impl Share {
     pub fn connect() -> Option<Share> {
         Conn::connect("share").map(Share)
     }
+    /// Connect to a specific KV/pub-sub socket (e.g. "settings" for settingsd).
+    pub fn connect_named(name: &str) -> Option<Share> {
+        Conn::connect(name).map(Share)
+    }
     pub fn put(&mut self, ns: &str, key: &str, val: &str) -> std::io::Result<()> {
         self.0.send(&Message::new("put", vec![ns.into(), key.into(), val.into()]))
     }
@@ -149,7 +153,7 @@ impl Settings {
     /// Connect, subscribe to `settings`, and request the current snapshot. `None` if sharemd
     /// isn't running (the app falls back to compiled defaults).
     pub fn connect() -> Option<Settings> {
-        let mut share = Share::connect()?;
+        let mut share = Share::connect_named(settings_kit::NAMESPACE)?;
         share.subscribe(settings_kit::NAMESPACE).ok()?;
         share.list(settings_kit::NAMESPACE).ok()?;
         Some(Settings { share, kv: std::collections::HashMap::new(), prefs: settings_kit::Prefs::default(), overrides: Vec::new() })
@@ -339,7 +343,7 @@ mod tests {
             }
         }
 
-        let listener = bind("share").expect("bind");
+        let listener = bind(settings_kit::NAMESPACE).expect("bind");
         std::thread::spawn(move || serve_hub(listener, SettingsHub::default()));
         std::thread::sleep(std::time::Duration::from_millis(50));
 
