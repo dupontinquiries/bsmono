@@ -59,6 +59,13 @@ const ENTRY_NAME: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0"
 /// Workgroup size in `chunk_mesh_octree.comp`. One thread per cell.
 const WORKGROUP_SIZE: u32 = 64;
 
+/// r478/r480: tiled shared-memory mesher path. Reads the live global atomic
+/// (seeded from UNENDLICH_OCTREE_TILE at startup, settable from the Performance
+/// page). The dispatch pushes it as a constant each batch.
+fn octree_tile_enabled() -> u32 {
+    crate::constants::octree_tile_enabled()
+}
+
 /// Cells per chunk = 32³ = 32768. Dispatched as 32768/64 = 512
 /// workgroups along X, batch chunks along Y.
 const CELLS_PER_CHUNK: u32 = 32 * 32 * 32;
@@ -249,7 +256,8 @@ struct PushConstants {
     /// `lod_cell_count * lod_cell_stride == 32`.
     lod_cell_count: u32,
     lod_cell_stride: u32,
-    _pad: u32,
+    /// r478: 1 = tiled shared-memory mesher path (UNENDLICH_OCTREE_TILE=1).
+    tile_enabled: u32,
 }
 const _: [(); 24] = [(); std::mem::size_of::<PushConstants>()];
 
@@ -751,7 +759,7 @@ impl OctreeGpuMesher {
                 batch_count: chunks.len() as u32,
                 lod_cell_count,
                 lod_cell_stride: lod_stride,
-                _pad: 0,
+                tile_enabled: octree_tile_enabled(),
             };
             let push_bytes = std::slice::from_raw_parts(
                 &push as *const _ as *const u8,
@@ -879,7 +887,7 @@ impl OctreeGpuMesher {
             };
             let indices = index_src.to_vec();
 
-            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices });
+            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices, ..ChunkMesh::empty() });
         }
 
         Ok(())

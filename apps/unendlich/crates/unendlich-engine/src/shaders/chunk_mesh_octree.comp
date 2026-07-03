@@ -132,7 +132,7 @@ layout(push_constant) uniform PC {
     // same parameterization.
     uint lod_cell_count;
     uint lod_cell_stride;
-    uint _pad;
+    uint tile_enabled;  // r478: 1 = use the tiled shared-memory mesher path
 } pc;
 
 // Workgroup of 64 invocations on the X axis. Y axis carries chunk
@@ -152,6 +152,14 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 bool is_solid_opaque(uint block_id) {
     if (block_id == 0u) return false;       // Air
     if (block_id == 9u) return false;       // Water (separate pass)
+    // r539: subvoxel-only blocks (leaves + crops) render ENTIRELY as subvoxel
+    // decoration in the post-pass; a solid cube here hides that detail — the
+    // "solid block over the leaves" bug, and the GPU-vs-CPU split (the CPU
+    // mesher's is_meshable already excluded these via !is_subvoxel_only). Skip
+    // them so neighbours emit faces toward them and the fronds show cleanly.
+    if (block_id == 18u || block_id == 20u) return false;   // Oak/Birch leaves
+    if (block_id == 88u || block_id == 89u ||
+        block_id == 90u || block_id == 91u) return false;   // Carrot/Potato/Cabbage/Sprout
     return true;
 }
 
@@ -433,7 +441,30 @@ vec3 color_for_block(uint block_id) {
     if (block_id == 46u) return vec3(0.85, 0.55, 0.18);   // Amber
     if (block_id == 47u) return vec3(0.78, 0.65, 0.95);   // Crystal
     if (block_id == 56u) return vec3(0.45, 0.85, 0.95);   // DiamondOre
+    // r543: blocks that were falling through to the magenta default in the GPU
+    // mesher (the CPU mesher had them; the GPU table lagged). Values mirror
+    // world::blocks::base_color / 255 so GPU and CPU worlds match.
+    if (block_id == 48u) return vec3(0.843, 0.784, 0.627); // Sandstone
+    if (block_id == 49u) return vec3(0.098, 0.078, 0.137); // Obsidian
+    if (block_id == 50u) return vec3(0.745, 0.510, 0.353); // CopperOre
+    if (block_id == 51u) return vec3(0.922, 0.922, 0.894); // Quartz
+    if (block_id == 57u) return vec3(0.667, 0.529, 0.353); // OakPlanks
+    if (block_id == 58u) return vec3(0.490, 0.490, 0.490); // StoneBricks
+    if (block_id == 59u) return vec3(0.627, 0.314, 0.255); // Bricks
+    if (block_id == 61u) return vec3(0.784, 0.882, 0.922); // Glass
+    if (block_id == 62u) return vec3(0.784, 0.784, 0.804); // IronBlock
+    if (block_id == 63u) return vec3(0.902, 0.784, 0.353); // GoldBlock
+    if (block_id == 64u) return vec3(0.176, 0.176, 0.196); // CoalBlock
+    if (block_id == 65u) return vec3(0.588, 0.431, 0.275); // Bookshelf
+    if (block_id == 66u) return vec3(0.863, 0.510, 0.157); // Pumpkin
     if (block_id == 80u) return vec3(0.95, 0.95, 0.97);   // SnowBlock
+    if (block_id == 81u) return vec3(0.420, 0.502, 0.380); // MossyCobblestone
+    if (block_id == 82u) return vec3(0.580, 0.580, 0.600); // PolishedStone
+    if (block_id == 83u) return vec3(0.878, 0.800, 0.580); // SmoothSandstone
+    if (block_id == 84u) return vec3(0.620, 0.341, 0.239); // Terracotta
+    if (block_id == 85u) return vec3(0.478, 0.471, 0.459); // ChiseledStoneBricks
+    if (block_id == 86u) return vec3(0.322, 0.220, 0.129); // DarkOakPlanks
+    if (block_id == 87u) return vec3(0.220, 0.212, 0.239); // PolishedBasalt
     // Default: a noticeable magenta so genuinely-unhandled block ids stay
     // visible in playtest. As of the render-parity pass this table mirrors the
     // CPU mesher's block_color for every defined BlockId, so reaching this
@@ -807,76 +838,162 @@ uint greedy_run_for_face(
     return find_greedy_run(meta, x, y, z, axis, face_dir, stride, self_block);
 }
 
+// v0.24.x cave fast path. A neighbor cell that lands INSIDE the self leaf
+// extent ([self_lo, self_lo+self_lsz)) is — by definition of a leaf — the same
+// block as self. Since self already passed the solid-opaque test, that face
+// culls, so we can skip the octree descent and just return self_block. This
+// saves up to 5 of the 6 neighbor descents for cells sitting on a leaf
+// face/edge/corner — the dominant case in caves and other high-detail geometry
+// (where the all-6-inside buried-cell fast path above does NOT trigger). For a
+// 1³ leaf self_lsz==1 so every neighbor falls outside and descends normally.
+// Provably identical to a full descent; verified by gpu_meshing_octree_cpu_ref.
+uint coleaf_or_sample(ChunkMeta meta, uvec3 self_lo, uint self_lsz, uint self_block,
+                      int nx, int ny, int nz) {
+    if (nx >= int(self_lo.x) && nx < int(self_lo.x + self_lsz) &&
+        ny >= int(self_lo.y) && ny < int(self_lo.y + self_lsz) &&
+        nz >= int(self_lo.z) && nz < int(self_lo.z + self_lsz)) {
+        return self_block;
+    }
+    return sample_or_neighbor(meta, nx, ny, nz);
+}
+
+// r478: 6^3 halo (4^3 tile + 1-cell border) for the tiled mesher path.
+shared uint s_halo[216];
+
 void main() {
     uint chunk_idx = gl_WorkGroupID.y;
     if (chunk_idx >= pc.batch_count) return;
 
-    // v0.24.39-mid-lod: cell iteration is parameterized by
-    // lod_cell_count and lod_cell_stride. Near uses (32, 1) so each
-    // thread corresponds to one source block. Mid uses (16, 2) so
-    // each thread corresponds to a 2³ source-block group; we sample
-    // the LOW-CORNER block as the representative. Higher LODs scale
-    // the same way.
-    //
-    // Invariant: lod_cell_count * lod_cell_stride == 32.
     uint cc = pc.lod_cell_count;
     uint stride = pc.lod_cell_stride;
-
-    // Cell index within the chunk, in [0, cc³).
-    uint cell_idx = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
-    if (cell_idx >= cc * cc * cc) return;
-
-    // Decode cell index → (mid_x, mid_y, mid_z) in LOD-space, then
-    // translate to chunk-local source-block coords by multiplying by
-    // stride. Convention matches Chunk's `block_index = x + z*N + y*N*N`.
-    uint mid_y = cell_idx / (cc * cc);
-    uint rem = cell_idx - mid_y * cc * cc;
-    uint mid_z = rem / cc;
-    uint mid_x = rem - mid_z * cc;
-    uint x = mid_x * stride;
-    uint y = mid_y * stride;
-    uint z = mid_z * stride;
-
+    int  is = int(stride);
     ChunkMeta meta = chunk_metas[chunk_idx];
 
-    // Sample self at the representative block. For stride=1 this is
-    // the only block; for stride>1 we currently use the low-corner
-    // sample (center-of-cell would also work; aggregation/majority
-    // sampling is filed for follow-up).
-    // Sample self with the covering leaf extent (one descent; the block result
-    // is byte-identical to octree_sample). The extent powers the buried-cell
-    // fast path below.
-    uvec3 self_lo;
-    uint self_lsz;
-    uint self_block = octree_sample_ext(meta.octree_base, uvec3(x, y, z), self_lo, self_lsz);
-    if (!is_solid_opaque(self_block)) return;
+    // Produced by EITHER the tiled or the per-cell path below; the common
+    // emit/greedy code then consumes them. Both paths compute byte-identical
+    // values for the same cell (same coords, same sample_or_neighbor), so the
+    // CPU reference (UNENDLICH_OCTREE_MESH_VERIFY=1) verifies both.
+    uint x, y, z, self_block;
+    uint n_px, n_nx, n_py, n_ny, n_pz, n_nz;
 
-    // v0.24.41 buried-cell fast path (Near LOD only). If this solid cell sits
-    // STRICTLY inside a uniform leaf (every ±1 axis-neighbor lands in the same
-    // leaf, so is the same solid block), all six faces cull and nothing emits —
-    // skip the six neighbor descents. Provably identical to running the full
-    // path (which would cull all six); gated by the solid_*cube parity tests.
-    // Boundary cells (on the leaf edge, incl. chunk-edge cells whose neighbors
-    // live in another chunk) fail the strict-interior test and fall through.
-    if (stride == 1u
-        && self_lsz >= 2u
-        && x > self_lo.x && x + 1u < self_lo.x + self_lsz
-        && y > self_lo.y && y + 1u < self_lo.y + self_lsz
-        && z > self_lo.z && z + 1u < self_lo.z + self_lsz) {
-        return;
+    if (pc.tile_enabled == 1u && cc >= 4u) {
+        // ── r478 tiled shared-memory path ──────────────────────────────────
+        // The workgroup count is already cc^3/64 = (cc/4)^3, so we reinterpret
+        // gl_WorkGroupID.x as a 4x4x4 spatial TILE and the 64 invocations as the
+        // cells within it. The workgroup cooperatively expands a 6^3 halo (tile +
+        // one-cell border) into shared memory with ONE octree descent per halo
+        // cell, then every cell reads its self + 6 axis neighbors from shared with
+        // ZERO further descents — replacing the per-cell 7 pointer-chasing octree
+        // walks that make this mesher slow on Asahi.
+        uint tpa = cc >> 2u;                        // tiles per axis = cc/4
+        uint tile_idx = gl_WorkGroupID.x;
+        uint tz_ = tile_idx / (tpa * tpa);
+        uint trem = tile_idx - tz_ * tpa * tpa;
+        uint ty_ = trem / tpa;
+        uint tx_ = trem - ty_ * tpa;
+        uint bx = tx_ * 4u;                          // tile base LOD-cell coords
+        uint by = ty_ * 4u;
+        uint bz = tz_ * 4u;
+
+        // r479: predictable prefetch with a per-lane LEAF CACHE.
+        // Each lane walks a CONTIGUOUS run of halo cells (not the old stride-64
+        // scatter), so the cells it touches are spatially adjacent and usually
+        // land in the SAME octree leaf. We resolve that leaf ONCE (one descent,
+        // which also returns its [lo, lo+sz) extent) and "pull up" every further
+        // cell of the run that falls inside it from the cached block — a flat
+        // bounds check, no re-walk. Worst case (all misses) equals the old cost,
+        // so it never hurts predictability; uniform regions (most of a chunk)
+        // collapse a 4-cell run to a single descent. Cross-chunk (OOB) cells use
+        // sample_or_neighbor and bypass the cache (its extent isn't cross-chunk).
+        uint li = gl_LocalInvocationID.x;
+        // Contiguous run split across all 64 lanes: lanes 0..23 take 4 cells,
+        // lanes 24..63 take 3 (24*4 + 40*3 = 216).
+        uint run_start = (li < 24u) ? (li * 4u) : (96u + (li - 24u) * 3u);
+        uint run_len   = (li < 24u) ? 4u : 3u;
+        bool have_leaf = false;
+        ivec3 leaf_lo = ivec3(0);
+        int   leaf_sz = 0;
+        uint  leaf_block = 0u;
+        for (uint j = 0u; j < run_len; j++) {
+            uint k = run_start + j;
+            uint hz = k / 36u;
+            uint hr = k - hz * 36u;
+            uint hy = hr / 6u;
+            uint hx = hr - hy * 6u;
+            int sx = (int(bx + hx) - 1) * is;            // source-block coord
+            int sy = (int(by + hy) - 1) * is;
+            int sz3 = (int(bz + hz) - 1) * is;
+            uint block;
+            if (sx >= 0 && sx < 32 && sy >= 0 && sy < 32 && sz3 >= 0 && sz3 < 32) {
+                if (have_leaf
+                    && sx >= leaf_lo.x && sx < leaf_lo.x + leaf_sz
+                    && sy >= leaf_lo.y && sy < leaf_lo.y + leaf_sz
+                    && sz3 >= leaf_lo.z && sz3 < leaf_lo.z + leaf_sz) {
+                    block = leaf_block;                  // cache hit — no descent
+                } else {
+                    uvec3 lo; uint lsz;
+                    block = octree_sample_ext(meta.octree_base,
+                                              uvec3(uint(sx), uint(sy), uint(sz3)), lo, lsz);
+                    leaf_lo = ivec3(lo); leaf_sz = int(lsz); leaf_block = block;
+                    have_leaf = true;                    // refill the cache
+                }
+            } else {
+                block = sample_or_neighbor(meta, sx, sy, sz3); // cross-chunk
+            }
+            s_halo[k] = block;
+        }
+        barrier();   // uniform: push-constant branch, all 64 threads, no early return
+
+        uint lz = li / 16u;
+        uint lr = li - lz * 16u;
+        uint ly = lr / 4u;
+        uint lx = lr - ly * 4u;
+        x = (bx + lx) * stride;
+        y = (by + ly) * stride;
+        z = (bz + lz) * stride;
+        // Halo index of self (+1 border): x stride 1, y stride 6, z stride 36.
+        uint c = (lz + 1u) * 36u + (ly + 1u) * 6u + (lx + 1u);
+        self_block = s_halo[c];
+        if (!is_solid_opaque(self_block)) return;
+        n_px = s_halo[c + 1u];
+        n_nx = s_halo[c - 1u];
+        n_py = s_halo[c + 6u];
+        n_ny = s_halo[c - 6u];
+        n_pz = s_halo[c + 36u];
+        n_nz = s_halo[c - 36u];
+    } else {
+        // ── per-cell path (default: one octree descent per self + neighbor) ──
+        uint cell_idx = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+        if (cell_idx >= cc * cc * cc) return;
+        uint mid_y = cell_idx / (cc * cc);
+        uint rem = cell_idx - mid_y * cc * cc;
+        uint mid_z = rem / cc;
+        uint mid_x = rem - mid_z * cc;
+        x = mid_x * stride;
+        y = mid_y * stride;
+        z = mid_z * stride;
+
+        uvec3 self_lo;
+        uint self_lsz;
+        self_block = octree_sample_ext(meta.octree_base, uvec3(x, y, z), self_lo, self_lsz);
+        if (!is_solid_opaque(self_block)) return;
+
+        // buried-cell fast path: strictly-interior solid cell culls all six faces.
+        if (stride == 1u
+            && self_lsz >= 2u
+            && x > self_lo.x && x + 1u < self_lo.x + self_lsz
+            && y > self_lo.y && y + 1u < self_lo.y + self_lsz
+            && z > self_lo.z && z + 1u < self_lo.z + self_lsz) {
+            return;
+        }
+
+        n_px = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x) + is, int(y),       int(z));
+        n_nx = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x) - is, int(y),       int(z));
+        n_py = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x),       int(y) + is, int(z));
+        n_ny = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x),       int(y) - is, int(z));
+        n_pz = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x),       int(y),       int(z) + is);
+        n_nz = coleaf_or_sample(meta, self_lo, self_lsz, self_block, int(x),       int(y),       int(z) - is);
     }
-
-    // v0.24.39-mid-lod: neighbor samples step by `stride` blocks.
-    // For stride>1 this skips intermediate cells (correct: a Mid
-    // cell's neighbor is the next Mid cell, which is `stride` source
-    // blocks away).
-    int is = int(stride);
-    uint n_px = sample_or_neighbor(meta, int(x) + is, int(y),       int(z));
-    uint n_nx = sample_or_neighbor(meta, int(x) - is, int(y),       int(z));
-    uint n_py = sample_or_neighbor(meta, int(x),       int(y) + is, int(z));
-    uint n_ny = sample_or_neighbor(meta, int(x),       int(y) - is, int(z));
-    uint n_pz = sample_or_neighbor(meta, int(x),       int(y),       int(z) + is);
-    uint n_nz = sample_or_neighbor(meta, int(x),       int(y),       int(z) - is);
 
     vec3 color = color_for_block(self_block);
     // v0.24.33-climate-tint: modulate base color by per-chunk

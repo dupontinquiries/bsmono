@@ -131,5 +131,15 @@ pub fn default_palette() -> Vec<PaletteEntry> {
         PaletteEntry { item: ItemId(9), name: "Water", color: [64, 108, 220] },
         PaletteEntry { item: ItemId(11), name: "Lava", color: [220, 90, 30] },
         PaletteEntry { item: ItemId(7), name: "Bedrock", color: [40, 40, 44] },
+        // r481: forged weapons (ids 4000..4007, one per WeaponClass). Names +
+        // swatches for the hotbar / drop cubes; geometry lives in sim::viewmodel.
+        PaletteEntry { item: ItemId(4000), name: "Dagger", color: [180, 188, 200] },
+        PaletteEntry { item: ItemId(4001), name: "Blade", color: [196, 168, 96] },
+        PaletteEntry { item: ItemId(4002), name: "Greatsword", color: [210, 214, 224] },
+        PaletteEntry { item: ItemId(4003), name: "Axe", color: [150, 120, 80] },
+        PaletteEntry { item: ItemId(4004), name: "Greataxe", color: [120, 96, 64] },
+        PaletteEntry { item: ItemId(4005), name: "Spear", color: [170, 178, 190] },
+        PaletteEntry { item: ItemId(4006), name: "Staff", color: [196, 168, 96] },
+        PaletteEntry { item: ItemId(4007), name: "Wand", color: [150, 160, 220] },
     ]
 }

@@ -46,7 +46,15 @@ use std::sync::{Arc, Mutex};
 /// codegen for the per-frame cycle. To A/B test FIF values, build
 /// with different values and run them against the same .unendtest
 /// via the launcher (c.11+).
-const MAX_FRAMES_IN_FLIGHT: usize = 1;
+/// Upper bound (cap) on frames in flight. Pools, descriptor sets, and command
+/// buffers are sized for this many; the ACTUAL number used at runtime is
+/// `frames_in_flight` (read from `UNENDLICH_FRAMES_IN_FLIGHT`, default 1, clamped
+/// to this cap). r476: was a hard `= 1`, which forced a full CPU↔GPU round-trip
+/// every frame (no overlap) — the dominant cause of streaming freezes in BOTH
+/// mesher modes, since the CPU stalls on `frame.in_flight` while the GPU does
+/// worldgen/mesh/render serially. Raising the cap + an opt-in runtime value lets
+/// the CPU pipeline ahead. Default stays 1 so visuals are unchanged until tested.
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 // Chunks are cubic 32^3 — AABB extent on each axis is CHUNK_SIZE.
 
@@ -168,6 +176,11 @@ struct CameraUbo {
     /// r431: 16×16 water-depth cells (blocks), packed 4 per vec4. Drives real depth-color
     /// (shallow→clear, deep→dark) instead of the view-angle guess. Zero/disabled = unchanged.
     water_depth_grid: [[f32; 4]; 64],
+    /// r597: up to 8 wind disturbers near the camera — xyz = world pos, w = strength
+    /// (heft from `sim::secondary_motion::disturber_strength`; w<=0 = empty slot).
+    /// Appended LAST so existing field offsets are unchanged. chunk.vert loops these
+    /// and shoves foliage aside (a dragon's bow-wave); zero = no effect.
+    disturbers: [[f32; 4]; 8],
 }
 
 /// Per-frame atmosphere/climate state, sampled by the bin and passed to
@@ -362,6 +375,29 @@ struct FrameSync {
     last_submit_at: Option<std::time::Instant>,
 }
 
+/// r545: per-frame survival meters the bin hands to the renderer for the HUD.
+/// `hunger`/`thirst`/`stamina` are `[0,1]` (1 = full); `comfort` is `[-1,1]`
+/// (−1 freezing … 0 comfortable … +1 overheating); `body_c` is body temp °C.
+/// thirst/stamina default to 1.0 until those pillars land (Roll 3).
+#[derive(Clone, Copy, Debug)]
+pub struct SurvivalHud {
+    pub hunger: f32,
+    pub thirst: f32,
+    pub stamina: f32,
+    pub comfort: f32,
+    pub body_c: f32,
+}
+
+/// r576: one occupied backpack slot for the survival inventory panel — a swatch
+/// colour + short label + stack count, pre-resolved by the bin so the renderer
+/// stays a pure view.
+#[derive(Clone)]
+pub struct InvSlotView {
+    pub color: [u8; 3],
+    pub name: String,
+    pub count: u32,
+}
+
 pub struct WorldRenderer {
     pub render_pass: vk::RenderPass,
     pub swapchain: Swapchain,
@@ -372,6 +408,10 @@ pub struct WorldRenderer {
     descriptor_pool: vk::DescriptorPool,
     frames: Vec<FrameSync>,
     current_frame: usize,
+    /// r476: actual frames in flight (1..=MAX_FRAMES_IN_FLIGHT), from
+    /// UNENDLICH_FRAMES_IN_FLIGHT (default 1). Drives the current_frame cycle and
+    /// the deferred-free hold so the CPU can pipeline ahead of the GPU.
+    frames_in_flight: usize,
     pub framebuffer_size: (u32, u32),
     /// r419 (flow-as-shader): latest coarse water-flow grid set by the bin each frame
     /// (`set_water_flow`). Uploaded in the UBO; `flow_coverage[3]` is the enable flag, 0 by
@@ -380,9 +420,20 @@ pub struct WorldRenderer {
     water_flow_grid: Box<[[f32; 4]; 128]>,
     /// r427: underwater screen-FX params (x = submerged, y = time).
     fx_params: [f32; 4],
+    /// r499: current season phase [0,1) (spring→summer→autumn→winter), packed
+    /// into fx_params.z for the foliage seasonal tint in chunk.frag.
+    world_season01: f32,
     /// r431: water-depth grid + coverage for depth-color.
     water_depth_cov: [f32; 4],
     water_depth_grid: Box<[[f32; 4]; 64]>,
+    /// r597: nearest wind disturbers (dragons/giants), refreshed each frame via
+    /// `set_disturbers`; uploaded in the CameraUbo for chunk.vert to shove foliage.
+    disturbers: [[f32; 4]; 8],
+    /// r603 (upload plan Tier 1c): per-window upload metrics — the "every tier
+    /// below has a before/after" instrumentation the operator's own upload plan
+    /// called for. Accumulates silently; periodically flushed to a log line
+    /// gated by `UNENDLICH_UPLOAD_METRICS=1` (see [`upload_metrics::UploadMetrics::maybe_flush`]).
+    upload_metrics: crate::render::upload_metrics::UploadMetrics,
 
     /// r306: neural deferred G-buffer (gated parallel pass). `Some` only when
     /// `UNENDLICH_NEURAL_GBUFFER=1`; otherwise `None` and the path is inert /
@@ -455,6 +506,17 @@ pub struct WorldRenderer {
     /// vitality, inventory). Rendered in the on-screen HUD card each frame.
     pub hud_status_lines: Vec<String>,
 
+    /// r545: survival meters (hunger + thermal comfort) shown as on-screen bars
+    /// in survival mode. `None` hides the panel (creative mode / menus). The bin
+    /// refreshes it every frame from the player's Vitality + Thermal state.
+    pub hud_survival: Option<SurvivalHud>,
+
+    /// r576: the player's real backpack contents for the centred inventory panel in
+    /// SURVIVAL (creative still shows the placeable catalog). Each entry is one
+    /// occupied slot, resolved via `item::item_display`. The bin refreshes it each
+    /// frame from `App::inventory().slots()`. Empty in creative.
+    pub backpack: Vec<InvSlotView>,
+
     /// Title/pause menu overlay (unendlich-fullgame). The bin sets `menu_open`;
     /// the centered menu panel writes the player's click into `menu_choice`
     /// (0=none, 1=Singleplayer, 2=Host, 3=Join, 4=Quit) which the bin reads + resets.
@@ -482,6 +544,16 @@ pub struct WorldRenderer {
     pub ui_perf_preset: u8,
     pub ui_fps_target: u32, // 0 = autotune off
     pub ui_autotune: bool,
+    /// r476: GPU-mesher throttle (percent of dispatch time slept after each
+    /// octree dispatch, to leave the shared queue idle for rendering). 0 = off.
+    pub ui_gpu_mesh_yield: u64,
+    /// r476: dynamic render distance — caps the radius below the chosen value
+    /// when frames run long, grows back when they recover.
+    pub ui_adaptive_rd: bool,
+    /// r480: tiled shared-memory octree mesher (only active with GPU_MESHER=2).
+    pub ui_octree_tile: bool,
+    /// r480: detached terrain — glide over not-yet-streamed ground, settle on spawn.
+    pub ui_detached_terrain: bool,
     pub ui_fog_on: bool,
     pub ui_shadows_on: bool,
     /// r437: debug-logging toggles, surfaced in Settings → Debug. `master` gates ALL of them and
@@ -496,6 +568,13 @@ pub struct WorldRenderer {
     /// (name, craftable, have-summary, canonical tooltip)
     pub craft_lines: Vec<(String, bool, String, String)>,
     pub craft_pick: u8,
+    /// r488: CHARACTER-SELECT window. The bin populates `character_roster`; the
+    /// window edits it (select/reroll/save) and, on Save, sets `character_chosen`
+    /// for the bin to apply + persist (loads across worlds). Opened from the
+    /// title menu's "Character" button.
+    pub character_menu_open: bool,
+    pub character_roster: Option<crate::player_character::CharacterRoster>,
+    pub character_chosen: Option<crate::player_character::CharacterProfile>,
     /// r169: ANALYTICS window (F4). Bin feeds samples + stat lines.
     pub perf_window_open: bool,
     /// r177: latch — bin dumps an ascii frame-time graph to the log.
@@ -1101,8 +1180,20 @@ impl WorldRenderer {
             )?
         };
 
-        let mut frames = Vec::with_capacity(MAX_FRAMES_IN_FLIGHT);
-        for i in 0..MAX_FRAMES_IN_FLIGHT {
+        // r476: frames in flight default 2 (CPU/GPU overlap — the single biggest
+        // smoothness win on Asahi). Metadata SSBO is double-buffered so >1 is
+        // crash-safe. Override with UNENDLICH_FRAMES_IN_FLIGHT (=1 old behavior).
+        let frames_in_flight: usize = std::env::var("UNENDLICH_FRAMES_IN_FLIGHT")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(1, MAX_FRAMES_IN_FLIGHT))
+            .unwrap_or(2);
+        log::info!(
+            "WorldRenderer: frames_in_flight = {} (cap {}; UNENDLICH_FRAMES_IN_FLIGHT)",
+            frames_in_flight, MAX_FRAMES_IN_FLIGHT
+        );
+        let mut frames = Vec::with_capacity(frames_in_flight);
+        for i in 0..frames_in_flight {
             let image_available = unsafe { ctx.device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)? };
             let render_finished = unsafe { ctx.device.create_semaphore(&vk::SemaphoreCreateInfo::builder(), None)? };
             let in_flight = unsafe {
@@ -1259,6 +1350,7 @@ impl WorldRenderer {
             crate::render::chunk_indirect::IndirectDrawSet::new(
                 &ctx.device, &ctx.instance, ctx.physical_device,
                 view_params.buffer,
+                frames_in_flight,
             )
         }.map_err(|e| WorldRenderError::Other(
             format!("Failed to create indirect draw set: {}", e)
@@ -1279,9 +1371,9 @@ impl WorldRenderer {
         // doesn't have to be rearranged. Each descriptor-set update is
         // idempotent and doesn't disturb the previously-written
         // bindings.
-        for frame in &frames {
+        for (i, frame) in frames.iter().enumerate() {
             let chunks_buffer_info = vk::DescriptorBufferInfo::builder()
-                .buffer(indirect.metadata_buffer())
+                .buffer(indirect.metadata_buffer(i))
                 .offset(0)
                 .range(indirect.metadata_buffer_size());
             let chunks_buffer_infos = [*chunks_buffer_info];
@@ -1415,13 +1507,16 @@ impl WorldRenderer {
 
         Ok(Self {
             render_pass, swapchain, depth, pipeline, entity_pipeline, command_pool, descriptor_pool,
-            frames, current_frame: 0,
+            frames, current_frame: 0, frames_in_flight,
             framebuffer_size,
             water_flow_coverage: [0.0; 4],
             water_flow_grid: Box::new([[0.0; 4]; 128]),
             fx_params: [0.0; 4],
+            world_season01: 0.0,
             water_depth_cov: [0.0; 4],
             water_depth_grid: Box::new([[0.0; 4]; 64]),
+            disturbers: [[0.0; 4]; 8],
+            upload_metrics: crate::render::upload_metrics::UploadMetrics::new(),
             gbuffer,
             neural_feat,
             neural_trainer,
@@ -1451,6 +1546,8 @@ impl WorldRenderer {
             ui_pointer_active: false,
             settings_open: false,
             hud_status_lines: Vec::new(),
+            hud_survival: None,
+            backpack: Vec::new(),
             menu_open: false,
             pause_menu_open: false,
             pause_action: 0,
@@ -1465,6 +1562,10 @@ impl WorldRenderer {
             ui_perf_preset: 2, // Medium
             ui_fps_target: 30,
             ui_autotune: false,
+            ui_gpu_mesh_yield: 0,
+            ui_adaptive_rd: false,
+            ui_octree_tile: true,
+            ui_detached_terrain: true,
             ui_fog_on: true,
             ui_debug_master: false,
             ui_debug_water: false,
@@ -1474,6 +1575,9 @@ impl WorldRenderer {
             craft_menu_open: false,
             craft_lines: Vec::new(),
             craft_pick: 0,
+            character_menu_open: false,
+            character_roster: None,
+            character_chosen: None,
             perf_window_open: false,
             perf_export_ascii: false,
             loading_fade: 0.0,
@@ -1718,7 +1822,7 @@ impl WorldRenderer {
                 self.pending_destroy.push(PendingDestroy {
                     slot: old.slot,
                     draw_slot: old.draw_slot,
-                    frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                    frames_remaining: self.frames_in_flight,
                 });
             }
             // v0.24.72: record "meshed empty at this version" so the
@@ -1801,7 +1905,9 @@ impl WorldRenderer {
         // v0.24.20-vertex-pack: bytes on the wire are PackedVertex
         // (8 bytes), not the CPU-side Vertex (24 bytes). 3× upload
         // bandwidth reduction vs the pre-pack path.
-        let vert_count = mesh.vertex_count() as usize;
+        // r596: count from whichever representation is populated (packed-only
+        // meshes have empty `vertices`).
+        let vert_count = (mesh.vertex_count() as usize).max(mesh.packed.len());
         let vert_bytes = vert_count * std::mem::size_of::<PackedVertex>();
         let idx_bytes = (mesh.index_count() as usize) * std::mem::size_of::<u32>();
 
@@ -1821,7 +1927,21 @@ impl WorldRenderer {
         let (ox, oy, oz) = coord.block_origin();
         let chunk_origin_f = [ox as f32, oy as f32, oz as f32];
 
-        let (packed_verts, min_y, max_y) = if mesh.vertices.is_empty() {
+        // r603 (upload plan Tier 1c): bracket the L1 memcpy/pack cost (whichever
+        // branch below actually runs — fast-path clone or the legacy per-vertex
+        // pack) so it's measurable. `Instant::now()` is cheap but not free, so
+        // skip it entirely when metrics aren't requested (`enabled()` is a plain
+        // bool read — zero-cost when off).
+        let metrics_on = self.upload_metrics.enabled();
+        let t_pack = if metrics_on { Some(std::time::Instant::now()) } else { None };
+
+        let (packed_verts, min_y, max_y) = if !mesh.packed.is_empty() {
+            // r596 fast path (upload Tier 2a/5): the meshing pool already
+            // quantized this mesh off-thread (`ChunkMesh::pack_in_place`),
+            // including foliage sway tags. The frame thread just copies the
+            // bytes — no per-vertex work here at all.
+            (mesh.packed.clone(), mesh.packed_min_y, mesh.packed_max_y)
+        } else if mesh.vertices.is_empty() {
             let oy_f = oy as f32;
             (Vec::new(), oy_f, oy_f + CHUNK_SIZE as f32)
         } else {
@@ -1829,14 +1949,24 @@ impl WorldRenderer {
             let first_y = mesh.vertices[0].position[1];
             let mut min_y = first_y;
             let mut max_y = first_y;
-            for v in mesh.vertices.iter() {
+            for (i, v) in mesh.vertices.iter().enumerate() {
                 let y = v.position[1];
                 if y < min_y { min_y = y; }
                 if y > max_y { max_y = y; }
-                packed.push(PackedVertex::from_world(v, chunk_origin_f));
+                // r596: fold the out-of-band foliage sway tag (bits 30-31).
+                packed.push(PackedVertex::from_world_tagged(v, chunk_origin_f, mesh.sway_tag(i)));
             }
             (packed, min_y, max_y)
         };
+
+        // r603: record now that packing/cloning is done — `t_pack` is `None`
+        // (and this is a no-op) whenever metrics aren't enabled.
+        if let Some(t0) = t_pack {
+            self.upload_metrics.record_chunk(vert_bytes as u64, idx_bytes as u64, t0.elapsed());
+        }
+        if let Some(line) = self.upload_metrics.maybe_flush() {
+            log::info!("{line}");
+        }
 
         // Sub-allocator design (v0.19): every upload allocates fresh
         // spans sized to the actual mesh. No slot reuse — the previous
@@ -1996,7 +2126,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: old.slot,
                 draw_slot: old.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
         }
 
@@ -2033,7 +2163,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: stale.slot,
                 draw_slot: stale.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
         }
         // LRU eviction if at capacity.
@@ -2067,7 +2197,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: evicted.slot,
                 draw_slot: evicted.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
         }
     }
@@ -2102,7 +2232,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: cached.slot,
                 draw_slot: cached.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
             return false;
         }
@@ -2158,7 +2288,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: displaced.slot,
                 draw_slot: displaced.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
         }
         // v0.24.72: defensive — if any stale empty-mesh record exists
@@ -2280,7 +2410,7 @@ impl WorldRenderer {
             self.pending_destroy.push(PendingDestroy {
                 slot: cm.slot,
                 draw_slot: cm.draw_slot,
-                frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                frames_remaining: self.frames_in_flight,
             });
         }
     }
@@ -2305,7 +2435,7 @@ impl WorldRenderer {
                     self.pending_destroy.push(PendingDestroy {
                         slot: unparked.slot,
                         draw_slot: unparked.draw_slot,
-                        frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                        frames_remaining: self.frames_in_flight,
                     });
                 }
             }
@@ -2329,7 +2459,7 @@ impl WorldRenderer {
                 self.pending_destroy.push(PendingDestroy {
                     slot: unparked.slot,
                     draw_slot: unparked.draw_slot,
-                    frames_remaining: MAX_FRAMES_IN_FLIGHT,
+                    frames_remaining: self.frames_in_flight,
                 });
             }
         }
@@ -2840,7 +2970,7 @@ impl WorldRenderer {
             stride,
             stride_phase,
         };
-        self.indirect.record_cull_dispatch(cmd, &push);
+        self.indirect.record_cull_dispatch(cmd, &push, self.current_frame);
 
         // Step 4: barrier — the cull shader's writes to the commands
         // and count buffers must be visible to the indirect-draw stage
@@ -2949,6 +3079,25 @@ impl WorldRenderer {
         self.fx_params = [submerged, time, 0.0, 0.0];
     }
 
+    /// r597: refresh the wind disturbers for the next frame. `movers` are
+    /// (world_pos, strength) for candidate heavy bodies (creatures — strength via
+    /// `sim::secondary_motion::disturber_strength(mass, ground_shake)`); this keeps
+    /// the most significant few near `player` (see `select_disturbers`) and uploads
+    /// them so chunk.vert shoves foliage aside as they pass. Call once per frame
+    /// before render; passing an empty slice clears all disturbers.
+    pub fn set_disturbers(&mut self, player: [f32; 3], movers: &[([f32; 3], f32)]) {
+        // min strength ~0.5 skips ordinary creatures (a 1.8-block human is 0);
+        // 48-block reach keeps it local to where foliage is actually rendered.
+        crate::sim::secondary_motion::select_disturbers(
+            player, movers, 0.5, 48.0, &mut self.disturbers,
+        );
+    }
+
+    /// r499: set the world season phase [0,1) for the foliage seasonal tint.
+    pub fn set_season(&mut self, season01: f32) {
+        self.world_season01 = season01.rem_euclid(1.0);
+    }
+
     pub fn draw_frame(&mut self, ctx: &VulkanContext) -> Result<bool> {
         let view = self.camera.as_view();
         let atmos = AtmosphereParams::neutral();
@@ -3024,6 +3173,11 @@ impl WorldRenderer {
         unsafe {
             ctx.device.wait_for_fences(std::slice::from_ref(&frame.in_flight), true, u64::MAX)?;
         }
+        // r476: the GPU is now finished with this frame slot, so its metadata
+        // copy is safe to write. Sync the chunk-draw entries that changed since
+        // this slot last rendered, BEFORE the cull/vertex shaders read them.
+        // At frames_in_flight==1 this is the same single buffer as before.
+        self.indirect.flush_frame(frame_idx);
         let wait_dur = wait_start.elapsed();
         let wait_ms = wait_dur.as_secs_f64() * 1000.0;
         // v0.24.63-adaptive-uploads: expose this measurement on the
@@ -3093,7 +3247,20 @@ impl WorldRenderer {
             // #1: the creative picker is an overlay you interact with only in
             // panel mode; when the mouse is captured for look (game mode) it must
             // disappear. `ui_pointer_active` mirrors panel mode. The hotbar stays.
-            let show_creative = self.ui_pointer_active;
+            // r577: the `p`/creative panel is one EXCLUSIVE surface — it must yield to
+            // settings, pause, debug, crafting, the title and the wizard rather than
+            // drawing on top of them (was `= ui_pointer_active`, which is true for ANY
+            // open UI, so the panel stacked over settings). At the state level these are
+            // already mutually exclusive; this makes the render agree.
+            let show_creative = self.ui_pointer_active
+                && !self.settings_menu_open
+                && !self.pause_menu_open
+                && !self.settings_open
+                && !self.perf_window_open
+                && !self.craft_menu_open
+                && !self.character_menu_open
+                && !self.menu_open
+                && !self.wizard_open;
             let settings_open = self.settings_open;
             let mut settings_menu_open_local = self.settings_menu_open; // r203 (menu opens tabbed settings)
             // r167: a clean title — no in-world HUD while the menu is up.
@@ -3102,6 +3269,8 @@ impl WorldRenderer {
             } else {
                 self.hud_status_lines.clone()
             };
+            // r545: survival meters local (hidden while a menu is up).
+            let hud_survival = if self.menu_open { None } else { self.hud_survival };
             // Title/pause menu: copy the flag to a Copy local (the closure can't
             // borrow self while prepare holds it mutably); the click is collected
             // into menu_pick and written back to self.menu_choice after prepare.
@@ -3117,6 +3286,10 @@ impl WorldRenderer {
             let mut ui_render_scale = self.ui_render_scale; // r325
             let mut ui_fps_target = self.ui_fps_target;
             let mut ui_autotune = self.ui_autotune;
+            let mut ui_gpu_mesh_yield = self.ui_gpu_mesh_yield;
+            let mut ui_adaptive_rd = self.ui_adaptive_rd;
+            let mut ui_octree_tile = self.ui_octree_tile;
+            let mut ui_detached_terrain = self.ui_detached_terrain;
             let mut wizard_seed_buf = self.wizard_seed_buf.clone();
             // r181/r182: preview upload happens INSIDE the closure (ctx
             // lives there); captured locals + write-back, like the latches.
@@ -3192,6 +3365,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             let mut settings_close = false;
             let craft_menu_open = self.craft_menu_open;
             let craft_lines = self.craft_lines.clone();
+            // r576: survival backpack snapshot for the centred inventory panel.
+            let backpack = self.backpack.clone();
+            let survival_inv = self.hud_survival.is_some();
             let mut craft_pick: u8 = 0;
             let mut craft_close = false;
             let perf_window_open = self.perf_window_open;
@@ -3226,6 +3402,54 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             let mut menu_world_delete_cancel_local = false; // r205 (dismiss confirm)
             let menu_keybind_list = self.menu_keybind_list.clone(); // r199
             let keybind_capturing = self.keybind_capturing; // r199 (read)
+            // r488: character-select snapshot (closure can't borrow self) + action latches.
+            let character_menu_open = self.character_menu_open;
+            let mut char_cards: Vec<(String, String, bool)> = Vec::new(); // (name, plan, is_custom)
+            let mut char_selected: usize = 0;
+            let mut char_custom_index: usize = 0;
+            let mut char_stat = String::new();
+            let mut char_preview: Vec<crate::creature_viewer::ProjectedBox> = Vec::new();
+            // r538: live-edited copy of the custom slot's body-build sliders.
+            let mut char_build_edit = crate::player_character::BuildParams::default();
+            let mut char_is_hero = false;
+            if character_menu_open {
+                if let Some(roster) = self.character_roster.as_ref() {
+                    char_selected = roster.selected;
+                    char_custom_index = roster.custom_index;
+                    char_build_edit = roster.current().build;
+                    char_is_hero = crate::hero_forge::HeroKind::from_name(
+                        &roster.current().name,
+                    ).is_some();
+                    for (i, c) in roster.options.iter().enumerate() {
+                        char_cards.push((c.name.clone(), c.arche.clone(), i == roster.custom_index));
+                    }
+                    let cur = roster.current();
+                    char_stat = format!("{} · {} · seed {:#x}", cur.name, cur.arche, cur.seed);
+                    // r541: heroes preview their actual voxel mesh (shaped by the build
+                    // sliders), not the generic blueprint silhouette.
+                    char_preview = if let Some(kind) =
+                        crate::hero_forge::HeroKind::from_name(&cur.name)
+                    {
+                        crate::hero_forge::preview_boxes(kind, &cur.build)
+                    } else {
+                        crate::creature_viewer::project(
+                            &cur.blueprint(),
+                            crate::creature_viewer::ViewAxis::Side,
+                        )
+                    };
+                    char_preview.sort_by(|a, b| {
+                        a.depth.partial_cmp(&b.depth).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+            let mut char_pick_local: i32 = -1;
+            let mut char_reroll_local = false;
+            let mut char_save_local = false;
+            let mut char_close_local = false;
+            let mut char_cycle_arche_local = false;
+            let mut char_tint_local: Option<[f32; 3]> = None;
+            let mut char_build_local: Option<crate::player_character::BuildParams> = None;
+            let mut open_character_local = false;
             let mut keybind_rebind_local: i32 = -1; // r199 (write-back below)
             let mut ui_scale_local = self.ui_scale; // r200 GUI scale (write-back below)
             let mut ui_scale_staged = self.ui_scale; // r202: slider edits this; commits on release
@@ -3570,6 +3794,9 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         // renders over any screen and has its own
                                         // "Done" close button.
                                         if dest_button(ui, "Settings") { settings_menu_open_local = true; }
+                                        ui.add_space(4.0);
+                                        // r488: open the character-select / customizer.
+                                        if dest_button(ui, "Character") { open_character_local = true; }
                                         ui.add_space(12.0);
                                         if dest_button(ui, "Quit") { menu_pick = 4; }
                                     }
@@ -3655,6 +3882,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 if tbtn_sized(ui, "Resume", 220.0, 32.0) { pause_pick = 1; }
                                 ui.add_space(6.0);
                                 if tbtn_sized(ui, "Settings", 220.0, 32.0) { pause_pick = 2; }
+                                ui.add_space(6.0);
+                                // r533: change character WITHOUT leaving the world — the
+                                // selector was previously only on the title screen.
+                                if tbtn_sized(ui, "Character", 220.0, 32.0) { open_character_local = true; }
                                 ui.add_space(6.0);
                                 ui.separator();
                                 ui.add_space(6.0);
@@ -3972,6 +4203,38 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         int_slider!("target fps", ui_fps_target, u32, 15, 120);
                                     }
                                     ui.weak("autotune raises strides / lowers budget below target, relaxes above");
+
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("GPU MESHER").weak().extra_letter_spacing(2.0));
+                                    ui.add_space(4.0);
+                                    // r476: live mesher throttle. Sleeps a % of each octree dispatch
+                                    // so the shared GPU queue is left idle for rendering — trades
+                                    // chunk pop-in speed for FPS while streaming.
+                                    ui.label("mesh throttle (% — higher = smoother streaming, slower chunk pop-in)");
+                                    int_slider!("throttle", ui_gpu_mesh_yield, u64, 0, 200);
+                                    ui.add_space(6.0);
+                                    if unendlich_ui::menu::toggle(ui, ui_adaptive_rd, accent).clicked() {
+                                        ui_adaptive_rd = !ui_adaptive_rd;
+                                    }
+                                    ui.label("adaptive render distance");
+                                    ui.weak("auto-shrinks the radius when frames run long, grows back when they recover");
+                                    ui.add_space(6.0);
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.label(egui::RichText::new("ADVANCED").weak().extra_letter_spacing(2.0));
+                                    ui.add_space(4.0);
+                                    if unendlich_ui::menu::toggle(ui, ui_octree_tile, accent).clicked() {
+                                        ui_octree_tile = !ui_octree_tile;
+                                    }
+                                    ui.label("GPU tile mesher (on by default)");
+                                    ui.weak("shared-memory tiled octree mesh — fewer GPU descents, faster remeshing; only active with the octree GPU mesher");
+                                    ui.add_space(6.0);
+                                    if unendlich_ui::menu::toggle(ui, ui_detached_terrain, accent).clicked() {
+                                        ui_detached_terrain = !ui_detached_terrain;
+                                    }
+                                    ui.label("detached terrain");
+                                    ui.weak("glide over not-yet-streamed ground instead of falling, settle when it spawns");
                                 }
                                 5 => {
                                     // r437: DEBUG tab. Master gate (off by default) + per-system
@@ -4092,6 +4355,163 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             }
                             ui.add_space(8.0);
                             if tbtn(ui, "  Close (C)  ") { craft_close = true; }
+                        });
+                }
+                // ── r488: CHARACTER-SELECT / customizer ──
+                if character_menu_open {
+                    egui::Window::new("character_select")
+                        .frame(glass.clone())
+                        .anchor(egui::Align2::CENTER_CENTER, cone_par(c, "character_select", 0.012))
+                        .collapsible(false)
+                        .resizable(false)
+                        .show(c, |ui| {
+                            unendlich_ui::set_theme(ui.ctx(), unendlich_ui::Theme::DARK);
+                            ui.label(
+                                egui::RichText::new("CHOOSE YOUR CHARACTER")
+                                    .font(unendlich_ui::menu::blocks_font(22.0))
+                                    .color(egui::Color32::from_rgb(0xee, 0xf3, 0xe8))
+                                    .extra_letter_spacing(4.0),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for (i, (name, plan, is_custom)) in char_cards.iter().enumerate() {
+                                    let marker = if i == char_selected { "\u{25b8} " } else { "" };
+                                    let star = if *is_custom { " \u{2605}" } else { "" };
+                                    if ui.button(format!("{marker}{name}{star}\n{plan}")).clicked() {
+                                        char_pick_local = i as i32;
+                                    }
+                                }
+                            });
+                            ui.add_space(10.0);
+                            // live silhouette preview of the highlighted character
+                            let (rect, _resp) = ui.allocate_exact_size(
+                                egui::vec2(260.0, 200.0),
+                                egui::Sense::hover(),
+                            );
+                            let painter = ui.painter_at(rect);
+                            painter.rect_filled(
+                                rect,
+                                6.0,
+                                egui::Color32::from_rgba_unmultiplied(10, 12, 16, 150),
+                            );
+                            let pad = 18.0;
+                            let area = egui::vec2(
+                                (rect.width() - pad * 2.0).max(1.0),
+                                (rect.height() - pad * 2.0).max(1.0),
+                            );
+                            for pb in &char_preview {
+                                // projection space: unit square, +y up → flip for egui.
+                                let x = rect.min.x + pad + pb.x * area.x;
+                                let y = rect.min.y + pad + (1.0 - pb.y - pb.h) * area.y;
+                                let r = egui::Rect::from_min_size(
+                                    egui::pos2(x, y),
+                                    egui::vec2((pb.w * area.x).max(1.0), (pb.h * area.y).max(1.0)),
+                                );
+                                let col = egui::Color32::from_rgb(
+                                    (pb.color[0].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (pb.color[1].clamp(0.0, 1.0) * 255.0) as u8,
+                                    (pb.color[2].clamp(0.0, 1.0) * 255.0) as u8,
+                                );
+                                painter.rect_filled(r, 1.0, col);
+                            }
+                            ui.add_space(8.0);
+                            ui.weak(char_stat.clone());
+                            // customizer controls — only on the player's own (custom) slot
+                            if char_selected == char_custom_index {
+                                ui.add_space(8.0);
+                                let plan = char_cards
+                                    .get(char_custom_index)
+                                    .map(|c| c.1.clone())
+                                    .unwrap_or_default();
+                                if tbtn(ui, &format!("  Body: {plan}  \u{25b8}")) {
+                                    char_cycle_arche_local = true;
+                                }
+                                ui.add_space(6.0);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.weak("Colour:");
+                                    for (name, tint) in
+                                        crate::player_character::TINT_SWATCHES.iter()
+                                    {
+                                        let sw = egui::Color32::from_rgb(
+                                            (tint[0].clamp(0.0, 1.0) * 200.0) as u8 + 40,
+                                            (tint[1].clamp(0.0, 1.0) * 200.0) as u8 + 40,
+                                            (tint[2].clamp(0.0, 1.0) * 200.0) as u8 + 40,
+                                        );
+                                        let b = egui::Button::new(
+                                            egui::RichText::new(*name).color(sw),
+                                        );
+                                        if ui.add(b).clicked() {
+                                            char_tint_local = Some(*tint);
+                                        }
+                                    }
+                                });
+                                // r538: BODY BUILD sliders (forge heroes are shaped by
+                                // these live; ordinary body-plans ignore them for now).
+                                ui.add_space(8.0);
+                                ui.weak(if char_is_hero {
+                                    "Build:"
+                                } else {
+                                    "Build (affects forge heroes):"
+                                });
+                                let mut build_changed = false;
+                                let accent = unendlich_ui::current_theme(ui.ctx()).accent;
+                                // tallness is the stature in BLOCKS (0.1..50.0, default 1.8);
+                                // see docs/STATURE.md. Semi-LOG slider (equal travel = equal
+                                // ratio) so there's fine control near the human default and it
+                                // still reaches the giants; the value is shown alongside.
+                                ui.horizontal(|ui| {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(78.0, 22.0),
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| { ui.weak("tallness"); },
+                                    );
+                                    // r569: max raised 25 → 50 blocks.
+                                    let (lo, hi) = (
+                                        crate::sim::stature::MIN_HEIGHT,
+                                        crate::sim::stature::MAX_HEIGHT,
+                                    );
+                                    let mut t = char_build_edit.height.clamp(lo, hi).ln();
+                                    if unendlich_ui::menu::slider(ui, &mut t, lo.ln(), hi.ln(), 0, accent).changed() {
+                                        char_build_edit.height = t.exp().clamp(lo, hi);
+                                        build_changed = true;
+                                    }
+                                    ui.add_space(6.0);
+                                    ui.label(egui::RichText::new(format!("{:.1} blk", char_build_edit.height)).strong().color(accent));
+                                });
+                                let mut row = |ui: &mut egui::Ui, label: &str, v: &mut f32, lo: f32, hi: f32, dec: usize| {
+                                    ui.horizontal(|ui| {
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(78.0, 22.0),
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| { ui.weak(label); },
+                                        );
+                                        if unendlich_ui::menu::slider(ui, v, lo, hi, dec, accent).changed() {
+                                            build_changed = true;
+                                        }
+                                    });
+                                };
+                                row(ui, "muscle", &mut char_build_edit.bulk, 0.7, 1.5, 0);
+                                row(ui, "head", &mut char_build_edit.head, 0.7, 1.4, 0);
+                                row(ui, "shoulders", &mut char_build_edit.shoulders, 0.7, 1.5, 0);
+                                row(ui, "arms", &mut char_build_edit.arm, 0.7, 1.5, 0);
+                                row(ui, "legs", &mut char_build_edit.leg, 0.7, 1.4, 0);
+                                if build_changed {
+                                    char_build_local = Some(char_build_edit);
+                                }
+                            }
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                if char_selected == char_custom_index {
+                                    if tbtn(ui, "  Reroll look  ") { char_reroll_local = true; }
+                                    if tbtn(ui, "  Save & Use  ") { char_save_local = true; }
+                                } else if tbtn(ui, "  Use this one  ") {
+                                    char_save_local = true;
+                                }
+                                if tbtn(ui, "  Close  ") { char_close_local = true; }
+                            });
+                            ui.add_space(4.0);
+                            ui.weak("\u{2605} is your saved character — it carries across every world.");
+                            ui.weak("In-world, press F5 to see your character (third-person).");
                         });
                 }
                 // ── r169: ANALYTICS dashboard (F4) ──
@@ -4276,6 +4696,17 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 _ => "0: CW + cull BACK   (default)",
                             });
                             ui.separator();
+                            // r592: live foliage-disturber strength — amp the "plants
+                            // part around you" push to confirm it's working. 1.0 = the
+                            // r591 default; higher also widens the reach so cranking it
+                            // is a decisive test even if little foliage is right at your feet.
+                            ui.label("foliage disturber (live) — plants part around you");
+                            let mut fd = DEBUG.foliage_disturb.load(Relaxed) as f32 / 10.0;
+                            if ui.add(egui::Slider::new(&mut fd, 0.0..=30.0).text("strength")).changed() {
+                                DEBUG.foliage_disturb.store((fd.clamp(0.0, 30.0) * 10.0) as u32, Relaxed);
+                            }
+                            ui.label("1.0 = default · 0 = off · crank to ~15+ to confirm");
+                            ui.separator();
                             if ui.button("Quit").clicked() {
                                 DEBUG.request_quit.store(true, Relaxed);
                             }
@@ -4332,7 +4763,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                 // #1: only while in panel mode (mouse free); hidden in game mode.
                 if show_creative && !menu_open && !wizard_open { // r175: not on the title
                 egui::Area::new(egui::Id::new("unendlich_creative"))
-                    .fixed_pos(egui::pos2((pw - 372.0).max(16.0), 16.0))
+                    .fixed_pos(egui::pos2(
+                        ((pw - 372.0) * 0.5).max(16.0),
+                        ((ph - 520.0) * 0.5).max(16.0),
+                    ))
                     .show(c, |ui| {
                         ui.set_max_width(356.0); // bound the grid so grid_fit wraps
                         // Theme the picker by the in-hand item's display color
@@ -4342,19 +4776,23 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             egui::Color32::from_rgb(tr, tg, tb),
                         )
                         .lit(hud_ambient);
-                        let title = match creative_tab {
+                        let title = if survival_inv {
+                            "backpack"
+                        } else {
+                            match creative_tab {
                             Tab::Inventory => "creative \u{00b7} inventory",
                             Tab::Items => "creative \u{00b7} items",
                             Tab::SpawnEggs => "creative \u{00b7} eggs",
+                            }
                         };
                         unendlich_ui::card_themed(
                             ui,
                             theme,
                             Some(title),
                             |ui| {
-                                // Tab strip: click to switch catalog. Takes effect
-                                // next frame (the item list is built before this
-                                // closure), so selection resets to 0 on switch.
+                                // Tab strip (creative only — survival shows the real
+                                // backpack, no catalog tabs).
+                                if !survival_inv {
                                 ui.horizontal(|ui| {
                                     for t in Tab::ALL {
                                         let lbl = match t {
@@ -4368,13 +4806,46 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                         }
                                     }
                                 });
-                                // r226: creative inventory on the mockup's
-                                // crosshair cell grid — neutral hollow cells,
-                                // clear interiors, row×col crosshair on hover.
-                                // The content callback paints each item's colour
-                                // swatch + short name into the cell rect.
+                                }
                                 let accent = unendlich_ui::current_theme(ui.ctx()).accent;
-                                if let Some(i) = unendlich_ui::menu::cell_grid(
+                                if survival_inv {
+                                    // r576: REAL BACKPACK — a 3×9 grid of the player's
+                                    // occupied slots (swatch + stack count + short name),
+                                    // resolved by the bin into `backpack`. Read-only for
+                                    // now (pick/place mouse model lands in a follow-up).
+                                    let slots = 27usize;
+                                    let _ = unendlich_ui::menu::cell_grid(
+                                        ui, "survival_backpack", slots, 56.0, 6.0, accent,
+                                        |ui, i, rect| {
+                                            let p = ui.painter();
+                                            if let Some(s) = backpack.get(i) {
+                                                let [r, g, b] = s.color;
+                                                let sw = egui::Color32::from_rgb(r, g, b);
+                                                p.rect_filled(rect.shrink(8.0), egui::CornerRadius::same(2), sw);
+                                                // stack count, top-right
+                                                if s.count > 1 {
+                                                    p.text(
+                                                        rect.right_top() + egui::vec2(-4.0, 2.0),
+                                                        egui::Align2::RIGHT_TOP,
+                                                        format!("{}", s.count),
+                                                        egui::FontId::proportional(11.0),
+                                                        egui::Color32::from_rgb(236, 240, 248),
+                                                    );
+                                                }
+                                                // short name, bottom
+                                                let short: String = s.name.chars().take(6).collect();
+                                                p.text(
+                                                    rect.center_bottom() - egui::vec2(0.0, 3.0),
+                                                    egui::Align2::CENTER_BOTTOM,
+                                                    short,
+                                                    egui::FontId::proportional(9.0),
+                                                    egui::Color32::from_rgb(220, 228, 242),
+                                                );
+                                            }
+                                            // empty slots: cell_grid already paints the hollow cell
+                                        },
+                                    );
+                                } else if let Some(i) = unendlich_ui::menu::cell_grid(
                                     ui, "creative_inv", items.len(), 56.0, 6.0, accent,
                                     |ui, i, rect| {
                                         let name = items[i].display_name();
@@ -4409,6 +4880,93 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                                 ) {
                                     selected = i;
                                 }
+                                // r553: HOTBAR SWITCHER — the quick-bar slots inline
+                                // in the centered inventory; click to pick the in-hand
+                                // slot (mirrors the bottom hotbar + the scroll wheel).
+                                // r576: creative-only (it lists the placeable catalog,
+                                // not the survival backpack).
+                                if !survival_inv {
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("HOTBAR")
+                                        .size(11.0)
+                                        .color(egui::Color32::from_rgb(176, 186, 202))
+                                        .extra_letter_spacing(3.0),
+                                );
+                                ui.horizontal(|ui| {
+                                    let hbn = items.len().min(9);
+                                    for i in 0..hbn {
+                                        let [r, g, b] = items[i].display_color();
+                                        let (rect, resp) = ui.allocate_exact_size(
+                                            egui::vec2(30.0, 30.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let p = ui.painter();
+                                        p.rect_filled(
+                                            rect,
+                                            egui::CornerRadius::same(3),
+                                            egui::Color32::from_rgba_unmultiplied(20, 24, 30, 200),
+                                        );
+                                        let sw = egui::Color32::from_rgb(r, g, b);
+                                        p.rect_filled(
+                                            rect.shrink(5.0),
+                                            egui::CornerRadius::same(2),
+                                            if i == selected { sw } else { sw.gamma_multiply(0.65) },
+                                        );
+                                        if i == selected {
+                                            p.rect_stroke(
+                                                rect.shrink(1.0),
+                                                egui::CornerRadius::same(0),
+                                                egui::Stroke::new(1.5, accent),
+                                                egui::StrokeKind::Inside,
+                                            );
+                                        }
+                                        p.text(
+                                            rect.left_top() + egui::vec2(3.0, 1.0),
+                                            egui::Align2::LEFT_TOP,
+                                            format!("{}", i + 1),
+                                            egui::FontId::proportional(8.0),
+                                            egui::Color32::from_rgb(210, 216, 228),
+                                        );
+                                        if resp.clicked() {
+                                            selected = i;
+                                        }
+                                    }
+                                });
+                                } // end hotbar switcher (creative only)
+                                // r553: CRAFTING merged into the same panel (the single
+                                // `p` UI now shows backpack + hotbar + crafting). Recipes
+                                // are filled by the bin while this panel is open.
+                                if !craft_lines.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("CRAFTING")
+                                            .size(11.0)
+                                            .color(egui::Color32::from_rgb(176, 186, 202))
+                                            .extra_letter_spacing(3.0),
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .max_height(210.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            for (i, (name, can, have, tip)) in craft_lines.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    ui.add_enabled_ui(*can, |ui| {
+                                                        if ui
+                                                            .button(format!("craft  {name}"))
+                                                            .on_hover_text(tip.clone())
+                                                            .clicked()
+                                                        {
+                                                            craft_pick = (i + 1) as u8;
+                                                        }
+                                                    });
+                                                    ui.weak(have);
+                                                });
+                                            }
+                                        });
+                                }
                             },
                         );
                     });
@@ -4437,6 +4995,66 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                             unendlich_ui::slot_swatch(ui, 44.0, i == selected, sw, key.as_deref());
                         });
                     });
+                // r545: SURVIVAL METERS — small bars above the hotbar (hunger +
+                // thermal; thirst/stamina join in Roll 3). Only in survival mode.
+                if let Some(sv) = hud_survival {
+                    egui::Area::new(egui::Id::new("unendlich_survival_hud"))
+                        .fixed_pos(egui::pos2(12.0, ph - 190.0))
+                        .show(c, |ui| {
+                            let bar = |ui: &mut egui::Ui, label: &str, frac: f32, col: egui::Color32| {
+                                let f = frac.clamp(0.0, 1.0);
+                                let (rect, _resp) =
+                                    ui.allocate_exact_size(egui::vec2(140.0, 14.0), egui::Sense::hover());
+                                let p = ui.painter_at(rect);
+                                p.rect_filled(rect, 3.0, egui::Color32::from_rgba_unmultiplied(8, 10, 14, 180));
+                                let mut fill = rect;
+                                fill.set_width(rect.width() * f);
+                                p.rect_filled(fill, 3.0, col);
+                                p.text(
+                                    rect.left_center() + egui::vec2(6.0, 0.0),
+                                    egui::Align2::LEFT_CENTER,
+                                    label,
+                                    egui::FontId::proportional(10.0),
+                                    egui::Color32::from_rgb(235, 238, 242),
+                                );
+                            };
+                            // hunger: green→amber→red as it empties.
+                            let hcol = if sv.hunger > 0.5 {
+                                egui::Color32::from_rgb(96, 184, 96)
+                            } else if sv.hunger > 0.25 {
+                                egui::Color32::from_rgb(210, 170, 60)
+                            } else {
+                                egui::Color32::from_rgb(200, 70, 60)
+                            };
+                            bar(ui, "Hunger", sv.hunger, hcol);
+                            ui.add_space(3.0);
+                            // thirst: blue, amber when thirsty, red when parched.
+                            let wcol = if sv.thirst > 0.5 {
+                                egui::Color32::from_rgb(70, 150, 210)
+                            } else if sv.thirst > 0.2 {
+                                egui::Color32::from_rgb(210, 170, 60)
+                            } else {
+                                egui::Color32::from_rgb(200, 70, 60)
+                            };
+                            bar(ui, "Thirst", sv.thirst, wcol);
+                            ui.add_space(3.0);
+                            // stamina: cyan-green; dims as it empties.
+                            bar(ui, "Stamina", sv.stamina, egui::Color32::from_rgb(90, 200, 170));
+                            ui.add_space(3.0);
+                            // thermal: comfort −1..1 → bar fill from center; blue cold, green ok, red hot.
+                            let c01 = (sv.comfort.clamp(-1.0, 1.0) * 0.5 + 0.5);
+                            let warmth = sv.comfort.clamp(-1.0, 1.0);
+                            let tcol = if warmth < -0.25 {
+                                egui::Color32::from_rgb(90, 150, 220) // cold
+                            } else if warmth > 0.25 {
+                                egui::Color32::from_rgb(220, 110, 60) // hot
+                            } else {
+                                egui::Color32::from_rgb(96, 184, 120) // comfortable
+                            };
+                            // show "distance from comfortable" as the fill so either extreme grows the bar
+                            bar(ui, &format!("Warmth {:.0}\u{b0}C", sv.body_c), 1.0 - (c01 - 0.5).abs() * 2.0, tcol);
+                        });
+                }
                 } // r175b: end in_world_overlays gate (correct nesting)
                 wants_keyboard_out = c.wants_keyboard_input(); // r185
             })?;
@@ -4479,6 +5097,57 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             if craft_pick != 0 { self.craft_pick = craft_pick; }
             if perf_export { self.perf_export_ascii = true; } // r177
             if craft_close { self.craft_menu_open = false; }
+            // r488: character-select write-back. Apply selection/reroll, then on
+            // Save make the highlighted character the saved global default (so it
+            // loads in every world) and hand it to the bin via character_chosen.
+            if open_character_local {
+                if self.character_roster.is_none() {
+                    self.character_roster = Some(crate::player_character::CharacterRoster::load());
+                }
+                self.character_menu_open = true;
+            }
+            let mut char_chosen_out: Option<crate::player_character::CharacterProfile> = None;
+            let mut char_close_out = char_close_local;
+            if let Some(roster) = self.character_roster.as_mut() {
+                if char_pick_local >= 0 {
+                    roster.select(char_pick_local as usize);
+                }
+                if char_reroll_local && roster.selected == roster.custom_index {
+                    roster.custom_mut().reroll();
+                }
+                if char_cycle_arche_local && roster.selected == roster.custom_index {
+                    roster.custom_mut().cycle_arche();
+                }
+                if let Some(t) = char_tint_local {
+                    if roster.selected == roster.custom_index {
+                        roster.custom_mut().set_tint(t);
+                    }
+                }
+                if let Some(b) = char_build_local {
+                    if roster.selected == roster.custom_index {
+                        roster.custom_mut().build = b;
+                    }
+                }
+                if char_save_local {
+                    // a chosen preset is copied into the custom slot so whatever the
+                    // player picks becomes their persisted, cross-world character.
+                    let sel = roster.selected;
+                    if sel != roster.custom_index {
+                        let picked = roster.options[sel].clone();
+                        *roster.custom_mut() = picked;
+                        roster.selected = roster.custom_index;
+                    }
+                    let _ = roster.save_custom();
+                    char_chosen_out = Some(roster.current().clone());
+                    char_close_out = true;
+                }
+            }
+            if let Some(c) = char_chosen_out {
+                self.character_chosen = Some(c);
+            }
+            if char_close_out {
+                self.character_menu_open = false;
+            }
             if wizard_pick != 0 { self.wizard_action = wizard_pick; }
             self.wizard_name_buf = wizard_name_buf; // r179
             self.wizard_seed_buf = wizard_seed_buf; // r181
@@ -4494,6 +5163,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             self.ui_render_scale = ui_render_scale; // r325
             self.ui_fps_target = ui_fps_target;
             self.ui_autotune = ui_autotune;
+            self.ui_gpu_mesh_yield = ui_gpu_mesh_yield;
+            self.ui_adaptive_rd = ui_adaptive_rd;
+            self.ui_octree_tile = ui_octree_tile;
+            self.ui_detached_terrain = ui_detached_terrain;
             self.wizard_preview_tex = wizard_preview_tex; // r182
             if wizard_preview_uploaded {
                 self.wizard_preview_dirty = false;
@@ -4815,7 +5488,10 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
                 sun_dir_norm.x, sun_dir_norm.y, sun_dir_norm.z,
                 atmos.sun_intensity,
             ],
-            sun_color:     [atmos_eff.sun_color[0], atmos_eff.sun_color[1], atmos_eff.sun_color[2], 1.0],
+            sun_color:     [atmos_eff.sun_color[0], atmos_eff.sun_color[1], atmos_eff.sun_color[2],
+                // r592: sun_color.a is unused by shading — repurposed to carry the live
+                // foliage-disturber strength (F3 slider) to chunk.vert. ×10 fixed-point.
+                crate::debug_settings::DEBUG.foliage_disturb.load(std::sync::atomic::Ordering::Relaxed) as f32 / 10.0],
             sky_color:     [atmos_eff.sky_color[0], atmos_eff.sky_color[1], atmos_eff.sky_color[2],
                 // r358: w carries the snow-cap line altitude (0 = feature off).
                 // Unread by the shader as a color (only .rgb is sampled).
@@ -4842,9 +5518,14 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
             light_view_proj: mat4_to_array(&cascade.view_proj),
             flow_coverage: self.water_flow_coverage,
             flow_grid: *self.water_flow_grid,
-            fx_params: self.fx_params,
+            fx_params: {
+                let mut f = self.fx_params;
+                f[2] = self.world_season01; // r499: season for foliage tint
+                f
+            },
             water_depth_cov: self.water_depth_cov,
             water_depth_grid: *self.water_depth_grid,
+            disturbers: self.disturbers, // r597
         };
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -5731,7 +6412,7 @@ fn fresnel(ui: &egui::Ui, r: egui::Rect, a: f32) {
     }
 
     fn advance_frame(&mut self) {
-        self.current_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+        self.current_frame = (self.current_frame + 1) % self.frames_in_flight;
     }
 
     pub fn recreate_swapchain(&mut self, ctx: &VulkanContext, new_size: (u32, u32)) -> Result<()> {

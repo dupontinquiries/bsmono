@@ -21,6 +21,12 @@ use std::f32::consts::{PI, TAU};
 pub const CADENCE: f32 = 2.2;
 /// Peak leg swing at full speed (radians fore/aft from neutral).
 pub const LEG_SWING_MAX: f32 = 0.7;
+/// Peak arm swing at full speed (radians). Gentler than the legs and in
+/// counter-phase, so a walking biped's arms swing opposite its stride.
+pub const ARM_SWING_MAX: f32 = 0.5;
+/// Peak tail sway at full speed (radians, side-to-side about the vertical axis).
+/// The tail swings laterally with the stride, lending momentum to the gait.
+pub const TAIL_SWAY_MAX: f32 = 0.38;
 /// Peak body bob (vertical, in block units) at full speed.
 pub const BODY_BOB_MAX: f32 = 0.12;
 /// Peak wing-flap angle (radians) and how much faster wings beat than legs.
@@ -155,6 +161,13 @@ fn roll_yz(v: [f32; 3], a: f32) -> [f32; 3] {
     [v[0], v[1] * c - v[2] * s, v[1] * s + v[2] * c]
 }
 
+/// Rotate a body-local vector about the vertical Y axis (in the X-forward /
+/// Z-right plane) — a tail swinging side to side.
+fn yaw_xz(v: [f32; 3], a: f32) -> [f32; 3] {
+    let (s, c) = a.sin_cos();
+    [v[0] * c + v[2] * s, v[1], -v[0] * s + v[2] * c]
+}
+
 /// Animate every part of `anatomy` for gait `phase` and locomotion `loco`. The
 /// number of legs is taken from the anatomy's foot count, so the gait matches
 /// the body plan. Returns one [`AnimatedPart`] per `anatomy.parts`, in order.
@@ -180,6 +193,9 @@ pub fn animate(
     let pose = pose_for(phase, n_legs, loco);
 
     let mut leg_i = 0usize;
+    let mut hand_i = 0usize;
+    // Arm swing amplitude scales with speed + leg health, like the legs.
+    let arm_amp = (loco.speed / 6.0).clamp(0.0, 1.0) * loco.leg_health.clamp(0.0, 1.0) * ARM_SWING_MAX;
     anatomy
         .parts
         .iter()
@@ -191,8 +207,22 @@ pub fn animate(
                     leg_i += 1;
                     offset = swing_xy(offset, swing);
                 }
+                Part::Hand => {
+                    // Arms swing fore/aft in COUNTER-phase to the same-index leg
+                    // (contralateral gait): right arm forward as the right leg goes
+                    // back. r485 — previously static.
+                    let off = PI + leg_phase_offset(hand_i, 0);
+                    hand_i += 1;
+                    offset = swing_xy(offset, arm_amp * (phase + off).sin());
+                }
                 Part::Wing => {
                     offset = roll_yz(offset, pose.wing_flap);
+                }
+                Part::Tail => {
+                    // Tail swings side to side with the stride (one sway per stride),
+                    // pivoting about the body's vertical axis. r486 — previously static.
+                    let sway = arm_amp / ARM_SWING_MAX * TAIL_SWAY_MAX * phase.sin();
+                    offset = yaw_xz(offset, sway);
                 }
                 _ => {}
             }

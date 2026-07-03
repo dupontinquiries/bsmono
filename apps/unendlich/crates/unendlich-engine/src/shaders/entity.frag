@@ -28,6 +28,7 @@
 
 layout(location = 0) in vec3 v_color;
 layout(location = 1) in vec3 v_world_pos;
+layout(location = 2) in float v_alpha;
 
 layout(location = 0) out vec4 out_color;
 
@@ -57,8 +58,29 @@ layout(set = 0, binding = 2) uniform sampler3D froxel_volume;
 const float FROXEL_NEAR = 0.5;
 const float FROXEL_FAR  = 200.0;
 
+#ifndef ENTITY_RIM_LIGHT
+#define ENTITY_RIM_LIGHT 1   // r473: sky/sun rim light on creatures for silhouette form (0 = flat)
+#endif
+
 void main() {
     vec3 color = v_color;
+
+#if ENTITY_RIM_LIGHT
+    // r473: the entity mesh carries no normal attribute, so reconstruct a flat geometric normal
+    // from the world-position screen-space gradient. Add a soft Fresnel-style rim (sky-cool on the
+    // shaded side, warming toward the sun on the lit side) so creatures separate from the terrain
+    // behind them. PURELY ADDITIVE — the base vertex colour is never darkened.
+    vec3  rN   = normalize(cross(dFdx(v_world_pos), dFdy(v_world_pos)));
+    vec3  rV   = normalize(ubo.camera_pos.xyz - v_world_pos);
+    float rim  = pow(1.0 - max(dot(rN, rV), 0.0), 3.2);
+    float rndl = max(dot(rN, -ubo.sun_dir.xyz), 0.0);
+    vec3  rcol = mix(ubo.ambient_color.rgb, ubo.sun_color.rgb, rndl * 0.6);
+    // r550: edge-only and gentle. The previous 0.85 over a flat-shaded box body
+    // washed dark colours (teal/near-black heroes) toward white; concentrate it at
+    // grazing silhouette edges (higher power) at a fraction of the strength so the
+    // base vertex colour reads true while creatures still get a soft rim.
+    color += rcol * min(rim, 0.6) * 0.28;
+#endif
 
     // Eye→fragment distance in world units (same basis as chunk.frag).
     float dist = length(ubo.camera_pos.xyz - v_world_pos);
@@ -83,5 +105,7 @@ void main() {
         color = color * froxel.a + froxel.rgb;
     }
 
-    out_color = vec4(color, 1.0);
+    // r535: real per-vertex transparency. Fog is composited into rgb above; the
+    // alpha here drives the hardware blend (opaque entities pass v_alpha = 1.0).
+    out_color = vec4(color, v_alpha);
 }

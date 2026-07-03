@@ -6,10 +6,15 @@
 //! the rigid line is returned as an offset the renderer adds to the wing boxes, so
 //! the trailing edge lags a fast down-beat and settles when the wing holds still.
 //!
+//! r599: the membrane also catches WIND — the caller supplies a force vector
+//! (sampled from `crate::wind::wind_at` or `sim::wind_perturb::perturbed`, rotated
+//! into the model's local frame) each `step`, so a wing billows and flutters in a
+//! gust the same way foliage and cloth do, on top of its own flight-driven lag.
+//!
 //! Stateful (Verlet keeps previous positions across frames), so it lives on the
 //! creature, not inside the stateless `skin`. Pure: no render/IO/clock/RNG. The
-//! wing root motion is supplied by the caller (from the rigid skin), so this never
-//! reaches into the renderer.
+//! wing root motion (and now wind) is supplied by the caller, so this never
+//! reaches into the renderer or the wind field itself.
 
 use crate::sim::verlet_strand::{step as strand_step, Strand};
 
@@ -28,11 +33,15 @@ pub struct FlexParams {
     pub follow01: f32,
     /// Clamp on the returned offset magnitude (keeps the membrane from blowing up).
     pub max_offset: f32,
+    /// r599: how strongly ambient wind pushes the free points (world units/s² per
+    /// unit force magnitude the caller passes to `step`). `0` disables wind
+    /// entirely (old behaviour — gravity-only droop).
+    pub wind_gain: f32,
 }
 
 impl Default for FlexParams {
     fn default() -> Self {
-        FlexParams { iters: 6, damping01: 0.15, droop: 3.0, follow01: 0.35, max_offset: 0.6 }
+        FlexParams { iters: 6, damping01: 0.15, droop: 3.0, follow01: 0.35, max_offset: 0.6, wind_gain: 1.0 }
     }
 }
 
@@ -73,19 +82,24 @@ impl WingFlex {
     /// Advance both wings one tick. Each wing supplies its current *rigid* root and
     /// tip positions (from the skinned model, same space) as `(root, tip)`. Both
     /// ends are pinned to the rigid wing (leading bone + tip bone); the mid-span
-    /// membrane lags under inertia + droop and is pulled back toward the rigid line
-    /// by `follow01`. Returns, per wing, the offset for each span sample =
-    /// (strand point) − (rigid line point). The two endpoints are ≈0; the lag peaks
-    /// mid-span — the soft flutter the renderer adds to the wing boxes.
+    /// membrane lags under inertia + droop + `wind` (a force vector, same space as
+    /// the wing positions — the caller rotates ambient wind into that frame) and is
+    /// pulled back toward the rigid line by `follow01`. Returns, per wing, the
+    /// offset for each span sample = (strand point) − (rigid line point). The two
+    /// endpoints are ≈0; the lag peaks mid-span — the soft flutter the renderer
+    /// adds to the wing boxes. `wind = [0,0,0]` reproduces the old gravity-only feel.
     pub fn step(
         &mut self,
         l: ([f32; 3], [f32; 3]),
         r: ([f32; 3], [f32; 3]),
+        wind: [f32; 3],
         dt: f32,
         p: &FlexParams,
     ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
         let dt = if dt.is_finite() { dt.max(0.0) } else { 0.0 };
-        let g = [0.0, -p.droop, 0.0];
+        let wg = if p.wind_gain.is_finite() { p.wind_gain.max(0.0) } else { 0.0 };
+        let wf = if wind.iter().all(|c| c.is_finite()) { wind } else { [0.0; 3] };
+        let g = [wf[0] * wg, -p.droop + wf[1] * wg, wf[2] * wg];
         let off_l = Self::drive(&mut self.left, l.0, l.1, g, dt, p);
         let off_r = Self::drive(&mut self.right, r.0, r.1, g, dt, p);
         (off_l, off_r)
@@ -182,7 +196,7 @@ mod tests {
     fn pinned_ends_have_no_offset() {
         let mut wf = WingFlex::new(2.0, 6);
         let p = FlexParams::default();
-        let (l, _r) = wf.step(([1.0, 3.0, 0.0], [-1.0, 3.0, 0.0]), ([1.0, 3.0, 0.0], [3.0, 3.0, 0.0]), 0.016, &p);
+        let (l, _r) = wf.step(([1.0, 3.0, 0.0], [-1.0, 3.0, 0.0]), ([1.0, 3.0, 0.0], [3.0, 3.0, 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
         assert!(mag(l[0]) < 1e-3 && mag(l[l.len() - 1]) < 1e-3, "root and tip ride the rigid wing bone");
     }
 
@@ -195,15 +209,15 @@ mod tests {
         let mut peak = 0.0f32;
         for _ in 0..6 {
             y += 0.25;
-            let (l, _r) = wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), 0.016, &p);
+            let (l, _r) = wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
             peak = peak.max(max_off(&l));
         }
         assert!(peak > 0.02, "the membrane lags the driven beat");
         // hold still — the active-beat lag should clearly exceed the resting sag
         for _ in 0..240 {
-            wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), 0.016, &p);
+            wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
         }
-        let (l, _r) = wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), 0.016, &p);
+        let (l, _r) = wf.step(([0.0, y, 0.0], [-2.0, y, 0.0]), ([0.0, y, 0.0], [2.0, y, 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
         let resting = max_off(&l);
         assert!(peak > resting * 1.3, "a beat lags more than the resting sag (peak {peak} vs rest {resting})");
     }
@@ -215,7 +229,7 @@ mod tests {
         for k in 0..200 {
             let y = (k as f32 * 0.7).sin() * 5.0;
             let x = (k as f32).cos() * 5.0;
-            let (l, r) = wf.step(([x, y, 0.0], [x - 3.0, y, 0.0]), ([x, y, 0.0], [x + 3.0, y, 0.0]), 0.016, &p);
+            let (l, r) = wf.step(([x, y, 0.0], [x - 3.0, y, 0.0]), ([x, y, 0.0], [x + 3.0, y, 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
             for d in l.iter().chain(r.iter()) {
                 assert!(d[0].is_finite() && d[1].is_finite() && d[2].is_finite());
                 assert!(mag(*d) <= p.max_offset + 1e-3, "offset clamped to max_offset");
@@ -227,7 +241,7 @@ mod tests {
     fn dt_zero_is_a_noop_on_the_chain() {
         let mut wf = WingFlex::new(2.0, 5);
         let p = FlexParams::default();
-        let (l, _r) = wf.step(([0.0, 1.0, 0.0], [-2.0, 1.0, 0.0]), ([0.0, 1.0, 0.0], [2.0, 1.0, 0.0]), 0.0, &p);
+        let (l, _r) = wf.step(([0.0, 1.0, 0.0], [-2.0, 1.0, 0.0]), ([0.0, 1.0, 0.0], [2.0, 1.0, 0.0]), [0.0, 0.0, 0.0], 0.0, &p);
         assert!(l.iter().all(|d| mag(*d) < 2.0), "dt=0 doesn't explode");
     }
 
@@ -250,7 +264,7 @@ mod tests {
             let mut root = [0.0, 0.0, 0.0];
             for k in 0..50 {
                 root[1] = (k as f32 * 0.3).sin();
-                let (l, r) = wf.step((root, [root[0] - 2.0, root[1], 0.0]), (root, [root[0] + 2.0, root[1], 0.0]), 0.016, &p);
+                let (l, r) = wf.step((root, [root[0] - 2.0, root[1], 0.0]), (root, [root[0] + 2.0, root[1], 0.0]), [0.0, 0.0, 0.0], 0.016, &p);
                 for d in l.iter().chain(r.iter()) {
                     acc += mag(*d);
                 }
@@ -272,7 +286,7 @@ impl crate::sim::service_registry::Service for WingFlexService {
         let p = FlexParams::default();
         let l = ([0.0, 0.0, 0.0], [2.0, 0.0, 0.0]);
         let r = ([0.0, 0.0, 0.0], [-2.0, 0.0, 0.0]);
-        let _ = self.0.step(l, r, ctx.dt, &p);
+        let _ = self.0.step(l, r, [0.0, 0.0, 0.0], ctx.dt, &p);
     }
 }
 #[linkme::distributed_slice(crate::sim::service_registry::SERVICES)]

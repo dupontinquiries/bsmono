@@ -50,7 +50,10 @@ use crate::world::octree::OctreeArray;
 
 /// Mirror of the GLSL `is_solid_opaque` predicate.
 pub fn is_solid_opaque(block: BlockId) -> bool {
-    !matches!(block, BlockId::Air | BlockId::Water)
+    // r539: subvoxel-only blocks (leaves + crops) render entirely as subvoxel
+    // decoration; emitting a solid cube hides that detail (the "solid block over
+    // leaves" bug). Matches the CPU mesher's is_meshable and the GLSL update.
+    !matches!(block, BlockId::Air | BlockId::Water) && !block.is_subvoxel_only()
 }
 
 /// v0.24.28-bumpy-foundation: which block-ids get the 4×4 bumpy top
@@ -113,20 +116,75 @@ fn hash2d(x: f32, z: f32) -> f32 {
 
 /// Mirror of the GLSL `color_for_block` table.
 pub fn color_for_block(block: BlockId) -> [f32; 3] {
+    // r544: full mirror of the GLSL color_for_block table (chunk_mesh_octree.comp).
+    // Kept in sync so the table is honest; color is not part of the VERIFY geometry
+    // parity check, but this protects any future color-aware comparison.
     match block as u8 {
-        1  => [0.50, 0.50, 0.50],   // Stone
-        2  => [0.30, 0.65, 0.20],   // Grass
-        3  => [0.55, 0.40, 0.25],   // Dirt
-        4  => [0.45, 0.45, 0.45],   // Cobblestone
-        7  => [0.15, 0.15, 0.15],   // Bedrock
-        12 => [0.85, 0.80, 0.55],   // Sand
-        13 => [0.50, 0.48, 0.45],   // Gravel
-        17 => [0.40, 0.30, 0.20],   // OakLog
-        18 => [0.20, 0.55, 0.18],   // OakLeaves
-        22 => [0.55, 0.50, 0.45],   // Clay
-        31 => [0.75, 0.85, 0.95],   // Ice
-        32 => [0.95, 0.95, 0.97],   // Snow
-        _  => [0.80, 0.20, 0.80],   // Default magenta
+        1  => [0.50, 0.50, 0.50],
+        2  => [0.30, 0.65, 0.20],
+        3  => [0.55, 0.40, 0.25],
+        4  => [0.45, 0.45, 0.45],
+        7  => [0.15, 0.15, 0.15],
+        11 => [0.95, 0.45, 0.10],
+        12 => [0.85, 0.80, 0.55],
+        13 => [0.50, 0.48, 0.45],
+        14 => [0.85, 0.75, 0.30],
+        15 => [0.70, 0.60, 0.50],
+        16 => [0.30, 0.30, 0.30],
+        17 => [0.40, 0.30, 0.20],
+        18 => [0.20, 0.55, 0.18],
+        19 => [0.85, 0.85, 0.80],
+        20 => [0.40, 0.65, 0.35],
+        21 => [0.20, 0.55, 0.20],
+        22 => [0.65, 0.65, 0.75],
+        23 => [0.30, 0.55, 0.30],
+        24 => [0.78, 0.45, 0.25],
+        25 => [0.95, 0.30, 0.40],
+        26 => [0.40, 0.70, 0.30],
+        27 => [0.30, 0.60, 0.30],
+        28 => [0.55, 0.40, 0.20],
+        29 => [0.30, 0.55, 0.25],
+        30 => [0.65, 0.50, 0.50],
+        31 => [0.75, 0.85, 0.95],
+        32 => [0.95, 0.95, 0.97],
+        33 => [0.85, 0.30, 0.30],
+        34 => [0.85, 0.85, 0.85],
+        35 => [0.55, 0.65, 0.55],
+        36 => [0.85, 0.83, 0.78],
+        37 => [0.92, 0.92, 0.89],
+        38 => [0.18, 0.17, 0.20],
+        39 => [0.55, 0.52, 0.50],
+        40 => [0.72, 0.55, 0.48],
+        41 => [0.30, 0.32, 0.38],
+        42 => [0.94, 0.94, 0.96],
+        43 => [0.50, 0.50, 0.52],
+        44 => [0.38, 0.36, 0.40],
+        45 => [0.93, 0.90, 0.78],
+        46 => [0.85, 0.55, 0.18],
+        47 => [0.78, 0.65, 0.95],
+        48 => [0.843, 0.784, 0.627],
+        49 => [0.098, 0.078, 0.137],
+        50 => [0.745, 0.510, 0.353],
+        51 => [0.922, 0.922, 0.894],
+        56 => [0.45, 0.85, 0.95],
+        57 => [0.667, 0.529, 0.353],
+        58 => [0.490, 0.490, 0.490],
+        59 => [0.627, 0.314, 0.255],
+        61 => [0.784, 0.882, 0.922],
+        62 => [0.784, 0.784, 0.804],
+        63 => [0.902, 0.784, 0.353],
+        64 => [0.176, 0.176, 0.196],
+        65 => [0.588, 0.431, 0.275],
+        66 => [0.863, 0.510, 0.157],
+        80 => [0.95, 0.95, 0.97],
+        81 => [0.420, 0.502, 0.380],
+        82 => [0.580, 0.580, 0.600],
+        83 => [0.878, 0.800, 0.580],
+        84 => [0.620, 0.341, 0.239],
+        85 => [0.478, 0.471, 0.459],
+        86 => [0.322, 0.220, 0.129],
+        87 => [0.220, 0.212, 0.239],
+        _  => [0.80, 0.20, 0.80],   // magenta — unhandled id (matches GLSL default)
     }
 }
 
@@ -294,7 +352,7 @@ pub fn mesh_chunk_octree_cpu_reference_with_neighbors(
         }
     }
 
-    ChunkMesh { vertices, indices }
+    ChunkMesh { vertices, indices, ..ChunkMesh::empty() }
 }
 
 fn emit_quad(
@@ -657,6 +715,7 @@ mod tests {
                 Vertex::new([0.5, 1.5, 0.5], [1.0, 0.0, 0.0]),
             ],
             indices: vec![0, 1, 2, 0, 2, 3],
+            ..ChunkMesh::empty()
         };
         let err = check_mesh_invariants(&mesh, coord)
             .expect_err("expected AABB rejection");
@@ -676,6 +735,7 @@ mod tests {
                 Vertex::new([0.0, 1.0, 0.0], [0.0; 3]),
             ],
             indices: vec![0, 1, 2, 0, 2, 99],  // 99 is out of range
+            ..ChunkMesh::empty()
         };
         assert!(check_mesh_invariants(&mesh, coord).is_err());
     }
@@ -698,6 +758,7 @@ mod tests {
             ],
             // Index 99 is out of range (only 4 vertices exist).
             indices: vec![0, 1, 2, 99, 2, 3],
+            ..ChunkMesh::empty()
         };
         assert!(check_mesh_invariants(&mesh, coord).is_err());
     }

@@ -913,17 +913,39 @@ pub fn default_spawn_rules() -> Vec<SpawnRule> {
 /// ```glsl
 /// layout(location = 0) in vec3 in_position;
 /// layout(location = 1) in vec3 in_color;
+/// layout(location = 2) in float in_alpha;
 /// ```
 ///
 /// `repr(C)` ensures field order and no padding insertion. Total size
-/// 24 bytes (6× f32). Future iterations may add a normal (vec3) for
-/// directional lighting — that's an additive layout change, just bump
-/// vertex stride and add a third `in_` declaration in the shader.
+/// 28 bytes (7× f32). r535: `alpha` was added for real per-vertex
+/// transparency (the player's own avatar fades as it obscures the camera);
+/// it defaults to 1.0 (fully opaque) everywhere else.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityVertex {
     pub position: [f32; 3],
     pub color: [f32; 3],
+    pub alpha: f32,
+    /// r599: wind/disturber sway weight `0..1` (0 = rigid, 1 = free). Drives the
+    /// same bending model as foliage — a steady downwind lean plus the mob/dragon
+    /// disturber wake from `sim::secondary_motion` — applied per-part in
+    /// `hero_forge::dress()` to capes, scarves, and trailing cloth. `entity.vert`
+    /// reads this to displace; solid body parts default to 0 (no motion).
+    pub sway: f32,
+}
+
+impl EntityVertex {
+    /// Opaque vertex (alpha = 1.0) — the common case.
+    #[inline]
+    pub fn opaque(position: [f32; 3], color: [f32; 3]) -> Self {
+        Self { position, color, alpha: 1.0, sway: 0.0 }
+    }
+
+    /// Like [`opaque`], with an explicit wind-sway weight (see [`sway`](Self::sway)).
+    #[inline]
+    pub fn opaque_sway(position: [f32; 3], color: [f32; 3], sway: f32) -> Self {
+        Self { position, color, alpha: 1.0, sway }
+    }
 }
 
 /// Default per-kind color when no per-instance data overrides. The
@@ -1007,6 +1029,8 @@ pub fn snapshot_to_vertices(
                     verts.push(EntityVertex {
                         position: [x, y, z],
                         color,
+                        alpha: 1.0,
+                        sway: 0.0,
                     });
                 }
             }
@@ -1055,7 +1079,7 @@ fn push_box(
     for &x in &xs {
         for &y in &ys {
             for &z in &zs {
-                verts.push(EntityVertex { position: [x, y, z], color });
+                verts.push(EntityVertex { position: [x, y, z], color, alpha: 1.0, sway: 0.0 });
             }
         }
     }
@@ -1103,6 +1127,8 @@ fn push_box_oriented(
                 verts.push(EntityVertex {
                     position: [world_origin[0] + rx, world_origin[1] + y2, world_origin[2] + rz],
                     color,
+                    alpha: 1.0,
+                    sway: 0.0,
                 });
             }
         }
@@ -1174,7 +1200,12 @@ pub fn forge_to_vertices(
         head_pitch: creature.gaze_pitch,
         wing_pose,
     };
-    let boxes = crate::sim::dragon_forge::skin(model, &anim);
+    // r599: apply the wing-membrane flex (sim::dragon_wing_flex, stepped live in
+    // the bin's creature tick) — empty offsets (no forge/never ticked) reproduce
+    // `skin`'s output exactly, so this is a strict superset of the old behaviour.
+    let boxes = crate::sim::dragon_forge::skin_with_flex(
+        model, &anim, &creature.wing_offset_l, &creature.wing_offset_r,
+    );
     let lean_pitch = creature.pitch;
     let lean_roll = creature.roll + creature.torso_bend;
     for b in &boxes {
@@ -1194,6 +1225,58 @@ pub fn forge_to_vertices(
             crate::sim::creature_grime::apply_grime_color(model.body_color, ny, &creature.grime)
         };
         push_box_oriented(&mut verts, &mut indices, p, [lx, ly, lz], half, color, yaw, lean_pitch, lean_roll);
+    }
+    // r555: WING MEMBRANE — the forge leaves the membrane out of the voxels (it's
+    // render-only); now that the entity path carries per-vertex alpha we fill each
+    // wing's footprint with a translucent membrane sheet so the wings read as skin
+    // rather than sparse bones (docs/TODO.md #6). One triangle fan per side across
+    // the combined span of that side's wing bones; alpha from wing_opacity.
+    {
+        use crate::sim::dragon_forge::{J_WING_L, J_WING_R};
+        let (sy, cy) = yaw.sin_cos();
+        let (sp, cp) = lean_pitch.sin_cos();
+        let (sr, cr) = lean_roll.sin_cos();
+        for joint in [J_WING_L, J_WING_R] {
+            // combined bounding box of this side's wing bones (model space)
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            let mut any = false;
+            for b in &boxes {
+                if b.joint == joint && !b.glow {
+                    any = true;
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(b.center[k] - b.half[k]);
+                        hi[k] = hi[k].max(b.center[k] + b.half[k]);
+                    }
+                }
+            }
+            if !any {
+                continue;
+            }
+            let center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let half = [(hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5];
+            // span axis 0 = model X (wingspan); chord picks the larger of Y/Z (front-back).
+            let mem = crate::wing_membrane::membrane_from_box(center, half, 0, 14, 0.55);
+            let base = verts.len() as u32;
+            for (vi, v) in mem.positions.iter().enumerate() {
+                // model -> engine local (same mapping as the boxes above)
+                let lx = v[2] * scale;
+                let ly = (v[1] - model.min[1]) * scale - half_y;
+                let lz = v[0] * scale;
+                // rotate (roll about X, pitch about Z, yaw about Y) + world origin
+                let (y1, z1) = (ly * cr - lz * sr, ly * sr + lz * cr);
+                let (x2, y2) = (lx * cp - y1 * sp, lx * sp + y1 * cp);
+                let (rx, rz) = (x2 * cy - z1 * sy, x2 * sy + z1 * cy);
+                verts.push(EntityVertex {
+                    position: [p[0] + rx, p[1] + y2, p[2] + rz],
+                    color: model.body_color,
+                    alpha: mem.alpha.get(vi).copied().unwrap_or(0.55),
+                    sway: 0.0,
+                });
+            }
+            for &idx in &mem.indices {
+                indices.push(base + idx);
+            }
+        }
     }
     (verts, indices)
 }
@@ -1218,9 +1301,47 @@ pub fn creature_to_vertices_lod(creature: &crate::creature::Creature, min_part_h
     // heading and leans with the terrain instead of sitting axis-aligned.
     let tint = creature.tint;
     let tinted = |c: [f32; 3]| [c[0] * tint[0], c[1] * tint[1], c[2] * tint[2]];
-    push_box_oriented(&mut verts, &mut indices, p, [0.0, 0.0, 0.0], creature.body.half_extents, tinted(CREATURE_BODY_COLOR), yaw, pitch, roll + creature.torso_bend);
-    if let Some(anat) = creature.anatomy.as_ref() {
-        for part in &anat.parts {
+
+    // r484: drive the full pose rig (pose.rs) instead of the old foot-only inline
+    // swing — legs swing with a proper cadence, wings flap while airborne, the
+    // body bobs with the gait, and a damaged leg limps automatically. Current
+    // flight state comes from the body's velocity (a grounded flyer doesn't flap);
+    // leg-health / fly-power come from the graded anatomy so injuries read.
+    // gait_phase = 0 + grounded + still leaves every part at rest, so a standing
+    // creature is byte-identical to before.
+    let (body_bob, animated) = if let Some(anat) = creature.anatomy.as_ref() {
+        let vel = creature.body.velocity;
+        let hspeed = (vel[0] * vel[0] + vel[2] * vel[2]).sqrt();
+        let flying = vel[1] > 0.5 || (vel[1].abs() <= 0.5 && hspeed > 3.0);
+        let (leg_health, fly_power) = creature
+            .graded_capabilities()
+            .map(|g| (g.move_speed, g.fly_power))
+            .unwrap_or((1.0, 1.0));
+        let loco = crate::pose::Locomotion {
+            speed: hspeed,
+            leg_health,
+            flying,
+            fly_power: if flying { fly_power.max(0.3) } else { 0.0 },
+        };
+        let n_legs = anat
+            .parts
+            .iter()
+            .filter(|pp| matches!(pp.part, crate::creature::Part::Foot | crate::creature::Part::StickyFoot))
+            .count();
+        let pose = crate::pose::pose_for(creature.gait_phase, n_legs, &loco);
+        let animated = crate::pose::animate(anat, creature.gait_phase, &loco);
+        (pose.body_bob, Some((anat, animated)))
+    } else {
+        (0.0, None)
+    };
+
+    // Torso rotates with the body (its corners orbit the centre), so it faces the
+    // heading and leans with the terrain instead of sitting axis-aligned; it also
+    // rides the gait bob so the whole creature rises and falls together.
+    push_box_oriented(&mut verts, &mut indices, p, [0.0, body_bob, 0.0], creature.body.half_extents, tinted(CREATURE_BODY_COLOR), yaw, pitch, roll + creature.torso_bend);
+
+    if let Some((anat, animated)) = animated {
+        for (part, ap) in anat.parts.iter().zip(animated.iter()) {
             if part.is_destroyed() {
                 continue;
             }
@@ -1229,20 +1350,8 @@ pub fn creature_to_vertices_lod(creature: &crate::creature::Creature, min_part_h
             if !keep_always && biggest < min_part_half {
                 continue; // LOD: too small to matter at this distance
             }
-            let mut o = part.offset;
-            // Walking gait: feet swing fore-aft (along the facing/local +X) and
-            // lift on the forward swing, with diagonally-opposite feet a half-cycle
-            // apart (a trot). gait_phase = 0 leaves them at rest, so standing
-            // creatures are unchanged.
-            if matches!(part.part, crate::creature::Part::Foot | crate::creature::Part::StickyFoot) {
-                let diagonal = (o[0] >= 0.0) == (o[2] >= 0.0);
-                let phase = creature.gait_phase + if diagonal { 0.0 } else { std::f32::consts::PI };
-                let s = phase.sin();
-                let leg = part.half_extents[1].max(0.05);
-                o[0] += leg * 0.6 * s; // step forward/back
-                o[1] += leg * 0.4 * s.max(0.0); // lift the foot mid-stride
-            }
-            push_box_oriented(&mut verts, &mut indices, p, o, part.half_extents, tinted(part_color(part.part)), yaw, pitch, roll);
+            // ap.offset already carries the leg swing / wing flap / body bob.
+            push_box_oriented(&mut verts, &mut indices, p, ap.offset, part.half_extents, tinted(part_color(part.part)), yaw, pitch, roll);
         }
     }
     (verts, indices)
@@ -1925,10 +2034,13 @@ mod tests {
 
     #[test]
     fn entity_vertex_size_matches_shader_layout() {
-        // EntityVertex must be exactly 6 floats = 24 bytes, repr(C),
-        // no padding. The vertex shader declares 2 vec3 inputs at
-        // tightly-packed offsets 0 and 12.
-        assert_eq!(std::mem::size_of::<EntityVertex>(), 24);
+        // EntityVertex is 8 floats = 32 bytes, repr(C), no padding: position[3] @0,
+        // color[3] @12, alpha @24, sway @28 (r599). NOTE: this assertion was stale
+        // (asserted 24 after r535's `alpha` made it 28) until r599 fixed it while
+        // adding `sway`; entity_pipeline.rs's manual field-by-field byte-packer is
+        // the actual upload path and is not affected by Rust struct padding either
+        // way, but keeping this in sync is cheap insurance.
+        assert_eq!(std::mem::size_of::<EntityVertex>(), 32);
         assert_eq!(std::mem::align_of::<EntityVertex>(), 4);
     }
 

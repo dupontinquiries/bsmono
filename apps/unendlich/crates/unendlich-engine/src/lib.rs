@@ -84,6 +84,7 @@ pub mod moisture_field;
 pub mod moisture_texture;
 #[cfg(feature = "render-core")]
 pub mod local_player;
+pub mod timebend_scrub;
 pub mod permissions;
 pub mod phys; // r200: general physics-sim helpers (rope, fluid forces)
 pub mod physics;
@@ -105,6 +106,8 @@ pub mod texture_atlas;
 pub mod creature_design;
 pub mod genetics;
 pub mod creature_viewer;
+pub mod player_character;
+pub mod hero_forge;
 #[cfg(feature = "egui_debug")]
 pub mod creature_viewer_ui;
 pub mod air;

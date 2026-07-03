@@ -29,6 +29,83 @@ EXPLICIT PER-SCENE OVERRIDES the user asked for (do NOT propagate to other scene
 - ATLANTIS: self-enclosing (excluded from generic shell); banners; perimeter soffit.
 
 
+## 2026-07-02 (pass 67) — MIC PEARL: marble-sheen voice indicator, derived from the panel idiom table
+
+A small in-scene orb beside the message panel (billboarded, camera-facing) showing live voice state:
+  - asleep (mic off) — dim grey mote, barely breathing.
+  - armed (mic on, no speech yet) — a warm marble shell, slow breathing glow in the scene's own accent
+    colour (reuses the panel's (pc,tc,tglow,pmat) idiom table verbatim — so every scene's mic pearl is a
+    FREE, coherent derivative of its message-panel idiom, satisfying the 'plan derivatives for other
+    scenes' ask by construction rather than a bespoke per-world table).
+  - active (hearing an utterance, i.e. voice.partial() non-empty) — brighter/faster pulse + two orbiting
+    cyan-tier sparkle motes, so 'catching your voice' reads before whisper even finalizes.
+Deliberately a DIFFERENT physical object from the flat resonance-cell text (glossy sphere vs glyph cells)
+per the 'behaves differently to the text pearl' ask.
+
+VISUALLY VERIFIED headless (Xvfb + llvmpipe), not just code-reviewed — built a new debug harness
+`src/bin/mic-pearl-view.rs` (constructs a real `Chat`, calls the production `scene_ui`, loads a sample
+.logscope so the panel/pearl actually populate — Chat::default() alone shows the empty-state placeholder).
+LOGSCOPE_MIC_PEARL_DEBUG=armed|active forces the state (the `voice` feature can't build in-sandbox, so this
+is the verification path — kept as a permanent debug hook for checking derivatives on the remaining scenes).
+Atlantis render: 6612 bright(>200) pixels in the panel band, sample colours (121,250,255)/(156,239,255) —
+near-exact match to Atlantis's tc=(156,238,255) accent, confirming the pearl picks up the scene tint
+correctly. Canopy render showed a different bright-pixel count (3406, real per-scene geometry variation,
+not a cached/identical frame). Default build + gpu-scene bin compile; chat (15) tests green.
+
+NEXT for the derivatives plan: spot-check the mic pearl on the remaining scenes (Mistfall carved-rune,
+Archive/Reading ink idiom, Mansion Garden marble+gold, wood-board scenes) the same way, and consider a
+per-scene SHAPE variant (not just colour) — e.g. a faceted gem for Fractal Spires/Recursive Citadel vs a
+smooth pearl for Atlantis/Mistfall — as a second derivative axis once the colour pass reads well.
+
+## 2026-06-30 (pass 66) — FREECAM: free-flight camera (step 3, part 1)
+
+Added a free-flight camera mode to the spatial view, reusing OrbitCam (no parallel camera).
+  - Toggle: “✜ Freecam” / “■ Exit freecam” button next to Tour; mutually exclusive with Tour, and it turns
+    off spatial_auto (auto-frame) so the user has full control. Exiting hands back to Overview.
+  - Controls: WASD move along the look basis (fly where you look), Q/E down/up, Shift boosts (16→42 u/s),
+    drag looks (existing orbit drag), scroll zooms (existing). Movement = translate orbit.target along
+    fwd=(cp*sy,-sp,-cp*cy)/right=(cy,0,sy) (same basis as the fly eye), eye follows (dist held).
+  - Gated on canvas hover/drag so WASD never leaks into the composer; repaints continuously to poll keys.
+App compiles; chat (15) tests green. Runtime egui path — verify visually with the Freecam button.
+
+NEXT (step 3 remainder):
+3b. Perf pass, UI overlay (freecam HUD / controls hint), whisper STT.
+
+## 2026-06-30 (pass 65) — CAMERA: AABB clamp completes the bounded spline traversal (step 2)
+
+Step 2 was mostly already in place: the Tour fly (fly_auto / LOGSCOPE_FLY) ALREADY splines the camera along the
+strand via Catmull-Rom through the 4 surrounding node positions (here + a look-ahead on the same spline), with
+a cinematic-shot director and collider-based evasion (out of Pillars, inside the perimeter Bound, between
+floor/ceil). The missing piece was the “clamped to the mind-palace AABB” guarantee: the perimeter Bound
+deliberately OPENS at gates, so the fly could slip out a hallway mouth and sail past the hall end into open
+ocean (the pass-63 overshoot the virtual end-cap only partly caught).
+Added (chat.rs, fly block): a HARD OUTER BOUND. Extend the floor/ceil collider pass to also accumulate the
+horizontal collider extent (Pillars = halls+wings, Bound = rotunda), union it with the strand NODE extent (so
+the clamp can never fight the spline or the ESTABLISH pull-back — the eye can always reach every node), and
+clamp the eye into that AABB +4u. Applied through the eased fly_push (shifts target+eye together), so it eases
+in smoothly, not a snap. App compiles; scene3d (7) + chat (15) tests green.
+Note: runtime egui path, so not unit-tested headless; verify visually with the Tour button / LOGSCOPE_FLY_AUTO.
+
+NEXT:
+3. Freecam (WASD/drag free flight), perf pass, UI overlay, whisper STT.
+
+## 2026-06-30 (pass 64) — CLEAR THE CENTRAL LANE in Atlantis (step 1 of pass 63's NEXT)
+
+Done: the rotunda colonnade now leaves a ±4u corridor along the x-axis (the routed strand's lane), so the
+strand threads OPEN space instead of the columned centre. In atlantis()'s colonnade loop, after computing the
+column (cx,cz), skip when cz.abs() <= min(4.0, r_col*sz*0.6) — the cap keeps the OUTER columns on small halls so
+the colonnade never fully vanishes. Atlantis-only (inside atlantis()); Mansion's shared room_column untouched.
+Regression test scene3d::tests::atlantis_central_lane_cleared_for_strand: colonnade (r=0.8 pillars) still ≥6
+columns, 0 in the lane. Headless/CPU (with_env + env_colliders), so it runs without a GPU.
+Note: a lone WING/region landmark (r=1.1) can still sit in the lane far down a hall — that's the obstacle
+FLEX's job (pass 62), which pays off now that the dense colonnade is out of the lane. Not the colonnade.
+VERIFY ON HW: LOGSCOPE_GEOM_DUMP=1 then tools/geom_check.py --all — expect Atlantis obj_clip to drop from ~72%
+while strand_aspect stays high (couldn't run the full geom dump headless: node positions need the egui layout).
+
+NEXT (unchanged from pass 63, now that step 1 is done):
+2. CAMERA spline (Catmull-Rom through nodes, clamped to the mind-palace AABB) for smooth bounded traversal.
+3. Then freecam, perf, UI overlay, whisper STT.
+
 ## 2026-06-22 (pass 63) — hall-routing makes Atlantis a STRAND + strand_aspect metric
 
 Continued harness-driven. Key result: the user's "not aligned with the hallways" is about strand SHAPE (follow the

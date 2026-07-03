@@ -1,0 +1,53 @@
+--- a/crates/gpu-gemm/src/lib.rs
++++ b/crates/gpu-gemm/src/lib.rs
+@@ -436,6 +436,16 @@
+     pub wqkv: Lin,
+     pub wgate_up: Lin, pub wdown: Lin, pub g1: Tensor, pub g2: Tensor,
+ }
++/// One ViT/CLIP encoder layer (pre-norm): LN → multi-head bidirectional attention → residual →
++/// LN → MLP (fc1 → GELU → fc2) → residual. Separate Q/K/V (no fusion: t = num_patches > 1 here, and
++/// the tower runs once per image). Each Lin may carry its bias via `with_bias`. The GGUF→struct
++/// name mapping is model-specific (CLIP vs SigLIP vs Qwen2-VL) and lives in the vision loader.
++pub struct VisionBlock {
++    pub g1: Tensor, pub b1: Tensor,                 // LN1 scale/bias
++    pub wq: Lin, pub wk: Lin, pub wv: Lin, pub wo: Lin,
++    pub g2: Tensor, pub b2: Tensor,                 // LN2 scale/bias
++    pub fc1: Lin, pub fc2: Lin,                     // MLP: [mlp,d] then [d,mlp]
++}
+ 
+ /// A weight matrix kept resident in low-precision int8 form (Q8_0-style): for each
+ /// 32-wide block of each row, an int8 quant (packed 4-per-u32) and an f32 scale.
+@@ -474,7 +484,7 @@
+     pub fn f32(t: Tensor) -> Self { Lin { kind: LinKind::F32(t), bias: None } }
+     pub fn q8(q: QWeight) -> Self { Lin { kind: LinKind::Q8(q), bias: None } }
+     pub fn q4(q: Q4Weight) -> Self { Lin { kind: LinKind::Q4(q), bias: None } }
+-    fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
++    pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
+     fn has_bias(&self) -> bool { self.bias.is_some() }
+     pub fn apply(&self, gpu: &Gpu, a: &Tensor, m: usize) -> Tensor {
+         let out = match &self.kind {
+@@ -991,6 +1001,24 @@
+         let dims = [c as u32, h as u32, w as u32, p as u32];
+         self.dispatch(IM2COL, &[img], &out, bytemuck::cast_slice(&dims), (((np * cpp) as u32).div_ceil(64), 1, 1)); out
+     }
++    /// One pre-norm ViT/CLIP encoder layer over `t` tokens of width `d` with `n_heads` heads.
++    /// `quick_gelu` selects OpenAI-CLIP's QuickGELU vs the tanh GELU. Returns [t, d]. All ops are
++    /// gated primitives (layernorm_t, apply, attention_mh_full_t, gelu_*_t, add_t); --gate-vit-block
++    /// validates the assembly (residual placement, norm order, attention scale) vs a CPU reference.
++    pub fn vit_block(&self, b: &VisionBlock, x: &Tensor, t: usize, d: usize, n_heads: usize, eps: f32, quick_gelu: bool) -> Tensor {
++        let h1 = self.layernorm_t(x, &b.g1, &b.b1, t, d, eps);
++        let q = b.wq.apply(self, &h1, t);
++        let k = b.wk.apply(self, &h1, t);
++        let v = b.wv.apply(self, &h1, t);
++        let attn = self.attention_mh_full_t(&q, &k, &v, t, d, n_heads, n_heads);
++        let o = b.wo.apply(self, &attn, t);
++        let x2 = self.add_t(x, &o);
++        let h2 = self.layernorm_t(&x2, &b.g2, &b.b2, t, d, eps);
++        let f1 = b.fc1.apply(self, &h2, t);
++        let act = if quick_gelu { self.gelu_quick_t(&f1) } else { self.gelu_tanh_t(&f1) };
++        let f2 = b.fc2.apply(self, &act, t);
++        self.add_t(&x2, &f2)
++    }
+     pub fn rope_t(&self, x: &Tensor, t: usize, d: usize, base: f32) -> Tensor {
+         let out = self.alloc(t, d); let dims = [t as u32, d as u32, base.to_bits(), 0];
+         self.dispatch(ROPE, &[x], &out, bytemuck::cast_slice(&dims), (((t * d / 2) as u32).div_ceil(64), 1, 1)); out

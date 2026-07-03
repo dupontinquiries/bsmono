@@ -45,7 +45,8 @@ pub fn proper_tool(block: BlockId) -> Option<ToolKind> {
 
         // Hand: fluids, air, decorative plants, foliage, cactus, bedrock.
         Air | Water | Lava | OakLeaves | BirchLeaves | Cactus | Flower | TallGrass
-        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen | Bedrock => None,
+        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen | Bedrock
+        | Carrot | Potato | Cabbage | Sprout => None,
     }
 }
 
@@ -73,7 +74,7 @@ pub fn required_tier(block: BlockId) -> u8 {
 
         // Tier 0: hand-harvestable.
         Air | Water | Lava | OakLeaves | BirchLeaves | Cactus | Flower | TallGrass
-        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen => 0,
+        | Fern | DeadBush | Vine | Cobweb | Mushroom | Lichen | Carrot | Potato | Cabbage | Sprout => 0,
     }
 }
 
@@ -104,6 +105,7 @@ pub fn block_drop(block: BlockId, tool: Option<(ToolKind, MetalKind)>) -> Option
     match block {
         Air | Water | Lava => None,
         OakLeaves | BirchLeaves => None, // canopy yields nothing here (no sapling item yet)
+        Sprout => None, // r520: a seedling yields nothing if smashed; harvest returns the seed
         Stone => Some(ItemKind::Block(Cobblestone)),
         Grass => Some(ItemKind::Block(Dirt)),
         other => Some(ItemKind::Block(other)),
@@ -128,7 +130,7 @@ pub fn base_hardness(block: BlockId) -> u16 {
     match block {
         // Fluids + decorative plants: snap / no resistance.
         Air | Water | Lava | Flower | TallGrass | Fern | DeadBush | Vine | Cobweb
-        | Mushroom | Lichen => INSTANT,
+        | Mushroom | Lichen | Carrot | Potato | Cabbage | Sprout => INSTANT,
         // Leaves + loose ground: soft.
         OakLeaves | BirchLeaves | Dirt | Grass | Sand | Gravel | Clay | Snow | SnowBlock
         | Moss => SOFT,

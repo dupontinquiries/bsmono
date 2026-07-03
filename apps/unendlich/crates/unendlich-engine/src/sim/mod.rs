@@ -151,6 +151,7 @@ pub mod concealment;
 pub mod lauscher;
 pub mod sentinel;
 pub mod elemental;
+pub mod stature;
 pub mod lightning;
 pub mod armor;
 pub mod item_entity;
@@ -577,6 +578,9 @@ pub mod bending_focus;
 pub mod indirect_batch;
 pub mod submit_schedule;
 pub mod pioneer_flora;
+pub mod cave_ore; // r516: depth-weighted ore for the runtime cave-enrichment pass
+pub mod whitelist; // r518: open-server access control (allow-list + open/closed policy)
+pub mod ui_state; // r525: unified two-level UI state machine (AppMode + MenuState)
 pub mod plant_growth;
 pub mod perf_primitives;
 pub mod main_menu;
@@ -589,10 +593,14 @@ pub mod water_physics;
 pub mod water_batch; // r395: parallel water simulation across the rayon worker lane
 pub mod flora_spread;
 pub mod plant_growth_env;
+pub mod plant_survival;
 pub mod ingame_menu;
 pub mod plant_tree_genetics;
 pub mod bee_pollination;
 pub mod wind_field;
+pub mod wind_perturb;
+pub mod secondary_motion;
+pub mod stomp_erosion;
 pub mod movement_tune;
 pub mod mp_dht;
 pub mod env_frame;
@@ -702,6 +710,7 @@ pub mod dht_join;
 
 pub mod shader_from_image;
 pub mod viewmodel;
+pub mod precipitation;
 pub mod particles;   // r263 merge: pooled particle system (PARTICLES worker, 8 tests)
 pub mod mob_bands;   // r263 merge: band-aware mob tick decision (T-MOBS worker, 6 tests)
 pub mod convergence; // r273: convergence classes + free structural pre-filter (deep-time)

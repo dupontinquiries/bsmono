@@ -267,6 +267,33 @@ fn mesh_defer_budget_bytes() -> u64 {
         .unwrap_or(1 << 20)
 }
 
+/// r596 (upload plan Tier 1b): sort copy regions by destination offset and merge
+/// runs that are contiguous in BOTH src and dst into single regions (the staging
+/// ring mirrors the pool 1:1 by offset, so adjacent allocations satisfy both).
+/// Returns how many regions were merged away. Pure; unit-tested below.
+fn coalesce_copy_regions(regions: &mut Vec<vk::BufferCopy>) -> usize {
+    if regions.len() < 2 {
+        return 0;
+    }
+    regions.sort_by_key(|r| r.dst_offset);
+    let before = regions.len();
+    let mut out: Vec<vk::BufferCopy> = Vec::with_capacity(regions.len());
+    for r in regions.drain(..) {
+        if let Some(last) = out.last_mut() {
+            let dst_contig = last.dst_offset + last.size == r.dst_offset;
+            let src_contig = last.src_offset + last.size == r.src_offset;
+            if dst_contig && src_contig {
+                last.size += r.size;
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    let merged = before - out.len();
+    *regions = out;
+    merged
+}
+
 /// Pure budget-split for the deferrable copy lane: given copy `sizes` (in
 /// order) and a `budget`, with `already_spent` bytes consumed earlier this
 /// frame, return how many leading copies to drain now. The remainder carries
@@ -290,6 +317,35 @@ fn count_within_budget(sizes: impl IntoIterator<Item = u64>, budget: u64, alread
 #[cfg(test)]
 mod budget_tests {
     use super::count_within_budget;
+    use super::coalesce_copy_regions;
+    use ash::vk;
+
+    #[test]
+    fn coalesce_merges_contiguous_and_keeps_gaps() {
+        // three regions: [0..64]+[64..128] contiguous in src+dst → merge;
+        // [200..232] gapped → kept. Shuffled input order proves the sort.
+        let mut v = vec![
+            vk::BufferCopy { src_offset: 200, dst_offset: 200, size: 32 },
+            vk::BufferCopy { src_offset: 0, dst_offset: 0, size: 64 },
+            vk::BufferCopy { src_offset: 64, dst_offset: 64, size: 64 },
+        ];
+        let merged = coalesce_copy_regions(&mut v);
+        assert_eq!(merged, 1);
+        assert_eq!(v.len(), 2);
+        assert_eq!((v[0].dst_offset, v[0].size), (0, 128));
+        assert_eq!((v[1].dst_offset, v[1].size), (200, 32));
+    }
+
+    #[test]
+    fn coalesce_requires_src_contiguity_too() {
+        // dst contiguous but src gapped (staging ring wrapped) → no merge.
+        let mut v = vec![
+            vk::BufferCopy { src_offset: 0, dst_offset: 0, size: 64 },
+            vk::BufferCopy { src_offset: 4096, dst_offset: 64, size: 64 },
+        ];
+        assert_eq!(coalesce_copy_regions(&mut v), 0);
+        assert_eq!(v.len(), 2);
+    }
 
     #[test]
     fn empty_drains_none() {
@@ -684,6 +740,20 @@ impl VulkanMeshPool {
 
         if s.pending_vert_copies.is_empty() && s.pending_idx_copies.is_empty() {
             return;
+        }
+
+        // r596 (upload plan Tier 1b): coalesce adjacent copy regions. Bursty
+        // streaming allocates many back-to-back pool spans; merging regions that
+        // are contiguous in BOTH src (staging) and dst (device) collapses them
+        // into single VkBufferCopy entries — fewer regions for the driver to
+        // walk, one barrier per pool per frame as before.
+        let vmerged = coalesce_copy_regions(&mut s.pending_vert_copies);
+        let imerged = coalesce_copy_regions(&mut s.pending_idx_copies);
+        if vmerged + imerged > 0 {
+            log::trace!(
+                "mesh-pool: coalesced {} vert + {} idx copy regions this flush",
+                vmerged, imerged
+            );
         }
 
         // Record copies. vkCmdCopyBuffer takes a slice of regions; we

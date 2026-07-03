@@ -380,6 +380,23 @@ impl OctreeArray {
         self.nodes.len()
     }
 
+    /// True if this chunk collapses to a single pure-air leaf (the common
+    /// "sky" case — most chunks above the surface, and almost everything
+    /// while flying). Such a chunk emits ZERO mesh faces regardless of its
+    /// neighbors: air cells never produce geometry, and the faces on any
+    /// adjacent solids belong to those neighbors' own chunks. So the GPU
+    /// mesher (which spends ~7 latency-bound octree walks per cell on all
+    /// 32768 cells just to discover there's nothing to emit) can be skipped
+    /// entirely and an empty mesh returned directly. Conservative: only the
+    /// fully-collapsed single-leaf form is detected here; a rare un-collapsed
+    /// all-air octree falls through to normal meshing (correct, just not
+    /// skipped). Cheap O(1) check — safe to call before every dispatch.
+    pub fn is_uniform_air(&self) -> bool {
+        self.nodes.len() == 1
+            && self.nodes[0].is_leaf()
+            && self.nodes[0].leaf_block() == BlockId::Air
+    }
+
     /// Reverse-propagate a "modified at tick `tick`" stamp from a
     /// single leaf at chunk-local (x, y, z) up to the root.
     ///

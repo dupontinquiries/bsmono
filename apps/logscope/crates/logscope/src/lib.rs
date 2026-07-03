@@ -16,3 +16,14 @@ pub mod providers;
 pub mod llm_backend;
 #[cfg(feature = "bloc")]
 pub mod bloc_engine;
+#[allow(dead_code)] pub mod specdecode;
+#[allow(dead_code)] pub mod multimodal;
+#[allow(dead_code)] pub mod batching;
+#[allow(dead_code)] pub mod kvcache;
+#[allow(dead_code)] pub mod arch;
+#[allow(dead_code)] pub mod gemmplan;
+#[allow(dead_code)] pub mod dedup;
+#[allow(dead_code)] pub mod moe;
+#[allow(dead_code)] pub mod mla;
+#[allow(dead_code)] pub mod rope;
+#[allow(dead_code)] pub mod quantfmt;

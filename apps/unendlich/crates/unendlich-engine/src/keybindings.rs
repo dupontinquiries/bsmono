@@ -54,6 +54,14 @@ pub enum GameAction {
     ToggleFullscreen,
     ToggleChunkBorders,
     ReloadChunks,
+    /// r515: toggle first-person ↔ third-person self-view.
+    ToggleThirdPerson,
+    /// r515: toggle the cinematic over-the-shoulder camera.
+    ToggleCinematicCam,
+    /// r528: hold to channel a bending cast (elemental discharge). Rebindable so
+    /// it works across keyboard layouts — physical `B` is wrong on Dvorak, which
+    /// was why "B does nothing" for the operator.
+    Bend,
     /// Spawn a heat source (fire) at the player's current position.
     /// Demo / playtest: drives the temperature → convection coupling
     /// so the F4 wind arrow visibly tilts up where fires were placed.
@@ -87,6 +95,23 @@ pub struct KeyBindings {
 #[derive(Serialize, Deserialize)]
 struct StoredBindings {
     bindings: HashMap<GameAction, Vec<String>>,
+    /// r528: mouse-button bindings, serialized as MouseBtn Debug names
+    /// ("Back", "Forward", "Middle", …). `default` keeps old files loadable.
+    #[serde(default)]
+    mouse: HashMap<GameAction, Vec<String>>,
+}
+
+/// r528: parse a MouseBtn from its Debug name (round-trips the side buttons a
+/// player would actually bind). `Other(n)` is not persisted.
+fn mouse_from_name(name: &str) -> Option<MouseButton> {
+    match name {
+        "Left" => Some(MouseButton::Left),
+        "Right" => Some(MouseButton::Right),
+        "Middle" => Some(MouseButton::Middle),
+        "Back" => Some(MouseButton::Back),
+        "Forward" => Some(MouseButton::Forward),
+        _ => None,
+    }
 }
 
 impl Default for KeyBindings {
@@ -157,6 +182,9 @@ impl KeyBindings {
         kb.add_key(GameAction::MoveBackward, Key::Down);
         kb.add_key(GameAction::MoveLeft, Key::Left);
         kb.add_key(GameAction::MoveRight, Key::Right);
+        // r528: on Dvorak the key LABELED 'b' is at the physical QWERTY-N
+        // position — bind Bend there too so the operator's 'b' actually casts.
+        kb.add_key(GameAction::Bend, Key::N);
         kb
     }
 
@@ -240,6 +268,10 @@ impl KeyBindings {
         b.insert(GameAction::LightFire, Key::F9);
         b.insert(GameAction::Screenshot, Key::F2);
         b.insert(GameAction::ToggleFullscreen, Key::F11);
+        // r515: camera views — third-person (F5) and cinematic shoulder (Y). Rebindable.
+        b.insert(GameAction::ToggleThirdPerson, Key::F5);
+        b.insert(GameAction::ToggleCinematicCam, Key::Y);
+        b.insert(GameAction::Bend, Key::B); // r528: rebindable bending cast (hold)
         let mut kb = Self::from_single_key_map(b);
         // `I` stays as a secondary alias for the inventory (P is primary).
         kb.add_key(GameAction::OpenInventory, Key::I);
@@ -327,6 +359,20 @@ impl KeyBindings {
         }
     }
 
+    /// r528: REPLACE `action`'s binding with a single mouse `button` — a clean
+    /// rebind from the Controls page. Clears the action's keyboard keys and frees
+    /// the button from any other action, so the row reads as just that button.
+    /// (This is what lets a player put e.g. Bending on a side mouse button.)
+    pub fn set_mouse_binding(&mut self, action: GameAction, button: MouseButton) {
+        for (a, bs) in self.mouse_bindings.iter_mut() {
+            if *a != action {
+                bs.retain(|b| *b != button);
+            }
+        }
+        self.bindings.remove(&action);
+        self.mouse_bindings.insert(action, vec![button]);
+    }
+
     /// True if ANY mouse button bound to this action is currently held.
     pub fn is_action_pressed_mouse(&self, action: GameAction, input: &crate::input::InputCache) -> bool {
         self.mouse_buttons_for_action(action).iter()
@@ -348,6 +394,9 @@ impl KeyBindings {
         let stored = StoredBindings {
             bindings: self.bindings.iter()
                 .map(|(a, ks)| (*a, ks.iter().map(|k| format!("{:?}", k)).collect()))
+                .collect(),
+            mouse: self.mouse_bindings.iter()
+                .map(|(a, bs)| (*a, bs.iter().map(|b| format!("{:?}", b)).collect()))
                 .collect(),
         };
         let json = serde_json::to_string_pretty(&stored)
@@ -374,7 +423,18 @@ impl KeyBindings {
                 bindings.insert(action, keys);
             }
         }
-        Ok(Self::from_map(bindings))
+        let mut kb = Self::from_map(bindings);
+        // r528: restore mouse-button bindings.
+        for (action, names) in stored.mouse {
+            for name in names {
+                if let Some(btn) = mouse_from_name(&name) {
+                    kb.bind_mouse(action, btn);
+                } else {
+                    log::warn!("Discarding unknown mouse button {:?} for {:?}", name, action);
+                }
+            }
+        }
+        Ok(kb)
     }
 
     pub fn load_or_default<P: AsRef<Path>>(path: P) -> Self {

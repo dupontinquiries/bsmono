@@ -21,6 +21,7 @@ struct Cell {
     star: bool,   // a white-hot "star" cell
     life: f32,    // 0..1 current brightness/presence
     target: f32,  // 1 = should be present, 0 = fading out
+    prov: bool,   // provisional: a live-transcription PREVIEW cell (rendered dimmer/cooler than committed text)
 }
 
 #[derive(Default)]
@@ -36,7 +37,7 @@ impl PearlInput {
 
     /// Draw the pearl backdrop + the temporally-stable resonance text for `text`, in a band `height` tall.
     /// Returns the band rect (the caller overlays the real TextEdit on it). `t` is the animation clock.
-    pub fn show(&mut self, ui: &mut egui::Ui, text: &str, t: f32, height: f32, accent: Color32) -> Rect {
+    pub fn show(&mut self, ui: &mut egui::Ui, text: &str, preview: &str, t: f32, height: f32, accent: Color32) -> Rect {
         let avail = ui.available_width();
         let (rect, _resp) = ui.allocate_exact_size(Vec2::new(avail, height), Sense::hover());
         let p = ui.painter_at(rect);
@@ -130,19 +131,29 @@ impl PearlInput {
         let pad_x = 16.0; let pad_y = 12.0;
         let max_cols = (((rect.width() - 2.0 * pad_x) / cw).floor() as usize).max(1);
         let mut desired: HashMap<Key, Pos2> = HashMap::new();
+        let mut prov_keys: HashSet<Key> = HashSet::new();
         let mut caret_home = Pos2::new(rect.left() + pad_x, rect.top() + pad_y + 3.0 * scale);
-        for (i, ch) in text.chars().take(180).enumerate() {
+        // committed `text`, then the live-transcription `preview` (dimmer, separated by a space) — so the word
+        // forming from speech appears on the pearl in real time before it's committed into the composer.
+        let committed = text.chars().count();
+        let mut combined: Vec<(char, bool)> = text.chars().map(|c| (c, false)).collect();
+        if !preview.is_empty() {
+            if !combined.is_empty() { combined.push((' ', true)); }
+            combined.extend(preview.chars().map(|c| (c, true)));
+        }
+        for (i, (ch, prov)) in combined.into_iter().take(180).enumerate() {
             let col = i % max_cols; let row = i / max_cols;
             let ox = rect.left() + pad_x + col as f32 * cw;
             let oy = rect.top() + pad_y + row as f32 * lh;
-            caret_home = Pos2::new(ox + cw, oy + 3.0 * scale);
+            if i < committed { caret_home = Pos2::new(ox + cw, oy + 3.0 * scale); } // caret trails committed text only
             if ch == ' ' { continue; }
             let g = crate::mesh3d::glyph5x7(ch);
             for gx in 0..5usize {
                 for gy in 0..7usize {
                     if (g[gx] >> gy) & 1 == 1 {
-                        desired.insert((i as u16, gx as u8, gy as u8),
-                                       Pos2::new(ox + gx as f32 * scale, oy + gy as f32 * scale));
+                        let key = (i as u16, gx as u8, gy as u8);
+                        desired.insert(key, Pos2::new(ox + gx as f32 * scale, oy + gy as f32 * scale));
+                        if prov { prov_keys.insert(key); }
                     }
                 }
             }
@@ -152,7 +163,7 @@ impl PearlInput {
         let mut active: HashSet<Key> = HashSet::new();
         for c in &mut self.cells {
             if let Some(&home) = desired.get(&c.key) {
-                c.home = home; c.target = 1.0; active.insert(c.key);
+                c.home = home; c.target = 1.0; c.prov = prov_keys.contains(&c.key); active.insert(c.key);
             } else {
                 c.target = 0.0; // disperse out, but keep animating until faded
             }
@@ -167,7 +178,7 @@ impl PearlInput {
                     phase: hash(k.0 as i32 + k.1 as i32 * 31, 5) * std::f32::consts::TAU,
                     speed: 1.0 + 1.8 * hash(k.0 as i32 + k.2 as i32 * 17, 6),
                     star: hash(k.0 as i32 * 3 + k.1 as i32 + k.2 as i32, 9) > 0.74,
-                    life: 0.0, target: 1.0,
+                    life: 0.0, target: 1.0, prov: prov_keys.contains(k),
                 });
             }
         }
@@ -180,8 +191,9 @@ impl PearlInput {
             let tw = 0.5 + 0.5 * (t * c.speed + c.phase).sin();
             let uni = 0.72 + 0.55 * hash(c.key.0 as i32 * 5 + c.key.1 as i32, 8); // non-uniform size/brightness
             let bright = c.life * (0.40 + 0.60 * tw) * uni;
-            let (cre, cg, cb) = if c.star { (236, 248, 255) } else { (140, 226, 255) };
-            let a = (bright * 230.0).clamp(0.0, 255.0) as u8;
+            // provisional (live-preview) cells read as a cooler, dimmer ghost until the utterance commits
+            let (cre, cg, cb) = if c.prov { (198, 230, 255) } else if c.star { (236, 248, 255) } else { (140, 226, 255) };
+            let a = (bright * 230.0 * if c.prov { 0.5 } else { 1.0 }).clamp(0.0, 255.0) as u8;
             let rad = scale * (if c.star { 0.62 } else { 0.5 }) * uni;
             // lens chromatic aberration: red/blue fringes that grow toward the edges of the frame
             let dx = ((c.pos.x - center.x).abs() * 0.010 + 0.5).min(2.3);

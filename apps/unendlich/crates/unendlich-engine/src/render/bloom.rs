@@ -30,11 +30,11 @@ use crate::render::swapchain::create_bloom_render_pass;
 // Bright-pass tunables (pushed to bloom_prefilter.frag). The scene is linear
 // HDR, so a threshold near 1.0 catches highlights (sun disc, bright sky, water
 // glints) while leaving the [0,1] midtones untouched. Dial to taste.
-const BLOOM_THRESHOLD: f32 = 1.0;
+const BLOOM_THRESHOLD: f32 = 0.85; // r476: catch more highlights (water glints, sky near sun)
 const BLOOM_KNEE: f32 = 0.5;
 
 /// Additive intensity pushed to present.frag when bloom is active (0 when off).
-pub const BLOOM_INTENSITY: f32 = 0.05;
+pub const BLOOM_INTENSITY: f32 = 0.13; // r476: dreamier, more visible glow
 
 /// Mandatory color-attachment + storage-free, linear-sampled HDR format (same
 /// as the scene offscreen). Holds bright energy > 1.0 so the glow is HDR-correct.
@@ -99,9 +99,11 @@ impl Bloom {
         scene_view: vk::ImageView,
         scene_sampler: vk::Sampler,
     ) -> Result<Option<Self>, vk::Result> {
+        // r476: bloom on by default (the dreamier glow the operator locked in).
+        // Opt out with UNENDLICH_BLOOM=0.
         let enabled = std::env::var("UNENDLICH_BLOOM")
             .map(|v| v != "0" && !v.is_empty())
-            .unwrap_or(false);
+            .unwrap_or(true);
         if !enabled {
             return Ok(None);
         }

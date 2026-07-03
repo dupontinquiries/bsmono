@@ -5,7 +5,6 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
-core-kit = { path = "../../../../shared/core-kit" }
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
 # Asahi driver's max_color_attachments=5). glow sidesteps it.
 eframe = { optional = true, version = "0.34", default-features = false, features = [
@@ -30,12 +29,21 @@ tree-sitter-rust = { version = "0.23", optional = true }
 # The pure-Rust clean-room GPU inference engine (wgpu→Vulkan). Optional/off by
 # default to keep the normal build light; enable with `--features wgpu-engine`.
 gpu-gemm = { path = "../gpu-gemm", optional = true }
+# Local speech-to-text: whisper.cpp bindings + mic capture. Optional, behind `voice`.
+# whisper-rs bundles/builds whisper.cpp (needs a C/C++ toolchain); voice-vulkan adds GPU whisper
+# via Vulkan (works on the Asahi M2), voice-metal on macOS. Rebuild with `--features voice-vulkan`.
+whisper-rs = { version = "0.16", optional = true }
+cpal = { version = "0.15", optional = true }
 
 [features]
 default = ["gui", "gpu-scene"]
 # the egui/eframe GUI + its modules; off lets logscope-cli build lean (no eframe/vello)
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:async-std", "dep:tree-sitter", "dep:tree-sitter-rust"]
 wgpu-engine = ["dep:gpu-gemm"]
+# Speech-to-text base: whisper worker pool (whisper_pool) + mic capture (voice.rs) → voice_ingest::Pass.
+voice = ["dep:whisper-rs", "dep:cpal"]
+voice-vulkan = ["voice", "whisper-rs/vulkan"]  # GPU whisper on the Asahi M2 (recommended there)
+voice-metal = ["voice", "whisper-rs/metal"]    # GPU whisper on macOS
 # the GPU scene renderer (depth-sorted GLSL pass via an egui_glow callback over scene3d). DEFAULT so the GUI
 # uses the same renderer as scene-view — without it the GUI silently falls back to the CPU software path and
 # none of the shader work (pearl/frost/bloom/grade/underwater) appears. CPU-only build: --no-default-features --features gui

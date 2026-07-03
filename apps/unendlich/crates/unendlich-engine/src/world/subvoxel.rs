@@ -129,6 +129,12 @@ pub fn procedural_subgrid(host_id: BlockId, world_x: i32, world_y: i32, world_z:
         }
         BlockId::OakLeaves   => recipes::leaves(rng01, rng_int, /*birch=*/false),
         BlockId::BirchLeaves => recipes::leaves(rng01, rng_int, /*birch=*/true),
+        // r513: crops render as small leafy plants instead of cubes.
+        BlockId::Carrot  => recipes::crop(rng01, rng_int, 0),
+        BlockId::Potato  => recipes::crop(rng01, rng_int, 1),
+        BlockId::Cabbage => recipes::crop(rng01, rng_int, 2),
+        // r520: a young seedling — a couple of tiny green shoots.
+        BlockId::Sprout  => recipes::sprout(rng01),
         // Default for any other host: empty grid (no decoration).
         _ => SubVoxelGrid::empty(),
     })
@@ -241,6 +247,66 @@ mod recipes {
         grid
     }
 
+    /// r520: a young seedling — two or three short shoots poking up from the soil,
+    /// small enough to read as "just sprouted" next to a full-grown crop.
+    pub fn sprout(shade: f32) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let young = green(shade * 0.5 + 0.35);
+        cell(&mut grid, 4, 0, 4, young);
+        cell(&mut grid, 4, 1, 4, young);
+        cell(&mut grid, 3, 0, 4, young);
+        cell(&mut grid, 5, 1, 5, young);
+        grid
+    }
+
+    /// r513: Vegetable crops — small leafy plants so a tilled field reads as rows
+    /// of greenery rather than a wall of colored cubes. `kind`: 0=Carrot (leafy fan
+    /// with an orange crown peeking out), 1=Potato (low bushy mound), 2=Cabbage
+    /// (a tight round green head close to the soil). The host block's base_color
+    /// already tints the cube path; here we shape the silhouette.
+    pub fn crop(shade: f32, _rng_int: u32, kind: u8) -> SubVoxelGrid {
+        let mut grid = SubVoxelGrid::empty();
+        let leaf = green(shade * 0.7 + 0.25);
+        let stem = green(shade * 0.45 + 0.1);
+        match kind {
+            0 => {
+                // Carrot: a central stalk with leaves fanning out, orange crown at base.
+                let carrot = [0.90_f32, 0.49, 0.13];
+                for y in 0..5 { cell(&mut grid, 4, y, 4, stem); }
+                for &y in &[2u8, 3, 4] {
+                    cell(&mut grid, 3, y, 4, leaf);
+                    cell(&mut grid, 5, y, 4, leaf);
+                    cell(&mut grid, 4, y, 3, leaf);
+                    cell(&mut grid, 4, y, 5, leaf);
+                }
+                cell(&mut grid, 4, 0, 4, carrot);
+                cell(&mut grid, 4, 1, 4, carrot);
+            }
+            2 => {
+                // Cabbage: a dense round head hugging the ground.
+                let head = green(shade * 0.6 + 0.3);
+                for &(x, z) in &[
+                    (3u8, 3u8), (3, 4), (3, 5), (4, 3), (4, 4),
+                    (4, 5), (5, 3), (5, 4), (5, 5),
+                ] {
+                    cell(&mut grid, x, 0, z, head);
+                    cell(&mut grid, x, 1, z, head);
+                }
+                cell(&mut grid, 4, 2, 4, head);
+            }
+            _ => {
+                // Potato: a low bushy mound of leaves.
+                for y in 0..3 { cell(&mut grid, 4, y, 4, stem); }
+                for &(x, z) in &[(3u8, 4u8), (5, 4), (4, 3), (4, 5), (3, 3), (5, 5)] {
+                    cell(&mut grid, x, 1, z, leaf);
+                    cell(&mut grid, x, 2, z, leaf);
+                }
+                cell(&mut grid, 4, 3, 4, leaf);
+            }
+        }
+        grid
+    }
+
     /// Tree leaves: dense clusters of small mini-leaves filling most of
     /// the host cell, with deliberate gaps for the silhouette to read as
     /// "foliage" rather than "solid block." Variation per (world position)
@@ -265,50 +331,50 @@ mod recipes {
             [0.18 + 0.10 * shade, 0.50 + 0.20 * shade, 0.20 + 0.08 * shade]
         };
 
-        // **Distinct leaf clumps** instead of uniform-density fill.
-        // Each clump is a small voxel pattern at a hash-driven position.
-        // Result reads as a cluster of individual leaves, not a fuzzy
-        // blob. Same memory budget (~25-40 cells) — better silhouette.
-        //
-        // Pattern: 6-10 clumps per host. Each clump is one of several
-        // small shapes (3-5 cells) representing one leaf cluster.
-        // Per-clump color jitter for life.
-        //
-        // Future: per-clump animation phase for individually-swaying
-        // leaves; per-clump decay timing for the leaf-decay handler to
-        // pick off individual leaves rather than the whole block.
-
-        let n_clumps = 6 + ((rng_int >> 2) & 0x3) as usize; // 6..9
-        let mut h = rng_int;
-        for _i in 0..n_clumps {
-            // Cheap rehash for next clump.
-            h = h.wrapping_mul(0x9E37_79B9).wrapping_add(0x12345);
-            h ^= h >> 13;
-
-            // Place the clump's center somewhere inside the host
-            // (sub coords 1..7) so clumps spread through the cell.
-            let cx = 1 + ((h >> 4) & 0x5) as i32;
-            let cy = 1 + ((h >> 7) & 0x5) as i32;
-            let cz = 1 + ((h >> 10) & 0x5) as i32;
-
-            // Per-clump shade jitter: ±10% brightness so each leaf
-            // cluster reads slightly differently lit.
-            let j = ((h >> 13) & 0xFF) as f32 / 255.0 - 0.5; // [-0.5, 0.5]
-            let c = [
-                (leaf_color[0] + j * 0.10).clamp(0.0, 1.0),
-                (leaf_color[1] + j * 0.15).clamp(0.0, 1.0),  // greens vary more
-                (leaf_color[2] + j * 0.10).clamp(0.0, 1.0),
-            ];
-
-            // Pick a clump shape based on hash. 4 shape variants.
-            let shape = (h >> 22) & 0x3;
-            place_leaf_clump(&mut grid, cx, cy, cz, c, shape);
+        // r496: STRINGY, DENSE foliage — rebuilt from clumps into thin vertical
+        // strands (like grass blades) packed across the whole cell footprint, so
+        // a leaf block reads as a dense mass of hanging fronds rather than a few
+        // blobby clusters. Most (x,z) columns bear a 1-wide strand at a hashed
+        // height; some hang downward (droop). Many more cells than the old clump
+        // recipe → much denser canopy.
+        let res = SUBVOXEL_RESOLUTION as i32; // 8
+        let mut h = rng_int | 1;
+        for x in 0..res {
+            for z in 0..res {
+                h = h.wrapping_mul(0x9E37_79B9).wrapping_add(0x1_2345);
+                h ^= h >> 13;
+                // r523: SPARSER canopy — ~45% of columns bear a strand (was ~64%, which read
+                // as a near-solid mass even without the cube). Real gaps let sky show through so
+                // it reads as foliage. Coverage = keep when (h&0xFF) <= 115.
+                if (h & 0xFF) > 115 {
+                    continue;
+                }
+                // A thin vertical strand: a top somewhere up the cell, hanging
+                // down a few cells (droop). 1 sub-voxel wide → stringy.
+                let len = 2 + ((h >> 8) & 0x3) as i32; // 2..5 tall
+                let top = 2 + ((h >> 11) & 0x5) as i32; // 2..7
+                let y0 = (top - len).max(0);
+                let y1 = top.min(res - 1);
+                // Per-strand colour jitter (greens vary most).
+                let j = ((h >> 16) & 0xFF) as f32 / 255.0 - 0.5;
+                let c = [
+                    (leaf_color[0] + j * 0.10).clamp(0.0, 1.0),
+                    (leaf_color[1] + j * 0.16).clamp(0.0, 1.0),
+                    (leaf_color[2] + j * 0.10).clamp(0.0, 1.0),
+                ];
+                for y in y0..=y1 {
+                    cell(&mut grid, x as u8, y as u8, z as u8, c);
+                }
+            }
         }
         grid
     }
 
     /// Place a small leaf-cluster shape at (cx, cy, cz). Variant chooses
     /// the pattern: roughly oval, vertical, horizontal, or single dot.
+    /// (r496: superseded by the stringy-strand `leaves` recipe; kept for
+    /// reference and possible reuse.)
+    #[allow(dead_code)]
     fn place_leaf_clump(grid: &mut SubVoxelGrid,
         cx: i32, cy: i32, cz: i32, color: [f32; 3], variant: u32)
     {

@@ -480,7 +480,12 @@ pub fn load_or_create_default(speaker_id: &str) -> Workspace {
     Workspace::new("default")
 }
 
-fn now_ms() -> u64 { core_kit::time::now_millis() }
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 fn escape_toml(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")

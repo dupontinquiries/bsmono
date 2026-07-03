@@ -98,14 +98,14 @@ impl RuntimeConfig {
             render_scale: f32v("UNENDLICH_RENDER_SCALE", 1.0),
             shadow_map_size: u32v("UNENDLICH_SHADOW_MAP_SIZE", 2048),
             vsync: u32v("UNENDLICH_VSYNC", 1),
-            gpu_mesher: u32v("UNENDLICH_GPU_MESHER", 2),
+            gpu_mesher: u32v("UNENDLICH_GPU_MESHER", 0),
         }
     }
 
     /// A named quality preset. `Medium` mirrors the shipping defaults; the
     /// others scale the render distance / LOD reach / upload throughput / cache
     /// / shadow resolution around it. vsync and gpu_mesher are held constant
-    /// (vsync is a user preference, gpu_mesher=2 is the recommended backend).
+    /// (vsync is a user preference, gpu_mesher=0 (CPU) is the default; octree=2 is opt-in).
     pub fn preset(p: PerfPreset) -> Self {
         let base = RuntimeConfig {
             render_distance: 6,
@@ -119,7 +119,7 @@ impl RuntimeConfig {
             render_scale: 1.0,
             shadow_map_size: 2048,
             vsync: 1,
-            gpu_mesher: 2,
+            gpu_mesher: 0,
         };
         match p {
             PerfPreset::BatterySaver => RuntimeConfig {
@@ -203,7 +203,7 @@ mod tests {
         let m = RuntimeConfig::preset(PerfPreset::Medium);
         assert_eq!(m.render_distance, 6);
         assert_eq!(m.lod_bands, [8, 16, 32]);
-        assert_eq!(m.gpu_mesher, 2);
+        assert_eq!(m.gpu_mesher, 0); // r477: CPU mesher is the default
         assert_eq!(m.mesh_cache_size, 0);
     }
 

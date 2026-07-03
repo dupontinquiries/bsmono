@@ -52,6 +52,7 @@ pub mod world_renderer;
 // `UNENDLICH_OCTREE_VERIFY=1`). No production consumer migrates this
 // ship; this is foundation for the mesher/raycast migrations.
 pub mod octree_buffer;
+pub mod upload_metrics;
 pub mod octree_probe_pipeline;
 // r301: neural deferred shading (forward-ported from the r67 integration; compile-only,
 // not yet wired into the render loop — the live-context wiring is M2-side per RUST_INTEGRATION.md).

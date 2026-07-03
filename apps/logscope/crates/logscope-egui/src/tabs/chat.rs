@@ -63,6 +63,38 @@ fn save_to_msg(s: &MsgSave) -> Msg {
 }
 fn now_unix() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }
 
+/// Build a fenced attachment block from a file's bytes for the composer. Bounded (text only). Three things
+/// the old inline versions got wrong, which is what mangled pasted-in code:
+///   1. FENCE SAFETY — if the file itself contains a ``` run, a 3-backtick fence around it breaks the block
+///      (the file's fence closes ours early, and everything after leaks out as prose). We pick a fence of
+///      enough backticks to always exceed the longest run inside the file.
+///   2. LARGER CAP — 16 KB truncated real source files mid-function. Default 256 KB (LOGSCOPE_ATTACH_KB to
+///      override), enough for almost any single source file.
+///   3. HEAD+TAIL on LINE BOUNDARIES — for files past the cap, keep the head AND the tail (a file's end
+///      usually carries the code you're actually asking about, which a head-only cut drops), cut on newlines
+///      so no line is sliced mid-token, and mark the omitted middle with an exact line count.
+fn fenced_attachment(name: &str, lang: &str, bytes: &[u8]) -> String {
+    let cap = std::env::var("LOGSCOPE_ATTACH_KB").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(256) * 1024;
+    let text = String::from_utf8_lossy(bytes);
+    let body = if text.len() <= cap {
+        text.into_owned()
+    } else {
+        let head_budget = cap * 65 / 100;
+        let tail_budget = cap - head_budget;
+        let head_end = text[..head_budget.min(text.len())].rfind('\n').unwrap_or(head_budget.min(text.len()));
+        let tail_from = text.len().saturating_sub(tail_budget);
+        let tail_start = text[tail_from..].find('\n').map(|i| tail_from + i + 1).unwrap_or(tail_from);
+        let omitted = if tail_start > head_end { text[head_end..tail_start].lines().count() } else { 0 };
+        format!("{}\n\n… {omitted} lines omitted ({} KB total; showing head+tail — raise LOGSCOPE_ATTACH_KB) …\n\n{}",
+            &text[..head_end], bytes.len() / 1024, &text[tail_start..])
+    };
+    // Fence must be longer than any backtick run inside the body, so embedded ``` can't close it early.
+    let max_run = body.as_bytes().split(|&b| b != b'`').map(<[u8]>::len).max().unwrap_or(0);
+    let fence = "`".repeat(max_run.max(2) + 1);
+    let tag = if lang.is_empty() { name.to_string() } else { format!("{lang} {name}") };
+    format!("\n{fence}{tag}\n{body}\n{fence}\n")
+}
+
 /// Content-driven COLOUR SALIENCE in [0,1]: how much the conversation is *about* colour. Mixes raw frequency
 /// (saturating) with term-frequency percentage over a small colour lexicon (basic NLP: lowercase tokenise +
 /// stem match). Drives scene colour that stays muted until colour is discussed, intensifying as the topic grows.
@@ -138,27 +170,31 @@ fn segment_message(text: &str) -> Vec<Seg> {
     out
 }
 
-/// Split a non-thinking span into prose + fenced code blocks (handles an unclosed fence).
+/// Split a non-thinking span into prose + fenced code blocks. Tracks fence LENGTH (CommonMark-style): a
+/// block opened with N backticks stays open until a line of ≥N backticks with nothing after it but
+/// whitespace. This fixes the mangling from the old naive toggle, where any ``` line flipped state — so an
+/// info-string fence like ```diff, or an unbalanced fence, desynced prose/code for the rest of the message.
+/// Now an info-string fence (```diff) can only OPEN, only a bare fence CLOSES, and a longer outer fence can
+/// wrap inner ``` runs without being closed early.
 fn segment_codeprose(text: &str, out: &mut Vec<Seg>) {
     let (mut prose, mut code, mut lang) = (String::new(), String::new(), String::new());
-    let mut in_code = false;
+    let mut fence_len = 0usize; // 0 = in prose; otherwise the backtick count that opened the current block
     for line in text.split('\n') {
-        if line.trim_start().starts_with("```") {
-            if in_code {
-                out.push(Seg::Code { lang: std::mem::take(&mut lang), body: code.trim_end_matches('\n').to_string() });
-                code.clear(); in_code = false;
-            } else {
+        let trimmed = line.trim_start();
+        let ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+        if fence_len == 0 {
+            if ticks >= 3 { // opening fence (optionally with an info string / lang)
                 if !prose.trim().is_empty() { out.push(Seg::Prose(prose.trim_end().to_string())); }
                 prose.clear();
-                lang = line.trim_start().trim_start_matches('`').trim().to_string();
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code { code.push_str(line); code.push('\n'); }
-        else { prose.push_str(line); prose.push('\n'); }
+                lang = trimmed[ticks..].trim().to_string();
+                fence_len = ticks;
+            } else { prose.push_str(line); prose.push('\n'); }
+        } else if ticks >= fence_len && trimmed[ticks..].trim().is_empty() { // bare closing fence of ≥ opener length
+            out.push(Seg::Code { lang: std::mem::take(&mut lang), body: code.trim_end_matches('\n').to_string() });
+            code.clear(); fence_len = 0;
+        } else { code.push_str(line); code.push('\n'); }
     }
-    if in_code { out.push(Seg::Code { lang, body: code.trim_end_matches('\n').to_string() }); }
+    if fence_len > 0 { out.push(Seg::Code { lang, body: code.trim_end_matches('\n').to_string() }); }
     else if !prose.trim().is_empty() { out.push(Seg::Prose(prose.trim_end().to_string())); }
 }
 
@@ -302,6 +338,43 @@ short line on why, or what to check next. Keep it tight. Use only the paths, num
 output the user actually provided — never invent them. If the log or code is insufficient to \
 locate the fault, say exactly which additional lines or files you need.";
 
+/// The DEFAULT persona: a long-horizon engineer for a continuing session on a large codebase. Distilled
+/// from the ENGINEERING MODE spec into a tight, concrete brief (small models follow a short spec far
+/// better than a long one). Keeps the same file-output convention as BASE_SYSTEM so the generated-files /
+/// cargo-check workspace keeps working. The router downshifts to BASE_SYSTEM (logscope) for easy log fixes.
+const LONG_HORIZON: &str = "You are Logscope, a senior software engineer maintaining a large, long-lived \
+codebase across a continuing session. Your job is the CORRECT change with the SMALLEST necessary edit \
+that preserves the existing architecture — not the most code.
+
+Priorities, in order: correctness, understanding, keep existing architecture, incremental change, \
+performance, readability, new features. Never trade an earlier one for a later one.
+
+Before writing: state the goal in one line, name the existing systems/files involved, and the key \
+assumption you are making; then act. Treat earlier work as authoritative — extend before replacing, \
+never silently redesign, never add a second system that does what one already does. Prefer patching \
+functions over rewriting files. Ask a question only when genuinely blocked; otherwise state the \
+assumption and proceed.
+
+When debugging: rank the likely causes with their evidence, try the smallest fix first, and don't touch \
+unrelated code. Before finalizing, check that it would compile and handles empty/invalid/boundary input. \
+Stop when the requested change is done — no speculative extras.
+
+Work only from information provided; never invent file contents, log lines, paths, or output. Write \
+plainly; lead with the answer; prose for reasoning, lists only for real lists.
+
+When you produce a file, put it in a fenced block whose info line is the path (e.g. ```rust src/main.rs```) \
+or precede it with a `// file: path` line, one block per file, so it saves directly. Use ```diff for patches.";
+
+/// Selectable system personas the router and the Prompting page switch between. First entry is the
+/// default. Each is a full system prompt (not an action-prompt like `prompts::PROMPTS`): the long-horizon
+/// engineer leads; `logscope` is the tight log/code-fix persona kept as a fast reach tool for easy fixes.
+const PERSONAS: &[(&str, &str, &str)] = &[
+    ("longhorizon", "Long-horizon engineer", LONG_HORIZON),
+    ("logscope", "Logscope · quick log fix", BASE_SYSTEM),
+];
+#[allow(dead_code)] // router seam (next): pick a persona by key
+fn persona_by_key(key: &str) -> Option<&'static str> { PERSONAS.iter().find(|p| p.0 == key).map(|p| p.2) }
+
 /// Which subpage the right sidebar shows. The sidebar consolidates the per-conversation panels
 /// (generated files, context/system settings, prompting modes) behind a button rail.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -413,6 +486,18 @@ pub struct Chat {
     fold_pos: Vec<crate::spatial::Vec3>, // cached protein-fold layout (recomputed when the tree changes)
     flex_pos: Vec<crate::spatial::Vec3>, // cached obstacle-AVOIDED render positions (strand weaved around scenery)
     flex_key: Option<(usize, crate::scene3d::EnvParams)>, // (node count, env) the flex was computed for
+    fly_auto: Option<f32>,               // interactive Tour: when Some(speed), the camera flies along the strand
+    tour_s: f32,                         // accumulated strand position (variable-speed traversal — lingers on long msgs)
+    tour_dwell: Vec<f32>,                // per-node dwell weight (bounded z-score of text length); recomputed on tree change
+    cam_drift: Option<crate::voice_intent::MoveDir>, // "move back"/"move forward" continuous travel; cleared by stop/hold
+    fly_push: crate::spatial::Vec3,      // eased collision-avoidance offset for the fly (so evasion glides, not jolts)
+    freecam: bool,                       // free-flight camera: WASD/QE move the eye, drag looks (no auto-frame/tour)
+    voice: Option<crate::voice_session::VoiceSession>, // live mic session (None = off); pumped each frame in ui()
+    voice_err: Option<String>,           // last mic-start error, shown inline in the composer row
+    code_voice: bool,                    // coder dictation: spoken symbols → punctuation ("prose mode" turns off)
+    cam_shot: u8,                  // cinematic director: current shot (0 travel,1 establish,2 orbit,3 dutch,4 push)
+    cam_shot_until: f32,           // wall-clock time (s) the current shot runs until
+    cam_orbit_phase: f32,          // accumulated phase for slow orbit/dutch drift
     mode: crate::vimmode::Mode,    // modal control (Normal/Insert/Command/Search) — both views now
     cmdline: String,               // the `:` command buffer
     search_q: String,              // the `/` search buffer
@@ -451,7 +536,7 @@ impl Default for Chat {
     fn default() -> Self {
         Self {
             msgs: Vec::new(), input: String::new(),
-            context: BASE_SYSTEM.into(),
+            context: LONG_HORIZON.into(),
             threading: true, show_context: false, attach_log: true, fix_mode: false,
             right_page: RightPage::Prompting, coord_mode: crate::coordinator::Mode::Barebones,
             verify_job: None,
@@ -476,6 +561,16 @@ impl Default for Chat {
             fold_pos: Vec::new(),
             flex_pos: Vec::new(),
             flex_key: None,
+            fly_auto: None,
+            tour_s: 0.0,
+            tour_dwell: Vec::new(),
+            cam_drift: None,
+            fly_push: crate::spatial::Vec3::new(0.0, 0.0, 0.0),
+            freecam: false,
+            voice: None,
+            voice_err: None,
+            code_voice: true,
+            cam_shot: 0, cam_shot_until: 0.0, cam_orbit_phase: 0.0,
             mode: crate::vimmode::Mode::Insert, cmdline: String::new(), search_q: String::new(),
             search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, leader_pending: false,
             request_smaller_model: false,
@@ -833,8 +928,11 @@ impl Chat {
             BackendKind::Wgpu => match self.template {
                 TemplateKind::ChatML => self.build_prompt_chatml(&sys, upto),
                 TemplateKind::Llama3 => self.build_prompt_llama3(&sys, upto),
+                TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
             },
+            // llama.cpp path is otherwise Plain, but Gemma needs its own turn markers to stop correctly.
+            _ if self.template == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
             _ => self.build_prompt_plain(&sys, upto),
         }
     }
@@ -1047,7 +1145,7 @@ impl Chat {
 
     fn sys(&self) -> &str {
         let s = self.context.trim();
-        if s.is_empty() { BASE_SYSTEM } else { s }
+        if s.is_empty() { LONG_HORIZON } else { s }
     }
 
     /// Plain transcript format (llama.cpp path; the model adds BOS).
@@ -1083,6 +1181,22 @@ impl Chat {
             s.push_str(&format!("<|im_start|>{role}\n{}<|im_end|>\n", neutralize_markers(m.text())));
         }
         s.push_str("<|im_start|>assistant\n");
+        s
+    }
+
+    /// Gemma 4 chat template. Gemma 4 CHANGED its turn markers from Gemma 3: it uses `<|turn>ROLE\n…<turn|>`
+    /// (not `<start_of_turn>`/`<end_of_turn>`) and adds a native `system` role. This is the BASIC-CHAT form —
+    /// Gemma 4's tool tokens (`<|tool|>` …) and thinking channels (`<|think|>`, `<|channel>`) are not emitted
+    /// here. BOS is left to the backend (llama.cpp adds `<bos>`). The authoritative template ships as the
+    /// GGUF's embedded jinja; if this ever drifts, prefer having the backend apply that instead.
+    fn build_prompt_gemma(&self, sys: &str, upto: usize) -> String {
+        let mut s = String::new();
+        if !sys.trim().is_empty() { s.push_str(&format!("<|turn>system\n{}<turn|>\n", sys)); }
+        for m in self.chosen_msgs(8, sys, upto) {
+            let role = if m.role == Role::User { "user" } else { "model" };
+            s.push_str(&format!("<|turn>{role}\n{}<turn|>\n", neutralize_markers(m.text())));
+        }
+        s.push_str("<|turn>model\n");
         s
     }
 
@@ -1226,16 +1340,13 @@ impl Chat {
     /// Pull an attached file into the composer as a fenced block (bounded), so the user can
     /// send a file as part of their message. Text only; large files are truncated with a note.
     fn attach(&mut self, path: &std::path::Path) {
-        const CAP: usize = 16 * 1024;
         match std::fs::read(path) {
             Ok(bytes) => {
-                let truncated = bytes.len() > CAP;
-                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(CAP)]).to_string();
                 let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "file".into());
                 let lang = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
-                self.input.push_str(&format!("\n```{lang} {name}\n{text}\n```\n"));
-                if truncated { self.input.push_str(&format!("(attached {} truncated to first {} KB)\n", name, CAP / 1024)); }
+                let block = fenced_attachment(&name, lang, &bytes);
+                self.input.push_str(&block);
             }
             Err(e) => { self.ws_note = Some((format!("attach error: {e}"), Instant::now())); }
         }
@@ -1266,6 +1377,14 @@ impl Chat {
                 .and_then(|m| t0.map(|t0| m.born.saturating_duration_since(t0).as_secs_f64()))
                 .unwrap_or(i as f64)).collect();
             self.fold_pos = crate::spatial::flow(&parents, &times);
+            // Per-node TOUR DWELL weight from message length: the camera lingers on longer messages (time to
+            // read) and moves quicker past short ones. BOUNDED by a z-score clamp to [0.6, 2.4] so the pacing
+            // stays even (the "bounded mean/stddev-wise to keep the flow" request) rather than crawling on one
+            // huge turn or racing past a cluster of short ones. Indexed to match `pos` (g.nodes order).
+            let lens: Vec<f32> = g.nodes.iter().map(|nd| self.msgs.get(nd.id).map(|m| m.text().chars().count() as f32).unwrap_or(0.0)).collect();
+            let mean = if n > 0 { lens.iter().sum::<f32>() / n as f32 } else { 0.0 };
+            let sd = if n > 0 { (lens.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / n as f32).sqrt().max(1.0) } else { 1.0 };
+            self.tour_dwell = lens.iter().map(|&l| (1.0 + 0.6 * ((l - mean) / sd)).clamp(0.6, 2.4)).collect();
         }
         let pos = {
             let mut p = self.fold_pos.clone();
@@ -1275,7 +1394,9 @@ impl Chat {
             // unaffected. This raises the walk to about eye level for the fly camera that rides the strand.
             let min_y = p.iter().map(|q| q.y).fold(f32::INFINITY, f32::min);
             if min_y.is_finite() {
-                let target_bottom = -1.6; // sit the lowest node about here, clear of typical floors (~-3.2)
+                // Mistfall floats the conversation HIGH over its deep lake (the void between the low water and the
+                // strand is what gives the cave its depth); other scenes seat just above their floor (~−3.2).
+                let target_bottom = if theme::active().name == "Mistfall" { 1.6 } else { -1.6 };
                 let lift = (target_bottom - min_y).max(0.0);
                 for q in &mut p { q.y += lift; }
             }
@@ -1286,17 +1407,9 @@ impl Chat {
         // not balloon into the furnished rotunda. Scale the graph laterally so its WIDEST node fits inside the clear
         // central corridor (between the colonnade rows + book-stacks), so it threads the open lane instead of the
         // columns. Scene-aware: round/open scenes keep their full spread. The geom harness then measures the drop.
-        let pos = {
-            let mut p = pos;
-            if theme::active().name == "Atlantis" {
-                // moderate lateral compression: enough to read as a strand running down the hall (strand_aspect
-                // ~2.7) without packing onto the central-axis structure (tighter lanes measured WORSE clip, since
-                // the rotunda+halls are columned through their full height — a true clip fix needs a clear conduit
-                // in the scene, tracked separately).
-                for q in &mut p { q.z *= 0.42; }
-            }
-            p
-        };
+        // Atlantis no longer squishes the strand laterally: its rotunda is now an OVAL that EXPANDS to contain the
+        // graph's full branch span (see scene3d::atlantis + hall_dims), so the conversation spreads naturally rather
+        // than being crammed onto the central axis. Other scenes already keep their full spread.
 
         // OBSTACLE FLEX: weave the strand AROUND solid scenery instead of clipping through it. The geom harness
         // showed tuning can't fix this (the strand balls up among thousands of obstacles), so push each node out
@@ -1319,7 +1432,8 @@ impl Chat {
                         for v in &m.verts { blo.x = blo.x.min(v.x); blo.y = blo.y.min(v.y); blo.z = blo.z.min(v.z); bhi.x = bhi.x.max(v.x); bhi.y = bhi.y.max(v.y); bhi.z = bhi.z.max(v.z); }
                         let hx = (bhi.x - blo.x).max(bhi.z - blo.z); let vy = bhi.y - blo.y;
                         let fp_min = (bhi.x - blo.x).min(bhi.z - blo.z);
-                        if hx < rext * 0.5 && vy > 1.5 && fp_min > 0.4 { obs.push(([blo.x, bhi.x], [blo.z, bhi.z], [blo.y, bhi.y])); }
+                        let hard = matches!(m.mat as u32, 1 | 2); // wood/stone only — leaves/water/paper are passable
+                        if hard && hx < 14.0 && vy > 1.5 && fp_min > 0.4 { obs.push(([blo.x, bhi.x], [blo.z, bhi.z], [blo.y, bhi.y])); } // local solids, not terrain slabs
                     }
                 });
                 let r = 0.5f32; let cap = 8.0f32;
@@ -1347,6 +1461,47 @@ impl Chat {
             }
             if self.flex_pos.len() == n { self.flex_pos.clone() } else { pos }
         };
+
+        // CANOPY HANG: in the Canopy scene the conversation DANGLES from the trees rather than resting among them.
+        // A cone-scan upward from every third node finds a branch overhead and "ties a rope" — that node is pinned
+        // up at branch height; the nodes between anchors then sag under gravity (catenary relaxation), so the strand
+        // hangs in draped swags from the canopy instead of being squished flat by the surroundings. Distinct shape.
+        let pos = if theme::active().name == "Canopy" && n > 2 {
+            use crate::spatial::Vec3 as V3;
+            let mut p = pos.clone();
+            let floor = -3.2f32;
+            // per-anchor branch height from a cone-scan: sample the canopy solids above the node and tie on just
+            // beneath the lowest branch found (fall back to a default canopy height when the cone finds nothing).
+            let mut obs: Vec<(V3, V3)> = Vec::new(); // (lo, hi) AABBs of canopy solids
+            crate::scene3d::with_env("Canopy", 0.0, |meshes| {
+                for m in meshes {
+                    if m.verts.is_empty() || !matches!(m.mat as u32, 1 | 2 | 4) { continue; } // wood/stone/moss = branches & platforms
+                    let (mut lo, mut hi) = (m.verts[0], m.verts[0]);
+                    for v in &m.verts { lo.x = lo.x.min(v.x); lo.y = lo.y.min(v.y); lo.z = lo.z.min(v.z); hi.x = hi.x.max(v.x); hi.y = hi.y.max(v.y); hi.z = hi.z.max(v.z); }
+                    if hi.y > floor + 3.0 { obs.push((lo, hi)); } // only things up in the canopy
+                }
+            });
+            let cone = |x: f32, z: f32| -> f32 {                       // lowest branch overhead within a widening cone
+                let mut best = f32::INFINITY;
+                for (lo, hi) in &obs {
+                    let r = 1.5 + (hi.y - floor) * 0.25;               // cone widens with height
+                    if x > lo.x - r && x < hi.x + r && z > lo.z - r && z < hi.z + r && lo.y > floor + 2.0 { best = best.min(lo.y); }
+                }
+                if best.is_finite() { (best - 0.8).min(floor + 11.0) } else { floor + 7.5 } // tie on just under the branch
+            };
+            for (i, q) in p.iter_mut().enumerate() {
+                if i % 3 == 0 { q.y = cone(q.x, q.z) + (((i as f32 * 12.9898).sin() * 43758.5453).fract().abs() - 0.5) * 1.2; } // anchor: roped to the branch
+            }
+            for _ in 0..60 {                                          // GRAVITY relaxation: chains sag between anchors
+                for i in 1..p.len() - 1 {
+                    if i % 3 == 0 { continue; }
+                    let chord = (p[i - 1].y + p[i + 1].y) * 0.5;
+                    p[i].y += (chord - 0.7 - p[i].y) * 0.5;           // pull below the chord → droop
+                }
+                for q in p.iter_mut() { if q.y < floor + 0.6 { q.y = floor + 0.6; } } // never sag through the floor
+            }
+            p
+        } else { pos };
 
         // GEOMETRY DUMP (LOGSCOPE_GEOM_DUMP=1) for the geometric self-check harness (tools/geom_check.py): writes
         // scene object AABBs + graph node positions + the scene AABB to /tmp/scene_geom_<theme>.json, so bbox-
@@ -1424,10 +1579,19 @@ impl Chat {
                 bear
             };
             let color_salience = chat_color_salience(self.msgs.iter().map(|m| m.text()));
+            // procedural TREE character (Forest), seed-derived so each conversation grows a distinct wood, with a
+            // light branchiness influence on the fork factor
+            let tfrac = |salt: u32| -> f32 { let mut h = seed ^ salt.wrapping_mul(0x9E37_79B1); h ^= h >> 13; h = h.wrapping_mul(0xC2B2_AE35); h ^= h >> 16; (h & 0xFFFF) as f32 / 65535.0 };
+            let tree_size = 0.93 + tfrac(0x71) * 0.14;        // 0.93..1.07 mild overall scale (compounds with h/g)
+            let tree_height = 0.92 + tfrac(0x72) * 0.18;      // 0.92..1.10 trunk length factor (tall trees reach the upper strand → clip)
+            let tree_girth = 0.85 + tfrac(0x73) * 0.40;       // 0.85..1.25 trunk radius factor (girth varies more freely)
+            let tree_branch = (3 + branches / 8).clamp(3, 5); // only genuinely forky chats bushier (branches are obstacles)
+            let branch_spread = 0.5 + tfrac(0x75) * 0.35;     // 0.50..0.85 second branching factor: how wide forks splay
+            let prop_density = (0.75 + tfrac(0x76) * 0.5 + (n as f32 / 240.0).min(0.35)).clamp(0.7, 1.6); // street props scale with seed + size
             crate::scene3d::set_env_params(crate::scene3d::EnvParams {
                 nodes: n as u32, branches, segments: segs.len() as u32, seed,
                 ext_x: ext_x.ceil() as u32, ext_z: ext_z.ceil() as u32, bear,
-                color_salience,
+                color_salience, tree_size, tree_height, tree_girth, tree_branch, branch_spread, prop_density,
             });
         }
         let mut seg_of = vec![0usize; n];
@@ -1466,6 +1630,23 @@ impl Chat {
             if overview.on_hover_text("Recenter and fit the whole graph").clicked() {
                 self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; ui.ctx().request_repaint();
             }
+            // TOUR: fly the camera along the conversation strand, threading the palace. Eased path + eased collision
+            // avoidance keep it off the columns and within the walls — a smooth flythrough, not a ricochet.
+            let touring = self.fly_auto.is_some();
+            if ui.add(egui::Button::new(RichText::new(if touring { "■ Stop tour" } else { "▶ Tour" }).small()))
+                .on_hover_text("Fly through the palace following the conversation").clicked() {
+                self.fly_auto = if touring { None } else { Some(1.0) };
+                if self.fly_auto.is_none() { self.spatial_auto = true; self.spatial_zoomed = false; } // hand back to overview
+                if self.fly_auto.is_some() { self.freecam = false; } // tour and freecam are mutually exclusive
+                ui.ctx().request_repaint();
+            }
+            if ui.add(egui::Button::new(RichText::new(if self.freecam { "■ Exit freecam" } else { "✜ Freecam" }).small()))
+                .on_hover_text("Free-flight camera — WASD move, Q/E down/up, drag to look, Shift to boost").clicked() {
+                self.freecam = !self.freecam;
+                if self.freecam { self.fly_auto = None; self.spatial_auto = false; self.spatial_zoomed = true; }
+                else { self.spatial_auto = true; self.spatial_zoomed = false; } // hand back to overview
+                ui.ctx().request_repaint();
+            }
             let sup = g.superseded();
             let prunable = sup.iter().filter(|id| !self.pruned.contains(id)).count();
             if ui.add_enabled(prunable > 0, egui::Button::new(RichText::new(format!("✂ Prune churn ({prunable})")).small()))
@@ -1485,8 +1666,9 @@ impl Chat {
         }
 
         let total = ui.available_size();
-        // backdrop fills the whole rect; the interactive view reserves a thin strip for the focused-node hint
-        let canvas_h = if self.backdrop { total.y.max(180.0) } else { (total.y - 30.0).max(180.0) };
+        // backdrop fills the whole rect; the interactive view reserves a taller strip so the focused-node
+        // message reads as a real box (multiple lines, scrollable) instead of a one-line sliver under the scene.
+        let canvas_h = if self.backdrop { total.y.max(180.0) } else { (total.y - 92.0).max(180.0) };
         let (resp, p) = ui.allocate_painter(egui::vec2(total.x, canvas_h), egui::Sense::click_and_drag());
         let rect = resp.rect;
         // Opaque base under the backdrop so empty/sky regions never reveal undefined framebuffer memory (garbage
@@ -1504,8 +1686,20 @@ impl Chat {
         // out; "Overview" opts back in. With auto on, the strand stays centered as it grows (the protein).
         let c = crate::spatial::centroid(&pos);
         if self.spatial_auto {
-            self.orbit.target = c;
-            if !self.spatial_zoomed { self.orbit.dist = crate::spatial::fit_distance(crate::spatial::bounding_radius(&pos, c)); }
+            // EASE toward the centroid + fit distance rather than SNAPPING every frame. Snapping made the camera
+            // twitch/ricochet as the strand breathes (centroid + bounding radius shift each frame); a gentle lerp
+            // tracks it as a calm drift that combines the graph's motion with the framing of its bounds. Converges
+            // in a few frames, so headless captures (which honour an explicit dist via spatial_zoomed) are unaffected.
+            let k = 0.09;
+            self.orbit.target.x += (c.x - self.orbit.target.x) * k;
+            self.orbit.target.y += (c.y - self.orbit.target.y) * k;
+            self.orbit.target.z += (c.z - self.orbit.target.z) * k;
+            self.orbit.roll += (0.0 - self.orbit.roll) * k; // level the horizon when not in a cinematic shot
+            if !self.spatial_zoomed {
+                let fit = crate::spatial::fit_distance(crate::spatial::bounding_radius(&pos, c));
+                self.orbit.dist += (fit - self.orbit.dist) * k;
+            }
+            ui.ctx().request_repaint(); // keep easing until settled
         }
         if resp.dragged() {
             let d = resp.drag_delta();
@@ -1517,6 +1711,63 @@ impl Chat {
             if sy.abs() > 0.0 { self.orbit.zoom(1.0 - sy * 0.0015); self.spatial_zoomed = true; ui.ctx().request_repaint(); }
         }
 
+        // FREECAM: free-flight through the scene. WASD move along the look basis, Q/E down/up, drag looks (above),
+        // Shift boosts. Moving the target translates the eye with it (dist held), so you fly wherever you look.
+        // Gated on hovering the canvas so WASD never leaks into the composer; repaints continuously to poll keys.
+        if self.freecam {
+            use crate::spatial::Vec3 as V3;
+            if resp.hovered() || resp.dragged() {
+                let (mv, dt, boost) = ui.input(|i| {
+                    let (cy, sy) = (self.orbit.yaw.cos(), self.orbit.yaw.sin());
+                    let (cp, sp) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
+                    let fwd = V3::new(cp * sy, -sp, -cp * cy);   // eye→target look direction (fly where you look)
+                    let right = V3::new(cy, 0.0, sy);            // horizontal strafe
+                    let mut mv = V3::new(0.0, 0.0, 0.0);
+                    if i.key_down(egui::Key::W) { mv.x += fwd.x; mv.y += fwd.y; mv.z += fwd.z; }
+                    if i.key_down(egui::Key::S) { mv.x -= fwd.x; mv.y -= fwd.y; mv.z -= fwd.z; }
+                    if i.key_down(egui::Key::D) { mv.x += right.x; mv.z += right.z; }
+                    if i.key_down(egui::Key::A) { mv.x -= right.x; mv.z -= right.z; }
+                    if i.key_down(egui::Key::E) { mv.y += 1.0; }
+                    if i.key_down(egui::Key::Q) { mv.y -= 1.0; }
+                    (mv, i.stable_dt.min(0.05), i.modifiers.shift)
+                });
+                if mv.x != 0.0 || mv.y != 0.0 || mv.z != 0.0 {
+                    let speed = (if boost { 42.0 } else { 16.0 }) * dt;
+                    self.orbit.target.x += mv.x * speed;
+                    self.orbit.target.y += mv.y * speed;
+                    self.orbit.target.z += mv.z * speed;
+                    self.spatial_auto = false; self.spatial_zoomed = true;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
+
+        // VOICE DIRECTIONAL TRAVEL: "move back"/"move forward"/… drift the camera continuously along the
+        // look basis until "stop"/"hold here" clears it. Same basis as freecam, but hands-free and steady.
+        if let Some(dir) = self.cam_drift {
+            use crate::spatial::Vec3 as V3;
+            use crate::voice_intent::MoveDir;
+            let (cy, sy) = (self.orbit.yaw.cos(), self.orbit.yaw.sin());
+            let (cp, sp) = (self.orbit.pitch.cos(), self.orbit.pitch.sin());
+            let fwd = V3::new(cp * sy, -sp, -cp * cy);   // eye→target
+            let right = V3::new(cy, 0.0, sy);
+            let v = match dir {
+                MoveDir::Forward => fwd,
+                MoveDir::Back => V3::new(-fwd.x, -fwd.y, -fwd.z),
+                MoveDir::Right => right,
+                MoveDir::Left => V3::new(-right.x, 0.0, -right.z),
+                MoveDir::Up => V3::new(0.0, 1.0, 0.0),
+                MoveDir::Down => V3::new(0.0, -1.0, 0.0),
+            };
+            let dt = ui.input(|i| i.stable_dt).min(0.05);
+            let speed = 14.0 * dt;
+            self.orbit.target.x += v.x * speed;
+            self.orbit.target.y += v.y * speed;
+            self.orbit.target.z += v.z * speed;
+            self.spatial_auto = false;
+            ui.ctx().request_repaint();
+        }
+
         // SMOOTH GRAPH-PATH PAN: when a node is focused, glide the orbit target along the graph's OWN shortest
         // path (parent links via LCA) — Catmull-Rom through the node positions — instead of jumping straight there.
         if let Some(t0) = self.cam_pan_t0 {
@@ -1524,7 +1775,7 @@ impl Chat {
             if np >= 2 {
                 use crate::spatial::Vec3 as V3;
                 let pp: Vec<V3> = self.cam_pan_path.iter().map(|&id| pos[id.min(pos.len() - 1)]).collect();
-                let dur = 0.30 + 0.10 * (np as f32 - 1.0);          // longer paths glide a little longer
+                let dur = 0.55 + 0.16 * (np as f32 - 1.0);          // longer, smoother glide along the path
                 let raw = (t0.elapsed().as_secs_f32() / dur).clamp(0.0, 1.0);
                 let e = raw * raw * (3.0 - 2.0 * raw);              // smoothstep ease
                 let seg = e * (np - 1) as f32;
@@ -1551,11 +1802,22 @@ impl Chat {
         // so we move THROUGH the mind palace. LOGSCOPE_FLY_AUTO=speed animates s from the clock for a
         // continuous glide. The forward look is derived from the path tangent (see OrbitCam::project).
         {
-            let auto = std::env::var("LOGSCOPE_FLY_AUTO").ok().and_then(|v| v.trim().parse::<f32>().ok());
+            let auto = self.fly_auto.or_else(|| std::env::var("LOGSCOPE_FLY_AUTO").ok().and_then(|v| v.trim().parse::<f32>().ok()));
             let manual = std::env::var("LOGSCOPE_FLY").ok().and_then(|v| v.trim().parse::<f32>().ok());
             let s_opt = if let Some(spd) = auto {
-                let tt = ui.input(|i| i.time) as f32;
-                Some(((tt * spd * 0.05).fract() + 1.0).fract())
+                // Variable-speed traversal: advance the strand position by dt scaled DOWN by the current node's
+                // dwell weight, so longer messages linger and short ones pass quicker (bounded, see tour_dwell).
+                // Falls back to the old time-linear mapping if dwell weights aren't computed yet.
+                if !self.tour_dwell.is_empty() && n > 1 {
+                    let dt = ui.input(|i| i.stable_dt).min(0.05);
+                    let cur = (self.tour_s.clamp(0.0, 0.999) * (n - 1) as f32).round() as usize;
+                    let dwell = self.tour_dwell.get(cur).copied().unwrap_or(1.0);
+                    self.tour_s = (self.tour_s + dt * spd * 0.02 / dwell).fract();
+                    Some(self.tour_s)
+                } else {
+                    let tt = ui.input(|i| i.time) as f32;
+                    Some(((tt * spd * 0.015).fract() + 1.0).fract())
+                }
             } else { manual };
             if let (Some(s), true) = (s_opt, n > 1) {
                 use crate::spatial::Vec3 as V3;
@@ -1577,21 +1839,48 @@ impl Chat {
                 let (tx, ty, tz) = (look.x - here.x, look.y - here.y, look.z - here.z);
                 let tl = (tx * tx + ty * ty + tz * tz).sqrt().max(1e-3);
                 let (txn, tyn, tzn) = (tx / tl, ty / tl, tz / tl);
-                let want_pitch = ((-tyn).asin().clamp(-1.2, 1.2)) + 0.12; // downward bias to see floor/pearls
-                let want_yaw = txn.atan2(-tzn);
-                let want_dist = std::env::var("LOGSCOPE_FLY_DIST").ok().and_then(|d| d.trim().parse().ok()).unwrap_or(5.2);
-                // EASE the persistent orbit toward the desired pose each frame (smooth motion); converges within
-                // the headless capture window and glides continuously in LOGSCOPE_FLY_AUTO mode.
-                let k = 0.12;
-                self.orbit.target.x += (here.x - self.orbit.target.x) * k;
-                self.orbit.target.y += (here.y - self.orbit.target.y) * k;
-                self.orbit.target.z += (here.z - self.orbit.target.z) * k;
+                let base_pitch = ((-tyn).asin().clamp(-1.2, 1.2)) + 0.12; // downward bias to see floor/pearls
+                let base_yaw = txn.atan2(-tzn);
+                let base_dist = std::env::var("LOGSCOPE_FLY_DIST").ok().and_then(|d| d.trim().parse().ok()).unwrap_or(5.2);
+                // ── CINEMATIC DIRECTOR ── a shot state machine fed the graph's AABB (centroid + bounding radius)
+                // and the current strand point. It cycles slowly through filmic shots — travelling along the strand,
+                // pulling back to ESTABLISH the whole graph (the re-frame on arrival), slow ORBIT arcs, DUTCH tilts,
+                // and close PUSH-IN passes — with slow eases so the camera glides like a movie rather than snapping.
+                let now = ui.input(|i| i.time) as f32;
+                let cc = crate::spatial::centroid(&pos);
+                let fitd = crate::spatial::fit_distance(crate::spatial::bounding_radius(&pos, cc));
+                let rnd = |seed: f32| ((seed * 12.9898).sin() * 43758.5453).fract().abs();
+                if now >= self.cam_shot_until {
+                    let h = rnd(now);
+                    self.cam_shot = match self.cam_shot {                         // arrival → often ESTABLISH (re-frame graph)
+                        0 => if h < 0.5 { 1 } else if h < 0.75 { 2 } else { 3 },  // travel → establish / orbit / dutch
+                        1 => if h < 0.6 { 0 } else { 2 },                         // establish → travel / orbit
+                        2 => if h < 0.55 { 0 } else if h < 0.8 { 1 } else { 4 },  // orbit → travel / establish / push
+                        3 => 0,                                                   // dutch → travel
+                        _ => if h < 0.6 { 0 } else { 1 },                         // push → travel / establish
+                    };
+                    self.cam_shot_until = now + 7.0 + h * 6.0;                    // 7–13 s dwell: slow film pacing
+                }
+                self.cam_orbit_phase += 0.0026;                                  // slow continuous drift for orbit/dutch
+                let (mut want_target, mut want_yaw, mut want_pitch, mut want_dist, mut want_roll, mut k) =
+                    (here, base_yaw, base_pitch, base_dist, 0.0f32, 0.035f32);    // default: slow travel along the strand
+                match self.cam_shot {
+                    1 => { want_target = cc; want_dist = fitd; want_pitch = 0.42; want_yaw = base_yaw + (self.cam_orbit_phase * 0.4).sin() * 0.5; k = 0.024; } // ESTABLISH
+                    2 => { want_target = here; want_dist = (fitd * 0.55).clamp(7.0, 40.0); want_pitch = 0.3; want_yaw = self.cam_orbit_phase * 0.8; k = 0.03; } // ORBIT arc
+                    3 => { want_roll = (self.cam_orbit_phase * 0.5).sin() * 0.26; k = 0.04; }                                                                   // DUTCH tilt
+                    4 => { want_dist = 3.4; want_pitch = base_pitch * 0.7; k = 0.05; }                                                                          // PUSH-IN passthrough
+                    _ => {}
+                }
+                self.orbit.target.x += (want_target.x - self.orbit.target.x) * k;
+                self.orbit.target.y += (want_target.y - self.orbit.target.y) * k;
+                self.orbit.target.z += (want_target.z - self.orbit.target.z) * k;
                 let mut dyaw = want_yaw - self.orbit.yaw;
                 while dyaw > std::f32::consts::PI { dyaw -= std::f32::consts::TAU; }
                 while dyaw < -std::f32::consts::PI { dyaw += std::f32::consts::TAU; }
                 self.orbit.yaw += dyaw * k;
                 self.orbit.pitch += (want_pitch - self.orbit.pitch) * k;
                 self.orbit.dist += (want_dist - self.orbit.dist) * k;
+                self.orbit.roll += (want_roll - self.orbit.roll) * (k * 0.8);    // ease the Dutch tilt in/out
 
                 // CAMERA BOUNDING-SPHERE EVASION: keep the eye OUT of opaque solids (columns / central plinth)
                 // and INSIDE the perimeter wall, using the colliders the env generator emitted from the same
@@ -1611,8 +1900,20 @@ impl Chat {
                 // floor/ceiling envelope from the solids, so the eye rides BETWEEN floor and dome (no diving
                 // through the floor or punching the roof while it follows the strand).
                 let (mut floor_y, mut ceil_y) = (f32::MAX, f32::MIN);
+                // Horizontal palace AABB from the same colliders (Pillars cover hallway + wing geometry, Bound the
+                // rotunda perimeter) → a hard OUTER bound for the fly, below.
+                let (mut ax0, mut az0, mut ax1, mut az1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
                 for c in crate::scene3d::env_colliders() {
-                    if let crate::scene3d::Collider::Pillar { y0, y1, .. } = c { floor_y = floor_y.min(y0); ceil_y = ceil_y.max(y1); }
+                    match c {
+                        crate::scene3d::Collider::Pillar { x, z, r, y0, y1 } => {
+                            floor_y = floor_y.min(y0); ceil_y = ceil_y.max(y1);
+                            ax0 = ax0.min(x - r); ax1 = ax1.max(x + r); az0 = az0.min(z - r); az1 = az1.max(z + r);
+                        }
+                        crate::scene3d::Collider::Bound { r } => {
+                            ax0 = ax0.min(-r); ax1 = ax1.max(r); az0 = az0.min(-r); az1 = az1.max(r);
+                        }
+                        _ => {}
+                    }
                 }
                 let (mut px, mut py, mut pz) = (0.0f32, 0.0f32, 0.0f32);
                 // a few relaxation passes so the eye settles in the GAP between solids (one pass under-resolves
@@ -1653,7 +1954,34 @@ impl Chat {
                     if ey < lo { py += lo - ey; }
                     else if hi > lo && ey > hi { py += hi - ey; }
                 }
-                self.orbit.target.x += px; self.orbit.target.y += py; self.orbit.target.z += pz;
+                // HARD OUTER BOUND: clamp the eye into the palace AABB (+margin) so bounded traversal holds even
+                // when the fly slips out a gate down a hall — it stops at the hall's end instead of sailing into
+                // open ocean (pass-63 overshoot). Bound = union of the node extent (so the eye can always reach
+                // every strand node and pull back to ESTABLISH them) and the collider solids (walls/wings), so the
+                // clamp never fights the spline; it only catches what would leave the palace.
+                let (mut bx0, mut bz0, mut bx1, mut bz1) = (ax0, az0, ax1, az1);
+                for q in &pos { bx0 = bx0.min(q.x); bx1 = bx1.max(q.x); bz0 = bz0.min(q.z); bz1 = bz1.max(q.z); }
+                // Skip the outer clamp during the ESTABLISH (1) and ORBIT (2) shots — those DELIBERATELY pull
+                // the eye far outside the graph extent to frame the whole palace. Clamping them jammed the eye
+                // onto the graph edge, so the scene fell entirely out of view ("starting tour blanks the
+                // scene"). The close travel/dutch/push shots still get the clamp, catching a slip out a hallway
+                // into open ocean (the pass-63 overshoot it was added for).
+                let framing_shot = matches!(self.cam_shot, 1 | 2);
+                if bx0.is_finite() && !framing_shot {
+                    let m = 4.0;
+                    let ex = eye.x + px;
+                    if ex < bx0 - m { px += (bx0 - m) - ex; } else if ex > bx1 + m { px += (bx1 + m) - ex; }
+                    let ez = eye.z + pz;
+                    if ez < bz0 - m { pz += (bz0 - m) - ez; } else if ez > bz1 + m { pz += (bz1 + m) - ez; }
+                }
+                // EASE the evasion offset toward the freshly-computed push so the camera SLIDES around columns and
+                // along walls instead of snapping (the snap is what read as "ricochet"). The smoothed offset is
+                // what shifts the eye+target, preserving look direction.
+                let target_push = crate::spatial::Vec3::new(px, py, pz);
+                self.fly_push.x += (target_push.x - self.fly_push.x) * 0.18;
+                self.fly_push.y += (target_push.y - self.fly_push.y) * 0.18;
+                self.fly_push.z += (target_push.z - self.fly_push.z) * 0.18;
+                self.orbit.target.x += self.fly_push.x; self.orbit.target.y += self.fly_push.y; self.orbit.target.z += self.fly_push.z;
 
                 self.spatial_auto = false; self.spatial_zoomed = true;
             }
@@ -1951,6 +2279,45 @@ impl Chat {
                         cm.emissive = 1.4 * tglow; graph.push(cm);
                     }
                 }
+                // MIC PEARL — a small marble-sheen orb beside the message panel, showing live voice state at a
+                // glance. Deliberately a DIFFERENT physical object from the flat resonance-cell text (a glossy
+                // stone/pearl bead rather than glyph cells), but its colour is DERIVED from the same per-scene
+                // (pc, tc, tglow, pmat) table above — so every scene's mic pearl is a free, coherent derivative
+                // of its message-panel idiom rather than a bespoke style per world.
+                //   asleep (mic off)   — dim grey mote, barely breathing.
+                //   armed (mic on)     — a warm marble shell, slow breathing glow in the scene's accent colour.
+                //   active (hearing an utterance) — brighter + faster pulse + two orbiting sparkle motes, so
+                //     "it's catching your voice" reads even before whisper finalizes the utterance.
+                // armed/active state: real self.voice, or LOGSCOPE_MIC_PEARL_DEBUG=armed|active for headless
+                // render verification (mic-pearl-view bin) — the `voice` feature can't build without a real
+                // ALSA/whisper.cpp toolchain, so this is how the pearl's states get visually checked per scene.
+                let debug = std::env::var("LOGSCOPE_MIC_PEARL_DEBUG").ok();
+                let armed = self.voice.is_some() || matches!(debug.as_deref(), Some("armed") | Some("active"));
+                let active = self.voice.as_ref().map(|v| !v.partial().is_empty()).unwrap_or(false) || debug.as_deref() == Some("active");
+                let mcen = V3::new(cen.x + right.x * 2.22 + fwd.x * 0.06, cen.y + up.y * 0.02 + fwd.y * 0.06, cen.z + right.z * 2.22 + fwd.z * 0.06);
+                let breathe = if active { (t * 3.4).sin() * 0.5 + 0.5 } else { (t * 1.1).sin() * 0.5 + 0.5 };
+                let r = 0.12 + (if active { 0.045 } else { 0.018 }) * breathe;
+                let shell = if armed {
+                    egui::Color32::from_rgb((pc[0] as u16 + 18).min(255) as u8, (pc[1] as u16 + 14).min(255) as u8, (pc[2] as u16 + 6).min(255) as u8)
+                } else { egui::Color32::from_rgb(0x6a, 0x6a, 0x70) }; // asleep: dim grey mote, no scene tint
+                let mut orb = m3::uv_sphere(mcen, r, 10, 8, shell);
+                orb.mat = if armed { pmat } else { crate::texgen::mat::STONE };
+                orb.emissive = if !armed { 0.06 } else if active { (0.55 + 0.85 * breathe) * tglow } else { (0.18 + 0.22 * breathe) * tglow };
+                graph.push(orb);
+                if active {
+                    // two tiny orbiting sparkle motes in the scene's accent colour — the pearl actively
+                    // "catching" your voice, distinct from the steady breathing glow of just being armed.
+                    for i in 0..2u32 {
+                        let ang = t * 2.2 + i as f32 * std::f32::consts::PI;
+                        let orad = r * 2.1;
+                        let ox = mcen.x + right.x * ang.cos() * orad + up.x * ang.sin() * orad * 0.6;
+                        let oy = mcen.y + right.y * ang.cos() * orad + up.y * ang.sin() * orad * 0.6;
+                        let oz = mcen.z + right.z * ang.cos() * orad + up.z * ang.sin() * orad * 0.6;
+                        let mut mote = m3::uv_sphere(V3::new(ox, oy, oz), r * 0.22, 5, 4, egui::Color32::from_rgb(tc[0], tc[1], tc[2]));
+                        mote.emissive = 1.6 * tglow;
+                        graph.push(mote);
+                    }
+                }
             }
 
             // CPU path (default): software-shaded triangles into egui's painter.
@@ -1965,8 +2332,12 @@ impl Chat {
             {
                 let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, 0.1, 400.0);
                 let mut verts = Vec::new();
-                crate::scene3d::with_env(name, t, |env| verts.extend(crate::gpuscene::pack_sorted(env, &cam)));
-                if !world_only { verts.extend(crate::gpuscene::pack_sorted(&graph, &cam)); } // graph after env → drawn in front
+                // dynamic-LOD screen-size threshold (NDC) for SCENERY: drop meshes too small to read; more
+                // aggressive under battery-saver POWER; tunable via LOGSCOPE_LOD, off via LOGSCOPE_NO_LOD=1.
+                let lod_ndc = if std::env::var("LOGSCOPE_NO_LOD").map(|v| v == "1").unwrap_or(false) { 0.0 }
+                    else { std::env::var("LOGSCOPE_LOD").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(0.0035) / crate::theme::power_mode().max(0.25) };
+                crate::scene3d::with_env(name, t, |env| verts.extend(crate::gpuscene::pack_sorted(env, &cam, lod_ndc)));
+                if !world_only { verts.extend(crate::gpuscene::pack_sorted(&graph, &cam, 0.0)); } // graph: no LOD (keep every node), drawn in front
                 let sun = m3::sun_dir_3d();
                 let c3 = |c: egui::Color32| [c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0];
                 let sun_uv = cam.dir_uv([sun.x, sun.y, sun.z]).unwrap_or([0.5, 1.25]); // above-screen if behind → faint
@@ -2101,7 +2472,13 @@ impl Chat {
             //  scene. Significance is already carried by node size/glow; the rings read as stray geometry.)
             let _ = (hot, prn);
             if self.region.as_ref().map_or(false, |r| r.contains(&id)) { p.circle_stroke(pt, radius + 5.0, egui::Stroke::new(1.6, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); } // :best region
-            if self.walk_focus == Some(id) { p.circle_stroke(pt, radius + 4.0, egui::Stroke::new(2.0, theme::AMBER())); }
+            if self.walk_focus == Some(id) {
+                // pulsing double halo so a voice/keyboard-focused node reads at a glance even mid-scene: an
+                // outer ring that breathes in radius + a steady inner ring. (Was a single static ring.)
+                let pulse = 0.5 + 0.5 * (time * 3.0 + id as f32).sin();
+                p.circle_stroke(pt, radius + 3.0, egui::Stroke::new(2.2, theme::AMBER()));
+                p.circle_stroke(pt, radius + 5.5 + 3.5 * pulse, egui::Stroke::new(1.6, theme::AMBER().linear_multiply(0.35 + 0.4 * (1.0 - pulse))));
+            }
             if self.branch_from == Some(id) { p.circle_stroke(pt, radius + 6.5, egui::Stroke::new(2.0, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); }
             if self.active_leaf == Some(id) { p.circle_stroke(pt, radius + 2.0, egui::Stroke::new(1.5, theme::CYAN())); } // live tip
             if prn {
@@ -2230,7 +2607,10 @@ impl Chat {
                         self.branch_from = Some(id); ui.ctx().request_repaint();
                     }
                 });
-                ui.label(RichText::new(text).color(if prn { theme::DIM() } else { theme::INK() }).small());
+                // the message as a real, scrollable box (was clipped to the first line by the old thin strip)
+                egui::ScrollArea::vertical().id_salt("focus_msg").max_height(64.0).show(ui, |ui| {
+                    ui.label(RichText::new(text).color(if prn { theme::DIM() } else { theme::INK() }).small());
+                });
             });
         } else {
             ui.label(RichText::new("Click a node to read its turn here. ⊹ Overview reframes; ✂ prunes to free context.").color(theme::FAINT()).small());
@@ -2386,13 +2766,11 @@ impl Chat {
         let p = shellexpand_home(path);
         match std::fs::read(&p) {
             Ok(bytes) => {
-                let cap = 64 * 1024;
-                let shown = &bytes[..bytes.len().min(cap)];
-                let text = String::from_utf8_lossy(shown);
                 let name = std::path::Path::new(&p).file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                let lang = std::path::Path::new(&p).extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
-                self.input.push_str(&format!("\n--- {name} ---\n```\n{text}\n```\n"));
-                if bytes.len() > cap { self.input.push_str(&format!("(truncated; showed first {cap} bytes)\n")); }
+                let block = fenced_attachment(name, lang, &bytes);
+                self.input.push_str(&block);
                 self.enter_insert(ui);
             }
             Err(e) => { self.cmdline = format!(":a — can't read {path}: {e}"); }
@@ -2433,7 +2811,19 @@ impl Chat {
         match cmd {
             Command::Branch => { if let Some(f) = self.walk_focus { self.branch_from = Some(f); } }
             Command::Attach(p) => self.attach_path(&p, ui),
-            Command::Goto(n) => { let i = n.saturating_sub(1).min(self.msgs.len().saturating_sub(1)); self.set_focus(Some(i)); }
+            Command::Goto(n) => {
+                let i = n.saturating_sub(1).min(self.msgs.len().saturating_sub(1));
+                // Glide along the graph's shortest path (like clicking a node) AND zoom in, so a voice "go to
+                // 12" for an off-screen node visibly travels there and arrives prominent — set_focus alone only
+                // re-centres at the current (far overview) distance, which read as "nothing happened".
+                let from = self.walk_focus.unwrap_or(i);
+                let g = self.convo_graph(self.msgs.len());
+                let path = graph_path(&g, from, i);
+                if path.len() > 1 { self.cam_pan_path = path; self.cam_pan_t0 = Some(std::time::Instant::now()); }
+                self.set_focus(Some(i));
+                self.orbit.dist = self.orbit.dist.clamp(8.0, 13.0); // pull in from overview so the node reads
+                self.spatial_auto = false; self.spatial_zoomed = true;
+            }
             Command::Prune => { if let Some(f) = self.walk_focus { self.pruned.insert(f); self.fold_pos.clear(); } }
             Command::Unprune => { if let Some(f) = self.walk_focus { self.pruned.remove(&f); } }
             Command::Overview => { self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; }
@@ -2981,12 +3371,90 @@ impl Chat {
         }
     }
 
+    /// Pump the live mic session once per frame: capture → whisper → finalized utterances / barge-in.
+    /// Runs in both the linear and spatial views. Utterances route through `on_voice_utterance` (the single
+    /// seam future voice features extend); a barge-in reaction while the model streams cancels generation.
+    fn pump_voice(&mut self, infer: &Inference, doc: &crate::analysis::Doc, ui: &egui::Ui, streaming: bool) {
+        // Arm barge-in only while the model generates; take the owned tick so the &mut borrow is released.
+        let tick = match self.voice.as_mut() {
+            Some(v) => { v.arm(streaming); v.poll() }
+            None => return,
+        };
+        if streaming {
+            if let Some(r) = &tick.reaction { if r.is_cancel() { infer.cancel(); } } // spoke over the model
+        }
+        for u in tick.utterances { self.on_voice_utterance(u, infer, doc, ui, streaming); }
+    }
+
+    /// The routing seam: what a finalized spoken utterance DOES. Parse it (voice_intent) and dispatch —
+    /// graph commands ride the existing modal `run_command`; camera/send are handled here; anything else
+    /// dictates into the composer. New voice behaviors are a match arm in voice_intent + (rarely) here.
+    /// Freeze camera traversal where it is: stop the tour, exit freecam, and cancel any in-flight glide, but
+    /// keep the current framing (spatial_zoomed) rather than snapping back to overview. This is what "hold
+    /// here" / "wait a minute" / "stop" (mid-fly) do — the user wants to READ where they are.
+    fn hold_camera(&mut self) {
+        self.fly_auto = None;
+        self.freecam = false;
+        self.cam_pan_t0 = None;
+        self.cam_pan_path.clear();
+        self.cam_drift = None;       // stop directional travel too
+        self.spatial_auto = false;   // don't re-frame to the centroid — hold this view
+        self.spatial_zoomed = true;
+    }
+
+    fn on_voice_utterance(&mut self, u: crate::voicefan::Utterance, infer: &Inference, doc: &crate::analysis::Doc, ui: &egui::Ui, streaming: bool) {
+        use crate::voice_intent::VoiceIntent;
+        crate::clog!("voice", "acting on {:?}", u.text);
+        match crate::voice_lang::parse_for_lang(&u.text) {
+            VoiceIntent::Command(c) => {
+                // Smart context: "stop"/"cancel" while a tour or freecam is running holds the CAMERA (what the
+                // user means mid-fly) instead of cancelling generation. Otherwise Stop runs normally.
+                if matches!(c, crate::vimmode::Command::Stop) && (self.fly_auto.is_some() || self.freecam) {
+                    self.hold_camera();
+                } else {
+                    self.run_command(c, ui);
+                }
+            }
+            VoiceIntent::HoldCamera => self.hold_camera(),
+            VoiceIntent::Move(dir) => {
+                // start continuous travel; also drop out of tour/freecam so nothing fights the drift
+                self.fly_auto = None; self.freecam = false;
+                self.cam_pan_t0 = None; self.cam_pan_path.clear();
+                self.cam_drift = Some(dir);
+                self.spatial_auto = false; self.spatial_zoomed = true;
+            }
+            VoiceIntent::Tour(on) => {
+                self.fly_auto = if on { Some(1.0) } else { None };
+                self.freecam = false;
+                if !on { self.spatial_auto = true; self.spatial_zoomed = false; }
+            }
+            VoiceIntent::Freecam(on) => {
+                self.freecam = on;
+                if on { self.fly_auto = None; self.spatial_auto = false; self.spatial_zoomed = true; }
+                else { self.spatial_auto = true; self.spatial_zoomed = false; }
+            }
+            VoiceIntent::CodeMode(on) => { self.code_voice = on; }
+            VoiceIntent::Send => {
+                if !streaming && !self.input.trim().is_empty() { self.send(infer, doc); }
+            }
+            VoiceIntent::Dictate(text) => {
+                // coder dictation: spoken symbols → punctuation ("open paren" → "("), unless prose mode
+                let text = if self.code_voice { crate::voice_dict::dictate(text.trim()) } else { text.trim().to_string() };
+                let text = text.trim();
+                if text.is_empty() { return; }
+                if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) { self.input.push(' '); }
+                self.input.push_str(text);
+            }
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, model: &mut ModelState, doc: &crate::analysis::Doc, infer: &Inference, model_loaded: bool) {
         self.sync_worker(infer);
         self.check_restore(); // first frame: offer to recover a crashed/closed conversation
         if self.pending_cancel { infer.cancel(); self.pending_cancel = false; }
         let streaming = self.stream.is_some();
         if streaming { ui.ctx().request_repaint(); }
+        self.pump_voice(infer, doc, ui, streaming); // mic → whisper → route utterances / barge-in (no-op when mic off)
         self.handle_modal(ui, infer, doc); // modal (vim) keys — both views; default Insert keeps typing free
 
         // ── top bar: status · threading toggle · context toggle · clear ──
@@ -3143,6 +3611,15 @@ impl Chat {
                     match self.right_page {
                         RightPage::Context => {
                             ui.label(RichText::new("CONTEXT (system prompt)").color(theme::DIM()).small().strong());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("persona").color(theme::DIM()).small());
+                                for (key, title, body) in PERSONAS {
+                                    let active = self.context.trim() == body.trim();
+                                    if ui.selectable_label(active, RichText::new(*title).small()).on_hover_text(*key).clicked() {
+                                        self.context = (*body).to_string();
+                                    }
+                                }
+                            });
                             ui.add(egui::TextEdit::multiline(&mut self.context).desired_rows(4).desired_width(f32::INFINITY)
                                 .hint_text("System prompt / persistent context for every turn…"));
                             ui.add_space(6.0);
@@ -3572,7 +4049,10 @@ impl Chat {
                 // language as the 3D pearls), with a real TextEdit overlaid transparently on the same band so it
                 // still owns input, caret, selection and IME — and the mobile focus fix below still applies.
                 let pearl_t = ui.input(|i| i.time) as f32;
-                let band = self.pearl_input.show(ui, &self.input, pearl_t, 132.0, theme::CYAN());
+                // live-transcription preview: while the mic is on, the forming utterance shows on the pearl
+                // (dimmer, ahead of the committed text) so dictation has real-time feedback before it commits.
+                let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
+                let band = self.pearl_input.show(ui, &self.input, &vpartial, pearl_t, 132.0, theme::CYAN());
                 // the pearl draws its OWN caret shimmer aligned to the cells; hide egui's caret (it sits at the
                 // transparent TextEdit's content origin — up/left of the cells) and its selection fill.
                 ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
@@ -3601,6 +4081,35 @@ impl Chat {
                             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
                             .unwrap_or_else(|| std::path::PathBuf::from("/"));
                         self.attach_picker.open_file(&start, "Attach a file", &[]);
+                    }
+                    // Mic toggle: start/stop the live voice session. Dictates finalized speech into the composer
+                    // (the routing seam in on_voice_utterance grows into graph commands next). Errors surface
+                    // inline (no model/mic, or a build without the `voice` feature).
+                    let miced = self.voice.is_some();
+                    if theme::carved_button(ui, if miced { "🔴 Stop mic" } else { "🎙 Mic" })
+                        .on_hover_text(
+                            "Voice — speak; each utterance runs as a command or dictates.\n\
+                             Nav: \"go to 12\" · \"focus on three\" · \"node seven\"\n\
+                             Graph: \"branch here\" · \"prune\" · \"unprune\" · \"best\"\n\
+                             View: \"overview\" · \"show the palace\" · \"back to chat\"\n\
+                             Camera: \"start/stop tour\" · \"free cam\" / \"exit freecam\"\n\
+                             Compose: \"send it\" · \"stop\" (cancel) · anything else dictates")
+                        .clicked() {
+                        if miced { self.voice = None; }
+                        else {
+                            match crate::voice_session::VoiceSession::start() {
+                                Ok(s) => { self.voice = Some(s); self.voice_err = None; ui.ctx().request_repaint(); }
+                                Err(e) => { self.voice_err = Some(format!("voice: {e}")); }
+                            }
+                        }
+                    }
+                    if let Some(v) = &self.voice {
+                        let p = v.partial();
+                        let shown = if p.is_empty() { "listening…".to_string() } else { p.chars().take(60).collect::<String>() };
+                        ui.label(RichText::new(shown).color(theme::CYAN()).small().italics());
+                        ui.ctx().request_repaint(); // keep transcription live while the mic is on
+                    } else if let Some(e) = &self.voice_err {
+                        ui.label(RichText::new(e).color(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c)).small());
                     }
                     ui.label(RichText::new(if self.threading { "threaded" } else { "single-shot" }).color(theme::FAINT()).small());
                     ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
@@ -3923,6 +4432,35 @@ mod tests {
     }
 
     #[test]
+    fn segments_longer_fence_wraps_inner_backticks() {
+        // a 4-backtick block containing a full ``` run stays ONE code block (the old toggle split it)
+        let segs = segment_message("````md doc\nuse ```rust\nfn x(){}\n``` inline\n````\nafter");
+        assert_eq!(segs.len(), 2, "outer 4-fence should not be closed by the inner 3-backtick run");
+        match &segs[0] { Seg::Code { body, .. } => assert!(body.contains("```rust") && body.contains("``` inline")), _ => panic!("expected code") }
+        assert!(matches!(&segs[1], Seg::Prose(p) if p == "after"));
+    }
+
+    #[test]
+    fn segments_info_string_fence_does_not_close() {
+        // ```diff has an info string, so it can only OPEN — a bare ``` closes. The old toggle let ```diff
+        // "close" a block and desynced everything after (the reported mangling).
+        let segs = segment_message("```diff\n-a\n+b\n```\ntail prose");
+        assert_eq!(segs.len(), 2);
+        match &segs[0] { Seg::Code { lang, body } => { assert_eq!(lang, "diff"); assert_eq!(body, "-a\n+b"); }, _ => panic!("expected code") }
+        assert!(matches!(&segs[1], Seg::Prose(p) if p == "tail prose"));
+    }
+
+    #[test]
+    fn attachment_fence_survives_embedded_backticks() {
+        // a file whose content contains ``` must be wrapped in a LONGER fence so it can't close early
+        let block = fenced_attachment("readme.md", "md", b"# Title\n```rust\nfn x(){}\n```\ndone");
+        // re-parsing the block should yield exactly one code segment holding the whole file
+        let segs = segment_message(block.trim());
+        assert_eq!(segs.len(), 1, "embedded ``` must not split the attachment");
+        match &segs[0] { Seg::Code { body, .. } => assert!(body.contains("```rust") && body.contains("done")), _ => panic!("expected one code block") }
+    }
+
+    #[test]
     fn segments_plain_text() {
         let segs = segment_message("no code here at all");
         assert_eq!(segs.len(), 1);
@@ -3987,6 +4525,29 @@ mod tests {
         assert!(p.starts_with("System: "));
         assert!(p.contains("why is the disk full?"));
         assert!(p.trim_end().ends_with("Assistant:"));
+    }
+
+    /// Regression guard: after a completed turn (live tip on the assistant), sending a new message must
+    /// put THAT message as the final user turn in the prompt — not drop it for the second-to-last.
+    #[test]
+    fn last_user_message_reaches_prompt() {
+        let mut c = Chat::default();
+        c.backend = BackendKind::Wgpu;
+        c.template = TemplateKind::Llama3;
+        c.attach_log = false;
+        c.msgs.push(Msg::user("FIRST_QUESTION".into()));
+        let mut a0 = Msg::assistant(); a0.variants[0] = "FIRST_ANSWER".into(); a0.parent = Some(0);
+        c.msgs.push(a0);
+        c.active_leaf = Some(1);
+        // replicate start_generation's prompt-build prefix for the second send
+        let parent = c.branch_from.take().or(c.active_leaf).or(c.msgs.len().checked_sub(1));
+        c.msgs.push(Msg::user("SECOND_QUESTION".into()));
+        let uid = c.msgs.len() - 1;
+        c.msgs[uid].parent = parent;
+        c.active_leaf = Some(uid);
+        let p = c.build_prompt(&Doc::from_text("", ""));
+        let last_user = p.rfind("user<|end_header_id|>").map(|i| &p[i..]).unwrap_or("");
+        assert!(last_user.contains("SECOND_QUESTION"), "last USER turn is not the newest message");
     }
 }
 

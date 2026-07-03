@@ -1,0 +1,14 @@
+logscope-suite bundle build info
+generated: 2026-07-02T22:12:18Z
+HEAD: 86ab32d9e31f3e56b57aa1b288e1285fe4de05e8
+
+  86ab32d feat(voice): "move back" — continuous directional camera travel (closes the batch)
+  ba72726 chore: refresh BUILD_INFO (code-block + attachments)
+  2fd912c fix(chat): code-block mangling + longer-context attachments (fence-length aware)
+  1ef0266 chore: refresh BUILD_INFO (tour+voice nav fixes)
+  3118cb6 fix(voice+tour): tour no longer blanks the scene; voice nav actually travels; hold/highlight/dwell
+  8e540af chore: refresh BUILD_INFO (mic pearl)
+  7b04c03 feat(ui): marble-sheen mic pearl — a distinct voice-state orb, derived per-scene (queue #3)
+  ae2e108 chore: refresh BUILD_INFO (multi-language)
+  31ffbf4 feat(voice): multi-language command parsing — es/fr/de with honest EN fallback (voiceterm port)
+  dcefbe9 chore: refresh BUILD_INFO (multi-speaker)

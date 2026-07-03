@@ -348,6 +348,10 @@ fn one_with(seed: u64, forced: Option<Arche>) -> CreatureBlueprint {
     let is_bird = matches!(arche, Arche::Bird);
     let is_canid = matches!(arche, Arche::Canid);
     let is_lauscher = matches!(arche, Arche::Lauscher);
+    // r531: bipeds stand UPRIGHT like the Lauscher (head on top), so a player
+    // character reads as a humanoid rather than a forward-necked "chicken".
+    let is_biped = matches!(arche, Arche::Biped);
+    let upright = is_lauscher || is_biped;
     let palette = *r.pick(&BODY_PALETTE);
     // Heritable coat colour: blend the curated palette base toward this seed's
     // genome. The r.pick above is kept so the geometry RNG stream is unchanged —
@@ -465,15 +469,15 @@ fn one_with(seed: u64, forced: Option<Arche>) -> CreatureBlueprint {
         } else {
             (neck_r * r.range(1.8, 2.4), neck_r * r.range(-0.1, 0.3)) // forward, near-level
         }
-    } else if is_lauscher {
+    } else if upright {
         // Upright: the neck climbs nearly straight up so the head sits ON TOP
         // (humanoid), not carried out front (animal).
         (neck_r * 0.12, neck_r * r.range(1.1, 1.6))
     } else {
         (neck_r * r.range(1.2, 1.8), neck_r * r.range(0.5, 1.3))
     };
-    let mut nx = if is_dragon { body_front } else if is_lauscher { 0.0 } else { bx * 0.7 };
-    let mut ny = if is_dragon && rear { by * r.range(0.7, 1.0) } else if is_lauscher { by * r.range(0.85, 1.0) } else { by * r.range(0.45, 0.85) };
+    let mut nx = if is_dragon { body_front } else if upright { 0.0 } else { bx * 0.7 };
+    let mut ny = if is_dragon && rear { by * r.range(0.7, 1.0) } else if upright { by * r.range(0.85, 1.0) } else { by * r.range(0.45, 0.85) };
     // Neck curvature: dragons sometimes bend the neck — a single forward arc or a
     // sinuous double (S) curve — instead of a straight ramp. Non-dragons stay
     // straight (gated, so the fauna sheet's RNG is undisturbed).
@@ -498,7 +502,7 @@ fn one_with(seed: u64, forced: Option<Arche>) -> CreatureBlueprint {
     } else {
         r.range(0.5, 0.8)
     };
-    let hx = tip[0] + if is_lauscher { hh * 0.15 } else { hh * 0.8 };
+    let hx = tip[0] + if upright { hh * 0.15 } else { hh * 0.8 };
     let hy = tip[1] + step_y * 0.3;
     bp.push([hx, hy, 0.0], [hh, hh, hh * r.range(0.85, 1.05)], tint(body, 1.05), BoxRole::Head);
     if is_bird {
@@ -507,6 +511,9 @@ fn one_with(seed: u64, forced: Option<Arche>) -> CreatureBlueprint {
     } else if is_canid {
         // A longer muzzle.
         bp.push([hx + hh * 1.05, hy - hh * 0.3, 0.0], [hh * 0.8, hh * 0.42, hh * 0.5], tint(body, 1.0), BoxRole::Snout);
+    } else if upright {
+        // r531: humanoid — a flat face with only a small nose, not an animal snout.
+        bp.push([hx + hh * 0.5, hy - hh * 0.05, 0.0], [hh * 0.22, hh * 0.28, hh * 0.30], tint(body, 1.0), BoxRole::Snout);
     } else {
         bp.push([hx + hh * 0.9, hy - hh * 0.2, 0.0], [hh * 0.55, hh * 0.5, hh * 0.7], tint(body, 1.0), BoxRole::Snout);
     }
@@ -727,9 +734,27 @@ fn one_with(seed: u64, forced: Option<Arche>) -> CreatureBlueprint {
         }
     }
 
+    if is_biped {
+        // r531: HUMANOID arms — a single pair at the shoulders (upper arm, forearm,
+        // hand), hanging at the sides so a biped reads as a person, not a chicken.
+        // Static Segment boxes (jointed look without per-box limb swing).
+        let aw = bx * 0.18;
+        let sh_y = by * 0.7;
+        let up_len = by * r.range(0.34, 0.46);
+        let fore_len = by * r.range(0.30, 0.42);
+        for &s in &[1.0f32, -1.0] {
+            let sz = s * (bz + aw); // just past the torso side
+            bp.push([0.0, sh_y - up_len, sz], [aw, up_len, aw], dark, BoxRole::Segment);
+            let ey = sh_y - up_len * 2.0;
+            bp.push([aw * 1.1, ey - fore_len, sz], [aw * 0.85, fore_len, aw * 0.85], dark, BoxRole::Segment);
+            let hgy = ey - fore_len * 2.0;
+            bp.push([aw * 1.1, hgy, sz], [aw, aw * 0.9, aw], tint(body, 0.8), BoxRole::Segment);
+        }
+    }
+
     // Wings: span scales with body size (no more giant wings on tiny critters).
     let wing_p = match arche {
-        Arche::Biped => 0.7,
+        Arche::Biped => 0.0,
         Arche::Quadruped => 0.25,
         Arche::Critter => 0.05,
         Arche::Serpent => 0.15,

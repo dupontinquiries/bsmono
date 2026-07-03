@@ -281,6 +281,7 @@ impl VulkanChunkGenerator {
     /// Convenience: generate a batch and convert to `Chunk` values directly.
     pub fn generate_chunks(&self, coords: &[ChunkCoord], seed: u32) -> Result<Vec<Chunk>> {
         let raw = self.generate_batch(coords, seed)?;
+        // Terrain only — structures are stamped by TerrainGenerator as a CPU post-pass.
         Ok(raw.into_iter().map(|g| Chunk::from_blocks(g.coord, g.blocks)).collect())
     }
 

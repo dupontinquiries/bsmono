@@ -150,8 +150,16 @@ impl TerrainGenerator {
                 let mut all = Vec::with_capacity(coords.len());
 
                 for batch in coords.chunks(cap) {
-                    match gpu.generate_chunks(batch, self.seed) {
-                        Ok(mut chunks) => all.append(&mut chunks),
+                    // Use the raw GPU terrain, then stamp structures with the CPU
+                    // generator (which carries the biome registry) BEFORE building the
+                    // Chunk, so plant/wood indices and biome-flavored ruins are correct.
+                    match gpu.generate_batch(batch, self.seed) {
+                        Ok(raw) => {
+                            for mut g in raw {
+                                self.cpu.stamp_ruins(&mut g.blocks, g.coord);
+                                all.push(crate::world::chunk::Chunk::from_blocks(g.coord, g.blocks));
+                            }
+                        }
                         Err(e) => {
                             log::warn!("GPU batch failed ({}). Falling back to CPU.", e);
                             for &c in batch { all.push(self.cpu.generate_chunk(c)); }

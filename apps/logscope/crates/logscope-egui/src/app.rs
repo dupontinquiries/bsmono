@@ -267,7 +267,7 @@ impl eframe::App for LogscopeApp {
                     ui.add_space(10.0);
                     // variant picker — flip between 10 baked candidate looks live (this round: surface detail)
                     crate::ui::combo(ui, "hdr_variant", theme::variant_label(theme::variant()), 140.0, |ui| {
-                        for v in 1..=10u8 {
+                        for v in 1..=16u8 {
                             if ui.selectable_label(theme::variant() == v, theme::variant_label(v)).clicked() {
                                 theme::set_variant(v); ui.ctx().request_repaint();
                             }

@@ -3028,7 +3028,7 @@ dependencies = [
 
 [[package]]
 name = "web2qml"
-version = "0.1.879"
+version = "0.1.900"
 dependencies = [
  "aho-corasick",
  "bcrypt",

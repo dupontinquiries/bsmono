@@ -90,10 +90,10 @@ GPU perf, and anything `ui-overlay`-gated (the egui-side held-item selection).
 
 ## What's left
 
-- **Movement.** The test spawns are static. Mobs already run the same
-  `step_character` kernel as the player (see `MOVEMENT.md`), so driving them is a
-  matter of ticking the sim + feeding AI intents in the bin — best done after the
-  static render was confirmed (it now is).
+- **Movement.** DONE (r526). The bin ticks each test mob's `brain` (wander/seek/
+  flee) and advances it with `step_character` against the live chunk store (via a
+  `MobWorld: WorldQuery` bridge) at a fixed 20 Hz. The Seeker chases the player,
+  the Grazer flees. Next: spawn from eggs + ambient population still pending.
 - **Spawning.** `spawn::resolve_use` already turns a held spawn egg into a
   `Creature` (pure, tested), but the bin's place path reads the held item through
   the `ui-overlay`/egui layer, which only builds on the full toolchain — so that

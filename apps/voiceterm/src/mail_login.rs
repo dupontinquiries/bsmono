@@ -77,6 +77,18 @@ pub fn login_page_qml(style: &PaneStyle, error: Option<&str>) -> String {
     // v0.1.869: in-pane status line. A pane's loaded QML can't reach the global
     // `toast`, so login feedback (success / 2FA needed / error) shows here. Driven
     // by `_setStatus` from the submit handler's `mail_login` result wire.
+    // v0.1.881: links to features that work WITHOUT a Proton login — the
+    // in-house peer contacts (device-as-provider messaging) and local drafts.
+    let _ = std::fmt::Write::write_fmt(
+        &mut o,
+        format_args!(
+            "Row {{ spacing: 16\nText {{ text: \"Peer contacts\"; color: \"{ac}\"; font.pixelSize: {fs}; font.family: \"{ff}\"; font.underline: true; MouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (backend && backend.mail_open_peers) backend.mail_open_peers() }} }}\nText {{ text: \"Drafts\"; color: \"{ac}\"; font.pixelSize: {fs}; font.family: \"{ff}\"; font.underline: true; MouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: if (backend && backend.mail_open_drafts) backend.mail_open_drafts() }} }}\n}}\n",
+            ac = qe(&style.accent),
+            fs = style.font_px,
+            ff = qe(&style.font_family),
+        ),
+    );
+
     let _ = std::fmt::Write::write_fmt(
         &mut o,
         format_args!(
@@ -99,10 +111,13 @@ pub fn login_page_qml(style: &PaneStyle, error: Option<&str>) -> String {
     o
 }
 
-/// Accounts-management pane for the settings view: each known account with a
-/// Remove button, plus an Add-account button that opens the login page.
-pub fn accounts_settings_qml(style: &PaneStyle, accounts: &[AccountSummary]) -> String {
-    let mut o = String::with_capacity(accounts.len() * 200 + 512);
+/// Accounts-management pane for the settings view: each known account with
+/// an Active/Use indicator and a Remove button, plus an Add-account button
+/// that opens the login page. `active_id` (an `AccountId::as_str()`, may be
+/// empty) marks which account the "Active" badge shows on; other rows get
+/// a "Use this account" button.
+pub fn accounts_settings_qml(style: &PaneStyle, accounts: &[AccountSummary], active_id: &str) -> String {
+    let mut o = String::with_capacity(accounts.len() * 260 + 640);
     let _ = std::fmt::Write::write_fmt(
         &mut o,
         format_args!(
@@ -123,6 +138,19 @@ pub fn accounts_settings_qml(style: &PaneStyle, accounts: &[AccountSummary]) -> 
                 ff = qe(&style.font_family),
             ),
         );
+    } else if accounts.len() > 1 {
+        // v0.1.901: only surface the "which account is active" concept once
+        // there's actually more than one to disambiguate between.
+        let _ = std::fmt::Write::write_fmt(
+            &mut o,
+            format_args!(
+                "Text {{ text: \"{n} accounts — pick which one compose/inbox act on.\"; color: \"{muted}\"; font.pixelSize: {fss}; font.family: \"{ff}\"; wrapMode: Text.WordWrap; width: parent.width }}\n",
+                n = accounts.len(),
+                muted = qe(&style.muted),
+                fss = style.font_px - 1,
+                ff = qe(&style.font_family),
+            ),
+        );
     }
 
     for a in accounts {
@@ -131,19 +159,68 @@ pub fn accounts_settings_qml(style: &PaneStyle, accounts: &[AccountSummary]) -> 
         } else {
             a.display_name.clone()
         };
+        let id = sanitize(a.id.as_str());
+        let is_active = !active_id.is_empty() && a.id.as_str() == active_id;
         let _ = std::fmt::Write::write_fmt(
             &mut o,
             format_args!(
-                "Rectangle {{\nwidth: parent.width\nimplicitHeight: _row_{id}.height + 12\ncolor: \"transparent\"\nborder.color: \"{border}\"\nborder.width: 1\nradius: 4\nRow {{\nid: _row_{id}\nx: 8; y: 6\nwidth: parent.width - 16\nspacing: 10\nColumn {{\nwidth: parent.width - 90\nText {{ text: \"{label}\"; color: \"{fg}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\"; elide: Text.ElideRight; width: parent.width }}\nText {{ text: \"{user}\"; color: \"{muted}\"; font.pixelSize: {fss}; font.family: \"{ff}\"; elide: Text.ElideRight; width: parent.width }}\n}}\nRectangle {{ radius: 4; color: \"transparent\"; border.color: \"{border}\"; border.width: 1; implicitWidth: _rm_{id}.width + 16; implicitHeight: _rm_{id}.height + 10; Text {{ id: _rm_{id}; anchors.centerIn: parent; text: \"Remove\"; color: \"{fg}\"; font.pixelSize: {fss}; font.family: \"{ff}\" }} MouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: {{ if (backend) backend.mail_remove_account(\"{aid}\") }} }} }}\n}}\n}}\n",
-                id = sanitize(a.id.as_str()),
-                border = qe(&style.border),
+                "Rectangle {{\nwidth: parent.width\nimplicitHeight: _col_{id}.height + 12\ncolor: \"transparent\"\nborder.color: \"{border}\"\nborder.width: {bw}\nradius: 4\nColumn {{\nid: _col_{id}\nx: 8; y: 6\nwidth: parent.width - 16\nspacing: 6\nRow {{\nspacing: 8\nText {{ text: \"{label}\"; color: \"{fg}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\"; elide: Text.ElideRight }}\n",
+                id = id,
+                border = qe(if is_active { &style.accent } else { &style.border }),
+                bw = if is_active { 2 } else { 1 },
                 label = qe(&label),
                 fg = qe(&style.fg),
                 fs = style.font_px,
                 ff = qe(&style.font_family),
+            ),
+        );
+        if is_active {
+            let _ = std::fmt::Write::write_fmt(
+                &mut o,
+                format_args!(
+                    "Rectangle {{ radius: 3; color: \"{accent}\"; implicitWidth: _ab_{id}.width + 12; implicitHeight: _ab_{id}.height + 6; Text {{ id: _ab_{id}; anchors.centerIn: parent; text: \"Active\"; color: \"{bg}\"; font.bold: true; font.pixelSize: {fss}; font.family: \"{ff}\" }} }}\n",
+                    id = id,
+                    accent = qe(&style.accent),
+                    bg = qe(&style.button_fg),
+                    fss = style.font_px - 2,
+                    ff = qe(&style.font_family),
+                ),
+            );
+        }
+        o.push_str("}\n"); // end label Row
+        let _ = std::fmt::Write::write_fmt(
+            &mut o,
+            format_args!(
+                "Text {{ text: \"{user}\"; color: \"{muted}\"; font.pixelSize: {fss}; font.family: \"{ff}\"; elide: Text.ElideRight; width: parent.width }}\nRow {{\nspacing: 8\n",
                 user = qe(&a.username),
                 muted = qe(&style.muted),
                 fss = style.font_px - 2,
+                ff = qe(&style.font_family),
+            ),
+        );
+        if !is_active {
+            let _ = std::fmt::Write::write_fmt(
+                &mut o,
+                format_args!(
+                    "Rectangle {{ radius: 4; color: \"transparent\"; border.color: \"{border}\"; border.width: 1; implicitWidth: _use_{id}.width + 16; implicitHeight: _use_{id}.height + 10; Text {{ id: _use_{id}; anchors.centerIn: parent; text: \"Use this account\"; color: \"{fg}\"; font.pixelSize: {fss}; font.family: \"{ff}\" }} MouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: {{ if (backend) _setStatus(backend.mail_set_active_account(\"{aid}\")) }} }} }}\n",
+                    id = id,
+                    border = qe(&style.border),
+                    fg = qe(&style.fg),
+                    fss = style.font_px - 2,
+                    ff = qe(&style.font_family),
+                    aid = qe(a.id.as_str()),
+                ),
+            );
+        }
+        let _ = std::fmt::Write::write_fmt(
+            &mut o,
+            format_args!(
+                "Rectangle {{ radius: 4; color: \"transparent\"; border.color: \"{border}\"; border.width: 1; implicitWidth: _rm_{id}.width + 16; implicitHeight: _rm_{id}.height + 10; Text {{ id: _rm_{id}; anchors.centerIn: parent; text: \"Remove\"; color: \"{fg}\"; font.pixelSize: {fss}; font.family: \"{ff}\" }} MouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: {{ if (backend) _setStatus(backend.mail_remove_account(\"{aid}\")) }} }} }}\n}}\n}}\n}}\n",
+                id = id,
+                border = qe(&style.border),
+                fg = qe(&style.fg),
+                fss = style.font_px - 2,
+                ff = qe(&style.font_family),
                 aid = qe(a.id.as_str()),
             ),
         );
@@ -162,9 +239,25 @@ pub fn accounts_settings_qml(style: &PaneStyle, accounts: &[AccountSummary]) -> 
         ),
     );
 
+    // v0.1.901: shared status line + setter for Remove/Use-this-account
+    // feedback — same pattern as login_page_qml / peers_pane_qml, so those
+    // two mutating actions no longer rely purely on the periodic pane
+    // refresh (~1.5s) for the user to learn whether they worked.
+    let _ = std::fmt::Write::write_fmt(
+        &mut o,
+        format_args!(
+            "Text {{ id: _sstatus; text: \"\"; visible: text.length>0; wrapMode: Text.WordWrap; width: parent.width; color: \"{fg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+            fg = qe(&style.fg), fs = style.font_px, ff = qe(&style.font_family),
+        ),
+    );
+    o.push_str(
+        "function _setStatus(r) { if(!r){_sstatus.text=\"\";return} var p=r.split(\"\\t\"); if(p[0]===\"ok\"){_sstatus.color=\"#86c986\";_sstatus.text=(p[1]||\"Done\")} else {_sstatus.color=\"#e0928f\";_sstatus.text=(p[1]||\"Failed\")} }\n",
+    );
+
     o.push_str("}\n}\n"); // Column, root Item
     o
 }
+
 
 /// Markdown for the `mail` settings manpage. Register in `manpages.rs` (add
 /// `"mail" => include_str!(...)` or an entry returning this), or render
@@ -405,17 +498,36 @@ mod tests {
     #[test]
     fn accounts_pane_lists_and_removes() {
         let accts = vec![summary("user-1", "alice@proton.me", "Alice"), summary("user-2", "bob@proton.me", "")];
-        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &accts);
+        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &accts, "user-1");
         assert!(qml.contains("Alice"));
         assert!(qml.contains("bob@proton.me"));
-        assert!(qml.contains("mail_remove_account(\"user-1\")"));
+        assert!(qml.contains("_setStatus(backend.mail_remove_account(\"user-1\"))"));
         assert!(qml.contains("mail_open_login()"));
         assert_eq!(qml.matches('{').count(), qml.matches('}').count(), "{qml}");
     }
 
     #[test]
+    fn accounts_pane_marks_active_and_offers_use_on_others() {
+        let accts = vec![summary("user-1", "alice@proton.me", "Alice"), summary("user-2", "bob@proton.me", "")];
+        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &accts, "user-1");
+        assert!(qml.contains("\"Active\""));
+        assert!(qml.contains("_setStatus(backend.mail_set_active_account(\"user-2\"))"));
+        // The active account itself gets no "Use this account" button.
+        assert!(!qml.contains("mail_set_active_account(\"user-1\")"));
+        assert_eq!(qml.matches('{').count(), qml.matches('}').count(), "{qml}");
+    }
+
+    #[test]
+    fn accounts_pane_no_active_marks_none() {
+        let accts = vec![summary("user-1", "alice@proton.me", "Alice")];
+        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &accts, "");
+        assert!(!qml.contains("\"Active\""));
+        assert!(qml.contains("mail_set_active_account(\"user-1\")"));
+    }
+
+    #[test]
     fn empty_accounts_pane_balanced() {
-        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &[]);
+        let qml = accounts_settings_qml(&PaneStyle::dark_default(), &[], "");
         assert!(qml.contains("No accounts yet"));
         assert_eq!(qml.matches('{').count(), qml.matches('}').count());
     }

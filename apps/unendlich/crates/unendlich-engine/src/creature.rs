@@ -427,11 +427,33 @@ pub struct Creature {
     /// the forge dragon's body material at mesh time. `clean()` for fresh/other
     /// creatures (unchanged look until something accumulates grime).
     pub grime: crate::sim::creature_grime::GrimeState,
+    /// r599: the wing-membrane Verlet solver (`sim::dragon_wing_flex`), stepped
+    /// once per tick for genome dragons (`forge.is_some()`) so the membrane sags
+    /// and catches wind. Lazily created on first tick; `None` for every other
+    /// creature (unchanged — `skin_with_flex` treats empty offsets as `skin`).
+    pub wing_flex: Option<Box<crate::sim::dragon_wing_flex::WingFlex>>,
+    /// r599: the last-computed per-span offsets from `wing_flex`'s most recent
+    /// `step`, cached here so the (immutable) render bake can read them without
+    /// re-running the solver. Empty = no flex applied (default; unchanged look).
+    pub wing_offset_l: Vec<[f32; 3]>,
+    pub wing_offset_r: Vec<[f32; 3]>,
+    /// r601: the creature's derived stature (`sim::stature::derive`, from its
+    /// actual physical height — `body.half_extents[1]*2`), recomputed each tick
+    /// for genome dragons. Gives a huge dragon a proportionally huge `mass`,
+    /// `ground_shake` (quake + stomp erosion), `strength` (attack scaling) and
+    /// `knockback_dealt` — the SAME laws a giant player uses, applied to
+    /// creatures. `None` for ordinary (non-forge) creatures — unchanged.
+    pub derived_stature: Option<crate::sim::stature::StatureProfile>,
+    /// r602: same-spot stomp streak (`sim::stomp_erosion`) for this creature's
+    /// footfall terrain erosion — repeated stomps in the SAME cell build toward
+    /// an actual break-through; a single step only weathers the surface.
+    pub stomp_cell: Option<(i32, i32)>,
+    pub stomp_streak: u32,
 }
 
 impl Creature {
     pub fn new(body: PhysicsBody) -> Self {
-        Self { body, yaw: 0.0, gait_phase: 0.0, pitch: 0.0, roll: 0.0, limbs: Vec::new(), mass: 1.0, parts: Vec::new(), anatomy: None, tint: [1.0, 1.0, 1.0], torso_bend: 0.0, anim_time: 0.0, gaze_yaw: 0.0, gaze_pitch: 0.0, forge: None, grime: crate::sim::creature_grime::GrimeState::clean() }
+        Self { body, yaw: 0.0, gait_phase: 0.0, pitch: 0.0, roll: 0.0, limbs: Vec::new(), mass: 1.0, parts: Vec::new(), anatomy: None, tint: [1.0, 1.0, 1.0], torso_bend: 0.0, anim_time: 0.0, gaze_yaw: 0.0, gaze_pitch: 0.0, forge: None, grime: crate::sim::creature_grime::GrimeState::clean(), wing_flex: None, wing_offset_l: Vec::new(), wing_offset_r: Vec::new(), derived_stature: None, stomp_cell: None, stomp_streak: 0 }
     }
 
     /// The creature's lowest point relative to its body centre (negative = below

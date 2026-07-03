@@ -213,3 +213,21 @@ not start learning from scratch. Approach to explore:
 - Buoyancy/pressure pass for submerged bodies; hydrostatic push on entities by depth.
 - Hot metal/lava → water: extend water_react so a SUBMERGED hot-metal cell heats and boils the adjacent water
   column (couple sim::hot_metal temp into the existing boil/steam path).
+
+## Done r539
+- GPU octree mesher emitted solid cubes for subvoxel-only leaves/crops (is_solid_opaque only skipped Air/Water) -> fixed + CPU-ref synced.
+- UNENDLICH_WATER_SIM defaulted on against its documented off-by-default -> rain-fed rising; restored off.
+
+## Done r543 (GPU shader investigation pass)
+- **Magenta blocks (GPU mesher): FIXED (r543).** chunk_mesh_octree.comp color_for_block was missing 20 defined blocks
+  (48–51, 57–66, 81–87) → magenta default. Added them (values = base_color/255). Crops 88–91 stay irrelevant (r539 made
+  them non-cubing).
+- **Biomes 19–27 in GPU worlds: ALREADY DONE — verified, item closed.** Re-investigation shows chunk_generation.comp is
+  fully synced with biomes.rs across the whole pipeline: determine_biome classification (r457/r458), biome_height_modifier
+  (r458), surface_block_type (r462), and the tree decision (r458) all return/handle Savanna/Jungle/Taiga/CrystalCave/
+  LushCave/Mesa/Mangrove/VolcanicWastes/FrozenOcean with thresholds and blocks matching the CPU. No work remaining; the
+  old "CPU-only, never in GPU worlds" note is stale.
+- **Missing top faces: diagnosed, NOT a same-LOD bug.** The octree sampler returns air on an open/unloaded +Y boundary
+  (top face emits correctly), and the CPU neighbor_py wiring (gpu_meshing_octree.rs lookup((0,1,0))) is correct. The
+  remaining artifact is the CROSS-LOD boundary (a chunk meshed at a coarser lod_stride sampling a finer neighbor, and vice
+  versa) — same root as "LOD overlap". Needs on-device LOD-band work; not a blind shader edit.

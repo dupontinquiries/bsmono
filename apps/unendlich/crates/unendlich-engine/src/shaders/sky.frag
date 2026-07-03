@@ -137,16 +137,18 @@ void main() {
     // ─── Horizon warmth at dusk ─────────────────────────────────────────
     // Near the horizon when the sun is low, push toward sun_color (orange/red).
     float horizon = 1.0 - up;                    // 1 at horizon, 0 at zenith
-    float dusk    = (1.0 - day) * smoothstep(0.0, 0.6, horizon);
-    sky = mix(sky, ubo.sun_color.rgb, dusk * 0.5 * sun_power);
+    float dusk    = (1.0 - day) * smoothstep(0.0, 0.7, horizon);
+    sky = mix(sky, ubo.sun_color.rgb, dusk * 0.85 * sun_power); // r476: deeper, warmer sunsets
 
     // ─── Sun disk + glow ────────────────────────────────────────────────
     float sun_glow = pow(max(cos_theta, 0.0), 8.0);          // broad glow
+    float sun_glow2 = pow(max(cos_theta, 0.0), 64.0);        // r476: tight inner glow
     float sun_disk = smoothstep(SUN_DISK_COS, 1.0, cos_theta); // sharp disk
     // Disk and glow only above the horizon and only when the sun is up.
     float sun_vis  = step(0.0, to_sun.y) * sun_power;
-    sky += ubo.sun_color.rgb * sun_glow * 0.25 * sun_vis;
-    sky += ubo.sun_color.rgb * sun_disk * 6.0  * sun_vis;     // bright core (HDR)
+    sky += ubo.sun_color.rgb * sun_glow  * 0.45 * sun_vis;   // r476: brighter halo
+    sky += ubo.sun_color.rgb * sun_glow2 * 0.85 * sun_vis;   // r476: hot inner ring
+    sky += ubo.sun_color.rgb * sun_disk * 7.0  * sun_vis;     // bright core (HDR)
 
     // ─── r136: Night sky — procedural starfield + moon ──────────────────
     // Stars: hash the quantized view direction; the brightest cells become
@@ -156,9 +158,9 @@ void main() {
     if (night > 0.02 && view_dir.y > 0.05) {
         vec3  sq  = floor(view_dir * 220.0);
         float h   = fract(sin(dot(sq, vec3(127.1, 311.7, 74.7))) * 43758.5453);
-        float star = smoothstep(0.9975, 1.0, h);
-        float tw  = 0.75 + 0.25 * sin(ubo.atmos_params.w * 60.0 + h * 6.2831);
-        sky += vec3(0.9, 0.95, 1.0) * star * tw * night * smoothstep(0.05, 0.2, view_dir.y);
+        float star = smoothstep(0.9965, 1.0, h);             // r476: more stars
+        float tw  = 0.7 + 0.3 * sin(ubo.atmos_params.w * 60.0 + h * 6.2831);
+        sky += vec3(1.0, 1.0, 1.12) * star * tw * night * 1.4 * smoothstep(0.05, 0.2, view_dir.y);
     }
     // Moon: a cool disk opposite the sun, visible at night.
     {

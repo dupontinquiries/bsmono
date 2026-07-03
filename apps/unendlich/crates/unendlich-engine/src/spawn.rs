@@ -43,9 +43,11 @@ fn dragon_seed(p: [f32; 3]) -> u64 {
 /// Genome-scaled physics box for a dragon. Always comfortably larger than the
 /// small creatures (the smallest `bulk` still dwarfs a Lauscher).
 pub fn dragon_body_half_extents(g: &Genome) -> [f32; 3] {
-    // wide, genome-driven size: small runts (~0.6×) to hulking adults (~1.7×),
+    // wide, genome-driven size: small runts (~0.6×) to hulking adults (~2.4×),
     // so a bred population reads as a real range of sizes, not one stamped body.
-    let s = lerp01(g.bulk, 0.6, 1.7);
+    // r502: max raised 1.7 → 2.4 so the collision box keeps up with the larger
+    // forge visuals (SIZE_SCALE_MAX bump).
+    let s = lerp01(g.bulk, 0.6, 2.4);
     [2.0 * s, 1.5 * s, 4.0 * s]
 }
 

@@ -45,26 +45,11 @@ onOpacityChanged: { if (opacity > 0 && !_sourceArmed) _sourceArmed = true }
 Component.onCompleted: { if (opacity > 0) _sourceArmed = true }
 Text {
 width: parent.width
-text: "JS link"
-color: "#5599dd"
+text: "JS link ⚡"
+color: "#555"
 font.pixelSize: 15
 font.family: "sans-serif"
-font.underline: true
 wrapMode: Text.WrapAtWordBoundaryOrAnywhere
-MouseArea {
-anchors.fill: parent
-cursorShape: Qt.PointingHandCursor
-acceptedButtons: Qt.LeftButton | Qt.RightButton
-pressAndHoldInterval: 350
-onClicked: function(mouse) {
-var p = mapToItem(null, mouse.x, mouse.y);
-if (backend) backend.link_menu("https://test.local/javascript:void(0)", p.x, p.y)
-}
-onPressAndHold: function(mouse) {
-var p = mapToItem(null, mouse.x, mouse.y);
-if (backend) backend.link_menu("https://test.local/javascript:void(0)", p.x, p.y)
-}
-}
 }
 }
 Item {

@@ -234,9 +234,19 @@ pub struct IndirectDrawSet {
     high_water: u32,
 
     // GPU buffers
-    metadata_buffer: vk::Buffer,
-    metadata_memory: vk::DeviceMemory,
-    metadata_ptr: *mut u8,
+    /// r476: per-frame metadata copies. The metadata SSBO is CPU-written
+    /// (`set`) during streaming and GPU-read by both the cull shader and the
+    /// vertex shader. With >1 frame in flight the CPU runs ahead of the GPU, so
+    /// each in-flight frame needs its OWN copy; `flush_frame` syncs a frame's
+    /// copy from `cpu_shadow` right after that frame's fence wait (when the GPU
+    /// is guaranteed done reading it). `cpu_shadow` stays the single source of
+    /// truth. At frames==1 this is one buffer and behaves exactly as before.
+    metadata: Vec<MetaBuf>,
+    /// Number of in-flight metadata copies (== renderer frames_in_flight).
+    frames: usize,
+    /// Per-frame list of slots whose `cpu_shadow` entry changed but hasn't yet
+    /// been written into that frame's metadata buffer. Drained by `flush_frame`.
+    frame_dirty: Vec<Vec<u32>>,
 
     pub commands_buffer: vk::Buffer,
     commands_memory: vk::DeviceMemory,
@@ -245,13 +255,22 @@ pub struct IndirectDrawSet {
     count_memory: vk::DeviceMemory,
 
     // Cull pipeline
-    pub descriptor_set: vk::DescriptorSet,
+    /// One cull descriptor set per frame (binds that frame's metadata copy at
+    /// binding 0; commands/count/view_params are shared).
+    cull_descriptor_sets: Vec<vk::DescriptorSet>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set_layout: vk::DescriptorSetLayout,
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
 
     device: Device,
+}
+
+/// One in-flight copy of the chunk-metadata SSBO (HOST_VISIBLE persistent map).
+struct MetaBuf {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
 }
 
 // SAFETY: same reasoning as the mesh pool — persistent map, HOST_COHERENT,
@@ -272,21 +291,30 @@ impl IndirectDrawSet {
         instance: &Instance,
         physical_device: vk::PhysicalDevice,
         view_params_buffer: vk::Buffer,
+        frames: usize,
     ) -> Result<Self, IndirectError> {
+        let frames = frames.max(1);
         let capacity = runtime_max_draws();
         if capacity != MAX_CHUNK_DRAWS {
             log::info!("indirect draw slot pool: capacity {} (UNENDLICH_MAX_DRAWS override)", capacity);
         }
 
-        // Metadata SSBO — HOST_VISIBLE so CPU can poke per-chunk updates.
+        // Metadata SSBO — HOST_VISIBLE so CPU can poke per-chunk updates. One
+        // copy per in-flight frame (r476) so CPU writes never race GPU reads.
         let metadata_size =
             (capacity as u64) * std::mem::size_of::<ChunkDraw>() as u64;
-        let (metadata_buffer, metadata_memory, metadata_ptr) = create_buffer(
-            device, instance, physical_device,
-            metadata_size,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-            true, // host-visible
-        )?;
+        let mut metadata: Vec<MetaBuf> = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let (buffer, memory, ptr) = create_buffer(
+                device, instance, physical_device,
+                metadata_size,
+                vk::BufferUsageFlags::STORAGE_BUFFER,
+                true, // host-visible
+            )?;
+            // Start all-inactive (matches the all-empty cpu_shadow).
+            std::ptr::write_bytes(ptr, 0, metadata_size as usize);
+            metadata.push(MetaBuf { buffer, memory, ptr });
+        }
 
         // Indirect commands — GPU-only (compute writes, draw reads).
         let commands_size =
@@ -317,31 +345,34 @@ impl IndirectDrawSet {
         let pipeline_layout = create_pipeline_layout(device, descriptor_set_layout)?;
         let pipeline = create_compute_pipeline(device, pipeline_layout)?;
 
-        let (descriptor_pool, descriptor_set) =
-            allocate_descriptor_set(device, descriptor_set_layout)?;
-        update_descriptor_set(
-            device, descriptor_set,
-            metadata_buffer, commands_buffer, count_buffer,
-            view_params_buffer,
-        );
+        // One cull descriptor set per frame; each binds its own metadata copy
+        // at binding 0 (commands/count/view_params are shared).
+        let (descriptor_pool, cull_descriptor_sets) =
+            allocate_descriptor_sets(device, descriptor_set_layout, frames)?;
+        for (f, &set) in cull_descriptor_sets.iter().enumerate() {
+            update_descriptor_set(
+                device, set,
+                metadata[f].buffer, commands_buffer, count_buffer,
+                view_params_buffer,
+            );
+        }
 
         // Slot bookkeeping.
         let cpu_shadow = vec![ChunkDraw::empty(); capacity as usize];
         let mut free_list = VecDeque::with_capacity(capacity as usize);
         for i in 0..capacity { free_list.push_back(i); }
 
-        // Initialize GPU metadata buffer to all zero (= all slots inactive).
-        std::ptr::write_bytes(metadata_ptr, 0, metadata_size as usize);
+        let frame_dirty = vec![Vec::new(); frames];
 
         Ok(Self {
             capacity,
             cpu_shadow,
             free_list,
             high_water: 0,
-            metadata_buffer, metadata_memory, metadata_ptr,
+            metadata, frames, frame_dirty,
             commands_buffer, commands_memory,
             count_buffer, count_memory,
-            descriptor_set, descriptor_pool, descriptor_set_layout,
+            cull_descriptor_sets, descriptor_pool, descriptor_set_layout,
             pipeline_layout, pipeline,
             device: device.clone(),
         })
@@ -356,7 +387,9 @@ impl IndirectDrawSet {
     /// shader reads `chunks[gl_InstanceIndex].aabb_min` to recover each
     /// chunk's world origin for unpacking the chunk-local packed vertex
     /// position (v0.24.20-vertex-pack).
-    pub fn metadata_buffer(&self) -> vk::Buffer { self.metadata_buffer }
+    pub fn metadata_buffer(&self, frame_idx: usize) -> vk::Buffer {
+        self.metadata[frame_idx % self.frames].buffer
+    }
     pub fn metadata_buffer_size(&self) -> u64 {
         (self.capacity as u64) * std::mem::size_of::<ChunkDraw>() as u64
     }
@@ -370,16 +403,34 @@ impl IndirectDrawSet {
         Ok(DrawSlot(idx))
     }
 
-    /// Update a slot's metadata. Writes through to the GPU's persistent
-    /// map immediately — the next compute dispatch sees the new values.
+    /// Update a slot's metadata. Writes the CPU shadow (authoritative) and
+    /// marks the slot dirty for every in-flight frame; the GPU copies are
+    /// synced lazily in `flush_frame` (after each frame's fence wait), so a
+    /// CPU write never races a GPU read even with frames in flight.
     pub fn set(&mut self, slot: DrawSlot, draw: ChunkDraw) {
         let i = slot.0 as usize;
         debug_assert!(i < self.cpu_shadow.len());
         self.cpu_shadow[i] = draw;
-        // SAFETY: persistent map, HOST_COHERENT.
-        unsafe {
-            let dst = (self.metadata_ptr as *mut ChunkDraw).add(i);
-            std::ptr::write(dst, draw);
+        for d in &mut self.frame_dirty {
+            d.push(slot.0);
+        }
+    }
+
+    /// Sync the given frame's metadata copy from `cpu_shadow` for every slot
+    /// that changed since this frame last flushed. MUST be called after that
+    /// frame's `in_flight` fence wait (GPU no longer reading the copy) and
+    /// before the frame's cull dispatch. Cheap: only touched slots are copied.
+    pub fn flush_frame(&mut self, frame_idx: usize) {
+        let f = frame_idx % self.frames;
+        if self.frame_dirty[f].is_empty() { return; }
+        let dst_base = self.metadata[f].ptr as *mut ChunkDraw;
+        // Drain into a temp so we don't hold a borrow on self.frame_dirty
+        // while reading self.cpu_shadow.
+        let dirty = std::mem::take(&mut self.frame_dirty[f]);
+        for slot in dirty {
+            let si = slot as usize;
+            // SAFETY: persistent map, HOST_COHERENT; si < capacity.
+            unsafe { std::ptr::write(dst_base.add(si), self.cpu_shadow[si]); }
         }
     }
 
@@ -412,13 +463,14 @@ impl IndirectDrawSet {
         &self,
         cmd: vk::CommandBuffer,
         push: &CullPushConstants,
+        frame_idx: usize,
     ) {
         unsafe {
             self.device.cmd_bind_pipeline(
                 cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
             self.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout,
-                0, std::slice::from_ref(&self.descriptor_set), &[],
+                0, std::slice::from_ref(&self.cull_descriptor_sets[frame_idx % self.frames]), &[],
             );
             let bytes = std::slice::from_raw_parts(
                 push as *const _ as *const u8,
@@ -448,17 +500,18 @@ impl IndirectDrawSet {
         d.destroy_descriptor_pool(self.descriptor_pool, None);
         d.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-        d.unmap_memory(self.metadata_memory);
-        d.destroy_buffer(self.metadata_buffer, None);
-        d.free_memory(self.metadata_memory, None);
+        for m in &self.metadata {
+            d.unmap_memory(m.memory);
+            d.destroy_buffer(m.buffer, None);
+            d.free_memory(m.memory, None);
+        }
+        self.metadata.clear();
 
         d.destroy_buffer(self.commands_buffer, None);
         d.free_memory(self.commands_memory, None);
 
         d.destroy_buffer(self.count_buffer, None);
         d.free_memory(self.count_memory, None);
-
-        self.metadata_ptr = std::ptr::null_mut();
     }
 }
 
@@ -613,21 +666,23 @@ unsafe fn create_compute_pipeline(
     Ok(pipelines[0])
 }
 
-unsafe fn allocate_descriptor_set(
-    device: &Device, layout: vk::DescriptorSetLayout,
-) -> Result<(vk::DescriptorPool, vk::DescriptorSet), IndirectError> {
-    // v0.24.0a: 4 descriptors (metadata, commands, count, view_params).
+unsafe fn allocate_descriptor_sets(
+    device: &Device, layout: vk::DescriptorSetLayout, n: usize,
+) -> Result<(vk::DescriptorPool, Vec<vk::DescriptorSet>), IndirectError> {
+    // v0.24.0a: 4 storage descriptors per set (metadata, commands, count,
+    // view_params). r476: n sets (one per frame in flight).
     let sizes = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4,
+        ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 * n as u32,
     }];
     let info = vk::DescriptorPoolCreateInfo::builder()
-        .pool_sizes(&sizes).max_sets(1);
+        .pool_sizes(&sizes).max_sets(n as u32);
     let pool = device.create_descriptor_pool(&info, None)?;
+    let layouts = vec![layout; n];
     let alloc = vk::DescriptorSetAllocateInfo::builder()
         .descriptor_pool(pool)
-        .set_layouts(std::slice::from_ref(&layout));
+        .set_layouts(&layouts);
     let sets = device.allocate_descriptor_sets(&alloc)?;
-    Ok((pool, sets[0]))
+    Ok((pool, sets))
 }
 
 unsafe fn update_descriptor_set(

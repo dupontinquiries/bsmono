@@ -65,11 +65,15 @@ pub mod constants {
     /// this effective friction.
     ///
     /// Bumped from 12.0 to 20.0 because users reported "always sliding"
-    /// on default surfaces. At 20.0/s, velocity drops to 1% in ~0.23s
-    /// after releasing input — close to Minecraft's feel without being
-    /// instant-stop. MOVE_ACCEL scales with this so target_speed stays
-    /// at WALK_SPEED.
-    pub const GROUND_FRICTION: f32 = 20.0;
+    /// on default surfaces. r508: softened back to 12.0 for a more realistic,
+    /// weighted ACCELERATION ramp (start/turn momentum) rather than near-instant
+    /// snap-to-speed (operator: "walking … linear when it should be more
+    /// realistic"). The old slide-on-stop this risked is now prevented by the
+    /// hard-stop path in `apply_input` (snaps to 0 on key release over
+    /// non-slippery ground), so stops stay crisp while starts and direction
+    /// changes carry believable weight. MOVE_ACCEL scales with this so
+    /// target_speed stays at WALK_SPEED. Raise toward 20 for snappier control.
+    pub const GROUND_FRICTION: f32 = 12.0;
 
     /// Air control factor in [0, 1] — how much of the input acceleration
     /// reaches the player while airborne. 1.0 = full Minecraft-style aerial
@@ -130,6 +134,9 @@ pub struct PhysicsParams {
     /// faces. So walking on bumpy terrain doesn't stutter at the
     /// physics level. Step-up is for actual block-height changes.
     pub step_height: f32,
+    /// r566: multiplier on ambient wind force (stature wind-resistance; lower =
+    /// more resistant). 1.0 = the reference person.
+    pub wind_resist: f32,
 }
 
 impl PhysicsParams {
@@ -141,6 +148,7 @@ impl PhysicsParams {
             apply_collision: true,
             wind_force: [0.0, 0.0],
             step_height: 1.1,
+            wind_resist: 1.0,
         }
     }
 
@@ -155,6 +163,7 @@ impl PhysicsParams {
             // Disable auto-step in fly mode — flying through a wall by
             // accidentally stepping up would feel weird.
             step_height: 0.0,
+            wind_resist: 1.0,
         }
     }
 
@@ -167,6 +176,7 @@ impl PhysicsParams {
             apply_collision: false,
             wind_force: [0.0, 0.0],
             step_height: 0.0,
+            wind_resist: 1.0,
         }
     }
 }
@@ -500,8 +510,8 @@ pub fn step_body(
     // Future: scale by exposed-surface-area (a player above ground catches
     // more wind than one in a tunnel), couple to body's mass, etc.
     const WIND_FORCE_SCALE: f32 = 4.0; // bumped from 0.5 — gusts now noticeable
-    body.velocity[0] += params.wind_force[0] * WIND_FORCE_SCALE * dt;
-    body.velocity[2] += params.wind_force[1] * WIND_FORCE_SCALE * dt;
+    body.velocity[0] += params.wind_force[0] * WIND_FORCE_SCALE * params.wind_resist * dt;
+    body.velocity[2] += params.wind_force[1] * WIND_FORCE_SCALE * params.wind_resist * dt;
 
     // Motion factor from overlapping non-solid cells. Walking through tall
     // grass slows you ~15%, water ~55%, cobweb 90%. The factor is the MIN

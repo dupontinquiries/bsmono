@@ -116,7 +116,105 @@ pub const MANSION_GARDEN: Palette = Palette {
     maxmark: c(0x9c,0x78,0x2e), whisker: c(0x32,0x2c,0x20),
 };
 
-pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN];
+pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE];
+
+/// Frozen Bifrost Bunker: a tight circular arena — a raised basalt dais (Nordic knotwork packed with frost) ringed
+/// by sunken glacial-ice trenches, its heart a shattered hexagonal pane of iridescent prismatic glass whose
+/// upward dagger-shards glow with diffuse white energy bleeding from below. Shifting magenta/cyan aurora overhead
+/// throws coloured light across the ice. Storytelling-lighting + verticality set-piece (not recursive).
+pub const BIFROST: Palette = Palette {
+    name: "Frozen Bifrost", dark: true, material: Material::Stone, lit: true, canopy: false, light: c(0xb4,0xdc,0xf0),
+    bg: c(0x08,0x0c,0x1c), window: c(0x16,0x22,0x38), panel: c(0x16,0x22,0x38), panel2: c(0x20,0x30,0x4c), line: c(0x2e,0x42,0x64),
+    ink: c(0xdc,0xe8,0xf6), dim: c(0x90,0xa6,0xc4), faint: c(0x58,0x6e,0x92), track_bg: c(0x0a,0x10,0x22),
+    amber: c(0x66,0xc8,0xe0), amber_soft: c(0xa6,0xe6,0xf2), amber_ink: c(0x06,0x12,0x18),
+    blue: c(0x60,0xa6,0xf0), cyan: c(0x5a,0xd6,0xe0), violet: c(0xc0,0x7c,0xf0), green: c(0x5a,0xc8,0xb0),
+    yellow: c(0x9a,0xdc,0xe6), red: c(0xe0,0x66,0xc0), red_soft: c(0xf0,0x96,0xd6),
+    maxmark: c(0x7a,0x9c,0xf0), whisker: c(0xd6,0xf0,0xff),
+};
+
+/// Titan's Ribcage Alleyway: a wide overgrown jungle lane straddled by the colossal fossilised ribs of a fallen
+/// giant — chalky pale-yellow limestone bone, pitted and gouged to grey marrow — erupting from fractured marble
+/// paving strangled by algae-green fig roots, flanked by dense recursive canopy. Knee-level yellow-green fog,
+/// humid and rotting. Bone-and-decay POI set-piece (jungle uses the recursive tree).
+pub const TITAN_RIBCAGE: Palette = Palette {
+    name: "Titan's Ribcage", dark: false, material: Material::Stone, lit: true, canopy: true, light: c(0xe6,0xea,0xb6),
+    bg: c(0x4a,0x52,0x36), window: c(0x32,0x3c,0x26), panel: c(0x32,0x3c,0x26), panel2: c(0x40,0x4a,0x30), line: c(0x4e,0x58,0x38),
+    ink: c(0xe8,0xea,0xce), dim: c(0x9a,0xa2,0x7c), faint: c(0x6c,0x74,0x52), track_bg: c(0x3a,0x42,0x2c),
+    amber: c(0xc8,0xb0,0x5e), amber_soft: c(0xe2,0xd0,0x8e), amber_ink: c(0x22,0x1e,0x0c),
+    blue: c(0x52,0x86,0xa0), cyan: c(0x52,0xa8,0x92), violet: c(0x96,0x82,0xb0), green: c(0x6e,0xa0,0x44),
+    yellow: c(0xd8,0xc8,0x66), red: c(0xc0,0x66,0x46), red_soft: c(0xd8,0x90,0x6e),
+    maxmark: c(0x6e,0xa0,0x44), whisker: c(0x22,0x26,0x16),
+};
+
+/// Yellow Brick Road: a storybook Oz world. A recursive yellow-brick road winds and branches across rolling green
+/// fields — scarlet poppies, golden corn, wildflower meadows — past recursive forests, toward a distant cluster of
+/// glowing EMERALD CITY towers. Bright fairy-tale palette: meadow green, brick gold, emerald glow, poppy red,
+/// cornflower sky.
+pub const YELLOW_BRICK_ROAD: Palette = Palette {
+    name: "Yellow Brick Road", dark: false, material: Material::Stone, lit: true, canopy: true, light: c(0xff,0xf0,0xc4),
+    bg: c(0x9c,0xc4,0xdc), window: c(0x3a,0x52,0x34), panel: c(0x3a,0x52,0x34), panel2: c(0x48,0x62,0x40), line: c(0x54,0x70,0x4a),
+    ink: c(0x2c,0x38,0x22), dim: c(0x5e,0x70,0x4c), faint: c(0x8a,0x9c,0x70), track_bg: c(0x86,0xae,0x6e),
+    amber: c(0xe6,0xb8,0x44), amber_soft: c(0xf6,0xd8,0x84), amber_ink: c(0x28,0x1c,0x06),
+    blue: c(0x5a,0x90,0xc8), cyan: c(0x46,0xb0,0x9a), violet: c(0x9a,0x7c,0xc0), green: c(0x4e,0xa0,0x50),
+    yellow: c(0xe8,0xc8,0x54), red: c(0xd0,0x46,0x3e), red_soft: c(0xe6,0x78,0x66),
+    maxmark: c(0x4e,0xa0,0x50), whisker: c(0x2c,0x38,0x22),
+};
+
+/// Hollow Jungle: a supersized world INSIDE a hollow rock planet. The ground is the inner surface of a vast
+/// stone shell, so jungle curves up and over you in every direction; recursive trees grow inward from the crust
+/// toward the open hollow at the heart, where a translucent OCEAN floats free, rippling and dripping, lit by a
+/// small suspended sun. Lush greens, wet-stone browns, lagoon blue, warm interior light.
+pub const HOLLOW_JUNGLE: Palette = Palette {
+    name: "Hollow Jungle", dark: false, material: Material::Stone, lit: true, canopy: true, light: c(0xff,0xe2,0x9c),
+    bg: c(0x24,0x3c,0x38), window: c(0x2a,0x3a,0x2c), panel: c(0x2a,0x3a,0x2c), panel2: c(0x36,0x48,0x36), line: c(0x40,0x54,0x40),
+    ink: c(0xe6,0xee,0xd8), dim: c(0x9a,0xae,0x90), faint: c(0x66,0x7c,0x60), track_bg: c(0x1c,0x2e,0x28),
+    amber: c(0xd8,0xa6,0x54), amber_soft: c(0xf0,0xcc,0x86), amber_ink: c(0x18,0x14,0x08),
+    blue: c(0x52,0x9c,0xc0), cyan: c(0x4e,0xb6,0xb6), violet: c(0x96,0x86,0xc0), green: c(0x5a,0x9c,0x46),
+    yellow: c(0xc4,0xd6,0x6a), red: c(0xc0,0x5e,0x46), red_soft: c(0xd8,0x86,0x6a),
+    maxmark: c(0x5a,0x9c,0x46), whisker: c(0x24,0x2c,0x1c),
+};
+
+/// Recursive Citadel: a supersized sunlit world of fractal towers. Each tower stacks a smaller drum on its crown
+/// and sprouts corner turrets, which stack their own — generation after generation from one rule, so a whole
+/// self-similar castle-city grows with no hand-planning. Warm sandstone + honeyed light, lapis pennants, a pale
+/// desert haze. Subdivision-recursion counterpart to Fractal Spires' branching.
+pub const RECURSIVE_CITADEL: Palette = Palette {
+    name: "Recursive Citadel", dark: false, material: Material::Stone, lit: true, canopy: false, light: c(0xff,0xe2,0xa6),
+    bg: c(0xc8,0xb4,0x90), window: c(0x6a,0x52,0x36), panel: c(0x6a,0x52,0x36), panel2: c(0x7e,0x62,0x42), line: c(0x8a,0x6e,0x4a),
+    ink: c(0x3a,0x2c,0x1c), dim: c(0x6e,0x5a,0x40), faint: c(0x9a,0x84,0x64), track_bg: c(0xb6,0xa2,0x80),
+    amber: c(0xd0,0x96,0x44), amber_soft: c(0xf0,0xc6,0x82), amber_ink: c(0x24,0x18,0x0a),
+    blue: c(0x4a,0x74,0xb0), cyan: c(0x52,0xa0,0xb0), violet: c(0x8a,0x6e,0xb0), green: c(0x86,0xa0,0x52),
+    yellow: c(0xe0,0xc2,0x66), red: c(0xc0,0x5a,0x42), red_soft: c(0xd8,0x84,0x68),
+    maxmark: c(0xc8,0x96,0x46), whisker: c(0x3a,0x2c,0x1c),
+};
+
+/// Fractal Spires: a supersized nocturnal world of self-similar crystalline towers. Each spire recursively
+/// sprouts smaller spires from its crown, generation after generation, so detail STACKS fractally from a single
+/// rule — no hand-placement. Deep indigo night; glacial teal + violet glow off the crystal tips lights a vast
+/// dark plain. The dynamic LOD/cull keep the recursion affordable: far generations dissolve into the dark.
+pub const FRACTAL_SPIRES: Palette = Palette {
+    name: "Fractal Spires", dark: true, material: Material::Stone, lit: true, canopy: false, light: c(0x9a,0xc4,0xe6),
+    bg: c(0x09,0x0d,0x1a), window: c(0x12,0x18,0x28), panel: c(0x12,0x18,0x28), panel2: c(0x1a,0x22,0x34), line: c(0x2a,0x36,0x4e),
+    ink: c(0xd8,0xe4,0xf4), dim: c(0x8a,0x9a,0xb8), faint: c(0x54,0x62,0x80), track_bg: c(0x09,0x0d,0x16),
+    amber: c(0x8a,0xd0,0xe6), amber_soft: c(0xbe,0xe8,0xf2), amber_ink: c(0x07,0x10,0x16),
+    blue: c(0x6f,0xb0,0xf0), cyan: c(0x57,0xd6,0xc9), violet: c(0xa6,0x8c,0xff), green: c(0x6a,0xd6,0xb0),
+    yellow: c(0x9a,0xe6,0xd2), red: c(0xc8,0x6a,0xb0), red_soft: c(0xe0,0x92,0xc8),
+    maxmark: c(0x6a,0x8c,0xd0), whisker: c(0xcc,0xe6,0xff),
+};
+
+/// Alley: a rain-soaked overgrown service lane turned cozy mind-palace — damp timber + brick, climbing ivy,
+/// wet stone with sky-mirroring puddles, trees leaning in for dappled afternoon light. Muted naturals: walnut
+/// and cedar browns, mossy spring greens, cool wet-asphalt grays, soft puddle-blue. Warm 5000K sun shafts cut
+/// through a cool 6800K overcast — painterly warm highlights over cool shadows.
+pub const ALLEY: Palette = Palette {
+    name: "Alley", dark: false, material: Material::Wood, lit: true, canopy: true, light: c(0xff,0xda,0x92),
+    bg: c(0x52,0x56,0x4e), window: c(0x3a,0x3e,0x38), panel: c(0x3a,0x3e,0x38), panel2: c(0x46,0x4a,0x42), line: c(0x5e,0x64,0x54),
+    ink: c(0xe8,0xea,0xdc), dim: c(0xa6,0xac,0x96), faint: c(0x76,0x7e,0x6a), track_bg: c(0x2c,0x30,0x2a),
+    amber: c(0xc8,0x9a,0x54), amber_soft: c(0xe0,0xc0,0x86), amber_ink: c(0x1a,0x18,0x10),
+    blue: c(0x7a,0x9c,0xbc), cyan: c(0x6a,0xb0,0xb0), violet: c(0x8a,0x76,0x9c), green: c(0x58,0x8c,0x4a),
+    yellow: c(0xb6,0xd1,0x84), red: c(0xb0,0x5a,0x42), red_soft: c(0xc8,0x82,0x6a),
+    maxmark: c(0x6a,0x96,0x46), whisker: c(0x2c,0x30,0x28),
+};
 
 /// Canopy: a sun-dappled forest — deep leaf-litter floor, warm bark, and a living tree overhead. The
 /// canopy's leaves grow with the conversation and rustle/shimmer with its generation activity; the sun
@@ -205,7 +303,28 @@ thread_local! { static VARIANT: std::cell::Cell<u8> = const { std::cell::Cell::n
 /// compared live in the running app without a recompile per idea. Its *meaning* is redefined each round —
 /// see `variant_label` for what the numbers currently are.
 pub fn variant() -> u8 { VARIANT.with(|v| v.get()) }
-pub fn set_variant(v: u8) { VARIANT.with(|c| c.set(v.clamp(1, 10))); }
+
+/// POWER mode for Linux phones / battery saving: `LOGSCOPE_POWER=full|half|quarter` (or a 0..1 number).
+/// Returns the resolution/work factor — `half`→0.5, `quarter`→0.25 — cutting fragment cost by factor² and
+/// capping texture tier + mesh density downstream so a phone GPU sips battery.
+pub fn power_mode() -> f32 {
+    match std::env::var("LOGSCOPE_POWER").ok().map(|v| v.trim().to_lowercase()) {
+        Some(ref v) if v == "half" => 0.5,
+        Some(ref v) if v == "quarter" => 0.25,
+        Some(ref v) if v == "full" || v.is_empty() => 1.0,
+        Some(ref v) => v.parse::<f32>().unwrap_or(1.0).clamp(0.25, 1.0),
+        None => 1.0,
+    }
+}
+
+/// The texture detail tier actually baked, after the POWER cap: half-power caps at tier 6, quarter at tier 3, so
+/// battery-saver modes bake far smaller textures (less VRAM + bandwidth) regardless of the chosen quality dial.
+pub fn effective_variant() -> u8 {
+    let v = variant();
+    let p = power_mode();
+    if p <= 0.3 { v.min(3) } else if p <= 0.6 { v.min(6) } else { v }
+}
+pub fn set_variant(v: u8) { VARIANT.with(|c| c.set(v.clamp(1, 16))); }
 
 /// The style tokens for the carved-material chrome — the stable surface the look is expressed in (sandwich
 /// layer 4). Iterating the *look* means editing these numbers (or swapping in a different `Skin`); the paint
@@ -272,7 +391,13 @@ pub fn detail(v: u8) -> (usize, f32, f32, f32) {
         7  => (320, 0.70, 1.10, 2.3),
         8  => (384, 0.85, 1.20, 2.6),
         9  => (448, 0.95, 1.30, 3.0),
-        10 => (512, 1.10, 1.40, 3.4), // maximal — finest textures + densest geometry, heaviest
+        10 => (512, 1.10, 1.40, 3.4), // (was the old maximum)
+        11 => (576, 1.15, 1.45, 3.8),
+        12 => (640, 1.20, 1.50, 4.2),
+        13 => (1024, 1.25, 1.55, 4.6),
+        14 => (1280, 1.35, 1.62, 5.0),
+        15 => (1536, 1.45, 1.68, 5.3),
+        16 => (2048, 1.55, 1.75, 5.7), // ultra — 2k textures + densest geometry, real-GPU only
         _  => (128, 0.35, 0.70, 1.0),
     }
 }
@@ -281,7 +406,10 @@ pub fn variant_label(v: u8) -> &'static str {
     match v {
         1 => "1 · 128px ×1.0", 2 => "2 · 128px ×1.2", 3 => "3 · 192px ×1.4", 4 => "4 · 192px ×1.6",
         5 => "5 · 256px ×1.8", 6 => "6 · 256px ×2.0", 7 => "7 · 320px ×2.3", 8 => "8 · 384px ×2.6",
-        9 => "9 · 448px ×3.0", 10 => "10 · 512px ×3.4", _ => "1 · 128px ×1.0",
+        9 => "9 · 448px ×3.0", 10 => "10 · 512px ×3.4",
+        11 => "11 · 576px ×3.8", 12 => "12 · 640px ×4.2", 13 => "13 · 1k ×4.6",
+        14 => "14 · 1280px ×5.0", 15 => "15 · 1536px ×5.3", 16 => "16 · 2k ×5.7",
+        _ => "1 · 128px ×1.0",
     }
 }
 
@@ -1441,7 +1569,7 @@ mod variant_tests {
     #[test]
     fn variant_clamps_and_grades_are_distinct() {
         set_variant(0); assert_eq!(variant(), 1, "clamps below 1");
-        set_variant(99); assert_eq!(variant(), 10, "clamps above 10");
+        set_variant(99); assert_eq!(variant(), 16, "clamps above 16");
         set_variant(5); assert_eq!(variant(), 5);
         // grade (locked atmosphere) still well-formed
         let (exp, fogm, bloom, thr, ambm, warm) = grade(LOCKED_GRADE);
@@ -1449,7 +1577,7 @@ mod variant_tests {
         // detail sweep: texture resolution non-decreasing, tessellation strictly increasing, all distinct
         let mut prev = (0usize, 0.0f32);
         let mut seen = std::collections::HashSet::new();
-        for v in 1..=10u8 {
+        for v in 1..=16u8 {
             let (texsz, texscale, bump, tess) = detail(v);
             assert!(texsz >= prev.0, "texture resolution does not shrink as the tier rises");
             assert!(tess > prev.1, "tessellation rises every tier (got {tess} after {})", prev.1);
@@ -1458,7 +1586,7 @@ mod variant_tests {
             prev = (texsz, tess);
             seen.insert((texsz, texscale.to_bits(), tess.to_bits()));
         }
-        assert_eq!(seen.len(), 10, "all ten detail tiers are distinct");
+        assert_eq!(seen.len(), 16, "all sixteen detail tiers are distinct");
         set_variant(1);
     }
 }

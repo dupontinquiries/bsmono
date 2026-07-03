@@ -57,7 +57,7 @@ use std::time::Instant;
 /// room without stretching the worst-case frame past the 8.3 ms
 /// vsync budget on 120 Hz displays. Backstop is still
 /// `MAX_UPLOADS_PER_FRAME_DEFAULT` and `UPLOAD_BYTES_BUDGET_DEFAULT`.
-const UPLOAD_BUDGET_MS_DEFAULT: f64 = 6.0;
+const UPLOAD_BUDGET_MS_DEFAULT: f64 = 8.0; // r482: ↑ from 6.0 (FIF=2 headroom)
 
 /// Default cap on how many uploads we'll do in a single frame even if
 /// the budget allows. Prevents pathological cases where uploads are
@@ -71,7 +71,7 @@ const UPLOAD_BUDGET_MS_DEFAULT: f64 = 6.0;
 /// drained the queue at 960 chunks/sec at 60 fps; the mesher peaks
 /// near 3,100. New cap matches the mesher's peak so the queue can
 /// fully drain in a single frame when bursts hit.
-const MAX_UPLOADS_PER_FRAME_DEFAULT: usize = 64;
+const MAX_UPLOADS_PER_FRAME_DEFAULT: usize = 96; // r482: ↑ from 64 (adaptive ctrl manages range [12,192])
 
 /// v0.24.3 upload-pressure investigation: default per-frame upload BYTES
 /// budget. Caps total mesh bytes (vertex_bytes + index_bytes) memcpy'd
@@ -92,7 +92,7 @@ const MAX_UPLOADS_PER_FRAME_DEFAULT: usize = 64;
 /// Default 8 MB. Observed peak in v0.24.3-multi-queue-a was ~30+ MB/s
 /// during chug windows; 8 MB caps each frame well under that.
 /// Overridable at runtime via `UNENDLICH_UPLOAD_BYTES_BUDGET`.
-const UPLOAD_BYTES_BUDGET_DEFAULT: usize = 8 * 1024 * 1024;
+const UPLOAD_BYTES_BUDGET_DEFAULT: usize = 12 * 1024 * 1024; // r482: ↑ from 8MB
 
 /// v0.24.3 upload-pressure investigation: emit an `upload_pressure`
 /// event when per-frame upload bytes exceeds this threshold. Hunting
@@ -103,7 +103,7 @@ const UPLOAD_PRESSURE_EVENT_THRESHOLD_BYTES: usize = 2 * 1024 * 1024;
 
 /// Number of mesh-worker threads. CPU-bound, so leave 2 cores for the OS
 /// + main thread. M2 Max has 12 perf+eco cores, so 8 is reasonable.
-const MESH_WORKERS: usize = 4;
+const MESH_WORKERS: usize = 6; // r482: ↑ from 4 (more CPU-mesher throughput; big win on Ultra)
 
 /// Mesh request queue capacity. ~4× per-frame upload cap so workers stay
 /// busy across player movement bursts.
@@ -193,6 +193,8 @@ struct Roamer {
 // Returns Some(block) if a place should proceed (consuming happened), None if
 // the event was consumed by eating or denied for lack of items.
 const MEAT_ITEM: u32 = 2000; // r127: dropped by slain creatures; hearty edible
+const COOKED_MEAT_ITEM: u32 = 2001; // r510: raw meat cooked at a fire — more nourishing
+const APPLE_ITEM: u32 = 2002; // r579: fruit foraged from leafy trees; a light, refreshing snack
 
 fn survival_use_item(
     app: &mut unendlich_engine::app::App,
@@ -201,22 +203,47 @@ fn survival_use_item(
 ) -> Option<unendlich_engine::world::blocks::BlockId> {
     use unendlich_engine::items::ItemId;
     use unendlich_engine::world::blocks::BlockId;
-    // r127: non-block hand items resolve first — meat is the hearty meal.
+    // r127/r510: non-block hand items resolve first. Cooked meat is the hearty meal;
+    // raw meat barely sustains you (cook it at a fire — see the cook tick in main).
     if let Some(h) = hand_item {
+        if h.0 == COOKED_MEAT_ITEM {
+            if app.inventory_mut().remove_item(h, 1) == 0 {
+                app.vitality_mut().feed(0.55);
+                log::info!("[survival] ate cooked meat — vitality {:.0}%", app.vitality().energy * 100.0);
+            }
+            return None;
+        }
         if h.0 == MEAT_ITEM {
             if app.inventory_mut().remove_item(h, 1) == 0 {
-                app.vitality_mut().feed(0.4);
-                log::info!("[survival] ate meat — vitality {:.0}%", app.vitality().energy * 100.0);
+                app.vitality_mut().feed(0.18); // raw: barely nourishing — cook it for the full meal
+                log::info!("[survival] ate RAW meat (cook it at a fire for more) — vitality {:.0}%", app.vitality().energy * 100.0);
+            }
+            return None;
+        }
+        if h.0 == APPLE_ITEM {
+            // r579: a foraged fruit — light but refreshing.
+            if app.inventory_mut().remove_item(h, 1) == 0 {
+                app.vitality_mut().feed(0.22);
+                log::info!("[survival] ate an apple — vitality {:.0}%", app.vitality().energy * 100.0);
             }
             return None;
         }
     }
     let id = ItemId(selected_block as u32);
-    // Edible hand items: right-mouse EATS instead of placing.
-    let edible = matches!(selected_block, BlockId::Mushroom);
+    // Edible hand items: right-mouse EATS instead of placing. r512: vegetables are food too —
+    // but the bin's place path plants them when you aim at soil, so eating only happens off-soil.
+    let edible = matches!(
+        selected_block,
+        BlockId::Mushroom | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage
+    );
     if edible {
         if app.inventory_mut().remove_item(id, 1) == 0 {
-            app.vitality_mut().feed(0.25);
+            let feed = match selected_block {
+                BlockId::Carrot | BlockId::Cabbage => 0.28,
+                BlockId::Potato => 0.34, // starchy — more filling
+                _ => 0.25,
+            };
+            app.vitality_mut().feed(feed);
             log::info!("[survival] ate {:?} — vitality {:.0}%", selected_block, app.vitality().energy * 100.0);
         } else {
             log::info!("[survival] no {:?} in inventory to eat", selected_block);
@@ -293,7 +320,8 @@ fn list_rollback_points(world_name: &str) -> Vec<RollbackPoint> {
 fn load_catalog_entries() -> Vec<unendlich_engine::sim::world_catalog::WorldEntry> {
     use unendlich_engine::sim::world_catalog::{GameMode, WorldEntry};
     let Ok(text) = std::fs::read_to_string(catalog_file_path()) else { return Vec::new() };
-    text.lines()
+    let mut all: Vec<WorldEntry> = text
+        .lines()
         .filter_map(|line| {
             let mut p = line.split('|');
             Some(WorldEntry {
@@ -304,7 +332,17 @@ fn load_catalog_entries() -> Vec<unendlich_engine::sim::world_catalog::WorldEntr
                 last_played_tick: p.next()?.parse().ok()?,
             })
         })
-        .collect()
+        .collect();
+    // r577: DEDUP BY NAME — the world's identity is its name (matching
+    // WorldCatalog::add and the player's mental model). A catalog file that
+    // accumulated same-named rows (e.g. a world re-created with a fresh seed) was
+    // surfacing DUPLICATE worlds in the menu, since the menu list is built straight
+    // from this loader. Keep the most-recently-played row for each name; the next
+    // save then rewrites the file clean. Stable for ties (preserves file order).
+    all.sort_by(|a, b| b.last_played_tick.cmp(&a.last_played_tick));
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|e| seen.insert(e.name.clone()));
+    all
 }
 
 fn save_catalog(entries: &[unendlich_engine::sim::world_catalog::WorldEntry]) {
@@ -336,7 +374,56 @@ fn cam_pitch_for_bend(lp: &unendlich_engine::local_player::LocalPlayer) -> f32 {
     lp.forward().y
 }
 
+/// r537: CAMERA PINCH. March from the eye toward the desired chase-camera position
+/// and pull the camera in so terrain never sits between it and the player in tight
+/// spaces. Returns the camera distance to actually use. Always pinches in a small
+/// baseline (5%); each step that hits a solid block clamps the distance to just
+/// short of it, weighted by how near the obstruction is (closer hit ⇒ tighter pull).
+fn pinch_camera_distance(
+    eye: nalgebra_glm::Vec3,
+    dir: nalgebra_glm::Vec3,
+    desired: f32,
+    solid: impl Fn(i32, i32, i32) -> bool,
+) -> f32 {
+    if desired <= 0.05 {
+        return desired;
+    }
+    // 5% baseline pinch so the camera never rides flush against a surface.
+    let mut limit = desired * 0.95;
+    let margin = 0.35_f32; // keep the near plane off the blocking face
+    let step = 0.15_f32;
+    let mut t = 0.25_f32; // skip the eye's own cell
+    while t < desired {
+        let p = eye + dir * t;
+        if solid(
+            p.x.floor() as i32,
+            p.y.floor() as i32,
+            p.z.floor() as i32,
+        ) {
+            // Distance weight: pull in to just before the hit (closer hit pulls
+            // the camera tighter, which is exactly what tight spaces need).
+            limit = limit.min((t - margin).max(0.3));
+            break;
+        }
+        t += step;
+    }
+    limit.max(0.3)
+}
+
 fn cz_off(cy: i32) -> i32 { cy - 3 }
+
+/// r526: a [`WorldQuery`](unendlich_engine::sim::physics::WorldQuery) over the
+/// live chunk store, so AI mobs navigate and collide against the REAL voxel
+/// terrain using the very same `step_character` kernel the player runs.
+struct MobWorld<'a> {
+    cm: &'a ChunkManager,
+}
+impl<'a> unendlich_engine::sim::physics::WorldQuery for MobWorld<'a> {
+    #[inline]
+    fn physics_at(&self, x: i32, y: i32, z: i32) -> unendlich_engine::sim::physics::BlockPhysics {
+        unendlich_engine::sim::physics::physics_of_block(self.cm.block_at(x, y, z))
+    }
+}
 
 fn main() {
     // Handle --help / --version BEFORE doing any setup. This keeps the
@@ -522,7 +609,7 @@ fn main() {
         .ok()
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(16);
+        .unwrap_or(24); // r482: ↑ from 16 (more chunks/gen dispatch)
     log::info!("GPU terrain-gen batch size = {} (UNENDLICH_GPU_GEN_BATCH)", gen_batch);
     let generator = match TerrainGenerator::new(WORLD_SEED_DEFAULT, Backend::Auto, gen_batch) {
         Ok(g) => Arc::new(g),
@@ -614,6 +701,17 @@ fn main() {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(0.30);
     let sapling_plant_pct: u64 = std::env::var("UNENDLICH_SAPLING_PLANT_PCT")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+    // r582: AIR-CLEANUP — until the terrain FP32/FP64 surface fix lands (see
+    // NEXT_SESSION_GUIDE §4a / handoff/HANDOFF_world_surface.md), placement reads the
+    // CPU FP64 surface *prediction* while the GPU fills voxels in FP32, so flora/trees
+    // can land on a surface that isn't really there and end up sitting on air. This pass
+    // cuts flora + floating tree trunks that have no solid support beneath them. Budgeted
+    // random probes near the player; default on. Set UNENDLICH_AIR_CLEANUP=0 to disable.
+    let air_cleanup_enabled = std::env::var("UNENDLICH_AIR_CLEANUP").map(|v| v != "0").unwrap_or(true);
+    let air_cleanup_interval: u64 = std::env::var("UNENDLICH_AIR_CLEANUP_INTERVAL")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(120);
+    let air_cleanup_budget: u32 = std::env::var("UNENDLICH_AIR_CLEANUP_BUDGET")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(12);
     // (pos, growth state) for each living sapling near the player.
     // r464: hot-metal thermodynamics (sim::hot_metal). Metal cells beside lava heat up; they quench
     // (steam) in water and melt to lava at their melting point (~1500°C — above lava, so a hotter
@@ -679,6 +777,9 @@ fn main() {
         ),
     );
     let tick_registry = std::sync::Arc::new(tick_reg);
+    // r514: keep a copy of the world root so the persistent flora store can load/save
+    // alongside the chunk edits (the chunk manager takes ownership of `world_root` next).
+    let mut flora_root = world_root.clone();
     let mut chunk_manager = ChunkManager::new(generator, num_workers)
         .with_storage(world_root)
         .with_fields(field_registry)
@@ -831,6 +932,10 @@ fn main() {
     // streams behind the menu as a live backdrop. Title music: sim::music_director.
     renderer.menu_open = true;
     renderer.ui_pointer_active = true;
+    // r488: the title menu's "Character" button opens the select/customizer; seed
+    // the roster (presets + the saved global default) so it's ready when opened.
+    renderer.character_roster =
+        Some(unendlich_engine::player_character::CharacterRoster::load());
     window.set_cursor_mode(CursorMode::Normal);
     let mut fg_music = unendlich_engine::sim::music_director::MusicState::new();
     let mut fg_music_clock = std::time::Instant::now();
@@ -874,6 +979,14 @@ fn main() {
     } else {
         log::info!("[mode] CREATIVE — palette placing, flight allowed (UNENDLICH_MODE=survival to switch)");
     }
+    // r487: load the player's global default character (persisted in the config
+    // dir, so it carries across every world). Falls back to a preset if none is
+    // saved. The character-select menu edits + re-saves this.
+    let mut active_character = unendlich_engine::player_character::load_global();
+    log::info!(
+        "[character] active = '{}' (plan={}, seed={:#x}, tint={:?})",
+        active_character.name, active_character.arche, active_character.seed, active_character.tint
+    );
     // r116b: feature banner — one line per wired feature so "not wired" vs
     // "wired but invisible" is diagnosable from the log alone.
     log::info!(
@@ -959,7 +1072,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     log::info!("Sentinel flock disabled (test scaffolding removed)");
     // A predator + prey mob (sim Mob -> render bridge) so the ambient mob path is
     // exercised live: Seeker renders reddish + bulky, Grazer small + tan.
-    let test_mobs: Vec<unendlich_engine::sim::mob::Mob> = {
+    let mut test_mobs: Vec<unendlich_engine::sim::mob::Mob> = {
         use unendlich_engine::sim::fixed::{Fixed, Vec3};
         use unendlich_engine::sim::mob::{Mob, MobKind};
         let gy = Fixed::from_int((spawn_pos.y - 4.0) as i64 + 1);
@@ -971,10 +1084,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         vec![seeker, grazer]
     };
     log::info!("Spawned {} test mob(s) via sim bridge", test_mobs.len());
+    // r526: mobs MOVE now. Tick their AI brains + step_character at a fixed 20 Hz
+    // (frame-rate independent), driving them against the live terrain. `mob_sim_tick`
+    // is the deterministic tick counter their wander/seek RNG keys off.
+    let mut mob_tick_accum: f32 = 0.0;
+    let mut mob_sim_tick: u64 = 0;
 
     // ── r118 (ported from parallel worker, adapted to real APIs) ──────────────
     // Game state: pause follows the settings panel (Esc) or the inventory view.
-    let mut show_inventory = false;
+    // r525: unified UI state machine. `menu_state` is the single source of truth
+    // for which in-world overlay is open (NoMenu/Inventory/Pause/Settings/Debug/Craft);
+    // the old renderer bools are PUSHED from it each frame and PULLED back on button
+    // closes. `show_inventory` / `ui_panel_open` survive only as per-frame derived
+    // locals (computed at the top of the loop) so the many downstream reads keep working.
+    use unendlich_engine::sim::ui_state::MenuState;
+    let mut menu_state = MenuState::NoMenu;
     let mut world_clock_elapsed: f32 = 0.0; // r121: 1 real sec = 1 game minute
     let fg_item_registry = unendlich_engine::items::UniformRegistry(64);
 
@@ -1068,7 +1192,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // the chosen one alive past mesh_pool's drop so the dispatcher
     // exits cleanly.
     let gpu_mesher_mode: u32 = std::env::var("UNENDLICH_GPU_MESHER")
-        .ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2); // R27: default octree GPU mesher (=0 CPU fallback; failures degrade to CPU)
+        .ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0); // r476: default CPU mesher (0.38ms/chunk, no stalls). Octree (=2) is GPU-hostile on Asahi (38-171ms/chunk); =1 sparse, =2 octree opt-in.
 
     // Surface a known-bad setting at startup rather than letting the player
     // silently run the slow, rough experimental mesher.
@@ -1128,37 +1252,55 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
         } else { None };
 
+    // r476: mesh-worker thread count is now tunable (UNENDLICH_MESH_WORKERS,
+    // default MESH_WORKERS=4). More workers raise CPU-mesher throughput on
+    // many-core machines (mode 0 / the extract+decorate passes); clamp to a sane
+    // 1..=32. The GPU-dispatcher modes are bounded by the single GPU dispatcher,
+    // so extra workers there mostly help the CPU-side pre/post passes.
+    let mesh_workers: usize = std::env::var("UNENDLICH_MESH_WORKERS")
+        .ok().and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 32))
+        .unwrap_or(MESH_WORKERS);
+    // r476: mesh queue capacity is now a lever too (UNENDLICH_MESH_QUEUE_CAPACITY,
+    // default 64). Larger = workers stay fed during big streaming bursts; smaller
+    // = tighter back-pressure so the queue can't balloon to 250+ (as seen on
+    // Asahi when the octree mesher falls behind). Clamp 8..=1024.
+    let mesh_queue_cap: usize = std::env::var("UNENDLICH_MESH_QUEUE_CAPACITY")
+        .ok().and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(8, 1024))
+        .unwrap_or(MESH_QUEUE_CAPACITY);
+
     // Declared second → dropped FIRST.
     let mesh_pool = if let Some(arc) = &_octree_gpu_mesher_for_cleanup {
         let pool = MeshingPool::with_octree_gpu_mesher(
-            MESH_WORKERS,
-            MESH_QUEUE_CAPACITY,
+            mesh_workers,
+            mesh_queue_cap,
             Arc::clone(&lod_settings),
             Arc::clone(arc),
         );
         log::info!(
             "MeshingPool ready ({} workers + Octree-GPU dispatcher, capacity {})",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY
+            mesh_workers, mesh_queue_cap
         );
         pool
     } else if let Some(arc) = &_gpu_mesher_for_cleanup {
         let pool = MeshingPool::with_gpu_mesher(
-            MESH_WORKERS,
-            MESH_QUEUE_CAPACITY,
+            mesh_workers,
+            mesh_queue_cap,
             Arc::clone(&lod_settings),
             Arc::clone(arc),
         );
         log::info!(
             "MeshingPool ready ({} workers + Sparse-GPU dispatcher, capacity {})",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY
+            mesh_workers, mesh_queue_cap
         );
         pool
     } else {
-        let pool = MeshingPool::new(MESH_WORKERS, MESH_QUEUE_CAPACITY, Arc::clone(&lod_settings));
+        let pool = MeshingPool::new(mesh_workers, mesh_queue_cap, Arc::clone(&lod_settings));
         log::info!("MeshingPool ready ({} workers, capacity {}; CPU-only; \
                     UNENDLICH_GPU_MESHER=1 for sparse-records GPU mesher, \
                     =2 for octree GPU mesher)",
-            MESH_WORKERS, MESH_QUEUE_CAPACITY);
+            mesh_workers, mesh_queue_cap);
         pool
     };
 
@@ -1198,6 +1340,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0x5eed_1234_abcd_0001);
     let mut weather_state = unendlich_engine::weather::Weather::new(weather_seed);
+
+    // r495: SEASONS. The natural year is long, so seasons are hard to witness in a
+    // session — these levers make them observable. UNENDLICH_YEAR_DAYS sets year
+    // length; UNENDLICH_SEASON=spring|summer|autumn|winter (or 0..1) forces a
+    // starting season; the O key advances the season ~1/8 year for live testing.
+    // season_offset_days is added to the climate day-of-year (drives temp/snow)
+    // and the plant-growth season01.
+    let season_days_per_year: f32 = std::env::var("UNENDLICH_YEAR_DAYS")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|d| *d >= 4.0)
+        .unwrap_or(360.0);
+    let mut season_offset_days: f32 = match std::env::var("UNENDLICH_SEASON")
+        .ok()
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("spring") => 0.0,
+        Some("summer") => season_days_per_year * 0.25,
+        Some("autumn") | Some("fall") => season_days_per_year * 0.50,
+        Some("winter") => season_days_per_year * 0.75,
+        Some(other) => other
+            .parse::<f32>()
+            .ok()
+            .map(|p| p.fract() * season_days_per_year)
+            .unwrap_or(0.0),
+        None => 0.0,
+    };
+    let mut last_logged_season: Option<unendlich_engine::season::Season> = None;
 
     // Load-adaptive fog — DEFAULT ON since r120 (hides the unloaded render-
     // distance edge in haze; built+proven, was only dark behind the env var).
@@ -1248,9 +1419,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // egui so the creative inventory / settings panels can be clicked. Press
     // `p` again (or Esc) to exit. `ui_mouse_down` is the live left-button
     // state we forward to the renderer; tracked from MouseButton events.
-    let mut ui_panel_open = false;
-    let mut ui_mouse_down = false;
     let mut p_pressed = false;
+    let mut ui_mouse_down = false;
 
     // Rollback input buffer — captures one InputFrame per simulation
     // tick boundary. Today this is passive infrastructure: simulation
@@ -1318,7 +1488,95 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut creative_tab_idx: usize = 0;
     let mut creative_item_idx: usize = 0;
     let mut hand_item: Option<unendlich_engine::items::ItemId> = None; // r127: raw hand item (survival)
+    // r481: debug override — cycle forged weapon models into the hand with J so
+    // all eight can be eyeballed first-person without the full loot plumbing.
+    let mut debug_weapon_class: Option<usize> = None;
+    // r509: TOOL/WEAPON DURABILITY (sim::item_durability). Tracks wear of the currently
+    // HELD forged weapon (ids 4000-4007): each mine/attack in survival lowers it, and at 0
+    // the weapon breaks (one removed from the inventory). v1 tracks only the equipped
+    // weapon — switching weapons re-initialises the tracker; a per-stack instance table is
+    // the documented next step (NEXT_SESSION_GUIDE "ITEMS WIRING") for persisting durability.
+    let mut equipped_weapon_dura: Option<(unendlich_engine::items::ItemId, i32, i32)> = None; // (id, cur, max)
+    const WEAPON_DURA_MAX: i32 = 120;
+    const WEAR_PER_ATTACK: i32 = 2;
+    const WEAR_PER_MINE: i32 = 1;
+    // r490: third-person self-view (F5). The render camera pulls back behind the
+    // player and the chosen character is drawn as a Creature avatar at the feet,
+    // so the player can actually SEE their character. First-person stays the
+    // default; raycast/physics/audio always use the real eye (local_player.view).
+    // r490/r515: CAMERA VIEWS. 0 = first-person, 1 = third-person (pulled back behind you),
+    // 2 = cinematic over-the-shoulder. F5 toggles first/third; Y toggles the cinematic shoulder
+    // cam. `fp_body` renders your own avatar in first-person so you can look down and see your
+    // body (the hand viewmodel is hidden then to avoid a second floating arm). Default on.
+    let mut camera_mode: u8 = 0;
+    // r534: third-person / cinematic camera-distance zoom (+/- keys). 1.0 = default
+    // pull-back; clamped so the camera can't clip into the player or fly too far.
+    let mut cam_zoom: f32 = 1.0;
+    // r540: CAMERA JUICE. `bob_phase` advances with footstep cadence to drive a
+    // subtle first-person walk bob; `cam_smoothed` eases the chase camera toward
+    // its target so pinch/zoom changes glide instead of snapping. Both are
+    // render-only (they never touch the logical eye used for physics/raycast).
+    let mut bob_phase: f32 = 0.0;
+    let mut prev_bob_phase: f32 = 0.0; // r566: footfall edge detection for ground-shake
+    // r602: same-spot stomp streak (sim::stomp_erosion) — repeated footfalls in the
+    // SAME cell build toward an actual break-through; a single step only weathers.
+    let mut player_stomp_cell: Option<(i32, i32)> = None;
+    let mut player_stomp_streak: u32 = 0;
+    let mut bob_amp_s: f32 = 0.0; // smoothed amplitude (settles to 0 when idle)
+    let mut cam_smoothed: Option<glm::Vec3> = None;
+    // r542: impulse camera shake — `shake_mag` is kicked up by hard landings (and
+    // other impacts) and decays each frame; the offset is multi-frequency so it
+    // reads as a jolt, not a wobble. Render-only.
+    let mut shake_mag: f32 = 0.0;
+    let mut shake_t: f32 = 0.0;
+    let view_bob_on = std::env::var("UNENDLICH_VIEW_BOB")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    let cam_smooth_on = std::env::var("UNENDLICH_CAM_SMOOTH")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    let cam_shake_on = std::env::var("UNENDLICH_CAM_SHAKE")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    let mut fp_body: bool = true;
+    let mut self_avatar: Option<unendlich_engine::creature::Creature> = None;
+    let mut self_avatar_dirty = true; // rebuild from active_character on next use
+    let mut self_avatar_prev: Option<[f32; 3]> = None; // for deriving avatar velocity
+    // r561: STATURE physical coupling. The active character's height drives the
+    // collider, the camera eye height, and locomotion via sim::stature. These are
+    // recomputed whenever the character changes (the self_avatar_dirty path) and
+    // anchored at the 1.8 person, so a default character is byte-for-byte today's
+    // tuning. `player_eye_offset` is the eye height ABOVE the AABB centre (so
+    // camera = body.render_y() + player_eye_offset).
+    let mut player_stature =
+        unendlich_engine::sim::stature::derive(1.8, 1.0, 1.0, 1.0);
+    let mut player_eye_offset: f32 =
+        player_stature.eye_height - player_stature.half_extents[1];
+    let mut player_eye_height: f32 = player_stature.eye_height;
+    // r563: incoming-vitality-damage multiplier from the stature's max_health
+    // (the player's vitality is normalised [0,1], so "more health" = take a
+    // smaller fraction per hit). = 1.0 for a default character.
+    let mut player_dmg_resist: f32 =
+        unendlich_engine::sim::stature::BASE_HEALTH / player_stature.max_health;
+    // r539: hero walk cycle — phase advances over time, amplitude tracks horizontal
+    // speed (→0 when idle so the limbs settle), passed to hero_forge::build.
+    let mut hero_gait_phase: f32 = 0.0;
+    let mut hero_gait_amp: f32 = 0.0;
+    // r570: airborne/landing pose state — `hero_airborne01` eases toward 1 while the
+    // player is off the ground (fall tuck), `hero_land_crouch` is pulsed to ~1 on a
+    // hard touchdown and decays (landing absorb).
+    let mut hero_airborne01: f32 = 0.0;
+    let mut hero_land_crouch: f32 = 0.0;
+    // r572: eased horizontal-flight blend (1 while actively flying & moving).
+    let mut hero_flight01: f32 = 0.0;
+    // r573: flight banking — eased roll into turns, from the view yaw rate.
+    let mut hero_bank: f32 = 0.0;
+    let mut prev_view_yaw: f32 = 0.0;
+    // r486: held-item swing — a short arc the viewmodel plays each time a block
+    // action fires (mine/place), so the hand item visibly swings on use.
+    let mut swing_timer: f32 = 0.0;
+    const SWING_DURATION: f32 = 0.24;
     let mut prev_fall_vy: f32 = 0.0; // r141: landing speed for fall impact
+    // r508: tracks an in-progress jump ascent so releasing Jump early can cut it short
+    // (variable jump height — tap = short hop, hold = full jump).
+    let mut jump_ascending = false;
     // r265: PARTICLES (kill switch, default OFF). A pooled CPU particle system
     // (sim::particles) stepped each frame; emits a Dust burst at the player's
     // feet on landing. The system TICK (emit/step/retire) is pure CPU and runs
@@ -1338,14 +1596,34 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // but the fire-douse and exposure blocks run before it; they read last
     // frame's value (one-frame lag, harmless).
     let mut precip01: f32 = 0.0;
+    let mut last_climate_temp_c: f32 = 12.0; // r492: latest column temp, for rain-vs-snow
     let mut current_world_name: Option<String> = None; // r165: for F6 catalog writes
     let mut sleep_hold: f32 = 0.0; // r165: sneak-to-sleep accumulator
+    // r510: COOKING — holding raw meat near a fire cooks it over ~COOK_TIME seconds into
+    // cooked meat (more nourishing). This accumulates while the conditions hold; it decays
+    // back when you step away or stop holding meat.
+    let mut cook_progress: f32 = 0.0;
+    const COOK_TIME: f32 = 4.0;
+    // r512/r514: FARMING — planted crops live in the persistent `session.flora` store
+    // (world/flora_store.rs), keyed by cell, round-tripped to disk. (Replaced the old
+    // bin-local Vec so crop growth survives save/load.)
+    // r522: SEED GENETICS — a per-world seed line per crop (Carrot/Potato/Cabbage). Each planting
+    // crosses the line with a fresh genome (sim::plant_tree_genetics) and stores the result on the
+    // plant; harvesting a ripe crop breeds its genome back into the line, so a grower who keeps
+    // replanting their best harvests improves yield/growth over generations. Genome traits drive
+    // growth speed + harvest yield; the per-plant genome persists in the flora store.
+    let mut seed_stock: [unendlich_engine::sim::plant_tree_genetics::PlantGenome; 3] =
+        [unendlich_engine::sim::plant_tree_genetics::PlantGenome::neutral(); 3];
     let fg_loot_table = unendlich_engine::items::loot::default_loot_table(); // r149
     // r142: body thermal state (sim::survival_exposure) — lags felt temp.
     let mut fg_thermal = unendlich_engine::sim::survival_exposure::Thermal {
         body_c: 36.5,
         comfort: 0.0,
     };
+    // r545 (Roll 3 / C2): player hydration. Reuses the dragon_thirst::Hydration
+    // reserve (drain/drink/parched). Player drain is slowed vs the dragon constant
+    // by scaling dt at the tick site so thirst is a periodic chore, not constant.
+    let mut fg_hydration = unendlich_engine::sim::dragon_thirst::Hydration::full();
     // r130: PLAYER BENDING — controller + the bend key edge state.
     let mut player_bending = unendlich_engine::sim::player_bending::PlayerBending::new();
     // r131: the real resonance economy (sim::bending_charge) replaces the
@@ -1463,6 +1741,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // r150: dragon daily life — activity (sleep/forage/alert) + hunt state.
     let mut scroll_accum: f32 = 0.0;
     let mut scroll_accum_x: f32 = 0.0; // r318: horizontal (trackpad) scroll
+    // r476: timebend snapshot/scrub camera mode — records pose+sky-time as the
+    // player roams; F8 freezes the world and scrolls back through those vantages.
+    let mut timebend = unendlich_engine::timebend_scrub::TimebendScrub::new();
+    // r476: "detached terrain" — when the player moves over ground that hasn't
+    // streamed in yet, suspend their fall (hover) instead of plummeting through
+    // the void, then settle them onto the real surface once it spawns. Default
+    // on; opt out with UNENDLICH_DETACHED_TERRAIN=0.
+    let detached_terrain = std::env::var("UNENDLICH_DETACHED_TERRAIN")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(true);
+    let mut terrain_suspended = false;
     let mut last_jump_tap: Option<Instant> = None; // r319: double-tap Space -> flight
 
     // -----------------------------------------------------------------------
@@ -1471,9 +1759,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let start = Instant::now();
     // r412: dynamic in-chunk water sim (experimental, gated UNENDLICH_WATER_SIM=1). Reads
     // each nearby chunk's water as a field, settles it toward its level, and writes back
-    // only Air↔Water cells (never touching terrain). Off by default.
+    // only Air↔Water cells (never touching terrain). OFF by default.
+    // r539: the default had drifted to `true`, so the experimental settle ran for everyone —
+    // and with rain feeding water into exposed columns each tick (apply_rain below), bodies
+    // visibly CLIMB during/after rain ("water rising strangely"). Restored to off; the sim is
+    // still backlog-blocked on a persistent per-chunk field, so opt in with UNENDLICH_WATER_SIM=1
+    // for testing only.
     let water_sim_enabled =
-        std::env::var("UNENDLICH_WATER_SIM").map(|v| v != "0").unwrap_or(true);
+        std::env::var("UNENDLICH_WATER_SIM").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
     // Tunable for bulk testing: chunk radius, set_block budget/tick, tick interval (ms).
     let water_sim_radius: i32 = std::env::var("UNENDLICH_WATER_RADIUS")
         .ok()
@@ -1519,6 +1812,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         std::env::var("UNENDLICH_WATER_FLOW_SHADER").map(|v| v != "0").unwrap_or(true);
     if water_flow_shader {
         log::info!("[water-flow] surface shader flow ON (UNENDLICH_WATER_FLOW_SHADER)");
+    }
+    // r506: BODY PUSH-BACK / WAVES — a body of some mass moving through water shoves a wake
+    // into the flow field (sim::water_react::wave_amplitude → flow_tiles.splash), so the
+    // surface visibly parts and foams around a swimmer or a dragon crashing into a lake.
+    // Reuses the flow-shader path, so it's inert when UNENDLICH_WATER_FLOW_SHADER=0. Default
+    // on; gain/max tune wake strength and cap. UNENDLICH_WATER_PUSHBACK=0 to disable.
+    let water_pushback =
+        std::env::var("UNENDLICH_WATER_PUSHBACK").map(|v| v != "0").unwrap_or(true);
+    let water_pushback_gain: f32 = std::env::var("UNENDLICH_WATER_PUSHBACK_GAIN")
+        .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.05).max(0.0);
+    let water_pushback_max: f32 = std::env::var("UNENDLICH_WATER_PUSHBACK_MAX")
+        .ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(4.0).max(0.0);
+    if water_pushback {
+        log::info!("[water-pushback] ON — moving bodies make wakes/waves (gain={water_pushback_gain}, max={water_pushback_max}; UNENDLICH_WATER_PUSHBACK=0 to disable)");
     }
     // r420: verbose water diagnostics ([water] prefix) + wave-speed knob to chase the
     // "too fast with the wind" report. wave-speed multiplies the wave animation only
@@ -1986,6 +2293,61 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // Per-frame timing: collected for the FPS log window. Reset each second.
     let mut frame_times_ms: Vec<f64> = Vec::with_capacity(2048);
 
+    // r476: DYNAMIC render distance. When streaming overwhelms the frame (the
+    // Asahi death-spiral: mesh_q backs up -> 2fps), shrink the effective render
+    // radius so there's less to generate/mesh, then expand back once frames
+    // recover. Runs on a WALL-CLOCK cadence (not frame-count — at 2fps a
+    // 120-frame autotuner is 60s too late) and only ever caps BELOW the UI/env
+    // render distance, never above. Gated (default off) so it can't surprise.
+    // Levers: shrink when a frame exceeds SHRINK_MS, grow when under GROW_MS.
+    let adaptive_rd = std::env::var("UNENDLICH_ADAPTIVE_RENDER_DISTANCE")
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+    let adaptive_rd_shrink_ms: f64 = std::env::var("UNENDLICH_ADAPTIVE_RD_SHRINK_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 3.0).max(25.0));
+    let adaptive_rd_grow_ms: f64 = std::env::var("UNENDLICH_ADAPTIVE_RD_GROW_MS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or((frame_target_ms * 1.5).max(12.0));
+    let adaptive_rd_min: i32 = std::env::var("UNENDLICH_ADAPTIVE_RD_MIN")
+        .ok().and_then(|s| s.parse().ok()).map(|n: i32| n.clamp(2, 32)).unwrap_or(2);
+    // r534: GROW SLEW LIMIT. Each +1 to the cap loads a whole new ring of chunks,
+    // which at large distances is a heavy one-frame spike. Require N consecutive
+    // good-frame checks before growing (so a single spike frame resets the streak
+    // and PAUSES growth until the frame rate is genuinely stable), and start the cap
+    // LOW so the world ramps up smoothly from spawn instead of slamming to max.
+    let adaptive_rd_grow_streak: u32 = std::env::var("UNENDLICH_ADAPTIVE_RD_GROW_STREAK")
+        .ok().and_then(|s| s.parse().ok()).map(|n: u32| n.clamp(1, 20)).unwrap_or(3);
+    let mut adaptive_rd_good_streak: u32 = 0;
+    let mut adaptive_rd_cap: i32 = adaptive_rd_min.max(6).min(32); // ramp up from here
+    let mut adaptive_rd_last = std::time::Instant::now();
+    if adaptive_rd {
+        log::info!("adaptive_render_distance: ENABLED — shrink>{:.1}ms grow<{:.1}ms min={} (UNENDLICH_ADAPTIVE_RENDER_DISTANCE)",
+            adaptive_rd_shrink_ms, adaptive_rd_grow_ms, adaptive_rd_min);
+    }
+    // r476: seed the Performance-page levers from their env vars so the env still
+    // works as the initial value and the in-game controls reflect it. After this
+    // the UI owns them live (the controller reads renderer.ui_adaptive_rd; the
+    // per-frame block below pushes ui_gpu_mesh_yield into the global the mesher
+    // dispatcher reads).
+    renderer.ui_adaptive_rd = adaptive_rd;
+    renderer.ui_gpu_mesh_yield = std::env::var("UNENDLICH_GPU_MESH_YIELD_PCT")
+        .ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0).min(200);
+    unendlich_engine::constants::set_gpu_mesh_yield_pct(renderer.ui_gpu_mesh_yield);
+    // r480: seed the new Performance-page toggles from env. octree_tile drives
+    // the global atomic the mesh dispatch reads each batch; detached terrain
+    // from UNENDLICH_DETACHED_TERRAIN.
+    // r557: default the tiled shared-memory mesher path ON — it replaces the
+    // per-cell "7 pointer-chasing octree walks" (slow on Asahi) with one
+    // cooperative halo load into LDS + zero-descent neighbour reads, and is
+    // verified byte-identical to the CPU reference. Set UNENDLICH_OCTREE_TILE=0
+    // (or the Performance-page toggle) to fall back to the per-cell path.
+    let octree_tile_env = !matches!(std::env::var("UNENDLICH_OCTREE_TILE"), Ok(s) if s == "0");
+    unendlich_engine::constants::set_octree_tile(octree_tile_env);
+    log::info!(
+        "[mesh] octree tiled shared-memory path: {} (UNENDLICH_OCTREE_TILE)",
+        if octree_tile_env { "ON" } else { "OFF" }
+    );
+    renderer.ui_octree_tile = octree_tile_env;
+    renderer.ui_detached_terrain = detached_terrain;
+
     // c.12-e: boot mode — emit per-frame frame_window events for the first
     // few seconds, then switch to 1Hz aggregated mode. Startup is the most
     // jank-prone phase (chunk gen, first paint, mouse capture) and
@@ -2261,6 +2623,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     let mut fg_world_seed: u64 = WORLD_SEED_DEFAULT as u64;
     // r461: named-location discovery (SPEC-010). Per-world registry of discovered biome-scale regions.
     let mut session = unendlich_engine::world::world_session::WorldSession::new(fg_world_seed);
+    // r514: load any persisted crop/flora growth state for this world (sparse — only planted
+    // cells). It round-trips to flora.json under the world root; absent → empty store.
+    session.flora = unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
+    if !session.flora.is_empty() {
+        log::info!("[farm] loaded {} persisted crop(s) from disk", session.flora.len());
+    }
+    // r518: OPEN-SERVER ACCESS CONTROL. When hosting, `whitelist.open` lets anyone join;
+    // closed admits only listed names (matched against the joiner's CH_AVATAR character name).
+    // Persisted per-world as whitelist.json next to the flora store. Default open.
+    let mut whitelist = unendlich_engine::sim::whitelist::Whitelist::load(&flora_root);
+    log::info!(
+        "[lan-mp] server access: {} ({} on allow-list)",
+        if whitelist.open { "OPEN (anyone may join)" } else { "CLOSED (whitelist only)" },
+        whitelist.len()
+    );
     let mut fg_create_spree: u8 = 0; // r186: Create World presses-through
     let mut fg_host_pending: bool = false; // r401: Host World → complete via one-click-create
     let mut fg_pending_load: Option<(String, u64, bool)> = None; // r197 load-world
@@ -2312,6 +2689,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     // frame. Lives in this map (not the streaming entity store) so it never despawns.
     let mut lan_remote_creatures: std::collections::HashMap<u64, unendlich_engine::creature::Creature> =
         std::collections::HashMap::new();
+    // r494: appearance (chosen character) per remote id, learned via CH_AVATAR, so
+    // remotes render as each other's actual character, not a default dragon.
+    let mut lan_remote_appearance: std::collections::HashMap<u64, unendlich_engine::player_character::CharacterProfile> =
+        std::collections::HashMap::new();
+    let mut lan_avatar_last_sent_ms: u64 = 0;
     // r404: last time (ms) each remote entity was heard from, for liveness timeout.
     let mut lan_remote_last_seen: std::collections::HashMap<u64, u64> =
         std::collections::HashMap::new();
@@ -2430,6 +2812,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if let Some(f) = g("gui_scale").as_f64() { renderer.ui_scale = (f as f32).clamp(1.0, 3.0); } // r200
             if let Some(n) = g("fps_target").as_u64() { renderer.ui_fps_target = n as u32; }
             if let Some(b) = g("autotune").as_bool() { renderer.ui_autotune = b; }
+            if let Some(n) = g("gpu_mesh_yield").as_u64() { renderer.ui_gpu_mesh_yield = n.min(200); }
+            if let Some(b) = g("adaptive_rd").as_bool() { renderer.ui_adaptive_rd = b; }
+            if let Some(b) = g("octree_tile").as_bool() { renderer.ui_octree_tile = b; }
+            if let Some(b) = g("detached_terrain").as_bool() { renderer.ui_detached_terrain = b; }
             log::info!("[settings] loaded {}", settings_path.display());
         }
     }
@@ -2442,6 +2828,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             "render_distance": r.ui_render_distance,
             "gui_scale": r.ui_scale,
             "autotune": r.ui_autotune,
+            "gpu_mesh_yield": r.ui_gpu_mesh_yield,
+            "adaptive_rd": r.ui_adaptive_rd,
+            "octree_tile": r.ui_octree_tile,
+            "detached_terrain": r.ui_detached_terrain,
         });
         if let Some(parent) = path.parent() { let _ = std::fs::create_dir_all(parent); }
         match std::fs::write(path, serde_json::to_string_pretty(&v).unwrap_or_default()) {
@@ -2647,7 +3037,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // is the US-QWERTY position and lands on Dvorak's 'l' key.
                     // `get_key_name(None, scancode)` resolves the layout char for
                     // the physical key; fall back to physical P if unavailable.
-                    let is_p = !renderer.ui_wants_keyboard && match glfw::get_key_name(None, Some(scancode)) {
+                    let is_p = match glfw::get_key_name(None, Some(scancode)) {
                         Some(name) => name == "p",
                         None => key == Key::P,
                     };
@@ -2671,14 +3061,83 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // Carry-aware: a late-drained Esc shows up as just-pressed next frame.
         esc_pressed |= input.is_key_just_pressed(Keycode::Escape);
 
-        // r118: inventory view toggle (I). Pausing follows the settings panel
-        // (Esc) or the open inventory — computed below as game_paused.
-        if mouse_captured && input.is_key_just_pressed(Keycode::I) {
-            show_inventory = !show_inventory;
-            log::info!("[inventory] {} — {} occupied slot(s), selected hotbar slot {}",
-                if show_inventory { "OPEN" } else { "CLOSED" },
-                fg_app.inventory().slots().iter().filter(|s| s.is_some()).count(),
-                fg_app.inventory().selected() + 1);
+        // ── r525: UNIFIED UI STATE (light in-world overlays) ──────────────
+        // `menu_state` owns the overlays the player toggles in-world: Inventory
+        // (p, or the rebindable OpenInventory alias) and Debug (F4). NoMenu is
+        // the default — playing with the cursor captured. The heavyweight FSM
+        // screens (Pause/Settings/Craft on Esc/C, and the Title screen) keep
+        // their existing plumbing but are reconciled here: opening one closes
+        // these light overlays, and these light overlays only toggle when no
+        // heavyweight screen is up. One overlay at a time, one key each.
+        let heavy_open = renderer.menu_open
+            || renderer.pause_menu_open
+            || renderer.settings_menu_open
+            || renderer.character_menu_open // r577: the customizer is a heavy surface too
+            || renderer.craft_menu_open;
+        if !heavy_open {
+            let typing = renderer.ui_wants_keyboard;
+            let prev = menu_state;
+            // p → inventory (Dvorak-aware p_pressed). Only OPENING is blocked
+            // while typing; closing always works.
+            if p_pressed {
+                p_pressed = false;
+                if menu_state == MenuState::Inventory || !typing {
+                    menu_state = menu_state.toggle(MenuState::Inventory);
+                }
+            }
+            // Rebindable OpenInventory (default R/I) is an alias for inventory.
+            if bindings.is_action_just_pressed(GameAction::OpenInventory, &input) && !typing {
+                menu_state = menu_state.toggle(MenuState::Inventory);
+            }
+            // F4 (or F3) → debug panels, on their own key (separate from inventory).
+            if input.is_key_just_pressed(Keycode::F4) || input.is_key_just_pressed(Keycode::F3) {
+                menu_state = menu_state.toggle(MenuState::Debug);
+            }
+            // Cursor follows the state: free it when an overlay opens, recapture
+            // it the instant we return to NoMenu — no extra click (the sticky fix).
+            if menu_state != prev {
+                if menu_state.captures_cursor() {
+                    window.set_cursor_mode(CursorMode::Disabled);
+                    mouse_captured = true;
+                    input.cursor_delta = (0.0, 0.0);
+                } else {
+                    window.set_cursor_mode(CursorMode::Normal);
+                    mouse_captured = false;
+                }
+                log::info!("[ui] overlay = {:?}", menu_state);
+            }
+        } else {
+            // A heavyweight screen is up — the light overlay yields to it.
+            menu_state = MenuState::NoMenu;
+            p_pressed = false; // don't let a queued 'p' leak into the next frame
+        }
+        // PUSH: derive the legacy flags the rest of the frame still reads.
+        let show_inventory = menu_state == MenuState::Inventory || renderer.pause_menu_open;
+        let ui_panel_open = menu_state.is_open();
+        renderer.settings_open = menu_state == MenuState::Debug; // shader/debug panel
+        renderer.perf_window_open = menu_state == MenuState::Debug; // frame-time dashboard
+        // r554: pull a hotbar/picker click (from the centered inventory's hotbar
+        // switcher last frame) back into the gameplay slot so clicking a slot
+        // selects it. Only valid hotbar slots; the scroll/key handlers below push
+        // the reverse direction, so the two stay in sync without fighting.
+        if renderer.creative_selected != selected_palette_idx
+            && renderer.creative_selected < PLACE_PALETTE.len()
+        {
+            selected_palette_idx = renderer.creative_selected;
+            selected_block = PLACE_PALETTE[selected_palette_idx];
+            fg_app.inventory_mut().set_selected(selected_palette_idx);
+            if survival_mode {
+                hand_item = fg_app.inventory().slot(selected_palette_idx).map(|s| s.item);
+                if let Some(stack) = fg_app.inventory().slot(selected_palette_idx) {
+                    if let Some(b) = unendlich_engine::world::blocks::BlockId::ALL
+                        .iter()
+                        .copied()
+                        .find(|b| *b as u32 == stack.item.0)
+                    {
+                        selected_block = b;
+                    }
+                }
+            }
         }
         // r449: K sorts the backpack (hotbar preserved) via the inventory_sort core.
         if mouse_captured && input.is_key_just_pressed(Keycode::K) {
@@ -2718,7 +3177,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             || show_inventory
             || renderer.pause_menu_open
             || renderer.settings_menu_open // r169
-            || renderer.craft_menu_open; // r169
+            || renderer.craft_menu_open // r169
+            || timebend.active; // r476: scrubbing freezes the live world
 
         // r317: any open UI surface owns the scroll wheel (so dialog / controls
         // ScrollAreas scroll) — don't let the hotbar eat it even if the cursor
@@ -2744,9 +3204,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             scroll_accum += scroll_accum_x;
             scroll_accum_x = 0.0;
         }
+        // r476: while scrubbing, the wheel walks the recorded vantages instead
+        // of the hotbar. One snapshot per notch; consumes the scroll so the
+        // palette doesn't also change.
+        if timebend.active {
+            while scroll_accum.abs() >= 1.0 {
+                let step: i32 = if scroll_accum > 0.0 { 1 } else { -1 }; // scroll up = forward in time
+                scroll_accum -= scroll_accum.signum();
+                timebend.scrub(step);
+            }
+            scroll_accum = 0.0;
+        }
         // r122: scroll wheel cycles the hotbar / place palette (swipe-scroll on
         // touchpads lands here too). One step per wheel notch, wraps at the ends.
-        while scroll_accum.abs() >= 1.0 && mouse_captured && !ui_scroll_target {
+        while scroll_accum.abs() >= 1.0 && mouse_captured && !ui_scroll_target && !timebend.active {
             let step: i32 = if scroll_accum > 0.0 { -1 } else { 1 }; // scroll up = previous
             scroll_accum -= scroll_accum.signum();
             let n = PLACE_PALETTE.len() as i32;
@@ -2769,6 +3240,71 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             log::info!("[hotbar] scroll -> slot {} ({:?})", selected_palette_idx + 1, selected_block);
+            // r554: make the selection VISIBLE — drive the hotbar UI highlight (the
+            // renderer's hotbar reads creative_selected) so scrolling actually shows.
+            renderer.creative_selected = selected_palette_idx;
+        }
+        // r487: keep hand_item synced to the held thing EVERY frame so the
+        // first-person viewmodel actually renders in CREATIVE too. Previously
+        // hand_item was only assigned inside survival-gated branches, so the
+        // default (creative) game had an empty hand and drew no viewmodel.
+        hand_item = if survival_mode {
+            fg_app.inventory().slot(selected_palette_idx).map(|s| s.item)
+        } else if (selected_block as u32) != 0 {
+            Some(unendlich_engine::items::ItemId(selected_block as u32))
+        } else {
+            None
+        };
+        // r509: keep the equipped-weapon durability tracker in sync with what's held —
+        // (re)initialise to full when a different forged weapon becomes the hand item, clear
+        // when the hand isn't a weapon. Holding the same weapon preserves its current wear.
+        match hand_item {
+            Some(h)
+                if unendlich_engine::sim::viewmodel::weapon_class_for_id(h.0).is_some() =>
+            {
+                if equipped_weapon_dura.map_or(true, |(id, _, _)| id != h) {
+                    equipped_weapon_dura = Some((h, WEAPON_DURA_MAX, WEAPON_DURA_MAX));
+                }
+            }
+            _ => equipped_weapon_dura = None,
+        }
+        // r488: when the character menu commits a pick, adopt it as the active
+        // character (already persisted as the global default by the renderer).
+        if let Some(chosen) = renderer.character_chosen.take() {
+            active_character = chosen;
+            self_avatar_dirty = true; // rebuild the third-person avatar from the new pick
+            log::info!(
+                "[character] now playing as '{}' (plan={}, seed={:#x}) — saved as global default",
+                active_character.name, active_character.arche, active_character.seed
+            );
+        }
+        // r490/r515: third-person toggle (rebindable — default F5).
+        if bindings.is_action_just_pressed(
+            unendlich_engine::keybindings::GameAction::ToggleThirdPerson, &input,
+        ) && !renderer.ui_wants_keyboard {
+            camera_mode = if camera_mode == 1 { 0 } else { 1 };
+            self_avatar_prev = None; // avoid a velocity spike on re-entry
+            log::info!("[view] camera = {}", match camera_mode {
+                1 => "third-person", 2 => "cinematic shoulder", _ => "first-person",
+            });
+        }
+        // r495: season for this frame. O advances it ~1/8 year (live testing); the
+        // offset feeds both the climate day-of-year (temp/snow) and plant season01.
+        if input.is_key_just_pressed(Keycode::O) && !renderer.ui_wants_keyboard {
+            season_offset_days += season_days_per_year / 8.0;
+        }
+        let season_day = world_clock_elapsed / 1440.0 + season_offset_days;
+        let current_season01 =
+            season_day.rem_euclid(season_days_per_year) / season_days_per_year;
+        {
+            let s = unendlich_engine::season::Season::from_phase(current_season01);
+            if last_logged_season != Some(s) {
+                last_logged_season = Some(s);
+                log::info!(
+                    "[season] now {:?} (phase {:.2}, year {} days)",
+                    s, current_season01, season_days_per_year as u32
+                );
+            }
         }
         if !mouse_captured || ui_scroll_target {
             // r205: when the cursor is free (a menu/dialog is open), the
@@ -2806,6 +3342,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         local_player.view.position.z,
                     ],
                 ));
+                self_avatar_dirty = true; // r561: size the new collider to the stature
             }
             log::info!(
                 "[mode] F6 -> {} mode{}",
@@ -2824,6 +3361,30 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 save_catalog(&entries);
                 log::info!("[saves] world '{}' mode updated in catalog", name);
+            }
+        }
+        // r476: F8 toggles the timebend snapshot/scrub camera. Enter freezes the
+        // world and jumps to the latest recorded vantage; exit restores the live
+        // pose + world clock. Both kick a fade so the cut reads cinematically.
+        if mouse_captured && input.is_key_just_pressed(Keycode::F8) {
+            if timebend.active {
+                if let Some((p, y, pi, sk)) = timebend.exit() {
+                    local_player.view.position = p;
+                    local_player.view.yaw = y;
+                    local_player.view.pitch = pi;
+                    sky_state.time_seconds = sk;
+                }
+                renderer.loading_label = String::new();
+                log::info!("[timebend] exit scrub — restored live vantage");
+            } else if timebend.enter(
+                local_player.view.position,
+                local_player.view.yaw,
+                local_player.view.pitch,
+                sky_state.time_seconds,
+            ) {
+                log::info!("[timebend] enter scrub — {} vantages recorded", timebend.len());
+            } else {
+                log::info!("[timebend] no history recorded yet — roam a bit first");
             }
         }
         if mouse_captured && input.is_key_just_pressed(Keycode::H) {
@@ -2903,17 +3464,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         }
 
         // P handling: toggle panel mode (cursor visible + UI clicks routed).
-        if p_pressed {
-            p_pressed = false;
-            ui_panel_open = !ui_panel_open;
-            if ui_panel_open {
-                window.set_cursor_mode(CursorMode::Normal);
-                mouse_captured = false;
-                log::info!("Panel mode ON (P to close, Esc also closes).");
-            } else {
-                log::info!("Panel mode OFF. Click to recapture mouse.");
-            }
-        }
+        // r525: the old 'p' "Panel mode" (ui_panel_open) is gone — 'p' now toggles
+        // MenuState::Inventory in the unified block above.
 
         // Esc handling: in panel mode -> close panel; else first press releases mouse, second quits.
         // r175: UI keys are handled UNCONDITIONALLY while their window is
@@ -2949,20 +3501,69 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 mouse_captured, game_paused, survival_mode
             );
         }
-        // r169: F4 — analytics dashboard (frame-time sparkline + counters).
-        if input.is_key_just_pressed(Keycode::F4) {
-            renderer.perf_window_open = !renderer.perf_window_open;
+        // r525: F4 now toggles MenuState::Debug (handled in the unified block
+        // above), which drives BOTH the perf dashboard and the debug panel.
+        // r481: J cycles through the eight forged weapon models in hand (debug).
+        if mouse_captured && input.is_key_just_pressed(Keycode::J) {
+            let n = unendlich_engine::sim::viewmodel::WEAPON_CLASSES.len();
+            debug_weapon_class = match debug_weapon_class {
+                None => Some(0),
+                Some(i) if i + 1 < n => Some(i + 1),
+                _ => None,
+            };
+            println!(
+                "[debug] hand weapon = {:?}",
+                debug_weapon_class.map(|i| unendlich_engine::sim::viewmodel::WEAPON_CLASSES[i])
+            );
         }
-        // r167: F3 owns the debug/shaderpack panel now (operator: "Esc is
-        // opening the debug menu" — Esc belongs to the PAUSE menu).
-        if input.is_key_just_pressed(Keycode::F3) {
-            renderer.settings_open = !renderer.settings_open;
-            if renderer.settings_open {
-                window.set_cursor_mode(CursorMode::Normal);
-                mouse_captured = false;
+        // r481: Y gives one of each forged weapon as a real inventory item
+        // (ids 4000..4007) — in survival, scroll the hotbar to one to hold it.
+        // r515: cinematic over-the-shoulder toggle (rebindable — default Y).
+        if bindings.is_action_just_pressed(
+            unendlich_engine::keybindings::GameAction::ToggleCinematicCam, &input,
+        ) && !renderer.ui_wants_keyboard {
+            camera_mode = if camera_mode == 2 { 0 } else { 2 };
+            self_avatar_prev = None;
+            log::info!("[view] camera = {}", match camera_mode {
+                1 => "third-person", 2 => "cinematic shoulder", _ => "first-person",
+            });
+        }
+        // r518: F10 toggles the server between OPEN (anyone may join) and CLOSED (whitelist
+        // only). Persists immediately so the policy survives a restart. The full add/remove-name
+        // management lives in the Multiplayer menu (see DESIGN_NOTES UI plan).
+        if input.is_key_just_pressed(Keycode::F10) && !renderer.ui_wants_keyboard {
+            let now_open = whitelist.toggle_open();
+            let _ = whitelist.save(&flora_root);
+            log::info!(
+                "[lan-mp] server is now {} ({} on allow-list)",
+                if now_open { "OPEN — anyone may join" } else { "CLOSED — whitelist only" },
+                whitelist.len()
+            );
+        }
+        // r534: +/- adjust the third-person / cinematic camera distance. In those
+        // views the keys zoom the chase camera (− pulls farther, + brings it closer);
+        // in first-person they fall through to their normal bindings (e.g. the debug
+        // weapon-give on Minus below).
+        if camera_mode != 0 && mouse_captured && !renderer.ui_wants_keyboard {
+            if input.is_key_just_pressed(Keycode::Minus) {
+                cam_zoom = (cam_zoom * 1.12).min(3.0);
+                log::info!("[view] camera distance x{:.2}", cam_zoom);
             }
-            // (r170: no re-capture here — the cursor authority below decides.)
+            if input.is_key_just_pressed(Keycode::Equal) {
+                cam_zoom = (cam_zoom * 0.89).max(0.4);
+                log::info!("[view] camera distance x{:.2}", cam_zoom);
+            }
         }
+        if camera_mode == 0 && mouse_captured && !show_inventory && input.is_key_just_pressed(Keycode::Minus) {
+            for c in unendlich_engine::sim::viewmodel::WEAPON_CLASSES {
+                let id = unendlich_engine::items::ItemId(
+                    unendlich_engine::sim::viewmodel::weapon_id_for_class(c));
+                fg_app.inventory_mut().add_item(id, 1, &fg_item_registry);
+            }
+            log::info!("[items] gave all 8 forged weapons to inventory");
+        }
+        // r525: F3 is a second alias for MenuState::Debug (handled in the unified
+        // block above, alongside F4) — both open the debug/shaderpack panel.
         if esc_pressed && !renderer.menu_open {
             // r167: Esc = PAUSE MENU (Resume / Settings / Save & Quit).
             renderer.pause_menu_open = !renderer.pause_menu_open;
@@ -3239,7 +3840,90 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().min(0.1); // cap dt at 100ms
         let dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
+        let frame_dt_s = (dt_ms as f32) / 1000.0; // r486: for the held-item swing decay
+
+        // ── r526: MOB AI + MOVEMENT ──────────────────────────────────────
+        // Tick each test mob's brain (wander / seek / flee) and advance it with
+        // the SAME `step_character` kernel the player uses, against the live
+        // voxel terrain, at a fixed 20 Hz (frame-rate independent). Static test
+        // spawns now actually move. Skipped while paused / in a menu.
+        if !game_paused && !test_mobs.is_empty() {
+            use unendlich_engine::sim::fixed::{Fixed, Vec3};
+            use unendlich_engine::sim::mob::MobKind;
+            use unendlich_engine::sim::state::Character;
+            mob_tick_accum += dt;
+            let pp = local_player.view.position;
+            let players = [Character {
+                pos: Vec3::new(
+                    Fixed::from_int(pp.x.floor() as i64),
+                    Fixed::from_int(pp.y.floor() as i64),
+                    Fixed::from_int(pp.z.floor() as i64),
+                ),
+                ..Character::default()
+            }];
+            let mut guard = 0;
+            while mob_tick_accum >= 0.05 && guard < 4 {
+                mob_tick_accum -= 0.05;
+                guard += 1;
+                mob_sim_tick += 1;
+                let prey: Vec<Vec3> = test_mobs
+                    .iter()
+                    .filter(|m| m.kind == MobKind::Grazer)
+                    .map(|m| m.body.pos)
+                    .collect();
+                let predators: Vec<Vec3> = test_mobs
+                    .iter()
+                    .filter(|m| m.kind == MobKind::Seeker)
+                    .map(|m| m.body.pos)
+                    .collect();
+                let world = MobWorld { cm: &chunk_manager };
+                for (i, m) in test_mobs.iter_mut().enumerate() {
+                    let input = m.brain(
+                        fg_world_seed,
+                        i as u64,
+                        mob_sim_tick,
+                        &players,
+                        &prey,
+                        &predators,
+                        &world,
+                    );
+                    m.body = unendlich_engine::sim::physics::step_character(&m.body, &input, &world);
+                }
+            }
+        }
         last_frame = now;
+
+        // r476: dynamic render-distance controller. Wall-clock cadence (every
+        // 400ms) so it reacts even at single-digit FPS. Shrinks the cap when the
+        // last frame ran long, grows it when frames are comfortably under budget.
+        // Catastrophic frames (>3x shrink threshold) cut two rings at once so the
+        // game can climb out of a streaming death-spiral quickly. The cap only
+        // limits BELOW the player's chosen distance (applied at the override).
+        if renderer.ui_adaptive_rd && adaptive_rd_last.elapsed() >= std::time::Duration::from_millis(400) {
+            adaptive_rd_last = now;
+            if dt_ms > adaptive_rd_shrink_ms && adaptive_rd_cap > adaptive_rd_min {
+                let step = if dt_ms > adaptive_rd_shrink_ms * 3.0 { 2 } else { 1 };
+                adaptive_rd_cap = (adaptive_rd_cap - step).max(adaptive_rd_min);
+                adaptive_rd_good_streak = 0; // a heavy frame breaks the grow streak
+                log::info!("[adaptive_rd] frame {:.0}ms -> render-distance cap {}", dt_ms, adaptive_rd_cap);
+            } else if dt_ms < adaptive_rd_grow_ms && adaptive_rd_cap < 32 {
+                // Only grow after a run of consecutive good frames, and never more
+                // than +1 per grow — so adding a ring can't pile onto a fresh spike.
+                adaptive_rd_good_streak += 1;
+                if adaptive_rd_good_streak >= adaptive_rd_grow_streak {
+                    adaptive_rd_good_streak = 0;
+                    adaptive_rd_cap += 1;
+                    log::debug!("[adaptive_rd] frame {:.0}ms -> render-distance cap {} (grew)", dt_ms, adaptive_rd_cap);
+                }
+            } else {
+                // a middling frame (between grow and shrink) neither grows nor resets
+                // hard — let the streak hold so brief jitter doesn't stall the ramp.
+            }
+            // Apply immediately on this cadence (the %15 slider block below is far
+            // too slow to react when the frame rate has already collapsed).
+            let effective_rd = renderer.ui_render_distance.min(adaptive_rd_cap).max(2);
+            unendlich_engine::constants::set_render_distance_override(effective_rd);
+        }
         // rNNN: WEATHER SIM readout — every ~2s, sample the physical weather for
         // the player's column and log it (no gameplay/render side effects).
         // effective_temp falls with altitude and drifts with the game-clock
@@ -3254,12 +3938,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             );
             // °C → [0,1] base temp (−10 °C → 0, 30 °C → 1) for the climate core.
             let base_temp = ((clim.temperature_c + 10.0) / 40.0).clamp(0.0, 1.0);
-            let day_of_year = world_clock_elapsed / 1440.0; // 1440 game-min per day
+            last_climate_temp_c = clim.temperature_c as f32; // r492: rain-vs-snow input
+            let day_of_year = season_day; // r495: season-offset adjustable
             // Run the REAL climate composition (season offset + snow line + cover).
             let surface = unendlich_engine::world::climate_surface::resolve(
                 unendlich_engine::world::climate_surface::ColumnClimate {
                     day_of_year,
-                    year_length: 360.0,
+                    year_length: season_days_per_year,
                     seasonal_amplitude: 0.3,
                     base_temp,
                     precip: clim.moisture01,
@@ -3522,6 +4207,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // O(active dragons) scan; dragons are rare so this is a
                     // handful of checks at most.
                     if matches!(kind, unendlich_engine::item::CreatureKind::Dragon) {
+                        // r545 (Roll 2 / B3): hard cap on concurrent dragons so heavy
+                        // seeds don't swarm the player (operator note r441). The 220u
+                        // spacing below stops clustering; this caps the global count.
+                        // Tunable via UNENDLICH_MAX_DRAGONS (default 6).
+                        let max_dragons = std::env::var("UNENDLICH_MAX_DRAGONS")
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            .unwrap_or(6);
+                        let dragon_count = roamers
+                            .iter()
+                            .filter(|r| {
+                                matches!(r.kind, unendlich_engine::item::CreatureKind::Dragon)
+                            })
+                            .count();
+                        if dragon_count >= max_dragons {
+                            continue;
+                        }
                         const DRAGON_MIN_SPACING: f32 = 220.0;
                         let too_close = roamers.iter().any(|r| {
                             if !matches!(r.kind, unendlich_engine::item::CreatureKind::Dragon) {
@@ -3746,6 +4448,118 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
         }
+        // r582: AIR-CLEANUP — cut flora + floating tree trunks that are growing on air.
+        // Root cause is the FP32/FP64 surface mismatch (NEXT_SESSION_GUIDE §4a): placement
+        // uses the CPU FP64 surface prediction while the GPU generates voxels in FP32, so
+        // things land where the predicted surface was, not the real one. The proper fix is
+        // to switch placement onto sim::surface_scan::top_solid_y_in_chunk (reads the actual
+        // top solid voxel — handoff/HANDOFF_world_surface.md); physics-anchored plants come
+        // later. Until then this budgeted pass removes the visible offenders near the player.
+        if air_cleanup_enabled && mouse_captured && frame_count % air_cleanup_interval == 73 {
+            use unendlich_engine::world::blocks::BlockId as B;
+            let pp = local_player.view.position;
+            let (pxi, pyi, pzi) = (pp.x.floor() as i32, pp.y.floor() as i32, pp.z.floor() as i32);
+            let r = flora_spread_radius.max(2);
+            let base = (frame_count as u64)
+                .wrapping_mul(0x2545_F491_4F6C_DD1D)
+                ^ ((pxi as i64 as u64) << 24)
+                ^ (pzi as i64 as u64);
+            let is_flora = |b: B| matches!(b, B::Flower | B::TallGrass | B::Fern | B::Mushroom);
+            let is_log = |b: B| matches!(b, B::OakLog | B::BirchLog);
+            let no_support = |b: B| matches!(b, B::Air | B::Water);
+            let mut cut = 0u32;
+            for s in 0..(flora_spread_scan as u64 * 2) {
+                if cut >= air_cleanup_budget {
+                    break;
+                }
+                let h = unendlich_engine::util::hash_util::mix64(base ^ s.wrapping_mul(0x9E37_79B9));
+                let ox = (h % (2 * r as u64 + 1)) as i32 - r;
+                let oz = ((h >> 21) % (2 * r as u64 + 1)) as i32 - r;
+                let (bx, bz) = (pxi + ox, pzi + oz);
+                // scan the column around the player's height for something growing on air.
+                for dy in (-14..=14).rev() {
+                    let ay = pyi + dy;
+                    let blk = chunk_manager.block_at(bx, ay, bz);
+                    let below = chunk_manager.block_at(bx, ay - 1, bz);
+                    if is_flora(blk) && no_support(below) {
+                        if chunk_manager.set_block(bx, ay, bz, B::Air) {
+                            cut += 1;
+                        }
+                        break;
+                    }
+                    if is_log(blk) {
+                        // Found a trunk. Walk to its base (lowest connected log) and judge
+                        // its footing. Two distinct conditions:
+                        //   • base on AIR  → a placement artifact (FP surface gap): cut whole.
+                        //   • base in WATER → genome decides. An aquatic lineage (rare, ~10%)
+                        //     belongs there (mangrove-like) and is spared; any other lineage
+                        //     ROTS — one crown layer removed per cleanup cycle — so it dies
+                        //     back gradually and organically instead of vanishing at once.
+                        let mut base_y = ay;
+                        let mut g = 0;
+                        while is_log(chunk_manager.block_at(bx, base_y - 1, bz)) && g < 48 {
+                            base_y -= 1;
+                            g += 1;
+                        }
+                        let base_below = chunk_manager.block_at(bx, base_y - 1, bz);
+                        let water_beside = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+                            .iter()
+                            .any(|&(dx, dz)| {
+                                chunk_manager.block_at(bx + dx, base_y, bz + dz) == B::Water
+                            });
+                        let in_water = base_below == B::Water || water_beside;
+                        let floating = base_below == B::Air;
+                        if floating {
+                            // placement artifact — remove the whole floating trunk + leaves
+                            let mut yy = base_y;
+                            let mut guard = 0;
+                            while is_log(chunk_manager.block_at(bx, yy, bz)) && guard < 48 {
+                                for (dx, dz) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                                    let nb = chunk_manager.block_at(bx + dx, yy, bz + dz);
+                                    if matches!(nb, B::OakLeaves | B::BirchLeaves) || is_log(nb) {
+                                        let _ =
+                                            chunk_manager.set_block(bx + dx, yy, bz + dz, B::Air);
+                                    }
+                                }
+                                yy += 1;
+                                guard += 1;
+                            }
+                            cut += 1;
+                            water_dirty = true;
+                        } else if in_water {
+                            let genes = unendlich_engine::sim::plant_survival::SurvivalGenes::from_seed(
+                                (bx as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                                    ^ ((bz as i64 as u64) << 1),
+                            );
+                            if !genes.is_aquatic() {
+                                // ROT: strip the topmost log layer (+ its hugging leaves).
+                                let mut top_y = base_y;
+                                let mut guard = 0;
+                                while is_log(chunk_manager.block_at(bx, top_y + 1, bz)) && guard < 48
+                                {
+                                    top_y += 1;
+                                    guard += 1;
+                                }
+                                for (dx, dz) in [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)] {
+                                    let nb = chunk_manager.block_at(bx + dx, top_y, bz + dz);
+                                    if matches!(nb, B::OakLeaves | B::BirchLeaves) || is_log(nb) {
+                                        let _ =
+                                            chunk_manager.set_block(bx + dx, top_y, bz + dz, B::Air);
+                                    }
+                                }
+                                cut += 1;
+                                water_dirty = true;
+                            }
+                            // aquatic lineage → leave it standing (a water-loving tree)
+                        }
+                        break; // a trunk owns this column — judged, move on
+                    }
+                }
+            }
+            if cut > 0 {
+                log::info!("[flora] cleared {} plant(s)/tree(s) that were growing on air", cut);
+            }
+        }
         // r450: FLORA SPREAD — surface plants seed nearby suitable ground using the
         // sim::flora_spread core (plant_propagation dispersal × plant_growth_env viability).
         // Knobs declared near plant_stride. Budgeted + strided; default ON.
@@ -3797,7 +4611,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     }
                 }
                 let light01 = (1.0 - blocked as f32 / 16.0).clamp(0.0, 1.0);
-                let cond = Conditions { moisture01: moisture, light01, temp_c, season01: 0.5 };
+                let cond = Conditions { moisture01: moisture, light01, temp_c, season01: current_season01 };
                 let (tol, ground_ok): (_, fn(B) -> bool) = match blk {
                     B::Mushroom => (
                         fs::mushroom_tolerance(),
@@ -3827,11 +4641,31 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         break;
                     }
                     let (tx, tz) = (t[0], t[1]);
-                    for dy in (-3..=3).rev() {
+                    for dy in (-5..=5).rev() {
                         let ay = *by + dy;
                         let here = chunk_manager.block_at(tx, ay, tz);
                         let below = chunk_manager.block_at(tx, ay - 1, tz);
                         if matches!(here, B::Air) && ground_ok(below) {
+                            // r578: SPACING / COMPETITION — don't carpet every cell. Count
+                            // the plant neighbours around this spot (8 at the same height);
+                            // if it's already crowded, leave a GAP instead of filling solid.
+                            // Keeps the world lush but patchy and WALKABLE, and makes the
+                            // spread self-limiting (it stops pushing into dense patches).
+                            let mut neigh = 0i32;
+                            for (dx, dz) in [
+                                (-1, 0), (1, 0), (0, -1), (0, 1),
+                                (-1, -1), (-1, 1), (1, -1), (1, 1),
+                            ] {
+                                if matches!(
+                                    chunk_manager.block_at(tx + dx, ay, tz + dz),
+                                    B::Flower | B::TallGrass | B::Fern | B::Mushroom
+                                ) {
+                                    neigh += 1;
+                                }
+                            }
+                            if neigh >= 3 {
+                                break; // crowded — keep a walkable gap here
+                            }
                             if chunk_manager.set_block(tx, ay, tz, *blk) {
                                 placed += 1;
                             }
@@ -3853,12 +4687,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let m = chunk_manager.model_arc();
             let pp = local_player.view.position;
             let (pxi, pyi, pzi) = (pp.x.floor() as i32, pp.y.floor() as i32, pp.z.floor() as i32);
-            // 1) ADVANCE each sapling; collect the ones that matured or were removed by the player.
-            let mut matured: Vec<usize> = Vec::new();
-            let mut invalid: Vec<usize> = Vec::new();
-            for (idx, (pos, st)) in session.saplings.iter_mut().enumerate() {
+            // 1) ADVANCE each sapling — OakLog cells in the persistent flora store. r519: saplings
+            //    were migrated out of the in-memory session.saplings into `flora`, so they now
+            //    persist across save/load like crops. Crops share the store but are advanced by the
+            //    farming tick (filtered out here by block type).
+            let oak = B::OakLog as u8;
+            let mut matured: Vec<[i32; 3]> = Vec::new();
+            let mut invalid: Vec<[i32; 3]> = Vec::new();
+            for (pos_ref, cell) in session.flora.iter_mut() {
+                if cell.block != oak {
+                    continue;
+                }
+                let pos = *pos_ref;
                 if !matches!(chunk_manager.block_at(pos[0], pos[1], pos[2]), B::OakLog) {
-                    invalid.push(idx);
+                    invalid.push(pos);
                     continue;
                 }
                 let h = (m.humidity(pos[0] as f64, pos[1] as f64, pos[2] as f64, 0.0) as f32)
@@ -3872,15 +4714,51 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     }
                 }
                 let l = (1.0 - blocked as f32 / 12.0).clamp(0.0, 1.0);
-                let step = pg::advance(*st, &pg::Fields { h, r, l, s: 0.0, b: 0.0 }, sapling_dt);
-                *st = step.state;
-                if step.event == pg::GrowthEvent::Matured || st.stage >= pg::FINAL_STAGE {
-                    matured.push(idx);
+                let st = pg::PlantState {
+                    growth01: cell.growth01, stage: cell.stage, element: cell.element, vigor: cell.vigor,
+                };
+                let step = pg::advance(st, &pg::Fields { h, r, l, s: 0.0, b: 0.0 }, sapling_dt);
+                cell.growth01 = step.state.growth01;
+                cell.stage = step.state.stage;
+                cell.element = step.state.element;
+                cell.vigor = step.state.vigor;
+                if step.event == pg::GrowthEvent::Matured || cell.stage >= pg::FINAL_STAGE {
+                    matured.push(pos);
                 }
             }
-            // 2) grow matured session.saplings into trees (positions read after the mut-borrow ends).
-            let grow: Vec<[i32; 3]> = matured.iter().map(|&i| session.saplings[i].0).collect();
-            for pos in grow {
+            if !matured.is_empty() || !invalid.is_empty() {
+                session.flora.mark_dirty();
+            }
+            // 2) grow matured saplings into trees.
+            for &pos in &matured {
+                // r578: COMPETITION — a sapling that matured while an established tree
+                // grew up close to it loses the contest for light/space: it does NOT
+                // become a tree (it's removed below). Combined with the spacing gate at
+                // planting, dense patches thin toward well-spaced canopies over time.
+                let spacing = 6i32;
+                let mut crowded = false;
+                'm: for ddz in -spacing..=spacing {
+                    for ddx in -spacing..=spacing {
+                        if ddx == 0 && ddz == 0 {
+                            continue; // skip the sapling's own column
+                        }
+                        if ddx * ddx + ddz * ddz > spacing * spacing {
+                            continue;
+                        }
+                        for hy in 0..=4 {
+                            if matches!(
+                                chunk_manager.block_at(pos[0] + ddx, pos[1] + hy, pos[2] + ddz),
+                                B::OakLog | B::BirchLog
+                            ) {
+                                crowded = true;
+                                break 'm;
+                            }
+                        }
+                    }
+                }
+                if crowded {
+                    continue; // lost the competition — removed below, no tree grown
+                }
                 let temp = m.temperature(pos[0] as f64, pos[1] as f64, pos[2] as f64, 0.0) as f32;
                 let species = if temp < 5.0 { FloraSpecies::Conifer } else { FloraSpecies::Broadleaf };
                 let mut placed = 0u32;
@@ -3895,16 +4773,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     log::info!("[flora] a sapling matured into a tree ({placed} blocks)");
                 }
             }
-            // 3) drop matured + invalid (descending index so swap_remove stays valid).
-            let mut rm: Vec<usize> = matured;
-            rm.extend(invalid);
-            rm.sort_unstable();
-            rm.dedup();
-            for &i in rm.iter().rev() {
-                session.saplings.swap_remove(i);
+            // 3) remove matured + invalid saplings from the store.
+            for pos in matured.iter().chain(invalid.iter()) {
+                session.flora.remove(*pos);
             }
             // 4) occasionally plant a new sapling on open grass/dirt near the player.
-            if session.saplings.len() < sapling_cap {
+            let sapling_count = session.flora.iter().filter(|(_, c)| c.block == oak).count();
+            if sapling_count < sapling_cap {
                 let hh = unendlich_engine::util::hash_util::mix64(
                     (frame_count as u64).wrapping_mul(0xA24B_9D7F)
                         ^ ((pxi as i64 as u64) << 16)
@@ -3915,28 +4790,137 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let ox = (hh % (2 * rad + 1)) as i32 - rad as i32;
                     let oz = ((hh >> 20) % (2 * rad + 1)) as i32 - rad as i32;
                     let (bx, bz) = (pxi + ox, pzi + oz);
-                    for dy in (-6..=8).rev() {
+                    for dy in (-12..=12).rev() {
                         let ay = pyi + dy;
                         let here = chunk_manager.block_at(bx, ay, bz);
                         let below = chunk_manager.block_at(bx, ay - 1, bz);
                         if matches!(here, B::Air) && matches!(below, B::Grass | B::Dirt) {
+                            // r578: TREE COMPETITION (spacing) — a sapling only takes root
+                            // in OPEN ground. Scan a radius for existing trunks; if a tree is
+                            // already close, skip, so trees end up spaced apart instead of
+                            // clumping into impassable thickets. ~6-block spacing.
+                            let spacing = 6i32;
+                            let mut crowded = false;
+                            'scan: for ddz in -spacing..=spacing {
+                                for ddx in -spacing..=spacing {
+                                    if ddx * ddx + ddz * ddz > spacing * spacing {
+                                        continue;
+                                    }
+                                    for hy in 0..=3 {
+                                        if matches!(
+                                            chunk_manager.block_at(bx + ddx, ay + hy, bz + ddz),
+                                            B::OakLog | B::BirchLog
+                                        ) {
+                                            crowded = true;
+                                            break 'scan;
+                                        }
+                                    }
+                                }
+                            }
+                            if crowded {
+                                break; // a tree already owns this spot — no new sapling
+                            }
                             let clear =
                                 (1..=6).all(|u| matches!(chunk_manager.block_at(bx, ay + u, bz), B::Air));
                             if clear && chunk_manager.set_block(bx, ay, bz, B::OakLog) {
-                                session.saplings.push((
-                                    [bx, ay, bz],
-                                    pg::PlantState {
-                                        growth01: 0.02,
-                                        stage: 0,
-                                        element: ((hh >> 40) % 6) as u8,
-                                        vigor: 0.4 + ((hh >> 48) % 100) as f32 / 250.0,
-                                    },
-                                ));
+                                let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
+                                    oak, frame_count,
+                                );
+                                fc.element = ((hh >> 40) % 6) as u8;
+                                fc.vigor = 0.4 + ((hh >> 48) % 100) as f32 / 250.0;
+                                session.flora.plant([bx, ay, bz], fc);
                             }
                             break;
                         }
                     }
                 }
+            }
+        }
+        // r512/r514: FARMING — advance planted crops in the persistent flora store via
+        // sim::plant_growth (climate-driven, like saplings). Ripe at FINAL_STAGE; crops whose
+        // host block was removed/changed drop out of tracking. Mutated growth is marked dirty so
+        // it gets saved. Runs in both modes.
+        if mouse_captured && frame_count % 90 == 41 && !session.flora.is_empty() {
+            use unendlich_engine::sim::plant_growth as pg;
+            let m = chunk_manager.model_arc();
+            let mut remove: Vec<[i32; 3]> = Vec::new();
+            let mut ripened: Vec<[i32; 3]> = Vec::new();
+            for (pos_ref, cell) in session.flora.iter_mut() {
+                // r519: only crops grow here — saplings (OakLog cells) share the store but are
+                // advanced by the sapling tick above.
+                if !matches!(
+                    cell.block,
+                    c if c == BlockId::Carrot as u8
+                        || c == BlockId::Potato as u8
+                        || c == BlockId::Cabbage as u8
+                        || c == BlockId::Sprout as u8
+                ) {
+                    continue;
+                }
+                let pos = *pos_ref;
+                if chunk_manager.block_at(pos[0], pos[1], pos[2]) as u8 != cell.block {
+                    remove.push(pos);
+                    continue;
+                }
+                let h = (m.humidity(pos[0] as f64, pos[1] as f64, pos[2] as f64, 0.0) as f32)
+                    .clamp(0.0, 1.0);
+                let temp_c = m.temperature(pos[0] as f64, pos[1] as f64, pos[2] as f64, 0.0) as f32;
+                let r = (temp_c / 30.0).clamp(0.0, 1.0);
+                let mut blocked = 0i32;
+                for up in 1..=8 {
+                    if !matches!(chunk_manager.block_at(pos[0], pos[1] + up, pos[2]), BlockId::Air) {
+                        blocked += 1;
+                    }
+                }
+                let l = (1.0 - blocked as f32 / 8.0).clamp(0.0, 1.0);
+                let was_ripe = cell.stage >= pg::FINAL_STAGE;
+                let st = pg::PlantState {
+                    growth01: cell.growth01,
+                    stage: cell.stage,
+                    element: cell.element,
+                    vigor: cell.vigor,
+                };
+                // r522: the seed's genome sets its growth pace — a high growth_rate gene ripens
+                // noticeably faster, so bred lines pay off in time as well as yield.
+                let g = unendlich_engine::sim::plant_tree_genetics::PlantGenome::from_array(cell.genome);
+                let dt = 0.5 * (0.6 + g.growth_rate * 0.8);
+                let step = pg::advance(st, &pg::Fields { h, r, l, s: 0.0, b: 0.0 }, dt);
+                cell.growth01 = step.state.growth01;
+                cell.stage = step.state.stage;
+                cell.vigor = step.state.vigor;
+                // (element is preserved — for a Sprout it encodes the target crop, 0/1/2.)
+                // r520: once a seedling is established (stage ≥ 2) it becomes its real crop block,
+                // so the field visibly progresses sprout → plant → ripe.
+                if cell.block == BlockId::Sprout as u8 && cell.stage >= 2 {
+                    let crop = match cell.element {
+                        1 => BlockId::Potato,
+                        2 => BlockId::Cabbage,
+                        _ => BlockId::Carrot,
+                    };
+                    if chunk_manager.set_block(pos[0], pos[1], pos[2], crop) {
+                        cell.block = crop as u8;
+                        log::info!("[farm] a seedling at ({},{},{}) grew into {:?}", pos[0], pos[1], pos[2], crop);
+                    }
+                }
+                if !was_ripe && cell.stage >= pg::FINAL_STAGE {
+                    ripened.push(pos);
+                }
+            }
+            for p in &remove {
+                session.flora.remove(*p);
+            }
+            session.flora.mark_dirty();
+            for p in ripened {
+                log::info!("[farm] crop at ({},{},{}) is ripe — harvest it for a yield", p[0], p[1], p[2]);
+            }
+        }
+        // r514: persist the flora store to disk on a cadence when it has unsaved changes
+        // (planted / harvested / grown). Atomic write; cheap because the store is sparse.
+        if frame_count % 1800 == 137 && session.flora.take_dirty() {
+            if let Err(e) = session.flora.save(&flora_root) {
+                log::warn!("[farm] failed to save flora state: {}", e);
+            } else {
+                log::debug!("[farm] persisted {} crop(s)", session.flora.len());
             }
         }
         // r455: PIONEER FLORA — climate-driven decoration variety (sim::pioneer_flora) using blocks
@@ -3963,7 +4947,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let ox = (h % (2 * r + 1)) as i32 - r as i32;
                 let oz = ((h >> 20) % (2 * r + 1)) as i32 - r as i32;
                 let (bx, bz) = (pxi + ox, pzi + oz);
-                for dy in (-6..=8).rev() {
+                for dy in (-12..=12).rev() {
                     let ay = pyi + dy;
                     let here = chunk_manager.block_at(bx, ay, bz);
                     let below = chunk_manager.block_at(bx, ay - 1, bz);
@@ -3982,6 +4966,61 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             }
             if placed > 0 {
                 log::info!("[flora] {placed} pioneer plant(s) colonised bare ground");
+            }
+        }
+        // r516: CAVE ENRICHMENT — seed ore into exposed cave stone near the player. The GPU
+        // world generator can't be edited here, so (like pioneer flora) this is a budgeted CPU
+        // pass: probe random cells underground, and where plain Stone faces Air (a cave wall)
+        // below sea level, depth-weighted sim::cave_ore picks an ore (rare; richer deeper). The
+        // CPU mesher renders it, so it's visible regardless of the worldgen backend.
+        if mouse_captured && frame_count % 67 == 17 {
+            use unendlich_engine::world::blocks::BlockId as B;
+            let sea = unendlich_engine::constants::SEA_LEVEL as i32;
+            let pp = local_player.view.position;
+            let (pxi, pyi, pzi) = (pp.x.floor() as i32, pp.y.floor() as i32, pp.z.floor() as i32);
+            // Only bother when the player is below the surface (in/near caves).
+            if pyi < sea - 3 {
+                let base = unendlich_engine::util::hash_util::mix64(
+                    (frame_count as u64).wrapping_mul(0x2545_F491)
+                        ^ ((pxi as i64 as u64) << 8)
+                        ^ (pzi as i64 as u64),
+                );
+                let mut placed = 0u32;
+                for s in 0..20u64 {
+                    if placed >= 2 {
+                        break;
+                    }
+                    let h = unendlich_engine::util::hash_util::mix64(base ^ s.wrapping_mul(0x9E37_79B9));
+                    let r = 14u64;
+                    let ox = (h % (2 * r + 1)) as i32 - r as i32;
+                    let oy = ((h >> 16) % (2 * r + 1)) as i32 - r as i32;
+                    let oz = ((h >> 32) % (2 * r + 1)) as i32 - r as i32;
+                    let (bx, by, bz) = (pxi + ox, pyi + oy, pzi + oz);
+                    if chunk_manager.block_at(bx, by, bz) != B::Stone {
+                        continue;
+                    }
+                    // Must be a cave wall: at least one face-neighbor is Air (exposed surface).
+                    let exposed = matches!(chunk_manager.block_at(bx + 1, by, bz), B::Air)
+                        || matches!(chunk_manager.block_at(bx - 1, by, bz), B::Air)
+                        || matches!(chunk_manager.block_at(bx, by + 1, bz), B::Air)
+                        || matches!(chunk_manager.block_at(bx, by - 1, bz), B::Air)
+                        || matches!(chunk_manager.block_at(bx, by, bz + 1), B::Air)
+                        || matches!(chunk_manager.block_at(bx, by, bz - 1), B::Air);
+                    if !exposed {
+                        continue;
+                    }
+                    let depth = sea - by;
+                    let roll = ((h >> 48) & 0xFFFF) as f32 / 65535.0;
+                    if let Some(ore) = unendlich_engine::sim::cave_ore::ore_for(depth, roll) {
+                        if chunk_manager.set_block(bx, by, bz, ore) {
+                            placed += 1;
+                        }
+                    }
+                }
+                if placed > 0 {
+                    water_dirty = true;
+                    log::debug!("[cave] enriched {placed} cave wall(s) with ore");
+                }
             }
         }
         // r471: quench sites collected this frame → injected into the smoke field as steam puffs below.
@@ -4389,6 +5428,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     "left water"
                 });
             }
+            // r545 (Roll 3 / C2): THIRST. Drink while standing in water (feet in a
+            // water block); otherwise dehydrate — faster while sprinting. Player
+            // drain is scaled down from the dragon constant (×0.3 ⇒ ~2.8 min idle)
+            // so it's a periodic chore. Parched (<20%) saps vitality, feeding the
+            // existing starvation/death loop without a separate death path.
+            {
+                if in_water {
+                    fg_hydration.drink(dt);
+                } else {
+                    let exertion = if fg_app.stamina().sprinting { 1.0 } else { 0.0 };
+                    fg_hydration.tick(dt * 0.3, exertion);
+                }
+                if fg_hydration.is_parched() {
+                    fg_app.vitality_mut().tick(dt, 0.012);
+                }
+            }
             // r123 (worker Phase 7 port): EXPOSURE from the REAL climate model
             // (model.temperature, the same source as the per-window climate log),
             // not a made-up depth formula. T is normalized ~[0,1]; outside the
@@ -4476,7 +5531,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
             }
             let drain = if survival_mode {
-                (if in_water { 0.02 } else { 0.01 }) + exposure
+                // r563: metabolic hunger scales with stature (Kleiber — bigger bodies
+                // burn more); exposure is environmental and left unscaled.
+                (if in_water { 0.02 } else { 0.01 }) * player_stature.hunger_rate + exposure
             } else {
                 0.0
             };
@@ -4494,13 +5551,43 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let p = r.creature.body.position;
                     let d2 = (p[0] - pp.x).powi(2) + (p[1] - pp.y).powi(2) + (p[2] - pp.z).powi(2);
                     if d2 < 1.6 * 1.6 {
-                        fg_app.vitality_mut().tick(1.0, 0.04);
+                        fg_app.vitality_mut().tick(1.0, 0.04 * player_dmg_resist);
                         log::info!(
                             "[combat] {:?} bites you — vitality {:.0}%",
                             r.kind, fg_app.vitality().energy * 100.0
                         );
                         break; // one bite per window
                     }
+                }
+            }
+            // r510: COOKING — hold RAW meat near a fire and it roasts over COOK_TIME into
+            // cooked meat (the proper meal). Uses the live heat field (fires + lava) so any
+            // heat source works: F9 campfire, a Fire-bending bloom, or standing by lava. The
+            // progress decays when you step away or stop holding meat, so it's a deliberate act.
+            if survival_mode {
+                let holding_raw = hand_item.map_or(false, |h| h.0 == MEAT_ITEM)
+                    && fg_app.inventory().count(unendlich_engine::items::ItemId(MEAT_ITEM)) > 0;
+                let pp = local_player.view.position;
+                let heat_near = heat_sources.total_heat_at(pp.x, pp.y, pp.z);
+                if holding_raw && heat_near > 3.0 {
+                    cook_progress += dt;
+                    if cook_progress >= COOK_TIME {
+                        cook_progress = 0.0;
+                        if fg_app.inventory_mut().remove_item(
+                            unendlich_engine::items::ItemId(MEAT_ITEM), 1,
+                        ) == 0 {
+                            fg_app.inventory_mut().add_item(
+                                unendlich_engine::items::ItemId(COOKED_MEAT_ITEM),
+                                1,
+                                &fg_item_registry,
+                            );
+                            log::info!("[cooking] the meat sizzles over the fire — cooked! (eat it for more vitality)");
+                        }
+                    } else if frame_count % 30 == 0 {
+                        log::info!("[cooking] roasting… {:.0}%", cook_progress / COOK_TIME * 100.0);
+                    }
+                } else if cook_progress > 0.0 {
+                    cook_progress = (cook_progress - dt * 2.0).max(0.0); // cools when you step away
                 }
             }
             // r125: DEATH at zero vitality (survival only) — drop everything
@@ -4544,7 +5631,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // heat / wind samples. The resolved EffectIntent acts on the
             // world: Earth raises a stone pillar at the aim point, Fire
             // plants a heat source, strikes damage the aimed creature.
-            if input.is_key_pressed(Keycode::B) {
+            if bindings.is_action_pressed(GameAction::Bend, &input)
+                || bindings.is_action_pressed_mouse(GameAction::Bend, &input)
+            {
                 use unendlich_engine::sim::gesture_resolve::{Directional, Element as GElem, Gesture, Stance};
                 let pp = local_player.view.position;
                 let m = chunk_manager.model_arc();
@@ -4628,6 +5717,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 } else {
                     GElem::Earth
                 };
+                // r534: BENDING SEPARATION — a hero character (Heliographer, Tidecaller,
+                // Windwalker, Stormweaver, Gravitybender) bends its OWN element regardless
+                // of surroundings. Ordinary characters keep the environment-derived element.
+                let element = unendlich_engine::player_character::bend_element(&active_character.name)
+                    .unwrap_or(element);
                 let pitch_up = cam_pitch_for_bend(&local_player);
                 let dir = if pitch_up > 0.5 {
                     Directional::Lift
@@ -4764,7 +5858,149 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 [fx, fy, fz], 400.0 * (0.5 + intent.power01), 4.0,
                             ));
                             session.fire_positions.push([fx, fy, fz]);
-                            log::info!("[bending] thermal bloom at ({:.0},{:.0})", fx, fz);
+                            // r532: thermal-phase payload — the heat MELTS nearby ice into
+                            // water and sublimates snow, a visible phase change scaled by power.
+                            let rad = 2 + (intent.power01 * 2.0) as i32; // 2..4 blocks
+                            let (cx, cy, cz) = (fx.floor() as i32, fy.floor() as i32, fz.floor() as i32);
+                            let mut melted = 0u32;
+                            for dy in -2..=2 {
+                                for dz in -rad..=rad {
+                                    for dx in -rad..=rad {
+                                        let (bx, by, bz) = (cx + dx, cy + dy, cz + dz);
+                                        match chunk_manager.block_at(bx, by, bz) {
+                                            BlockId::Ice => {
+                                                if chunk_manager.set_block(bx, by, bz, BlockId::Water) {
+                                                    melted += 1;
+                                                }
+                                            }
+                                            BlockId::SnowBlock => {
+                                                if chunk_manager.set_block(bx, by, bz, BlockId::Air) {
+                                                    melted += 1;
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            if melted > 0 {
+                                renderer.hud_status_lines.push(format!("thermal phase melted {}", melted));
+                            }
+                            log::info!("[bending] thermal bloom at ({:.0},{:.0}), melted {}", fx, fz, melted);
+                        }
+                        Discipline::Stormstrike => {
+                            // r556: STORMSTRIKE (Air → lightning) — route a chaining bolt
+                            // through the most-conductive creatures in the aim cone via the
+                            // bending_stormstrike core; mis-aiming grounds on the bender and
+                            // saps stamina. A gust follows so close targets are also shoved.
+                            use unendlich_engine::sim::bending_stormstrike as ss;
+                            let conductors: Vec<ss::Conductor> = roamers
+                                .iter()
+                                .map(|r| ss::Conductor {
+                                    pos: r.creature.body.position,
+                                    conductance01: (0.45 + (r.hp as f32 / 50.0)
+                                        + if r.airborne.is_some() { 0.25 } else { 0.0 }).clamp(0.0, 1.0),
+                                    is_self: false,
+                                })
+                                .collect();
+                            let plan = ss::route(
+                                [pp.x, pp.y, pp.z],
+                                [aimv.x, aimv.y, aimv.z],
+                                &conductors,
+                                2 + (intent.power01 * 3.0) as u8,
+                                8.0,
+                                0.80,
+                            );
+                            let mut struck = 0u32;
+                            for (hop, &ri) in plan.path.iter().enumerate() {
+                                if let Some(r) = roamers.get_mut(ri) {
+                                    let dmg = (((10.0 + intent.power01 * 26.0)
+                                        * 0.78f32.powi(hop as i32)) as i32).max(1);
+                                    r.hp -= dmg;
+                                    r.creature.torso_bend = 0.7 * intent.power01;
+                                    if witness_enabled {
+                                        let vk = match r.kind {
+                                            unendlich_engine::item::CreatureKind::Dinosaur => 1u8,
+                                            unendlich_engine::item::CreatureKind::Dragon => 2u8,
+                                            _ => 0u8,
+                                        };
+                                        attack_events.push((r.creature.body.position, vk));
+                                    }
+                                    struck += 1;
+                                }
+                            }
+                            if plan.grounded_on_self {
+                                fg_app.stamina_mut().level =
+                                    (fg_app.stamina().level - 0.2 * (1.0 + plan.penalty01)).max(0.0);
+                                renderer.hud_status_lines.push("stormstrike grounded — mis-aimed!".to_string());
+                                log::info!("[bending] stormstrike grounded on self (penalty {:.2})", plan.penalty01);
+                            } else {
+                                log::info!("[bending] stormstrike chained {} creature(s)", struck);
+                            }
+                            // a following gust shoves nearby creatures too
+                            use unendlich_engine::sim::bending_compose::{resolve_bend, BendWorld};
+                            use unendlich_engine::sim::bending_targeting::Target;
+                            let targets: Vec<Target> = roamers
+                                .iter()
+                                .map(|r| Target { pos: r.creature.body.position, radius: 0.9 })
+                                .collect();
+                            let mut hit_n = 0u32;
+                            if !targets.is_empty() {
+                                let world = BendWorld::for_targets([pp.x, pp.y, pp.z], &targets, &[]);
+                                let outcome = resolve_bend(&intent, &world, bend_resonance);
+                                for h in &outcome.hits {
+                                    if let Some(r) = roamers.get_mut(h.index) {
+                                        let push = (2.0 + 7.0 * outcome.power_realized01) * h.strength01;
+                                        r.creature.body.velocity[0] += aimv.x * push;
+                                        r.creature.body.velocity[1] += aimv.y * push + 0.6 * h.strength01;
+                                        r.creature.body.velocity[2] += aimv.z * push;
+                                        r.creature.torso_bend = 0.5 * h.strength01;
+                                        hit_n += 1;
+                                    }
+                                }
+                            }
+                            renderer.hud_status_lines.push(format!(
+                                "air gust — {} caught", hit_n
+                            ));
+                            log::info!("[bending] air gust knocked back {} creature(s)", hit_n);
+                        }
+                        Discipline::HeavyBrine => {
+                            // r556: WATERBENDING (HeavyBrine) — a surge that shoves creatures
+                            // back (gentler than air, more horizontal) AND conjures a water
+                            // block at the aimed surface point. (Was wired under a dead
+                            // Elemental(Water) arm; Water resolves to HeavyBrine.)
+                            use unendlich_engine::sim::bending_compose::{resolve_bend, BendWorld};
+                            use unendlich_engine::sim::bending_targeting::Target;
+                            let targets: Vec<Target> = roamers
+                                .iter()
+                                .map(|r| Target { pos: r.creature.body.position, radius: 0.9 })
+                                .collect();
+                            let mut hit_n = 0u32;
+                            if !targets.is_empty() {
+                                let world = BendWorld::for_targets([pp.x, pp.y, pp.z], &targets, &[]);
+                                let outcome = resolve_bend(&intent, &world, bend_resonance);
+                                for h in &outcome.hits {
+                                    if let Some(r) = roamers.get_mut(h.index) {
+                                        let push = (1.5 + 5.0 * outcome.power_realized01) * h.strength01;
+                                        r.creature.body.velocity[0] += aimv.x * push;
+                                        r.creature.body.velocity[2] += aimv.z * push;
+                                        hit_n += 1;
+                                    }
+                                }
+                            }
+                            // Conjure water at the aimed surface (on solid ground, into open air).
+                            let reach = 2.0 + intent.power01 * 5.0;
+                            let bx = (pp.x + aimv.x * reach).floor() as i32;
+                            let bz = (pp.z + aimv.z * reach).floor() as i32;
+                            if let Some(sy0) = chunk_manager.generator().cpu()
+                                .surface_y_at(bx, bz, probe_y_min, probe_y_max)
+                            {
+                                let _ = chunk_manager.set_block(bx, sy0 + 1, bz, BlockId::Water);
+                            }
+                            renderer.hud_status_lines.push(format!(
+                                "water surge — {} caught", hit_n
+                            ));
+                            log::info!("[bending] water surge pushed {} creature(s)", hit_n);
                         }
                         _ => {
                             // Strike disciplines: damage the aimed creature.
@@ -4801,14 +6037,33 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 if roamers[ri].hp <= 0 {
                                     let p = roamers[ri].creature.body.position;
                                     log::info!("[bending] {:?} slain", roamers[ri].kind);
-                                    fg_app.drops_mut().spawn(
-                                        unendlich_engine::items::ItemStack {
-                                            item: unendlich_engine::items::ItemId(MEAT_ITEM),
-                                            count: 1,
-                                        },
-                                        [p[0], p[1] + 0.6, p[2]],
-                                        [0.0, 2.0, 0.0],
-                                    );
+                                    // r501: route death drops through the tested loot_roll
+                                    // core (sim::batch_loot_roll) for varied, table-driven
+                                    // loot instead of a fixed single meat. Bigger creatures
+                                    // (more base hp) yield more meat.
+                                    let seed = (p[0].to_bits() as u64)
+                                        ^ ((p[2].to_bits() as u64) << 21)
+                                        ^ (frame_count as u64).wrapping_mul(0x9E37_79B1);
+                                    let table: [(u16, u32, f32); 4] = [
+                                        (MEAT_ITEM as u16, 1, 1.0),   // always ≥1 meat
+                                        (MEAT_ITEM as u16, 1, 0.6),   // often a 2nd
+                                        (MEAT_ITEM as u16, 1, 0.25),  // sometimes a 3rd
+                                        (999, 1, 0.12),               // occasional egg
+                                    ];
+                                    for (k, (id, count)) in unendlich_engine::sim::batch_loot_roll::loot_one(&table, seed)
+                                        .into_iter()
+                                        .enumerate()
+                                    {
+                                        let a = (seed.wrapping_add(k as u64) & 0xFF) as f32 / 255.0 * 6.2831;
+                                        fg_app.drops_mut().spawn(
+                                            unendlich_engine::items::ItemStack {
+                                                item: unendlich_engine::items::ItemId(id as u32),
+                                                count: count as u16,
+                                            },
+                                            [p[0] + a.cos() * 0.3, p[1] + 0.6, p[2] + a.sin() * 0.3],
+                                            [a.cos() * 1.4, 2.0, a.sin() * 1.4],
+                                        );
+                                    }
                                     roamers.swap_remove(ri);
                                 }
                             } else {
@@ -4831,44 +6086,73 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 // (r170: authority below.)
             }
-            if renderer.craft_menu_open || renderer.craft_pick != 0 {
+            if renderer.craft_menu_open || renderer.craft_pick != 0 || show_inventory {
                 use unendlich_engine::items::{crafting, ItemId, ItemStack};
                 use unendlich_engine::world::blocks::BlockId;
                 let id = |b: BlockId| ItemId(b as u32);
                 // r126: ingots live above the block id space (1000+metal idx).
                 const INGOT_BASE: u32 = 1000;
+                let ing = |b: BlockId, n: u16| (id(b), n);
+                let metal = |idx: u32, n: u16| (ItemId(INGOT_BASE + idx), n);
+                let out = |item: u32, count: u16| ItemStack { item: ItemId(item), count };
+                let out_b = |b: BlockId, count: u16| ItemStack { item: id(b), count };
+                // r552: a real survival crafting tree — smelting, building stock, the
+                // forged WEAPONS (gather→smelt→forge→fight loop) and cooking. Weapon
+                // ids 4000..4007 = Dagger/Blade/Greatsword/Axe/Greataxe/Spear/Staff/
+                // Wand; ingots 1000+idx (Iron/Gold/Copper).
                 let recipes = [
-                    ("1x Iron Ingot from 1 IronOre + 1 CoalOre", crafting::Recipe::new(
-                        vec![(id(BlockId::IronOre), 1), (id(BlockId::CoalOre), 1)],
-                        ItemStack { item: ItemId(INGOT_BASE + 0), count: 1 },
-                    )),
-                    ("1x Gold Ingot from 1 GoldOre + 1 CoalOre", crafting::Recipe::new(
-                        vec![(id(BlockId::GoldOre), 1), (id(BlockId::CoalOre), 1)],
-                        ItemStack { item: ItemId(INGOT_BASE + 1), count: 1 },
-                    )),
-                    ("4x Oak Planks from 1 Oak Log", crafting::Recipe::new(
-                        vec![(id(BlockId::OakLog), 1)],
-                        ItemStack { item: id(BlockId::OakPlanks), count: 4 },
-                    )),
-                    ("1x Stone from 4 Cobblestone", crafting::Recipe::new(
-                        vec![(id(BlockId::Cobblestone), 4)],
-                        ItemStack { item: id(BlockId::Stone), count: 1 },
-                    )),
-                    ("1x Glass from 2 Sand", crafting::Recipe::new(
-                        vec![(id(BlockId::Sand), 2)],
-                        ItemStack { item: id(BlockId::Glass), count: 1 },
-                    )),
+                    // ── smelting ──
+                    ("Iron Ingot  ·  Iron Ore + Coal", crafting::Recipe::new(
+                        vec![ing(BlockId::IronOre, 1), ing(BlockId::CoalOre, 1)], out(INGOT_BASE, 1))),
+                    ("Gold Ingot  ·  Gold Ore + Coal", crafting::Recipe::new(
+                        vec![ing(BlockId::GoldOre, 1), ing(BlockId::CoalOre, 1)], out(INGOT_BASE + 1, 1))),
+                    ("Copper Ingot  ·  Copper Ore + Coal", crafting::Recipe::new(
+                        vec![ing(BlockId::CopperOre, 1), ing(BlockId::CoalOre, 1)], out(INGOT_BASE + 2, 1))),
+                    // ── wood & stone building stock ──
+                    ("Oak Planks ×4  ·  1 Oak Log", crafting::Recipe::new(
+                        vec![ing(BlockId::OakLog, 1)], out_b(BlockId::OakPlanks, 4))),
+                    ("Stone  ·  4 Cobblestone", crafting::Recipe::new(
+                        vec![ing(BlockId::Cobblestone, 4)], out_b(BlockId::Stone, 1))),
+                    ("Stone Bricks ×4  ·  4 Stone", crafting::Recipe::new(
+                        vec![ing(BlockId::Stone, 4)], out_b(BlockId::StoneBricks, 4))),
+                    ("Glass  ·  2 Sand", crafting::Recipe::new(
+                        vec![ing(BlockId::Sand, 2)], out_b(BlockId::Glass, 1))),
+                    ("Bricks  ·  1 Clay", crafting::Recipe::new(
+                        vec![ing(BlockId::Clay, 1)], out_b(BlockId::Bricks, 1))),
+                    // ── forged weapons (ingots + a plank handle) ──
+                    ("Dagger  ·  1 Iron Ingot + 1 Planks", crafting::Recipe::new(
+                        vec![metal(0, 1), ing(BlockId::OakPlanks, 1)], out(4000, 1))),
+                    ("Blade  ·  2 Iron Ingot + 1 Planks", crafting::Recipe::new(
+                        vec![metal(0, 2), ing(BlockId::OakPlanks, 1)], out(4001, 1))),
+                    ("Greatsword  ·  3 Iron Ingot + 1 Planks", crafting::Recipe::new(
+                        vec![metal(0, 3), ing(BlockId::OakPlanks, 1)], out(4002, 1))),
+                    ("Axe  ·  2 Iron Ingot + 2 Planks", crafting::Recipe::new(
+                        vec![metal(0, 2), ing(BlockId::OakPlanks, 2)], out(4003, 1))),
+                    ("Greataxe  ·  3 Iron Ingot + 2 Planks", crafting::Recipe::new(
+                        vec![metal(0, 3), ing(BlockId::OakPlanks, 2)], out(4004, 1))),
+                    ("Spear  ·  1 Iron Ingot + 2 Planks", crafting::Recipe::new(
+                        vec![metal(0, 1), ing(BlockId::OakPlanks, 2)], out(4005, 1))),
+                    ("Staff  ·  1 Gold Ingot + 2 Planks", crafting::Recipe::new(
+                        vec![metal(1, 1), ing(BlockId::OakPlanks, 2)], out(4006, 1))),
+                    ("Builder Wand  ·  1 Gold Ingot + 1 Glass", crafting::Recipe::new(
+                        vec![metal(1, 1), ing(BlockId::Glass, 1)], out(4007, 1))),
+                    // ── cooking (campfire alternative) ──
+                    ("Cooked Meat  ·  Raw Meat + Coal", crafting::Recipe::new(
+                        vec![(ItemId(2000), 1), ing(BlockId::CoalOre, 1)], out(2001, 1))),
                 ];
-                // r141: the REAL sim::recipe_book indexes recipes by
-                // ingredient; holding an item prioritizes recipes using it.
-                let rb_id = |b: BlockId| unendlich_engine::sim::recipe_book::ItemId(b as u16);
-                let book = unendlich_engine::sim::recipe_book::RecipeBook::build(&[
-                    vec![rb_id(BlockId::IronOre), rb_id(BlockId::CoalOre)],
-                    vec![rb_id(BlockId::GoldOre), rb_id(BlockId::CoalOre)],
-                    vec![rb_id(BlockId::OakLog)],
-                    vec![rb_id(BlockId::Cobblestone)],
-                    vec![rb_id(BlockId::Sand)],
-                ]);
+                // r141/r552: the REAL sim::recipe_book indexes recipes by ingredient
+                // so holding an item floats its recipes to the top. Built from the
+                // recipe inputs above so the index always matches the table.
+                let book_sets: Vec<Vec<unendlich_engine::sim::recipe_book::ItemId>> = recipes
+                    .iter()
+                    .map(|(_, r)| {
+                        r.inputs
+                            .iter()
+                            .map(|(iid, _)| unendlich_engine::sim::recipe_book::ItemId(iid.0 as u16))
+                            .collect()
+                    })
+                    .collect();
+                let book = unendlich_engine::sim::recipe_book::RecipeBook::build(&book_sets);
                 let preferred: Vec<usize> = hand_item
                     .map(|h| {
                         book.find_by_ingredient(
@@ -4898,6 +6182,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             "Stone\nYield: 1 per 4 cobble\nDressed block; even faces\n\n\u{201c}Patience is a mason\u{2019}s first tool.\u{201d}\n\u{2014} Field record, Carrier designation 7".to_string(),
                         o if o == unendlich_engine::world::blocks::BlockId::Glass as u32 =>
                             "Glass\nYield: 1 per 2 sand\nTransparent; shatters on break\n\n\u{201c}Sand that learned to hold light.\u{201d}\n\u{2014} Shrine fragment, East Wall".to_string(),
+                        1002 => "Copper Ingot\nSmelting yield: 1 per ore + coal\nConducts the imbue; soft but willing".to_string(),
+                        o if o == unendlich_engine::world::blocks::BlockId::StoneBricks as u32 =>
+                            "Stone Bricks ×4\nDressed masonry from 4 stone\nClean courses for walls and keeps".to_string(),
+                        o if o == unendlich_engine::world::blocks::BlockId::Bricks as u32 =>
+                            "Bricks\nFired from clay\nWarm-toned building stock".to_string(),
+                        2001 => "Cooked Meat\nRaw meat seared over coal\nRestores far more than raw — and won't turn".to_string(),
+                        4000 => "Dagger\nFast, light, cheap to forge\n1 Iron Ingot + a plank handle".to_string(),
+                        4001 => "Blade\nBalanced sidearm\n2 Iron Ingot + a plank handle".to_string(),
+                        4002 => "Greatsword\nHeavy two-hander; big swing\n3 Iron Ingot + a plank handle".to_string(),
+                        4003 => "Axe\nHews wood and foe alike\n2 Iron Ingot + 2 planks".to_string(),
+                        4004 => "Greataxe\nBrutal reach and weight\n3 Iron Ingot + 2 planks".to_string(),
+                        4005 => "Spear\nKeeps the danger at arm's length\n1 Iron Ingot + 2 planks".to_string(),
+                        4006 => "Staff\nA channel for the imbue\n1 Gold Ingot + 2 planks".to_string(),
+                        4007 => "Builder Wand\nShapes and places at range\n1 Gold Ingot + 1 Glass".to_string(),
                         _ => "Crafted item\n(no canonical entry yet)".to_string(),
                     }
                 };
@@ -5093,8 +6391,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             leaf_stride_atom.store(renderer.ui_leaf_stride.max(1), std::sync::atomic::Ordering::Relaxed);
             chunk_manager.set_apply_budget(renderer.ui_apply_budget as usize);
             // r197: live render distance — the slider drives the override
-            // atomic that runtime_render_distance() consults first.
-            unendlich_engine::constants::set_render_distance_override(renderer.ui_render_distance);
+            // atomic that runtime_render_distance() consults first. r476: the
+            // adaptive controller caps it BELOW the chosen value under load.
+            let effective_rd = if renderer.ui_adaptive_rd {
+                renderer.ui_render_distance.min(adaptive_rd_cap).max(2)
+            } else {
+                renderer.ui_render_distance
+            };
+            unendlich_engine::constants::set_render_distance_override(effective_rd);
+            // r476: push the live mesh-throttle slider to the global the octree
+            // dispatcher reads each dispatch.
+            unendlich_engine::constants::set_gpu_mesh_yield_pct(renderer.ui_gpu_mesh_yield);
+            unendlich_engine::constants::set_octree_tile(renderer.ui_octree_tile);
         }
 
         // r199: HOTKEY REBINDING (Controls tab). Runs EVERY frame so the
@@ -5113,13 +6421,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // fallback), so a player can SEE that movement also
                     // works on the arrows regardless of letter layout.
                     let keys = bindings.keys_for_action(*action);
-                    let key = if keys.is_empty() {
+                    let mut parts: Vec<String> =
+                        keys.iter().map(|k| keybind_ui::key_label(*k)).collect();
+                    // r528: also show any mouse-button binding (e.g. a side button).
+                    for b in bindings.mouse_buttons_for_action(*action) {
+                        parts.push(keybind_ui::mouse_label(*b));
+                    }
+                    let key = if parts.is_empty() {
                         "—".to_string()
                     } else {
-                        keys.iter()
-                            .map(|k| keybind_ui::key_label(*k))
-                            .collect::<Vec<_>>()
-                            .join(" / ")
+                        parts.join(" / ")
                     };
                     (label.to_string(), key)
                 })
@@ -5154,6 +6465,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             log::warn!("[keybind] save failed: {e}");
                         } else {
                             log::info!("[keybind] {action:?} -> {k:?}");
+                        }
+                    } else {
+                        // r528: no key — try a mouse button (middle / side buttons),
+                        // so abilities like Bending can live on Mouse-4/5.
+                        let mut mbound = None;
+                        for b in keybind_ui::mouse_capture_candidates() {
+                            if input.is_mouse_button_just_pressed(b) {
+                                mbound = Some(b);
+                                break;
+                            }
+                        }
+                        if let Some(b) = mbound {
+                            bindings.set_mouse_binding(action, b);
+                            renderer.keybind_capturing = -1;
+                            if let Err(e) = bindings.save_to_file(&keybinds_path) {
+                                log::warn!("[keybind] save failed: {e}");
+                            } else {
+                                log::info!("[keybind] {action:?} -> {b:?} (mouse)");
+                            }
                         }
                     }
                 }
@@ -5239,7 +6569,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // Find a clear spawn position near the camera so toggling
                 // inside leaves / wall doesn't immediately stick the body.
                 let safe_pos = physics::find_safe_spawn(&chunk_manager, p.x, p.y, p.z);
-                let new_body = PhysicsBody::new_player(safe_pos);
+                let mut new_body = PhysicsBody::new_player(safe_pos);
+                // r561: size the collider to the stature, keeping the feet at the safe
+                // spawn (shift the centre up by the half-height delta vs the 1.8 default).
+                let old_half = new_body.half_extents[1];
+                new_body.half_extents = player_stature.half_extents;
+                new_body.position[1] += player_stature.half_extents[1] - old_half;
+                let center_y = new_body.position[1];
                 log::info!(
                     "Switched to PHYSICS mode at ({:.1}, {:.1}, {:.1}) (camera was at ({:.1}, {:.1}, {:.1}))",
                     safe_pos[0], safe_pos[1], safe_pos[2], p.x, p.y, p.z
@@ -5249,7 +6585,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // view doesn't jump weirdly.
                 local_player.view.position = glm::vec3(
                     safe_pos[0],
-                    safe_pos[1] + physics::constants::PLAYER_EYE_OFFSET,
+                    center_y + player_eye_offset,
                     safe_pos[2],
                 );
             }
@@ -5293,7 +6629,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let r_horiz = local_player.right();
 
                 let desired_world = f_horiz * move_local.x + r_horiz * move_local.z;
-                let mut speed = physics::constants::WALK_SPEED;
+                // r561: base walk speed scales with stature (longer stride);
+                // = WALK_SPEED for a default 1.8 character. Sprint multiplies on top.
+                let mut speed = player_stature.move_speed;
                 // r118: sprint costs stamina — gate on the meter (ticked above).
                 if bindings.is_action_pressed(GameAction::Sprint, &input)
                     && fg_app.stamina().sprinting {
@@ -5341,31 +6679,45 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     BlockId::Water
                 );
                 if feet_in_water {
-                    use unendlich_engine::sim::fixed::Fixed;
-                    let head_in_water = matches!(
-                        chunk_manager.block_at(
-                            b.position[0].floor() as i32,
-                            (b.position[1] + 1.2).floor() as i32,
-                            b.position[2].floor() as i32,
-                        ),
-                        BlockId::Water
-                    );
-                    let sub = unendlich_engine::sim::fluid::submerged_fraction(
-                        Fixed::from_f64(0.0),
-                        Fixed::from_f64(1.8),
-                        Fixed::from_f64(if head_in_water { 2.0 } else { 0.9 }),
-                    )
-                    .to_f32();
+                    // r508: CONTINUOUS SUBMERSION + FLOAT-OUT. The old code derived `sub` from a
+                    // two-state head check (water level 0.9 or 2.0 over a 1.8 body), so the instant
+                    // the head cleared the surface `sub` halved and buoyancy (26·sub) lost to gravity
+                    // (28), yanking the head back under — you could never surface (operator report).
+                    // Instead, find the REAL water surface at the body's column and measure how much
+                    // of feet..head is below it, then float with a peak buoyancy ABOVE gravity so a
+                    // submerged body RISES and settles where the head clears (equilibrium sub ≈
+                    // GRAVITY/BUOY). Vertical water drag damps the rise into a smooth bob, not a
+                    // linear ramp.
+                    let col_x = b.position[0].floor() as i32;
+                    let col_z = b.position[2].floor() as i32;
+                    let feet_yf = b.aabb_min()[1];
+                    let head_yf = b.aabb_max()[1];
+                    let body_h = (head_yf - feet_yf).max(0.1);
+                    let mut water_surface = feet_yf;
+                    for yy in (feet_yf.floor() as i32 - 1)..=(head_yf.ceil() as i32 + 1) {
+                        if matches!(chunk_manager.block_at(col_x, yy, col_z), BlockId::Water) {
+                            water_surface = water_surface.max(yy as f32 + 1.0);
+                        }
+                    }
+                    let sub = ((water_surface - feet_yf) / body_h).clamp(0.0, 1.0);
+                    let head_in_water = water_surface >= head_yf - 0.1;
                     let sp = unendlich_engine::sim::swim::SwimParams::default();
                     // Quadratic drag (per swim.rs): a = -drag * |v| * v
                     let vmag = (b.velocity[0].powi(2) + b.velocity[1].powi(2) + b.velocity[2].powi(2)).sqrt();
                     for k in 0..3 {
                         b.velocity[k] -= sp.drag * vmag * b.velocity[k] * dt * sub;
                     }
-                    // r178: buoyancy must nearly CANCEL gravity (28) or
-                    // the stroke (6) can never win — the operator sank
-                    // holding Space (14+6-28 = -8). Near-neutral: 26*sub.
-                    b.velocity[1] += 26.0 * sub * dt;
+                    // Archimedes float: peak buoyancy 36 > GRAVITY 28 ⇒ equilibrium sub ≈ 0.78, i.e.
+                    // the waterline settles near the shoulders with the head/eyes OUT. Vertical
+                    // damping turns the rise into a soft bob instead of a linear shoot-and-overshoot.
+                    const SWIM_BUOY: f32 = 36.0;
+                    const SWIM_VDAMP: f32 = 3.0;
+                    // r567: density (from the muscle slider) modulates float — a dense
+                    // body floats less (can sink, must stroke up), a lean one rides high.
+                    // = 36 (waterline at the shoulders) for a default character.
+                    let buoy = SWIM_BUOY / player_stature.density.clamp(0.4, 2.5);
+                    b.velocity[1] += buoy * sub * dt;
+                    b.velocity[1] -= SWIM_VDAMP * b.velocity[1] * sub * dt;
                     // Stroke: hold Jump to thrust up; Sneak to dive.
                     if bindings.is_action_pressed(GameAction::Jump, &input) {
                         b.velocity[1] += sp.thrust * sub * dt;
@@ -5403,14 +6755,41 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             water_current_max,
                             sub,
                         );
-                        // additive acceleration toward the drift; quadratic drag (above) bounds it
-                        b.velocity[0] += drift[0] * 4.0 * dt;
-                        b.velocity[2] += drift[1] * 4.0 * dt;
+                        // r566: WATER-CURRENT RESISTANCE from stature — a heavier (taller)
+                        // body needs a stronger current to budge (threshold ∝ mass) and is
+                        // pushed less once it does (mult ∝ 1/h). = unchanged for a default.
+                        let cur_mag = (drift[0] * drift[0] + drift[1] * drift[1]).sqrt();
+                        let thresh = 0.05 * player_stature.water_resist_threshold;
+                        if cur_mag > thresh {
+                            let m = player_stature.water_resist_mult;
+                            // additive acceleration toward the drift; quadratic drag (above) bounds it
+                            b.velocity[0] += drift[0] * 4.0 * dt * m;
+                            b.velocity[2] += drift[1] * 4.0 * dt * m;
+                        }
                     }
                     // Terminal cap so drag math stays sane on bad frames.
                     b.velocity[1] = b.velocity[1].clamp(-8.0, 6.0);
                 } else if bindings.is_action_just_pressed(GameAction::Jump, &input) {
-                    b.try_jump();
+                    if b.try_jump() {
+                        // r561: take-off velocity scales with stature (= JUMP_VELOCITY
+                        // for a default character; taller jumps higher absolutely).
+                        b.velocity[1] = player_stature.jump_velocity;
+                        jump_ascending = true; // r508: arm variable-height cut
+                    }
+                }
+                // r508: VARIABLE JUMP HEIGHT — releasing Jump while still rising cuts the upward
+                // velocity, so a tap is a short hop and a hold is the full jump. Out of water only
+                // (water has its own buoyant stroke). Makes the jump read as a deliberate effort
+                // instead of one fixed, linear-feeling arc.
+                if !feet_in_water {
+                    let jump_held = bindings.is_action_pressed(GameAction::Jump, &input);
+                    if jump_ascending && b.velocity[1] > 0.0 && !jump_held {
+                        b.velocity[1] *= 0.45;
+                        jump_ascending = false;
+                    }
+                    if b.velocity[1] <= 0.0 {
+                        jump_ascending = false;
+                    }
                 }
                 // r141: FALL IMPACT — landing converts descent speed into
                 // damage/stagger via the REAL sim::fall_impact model
@@ -5432,6 +6811,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 count,
                             );
                         }
+                        // r570: pulse the avatar's landing crouch, deeper with impact
+                        // speed; the gait block decays it back out over ~¼ s.
+                        let speed = (-prev_fall_vy).max(0.0);
+                        hero_land_crouch = ((speed - 6.0) / 14.0).clamp(0.35, 1.0);
+                        // r542: jolt the camera on a hard landing, scaled by impact
+                        // speed (landings below the ~9 m/s threshold don't reach here).
+                        if cam_shake_on {
+                            let speed = (-prev_fall_vy).max(0.0);
+                            // r566: heavier (taller) bodies land harder — scale the jolt by
+                            // the stature's ground_shake (= 0 for a default character).
+                            let impulse = ((speed - 8.0) / 22.0).clamp(0.0, 1.0)
+                                * (1.0 + player_stature.ground_shake * 0.25).min(4.0);
+                            shake_mag = shake_mag.max(impulse);
+                        }
                     }
                     if landed && survival_mode {
                         let imp = unendlich_engine::sim::fall_impact::impact_for(
@@ -5445,7 +6838,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         // fall damage: the mountain holds its own.
                         let earth_attuned = fg_imbue.element == 3 && fg_imbue.counter > 0.5;
                         let dmg_scale = if earth_attuned { 0.005 } else { 0.01 };
-                        fg_app.vitality_mut().tick(1.0, (imp.damage * dmg_scale).min(0.5));
+                        fg_app.vitality_mut().tick(1.0, (imp.damage * dmg_scale).min(0.5) * player_dmg_resist);
                             log::info!(
                                 "[survival] fall impact: {:.0} dmg{} — vitality {:.0}%",
                                 imp.damage,
@@ -5476,7 +6869,58 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 );
                 let mut params = PhysicsParams::player_default();
                 params.wind_force = [wind_x, wind_z];
+                // r561: auto-step height scales with stature (a giant steps over a wall;
+                // = 1.1 for a default character).
+                params.step_height = player_stature.step_height;
+                // r566: wind resistance from stature (a heavier body drifts less).
+                params.wind_resist = player_stature.wind_resist_mult;
+                // r508: REALISTIC ARC — fall faster than you rise. A heavier descent gives the jump
+                // an apex "hang" then a weighted drop, instead of the symmetric, linear-feeling
+                // up-down of constant gravity. Out of water only (water uses the buoyancy model
+                // above); terminal_velocity still caps the fall.
+                if !feet_in_water && b.velocity[1] < 0.0 {
+                    params.gravity *= 1.4;
+                }
 
+                // r476: detached-terrain check. Is the ground beneath the feet
+                // streamed in yet? We probe the player's cell and one below.
+                let fx = b.position[0].floor() as i32;
+                let fy = b.position[1].floor() as i32;
+                let fz = b.position[2].floor() as i32;
+                let ground_ready = !renderer.ui_detached_terrain
+                    || (chunk_manager.is_loaded_at(fx, fy, fz)
+                        && chunk_manager.is_loaded_at(fx, fy - 1, fz));
+
+                if !ground_ready {
+                    // Terrain under the player isn't real yet. Don't freeze them —
+                    // turn OFF gravity and zero the downward drift so they keep
+                    // gliding forward at altitude while chunks stream in below,
+                    // instead of plummeting through the void. (Horizontal velocity
+                    // still integrates in step_body, so flight feels continuous.)
+                    params.apply_gravity = false;
+                    if b.velocity[1] < 0.0 {
+                        b.velocity[1] = 0.0;
+                    }
+                    terrain_suspended = true;
+                } else if terrain_suspended {
+                    // Terrain just spawned under a gliding player. If they're now
+                    // embedded in (or buried under) solid ground, settle them onto
+                    // the real surface — the "replace the player when the chunk
+                    // spawns and the position differs" reconcile.
+                    if chunk_manager.block_at(fx, fy, fz).is_solid() {
+                        if let Some(surf_y) = chunk_manager.surface_above(fx, fy, fz, 64) {
+                            b.position[1] = surf_y as f32;
+                            b.velocity[1] = 0.0;
+                            log::info!(
+                                "[detached] terrain spawned under player — settled to surface y={}",
+                                surf_y
+                            );
+                        }
+                    }
+                    terrain_suspended = false;
+                }
+                // Always step (gravity flag set above) so horizontal flight is
+                // continuous whether or not the ground has streamed in.
                 physics::step_body(
                     b,
                     dt,
@@ -5489,7 +6933,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // smoothly lerps the camera up rather than teleporting.
                 local_player.view.position = glm::vec3(
                     b.position[0],
-                    b.render_y() + physics::constants::PLAYER_EYE_OFFSET,
+                    b.render_y() + player_eye_offset,
                     b.position[2],
                 );
             }
@@ -5642,6 +7086,22 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         } else {
                             (s.kind, unendlich_engine::spawn::spawn(s.kind, s.pos))
                         };
+                        // r545 (Roll 2 / B3): same concurrent-dragon cap on the ecology
+                        // stream path (dragons can come from the apportioned budget too,
+                        // not just the request queue). UNENDLICH_MAX_DRAGONS (default 6).
+                        if matches!(kind, CreatureKind::Dragon) {
+                            let max_dragons = std::env::var("UNENDLICH_MAX_DRAGONS")
+                                .ok()
+                                .and_then(|s| s.parse::<usize>().ok())
+                                .unwrap_or(6);
+                            let dragon_count = roamers
+                                .iter()
+                                .filter(|r| matches!(r.kind, CreatureKind::Dragon))
+                                .count();
+                            if dragon_count >= max_dragons {
+                                continue;
+                            }
+                        }
                         // s.pos.y is the surface TOP (surface block + 1); rest the
                         // feet there rather than a block under it.
                         cr.body.position[1] = cr.grounded_y(s.pos[1]);
@@ -5764,7 +7224,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             // forage/dragon over ~200 creatures) is the prime remaining
             // suspect. Time it to confirm.
             let _t_roamer = Instant::now();
-            // r294: fresh surface memo each tick (terrain can change between ticks).
+            // r294: fresh surface memo each tick (the world is mutated between ticks).
             if surface_cache_enabled {
                 surface_cache.borrow_mut().clear();
             }
@@ -5887,6 +7347,126 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 // gaze + verlet wing physics moved. Wrap at a TAU multiple so f32
                 // doesn't drift over a long session (continuous for integer freqs).
                 cr.anim_time = (cr.anim_time + dt) % (std::f32::consts::TAU * 256.0);
+                // r599: WING-FLEX — the verlet wing-membrane solver
+                // (sim::dragon_wing_flex) existed, was fully wired into
+                // dragon_forge::skin_with_flex, but was never actually STEPPED for a
+                // live creature (only a dummy service-registry probe ticked a
+                // fixed dummy rig). Wings therefore always rendered perfectly
+                // rigid. Wire it for real: for genome dragons, sample the wind at
+                // the creature's position, rotate it into the model's local frame
+                // (inverse of the yaw rotation the renderer applies going out), and
+                // step the membrane — same force model as foliage/cloth (gravity +
+                // wind), so wings billow and flutter in a gust on top of their
+                // flight-driven lag.
+                if let Some(model) = cr.forge.as_deref() {
+                    use unendlich_engine::sim::dragon_forge::{J_WING_L, J_WING_R};
+                    use unendlich_engine::sim::dragon_wing_flex::{FlexParams, WingFlex};
+                    let root_l = model.joints.get(J_WING_L as usize).copied().unwrap_or([0.0; 3]);
+                    let root_r = model.joints.get(J_WING_R as usize).copied().unwrap_or([0.0; 3]);
+                    let tip_l = [model.min[0], root_l[1], root_l[2]];
+                    let tip_r = [model.max[0], root_r[1], root_r[2]];
+                    let span = ((root_l[0] - tip_l[0]).abs()).max((root_r[0] - tip_r[0]).abs()).max(0.5);
+                    if cr.wing_flex.is_none() {
+                        cr.wing_flex = Some(Box::new(WingFlex::new(span, 5)));
+                    }
+                    // world wind at the creature -> model-local frame (inverse yaw).
+                    let (wwx, wwz, _wmag) = unendlich_engine::wind::wind_at(
+                        cr.body.position[0] as f64,
+                        cr.body.position[1] as f64,
+                        cr.body.position[2] as f64,
+                        sky_state.time_seconds as f64,
+                    );
+                    let (sy, cy) = cr.yaw.sin_cos();
+                    let wind_local = [wwx * cy + wwz * sy, 0.0, -wwx * sy + wwz * cy];
+                    let p = FlexParams::default();
+                    if let Some(wf) = cr.wing_flex.as_mut() {
+                        let (ol, or_) = wf.step((root_l, tip_l), (root_r, tip_r), wind_local, dt, &p);
+                        cr.wing_offset_l = ol;
+                        cr.wing_offset_r = or_;
+                    }
+                } else if !cr.wing_offset_l.is_empty() || !cr.wing_offset_r.is_empty() {
+                    // defensive: a creature that lost its forge model (shouldn't
+                    // happen — forge is set once at spawn) reverts to rigid.
+                    cr.wing_offset_l.clear();
+                    cr.wing_offset_r.clear();
+                }
+                // r601: GIANT-DRAGON STATURE — the ground-shake / stomp-erosion /
+                // wind-disturber / attack-scaling laws all existed for the PLAYER
+                // (via player_stature, the tallness slider) but nothing derived an
+                // equivalent stature for a huge CREATURE — a 50-block forge dragon
+                // walked with zero quake, crushed no terrain, barely stirred the
+                // wind, and its breath did flat genome-only damage regardless of
+                // whether it was rendered at 4 blocks or 50. Derive the SAME
+                // `sim::stature::StatureProfile` from the creature's actual
+                // physical height (its collider, not its genome traits) so every
+                // one of those systems now scales with a dragon's real size —
+                // exactly the laws a giant player already lives under.
+                if cr.forge.is_some() {
+                    let height = (cr.body.half_extents[1] * 2.0).max(0.5);
+                    let st = unendlich_engine::sim::stature::derive(height, 1.0, 1.0, 1.0);
+                    cr.mass = st.mass; // supersede the ad-hoc genome mass with the real one
+                    cr.derived_stature = Some(st);
+                    // r602: STOMP EROSION, reworked (operator: too destructive per
+                    // step, too uniform-looking) — most stomps now only WEATHER a
+                    // WIDER, JAGGED-edged patch (sim::stomp_erosion); an actual
+                    // break-through needs a same-spot streak, tracked via
+                    // cr.stomp_cell/stomp_streak. Same cadence idea as before (no
+                    // bob-phase for creatures, so a time-based trigger).
+                    let speed = cr.body.velocity[0].hypot(cr.body.velocity[2]);
+                    if st.ground_shake > 1.0 && cr.body.on_ground && speed > 0.3 {
+                        let stomp_interval = (0.7 / (1.0 + speed * 0.15)).max(0.15);
+                        let phase = cr.anim_time % stomp_interval;
+                        if phase < dt {
+                            use unendlich_engine::sim::stomp_erosion as se;
+                            let crush_cap = st.height / 8.0;
+                            let er = ((st.height / 12.0) as i32 + 1).clamp(2, 4);
+                            let depth = (1 + (crush_cap * 0.4) as i32).clamp(1, 3);
+                            let params = se::StompParams { crush_cap, radius: er, depth, streak_to_break: 3 };
+                            let fx = cr.body.position[0].floor() as i32;
+                            let fz = cr.body.position[2].floor() as i32;
+                            let fy = (cr.body.position[1] - cr.body.half_extents[1] - 0.05).floor() as i32;
+                            let cell = (fx, fz);
+                            cr.stomp_streak = se::update_streak(cr.stomp_cell, cell, cr.stomp_streak);
+                            cr.stomp_cell = Some(cell);
+                            let seed = cr.anim_time.to_bits() as u64 ^ (fx as u64) ^ ((fz as u64) << 24);
+                            let mut crushed = 0u32;
+                            for dz in -er..=er {
+                                for dx in -er..=er {
+                                    if !se::in_footprint(dx, dz, er, seed) {
+                                        continue;
+                                    }
+                                    for dd in 0..depth {
+                                        let (bx, by, bz) = (fx + dx, fy - dd, fz + dz);
+                                        let blk = chunk_manager.block_at(bx, by, bz);
+                                        if !blk.is_solid() {
+                                            continue;
+                                        }
+                                        let h = blk.hardness();
+                                        match se::decide(h, cr.stomp_streak, &params) {
+                                            None => break,
+                                            Some(se::CellAction::Crush) => {
+                                                if chunk_manager.set_block(bx, by, bz, BlockId::Air) {
+                                                    crushed += 1;
+                                                }
+                                            }
+                                            Some(se::CellAction::Weather) => {
+                                                if let Some(w) = se::weathered_variant(blk, seed ^ ((dx as u64) << 8) ^ (dz as u64)) {
+                                                    chunk_manager.set_block(bx, by, bz, w);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if crushed > 0 {
+                                water_dirty = true;
+                            }
+                        }
+                    }
+                } else if cr.derived_stature.is_some() {
+                    cr.derived_stature = None; // defensive symmetry with wing_flex above
+                }
                 // r152: GRIME — the entity baker already shades faces by the
                 // creature's GrimeState (belly-weighted); now it actually
                 // accumulates. Dusty ground + movement -> dirt in the local
@@ -5927,15 +7507,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let pdx = player_xz.0 - self_xz.0;
                     let pdz = player_xz.1 - self_xz.1;
                     let d2 = pdx * pdx + pdz * pdz;
-                    let mut stimuli: Vec<obs::Stimulus> = Vec::with_capacity(1);
+                    let mut stimulus: Option<obs::Stimulus> = None;
                     if d2 < 28.0 * 28.0 {
                         let mut bearing = pdz.atan2(pdx) - cr.yaw;
                         while bearing > std::f32::consts::PI { bearing -= std::f32::consts::TAU; }
                         while bearing < -std::f32::consts::PI { bearing += std::f32::consts::TAU; }
                         let sal = (1.0 - d2.sqrt() / 28.0).clamp(0.0, 1.0)
                             + (player_footstep as f32 * 0.005).min(0.5);
-                        stimuli.push(obs::Stimulus { bearing, salience: sal, dist2: d2 });
+                        stimulus = Some(obs::Stimulus { bearing, salience: sal, dist2: d2 });
                     }
+                    // r475 (perf): was Vec::with_capacity(1) — a heap alloc per creature per tick.
+                    // A stack Option + slice avoids the allocator storm in the hot roamer loop.
+                    let stim_slice: &[obs::Stimulus] = match &stimulus {
+                        Some(s) => std::slice::from_ref(s),
+                        None => &[],
+                    };
                     let prev_gaze = obs::Gaze {
                         yaw: cr.gaze_yaw,
                         pitch: cr.gaze_pitch,
@@ -5944,7 +7530,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let stepg = obs::observe(
                         &obs::GazeParams::default(),
                         prev_gaze,
-                        &stimuli,
+                        stim_slice,
                         cr.anim_time,
                         dt,
                     );
@@ -5953,18 +7539,10 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 }
                 // r129: relax any swipe/flinch pose impulse back to neutral.
                 cr.torso_bend *= 1.0 - (3.0 * dt).min(0.5);
-                // Weathering feed: creatures gradually pick up grime as they move
-                // about; it's belly-weighted into the forge material at mesh time
-                // (forge_to_vertices). Earthy default for now — biome-specific soil
-                // colour + water washing can refine this later. Harmless for non-forge
-                // creatures (only the forge dragon reads `grime`).
-                cr.grime.accumulate(&unendlich_engine::sim::creature_grime::GrimeSample {
-                    soil_grime01: 0.5,
-                    wetness01: 0.0,
-                    activity01: 0.5,
-                    soil_tint: [0.34, 0.25, 0.16],
-                    dt,
-                });
+                // r475 (perf): removed a SECOND, generic grime.accumulate that ran every creature
+                // every tick on top of the r152 ground-aware one above — it double-counted grime
+                // (2× wear rate) and doubled the grime cost in the hot roamer loop. The ground-aware
+                // accumulate above is the intended, more correct feed.
                 let cy = cr.body.position[1] as i32;
                 let here_biome = cpu.biome_at_3d(self_xz.0.floor() as i32, cy, self_xz.1.floor() as i32).biome;
 
@@ -6603,7 +8181,23 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 let step = (rdx * rdx + rdz * rdz).sqrt();
                 let desired = rdz.atan2(rdx);
                 let desperation = if threat.is_some() { 0.8 } else { 0.0 };
-                let (dx, dz) = sighted_step(self_xz, desired, step, ROAMER_HP, desperation, &surface_at);
+                // r503: LARGE-BODY LOCOMOTION. A big body can't slide straight to the
+                // desired direction and pivot in place (the "fixed-point turn" /
+                // moonwalk). It moves ALONG its current facing, carving an arc: it
+                // slows as it turns and accelerates once aligned. `axis_bias` scales
+                // with body size, so dragons fully carve while small/agile creatures
+                // keep the responsive step (bias≈0). Applied to the step direction +
+                // (below) the turn rate.
+                let body_len = cr.body.half_extents[0].max(cr.body.half_extents[2]);
+                let axis_bias = ((body_len - 1.0) / 4.0).clamp(0.0, 1.0);
+                let dyaw = {
+                    use std::f32::consts::{PI, TAU};
+                    (desired - cr.yaw + PI).rem_euclid(TAU) - PI
+                };
+                let align = dyaw.cos().max(0.0); // 1 facing goal, 0 perpendicular/behind
+                let move_heading = cr.yaw + dyaw * (1.0 - axis_bias);
+                let eff_step = step * (1.0 - axis_bias * (1.0 - align)).max(0.2);
+                let (dx, dz) = sighted_step(self_xz, move_heading, eff_step, ROAMER_HP, desperation, &surface_at);
                 if dx != 0.0 || dz != 0.0 {
                     cr.body.position[0] += dx;
                     cr.body.position[2] += dz;
@@ -6624,8 +8218,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // It wants to face where it stepped. Fleeing OR goal-pathing
                     // turns crisply; idle wandering uses the detent + nonlinear map
                     // so it doesn't vacillate or look robotic.
-                    w.heading = dz.atan2(dx);
-                    let max_step = *turn_rate * dt;
+                    // r503: turn toward the GOAL (desired), not the body-axis step
+                    // direction — so a large body curves its heading toward the goal
+                    // while it moves along its axis, carving an arc. For small bodies
+                    // (axis_bias≈0) desired ≈ the step direction, so behaviour is the
+                    // same as before.
+                    w.heading = desired;
+                    // r503: large bodies turn slower (wider arc) — scale the per-tick
+                    // turn cap down by body size so a dragon can't spin on a dime.
+                    let max_step = *turn_rate * dt / (1.0 + axis_bias * 1.5);
                     cr.yaw = if threat.is_some() || pathing {
                         unendlich_engine::sim::awareness::turn_toward(cr.yaw, w.heading, max_step)
                     } else {
@@ -7019,7 +8620,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             if miss < spread {
                                 let dmg01 = (rel.potency * 0.06).clamp(0.0, 0.18);
                                 if survival_mode {
-                                    fg_app.vitality_mut().tick(1.0, dmg01);
+                                    fg_app.vitality_mut().tick(1.0, dmg01 * player_dmg_resist);
                                 }
                                 log::info!(
                                     "[dragon] {:?} BENDING hits you — potency {:.1} (vitality {:.0}%)",
@@ -7058,16 +8659,46 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 if d > std::f32::consts::PI { d = std::f32::consts::TAU - d; }
                                 d
                             };
-                            let dmg = unendlich_engine::sim::breath_attack::damage_at(&bp, angle, dist);
+                            let base_dmg = unendlich_engine::sim::breath_attack::damage_at(&bp, angle, dist);
+                            // r601: SIZE-SCALED BREATH — `damage_at` only knows the
+                            // genome's traits (teeth, jaw_depth, bulk 0..1), not the
+                            // creature's actual rendered scale. A dragon forged at
+                            // 50 blocks should breathe far harder than one at 4 —
+                            // fold in the derived stature's `strength` (soft-scaled
+                            // via sqrt, matching stature.rs's own `max_health` /
+                            // `hunger_rate` convention, so a titan is devastating but
+                            // not a flat one-shot).
+                            let size_mult = cr.derived_stature.map(|st| st.strength.max(0.0).sqrt()).unwrap_or(1.0);
+                            let dmg = base_dmg * size_mult;
                             let elem = unendlich_engine::sim::dragon_archetype::ELEMENT_NAMES
                                 [bp.element as usize % unendlich_engine::sim::dragon_archetype::NUM_ELEMENTS];
                             if dmg > 0.5 {
                                 if survival_mode {
-                                    fg_app.vitality_mut().tick(1.0, dmg * 0.004);
+                                    fg_app.vitality_mut().tick(1.0, dmg * 0.004 * player_dmg_resist);
+                                }
+                                // r601: KNOCKBACK — breath damage now actually shoves
+                                // the player, scaled by the SAME laws a giant player's
+                                // own hits use: `knockback_impulse` (damage vs the
+                                // target's mass/resist) amplified by the dragon's own
+                                // `knockback_dealt` (bigger body, harder shove). Away
+                                // from the dragon in the XZ plane + a small lift, so a
+                                // titan's breath physically knocks you off your feet.
+                                let kb_mult = cr.derived_stature.map(|st| st.knockback_dealt).unwrap_or(1.0);
+                                let kb_speed = unendlich_engine::sim::knockback_impulse::impulse(
+                                    dmg, player_stature.mass, player_stature.knockback_resist01,
+                                ) * kb_mult;
+                                if kb_speed > 0.01 {
+                                    if let Some(b) = body.as_mut() {
+                                        let len = dx.hypot(dz).max(1e-3);
+                                        b.velocity[0] += (dx / len) * kb_speed;
+                                        b.velocity[2] += (dz / len) * kb_speed;
+                                        b.velocity[1] += (kb_speed * 0.15).min(3.0);
+                                    }
                                 }
                                 log::info!(
-                                    "[dragon] {} BREATH hits you for {:.0} at {:.0} blocks — vitality {:.0}%",
-                                    elem, dmg, dist, fg_app.vitality().energy * 100.0
+                                    "[dragon] {} BREATH hits you for {:.0} (×{:.1} size) at {:.0} blocks — \
+                                     knockback {:.1} — vitality {:.0}%",
+                                    elem, dmg, size_mult, dist, kb_speed, fg_app.vitality().energy * 100.0
                                 );
                             } else {
                                 log::info!("[dragon] {} breath misses ({:.0} blocks, off-axis)", elem, dist);
@@ -7431,6 +9062,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 {
                     selected_block = PLACE_PALETTE[i];
                     selected_palette_idx = i; // r122: keep scroll cursor in sync
+                    renderer.creative_selected = i; // r554: move the hotbar UI highlight
                     fg_app.inventory_mut().set_selected(i); // r120: hotbar cursor follows
                     if survival_mode {
                         hand_item = fg_app.inventory().slot(i).map(|s| s.item);
@@ -7445,6 +9077,39 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                     log::info!("Selected place block: {:?}", selected_block);
+                }
+            }
+            // r554: ALT + HOME-ROW chord — hold Left Alt and tap a labelled home-row
+            // key (a o e u i d h t n) to jump straight to that hotbar slot. The slots
+            // are already labelled with these keys; the modifier keeps the bare keys
+            // free for movement/typing.
+            if input.is_key_pressed(Keycode::LeftAlt) && !renderer.ui_wants_keyboard {
+                use unendlich_engine::world::blocks::BlockId;
+                const HOMEROW_KEYS: [Keycode; 9] = [
+                    Keycode::A, Keycode::O, Keycode::E, Keycode::U, Keycode::I,
+                    Keycode::D, Keycode::H, Keycode::T, Keycode::N,
+                ];
+                for (slot, &kc) in HOMEROW_KEYS.iter().enumerate() {
+                    if slot < PLACE_PALETTE.len() && input.is_key_just_pressed(kc) {
+                        selected_block = PLACE_PALETTE[slot];
+                        selected_palette_idx = slot;
+                        renderer.creative_selected = slot;
+                        fg_app.inventory_mut().set_selected(slot);
+                        if survival_mode {
+                            hand_item = fg_app.inventory().slot(slot).map(|s| s.item);
+                            if let Some(stack) = fg_app.inventory().slot(slot) {
+                                if let Some(b) = BlockId::ALL
+                                    .iter()
+                                    .copied()
+                                    .find(|b| *b as u32 == stack.item.0)
+                                {
+                                    selected_block = b;
+                                }
+                            }
+                        }
+                        log::info!("[hotbar] alt+home-row -> slot {}", slot + 1);
+                        break;
+                    }
                 }
             }
         }
@@ -7465,6 +9130,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // middle ground.
         let mouse_left_held = input.is_mouse_button_pressed(MouseBtn::Left);
         let mouse_right_held = input.is_mouse_button_pressed(MouseBtn::Right);
+        // r486: snapshot so we can detect when an action actually fires (any of
+        // the break/place/use sites resets last_block_action) → swing the hand.
+        let prev_block_action = last_block_action;
         let cooldown_ok = last_block_action.elapsed().as_millis() >= BLOCK_ACTION_COOLDOWN_MS;
         // Permission gate: a player without can_break_block / can_place_block
         // shouldn't even raycast (saves cycles). Single-player default
@@ -7472,6 +9140,19 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // server pushes restrictive permissions to e.g. spectators.
         let break_allowed = mouse_left_held && local_player.permissions.can_break_block;
         let place_allowed = mouse_right_held && local_player.permissions.can_place_block;
+        // r565: radius scales ~ceil((h−4)·¼) above a stature of 5 (1 at 5–8 blocks,
+        // 2 at 12, 3 at 16, 4 at 20, 6 at 25), capped at 6. Drives the place-mound
+        // size + the break fan below.
+        let dig_radius: i32 = if player_stature.height > 5.0 {
+            // r573: bigger mining volume + ceiling raised 8 → 16 (operator). Factor 0.36
+            // so a 50-block titan reaches ~16; placement uses half this (below).
+            (((player_stature.height - 4.0) * 0.36).ceil() as i32).clamp(1, 16)
+        } else {
+            0
+        };
+        // r573: PLACE sphere is HALF the mining sphere (operator) — building reads as a
+        // mound, not a crater-sized blob.
+        let place_radius: i32 = (dig_radius / 2).max(if dig_radius > 0 { 1 } else { 0 });
         if mouse_captured && cooldown_ok && (break_allowed || place_allowed) {
             let cam_forward = local_player.forward();
             // v0.24.23 propagation: route the player block-selection
@@ -7487,7 +9168,13 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let hit_opt = chunk_manager.raycast_octree(
                 [pos.x, pos.y, pos.z],
                 [cam_forward.x, cam_forward.y, cam_forward.z],
-                6.0,
+                // r569: reach grows ~LINEARLY with stature so a giant can actually reach
+                // the ground in front of it. (The old √ scaling fell short: a 25-block eye
+                // sits ~22 blocks up, but √ reach was only ~22 — it couldn't touch the floor.)
+                // = 6.0 for a default character; slope 1.2 (> eye fraction) clears the eye
+                // height so the ground a few blocks forward is always targetable.
+                (6.0 + 1.2 * (player_stature.height
+                    - unendlich_engine::sim::stature::BASE_HEIGHT).max(0.0)).max(6.0),
                 |b| b.is_solid(),
             );
             if let Some(world_hit) = hit_opt {
@@ -7648,6 +9335,20 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             roamers[ri].trust = nt;
                         }
                         roamers[ri].hp -= dmg_dealt;
+                        // r509: the weapon wears with each swing; at 0 it breaks (survival only).
+                        if survival_mode {
+                            if let Some((wid, cur, max)) = equipped_weapon_dura {
+                                let (nc, broke) = unendlich_engine::sim::item_durability::apply_wear(
+                                    cur, max, WEAR_PER_ATTACK,
+                                );
+                                equipped_weapon_dura = Some((wid, nc, max));
+                                if broke {
+                                    let _ = fg_app.inventory_mut().remove_item(wid, 1);
+                                    equipped_weapon_dura = None;
+                                    log::info!("[durability] your weapon shattered from the blow");
+                                }
+                            }
+                        }
                         // rNNN: LIGHTNING ARC — the strike chains to nearby foes
                         // via the REAL legendary_weapon swing resolver (r369). A
                         // Storm-element blade (element 5 ⇒ LightningArc proc) is
@@ -7729,6 +9430,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         );
                         roamers[ri].creature.torso_bend =
                             curl.iter().sum::<f32>() / curl.len().max(1) as f32 * 0.6;
+                        // r566: KNOCKBACK — the blow shoves the struck creature along the
+                        // punch direction (+ a small upward pop), scaled by the attacker's
+                        // stature (knockback_dealt = 1.0 default → a giant sends them flying).
+                        {
+                            let kb = 3.0 * player_stature.knockback_dealt;
+                            let v = &mut roamers[ri].creature.body.velocity;
+                            v[0] += cam_forward.x * kb;
+                            v[1] += 1.2;
+                            v[2] += cam_forward.z * kb;
+                        }
                         let p = roamers[ri].creature.body.position;
                         log::info!(
                             "[combat] punched {:?} for {} (hp {})",
@@ -7774,14 +9485,42 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     count, elem
                                 );
                             }
+                            // r511: VARIED LOOT — meat count scales with the creature's bulk
+                            // (tier) via sim::loot_quantity, and a luck-boosted sim::drop_chance
+                            // roll adds an occasional egg. A small fish yields one scrap; a big
+                            // beast yields a haul.
+                            let tier = ((roamers[ri].creature.mass * 0.4) as u32).min(4);
+                            let luck = 0.25;
+                            let meat_n = unendlich_engine::sim::loot_quantity::quantity(tier, luck, 5)
+                                .max(1) as u16;
                             fg_app.drops_mut().spawn(
                                 unendlich_engine::items::ItemStack {
                                     item: unendlich_engine::items::ItemId(MEAT_ITEM),
-                                    count: 1,
+                                    count: meat_n,
                                 },
                                 [p[0], p[1] + 0.6, p[2]],
                                 [0.0, 2.0, 0.0],
                             );
+                            let egg_p =
+                                unendlich_engine::sim::drop_chance::drop_chance(0.12, luck, 0.0);
+                            let roll = {
+                                let s = (p[0].to_bits() as u64)
+                                    ^ ((p[2].to_bits() as u64) << 17)
+                                    ^ (frame_count as u64).wrapping_mul(0x9E37_79B1);
+                                ((s >> 33) & 0xFFFF) as f32 / 65535.0
+                            };
+                            if roll < egg_p {
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(999),
+                                        count: 1,
+                                    },
+                                    [p[0] + 0.3, p[1] + 0.7, p[2]],
+                                    [0.5, 2.2, 0.2],
+                                );
+                                log::info!("[loot] …and an egg");
+                            }
+                            log::info!("[loot] {} meat (tier {})", meat_n, tier);
                             roamers.swap_remove(ri);
                         }
                         last_block_action = Instant::now();
@@ -7793,8 +9532,150 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let [x, y, z] = hit_cell;
                     if chunk_manager.set_block(x, y, z, BlockId::Air) {
                         log::info!("Broke {:?} at ({},{},{})", hit_block_id, x, y, z);
+                        // r512: SEEDS FROM GRASS — breaking wild ground cover sometimes yields a
+                        // vegetable, so a survival player can find their first crop and start a
+                        // farm (plant it on Grass/Dirt). Deterministic roll from cell + frame.
+                        if matches!(hit_block_id, BlockId::TallGrass | BlockId::Fern | BlockId::Flower) {
+                            let h = (x as u64).wrapping_mul(0x9E37_79B1)
+                                ^ ((z as u64) << 21)
+                                ^ (frame_count as u64).wrapping_mul(0x85EB_CA77);
+                            if (h & 0xFF) < 38 {
+                                // ~15%
+                                let veg = [BlockId::Carrot, BlockId::Potato, BlockId::Cabbage]
+                                    [((h >> 8) % 3) as usize];
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(veg as u32),
+                                        count: 1,
+                                    },
+                                    [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
+                                    [0.0, 1.4, 0.0],
+                                );
+                                log::info!("[farm] a {:?} was hidden in the grass — plant it on soil to farm", veg);
+                            }
+                        }
+                        // r521: SAPLINGS FROM LEAVES — breaking foliage occasionally drops a tree
+                        // sapling (a Sprout item) you can plant on soil under open sky to grow a tree.
+                        if matches!(hit_block_id, BlockId::OakLeaves | BlockId::BirchLeaves) {
+                            let h = (x as u64).wrapping_mul(0xD1B5_4A35)
+                                ^ ((z as u64) << 19)
+                                ^ (frame_count as u64).wrapping_mul(0xC2B2_AE3D);
+                            if (h & 0xFF) < 28 {
+                                // ~11%
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(BlockId::Sprout as u32),
+                                        count: 1,
+                                    },
+                                    [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
+                                    [0.0, 1.4, 0.0],
+                                );
+                                log::info!("[farm] a sapling fell from the leaves — plant it on soil under open sky");
+                            }
+                            // r579: FRUIT — leafy trees sometimes bear an apple you can eat
+                            // (right-click) for a light vitality bump. Independent roll from
+                            // the sapling drop above.
+                            let hf = (x as u64).wrapping_mul(0x9E37_79B1)
+                                ^ ((z as u64) << 17)
+                                ^ (frame_count as u64).wrapping_mul(0x2545_F491);
+                            if (hf & 0xFF) < 33 {
+                                // ~13%
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(APPLE_ITEM),
+                                        count: 1,
+                                    },
+                                    [x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5],
+                                    [0.0, 1.2, 0.0],
+                                );
+                                log::info!("[forage] an apple dropped from the tree");
+                            }
+                        }
                         water_dirty = true; // opt-1: terrain changed near possible water
                         last_block_action = Instant::now();
+                        // r509: mining with a forged tool wears it (survival only); breaks at 0.
+                        if survival_mode {
+                            if let Some((wid, cur, max)) = equipped_weapon_dura {
+                                let (nc, broke) = unendlich_engine::sim::item_durability::apply_wear(
+                                    cur, max, WEAR_PER_MINE,
+                                );
+                                equipped_weapon_dura = Some((wid, nc, max));
+                                if broke {
+                                    let _ = fg_app.inventory_mut().remove_item(wid, 1);
+                                    equipped_weapon_dura = None;
+                                    log::info!("[durability] your tool wore out and broke");
+                                }
+                            }
+                        }
+                        // r512/r514: HARVEST — breaking a tracked crop yields a bonus when ripe
+                        // (the farming payoff). The default block-break already drops 1; a ripe
+                        // one drops several more (sim::loot_quantity). Pulled from the persistent
+                        // flora store, so a crop you grew before saving still pays out after load.
+                        if let Some(cell) = session.flora.remove([x, y, z]) {
+                            // r519: only crops pay a harvest bonus; breaking an OakLog sapling
+                            // just removes it from tracking (handled by the remove above).
+                            // r520: uprooting a seedling (Sprout) returns the seed you sowed.
+                            if cell.block == BlockId::Sprout as u8 {
+                                let seed = match cell.element {
+                                    1 => BlockId::Potato,
+                                    2 => BlockId::Cabbage,
+                                    _ => BlockId::Carrot,
+                                };
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(seed as u32),
+                                        count: 1,
+                                    },
+                                    [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
+                                    [0.0, 1.5, 0.0],
+                                );
+                                log::info!("[farm] uprooted a {:?} seedling — seed recovered", seed);
+                            }
+                            let is_crop = matches!(
+                                cell.block,
+                                c if c == BlockId::Carrot as u8
+                                    || c == BlockId::Potato as u8
+                                    || c == BlockId::Cabbage as u8
+                            );
+                            let ripe = is_crop && cell.is_ripe();
+                            // r522: SEED GENETICS — a fruitful genome yields more, and harvesting a
+                            // ripe crop breeds its genome back into that crop's seed line, so the
+                            // next planting inherits the improvement (selective breeding).
+                            let g = unendlich_engine::sim::plant_tree_genetics::PlantGenome::from_array(cell.genome);
+                            if ripe {
+                                let idx = if cell.block == BlockId::Potato as u8 {
+                                    1usize
+                                } else if cell.block == BlockId::Cabbage as u8 {
+                                    2usize
+                                } else {
+                                    0usize
+                                };
+                                seed_stock[idx] = unendlich_engine::sim::plant_tree_genetics::cross(
+                                    &seed_stock[idx], &g,
+                                    ((x as u64) << 24) ^ ((z as u64) << 8) ^ frame_count,
+                                );
+                            }
+                            let luck = 0.3 + g.fruitfulness * 0.6;
+                            let extra = if ripe {
+                                unendlich_engine::sim::loot_quantity::quantity(2, luck, 5).max(1)
+                            } else {
+                                0
+                            };
+                            for k in 0..extra {
+                                let a = (k as f32) * 1.7;
+                                fg_app.drops_mut().spawn(
+                                    unendlich_engine::items::ItemStack {
+                                        item: unendlich_engine::items::ItemId(cell.block as u32),
+                                        count: 1,
+                                    },
+                                    [x as f32 + 0.5, y as f32 + 0.4, z as f32 + 0.5],
+                                    [a.cos() * 1.2, 1.6, a.sin() * 1.2],
+                                );
+                            }
+                            if ripe {
+                                log::info!("[farm] harvested ripe crop — +{} bonus yield", extra);
+                            }
+                        }
                         session.lan_outgoing_edits.push(
                             unendlich_engine::sim::world_authority::WorldCmd::Remove {
                                 pos: (x, y, z),
@@ -7969,6 +9850,40 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         }
                     }
+                    // r571: SOLID DIG — a large character carves a FILLED SPHERE of solid
+                    // blocks centred on the primary hit cell. (Replaces the old fan of
+                    // diverging rays, which feathered out with gaps and couldn't punch a
+                    // clean hole straight down at titan scale.) Bedrock (hardness < 0) is
+                    // spared; everything else in the radius goes. The central cell was
+                    // already cleared by the primary break above.
+                    if dig_radius > 0 {
+                        let [hx, hy, hz] = hit_cell;
+                        let r = dig_radius;
+                        let r2 = r * r;
+                        let mut cleared = 0u32;
+                        for dy in -r..=r {
+                            for dz in -r..=r {
+                                for dx in -r..=r {
+                                    if dx * dx + dy * dy + dz * dz > r2 {
+                                        continue;
+                                    }
+                                    let (cx, cy, cz) = (hx + dx, hy + dy, hz + dz);
+                                    let blk = chunk_manager.block_at(cx, cy, cz);
+                                    if blk.is_solid()
+                                        && blk.hardness() >= 0.0
+                                        && chunk_manager.set_block(cx, cy, cz, BlockId::Air)
+                                    {
+                                        cleared += 1;
+                                    }
+                                }
+                            }
+                        }
+                        if cleared > 0 {
+                            water_dirty = true;
+                            last_block_action = Instant::now();
+                            log::info!("[dig] carved {} blocks (solid sphere r={})", cleared, r);
+                        }
+                    }
                 } else {
                     // Place: put the selected palette block adjacent to the face we hit.
                     let target = hit_face.neighbor(hit_cell);
@@ -7986,16 +9901,134 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // accidentally aims at their own feet.
                             // No-op.
                         } else if !click_fed_creature {
-                            let go = if survival_mode {
-                                survival_use_item(&mut fg_app, selected_block, hand_item)
-                            } else {
+                            let go = if !survival_mode {
                                 Some(selected_block)
+                            } else if matches!(selected_block, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
+                                && fg_app.inventory().count(unendlich_engine::items::ItemId(selected_block as u32)) > 0
+                            {
+                                // r512: PLANT on tilled soil — consume one and place it (registered below).
+                                let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(selected_block as u32), 1);
+                                Some(selected_block)
+                            } else {
+                                survival_use_item(&mut fg_app, selected_block, hand_item)
                             };
                             if let Some(blk) = go {
                                 if chunk_manager.set_block(x, y, z, blk) {
                                     log::info!("Placed {:?} at ({},{},{}) on {:?} face of {:?}",
                                         blk, x, y, z, hit_face, hit_block_id);
                                     water_dirty = true; // opt-1: terrain changed
+                                    // r564: BIGGER MOUNDS — large characters place a sphere of
+                                    // the block into surrounding air (radius from stature). In
+                                    // survival each placed block costs one from inventory; it
+                                    // stops when you run out. Crops/saplings are excluded.
+                                    if place_radius > 0
+                                        && !matches!(blk, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                    {
+                                        let r2 = place_radius * place_radius;
+                                        let mut budget: i64 = if survival_mode {
+                                            fg_app.inventory().count(unendlich_engine::items::ItemId(blk as u32)) as i64
+                                        } else {
+                                            i64::MAX
+                                        };
+                                        let mut placed_extra = 0u32;
+                                        'mound: for dy in -place_radius..=place_radius {
+                                            for dz in -place_radius..=place_radius {
+                                                for dx in -place_radius..=place_radius {
+                                                    if dx * dx + dy * dy + dz * dz > r2 {
+                                                        continue;
+                                                    }
+                                                    if dx == 0 && dy == 0 && dz == 0 {
+                                                        continue;
+                                                    }
+                                                    if budget <= 0 {
+                                                        break 'mound;
+                                                    }
+                                                    let (bx, by, bz) = (x + dx, y + dy, z + dz);
+                                                    if !matches!(chunk_manager.block_at(bx, by, bz), BlockId::Air) {
+                                                        continue;
+                                                    }
+                                                    // never bury the player
+                                                    let overlaps = body.as_ref().map_or(false, |b| {
+                                                        let mn = b.aabb_min();
+                                                        let mx = b.aabb_max();
+                                                        (bx as f32) < mx[0] && (bx as f32 + 1.0) > mn[0]
+                                                            && (by as f32) < mx[1] && (by as f32 + 1.0) > mn[1]
+                                                            && (bz as f32) < mx[2] && (bz as f32 + 1.0) > mn[2]
+                                                    });
+                                                    if overlaps {
+                                                        continue;
+                                                    }
+                                                    if chunk_manager.set_block(bx, by, bz, blk) {
+                                                        placed_extra += 1;
+                                                        if survival_mode {
+                                                            let _ = fg_app.inventory_mut().remove_item(
+                                                                unendlich_engine::items::ItemId(blk as u32), 1,
+                                                            );
+                                                            budget -= 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if placed_extra > 0 {
+                                            log::info!("[mound] raised {} blocks (r={})", placed_extra, place_radius);
+                                        }
+                                    }
+                                    // r512/r520/r521: planting on soil. A crop becomes a SEEDLING
+                                    // (Sprout) that grows into the full crop; a Sprout item (a tree
+                                    // sapling, dropped by leaves) becomes an OakLog the sapling tick
+                                    // matures into a tree (needs open sky above).
+                                    if matches!(blk, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                        && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
+                                    {
+                                        if blk == BlockId::Sprout {
+                                            let clear = (1..=6).all(|u| {
+                                                matches!(chunk_manager.block_at(x, y + u, z), BlockId::Air)
+                                            });
+                                            if clear {
+                                                chunk_manager.set_block(x, y, z, BlockId::OakLog);
+                                                session.flora.plant(
+                                                    [x, y, z],
+                                                    unendlich_engine::world::flora_store::FloraCell::sown(
+                                                        BlockId::OakLog as u8, frame_count,
+                                                    ),
+                                                );
+                                                log::info!("[farm] planted a tree sapling at ({},{},{})", x, y, z);
+                                            } else {
+                                                // not enough room — leave the sprout block as placed.
+                                                log::info!("[farm] a tree needs open sky above to grow");
+                                            }
+                                        } else {
+                                            let target = match blk {
+                                                BlockId::Potato => 1u8,
+                                                BlockId::Cabbage => 2u8,
+                                                _ => 0u8,
+                                            };
+                                            chunk_manager.set_block(x, y, z, BlockId::Sprout);
+                                            let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
+                                                BlockId::Sprout as u8, frame_count,
+                                            );
+                                            fc.element = target;
+                                            // r522: genome = this crop's seed line crossed with a fresh draw.
+                                            let fresh = unendlich_engine::sim::plant_tree_genetics::PlantGenome::from_seed(
+                                                fg_world_seed
+                                                    ^ ((x as u64) << 20)
+                                                    ^ ((z as u64) << 4)
+                                                    ^ frame_count,
+                                            );
+                                            let g = unendlich_engine::sim::plant_tree_genetics::cross(
+                                                &seed_stock[target as usize], &fresh,
+                                                fg_world_seed ^ frame_count.wrapping_mul(0x9E37_79B9),
+                                            );
+                                            fc.genome = g.as_array();
+                                            session.flora.plant([x, y, z], fc);
+                                            log::info!(
+                                                "[farm] sowed {:?} seedling at ({},{},{}) — genome g/{:.2} f/{:.2} h/{:.2}",
+                                                blk, x, y, z, g.growth_rate, g.fruitfulness, g.hardiness
+                                            );
+                                        }
+                                    }
                                     last_block_action = Instant::now();
                                     session.lan_outgoing_edits.push(
                                         unendlich_engine::sim::world_authority::WorldCmd::Place {
@@ -8009,15 +10042,129 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             }
                         }
                     } else if !click_fed_creature {
-                        let go = if survival_mode {
-                            survival_use_item(&mut fg_app, selected_block, hand_item)
-                        } else {
-                            Some(selected_block)
-                        };
+                        let go = if !survival_mode {
+                                Some(selected_block)
+                            } else if matches!(selected_block, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
+                                && fg_app.inventory().count(unendlich_engine::items::ItemId(selected_block as u32)) > 0
+                            {
+                                // r512: PLANT on tilled soil — consume one and place it (registered below).
+                                let _ = fg_app.inventory_mut().remove_item(unendlich_engine::items::ItemId(selected_block as u32), 1);
+                                Some(selected_block)
+                            } else {
+                                survival_use_item(&mut fg_app, selected_block, hand_item)
+                            };
                         if let Some(blk) = go {
                             if chunk_manager.set_block(x, y, z, blk) {
                                 log::info!("Placed {:?} at ({},{},{}) on {:?} face", blk, x, y, z, hit_face);
                                 water_dirty = true; // opt-1: terrain changed
+                                    // r565: BIGGER MOUNDS (creative/no-body place path).
+                                    if place_radius > 0
+                                        && !matches!(blk, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                    {
+                                        let r2 = place_radius * place_radius;
+                                        let mut budget: i64 = if survival_mode {
+                                            fg_app.inventory().count(unendlich_engine::items::ItemId(blk as u32)) as i64
+                                        } else {
+                                            i64::MAX
+                                        };
+                                        let mut placed_extra = 0u32;
+                                        'mound2: for dy in -place_radius..=place_radius {
+                                            for dz in -place_radius..=place_radius {
+                                                for dx in -place_radius..=place_radius {
+                                                    if dx * dx + dy * dy + dz * dz > r2 {
+                                                        continue;
+                                                    }
+                                                    if dx == 0 && dy == 0 && dz == 0 {
+                                                        continue;
+                                                    }
+                                                    if budget <= 0 {
+                                                        break 'mound2;
+                                                    }
+                                                    let (bx, by, bz) = (x + dx, y + dy, z + dz);
+                                                    if !matches!(chunk_manager.block_at(bx, by, bz), BlockId::Air) {
+                                                        continue;
+                                                    }
+                                                    let overlaps = body.as_ref().map_or(false, |b| {
+                                                        let mn = b.aabb_min();
+                                                        let mx = b.aabb_max();
+                                                        (bx as f32) < mx[0] && (bx as f32 + 1.0) > mn[0]
+                                                            && (by as f32) < mx[1] && (by as f32 + 1.0) > mn[1]
+                                                            && (bz as f32) < mx[2] && (bz as f32 + 1.0) > mn[2]
+                                                    });
+                                                    if overlaps {
+                                                        continue;
+                                                    }
+                                                    if chunk_manager.set_block(bx, by, bz, blk) {
+                                                        placed_extra += 1;
+                                                        if survival_mode {
+                                                            let _ = fg_app.inventory_mut().remove_item(
+                                                                unendlich_engine::items::ItemId(blk as u32), 1,
+                                                            );
+                                                            budget -= 1;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if placed_extra > 0 {
+                                            log::info!("[mound] raised {} blocks (r={})", placed_extra, place_radius);
+                                        }
+                                    }
+                                    // r512/r520/r521: planting on soil. A crop becomes a SEEDLING
+                                    // (Sprout) that grows into the full crop; a Sprout item (a tree
+                                    // sapling, dropped by leaves) becomes an OakLog the sapling tick
+                                    // matures into a tree (needs open sky above).
+                                    if matches!(blk, BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
+                                        && matches!(chunk_manager.block_at(x, y - 1, z), BlockId::Grass | BlockId::Dirt)
+                                    {
+                                        if blk == BlockId::Sprout {
+                                            let clear = (1..=6).all(|u| {
+                                                matches!(chunk_manager.block_at(x, y + u, z), BlockId::Air)
+                                            });
+                                            if clear {
+                                                chunk_manager.set_block(x, y, z, BlockId::OakLog);
+                                                session.flora.plant(
+                                                    [x, y, z],
+                                                    unendlich_engine::world::flora_store::FloraCell::sown(
+                                                        BlockId::OakLog as u8, frame_count,
+                                                    ),
+                                                );
+                                                log::info!("[farm] planted a tree sapling at ({},{},{})", x, y, z);
+                                            } else {
+                                                // not enough room — leave the sprout block as placed.
+                                                log::info!("[farm] a tree needs open sky above to grow");
+                                            }
+                                        } else {
+                                            let target = match blk {
+                                                BlockId::Potato => 1u8,
+                                                BlockId::Cabbage => 2u8,
+                                                _ => 0u8,
+                                            };
+                                            chunk_manager.set_block(x, y, z, BlockId::Sprout);
+                                            let mut fc = unendlich_engine::world::flora_store::FloraCell::sown(
+                                                BlockId::Sprout as u8, frame_count,
+                                            );
+                                            fc.element = target;
+                                            // r522: genome = this crop's seed line crossed with a fresh draw.
+                                            let fresh = unendlich_engine::sim::plant_tree_genetics::PlantGenome::from_seed(
+                                                fg_world_seed
+                                                    ^ ((x as u64) << 20)
+                                                    ^ ((z as u64) << 4)
+                                                    ^ frame_count,
+                                            );
+                                            let g = unendlich_engine::sim::plant_tree_genetics::cross(
+                                                &seed_stock[target as usize], &fresh,
+                                                fg_world_seed ^ frame_count.wrapping_mul(0x9E37_79B9),
+                                            );
+                                            fc.genome = g.as_array();
+                                            session.flora.plant([x, y, z], fc);
+                                            log::info!(
+                                                "[farm] sowed {:?} seedling at ({},{},{}) — genome g/{:.2} f/{:.2} h/{:.2}",
+                                                blk, x, y, z, g.growth_rate, g.fruitfulness, g.hardiness
+                                            );
+                                        }
+                                    }
                                 last_block_action = Instant::now();
                                 session.lan_outgoing_edits.push(
                                     unendlich_engine::sim::world_authority::WorldCmd::Place {
@@ -9364,6 +11511,36 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             if frame_count % 30 == 0 {
                 // r126: on-screen HUD (egui card top-left) — same data as the
                 // [HUD] log line, visible without a terminal.
+                // r545: survival meters for the on-screen bars (hunger + thermal now;
+                // thirst placeholder until Roll 3). Hidden in creative mode.
+                renderer.hud_survival = if survival_mode {
+                    Some(unendlich_engine::render::world_renderer::SurvivalHud {
+                        hunger: fg_app.vitality().energy,
+                        thirst: fg_hydration.level,
+                        stamina: fg_app.stamina().level,
+                        comfort: fg_thermal.comfort,
+                        body_c: fg_thermal.body_c,
+                    })
+                } else {
+                    None
+                };
+                // r576: snapshot the real backpack (occupied slots) for the survival
+                // inventory panel, resolved to swatch+name+count via item_display.
+                renderer.backpack.clear();
+                if survival_mode {
+                    for slot in fg_app.inventory().slots() {
+                        if let Some(st) = slot {
+                            let d = unendlich_engine::item::item_display(st.item.0);
+                            renderer.backpack.push(
+                                unendlich_engine::render::world_renderer::InvSlotView {
+                                    color: d.color,
+                                    name: d.name,
+                                    count: st.count as u32,
+                                },
+                            );
+                        }
+                    }
+                }
                 let game_secs = (8 * 3600 + (world_clock_elapsed as u64) * 60) % 86_400;
                 renderer.hud_status_lines = vec![
                     format!(
@@ -9417,6 +11594,66 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         if bend_resonance.is_overdrawn() { "  OVERDRAWN" } else { "" },
                     ),
                 ];
+                // r517: BUILD/MINE FEEDBACK — show what you're aiming at (block + cell), and
+                // whether it's a mineable target in reach. Reuses the same octree raycast the
+                // break/place path uses, so the readout matches exactly what an action would hit.
+                {
+                    let cf = local_player.forward();
+                    if let Some(hit) = chunk_manager.raycast_octree(
+                        [pos.x, pos.y, pos.z],
+                        [cf.x, cf.y, cf.z],
+                        6.0,
+                        |b| b.is_solid(),
+                    ) {
+                        let (hx, hy, hz) = hit.world_cell;
+                        let tier = unendlich_engine::mining::required_tier(hit.block);
+                        let gate = if tier == unendlich_engine::mining::UNBREAKABLE {
+                            "  [unbreakable]"
+                        } else {
+                            ""
+                        };
+                        renderer.hud_status_lines.push(format!(
+                            "▸ {:?} ({},{},{}){}",
+                            hit.block, hx, hy, hz, gate
+                        ));
+                    }
+                }
+                // r509: show the held weapon's durability when one is equipped.
+                if let Some((_, cur, max)) = equipped_weapon_dura {
+                    renderer.hud_status_lines.push(format!(
+                        "weapon {}/{}{}",
+                        cur.max(0),
+                        max,
+                        if cur * 5 <= max { "  (worn!)" } else { "" }
+                    ));
+                }
+                // r510: cooking progress while roasting meat at a fire.
+                if cook_progress > 0.0 {
+                    renderer.hud_status_lines.push(format!(
+                        "roasting meat… {:.0}%",
+                        (cook_progress / COOK_TIME * 100.0).min(100.0)
+                    ));
+                }
+                // r506: MULTIPLAYER PRESENCE — when LAN peers are connected, list who's
+                // online on the HUD. Names come from each remote's chosen character
+                // (CH_AVATAR appearance sync, r494); falls back to the entity id otherwise.
+                if !lan_remote_creatures.is_empty() {
+                    let mut names: Vec<String> = lan_remote_creatures
+                        .keys()
+                        .map(|id| {
+                            lan_remote_appearance
+                                .get(id)
+                                .map(|p| p.name.clone())
+                                .unwrap_or_else(|| format!("player#{id}"))
+                        })
+                        .collect();
+                    names.sort();
+                    renderer.hud_status_lines.push(format!(
+                        "online ({}): you, {}",
+                        names.len() + 1,
+                        names.join(", ")
+                    ));
+                }
             }
             if frame_count % 120 == 0 && mouse_captured {
                 let game_secs = (8 * 3600 + (world_clock_elapsed as u64) * 60) % 86_400;
@@ -9472,6 +11709,365 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 everts.extend(cv);
                 eindices.extend(ci.iter().map(|i| i + base));
             }
+            // r490: the player's own character, shown only in third-person view.
+            // Built from active_character (rebuilt when the pick changes); parked
+            // at the player's feet and turned to face the look yaw.
+            // r490/r515: the player's own character — shown in third-person and cinematic
+            // views, and in first-person when `fp_body` is on (look down to see your body).
+            if camera_mode != 0 || fp_body {
+                if self_avatar_dirty || self_avatar.is_none() {
+                    let p = local_player.view.position;
+                    // r561: recompute the stature profile for the (possibly new)
+                    // character, then place the avatar's feet at the player's TRUE feet
+                    // (camera − the stature eye height) and resize the collider to match.
+                    {
+                        let bp = &active_character.build;
+                        // r567: density tracks the muscle/bulk slider (muscle is dense →
+                        // sinks; lean → floats), and strength too, so buoyancy/knockback get
+                        // real variation without a new slider.
+                        player_stature = unendlich_engine::sim::stature::derive(
+                            bp.height, bp.bulk, bp.bulk, bp.bulk,
+                        );
+                        player_eye_height = player_stature.eye_height;
+                        player_eye_offset =
+                            player_stature.eye_height - player_stature.half_extents[1];
+                        player_dmg_resist = unendlich_engine::sim::stature::BASE_HEALTH
+                            / player_stature.max_health;
+                        // resize the player collider to the stature, keeping the feet
+                        // planted (shift the AABB centre by the half-height delta).
+                        if let Some(b) = body.as_mut() {
+                            let old_half = b.half_extents[1];
+                            b.half_extents = player_stature.half_extents;
+                            b.position[1] += player_stature.half_extents[1] - old_half;
+                        }
+                    }
+                    let pos = [p.x, p.y - player_eye_height, p.z];
+                    self_avatar = Some(
+                        if matches!(
+                            active_character.arche(),
+                            unendlich_engine::creature_design::Arche::Dragon
+                        ) {
+                            // r531: actual dragon characters render as the forge dragon.
+                            // The elemental "hero" types are humanoid (Arche::Biped) and
+                            // take the blueprint path below — they are NOT dragons.
+                            unendlich_engine::spawn::spawn_dragon_arche(active_character.seed, pos)
+                        } else {
+                            let bp = active_character.blueprint();
+                            unendlich_engine::spawn::from_blueprint(&bp, pos)
+                        },
+                    );
+                    self_avatar_dirty = false;
+                }
+                if let Some(av) = self_avatar.as_mut() {
+                    let p = local_player.view.position;
+                    // r561: feet at the player's true feet for this stature.
+                    let cur = [p.x, p.y - player_eye_height, p.z];
+                    // derive velocity from the per-frame move so the pose rig
+                    // (legs/arms/wings) animates as the player walks/flies.
+                    if let Some(prev) = self_avatar_prev {
+                        let inv_dt = if frame_dt_s > 1e-4 { 1.0 / frame_dt_s } else { 0.0 };
+                        av.body.velocity = [
+                            (cur[0] - prev[0]) * inv_dt,
+                            (cur[1] - prev[1]) * inv_dt,
+                            (cur[2] - prev[2]) * inv_dt,
+                        ];
+                    }
+                    self_avatar_prev = Some(cur);
+                    av.body.position = cur;
+                    // r545 (Roll 2 / B1): advance the avatar's animation clocks so the
+                    // velocity-driven wing pose actually beats and the legs step. These
+                    // were only ticked for roamers, so the playable dragon picked the
+                    // Beating pose but held it frozen. anim_time drives the wing-beat/idle
+                    // sway; gait_phase advances with horizontal speed for the leg cycle.
+                    // (Forge heroes use their own hero_gait_phase, so this is dragon/
+                    // blueprint-avatar only in effect.)
+                    av.anim_time = (av.anim_time + frame_dt_s) % (std::f32::consts::TAU * 256.0);
+                    let spd_h = av.body.velocity[0].hypot(av.body.velocity[2]).min(12.0);
+                    av.gait_phase =
+                        (av.gait_phase + frame_dt_s * (2.0 + spd_h)) % std::f32::consts::TAU;
+                    av.yaw = local_player.view.yaw;
+                    // r534: NECK TRACKING — tilt the avatar's head/neck up/down with the
+                    // look pitch (gaze drives the head voxels in the vertex builder), so
+                    // looking up or down moves the head out of the camera's way instead of
+                    // the body squarely blocking the view. Clamped to a natural neck range.
+                    av.gaze_yaw = 0.0; // body yaw already faces the look direction
+                    av.gaze_pitch = local_player.view.pitch.clamp(-0.95, 0.95);
+                    // r538: forge heroes (Heliographer, Windwalker, Tidecaller, Stormweaver,
+                    // Gravitybender) render through the dedicated parameterized voxel hero
+                    // builder, shaped by the character's BuildParams sliders. Everyone else
+                    // uses the generic blueprint avatar. `av` is still updated above so its
+                    // velocity/gaze are current (used for the non-hero path + future anim).
+                    let (cv, ci) = if let Some(kind) =
+                        unendlich_engine::hero_forge::HeroKind::from_name(&active_character.name)
+                    {
+                        // walk cycle: amplitude follows horizontal speed (settles to 0
+                        // when standing), phase advances a touch faster as you move.
+                        let spd = (av.body.velocity[0] * av.body.velocity[0]
+                            + av.body.velocity[2] * av.body.velocity[2])
+                            .sqrt();
+                        let target_amp = (spd * 0.11).clamp(0.0, 0.5);
+                        let k = (frame_dt_s * 8.0).min(1.0);
+                        hero_gait_amp += (target_amp - hero_gait_amp) * k;
+                        // r568: ANTI FOOT-SLIDE. The swing amplitude already scales with
+                        // speed (target_amp = spd·0.11 above), so the planted foot's ground
+                        // speed at mid-stance ≈ leg_len · amp · dφ/dt. For that to track body
+                        // speed at ALL speeds, the phase RATE must be CONSTANT — cadence stays
+                        // fixed while stride LENGTH grows with speed, exactly as in real gait.
+                        // The rate is tuned to leg length (≈ ½·height), so a tall body strides
+                        // at a slower cadence (and, with its longer legs, covers more ground per
+                        // step). When stopped, amp→0 hides the still-advancing phase.
+                        let leg_len = 0.5 * player_stature.height;
+                        let gait_rate = 1.0 / (leg_len * 0.11).max(0.05);
+                        hero_gait_phase += frame_dt_s * gait_rate;
+                        if hero_gait_phase > std::f32::consts::TAU {
+                            hero_gait_phase -= std::f32::consts::TAU;
+                        }
+                        // (walk_phase + walk_amp are passed to the hero rig, which
+                        // derives the limb swing / bob / twist itself.)
+                        // r545: equipped-item colour for the hero's hand (simple
+                        // category map; None = empty-handed) + a continuous anim clock
+                        // for idle breathing.
+                        let held_color = hand_item.map(|h| match h.0 {
+                            4000..=4007 => [0.72, 0.74, 0.80], // forged weapon — steel
+                            1000 => [0.85, 0.72, 0.30],        // gold ingot
+                            1001 => [0.78, 0.78, 0.82],        // iron ingot
+                            2000 => [0.75, 0.30, 0.28],        // raw meat
+                            2001 => [0.62, 0.40, 0.26],        // cooked meat
+                            _ => [0.55, 0.45, 0.35],           // generic held item
+                        });
+                        // r570: airborne/landing pose drive. Ease `hero_airborne01` toward
+                        // 1 while off the ground (body=None ⇒ creative flight ⇒ also airborne),
+                        // and decay the landing crouch pulse over ~¼ s. vertical_vel comes from
+                        // the real player body so the fall/rise lean tracks actual motion.
+                        let (vvel, target_air) = match body.as_ref() {
+                            Some(b) => (b.velocity[1], if b.on_ground { 0.0 } else { 1.0 }),
+                            None => (0.0, 1.0), // flying
+                        };
+                        hero_airborne01 += (target_air - hero_airborne01)
+                            * (frame_dt_s * 9.0).min(1.0);
+                        hero_land_crouch = (hero_land_crouch - frame_dt_s * 4.0).max(0.0);
+                        // r572: flight blend — go horizontal "superman" while actively flying
+                        // (creative flight = no physics body) and moving; ease back upright when
+                        // hovering or grounded.
+                        let fly_target = if body.is_none() && spd > 1.5 { 1.0 } else { 0.0 };
+                        hero_flight01 += (fly_target - hero_flight01) * (frame_dt_s * 5.0).min(1.0);
+                        // r573: bank into flight turns — roll proportional to the view's yaw
+                        // rate (wrapped), smoothed and clamped, so a heading change arcs.
+                        let yaw_now = local_player.view.yaw;
+                        let mut dyaw = yaw_now - prev_view_yaw;
+                        while dyaw > std::f32::consts::PI {
+                            dyaw -= std::f32::consts::TAU;
+                        }
+                        while dyaw < -std::f32::consts::PI {
+                            dyaw += std::f32::consts::TAU;
+                        }
+                        prev_view_yaw = yaw_now;
+                        let yaw_rate = if frame_dt_s > 1e-4 { dyaw / frame_dt_s } else { 0.0 };
+                        let bank_target = (-yaw_rate * 0.22).clamp(-0.7, 0.7);
+                        hero_bank += (bank_target - hero_bank) * (frame_dt_s * 6.0).min(1.0);
+                        let pose = unendlich_engine::hero_forge::HeroPose {
+                            yaw: local_player.view.yaw,
+                            gaze_pitch: av.gaze_pitch,
+                            walk_phase: hero_gait_phase,
+                            walk_amp: hero_gait_amp,
+                            anim_t: start.elapsed().as_secs_f32(),
+                            held_color,
+                            airborne: hero_airborne01,
+                            vertical_vel: vvel,
+                            land_crouch: hero_land_crouch,
+                            flight01: hero_flight01,
+                            bank: hero_bank,
+                        };
+                        unendlich_engine::hero_forge::build(
+                            kind,
+                            &active_character.build,
+                            cur,
+                            &pose,
+                        )
+                    } else {
+                        creature_to_vertices(av)
+                    };
+                    let base = everts.len() as u32;
+                    // r535: AVATAR FADE (real alpha). As the body obscures more of the
+                    // camera, fade it out (down to 50% opacity) so it never squarely blocks
+                    // the view. The entity pipeline now blends per-vertex alpha, so this is
+                    // true transparency. Coverage = fraction of avatar triangles sitting
+                    // close + central in front of the render camera. Applies in every view;
+                    // in first-person it stacks on the r531 above-eye head clip.
+                    let cam_pos = match camera_mode {
+                        1 => local_player.view.position
+                            - local_player.view.forward() * (4.0 * cam_zoom)
+                            + glm::vec3(0.0, 0.6, 0.0),
+                        2 => local_player.view.position
+                            - local_player.view.forward() * (2.6 * cam_zoom)
+                            + local_player.view.right() * 0.9
+                            + glm::vec3(0.0, 0.45, 0.0),
+                        _ => local_player.view.position,
+                    };
+                    let cam_fwd = local_player.view.forward();
+                    // r562: taller bodies fill the FP view far more, so widen the
+                    // coverage net AND deepen the fade with height (= 1.0 at default).
+                    let fade_r = (player_stature.height
+                        / unendlich_engine::sim::stature::BASE_HEIGHT).max(1.0);
+                    let tri_count = ci.len() / 3;
+                    let mut covered = 0usize;
+                    for tri in ci.chunks_exact(3) {
+                        let p0 = cv[tri[0] as usize].position;
+                        let p1 = cv[tri[1] as usize].position;
+                        let p2 = cv[tri[2] as usize].position;
+                        let c = glm::vec3(
+                            (p0[0] + p1[0] + p2[0]) / 3.0,
+                            (p0[1] + p1[1] + p2[1]) / 3.0,
+                            (p0[2] + p1[2] + p2[2]) / 3.0,
+                        );
+                        let rel = c - cam_pos;
+                        let d = glm::dot(&rel, &cam_fwd);
+                        if d > 0.0 && d < 2.6 * fade_r {
+                            let lat = glm::length(&(rel - cam_fwd * d));
+                            if lat < 1.3 * fade_r {
+                                covered += 1;
+                            }
+                        }
+                    }
+                    let coverage01 = if tri_count > 0 {
+                        (covered as f32 / tri_count as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    // opacity 1.0 → floor as coverage rises — applied as real vertex alpha.
+                    // r550: gentler fade for a normal body (~45% floor). r562: taller
+                    // characters obscure far more, so the fade DEPTH grows with height
+                    // (up to ~92% transparent) — a default character is unchanged.
+                    let fade_depth = (0.55 * fade_r).min(0.92);
+                    let opacity = 1.0 - fade_depth * coverage01;
+                    let mut cv = cv;
+                    if opacity < 0.999 {
+                        for v in cv.iter_mut() {
+                            v.alpha = opacity;
+                        }
+                    }
+                    let clip_y = local_player.view.position.y - 0.25; // FP head clip
+                    everts.extend(cv.iter().cloned());
+                    for tri in ci.chunks_exact(3) {
+                        // First-person: drop triangles at/above eye level (r531 head clip).
+                        if camera_mode == 0
+                            && !tri.iter().all(|&i| cv[i as usize].position[1] < clip_y)
+                        {
+                            continue;
+                        }
+                        for &i in tri {
+                            eindices.push(i + base);
+                        }
+                    }
+                }
+            }
+            // r492: falling precipitation (rain/snow) when the weather is wet.
+            // Snow when the column is near/below freezing, else rain. Reuses the
+            // entity vertex stream — no separate particle pipeline.
+            if precip01 > 0.05 {
+                let pp = local_player.view.position;
+                let pt = sky_state.time_seconds as f32;
+                let (pwx, pwz, _pwm) = unendlich_engine::wind::wind_at(
+                    pp.x as f64, pp.y as f64, pp.z as f64, sky_state.time_seconds,
+                );
+                let snowing = last_climate_temp_c <= 1.0;
+                let inten = precip01.clamp(0.0, 1.0);
+                let (count, fall_speed, sway, half, pcolor) = if snowing {
+                    ((140.0 + 360.0 * inten) as usize, 2.2_f32, 0.5_f32,
+                     [0.06_f32, 0.06, 0.06], [0.95_f32, 0.97, 1.0])
+                } else {
+                    ((220.0 + 700.0 * inten) as usize, 14.0_f32, 0.04_f32,
+                     [0.02_f32, 0.20, 0.02], [0.60_f32, 0.69, 0.85])
+                };
+                let drops = unendlich_engine::sim::precipitation::field(
+                    [pp.x, pp.y, pp.z], pt, count, 16.0, 18.0, fall_speed, [pwx, pwz], sway,
+                );
+                let (hx, hy, hz) = (half[0], half[1], half[2]);
+                for d in &drops {
+                    let base = everts.len() as u32;
+                    let p = d.pos;
+                    for &(sx, sy, sz) in &[
+                        (-hx, -hy, -hz), (hx, -hy, -hz), (hx, -hy, hz), (-hx, -hy, hz),
+                        (-hx, hy, -hz), (hx, hy, -hz), (hx, hy, hz), (-hx, hy, hz),
+                    ] {
+                        everts.push(unendlich_engine::world::entity::EntityVertex {
+                            position: [p[0] + sx, p[1] + sy, p[2] + sz],
+                            color: pcolor,
+                            alpha: 1.0,
+                            sway: 0.0,
+                        });
+                    }
+                    for &i in &[
+                        0u32, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
+                        0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2,
+                        2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0,
+                    ] {
+                        eindices.push(base + i);
+                    }
+                }
+            }
+            // r493: drifting ICE FLOES on cold water — procedural floes around the
+            // player that drift downwind and only appear where the surface column is
+            // water. Visual (not collidable yet). Reuses the entity vertex stream.
+            if last_climate_temp_c <= 2.0 {
+                let pp = local_player.view.position;
+                let it = sky_state.time_seconds as f32;
+                let (iwx, iwz, _iwm) = unendlich_engine::wind::wind_at(
+                    pp.x as f64, pp.y as f64, pp.z as f64, sky_state.time_seconds,
+                );
+                let sea = unendlich_engine::constants::SEA_LEVEL;
+                let cold = ((2.0 - last_climate_temp_c).clamp(0.0, 6.0)) / 6.0; // 0..1
+                let n = (10.0 + 50.0 * cold) as usize;
+                let radius = 48.0_f32;
+                let ihash = |i: u32, s: u32| -> f32 {
+                    let mut h = i.wrapping_mul(0x9E37_79B1) ^ s.wrapping_mul(0x85EB_CA77);
+                    h ^= h >> 15; h = h.wrapping_mul(0x2C1B_3C6D); h ^= h >> 12;
+                    (h & 0x00FF_FFFF) as f32 / 16_777_216.0
+                };
+                let driftx = iwx * it * 0.30;
+                let driftz = iwz * it * 0.30;
+                for i in 0..n as u32 {
+                    let hx = ihash(i, 0x1); let hz = ihash(i, 0x2); let hs = ihash(i, 0x3);
+                    let bx = (hx * 2.0 - 1.0) * radius + driftx;
+                    let bz = (hz * 2.0 - 1.0) * radius + driftz;
+                    let wx = pp.x + ((bx + radius).rem_euclid(2.0 * radius) - radius);
+                    let wz = pp.z + ((bz + radius).rem_euclid(2.0 * radius) - radius);
+                    let xi = wx.floor() as i32;
+                    let zi = wz.floor() as i32;
+                    let on_water = matches!(chunk_manager.block_at(xi, sea, zi), BlockId::Water)
+                        && !chunk_manager.block_at(xi, sea + 1, zi).is_solid();
+                    if !on_water { continue; }
+                    let sx = 0.7 + hs * 1.6;          // floe half-width
+                    let sz = sx * (0.7 + ihash(i, 0x4) * 0.5);
+                    let y = sea as f32 + 0.95 + (it * 0.5 + hs * 6.28).sin() * 0.05;
+                    let yaw = hs * 6.2831 + it * 0.05 * (hx - 0.5); // slow spin
+                    let (cs, sn) = yaw.sin_cos();
+                    let (cyaw, syaw) = (sn, cs);
+                    let col = [0.82_f32, 0.90, 0.97];
+                    let base = everts.len() as u32;
+                    let hyt = 0.16_f32; // thin slab
+                    for &(cx, cy, cz) in &[
+                        (-sx, -hyt, -sz), (sx, -hyt, -sz), (sx, -hyt, sz), (-sx, -hyt, sz),
+                        (-sx, hyt, -sz), (sx, hyt, -sz), (sx, hyt, sz), (-sx, hyt, sz),
+                    ] {
+                        let rx = cx * cyaw - cz * syaw;
+                        let rz = cx * syaw + cz * cyaw;
+                        everts.push(unendlich_engine::world::entity::EntityVertex {
+                            position: [wx + rx, y + cy, wz + rz],
+                            color: col,
+                            alpha: 1.0,
+                            sway: 0.0,
+                        });
+                    }
+                    for &k in &[
+                        0u32, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
+                        0, 4, 5, 0, 5, 1, 1, 5, 6, 1, 6, 2,
+                        2, 6, 7, 2, 7, 3, 3, 7, 4, 3, 4, 0,
+                    ] {
+                        eindices.push(base + k);
+                    }
+                }
+            }
             // Append the streamed ambient roamers.
             for r in &roamers {
                 let cr = &r.creature;
@@ -9489,16 +12085,32 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let palette = unendlich_engine::items::default_palette();
                     // r147: drops afloat bob on the REAL water-wave field —
                     // params derived from the live wind + temperature.
-                    let wavep = {
+                    let (wavep, surf_adv) = {
                         let ppw = local_player.view.position;
                         let (wx, wz, wm) = unendlich_engine::wind::wind_at(
                             ppw.x as f64, ppw.y as f64, ppw.z as f64, sky_state.time_seconds,
                         );
-                        unendlich_engine::world::water_waves::water_wave_params(
+                        let wp = unendlich_engine::world::water_waves::water_wave_params(
                             wx as f32, wz as f32, wm as f32, 0.5,
                             sky_state.time_seconds as f32,
-                        )
+                        );
+                        // r504: match chunk.frag's surface advection (always-on baseline
+                        // + stronger wind) so drops ride the same lateral current the
+                        // water surface now shows. Keep in lockstep with the shader's
+                        // WW_BASE_DRIFT (0.60) / WW_WIND_DRIFT (0.55).
+                        let wlen = ((wx * wx + wz * wz).sqrt()).max(1e-3);
+                        let (dirx, dirz) = if wlen > 1e-3 {
+                            (wx as f32 / wlen as f32, wz as f32 / wlen as f32)
+                        } else {
+                            (0.7071, 0.7071)
+                        };
+                        let adv = [
+                            dirx * 0.60 + wx as f32 * 0.55,
+                            dirz * 0.60 + wz as f32 * 0.55,
+                        ];
+                        (wp, adv)
                     };
+                    let wave_t = sky_state.time_seconds as f32;
                     for d in fg_app.drops().drops() {
                         let c = palette
                             .iter()
@@ -9548,7 +12160,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             BlockId::Water
                         ) {
                             unendlich_engine::world::water_waves::water_wave_height_grad(
-                                d.pos[0], d.pos[2], &wavep,
+                                d.pos[0] - surf_adv[0] * wave_t,
+                                d.pos[2] - surf_adv[1] * wave_t,
+                                &wavep,
                             )
                             .0 * 0.5
                         } else {
@@ -9564,6 +12178,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             everts.push(unendlich_engine::world::entity::EntityVertex {
                                 position: [d.pos[0] + rx, d.pos[1] + cy + 0.25 + bob, d.pos[2] + rz],
                                 color: c,
+                                alpha: 1.0,
+                                sway: 0.0,
                             });
                         }
                         for &i in &[
@@ -9578,10 +12194,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         }
                     }
                 }
-                // r148: FIRST-PERSON VIEWMODEL (sim::viewmodel) — a tiny
                 // held-item model with walk bob + per-form pose, placed in
                 // camera space and pushed through the same entity stream.
-                if mouse_captured && hand_item.is_some() {
+                // r486: advance the held-item swing — fire on a block action, decay each frame.
+                if last_block_action != prev_block_action {
+                    swing_timer = SWING_DURATION;
+                }
+                swing_timer = (swing_timer - frame_dt_s).max(0.0);
+                if mouse_captured && camera_mode == 0 && !fp_body && (hand_item.is_some() || debug_weapon_class.is_some()) {
                     use unendlich_engine::sim::viewmodel as vm;
                     use unendlich_engine::sim::elemental::ItemForm;
                     let fwd = local_player.forward();
@@ -9597,13 +12217,49 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     };
                     let speed01 = (last_player_speed / 5.6).clamp(0.0, 1.0);
                     let walk_phase = (frame_count as f32) * 0.21 * (0.3 + speed01);
-                    let form = match hand_item.map(|h| h.0) {
-                        Some(1000) | Some(1001) => ItemForm::Blade, // ingots read as metal
-                        Some(id) if id >= 3000 => ItemForm::Staff,  // essence: arcane
+                    // r481: weapons take a dedicated model keyed by class; other
+                    // hand items fall back to the id->form heuristic.
+                    let hid = hand_item.map(|h| h.0);
+                    let weapon = debug_weapon_class
+                        .map(|i| vm::WEAPON_CLASSES[i])
+                        .or_else(|| hid.and_then(vm::weapon_class_for_id));
+                    // r485: a held BLOCK renders as a cube in the block's colour
+                    // instead of the generic tool fallback.
+                    let held_block = if weapon.is_none() {
+                        hid.and_then(|id| {
+                            unendlich_engine::world::blocks::BlockId::ALL
+                                .iter()
+                                .copied()
+                                .find(|b| *b as u32 == id && id != 0)
+                        })
+                    } else {
+                        None
+                    };
+                    let form = match (weapon, hid) {
+                        (Some(c), _) => vm::weapon_to_form(c),
+                        (None, Some(1000)) | (None, Some(1001)) => ItemForm::Blade, // ingots read as metal
+                        (None, Some(id)) if id >= 3000 => ItemForm::Staff,          // essence: arcane
                         _ => ItemForm::Tool,
                     };
-                    let pose = vm::viewmodel_pose(form, walk_phase, speed01, [0.0, 0.0]);
-                    for b in vm::item_model(form) {
+                    let mut pose = vm::viewmodel_pose(form, walk_phase, speed01, [0.0, 0.0]);
+                    // r486: overlay the use-swing — a quick down-forward arc that
+                    // peaks mid-swing, on top of the walk pose.
+                    if swing_timer > 0.0 {
+                        let prog = 1.0 - (swing_timer / SWING_DURATION).clamp(0.0, 1.0);
+                        let arc = (prog * std::f32::consts::PI).sin();
+                        pose.pitch += arc * 0.95;
+                        pose.roll += arc * 0.15;
+                        pose.offset[1] -= arc * 0.10;
+                        pose.offset[2] -= arc * 0.06;
+                    }
+                    let hand_boxes = if let Some(c) = weapon {
+                        vm::weapon_model(c)
+                    } else if let Some(b) = held_block {
+                        vm::block_model(b.base_color())
+                    } else {
+                        vm::item_model(form)
+                    };
+                    for b in hand_boxes {
                         let (corners, col) = vm::box_corners_in_view(&pose, &b);
                         let base = everts.len() as u32;
                         for cnr in corners {
@@ -9615,6 +12271,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     col[1] as f32 / 255.0,
                                     col[2] as f32 / 255.0,
                                 ],
+                                alpha: 1.0,
+                                sway: 0.0,
                             });
                         }
                         for &i in &[
@@ -9731,6 +12389,47 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             local_player.view.fov_y_radians = pose.fov_deg.to_radians();
         }
 
+        // r506: BODY PUSH-BACK — inject moving bodies' wakes into the flow field BEFORE it's
+        // packed to the shader, so this frame's swimmers/mobs disturb this frame's surface.
+        // Player wakes when swimming + moving; nearby mobs in water make wakes scaled by their
+        // mass (body volume) × speed — a dragon crashing in makes a far bigger wave than a fish.
+        if water_pushback && water_flow_shader {
+            let now_ms = start.elapsed().as_millis() as u64;
+            let pp = local_player.view.position;
+            if fg_app.swimming() && last_player_speed > 0.4 {
+                let f = local_player.forward();
+                let amp = unendlich_engine::sim::water_react::wave_amplitude(
+                    80.0, last_player_speed, 1.0, water_pushback_gain, water_pushback_max,
+                );
+                water_flow_tiles.splash(pp.x as i32, pp.z as i32, f.x, f.z, amp, now_ms);
+            }
+            for r in roamers.iter() {
+                let bp = r.creature.body.position;
+                let (dx, dz) = (bp[0] - pp.x, bp[2] - pp.z);
+                if dx * dx + dz * dz > 80.0 * 80.0 {
+                    continue; // outside the flow window
+                }
+                if !matches!(
+                    chunk_manager.block_at(bp[0].floor() as i32, bp[1].floor() as i32, bp[2].floor() as i32),
+                    unendlich_engine::world::blocks::BlockId::Water
+                ) {
+                    continue; // body isn't actually in water
+                }
+                let v = r.creature.body.velocity;
+                let speed = (v[0] * v[0] + v[2] * v[2]).sqrt();
+                if speed < 0.4 {
+                    continue;
+                }
+                let he = r.creature.body.half_extents;
+                let mass = (he[0] * he[1] * he[2] * 8.0).max(1.0) * 60.0; // volume × density proxy
+                let area = (he[0] * he[2] * 4.0).max(1.0); // frontal cross-section
+                let amp = unendlich_engine::sim::water_react::wave_amplitude(
+                    mass, speed, area, water_pushback_gain, water_pushback_max,
+                );
+                water_flow_tiles.splash(bp[0] as i32, bp[2] as i32, v[0], v[2], amp, now_ms);
+            }
+        }
+
         // r419 (flow-as-shader): hand the persisted flow tiles to the renderer as a coarse
         // 16×16 grid (32 blocks/cell → ~512-block window) centred on the player. Off → the
         // renderer's enable flag stays 0 and water uses wind only.
@@ -9762,9 +12461,255 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 start.elapsed().as_secs_f32(),
             );
         }
+        renderer.set_season(current_season01); // r499: foliage seasonal tint
 
+        // r597/r601: feed nearby heavy creatures to the foliage disturber system so
+        // they bow grass/leaves aside as they move (a dragon's bow-wave). For genome
+        // dragons, `derived_stature` (r601) now gives a real per-size ground_shake,
+        // so `secondary_motion::disturber_strength(mass, ground_shake)` — the same
+        // calibrated law used for the player disturber — replaces the earlier
+        // `mass/15` guess: a huge dragon now shoves the wind proportionally to how
+        // huge it actually is. Ordinary creatures (no derived stature) fall back to
+        // the flat mass heuristic, same as before.
+        {
+            let movers: Vec<([f32; 3], f32)> = roamers
+                .iter()
+                .map(|r| {
+                    let strength = match r.creature.derived_stature {
+                        Some(st) => unendlich_engine::sim::secondary_motion::disturber_strength(
+                            st.mass, st.ground_shake,
+                        ),
+                        None => (r.creature.mass / 15.0).max(0.0),
+                    };
+                    (r.creature.body.position, strength)
+                })
+                .collect();
+            let pp = local_player.view.position;
+            renderer.set_disturbers([pp.x, pp.y, pp.z], &movers);
+        }
+
+        // r476: timebend snapshot/scrub. While LIVE, record the player's vantage
+        // on the capture cadence. While SCRUBBING, override the camera + world
+        // clock to the selected past vantage so the live world re-renders exactly
+        // as it looked from there. The fade veil (driven below) covers each cut.
+        if timebend.active {
+            if let Some(s) = timebend.current() {
+                local_player.view.position = s.pos;
+                local_player.view.yaw = s.yaw;
+                local_player.view.pitch = s.pitch;
+                sky_state.time_seconds = s.sky_time;
+            }
+        } else {
+            timebend.maybe_capture(
+                local_player.view.position,
+                local_player.view.yaw,
+                local_player.view.pitch,
+                sky_state.time_seconds,
+            );
+        }
+        timebend.tick_fade(dt);
+        // Drive the existing veil from the scrub fade (max so we never undercut a
+        // genuine loading fade). While scrubbing, hold a light floor so the HUD
+        // label + a subtle vignette persist between cuts. r476.
+        let veil = if timebend.active {
+            timebend.fade.max(0.10)
+        } else {
+            timebend.fade
+        };
+        if veil > renderer.loading_fade {
+            renderer.loading_fade = veil;
+        }
+        if timebend.active {
+            renderer.loading_label = timebend.hud_label();
+        }
+
+        // r490: in third-person, render from a camera pulled back behind the eye
+        // (the look direction is unchanged, so the avatar sits centered ahead).
+        // Everything else — raycast, physics, culling, audio — still uses the eye.
+        // r537: in the pulled-back views, march the camera offset against the world
+        // and pinch it in so terrain can't wedge between the camera and the player
+        // (tight corridors, walls at your back). Applies in every pulled-back view.
+        // r562: chase cameras pull back, rise, and tilt down as the character grows,
+        // so a tall hero stays framed. `hz` = height / 1.8 (≥1); = 1.0 (no change) for
+        // a default character. Tilt is capped so it never looks straight down.
+        let cam_hz = (player_stature.height / unendlich_engine::sim::stature::BASE_HEIGHT).max(1.0);
+        let cam_tilt = (0.10 * (cam_hz - 1.0)).clamp(0.0, 0.45);
+        // r564: raise the chase camera well above the head as the character grows, so
+        // tilting down still frames the WHOLE body (the top no longer clips out). The
+        // lift adds ~0.6 per extra block of stature on top of the base lift.
+        let cam_lift_extra = 0.6 * (player_stature.height
+            - unendlich_engine::sim::stature::BASE_HEIGHT).max(0.0);
+        let mut render_view = match camera_mode {
+            1 => {
+                let mut v = local_player.view;
+                let eye = local_player.view.position;
+                let f = local_player.view.forward();
+                // desired: straight back behind the look direction, lifted a little.
+                let target = eye - f * (4.0 * cam_zoom * cam_hz)
+                    + glm::vec3(0.0, 0.6 * cam_hz + cam_lift_extra, 0.0);
+                let offset = target - eye;
+                let dist = glm::length(&offset);
+                let dir = if dist > 1e-4 { offset / dist } else { -f };
+                let pinched = pinch_camera_distance(eye, dir, dist, |x, y, z| {
+                    chunk_manager.block_at(x, y, z).is_solid()
+                });
+                v.position = eye + dir * pinched;
+                v.pitch = (v.pitch - cam_tilt).clamp(-1.5, 1.5);
+                v
+            }
+            2 => {
+                // r515: cinematic over-the-shoulder — pulled back, raised, offset right.
+                let mut v = local_player.view;
+                let eye = local_player.view.position;
+                let f = local_player.view.forward();
+                let r = local_player.view.right();
+                let target = eye - f * (2.6 * cam_zoom * cam_hz)
+                    + r * (0.9 * cam_hz.sqrt())
+                    + glm::vec3(0.0, 0.45 * cam_hz + cam_lift_extra, 0.0);
+                let offset = target - eye;
+                let dist = glm::length(&offset);
+                let dir = if dist > 1e-4 { offset / dist } else { -f };
+                let pinched = pinch_camera_distance(eye, dir, dist, |x, y, z| {
+                    chunk_manager.block_at(x, y, z).is_solid()
+                });
+                v.position = eye + dir * pinched;
+                v.pitch = (v.pitch - cam_tilt).clamp(-1.5, 1.5);
+                v
+            }
+            _ => local_player.view,
+        };
+        // r540: CAMERA JUICE (render-only). First-person walk bob + chase-camera
+        // smoothing. The logical eye (local_player.view) is untouched, so physics,
+        // raycast, culling and audio are unaffected.
+        {
+            let speed01 = (last_player_speed / 5.6).clamp(0.0, 1.0);
+            let grounded = !fg_app.swimming();
+            let target_amp = if view_bob_on && grounded { speed01 } else { 0.0 };
+            bob_amp_s += (target_amp - bob_amp_s) * (frame_dt_s * 6.0).min(1.0);
+            bob_phase += frame_dt_s * (6.0 + speed01 * 6.0);
+            if bob_phase > std::f32::consts::TAU {
+                bob_phase -= std::f32::consts::TAU;
+            }
+            // r566: GROUND-SHAKE per footfall — a heavy (tall) body's steps jolt the
+            // camera. The vertical bob is 2× stride, so a foot plants each time bob_phase
+            // crosses π or wraps past 0. Scaled by the stature's ground_shake (= 0 for a
+            // default character, so this never fires for them) and walking speed.
+            {
+                let pi = std::f32::consts::PI;
+                let footfall = (prev_bob_phase < pi && bob_phase >= pi) || (bob_phase < prev_bob_phase);
+                let walking = footfall && grounded && speed01 > 0.15 && body.is_some();
+                if walking && cam_shake_on && player_stature.ground_shake > 0.05 {
+                    let step_shake = (player_stature.ground_shake * 0.06).min(0.5) * speed01;
+                    shake_mag = shake_mag.max(step_shake);
+                }
+                // r571/r602: STOMP EROSION — footfalls of a heavy body wear at the
+                // terrain in their path. r602 (operator: "footsteps a little too
+                // destructive... in a way that's not very uniform"): most footsteps
+                // now only WEATHER the surface over a WIDER, JAGGED-edged area
+                // (sim::stomp_erosion::in_footprint — no more perfect circle) rather
+                // than instantly crushing it; a block only actually breaks once the
+                // SAME cell has been stomped a few times in a row
+                // (`streak_to_break`), tracked by `player_stomp_cell/_streak`. The
+                // weathered result is drawn from a small varied palette (Cobblestone
+                // / Gravel / MossyCobblestone for Stone, etc.) instead of always the
+                // same swap, so eroded ground doesn't read as uniform tiling.
+                if walking && player_stature.ground_shake > 1.0 {
+                    if let Some(b) = body.as_ref() {
+                        use unendlich_engine::sim::stomp_erosion as se;
+                        let crush_cap = player_stature.height / 8.0;
+                        // wider footprint than before (was clamp(1,3), now 2,4) since
+                        // each individual hit is gentler; depth unchanged.
+                        let er = ((player_stature.height / 12.0) as i32 + 1).clamp(2, 4);
+                        let depth = (1 + (crush_cap * 0.4) as i32).clamp(1, 3);
+                        let params = se::StompParams { crush_cap, radius: er, depth, streak_to_break: 3 };
+                        let fx = b.position[0].floor() as i32;
+                        let fz = b.position[2].floor() as i32;
+                        let fy = (b.aabb_min()[1] - 0.05).floor() as i32;
+                        let cell = (fx, fz);
+                        player_stomp_streak = se::update_streak(player_stomp_cell, cell, player_stomp_streak);
+                        player_stomp_cell = Some(cell);
+                        let seed = frame_count.wrapping_mul(0x9E37_79B9) ^ (fx as u64) ^ ((fz as u64) << 24);
+                        let mut crushed = 0u32;
+                        for dz in -er..=er {
+                            for dx in -er..=er {
+                                if !se::in_footprint(dx, dz, er, seed) {
+                                    continue;
+                                }
+                                for dd in 0..depth {
+                                    let (bx, by, bz) = (fx + dx, fy - dd, fz + dz);
+                                    let blk = chunk_manager.block_at(bx, by, bz);
+                                    if !blk.is_solid() {
+                                        continue; // punch through air/water to reach buried solids
+                                    }
+                                    let h = blk.hardness();
+                                    match se::decide(h, player_stomp_streak, &params) {
+                                        None => break, // bedrock — the foot can't drive past it
+                                        Some(se::CellAction::Crush) => {
+                                            if chunk_manager.set_block(bx, by, bz, BlockId::Air) {
+                                                crushed += 1;
+                                            }
+                                        }
+                                        Some(se::CellAction::Weather) => {
+                                            if let Some(w) = se::weathered_variant(blk, seed ^ ((dx as u64) << 8) ^ (dz as u64)) {
+                                                chunk_manager.set_block(bx, by, bz, w);
+                                            }
+                                            break; // still stops the foot sinking further this step
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if crushed > 0 {
+                            water_dirty = true;
+                        }
+                    }
+                }
+                prev_bob_phase = bob_phase;
+            }
+            if camera_mode == 0 && view_bob_on {
+                // vertical at 2× stride frequency, lateral at 1× — classic, subtle.
+                let up = (bob_phase * 2.0).sin() * 0.035 * bob_amp_s;
+                let lat = bob_phase.sin() * 0.045 * bob_amp_s;
+                let right = local_player.view.right();
+                render_view.position =
+                    render_view.position + glm::vec3(0.0, up, 0.0) + right * lat;
+            }
+            if cam_smooth_on && camera_mode != 0 {
+                // ease the chase camera toward its target so pinch/zoom glide; snap
+                // on big jumps (teleport/respawn/mode switch) to avoid a long slide.
+                let target = render_view.position;
+                let prev = cam_smoothed.unwrap_or(target);
+                let lerp = if glm::length(&(target - prev)) > 6.0 {
+                    1.0
+                } else {
+                    (frame_dt_s * 12.0).min(1.0)
+                };
+                let smoothed = prev + (target - prev) * lerp;
+                cam_smoothed = Some(smoothed);
+                render_view.position = smoothed;
+            } else {
+                cam_smoothed = None; // re-entering a chase view snaps the first frame
+            }
+            // r542: apply + decay the impulse shake (after bob/smoothing so it jolts
+            // the final camera). Multi-frequency sine on the camera's right/up axes.
+            if shake_mag > 0.001 {
+                shake_t += frame_dt_s;
+                let mag = shake_mag * 0.18; // world-unit scale of a full-strength jolt
+                let sx = (shake_t * 37.0).sin() * 0.6 + (shake_t * 19.0).sin() * 0.4;
+                let sy = (shake_t * 43.0).sin() * 0.6 + (shake_t * 23.0).sin() * 0.4;
+                let right = local_player.view.right();
+                render_view.position = render_view.position
+                    + right * (sx * mag)
+                    + glm::vec3(0.0, sy * mag, 0.0);
+                // exponential decay (~0.25s to fade) — settles quickly.
+                shake_mag *= (-frame_dt_s * 9.0).exp();
+                if shake_mag < 0.001 {
+                    shake_mag = 0.0;
+                }
+            }
+        }
         let draw_result = renderer.draw_frame_with_view_and_atmos(
-            &ctx, &local_player.view, &atmos,
+            &ctx, &render_view, &atmos,
         );
         _render_probe.set(unendlich_engine::thread_probe::Activity::Working);
         let draw_ms = t_draw_start.elapsed().as_secs_f64() * 1e3;
@@ -10596,6 +13541,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 local_player.view.position.y,
                                 local_player.view.position.z,
                             ]));
+                            self_avatar_dirty = true; // r561: size collider to stature
                             log::info!("[mode] survival launch -> flight ended, gravity on");
                         }
                         if was != survival_mode {
@@ -10624,10 +13570,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             // keep their OWN edits (a lightweight stand-in for a full
                             // world-id until that refactor lands).
                             let stem = if safe.is_empty() { "world".to_string() } else { safe };
-                            chunk_manager.set_world_root(std::path::PathBuf::from(format!(
+                            let new_world_dir = std::path::PathBuf::from(format!(
                                 "worlds/{}-{:016x}",
                                 stem, seed
-                            )));
+                            ));
+                            chunk_manager.set_world_root(new_world_dir.clone());
+                            // r580 FIX (world merging): the flora/crop store and whitelist
+                            // were bound to the STARTUP root (worlds/default) and never
+                            // rebound, so a new world inherited the previous world's crops &
+                            // saplings at stale positions — plants "floating over air" where
+                            // the old terrain used to be. Persist the old store, then rebind
+                            // BOTH roots to this world and load THIS world's flora (empty on
+                            // first visit ⇒ a clean, freshly-generated world).
+                            let _ = session.flora.save(&flora_root);
+                            let _ = whitelist.save(&flora_root);
+                            flora_root = new_world_dir;
+                            session.flora =
+                                unendlich_engine::world::flora_store::FloraStore::load(&flora_root);
+                            whitelist =
+                                unendlich_engine::sim::whitelist::Whitelist::load(&flora_root);
                         }
                         match chunk_manager.rebuild_for_seed(seed, Backend::Auto, gen_batch) {
                             Ok(()) => {
@@ -10660,11 +13621,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     use unendlich_engine::sim::world_catalog::{GameMode as CatMode, WorldEntry};
                                     let tick = world_clock_elapsed as u64;
                                     let mut entries = load_catalog_entries();
-                                    // r291: identity is name+seed — only replace the
-                                    // entry that matches BOTH (re-creating/replaying
-                                    // the same world), so two same-titled worlds with
-                                    // different seeds both keep their catalog rows.
-                                    entries.retain(|e| !(e.name == init.name && e.seed == seed));
+                                    // r577: identity is NAME (was name+seed, r291) —
+                                    // re-creating a world under an existing name REPLACES
+                                    // its row rather than leaving a duplicate behind. This
+                                    // matches WorldCatalog::add and the deduped loader, so
+                                    // the menu never shows two worlds of the same name.
+                                    entries.retain(|e| e.name != init.name);
                                     entries.push(WorldEntry {
                                         name: init.name.clone(),
                                         seed,
@@ -10802,6 +13764,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     const CH_HANDSHAKE: u8 = 1;
                     const CH_ENTITY: u8 = 2;
                     const CH_WORLDCMD: u8 = 3;
+                    const CH_AVATAR: u8 = 4; // r494: peer character appearance
                     use unendlich_engine::sim::net::world_cmd_wire::{decode_batch, encode_batch};
 
                     // Inbound: drain pending datagrams (non-blocking), route by channel.
@@ -10813,7 +13776,21 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 match buf[0] {
                                     CH_HANDSHAKE => match LanJoin::parse(payload) {
                                         Some(LanJoin::Join { name }) => {
-                                            log::info!("[lan-mp] join request from '{name}' ({src})");
+                                            // r518: enforce the access policy. Open hosts admit
+                                            // anyone; closed hosts admit only whitelisted names.
+                                            if !whitelist.admits(&name) {
+                                                log::info!("[lan-mp] join DENIED for '{name}' ({src}) — not on whitelist");
+                                                let deny = LanJoin::Deny {
+                                                    reason: "not on this server's whitelist".into(),
+                                                }
+                                                .encode();
+                                                let mut dg = vec![CH_HANDSHAKE];
+                                                dg.extend_from_slice(&deny);
+                                                let _ = sock.send_to(&dg, src);
+                                                continue;
+                                            }
+                                            log::info!("[lan-mp] join request from '{name}' ({src}) — admitted");
+                                            whitelist.allow(&name); // remember joiners so the host can later close + keep them
                                             if let std::net::SocketAddr::V4(a) = src {
                                                 lan_peer_addr = Some(a); // host learns where to replicate
                                             }
@@ -10855,8 +13832,15 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                         cr.yaw = yaw;
                                                     }
                                                     None => {
-                                                        let mut cr =
-                                                            unendlich_engine::spawn::spawn_beta_dragon(pos);
+                                                        // r494: build from the peer's known
+                                                        // appearance if we've received it, else
+                                                        // a default until CH_AVATAR arrives.
+                                                        let mut cr = match lan_remote_appearance.get(&s.id) {
+                                                            Some(profile) => unendlich_engine::spawn::from_blueprint(
+                                                                &profile.blueprint(), pos,
+                                                            ),
+                                                            None => unendlich_engine::spawn::spawn_beta_dragon(pos),
+                                                        };
                                                         cr.body.position = pos;
                                                         cr.yaw = yaw;
                                                         lan_remote_creatures.insert(s.id, cr);
@@ -10870,7 +13854,9 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                         }
                                     }
                                     CH_WORLDCMD => {
-                                        if let Some(cmds) = decode_batch(payload) {
+                                        // r498: payload is packet_compress-framed.
+                                        if let Some(raw) = unendlich_engine::sim::net::packet_compress::unpack(payload, 64 * 1024) {
+                                        if let Some(cmds) = decode_batch(&raw) {
                                             use unendlich_engine::sim::world_authority::WorldCmd;
                                             for (_player, cmd) in &cmds {
                                                 match cmd {
@@ -10888,6 +13874,38 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                                         );
                                                     }
                                                     _ => {}
+                                                }
+                                            }
+                                        }
+                                        }
+                                    }
+                                    CH_AVATAR => {
+                                        // r494: [id u64 LE][appearance 12B]. Store the
+                                        // peer's character; if their avatar already exists,
+                                        // rebuild it from the new look (keep pos/yaw).
+                                        if payload.len() >= 20 {
+                                            let mut idb = [0u8; 8];
+                                            idb.copy_from_slice(&payload[0..8]);
+                                            let id = u64::from_le_bytes(idb);
+                                            if let Some(profile) =
+                                                unendlich_engine::player_character::CharacterProfile::from_appearance_bytes(&payload[8..20])
+                                            {
+                                                let changed = lan_remote_appearance
+                                                    .get(&id)
+                                                    .map(|p| p != &profile)
+                                                    .unwrap_or(true);
+                                                if changed {
+                                                    if let Some(cr) = lan_remote_creatures.get(&id) {
+                                                        let (pos, yaw) = (cr.body.position, cr.yaw);
+                                                        let mut nc = unendlich_engine::spawn::from_blueprint(
+                                                            &profile.blueprint(), pos,
+                                                        );
+                                                        nc.body.position = pos;
+                                                        nc.yaw = yaw;
+                                                        lan_remote_creatures.insert(id, nc);
+                                                    }
+                                                    lan_remote_appearance.insert(id, profile);
+                                                    log::info!("[lan-mp] learned appearance for entity {id}");
                                                 }
                                             }
                                         }
@@ -10911,6 +13929,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         .collect();
                     for id in stale {
                         lan_remote_creatures.remove(&id);
+                        lan_remote_appearance.remove(&id); // r494
                         lan_remote_last_seen.remove(&id);
                         log::info!("[lan-mp] remote entity {id} timed out — avatar removed");
                     }
@@ -10974,6 +13993,16 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                 let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
                             }
 
+                            // r494: broadcast our chosen-character appearance ~every 2s so
+                            // the peer renders us as our character, not a default avatar.
+                            if now_ms.saturating_sub(lan_avatar_last_sent_ms) >= 2000 {
+                                lan_avatar_last_sent_ms = now_ms;
+                                let mut dg = vec![CH_AVATAR];
+                                dg.extend_from_slice(&(lan_session_port as u64).to_le_bytes());
+                                dg.extend_from_slice(&active_character.to_appearance_bytes());
+                                let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
+                            }
+
                             // Outbound block edits: drain this frame's place/break edits
                             // to the peer so building/mining propagates.
                             if !session.lan_outgoing_edits.is_empty() {
@@ -10983,8 +14012,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                                     .map(|cmd| (pid, cmd))
                                     .collect();
                                 let bytes = encode_batch(&batch);
+                                // r498: compress bulk edit batches (raw header for
+                                // small ones — single byte, never expands).
                                 let mut dg = vec![CH_WORLDCMD];
-                                dg.extend_from_slice(&bytes);
+                                dg.extend_from_slice(
+                                    &unendlich_engine::sim::net::packet_compress::pack(&bytes, 48),
+                                );
                                 let _ = sock.send_to(&dg, std::net::SocketAddr::V4(peer));
                             }
                         }
@@ -11441,6 +14474,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     if saved > 0 {
         log::info!("Saved {} edited chunks before shutdown", saved);
     }
+    // r514: flush the persistent flora/crop store so growth survives the session.
+    if let Err(e) = session.flora.save(&flora_root) {
+        log::warn!("[farm] failed to save flora state on shutdown: {}", e);
+    } else if !session.flora.is_empty() {
+        log::info!("Saved {} crop(s) before shutdown", session.flora.len());
+    }
+    // r518: persist the server access policy + allow-list.
+    let _ = whitelist.save(&flora_root);
     log::info!("Shutting down after {:.1}s", elapsed.as_secs_f32());
 
     // v0.21.3: dump the lifetime per-zone GPU timer stats. One line
