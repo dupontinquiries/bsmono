@@ -169,6 +169,39 @@ pub fn hit_test(layout: &Layout, board: Rect, adaptive: &Adaptive, pos: egui::Po
     None
 }
 
+/// Accessibility: a stable id for the key at (row, col), so voice focus survives re-layout.
+pub fn key_id(row: usize, col: usize) -> u64 {
+    ((row as u64) << 8) | (col as u64)
+}
+
+/// The emit string for a key id (inverse of [`key_id`]).
+pub fn emit_for_id(layout: &Layout, id: u64) -> Option<String> {
+    let r = (id >> 8) as usize;
+    let c = (id & 0xff) as usize;
+    layout.rows.get(r).and_then(|row| row.keys.get(c)).map(|k| k.emit.clone())
+}
+
+/// Register every key with an [`A11yScene`] so voice can navigate the keyboard. Call each
+/// frame (before/with rendering). Keys become focusable buttons labelled by their glyph.
+pub fn register_a11y(scene: &mut uikit_egui::A11yScene, layout: &Layout) {
+    scene.begin_frame();
+    for (r, row) in layout.rows.iter().enumerate() {
+        for (c, key) in row.keys.iter().enumerate() {
+            scene.add(key_id(r, c), uikit_egui::Semantics::button(&key.label), None);
+        }
+    }
+}
+
+/// Apply a voice accessibility action to the keyboard. On "activate" it returns the `emit`
+/// string of the focused key (the app types it); navigation/describe return `None` here (the
+/// scene speaks). This makes the ported keyboard fully voice-navigable via voiced.
+pub fn voice_key(scene: &mut uikit_egui::A11yScene, layout: &Layout, action: uikit_egui::A11yAction) -> Option<String> {
+    match scene.apply(action) {
+        uikit_egui::A11yOutcome::Activate(id) => emit_for_id(layout, id),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +232,21 @@ mod tests {
         // top-left of the first row should land on 'q'
         let hit = hit_test(&l, board, &a, egui::pos2(6.0, 5.0));
         assert_eq!(hit.as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn keyboard_is_voice_navigable() {
+        use uikit_egui::{A11yAction, A11yScene};
+        let l = Layout::qwerty();
+        let mut scene = A11yScene::new();
+        register_a11y(&mut scene, &l);
+        // "next" focuses the first key (q), "next" again → w
+        assert_eq!(voice_key(&mut scene, &l, A11yAction::Next), None); // focus q (nav speaks, no emit)
+        assert_eq!(voice_key(&mut scene, &l, A11yAction::Next), None); // focus w
+        // "activate" types the focused key
+        assert_eq!(voice_key(&mut scene, &l, A11yAction::Activate).as_deref(), Some("w"));
+        // id round-trips to emit; backspace's control char comes through
+        let bs_id = key_id(2, 8);
+        assert_eq!(emit_for_id(&l, bs_id).as_deref(), Some("\u{8}"));
     }
 }
