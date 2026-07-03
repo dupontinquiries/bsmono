@@ -1,0 +1,134 @@
+{
+  "name": "all-bigsilicon",
+  "description": "Every app across all groups \u2014 the full BigSilicon install",
+  "apps": [
+    {
+      "name": "ambient-learner",
+      "path": "apps/ambient-learner",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "av1tuner",
+      "path": "apps/av1tuner",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "av1tuner-m1",
+      "path": "apps/av1tuner-m1",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "beatspace",
+      "path": "apps/beatspace",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bo-suite",
+      "path": "apps/bo-suite",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bot-arena",
+      "path": "apps/bot-arena",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "cybertron",
+      "path": "apps/cybertron",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "fao-codec",
+      "path": "apps/fao-codec",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "gitmind",
+      "path": "apps/gitmind",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "krapper",
+      "path": "apps/krapper",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "logscope",
+      "path": "apps/logscope",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "paperbound",
+      "path": "apps/paperbound",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "rusty-board",
+      "path": "apps/rusty-board",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "snapclone",
+      "path": "apps/snapclone",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "unendlich",
+      "path": "apps/unendlich",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "voiceterm",
+      "path": "apps/voiceterm",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}
