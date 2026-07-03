@@ -140,6 +140,53 @@ impl FlowTileStore {
         }
     }
 
+    /// r506: BODY PUSH-BACK / WAKE. A body of some mass moving through water shoves a
+    /// transient disturbance into the flow field: an outward radial push around the body's
+    /// column, biased forward along `(dir_x, dir_z)` so it reads as a bow wave. `amp` (in
+    /// cells, from `sim::water_react::wave_amplitude(mass, speed, …)`) sets both the wake
+    /// radius and its strength — heavier + faster ⇒ wider, stronger wake. The surface
+    /// shader already streams waves + foam along the flow field, so this makes the water
+    /// visibly part and foam around a swimmer / a dragon crashing into a lake, with no new
+    /// render path. Only stamps cells that already hold water (depth ≥ 0); impulses ADD and
+    /// are clamped, and the per-tick sim ingest + `decay` wash the wake back out naturally.
+    pub fn splash(&mut self, wx: i32, wz: i32, dir_x: f32, dir_z: f32, amp: f32, now: u64) {
+        if !(amp > 0.0) {
+            return;
+        }
+        let r = (amp.ceil() as i32).clamp(1, 5); // bigger wave ⇒ wider wake
+        let dlen = (dir_x * dir_x + dir_z * dir_z).sqrt();
+        let (dnx, dnz) = if dlen > 1e-4 { (dir_x / dlen, dir_z / dlen) } else { (0.0, 0.0) };
+        for dz in -r..=r {
+            for dx in -r..=r {
+                let dist = ((dx * dx + dz * dz) as f32).sqrt();
+                if dist > r as f32 {
+                    continue;
+                }
+                let (cx, cz) = (wx + dx, wz + dz);
+                if self.sample_depth(cx, cz) < 0.0 {
+                    continue; // only push real water
+                }
+                // radial outward from the body (fall back to heading at the centre cell)
+                let (mut ox, mut oz) = if dist > 1e-3 {
+                    (dx as f32 / dist, dz as f32 / dist)
+                } else {
+                    (dnx, dnz)
+                };
+                let falloff = 1.0 - dist / (r as f32 + 0.5);
+                let fwd = (ox * dnx + oz * dnz).max(0.0); // ahead of the body ⇒ stronger (bow wave)
+                let mag = amp * falloff * (0.6 + 0.8 * fwd);
+                ox *= mag;
+                oz *= mag;
+                let key = (tile_of(cx), tile_of(cz));
+                let tile = self.tiles.entry(key).or_insert_with(|| FlowTile::empty(now));
+                let idx = cell_idx(local_of(cx), local_of(cz));
+                tile.vx[idx] = (tile.vx[idx] + ox).clamp(-8.0, 8.0);
+                tile.vz[idx] = (tile.vz[idx] + oz).clamp(-8.0, 8.0);
+                tile.last_update = now;
+            }
+        }
+    }
+
     /// Water depth (blocks) at a world cell, or -1 if no tile / never written.
     pub fn sample_depth(&self, wx: i32, wz: i32) -> f32 {
         match self.tiles.get(&(tile_of(wx), tile_of(wz))) {
@@ -374,5 +421,41 @@ mod tests {
         assert_eq!(cov[2], 8.0);
         assert_eq!(grid.len(), 16);
         assert!(grid.iter().all(|&d| d < 0.0)); // empty store → all no-data
+    }
+
+    #[test]
+    fn splash_pushes_only_water_cells() {
+        let mut s = FlowTileStore::new();
+        // Establish water at a small patch via a depth ingest (so sample_depth ≥ 0 there).
+        let side = 4usize;
+        let vx = vec![0.0; side * side];
+        let vz = vec![0.0; side * side];
+        let depth = vec![3.0; side * side]; // all wet
+        s.ingest_blend(100, 100, side, &vx, &vz, &depth, 1, 1.0);
+        // A dry cell far away should stay untouched by a splash centred on the water.
+        let (dry_before_x, dry_before_z) = s.sample(500, 500);
+        // Splash at the centre of the water patch, heading +x.
+        s.splash(101, 101, 1.0, 0.0, 3.0, 2);
+        let (wx, wz) = s.sample(101, 101);
+        assert!(
+            (wx * wx + wz * wz).sqrt() > 0.0,
+            "splash must impart flow at a wet cell"
+        );
+        let (dry_after_x, dry_after_z) = s.sample(500, 500);
+        assert_eq!(
+            (dry_before_x, dry_before_z),
+            (dry_after_x, dry_after_z),
+            "splash must not touch dry cells with no water depth"
+        );
+    }
+
+    #[test]
+    fn splash_zero_amplitude_is_noop() {
+        let mut s = FlowTileStore::new();
+        let side = 2usize;
+        s.ingest_blend(0, 0, side, &vec![0.0; 4], &vec![0.0; 4], &vec![2.0; 4], 1, 1.0);
+        let before = s.sample(0, 0);
+        s.splash(0, 0, 1.0, 0.0, 0.0, 2); // amp 0 → still body, no wave
+        assert_eq!(before, s.sample(0, 0));
     }
 }

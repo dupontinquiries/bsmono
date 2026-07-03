@@ -1,0 +1,75 @@
+logscope-suite — project structure (generated 2026-06-29T15:05Z)
+================================================================
+
+## crates/
+  crates
+  crates/gpu-gemm
+  crates/gpu-gemm/src
+  crates/logscope
+  crates/logscope-egui
+  crates/logscope-egui/src
+  crates/logscope/src
+  crates/logscope/tests
+
+## gpu-gemm engine sources (LOC)
+   10358 total
+    4142 crates/gpu-gemm/src/lib.rs
+    3474 crates/gpu-gemm/src/main.rs
+     652 crates/gpu-gemm/src/simconvo.rs
+     539 crates/gpu-gemm/src/store.rs
+     436 crates/gpu-gemm/src/gguf.rs
+     250 crates/gpu-gemm/src/toolpipe.rs
+     228 crates/gpu-gemm/src/tokenizer.rs
+     205 crates/gpu-gemm/src/netserve.rs
+     198 crates/gpu-gemm/src/memplan.rs
+     154 crates/gpu-gemm/src/archcfg.rs
+      80 crates/gpu-gemm/src/serve.rs
+
+## docs
+  BIGGER_MODELS.md
+  BOOTSTRAP.md
+  CAPACITY.md
+  DEEPSEEK_SUPPORT.md
+  DESIGN_generative_scenes.md
+  FIELD_NOTES.md
+  FLEET.md
+  HANDOFF.md
+  HARNESS-SCORECARD.md
+  HISTORY_DESIGN.md
+  INTEGRATION.md
+  LONG_CONTEXT.md
+  PREWARM.md
+  README.md
+  RESEARCH_weather_light.md
+  RULESET.md
+  RULE_MAP.md
+  RUN_ON_DEVICE.md
+  SCALING_PLAN.md
+  SCENE_RULES.md
+  SERVING.md
+  TODO.md
+  TOOLING.md
+  WORKER_CONTRACT.md
+  reference-docs/ENGINE_PERF_STATUS.md
+  reference-docs/HANDOFF-imagegen.md
+  reference-docs/HANDOFF.md
+  reference-docs/SESSION_BRIEF_deferrals.md
+  reference-docs/SPEC_DECODE.md
+
+## tools
+  __pycache__
+  bench-tps.sh
+  cand_mansion_garden.txt
+  cand_mistfall.txt
+  cand_slate.txt
+  flygrid.sh
+  gen_candidates.py
+  geom_check.py
+  grid.sh
+  lavapipe-gates.sh
+  markov_search.py
+  pearlgrid.sh
+  refs
+  score_render.py
+  sweep_matrix.py
+  tune_harness.sh

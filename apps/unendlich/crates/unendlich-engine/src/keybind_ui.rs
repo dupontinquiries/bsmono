@@ -9,6 +9,7 @@
 
 use crate::keybindings::GameAction;
 use crate::input_codes::Keycode as Key; // r328: native keycodes
+use crate::input_codes::MouseBtn as MouseButton; // r528: mouse-button rebinding
 
 /// The actions exposed on the rebinding page, in display order. Movement
 /// and the common toggles first, hotbar last. Not every GameAction is
@@ -34,6 +35,9 @@ pub fn rebindable_actions() -> &'static [(GameAction, &'static str)] {
         (Hotbar4, "Hotbar 4"),
         (Hotbar5, "Hotbar 5"),
         (ToggleDebugOverlay, "Toggle Debug Overlay"),
+        (ToggleThirdPerson, "Third-Person View"),
+        (ToggleCinematicCam, "Cinematic Camera"),
+        (Bend, "Bending (hold to cast)"),
         (Screenshot, "Screenshot"),
         (ToggleFullscreen, "Toggle Fullscreen"),
     ]
@@ -95,8 +99,30 @@ pub fn capture_candidates() -> Vec<Key> {
         Key::Space, Key::LeftShift, Key::RightShift, Key::LeftControl,
         Key::RightControl, Key::LeftAlt, Key::Tab, Key::Up, Key::Down,
         Key::Left, Key::Right,
+        // r528: navigation cluster — players often map abilities to these (and
+        // some mice emit PageUp/PageDown from wheel-tilt / side keys).
+        Key::PageUp, Key::PageDown, Key::Home, Key::End, Key::Insert, Key::Delete,
     ]);
     v
+}
+
+/// r528: mouse buttons the capture loop offers for rebinding. Left/Right stay
+/// reserved for look/place/break, so only the middle + the two side buttons
+/// (`Back`/`Forward`, the "extra" buttons many mice expose) are bindable.
+pub fn mouse_capture_candidates() -> Vec<MouseButton> {
+    vec![MouseButton::Middle, MouseButton::Back, MouseButton::Forward]
+}
+
+/// Display label for a bound mouse button.
+pub fn mouse_label(b: MouseButton) -> String {
+    match b {
+        MouseButton::Left => "Mouse-L".to_string(),
+        MouseButton::Right => "Mouse-R".to_string(),
+        MouseButton::Middle => "Mouse-Mid".to_string(),
+        MouseButton::Back => "Mouse-4".to_string(),
+        MouseButton::Forward => "Mouse-5".to_string(),
+        MouseButton::Other(n) => format!("Mouse-{}", n),
+    }
 }
 
 #[cfg(test)]

@@ -40,7 +40,7 @@ const ALTITUDE_GAIN: f32 = 0.005;
 const MAX_MAGNITUDE: f32 = 3.0;
 /// Time scale for slow direction rotation, in seconds. Direction completes
 /// a full rotation roughly every TWOPI × this many seconds.
-const DIRECTION_ROTATION_SECS: f64 = 30.0;
+const DIRECTION_ROTATION_SECS: f64 = 50.0;
 /// Spatial scale of the regional wind variation in blocks. Larger = wind
 /// magnitude varies over wider areas.
 const REGIONAL_SCALE: f64 = 256.0;
@@ -86,8 +86,8 @@ pub fn wind_at(world_x: f64, world_y: f64, world_z: f64, world_time: f64) -> (f3
     // 0.1 m/s shove that the player can feel.
     //
     // Two superimposed timescales:
-    //   - Slow: 8s period, ±0.5 around 1.0 — broad envelope.
-    //   - Fast: 1.5s period, ±0.4 around 1.0 — gust pulses.
+    //   - Slow: ~100s period, ±0.5 around 1.0 — broad envelope (r492: was 8).
+    //   - Fast: ~31s period, ±0.4 around 1.0 — gust pulses (r492: was 1.5, vacillated).
     // With a regional phase offset so different chunks gust at different
     // times (no synchronized world-wide gusts).
     let gust_phase_offset = noise::noise_2d(
@@ -95,8 +95,8 @@ pub fn wind_at(world_x: f64, world_y: f64, world_z: f64, world_time: f64) -> (f3
         world_z / REGIONAL_SCALE * 0.7,
         0x6B17BE8E,
     ) as f32;
-    let slow_t = (world_time / 8.0) as f32 + gust_phase_offset;
-    let fast_t = (world_time / 1.5) as f32 + gust_phase_offset * 2.0;
+    let slow_t = (world_time / 16.0) as f32 + gust_phase_offset;
+    let fast_t = (world_time / 5.0) as f32 + gust_phase_offset * 2.0;
     // Slow envelope ∈ [0.5, 1.5], fast pulse ∈ [0.6, 1.4].
     let slow = 1.0 + 0.5 * slow_t.sin();
     let fast = 1.0 + 0.4 * fast_t.sin();

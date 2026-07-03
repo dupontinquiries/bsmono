@@ -51,15 +51,22 @@ impl EntityPipeline {
                 .stage(vk::ShaderStageFlags::FRAGMENT).module(frag_module).name(entry).build(),
         ];
 
-        // EntityVertex: position[3] f32 @0, color[3] f32 @12, stride 24.
+        // EntityVertex: position[3] f32 @0, color[3] f32 @12, alpha f32 @24,
+        // sway f32 @28 (r599), stride 32.
         let binding = vk::VertexInputBindingDescription {
             binding: 0,
-            stride: 24,
+            stride: 32,
             input_rate: vk::VertexInputRate::VERTEX,
         };
         let attrs = [
             vk::VertexInputAttributeDescription { binding: 0, location: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
             vk::VertexInputAttributeDescription { binding: 0, location: 1, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+            // r535: per-vertex alpha for real transparency (avatar fade).
+            vk::VertexInputAttributeDescription { binding: 0, location: 2, format: vk::Format::R32_SFLOAT, offset: 24 },
+            // r599: per-vertex wind/disturber sway weight (0 rigid .. 1 free) — capes,
+            // scarves, trailing cloth. entity.vert reads this to bend the same way
+            // chunk.vert bends foliage.
+            vk::VertexInputAttributeDescription { binding: 0, location: 3, format: vk::Format::R32_SFLOAT, offset: 28 },
         ];
         let bindings = [binding];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
@@ -96,9 +103,20 @@ impl EntityPipeline {
             .depth_bounds_test_enable(false)
             .stencil_test_enable(false);
 
+        // r535: alpha blending ON so per-vertex alpha gives real transparency.
+        // Opaque entities (alpha = 1.0) are unaffected: src*1 + dst*0 == src. The
+        // avatar (alpha < 1) blends over the already-drawn opaque world. Depth
+        // write stays ON, so overlapping triangles of the same translucent body
+        // don't double-composite (nearest wins), keeping the fade visually clean.
         let color_blend_attachment = vk::PipelineColorBlendAttachmentState::builder()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)
             .build();
         let color_blend_attachments = [color_blend_attachment];
         let color_blend = vk::PipelineColorBlendStateCreateInfo::builder()
@@ -151,12 +169,16 @@ impl EntityPipeline {
     /// Must be called after the frame fence wait, before `record`.
     pub fn upload(&mut self, device: &Device, verts: &[EntityVertex], indices: &[u32]) -> Result<(), vk::Result> {
         // Pack vertices field-by-field so the GPU layout is exact regardless of
-        // EntityVertex's Rust repr: [px,py,pz, cr,cg,cb] f32, 24 bytes each.
-        let mut vbytes = Vec::with_capacity(verts.len() * 24);
+        // EntityVertex's Rust repr: [px,py,pz, cr,cg,cb, a, sway] f32, 32 bytes
+        // each (r599 added `sway` — MUST stay in lock-step with entity_pipeline's
+        // vertex-input stride/attrs above and entity.vert's `in_sway`).
+        let mut vbytes = Vec::with_capacity(verts.len() * 32);
         for v in verts {
             for f in v.position.iter().chain(v.color.iter()) {
                 vbytes.extend_from_slice(&f.to_le_bytes());
             }
+            vbytes.extend_from_slice(&v.alpha.to_le_bytes());
+            vbytes.extend_from_slice(&v.sway.to_le_bytes());
         }
         let ibytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
         self.index_count = indices.len() as u32;

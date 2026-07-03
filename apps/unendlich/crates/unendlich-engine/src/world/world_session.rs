@@ -15,7 +15,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::sim::dragon_activity::ActivityState;
 use crate::sim::dragon_bending_ai::BendIntent;
 use crate::sim::dragon_hunt::HuntState;
-use crate::sim::plant_growth::PlantState;
 use crate::sim::world_authority::WorldCmd;
 use crate::world::chunk::ChunkCoord;
 use crate::world::named_locations::LocationRegistry;
@@ -23,8 +22,10 @@ use crate::world::named_locations::LocationRegistry;
 pub struct WorldSession {
     /// Seed of the world this session belongs to.
     pub seed: u64,
-    /// Growing sapling stubs awaiting maturation: (block cell, growth state).
-    pub saplings: Vec<([i32; 3], PlantState)>,
+    /// r514/r519: persistent, sparse per-world crop AND sapling growth state — the single
+    /// flora layer. Round-trips to flora.json under the world root (crops and saplings are
+    /// distinguished by their block type).
+    pub flora: crate::world::flora_store::FloraStore,
     /// Hot-metal thermodynamics: cell → temperature (°C).
     pub hot_metal: HashMap<[i32; 3], f32>,
     /// Discovered named locations (the Collections backing store).
@@ -51,7 +52,7 @@ impl WorldSession {
     pub fn new(seed: u64) -> Self {
         Self {
             seed,
-            saplings: Vec::new(),
+            flora: crate::world::flora_store::FloraStore::new(),
             hot_metal: HashMap::new(),
             locations: LocationRegistry::new(),
             current_region: None,
@@ -94,7 +95,7 @@ mod tests {
         assert!(s.spawned_regions.is_empty());
         assert!(s.fire_positions.is_empty());
         // remaining accumulators start empty and are rebuilt by reset (same mechanism)
-        assert!(s.saplings.is_empty() && s.dragon_hunts.is_empty() && s.dragon_activities.is_empty());
+        assert!(s.dragon_hunts.is_empty() && s.dragon_activities.is_empty());
         assert!(s.dragon_bend_intents.is_empty() && s.lava_registered.is_empty());
         assert!(s.lan_outgoing_edits.is_empty() && s.fg_evict_queue.is_empty());
     }

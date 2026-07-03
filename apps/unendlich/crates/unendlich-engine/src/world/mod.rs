@@ -71,6 +71,7 @@ pub mod weather;
 pub mod water_field;
 pub mod water_flow_field; // r417: per-column flow vectors from the settle (phase 1 of flow-as-shader)
 pub mod water_flow_tiles; // r418: persistent sparse flow-vector tiles (phase 2 of flow-as-shader)
+pub mod flora_store; // r514: persistent sparse per-world crop/flora growth state
 pub mod water_evaporate; // r423: dries isolated shallow puddles (guarded; never lakes)
 pub mod water_sources; // r424: rain fills exposed columns up to a shallow cap (puddles, no flood)
 pub mod named_locations;
@@ -274,6 +275,7 @@ pub mod vegetation_density;
 pub mod snow_cover;
 pub mod climate_surface;
 pub mod weather_cell;
+pub mod orographic_precip;
 pub mod seasonal_weather;
 pub mod weather_front;
 pub mod storm_organization;

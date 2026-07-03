@@ -12127,3 +12127,27 @@ gates it on `stride == 1u`. At Mid, the cell-uniform color means
 greedy can merge cleanly without per-block color variation
 showing seams.
 
+
+## Multiplayer open-server + whitelist UI flow (r518 backbone; menu UI = next)
+BACKBONE DONE (r518, sim/whitelist.rs): a per-world Whitelist {open: bool, allowed: BTreeSet<name>} persisted as
+whitelist.json under the world root. Host gates joins at the CH_HANDSHAKE LanJoin::Join handler: open → admit anyone +
+remember the name; closed → admit only listed names, else reply LanJoin::Deny{reason}. F10 toggles open/closed (saved
+immediately). admits()/allow()/revoke()/names() are pure + unit-tested (5 tests). The bin holds `whitelist`, loads on
+world init, saves on shutdown.
+MENU UI FLOW (TODO — the unverifiable egui part, to build on-device with the menu kit in app/menu_view.rs +
+unendlich-ui/src/{menu,widget}.rs):
+  1. Multiplayer screen (Screen::Multiplayer, currently a stub at menu_view.rs:167) gains a "Host Settings" sub-panel
+     shown when hosting.
+  2. Top row: an OPEN/CLOSED segmented toggle bound to whitelist.open (elegant_button styling like the Controls tab).
+  3. Allow-list: a vertical ScrollArea (mirror the keybind list at world_renderer.rs:3951) listing whitelist.names(),
+     each row with a "revoke" (×) elegant_button.
+  4. Add-name: a text field + "Add" button calling whitelist.allow(); reuse the world-name text input widget.
+  5. Recently-seen: list lan_remote_appearance names with a "+" to allow() quickly.
+  6. Persist on every edit (whitelist.save(&world_root)); the bin already owns the store + root.
+  Wiring: expose `&mut whitelist` (or a snapshot + a command queue, matching how keybind rebinds round-trip through the
+  renderer) so menu_view can read names/open and emit Allow/Revoke/ToggleOpen commands the bin applies + saves.
+
+## Stature (height as the master physical scalar)
+See `docs/STATURE.md` + `sim::stature` (r559). Height (blocks, default 1.8, range 0.1..25.0) derives collider, eye,
+mass, health, hunger, strength, knockback (dealt/resist), step, jump, speed, turn, ground-shake, and wind/water-current
+resistance. The profile is authoritative from r559; consumers wired incrementally.

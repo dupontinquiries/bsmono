@@ -16,6 +16,7 @@
 //! code. Release-safe (no `#[cfg]`-gated helpers used in asserts).
 
 use crate::sim::elemental::ItemForm;
+use crate::sim::legendary_weapon::WeaponClass;
 
 type V3 = [f32; 3];
 
@@ -175,6 +176,141 @@ pub fn item_model(form: ItemForm) -> Vec<ItemBox> {
         ItemForm::Tool => vec![
             ItemBox { center: [0.0, 0.0, 0.22], half: [0.020, 0.020, 0.26], color: wood }, // handle
             ItemBox { center: [0.0, 0.05, 0.50], half: [0.06, 0.06, 0.05], color: steel }, // head
+        ],
+    }
+}
+
+/// r485: a held BLOCK — one cube in the block's own colour, sized to sit in the
+/// hand like a placed voxel. Paired with the Tool pose (close + low).
+pub fn block_model(color: [u8; 3]) -> Vec<ItemBox> {
+    vec![ItemBox { center: [0.0, 0.0, 0.30], half: [0.145, 0.145, 0.145], color }]
+}
+
+// ── r481: weapons ──────────────────────────────────────────────────────────
+// The forge produces eight `WeaponClass`es; each gets a distinct held model so
+// they read differently in first person. Pose reuse keeps the bob/sway math in
+// one place: `weapon_to_form` maps a class to the nearest existing `ItemForm`
+// for posing, while `weapon_model` supplies the geometry. The bin selects the
+// weapon path when the hand item id falls in the reserved weapon range.
+
+/// Reserved hand-item id range for forged weapons (one per class, in
+/// `WeaponClass` declaration order). Kept here so the bin and the model code
+/// agree on the convention.
+pub const WEAPON_ID_BASE: u32 = 4000;
+
+/// All weapon classes in declaration order (handy for cycling/iteration).
+pub const WEAPON_CLASSES: [WeaponClass; 8] = [
+    WeaponClass::Dagger,
+    WeaponClass::Blade,
+    WeaponClass::Greatsword,
+    WeaponClass::Axe,
+    WeaponClass::Greataxe,
+    WeaponClass::Spear,
+    WeaponClass::Staff,
+    WeaponClass::Wand,
+];
+
+/// Hand-item id -> weapon class, or `None` if the id isn't a weapon.
+pub fn weapon_class_for_id(id: u32) -> Option<WeaponClass> {
+    match id {
+        4000 => Some(WeaponClass::Dagger),
+        4001 => Some(WeaponClass::Blade),
+        4002 => Some(WeaponClass::Greatsword),
+        4003 => Some(WeaponClass::Axe),
+        4004 => Some(WeaponClass::Greataxe),
+        4005 => Some(WeaponClass::Spear),
+        4006 => Some(WeaponClass::Staff),
+        4007 => Some(WeaponClass::Wand),
+        _ => None,
+    }
+}
+
+/// Weapon class -> its reserved hand-item id (inverse of `weapon_class_for_id`).
+pub fn weapon_id_for_class(c: WeaponClass) -> u32 {
+    match c {
+        WeaponClass::Dagger => 4000,
+        WeaponClass::Blade => 4001,
+        WeaponClass::Greatsword => 4002,
+        WeaponClass::Axe => 4003,
+        WeaponClass::Greataxe => 4004,
+        WeaponClass::Spear => 4005,
+        WeaponClass::Staff => 4006,
+        WeaponClass::Wand => 4007,
+    }
+}
+
+/// Nearest existing [`ItemForm`] for POSE purposes (the bob/sway/offset). Geometry
+/// still comes from [`weapon_model`]; this only picks how the hand holds it.
+pub fn weapon_to_form(c: WeaponClass) -> ItemForm {
+    match c {
+        WeaponClass::Dagger | WeaponClass::Blade | WeaponClass::Greatsword => ItemForm::Blade,
+        WeaponClass::Axe | WeaponClass::Greataxe => ItemForm::Axe,
+        WeaponClass::Spear | WeaponClass::Staff => ItemForm::Staff,
+        WeaponClass::Wand => ItemForm::Tool,
+    }
+}
+
+/// Box model for a forged weapon. +Z is the length axis (grip near z=0, tip far),
+/// matching [`item_model`]. Distinct silhouettes per class.
+pub fn weapon_model(c: WeaponClass) -> Vec<ItemBox> {
+    let wood: [u8; 3] = [120, 84, 52];
+    let steel: [u8; 3] = [180, 188, 200];
+    let dark: [u8; 3] = [70, 74, 82];
+    let leather: [u8; 3] = [86, 64, 44];
+    let gold: [u8; 3] = [196, 168, 96];
+    match c {
+        // short blade, single-hand grip, tiny guard
+        WeaponClass::Dagger => vec![
+            ItemBox { center: [0.0, 0.0, 0.06], half: [0.018, 0.018, 0.07], color: leather }, // grip
+            ItemBox { center: [0.0, 0.0, 0.15], half: [0.050, 0.018, 0.015], color: gold },  // guard
+            ItemBox { center: [0.0, 0.0, 0.36], half: [0.022, 0.008, 0.20], color: steel },  // short blade
+        ],
+        // arming sword: grip, cross-guard, pommel, straight blade
+        WeaponClass::Blade => vec![
+            ItemBox { center: [0.0, 0.0, 0.10], half: [0.020, 0.020, 0.10], color: leather }, // grip
+            ItemBox { center: [0.0, 0.0, 0.015], half: [0.030, 0.030, 0.03], color: gold },   // pommel
+            ItemBox { center: [0.0, 0.0, 0.22], half: [0.085, 0.024, 0.02], color: gold },    // guard
+            ItemBox { center: [0.0, 0.0, 0.66], half: [0.028, 0.010, 0.44], color: steel },   // blade
+        ],
+        // greatsword: long two-hand grip, wide fuller'd blade, broad guard
+        WeaponClass::Greatsword => vec![
+            ItemBox { center: [0.0, 0.0, 0.14], half: [0.024, 0.024, 0.18], color: leather }, // long grip
+            ItemBox { center: [0.0, 0.0, 0.01], half: [0.040, 0.040, 0.04], color: gold },    // heavy pommel
+            ItemBox { center: [0.0, 0.0, 0.34], half: [0.150, 0.028, 0.025], color: gold },   // wide guard
+            ItemBox { center: [0.0, 0.0, 0.95], half: [0.046, 0.013, 0.58], color: steel },   // long wide blade
+            ItemBox { center: [0.0, 0.0, 0.95], half: [0.012, 0.015, 0.55], color: dark },    // fuller groove
+        ],
+        // axe: handle + offset single bit
+        WeaponClass::Axe => vec![
+            ItemBox { center: [0.0, 0.0, 0.34], half: [0.022, 0.022, 0.40], color: wood },  // handle
+            ItemBox { center: [0.07, 0.0, 0.70], half: [0.11, 0.17, 0.045], color: steel }, // bit (offset)
+            ItemBox { center: [0.0, 0.0, 0.72], half: [0.030, 0.05, 0.05], color: dark },   // eye/collar
+        ],
+        // greataxe: longer haft + double bit
+        WeaponClass::Greataxe => vec![
+            ItemBox { center: [0.0, 0.0, 0.42], half: [0.026, 0.026, 0.52], color: wood },   // long haft
+            ItemBox { center: [0.10, 0.0, 0.92], half: [0.13, 0.21, 0.05], color: steel },   // front bit
+            ItemBox { center: [-0.10, 0.0, 0.92], half: [0.13, 0.21, 0.05], color: steel },  // rear bit
+            ItemBox { center: [0.0, 0.0, 0.94], half: [0.040, 0.06, 0.07], color: dark },    // collar
+            ItemBox { center: [0.0, 0.0, 1.18], half: [0.020, 0.020, 0.06], color: gold },   // top spike
+        ],
+        // spear: long shaft + leaf head
+        WeaponClass::Spear => vec![
+            ItemBox { center: [0.0, 0.0, 0.55], half: [0.018, 0.018, 0.62], color: wood },  // shaft
+            ItemBox { center: [0.0, 0.0, 1.16], half: [0.024, 0.006, 0.05], color: steel }, // socket
+            ItemBox { center: [0.0, 0.0, 1.30], half: [0.045, 0.008, 0.12], color: steel }, // leaf head
+        ],
+        // staff: shaft + focus crystal
+        WeaponClass::Staff => vec![
+            ItemBox { center: [0.0, 0.0, 0.45], half: [0.018, 0.018, 0.55], color: wood },  // shaft
+            ItemBox { center: [0.0, 0.0, 1.00], half: [0.035, 0.035, 0.05], color: gold },  // collar
+            ItemBox { center: [0.0, 0.0, 1.09], half: [0.050, 0.050, 0.06], color: steel }, // focus
+        ],
+        // wand: short rod + gem tip
+        WeaponClass::Wand => vec![
+            ItemBox { center: [0.0, 0.0, 0.18], half: [0.016, 0.016, 0.20], color: dark }, // rod
+            ItemBox { center: [0.0, 0.0, 0.40], half: [0.034, 0.034, 0.04], color: gold }, // setting
+            ItemBox { center: [0.0, 0.0, 0.46], half: [0.028, 0.028, 0.03], color: steel }, // gem
         ],
     }
 }

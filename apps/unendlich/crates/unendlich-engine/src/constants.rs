@@ -62,6 +62,35 @@ pub fn set_render_distance_override(n: i32) {
     RENDER_DISTANCE_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// r476: live GPU-mesher throttle, in percent. After each octree dispatch the
+/// dispatcher sleeps `dispatch_time * pct/100`, leaving the shared GPU queue
+/// idle so the render pass can land a frame. Settable live from the Performance
+/// page (and seeded from UNENDLICH_GPU_MESH_YIELD_PCT at startup). 0 = off.
+pub static GPU_MESH_YIELD_PCT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_gpu_mesh_yield_pct(n: u64) {
+    GPU_MESH_YIELD_PCT.store(n.min(1000), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn gpu_mesh_yield_pct() -> u64 {
+    GPU_MESH_YIELD_PCT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// r480: live toggle for the tiled shared-memory octree mesher path
+/// (chunk_mesh_octree.comp, only relevant when GPU_MESHER=2). Seeded from
+/// UNENDLICH_OCTREE_TILE; settable live from the Performance page.
+pub static OCTREE_TILE_ENABLED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_octree_tile(on: bool) {
+    OCTREE_TILE_ENABLED.store(on as u32, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn octree_tile_enabled() -> u32 {
+    OCTREE_TILE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn runtime_render_distance() -> i32 {
     let ovr = RENDER_DISTANCE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if ovr > 0 {

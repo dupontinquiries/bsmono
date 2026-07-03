@@ -956,6 +956,13 @@ fn main() {
             (gpu.download(&x), submits)
         };
         let (r4, s4) = run(4);
+        // The 30-dispatch chain uses a SQUARE weight → all 30 dispatches share one dims uniform.
+        // With the content-keyed cache that's ONE create_buffer_init (an upload) + 29 reuses, instead
+        // of 30 uploads. This reduction is hardware-independent (it's a buffer-creation count).
+        let (dh, dm) = (gpu_kernels::dims_cache_hits(), gpu_kernels::dims_cache_misses());
+        ck(&format!("dims-uniform upload churn eliminated: {} dispatches → {dm} buffer create(s) + {dh} reuse(s)", dh + dm), dm <= 1 && dh >= 29);
+        let (ph, pm) = (gpu_kernels::pool_hits(), gpu_kernels::pool_misses());
+        ck(&format!("output-buffer alloc churn eliminated: {} allocs → {pm} create(s) + {ph} recycle(s)", ph + pm), pm <= 2 && ph >= 28);
         let (r64, s64) = run(64);
         ck(&format!("higher flush_every → fewer submits for the same work ({s4} at flush=4 vs {s64} at flush=64)"), s64 < s4 && s4 > 0);
         let e = r4.iter().zip(&r64).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
@@ -1196,6 +1203,17 @@ fn main() {
         let e = fused.iter().zip(&exp).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         ck(&format!("int8 fused QKV + fused bias == separate (m={m}) (max|Δ|={e:.2e})"), e == 0.0);
 
+        // End-to-end: fused decode (the DEFAULT now) == separate-projection decode, bit-exact, over a
+        // real multi-token forward through the loader. This is what makes LOGSCOPE_FUSED_QKV default-safe.
+        let hm = gen_model(64, 128, 2, 48, 4, 2);
+        let mdl = gpu.load_gguf_quantized(&write_gguf(&hm)).unwrap();
+        let ids = [1u32, 7, 13, 5, 21, 2];
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+        let sep = gpu.forward_kv(&mdl, &ids);
+        std::env::remove_var("LOGSCOPE_FUSED_QKV"); // unset → default = fused
+        let fus = gpu.forward_kv(&mdl, &ids);
+        ck("fused decode (default) == separate-projection decode, bit-exact end-to-end", sep == fus);
+
         println!("gate-qkv: {}", if ok { "fused QKV is bit-exact vs separate — safe to wire into the loader \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
@@ -1269,12 +1287,28 @@ fn main() {
         let c1 = cpu_linear(&a1, &w_eff, 1, n, k);
         let e1 = g1.iter().zip(&c1).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         ck("q4 mat-vec (m=1) bit-exact vs CPU dequant+matmul", e1 < 1e-3);
-        // (2) prefill (m=5)
+        // (2) small-batch kernel (2≤m≤8 routes to MATVEC_SMALL_Q4) vs CPU
         let m = 5; let a5 = rnd(m * k, 33);
         let g5 = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a5, m, k), &q4, m));
         let c5 = cpu_linear(&a5, &w_eff, m, n, k);
         let e5 = g5.iter().zip(&c5).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        ck("q4 linear (m=5) bit-exact vs CPU dequant+matmul", e5 < 1e-3);
+        ck("q4 small-batch mat-vec (m=5) vs CPU dequant+matmul", e5 < 1e-3);
+        // (2b) each small-batch row is BIT-EXACT to the m=1 decode kernel — same per-term arithmetic,
+        //      weight nibble read once. This is what makes Q4 + speculative/batched decode lossless.
+        let m4 = 4; let a4 = rnd(m4 * k, 77);
+        let g4 = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a4, m4, k), &q4, m4));
+        let mut row_exact = true;
+        for r in 0..m4 {
+            let row = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a4[r * k..(r + 1) * k], 1, k), &q4, 1));
+            for j in 0..n { if g4[r * n + j] != row[j] { row_exact = false; } }
+        }
+        ck("q4 small-batch row == m=1 decode (bit-exact, weight read once)", row_exact);
+        // (2c) keep the strided LINEAR_Q4 (m>8) path covered
+        let m12 = 12; let a12 = rnd(m12 * k, 88);
+        let g12 = gpu.download(&gpu.linear_q4_0_t(&gpu.upload(&a12, m12, k), &q4, m12));
+        let c12 = cpu_linear(&a12, &w_eff, m12, n, k);
+        let e12 = g12.iter().zip(&c12).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("q4 linear (m=12, strided) vs CPU dequant+matmul", e12 < 1e-3);
         // (3) lossy-but-bounded vs f32
         ck("q4 is lossy but bounded (0 < err < max|w|)", maxerr_q > 0.0 && maxerr_q < wmax);
         // (4) the memory lever memplan promised: q4 weight bytes ≈ half of int8
@@ -1295,6 +1329,24 @@ fn main() {
         let (na, nb) = (lq.iter().map(|x| x * x).sum::<f32>().sqrt(), lf.iter().map(|x| x * x).sum::<f32>().sqrt());
         let cos = dot / (na * nb);
         ck("q4-resident model loads via the loader + tracks f32 (finite, cos>0.8)", lq.iter().all(|x| x.is_finite()) && cos > 0.8);
+        // (6) the loader AUTO-selects q4 when int8 won't fit the budget — no LOGSCOPE_Q4_RESIDENT set.
+        // Budget placed exactly between the model's int8 and q4 totals (overhead cancels at the midpoint),
+        // so plan() must return Q4; the auto-loaded model must be BIT-IDENTICAL to the forced-q4 one above.
+        let shape6 = ModelShape { d: 64, ffn: 128, layers: 2, vocab: 48, n_heads: 4, n_kv_heads: 2, tied_embed: false };
+        let ovh = 256u64 * (1 << 20);
+        let i8t = resident_weight_bytes(&shape6, Residency::Int8) + kv_cache_bytes(&shape6, 4096, 2) + ovh;
+        let q4t = resident_weight_bytes(&shape6, Residency::Q4) + kv_cache_bytes(&shape6, 4096, 2) + ovh;
+        let budget = (i8t + q4t) / 2;
+        let plan_q4 = matches!(plan(&shape6, budget, 4096, 2, ovh), Fit::Resident { fmt: Residency::Q4, .. });
+        std::env::set_var("LOGSCOPE_MAX_RESIDENT_GB", format!("{:.9}", budget as f64 / (1u64 << 30) as f64));
+        let auto = gpu.load_gguf_quantized(&write_gguf(&hm));
+        let auto_is_q4 = auto.as_ref().map(|m| gpu.model_forward(m, &ids) == lq).unwrap_or(false);
+        std::env::set_var("LOGSCOPE_MAX_RESIDENT_GB", format!("{:.9}", (q4t / 2) as f64 / (1u64 << 30) as f64));
+        let refused = gpu.load_gguf_quantized(&write_gguf(&hm)).is_err();
+        std::env::remove_var("LOGSCOPE_MAX_RESIDENT_GB");
+        ck("memplan picks q4 at the between-budget", plan_q4);
+        ck("loader AUTO-selects q4 when int8 won't fit (no flag) → bit-identical to forced q4", auto.is_ok() && auto_is_q4);
+        ck("loader refuses with a number when even q4 won't fit", refused);
         println!("gate-q4resident: {} | 70B int8 {:.1} GiB → q4 {:.1} GiB | model q4·f32 cos={:.4}",
             if ok { "4-bit resident matmul validated \u{2713}" } else { "FAIL \u{2717}" }, gib(i8b), gib(q4b), cos);
         return;

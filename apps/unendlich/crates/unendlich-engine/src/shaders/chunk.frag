@@ -245,6 +245,39 @@ vec3 tint_water(vec3 base, float depth, float temp, float sal, float ero) {
     return clamp(c * (1.0 - d * 0.5), 0.0, 1.0);
 }
 
+// r493: ALGAE — green surface scum that blooms in WARM, SHALLOW water, in
+// patches (low-frequency world noise), thinning over deep/cold water. Shader-only
+// (does not touch tint_water's CPU-mirrored body colour), purely a surface look.
+const vec3 ALGAE_COLOR = vec3(0.13, 0.32, 0.11);
+float algae_level(vec3 wp, float temp, float depth) {
+    float warm    = smoothstep(0.45, 0.85, temp);
+    float shallow = 1.0 - clamp(max(depth, 0.0) / 6.0, 0.0, 1.0);
+    // patchy coverage: two low-freq sine octaves → soft blotches
+    float n = sin(wp.x * 0.047) * sin(wp.z * 0.041)
+            + 0.5 * sin(wp.x * 0.013 + 1.7) * sin(wp.z * 0.017 - 0.9);
+    n = clamp(n * 0.6 + 0.4, 0.0, 1.0);
+    return clamp(warm * shallow * n, 0.0, 1.0);
+}
+vec3 apply_algae(vec3 albedo, vec3 wp, float temp, float depth) {
+    float a = algae_level(wp, temp, depth);
+    return mix(albedo, ALGAE_COLOR, a * 0.62);
+}
+
+// r499: seasonal foliage tint — green through spring/summer, shifting to warm
+// autumn oranges then a desaturated winter brown. Driven by season01
+// (ubo.fx_params.z). Per-leaf colour variation in the sub-voxel template is
+// preserved (this mixes on top). Phases: autumn peaks ~0.6, winter ~0.85.
+vec3 seasonal_foliage(vec3 c, float season01) {
+    float autumn = smoothstep(0.45, 0.62, season01)
+                 * (1.0 - smoothstep(0.70, 0.92, season01));
+    float winter = smoothstep(0.72, 0.92, season01);
+    vec3 autumn_col = vec3(0.80, 0.43, 0.12); // warm orange
+    vec3 winter_col = vec3(0.46, 0.35, 0.23); // dry brown
+    c = mix(c, autumn_col, autumn * 0.70);
+    c = mix(c, winter_col, winter * 0.55);
+    return c;
+}
+
 vec3 apply_block_texture(vec3 base, vec3 wpos, vec3 n) {
     vec3 qc = floor(base * 6.0 + 0.5);
     float seed = hash12(qc.xy + qc.z * 23.0);
@@ -382,6 +415,9 @@ float fbm2(vec3 p) {
 #ifndef CHUNK_WATER_GLITTER
 #define CHUNK_WATER_GLITTER 1 // r472: sun-glitter sparkle path on water (0 = single smooth glint blob)
 #endif
+#ifndef CHUNK_CAVITY_AO
+#define CHUNK_CAVITY_AO 1    // r473: micro-cavity ambient occlusion from the grain field (0 = flat ambient)
+#endif
 #ifndef CHUNK_SHADOWS
 #define CHUNK_SHADOWS 1      // 0 = skip shadow-map PCF (fully lit)
 #endif
@@ -441,11 +477,10 @@ void face_tangents(vec3 n, out vec3 t, out vec3 b) {
 // (same fbm the albedo grain uses, so bumps line up with shading).
 // Central-ish difference along the two face tangents — no normal/
 // tangent vertex attribute required.
-vec3 perturb_normal(vec3 n, vec3 world_pos, float strength) {
+vec3 perturb_normal(vec3 n, vec3 world_pos, float strength, float h0) {
     vec3 t, b;
     face_tangents(n, t, b);
     const float E = 0.15;          // world-space sample step (m)
-    float h0 = fbm2(world_pos * 1.7);
     float ht = fbm2((world_pos + t * E) * 1.7);
     float hb = fbm2((world_pos + b * E) * 1.7);
     float dhdt = (ht - h0) / E;
@@ -460,6 +495,31 @@ void main() {
     vec3 to_cam   = cam_pos - v_world_pos;
     float dist    = length(to_cam);
     vec3 view_dir = to_cam / max(dist, 1e-4);
+
+    // r537: NEAR-CAMERA FADE. A block wedged right against the lens — backing into
+    // a wall, or the chase camera pinched into a corner — shouldn't black out the
+    // screen. Dissolve fragments very close to the camera with an ordered screen-
+    // door pattern so you can see past them; fully solid again beyond the end
+    // distance. Works in every perspective (it's purely camera-distance based) and
+    // needs no blending (discard keeps the opaque pipeline; killed fragments don't
+    // write depth, so geometry behind them shows through).
+    {
+        const float NEAR_FADE_START = 0.12; // fully gone closer than this
+        const float NEAR_FADE_END   = 0.85; // fully solid past this
+        if (dist < NEAR_FADE_END) {
+            float vis = clamp(
+                (dist - NEAR_FADE_START) / (NEAR_FADE_END - NEAR_FADE_START),
+                0.0, 1.0);
+            int nbx = int(gl_FragCoord.x) & 3;
+            int nby = int(gl_FragCoord.y) & 3;
+            float nbayer[16] = float[16](
+                 0.0/16.0,  8.0/16.0,  2.0/16.0, 10.0/16.0,
+                12.0/16.0,  4.0/16.0, 14.0/16.0,  6.0/16.0,
+                 3.0/16.0, 11.0/16.0,  1.0/16.0,  9.0/16.0,
+                15.0/16.0,  7.0/16.0, 13.0/16.0,  5.0/16.0);
+            if (nbayer[nby * 4 + nbx] >= vis) discard;
+        }
+    }
 
     // ─── Surface normal (axis-snapped, temporally stable) ───────────────
     //
@@ -645,8 +705,11 @@ void main() {
         float wt_temp = wt_temperature(v_world_pos);
         float wt_sal = wt_salinity(wt_temp, v_world_pos);
         albedo = tint_water(v_color, depth, wt_temp, wt_sal, 0.15) * detail;
+        albedo = apply_algae(albedo, v_world_pos, wt_temp, depth);
     }
     if (ubo.camera_pos.w > 0.5) albedo = apply_block_texture(albedo, v_world_pos, normal);
+    // r499: foliage shifts colour with the season (autumn warmth, winter brown).
+    if (is_foliage(v_color)) albedo = seasonal_foliage(albedo, ubo.fx_params.z);
 
     // UNENDLICH_SNOW (r358): altitude snow caps. ubo.sky_color.w = snow-line
     // altitude (0 = feature off). Above the line, blend albedo toward snow white
@@ -676,9 +739,12 @@ void main() {
 
     // Shading normal: perturb the snapped geometric normal by the grain
     // height field (normal mapping without a tangent attribute).
+    // r475: compute the grain height ONCE and share it with both the normal map and the cavity AO
+    // below (both wanted fbm2(world_pos*1.7) — this drops a redundant ~16-hash fbm per fragment).
+    float grain_h = fbm2(v_world_pos * 1.7);
     vec3 N = normal;
 #if PBR_NORMAL_MAP
-    N = perturb_normal(normal, v_world_pos, NORMAL_STRENGTH);
+    N = perturb_normal(normal, v_world_pos, NORMAL_STRENGTH, grain_h);
 #endif
 
     vec3 V = view_dir;
@@ -690,6 +756,15 @@ void main() {
     float v_dot_h = max(dot(V, H), 0.0);
 
     vec3 sun_radiance = ubo.sun_color.rgb * sun_power * sun_attenuation;
+
+#if CHUNK_CAVITY_AO
+    // r473: micro-cavity AO — the same grain height field that perturbs the normal also darkens
+    // ambient in its valleys, giving surfaces a subtle weathered, tactile depth without a texture.
+    // Ambient-only (direct sun keeps its punch); terrain only, since water/cloud override color
+    // below. r475: reuses `grain_h` computed above — zero extra fbm cost.
+    float cavity_ao = mix(0.68, 1.0, smoothstep(0.20, 0.80, grain_h));
+    ambient_term   *= cavity_ao;
+#endif
 
     vec3 color;
 #if PBR_QUALITY
@@ -785,6 +860,19 @@ void main() {
         vec2  wind_xy  = ubo.wind_params.xy;
         float wind_mag = ubo.wind_params.z;
 
+        // r491/r504: lateral SURFACE ADVECTION — carry the wave pattern sideways so
+        // water visibly FLOWS, not just bobs in place. r492 calmed the wind, which left
+        // the old wind-only drift (×0.18) near zero on a still day, so the surface read
+        // as standing. r504 adds an ALWAYS-ON baseline drift (independent of wind
+        // magnitude) plus a stronger wind coefficient, so even a calm lake slides
+        // gently; the sim's current (below) adds a stronger downstream carry on rivers.
+        // Sampling the wave field at pos - vel*t translates the whole pattern at `vel`.
+        const float WW_WIND_DRIFT = 0.55; // blocks/s drift per unit wind vector (TUNABLE)
+        const float WW_FLOW_DRIFT = 1.30; // blocks/s carry per unit sim flow
+        const float WW_BASE_DRIFT = 0.60; // always-on baseline slide (blocks/s) (TUNABLE)
+        vec2 wind_dir = (length(wind_xy) > 1e-3) ? normalize(wind_xy) : vec2(0.7071, 0.7071);
+        vec2 surf_adv = wind_dir * WW_BASE_DRIFT + wind_xy * WW_WIND_DRIFT;
+
         // Wave normal from the shared analytic field; only top-facing water
         // gets rippled (side faces keep the block normal).
         WaveParams wp  = water_wave_params(wind_xy, wind_mag, w_temp, w_time);
@@ -818,11 +906,15 @@ void main() {
                     vec2 bd = mix(wp.dir, fdir, t);
                     wp.dir = (length(bd) > 1e-3) ? normalize(bd) : fdir;
                     wp.speed_scale *= (1.0 + min(fspeed, 2.0) * 0.6);
+                    // carry the surface downstream along the current
+                    surf_adv += flow * WW_FLOW_DRIFT;
                 }
             }
         }
         float grazing  = clamp(abs(view_dir.y), 0.0, 1.0);
-        vec3  wnormal  = water_wave_normal(v_world_pos.xz, wp, grazing);
+        // sample the wave field at the advected position so the ripples travel
+        vec2  wave_pos = v_world_pos.xz - surf_adv * w_time;
+        vec3  wnormal  = water_wave_normal(wave_pos, wp, grazing);
         float up_face  = clamp(normal.y, 0.0, 1.0);
         vec3  N        = normalize(mix(normal, wnormal, up_face));
 
@@ -844,13 +936,16 @@ void main() {
         // path" real water shows. Rides the wave normal (refl_dir already uses N), so it travels
         // with the swell; costs ~nothing away from the highlight because `align` gates it out.
         float align = max(dot(refl_dir, to_sun), 0.0);
-        if (align > 0.5 && sun_power > 0.01) {
-            vec2  guv     = v_world_pos.xz;
+        if (align > 0.42 && sun_power > 0.01) {
+            // r504: drift the sparkle field with the surface advection so the
+            // glitter visibly travels sideways with the flow (a strong motion cue),
+            // on top of the per-hash scroll.
+            vec2  guv     = v_world_pos.xz - surf_adv * w_time;
             float s1      = hash12(guv * 6.0  + vec2(w_time * 0.8, -w_time * 0.6));
             float s2      = hash12(guv * 17.0 + vec2(-w_time * 1.3, w_time * 1.1));
-            float facets  = smoothstep(0.62, 1.0, s1 * 0.6 + s2 * 0.4);
-            float sparkle = pow(align, 700.0) * facets;
-            reflection   += ubo.sun_color.rgb * sparkle * 1.2 * sun_power;
+            float facets  = smoothstep(0.55, 1.0, s1 * 0.6 + s2 * 0.4);
+            float sparkle = pow(align, 400.0) * facets;
+            reflection   += ubo.sun_color.rgb * sparkle * 2.0 * sun_power;
         }
 #endif
 
@@ -968,7 +1063,12 @@ void main() {
             float foam   = crest * smoothstep(0.15, 0.55, steep + 0.25) * fn;
             // r420: flow-driven whitewater — fast current foams even without steep crests
             // (rapids). Only contributes when the flow shader is on (speed stays 0 otherwise).
-            float rapids = smoothstep(0.25, 1.2, water_flow_speed) * fn;
+            // r506: the foam now CHURNS faster where the current is faster — a heavy/fast body's
+            // wake (water_react push-back) boils, while a gentle drift barely ripples — so the
+            // mass behind a wake reads in the motion of the foam, not just its extent.
+            float churn  = w_time * (0.08 + water_flow_speed * 0.25);
+            float rfn    = fbm2(vec3(v_world_pos.xz * 1.9, churn));
+            float rapids = smoothstep(0.25, 1.2, water_flow_speed) * rfn;
             foam = max(foam, rapids);
             foam = max(foam, shore_foam); // r435: waterline ribbon
             water = mix(water, vec3(0.86, 0.90, 0.95), clamp(foam, 0.0, 1.0) * WATER_FOAM_AMT);
@@ -1460,12 +1560,22 @@ void main() {
     {
         float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
         float chroma = max(max(color.r, color.g), color.b) - min(min(color.r, color.g), color.b);
-        float vib = 0.16 * (1.0 - chroma);            // boost dull pixels more than saturated ones
-        color = mix(vec3(luma), color, 1.0 + vib);    // saturate
-        color = clamp(mix(vec3(0.5), color, 1.055), 0.0, 1.0); // subtle contrast
+        // r476: punchier vibrance — dull pixels lift noticeably more than vivid ones.
+        float vib = 0.30 * (1.0 - chroma);
+        color = mix(vec3(luma), color, 1.0 + vib);
+        // r476: cinematic split-tone. Cool the shadows toward teal, warm the
+        // highlights toward amber — the classic teal/orange look — keyed off
+        // luminance so midtones stay roughly neutral. This is the change that
+        // reads instantly on every surface (vs the near-invisible r465 grade).
+        vec3 shadow_tint = vec3(0.92, 0.985, 1.07); // cool shadows
+        vec3 high_tint   = vec3(1.08, 1.01, 0.89);  // warm highlights
+        float tt = smoothstep(0.0, 1.0, luma);
+        color *= mix(shadow_tint, high_tint, tt);
+        // r476: firmer S-curve about mid-grey for depth.
+        color = clamp(mix(vec3(0.5), color, 1.12), 0.0, 1.0);
     }
 #endif
-    color = filmic_contrast(color, 0.08);
+    color = filmic_contrast(color, 0.14);
 
     // ─── Vignette (proper screen-space) ─────────────────────────────────
     //
@@ -1476,7 +1586,7 @@ void main() {
     vec2 screen_uv = (gl_FragCoord.xy - viewport_off) / viewport_size;
     vec2 vv = (screen_uv - 0.5) * 2.0;
     float vignette_dist = dot(vv, vv);
-    float vignette = 1.0 - smoothstep(0.5, 1.7, vignette_dist) * 0.25;
+    float vignette = 1.0 - smoothstep(0.40, 1.65, vignette_dist) * 0.32; // r476: deeper frame
     color *= vignette;
 
     // No film-grain dither in v0.11.2: the previous attempt at

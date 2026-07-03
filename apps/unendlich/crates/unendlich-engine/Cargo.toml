@@ -1,6 +1,6 @@
 [package]
 name = "unendlich-engine"
-version = "0.24.63-adaptive-uploads"
+version = "1.4.0-r603-upload-metrics"
 edition = "2021"
 build = "build.rs"
 

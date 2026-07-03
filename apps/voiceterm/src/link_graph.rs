@@ -178,6 +178,138 @@ impl LinkGraph {
             arr(&self.links_from(title)),
             arr(&self.backlinks(title)))
     }
+
+    /// v0.1.894: degree of a slug — outgoing wikilinks + incoming backlinks.
+    /// Edges to/from not-yet-created (dangling) targets still count: a note
+    /// that links out to many things is a hub of intent even before those
+    /// notes exist, which is what "connectedness" means in a zettelkasten.
+    fn degree(&self, slug: &str) -> usize {
+        self.forward.get(slug).map(|s| s.len()).unwrap_or(0)
+            + self.backward.get(slug).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// v0.1.894: degree centrality of one doc by title. Unknown docs score 0.
+    /// The simplest centrality that answers "is this a hub?" — and the one the
+    /// graph view, the walkthrough, and a "show me the key notes" voice query
+    /// all want first. (Eigenvector/PageRank can layer on later; degree is the
+    /// honest, cheap baseline and needs no iteration.)
+    pub fn degree_centrality(&self, title: &str) -> usize {
+        self.degree(&slugify(title))
+    }
+
+    /// v0.1.894: every indexed doc ranked by degree centrality, most-connected
+    /// first; ties broken by slug so the order is stable. The "where are the
+    /// hubs" view of the corpus — and the seed order for [`walkthrough`].
+    pub fn centrality_ranking(&self) -> Vec<(String, usize)> {
+        let mut v: Vec<(String, usize)> = self.known.iter()
+            .map(|slug| (slug.clone(), self.degree(slug)))
+            .collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v
+    }
+
+    /// Known docs directly linked to `slug` in either direction (forward or
+    /// back), excluding self-loops. Dangling (uncreated) targets are skipped —
+    /// the walk can only step to notes that actually exist.
+    fn known_neighbors(&self, slug: &str) -> Vec<String> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        if let Some(f) = self.forward.get(slug) {
+            for t in f { if self.known.contains(t) { set.insert(t.clone()); } }
+        }
+        if let Some(b) = self.backward.get(slug) {
+            for t in b { if self.known.contains(t) { set.insert(t.clone()); } }
+        }
+        set.remove(slug);
+        set.into_iter().collect()
+    }
+
+    /// v0.1.894: a guided visiting order over all indexed docs — the spine of a
+    /// "graph walkthrough" (a voice tour, a replay, guided reading). Starts at
+    /// the most-central hub and walks its connected neighbourhood breadth-first
+    /// in centrality order, so the tour follows the link web outward from its
+    /// densest point. When a connected component is exhausted it jumps to the
+    /// most-central not-yet-visited doc, so disconnected clusters are still
+    /// covered, each entered at its own hub. Only KNOWN docs are visited;
+    /// dangling targets surface separately via [`dangling_targets`].
+    /// Deterministic: BTree iteration + explicit centrality/slug tiebreaks.
+    ///
+    /// Parser-agnostic by construction — anything that feeds (node, links)
+    /// into the graph gets a walkthrough for free, so the same call orders a
+    /// zettelkasten note web AND an email attachment graph.
+    pub fn walkthrough(&self) -> Vec<String> {
+        use std::collections::VecDeque;
+        let ranking = self.centrality_ranking();
+        let mut visited: BTreeSet<String> = BTreeSet::new();
+        let mut order: Vec<String> = Vec::new();
+        for (seed, _) in &ranking {
+            if visited.contains(seed) { continue; }
+            let mut queue: VecDeque<String> = VecDeque::new();
+            queue.push_back(seed.clone());
+            visited.insert(seed.clone());
+            while let Some(cur) = queue.pop_front() {
+                order.push(cur.clone());
+                let mut neigh = self.known_neighbors(&cur);
+                // hub-first within the frontier: higher degree, then slug.
+                neigh.sort_by(|a, b| self.degree(b).cmp(&self.degree(a)).then_with(|| a.cmp(b)));
+                for n in neigh {
+                    if visited.insert(n.clone()) {
+                        queue.push_back(n);
+                    }
+                }
+            }
+        }
+        order
+    }
+
+    /// v0.1.894: the walkthrough order as a JSON array of slugs, for QML to
+    /// drive a guided tour / replay control. Mirrors [`doc_json`]'s escaping.
+    pub fn walkthrough_json(&self) -> String {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let items: Vec<String> = self.walkthrough().iter()
+            .map(|s| format!("\"{}\"", esc(s))).collect();
+        format!("[{}]", items.join(","))
+    }
+
+    /// v0.1.895: build a link graph from a niftyplot graph source — the adapter
+    /// that lets the centrality + walkthrough machinery tour ANY niftyplot
+    /// graph: an inbox sender / attachment graph from `mail_panes`, a fenced
+    /// niftyplot block in a note, a hand-drawn diagram. Node ids become doc
+    /// slugs (the SAME slugify a `[[link]]` uses, so it composes with the note
+    /// web); each directed edge `from -> to` becomes one forward link. Edge
+    /// labels/styles are ignored — centrality is about connectivity, not weight.
+    /// Nodes with no outgoing edges are still registered so they appear in the
+    /// walk, and edge endpoints that were never declared as nodes are registered
+    /// too. Reuses `add_document` verbatim (via a synthesized wikilink body) so
+    /// the forward/back/known/re-index logic is exactly the corpus path.
+    pub fn from_niftyplot(source: &str) -> LinkGraph {
+        let doc = crate::niftyplot::parse(source);
+        // The niftyplot edge grammar can leave a trailing `:` / whitespace on a
+        // target id when an edge carries a `: "label"` suffix (e.g. the inbox
+        // sender graph's `alice -> You : "5"` yields a target of `You :`).
+        // Normalize endpoints so that target matches its declared node — trim
+        // whitespace and any trailing colon. Safe: niftyplot ids never end in
+        // a colon (it's the label separator).
+        let clean = |raw: &str| raw.trim().trim_end_matches(':').trim().to_string();
+        // Outgoing-target lists per node id (declared nodes seed empty lists;
+        // edges append and also register their endpoints).
+        let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for n in &doc.nodes {
+            let id = clean(&n.id);
+            if !id.is_empty() { out.entry(id).or_default(); }
+        }
+        for e in &doc.edges {
+            let (from, to) = (clean(&e.from), clean(&e.to));
+            if from.is_empty() || to.is_empty() { continue; }
+            out.entry(from).or_default().push(to.clone());
+            out.entry(to).or_default();
+        }
+        let mut g = LinkGraph::new();
+        for (id, targets) in &out {
+            let body: String = targets.iter().map(|t| format!("[[{}]] ", t)).collect();
+            g.add_document(id, &body);
+        }
+        g
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +414,95 @@ mod tests {
         let mut g = LinkGraph::new();
         g.add_document("", "[[x]]");
         assert_eq!(g.doc_count(), 0);
+    }
+
+    // v0.1.894: degree centrality ranks hubs first.
+    #[test]
+    fn centrality_ranks_hubs_first() {
+        let mut g = LinkGraph::new();
+        g.add_document("a", "[[hub]]");
+        g.add_document("b", "[[hub]]");
+        g.add_document("c", "[[hub]]");
+        g.add_document("hub", "[[x]]");
+        g.add_document("x", "leaf");
+        // hub: forward {x}=1 + backlinks {a,b,c}=3 → 4
+        assert_eq!(g.degree_centrality("hub"), 4);
+        assert_eq!(g.degree_centrality("a"), 1);
+        assert_eq!(g.degree_centrality("x"), 1);
+        assert_eq!(g.degree_centrality("missing"), 0);
+        let rank = g.centrality_ranking();
+        assert_eq!(rank[0], ("hub".to_string(), 4));
+        assert_eq!(rank.len(), 5); // a,b,c,hub,x
+        // degree-1 docs tie → stable slug order among the tail
+        let tail: Vec<&str> = rank[1..].iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(tail, vec!["a", "b", "c", "x"]);
+    }
+
+    // v0.1.894: the walkthrough starts at the hub and visits every known doc once.
+    #[test]
+    fn walkthrough_starts_at_hub_and_covers_all() {
+        let mut g = LinkGraph::new();
+        g.add_document("a", "[[hub]]");
+        g.add_document("b", "[[hub]]");
+        g.add_document("hub", "[[x]]");
+        g.add_document("x", "leaf");
+        let w = g.walkthrough();
+        assert_eq!(w[0], "hub", "densest node first");
+        assert_eq!(w.len(), 4, "every known doc once");
+        let mut uniq = w.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq, vec!["a", "b", "hub", "x"]);
+    }
+
+    // v0.1.894: disconnected clusters are each entered at their own hub, the
+    // denser component first, with no interleaving.
+    #[test]
+    fn walkthrough_covers_disconnected_components() {
+        let mut g = LinkGraph::new();
+        g.add_document("q", "[[p]] [[r]]"); // q is the degree-2 hub of cluster 1
+        g.add_document("p", "leaf");
+        g.add_document("r", "leaf");
+        g.add_document("s", "[[t]]"); // cluster 2: s → t
+        g.add_document("t", "leaf");
+        let w = g.walkthrough();
+        assert_eq!(w[0], "q", "overall densest node first");
+        assert_eq!(w.len(), 5);
+        let pos = |k: &str| w.iter().position(|x| x == k).unwrap();
+        // cluster 1 (q,p,r) fully precedes cluster 2 (s,t)
+        assert!(pos("p") < pos("s") && pos("r") < pos("s"));
+    }
+
+    #[test]
+    fn walkthrough_json_and_empty() {
+        let g = LinkGraph::new();
+        assert_eq!(g.walkthrough(), Vec::<String>::new());
+        assert_eq!(g.walkthrough_json(), "[]");
+        let mut g = LinkGraph::new();
+        g.add_document("hub", "[[x]]");
+        g.add_document("x", "leaf");
+        assert_eq!(g.walkthrough_json(), "[\"hub\",\"x\"]");
+    }
+
+    // v0.1.895: the niftyplot adapter — an inbox sender graph (every sender
+    // points at "You") tours from the hub outward. This is "graph walkthrough
+    // email integration" exercised end-to-end on the real DSL format.
+    #[test]
+    #[test]
+    fn from_niftyplot_inbox_graph_walks_from_you() {
+        let src = "%kind: graph\n%title: \"Inbox senders\"\n\
+                   You: circle \"You\"\n\
+                   alice => You : \"5\"\n\
+                   bob -> You : \"1\"\n\
+                   carol -> You : \"2\"\n";
+        let g = LinkGraph::from_niftyplot(src);
+        assert_eq!(g.doc_count(), 4); // You + 3 senders
+        // "You" is the hub: 3 senders point in.
+        assert_eq!(g.degree_centrality("you"), 3);
+        assert_eq!(g.degree_centrality("alice"), 1);
+        assert_eq!(g.backlinks("you"), vec!["alice", "bob", "carol"]);
+        let w = g.walkthrough();
+        assert_eq!(w[0], "you", "tour starts at the inbox hub");
+        assert_eq!(w.len(), 4);
     }
 }

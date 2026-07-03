@@ -80,7 +80,7 @@ fn class(b: BlockId) -> Class {
         IronBlock | GoldBlock => Class::Metal,
         Grass | OakLog | OakLeaves | BirchLog | BirchLeaves | Cactus | Moss | Flower
         | TallGrass | Fern | DeadBush | Vine | Mushroom | Lichen | OakPlanks | Bookshelf
-        | Pumpkin | DarkOakPlanks => Class::Organic,
+        | Pumpkin | DarkOakPlanks | Carrot | Potato | Cabbage | Sprout => Class::Organic,
         Stone | Dirt | Cobblestone | Bedrock | Sand | Gravel | GoldOre | IronOre | CoalOre
         | Clay | RedSandstone | Dripstone | Limestone | Marble | Basalt | Tuff | Granite
         | Slate | Calcite | Andesite | Schist | Bone | Sandstone | CopperOre | DiamondOre

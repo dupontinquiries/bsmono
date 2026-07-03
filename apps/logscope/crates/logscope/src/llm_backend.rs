@@ -188,7 +188,7 @@ pub fn load_model(_path: &str, _params: &GenParams) -> Result<LoadedModel, Strin
 /// Streaming completion: invokes `on_token` for each decoded piece and returns
 /// the number of tokens generated. `generate` is the buffered wrapper.
 #[cfg(feature = "llama-ffi")]
-pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, mut on_token: impl FnMut(&str)) -> Result<usize, String> {
+pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, cancel: impl Fn() -> bool, mut on_token: impl FnMut(&str) -> bool) -> Result<usize, String> {
     use std::num::NonZeroU32;
     use llama_cpp_2::context::params::LlamaContextParams;
     use llama_cpp_2::llama_batch::LlamaBatch;
@@ -226,10 +226,13 @@ pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, m
     }
     ctx.decode(&mut batch).map_err(|e| format!("prompt decode failed: {e}"))?;
 
+    // Repetition penalty (params.repeat_penalty, default 1.15) FIRST in the chain — without it small/quant
+    // models (e.g. Gemma) run away into repeated loops. penalty_last_n=64; freq/present penalties off.
+    let penalties = LlamaSampler::penalties(64, params.repeat_penalty, 0.0, 0.0);
     let mut sampler = if params.temperature <= 0.01 {
-        LlamaSampler::greedy()
+        LlamaSampler::chain_simple([penalties, LlamaSampler::greedy()])
     } else {
-        LlamaSampler::chain_simple([LlamaSampler::temp(params.temperature), LlamaSampler::dist(1234)])
+        LlamaSampler::chain_simple([penalties, LlamaSampler::temp(params.temperature), LlamaSampler::dist(1234)])
     };
 
     let mut n_cur = n_prompt as i32;
@@ -239,12 +242,13 @@ pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, m
     let ceiling = params.reply_ceiling.max(params.max_tokens)
         .min((params.n_ctx as usize).saturating_sub(n_prompt).max(1));
     while n_decoded < ceiling {
+        if cancel() { break; } // stop button / barge-in flipped the flag → halt promptly
         let token = sampler.sample(&ctx, batch.n_tokens() - 1);
         sampler.accept(token);
         if loaded.model.is_eog_token(token) { break; }
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let piece = loaded.model.token_to_piece(token, &mut decoder, false, None).unwrap_or_default();
-        on_token(&piece);
+        if !on_token(&piece) { break; } // consumer asked to stop
         batch.clear();
         batch.add(token, n_cur, &[0], true).map_err(|e| format!("batch add (gen) failed: {e}"))?;
         n_cur += 1;
@@ -258,12 +262,12 @@ pub fn generate_stream(loaded: &LoadedModel, prompt: &str, params: &GenParams, m
 #[cfg(feature = "llama-ffi")]
 pub fn generate(loaded: &LoadedModel, prompt: &str, params: &GenParams) -> Result<String, String> {
     let mut out = String::new();
-    generate_stream(loaded, prompt, params, |p| out.push_str(p))?;
+    generate_stream(loaded, prompt, params, || false, |p| { out.push_str(p); true })?;
     Ok(out)
 }
 
 #[cfg(not(feature = "llama-ffi"))]
-pub fn generate_stream(_loaded: &LoadedModel, _prompt: &str, _params: &GenParams, _on_token: impl FnMut(&str)) -> Result<usize, String> {
+pub fn generate_stream(_loaded: &LoadedModel, _prompt: &str, _params: &GenParams, _cancel: impl Fn() -> bool, _on_token: impl FnMut(&str) -> bool) -> Result<usize, String> {
     Err("not built with the `llamacpp` feature".into())
 }
 #[cfg(not(feature = "llama-ffi"))]

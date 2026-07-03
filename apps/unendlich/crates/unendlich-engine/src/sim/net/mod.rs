@@ -27,7 +27,9 @@
 
 pub mod codec; // r340-sl-net: shared wire codec
 pub mod chunk_stream; // r332: world-streaming chunk record codec (item 6, §B)
-pub mod chunk_compress; // r387-mp: RLE payload codec + seal/open path for chunk_stream
+pub mod chunk_compress;
+pub mod packet_compress; // r387-mp: RLE payload codec + seal/open path for chunk_stream
+pub mod dht; // r500: Kademlia routing table + channels for DHT multiplayer
 pub mod rendezvous_join; // r388-mp: bridge dht_mailbox Accept → net_rendezvous hole-punch
 pub mod mp_dht_mailbox; // r389-mp: MailboxDht backed by mp_dht Mailboxes (real routing model)
 pub mod entity_replication; // r390-mp: host seal + client receive over entity_snapshot

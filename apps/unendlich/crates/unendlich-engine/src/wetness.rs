@@ -33,7 +33,7 @@ pub fn absorbency(block: BlockId) -> u8 {
         Snow | SnowBlock => 120,
         OakLog | BirchLog | OakPlanks | Bookshelf | DarkOakPlanks => 180, // wood drinks
         OakLeaves | BirchLeaves | Cactus | Pumpkin | Flower | TallGrass | Fern | DeadBush
-        | Vine | Mushroom | Cobweb | Lichen => 90, // foliage holds droplets
+        | Vine | Mushroom | Cobweb | Lichen | Carrot | Potato | Cabbage | Sprout => 90, // foliage holds droplets
         Stone | Cobblestone | Bedrock | RedSandstone | Dripstone | Limestone | Basalt | Tuff
         | Granite | Slate | Andesite | Schist | Sandstone | StoneBricks | Bricks | CoalBlock
         | Marble | Calcite | MossyCobblestone | PolishedStone | PolishedBasalt | ChiseledStoneBricks | SmoothSandstone | Terracotta => 60, // stone takes a film

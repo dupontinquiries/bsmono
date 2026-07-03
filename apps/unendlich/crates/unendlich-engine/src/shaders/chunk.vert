@@ -50,6 +50,15 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     vec4 wind_params;      // xy = wind vector at player, z = wind magnitude, w = unused
     vec4 viewport_rect;    // xy = viewport size px, zw = viewport offset px
     mat4 light_view_proj;  // light-space VP for shadow-map sampling (Phase 2 will read this)
+    // r597: the block must declare the FULL CameraUbo layout up to `disturbers`
+    // (mirrors chunk.frag lines 52-68) so std140 offsets line up. Fields between
+    // here and `disturbers` are unused by this shader but must be present.
+    vec4 flow_coverage;        // r419
+    vec4 flow_grid[128];       // r419
+    vec4 fx_params;            // r427
+    vec4 water_depth_cov;      // r431
+    vec4 water_depth_grid[64]; // r431
+    vec4 disturbers[8];        // r597: xyz = world pos, w = strength (w<=0 = empty)
 } ubo;
 
 // v0.24.20-vertex-pack: chunks-metadata SSBO. Mirrors the layout of
@@ -116,11 +125,60 @@ void main() {
             vec2  wd   = ubo.wind_params.xy;
             float wlen = length(wd);
             wd = wlen > 0.001 ? wd / wlen : vec2(1.0, 0.0);
-            float t     = ubo.atmos_params.w * 1.4;
-            float phase = world_pos.x * 0.6 + world_pos.z * 0.45 + t;
-            float amp   = 0.02 + 0.04 * wmag;
-            world_pos.xz += wd * (sin(phase) * amp);
-            world_pos.y  += sin(phase * 1.7) * 0.012 * (0.3 + wmag);
+            float t = ubo.atmos_params.w; // seconds (r323)
+            // Physics-based sway: aerodynamic drag rises with the SQUARE of wind
+            // speed, so foliage takes on a steady DOWNWIND lean (∝ wmag²) and then a
+            // slow sway + faster flutter oscillate about that lean — rather than a
+            // symmetric wobble about vertical. At zero wind there's only a whisper of
+            // idle motion. (Per-tree stiffness from trunk-thickness / flexibility genes
+            // — sim::plant_survival::sway_offset — is a mesher-encoded follow-up.)
+            float pressure = wmag * wmag;
+            float phase   = world_pos.x * 0.6 + world_pos.z * 0.45 + t * 1.4;
+            float flutter = world_pos.x * 1.7 + world_pos.z * 1.3 + t * 3.1;
+            float bend = 0.10 * pressure;                        // steady downwind lean
+            float osc  = 0.6 * sin(phase) + 0.4 * sin(flutter);  // sway + flutter
+            float amp  = 0.015 + 0.05 * pressure;                // idle whisper + gust
+            world_pos.xz += wd * (bend + osc * amp);
+            world_pos.y  -= bend * 0.2;                          // tip dips as it leans
+
+            // r591/r592: DISTURBER — foliage shoved aside by nearby heavy things. The
+            // camera (≈ the player) is the first disturber (mobs become extra entries in
+            // a disturber array later). Strength comes live from the F3 slider via
+            // ubo.sun_color.a (1.0 = default, 0 = off); higher also widens the reach so
+            // cranking it is a decisive test. Radial push away, fading to 0 at `reach`,
+            // roots (tag 2) stay so plants pivot at the base.
+            float dstr = ubo.sun_color.a;
+            if (dstr > 0.001) {
+                vec2  d_xz  = world_pos.xz - ubo.camera_pos.xz;
+                float d_len = length(d_xz);
+                float reach = 3.0 + dstr * 0.3;                  // widens as you crank
+                if (d_len > 0.001 && d_len < reach) {
+                    float fall = 1.0 - d_len / reach;
+                    fall *= fall;
+                    world_pos.xz += (d_xz / d_len) * fall * 0.35 * dstr;
+                    world_pos.y  -= fall * 0.05 * dstr;
+                }
+            }
+
+            // r597: MOB/DRAGON disturbers — nearby heavy bodies shove foliage aside
+            // (the bow-wave). Each slot is xyz = world pos, w = strength (heft from
+            // stature). Radial push away, reach and push both scale with strength so
+            // a dragon parts a wide swath and a wolf barely a ripple; capped so tips
+            // bend hard without stretching. Empty slots (w<=0) cost one branch.
+            for (int di = 0; di < 8; di++) {
+                vec4 dstb = ubo.disturbers[di];
+                if (dstb.w <= 0.001) { continue; }
+                vec2  m_xz  = world_pos.xz - dstb.xz;
+                float m_len = length(m_xz);
+                float m_reach = 2.0 + pow(dstb.w, 0.333) * 2.2;  // ~8.5 blocks at str 35
+                if (m_len > 0.001 && m_len < m_reach) {
+                    float mf = 1.0 - m_len / m_reach;
+                    mf *= mf;
+                    float push = min(mf * 0.18 * dstb.w, 1.5);   // capped bend
+                    world_pos.xz += (m_xz / m_len) * push;
+                    world_pos.y  -= min(mf * 0.04 * dstb.w, 0.4);
+                }
+            }
         }
         // sway_tag == 2u (Anchor) deliberately falls through: the base vertex
         // stays put so the plant pivots about its root.

@@ -87,13 +87,21 @@ pub enum BlockId {
     ChiseledStoneBricks = 85,
     DarkOakPlanks = 86,
     PolishedBasalt = 87,
+    // r512: FARMING — placeable vegetable crops. Planted on Grass/Dirt in survival they grow
+    // over time (sim::plant_growth) and yield a harvest when ripe; all three are edible.
+    Carrot = 88,
+    Potato = 89,
+    Cabbage = 90,
+    // r520: a generic young seedling — every crop starts as this and the growth tick swaps it
+    // for the real crop block once it's established, so plants visibly grow through stages.
+    Sprout = 91,
 }
 
 impl BlockId {
     /// Every block variant, in declaration order. Lets tests and tooling
     /// quantify invariants over the whole palette (e.g. "every gate-skippable
     /// block is non-solid"). Kept exhaustive by `all_const_is_exhaustive`.
-    pub const ALL: [BlockId; 66] = [
+    pub const ALL: [BlockId; 70] = [
         BlockId::Air, BlockId::Stone, BlockId::Grass, BlockId::Dirt,
         BlockId::Cobblestone, BlockId::Bedrock, BlockId::Water, BlockId::Lava,
         BlockId::Sand, BlockId::Gravel, BlockId::GoldOre, BlockId::IronOre,
@@ -112,6 +120,7 @@ impl BlockId {
         BlockId::MossyCobblestone, BlockId::PolishedStone, BlockId::SmoothSandstone,
         BlockId::Terracotta, BlockId::ChiseledStoneBricks, BlockId::DarkOakPlanks,
         BlockId::PolishedBasalt,
+        BlockId::Carrot, BlockId::Potato, BlockId::Cabbage, BlockId::Sprout,
     ];
 
     pub fn is_air(self) -> bool {
@@ -361,6 +370,10 @@ impl BlockId {
             BlockId::ChiseledStoneBricks => [122, 120, 117],
             BlockId::DarkOakPlanks       => [82, 56, 33],
             BlockId::PolishedBasalt      => [56, 54, 61],
+            BlockId::Carrot              => [230, 126, 34],
+            BlockId::Potato              => [200, 170, 120],
+            BlockId::Cabbage             => [120, 180, 90],
+            BlockId::Sprout              => [120, 200, 110],
         }
     }
 
@@ -421,7 +434,9 @@ impl BlockId {
             | BlockId::Fern
             | BlockId::Flower
             | BlockId::OakLeaves   // canopy detail — clusters of mini-leaves
-            | BlockId::BirchLeaves)
+            | BlockId::BirchLeaves
+            // r513: crops render as small plant shapes, not cubes.
+            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
     }
 
     /// **Sub-voxel-only** blocks: the sub-voxel grid IS the entire visual.
@@ -439,7 +454,10 @@ impl BlockId {
     pub fn is_subvoxel_only(self) -> bool {
         matches!(self,
             BlockId::OakLeaves
-            | BlockId::BirchLeaves)
+            | BlockId::BirchLeaves
+            // r513: crops are decoration-shaped (no cube), but stay is_solid so they're
+            // still raycast-harvestable; blocks_collision is false so you walk through them.
+            | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
     }
 
     /// "Softness" of a block's edges — how much its top corners sag at
@@ -677,6 +695,7 @@ mod tests {
                 | BlockId::MossyCobblestone | BlockId::PolishedStone | BlockId::SmoothSandstone
                 | BlockId::Terracotta | BlockId::ChiseledStoneBricks | BlockId::DarkOakPlanks
                 | BlockId::PolishedBasalt => {}
+                | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout => {}
             }
         }
         for b in BlockId::ALL { _forces_update(b); }

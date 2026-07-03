@@ -330,9 +330,77 @@ pub fn creative_palette(tab: crate::inventory_screen::Tab) -> Vec<ItemKind> {
     }
 }
 
+/// r574: how a carried item should READ in a slot — a colour swatch and a short
+/// name — resolved from its raw `ItemId` value. This is the prerequisite for
+/// drawing the real survival backpack (the inventory grid stores raw ids, not
+/// `ItemKind`s, and the id space is mixed: blocks, ingots, food, weapons).
+///
+/// The id convention (authoritative, from the crafting recipes + game loop):
+///   - `0..256`        a `BlockId` (placeable block) — `base_color` + Debug name
+///   - `1000 + idx`    an ingot of `MetalKind::ALL[idx]` (1000 Iron, 1001 Gold, …)
+///   - `2000 / 2001`   raw / cooked meat (the two food ids the loop uses)
+///   - `4000..4008`    a forged legendary weapon
+///   - anything else   a neutral generic fallback (never panics)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemDisplay {
+    pub color: [u8; 3],
+    pub name: String,
+}
+
+/// Resolve a raw item id to its slot display. Total: every u32 maps to something.
+pub fn item_display(id: u32) -> ItemDisplay {
+    // food ids used directly by the survival loop (not ItemKind variants)
+    match id {
+        2000 => return ItemDisplay { color: [191, 77, 71], name: "Raw Meat".into() },
+        2001 => return ItemDisplay { color: [158, 102, 66], name: "Cooked Meat".into() },
+        2002 => return ItemDisplay { color: [206, 58, 54], name: "Apple".into() },
+        _ => {}
+    }
+    // blocks occupy the low id space (BlockId is repr(u8))
+    if id < 256 {
+        if let Ok(b) = BlockId::try_from(id as u8) {
+            if b != BlockId::Air {
+                return ItemDisplay { color: b.base_color(), name: format!("{b:?}") };
+            }
+        }
+    }
+    // ingots: 1000 + index into MetalKind::ALL
+    let ingot_base = 1000u32;
+    if id >= ingot_base && (id - ingot_base) < MetalKind::ALL.len() as u32 {
+        let m = MetalKind::ALL[(id - ingot_base) as usize];
+        return ItemDisplay { color: m.color(), name: format!("{} Ingot", m.name()) };
+    }
+    // forged legendary weapons
+    if (4000..4008).contains(&id) {
+        return ItemDisplay { color: [184, 189, 196], name: "Weapon".into() };
+    }
+    ItemDisplay { color: [150, 150, 156], name: "Item".into() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn item_display_resolves_each_id_class() {
+        // block id (Stone = 1) → its base colour + Debug name
+        let stone = item_display(BlockId::Stone as u32);
+        assert_eq!(stone.name, "Stone");
+        assert_eq!(stone.color, BlockId::Stone.base_color());
+        // ingot 1000 → Iron (MetalKind::ALL[0])
+        let iron = item_display(1000);
+        assert_eq!(iron.name, "Iron Ingot");
+        assert_eq!(iron.color, MetalKind::Iron.color());
+        // ingot 1001 → Gold
+        assert_eq!(item_display(1001).name, "Gold Ingot");
+        // food ids
+        assert_eq!(item_display(2000).name, "Raw Meat");
+        assert_eq!(item_display(2001).name, "Cooked Meat");
+        // weapon range
+        assert_eq!(item_display(4000).name, "Weapon");
+        // unknown id never panics → generic fallback
+        assert_eq!(item_display(999_999).name, "Item");
+    }
     use crate::emblem::Motif;
 
     #[test]

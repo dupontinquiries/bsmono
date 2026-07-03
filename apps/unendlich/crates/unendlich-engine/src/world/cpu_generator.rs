@@ -928,7 +928,95 @@ impl WorldGenerator {
             }
         }
 
+        // Phase 6: scattered surface RUINS. Extracted to `stamp_ruins` so the GPU
+        // worldgen path can run the SAME decoration after read-back (the GPU shader
+        // mirrors terrain only — structures are a CPU post-pass in both paths).
+        self.stamp_ruins(&mut blocks, coord);
+
         Chunk::from_blocks(coord, blocks)
+    }
+
+    /// Stamp scattered surface ruins into a chunk's block array. Deterministic per
+    /// 80×80 region (no per-chunk RNG); each hosting region drops one `make_ruin`
+    /// footprint at a hashed anchor on dry land, written cross-chunk so seams match.
+    /// Runs as a CPU post-pass in BOTH the CPU generator and the GPU read-back path,
+    /// since the GPU shader produces terrain only. Surface height + biome come from
+    /// the analytic generator, which the GPU terrain mirrors.
+    pub fn stamp_ruins(&self, blocks: &mut [BlockId], coord: ChunkCoord) {
+        let (origin_x, origin_y, origin_z) = coord.block_origin();
+        let chunk_x_lo = origin_x;
+        let chunk_x_hi = origin_x + CHUNK_SIZE;
+        let chunk_y_lo = origin_y;
+        let chunk_y_hi = origin_y + CHUNK_SIZE;
+        let chunk_z_lo = origin_z;
+        let chunk_z_hi = origin_z + CHUNK_SIZE;
+        const RUIN_REGION: i32 = 80;
+        const RUIN_MAX: i32 = 12;
+        let r_x0 = (chunk_x_lo - RUIN_MAX).div_euclid(RUIN_REGION);
+        let r_x1 = chunk_x_hi.div_euclid(RUIN_REGION);
+        let r_z0 = (chunk_z_lo - RUIN_MAX).div_euclid(RUIN_REGION);
+        let r_z1 = chunk_z_hi.div_euclid(RUIN_REGION);
+        let span = (RUIN_REGION - RUIN_MAX) as u64;
+        for rz in r_z0..=r_z1 {
+            for rx in r_x0..=r_x1 {
+                let rh = ruin_region_hash(rx, rz, self.params.seed as u64);
+                if rh % 100 >= 38 {
+                    continue; // ~38% of regions host a ruin
+                }
+                let ax = rx * RUIN_REGION + ((rh >> 8) % span) as i32;
+                let az = rz * RUIN_REGION + ((rh >> 24) % span) as i32;
+                let w = 5 + ((rh >> 40) % 4) as i32;
+                let h = 5 + ((rh >> 44) % 4) as i32;
+                if ax + w < chunk_x_lo || ax > chunk_x_hi
+                    || az + h < chunk_z_lo || az > chunk_z_hi
+                {
+                    continue;
+                }
+                let base_y = match self.surface_y_at(ax, az, chunk_y_lo - 64, chunk_y_hi + 96) {
+                    Some(y) => y,
+                    None => continue,
+                };
+                if base_y < crate::constants::SEA_LEVEL {
+                    continue; // dry land only
+                }
+                // Log once per ruin — when its anchor lands in THIS chunk — so a
+                // session log confirms ruins are being generated and where.
+                if ax >= chunk_x_lo && ax < chunk_x_hi && az >= chunk_z_lo && az < chunk_z_hi {
+                    log::info!("[worldgen] ruin at ({},{},{}) {}x{}", ax, base_y, az, w, h);
+                }
+                let wall_h = 3 + ((rh >> 48) % 2) as i32; // 3..4 tall — clearly visible
+                let mat = match self.biome_at_3d(ax, base_y, az).biome {
+                    Biome::Desert | Biome::Beach => BlockId::Sandstone,
+                    Biome::RedSandstoneCanyon | Biome::BloomingCanyon => BlockId::RedSandstone,
+                    Biome::Swamp | Biome::LushCave => BlockId::MossyCobblestone,
+                    _ => BlockId::Cobblestone,
+                };
+                let tmpl = crate::world::structure_template::make_ruin(w as u32, h as u32, 1, 2, rh);
+                for cz in 0..h {
+                    for cx in 0..w {
+                        let code = tmpl.cells[(cz * w + cx) as usize];
+                        if code == 0 {
+                            continue;
+                        }
+                        let wx = ax + cx;
+                        let wz = az + cz;
+                        if code == 2 {
+                            ruin_write(
+                                blocks, wx, base_y, wz, mat,
+                                chunk_x_lo, chunk_x_hi, chunk_y_lo, chunk_y_hi, chunk_z_lo, chunk_z_hi,
+                            );
+                        } else {
+                            for dy in 1..=wall_h {
+                                ruin_write(
+                                    blocks, wx, base_y + dy, wz, mat,
+                                    chunk_x_lo, chunk_x_hi, chunk_y_lo, chunk_y_hi, chunk_z_lo, chunk_z_hi,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -985,6 +1073,40 @@ fn tree_origin_hash(wx: i32, wz: i32, seed: u64) -> f64 {
     h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
     h ^= h >> 33;
     (h & 0xFFFFFFFF) as f64 / (u32::MAX as f64)
+}
+
+/// r530: deterministic per-region hash for surface ruin placement.
+fn ruin_region_hash(rx: i32, rz: i32, seed: u64) -> u64 {
+    let mut h: u64 = (rx as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ (rz as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
+        ^ seed.wrapping_mul(0xA376_2DAB_5CE3_43E9);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^= h >> 33;
+    h
+}
+
+/// r530: write a ruin block at world (wx,wy,wz) into this chunk if in-bounds,
+/// overwriting only air, foliage, and soft ground (never solid rock / existing
+/// structure), so ruins drape onto terrain without gouging hillsides.
+#[allow(clippy::too_many_arguments)]
+fn ruin_write(
+    blocks: &mut [BlockId], wx: i32, wy: i32, wz: i32, b: BlockId,
+    x_lo: i32, x_hi: i32, y_lo: i32, y_hi: i32, z_lo: i32, z_hi: i32,
+) {
+    if wx < x_lo || wx >= x_hi || wy < y_lo || wy >= y_hi || wz < z_lo || wz >= z_hi {
+        return;
+    }
+    let idx = Chunk::block_index(wx - x_lo, wy - y_lo, wz - z_lo);
+    let existing = blocks[idx];
+    let overwriteable = existing == BlockId::Air
+        || !existing.is_solid()
+        || matches!(existing, BlockId::Grass | BlockId::Dirt | BlockId::Sand | BlockId::SnowBlock);
+    if overwriteable {
+        blocks[idx] = b;
+    }
 }
 
 fn legacy_surface_block(biome: Biome, y: i32) -> BlockId {

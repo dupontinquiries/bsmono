@@ -143,48 +143,54 @@ bool aabb_visible(vec3 mn, vec3 mx) {
     return true;
 }
 
+// r482: workgroup-local aggregation of the visible-count atomic. The old path
+// did one global atomicAdd(visible_count,1) per visible chunk — heavy contention
+// when most chunks pass. Instead each 64-wide workgroup tallies its own visible
+// chunks in shared memory (cheap shared atomics), then does ONE global atomicAdd
+// to reserve a contiguous base, and each thread writes commands[base+local].
+// 64:1 fewer global atomics. Output is the same SET of draws (order differs, which
+// is irrelevant for indirect draws). NB: no early `return` before the barriers —
+// every thread must reach each barrier or the workgroup deadlocks.
+shared uint s_local_count;
+shared uint s_base;
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.chunk_count) return;
 
-    ChunkDraw c = chunks[i];
+    if (gl_LocalInvocationID.x == 0u) s_local_count = 0u;
+    barrier();
 
-    // Inactive slot — skip.
-    if (c.index_count == 0u) return;
-
-    // v0.24.4 (shadow-stride): temporal amortization. When stride > 1
-    // (shadow cull only) we admit one in `stride` chunks per frame,
-    // cycling through which chunks via `stride_phase`. Inactive slot
-    // check above runs first so inactive slots don't break the
-    // residue pattern (they're already excluded). Active slots are
-    // distributed across residues by `slot_index % stride`.
-    //
-    // The shadow map is NOT cleared between frames in stride>1 mode
-    // (see ShadowMap::render_pass_load); previous frames' depth
-    // values remain valid for chunks we skip here.
-    if (pc.stride > 1u) {
-        if ((i % pc.stride) != pc.stride_phase) return;
+    // Decide visibility without returning (OOB threads just don't emit). Read a
+    // clamped index so `c` is always initialized; it's only USED when emit=true,
+    // which implies i < chunk_count.
+    ChunkDraw c = chunks[(i < pc.chunk_count) ? i : 0u];
+    bool emit = false;
+    if (i < pc.chunk_count && c.index_count != 0u) {
+        // shadow-stride temporal amortization (admit 1 in `stride`, cycling phase)
+        bool stride_ok = (pc.stride <= 1u) || ((i % pc.stride) == pc.stride_phase);
+        if (stride_ok) {
+            bool always_emit = (c.flags & FLAG_DEBUG_OVERLAY) != 0u;
+            emit = always_emit || aabb_visible(c.aabb_min.xyz, c.aabb_max.xyz);
+        }
     }
 
-    // Cull test (debug overlay always passes).
-    bool always_emit = (c.flags & FLAG_DEBUG_OVERLAY) != 0u;
-    if (!always_emit) {
-        if (!aabb_visible(c.aabb_min.xyz, c.aabb_max.xyz)) return;
-    }
+    // Per-workgroup tally (shared atomic) → each emitter gets a local slot.
+    uint local_idx = 0u;
+    if (emit) local_idx = atomicAdd(s_local_count, 1u);
+    barrier();
 
-    // Reserve a slot in the output and write the draw command.
-    //
-    // v0.24.20-vertex-pack: `first_instance` carries the chunk's slot
-    // index in the metadata SSBO so the vertex shader can recover the
-    // chunk origin via `gl_InstanceIndex`. Each draw command still
-    // renders one instance (instance_count=1), but Vulkan adds the
-    // per-draw `firstInstance` value into `gl_InstanceIndex` —
-    // effectively a free per-draw "which chunk is this?" channel that
-    // doesn't cost a push constant or a separate buffer.
-    uint slot = atomicAdd(visible_count, 1u);
-    commands[slot].index_count    = c.index_count;
-    commands[slot].instance_count = 1u;
-    commands[slot].first_index    = c.first_index;
-    commands[slot].vertex_offset  = c.vertex_offset;
-    commands[slot].first_instance = i;
+    // One global atomic per workgroup reserves a contiguous run of output slots.
+    if (gl_LocalInvocationID.x == 0u) {
+        s_base = atomicAdd(visible_count, s_local_count);
+    }
+    barrier();
+
+    if (emit) {
+        uint slot = s_base + local_idx;
+        commands[slot].index_count    = c.index_count;
+        commands[slot].instance_count = 1u;
+        commands[slot].first_index    = c.first_index;
+        commands[slot].vertex_offset  = c.vertex_offset;
+        commands[slot].first_instance = i;
+    }
 }

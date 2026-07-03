@@ -22,7 +22,7 @@ impl eframe::App for App {
             .show_inside(ui, |ui| {
                 ui.add_space(34.0);
                 let accent = egui::Color32::from_rgb(0x4d, 0xd6, 0xe6);
-                self.pearl.show(ui, &self.text, t as f32, 168.0, accent);
+                self.pearl.show(ui, &self.text, "", t as f32, 168.0, accent);
             });
         ui.ctx().request_repaint();
     }

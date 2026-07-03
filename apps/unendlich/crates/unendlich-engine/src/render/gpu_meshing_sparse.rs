@@ -366,7 +366,7 @@ impl SparseGpuMesher {
             } else if c.records.is_empty() {
                 ChunkBatchOutput {
                     coord: c.coord,
-                    mesh: Ok(ChunkMesh { vertices: Vec::new(), indices: Vec::new() }),
+                    mesh: Ok(ChunkMesh::empty()),
                 }
             } else {
                 // Placeholder; filled after GPU dispatch.
@@ -592,7 +592,7 @@ impl SparseGpuMesher {
                 raw.to_vec()
             };
 
-            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices });
+            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices, ..ChunkMesh::empty() });
         }
 
         Ok(outputs)
@@ -639,7 +639,7 @@ impl SparseGpuMesher {
             } else if c.runs.is_empty() {
                 ChunkBatchOutput {
                     coord: c.coord,
-                    mesh: Ok(ChunkMesh { vertices: Vec::new(), indices: Vec::new() }),
+                    mesh: Ok(ChunkMesh::empty()),
                 }
             } else {
                 ChunkBatchOutput {
@@ -846,7 +846,7 @@ impl SparseGpuMesher {
                 );
                 raw.to_vec()
             };
-            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices });
+            outputs[slot_idx].mesh = Ok(ChunkMesh { vertices, indices, ..ChunkMesh::empty() });
         }
 
         Ok(outputs)

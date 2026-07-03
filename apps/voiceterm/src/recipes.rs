@@ -440,6 +440,9 @@ mod tests {
             "web2qml://mail",
             "web2qml://mail/login",
             "web2qml://mail/settings",
+            "web2qml://mail/compose",
+            "web2qml://mail/drafts",
+            "web2qml://mail/peers",
             // v0.1.875: format-template artifact — the scanner picks up
             // the literal `format!("web2qml://man/{}", ...)`. The bare
             // `web2qml://man` already has a URL_RECIPES entry; the

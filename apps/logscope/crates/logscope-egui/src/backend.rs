@@ -59,10 +59,13 @@ impl Backend for LlamaCpp {
     fn load(&mut self, path: &str, params: &GenParams) -> Result<(), String> {
         self.model = Some(llm_backend::load_model(path, params)?); Ok(())
     }
-    fn generate(&mut self, prompt: &str, params: &GenParams, _cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
-        // ggml's stream callback has no stop signal, so llama.cpp can't be
-        // cancelled mid-token here; the bool from `on` is dropped for this backend.
-        match &self.model { Some(m) => llm_backend::generate_stream(m, prompt, params, |s| { on(s); }), None => Err("no model loaded".into()) }
+    fn generate(&mut self, prompt: &str, params: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
+        // Cancellation now threads through: the decode loop checks `cancel()` each token and stops when `on`
+        // returns false, so the Stop button and voice barge-in halt llama.cpp generation.
+        match &self.model {
+            Some(m) => llm_backend::generate_stream(m, prompt, params, || cancel(), |s| on(s)),
+            None => Err("no model loaded".into()),
+        }
     }
 }
 
@@ -114,6 +117,11 @@ mod engine {
         /// Adapts passes-per-submit across replies (sweeps SUBMIT_PROFILES, settles on the fastest by
         /// per-token decode time, caches it). None when env-pinned, cached, or autotune is disabled.
         submit_tuner: Option<gpu_kernels::SubmitTuner>,
+        /// Optional small DRAFT model for speculative decoding (opt-in via `LOGSCOPE_SPEC_DRAFT`).
+        /// When present, `generate` routes through the engine's `speculative_generate_stats`: the
+        /// draft proposes a block of tokens that the target verifies in ONE forward — bit-exact to
+        /// greedy decode, but more tokens per expensive target pass. Must share the target's vocab.
+        draft: Option<Model>,
     }
     impl Engine {
         pub fn load(path: &str) -> Result<Self, String> {
@@ -126,19 +134,19 @@ mod engine {
             let gpu = Gpu::new();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
             let g = gpu_kernels::gguf::parse(&bytes)?;
-            // Pre-flight: this build keeps weights int8-resident; a model whose int8 footprint exceeds
-            // available memory would OOM-KILL the process mid-dequant (the 70B/30B kills). Estimate it
-            // from metadata and refuse with a clear message instead. LOGSCOPE_FORCE_LOAD=1 bypasses;
-            // LOGSCOPE_MAX_RESIDENT_GB sets the budget.
+            // Pre-flight: the loader auto-selects q4-resident (≈half the int8 footprint) when int8 won't
+            // fit, and falls back to q4 on a GPU OOM. So only refuse when even q4 can't fit the budget;
+            // otherwise let the loader pick. LOGSCOPE_FORCE_LOAD=1 bypasses; LOGSCOPE_MAX_RESIDENT_GB sets
+            // the budget; LOGSCOPE_Q4_RESIDENT=1 forces q4 up front.
             if std::env::var("LOGSCOPE_FORCE_LOAD").is_err() {
                 if let (Some(est), Some(budget)) = (gpu_kernels::store::estimate_int8_resident(&g), gpu_kernels::store::resident_budget_bytes()) {
-                    if est > budget {
+                    let q4_est = est / 2; // q4-resident is ≈half of int8
+                    if q4_est > budget {
                         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
                         return Err(format!(
-                            "won't fit: ~{:.1} GiB int8-resident needed, ~{:.1} GiB available. This build keeps \
-                             weights int8-resident (≈2× the q4 file), so big models don't fit yet — q4-resident is \
-                             on the roadmap. Try a smaller model, free memory, or LOGSCOPE_FORCE_LOAD=1 to try anyway (likely OOM).",
-                            gib(est), gib(budget)));
+                            "won't fit: ~{:.1} GiB needed even at q4-resident, ~{:.1} GiB available. Try a \
+                             smaller model, free memory, or LOGSCOPE_FORCE_LOAD=1 to try anyway (likely OOM).",
+                            gib(q4_est), gib(budget)));
                     }
                 }
             }
@@ -165,6 +173,8 @@ mod engine {
                 TemplateKind::ChatML
             } else if tok.special_id("<|eot_id|>").is_some() || tok.special_id("<|start_header_id|>").is_some() {
                 TemplateKind::Llama3
+            } else if tok.special_id("<|turn>").is_some() || tok.special_id("<turn|>").is_some() {
+                TemplateKind::Gemma // Gemma 4 turn markers (changed from Gemma 3's <start_of_turn>/<end_of_turn>)
             } else {
                 TemplateKind::Plain
             };
@@ -182,7 +192,7 @@ mod engine {
             let model = match gpu.load_int8_cache(&cache, fp) {
                 Some(m) => { eprintln!("wgpu-engine: loaded int8 cache (skipped dequant) in {:.1}s [{}]", t0.elapsed().as_secs_f32(), cache.display()); m }
                 None => {
-                    eprintln!("wgpu-engine: loading {path} ({:.1} MiB) — dequantizing to int8-resident…", bytes.len() as f32 / (1 << 20) as f32);
+                    eprintln!("wgpu-engine: loading {path} ({:.1} MiB) — quantizing to resident weights (int8, or q4 if it won't fit)…", bytes.len() as f32 / (1 << 20) as f32);
                     let m = gpu.load_gguf_quantized(&bytes)?;
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
@@ -306,7 +316,31 @@ mod engine {
                 .map(|v| v.trim().parse::<usize>().unwrap_or(6).max(1)).unwrap_or(3);
             if std::env::var("LOGSCOPE_KV_OFF").is_ok() { eprintln!("wgpu-engine: KV reuse DISABLED (LOGSCOPE_KV_OFF) — full prefill every turn, graph speedups off"); }
             else if kv_cap > 1 { eprintln!("wgpu-engine: KV prefix tree ON — pool cap {kv_cap} (each entry holds a KV cache; trades memory for fewer prefills on branchy/fan-out chats)"); }
-            Ok(Self { gpu, model, tok, eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner })
+            // Speculative decoding (opt-in): if LOGSCOPE_SPEC_DRAFT points at a GGUF, load it as a
+            // small DRAFT model. It must share the target's vocab/tokenizer (same family, smaller
+            // size — e.g. a 1B draft for an 8B target). `generate` then runs the engine's
+            // speculative_generate_stats (draft proposes, target verifies a block per forward).
+            let draft = match std::env::var("LOGSCOPE_SPEC_DRAFT") {
+                Ok(dpath) if !dpath.trim().is_empty() => {
+                    let load_draft = || -> Result<Model, String> {
+                        let dmm = gpu_kernels::mmap_ro(&dpath).map_err(|e| format!("spec draft mmap {dpath}: {e}"))?;
+                        let dm = gpu.load_gguf_quantized(&dmm[..]).map_err(|e| format!("spec draft load {dpath}: {e}"))?;
+                        Ok(dm)
+                    };
+                    match load_draft() {
+                        Ok(dm) if dm.vocab == model.vocab => {
+                            let base = std::path::Path::new(&dpath).file_name().and_then(|s| s.to_str()).unwrap_or(&dpath);
+                            gpu.prewarm(&dm);
+                            eprintln!("wgpu-engine: spec-decode ENABLED — draft {base} (d={} L={} vocab={}) proposes, target verifies; tune the block with LOGSCOPE_SPEC_K (default 4)", dm.d, dm.n_layers, dm.vocab);
+                            Some(dm)
+                        }
+                        Ok(dm) => { eprintln!("wgpu-engine: spec draft vocab {} != target {} — spec-decode OFF (draft and target must share a tokenizer)", dm.vocab, model.vocab); None }
+                        Err(e) => { eprintln!("wgpu-engine: spec draft load failed — spec-decode OFF: {e}"); None }
+                    }
+                }
+                _ => None,
+            };
+            Ok(Self { gpu, model, tok, eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, draft })
         }
         pub fn template(&self) -> TemplateKind { self.template }
 
@@ -358,6 +392,36 @@ mod engine {
             // the window instead of forcing prompt truncation).
             let n_new = ceiling.min(window.saturating_sub(prompt_ids.len()).max(1));
             let cap = (prompt_ids.len() + n_new).max(1);
+            // ── Speculative-decode path (opt-in: a draft model was loaded) ───────────────────────────
+            // Draft proposes a block; target verifies the whole block in one forward (engine
+            // `speculative_generate_stats`). Greedy and bit-exact to normal decode, but more tokens per
+            // expensive target pass. Bypasses KV-tree reuse (spec manages its own target+draft caches).
+            if let Some(draft) = self.draft.as_ref() {
+                let k: usize = std::env::var("LOGSCOPE_SPEC_K").ok().and_then(|s| s.trim().parse().ok()).filter(|&k| k >= 1).unwrap_or(4);
+                let mut st = gpu_kernels::SpecStats::default();
+                let td = Instant::now();
+                let ids = self.gpu.speculative_generate_stats(&self.model, draft, &prompt_ids, n_new, k, &mut st);
+                let secs = td.elapsed().as_secs_f32().max(1e-3);
+                // Emit through the same UTF-8 byte-buffering + special-swallow + stop logic as streaming.
+                let mut pending: Vec<u8> = Vec::new();
+                let mut produced = 0usize;
+                for &next in &ids {
+                    if self.stop_ids.contains(&next) { break; }
+                    if self.tok.is_special(next) { continue; }
+                    produced += 1;
+                    pending.extend_from_slice(&self.tok.decode_bytes(&[next]));
+                    let valid = match std::str::from_utf8(&pending) { Ok(s) => s.len(), Err(e) => e.valid_up_to() };
+                    if valid == 0 { continue; }
+                    let chunk = String::from_utf8_lossy(&pending[..valid]).into_owned();
+                    pending.drain(..valid);
+                    if !on(&chunk) { break; }
+                }
+                if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
+                eprintln!("wgpu-engine: [{}] SPECULATIVE k={k} — {} tokens in {:.1}s = {:.2} tok/s | {:.2} accepted/round × {} rounds (~{:.2} tok per target verify-pass)",
+                    self.name, ids.len(), secs, ids.len() as f32 / secs,
+                    st.accepted as f64 / st.rounds.max(1) as f64, st.rounds, st.emitted as f64 / st.rounds.max(1) as f64);
+                return Ok(produced);
+            }
             // Which cached branch tip shares the longest usable prefix with this prompt? `pick_anchor`
             // applies the same thresholds the single-anchor path used (≥16 shared, ≤256 divergent), but
             // searches the whole pool — so a sibling switch or an Nth fan-out continuation reuses ITS
@@ -693,7 +757,7 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// must match the model: a ChatML model (smollm2, `<|im_end|>`) fed Llama-3 markers drifts into
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TemplateKind { Llama3, ChatML, Plain }
+pub enum TemplateKind { Llama3, ChatML, Plain, Gemma }
 
 /// What a successful load reports back to the UI.
 pub struct LoadInfo { pub path: String, pub template: TemplateKind }

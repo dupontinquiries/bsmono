@@ -25,14 +25,15 @@ impl SurfaceCache {
         SurfaceCache { map: HashMap::new(), hits: 0, misses: 0 }
     }
 
-    /// Drop all memoized columns. Call once per tick — terrain can change (edits,
-    /// streaming) between ticks, so the memo must not outlive one.
+    /// Drop all memoized columns. Call once per tick — the world is mutated between ticks (erosion,
+    /// water, builder dragons, plant growth …), and grounding may become terrain-aware, so the memo
+    /// is intentionally kept to a single tick rather than persisted.
     pub fn clear(&mut self) {
         self.map.clear();
     }
 
-    /// Surface height at `(x, z)`, served from the memo if seen this tick, else
-    /// computed via `scan` (the real column scan) and remembered.
+    /// Surface height at `(x, z)`, served from the memo if seen this tick, else computed via `scan`
+    /// (the real column scan) and remembered for the rest of the tick.
     pub fn get_or<F: FnOnce() -> Option<i32>>(&mut self, x: i32, z: i32, scan: F) -> Option<i32> {
         if let Some(v) = self.map.get(&(x, z)) {
             self.hits += 1;

@@ -324,6 +324,112 @@ pub fn map_click(click: MenuClick, app: &crate::app::App) -> AppInput {
     }
 }
 
+// ── r487: character-select screen ───────────────────────────────────────────
+
+/// What the character-select screen reports back to the caller each frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CharacterClick {
+    None,
+    /// Highlight roster option `i`.
+    Pick(usize),
+    /// Reroll the player's custom character's look (new seed, same plan/colour).
+    Reroll,
+    /// Persist the custom character as the global default and enter the world.
+    SaveAndPlay,
+    /// Enter the world with the currently highlighted character.
+    Play,
+}
+
+/// Paint a character's side silhouette into `rect` from its blueprint projection.
+fn paint_character_preview(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    profile: &crate::player_character::CharacterProfile,
+) {
+    use egui::Color32;
+    painter.rect_filled(rect, 6.0, Color32::from_rgba_unmultiplied(10, 12, 16, 150));
+    let bp = profile.blueprint();
+    let mut boxes = crate::creature_viewer::project(&bp, crate::creature_viewer::ViewAxis::Side);
+    // back-to-front so nearer boxes overpaint
+    boxes.sort_by(|a, b| a.depth.partial_cmp(&b.depth).unwrap_or(std::cmp::Ordering::Equal));
+    let pad = 18.0;
+    let area = egui::vec2((rect.width() - pad * 2.0).max(1.0), (rect.height() - pad * 2.0).max(1.0));
+    for pb in &boxes {
+        // projection space is a unit square with +y up; egui +y is down → flip.
+        let x = rect.min.x + pad + pb.x * area.x;
+        let y = rect.min.y + pad + (1.0 - pb.y - pb.h) * area.y;
+        let r = egui::Rect::from_min_size(
+            egui::pos2(x, y),
+            egui::vec2((pb.w * area.x).max(1.0), (pb.h * area.y).max(1.0)),
+        );
+        let c = Color32::from_rgb(
+            (pb.color[0].clamp(0.0, 1.0) * 255.0) as u8,
+            (pb.color[1].clamp(0.0, 1.0) * 255.0) as u8,
+            (pb.color[2].clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        painter.rect_filled(r, 1.0, c);
+    }
+}
+
+/// Draw the character-select screen: a row of selectable character cards, a live
+/// silhouette preview of the highlighted one, and reroll / save / play actions.
+/// Pure egui — the renderer calls it in its overlay pass, tests call it headless.
+pub fn character_select_ui(
+    ctx: &egui::Context,
+    roster: &crate::player_character::CharacterRoster,
+) -> CharacterClick {
+    let mut click = CharacterClick::None;
+    egui::CentralPanel::default().show(ctx, |ui| {
+        apply_frosted_style(ui);
+        ui.vertical_centered(|ui| {
+            blocky_heading(ui, "Choose Your Character");
+            ui.add_space(8.0);
+
+            // selectable cards
+            ui.horizontal_wrapped(|ui| {
+                for (i, c) in roster.options.iter().enumerate() {
+                    let marker = if i == roster.selected { "▸ " } else { "" };
+                    let is_custom = i == roster.custom_index;
+                    let label = if is_custom {
+                        format!("{}{} ★\n{}", marker, c.name, c.arche)
+                    } else {
+                        format!("{}{}\n{}", marker, c.name, c.arche)
+                    };
+                    if ui.button(label).clicked() {
+                        click = CharacterClick::Pick(i);
+                    }
+                }
+            });
+
+            ui.add_space(10.0);
+            // live preview of the highlighted character
+            let (rect, _r) = ui.allocate_exact_size(egui::vec2(260.0, 200.0), egui::Sense::hover());
+            paint_character_preview(&ui.painter_at(rect), rect, roster.current());
+
+            ui.add_space(8.0);
+            let cur = roster.current();
+            ui.label(format!("{} · {} · seed {:#x}", cur.name, cur.arche, cur.seed));
+            ui.add_space(10.0);
+
+            ui.horizontal(|ui| {
+                if roster.selected == roster.custom_index {
+                    if ui.button("  Reroll look  ").clicked() {
+                        click = CharacterClick::Reroll;
+                    }
+                    if ui.button("  Save & Play  ").clicked() {
+                        click = CharacterClick::SaveAndPlay;
+                    }
+                } else if ui.button("  Play  ").clicked() {
+                    click = CharacterClick::Play;
+                }
+            });
+            ui.add_space(4.0);
+            ui.weak("★ is your saved character — it carries across every world.");
+        });
+    });
+    click
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +462,30 @@ mod tests {
         let menu = MenuController::with_defaults();
         let out = run_once(&menu);
         assert!(!out.shapes.is_empty(), "the title menu drew shapes");
+    }
+
+    #[test]
+    fn character_select_draws_and_returns_none_without_interaction() {
+        let roster = crate::player_character::CharacterRoster::load();
+        let ctx = egui::Context::default();
+        install_test_fonts(&ctx);
+        let mut click = CharacterClick::Pick(99);
+        let out = ctx.run(egui::RawInput::default(), |c| {
+            click = character_select_ui(c, &roster);
+        });
+        // it draws (cards + the silhouette preview rects) and, with no pointer
+        // interaction, reports no click.
+        assert!(!out.shapes.is_empty(), "character select drew shapes");
+        assert_eq!(click, CharacterClick::None);
+    }
+
+    #[test]
+    fn character_preview_paints_silhouette_boxes() {
+        // The highlighted character's blueprint projects to a non-empty silhouette.
+        let roster = crate::player_character::CharacterRoster::load();
+        let bp = roster.current().blueprint();
+        let boxes = crate::creature_viewer::project(&bp, crate::creature_viewer::ViewAxis::Side);
+        assert!(!boxes.is_empty(), "a character must have a paintable silhouette");
     }
 
     #[test]

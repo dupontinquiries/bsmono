@@ -9538,3 +9538,2617 @@ It had ONE smooth glint blob; real sun-on-water shows a shimmering glitter path.
 
 Shader roadmap remaining: sky/horizon gradient + sun disc (needs wiring the unwired sky.frag — a new pass, higher
 risk, deferred), emissive hot-metal glow (needs a per-block temp→shader data path), contact-AO / LOD-seam.
+
+## r473 — Shader polish batch: terrain cavity AO + entity rim light
+Two independent, guarded, ADDITIVE-or-ambient-only passes (low black-screen risk; each A/B-able via its #define).
+1. chunk.frag CHUNK_CAVITY_AO (default 1): micro-cavity ambient occlusion. The same fbm grain field that
+   perturbs the normal now darkens AMBIENT (not direct sun) in its valleys — mix(0.80,1.0,smoothstep(0.22,0.78,
+   cav)) — giving terrain a subtle weathered, tactile depth. One extra fbm2 octave; terrain only (water/cloud
+   override color afterward). Checked first that existing crest-foam/whitecaps were already thorough (they are —
+   steepness-gated + fbm-broken + rapids + shore ribbon) so did NOT duplicate them.
+2. entity.frag ENTITY_RIM_LIGHT (default 1): creatures had NO lighting (flat v_color + fog) and the mesh carries
+   no normal attribute — so reconstruct a flat geometric normal from dFdx/dFdy(v_world_pos) and add a purely
+   ADDITIVE Fresnel rim: sky-cool on the shaded side, warming toward the sun on the lit side, intensity 0.35.
+   Creatures now separate from terrain at their silhouette without any base-colour darkening.
+- VALIDATED: glslangValidator -V → RC=0 for both; rustcheck → PASS (0 shader-err). Regenerated
+  entity.frag.spv + chunk.frag.spv + their .spv.hash sidecars. Bin compiles (build.rs accepts the shaders).
+- DEVICE-VERIFY both on the next GPU run. A/B: set CHUNK_CAVITY_AO=0 / ENTITY_RIM_LIGHT=0 in the respective
+  .frag. Tunables: cavity darkness floor (0.80) + range (0.22..0.78); rim intensity (0.35) + power (3.0).
+
+Shader passes shipped so far this run: r472 water glitter, r473 cavity AO + entity rim. Still open (higher risk /
+deferred): sky.frag wiring (new pass), emissive hot-metal glow (needs per-block temp data path).
+
+## r474 — Shader visibility: diagnose "didn't notice" + strengthen r472/r473 effects
+Operator didn't notice r472/r473 shaders; asked what flag enables them + to check menu/linkme paths.
+DIAGNOSIS (no flag needed — they were on, just subtle):
+- PROOF the effects are compiled in: shipped chunk.frag.spv = 84528 bytes vs a features-OFF compile
+  (-DCHUNK_CAVITY_AO=0 -DCHUNK_WATER_GLITTER=0) = 82760. read_spv() loads assets/shaders/chunk.frag.spv from
+  disk at runtime (hot-shaders on; resolves via CARGO_MANIFEST_DIR/../../assets/shaders), so the regenerated
+  .spv IS what runs. No `-D` override anywhere; the runtime glslangValidator call in dynamic_lights.rs is a
+  test-time SPIR-V *validation*, not a variant recompile.
+- linkme lead: linkme registers sim SERVICES (service_registry::SERVICES), NOT shaders — unrelated. Menu lead:
+  the main menu renders the live world through the same WorldRenderer/chunk_pipeline (device log shows FPS/water
+  ticking in-menu), so no diverged render path. kitfinder on render/ showed only routine Vulkan boilerplate dup.
+- ROOT CAUSE: effects were tuned subtle + situational (cavity AO is ambient-only → near-invisible at bright noon;
+  glitter only along the sun's mirror line on water; entity rim only on silhouetted creatures, and fauna were
+  "resting"/few).
+FIX — turned all three up to clearly-visible-but-tasteful:
+- water glitter: intensity 1.2→2.0, pow(align,700)→400 (wider path), gate 0.5→0.42, facet smoothstep 0.62→0.55.
+- cavity AO: floor mix(0.80→0.68,1.0), range smoothstep(0.22..0.78 → 0.20..0.80) — deeper valleys.
+- entity rim: intensity 0.35→0.55, pow 3.0→2.5 (wider rim).
+All re-validated (glslang RC=0, rustcheck PASS), spv+hash refreshed. A/B via CHUNK_CAVITY_AO / CHUNK_WATER_GLITTER
+/ ENTITY_RIM_LIGHT defines. VIEWING: glitter = sunlit water with the sun low/behind the reflection; cavity = best
+in ambient/shadow/overcast & on steep faces; rim = a creature silhouetted against terrain. Dial to taste after.
+
+## r475 — Performance: persistent surface memo + roamer-loop waste (targets the 11ms roamer_tick)
+From the earlier device log: steady-state frame p50≈14.3ms (70fps) is dominated by game_update p50=11.25ms,
+which is almost entirely roamer_tick p50=11.21ms — and the instrumented sub-zones (roamer_blockscan/herdscan)
+read ~0, so the cost is in the UN-instrumented per-creature work. Found and fixed three things there:
+
+1. PERSISTENT SURFACE MEMO (the big one). The roamer grounding probe calls cpu.surface_y_at — a 64-deep
+   density()+is_cave() PROCEDURAL noise scan (the cost that once "dominated at ~90ms"). The SurfaceCache
+   memoized it but was CLEARED EVERY TICK on the false premise that "terrain changes between ticks" — yet
+   surface_y_at is a PURE function of (x,z)+seed (it reads no live blocks), so the memo is valid for the whole
+   world. Now it persists across ticks (cleared only on world switch — seed-derived — and on a 256K-entry cap),
+   so a column is scanned once then served from the map forever. This scan sat in the un-instrumented 11ms, so
+   roamer_tick should drop materially once the herd warms its local columns.
+   CORRECTNESS: the memo keys on (x,z) but the scan window is cy-relative, so it's gated to GROUNDED, non-flying
+   creatures (cy≈surface → canonical terrain top); airborne/flying probes (elevated cy) bypass the memo so they
+   can't poison a column with a depth-shifted result. surface_cache.rs got a CAP + persist semantics; the bin
+   clears it in the world-switch reset; a periodic `[surface_cache] hit_rate=…` log (every 300 frames) confirms
+   it (should climb toward ~95%+ vs ~0 before). UNENDLICH_SURFACE_CACHE=0 still reverts to direct scans.
+2. Removed a SECOND grime.accumulate that ran every creature every tick on top of the r152 ground-aware one —
+   it double-counted grime (2× wear) AND doubled grime cost in the hot loop.
+3. Removed a Vec::with_capacity(1) heap alloc per creature per tick in the gaze/observe block (an allocator
+   storm) — now a stack Option + slice.
+Bin + lib (+tests) compile; surface_cache tests still valid (cap unreached at ≤3 entries; clear() still works).
+CONFIRM on next run: roamer_tick p50 down, [surface_cache] hit_rate high. Separate one-off spike (tick_sim max
+748ms / frame max 1221ms at world-load — the first plant_lifecycle/reef scan) left for a later pass.
+
+## r475 REVISED — surface-memo persistence REVERTED; kept safe wins + honest bottleneck analysis
+Operator pushed back on persisting the surface memo: the world is mutated by erosion, water physics, builder
+dragons, plant growth, etc., and grounding may become terrain-aware — so a persistent (x,z)→height memo is a
+landmine even though surface_y_at is procedural-only TODAY (confirmed: surface_y_at → density() → model.density,
+pure noise, reads no live blocks; it already ignores erosion/builds, a separate pre-existing limitation). REVERTED
+the persistence: SurfaceCache is back to per-tick clear (no CAP, no world-switch clear, no cache_ok gate, no
+hit_rate log).
+KEPT (unambiguously safe, real): (1) removed the redundant SECOND grime.accumulate per creature/tick (2× wear +
+wasted work); (2) removed the per-creature Vec::with_capacity(1) heap alloc in gaze/observe (stack Option+slice);
+(3) chunk.frag: compute the grain-height fbm ONCE and share it between the normal map (perturb_normal now takes
+h0) and the r473 cavity AO — drops one ~16-hash fbm per terrain fragment (small GPU main-pass win). glslang RC=0,
+spv refreshed.
+
+HONEST BOTTLENECK ANALYSIS (from the earlier device log, for the next pass):
+- STEADY STATE is CPU-BOUND, not GPU-bound: cpu_zones wait_fences≈0.02ms (CPU never stalls on the GPU). The 14ms
+  frame = game_update 11.25ms (≈ roamer_tick 11.21ms) + record/submit ~3ms, all CPU; GPU main=7.6ms runs async
+  and overlaps. So raising idle FPS means cutting roamer_tick, NOT the GPU.
+- MESHING is on the CPU by default. UNENDLICH_GPU_MESHER: 0=CPU (default, visual reference), 1=SparseGpuMesher
+  (advisory: ~1.22x SLOWER, rough — avoid), 2=OctreeGpuMesher (the intended GPU path "for play"). The GPU mesher
+  helps DURING MOVEMENT/STREAMING (offloads CPU mesh_chunk), not idle FPS. Mode 2 is the device-test candidate.
+- Fog is froxel-baked (froxel_fill.comp); the 6-step per-fragment march is only a fallback (if !froxel_filled),
+  so it's not the steady main-pass cost. The 7.6ms is just heavy full-screen PBR (GGX + hemi + my r472-473 adds).
+NEXT (device-gated): try UNENDLICH_GPU_MESHER=2 on the FP5/M2 to offload streaming mesh cost; for idle FPS, the
+lever is roamer_tick (needs finer per-phase instrumentation to target the un-bucketed 11ms — blockscan/herdscan
+zones read 0, so the cost is in observe/steering/dragon/forage). Both are real; the GPU mesher is movement-time.
+
+## r476 — octree GPU mesher streaming-stutter ROOT CAUSE + adaptive batch mitigation
+Operator log (log-r473-shader-polish, run with UNENDLICH_GPU_MESHER=2 + NEURAL_GBUFFER=1 NEURAL_TRAIN=1
+WATER_SIM=1 + all water subflags + WEATHER_SIM=1): "loading is fast but the stutters are real." 91 LONG FRAMEs.
+
+ROOT CAUSE (definitive): the stutters are the OctreeGpuMesher (mode 2) saturating the shared GPU queue during
+chunk streaming. Evidence:
+- `[mesh-stall] octree dispatch 190ms for 4 chunks (47642us/chunk)` — the octree mesh compute runs ~47ms PER
+  CHUNK on the M2/Asahi GPU; a 4-chunk batch is one ~190ms synchronous GPU block.
+- `Compute queue acquired: family=0 distinct=false (graphics handle reused: true)` — there is NO distinct compute
+  queue; mesher compute serializes on the SAME queue as rendering. So a 190ms mesher dispatch blocks the render
+  present: `cpu_zones: ... acquire=44.84ms` (render's swapchain acquire waits out the mesher).
+- Airtight FPS↔mesh_q correlation: mesh_q=0/0 → 40-56fps (smooth); mesh_q=90-132 (backed up while MOVING) →
+  1-10fps. The CPU `draw=28ms` during stutters is the CPU waiting on the saturated GPU, not CPU work.
+- NOT shading: GPU total is 30ms; the 100-130ms frame is dominated by the unmeasured acquire-stall behind the
+  mesher. NOT the readback either (already bulk/exact-count via v0.24.44). The 47ms/chunk is GPU compute+upload,
+  which can't be profiled/fixed from the Linux box (no GPU here).
+
+FIX (r476, safe + verifiable, CPU-side scheduling): ADAPTIVE batch sizing in octree_gpu_dispatcher_loop. Was a
+fixed batch_target=4 (one 190ms stall). Now starts at batch_cap and shrinks toward 1 when a dispatch overruns a
+~30fps frame budget (ADAPT_SHRINK_US=33ms) so rendering interleaves between shorter dispatches, grows back when
+dispatches are cheap (ADAPT_GROW_US=12ms). Auto-tunes per hardware: fast GPUs keep big throughput batches, slow
+ones (this M2) pin near 1 → worst stall ~47ms instead of ~190ms (≈21fps vs ≈5fps during heavy streaming).
+Correctness-preserving (only changes how many chunks group per dispatch; every chunk still meshes). Gated
+UNENDLICH_GPU_MESH_ADAPTIVE=0 to restore fixed batch_cap. lib+bin compile.
+
+HONEST CEILING + config levers for the next DEVICE test (mark DEVICE-VERIFY):
+- The real cure is faster octree compute (GPU-side, can't do blind) OR not meshing on the GPU at all here.
+- `UNENDLICH_GPU_MESHER=0` (CPU mesher, the DEFAULT) meshes on CPU worker threads in PARALLEL with GPU render —
+  NO shared-queue contention. Given the GPU compute is ~47ms/chunk on this hardware, mode 0 is very likely the
+  SMOOTHEST option on the M2. This is the honest answer to "are the GPU meshers working properly": mode 2 is
+  functional but its compute is too slow on M2/Asahi to mesh live without stalling rendering.
+- `UNENDLICH_GPU_MESH_BATCH=1` manually pins what the adaptive logic now reaches on its own.
+- The run also had NEURAL_TRAIN=1 (on-device training) + full WATER_SIM/WEATHER_SIM; for a clean perf read,
+  isolate by testing mode 0 vs mode 2 with fewer heavy flags.
+
+FOLLOW-UP (flagged, NOT done — correctness-risky, needs device verify): ~42% of GPU-dispatched chunks return
+EMPTY (octree stats empty=211 nonempty=292). Pure-AIR chunks always mesh to nothing and could be skipped CPU-side
+before dispatch (cheap uniform-air octree check) to cut ~40% of dispatches during streaming. CAUTION: only
+uniform-AIR is safe to skip; fully-enclosed SOLID chunks also produce empty meshes but need neighbor info to
+detect, and a wrongly-skipped chunk leaves a hole. Deferred until device-verifiable.
+
+## r476 (cont.) — THE GPU blocker: MAX_FRAMES_IN_FLIGHT = 1 (no CPU/GPU overlap)
+Operator: "UNENDLICH_GPU_MESHER=0 is also slower / worse freezes — there's something we're missing to
+unblock the GPU." Correct. The freeze is NOT the mesher (it hits BOTH modes). Root cause is structural:
+
+- world_renderer.rs had `const MAX_FRAMES_IN_FLIGHT = 1` (the ACTIVE renderer; bin uses WorldRenderer::new).
+  One frame in flight = the CPU records -> submits -> BLOCKS on `frame.in_flight` fence (world_renderer.rs:3025,
+  wait u64::MAX) until the GPU fully finishes, EVERY frame. Zero CPU/GPU overlap. So every GPU stall (worldgen
+  on its own device/queue, mesh dispatch, a heavy render frame) freezes the CPU and vice-versa. This is exactly
+  the `acquire=44ms` waits and why mode 0 freezes too — it's mesher-independent.
+- The infra was BUILT for >1: per-frame FrameSync already duplicates UBO/descriptor/cmd-buffer/fence/semaphores;
+  deferred-free holds evicted buffers MAX_FRAMES_IN_FLIGHT frames. Only the constant pinned it to 1.
+
+SCAFFOLDING SHIPPED (safe, default-OFF, compiles): world_renderer MAX_FRAMES_IN_FLIGHT is now a CAP (3); added
+runtime `frames_in_flight` from UNENDLICH_FRAMES_IN_FLIGHT (default 1, clamp 1..=3). Drives the frame-creation
+loop, the current_frame cycle (% frames_in_flight), and the deferred-free hold (frames_remaining =
+self.frames_in_flight, 9 sites). Pools/descriptors/GpuTimer sized for the cap (safe over-alloc). At the default 1
+behavior is BYTE-IDENTICAL to before.
+
+BLOCKER to actually enabling >1 (NOT yet done — would corrupt): the per-chunk DRAW DATA is CPU-written into
+SHARED, non-double-buffered buffers during streaming:
+  - the indirect-draw buffer: `self.indirect.set(draw_slot, chunk_draw)` (world_renderer.rs:2007)
+  - the chunks SSBO (per-chunk ChunkDraw) and the mesh staging buffers (mesh_pool.write_at).
+At FIF=1 the per-frame fence-wait guarantees the GPU is done before the CPU mutates these. At FIF>1 the CPU runs
+ahead and overwrites buffers a prior in-flight frame's GPU draw is still reading -> corruption / GPU fault.
+Shadow/froxel images are fine (single queue serializes GPU access; no CPU write). The camera UBO is already
+per-frame.
+
+=> The REAL unblock = double-buffer the indirect-draw buffer + count buffer + chunks SSBO per-frame (write a
+chunk's draw entry into ALL in-flight copies, since it persists every frame until eviction), then FIF=2/3 is
+safe and the CPU pipelines ahead of the GPU. This is the substantial, device-verify-required next step. The
+scaffolding above is the foundation; the env stays default-1 until the double-buffering lands.
+
+## r476 (cont.) — metadata double-buffering: FIF>1 is now CRASH-SAFE (testable)
+Enabling frames-in-flight>1 needs every single-buffered, CPU-written-per-frame, GPU-read resource
+double-buffered. Audit found THREE:
+  1. indirect metadata SSBO (per-chunk ChunkDraw) — CPU-written by `indirect.set()` during streaming,
+     read by the cull shader AND the vertex shader (binding 3). **Torn read here can CRASH**: a garbled
+     index_count/first_index makes the indirect draw read out of the mesh buffer bounds -> GPU fault.
+  2. view_params SSBO (view/proj matrices + derived frustum planes) — CPU-written each frame, read by
+     view_compute/cascade_fit/cull. Torn read = wrong culling for a frame (VISUAL only, no OOB).
+  3. entity vertex/index buffers (entity_pipeline) — "single-buffered host memory" (world_renderer.rs
+     ~2932), CPU-written each frame by upload_entities. Torn = jittered/torn creatures (VISUAL only).
+UBO (camera/lights/water/sun/fx) is already per-frame; shadow/froxel are GPU-written (single-queue
+serialized) — both safe.
+
+DONE this pass: double-buffered #1 (the crash one). chunk_indirect.rs IndirectDrawSet now holds N metadata
+copies + N cull descriptor sets; `cpu_shadow` stays authoritative; `set()` marks the slot dirty for every
+frame; new `flush_frame(frame_idx)` syncs a frame's copy from cpu_shadow right AFTER that frame's fence wait
+(GPU guaranteed done reading it) and before its cull. commands/count stay shared (reset->cull->draw all in one
+per-frame cmd buffer => single-queue serialized). world_renderer binds metadata[i] into frame i's graphics
+descriptor (binding 3), passes current_frame to record_cull_dispatch, and calls flush_frame after the fence
+wait. Eviction holds the mesh slot frames_in_flight frames, which outlasts the empty-entry propagation to all
+copies. At frames_in_flight==1: one buffer, one cull set, behaviorally identical (writes batched at flush =
+same GPU-visible result). lib + bin + lib --tests all compile.
+
+=> STATUS: UNENDLICH_FRAMES_IN_FLIGHT=2 is now CRASH-SAFE to test. Expect possible VISUAL flicker on creatures
+(entity buffers) and chunk-edge cull pop (view_params) until #2 and #3 are also double-buffered — those are the
+cleanup, deferred until we confirm FIF=2 actually removes the streaming freezes (the whole hypothesis). The
+test question: does UNENDLICH_FRAMES_IN_FLIGHT=2 (or 3) eliminate the streaming freezes in BOTH mesher modes?
+If yes -> finish #2/#3 to remove the flicker. If no -> the blocker is elsewhere and we saved the polish work.
+
+## r476 (cont.) — meshing/generation speed: uniform-air skip + honest analysis
+Operator wants to focus on meshing + chunk generation speed. Findings + work:
+
+SHIPPED — uniform-air dispatch skip (safe, verifiable): added OctreeArray::is_uniform_air() (O(1): single
+air-leaf root). In the meshing-pool worker, before routing a chunk to the GPU octree dispatcher, if the chunk
+is uniform air, emit an empty mesh result directly and skip the GPU round-trip. A pure-air chunk ALWAYS meshes
+to nothing (air emits no faces regardless of neighbors), so this is correctness-preserving. The field log had
+~42% of GPU dispatches return empty; a flying dragon spends most of its time over air, so this removes a large
+slice of streaming dispatch load. lib+bin compile.
+
+ANALYSIS — why the GPU octree mesher is ~47ms/chunk vs the CPU mesher's ~0.38ms (124×):
+- The per-cell shader logic is ALREADY optimal. chunk_mesh_octree.comp main(): air cells early-out after ONE
+  octree walk (line ~852 `if(!is_solid_opaque(self_block)) return;`); cells strictly inside a uniform leaf skip
+  all 6 neighbor descents (lines ~855-867). So only SURFACE cells pay the 7-walk cost; air/interior pay 1.
+- The cost is therefore NOT redundant work — it's the octree walk itself: pointer-chasing OCTREE_DEPTH levels
+  of DEVICE_LOCAL `nodes[]` per cell, across 32768 cells, with each thread descending a different path =
+  divergent, uncoalesced memory loads. GPUs are bad at exactly this (pointer-based tree traversal). The CPU
+  mesher reads a FLAT decompressed block array (O(1), cache-friendly) — which is why it's 124× faster.
+- => There is no CPU-side or simple-shader win left for the nonempty case. The only real speedup is to change
+  the DATA the GPU meshes: a pre-pass that EXPANDS the octree into a flat 32^3 (+halo) block grid once
+  (coalesced writes), then mesh from the flat grid (coalesced reads, no per-cell tree walk). That's a
+  shader+pipeline change that needs on-device verification (a wrong expansion = holes/garbage in the world) —
+  NOT done blind. Filed as the high-value next step IF the GPU mesher is to be kept.
+- Strategic note: the CPU mesher is the faster mesher here (flat-data friendly). What made mode 0 "freeze worse"
+  was almost certainly the MAX_FRAMES_IN_FLIGHT=1 serialization (now addressed), NOT meshing throughput
+  (0.38ms/chunk × 4 workers ≈ 10k chunks/s). Worth re-testing mode 0 once FIF>1 is confirmed.
+
+GENERATION: the field log shows gen_pending=0 during the stutters — GPU worldgen (batch=16, own device/queue)
+keeps up and is NOT the streaming bottleneck in that run. Meshing + the FIF=1 serialization are. (Worldgen
+batch-size tuning remains available via the loader if a gen-bound workload shows up later.)
+
+## r476 (cont.) — meshing/gen payoffs piped to settings (breadth)
+Per operator ("pipe it to the settings ... we need all the payoffs"):
+- UNENDLICH_SKIP_AIR_CHUNKS (default 1/on): the uniform-air dispatch skip is now a toggle. Default on
+  (safe + a confirmed prior win); =0 forces every chunk through the mesher for A/B.
+- UNENDLICH_MESH_WORKERS (default 4 = MESH_WORKERS): mesh-pool worker thread count, clamped 1..=32. Raises
+  CPU-mesher throughput on many-core machines (mode 0 + the extract/decorate pre/post passes). The bin reads
+  it once and threads it into all three pool constructors.
+- (already existed) UNENDLICH_GPU_GEN_BATCH: GPU worldgen per-dispatch batch size. Generation was NOT the
+  streaming bottleneck in the field log (gen_pending=0), so this is available but not the lever.
+lib + bin compile.
+
+NEXT (queued) — flat-grid GPU mesh expansion: the nonempty-chunk 47ms is fundamental octree-walk memory
+latency. The real speedup is a pre-pass that expands the octree -> flat 32^3(+halo) block grid once, then
+meshes the flat grid (coalesced reads, no per-cell tree walk). It is DEVICE-VERIFIABLE via the existing CPU
+reference (gpu_meshing_octree_cpu_ref.rs) + UNENDLICH_OCTREE_MESH_VERIFY=1, which cross-checks GPU mesh output
+against the CPU ref and flags mismatches — so a gated flat-grid path can be validated on the operator's box
+even though it can't be verified from the Linux dev box. Substantial shader+pipeline work; to be built gated
+(default off) so a wrong expansion can't corrupt the default path.
+
+## r476 (cont.) — more knobs + dynamicism (operator: "turn constants into levers")
+Field log r476 (M2 ULTRA Asahi): frame p50=380ms (~2.6fps); mesh_q=0 -> 110-124fps, mesh_q>0 -> 2-4fps; octree
+dispatch up to 171ms for ONE chunk. CRITICAL: the run set `FRAMES_IN_FLIGHT=2` but the var is
+`UNENDLICH_FRAMES_IN_FLIGHT` — log shows "frames_in_flight = 1". So FIF>1 was NOT actually tested; this whole
+run is still single-frame-in-flight.
+
+New LEVERS (were hardcoded constants):
+- UNENDLICH_GPU_MESH_TIMEOUT_MS  (def 8)     — octree batch accumulation window.
+- UNENDLICH_GPU_MESH_SHRINK_US   (def 33000) — adaptive batch shrinks when a dispatch exceeds this.
+- UNENDLICH_GPU_MESH_GROW_US     (def 12000) — adaptive batch grows when a dispatch is under this.
+- UNENDLICH_MESH_QUEUE_CAPACITY  (def 64)    — mesh request queue depth (back-pressure); clamp 8..=1024.
+- (earlier) UNENDLICH_MESH_WORKERS, UNENDLICH_SKIP_AIR_CHUNKS, UNENDLICH_GPU_GEN_BATCH, UNENDLICH_MESH_CACHE_SIZE.
+
+New DYNAMICISM:
+- UNENDLICH_GPU_MESH_YIELD_PCT (def 0): after each octree dispatch, sleep dispatch_time*pct/100 so the shared
+  GPU queue is left idle for the render pass. =100 -> ~50% mesh duty (render gets the other half). Trades chunk
+  pop-in speed for playable FPS while streaming. The dispatch is what monopolizes the shared queue, so this is
+  the direct throttle for the "2fps while mesh_q>0" symptom.
+- UNENDLICH_ADAPTIVE_RENDER_DISTANCE (def off): wall-clock (400ms) controller that caps render distance BELOW
+  the chosen value when frames run long (>SHRINK_MS, catastrophic frames cut 2 rings at once) and grows it back
+  when frames are under GROW_MS. Reacts at single-digit FPS (the 120-frame autotuner is 60s too late at 2fps).
+  Levers: UNENDLICH_ADAPTIVE_RD_SHRINK_MS (def 3x frame target), _GROW_MS (def 1.5x), _MIN (def 2). Only caps
+  below the UI/env distance, never above; applied on the 400ms cadence (the %15-frame slider write is too slow
+  once FPS collapses). Default off => behavior unchanged.
+
+All compile (lib+bin). NEXT device test should: (1) use UNENDLICH_FRAMES_IN_FLIGHT=2 (correct name!), (2) try
+UNENDLICH_GPU_MESHER=0 under it (CPU mesher is 0.38ms/chunk vs the octree's 38-171ms on Asahi — almost certainly
+the right call here), (3) UNENDLICH_GPU_MESH_YIELD_PCT=100 + UNENDLICH_ADAPTIVE_RENDER_DISTANCE=1 if staying on
+the octree mesher.
+
+## r476 (cont.) — live levers on the Performance settings page
+The two LIVE-tunable r476 levers are now in-game controls (Settings → Performance), not just env vars:
+- "mesh throttle (%)" slider [0..200] -> renderer.ui_gpu_mesh_yield -> constants::GPU_MESH_YIELD_PCT global
+  (new), which the octree dispatcher reads each dispatch (was env-read-once). Seeded from
+  UNENDLICH_GPU_MESH_YIELD_PCT at startup; the bin pushes the slider value into the global each frame.
+- "adaptive render distance" toggle -> renderer.ui_adaptive_rd, which the wall-clock RD controller now reads
+  live (was an immutable env flag). Seeded from UNENDLICH_ADAPTIVE_RENDER_DISTANCE.
+Full lifecycle wired like the existing autotune/stride levers: struct field + init, local-copy + UI widget +
+write-back in the Performance tab, JSON load/save ("gpu_mesh_yield"/"adaptive_rd"), and the runtime read path.
+Env vars still work as the initial seed. lib + bin compile.
+
+NOT on the page (construction-time only — need a restart, so they stay env): UNENDLICH_FRAMES_IN_FLIGHT,
+UNENDLICH_MESH_WORKERS, UNENDLICH_MESH_QUEUE_CAPACITY, UNENDLICH_GPU_GEN_BATCH, UNENDLICH_GPU_MESHER. The
+adaptive-RD thresholds (_SHRINK_MS/_GROW_MS/_MIN) and the octree timeout/shrink/grow knobs remain env (the
+toggle + throttle are the ones worth a live slider).
+
+## r476 — timebend snapshot/scrub camera mode (player-facing)
+The branching-timeline sim (sim/timeline.rs) had no viewfinder. Added one: src/timebend_scrub.rs
+(TimebendScrub) — a rolling ring of (camera pose + sky time) vantages recorded as the player roams.
+
+Interpretation of "pull up images from the rendered position of the player at that time": rather than store
+screenshots, store the POSE + world clock and, on scrub, fly the camera to that past vantage and wind the sky
+to the time-of-day it was then, so the LIVE world re-renders exactly as it looked from there (3D, not a static
+image; "change the world scene to the world").
+
+Wiring (bin):
+- F8 toggles scrub mode. Enter saves the live pose+clock, jumps to the latest vantage, kicks a fade; exit
+  restores them.
+- timebend.active folds into game_paused -> the world (sky/weather/sim/physics) freezes while scrubbing.
+- Scroll wheel walks vantages (intercepted before the hotbar). Each cut pulses the fade.
+- Before render: LIVE -> maybe_capture on cadence; SCRUBBING -> override view + sky_state.time_seconds from
+  the selected vantage. The existing loading veil is driven from timebend.fade (0.10 floor while scrubbing so a
+  subtle vignette + HUD label persist); loading_label shows "TIMEBEND · vantage N/M · Xs ago · scroll to scrub,
+  F8 to return". Label cleared on exit.
+- Levers: UNENDLICH_TIMEBEND_SNAPSHOTS (def 120), UNENDLICH_TIMEBEND_INTERVAL_S (def 1.5).
+
+Core is pure logic with 4 unit tests (ring cap, enter-jumps-to-latest, scrub clamp, exit restore) — all pass
+(flatten-tested). lib + bin + lib --tests compile.
+
+VISUAL CAVEAT (device-verify): the HUD currently reuses the loading-overlay label/veil — functional but not a
+styled panel. Fleshing it into a dedicated timebend menu (timeline bar, vantage thumbnails, styled fade) is the
+next visual iteration; can't verify rendering from the Linux box.
+
+## r476 — bold visual batch (operator green-lit blind shader work, batched)
+All validated (glslangValidator RC=0) + spv/hashes regenerated. Hot-shaders picks them up without a rebuild.
+- chunk.frag (the whole-frame grade — highest leverage): vibrance 0.16->0.30; NEW cinematic teal/orange
+  split-tone (cool shadows vec3(0.92,0.985,1.07), warm highlights vec3(1.08,1.01,0.89), keyed off luma);
+  contrast 1.055->1.12; filmic 0.08->0.14; vignette 0.25->0.32. This is the change that reads on every surface.
+  spv 84528->84936 bytes (confirms split-tone compiled in).
+- sky.frag: deeper/warmer sunsets (dusk mix 0.5->0.85, band 0.6->0.7); brighter sun halo 0.25->0.45 + NEW tight
+  inner glow lobe pow(cos,64)*0.85 + disk 6->7; denser brighter stars (threshold 0.9975->0.9965, color
+  vec3(1,1,1.12)*1.4).
+- entity.frag: rim light 0.55->0.85, pow 2.5->2.2 — creatures + dragon separate from terrain.
+- bloom.rs (CPU consts; needs UNENDLICH_BLOOM=1): threshold 1.0->0.85, intensity 0.05->0.13 — dreamier glow.
+
+DEVICE-VERIFY: can't see the result from the Linux box; operator to eyeball the batch together and report what's
+too much / too little. The split-tone + sunset warmth + vignette are the deliberate "feels different" trio.
+
+## r476 — locked-in defaults + detached terrain
+Field log r476-mesh confirmed the win (steady mean ~21ms; note: the uploaded log was actually GPU_MESHER=2,
+env dump line 7244 — it still had octree dispatch stalls up to 1129ms; the operator's "so much better" run was
+=0. Also: the late-window p50=85ms is a profiler artifact — p50 > mean is impossible; trust the mean).
+
+DEFAULTS NOW LOCKED IN (all still overridable):
+- UNENDLICH_GPU_MESHER default 2 -> 0 (CPU mesher, 0.38ms/chunk, no stalls). Octree (=2) opt-in.
+- UNENDLICH_FRAMES_IN_FLIGHT default 1 -> 2 (CPU/GPU overlap; metadata SSBO double-buffered so safe).
+- UNENDLICH_BLOOM default off -> on (opt out =0).
+- (left conservative: UNENDLICH_MESH_CACHE_SIZE stays 256 — bumping to 512 risks the documented driver crash.)
+
+DETACHED TERRAIN (new, default on; UNENDLICH_DETACHED_TERRAIN=0 to disable):
+- block_at returns Air for unloaded chunks, so a fast/flying player used to fall THROUGH terrain that hadn't
+  streamed in. Now: when the cell at the feet (and one below) isn't loaded, gravity is turned OFF and downward
+  velocity zeroed, so the player GLIDES forward at altitude while chunks stream in below (horizontal velocity
+  still integrates in step_body — flight stays continuous, no stop-and-wait).
+- When terrain spawns under a previously-suspended player and they're embedded in solid, they're settled to the
+  first non-solid cell above (chunk_manager.surface_above, scan up to 64) — the "replace the player when the
+  chunk spawns and position differs" reconcile.
+- New helpers: chunk_manager.is_loaded_at(x,y,z), surface_above(x,y,z,max_up). Only affects physics-mode bodies;
+  no-op when ground is loaded (normal play unchanged).
+- This is a PRAGMATIC reconcile, not the full sim/rollback.rs replay engine (that exists for netcode and could
+  drive a deeper deterministic version later). lib+bin+lib --tests compile.
+
+## r476 — octree mesher (MESHER=2) cave speedup: co-leaf neighbor skip
+The octree GPU mesher's hot path is 6 per-cell neighbor octree descents (chunk_mesh_octree.comp ~874-879).
+The existing buried-cell fast path skips all 6 only when the cell is STRICTLY interior to a uniform leaf — but
+the cells that actually emit (and cost time) are SURFACE cells on leaf faces, which fall through to all 6.
+
+New coleaf_or_sample(): octree_sample_ext already returns the self leaf extent (self_lo/self_lsz). Any neighbor
+that lands INSIDE that extent is the same block as self (leaf = uniform), and since self is solid-opaque that
+face culls — so we return self_block WITHOUT descending. A flat cave-wall cell (5 of 6 neighbors co-leaf) drops
+from 6 descents to ~1. Edge/corner cells save 4/3. A 1³ leaf (self_lsz==1) naturally descends all 6 (no regression).
+
+PROVABLY output-identical to a full descent (co-leaf neighbor == self_block == solid == face culls), so the CPU
+reference (gpu_meshing_octree_cpu_ref.rs, unchanged) still matches. Validates RC=0; build.rs recompiles it.
+DEVICE-VERIFY: run once with UNENDLICH_GPU_MESHER=2 UNENDLICH_OCTREE_MESH_VERIFY=1 to confirm bit-for-bit parity,
+then time a cavey area vs the previous octree build.
+
+NEXT (bigger): shared-memory tile expansion — cooperatively expand an octree sub-tile (+1 halo) into workgroup
+shared memory once, then mesh from shared (coalesced, zero per-cell descents). That's the structural cure that
+would let MESHER=2 parallel throughput overtake the CPU mesher; larger rewrite, also CPU-ref-verifiable.
+
+## r477 — fix smoke.sh + resume revision numbering
+TWO operator-reported breakages fixed:
+1. REVISION NUMBERING: r449–r476 were all tagged "r476" this session (8+ distinct deliverables), so per-revision
+   iteration tracking / smoke-latest had nothing to distinguish builds. Resumed incrementing: this is r477, and
+   the crate version is bumped 0.24.63-adaptive-uploads -> 0.24.64-r477-octree-tile so the build reports a new
+   version. Future deliverables increment from here.
+2. SMOKE.SH: an earlier zip shipped a STALE chunk.frag.spv.hash. Root cause: chunk.frag has
+   `#include "water_waves.glsl"`, so build.rs's transitive_source_hash includes that file's bytes — but the spv
+   regen used a plain `sha256sum chunk.frag` (wrong for include-bearing shaders). That tripped the
+   `committed_spirv_is_fresh_against_transitive_source` test. build.rs self-heals it on rebuild, but the shipped
+   zip was stale. Now: ALL sidecars verified fresh against transitive_source_hash (stale count 0). For future
+   shader edits with includes, regen the hash via build.rs (cargo build) or the transitive method, NOT sha256sum.
+
+Also fixed a latent inconsistency introduced when the mesher default flipped to CPU: runtime_config.rs defaulted
+gpu_mesher to 2 (octree) while the bin now defaults to 0 (CPU). Aligned runtime_config (from_env + Medium/base
+preset) to 0 and updated the freshness/default test (assert_eq!(m.gpu_mesher, 0)). lib+tests+bin compile.
+
+NEXT: shared-memory tile expansion for the octree mesher (the structural cure). Deliberately NOT rushed onto a
+just-fixed smoke — it's a real rewrite (workgroup -> spatial 4³ tile + 6³ halo in shared memory, cooperative
+single-descent load, barrier, then zero-descent meshing) that also touches the dispatch indexing and the
+greedy-run path (a run can extend past the tile). Will be done as a focused, CPU-ref-verified pass.
+
+## r478 — octree mesher: shared-memory tile expansion (UNENDLICH_OCTREE_TILE=1)
+The structural cure for the octree mesher's per-cell pointer-chasing. chunk_mesh_octree.comp now has a tiled path
+(gated by the repurposed PC field tile_enabled, set from UNENDLICH_OCTREE_TILE; default 0 = unchanged per-cell path).
+
+Key realization: NO dispatch change needed. The workgroup count is already cells/64 = (cc/4)^3, so the tiled path
+just reinterprets gl_WorkGroupID.x as a 4x4x4 spatial TILE and the 64 invocations as its cells. The workgroup
+cooperatively expands a 6^3 halo (tile + 1-cell border) into `shared uint s_halo[216]` — ONE octree descent per
+halo cell (216 cells / 64 threads = ~3.4 each) — barrier, then every cell reads its self + 6 axis neighbors from
+shared with ZERO further descents. Replaces the per-cell 7 descents (self + 6 neighbors) that made the mesher
+38-171ms/chunk on Asahi. Guarded to cc>=4 (falls back to per-cell for very-high LODs where cc<4 would make the
+tile grid degenerate); barrier is in uniform control flow (tile_enabled + cc are push-constant-uniform, all 64
+threads = one tile, no early return before the barrier). Halo corners are multi-axis-OOB -> air, harmless (only
+axis neighbors are ever read). Greedy-run continuation still uses sample_or_neighbor descents — unchanged — so
+output is BIT-IDENTICAL to the per-cell path (same coords, same samples, same merge).
+
+Rust: PushConstants _pad -> tile_enabled, fed by cached octree_tile_enabled() (OnceLock env read). ChunkMetaGpu
+_pad untouched. Validates RC=0, build.rs regenerates the spv (hash FRESH), bin compiles.
+
+DEVICE-VERIFY: UNENDLICH_GPU_MESHER=2 UNENDLICH_OCTREE_TILE=1 UNENDLICH_OCTREE_MESH_VERIFY=1 must report parity
+(bit-identical to per-cell). Then time a cavey/streaming area: tile vs per-cell octree vs CPU mesher (=0). This is
+the path meant to let MESHER=2 parallel throughput overtake MESHER=0. If verify FAILS, the likely suspects are the
+halo index math or the tile decode — both isolated to the tile branch.
+
+## r479 — tiled mesher: predictable prefetch loop + per-lane leaf cache
+Refines the r478 tile halo load (active when UNENDLICH_OCTREE_TILE=1). The halo descents were the remaining
+cost in the tiled path; this makes them predictable and cache-friendly without adding divergent/unbounded work.
+
+- LOOP made PREDICTABLE: each lane now walks a CONTIGUOUS run of halo cells (lanes 0..23 -> 4 cells, 24..63 -> 3;
+  216 total) instead of the old stride-64 scatter. Contiguous = spatially adjacent cells.
+- CACHE TABLE (per-lane): octree_sample_ext already returns the resolved leaf's [lo, lo+sz) extent. We keep that
+  as a small per-lane cache; for each subsequent cell in the run we first "look into" the cache — a flat bounds
+  check — and "pull up" the cached block with NO octree re-walk when the cell falls inside the same leaf (which,
+  for spatially-adjacent cells in the uniform interior of a chunk, is the common case). Miss -> one descent that
+  refills the cache. Cross-chunk (OOB) cells use sample_or_neighbor and bypass the cache.
+- PREDICTABILITY PRESERVED: worst case (all misses) == the old per-cell descent cost, so it never regresses; the
+  added work is a bounded bounds-check, no unbounded loops, no new barriers. Uniform runs collapse to 1 descent.
+
+Output is unchanged (a leaf is uniform, so the cached block == what a descent returns) -> still BIT-IDENTICAL to
+the per-cell path, so UNENDLICH_OCTREE_MESH_VERIFY=1 still validates. RC=0, spv hash fresh, bin compiles.
+DEVICE-VERIFY: same as r478 (verify parity, then time tile vs per-cell vs CPU) — expect the halo-load cost to
+drop further in cavey/large-uniform terrain.
+
+## r480 — Performance page: tile-mesher + detached-terrain toggles
+Promoted two env flags to live Settings -> Performance toggles (GPU MESHER section), same lifecycle as the
+mesh-throttle / adaptive-RD sliders:
+- "GPU tile mesher" (ui_octree_tile) -> constants::OCTREE_TILE_ENABLED atomic; octree_tile_enabled() in
+  gpu_meshing_octree.rs now reads the atomic (bin seeds it from UNENDLICH_OCTREE_TILE at startup, pushes the
+  toggle each frame). Only bites when GPU_MESHER=2 (the octree path); harmless otherwise.
+- "detached terrain" (ui_detached_terrain) -> the physics ground-ready check reads the live toggle instead of
+  the immutable env read; seeded from UNENDLICH_DETACHED_TERRAIN.
+Fields + init + local-copy + UI + write-back in world_renderer.rs; JSON load/save in the bin. lib+bin compile.
+
+## r481 — weapon models (held viewmodels for all 8 WeaponClasses)
+The forge already produced eight WeaponClasses but the hand only knew 4 crude ItemForms. Added, in
+sim/viewmodel.rs:
+- weapon_model(WeaponClass) -> Vec<ItemBox>: eight DISTINCT box silhouettes (dagger, arming sword, greatsword
+  w/ fuller, single-bit axe, double-bit greataxe w/ top spike, leaf-head spear, focus staff, gem wand). +Z is
+  the length axis, same convention as item_model; palette extended with leather + gold accents.
+- weapon_to_form(WeaponClass) -> ItemForm: maps a class to the nearest existing form for POSE reuse (bob/sway/
+  offset stay in one place); geometry still comes from weapon_model.
+- weapon_class_for_id / weapon_id_for_class: reserved hand-item id range 4000..4007 (one per class, decl order).
+- WEAPON_CLASSES[8]: declaration-order array for cycling.
+Bin wiring (unendlich_fullgame.rs): the first-person viewmodel render now takes the weapon path when the hand id
+is in the weapon range (weapon_model + weapon_to_form pose), else the old id->form fallback. DEBUG: J cycles the
+eight weapon models into the hand (debug_weapon_class override, takes precedence over inventory, prints the class)
+so all eight can be eyeballed first-person without the loot/inventory plumbing. lib+bin compile clean.
+DEVICE-VERIFY: hold J through the eight shapes — confirm each reads distinctly and sits right in the hand; the
+poses are reused from Blade/Axe/Staff/Tool so greatsword/greataxe/spear/dagger may want per-class offset tuning
+after a look. NOT YET wired: forged weapons actually entering the inventory as ids 4000+ (loot/give path) — the
+models + debug viewer are in; the loot plumbing is the next step.
+
+### r481 (cont.) — weapons as real inventory items
+Closed the loop flagged above: weapons can now enter the inventory as real items, not just the debug render.
+- items/mod.rs default_palette: registered the eight weapon ids (4000..4007) with names + swatch colors, so they
+  read correctly on the hotbar and as ground-drop cubes (the drop render's palette lookup falls back safely for
+  unknown ids, so this is additive).
+- bin: Y gives one of each forged weapon (add_item via the existing UniformRegistry). In survival (F6), scrolling
+  the hotbar to a weapon sets hand_item to its 4000+ id, which the viewmodel renders as that weapon's model. The
+  survival select path's BlockId lookup leaves selected_block untouched for non-block ids (verified, no panic).
+So: F6 -> Y -> scroll to a weapon = hold it. J remains the quick mode-agnostic model cycler. Tables verified
+consistent (4000+i <-> WEAPON_CLASSES[i] <-> palette entry i). lib (incl. --tests) + bin compile clean.
+STILL OPEN: real loot/forge drops (legendary_loot) handing out these ids in worldgen/combat, and wiring
+resolve_weapon_swing so a held weapon's stats drive attacks — the items + models are in; gameplay use is next.
+
+## r482 — upload/gen/mesh budget bumps + culling atomic aggregation
+Performance pass across the streaming pipeline now that FIF=2 gives CPU/GPU overlap headroom. All the numeric
+bumps stay env-overridable (the listed UNENDLICH_* vars), and uploads are still governed by the adaptive
+controller (default ON), so raising the base only lets it ride higher when smooth — it backs off on fence-wait
+pressure exactly as before.
+
+UPLOAD BUDGETS (bin consts):
+- MAX_UPLOADS_PER_FRAME_DEFAULT 64 -> 96 (adaptive range becomes [12, 192]).
+- UPLOAD_BUDGET_MS_DEFAULT 6.0 -> 8.0 ms.
+- UPLOAD_BYTES_BUDGET_DEFAULT 8 MiB -> 12 MiB.
+  (count / ms / bytes raised together so no single cap becomes the lone bottleneck.)
+
+GENERATION + MESHING:
+- gen_batch default 16 -> 24 (more chunks per GPU terrain-gen dispatch; UNENDLICH_GPU_GEN_BATCH).
+- MESH_WORKERS 4 -> 6 (more CPU-mesher throughput; modest on the 8-core M2, large on the Ultra;
+  UNENDLICH_MESH_WORKERS).
+
+CULLING (chunk_cull.comp) — the one algorithmic change:
+- The cull emitted draws with one GLOBAL atomicAdd(visible_count,1) PER visible chunk — heavy contention when
+  most chunks pass frustum. Rewrote main() to aggregate per 64-wide workgroup: each workgroup tallies its
+  visible chunks in shared memory (cheap shared atomics), then does ONE global atomicAdd to reserve a contiguous
+  base, and each thread writes commands[base+local]. 64:1 fewer global atomics on the hot path. Restructured so
+  NO thread early-returns before the two barriers (OOB threads read a clamped index and simply don't emit), which
+  keeps the workgroup from deadlocking. Output is the same SET of draw commands (order differs, irrelevant for
+  indirect draws); the emit condition (inactive skip, shadow-stride phase, AABB-vs-frustum) is byte-for-byte the
+  same. Validates RC=0, spv hash fresh.
+lib (incl. --tests) + bin compile clean. DEVICE-VERIFY: confirm no missing/flickering chunks (cull parity) and
+watch wait_fences / frame time under streaming — expect smoother mass-load and a lighter cull dispatch; dial any
+bump back via its env var if a device stutters.
+
+## r483 — procedural dragon CHARACTER model (sim::dragon_model)
+First character-model system in the engine, ported from the uploaded character_forge_3d.html design tool. A dragon
+is described by a GENOME (proportions) + an ELEMENT (palette) and assembled from analytic solids, then VOXELIZED
+into cubes — the natural form for an engine that draws cubes through the entity stream (the forge tool's own final
+render path voxelizes too).
+
+sim/dragon_model.rs (pure / deterministic / panic-free, array math, 5 unit tests pass via flatten-test):
+- DragonGenome (17 params: pose, bulk, neck len/arch, tail, legs, wing span/spread, snout, jaw, brow, cheek, teeth,
+  crest, horns, horn sweep) with Default matching the tool's SPECS defaults.
+- DragonElement (Wood/Water/Air/Dust/Fire/Storm) -> body/scale/emissive palette (hexes from the tool).
+- build_solids(): spine Catmull-Rom curve of body spheres (tail→hips→torso→shoulders→neck, reared by pose), four
+  2-segment legs + toes, two wing arms (bones; the membrane is a sheet, not voxelized), and a horned skull (cranium,
+  occipital plate, upper/lower jaws, nose ridge + nostrils, teeth, brow, cheek shields, emissive eyes pushed onto
+  the skull surface, crest, horns by count+sweep, emissive spine ridge plates).
+- voxelize(genome, element, res, unit_scale): AABB → grid → per-solid stamp (winning material rank, eye>scale>body)
+  with a CENTRE-CELL SNAP so sub-cell features (eyes/teeth/ridges) never vanish between samples; surface-shell emit
+  (interior cells skipped) except emissive cells always emit so eyes/ridges read. Default res 48 → ~319 boxes,
+  8 emissive. dragon_model() is the convenience wrapper.
+
+Bin preview (no real dragon entity wired yet — this is the "not on the frontend" part): N cycles a cached voxel
+dragon (off → 6 elements → off) into the world ~8 blocks in front of the player, emitted as world cubes through the
+drops/viewmodel entity stream. Cached; rebuilt only on element change. lib (incl --tests) + bin compile clean.
+DEVICE-VERIFY: press N to step the elements; confirm the silhouette reads as a dragon (spine/legs/wings/horned
+head) and the eyes/ridges glow. It faces +Z and floats at a fixed offset — placement/ground-snap, facing the
+player, rotation/animation, and binding to the real sim::dragon DragonService (pose from the genome) are all next.
+FOLLOW-UP: the forge tool exports a genome JSON; a loader (JSON -> DragonGenome) would let designed dragons drop
+straight in.
+
+## r484 — wire pose.rs animation into the 3D in-world creature render
+(Also REVERTS the r483 sim/dragon_model.rs + N-key preview: redundant — in-game dragons already render via the
+existing sim::dragon_forge voxel model through forge_to_vertices. Module, mod registration, debug state, N key,
+and preview render block all removed; lib+bin clean, zero remaining refs.)
+
+The box-anatomy render path (world/entity.rs::creature_to_vertices_lod, used by every non-dragon creature: the
+ambient roamers, test creatures, and LAN avatars) only ever applied a hand-inlined FOOT swing off gait_phase —
+pose.rs (the real rig: leg cadence, body bob, wing flap, health-based limp) was never wired into the 3D render,
+only the 2D inspector. Now it is:
+- Build a pose::Locomotion per creature: speed + flight from the body's CURRENT velocity (vy>0.5 or fast
+  horizontal => flying, matching the dragon-forge heuristic so a grounded flyer doesn't flap), leg_health +
+  fly_power from creature.graded_capabilities() so injuries read as a limp / weaker flap.
+- pose::pose_for() drives the torso's gait bob; pose::animate() drives the parts (feet swing fore/aft + lift,
+  wings roll/flap, every part rides the body bob). LOD + destroyed-part culling preserved by zipping the animated
+  parts back to anat.parts.
+- Verified pure-pose math (flatten-test): still creature = rest on every channel (so STANDING creatures are
+  byte-identical to before), walking => alternating leg swing + body bob + no flap, flying => wing flap, lower
+  leg_health => damped swing (limp). Dragons unaffected (forge path returns early).
+lib + bin compile clean. Per-creature cost: one graded() (a few part passes + a small alloc) + pose_for + animate
+each frame — fine for the bounded creature counts; cache graded on the creature if it ever shows up in a profile.
+DEVICE-VERIFY: walk a roamer herd — legs should stride and bodies bob; send a winged creature airborne and its
+wings should beat; an injured-leg creature should limp.
+
+## r485 — character: arm swing · item: held-block model
+CHARACTER (pose.rs): the rig animated feet + wings + body bob but left Part::Hand (arms) static. Added an arm
+swing in animate(): each Hand swings fore/aft in COUNTER-phase to its same-index leg (PI + leg_phase_offset), so a
+walking biped's arms swing opposite the stride (contralateral gait). Amplitude ARM_SWING_MAX=0.5 (gentler than the
+0.7 legs), scaled by speed + leg_health like the legs — so a still creature's arms are at rest (rest=identity
+preserved) and a slow/limping one swings less. Verified counter-phase + rest-identity by math check. Only creatures
+with Hand parts (bipeds/graspers) are affected; footed quadrupeds unchanged.
+
+ITEM (sim/viewmodel.rs + bin): holding a BLOCK fell through to the generic Tool viewmodel. Added block_model(color)
+— a single cube sized to sit in the hand — and wired the first-person render: when the hand id maps to a real
+BlockId (1..87, not a weapon/ingot/essence), render block_model(block.base_color()) instead of item_model(Tool).
+So placing-blocks now shows the actual block in hand, tinted by its albedo. Weapons (r481) and the id→form fallback
+are unchanged.
+lib (incl --tests) + bin compile clean. DEVICE-VERIFY: walk a biped/humanoid — arms should swing opposite the legs;
+select a block on the hotbar and the held model should be a cube in that block's colour.
+
+## r486 — character: tail sway · item: held-item use-swing
+CHARACTER (pose.rs): Part::Tail was static (body-bob only). Added a lateral sway in animate(): each Tail part
+rotates about the body's vertical axis (new yaw_xz helper) by TAIL_SWAY_MAX=0.38 * sin(phase), scaled by the same
+speed*leg_health factor as the limbs — so the tail swings side to side with the stride and is at rest when the
+creature is still (rest=identity preserved). Parts further back swing wider (they pivot at the body origin), giving
+a natural whip. Tail-heavy plans (serpents) get the most life from this.
+
+ITEM (bin): the first-person held item now plays a short USE-SWING whenever a block action fires. A block action
+resets last_block_action at ~8 break/place/use sites; rather than touch each, the loop snapshots last_block_action
+before the action block and detects the change after, setting swing_timer = SWING_DURATION (0.24s). swing_timer
+decays by the frame dt; while active the viewmodel pose gets a down-forward arc (sin(prog*PI): pitch +0.95, slight
+roll, offset dip) overlaid on the walk pose. Applies to every held item (block / weapon / tool). Standing-still with
+no action = no swing.
+lib (incl --tests) + bin compile clean. DEVICE-VERIFY: walk a tailed creature — the tail should swish with the
+gait; mine/place a block — the hand item should swing on each hit.
+
+## r487 — FIX first-person view · character profiles + cross-world persistence · select screen
+FIX (first-person viewmodel was invisible): the default game mode is CREATIVE, but hand_item was only ever
+assigned inside `if survival_mode` branches — so in creative the hand was always None and the viewmodel block
+(gated on hand_item.is_some()) never ran. Now hand_item is synced EVERY frame from the mode: survival → the
+selected inventory slot; creative → the selected place block's id (so the held-block model from r485 shows). The
+first-person item now renders in the default mode.
+
+CHARACTER SYSTEM (new player_character.rs, pure + 6 tests):
+- CharacterProfile { name, arche (stable string key), seed, tint } → egg_spec() → blueprint() (tinted), reroll().
+- presets() (6 starter characters across arches), SELECTABLE_ARCHES, Default = first preset.
+- Cross-world persistence: config_path() = ~/.config/unendlich/character.json; load_global() (file or preset,
+  never fails); save_global(); so the player's customized character loads in EVERY world.
+- CharacterRoster { options = presets + saved custom slot, custom_index, selected } with load/current/step/
+  select/custom_mut/save_custom — the select-menu state.
+- Bin: load_global() at startup → active_character, logged (the cross-world load is live).
+
+SELECT SCREEN (app/menu_view.rs, headless-tested like the rest of the menu):
+- CharacterClick { None, Pick(i), Reroll, SaveAndPlay, Play }.
+- character_select_ui(ctx, roster): selectable character cards (★ marks the saved custom one), a LIVE silhouette
+  PREVIEW painted from the blueprint's side projection (creature_viewer::project → egui rects, depth-sorted), the
+  pick's stats, and Reroll / Save & Play (custom) or Play (preset) actions.
+- paint_character_preview() renders the silhouette; 2 headless tests (draws shapes + returns None w/o interaction;
+  preview projects non-empty).
+
+lib (incl --tests) + bin compile clean. STILL TODO (next): hook character_select_ui into the live title/overlay
+pass so it shows on launch, route CharacterClick (Pick/Reroll/SaveAndPlay/Play) through, and apply the chosen
+profile to the in-world/LAN avatar. DEVICE-VERIFY: (1) creative — held block now visible first-person; (2) once
+the screen is hooked live, the roster + silhouette preview render and Save persists across worlds.
+
+## r488 — character-select menu LIVE (title → previews → pick/customize/save → cross-world)
+The fullgame draws its menu INLINE in render/world_renderer.rs (an egui::Window per screen), NOT via
+app::menu_view::menu_ui (that's the App/MenuController path). So the r487 tested screen lived in the wrong place
+to show. r488 hooks character-select into the fullgame's actual overlay, following the independent-window pattern
+of settings_menu_open / craft_menu_open (precompute-locals → draw → write-back, since the overlay closure can't
+borrow self):
+- WorldRenderer fields: character_menu_open, character_roster: Option<CharacterRoster>, character_chosen:
+  Option<CharacterProfile> (result for the bin).
+- Title menu: new "Character" button (open_character_local → write-back lazily loads the roster + opens the window).
+- Character window ("character_select"): selectable cards (★ = saved custom slot), a LIVE silhouette PREVIEW
+  painted from the highlighted character's blueprint side-projection (creature_viewer::project → depth-sorted egui
+  rects, precomputed before the closure), the pick's stats, and Reroll look / Save & Use (custom) or Use this one
+  (preset) + Close. Painter is clipped to the preview rect (out-of-range projection boxes clip, never panic).
+- Write-back: pick → roster.select; reroll → custom_mut().reroll (custom only); Save/Use → copies a chosen PRESET
+  into the custom slot first (so whatever you pick becomes your persisted character), save_custom() (writes
+  ~/.config/unendlich/character.json), hands current to character_chosen, closes.
+- Bin: seeds renderer.character_roster at startup; drains renderer.character_chosen each frame → active_character
+  (mut) + logs. Cross-world: load_global at startup + save_custom on Save = the pick loads in every world.
+
+bin compiles clean (pre-existing unrelated warnings only). DEVICE-VERIFY: title menu now has a "Character" button →
+opens a window showing the roster cards + a silhouette preview of the highlighted character; clicking cards swaps
+the preview; Reroll changes the custom look; Save & Use closes + persists; relaunch loads the saved character
+(log line "[character] active = ..."). STILL TODO: apply active_character to the actual in-world/LAN avatar Creature
+(others see your character); optionally auto-open character-select on world-join instead of a title button.
+
+## r489 — character customizer: body-plan cycling + colour tinting (live in the preview)
+r488 gave preset cards + seed-reroll + save. r489 makes "the player customizes" real, all live in the menu preview:
+- player_character.rs: CharacterProfile::set_arche/cycle_arche (walks SELECTABLE_ARCHES, wraps) + set_tint;
+  TINT_SWATCHES[6] named colours (Natural/Ember/Frost/Moss/Dusk/Shadow). +2 tests (cycle wraps; darker tint dims
+  the blueprint). lib(+tests) compiles.
+- Character window (custom slot only): a "Body: <plan> ▸" button cycles the body plan, and a "Colour:" row of named
+  swatch buttons sets the tint. Both edit the custom slot; the silhouette preview (recomputed each frame from
+  roster.current().blueprint()) updates next frame, so changes are visible immediately. New latches
+  char_cycle_arche_local / char_tint_local, applied in write-back (custom slot only); presets stay fixed.
+  Save & Use persists the customized character (cross-world); Close keeps edits in-session but doesn't write disk.
+bin compiles clean. DEVICE-VERIFY: open Character → your ★ slot → "Body ▸" changes the silhouette shape, the colour
+swatches recolour it, Reroll varies the look, Save & Use persists across worlds. STILL TODO (next): apply the chosen
+profile to an in-world avatar — needs either a third-person self-view (solo-visible) or networking appearance over
+LAN (EntityState protocol change); flagged but not done (invasive / low solo-visibility respectively).
+
+## r490 — THIRD-PERSON self-view (F5): see your character in the world
+The chosen character now has a visible body. F5 toggles third-person; first-person stays default, and raycast /
+physics / culling / audio ALWAYS use the real eye (local_player.view) — only the render camera + a self-avatar
+change.
+- Render camera: in third-person the draw gets a pulled-back View (eye - forward*4 + up*0.6, same yaw/pitch) so the
+  avatar sits centered ahead. local_player.view itself is untouched (View is Copy; we pass a modified copy only to
+  draw_frame_with_view_and_atmos).
+- Self-avatar: built from active_character.blueprint() via spawn::from_blueprint (rebuilt when the pick changes —
+  self_avatar_dirty set on character_chosen), appended to the entity vertex stream next to the LAN-remote avatars
+  (same creature_to_vertices bake). Parked at the eye minus 1.5 (feet), turned to local_player.view.yaw.
+- ANIMATED: avatar velocity is derived from the per-frame eye delta (/frame_dt_s), so the r484–r486 pose rig
+  (leg/arm stride, wing beat, tail/limp) plays as the player walks/flies. self_avatar_prev reset on toggle to avoid
+  a one-frame velocity spike.
+- First-person viewmodel hidden while third-person (gate gains `&& !third_person`).
+- Menu: character window gains a hint "In-world, press F5 to see your character (third-person)."
+bin + lib(+tests) compile clean. DEVICE-VERIFY: in-world press F5 → camera pulls back, your chosen character stands
+at your feet facing your look direction; walking animates its legs/arms; the held item disappears; F5 again returns
+to first-person. Tuning likely: pull-back distance (4.0) and feet offset (1.5) — easy one-line changes on feedback.
+Camera has no terrain collision yet (may clip walls behind you). STILL OPEN: LAN remotes still spawn as a default
+dragon (appearance not networked); a rotating in-menu preview; typed character names.
+
+## r491 — water moves SIDEWAYS: lateral surface advection (shader + CPU lockstep)
+Diagnosis: the water surface only BOBBED. The r419 flow path was fully wired (settle out-flux → WaterFlowField →
+water_flow_tiles → pack_grid → chunk.frag flow_grid), but the shader only ROTATED the wave direction toward the
+current + sped ripples — it never ADVECTED the surface, so nothing visibly travelled sideways. And settled (standing)
+water produces zero sim flow, so lakes/ocean sat dead-still.
+Fix (chunk.frag water branch): build a surface-advection velocity and sample the wave field at pos - vel*t, which
+translates the whole ripple pattern laterally:
+- surf_adv = wind_xy * WW_WIND_DRIFT (0.18) — a gentle wind-driven drift so EVEN STANDING water slides downwind
+  (works with flow disabled too; this is the always-on "moves sideways").
+- + flow * WW_FLOW_DRIFT (1.30) inside the flow-coverage block — a stronger downstream carry where the sim says
+  water is actually flowing (rivers/spills stream visibly).
+- wave_pos = v_world_pos.xz - surf_adv*w_time feeds water_wave_normal.
+CPU lockstep (RULESET §water): the floating-drop bob (bin ~9845, uses world::water_waves::water_wave_height_grad)
+now advects its sample by the same wind drift (0.18) so drops ride the advected surface. Flow-part advection isn't
+mirrored on CPU (no per-column flow handy there; drops mostly float on standing water where wind drift dominates).
+chunk.frag validates (glslang RC=0); spv + .spv.hash regenerated FRESH (transitive hash matches); bin compiles.
+DEVICE-VERIFY: water surface now drifts laterally (downwind) instead of only bobbing; near flowing/spilling water it
+streams along the current; floating item-drops bob in step. TUNABLES (one-liners on feedback): WW_WIND_DRIFT 0.18
+(standing-water drift) + WW_FLOW_DRIFT 1.30 (river carry) in chunk.frag — keep the bin's 0.18 in sync with WIND_DRIFT.
+
+## r492 — calmer wind + visible rain/snow
+WIND (was vacillating too fast — also now drives water drift + sway): slowed all three timescales in wind.rs.
+DIRECTION_ROTATION_SECS 30→50; gust slow /8→/16 (~100s); gust fast /1.5→/5 (~31s, was the ~9s vacillation). Wind
+now shifts gradually.
+RAIN/SNOW (weather was on + composing climate, but precipitation had NO falling visual — only sky-darken + fog):
+new sim/precipitation.rs (pure, 2 tests) — field() returns a closed-form falling-particle cloud around the player
+(wraps in y, leans with wind, snow sways). Bin renders it in the entity vertex stream (no new pipeline) when
+precip01 > 0.05: snow (near/below 1°C — white, slow, swaying flakes) vs rain (thin fast blue-grey streaks);
+particle count scales with intensity; rain/snow chosen by last_climate_temp_c (stored from the live climate sample).
+lib(+tests)+bin compile. DEVICE-VERIFY: in wet weather you now see rain streaks (or snow flakes in the cold) falling
+around you; wind shifts slowly instead of jittering. Tunables: particle counts / fall_speed / radius(16) / height(18)
+in the bin precip block; wind timescales in wind.rs. NEXT in this batch: water colour variation + algae + drifting
+ice chunks; seasons actually advancing; multiplayer avatar appearance.
+
+## r493 — algae + drifting ice floes (water variation)
+ALGAE (chunk.frag, shader-only so tint_water stays CPU-mirror-locked): apply_algae() blooms a green scum
+(ALGAE_COLOR) in WARM + SHALLOW water, patchy via two low-freq world-noise octaves, thinning over deep/cold water;
+mixed into the water albedo after tint_water. Adds visible per-location water variation on top of the existing
+depth/temp/salinity tint.
+ICE FLOES (bin entity stream): when the column temp ≤ 2°C, scatter procedural floes around the player (count scales
+with cold), drifting downwind over time (wrapped into a 48-block box), placed ONLY where the surface column is water
+(block_at(x,SEA_LEVEL,z)==Water with non-solid above). Each floe is a thin yaw-rotated slab (bluish white) bobbing
+slightly + slowly spinning. Visual only (not collidable yet).
+chunk.frag validates (RC=0), spv+hash FRESH; bin compiles. DEVICE-VERIFY: warm shallow water shows green algae
+patches; cold water (snowy biomes / winter) shows white ice floes drifting on the surface. Tunables: ALGAE_COLOR +
+0.62 strength + noise freqs (chunk.frag); floe count/radius(48)/temp-gate(≤2°C)/size in the bin ice block. NEXT:
+seasons advancing; multiplayer avatar appearance.
+
+## r494 — multiplayer: LAN players see each other's chosen character
+LAN remotes used to spawn as a fixed spawn_beta_dragon regardless of who the peer was. Now appearance is networked:
+- player_character.rs: ALL_ARCHES[10] + arche_to_u8/from_u8 (stable index); CharacterProfile::to_appearance_bytes
+  (arche1+seed8+tint3 = 12B) / from_appearance_bytes. +2 tests (arche u8 round-trip, appearance wire round-trip).
+- New channel CH_AVATAR=4: [id u64 LE][appearance 12B]. Sent ~every 2s to the peer (active_character). On receipt,
+  stored in lan_remote_appearance{id→profile}; if that remote's Creature already exists it's rebuilt from the new
+  blueprint (keeping pos/yaw). The CH_ENTITY spawn (None branch) builds from the stored appearance via
+  spawn::from_blueprint if known, else the default until CH_AVATAR arrives. Appearance dropped on peer timeout.
+lib(+tests)+bin compile. DEVICE-VERIFY (two instances on a LAN): each player appears to the other as their selected
+character (body plan + tint), updating within ~2s if they change it in the menu. Note: the local third-person F5 view
+already shows YOUR character; this makes the OTHER player's character correct too. Wire is unsealed idempotent state
+(newest-wins), 20-byte datagram. STILL OPEN from this batch: seasons advancing/visible.
+
+## r495 — seasons wired + observable (ties weather/snow/ice together)
+season.rs was a complete tested model but unused live: plant Conditions had season01 hardcoded 0.5, and a natural
+year (~144 real hours) is impossible to witness in a session. Now:
+- Per-frame season_day = world_clock/1440 + season_offset_days; current_season01 = phase in [0,1).
+- Feeds the climate composition (day_of_year + year_length) → seasonal temperature offset → snow line / cover, so
+  WINTER actually turns the world cold (→ r492 snow falls + r493 ice floes) and SUMMER warm (→ r493 algae).
+- Drives plant-growth season01 (was 0.5).
+- Levers so it's visible: UNENDLICH_YEAR_DAYS (year length, default 360), UNENDLICH_SEASON=spring|summer|autumn|
+  winter|0..1 (forced start), and the O key advances the season ~1/8 year live. Season transitions logged
+  ("[season] now Winter ...").
+bin compiles. DEVICE-VERIFY: launch with UNENDLICH_SEASON=winter → cold column → snow + ice on water; press O to
+cycle seasons and watch temp/snow/algae respond; the season prints on change. This closes the requested batch
+(wind r492, rain/snow r492, water variation/algae/ice r493, multiplayer r494, seasons r495).
+
+## r496 — leaves reworked: stringy + dense (like grass)
+Leaves were already sub-voxel-only (no solid cube faces) but their sub-voxel recipe placed 6-9 blobby CLUMPS, which
+read as a solid-ish block. Rewrote world/subvoxel.rs `recipes::leaves` into thin VERTICAL STRANDS like grass blades:
+most (x,z) columns (~64% coverage) bear a 1-sub-voxel-wide strand at a hashed top height hanging down 2-4 cells
+(droop), with per-strand green jitter. Result: a dense mass of stringy hanging fronds (~3-4× the cell count of the
+old clump recipe) instead of clusters. Templates rebake from this recipe automatically (bake_variants →
+procedural_subgrid → recipes::leaves), so all Oak/Birch leaf blocks pick it up. place_leaf_clump kept (#[allow(dead_code)]).
+lib(+tests) compiles. DEVICE-VERIFY: tree canopies should look like dense stringy foliage, not blocky clumps; no
+solid leaf cube. PERF NOTE: denser sub-voxel leaves raise canopy vertex count — coverage (164/255 ≈ 64%) + strand
+length (2-4) are the dials in recipes::leaves if it's too heavy; the chunk-cull work (next) offsets mesh load.
+
+## r497 — decoration LOD culling (mesh-perf win, offsets denser leaves)
+The GPU-decorate post-pass (meshing_pool ~1258) appended sub-voxel decoration — the dense stringy leaves (r496) +
+grass tufts — for GPU-meshed chunks at ALL tiers. Its fine detail is sub-pixel past mid-distance, so Far/VeryFar
+chunks were paying full canopy cost for nothing. Now gated: decorate only when r.lod <= Mid; Far/VeryFar skip it
+(water + lava surfaces still emit at all tiers — they read at distance). The CPU downsampled/virtual paths already
+skipped decoration, and CPU-Near decorates internally, so only the Far/VeryFar GPU chunks change. Net: big canopy
+mesh-cost reduction at distance, directly offsetting r496's denser leaves; near canopies keep full stringy detail.
+lib + bin compile. DEVICE-VERIFY: distant tree canopies render as simpler downsampled blocks (no dense sub-voxel
+fronds) while near trees keep them; frame time / vertex upload should drop in forests. Dial: change `<= Mid` to
+`== Near` for an even tighter decoration radius (less foliage distance, more savings).
+
+## r498 — network compression (per-datagram, reuses the chunk RLE codec)
+Chunk streaming already compressed via chunk_compress (dependency-free PackBits RLE); the rest of LAN traffic didn't.
+New sim/net/packet_compress.rs: pack(payload, min_len) prefixes a 1-byte header (0=raw, 1=RLE) — small packets stay
+raw (one byte, never expand), bulk payloads RLE-compress only when it actually shrinks; unpack(buf, max_out) is
+bounded (no panic/OOM on corrupt input). 4 tests (raw round-trip, compressible shrinks, incompressible stays raw +1,
+corrupt→None). Wired into CH_WORLDCMD (bin): block-edit batches are pack()'d on send (threshold 48B) and unpack()'d
+on receive (≤64KB). Transforms/avatar packets stay raw (too small to benefit). lib(+tests)+bin compile. Net effect:
+bulk edits (large structures, fills) shrink on the wire; per-edit traffic unchanged. Same-build LAN only (wire format
+gained the 1-byte header on CH_WORLDCMD). DEVICE-VERIFY: building/mining still propagates between two LAN instances
+(now with a compression header); large pastes send fewer bytes.
+
+## r499 — nature integration: seasonal foliage colour (ties seasons → leaves/grass)
+The r495 season now visibly recolours foliage. Renderer packs current_season01 into the spare fx_params.z (new
+world_season01 field + set_season(); bin calls it each frame). chunk.frag seasonal_foliage() shifts is_foliage
+fragments: green through spring/summer, warm orange at autumn (~0.6), desaturated brown at winter (~0.85), applied
+after albedo (per-leaf sub-voxel colour variation preserved). So advancing the season (O key / UNENDLICH_SEASON)
+turns the canopy autumnal then wintry — integrating seasons with the r496 stringy leaves + grass.
+chunk.frag validates (RC=0), spv+hash FRESH; bin compiles. DEVICE-VERIFY: press O to roll through seasons and watch
+leaves/grass go green→orange→brown; summer keeps them green (+ algae in warm water from r493). Tunables: autumn/
+winter colours + blend strengths + phase windows in seasonal_foliage (chunk.frag).
+
+## r500 — DHT routing core + channels (foundation for hostless multiplayer)
+LAN MP needs a known host IP. New sim/net/dht.rs is the pure Kademlia core for peer discovery by NodeId XOR-distance:
+NodeId=u64, distance(=XOR), Contact{id,addr_v4,port}, RoutingTable{64 k-buckets, K=8} with insert (dedup +
+move-to-most-recently-seen, cap at K), remove, and closest(target,n) (the routing lookup). Plus a Channel enum
+{Handshake=1,Entity=2,WorldCmd=3,Avatar=4,Dht=5} formalizing the bare CH_* bytes and adding the Dht channel. 6 tests,
+all PASS (flatten-verified: distance symmetry, insert dedup/cap, closest-by-XOR ordering, channel round-trip, remove).
+lib(+tests) compiles. STILL TODO (on-device transport step): the UDP DHT RPCs (ping / find_node / bootstrap), wiring
+the bin's networking to route via the table + CH_DHT, and a bootstrap node list — these need live multi-node testing.
+This rev lands the verifiable routing math the transport builds on.
+
+### Batch summary (r496–r500)
+r496 stringy dense leaves · r497 decoration-LOD culling (mesh perf) · r498 per-datagram network compression ·
+r499 seasonal foliage colour (nature integration) · r500 DHT routing core + channels (multiplayer).
+
+## r501 — two doc-flagged wires: decoration sun lighting + creature loot via loot_roll
+(A) DECORATION SUN LIGHTING (BACKLOG "Remaining" one-liner). The GPU-decorate post-passes (tufts/dense leaves,
+water, lava) were lit neutral (sky:None) because Sky's Clone-ability was unconfirmed. Sky is #[derive(Clone,Copy)],
+so the blocker's gone: added `sky: crate::sky::Sky` to OctreeGpuMeshRequest (populated `sky: req.sky` at
+construction), and passed Some(&r.sky) to decorate_chunk/emit_water_surface/emit_lava_surface. Decoration now takes
+the same sun/sky lighting as the solid mesh instead of flat ambient. lib+bin compile.
+(B) CREATURE LOOT via loot_roll (NEXT_SESSION_GUIDE "route creature death drops through them like blocks"). The
+combat-death site (bin ~5065) dropped a hardcoded single MEAT_ITEM. Now rolls sim::batch_loot_roll::loot_one on a
+table [meat@1.0, meat@0.6, meat@0.25, egg(999)@0.12] (seed from creature pos + frame_count), spawning each rolled
+item with a hashed scatter — 1-3 meat + an occasional egg, table-driven through the tested loot core. bin compiles.
+DEVICE-VERIFY: (A) tuft/leaf/water/lava decoration should respond to time-of-day sun like terrain (brighter noon,
+warmer/dimmer dusk); (B) slaying a roamer drops a variable pile (sometimes an egg) instead of exactly one meat.
+NOTE: no hide/bone item types exist yet — table uses meat + egg; extend once those items are added.
+
+## r501 doc-mining audit — what's ALREADY wired (stale docs) vs genuinely remaining
+Verified-already-wired (don't re-investigate; docs predate the wiring):
+- lava_water_contact → obsidian/stone+steam: WIRED (bin ~10859).
+- quench steam puff into smoke_field (hot metal in water): WIRED (bin 4251/4305/4559).
+- settings render_scale / neural-upscale slider: WIRED (world_renderer ~4060, live-applied).
+- plant_growth sapling→tree staged maturation: WIRED (bin 4111-4159, session.saplings).
+- flora_harvest bloom→essence drops on break: WIRED (bin 8146).
+- player + dropped-item buoyancy/swim: WIRED (bin 5623-5680, sim::fluid/swim/buoyancy).
+- fauna_roster-driven spawn (species base_health etc.): WIRED (bin 3819).
+
+Genuinely remaining, but DEFERRED with reason (not blindly attempted — unverifiable + high blast radius):
+- Per-face block colour (grass-top-green/dirt-sides), magenta-foliage, missing-top-faces: all live in
+  chunk_mesh_octree.comp (the central GPU mesher). A blind edit there can corrupt ALL GPU-meshed terrain
+  (same risk class as the transparent-water pass). Needs an on-device A/B (UNENDLICH_GPU_MESHER=0 vs 1) per step.
+- Real-field water tint: chunk.frag's temperature/humidity proxies are INTENTIONAL (they give per-position spatial
+  variation a single global uniform can't). The real fix needs per-chunk climate baked into water vertices
+  (emit_water_surface + vertex format), not a uniform swap — a mesher change, device-verify.
+- Creature buoyancy: roamers use grounded_y snapping, not free vertical physics — no clean integration point;
+  would require reworking creature locomotion (big, risky).
+- inventory_txn move/split: core is tested (sim/inventory_txn.rs) but wiring needs drag/drop in the egui inventory
+  — UI work best done with the screen visible.
+- Chunk-sim elapsed-time catch-up + structural dirty-marking (DESIGN_NOTES): architectural, not a quick wire.
+
+## r502 — Character-Forge elementals in the roster + bigger maximum dragon size
+(A) FORGE CHARACTERS. Added four Character-Forge elementals to player_character::presets() as Arche::Dragon avatars,
+each an elemental cast via distinct seed + tint: Heliographer (sun-gold), Windwalker (pale sky), Tidecaller (deep
+teal), Stormweaver (storm violet). They appear as selectable cards on the character page alongside the animals.
+Dragon is excluded from the customizer body-cycle (SELECTABLE_ARCHES) but valid for presets, so they select + render
+through the existing creature/forge path (preview tile, in-world avatar, LAN remote). lib+bin compile.
+(B) BIGGER DRAGONS. The live forge dragon size is dragon_archetype::size_scale(size_class) folded into the forge's
+rest dimensions. Raised SIZE_SCALE_MAX 3.0 → 4.2 (biggest dragons now ≈9.3× the smallest, up from 6.7×); the forge's
+rest·1.15 animation clamp scales with it so animated poses grow too. Also raised the dragon physics/collision box max
+(spawn::dragon_body_half_extents) 1.7 → 2.4 so collision keeps up with the larger visual. size_scale tests compare
+against the constant so they still pass. DEVICE-VERIFY: high-bulk dragons should now tower noticeably larger; confirm
+collision/terrain clipping looks right at the new max and the forge characters appear + preview on the character page.
+NOTE: sim::dragon_growth_stage (age→size) remains UNWIRED — live size is genome/size-class, not age; wiring
+age-based growth is a separate task.
+
+## r503 — large-body locomotion: carve an arc instead of a fixed-point turn
+The roamer step picked a direction toward the goal and MOVED there immediately, then rotated to face it — so a big
+body slid sideways and pivoted in place (the "fixed-point turn" / moonwalk; the head_steer/turning docs name this).
+Reworked the step to be BODY-AXIS aware (bin ~6934): `axis_bias = clamp((body_len-1)/4, 0, 1)` from the creature's
+half-extents scales how constrained it is to move along its facing. The creature now steps along `move_heading =
+yaw + dyaw*(1-axis_bias)` (≈current facing for big bodies, ≈goal for small), at `eff_step` reduced by mis-alignment
+(floored at 0.2 so a turning body keeps inching forward and arcs round rather than stalling), and its turn target is
+the GOAL (`desired`) so the heading curves toward it while the body advances — carving an arc. Turn rate also scales
+down with size (`/(1+axis_bias*1.5)`) so a dragon can't spin on a dime. Small/agile creatures (axis_bias≈0) keep the
+old responsive step exactly. bin compiles. DEVICE-VERIFY: big dragons should sweep through wide curved paths (no
+in-place spins / sideways slides); small fauna unchanged. Dials: the `/4` size scale, the `1.5` turn-slowdown, and
+the `0.2` step floor (bin r503 block). NOT applied to the player (responsive WASD is expected) — that's a follow-up.
+
+## r504 — water lateral drift, take 2 (it still didn't move sideways)
+r491 added wave-pattern advection driven by wind×0.18, but r492 calmed the wind, so on a still day surf_adv≈0 and the
+surface read as standing (the operator's report). Root cause: the drift depended entirely on wind magnitude, which is
+near-zero in calm weather. Fixes (chunk.frag, shader-only): (1) ALWAYS-ON baseline drift WW_BASE_DRIFT=0.60 blocks/s
+in the wind direction (or a fixed NE bearing when dead calm) so even a still lake visibly slides; (2) stronger wind
+coefficient WW_WIND_DRIFT 0.18→0.55; (3) advect the SUN-GLITTER field (guv -= surf_adv·t) so the sparkle visibly
+travels sideways with the flow — a strong, bright motion cue beyond the subtle normal shift. atmos_params.w is
+time-of-day IN SECONDS (verified — a real monotonic clock), so the drift accumulates. CPU floating-drop advection
+(bin ~9986) synced to the same baseline+wind so drops ride the current. Sim flow (rivers) still adds WW_FLOW_DRIFT
+on top when flow is enabled. chunk.frag RC=0, spv+hash FRESH; bin compiles. DEVICE-VERIFY: a calm lake surface +
+its sun-glitter should now visibly slide laterally (~0.6 blk/s); rivers stream faster. Dials: WW_BASE_DRIFT /
+WW_WIND_DRIFT in chunk.frag (keep the bin drop-advection constants in lockstep).
+
+## r505 — perf: decoration Near-only (offsets r496 leaf density's upload pressure)
+The pipeline still stalls in spots. Most documented stall mitigations are already DEFAULT-ON (verified this session:
+adaptive_uploads, submit_skip, submit_budget, slack_scheduler, biased_shell_walk, upload_priority — all R27 default-on),
+and the remaining big levers (octree pool-lock early-unlock, MAX_FRAMES_IN_FLIGHT=1→2) touch GPU memory/sync and want
+on-device A/B given Asahi's documented coherency quirks — not a blind flip. The one stall I could attribute to THIS
+session's work: r496 made leaves ~3-4× denser, inflating near/mid chunk mesh size, and bigger meshes feed the M2
+upload-pressure stall (HOST_COHERENT memcpy → GPU cache-invalidation, the known "chug" mechanism). r497 had decorated
+Near+Mid; r505 tightens to NEAR-ONLY so mid-distance forests stop paying the dense-leaf upload cost while near forests
+keep the full look. lib+bin compile. DEVICE-VERIFY: forest frame-time / upload-pressure events should drop vs r504,
+especially while moving through wooded terrain; foliage now fades to plain cubes one LOD band closer. Revert lever:
+set the gate back to `<= Mid` in meshing_pool (r505 block). The provably-safe pool-lock lever remains
+UNENDLICH_GPU_POOL_EARLY_UNLOCK=1 for an on-device A/B.
+
+## r506 — water push-back / waves (wave_amplitude wired) + churning wake foam + shader
+DOC→IMPL of r443 water core #4 ("push back on the water and create waves with a mass"). The tested-but-unwired
+`sim::water_react::wave_amplitude(mass, speed, area, gain, max)` now drives a real wake: new
+`FlowTileStore::splash(wx, wz, dir, amp, now)` stamps an outward radial + forward-biased flow impulse around a moving
+body's column into the persisted flow tiles (only on cells that already hold water; impulses ADD + clamp; the per-tick
+sim ingest + decay wash it back out). Bin injects it each frame BEFORE pack_grid: the PLAYER when swimming + moving
+(mass 80), and nearby ROAMERS in water with wakes scaled by body volume × speed — a dragon crashing into a lake makes a
+far bigger wave than a fish. The surface shader already foams on flow speed (r420 rapids), so the wake reads as
+whitewater with no new render path; r506 additionally makes that rapids/wake foam CHURN faster where flow is faster
+(chunk.frag), so the mass behind a wake shows in the motion of the foam. chunk.frag RC=0, hash FRESH. lib+bin compile;
+2 new splash tests pass (14 total in water_flow_tiles). Knobs: UNENDLICH_WATER_PUSHBACK=0 disables;
+UNENDLICH_WATER_PUSHBACK_GAIN (0.05), _MAX (4.0). Inert when UNENDLICH_WATER_FLOW_SHADER=0 (no grid uploaded).
+DEVICE-VERIFY: swim/run through a lake → surface should part + foam in your wake; a dragon entering water → big wake.
+NEXT (MP candidate still open): remote-player nameplates (lan_remote_appearance has .name; needs a billboard/text path)
+or a chat channel — both still unwired in bin.
+
+## r507 — MP: connected-players presence on the HUD
+LAN remotes already render as avatars (lan_remote_creatures) with names learned via CH_AVATAR (lan_remote_appearance,
+r494), but there was no in-world indication of who's connected. r507 appends an "online (N): you, <names>" line to the
+existing hud_status_lines (already rendered top-left), built each frame from the live remote set — names from each
+peer's chosen character, falling back to player#<id>. Zero new render path (reuses hud_status_lines). bin compiles.
+DEVICE-VERIFY (needs 2 machines on a LAN, UNENDLICH_LAN_MP default on): join a peer → HUD shows both players by name;
+the line disappears when peers time out (lan_remote liveness eviction). FOLLOW-UP (still open): floating NAMEPLATES above
+remote avatars need camera view_proj projected into the egui overlay pass (or a 3D text-billboard pipeline) — deferred
+because it's renderer egui/projection work with no way to verify off-device. A simple chat channel (new CH over the LAN
+session socket) is the other open MP candidate.
+
+## r508 — movement feel: head surfaces when swimming + non-linear swim/jump/walk
+Operator: "the head can't surface above the water when swimming, and swimming/walking/jumping are linear when they
+should be more realistic." Four fixes (player-only; only the player calls apply_input/try_jump, confirmed):
+1. HEAD SURFACES (the bug). Buoyancy derived `sub` from a two-state head check (water level 0.9 or 2.0 over a 1.8
+   body); the instant the head cleared, sub halved and buoyancy (26·sub) lost to gravity (28) and dragged the head
+   back under. Now the bin scans the body's column for the REAL water surface, computes a CONTINUOUS submerged fraction
+   over feet..head, and floats with peak buoyancy 36 > GRAVITY 28 → equilibrium sub ≈ 0.78 (waterline at the shoulders,
+   head/eyes out). You can tread with your head out and stroke (Jump) to climb higher.
+2. SWIM not linear: vertical water damping (SWIM_VDAMP) turns the rise into a smooth bob instead of a linear
+   shoot/overshoot.
+3. JUMP not linear: variable jump height (releasing Jump mid-ascent cuts upward velocity ×0.45 → tap = short hop, hold =
+   full jump) + asymmetric gravity (×1.4 on descent) for an apex hang then a weighted drop, vs the old symmetric arc.
+4. WALK not linear: GROUND_FRICTION 20→12 (physics.rs) for a weighted acceleration ramp + turn momentum; the newer
+   hard-stop path keeps stops crisp so this doesn't reintroduce the old slide-on-stop. MOVE_ACCEL auto-derives so top
+   speed stays WALK_SPEED; all 4 physics movement tests remain valid (speed cap holds steady-state; decay-ordering
+   preserved). Raise toward 20 for snappier control.
+lib + lib --tests + bin all compile. DEVICE-VERIFY: swim up → head breaches and stays out while treading; tap vs hold
+Space → short vs full jump; falls land a touch faster; walking starts/turns carry a little weight. Tuning levers:
+SWIM_BUOY/SWIM_VDAMP (bin swim block), the ×0.45 cut and ×1.4 descent (bin), GROUND_FRICTION (physics.rs).
+
+## r509 — items: tool/weapon DURABILITY (first wire of the item-system plan)
+Per NEXT_SESSION_GUIDE "ITEMS WIRING", wired sim::item_durability::apply_wear (pure, tested, was unwired). The held
+forged weapon (ids 4000-4007, weapon_class_for_id) now has durability tracked in the bin: WEAR_PER_ATTACK(2) on each
+melee swing that lands, WEAR_PER_MINE(1) on each block mined, breaking (one removed from inventory) at 0. Survival-only
+(creative weapons don't wear). HUD shows "weapon cur/max (worn!)" while one is equipped. v1 tracks ONLY the equipped
+weapon (id,cur,max) — switching weapons re-inits the tracker; the documented next step is a per-stack instance table so
+durability persists per item (and unblocks affixes/rarity/tooltips). bin compiles. DEVICE-VERIFY (survival, hold a Y-given
+weapon, scroll to it): mining/attacking drains the HUD durability; at 0 it breaks with a log line + vanishes from hand.
+Levers: WEAPON_DURA_MAX(120), WEAR_PER_ATTACK/_MINE.
+
+## r510 — survival: COOKING (raw meat → cooked at a fire)
+A real survival food loop. New COOKED_MEAT_ITEM (2001). Raw meat (2000) now barely nourishes (feed 0.18, down from
+0.4); holding raw meat near ANY heat source (heat_sources.total_heat_at > 3.0 — F9 campfire, Fire-bending bloom, or
+lava) roasts it over COOK_TIME(4s) into cooked meat (feed 0.55). Progress accumulates while held near heat and cools
+when you step away; logged + shown on the HUD ("roasting meat… N%"). Survival-only. bin compiles. DEVICE-VERIFY
+(survival): slay a creature for raw meat, plant a fire (F9), hold the raw meat near it → it cooks; eat cooked for the
+full meal, raw for a pittance. Reuses the live heat field, so lava-side cooking works too. Levers: COOK_TIME, the >3.0
+heat threshold, feed values in survival_use_item.
+
+## r511 — items: varied combat loot (loot_quantity + drop_chance)
+The main melee (punch/weapon) kill dropped a fixed single meat; now it routes through sim::loot_quantity::quantity
+(meat count scales with the creature's bulk → tier 0..4, +luck, cap 5) and sim::drop_chance::drop_chance (a
+luck-boosted ~12% roll adds an egg). Small fauna yield a scrap; big beasts yield a haul. Deterministic roll from
+position+frame. Pairs with r501 (bending kill already used batch_loot_roll) so both kill paths now give varied,
+core-driven loot. bin compiles. NEXT in the items arc (NEXT_SESSION_GUIDE): the per-stack INSTANCE/metadata table that
+unblocks affixes/rarity/tooltips (item_modifier/item_genetics/item_tooltip cores are all present + unwired); inventory_txn
+move/split in the open-inventory UI (needs egui drag/drop); flora_harvest seed drops on flora break.
+
+## r512 — survival: VEGETABLES + FARMING (ungated, menu-wired)
+Three new crop blocks — Carrot(88), Potato(89), Cabbage(90) — fully integrated into the block palette (ALL[69], base_color,
+is_solid/mining/thermal/wetness/material/material_response matches all extended; the all_const_is_exhaustive +
+no-dup-discriminant tests pass; from_u8 left consistent with the pre-existing 81-87 gap since chunk storage uses raw u8).
+MENU WIRING: classified into the Plants creative tab (sim::creative_tabs::tab_of), so G/V in the creative menu selects +
+places them. FARMING LOOP (ungated, no env flag): right-click a crop on Grass/Dirt PLANTS it (consumes one, registers in
+a bin-local crops list); it grows via sim::plant_growth (climate-driven h/r/l like saplings) and is RIPE at FINAL_STAGE;
+breaking a ripe crop yields a bonus harvest via sim::loot_quantity (a tended field returns more than you planted), unripe
+just returns the one. EDIBLE: eating (right-click off-soil, or harvested) feeds vitality — Carrot/Cabbage 0.28, Potato 0.34.
+SURVIVAL SOURCE: breaking wild TallGrass/Fern/Flower has ~15% to drop a vegetable ("seeds from grass") so a survival
+player can start a farm without creative. lib+lib --tests+bin all compile. CPU mesher (default) renders crops via
+base_color; no GPU/shader change (crops are never worldgen-emitted). DEVICE-VERIFY: creative → Plants tab has the 3 crops;
+survival → break grass to find a crop, plant on dirt, wait for the "ripe" log, break it for a multi-drop harvest, eat for
+vitality. Levers: growth cadence (frame%90), ripeness via plant_growth, harvest tier/luck, feed values, seed-drop ~15%.
+
+## r513 — foliage: crops render as plants, not cubes (subvoxel shapes)
+"Make foliage less blocky": the r512 crop blocks rendered as solid colored cubes. Now Carrot/Potato/Cabbage are
+has_subvoxels + is_subvoxel_only (the leaves pattern), so the CPU mesher skips their cube faces (surface.rs excludes
+is_subvoxel_only from the solid surface) and emits a procedural plant silhouette instead via a new recipes::crop(shade,
+rng_int, kind) in world/subvoxel.rs — Carrot = leafy fan + orange crown, Potato = low bushy mound, Cabbage = tight round
+head. Crops stay is_solid (still raycast-harvestable) but blocks_collision is now false (walk through a field) and
+foliage_sway sways them in wind like leaves. No GPU/shader change (procedural CPU subvoxel path; leaves use baked
+templates, crops fall through to procedural). lib+lib --tests+bin compile; palette invariants pass. NOTE: subvoxel
+decoration is Near-LOD only (r505), so crops are shaped up close and invisible at distance — fine for small plants.
+DEVICE-VERIFY: plant a crop and confirm it looks like a little plant (and sways), not a cube; harvest still works.
+
+## r514 — ARCHITECTURE: persistent sparse flora/crop state store (world/flora_store.rs)
+Operator-flagged: "foliage and crop state like entities/populations with permanent state… stored efficiently." Crops were
+bin-local (lost on restart). New world::flora_store::FloraStore — a SPARSE HashMap<[i32;3], FloraCell> (only planted cells
+cost anything), where FloraCell = {block:u8, growth01, stage, element, vigor, planted_tick}, mirroring plant_growth::PlantState.
+Serialises to flora.json under the world root (flattened to a Vec since JSON keys can't be arrays), written atomically
+(temp-file + rename) like crate::storage does for chunk edits. O(1) plant/harvest/lookup by cell. Lives on WorldSession
+(reset() auto-clears on world switch). WIRED into the bin replacing the old crops Vec: load on world init; plant → flora.plant
+(FloraCell::sown); growth tick advances each cell in place (marks dirty); harvest → flora.remove (ripe payout uses cell.block);
+saved on a 1800-frame cadence when dirty + flushed on shutdown next to chunk save_all. 4 unit tests (plant/get/remove, dirty
+tracking, disk round-trip, absent→empty) compile under lib --tests; lib+tests+bin all build. DEVICE-VERIFY: plant crops, quit,
+relaunch the same world (worlds/default) → "loaded N persisted crop(s)" and they resume growing/are harvestable. NEXT: migrate
+session.saplings (and fire_positions) into the same store for a single persistent flora layer; add per-stage crop visuals.
+
+## r515 — camera: first-person body + cinematic shoulder cam (Y) + keybind-menu wiring
+Camera is now a mode (0 first-person, 1 third-person, 2 cinematic over-the-shoulder) instead of a bool.
+- FIRST-PERSON BODY (`fp_body`, default ON): your own avatar renders in first-person so you can look down and see
+  your body; the hand viewmodel is hidden then to avoid a duplicate floating arm.
+- CINEMATIC SHOULDER (camera_mode 2): pulled back 2.6, right 0.9, up 0.45 — body frames the lower-left, view open ahead.
+- KEYBINDS: added GameAction::ToggleThirdPerson (default F5) + ToggleCinematicCam (default Y) to keybindings.rs
+  (enum + shared defaults) and keybind_ui::rebindable_actions, so both appear in Settings ▸ Controls and are
+  REBINDABLE (the bin now reads them via bindings.is_action_just_pressed, not hardcoded keys). The old Y debug
+  "give all weapons" moved to P. bin+lib+tests compile. DEVICE-VERIFY: Y cycles into the shoulder cam; first-person
+  shows your body; rebind either in the Controls tab. NOTE: in fp_body the camera sits at the eyes so the head mesh is
+  at the camera origin (front-faces point away → typically invisible); if the head clips, lowering the avatar or
+  head-culling is the follow-up.
+
+## r516 — caves: runtime ore enrichment + dragons-in-caves finding
+MORE ORES IN CAVES: the world generator runs on the GPU here, so CPU roll_ore changes are invisible. Instead added a
+budgeted runtime CPU pass (modeled on pioneer_flora) — sim::cave_ore::ore_for(depth, roll01) picks a depth-weighted ore
+(coal/copper shallow → iron/gold mid → quartz/amber/crystal/diamond deep; rare, richer deeper, pure + 5 unit tests), and
+the bin seeds it into plain Stone that faces Air (a real cave wall) below sea level near the player, ~2 per 67 frames.
+CPU-mesher-rendered, so visible regardless of worldgen backend. Uses only EXISTING ore blocks (no new BlockId, no shader).
+DRAGONS IN CAVES (operator asked to check the docs): NO — by design. docs/design/fluid_pois_waterfalls.extracted.md states
+"dragons do not enter cave systems" (they're aerial predators); cave waterfalls instead use "underground fauna spawners"
+(non-dragon). MENU_SYSTEM notes a spawn override for underground/in-air if we ever want to change this, but it contradicts
+the design intent, so left as-is. bin+lib+tests compile. DEVICE-VERIFY: descend into a cave and watch ore appear on exposed
+walls (deeper = better); confirm no dragons underground.
+
+## r517 — building/mining feedback: targeted-block readout
+The held item already renders as a hand viewmodel and a held BLOCK shows as a colored cube in hand (r485). Added the
+missing piece — what you're about to AFFECT: a HUD line "▸ <Block> (x,y,z)" for whatever solid block the aim ray hits
+within reach, flagged "[unbreakable]" for bedrock. Reuses the exact octree raycast the break/place path uses, so the
+readout always matches the action. Pure HUD; compiles. DEVICE-VERIFY: aim at a block and see its name/coords update;
+bedrock shows unbreakable. (Debris particles + audio cues are the natural next feel additions when an audio backend lands.)
+
+## r518 — multiplayer: open-server + whitelist (backbone wired; menu UI planned)
+sim/whitelist.rs: per-world Whitelist {open, allowed:BTreeSet<name>} — admits()/allow()/revoke()/toggle_open()/names(),
+case-insensitive, serde, atomic save under world root (whitelist.json). 5 unit tests. WIRED: host gates the CH_HANDSHAKE
+join — open admits anyone (and remembers the name so you can later close + keep current players); closed replies
+LanJoin::Deny{reason} to non-listed names. F10 toggles open/closed (persisted). Loaded on world init, saved on shutdown.
+Default OPEN. bin+lib+tests compile. The add/remove-name + open toggle MENU UI is specced in DESIGN_NOTES (egui flow on the
+existing menu kit) as the on-device next step — the data layer + commands it needs are all in place. DEVICE-VERIFY: host,
+press F10 to close, have a non-listed peer try to join → denied; an admitted peer is remembered.
+
+## r519 — flora: saplings unified into the persistent store (single flora layer)
+Followed through on the r514 note: session.saplings (in-memory Vec, lost on restart) is GONE — saplings now live in the
+same persistent session.flora store as crops, distinguished by block type (OakLog = sapling; Carrot/Potato/Cabbage =
+crop). The sapling growth tick now iterates flora's OakLog cells (advance → mature into a tree via flora_blocks → remove
+from store; new saplings planted via flora.plant(FloraCell::sown(OakLog,…))), and the crop tick + harvest skip non-crop
+cells so the two don't cross-advance. Net: ONE sparse, serializable per-world flora layer (flora.json) covering crops AND
+saplings — both survive save/load now. Removed the vestigial WorldSession.saplings field + its PlantState import + test
+ref. lib+lib --tests+bin compile. DEVICE-VERIFY: let a wild sapling grow, quit/relaunch the world → it resumes and still
+matures into a tree.
+
+## r520 — farming: per-stage crop visuals (seedling → plant → ripe)
+The mesher renders by block, not growth state, so per-stage visuals come from swapping the BLOCK as the plant grows.
+New BlockId::Sprout (91) — a tiny green-shoot subvoxel (recipes::sprout), has_subvoxels + is_subvoxel_only like crops,
+full exhaustive-match cascade + invariant tests pass, block_drop None (a smashed seedling yields nothing). FLOW: planting
+a crop now places a Sprout that records its target crop in FloraCell.element (0/1/2); the crop growth tick advances it and,
+at stage ≥ 2, PROMOTES it — set_block to the real Carrot/Potato/Cabbage (the fuller r513 plant) and updates the cell —
+then it ripens at FINAL_STAGE as before. So a field visibly reads sprout → plant → ripe. The growth tick now preserves
+FloraCell.element (it encodes the target; advance no longer overwrites it). Uprooting a seedling returns the seed (drops
+the target crop item). lib+lib --tests+bin compile; palette invariants pass. DEVICE-VERIFY: sow a crop → see a small
+sprout → watch it become the full plant → harvest when ripe; break a young sprout → get your seed back.
+
+## r521 — farming: plantable trees (leaves → sapling → plant → tree)
+Completed the tree loop using existing systems (sapling tick + persistent flora store). Breaking OakLeaves/BirchLeaves
+now ~11% drops a tree sapling — reusing the r520 Sprout as the sapling item. Planting a Sprout on Grass/Dirt UNDER OPEN
+SKY (6 clear cells above) places an OakLog and registers it in session.flora as a sapling; the existing sapling tick
+matures it into a full tree (flora_blocks), persisted across save/load like everything else in the store. Crop planting is
+unchanged (Carrot/Potato/Cabbage → seedling). The plant interception + registration (both place branches) now branch:
+Sprout → tree, crops → crop seedling. bin compiles (bin-only change; Sprout block + invariants from r520). DEVICE-VERIFY:
+chop leaves until a sapling drops, plant it on dirt with sky above → it grows into a tree; without headroom it warns and
+stays a sprout. Closes the build/farm loop: harvest wood+leaves → replant forests.
+
+## r522 — farming: seed genetics (genome metadata on every plant)
+Wired sim::plant_tree_genetics (the canonical plant genome, mirroring dragon_archetype::Genome — 13 normalized genes:
+max_height, fruitfulness, growth_rate, hardiness, …, with from_seed/cross/phenotype). FloraCell now carries a `genome:
+[f32;13]` (serde #[serde(default)] = neutral, so old saves still load) — per-plant genetic METADATA that persists in the
+flora store. FLOW: a per-world seed line per crop (Carrot/Potato/Cabbage). Planting crosses that line with a fresh genome
+(plant_tree_genetics::cross — Mendelian pick + blend + mutation) and stores the result on the plant. GENOME EXPRESSION:
+growth_rate gene scales the growth tick's dt (bred lines ripen faster); fruitfulness gene raises the harvest yield (luck
+into loot_quantity). INHERITANCE: harvesting a ripe crop breeds its genome back into that crop's seed line, so a grower who
+keeps replanting their best harvests steadily improves yield + speed (selective breeding) — emergent, no per-item table
+needed. Seed line is in-memory (resets per session); the per-plant genome persists. bin+lib+tests compile. DEVICE-VERIFY:
+plant log shows g/f/h genes; harvest ripe crops repeatedly and watch later plantings grow faster + yield more. NEXT: persist
+the seed line in the flora store; let genome drive crop appearance (subvoxel fullness) and tree shape (the genome already has
+height/canopy genes the tree builder could read).
+
+## r523 — two bug fixes: solid-leaf cube + inventory won't close
+1) SOLID LEAF CUBE (operator screenshot, red outline). render/mesher.rs fn is_meshable was
+`!is_air() && is_solid()` — it did NOT exclude is_subvoxel_only, unlike world/surface.rs is_meshable
+which does (and whose comment says the two mirror). So the mesher emitted a full solid cube for leaves
+(and crops) AND decorated subvoxels on top — the opaque cube hid the subvoxel foliage. Fixed: added
+`&& !b.is_subvoxel_only()`, matching surface.rs. Leaves/crops now render purely as subvoxel detail (no
+cube). NOTE/trade-off: subvoxel decoration is Near-LOD only, so at Mid+ distance leaves render nothing
+(distant trees may look bald) — follow-up could add a sparse Mid-LOD leaf impostor.
+2) INVENTORY WON'T CLOSE WITH P (takes many presses). The toggle was hardcoded to raw Keycode::I and
+gated on `mouse_captured` — but opening the inventory releases the mouse, so the gate could never fire
+to close it, and a rebound key (P) was ignored entirely. Fixed: toggle now reads the OpenInventory
+*binding* (respects the user's key) and fires when `mouse_captured || show_inventory` (so it closes while
+open). Also moved the r515 debug "give all weapons" off raw P → N (and gated to !show_inventory) so it
+can't collide with an inventory rebind. lib+bin compile. DEVICE-VERIFY: leaves show stringy subvoxel
+foliage with no solid block; inventory opens AND closes on the same key first press.
+
+## r524 — real menu-sticky fix (Dvorak 'p' panel) + sparser leaves
+MENU: r523 fixed the WRONG handler. The operator runs Dvorak (hotbar a/o/e/u/i), and their "P" is the key
+LABELED 'p' (resolved via glfw::get_key_name on scancode), which drives `ui_panel_open` ("Panel mode") —
+NOT the keycode-based OpenInventory binding I touched in r523. The panel toggle (a) released the cursor on
+open but on close only logged "Click to recapture mouse" (cursor stayed free → look-around dead → pressing
+'p' again reopened it → "sticky"), and (b) gated detection on !ui_wants_keyboard so a focused field could
+trap it open. Fixed: closing the panel now recaptures the cursor immediately (CursorMode::Disabled +
+mouse_captured=true); the typing gate now only blocks OPENING, never closing. Applied the same
+recapture-on-close to the inventory (show_inventory) toggle. LEAVES: kept the r523 is_meshable cube fix
+(provably gates all LODs — Near, downsampled, far_virtual). ALSO sparsened the subvoxel leaf recipe from
+~64% → ~45% column coverage so the canopy reads as foliage with sky through it rather than a near-solid
+mass even once the cube is gone. lib+bin compile. DEVICE-VERIFY: 'p' opens AND closes the panel with the
+cursor returning to the game on close; leaves look airy. IF a hard solid cube still shows, it's a stale
+build — the cube path is gone in source.
+
+## r525 — unified UI state machine (AppMode + MenuState)
+NEW sim/ui_state.rs: a two-level state machine replacing the bool soup. AppMode { TitleScreen, Playing }
+is the top level; MenuState { NoMenu, Inventory, Pause, Settings, Debug, Craft } is the in-world subset,
+NoMenu = playing/cursor-captured (the default). Helpers: toggle (one key per overlay, press-again-closes),
+on_escape (open→back out, NoMenu→Pause, Settings→Pause), captures_cursor, pauses_game, shows_* . 8 unit
+tests (flatten-tested, pass). KEY MAP (operator's): p → Inventory (Dvorak-aware p_pressed, + rebindable
+OpenInventory R/I alias); F4/F3 → Debug (now ONE thing: drives both the perf dashboard and the debug/shader
+panel); Esc → Pause (which shows the inventory too); C → Craft. WIRING: menu_state owns the light in-world
+overlays (Inventory/Debug/NoMenu) as the single source of truth; the heavyweight FSM screens (Pause via the
+app FSM + pause_action, Settings/Craft self-closed by renderer Done buttons, Title) keep their existing
+plumbing but are SUBORDINATED — opening one forces menu_state=NoMenu and the light overlays only toggle when
+no heavy screen is up. Cursor FOLLOWS menu_state: releases on open, recaptures the instant we return to
+NoMenu (no click — kills the "sticky" feel). REMOVED the old split paths: 'p' "Panel mode" (ui_panel_open),
+separate F4-perf toggle, separate F3-settings_open toggle. show_inventory/ui_panel_open survive only as
+per-frame derived locals so downstream reads (game_paused, cursor authority, ui_pointer_active) are unchanged.
+bin+lib+tests compile. SCOPE/HONESTY: Pause/Settings/Craft transitions remain renderer+FSM-owned (subordinated,
+not fully inside the enum) — rewriting the FSM-integrated pause blind was too risky; the enum cleanly owns the
+operator's named keys + NoMenu + the title/playing split. DEVICE-VERIFY: p opens/closes inventory on one press
+with the cursor snapping back; F4 toggles debug (separate from inventory); Esc pauses; opening pause/craft
+closes the inventory.
+
+## r526 — mobs MOVE (AI brains + step_character against live terrain)
+docs/MOBS.md flagged movement as the top "what's left": the test Seeker+Grazer were STATIC spawns. Now the bin
+ticks them. NEW bridge `MobWorld<'a> { cm: &ChunkManager }` impl sim::physics::WorldQuery (physics_at →
+physics_of_block(cm.block_at)). Each frame, gated on !game_paused: accumulate dt, tick at a fixed 20 Hz
+(frame-rate independent, max 4 catch-up ticks): build the player as a sim Character, snapshot grazer positions
+(prey) + seeker positions (predators), then for each mob `m.brain(world_seed, id, tick, &players, &prey,
+&predators, &world)` → `step_character(&m.body, &input, &world)`. test_mobs is now `let mut` and baked live each
+frame (mobs_to_vertices already read it), so they visibly move: the Seeker chases the player, the Grazer flees
+within FLEE_RANGE, both wander otherwise, all colliding against real voxel terrain. mob_sim_tick is the
+deterministic RNG key. bin compiles. DEVICE-VERIFY: walk toward the two test mobs near spawn — one should chase,
+one should run; both should walk on the ground, not float/fall. NEXT (per MOBS.md): spawn-from-egg place path
+(ui-overlay-gated), ambient population via sim::spawn::spawn_region, creature part facing by body yaw.
+
+## r527 — bending wired end-to-end + fixed for Dvorak ("B does nothing")
+TWO parts. (1) END-TO-END EFFECT: bending fired (resonance build/spend + fields) but bending_compose's
+documented gap stood — an EffectIntent was produced yet nothing turned it into resolved targets + a discipline
+effect. Now at the cast site, after the intent resolves, we build Targets from nearby roamers, call
+sim::bending_compose::resolve_bend(&intent, &BendWorld::for_targets(origin, &targets, &[]), bend_resonance)
+[Resonance is Copy → no double-spend; we read only hits/power/backlash], and KNOCK BACK each hit creature along
+the aim (+ lift), scaled by hit strength × power_realized. HUD: "bending struck N — power P%". So a bend now
+visibly shoves creatures. (2) THE "B DOES NOTHING" ROOT CAUSE: the trigger was raw is_key_pressed(Keycode::B) —
+PHYSICAL B, which on the operator's Dvorak layout is NOT the key labeled 'b'. Same layout trap as the 'p'
+inventory bug. FIX: new rebindable GameAction::Bend (default physical B via with_common_bindings; Dvorak preset
+ALSO binds it to physical-N = the Dvorak 'b' key). Trigger is now bindings.is_action_pressed(GameAction::Bend).
+Added to keybind_ui rebindable_actions → shows in Settings▸Controls, rebindable. Moved the r523 debug
+weapon-give off Keycode::N (now Dvorak-Bend) → Keycode::Minus to avoid collision. lib+bin+tests compile.
+DEVICE-VERIFY: stand still (build resonance), hold the bend key (Dvorak 'b' / physical N, or rebind) aiming at a
+creature → it gets knocked back + HUD shows the strike. NEXT: damage/elemental effects per discipline (knockback
+is the first visible payoff; resolve_bend already returns the discipline effect to apply), extend targets to mobs.
+
+## r528 — rebind to MOUSE BUTTONS + PageUp/Down (operator: bind Bending to a side button)
+Bending was already in the Controls list (r527), but the rebind capture only scanned keyboard keys + only wrote
+keyboard bindings, and action triggers ignored mouse bindings — so a player COULDN'T put Bending on a side mouse
+button. Now they can. KeyBindings already had bind_mouse/mouse_buttons_for_action/is_action_pressed_mouse; added
+`set_mouse_binding` (clean rebind: clears the action's keys + frees the button from others) and mouse PERSISTENCE
+(StoredBindings gained `mouse: HashMap<GameAction,Vec<String>>` with #[serde(default)] so old files still load;
+save/load round-trip MouseBtn Debug names via mouse_from_name). keybind_ui: capture_candidates gained PageUp/
+PageDown/Home/End/Insert/Delete; new mouse_capture_candidates() = [Middle, Back, Forward] and mouse_label
+(Mouse-Mid / Mouse-4 / Mouse-5). Bin Controls page: rows now show mouse bindings too; the capture loop, after
+finding no key, scans mouse_capture_candidates and calls set_mouse_binding + saves. Bend trigger now fires on
+is_action_pressed OR is_action_pressed_mouse. lib+bin+tests compile. DEVICE-VERIFY: Settings▸Controls → click
+the "Bending" row → press Mouse-4/5 or PageUp → row shows it, persists across restart, and holding that input casts.
+NOTE: only Bend's trigger ORs in the mouse check so far; other actions can adopt the same OR if desired.
+
+## r529 — bending: distinct elemental effects (Air gust + Water surge)
+Found bending was already richly wired: the discipline match raises an Earth stone pillar, blooms Fire as a heat
+source, and strikes (the _ arm) damage + kill creatures with loot drops. My r527 AOE knockback ran for EVERY cast,
+redundant with the strike. Refactored so each ELEMENT is distinct: removed the always-on knockback and added two
+arms. AIR (Elemental(Air)) = a gust that knocks back every creature resolve_bend's targeting catches, shoved along
+aim + lifted, scaled by hit strength × power (HUD "air gust — N caught"). WATER (Elemental(Water)) = a gentler,
+more horizontal surge that shoves creatures AND conjures a Water block at the aimed surface point (visible water you
+pulled up). Both use bending_compose::resolve_bend with a Copy of the resonance (no double-spend). Now: Earth→pillar,
+Fire→bloom, Air→gust-knockback, Water→surge+water, strike→damage/kill. The cast element is derived from environment
+(swimming→Water, near heat→Fire, airborne→Air, else Earth) so different contexts cast different elements. bin
+compiles. DEVICE-VERIFY: cast (hold bend key) while swimming → water surge + a water block appears; airborne → air
+gust scatters creatures; near fire → thermal bloom; on ground → earth pillar.
+
+## r530 — worldgen: surface ruins (structure_template wired into the world)
+docs/design/STRUCTURES_worldgen.md describes a full structure pipeline whose pure cores all exist
+(structure_template::make_ruin, structure_place, dungeon_layout, structure_grammar, cave_carve, …) — but NOTHING
+placed them into the world. Wired the first one. New Phase 6 in cpu_generator::generate_chunk: deterministic
+per-region surface ruins. Each 80×80 region rolls (ruin_region_hash) ~30% to host one make_ruin footprint (5..8
+square, wall ring + floor + crumble gaps) at a hashed anchor, on dry land (surface ≥ SEA_LEVEL). Stamped
+cross-chunk EXACTLY like the Phase 5 trees — every chunk overlapping the footprint writes its own slice via
+ruin_write (overwrites air / foliage / soft ground only, never solid rock, so ruins drape on terrain), no
+per-chunk RNG, seams match. Floor = a cobblestone slab at the surface; walls = 2..3-tall cobblestone columns.
+lib+bin compile. DEVICE-VERIFY: explore and look for broken cobblestone ruins scattered on flat-ish dry ground
+(~one per few 80-block regions). CAVEAT: placement lives in the CPU generator (same path as trees) — if a run uses
+pure GPU worldgen and trees still appear, ruins will too; if trees come only from CPU, so do ruins. NEXT: biome
+flavor (sandstone ruins in desert), towers (tower_taper), and dungeons (dungeon_layout + cave_carve) are the next
+structure cores to wire the same way.
+
+## r531 — first-person head-clip + humanoid bipeds (operator: "chicken looking thing" + head blocked screen)
+TWO fixes from the operator's feedback running as a Biped.
+(1) FIRST-PERSON HEAD CLIP — fp_body (r515) bakes your avatar at the player position, so in first person the head/
+torso filled the screen. In the self_avatar bake, when camera_mode==0, clip away any triangle whose three verts are
+all at/above eye level (clip_y = view.position.y - 0.25): you still see your body/arms/legs looking down, but the
+head no longer blocks the view. Model-agnostic (works for any avatar). Third-person/cinematic keep the full model.
+(2) HUMANOID BIPEDS — the Biped archetype rendered chicken-like: neck juts FORWARD (head carried out front), no
+arms, and a 70% wing chance. creature_design now treats Biped as UPRIGHT like the Lauscher: added is_biped/upright
+flags; neck climbs straight up (head ON TOP); head placed over the body (hh*0.15 not hh*0.8); a flat humanoid face
+(small nose) instead of an animal snout; a single pair of articulated arms (upper arm + forearm + hand) at the
+shoulders; and wing chance dropped to 0. Lauscher-only traits (many-armed stacks, big ears, smaller eyes, gape/hinge)
+stay Lauscher-only. The "Wanderer"/"Strider" presets are Biped, so they now read as humanoids. lib+bin+lib-tests
+compile. DEVICE-VERIFY: pick Wanderer/Strider — upright human-ish figure with arms and head on top; in first person
+the head no longer fills the screen; look down to still see arms/body/legs.
+
+## r531 (addendum) — player dragons use the NEW forge dragon
+The sophisticated voxel FORGE dragon (sim::dragon_forge::build → res-256 model, .with_forge, element-tinted by
+Genome) was already used by WORLD dragons (spawn(CreatureKind::Dragon) → spawn_dragon_with_genome). But the PLAYER
+avatar for Arche::Dragon presets (Heliographer/Windwalker/Tidecaller/Stormweaver) built via from_blueprint = the OLD
+box anatomy. Fixed the self_avatar build: when active_character.arche()==Dragon, spawn via spawn_dragon_arche(seed)
+so the avatar carries a forge and creature_to_vertices_lod dispatches to forge_to_vertices. Now player dragons match
+world dragons (new model). Non-dragon archetypes still use from_blueprint. bin compiles. DEVICE-VERIFY: pick a dragon
+preset, go third-person (F5) — the detailed voxel forge dragon, not the blocky box one.
+
+## r532 — bending thermal-phase payload (ice-melt) + biome-flavored ruins
+Continuing bending + structures per the operator.
+BENDING: the Fire/ThermalPhase arm now carries a real phase-change payload — besides the heat bloom, it MELTS a
+2..4-block radius (scaled by power) of nearby BlockId::Ice into Water and sublimates SnowBlock to Air, via
+chunk_manager.block_at/set_block, with a HUD "thermal phase melted N" line. So firebending visibly thaws ice and
+clears snow.
+STRUCTURES: ruins are now biome-flavored. The Phase-6 ruin pass samples biome_at_3d at the anchor and picks the
+wall/floor material: Desert/Beach → Sandstone, RedSandstoneCanyon/BloomingCanyon → RedSandstone, Swamp/LushCave →
+MossyCobblestone, else Cobblestone. Ruins now read as belonging to their landscape.
+lib+bin compile. DEVICE-VERIFY: firebend at ice/snow → it turns to water / clears; explore a desert → sandstone
+ruins, a canyon → red-sandstone ruins, a swamp → mossy ruins. NEXT (noted): Stormstrike CHAIN on the strike arm
+(needs care with swap_remove index handling) and towers via tower_taper.
+
+## r533 — STRUCTURES under GPU worldgen + character access/variety (operator: no structures, can't switch character)
+ROOT CAUSE of "no structures": on the M2, Backend::Auto picks GPU worldgen (gpu_generator). TerrainGenerator::generate
+called gpu.generate_chunks, which reads back the compute-shader terrain with NO CPU decoration — so the ruins (placed
+only in cpu_generator::generate_chunk) never reached the operator's chunks. (Vegetation comes from the separate flora-
+store streaming, which is why trees showed but ruins didn't.)
+FIX: extracted ruin placement into WorldGenerator::stamp_ruins(blocks, coord) (analytic surface_y + biome, so it works
+for any chunk). cpu_generator calls it (as before). TerrainGenerator's GPU branch now uses gpu.generate_batch, runs
+self.cpu.stamp_ruins on the raw blocks (self.cpu carries the biome registry → biome-flavored ruins), THEN builds the
+Chunk (before from_blocks, so plant/wood indices stay correct). So ruins now appear under BOTH backends. Bumped to ~38%
+of regions, walls 3..4 tall for visibility, and added a "[worldgen] ruin at (x,y,z) WxH" info log (one per ruin, when
+its anchor lands in a chunk) so the next session log CONFIRMS generation.
+CHARACTERS: (1) the character selector was only on the TITLE screen — added a "Character" button to the in-game PAUSE
+menu (sets open_character_local), so you can switch mid-world; the bin already applies character_chosen + rebuilds the
+avatar. (2) Added the missing GRAVITYBENDER dragon preset. (3) Mapped each named elemental dragon to its element in the
+avatar build (helio→Fire, tide→Water, wind→Air, storm→Storm, gravity→Dust) via spawn_dragon_element, so they render as
+distinct elemental forge dragons instead of all-same-by-seed.
+lib+bin+tests compile. DEVICE-VERIFY: explore → cobblestone/sandstone ruins (grep log for "[worldgen] ruin"); Esc →
+Character → pick Tidecaller/Gravitybender/Heliographer → F5 to see the element-tinted forge dragon.
+NOTE: the forge HTML's bespoke voxel HERO builders (buildHeliographer/Tidecaller/Gravitybender/… — hand-placed scale
+plates, horns, armor) are far richer than the genome forge; fully porting them to Rust is a large separate effort.
+This roll makes all five selectable + elementally distinct via the genome forge as the interim.
+
+## r534 — HERO CHARACTER TYPES are humanoid benders, not dragons (operator correction)
+Operator clarified: the character-forge HTML grafts a CHARACTER designer onto the dragon forge. The dragon is only ONE
+tab; the other five — Heliographer, Stormweaver, Windwalker, Tidecaller, Gravitybender — are distinct HUMANOID player
+character types (voxel "heroes", each with a shoulder/hip rig; Tidecaller is gendered female) for multiplayer + "bending
+separation". r533 wrongly made them Arche::Dragon. Fixes:
+- presets(): the five heroes are now Arche::Biped (the upright humanoid model from r531), keeping their tints. They render
+  as humanoid characters, NOT dragons.
+- Reverted r533's dragon-name→element mapping in the self_avatar build. Only a true Arche::Dragon uses the forge dragon;
+  everything else (incl. the heroes) takes the humanoid blueprint path.
+- BENDING SEPARATION: added player_character::bend_element(name) -> Option<gesture_resolve::Element> (Heliographer→Fire,
+  Tidecaller→Water, Windwalker→Air, Stormweaver→Air/storm, Gravitybender→Earth). At the bend cast, the player's character
+  element now OVERRIDES the environment-derived element, so each hero bends its own element regardless of surroundings.
+  Ordinary characters still fall back to the environment (water→Water, heat→Fire, airborne→Air, else Earth).
+lib+bin+tests compile. DEVICE-VERIFY: Esc → Character → pick Tidecaller/Gravitybender/Heliographer → F5 shows a HUMANOID
+(not a dragon); casting a bend produces that character's element anywhere (e.g. Tidecaller surges water on dry land).
+NOTE: still interim — the forge's bespoke hand-built voxel hero geometry (buildHeliographer/Tidecaller/… with scale
+plates, horns, armor, + the __RELIEFS 2D voxel portraits) is a large separate port; this roll uses the upright humanoid
+model + correct element wiring. Port the real hero meshes one at a time when requested.
+
+## r535 — adaptive-RD slew limit + camera zoom keys + avatar fade + neck tracking
+Confirmed from operator log: ruins generate (`[builders] ruin at ...`, `[worldgen] ruin ...`) — just none in the ocean
+(dry-land only, as intended). Four changes:
+- ADAPTIVE RENDER-DISTANCE SLEW: the cap started at 32 (so distance slammed straight to max at spawn) and regrew +1 every
+  400ms with no guard, and each new ring at large distance is a heavy one-frame spike. Now: cap starts LOW (~6) and ramps
+  up; growth requires a streak of consecutive good-frame checks (UNENDLICH_ADAPTIVE_RD_GROW_STREAK, default 3) so a single
+  spike frame resets the streak and PAUSES growth until the rate is stable; shrink stays fast. Smooths the ramp, kills the
+  big spikes.
+- CAMERA ZOOM KEYS: +/- (Equal / Minus) adjust third-person & cinematic camera distance via a cam_zoom multiplier
+  (0.4..3.0; − farther, + closer). In first-person the keys keep their old bindings (the Minus debug weapon-give is now
+  gated to first-person only). Applied to both pull-back distances.
+- AVATAR FADE: the player's own avatar now fades as it obscures more of the camera, in ALL views, down to 50%. Entity
+  verts are RGB-only / opaque pipeline, so this is screen-door (dithered) transparency — keep a coverage-scaled fraction
+  of triangles via a stable per-triangle hash (no flicker). Coverage = fraction of avatar tris close+central in front of
+  the render camera. In first-person it stacks on the r531 above-eye head clip.
+- NECK TRACKING: the avatar's head/neck now tilts with the look pitch (av.gaze_pitch = view.pitch, clamped ±0.95), via the
+  gaze→head rig in the vertex builder, so looking up/down moves the head out of the camera's way.
+bin compiles. DEVICE-VERIFY: enable adaptive RD and watch for a smooth ramp without 80ms+ spikes; in third/cinematic press
++/- to zoom; zoom in close (or look down in FP) and confirm the body dithers toward ~50%; look up/down and confirm the
+head tilts (if it tilts the WRONG way, flip the sign on av.gaze_pitch).
+
+## r536 — REAL per-vertex alpha for the avatar fade (replaces r535 dithering)
+Operator preferred true transparency over the screen-door dither. Implemented an alpha channel end-to-end through the
+entity pipeline:
+- EntityVertex gained `alpha: f32` (stride 24→28; defaults 1.0 via the new `EntityVertex::opaque` helper and at all 7
+  construction sites — precip/drops/viewmodel/creature bakes all stay opaque).
+- entity_pipeline.rs: added vertex attribute location 2 (R32_SFLOAT @24), bumped stride to 28, extended the manual
+  upload packer to emit the 7th float, and ENABLED alpha blending (SRC_ALPHA / ONE_MINUS_SRC_ALPHA, color+alpha ADD).
+  Depth-test+write stay ON, so opaque entities (alpha=1) are pixel-identical to before and the translucent avatar's
+  overlapping triangles don't double-composite (nearest wins).
+- shaders/entity.vert + entity.frag: pass `in_alpha`→`v_alpha`; frag now outputs `vec4(color, v_alpha)` (fog still
+  composited into rgb). Recompiled assets/shaders/entity.{vert,frag}.spv with glslangValidator (covers both the
+  include_bytes! non-hot path and the hot-shaders runtime path, which read the same assets/shaders dir).
+- bin: the avatar fade now sets real per-vertex alpha = opacity (1.0→0.5 by camera coverage) instead of dithering tris;
+  the r531 first-person above-eye head clip still applies.
+lib+bin+tests compile; SPIR-V regenerated. DEVICE-VERIFY: zoom in close in third/cinematic (or look down in FP) — the
+body should smoothly turn translucent (real alpha, no dither grain), down to ~50%; confirm other entities/mobs/rain are
+unchanged (fully opaque).
+NOTE (minor): froxel fog in-scatter is multiplied by alpha on the translucent avatar, so its fog glow is slightly dimmer
+when faded — cosmetic, only affects the semi-transparent self-avatar.
+
+## r537 — camera occlusion package: pinch + near-camera terrain fade + deeper avatar fade
+- AVATAR FADE FLOOR: lowered from 50% to 10% opacity (opacity = 1.0 − 0.9·coverage).
+- CAMERA PINCH: new pinch_camera_distance() marches the chase-camera offset against the world (chunk_manager.block_at +
+  is_solid) and pulls the camera in so terrain can't wedge between it and the player. 5% baseline pinch always, then
+  clamp to just short of the first solid hit (closer hit ⇒ tighter pull = the requested distance weight). Applied to both
+  third-person and cinematic by raycasting along the true eye→camera offset (handles the cinematic's right/up offset too).
+- NEAR-CAMERA TERRAIN FADE (chunk.frag): fragments closer than ~0.85 units dissolve via an ordered Bayer screen-door
+  (fully gone < 0.12), so a block right on the lens — backing into a wall, or the camera pinched into a corner — no longer
+  blacks the screen. Discard-based (no blend, no pipeline change); works in ALL perspectives incl. first-person. Reuses
+  the same Bayer pattern the water-transparency path already uses.
+- SHADERS: edited chunk.frag (near fade) + entity.{vert,frag} (already alpha from r536); recompiled all three .spv with
+  glslangValidator --target-env vulkan1.2 and removed their .hash sidecars so build.rs regenerates cleanly on the operator
+  build. (build.rs auto-recompiles changed GLSL anyway; this keeps the shipped .spv consistent for the hot-shaders path.)
+bin compiles; shaders validate. DEVICE-VERIFY: in third/cinematic back into a wall or enter a corridor — the camera
+should pull in smoothly instead of clipping into terrain; any block that still reaches the lens should dissolve rather
+than black out; the avatar should fade further (to ~10%) when it fills the view.
+
+## r538 — forge HERO MODELS ported to the engine + body-build sliders
+Port of the character-forge voxel heroes so you can actually play as them, plus the muscularity/tallness sliders.
+- NEW MODULE hero_forge.rs: a parameterized humanoid voxel hero builder. `HeroKind` (Heliographer/Windwalker/Tidecaller/
+  Stormweaver/Gravitybender — keyed by NAME, since Storm+Wind share the Air element) selects palette + element features
+  (Heliographer sun-halo, Stormweaver/Gravitybender horns, Tidecaller head-fin + female build, Gravitybender heavy
+  plating). `build(kind, &BuildParams, origin, yaw, gaze_pitch) -> (Vec<EntityVertex>, Vec<u32>)` assembles legs/pelvis/
+  torso/chest-plate/pauldrons/arms/neck/head as cubes, applies body yaw + head gaze pitch, and scales every part by the
+  build sliders. HONEST SCOPE: engine-native interpretation matched to the forge's proportions/palettes/features, NOT a
+  byte-for-byte copy of the bespoke JS geometry.
+- CharacterProfile gained `build: BuildParams { height, bulk, head, shoulders, arm, leg }` (all default 1.0,
+  #[serde(default)] so old character.json still loads). CharacterProfile::new keeps its signature.
+- BAKE WIRING: in the self_avatar bake, characters whose name resolves to a HeroKind now render through hero_forge::build
+  (shaped by active_character.build) instead of the generic blueprint; everyone else unchanged. Runs per-frame so slider
+  edits are live once applied. Flows through the existing coverage-fade / real-alpha / FP head-clip path.
+- MENU SLIDERS: the Character window's custom slot now has tallness / muscle / head / shoulders / arms / legs sliders
+  (range 0.7–1.4) editing the profile's BuildParams; persisted + applied via Save & Use (bin takes character_chosen →
+  active_character, rebuilds avatar).
+lib + tests + bin compile. DEVICE-VERIFY: Character → pick a hero (e.g. Tidecaller) → Save & Use → F5/third-person shows
+the element-themed humanoid (fin/halo/horns/plating per hero); reopen Character (custom slot) → drag muscle/tallness/etc.
+→ Save & Use → the in-world body reshapes.
+KNOWN LIMITS (next): the menu's 2D PREVIEW still draws the generic blueprint, not the hero mesh (preview-only — in-world
+is correct); heroes are a static gaze-tracked pose (no walk animation yet); sliders live on the custom slot so the flow is
+pick-hero → Save & Use → reopen → adjust. A byte-faithful port of each bespoke JS hero (exact scale plates / __RELIEFS 2D
+portraits) remains a per-hero follow-up if you want exact geometry.
+
+## r539 — leaves GPU-mesher fix + water-rising fix + hero walk cycle
+Three operator reports addressed.
+- LEAVES (GPU vs CPU, confirmed): r523 fixed the solid-leaf cube in the CPU mesher (is_meshable excludes
+  is_subvoxel_only), but the LIVE path is the GPU octree mesher, whose `is_solid_opaque` only excluded Air+Water — so it
+  still emitted full solid cubes for leaves/crops UNDER the subvoxel fronds ("solid block over the leaves"). Fixed in
+  lockstep: chunk_mesh_octree.comp `is_solid_opaque` now also returns false for 18/20 (Oak/Birch leaves) and 88/89/90/91
+  (Carrot/Potato/Cabbage/Sprout); the Rust CPU-ref (gpu_meshing_octree_cpu_ref.rs) now mirrors it via
+  `!is_subvoxel_only()` so UNENDLICH_OCTREE_MESH_VERIFY parity holds. Recompiled the .spv + dropped its hash sidecar.
+  (Sparse/runs meshers use CPU-extracted SurfaceRecords already fixed by r523's surface.rs; chunk_mesh.comp is a separate
+  path, left as-is.)
+- WATER RISING (regression): UNENDLICH_WATER_SIM defaulted to TRUE despite the code comment saying "off by default", so the
+  experimental in-chunk settle ran for everyone — and apply_rain feeds water into exposed columns each tick, so bodies
+  visibly CLIMB during/after rain. Restored the documented default to OFF (opt in with UNENDLICH_WATER_SIM=1). The sim is
+  still backlog-blocked on a persistent per-chunk field; rain-equilibrium tuning is the follow-up before it ships on.
+- HERO WALK CYCLE (character "needs more work"): hero_forge box_at generalized to an optional (pivot, angle) rotation;
+  legs now swing fore/aft about the hip and arms counter-swing about the shoulder, driven by a new `gait` arg. The bin
+  advances a gait phase over time with amplitude tracking horizontal speed (settles to 0 when standing). Heroes were a
+  static pose before; they now walk.
+lib + tests + bin compile; octree .spv recompiled + validated. DEVICE-VERIFY: foliage should show fronds (no solid cube
+over leaves; A/B vs CPU with UNENDLICH_GPU_MESHER=0 should now match); water should sit still in rain (no climbing) unless
+you set UNENDLICH_WATER_SIM=1; a forge hero (F5) should swing arms/legs while walking and settle when idle.
+
+## r540 — camera juice: first-person walk bob + chase-camera smoothing
+Picked up from the backlog's "camera juice (shake/smoothing/step-bob)" item, continuing the recent camera work. Both
+effects are RENDER-ONLY — they offset render_view, never the logical eye (local_player.view), so physics, raycast,
+culling and audio are unaffected.
+- FIRST-PERSON WALK BOB: a subtle head bob while moving — vertical at 2× stride frequency, lateral at 1×, amplitude eased
+  toward the player's horizontal speed (settles to 0 when standing / swimming). Phase cadence rises a little with speed.
+  Amplitudes are small (≤~0.045) so it reads as weight, not nausea. Toggle UNENDLICH_VIEW_BOB=0.
+- CHASE-CAMERA SMOOTHING: in third/cinematic the camera eases toward its (pinched) target each frame instead of snapping,
+  so +/- zoom and the occlusion pinch glide. Snaps on big jumps (>6u: teleport/respawn/mode switch) to avoid a long
+  slide; the smoothed state resets when leaving a chase view so re-entry snaps the first frame. Toggle UNENDLICH_CAM_SMOOTH=0.
+bin compiles (bin-only; no lib/shader changes). DEVICE-VERIFY: walk in first-person — a gentle bob that fades when you
+stop; in third/cinematic, zoom with +/- or walk into a wall — the camera should glide rather than jump. Either is
+disable-able via its env var if it feels off.
+
+## r541 — character menu previews the actual hero mesh
+Closes the r538 limitation where the menu's 2D silhouette always drew the generic blueprint, even for forge heroes.
+- NEW hero_forge::preview_boxes(kind, &BuildParams) -> Vec<ProjectedBox>: builds the hero at rest (yaw/gaze/gait=0),
+  takes each cube's X-Y side-profile rect, and normalizes the figure into the [0,1] +y-up unit square the menu painter
+  expects — same convention as creature_viewer::project, so it drops straight into char_preview (depth-sorted as before).
+- world_renderer: when the highlighted character resolves to a HeroKind, the preview now comes from preview_boxes (shaped
+  by the live build sliders) instead of the blueprint projection; non-heroes are unchanged. Updates one frame after a
+  slider drag (slider write-back lands at end of frame), which is imperceptible.
+lib + bin compile. DEVICE-VERIFY: open Character, highlight a forge hero — the 2D preview should now show the element-themed
+humanoid (fin/halo/horns/plating, body proportions) rather than the generic blueprint, and reshape as you drag the build
+sliders.
+
+## r542 — impulse camera shake (completes the camera-juice trio: bob + smoothing + shake)
+- IMPULSE SHAKE: a hard landing now jolts the camera, scaled by impact speed (mapped from the existing landing detector
+  at prev_fall_vy < -9; sub-threshold landings don't shake). `shake_mag` decays exponentially (~0.25s) and the per-frame
+  offset is a multi-frequency sine on the camera's right/up axes, so it reads as a jolt rather than a wobble. Render-only
+  (offsets render_view after bob+smoothing; the logical eye is untouched). Toggle UNENDLICH_CAM_SHAKE=0.
+  Hooked into the same landing branch that already emits the dust puff, so it fires exactly when you thud down. Easy to
+  extend later (damage, bend impacts, nearby thunder) by kicking shake_mag from those events.
+bin compiles (bin-only). DEVICE-VERIFY: take a long fall and land — a brief jolt that settles fast; small hops shouldn't
+shake; disable with UNENDLICH_CAM_SHAKE=0.
+
+## r543 — GPU mesher: fix magenta blocks (color-table gap vs the CPU mesher)
+The GPU octree mesher's color_for_block only covered ids up to 47/56/80, so 20 defined blocks fell through to the magenta
+default and rendered magenta in GPU worlds (the "magenta foliage/blocks" report). Added the missing entries, values =
+world::blocks::base_color/255 so GPU and CPU worlds match: Sandstone(48), Obsidian(49), CopperOre(50), Quartz(51),
+OakPlanks(57), StoneBricks(58), Bricks(59), Glass(61), IronBlock(62), GoldBlock(63), CoalBlock(64), Bookshelf(65),
+Pumpkin(66), MossyCobblestone(81), PolishedStone(82), SmoothSandstone(83), Terracotta(84), ChiseledStoneBricks(85),
+DarkOakPlanks(86), PolishedBasalt(87). (Crops 88–91 stay magenta-irrelevant — r539 made them not cube.) Recompiled the
+.spv (glslang RC=0) + dropped the hash sidecar. NOTE: color is NOT part of the UNENDLICH_OCTREE_MESH_VERIFY parity check
+(geometry only) — the CPU-ref color table was already ~34 blocks behind with no failures — so no CPU-ref sync needed; the
+r539 geometry change WAS synced.
+bin compiles; shader validates. DEVICE-VERIFY: place/þgenerate any of the above blocks (planks, bricks, glass, pumpkin,
+mossy cobble in ruins, sandstone in deserts) — they should show real colours, not magenta.
+NOT DONE (need device/CPU-side, not blind shader edits): missing top faces looks like neighbor_py wiring/LOD, not the
+sampler logic (which correctly returns air on open boundary); biomes 19–27 GPU port is the big remaining worldgen-shader item.
+
+## r544 — GPU shader audit + CPU-ref color table synced
+Investigation pass on the GPU-shader backlog (the operator asked to push on these regardless of device-verify risk):
+- BIOMES 19–27: verified ALREADY fully wired in chunk_generation.comp — determine_biome (r457/r458), height_modifier
+  (r458), surface_block_type (r462) and the tree decision (r458) all return/handle Savanna/Jungle/Taiga/CrystalCave/
+  LushCave/Mesa/Mangrove/VolcanicWastes/FrozenOcean with the same thresholds + blocks as biomes.rs. The "CPU-only" backlog
+  note was stale; closed it.
+- MISSING TOP FACES: diagnosed as a CROSS-LOD boundary issue, NOT a same-LOD bug. The octree sampler returns air on an
+  open/unloaded +Y boundary (top face emits) and octree_sample always reads full-res data, and the CPU neighbor_py wiring
+  (gpu_meshing_octree.rs lookup((0,1,0))) is correct. Remaining artifact is at LOD-band boundaries — needs on-device LOD
+  work, not a blind shader edit. Left untouched rather than risk a regression.
+- CPU-REF COLOR TABLE SYNCED: render/gpu_meshing_octree_cpu_ref.rs::color_for_block claimed to "mirror the GLSL" but was
+  ~34 blocks stale (only ~12 entries). Replaced it with the full table (65 arms) matching chunk_mesh_octree.comp after the
+  r543 additions. Color is NOT part of the VERIFY geometry parity check, so this changes no current behavior — it just
+  makes the mirror honest and protects any future color-aware comparison.
+lib + tests compile. No shader/runtime behavior change beyond r543; this is audit + test-infra hygiene.
+
+## r545 — BIG PASS Roll 1: survival HUD + hero held-item + hero idle
+First roll of the planned pass (docs/BIG_PASS_PLAN_r545.md). All pure-Rust, compile-verified.
+- SURVIVAL HUD (C1): new WorldRenderer::hud_survival (SurvivalHud {hunger,thirst,stamina,comfort,body_c}); the bin fills
+  it each HUD tick in survival mode. Renderer draws on-screen bars above the hotbar — Hunger (green→amber→red as it
+  empties) and Warmth (fill = comfort, blue cold / green ok / red hot, labelled with body °C). Hidden in creative / while
+  a menu is up. Turns the previously console-only Vitality + Thermal systems into a visible loop. (thirst/stamina fields
+  carried now, drawn in Roll 3.)
+- HERO HELD ITEM (A1): hero_forge::build now takes a HeroPose { yaw, gaze_pitch, gait, anim_t, held_color }. When the
+  player holds something, a small item box renders in the hero's right hand and swings with the arm; colour by item
+  category (steel weapon / gold / iron / meat / generic). Third-person heroes were empty-handed before.
+- HERO IDLE (A2): a slow breathing head-bob + opposite-arm idle sway (driven by anim_t) so a standing hero reads as alive
+  instead of frozen. Tiny amplitudes so it doesn't fight the walk cycle.
+hero_forge build signature changed to (kind, params, origin, &HeroPose); preview_boxes + the bin call updated. lib + bin
+compile. DEVICE-VERIFY: enter survival (UNENDLICH_MODE=survival) → Hunger/Warmth bars show above the hotbar and react
+(eat, stand by fire / in cold); as a forge hero (F5) hold a weapon → it shows in-hand and swings; stand still → subtle
+breathing/sway.
+
+## r546 — BIG PASS Roll 2: playable dragon flight + dragon density cap
+- B1 PLAYABLE DRAGON FLAPS: the dragon baker (creature_to_vertices, entity.rs:1175) already chose WingPose from velocity
+  (climb/fast → Beating, fast descent → Flared, else Spread), but the self-avatar's anim_time + gait_phase were only ticked
+  for ROAMERS — so the playable dragon picked the Beating pose and held it frozen. The bin now advances av.anim_time
+  (+frame_dt_s) and av.gait_phase (with horizontal speed) every frame in the self-avatar update, so the wings actually beat
+  and the legs step. Forge heroes use their own hero_gait_phase, so this is dragon/blueprint-avatar only in effect.
+- B3 DRAGON DENSITY CAP (operator note r441): the 220u DRAGON_MIN_SPACING stopped clustering but not total count, so a
+  roaming player could still accumulate too many dragons. Added a hard concurrent cap (count active Dragon roamers; skip
+  the spawn once at/over the cap) at BOTH dragon spawn paths — the request-queue path (~4106) and the ecology-stream path
+  (~6657, where the apportioned budget can also emit dragons). Tunable via UNENDLICH_MAX_DRAGONS (default 6).
+bin compiles. DEVICE-VERIFY: play as a dragon (pick Arche::Dragon), fly up / glide fast → wings beat; dive → flare; on the
+ground → idle. Heavy-dragon seeds should now settle to ≤6 concurrent dragons (set UNENDLICH_MAX_DRAGONS to taste).
+
+## r547 — BIG PASS Roll 3: thirst pillar + stamina/thermal on the HUD
+- C2 THIRST (new pillar): the player now carries a hydration reserve (reuses sim::dragon_thirst::Hydration — drain/drink/
+  is_parched). It drains over time (slowed ×0.3 from the dragon constant ⇒ ~2.8 min idle, faster while sprinting) and
+  refills while standing in water (feet in a Water block — `drink(dt)` at 0.6/s, tops up in a couple seconds). Parched
+  (<20%) saps vitality, feeding the existing starvation/death loop rather than adding a separate death path. fg_hydration
+  lives beside fg_thermal; ticked in the survival services block next to the in_water/swimming check.
+- C3 STAMINA: the sprint reserve was ALREADY fully wired (sim::stamina — sprint drains it, gated on the meter, 25% speed
+  penalty until it recovers past 15%); this roll just surfaces it on the HUD.
+- HUD now shows four bars above the hotbar: Hunger, Thirst (blue→amber→red), Stamina (cyan-green), Warmth (°C). Panel
+  moved up (ph−190) to clear the hotbar. SurvivalHud.thirst fed from fg_hydration.level (was a 1.0 placeholder).
+lib + bin compile. DEVICE-VERIFY: in survival, watch Thirst fall (faster sprinting) and refill when you stand in water;
+let it hit parched and confirm vitality starts dropping; Stamina bar tracks sprinting.
+
+## r548 — hero model fixes: orientation, per-voxel colour, Heliographer staff
+Operator feedback pass on the forge heroes (hero_forge.rs). Three of the four reported issues fixed; the fourth (full
+hierarchical joint system + richer animation) is the next roll.
+- SIDEWAYS (fixed): the hero faces +X (camera forward at yaw 0) but its LIMBS were also spread along X (sx*shoulder_hw,
+  sx*hip_x were X offsets) — so arms/legs splayed front-to-back and the figure read edge-on. Rebuilt the whole body on a
+  consistent convention: facing/DEPTH = X, WIDTH (left/right) = Z, up = Y. Limb L/R offsets now use Z; torso/pelvis/chest
+  half-extents swapped so the body is wider side-to-side than front-to-back; forward features (emblem, eyes, fin) stay on
+  +X; horns/back-slab corrected. Walk swing still pivots fore/aft in the X-Y plane (correct for a Z-offset limb).
+- ALL-WHITE (addressed): the palette was 4 entries (base/cloth/accent/glow) and several heroes were light-toned, so under
+  the additive entity rim-light + fog they washed pale. Replaced with a 9-slot per-part palette (skin, hair, eye, base,
+  cloth, trim, accent, glow, boots) and assigned each body part its own colour (head/hands = skin, hair cap + back, eyes,
+  belt = trim, legs = cloth, feet = boots, torso = base, plating = accent, emblem = glow). The hero now reads as a
+  coloured character. NOTE: if any wash persists it's the shader rim-light/fog on small meshes (device-side), not the data.
+- HELIOGRAPHER RINGS (fixed): moved off the head — they were a head-halo — onto the iconic SUN-STAFF held at the left
+  side (vertical shaft + hub + a 6-segment glowing ring), per the operator.
+- Bonus toward the joint ask: limbs are now segmented (thigh+shin, upper+forearm+hand) and the head has hair + a pair of
+  eyes, so there's more articulation to animate next.
+- Preview (menu): switched the 2D projection to a FRONT view (Z→horizontal, X→depth key) since width moved to Z.
+lib + bin compile. DEVICE-VERIFY: pick each hero (F5) — should face the look direction (not edge-on), show distinct
+colours per part, and the Heliographer should carry a ringed staff at its side instead of rings on its head.
+NEXT ROLL: port the full hierarchical joint/body system + more animation states (the operator's "port the full body system
+and the joints still ... should have more [animation]").
+
+## r549 — hero rig PORT from the real character-forge models (not the ✦ relief/"star" versions)
+Operator clarified: the "star" versions are the `✦` RELIEF models (relief_sw/he/ww/tc/gb — "image-matched voxel relief
+built from concept art via voxelize.py"), a depth-renderer for dimensioning — DISCARD. The REAL models are the
+buildHeliographer/Stormweaver/Windwalker/Tidecaller/Gravitybender() functions in character_forge_3d.html. Ported those
+(was hand-authoring approximations before).
+- JOINT HIERARCHY: ported makePivots — a compounding pivot rig (bodyRoot→hips→chest→neck→head; chest→shoulder→elbow→hand;
+  hips→hip→knee→foot, 15 pivots). Implemented a tiny transform stack (Xf = rot+translate, world = parent∘local) since the
+  old single-pivot box_at couldn't compound shoulder→elbow→hand etc. This is the "full body system and joints".
+- SHARED BODY: ported buildBody faithfully — legs (thigh/shin/foot), torso (masc broad chest+deltoids / fem bust+hip flare
+  via gender), neck+collar, head (skull/jaw/eyes/brow/nose/mouth/chin/beard) + hair, arms (sleeve/forearm/hand). Each part
+  is one box at its pivot-local position; sizes are the real voxel dims ×u (u=0.072).
+- REAL COLOURS + DIMS: ported every hero's palette (the P={…} hexes) via their buildBody colour mapping (legs/foot/torso/
+  collar/skin/eye/sleeve/fore/brow/beard + accent/glow) and their dim{} proportions. Replaces the 9-slot hand-palette.
+- ORIENTATION: forge characters face +Z; remap three→engine (X=+Z, Y=Y, Z=−X) so the hero faces the look direction. Feet
+  auto-grounded (min-Y→0) for any dims/pose. BuildParams sliders scale the ported dims.
+- ANIMATION: walk (hip/knee + counter-swing shoulder/elbow about the joints) + idle (body sway, head turn, shoulder
+  breathe) driven through pivot rotations. Held item rides the right hand.
+- Preview: front (Z-Y) projection, proven output mapping (+role/bumpiness fields).
+lib + bin compile. build() signature unchanged (kind, params, origin, &HeroPose).
+DEVICE-VERIFY: each hero should now have the real proportions + real per-part colours + a jointed walk/idle, facing the
+look direction. NOT YET (next rolls): per-hero PROPS (Heliographer sun-staff+lantern+cape, Tidecaller trident+sea-beast,
+Gravitybender gravity orb+rock cubes+cloak, Windwalker sash+wind, Stormweaver storm FX); finer per-VOXEL density (1 box/
+part now, not voxel-filled); the update() element FX. Gravitybender is legless (levitator) until its debris/orb prop lands.
+
+## r550 — heroes: fix the white-wash + much richer animation
+DIAGNOSED the "very white" body: dumped the built hero vertex colours — they are CORRECT and dark (Tidecaller teal
+0.18,0.43,0.43; Stormweaver near-black 0.08) yet render white. So the data path is fine; the wash is render-side. Two
+additive culprits, both fixed:
+- ENTITY RIM LIGHT (entity.frag): `color += rcol*rim*0.85` over a flat-shaded box body pushed dark colours toward white.
+  Made it edge-only + gentle: `pow(...,3.2)`, `min(rim,0.6)`, strength `0.28` (was 0.85). Creatures still get a soft
+  silhouette rim; the base vertex colour now reads true. Recompiled entity.frag.spv (glslang RC=0, hash dropped).
+- AVATAR FADE (bin): opacity floor was 10% (`1 - 0.9*coverage`) — a covering body washed toward the bright background.
+  Softened to ~45% (`1 - 0.55*coverage`) so the body stays clearly coloured.
+RICHER ANIMATION: HeroPose now carries the raw walk_phase + walk_amp (was a single pre-baked `gait`), so build() derives
+a fuller cycle: shoulders/chest counter-rotate the hips (twist about Y), pelvis tilt/drop + weight shift, forward lean
+into the stride, deeper knee flex at speed, larger arm throw with elbow flex through the swing, a 2× vertical bob, and a
+livelier idle (breathing drift, weight shift, head turn + nod). bin passes hero_gait_phase/amp straight through.
+lib + bin compile; shader validates. DEVICE-VERIFY: heroes should now show their real (often dark/saturated) colours
+instead of washing white, and walk/idle with visibly more body english. If any wash REMAINS, the colours are confirmed
+correct in-data, so the next suspect would be the froxel-fog composite or scene exposure (not the hero).
+
+## r551 — hero props: Heliographer kit + Gravitybender levitation
+First per-hero prop pass (ported from the character-forge builders), via a new dress(kind, …) called after build_body.
+Props attach to a hand pivot (ride the arm) or to world/root space (stand upright, turn with yaw); anim_t drives spins.
+- HELIOGRAPHER: leather cap + dark sunglasses visor + gold brow rim; a flowing two-slab cape down the back; the iconic
+  sun-orb STAFF at the left (shaft + 5 gold bands + a 12-cube halo ring that slowly spins + sun disk + glowing core +
+  finial); and a LANTERN hanging from the right hand (cage top/bottom + 4 bars + caged light) that rides the arm swing.
+- GRAVITYBENDER: fixed the broken legless look — a hooded cloak (head + back), a floating DEBRIS PLATFORM of 5 stone
+  slabs (gentle bob; becomes the grounded base so the sorcerer levitates on rubble), and a purple gravity ORB in front of
+  the chest with 3 ROCK CUBES orbiting it (anim_t).
+lib + bin compile. DEVICE-VERIFY: Heliographer should carry a ringed sun-staff (left) + swinging lantern (right) under a
+capped/visored head with a cape; Gravitybender should float on bobbing debris with an orbiting-rock gravity orb instead of
+standing legless.
+NEXT: Windwalker (blue sash + wind streams), Tidecaller (trident + sea-serpent mount), Stormweaver (storm staff + FX);
+optional per-voxel density (currently 1 box/part).
+
+## r552 — survival crafting tree (gather → smelt → forge → fight)
+Expanded the C-menu crafting from 5 hardcoded recipes to a real survival tree (still using the wired
+items::crafting::{Recipe,can_craft,craft} against fg_app.inventory(), so the gather→drops→inventory→craft loop is intact):
+- Smelting: Iron / Gold / Copper Ingot (ore + coal).
+- Building stock: Oak Planks ×4, Stone (4 cobble), Stone Bricks ×4, Glass (2 sand), Bricks (clay).
+- FORGED WEAPONS (ids 4000..4007 = Dagger/Blade/Greatsword/Axe/Greataxe/Spear/Staff/Builder Wand) from ingots + a plank
+  handle — completes gather→smelt→forge→fight. (4006 Staff / 4007 Builder Wand are the items the operator flagged as the
+  hero staff/wand props; weapons are holdable via the survival hotbar + durability path at bin ~3168.)
+- Cooking: Cooked Meat (raw meat + coal) as a campfire alternative.
+The sim::recipe_book index is now built FROM the recipe inputs (was a parallel hand-list that could drift), so holding an
+ingredient still floats its recipes to the top. Added canonical tooltips for every new output.
+bin compiles. DEVICE-VERIFY: in survival, mine ore+coal+logs, press C, and the new recipes should light up as their
+ingredients are met; forge a weapon and hold it from the hotbar.
+NOTES for next: (1) hero props → STARTER inventory items per character (operator: they "come with the characters"; 4007
+Builder Wand already exists). (2) survival inventory GRID display (the creative picker shows placeable blocks; survival
+wants the player's collected stacks+counts on screen). (3) optional crafting STATIONS (recipe.rs already has Station::
+Bench/Furnace — gate smelting behind a furnace, weapons behind a bench).
+
+## r553 — unified inventory UI: crafting + inventory + hotbar switcher under `p`, centered
+Merged the separate inventory (creative picker) and crafting (C window) surfaces into one centered panel opened by `p`.
+- CRAFTING UNDER `p`: the bin now fills craft_lines whenever the inventory panel is open (gate += show_inventory, was
+  craft_menu_open only), so the recipes appear in the `p` panel. (The standalone C window still works as a quick shortcut.)
+- CENTERED: the creative inventory Area moved from top-right to screen-centre.
+- HOTBAR SWITCHER: a row of the 9 quick slots is drawn inside the centered panel — click a slot to pick the in-hand item
+  (mirrors the bottom hotbar + scroll wheel; selected slot gets the accent stroke).
+- CRAFTING SECTION: the recipes render inline under the grid in a scroll area (craft button + have/need + hover tooltip),
+  setting craft_pick exactly like the old window.
+- MOUSE SCROLL → HOTBAR: already wired (bin ~3125 cycles selected_palette_idx in game mode, wraps, survival maps it to the
+  inventory slot). Confirmed; left as is.
+lib + bin compile. DEVICE-VERIFY: press `p` — a centered panel should show the inventory grid + a HOTBAR row + a CRAFTING
+list together; clicking a craft row with met ingredients should craft; clicking a hotbar slot or scrolling should change
+the held item.
+NOTE: the panel's grid is the existing creative catalog (Inv/Items/Eggs tabs). Feeding the real survival backpack stacks
+(fg_app.inventory contents + counts) into this same grid is the natural next step if you want survival to show only what
+you've gathered.
+
+## r554 — hotbar selection: make scroll VISIBLE + Alt+home-row chord + click-to-select
+Root cause of "scroll didn't work / only number keys did": the bin tracked the active slot in `selected_palette_idx`, but
+the hotbar UI highlights `renderer.creative_selected`, which the bin never set — so scrolling changed the selection
+invisibly and felt dead.
+- SCROLL NOW SHOWS: the scroll handler and the number/home-row key handler both set renderer.creative_selected =
+  selected_palette_idx, so the bottom hotbar highlight (and the centered panel's hotbar row) move with the wheel/keys.
+- ALT + HOME-ROW CHORD: hold Left Alt and tap a labelled home-row key (a o e u i d h t n) to jump to that hotbar slot.
+  The slots were already labelled with these keys; the modifier keeps the bare keys free for movement/typing.
+- CLICK-TO-SELECT: a click in the centered inventory's hotbar switcher (r553) is now read back into the gameplay slot at
+  the top of the loop, so clicking a slot actually selects it (push from keys/scroll + this pull stay in sync via equality).
+bin compiles. DEVICE-VERIFY: scroll the wheel in-world → the bottom hotbar highlight moves and the held item changes;
+Alt+a/o/e/… jumps to that slot; clicking a slot in the `p` panel selects it.
+STILL TODO (operator noted): a HAND-HELD BLOCK viewmodel — the first-person viewmodel renders weapons but not the selected
+block, so block selection has no in-hand model yet. That's a separate viewmodel feature (render the held BlockId as a small
+cube in hand), good for the next roll.
+
+## r555 — dragon WING MEMBRANE wired (docs/TODO.md #6)
+The forge deliberately leaves the wing membrane out of the voxels ("membrane is render-only", dragon_forge.rs:225); the
+ready-made pure module wing_membrane.rs (membrane_from_box) was written for "an alpha-capable entity vertex path, once one
+exists" — which now exists (EntityVertex per-vertex alpha, r535). Wired it in forge_to_vertices (world/entity.rs): after
+the opaque bone boxes, emit ONE translucent triangle-fan membrane per wing, spanning the combined bounding box of that
+side's wing bones (joint == J_WING_L / J_WING_R), span axis = model X. Membrane vertices go through the same model→engine
+axis remap + yaw/pitch/roll orientation + origin as the boxes; colour = body_color, per-vertex alpha from wing_opacity.
+Keeps the bone boxes (structure) and adds the skin (sheet), so the wings should read as membranes instead of sparse bones.
+lib + bin compile. DEVICE-VERIFY: dragon wings should now show a translucent skin filling each wing, flapping with the
+bones. If too faint/opaque, the alpha gene (0.55) and detail (14 panels) are the knobs; if the sheet is mis-oriented, the
+span axis / chord pick in membrane_from_box is the thing to revisit.
+
+## r556 — bending: wire STORMSTRIKE lightning + fix dead Air/Water arms
+Found a real bug while doing bending work: player_bending::step resolves the discipline via discipline_for, which maps
+Air→Stormstrike, Water→HeavyBrine, Fire→ThermalPhase, Earth→Elemental(Earth). But the bin's discharge match had arms for
+`Elemental(Air)` and `Elemental(Water)` — which therefore NEVER matched, so air/water bending silently fell through to the
+generic `_` strike, and the dedicated sim::bending_stormstrike module was unused.
+- STORMSTRIKE (Air → lightning) now wired to the real bending_stormstrike::route: builds Conductors from the roamers
+  (conductance scales with hp + airborne), routes a forward conductance-seeking bolt through the aim cone (chain length
+  grows with power), and damages each chained creature with per-hop falloff. Mis-aiming (route grounds on the bender) saps
+  stamina by the misprediction penalty. A gust still follows to shove close targets. Witnessed-attack events recorded.
+- WATERBENDING re-reached: the surge+conjure arm is now under `Discipline::HeavyBrine` (Water's real discipline) instead of
+  the dead Elemental(Water), so waterbending works again.
+bin compiles, no unreachable-pattern warnings (the dead arms are gone). DEVICE-VERIFY: with UNENDLICH_MODE=survival, an
+air/lightning discharge should chain a bolt through creatures in the aim cone (HUD/log "stormstrike chained N"), and a
+mis-aim should sap stamina ("grounded — mis-aimed"); water discharges should surge + conjure water again.
+
+## r557 — GPU meshing speed: default the tiled shared-memory path ON
+The octree mesher (chunk_mesh_octree.comp) already has the right optimization built and gated: the per-cell path does
+"7 pointer-chasing octree walks" per cell (self + 6 neighbours) — the comment itself calls this "slow on Asahi". The TILED
+path (r478/r479) reinterprets each 64-thread workgroup as a 4³ spatial tile, cooperatively loads the 6³ halo (tile + 1
+border) into shared memory with ONE octree descent per contiguous run (a per-lane leaf cache collapses uniform runs to a
+single descent), barriers, then every cell reads self + 6 neighbours from LDS with ZERO further descents. Both paths
+already compute byte-identical values (verified by UNENDLICH_OCTREE_MESH_VERIFY=1 against the CPU reference) and the
+dispatch launches the same workgroup count for both (cells/64 == tiles), so it's a drop-in.
+It was gated OFF by default (UNENDLICH_OCTREE_TILE). r557 flips the default to ON (off only if UNENDLICH_OCTREE_TILE=0);
+the live Performance-page toggle still works. Logs "[mesh] octree tiled shared-memory path: ON".
+bin compiles. DEVICE-VERIFY: expect faster remeshing (fewer octree descents) especially while streaming/editing. Please
+confirm parity once with UNENDLICH_OCTREE_MESH_VERIFY=1 (GPU vs CPU mesh) on the M2; if anything looks off, UNENDLICH_
+OCTREE_TILE=0 restores the per-cell path instantly. (Did not touch the emit-path atomics — a per-cell atomic-aggregation
+is the next lever but is a riskier blind refactor; the tiled path is the bigger, verified win.)
+
+## r558 — hero models default to 2 blocks (slider → 4) + camera grounded to the face
+Hero models were ~4.2 blocks tall, so the first-person camera (physics eye 1.62) sat at mid-torso and the model
+floated ~0.12 above the ground (avatar feet were hardcoded at camera−1.5).
+- hero_forge: overall height is now ONE uniform scale applied in Body::finalize — the model is scaled so its span equals
+  `hero_total_height(params) = 2.0 * height.clamp(0.5,2.0)` blocks. Default (slider 1.0) = **2.00 blocks**, slider max
+  (2.0) = **4.00 blocks** (verified by a build dump). The other sliders (bulk/head/shoulders/arm/leg) now adjust SHAPE
+  proportions only, not overall height, so they no longer fight the height scale. Scaling is about the rig's local origin
+  (already centred) so the body stays under the camera; held props scale with the model.
+- New `pub fn hero_total_height(&BuildParams) -> f32` so the bin can size the camera + collider from the same number.
+- bin: the avatar's feet are now placed at the player's TRUE feet (`camera − (PLAYER_HALF_HEIGHT+PLAYER_EYE_OFFSET)` =
+  camera − 1.62) instead of a hardcoded 1.5. With the model at ~2 blocks this lands the camera at the face and grounds
+  the feet. Both the rebuild and per-frame avatar paths updated.
+lib + bin compile; height verified 2.00 / 4.00. DEVICE-VERIFY: default characters should look ~2 blocks tall with the
+camera at the face, feet on the ground; the height slider should scale them up to ~4 blocks.
+PENDING (next): couple the player COLLIDER height + eye offset to hero_total_height at spawn so a 4-block character also
+gets a 4-block bounding box + raised eye (today the collider stays 1.8 regardless of slider — fine at the 2-block
+default, loose for tall characters). Then: walk-slide→ground tie, falling/impact/flying poses, survival 3×9+2×2 inventory,
+Performance "advanced" tiled-mesher toggle.
+
+## r559 — STATURE system: height as the master physical scalar (foundation)
+New design (operator request): a character's height drives their whole physical identity. Documented in docs/STATURE.md
+(modelled on ELEMENTS.md) + a pointer from DESIGN_NOTES.md.
+- NEW pure module `sim::stature`: `StatureProfile` + `derive(height, bulk, density, strength) -> StatureProfile`,
+  computing mass (∝ h³·bulk·density), buoyancy (1−density), max_health, strength, hunger_rate (Kleiber ∝ mass^¾),
+  knockback dealt/resist, step_height, jump_velocity, move_speed, turn_rate, ground_shake (≈0 at the person, grows with
+  mass), and wind/water-current resist (threshold ∝ mass, mult ∝ 1/h). Anchored at the 1.8 person so `derive(1.8,1,1,1)`
+  reproduces today's tuning EXACTLY (verified: eye 1.62, jump 10, walk 4.5, step 1.1, shake 0, kbResist 0.5). Tests +
+  an example dump confirm the anchor, monotonicity (taller = heavier/stronger/slower-turn/more-shake/more-kb-resist),
+  buoyancy sign from density, and finite/clamped extremes (0.9..15.0).
+- `BuildParams.height` is now the stature in BLOCKS (default 1.8, was a 1.0 multiplier); `hero_total_height` clamps to
+  0.9..15.0 and the model uniformly scales to it — so the tallness slider now spans 0.9..15.0 BLOCKS (customizer slider
+  range widened from 0.7..1.4; 1 decimal). Default characters are 1.8 blocks with the camera at the face (r558 grounding).
+lib + bin compile. DEVICE-VERIFY: the tallness slider should now produce sprites (~0.9) up to building-sized titans (~15);
+default 1.8 unchanged/correct.
+PENDING (next roll — all read the now-authoritative profile): runtime eye-offset so the camera sits at the face for ANY
+stature; collider half-extents + feet-grounding from the profile; then max_health/hunger, move/jump/step/turn, knockback
+dealt/resist, ground_shake → camera-shake/earthquake/erosion, and wind/water-current resist. (Today non-1.8 statures
+render at the right model size but keep the 1.8 collider + 1.62 eye until that coupling lands.)
+
+## r560 — Performance: tiled mesher under an "Advanced" section + default-on reflected
+Closes the r557 follow-up. The Performance tab's GPU-mesher controls now have an "ADVANCED" subheading; the GPU tile
+mesher toggle is labelled "(on by default)" with a description noting it cuts GPU descents / speeds remeshing. The
+renderer's ui_octree_tile field now initialises to true (the bin already syncs it from UNENDLICH_OCTREE_TILE, default on,
+at startup) so the toggle reads ON out of the box. lib compiles.
+
+## r561 — stature physics coupling + semi-log height slider
+- **Semi-LOG tallness slider** (world_renderer customizer): the slider now travels in ln(height) over [ln 0.9, ln 15.0]
+  so equal travel = equal ratio (fine control near the 1.8 human, still reaches the 15-block giants), with the value
+  shown alongside ("1.8 blk").
+- **Stature physics coupling** (bin): a `player_stature` profile is derived from the active character's height/bulk and
+  recomputed whenever the character changes (the self_avatar_dirty path) + on every body creation (F6 / respawn / menu
+  launch, which now flag the resize). From it the bin drives:
+  - **collider** — `body.half_extents` set to the stature's; on a change the AABB centre is shifted by the half-height
+    delta so the FEET stay planted (no sink/pop).
+  - **camera eye height** — a runtime `player_eye_offset = eye_height − height/2` replaces the `PLAYER_EYE_OFFSET` const
+    at every camera-sync site (per-frame, respawn snap), so the camera sits at the FACE for any stature; the third-person
+    avatar feet use `player_eye_height` too.
+  - **move speed** (base walk = `move_speed`), **jump** (`velocity[1] = jump_velocity` on take-off), **step height**
+    (`params.step_height`). All anchored at the 1.8 person, so a DEFAULT character is byte-for-byte today's tuning.
+- lib + bin compile. DEVICE-VERIFY: default characters unchanged; a tall character should have a taller collider, camera
+  at the face, step over higher ledges, jump higher + move faster; a short one the opposite. Watch for ceiling clipping
+  when switching to a much taller stature in a low space (the resize keeps feet planted and grows upward).
+PENDING (next): max_health/hunger, knockback dealt/resist, ground_shake → camera-shake/earthquake/erosion, wind/water
+resist, buoyancy/density → water. Then the queued walk-slide / falling-impact-flying anims / survival 3×9+2×2 inventory.
+
+## r562 — stature feel: slower gait, height-scaled chase cameras, height-scaled FP fade
+Three pieces of operator feedback, all reading `player_stature`:
+- **Gait cadence** slows as the body grows: the hero walk-phase rate is multiplied by (1.8/height)^0.6, so a giant takes
+  slow, long strides even though its ground speed (move_speed) is higher; = 1.0 for a default character.
+- **Chase cameras** (third-person mode 1 + over-the-shoulder mode 2) pull back, rise, and tilt down with height:
+  distance ×(height/1.8), lift ×(height/1.8), pitch −(0.10·(hz−1), capped 0.45 rad) so a tall hero stays framed. The
+  shoulder offset widens by √hz. Default characters are unchanged (hz=1).
+- **First-person avatar fade** scales with height: the coverage net (near-depth 2.6, lateral 1.3) widens ×(height/1.8)
+  and the fade DEPTH grows from 0.55 up to 0.92, so a tall character's body — which fills the FP view — fades nearly
+  transparent instead of obscuring it. Default unchanged.
+bin compiles. DEVICE-VERIFY: tall characters should stride slowly, stay framed in 3rd/shoulder views (camera further +
+tilted), and not block the FP view (body fades out when it fills the frame); default characters identical to before.
+
+## r563 — stature: health (damage-resist) + hunger (metabolism)
+- **Hunger** scales with stature: the base metabolic vitality drain ((0.01 idle / 0.02 in water)) is multiplied by
+  `hunger_rate` (Kleiber ∝ mass^¾), so a giant gets hungry far faster; exposure (climate) is left unscaled. = today's
+  rate for a default character.
+- **Health**: the player's vitality is normalised [0,1] (no HP pool to enlarge), so max_health is applied as a
+  damage-resist multiplier `player_dmg_resist = 100 / max_health` (recomputed on character change). Every incoming
+  vitality hit — predator bites, fall/impact, creature attacks (4 sites) — is scaled by it, so a bigger character takes a
+  proportionally smaller fraction per hit (effectively far more durable); = 1.0 (unchanged) for a default character.
+- `stature::BASE_HEALTH` made public for the normaliser. bin compiles.
+PENDING: knockback dealt/resist, ground_shake → camera/earthquake/erosion, wind/water-current resist, buoyancy/density →
+water. Then the queued walk-slide / falling-impact-flying anims / survival 3×9+2×2 inventory.
+
+## r564 — chase-cam bump-up, tallness range 0.1..25, sphere building for giants
+- **Chase camera bump-up**: the third-person/shoulder cameras now rise ~0.6 per extra block of stature (on top of the
+  ×hz base lift), so tilting down still frames the WHOLE body — the top of tall characters no longer clips out.
+- **Tallness range extended to 0.1 .. 25.0 blocks** (was 0.9..15): stature::MIN_HEIGHT/MAX_HEIGHT + the semi-log slider
+  bounds. (Doc updated.)
+- **SPHERE BUILDING** (operator request): above a stature of 5 blocks the block break/place becomes spherical, radius
+  `floor((h−5)/5)+1` capped at 5 (1 at 5 blocks → 5 at 25). BREAK consumes a sphere of solids around the raycast hit
+  (carve caverns in one click); PLACE raises a sphere "mound" of the selected block into surrounding air — in survival
+  each extra block costs one from inventory and it stops when you run out; the player's own AABB is never filled; crops/
+  saplings are excluded from mounding. Raycast reach also scales with stature (√(h/1.8), = 6.0 at default) so giants can
+  actually target blocks. Default characters: single-block break/place, reach 6, unchanged.
+bin compiles. DEVICE-VERIFY: tall characters stay fully framed in 3rd/shoulder views; the slider spans 0.1..25; a >5-block
+character carves/fills spheres (bigger with height) and reaches further; a default character is unchanged.
+
+## r565 — fan-dig + fix 1×1 place + bigger radius
+- **Fixed place "still 1×1"**: there are TWO place code paths (with-body and the no-body/creative-flight path); r564's
+  mound was only on the first, so creative placing stayed single-block. The no-body path now raises a mound too.
+- **Bigger radius**: dig_radius is now ceil((h−4)·¼), clamp 1..6 — 1 at 5–8 blocks, 2 at 12, 3 at 16, 4 at 20, 6 at 25.
+- **FAN DIG** (operator: "breaking depends on a single central ray; fan out to cover area"): breaking now casts a grid
+  fan of rays (half-count min(dig_radius+1, 4), ~0.06 rad apart) around the look direction; each ray raycasts and carves a
+  short inward column (depth min(dig_radius+1, 5)). So a break covers an AREA following the surface and digs down easily,
+  instead of a fixed sphere at one point. The central ray keeps the normal drop/durability/harvest logic; ray count is
+  capped (≤81) to bound the per-click cost.
+bin compiles. DEVICE-VERIFY: a tall character's break should clear a fanned patch + depth (digging down is quick), and
+placing should raise a real mound in BOTH creative and survival; default characters unchanged (single block, reach 6).
+
+## r566 — stature: ground-shake, knockback (dealt), wind + water-current resistance
+- **Ground-shake** (camera): a heavy body's footfalls + landings jolt the camera. The hard-landing jolt is multiplied by
+  (1 + ground_shake·0.25, cap 4×); and a per-FOOTFALL shake fires while walking on the ground — detected from the view-bob
+  phase crossing π (the 2× stride) — scaled by ground_shake × speed. Both are 0 for a default character (ground_shake≈0).
+- **Knockback dealt**: a melee punch now shoves the struck creature along the punch direction (+ a small upward pop),
+  magnitude 3·knockback_dealt — a default character gives a light shove, a giant sends them flying. (knockback RESIST has
+  no site yet — nothing currently applies melee knockback TO the player; deferred.)
+- **Wind resistance**: PhysicsParams gained a `wind_resist` field (default 1.0); step_body multiplies the ambient wind
+  force by it; the bin sets it to the stature's wind_resist_mult (∝ 1/h), resolving the old "couple to mass" TODO.
+- **Water-current resistance**: the current-drift push to the player is now gated by a stature threshold (∝ mass — weak
+  currents don't budge a giant) and scaled by water_resist_mult (∝ 1/h). Default characters: unchanged.
+lib + bin compile. PENDING: ground_shake → erosion (block displacement under the foot), buoyancy/density → water
+(sim::buoyancy exists), knockback-resist site. Then the queued walk-slide / falling-impact-flying anims / survival 3×9+2×2.
+
+## r567 — stature: buoyancy/density + erosion footprints
+- **Density now tracks the muscle/bulk slider** (the stature derive is called with density=bulk and strength=bulk), so
+  buoyancy/knockback/health get real variation without a new slider. A muscular body is denser + heavier; a lean one
+  lighter.
+- **Buoyancy → swim float**: the swim buoyancy force (36) is divided by the body's density (clamped 0.4..2.5), so a dense
+  (muscular) character floats lower / can sink and must stroke up, while a lean one rides high. = unchanged (waterline at
+  the shoulders) for a default bulk-1.0 character.
+- **Erosion footprints** (completes ground_shake): a very heavy body (ground_shake > 2 ≈ taller than ~3.5 blocks)
+  tramples/cracks the ground on each footfall — grass→dirt, stone→cobblestone, snow crushed — over a small patch under
+  the feet that grows with height (radius 0..3). Leaves a visible trail; gated so normal characters never erode terrain.
+  Footfall effects are now also gated on having a physics body (no phantom shake/erosion while flying in creative).
+lib + bin compile. The stature system is now substantially complete; only knockback-RESIST lacks a site (nothing applies
+melee knockback to the player yet). NEXT: the older queue — walk-slide fix, falling/impact/flying poses, survival 3×9+2×2.
+
+## r568 — hero gait: anti foot-slide (constant cadence)
+Operator (older queue): the hero's feet slide as it walks. Root cause: the gait PHASE advanced on a speed-scaled
+timer `(4 + spd·1.5)·cadence`, while the leg-swing AMPLITUDE also scales with speed (`amp = spd·0.11`). With both the
+rate and the amplitude rising with speed, the planted foot's ground speed (≈ leg_len·amp·dφ/dt) grew ~quadratically and
+outran the body — the foot skated. Fix: hold the phase RATE CONSTANT so the mid-stance foot speed (leg_len·amp·rate)
+tracks body speed linearly — i.e. fixed cadence, stride LENGTH grows with speed, which is how real gait works. The rate
+is tuned to leg length (≈ ½·height) as `1/(leg_len·0.11)`, so a tall body strides at a slower cadence and, with longer
+legs, covers more ground per step (this also subsumes the r562 explicit cadence term). When stopped, amp→0 hides the
+still-advancing phase.
+- TUNING KNOBS (I can't see the result — please eyeball on the M2): leg-length fraction `0.5` (raise if the cadence
+  feels too quick), the `0.11` amp coefficient (must match the `target_amp = spd·0.11` line for zero slide), and the amp
+  clamp `0.5` (above the speed where amp saturates — i.e. sprinting — a little slide returns; raise the clamp toward 0.6
+  to push that point out, at the cost of a wider leg splay).
+lib + bin compile. NEXT (queue): falling / ground-impact / flying hero poses; survival 3×9 + 2×2 inventory panel.
+
+## r569 — stature: range → 50 blocks + LINEAR reach (giants can break blocks)
+Operator: 25-block giants can't break any blocks; raise the slider to 50 and make reach scale with tallness.
+- **Range 25 → 50.** `sim::stature::MAX_HEIGHT` is now 50.0; the in-game tallness slider reads its bounds from
+  MIN_HEIGHT/MAX_HEIGHT (semi-log, 0.1..50) instead of hard-coded 0.1..25.
+- **Reach now scales LINEARLY** with stature: `reach = (6 + 1.2·(height − 1.8)).max(6)` for both the primary block
+  break/place ray and the giant dig-fan rays. The old √ scaling (`6·√(h/1.8)`) was the bug: a 25-block character's eye
+  sits ~22.5 blocks up, but √ reach was only ~22.4 — the ray literally couldn't reach the floor in front of it, so
+  nothing was ever targeted. Linear with slope 1.2 clears the eye height at every stature (verified: reach 33.8 vs eye
+  22.5 at 25 blocks; 63.8 vs 45.0 at 50), so a giant can target the ground a good distance forward.
+- **Other factors swept for the wider range** (verified finite + sensible at 50): mass ∝ h³, max_health, hunger,
+  ground_shake, jump, move_speed, step_height, turn_rate all stay finite; the clamped consumers (footfall/landing shake
+  .min caps, erosion radius clamp 0..3, sphere/fan dig_radius clamp 1..6) and the proportional chase-camera framing
+  (distance/lift ∝ height, terrain-pinched) all behave at 50 with no new saturation. No re-tuning needed beyond reach.
+lib + bin compile. (Runtime example blocked only by a full disk; formulas verified analytically + lib typechecks.)
+NEXT (queue): falling / ground-impact / flying hero poses; survival 3×9 + 2×2 inventory panel.
+
+## r570 — hero poses: falling tuck + landing crouch (+ basic flight)
+Operator (older queue): the hero lacks falling / ground-impact / flying poses. HeroPose gained three inputs — `airborne`
+(0 grounded … 1 off-ground), `vertical_vel` (signed, m/s), `land_crouch` (0..1 touchdown pulse) — and hero_forge::build
+blends them additively onto the walk rig (walk amp is ~0 mid-air, so they read cleanly):
+- **Falling tuck**: knees draw up, thighs flex, arms abduct outward for balance; the torso leans BACK the faster you
+  drop and slightly FORWARD when rising (jump apex / fly-ascend), from the sign of vertical_vel.
+- **Landing crouch**: a transient deep knee+hip flex with the arms swung forward to brace, pulsed on a hard touchdown
+  (depth scales with impact speed) and decayed over ~¼ s by the caller.
+- **Flight**: in creative flight (no physics body) `airborne` rides at 1, so the flying hero holds the airborne tuck —
+  a basic flight pose. (A dedicated horizontal "superman" flight rig is a later refinement.)
+Wiring (bin): `hero_airborne01` eases toward (body.on_ground ? 0 : 1; None⇒1 flying); `hero_land_crouch` is set to
+((impact−6)/14).clamp(.35,1) in the landing block and decayed in the gait block; `vertical_vel` is the real player body
+velocity[1]. lib + bin compile.
+- TUNING KNOBS (I can't see these — please eyeball on the M2): tuck depths (knee 0.9 / arm_out 0.7 / hip 0.35), crouch
+  depths (knee 1.1 / arm 0.85), the airborne ease rate 9.0/s, and the crouch decay 4.0/s.
+NEXT (queue): survival 3×9 + 2×2 inventory panel (currently the centred `p` panel shows the CREATIVE catalog even in
+survival); then character-forge detail.
+
+## r571 — giant-scale interaction: solid dig, stomp-crush erosion, bigger placement
+Operator: titans can't dig DOWN (mining too feathered — needs to be solid); erosion should hit harder and each step
+should destroy blocks in its path via block density×fill; building still feels like single blocks at scale.
+- **SOLID DIG.** The old break used a fan of diverging rays — at titan scale the rays spread out and left gaps, and it
+  couldn't punch a clean hole straight down. Replaced with a FILLED-SPHERE carve centred on the primary hit cell: every
+  solid block within `dig_radius` is set to air (bedrock, hardness < 0, spared). Clean solid holes in any direction.
+- **STOMP-CRUSH EROSION.** Each footfall now compares the stomp's crush capacity (≈ height/8, growing with mass /
+  ground_shake) against each block's `hardness()` — the engine's density×fill resistance (soft 0.5, stone 1.5, wood 2.0,
+  crystal 2.5, bedrock −1). Blocks it overpowers are pulverised to air; blocks it can't are weathered a tier; bedrock
+  stops the foot. It drives DOWN through a depth that grows with the crush capacity, so a titan gouges a trench while a
+  ~4-block ogre just packs the dirt. (Replaces the old cosmetic grass→dirt-only weathering.)
+- **BIGGER VOLUME.** `dig_radius` now scales 0.28·(h−4), ceiling raised 6 → 8, shared by dig AND the existing
+  filled-sphere place. Placement was already a solid sphere; with the larger radius it reads as a real mass, not a
+  single block. (Creative fills the full sphere; survival is still bounded by inventory.)
+lib + bin compile.
+- DEVICE-VERIFY (M2): titan digging straight down should carve a clean solid bowl; each footstep should crush a crater
+  (soft fully, stone/wood weathered until big enough, bedrock unbroken) — confirm a walking titan gouging a trench does
+  NOT get stuck (its huge step_height should climb out; if it sticks, lower the erosion `depth` cap from 5).
+- TUNING KNOBS: radius factor 0.28 / cap 8; crush_cap = h/8; foot footprint h/7 cap 4; sink depth 1+crush cap 5. Watch
+  set_block volume per click (r=8 sphere ≈ 2k blocks) for remesh spikes.
+NEXT (queue): survival 3×9 + 2×2 inventory panel; then character-forge detail.
+
+## r572 — hero pose: horizontal "superman" flight (closes the r570 gap)
+r570 left flight as the upright airborne tuck. HeroPose gained `flight01` (0 upright … 1 horizontal); build() blends a
+superman pose: the torso pitches toward horizontal, arms stream forward overhead, legs straighten and trail back
+together, and the neck/head lift to hold the gaze along the flight line. Bin: `hero_flight01` eases toward 1 while
+actively flying (creative flight = no physics body) AND moving (>1.5 m/s), and back to 0 when hovering or grounded — so
+hovering keeps the upright tuck and cruising goes prone. lib + bin compile.
+- TUNING KNOBS (eyeball on M2): body tilt −1.45 rad, arm-forward −2.6, head/neck lift 0.6/0.7, ease rate 5/s, the
+  1.5 m/s move threshold.
+
+## INVENTORY PANEL — deferred, needs a dedicated pass (not a quick fix)
+The centred `p` panel still draws the creative catalog in survival. Making it the real 3×9 + 2×2 backpack is bigger than
+it looks: (1) the renderer has no player-inventory snapshot (it only gets the creative `items` Vec + a SurvivalHud with
+no stacks), so the stacks must be plumbed in from the bin each frame; (2) there is no `ItemId → ItemKind` lookup, and the
+id space is mixed (blocks <~256, ingots 1000s, food 2000s, weapons 4000s), so rendering real slot icons/colours needs a
+small id→kind/colour resolver built first; (3) the full mouse model (pick/place/split) lives in inventory_screen.rs and
+would need wiring to egui. Recommend doing this as its own roll WITH an operator screenshot to verify layout, since it's
+egui and can't be checked here. Suggested increment order: id→colour resolver → bin inventory snapshot → read-only real
+grid in the panel (reuse the existing cell_grid widget) → then click interactions.
+
+## r573 — giant tuning pass (operator feedback on r571/r572)
+- **Mining bigger + place = half.** `dig_radius` factor 0.28→0.36, ceiling 8→16 (a 50-block titan now carves ~r16).
+  A new `place_radius = dig_radius/2` drives both place mounds, so building reads as a mound at HALF the crater size.
+- **Flight pose was belly-up — FIXED.** The torso pitch sign was wrong (rotated face-up); flipped to +1.45 so the body
+  leans FORWARD into a face-down superman, with the head/neck lift signs flipped to match (gaze stays on the flight
+  line) and the legs trailing back. Added **banking**: `HeroPose.bank` rolls the body into turns, eased from the view's
+  yaw rate (clamped ±0.7 rad), so a heading change arcs — the "turn radius" read.
+- **Footstep erosion curbed** for mid titans (~15–35 blocks felt too strong): footprint `h/7 cap4 → h/12 cap3` and sink
+  depth `1+crush → 1+0.4·crush, cap 5→3`. Roughly 3–5× less volume per step in that range; titans still crater but the
+  foot scuffs rather than excavating a pit.
+- **Move-speed scaling curbed ~15%**: stature `move_speed` exponent 0.7→0.65 (base 1.8 person unchanged at 4.5; ~15%
+  slower at 50 blocks, scaling down progressively below that).
+lib + bin compile.
+- DEVICE-VERIFY (M2): flight should now lean FORWARD (face-down) and bank into turns; mining sphere noticeably bigger,
+  placement half its size; mid titans leave shallower prints; giants a touch slower.
+- KNOBS: dig factor 0.36/cap16; place = dig/2; flight tilt +1.45 & bank gain 0.22 (flip if banking goes the wrong way),
+  NECK/HEAD/leg signs if the flight head/limbs read off; erosion h/12 cap3 & depth 0.4·crush cap3; speed exponent 0.65.
+- ⚠ PERF: an r16 dig sphere is ~17k set_block calls in one click → a large remesh; if it hitches on device, say so and
+  I'll spread the carve across frames or lower the ceiling.
+NEXT (queue): survival 3×9+2×2 inventory (needs id→kind resolver + bin snapshot — see prior note); character-forge detail.
+
+## r574 — item_display resolver (unblocks the survival inventory panel)
+Built the documented prerequisite for the real backpack: `item::item_display(id: u32) -> ItemDisplay { color, name }`,
+a total (never-panics) resolver from a raw inventory `ItemId` to a slot swatch colour + short name. Decodes the mixed id
+space authoritatively (per the crafting recipes + game loop): `0..256` → BlockId (base_color + name), `1000+idx` →
+MetalKind::ALL ingot (1000 Iron / 1001 Gold / 1002 Copper), `2000/2001` → raw/cooked meat, `4000..4008` → forged weapon,
+else a neutral fallback. Unit test + temp-example verified every class (Stone→grey, Grass→green, ingots tinted, meat,
+weapon, unknown→generic). lib compiles.
+- This is step 1 of the inventory panel plan. NEXT step: snapshot the player's real stacks in the bin each frame
+  (`fg_app.inventory().slots()` → Vec of (id, count) → `item_display`) into a renderer field, then draw a 3×9 grid + 2×2
+  craft area with the existing `cell_grid` widget when survival + Inventory tab (reuse proven widget = low visual risk).
+  Click interactions (inventory_screen.rs mouse model) come after. An operator screenshot would help verify the layout.
+
+## r575 — small-character jump boost
+Operator: characters under ~1.4 blocks should jump ~75% higher. Apex height ∝ v², so the boost is v × √1.75 ≈ ×1.323,
+applied in `stature::derive` and ramped over [1.35, 1.4] (full at/under 1.35, none at/above 1.4 → the 1.8 reference is
+untouched). Verified: apex height is exactly ×1.75 for h ≤ 1.35 and ×1.00 for h ≥ 1.4. lib compiles; anchor/monotonicity
+tests unaffected (both use h ≥ 1.8).
+
+## r576 — survival backpack panel (real inventory, read-only)
+The centred `p` panel now shows the player's REAL backpack in survival instead of the creative catalog (step 2, built on
+the r574 resolver):
+- **Bin snapshot**: each HUD tick, `fg_app.inventory().slots()` → occupied stacks → `item::item_display(id)` →
+  `renderer.backpack: Vec<InvSlotView{color,name,count}>` (empty in creative).
+- **Panel**: when survival (`hud_survival.is_some()`), the title reads "backpack", the creative tab strip and the
+  creative hotbar-switcher row are hidden, and a 3×9 (27-cell) grid draws each occupied slot — colour swatch + stack
+  count (top-right) + short name (bottom) — via the same proven `cell_grid` widget. Creative mode is byte-for-byte
+  unchanged (its catalog grid + tabs + switcher all still run through the `else` branch). The existing recipe-based
+  CRAFTING section is retained below.
+lib + bin compile.
+- DEVICE-VERIFY (M2) + please screenshot: open `p` in survival — it should show your actual items (swatch/count/name),
+  NOT the block catalog. A screenshot would let me tune cell size / wrap and confirm legibility.
+- SCOPE / honest gaps: (1) READ-ONLY — no pick/place/split yet (the inventory_screen.rs mouse model is the next step);
+  (2) slots are shown PACKED (occupied stacks first) rather than at fixed grid positions — fine for an overview, but the
+  interactive version will need true slot positions; (3) the operator's "2×2 crafting grid" is not yet a visual slot grid
+  — crafting still uses the recipe-button list (functional, just not the 2×2 layout). These are the follow-up.
+NEXT: inventory click interactions (or the 2×2 craft grid) ; character-forge detail.
+
+## r577 — bug hunt: duplicate worlds, settings-under-`p` stacking, slider-vanishes-menu
+**(1) DUPLICATE WORLDS.** The menu world list is built straight from `load_catalog_entries()`, which read the catalog
+file with NO dedup. Identity was keyed on (name, seed) at creation (r291) while `WorldCatalog::add` and the player key on
+NAME — so a world re-created under an existing name (e.g. fresh random seed) left a second row, and the menu showed both.
+Fix: `load_catalog_entries` now DEDUPS BY NAME, keeping the most-recently-played row (every consumer — menu list, startup
+catalog, the add/update paths — funnels through it, so this fixes all of them and the next save rewrites the file clean);
+and the creation path now `retain(|e| e.name != name)` (replace by name, not name+seed).
+
+**(2) SETTINGS COVERED BY `p`.** `show_creative` (which draws the centred `p`/creative panel) was set to
+`ui_pointer_active`, which is true whenever ANY UI surface is open — so the panel rendered ON TOP of settings/pause/debug.
+At the state level these were already mutually exclusive (`heavy_open` forces the inventory closed); the render gate just
+didn't agree. Fix: `show_creative` now additionally requires that settings/pause/debug/perf/craft/character/title/wizard
+are all closed — the `p` panel is one exclusive surface that yields to the others instead of stacking.
+
+**(3) SLIDER MAKES MENUS DISAPPEAR (probable fix — please confirm).** The character customizer (where the tallness/muscle
+sliders live) was MISSING from `heavy_open`, so the lightweight menu-state machine (which frees/RECAPTURES the mouse
+cursor on overlay changes) kept running while the customizer was open. Dragging a slider there could let the cursor be
+recaptured mid-drag, yanking pointer focus and making the menu vanish. Fix: `character_menu_open` is now part of
+`heavy_open` (and excluded from `show_creative`), so the customizer suppresses the light overlay like every other heavy
+menu. This is the most likely cause of the slider-vanish since the tallness slider lives there; if a DIFFERENT slider/menu
+still vanishes, tell me which and I'll trace that path.
+lib + bin compile.
+- DEVICE-VERIFY (M2): create two worlds with the same name → only one row should show; open settings while the `p` panel
+  was up → `p` should not cover it; drag the tallness/muscle sliders in the customizer → the menu should stay put.
+
+## r578 — flora spacing & tree competition (walkable world)
+Operator: every block grows full → walking is very hard; keep the alive feeling but let tree competition push trees
+apart. Referenced docs/foraging_and_ecology.md (the living-ecology direction) + docs/FLORA-WIRING.md (surface growth is
+the runtime spread, not cave flora). The runaway density came from `sim::flora_spread`: it placed a plant in EVERY
+suitable Air cell with no neighbour check, carpeting the ground solid.
+- **Ground-cover spacing/competition**: before the spread sets a Flower/TallGrass/Fern/Mushroom, it now counts the 8
+  plant neighbours at that height and leaves a GAP if ≥3 are already plants. Coverage settles patchy + WALKABLE instead
+  of solid, and the spread self-limits (it stops pushing into dense patches) — the "very alive" feel stays, the wall of
+  vegetation goes.
+- **Tree competition (spacing ≈6 blocks)**: (a) a new sapling only takes root if no trunk (OakLog/BirchLog) is within 6
+  blocks — no sprouting under an existing canopy; (b) a sapling that matures while a tree grew up close to it LOSES the
+  contest and is removed rather than becoming a tree. Together, new tree growth trends toward well-spaced canopies.
+  NOTE: pre-existing dense clumps from GPU worldgen are not retroactively thinned (that needs a separate, careful cull
+  pass — flagged); this governs ongoing growth.
+bin compiles.
+- DEVICE-VERIFY (M2): ground cover should be patchy/walkable (not a carpet); over time new trees should keep their
+  distance. Tunable: ground-cover crowd threshold (3 of 8), tree spacing radius (6).
+NEXT (this request): trunk girth variation + log block shape; fruits & farming; then character porting to stature.
+
+## r579 — fruit foraging (+ farming already lands)
+Operator: add fruits and farming. FARMING already works — crops (Carrot/Potato/Cabbage/Pumpkin/Sprout) are placed on
+soil, tracked in the persistent flora store, advanced by the `sim::plant_growth` tick to FINAL_STAGE, and Carrot/Potato/
+Cabbage/Mushroom are edible (right-click → `vitality_mut().feed`). Added FRUIT without touching the (risky) block enum:
+- `APPLE_ITEM = 2002`, a food ITEM. Breaking leafy foliage (OakLeaves/BirchLeaves) now also drops an apple ~13% (its own
+  roll, alongside the existing ~11% sapling drop), so trees are foragable. Right-click eats it (`feed(0.22)` — a light,
+  refreshing snack, between raw meat 0.18 and cooked 0.55). Resolved in `item_display` (2002 → "Apple", red) so it reads
+  correctly in the survival backpack.
+lib + bin compile.
+- DEVICE-VERIFY (M2): chop tree leaves in survival → apples sometimes drop; pick one up, select it, right-click to eat →
+  vitality rises. Tunable: drop rate (33/256 ≈ 13%), feed amount (0.22).
+NEXT (this request): trunk girth variation + log shape (GPU worldgen/mesher — the riskier blind piece); then porting the
+other heroes to the stature/customization system + their models.
+
+## r580 — bugfixes: default-height ground-shake + world/flora merging
+**(1) GROUND-SHAKE TOO STRONG AT 1.8.** Root cause: `ground_shake = √(mass/70) − 1`, and `mass` includes bulk×density.
+After r567 tied density to the muscle slider, a MUSCULAR but normal-HEIGHT (1.8) character got mass>70 ⇒ a non-zero
+ground-shake ⇒ footfall camera shake firing on a normal person ("felt like a giant"). Fixed: ground_shake is now keyed on
+the HEIGHT ratio only — `(r^1.5 − 1).max(0)` — so it is exactly 0 at 1.8 for ANY build, and identical to the old curve at
+default bulk (r^1.5 = √(r³)). Only true tallness shakes the ground now.
+
+**(2) WORLD / FLORA MERGING ("coverage over air", not patchy).** Root cause: the chunk store rebinds + clears on world
+switch (`set_world_root` + `rebuild_for_seed` drops loaded chunks and reseeds — verified by its test), BUT the FLORA/crop
+store and whitelist were bound to the STARTUP root (`worlds/default`) and never rebound. So a new world kept the previous
+world's crops & saplings at stale positions — plants floating where the OLD terrain used to be, and the spacing gate was
+operating on stale/merged flora (hence "not patchy"). Fixed: on world launch, persist the old store, rebind `flora_root`
+to this world's dir (`worlds/{name}-{seed}`), and reload `session.flora`/`whitelist` from it (empty on first visit ⇒ a
+clean, freshly-generated world). Covers both new-world and load-world (single launch path). Storage is already isolated
+per (name,seed); a full unique-world-id refactor (the r291 "stand-in" note) can come later but isn't needed for the merge.
+lib + bin compile.
+- DEVICE-VERIFY (M2): default 1.8 character should NOT shake the camera when walking (any muscle level); create/load
+  worlds back-to-back → no plants floating over air, ground cover patchy + walkable, no terrain bleed between worlds.
+
+## r581 — flora thinning (de-densify existing carpets)
+Operator: flora still everywhere. The r578 spacing gate only stops NEW crowding — it can't thin flora that's ALREADY
+placed (accumulated before the gate, or persisted in a world's chunk edits). Confirmed the only ground-plant placement is
+the runtime spread (worldgen places none); so the carpet is pre-existing blocks the gate never touches. Fixes:
+- **Active thinning**: each flora tick, sampled plants with ≥4 plant neighbours are culled ~50% of the time (budgeted,
+  probabilistic), so over-grown areas open up toward patchy + walkable over time — including worlds carpeted before the
+  gate landed. It thins near the player (where walkability matters) and never strip-clears.
+- **Tighter spread gate** (3→2): new growth only takes a spot with <2 plant neighbours, so dense areas are net-negative
+  (spread places nothing, thinning removes) and won't re-carpet; open areas still fill in (stays lush).
+bin compiles.
+- DEVICE-VERIFY (M2): walk around an over-grown world → it should gradually open into patchy, walkable ground cover
+  (gradual by design). To thin FASTER on a heavily carpeted save, set UNENDLICH_FLORA_SPREAD_INTERVAL lower (default 300)
+  or UNENDLICH_FLORA_SPREAD_BUDGET higher (default 8). A brand-new world (post-r580) already starts clean.
+
+## r582 — REVERT r581 thinning + air-growth cleanup (the real bug)
+Operator: the thinner was way too strong; thick forests/grasses were more TRUE — clearing should come from a future
+FAUNA loop (bugs/birds/herbivores with memory eating plants), not artificial thinning. And keep chasing why plants grow
+on air.
+- **Reverted r581**: removed the active thinning pass entirely; restored the r578 ground-cover spread gate (2→3). The
+  world is lush again; no artificial culling. (Future ecology balance = fauna, tracked separately.)
+- **Diagnosed the air-growth** (searched c1 transcripts): it's the known **FP32/FP64 surface mismatch**
+  (NEXT_SESSION_GUIDE §4a). The GPU compute generator fills voxels in FP32 (Apple/Honeykrisp) but flora/tree placement
+  reads the CPU **FP64** surface *prediction* (`world/chunk_manager.rs::surface_y_at`), so things land where the
+  predicted surface was — not the real one — and end up on air. The proper fix (switch placement onto
+  `sim::surface_scan::top_solid_y_in_chunk`, which reads the ACTUAL top solid voxel — built r331, wiring proposed in
+  handoff/HANDOFF_world_surface.md) is deferred to the physics/anchoring pass per operator. Interim, per operator:
+  - **Widened the placement scans** ("increase the tree scan a bit"): sapling planting −6..8 → −12..12, pioneer flora
+    −6..8 → −12..12, flora-spread target −3..3 → −5..5, so placement searches deeper for the REAL ground before seeding.
+  - **AIR-CLEANUP pass** (`UNENDLICH_AIR_CLEANUP`, default on; INTERVAL 120, BUDGET 12): budgeted random probes near the
+    player cut flora (Flower/TallGrass/Fern/Mushroom) with Air/Water directly beneath, and floating tree trunks (a log
+    whose base sits on air) — clearing the connected trunk upward plus each layer's hugging leaves so no canopy is left
+    orphaned.
+bin compiles (only pre-existing warnings).
+- DEVICE-VERIFY (M2): forests/grass thick again; over ~seconds, plants and trees that were hanging in the air get cut
+  and fall away near you. Knobs: AIR_CLEANUP_INTERVAL / _BUDGET; AIR_CLEANUP=0 to disable. The lasting fix is the
+  surface_scan call-site switch (HANDOFF_world_surface.md) — flagged for the physics pass.
+NEXT: the surface_scan placement switch (proper air fix) + character porting to stature.
+
+## r583 — authoritative surface from real voxels (the definitive air-growth fix, CPU-side)
+Went to implement the GPU-side per-column heightmap emit, but investigating the path changed the plan (reported honestly):
+1. `world/gpu_generator.rs::read_back` ALREADY reconstructs every voxel on the CPU (they live in `self.chunks`), so
+   the true surface is derivable CPU-side — a GPU emit is redundant for CORRECTNESS (it'd only matter to later DROP the
+   voxel readback, a perf path).
+2. The generation shader ALREADY density-anchors tree trunks (r447 floating-trees fix in chunk_generation.comp: scans the
+   FP32 density for the topmost solid-with-air-above instead of the analytic surface_target), so gen-time trees match the
+   FP32 terrain. And the CPU flora spread already verifies `below.is_solid()` via real voxels.
+   ⇒ the remaining FP32/FP64 offenders are the consumers of the CPU FP64 *prediction*: `chunk_manager::surface_y_at`
+   (spawn via `pick_spawn`, mob ground, placement anchors).
+**Fix**: made `chunk_manager::surface_y_at` AUTHORITATIVE. It still computes the FP64 prediction as an anchor, then scans
+the REAL voxels in a tight window (pred+8 .. pred−24) for the topmost GROUND block (solid, excluding logs/leaves so it
+lands on terrain not a canopy). Resident column ⇒ returns the true voxel surface; non-resident column reads all-Air ⇒
+returns the prediction unchanged (distant spawn picks behave exactly as before). This is the r330-world handoff's
+call-site switch, using the r331 surface_scan semantics on the voxels read_back already provides. No shader/descriptor
+risk. lib + bin compile.
+- DEVICE-VERIFY (M2): spawn/mobs should sit ON the ground (not hovering/buried); combined with r582's air-cleanup +
+  widened scans, plants shouldn't accumulate on air. Behaviour-preserving where chunks aren't loaded.
+- NOTE (perf, deferred): the pure GPU emit (compute shader writes a per-column top-solid-Y into a small SSBO) is only
+  worth doing to ELIMINATE the 128KB/chunk voxel readback → ~4KB heightmap, for a future GPU-only (no-CPU-voxel) path.
+  That's a bigger, on-device-verified change (descriptor layout + mesher/store must stop needing CPU voxels). Flagged, not done.
+
+## r584 — cancel trees growing on/in water (the submerged-base gap)
+Operator: trees still spawning on water; water may be an intended placement substrate, but the lifecycle should cancel
+the "not touching (dry) ground" no-plant condition. Traced it:
+- Gen-time trees ARE gated below sea level (chunk_generation.comp: `surface_y < model_sea_level → skip`), CPU saplings
+  need Grass/Dirt, flora `ground_ok` excludes water, and `is_tree_anchorage()` excludes Water — so the lifecycle marks a
+  tree with no anchored wood as unanchored → degrows.
+- THE GAP: a tree rooted in SUBMERGED anchorage (a sand/stone seafloor UNDER water) has solid below its base, so it's
+  "anchored" and never flagged — it just rises out of the water. r582's air-cleanup only caught bases on air/water BELOW.
+**Fix**: extended the r582 air-cleanup log branch. On finding a trunk it now walks to the base (lowest connected log)
+and cuts the tree (trunk + hugging leaves, upward) if the base has no solid support OR it's standing in water — water
+directly beneath the base, or flanking it at its own level (rooted in a submerged seafloor). A dry-land shoreline tree
+has its base above the water line, so its base-level neighbours aren't water → not a false positive. Water is deliberately
+LEFT as a valid substrate (aquatic plants), per operator; only land trees on/in water are cancelled. bin compiles.
+- DEVICE-VERIFY (M2): trees standing in / rising out of water near you should get cut within a cleanup cycle; shoreline
+  trees on dry land should be untouched. Knobs: UNENDLICH_AIR_CLEANUP_INTERVAL/_BUDGET.
+- DEEPER OPTION (deferred): fold "submerged anchorage = unanchored" into world/plant_lifecycle.rs so the
+  replay-deterministic degrowth handles it at the source (the anchorage check would reject a root whose base is water-
+  flanked/submerged). Riskier (determinism); the cleanup pass covers the visible symptom now.
+
+## r585 — rot + survival genes (aquatic tolerance, unorthodox growth, light-starvation)
+Operator: add ROT (slowly kill certain genomes in water) + upside-down/sideways tree growth for the right genome, which
+must still catch light or starve.
+- **NEW pure core `sim::plant_survival`** (unit-tested; executed via a temp example — all assertions pass): `SurvivalGenes
+  { water_tolerance, orientation_freedom }` (`from_seed`, deterministic). Rare-tail thresholds: aquatic ≥0.90 (~10% of
+  lineages), unorthodox ≥0.80 (~20%), lateral ~0.90 (~10%). APIs:
+  - ROT: `water_rot_increment(genes, submerged, dt)` — 0 for aquatic or dry; else scales with intolerance; `is_dead(accum)`
+    at ≥1.0. Gradual (probe: dryland dies in ~51 rot-ticks, not instant, not forever).
+  - ORIENTATION: `GrowthDir{Up,Down,N,S,E,W}` + `step()`/`support_offset()` (support is the OPPOSITE side — up anchors
+    below, pendant hangs from above, lateral braces behind); `permits(genes, dir)` (Up always; Down needs unorthodox;
+    lateral needs more).
+  - STARVATION: `energy_balance(light01, dt)` = light−maintenance(0.18); `accumulate_starvation` (clamped ≥0, doesn't bank
+    surplus); `is_dead` at deficit ≥1.0. So unorthodox plants that grow into the dark starve; lit ones live.
+- **ROT wired** into the air-cleanup: a trunk whose base is on AIR is a placement artifact → cut whole (as before); a
+  trunk standing IN WATER is now genome-gated — an aquatic lineage (~10%) is SPARED (a water-loving, mangrove-like tree),
+  any other lineage ROTS one crown layer per cleanup cycle so it dies back gradually instead of vanishing at once.
+  lib + bin compile.
+- DEVICE-VERIFY (M2): most trees in water visibly rot down over several cycles; the occasional aquatic one stands. Knobs:
+  AIR_CLEANUP_INTERVAL/_BUDGET; thresholds in plant_survival.rs.
+- DEFERRED (honest): the actual DIRECTIONAL GROWTH (making a tree grow pendant/lateral, anchoring to ceiling/wall) is a
+  real change to the tree grower (sapling→tree) that I can't verify visually; the pure gating + support + light-starvation
+  logic is built and tested so the grower can consume it. That wiring — plus feeding each unorthodox segment its caught
+  light so `energy_balance` can starve the ones in the dark — is the next step.
+
+## r586 — physics wind sway + trunk-thickness/flexibility genes
+Operator: add physics-based wind sway + trunk-thickness genes, then back to the todo list.
+- **Genome grew**: `SurvivalGenes` gains `trunk_thickness` (girth + stiffness) and `flexibility` (whippiness), both
+  `from_seed`-derived. `new()` is now 4-arg (tests updated).
+- **NEW physics in `sim::plant_survival`** (unit-tested + executed via probe):
+  - `stiffness(thickness, flexibility)` — rises ∝ 1+6·t² (beam-like: thick trunks are dramatically stiffer), softens with
+    flexibility, floored so nothing divides by zero.
+  - `tip_deflection(wind_speed, height, thickness, flexibility)` — drag ∝ wind_speed² × height / stiffness, clamped to
+    ≤½·height. Probe: stout 0.61 vs thin 3.72 at equal wind; doubling wind ≈4× deflection (quadratic); zero wind → zero.
+  - `height_profile(y_frac)=y²` (base-anchored cantilever), `sway_offset(...)` = steady DOWNWIND lean + slow sway + faster
+    flutter, scaled by tip deflection × profile (base vertex stays put).
+  - `trunk_radius_from_gene(thickness)→1..=MAX_TRUNK_RADIUS(4)` — girth mapping for the grower; lineage spread ~16/34/34/16%.
+- **Visible sway (chunk.vert)** reshaped to physics: aerodynamic drag ∝ wind² gives a steady downwind LEAN plus a slow
+  sway + faster flutter oscillating about it (not a symmetric wobble), and the tip dips slightly as it leans; a whisper of
+  idle motion at zero wind. Validated: `glslangValidator --target-env vulkan1.2` + `spirv-val` both clean; build.rs
+  hash-manages chunk.vert so it recompiles from source (no committed .spv to go stale). lib + bin compile.
+- DEVICE-VERIFY (M2): foliage should lean downwind and flutter, harder in stronger wind (noticeably nonlinear); calm =
+  near-still.
+- DEFERRED (honest): (a) PER-TREE genome sway — the mesher would encode thickness/flexibility/height-fraction per foliage
+  vertex to feed `sway_offset`, so stout trees barely move and supple ones whip; the shader sway is currently uniform. (b)
+  THICK-TRUNK GENERATION — the grower/worldgen consuming `trunk_radius_from_gene` for real girth variation. Both are
+  mesher/grower changes needing on-device verification; the genes, physics model, and radius mapping are ready to consume.
+
+## r587 — hero porting complete (all 5 heroes finished + on stature)
+Back to the standing todo: port the other heroes onto stature/customization + finish designs + animations. Investigation
+showed the scaffolding was already broad — ALL 5 kinds have palettes (HeroColors) + proportions (HeroDims), and build()
+already: scales dims by BuildParams (bulk/head/shoulders/arm/leg), applies the FULL animation rig (walk gait, idle
+breathe/sway/weight-shift/head-turn, r570 airborne fall-tuck, landing crouch, r572 flight, r573 bank) generically, and
+uniform-scales to `target_height` in finalize (tallness). The ONE gap was `dress()` element props: only Heliographer +
+Gravitybender were done; Windwalker/Tidecaller/Stormweaver hit `_ => {}` ("next roll").
+**Done**: authored distinct, animated element props for the three, matched to their palettes:
+- **Windwalker (air)**: aviator scarf streaming + fluttering behind (per-segment sin), wind-wisps (glow) orbiting the
+  torso in world space, faint updrafts off the feet.
+- **Tidecaller (water)**: wave-crest circlet round the head, a rippling tidal train widening down the back, a water orb
+  cupped in the hand with droplets in orbit.
+- **Stormweaver (storm)**: a dark cloud crackling overhead, a charged staff with an electric orb, and lightning arcs that
+  STROBE on/off (sin threshold on anim_t) around cloud + orb.
+The `dress()` match is now exhaustive over all 5 kinds (no `_`). "More animations" this roll = these per-element idle
+motions (flutter / orbit / strobe) on top of the shared rig.
+**Verified** via temp example: all 5 heroes build non-empty, all-finite, in-range geometry at heights {0.9, 1.8, 4, 15}
+across 4 anim phases; finalize scaling hits the target height exactly (Tidecaller h4 span = 4.00). lib + bin compile.
+- DEVICE-VERIFY (M2): switch between the 5 heroes — each should show its signature kit, animated (scarf flutter, water
+  droplet orbit, lightning strobe), scaling correctly with the tallness slider and body sliders.
+- DEFERRED (optional next): per-element ACTION poses (element-specific cast/attack), and the r586 per-tree genome sway /
+  thick-trunk generation.
+
+## r588 — objects deform the wind (perturbation layer) — the missing field half
+Operator vision: global base wind, but objects deform the FIELD — mobs break it, trees filter it, mountains updraft/mix;
+then meshes (fabric/hair/wings) deform in it. AUDITED existing wind first ("if they don't already"): a lot is present —
+`wind.rs::wind_at` (spatial gusty base field), `vertical_wind_at` (THERMAL updraft via convection), `sim::wind_field`
+(gusts), `world::pressure_gradient_wind`/`wind_shear` (speed models), `cloth_wind_force` (mesh-side force, pure). The
+GAPS vs the vision: nothing let OBJECTS deform the field — no mover wind-break/wake, no foliage filter, and the only
+vertical wind was thermal (not orographic mountain lift).
+**NEW pure core `sim::wind_perturb`** (unit-tested + probe-run) fills exactly those gaps, composing ONTO the base field:
+- `Mover{pos,vel,radius,strength}` + `mover_delta`/`movers_delta`: a downwind SHADOW (calms the lee) + a WAKE (radial
+  shove outward + tug along motion), heft-weighted (`strength` = stature mass/ground_shake) and distance-faded. This is
+  what bends trees aside as a dragon passes. Probe: lee dx −0.05, wake 2.08→0.08 with distance, heavier carves harder.
+- `foliage_delta`: canopy01 damps through-wind (×0.6 at full) + sheds small cross-turbulence. Probe: +4 → +1.2.
+- `orographic_delta`: wind climbing a windward slope is forced UP, lee sinks, fades with altitude (e-fold 18 b). Probe:
+  +1.8 / −1.8 / 0.007 aloft. (Mechanical mountain lift — complements the existing thermal `vertical_wind_at`.)
+- `perturbed(base, movers, canopy01, slope, alt, pos, t)` composes all three, finite. Pure/deterministic — the CPU
+  reference AND the spec a GPU froxel-fill will mirror.
+lib compiles.
+- NOT WIRED YET (the pipeline this foundation feeds; device-verified): (1) build the Mover list from live mobs/dragons
+  (strength from stature) each frame; (2) sample canopy density + terrain slope per point; (3) a GPU froxel-fill compute
+  pass (precedent: froxel_fill.comp writes image3D) bakes `perturbed()` into a low-res 3D wind texture around the camera;
+  (4) the deform shaders (chunk.vert foliage, entity.vert cloth/hair/wings) sample that texture — `cloth_wind_force` is
+  the ready mesh-side force. Phased so each step is shippable + eyeball-verifiable on the M2.
+
+## r589 — wind ↔ moisture ↔ weather coupling (orographic precip bridge)
+Operator: the wind field also has to play with moisture + global weather. AUDITED first: much coupling ALREADY exists —
+`moisture_field` is wind-ADVECTED, `world::rain_shadow` dries the LEE, `world::weather_cell::resolve_cell` composes
+rain_shadow→moisture→cloud→precip→storm + pressure-gradient wind, `storm_organization` folds in wind shear. The GAP: the
+new perturbation layer (r588), especially the orographic UPDRAFT, wasn't connected — and the WINDWARD complement of the
+rain shadow (mountains rain MORE on the upwind face) wasn't modelled at all.
+**NEW pure core `world::orographic_precip`** (tested + probe-run), composing into the existing weather_cell (augments,
+doesn't reimplement):
+- `condensation(updraft, moisture01, temp_norm)` — lifting moist air cools it to saturation ⇒ windward rain; rises with
+  updraft × moisture × coolness; 0 for downdrafts/dry/warm. Probe: 0.704 at lift+moist+cool.
+- `uplift_instability(updraft, moisture01)` — forced ascent destabilises the column (primes storms).
+- `augment_cell(CellInputs, updraft)` — folds uplift into windward_moisture (capped) + instability so `resolve_cell`
+  yields the orographic-enhanced cloud/precip/storm; a downdraft leaves it to the existing rain-shadow term.
+Result: the full orographic DIPOLE — probe shows flat precip 0.079 → windward 0.217 (2.7×), and upwind 0.441 vs a dry
+lee 0.000. The updraft it consumes is exactly `sim::wind_perturb::orographic_delta` (r588), so wind lift now drives
+weather. lib compiles.
+- NOT WIRED YET (runtime/device): (1) feed real per-cell updraft (wind_perturb + terrain slope) into the weather tick;
+  (2) advect `moisture_field` along the PERTURBED wind (movers/foliage shape humidity too), not just the base; (3) the
+  GPU froxel-fill still bakes the perturbed field for the deform shaders. The pure physics of the coupling is in place.
+
+## r590 — shared secondary-motion core (the keystone: one deform model, two tiers)
+Free choice ("take them as you wish"): built the keystone the whole wind→mesh discussion converges on — a SHARED
+flutter/deform response so foliage, fabric, hair, and dragon wings all bend from the same influence + material. AUDITED
+first: `sim::deform` already exists but is volume-preserving SQUASH & STRETCH (different concept) → named this
+`sim::secondary_motion`.
+Pure core (tested + probe-run), both tiers the architecture called for:
+- **Tier 1 stateless** `deflect(force, material, anchor_weight, lever)` — quasi-static bend, pivots about the anchor,
+  clamped to the lever (bends, never inverts). What a VERTEX SHADER runs for millions of leaves / a wind-lifted cloak.
+- **Tier 2 stateful** `verlet_step(particle, anchor, rest_len, force, material, dt)` — Verlet integrate + distance
+  constraint back to the anchor bone → real lag/overshoot/settle. What a GPU COMPUTE PASS runs for cloak/hair strands.
+  Probe: a horizontal strand swings down under gravity and holds its constraint.
+- **Shared inputs**: `influence(wind, normal, area, gravity, self_accel)` = wind drag scaled by how it FACES the wind
+  (|n·ŵ|, the cloth_wind_force idea) + gravity + inertial lag; `Material{stiffness,damping}`; `disturber_strength(mass,
+  ground_shake)` maps stature heft → a `wind_perturb::Mover` strength (human 0, giant 35+). Both tiers consume the SAME
+  influence + material — that's the unification.
+lib compiles; all assertions pass (deflect clamps@lever, face 5.0 > edge 0.0, strand swings to y=−0.53, giant 35.1 > human 0).
+This completes the PURE foundation of the wind→deform→weather system: plant_survival (foliage physics) + wind_perturb
+(objects deform the field) + orographic_precip (field ↔ weather) + secondary_motion (shared mesh response). Everything
+downstream is now GPU/runtime WIRING (device-verified): the froxel-fill baking `perturbed()` into a 3D wind texture; the
+disturber SSBO from live mobs (strength via `disturber_strength`); chunk.vert/entity.vert sampling the field and calling
+`deflect` (Tier 1) or a compute pass calling `verlet_step` (Tier 2); moisture advected along the perturbed wind.
+
+## r591 — foliage disturber (FIRST TESTABLE wiring): plants part around you
+Operator ready to test → shipped the safest visible slice of the deform system. Foliage now gets shoved aside by a
+DISTURBER, using the wake idea from `sim::wind_perturb`. The camera (≈ the player) is the first disturber because it's
+ALREADY in the shared UBO (`camera_pos`) — so this needed ZERO uniform/descriptor plumbing, just a validated `chunk.vert`
+edit (glslangValidator + spirv-val both clean; build.rs recompiles from source). In the sway block (tag 1 / free foliage
+only), a radial push away from the camera's horizontal position, fading to nothing at reach=3 blocks (push 0.35, slight
+press-down). Anchored bases (tag 2) don't reach the code, so plants pivot at the root as they part. bin compiles.
+- TEST ON M2: walk through tall grass / low leaves → they bend away from you in a ~3-block radius and spring back as you
+  leave; roots stay planted. Knobs in chunk.vert: `reach` (3.0), push (0.35).
+- NEXT (the mob/dragon effect proper): append a small disturber ARRAY to the UBO (after light_view_proj so existing
+  offsets are untouched) — each entry xyz=pos, w=strength via `sim::secondary_motion::disturber_strength(mass,ground_shake)`
+  — populate the nearest N streamed creatures at the world_renderer UBO write, and extend this same wake loop over the
+  array. That's the "trees bow as the dragon passes" step; deferred as its own roll so a UBO-layout mistake can't
+  black-screen this test session.
+
+## r592 — live F3 slider to amp the foliage disturber (confirm it's working)
+Operator not seeing the r591 effect → added a live strength slider to the F3 "debug · shaderpack" window so it can be
+cranked to confirm. No UBO layout change: `sun_color.a` is unused by shading, so it now carries the strength (×10
+fixed-point) from `DEBUG.foliage_disturb` (new AtomicU32, default 10 = ×1.0) to chunk.vert. The slider (0–30) scales BOTH
+the push (×0.35·strength) AND the reach (3 + strength·0.3 blocks), so cranking is a decisive test even if little foliage
+is right at your feet. Validated (glslang + spirv-val); lib + bin compile.
+- TEST ON M2: open F3 → "foliage disturber (live)" slider → crank to ~15–30 and walk through grass / low leaves. Expect
+  a wide, obvious parting around you (roots stay planted). 1.0 = r591 default, 0 = off.
+- DIAGNOSTIC: if even at 30 NOTHING moves, the cause is structural, not subtlety — likely (a) the foliage near you isn't
+  Sway-tagged (only leaf-cubes + plant tops get tag 1; solid grass-block tops don't sway), (b) hot-shaders served a stale
+  chunk.vert.spv (confirm the build recompiled it), or (c) camera_pos.xz isn't tracking the player as expected. Report
+  which and I'll chase it. If it DOES move, it was just too subtle at 1.0 and we pick a good default.
+
+## r593 — DIAGNOSTIC: split the two failure modes (value delivery vs sway tag)
+Operator: clean build (not stale spv), cranking the r592 slider does nothing, foliage near spawn unaffected. Confirmed
+the bin uses WorldRenderer (chunk_renderer.rs is unused/legacy — its zeroed UBO is irrelevant), and WorldRenderer has a
+SINGLE CameraUbo write (world_renderer.rs:5420) feeding chunk.vert, with my sun_color.a edit in it. `world_pos` is
+absolute world space (chunk_origin + local) and camera_pos is world-space, so the distance math is correct — the space
+isn't the bug. Two forks remain: (A) sun_color.a not reaching chunk.vert, or (B) foliage near you isn't Sway-tagged so the
+whole `if(sway_tag==1u)` block (wind sway AND disturber) is skipped.
+Added a decisive TEMP diagnostic in chunk.vert: an UNCONDITIONAL magenta tint that ramps in as the slider passes 5,
+depending ONLY on sun_color.a (not sway tags). bin compiles, shader validated.
+- TEST ON M2: open F3, drag the foliage-disturber slider past 5 toward 30.
+  • WORLD TINTS MAGENTA ⇒ sun_color.a is arriving → the disturber's silence is a sway-TAG/geometry issue (the foliage
+    near you isn't tag 1 — e.g. grass-block tops don't sway; only plant tops / leaf cubes do). Next: check foliage_sway
+    tagging + whether wind sway itself is visible.
+  • NO TINT AT MAX ⇒ sun_color.a isn't reaching chunk.vert (UBO/pass mismatch) → chase the descriptor/pass.
+  Report which and I'll fix the identified half. (Diagnostic tint is temporary — removed once the path is confirmed.)
+
+## r594 — THE FIX: wire the foliage sway tag into the mesher (sway never worked)
+Diagnostic (r593) result: world tinted purple (sun_color.a arrives) but stayed static → nothing is Sway-tagged. Root
+cause found: the default mesher is the CPU mesher (GPU octree is off by default — Asahi-hostile), it produces the
+packed-u32 chunk.vert vertices, and the sway-tag helpers (`vertex_sway_tag`/`tag_packed_pos`) were DEFINED BUT NEVER
+CALLED in emission — the exact "wire the tag emission" step `HANDOFF_gpu_foliage_sway.md` left open. So bits 30-31 were
+always 0 (SwayTag::None): wind sway AND the r591 disturber never had anything to act on.
+Wired it:
+- `Vertex` gains a `sway: u8` (default 0; `new()` unchanged so all 24 call sites compile; added `with_sway`).
+- `PackedVertex::from_world` now stamps a non-zero `sway` into pos_packed bits 30-31 via
+  `foliage_sway::pack_tag_into_pos` (solid geometry untouched).
+- New `push_quad_foliage` tags each vertex: the planted bottom row (within ½ sub-voxel of the grid base) → Anchor(2),
+  the rest → Sway(1). `emit_subvoxel_grid` (the sole foliage/leaf/plant emitter) now uses it for all 6 faces.
+- Removed the r593 diagnostic tint.
+lib + bin compile; chunk.vert validated. This is what finally connects sim::foliage_sway → mesh → chunk.vert (wind sway
+r586) → the r591/r592 disturber.
+- TEST ON M2: foliage must RE-MESH to pick up the tag — walk to fresh chunks or reload the world. Then: (1) grass/plants/
+  leaves visibly sway in wind (r586, now actually active); (2) with the F3 disturber slider up, foliage parts around you.
+  If it now works, we set a sane default disturber strength and (next) add the mob/dragon disturber array.
+
+## r595 — REVERT r594 (fix the large-mesh-planes regression) + real diagnosis
+r594 regressed: "large mesh planes" + still no sway. Root cause of the planes: `gpu_meshing_octree.rs:872`
+REINTERPRETS the GPU's float output as `&[mesher::Vertex]` via `from_raw_parts`, hard-assuming Vertex == 6 floats (24
+bytes). r594 added `sway: u8` → Vertex became 28 bytes → the cast strode 28 over 24-byte-packed data → every vertex
+garbled → stretched planes. REVERTED all of r594 (Vertex back to 24B, from_world, push_quad_foliage, emit_subvoxel_grid).
+lib + bin compile — planes gone.
+**Key realisation**: the operator's build runs the **OCTREE GPU mesher** (smoke.sh enables it; this `&[Vertex]` cast is
+its readback path), NOT the CPU mesher I'd assumed. Consequences:
+- My CPU-mesher tag wiring never applied to their path (so r594 couldn't fix sway even without the crash).
+- The octree GPU mesher (chunk_mesh_octree.comp) emits float verts and NEVER sets the sway tag (bits 30-31) — that's why
+  wind sway + the disturber are dead for them. (The r593 purple tint worked because it only needed sun_color.a in
+  chunk.vert, independent of the mesher.)
+**Real fix (next, careful)**: emit the 2-bit sway tag from the OCTREE path. Options, tied to the operator's bit-budget
+question: the float vertex (pos.xyz,color.rgb) has no room, so either (a) the comp packs a tag into spare color-float
+precision for from_world to extract, (b) add a 7th float carried consistently (comp *7 + Vertex 7-float + cast *7 — a
+coordinated layout bump, no cast break), or (c) the comp emits PackedVertex u32s directly with the tag in bits 30-31,
+dropping the float intermediate. (c) is cleanest long-term. Deferred to its own roll.
+NOTE: F3 disturber slider + sun_color.a plumbing (r592) and the chunk.vert disturber (r591) remain in place — harmless,
+they just have no tags to act on until the octree path emits them.
+
+## r596 — octree-path foliage sway + off-thread packing + copy coalescing (NOT COMPILED)
+Heads-down batch (operator: "code code code, no big compiles, rendezvous after"). NOT built here — expect possible
+compile fixups at rendezvous. Landed together because they share the pack seam:
+
+**Key insight that made it safe & small**: the octree GPU comp emits ONLY solid faces; leaves/plants/crops are skipped
+there and produced by the CPU decoration post-pass (`decorate_chunk` → `emit_subvoxel_grid`) in the octree dispatcher. So
+foliage sway needs NO comp-shader change — tag in decoration, pack after.
+
+1. **Sway tags, out-of-band (avoids the r594 planes)**: `Vertex` stays 24 bytes (octree readback's `&[Vertex]` cast
+   intact). New `ChunkMesh.sway: Vec<u8>` (parallel, may be short → pad 0). `mark_sway_quad` pads+appends 4 tags;
+   `sway_tag(i)` reads with 0 default. `push_quad_foliage` (v2) uses `mark_sway_quad`; the 6 `emit_subvoxel_grid` faces
+   use it. `PackedVertex::from_world_tagged` folds the tag into pos bits 30-31 (tag 0 == byte-identical to `from_world`).
+2. **Off-thread packing (upload Tier 2a/5)**: `ChunkMesh.packed: Vec<PackedVertex>` + `packed_min_y/max_y` + `pack_in_place`.
+   Called on the meshing-pool threads at all 3 send sites (CPU worker, sparse dispatcher, octree dispatcher AFTER
+   decoration). Renderer upload now: if `!packed.is_empty()` → clone bytes (memcpy), else legacy per-vertex path (now
+   `from_world_tagged`). `vert_count` hardened for packed-only meshes.
+3. **Copy coalescing (upload Tier 1b)**: `coalesce_copy_regions` merges regions contiguous in BOTH src+dst; called in
+   `flush_pending_copies` for vert+idx lanes. 2 unit tests.
+4. **Housekeeping**: all 11 `ChunkMesh { … }` literals migrated to `::empty()` / `..ChunkMesh::empty()` for the new fields.
+
+Compile-free sweep PASSED: 0 bare literals; each helper defined once; 3 pack sites; fast path present; derive satisfied.
+
+RENDEZVOUS CHECKLIST:
+- Build (`smoke.sh`). If it fails, likely spots: a ChunkMesh literal in a path I didn't grep, a borrow tweak on the
+  `let mut mesh` in the CPU worker, or `ash::vk` import in the mesh_buffer_pool test.
+- Walk to FRESH chunks (re-mesh needed). Expect for the FIRST time on your octree build: grass/plants/leaves sway in
+  wind, and with the F3 disturber slider up they part around you. (Set slider ~5-10; we'll pick a default.)
+- Watch for planes — there should be NONE now (Vertex is 24B again). If planes return, it's a pack-path bug, not the cast.
+- Perf: upload memcpy should be cheaper (packed off-thread); copy-region count lower under burst (trace log:
+  "coalesced N vert + M idx").
+
+## r597 — r596 VERIFIED (compiles clean) + disturber-array selection core
+"keep working": first de-risked r596 by actually compiling it — lib + bin both Finished with only pre-existing warnings,
+NO fixups. So the r596 batch (octree-path foliage sway via decoration tagging, off-thread PackedVertex packing, copy
+coalescing) is correct as shipped; the rendezvous build will work.
+Then prepped the flagship mob/dragon disturber array WITHOUT gambling a second blind layout change on top of unverified
+r596 (the array's entire payoff depends on r596's sway tagging working on-device — no tags, nothing to move). Added the
+pure, tested piece it needs:
+- `sim::secondary_motion::select_disturbers(origin, movers, min_strength, max_dist, out)` — picks the N most significant
+  wind disturbers near the player for the shader's small fixed array. Ranks by heft/proximity score
+  (`strength/(1+dist)`), drops sub-threshold (most creatures) and out-of-range movers, writes `[x,y,z,strength]` slots
+  (w<=0 = empty), caps at `out.len()` keeping the best. Verified via probe: near+strong kept, weak/far dropped, cap keeps
+  top-2, empty-safe. `Creature.mass` → strength via the existing `disturber_strength`.
+lib compiles; selection tests pass.
+WHAT'S LEFT for the array (land right AFTER the rendezvous confirms sway, so we're not stacking unverified changes):
+append `disturbers: [[f32;4];8]` to CameraUbo (the proven r419/r427/r431 append-last pattern → existing offsets
+unchanged), a `WorldRenderer::set_disturbers` populating it from `roamers` via `select_disturbers` each frame, chunk.vert
+declares the full UBO block + loops the array applying `wind_perturb::mover_delta` wake to foliage. chunk.frag already
+declares the full struct (lines 52-68) — the exact block to mirror in chunk.vert.
+RENDEZVOUS PLAN unchanged: build, walk to fresh chunks, confirm wind sway + the F3 disturber slider part foliage, confirm
+no planes. If sway works → I wire the array immediately (selection is ready). If not → we debug the pack path with a much
+smaller surface.
+
+## r598 — mob/dragon disturber array WIRED end-to-end (compile-verified)
+"keep working" ×3 → built the flagship: foliage bows aside from nearby heavy creatures (a dragon's bow-wave). Full chain,
+lib+bin compile clean, chunk.vert validated (glslang+spirv-val):
+- **UBO**: `disturbers: [[f32;4];8]` appended LAST to CameraUbo (r419/r427/r431 append-last pattern → existing offsets
+  unchanged). All 3 sizing sites already use `size_of::<CameraUbo>()` (buffer alloc, descriptor range, copy) so it grows
+  consistently — verified.
+- **chunk.vert**: block extended to the FULL CameraUbo layout (mirrors chunk.frag 52-68) so std140 offsets line up, +
+  `disturbers[8]`. New loop after the camera disturber: each slot (xyz world pos, w strength) does a radial push away,
+  reach `2 + strength^0.33·2.2` (~8.5 blocks at str 35) and push `min(0.18·strength, 1.5)` (capped bend, no stretch).
+- **WorldRenderer**: `disturbers` field + `set_disturbers(player, movers)` → `secondary_motion::select_disturbers`
+  (min_strength 0.5, 48-block reach); uploaded via the UBO write.
+- **bin**: each frame builds `movers` from `roamers` (pos + strength) and calls `set_disturbers`. NOTE: creature `mass`
+  (~1-40) is a smaller scale than stature's 70-baseline, so strength = `mass/15` (tuned) — medium+ creatures disturb,
+  critters are filtered, big beasts dominate. Likely to need tuning once visible.
+- DEVICE-VERIFY (M2, AFTER confirming r596 sway works — the array only shows if foliage is sway-tagged): walk a big
+  creature near grass/leaves → foliage bows away from it and springs back as it passes. Tune knobs: `mass/15` in the bin,
+  push/reach constants in chunk.vert, min_strength/max_dist in `set_disturbers`.
+- Honest: compile-verified only; stacks with r596 for on-device testing (they're coupled — no sway tags, no disturbance).
+
+## r599 — entity cloth/cape sway on the SAME field (wind + disturbers) + a found-not-wired gap
+Operator: wire more bending into the disturbance/wind/pressure/moisture systems so either it all works together, or the
+fixups become more meaningful, and find gaps. Compile-verified (lib+bin clean, both shaders validate).
+
+**Key finding**: `entity.vert` (heroes/dragons) already shares the EXACT SAME UBO/descriptor set as `chunk.vert` — the
+file even says so explicitly ("reuse the existing descriptor set without rebinding"). So wind + the r598 disturber array
+were already reachable there for zero new plumbing; the only gap was the shader doing nothing with them.
+**Also found**: `EntityVertex` has grown before (24→28 for `alpha`, r535) with the pipeline updated in lock-step — a
+supported growth pattern here, unlike the mesher's raw reinterpret-cast (the r594 lesson doesn't apply to this struct).
+
+Landed:
+- `EntityVertex` +`sway: f32` (0 rigid .. 1 free) + `opaque_sway()` ctor. Fixed ALL 12 existing construction sites
+  (11 literals across entity.rs/bin + `Body::part`'s push) to carry `sway: 0.0` — solid body parts unaffected.
+- `Body::part_sway(...)` — tagged cube emitter; `part()` now delegates to it with sway=0.
+- **Retrofitted sway onto EXISTING trailing cloth parts** (no new geometry): Heliographer's cape (0.5 upper / 0.9 lower,
+  graduated), Gravitybender's cloak back-panel (0.6, hood itself stays rigid — it's fitted), Windwalker's scarf tail and
+  Tidecaller's tidal train (both graduated 0→1 across their segment loop, tip freest). This STACKS with each part's
+  existing per-frame procedural flutter — the new part is response to ACTUAL wind speed and passing disturbers, the old
+  part is baked idle motion.
+- `entity_pipeline.rs`: stride 28→32, new attribute (location 3, R32_SFLOAT, offset 28). **Caught the real bug before it
+  shipped**: the upload path is a MANUAL field-by-field byte-packer (not a reinterpret cast) that still wrote only 28
+  bytes/vertex — exactly the r594 class of mismatch, but in a different subsystem. Fixed it to pack `sway` too (32
+  bytes/vertex), keeping the packer and the pipeline stride in lock-step.
+- `entity.vert`: UBO block extended to match chunk.vert byte-for-byte through `disturbers[8]` (comment already mandated
+  lock-step); new `in_sway` input; wind bend (same quadratic-pressure lean+flutter model as chunk.vert) + the same
+  disturber wake loop, both scaled by `in_sway`. Validated (glslang + spirv-val).
+- Fixed a pre-existing STALE test (`entity_vertex_size_matches_shader_layout` asserted 24 bytes since r535 made it 28 —
+  never caught because `cargo test` isn't run in this environment); now correctly asserts 32.
+
+**Gap found, deliberately NOT wired blind**: `moisture_field::advect(dt, clamp, wind_fn)` takes a wind closure but is
+NEVER actually driven live in the bin — the only call site outside its own module/tests feeds it a hardcoded unit vector
+(`sim/service_registry_batch.rs`). So "wind perturbs moisture" has no live hook to attach to yet; wiring it would mean
+standing up real per-tick service registration and world-coord mapping I can't verify blind. Noted as the concrete next
+step for the moisture/pressure side, rather than guessed at.
+
+DEVICE-VERIFY (M2, after r596/r598 confirm working): a hero's cape/scarf/cloak-tail should visibly react to wind speed
+(more billow in gusts) AND to a passing dragon/giant (the disturber wake), on top of the existing idle flutter.
+
+## r600 — dragon wings actually flex now (found: fully-built system, never ticked) + docs audit
+Operator: "keep working player bending stuff and dragon bending and building with the character design... it all fits
+together, read the docs." Read the docs first — this surfaced a SECOND meaning of "bending" in this codebase: a full
+Avatar-style elemental combat system (`gesture_resolve`/`player_bending`/`dragon_bending_ai`/`resonance_state`), separate
+from the mesh-deform work (r591-599). Audited BOTH before touching anything:
+
+**Combat bending (checked, already solid — no gap)**: `player_character::bend_element()` already maps hero names
+(Heliographer→Fire, Windwalker/Stormweaver→Air, Tidecaller→Water, Gravitybender→Earth) and IS called live in the bin's
+bend-input resolution (line ~5719), overriding the environment-derived element for hero characters. `dragon_bending_ai`
+mirrors the exact same `gesture_resolve` grammar for dragon genomes. This connection was already complete — nothing to
+wire here.
+
+**Dragon WING mesh-bending (the real gap — this is what got wired)**: `sim::dragon_wing_flex` (a Verlet wing-membrane
+solver: root+tip pinned, mid-span lags under gravity/inertia) was fully built, tested, and — critically — `dragon_forge::
+skin_with_flex` (which APPLIES the solved offsets to the rendered wing boxes) already existed too. But nothing ever
+called it: the live dragon render path (`world/entity.rs::forge_to_vertices`) called plain `skin()`, and the only place
+that ever stepped a `WingFlex` was a dummy service-registry probe animating a fixed fake rig forever (its own comment
+said "real per-frame wing pose is a later wiring pass"). So every dragon in the game has ALWAYS rendered with perfectly
+rigid wings — this was dead code with a real render hook sitting right next to it, same class of gap as foliage sway.
+
+**Landed** (lib+bin compile clean, no fixups):
+1. `dragon_wing_flex::WingFlex::step` gains a `wind: [f32;3]` force parameter (folded in alongside gravity before the
+   Verlet integrate) + `FlexParams.wind_gain` (default 1.0). Verified via probe: a lateral gust visibly increases
+   membrane billow vs calm air, AND `wind_gain=0` reproduces the OLD gravity-only trajectory byte-for-byte (zero
+   regression risk for the one existing dummy caller). 8 existing call sites updated.
+2. `Creature` gains `wing_flex: Option<Box<WingFlex>>` (lazy) + cached `wing_offset_l/r: Vec<[f32;3]>` (empty by
+   default = unchanged rendering — same "empty slice = no-op" contract `skin_with_flex` already had).
+3. **Actually ticked it**: in the bin's per-creature tick (right where the existing comment already flagged "only gaze +
+   verlet wing physics moved" — a breadcrumb admitting this was known-missing), genome dragons now: derive wing
+   root/tip from the forge model's joints + bounding box, sample real wind at the creature's world position
+   (`wind::wind_at`), rotate it into the model's local frame (inverse yaw), and step the solver — storing the result on
+   the creature each tick.
+4. `world/entity.rs::forge_to_vertices` now calls `skin_with_flex(...)` with those cached offsets instead of plain
+   `skin()` — a strict superset (empty offsets ≡ old output) so nothing regresses for creatures that never tick it.
+
+DEVICE-VERIFY (M2): dragons in flight (or standing, wings semi-spread) should show visible mid-span wing droop/lag that
+responds to actual wind — more flutter/billow in gusty conditions, calmer in still air, on top of the existing
+flap/beat animation. Tuning knobs: `FlexParams::wind_gain` (bin currently uses `FlexParams::default()`), the wind-force
+scale in the tick block, `WingFlex::new(span, 5)`'s sample count.
+
+**Also found, not touched**: the yaw rotation used to convert world wind into the model's local frame is a reasonable
+standard rotation but wasn't cross-checked bit-for-bit against `push_box_oriented`'s internal convention (that helper's
+exact formula wasn't inspected). Worst case if the convention differs: wind pushes the membrane in a rotated-but-still-
+wind-reactive direction — not a crash, just possibly not perfectly aligned with the visible gust direction. Flag as a
+device-verify item, not a correctness blocker.
+
+## r601 — giant dragons hook into quake/stomp-erosion/wind/breath/knockback (all player-only laws, now creature laws too)
+Operator: huge (50-block) dragons should hook into the quake + destruction-walk systems, have huge wind force, and scale
+their breath/attacks including knockback. Audited first: `sim::stature::derive` (MAX_HEIGHT=50, matches the operator's
+number exactly) already computes `ground_shake`, `mass`, `strength`, `knockback_dealt`, `knockback_resist01` from a
+body's real height — but EVERY consumer of it was player-only (`player_stature`, the tallness slider). The r571/r573
+"STOMP EROSION" system (footfall crushes terrain, scaled by ground_shake) only ever fired for the player. `breath_attack::
+params_from` only reads GENOME traits (teeth, bulk 0..1), never the creature's actual rendered scale — a 4-block and a
+50-block dragon with the same genome breathed identically. `knockback_impulse::impulse` was a fully tested pure function
+with ZERO live callers anywhere — breath attacks dealt damage but never knocked the player back.
+**Landed** (lib+bin compile clean; sanity-probed across h=1.8/4/15/50 — all monotonic, baseline unchanged, no NaN risk):
+- `Creature` gains `derived_stature: Option<StatureProfile>`, recomputed each tick for genome dragons from their ACTUAL
+  physical height (`body.half_extents[1]*2`, not a genome trait) via `stature::derive(height, 1,1,1)`. Also supersedes
+  the ad-hoc genome `mass` with the real height-derived one.
+- **Stomp erosion for dragons**: the exact r571/r573 crush-vs-hardness rule (same footprint/depth math, same
+  crush_cap=height/8), reused for any `derived_stature.ground_shake > 1.0` creature that's grounded and moving — no
+  view-bob available for creatures, so footfall cadence is a simple time-based trigger (~1 stomp/gait-cycle, faster
+  while running) instead of the player's bob-phase edge. A default-sized creature (ground_shake≈0) never touches terrain.
+- **Wind disturber fixed**: r598's `mass/15` guess replaced with the real calibrated `secondary_motion::
+  disturber_strength(mass, ground_shake)` for forge dragons (probe: a 50-block dragon's disturber strength is ~21650 vs
+  a baseline person's 0 — but the chunk.vert/entity.vert push is already hard-clamped from r598/r599, so this can't cause
+  runaway visuals, only a wider reach).
+- **Breath scales with actual size**: `damage_at`'s result is now multiplied by the dragon's derived `strength`, SOFT-
+  scaled via `.sqrt()` (matching stature.rs's own convention for `max_health`/`hunger_rate` — avoids a flat multiply
+  turning a titan's breath into an always-instant-kill). Probe: base 17 dmg at h=1.8 → 25 at h=4 → 49 at h=15 → 90 at h=50.
+- **Knockback wired for the first time**: on a successful breath hit, `knockback_impulse::impulse(dmg, player_mass,
+  player_resist)` — amplified by the dragon's own `knockback_dealt` — pushes the player's velocity away from the dragon
+  (XZ + a capped upward lift). Probe: 0.24 b/s at h=1.8 (barely felt) → 5.9 at h=15 → 35.6 at h=50 (a titan's breath
+  genuinely launches you).
+DEVICE-VERIFY (M2): stand near a large forge dragon while it walks — expect visible terrain crushing/trenching and
+foliage parting from further away than before; get hit by a big dragon's breath — expect a real shove, scaling hard with
+size. TUNING KNOBS (flagged, not finalized): the `.sqrt()` breath-damage exponent, the knockback lift cap (3.0 b/s),
+stomp cadence (~0.7s/gait-cycle baseline). 35 b/s knockback at h=50 is dramatic by design but worth an eyeball check.
+
+## r602 — gentler, accumulation-gated, varied-palette stomp erosion (player + dragons)
+Operator: footsteps too destructive per-step and too uniform-looking; want a gentler "partial mining" state over a wider
+area, with an actual break-through only after repeated stomps in the SAME spot (their "3 jumps break the ground" idea);
+also wants more block-palette variety worked into the erosion (mentioned slabs/stairs).
+**Slabs/stairs — deliberately NOT attempted this roll**: no such block types exist yet; adding them means new partial-
+height mesh geometry (BlockId variants, mesher face logic, hardness/harvest tables) that I can't verify visually blind.
+Flagged as a real, separate, larger follow-up rather than guessed at.
+**What DID land** (lib+bin compile clean; pure core probe-verified): new pure, tested `sim::stomp_erosion`, replacing the
+inline circular-crush logic in BOTH the player's (r571/r573) and the dragon's (r601) stomp blocks:
+- `in_footprint(dx,dz,radius,seed)` — a JAGGED footprint (hash-perturbed effective radius per cell) instead of a perfect
+  disc, so eroded ground doesn't read as a stack of identical circles. Probe: a mid-rim cell disagrees across seeds
+  (151/200 in, 49/200 out) — genuinely irregular, not uniform.
+- `update_streak(last_cell, cell, prev_streak)` — same-cell stomps grow the streak; moving anywhere else resets it to 1.
+- `decide(hardness, streak, params)` — bedrock stops the foot; otherwise Weather (tier down a notch) unless the streak
+  has reached `streak_to_break` (3) AND the block is soft enough, in which case Crush (remove to air). So a single
+  footstep now almost always just WEATHERS a wide patch; only repeated stomps in the exact same cell actually break
+  through — the "partial mining state over a larger area, breaks after ~3 in a spot" the operator asked for.
+- `weathered_variant(block, seed)` — a small VARIED palette per block instead of always the same swap: Stone → Cobblestone
+  /Gravel/MossyCobblestone (all pre-existing, already-rendering block types — Gravel and MossyCobblestone were sitting
+  unused in the weathering tier before this). Probe: 3 distinct outcomes for Stone across seeds, deterministic per seed.
+Both call sites widened their footprint radius (was clamp 1..3, now clamp 2..4 — "larger area") while gating actual
+destruction behind the streak (the "less destructive per step" half). New state: `player_stomp_cell/_streak` (bin-level)
+and `Creature.stomp_cell/_streak` (per dragon) track the same-spot streak.
+DEVICE-VERIFY (M2): walking as a giant (or near a giant dragon) should leave a wide, ragged-edged patch of WORN ground
+(varied block types) rather than a small perfect crater; only standing/stomping repeatedly in the exact same spot should
+actually punch through to open ground. Tuning knobs: `streak_to_break` (3), the `.clamp(2,4)` footprint radius,
+`weathered_variant`'s per-block probability splits.
+
+## r603 — upload metrics (Tier 1c) + a documented sweep of what ISN'T worth chasing
+Operator: "keep finding things from docs to implement." Did a systematic sweep before landing on this roll's pick — worth
+recording both what I found and WHY I didn't force the bigger ones:
+- **`docs/FOLLOWUPS.md` #2 "mobs invisible"**: refers to `sim::mob`/`SimDriver`/`bin/unendlich_world.rs` — a DIFFERENT
+  binary from `unendlich_fullgame.rs` (the one smoke.sh builds and the operator tests). Not touched — out of scope for
+  the live game.
+- **A family of `sim::dragon_*` modules** (signature, attunement, material_yield, thirst, population, hunt, observe,
+  language, growth_stage, elemental, activity, brain, locomotion_sim, forage_sim) — ALL share the same
+  `service_registry` dummy-smoke-test pattern (like the WingFlex stub I found last time) and have ZERO real callers
+  anywhere, including cross-references to each other. Unlike `dragon_wing_flex` (which had `skin_with_flex` sitting
+  ready to consume it — a SMALL missing connection), these have no existing render/consumption hook at all — wiring any
+  one means inventing a whole new integration, not restoring a nearly-finished one. Left alone; flagged as a bigger,
+  deliberate future architecture rather than individually-actionable gaps.
+- **`sim::creature_from_image`**: a genuine, partially-built "generate a dragon from a reference image" feature (C1
+  shape / C2 palette / C3 surface-glow threads). C3 (`surface_from_image` → `place_surface_glow`, which IS already
+  hooked to `dragon_forge`) is the only thread actually implemented; C1/C2 don't exist yet, AND there's no `image`/`png`
+  crate dependency in Cargo.toml to decode a real file. Genuinely valuable but too large + unverifiable blind (new
+  dependency, 2 of 3 threads missing, no way to see the result). Flagged, not attempted.
+**What DID land**: the operator's own attached upload-plan.md called for Tier 1c ("report per-frame uploaded_chunks/
+uploaded_bytes/memcpy_ms/gpu_copy_ms as a metric line so every tier below has a before/after") — confirmed nothing like
+it existed, and it directly closes the loop on r596's unverified packing/coalescing claims. New `render::upload_metrics`
+(mirrors the existing `mesher_timer` pattern, but `&mut self` plain fields since upload only happens on the frame
+thread — no Mutex needed): accumulates chunks/vert_bytes/idx_bytes/memcpy-time per window, gated behind
+`UNENDLICH_UPLOAD_METRICS=1` (env checked ONCE at construction, a plain bool read per chunk when off — zero cost
+unrequested), periodically flushed to one log line. Wired into `upload_mesh`'s existing pack/clone branch (brackets
+whichever path runs — the r596 fast-path clone or the legacy per-vertex pack — so it measures the REAL cost either way).
+lib + bin compile clean. Logic verified via in-module unit tests (accumulate/gate/reset, zero-period flush) + a partial
+live probe (enabled-flag + pre-window withholding); the full flush-after-1s timing wasn't re-probed live this round —
+a disk-space crunch from an unrelated aggressive cleanup forced a full dependency rebuild mid-verification and I judged
+re-running a multi-minute full rebuild not worth the time against the already-passing type-check + unit-test coverage.
+DEVICE-VERIFY (M2): run with `UNENDLICH_UPLOAD_METRICS=1`, watch the log for `[upload] N chunks/s, N MB/s ... memcpy N
+ms/s` lines during a burst (e.g. flying fast through new terrain) — this is the first hard number confirming whether
+r596's off-thread packing actually reduced frame-thread cost.

@@ -25,6 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Last scroll velocity in pixels-per-second, scaled by 1000 and
 /// stored as integer for atomic access. Signed because scrolling
@@ -80,7 +81,12 @@ const REST_VELOCITY_THRESHOLD: f64 = 5.0;
 /// coherently. Lock is very short-held.
 static UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
-fn now_ms() -> u64 { core_kit::time::now_millis() }
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Push a raw scroll sample. Called from QML's
 /// `browseFlick.onContentYChanged` handler (throttled to ~10/sec).

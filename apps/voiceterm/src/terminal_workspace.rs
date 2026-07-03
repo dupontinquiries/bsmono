@@ -502,6 +502,27 @@ impl TermWorkspace {
         self.active_mut().focused_pane = prev_focus;
         new_id
     }
+    /// v0.1.881: close the newest web pane in the active tab (highest id).
+    /// Web panes are never the focused pane (split_web restores focus to the
+    /// prior pane), so `close_pane` can't reach them — this is what lets
+    /// Ctrl+Shift+W close a web pane. Returns the closed id, or None when
+    /// there are no web panes (caller then falls back to close_pane).
+    pub fn close_newest_web_pane(&mut self) -> Option<u64> {
+        let mut web_ids: Vec<u64> = self
+            .active()
+            .root
+            .pane_ids()
+            .into_iter()
+            .filter(|id| matches!(self.active().root.find_kind(*id), Some(PaneKind::Web { .. })))
+            .collect();
+        web_ids.sort_unstable();
+        let target = *web_ids.last()?;
+        if self.close_pane_id(target) {
+            Some(target)
+        } else {
+            None
+        }
+    }
     /// Close the focused pane (won't close the last pane in the last tab; if
     /// it's the last pane of a non-last tab, closes the tab). Returns the
     /// removed pane id, if any.
@@ -979,6 +1000,27 @@ mod tests {
         let mut ws = TermWorkspace::new();
         assert_eq!(ws.close_pane(), None);
         assert_eq!(ws.total_panes(), 1);
+    }
+
+    #[test]
+    fn close_newest_web_pane_targets_web_not_terminal() {
+        let mut ws = TermWorkspace::new();
+        // terminal pane (root) + two web panes
+        let w1 = ws.split_web(Dir::Right, "https://a.example");
+        let w2 = ws.split_web(Dir::Right, "https://b.example");
+        assert_eq!(ws.active().root.count(), 3);
+        // focus was restored to the original terminal pane, not the web panes
+        assert_ne!(ws.active().focused_pane, w1);
+        assert_ne!(ws.active().focused_pane, w2);
+        // closes the NEWEST web pane (highest id), leaving the terminal + w1
+        assert_eq!(ws.close_newest_web_pane(), Some(w2.max(w1)));
+        assert_eq!(ws.active().root.count(), 2);
+        // again → the remaining web pane
+        assert_eq!(ws.close_newest_web_pane(), Some(w1.min(w2)));
+        assert_eq!(ws.active().root.count(), 1);
+        // none left → None (and the terminal pane survives)
+        assert_eq!(ws.close_newest_web_pane(), None);
+        assert_eq!(ws.active().root.count(), 1);
     }
 
     #[test]

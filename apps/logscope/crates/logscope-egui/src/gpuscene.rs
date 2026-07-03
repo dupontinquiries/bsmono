@@ -40,6 +40,12 @@ fn rot_x(a: f32) -> M4 { // matches OrbitCam pitch
     m[idx(1,1)] = c; m[idx(1,2)] = s; m[idx(2,1)] = -s; m[idx(2,2)] = c;
     m
 }
+fn rot_z(a: f32) -> M4 { // Dutch-angle roll around the view axis
+    let (c, s) = (a.cos(), a.sin());
+    let mut m = ident();
+    m[idx(0,0)] = c; m[idx(0,1)] = s; m[idx(1,0)] = -s; m[idx(1,1)] = c;
+    m
+}
 fn mul_point(m: &M4, p: Vec3) -> [f32; 4] {
     [
         m[idx(0,0)]*p.x + m[idx(1,0)]*p.y + m[idx(2,0)]*p.z + m[idx(3,0)],
@@ -103,8 +109,8 @@ void main() {}
 pub struct Camera { view: M4, proj: M4 }
 impl Camera {
     pub fn from_orbit(o: &OrbitCam, width: f32, height: f32, scale: f32, znear: f32, zfar: f32) -> Self {
-        // view = T(0,0,-dist) · Rx(pitch) · Ry(yaw) · T(-target)   →   view = (x1, y2, z2 - dist)
-        let view = mul(&mul(&mul(&translate(0.0, 0.0, -o.dist), &rot_x(o.pitch)), &rot_y(o.yaw)),
+        // view = Rz(roll) · T(0,0,-dist) · Rx(pitch) · Ry(yaw) · T(-target)   (roll = Dutch tilt around view axis)
+        let view = mul(&mul(&mul(&mul(&rot_z(o.roll), &translate(0.0, 0.0, -o.dist)), &rot_x(o.pitch)), &rot_y(o.yaw)),
                        &translate(-o.target.x, -o.target.y, -o.target.z));
         let fy = 2.0 * scale / height.max(1.0);
         let fx = 2.0 * scale / width.max(1.0);
@@ -156,16 +162,51 @@ impl Camera {
 /// Flatten the scene to a back-to-front-sorted triangle soup: 12 floats per vertex (pos×3, normal×3,
 /// colour×4, material×1), 3 vertices per triangle, applying each mesh's `offset` (floating). Draw with
 /// `glDrawArrays`. The material id selects a `texgen` layer; the shader samples it triplanar.
-pub fn pack_sorted(meshes: &[Mesh3], cam: &Camera) -> Vec<f32> {
+pub fn pack_sorted(meshes: &[Mesh3], cam: &Camera, min_ndc: f32) -> Vec<f32> {
     // (depth, mesh index, tri index)
     let mut order: Vec<(f32, usize, usize)> = Vec::new();
+    // FRUSTUM CULLING — drop triangles whose centroid falls well outside the view frustum before they reach the
+    // GPU (the scene is one big draw call, so this is the only place to cull). Large triangles (walls/floor/dome
+    // that span the screen even when their centroid is off-frame) are exempt by a size test so we never punch
+    // holes. Tighter margin under battery-saver POWER so a phone culls harder. LOGSCOPE_NO_CULL=1 disables it.
+    let cull_on = std::env::var("LOGSCOPE_NO_CULL").map(|v| v != "1").unwrap_or(true);
+    let vp = cam.view_proj();
+    let fy = cam.proj[idx(1, 1)].abs(); // vertical focal term → projected NDC size = radius * fy / depth
+    let margin = 1.05 + 0.45 * crate::theme::power_mode(); // full 1.5 · half 1.275 · quarter 1.16
+    let clipw = |p: Vec3| -> (f32, f32, f32) {
+        (vp[idx(0, 0)] * p.x + vp[idx(1, 0)] * p.y + vp[idx(2, 0)] * p.z + vp[idx(3, 0)],
+         vp[idx(0, 1)] * p.x + vp[idx(1, 1)] * p.y + vp[idx(2, 1)] * p.z + vp[idx(3, 1)],
+         vp[idx(0, 3)] * p.x + vp[idx(1, 3)] * p.y + vp[idx(2, 3)] * p.z + vp[idx(3, 3)])
+    };
     for (mi, m) in meshes.iter().enumerate() {
         let off = m.offset;
+        // DYNAMIC LOD — drop an entire scenery mesh whose projected screen size is below the threshold (far + small).
+        // Hole-free: we only remove meshes too small to read, and it re-evaluates every frame as the camera moves,
+        // so distant foliage/props dissolve out and resolve back in. min_ndc==0 (the graph) keeps everything.
+        if min_ndc > 0.0 && !m.verts.is_empty() {
+            let inv = 1.0 / m.verts.len() as f32;
+            let (mut sx, mut sy, mut sz) = (0.0f32, 0.0f32, 0.0f32);
+            for v in &m.verts { sx += v.x; sy += v.y; sz += v.z; }
+            let cen = Vec3::new(sx * inv + off.x, sy * inv + off.y, sz * inv + off.z);
+            let mut rad2 = 0.0f32;
+            for v in &m.verts { let (dx, dy, dz) = (v.x + off.x - cen.x, v.y + off.y - cen.y, v.z + off.z - cen.z); rad2 = rad2.max(dx * dx + dy * dy + dz * dz); }
+            let depth = cam.depth(cen).max(0.25);
+            if rad2.sqrt() * fy / depth < min_ndc { continue; } // too small on screen → skip the whole mesh
+        }
         for (ti, tri) in m.tris.iter().enumerate() {
-            let c = {
-                let (a, b, d) = (m.verts[tri[0] as usize], m.verts[tri[1] as usize], m.verts[tri[2] as usize]);
-                Vec3::new((a.x + b.x + d.x) / 3.0 + off.x, (a.y + b.y + d.y) / 3.0 + off.y, (a.z + b.z + d.z) / 3.0 + off.z)
-            };
+            let (a, b, d) = (m.verts[tri[0] as usize], m.verts[tri[1] as usize], m.verts[tri[2] as usize]);
+            let c = Vec3::new((a.x + b.x + d.x) / 3.0 + off.x, (a.y + b.y + d.y) / 3.0 + off.y, (a.z + b.z + d.z) / 3.0 + off.z);
+            if cull_on {
+                let r2 = { // triangle size proxy: keep big tris regardless of where their centroid lands
+                    let da = (a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z);
+                    let db = (a.x - d.x) * (a.x - d.x) + (a.y - d.y) * (a.y - d.y) + (a.z - d.z) * (a.z - d.z);
+                    da.max(db)
+                };
+                if r2 < 64.0 { // only cull triangles smaller than ~8 units across
+                    let (cx, cy, cw) = clipw(c);
+                    if cw <= 0.05 || cx.abs() > cw * margin || cy.abs() > cw * margin { continue; }
+                }
+            }
             order.push((cam.depth(c), mi, ti));
         }
     }
@@ -672,7 +713,7 @@ mod tests {
     // or the GPU scene and the 2D dots/runes/labels would drift apart.
     #[test]
     fn view_proj_matches_orbitcam_project() {
-        let o = OrbitCam { yaw: 0.6, pitch: 0.32, dist: 15.0, target: Vec3::new(0.0, -3.0, 0.0) };
+        let o = OrbitCam { yaw: 0.6, pitch: 0.32, dist: 15.0, target: Vec3::new(0.0, -3.0, 0.0), roll: 0.0 };
         let (w, h, scale) = (820.0f32, 610.0f32, 400.0f32);
         let cam = Camera::from_orbit(&o, w, h, scale, 0.1, 300.0);
         let vp = cam.view_proj();
@@ -702,7 +743,7 @@ mod tests {
         let o = OrbitCam::default();
         let cam = Camera::from_orbit(&o, 800.0, 600.0, 400.0, 0.1, 300.0);
         let scene = vec![mesh3d::uv_sphere(o.target, 1.0, 8, 6, Color32::WHITE)];
-        let v = pack_sorted(&scene, &cam);
+        let v = pack_sorted(&scene, &cam, 0.0);
         assert_eq!(v.len() % 36, 0, "12 floats × 3 verts per triangle");
         assert_eq!(v.len() / 36, 8 * 6 * 2, "all sphere triangles packed");
         // recompute per-triangle depth from the packed positions; must be non-increasing (far → near).

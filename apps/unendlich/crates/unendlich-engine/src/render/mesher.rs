@@ -699,6 +699,21 @@ impl PackedVertex {
         }
     }
 
+    /// r596: like [`from_world`], but folds a 2-bit foliage sway tag into
+    /// pos_packed bits 30-31 (see `sim::foliage_sway`). Tag 0 is byte-identical
+    /// to `from_world`, so solid geometry is unchanged.
+    #[inline]
+    pub fn from_world_tagged(v: &Vertex, chunk_origin: [f32; 3], tag: u8) -> Self {
+        let mut p = Self::from_world(v, chunk_origin);
+        if tag != 0 {
+            p.pos_packed = crate::sim::foliage_sway::pack_tag_into_pos(
+                p.pos_packed,
+                crate::sim::foliage_sway::SwayTag::from_bits(tag),
+            );
+        }
+        p
+    }
+
     /// Decode chunk-local position (for tests / debugging).
     pub fn unpack_pos(self) -> [f32; 3] {
         let x = ((self.pos_packed) & 0x3FF) as f32 / 1023.0 * Self::CHUNK_EXTENT;
@@ -763,13 +778,78 @@ pub fn tag_packed_pos(pos_packed: u32, tag: SwayTag) -> u32 {
 pub struct ChunkMesh {
     pub vertices: Vec<Vertex>,
     pub indices:  Vec<u32>,
+    /// r596: OUT-OF-BAND per-vertex foliage sway tags (0 None / 1 Sway / 2 Anchor),
+    /// parallel to `vertices`. Kept outside `Vertex` on purpose: growing `Vertex`
+    /// past 24 bytes breaks the octree readback's `&[Vertex]` reinterpret cast
+    /// (the r594 "large planes" regression). May be SHORTER than `vertices` —
+    /// solid geometry never appends tags; readers pad missing entries with 0.
+    pub sway: Vec<u8>,
+    /// r596 (upload plan Tier 2a/5): vertices pre-packed OFF the frame thread by
+    /// [`ChunkMesh::pack_in_place`] in the meshing pool. When non-empty the
+    /// renderer's upload skips its per-vertex `from_world` pass entirely and
+    /// uses these bytes + the world-space Y bounds below.
+    pub packed: Vec<PackedVertex>,
+    pub packed_min_y: f32,
+    pub packed_max_y: f32,
 }
 
 impl ChunkMesh {
-    pub fn empty() -> Self { Self { vertices: Vec::new(), indices: Vec::new() } }
+    pub fn empty() -> Self {
+        Self {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            sway: Vec::new(),
+            packed: Vec::new(),
+            packed_min_y: 0.0,
+            packed_max_y: 0.0,
+        }
+    }
     pub fn is_empty(&self) -> bool { self.indices.is_empty() }
     pub fn vertex_count(&self) -> u32 { self.vertices.len() as u32 }
     pub fn index_count(&self)  -> u32 { self.indices.len()  as u32 }
+
+    /// r596: the sway tag for vertex `i` (0 when untagged — solid geometry).
+    #[inline]
+    pub fn sway_tag(&self, i: usize) -> u8 {
+        self.sway.get(i).copied().unwrap_or(0)
+    }
+
+    /// r596: tag the 4 vertices ABOUT TO BE PUSHED with foliage sway bits.
+    /// Pads the tag vec with zeros up to the current vertex count first, so
+    /// solid geometry emitted earlier stays untagged and alignment holds.
+    #[inline]
+    pub fn mark_sway_quad(&mut self, tags: [u8; 4]) {
+        if self.sway.len() < self.vertices.len() {
+            self.sway.resize(self.vertices.len(), 0);
+        }
+        self.sway.extend_from_slice(&tags);
+    }
+
+    /// r596 (Tier 2a/5): quantize this mesh's world-space vertices into
+    /// [`PackedVertex`] form — the exact bytes the GPU pool draws — on the
+    /// CALLING thread (a meshing-pool worker), so the frame thread's upload
+    /// becomes a memcpy instead of a per-vertex pack. Folds each vertex's
+    /// foliage sway tag into pos bits 30-31 (what chunk.vert's wind sway and
+    /// the r591 disturber read). Also records world-space Y bounds in one pass.
+    /// `vertices` are kept intact (the octree CPU-compare path reads them).
+    pub fn pack_in_place(&mut self, chunk_origin: [f32; 3]) {
+        if self.vertices.is_empty() {
+            self.packed.clear();
+            return;
+        }
+        let mut min_y = self.vertices[0].position[1];
+        let mut max_y = min_y;
+        let mut packed = Vec::with_capacity(self.vertices.len());
+        for (i, v) in self.vertices.iter().enumerate() {
+            let y = v.position[1];
+            if y < min_y { min_y = y; }
+            if y > max_y { max_y = y; }
+            packed.push(PackedVertex::from_world_tagged(v, chunk_origin, self.sway_tag(i)));
+        }
+        self.packed = packed;
+        self.packed_min_y = min_y;
+        self.packed_max_y = max_y;
+    }
 }
 
 // =============================================================================
@@ -971,7 +1051,11 @@ fn block_color_per_face(b: BlockId) -> Option<[[f32; 3]; 6]> {
 
 /// Whether this block should be meshed at all (i.e. has visible faces).
 fn is_meshable(b: BlockId) -> bool {
-    !b.is_air() && b.is_solid()
+    // r523: subvoxel-only blocks (leaves, crops) must NOT emit a solid cube — they render
+    // entirely as subvoxel decoration, and a cube on top hides that detail (the "solid block
+    // over the leaves" bug). This now matches world::surface::is_meshable, which already
+    // excluded them; the two paths are meant to agree.
+    !b.is_air() && b.is_solid() && !b.is_subvoxel_only()
 }
 
 /// Whether a face between `inner` (the meshed block) and `neighbor` should
@@ -2360,6 +2444,27 @@ fn hash_for_decoration(x: i32, y: i32, z: i32) -> (f32, f32) {
 /// `[1.0, 1.0, 1.0]` for no change. Used by lifecycle/decay handlers to
 /// shift living plants toward yellow (drying) or brown (withered) without
 /// having to rebuild the recipe — same geometry, modulated colors.
+/// r596: like [`push_quad`] but records a per-vertex foliage sway tag OUT-OF-BAND
+/// (`ChunkMesh::mark_sway_quad`) — `Vertex` itself stays 24 bytes, so the octree
+/// readback's `&[Vertex]` cast is untouched (the r594 lesson). The planted BOTTOM
+/// row of the plant (within half a sub-voxel of `grid_bottom_y`) anchors (2),
+/// everything above sways (1). At pack time (`from_world_tagged` /
+/// `pack_in_place`) the tag lands in pos bits 30-31, which chunk.vert's wind sway
+/// and the r591 disturber read. Used only by the subvoxel foliage emitter.
+fn push_quad_foliage(
+    mesh: &mut ChunkMesh,
+    p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3],
+    color: [f32; 3],
+    grid_bottom_y: f32,
+) {
+    use crate::world::subvoxel::SUBVOXEL_SIZE;
+    let tag = |p: [f32; 3]| -> u8 {
+        if p[1] - grid_bottom_y < 0.5 * SUBVOXEL_SIZE { 2 } else { 1 }
+    };
+    mesh.mark_sway_quad([tag(p0), tag(p1), tag(p2), tag(p3)]);
+    push_quad(mesh, p0, p1, p2, p3, color);
+}
+
 fn emit_subvoxel_grid(
     mesh: &mut ChunkMesh,
     grid: &crate::world::subvoxel::SubVoxelGrid,
@@ -2491,45 +2596,45 @@ fn emit_subvoxel_grid(
         // +Y top face
         // +Y top face — all 4 verts at y1, use top_ coords
         if !lookup(bx, by + 1, bz) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [top_x0, y1, top_z0], [top_x1, y1, top_z0],
                 [top_x1, y1, top_z1], [top_x0, y1, top_z1],
-                shade([0.0, 1.0, 0.0]));
+                shade([0.0, 1.0, 0.0]), host_origin[1]);
         }
         // -Y bottom face — all 4 verts at y0, use bot_ coords
         if !lookup(bx, by - 1, bz) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [bot_x0, y0, bot_z1], [bot_x1, y0, bot_z1],
                 [bot_x1, y0, bot_z0], [bot_x0, y0, bot_z0],
-                shade([0.0, -1.0, 0.0]));
+                shade([0.0, -1.0, 0.0]), host_origin[1]);
         }
         // +X east face — left edge is bottom, right edge is top
         if !lookup(bx + 1, by, bz) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [bot_x1, y0, bot_z0], [bot_x1, y0, bot_z1],
                 [top_x1, y1, top_z1], [top_x1, y1, top_z0],
-                shade([1.0, 0.0, 0.0]));
+                shade([1.0, 0.0, 0.0]), host_origin[1]);
         }
         // -X west face
         if !lookup(bx - 1, by, bz) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [bot_x0, y0, bot_z1], [bot_x0, y0, bot_z0],
                 [top_x0, y1, top_z0], [top_x0, y1, top_z1],
-                shade([-1.0, 0.0, 0.0]));
+                shade([-1.0, 0.0, 0.0]), host_origin[1]);
         }
         // +Z south face
         if !lookup(bx, by, bz + 1) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [bot_x1, y0, bot_z1], [bot_x0, y0, bot_z1],
                 [top_x0, y1, top_z1], [top_x1, y1, top_z1],
-                shade([0.0, 0.0, 1.0]));
+                shade([0.0, 0.0, 1.0]), host_origin[1]);
         }
         // -Z north face
         if !lookup(bx, by, bz - 1) {
-            push_quad(mesh,
+            push_quad_foliage(mesh,
                 [bot_x0, y0, bot_z0], [bot_x1, y0, bot_z0],
                 [top_x1, y1, top_z0], [top_x0, y1, top_z0],
-                shade([0.0, 0.0, -1.0]));
+                shade([0.0, 0.0, -1.0]), host_origin[1]);
         }
     }
 }

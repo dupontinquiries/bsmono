@@ -60,6 +60,10 @@ pub struct DebugSettings {
     /// Volumetric march step count — the main perf knob for the raymarching
     /// approaches. Read by the fog march. (hook)
     pub fog_steps: AtomicU32,
+    /// r592: foliage-disturber strength multiplier (×10 fixed-point; 10 = ×1.0, the
+    /// r591 default). A live F3 slider so the operator can amp the "plants part around
+    /// you" push to confirm it's working. Uploaded in `sun_color.a`, read by chunk.vert.
+    pub foliage_disturb: AtomicU32,
 }
 
 impl DebugSettings {
@@ -86,6 +90,7 @@ impl DebugSettings {
             fog_approach: AtomicU32::new(0),
             advect_clamp: AtomicBool::new(true),
             fog_steps: AtomicU32::new(12),
+            foliage_disturb: AtomicU32::new(10), // ×10 fixed-point ⇒ ×1.0 default
         }
     }
 }

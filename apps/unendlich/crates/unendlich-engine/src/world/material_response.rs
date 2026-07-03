@@ -407,6 +407,7 @@ pub fn for_block(block: BlockId, world_y: i32) -> MaterialResponse {
         | IronBlock | GoldBlock | CoalBlock | Bookshelf | Pumpkin
         | MossyCobblestone | PolishedStone | SmoothSandstone | Terracotta
         | ChiseledStoneBricks | DarkOakPlanks | PolishedBasalt
+        | Carrot | Potato | Cabbage | Sprout
         | Air => {
             // Default: pull base color from existing palette, no
             // environmental shifts, allow greedy merge. Some blocks

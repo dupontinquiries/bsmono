@@ -283,8 +283,11 @@ fn is_private_v4(ip: std::net::Ipv4Addr) -> bool {
 }
 
 fn now_ms() -> i64 {
-        core_kit::time::now_millis() as i64
-    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 fn db_path() -> PathBuf {
     dirs::data_local_dir()

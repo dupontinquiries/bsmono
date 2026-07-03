@@ -638,6 +638,15 @@ fn build_prompt(tmpl: TemplateKind, system: &str, turns: &[(Role, &str)]) -> Str
             }
             s.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         }
+        TemplateKind::Gemma => {
+            // Gemma 4: <|turn>ROLE\n…<turn|> (changed from Gemma 3), native system role; BOS added by backend.
+            if !system.is_empty() { s.push_str(&format!("<|turn>system\n{}<turn|>\n", neutralize(system))); }
+            for (role, text) in turns {
+                let r = if *role == Role::User { "user" } else { "model" };
+                s.push_str(&format!("<|turn>{r}\n{}<turn|>\n", neutralize(text)));
+            }
+            s.push_str("<|turn>model\n");
+        }
         TemplateKind::Plain => {
             if !system.is_empty() { s.push_str(&format!("{system}\n\n")); }
             for (role, text) in turns {

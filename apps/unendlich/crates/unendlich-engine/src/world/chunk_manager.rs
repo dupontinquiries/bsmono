@@ -1827,6 +1827,32 @@ impl ChunkManager {
 
     pub fn loaded_count(&self) -> usize { self.chunks.len() }
 
+    /// r476: is the chunk containing this world cell loaded (data present)?
+    /// Used by the "detached terrain" physics path to decide whether the
+    /// ground under the player is real yet or still streaming in.
+    pub fn is_loaded_at(&self, world_x: i32, world_y: i32, world_z: i32) -> bool {
+        self.chunks.contains_key(&block_to_chunk(world_x, world_y, world_z))
+    }
+
+    /// r476: first AIR cell at or above `world_y` in this column, scanning up to
+    /// `max_up` blocks. Used to settle a suspended player onto the real surface
+    /// once terrain spawns under them (so they're not left embedded in rock).
+    /// Returns None if the whole scanned span is solid or the column is unloaded.
+    pub fn surface_above(&self, world_x: i32, world_y: i32, world_z: i32, max_up: i32) -> Option<i32> {
+        if !self.is_loaded_at(world_x, world_y, world_z) {
+            return None;
+        }
+        for dy in 0..max_up {
+            let y = world_y + dy;
+            let b = self.block_at(world_x, y, world_z);
+            // Standable: this cell is air/non-solid AND the cell below is solid.
+            if !b.is_solid() {
+                return Some(y);
+            }
+        }
+        None
+    }
+
     // ─── F4: generator lifecycle (seed → fresh world) ───────────────────────
     //
     // The generator is no longer a startup-once singleton. On `Confirm ->
@@ -1840,10 +1866,57 @@ impl ChunkManager {
         self.generator.seed()
     }
 
-    /// Surface height at a world column, delegated to the active generator's CPU
-    /// world model (same query `heightmap_collage` and the spawn pick use).
+    /// Surface height at a world column. When the column's voxels are RESIDENT this
+    /// reads the actual generated terrain (ground truth); it falls back to the CPU world
+    /// model's analytic prediction only for not-yet-loaded columns.
+    ///
+    /// r583 — AUTHORITATIVE SURFACE (fixes the FP32/FP64 "float on air" bug,
+    /// NEXT_SESSION_GUIDE §4a). The GPU fills voxels in FP32 (Asahi/Honeykrisp) while the
+    /// CPU world model predicts in FP64, so the analytic surface drifts a block or two off
+    /// the terrain that was actually generated — and flora/mobs/spawn placed at the
+    /// prediction end up hovering or buried. Because `gpu_generator::read_back` hands us
+    /// every generated voxel (they live in `self.chunks`), we prefer the TRUTH: take the
+    /// prediction as an anchor, then scan the real blocks in a tight window for the topmost
+    /// GROUND block (solid, excluding logs/leaves so we land on terrain, not a canopy) that
+    /// has non-ground directly above. Non-resident columns read as all-Air here, so we
+    /// return the prediction unchanged — distant spawn picks behave exactly as before.
     pub fn surface_y_at(&self, x: i32, z: i32, y_min: i32, y_max: i32) -> Option<i32> {
-        self.generator.cpu().surface_y_at(x, z, y_min, y_max)
+        let pred = self.generator.cpu().surface_y_at(x, z, y_min, y_max);
+        if let Some(p) = pred {
+            use crate::world::blocks::BlockId;
+            let is_ground = |b: BlockId| {
+                b.is_solid()
+                    && !matches!(
+                        b,
+                        BlockId::OakLog
+                            | BlockId::BirchLog
+                            | BlockId::OakLeaves
+                            | BlockId::BirchLeaves
+                    )
+            };
+            // The FP gap is only a few blocks; scan a generous window around the anchor.
+            let hi = (p + 8).min(y_max);
+            let lo = (p - 24).max(y_min);
+            let mut resident = false;
+            let mut top: Option<i32> = None;
+            let mut y = hi;
+            while y >= lo {
+                let b = self.block_at(x, y, z);
+                if b != BlockId::Air {
+                    resident = true;
+                }
+                if top.is_none() && is_ground(b) {
+                    top = Some(y); // topmost ground cell (air/veg above, since top-down)
+                    break;
+                }
+                y -= 1;
+            }
+            // Trust the voxels only if the column is actually loaded; else the prediction.
+            if resident {
+                return top.or(pred);
+            }
+        }
+        pred
     }
 
     /// Choose a spawn position on the CURRENT surface: returns

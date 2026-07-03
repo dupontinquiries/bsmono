@@ -238,7 +238,10 @@ fn size_class_of(g: &Genome) -> u8 {
 /// Smallest body-scale multiplier (size_class 0) — a small dragon.
 pub const SIZE_SCALE_MIN: f32 = 0.45;
 /// Largest body-scale multiplier (size_class `SIZE_CLASS_MAX`) — a huge dragon.
-pub const SIZE_SCALE_MAX: f32 = 3.0;
+/// r502: raised 3.0 → 4.2 so the biggest dragons grow markedly larger (≈9.3× the
+/// smallest). The forge's animation clamp (rest·1.15) scales with this, so the
+/// extra size carries through to animated poses too.
+pub const SIZE_SCALE_MAX: f32 = 4.2;
 
 /// Whole-body rest-scale for a `size_class` bucket, spanning a small→huge range
 /// (`SIZE_SCALE_MIN`..`SIZE_SCALE_MAX`, ≈6.7× from smallest to largest).

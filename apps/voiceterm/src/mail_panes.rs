@@ -157,10 +157,161 @@ pub fn draft_pane_qml(style: &PaneStyle, drafts: &[DraftRow]) -> String {
             ),
         );
         push_button(&mut o, style, "Edit", &format!("if (backend) backend.mail_open_draft(\"{}\")", q(&d.id)));
-        push_button(&mut o, style, "Send", &format!("if (backend) backend.mail_send_draft(\"{}\")", q(&d.id)));
+        // v0.1.901: was a bare fire-and-forget call that threw away the
+        // `status\tdetail` wire mail_send_draft returns — clicking Send gave
+        // the user NO feedback at all (not even the honest "not wired yet"
+        // message), which is exactly the "looks like nothing happened"
+        // class of UI bug. Route it through the same _setStatus pattern the
+        // compose pane already uses.
+        push_button(&mut o, style, "Send", &format!("if (backend) _setStatus(backend.mail_send_draft(\"{}\"))", q(&d.id)));
         o.push_str("}\n}\n}\n"); // Row, Column, Rectangle
     }
+    // Shared status line + setter for the Send buttons above.
+    let _ = std::fmt::Write::write_fmt(
+        &mut o,
+        format_args!(
+            "Text {{ id: _dstatus; text: \"\"; visible: text.length>0; wrapMode: Text.WordWrap; width: parent.width; color: \"{fg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+            fg = q(&style.fg), fs = style.font_px, ff = q(&style.font_family),
+        ),
+    );
+    o.push_str(
+        "function _setStatus(r) { if(!r){_dstatus.text=\"\";return} var p=r.split(\"\\t\"); if(p[0]===\"ok\"){_dstatus.color=\"#86c986\";_dstatus.text=(p[1]||\"Done\")} else {_dstatus.color=\"#e0928f\";_dstatus.text=(p[1]||\"Failed\")} }\n",
+    );
     o.push_str("}\n}\n}\n"); // list Column + header Column + root Item
+    o
+}
+
+/// v0.1.881: peers pane — this device's address, an add-contact form,
+/// and the contact keyring. `my_address` is the base64 public key (None
+/// when no identity exists yet); `contacts` is (handle, public_key_b64).
+pub fn peers_pane_qml(
+    style: &PaneStyle,
+    my_address: Option<&str>,
+    contacts: &[(String, String)],
+) -> String {
+    use std::fmt::Write as _;
+    let mut o = String::with_capacity(contacts.len() * 320 + 1024);
+    pane_header(&mut o, style, "Peers");
+    o.push_str("Column {\nwidth: parent.width\nspacing: 10\n");
+
+    // Your address.
+    let _ = write!(
+        o,
+        "Text {{ text: \"Your address\"; color: \"{ac}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+        ac = q(&style.accent), fs = style.font_px, ff = q(&style.font_family)
+    );
+    match my_address {
+        Some(addr) if !addr.is_empty() => {
+            let _ = write!(
+                o,
+                "Text {{ text: \"Share this so peers can message you:\"; color: \"{muted}\"; font.pixelSize: {fss}; font.family: \"{ff}\" }}\nText {{ text: \"{addr}\"; color: \"{fg}\"; font.pixelSize: {fss}; font.family: \"{ff}\"; wrapMode: Text.WrapAnywhere; width: parent.width }}\n",
+                muted = q(&style.muted), fss = style.font_px - 1, ff = q(&style.font_family),
+                addr = q(addr), fg = q(&style.fg)
+            );
+            push_button(
+                &mut o, style, "Copy address",
+                &format!("if (backend && backend.clipboard_set) backend.clipboard_set(\"{}\")", q(addr)),
+            );
+        }
+        _ => push_empty_notice(
+            &mut o, style,
+            "No identity yet — minting your keypair needs the crypto build.",
+        ),
+    }
+
+    // Add a contact.
+    let _ = write!(
+        o,
+        "Text {{ text: \"Add a contact\"; color: \"{ac}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\" }}\nTextField {{ objectName: \"peer_handle\"; width: parent.width; placeholderText: \"Handle\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\nTextField {{ objectName: \"peer_pubkey\"; width: parent.width; placeholderText: \"Public key (base64)\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\n",
+        ac = q(&style.accent), fs = style.font_px, ff = q(&style.font_family), fg = q(&style.fg)
+    );
+    push_button(
+        &mut o, style, "Add contact",
+        "if (backend) _setStatus(backend.peer_add_contact(_pf(\"peer_handle\"), _pf(\"peer_pubkey\")))",
+    );
+    let _ = write!(
+        o,
+        "Text {{ id: _pstatus; text: \"\"; visible: text.length>0; wrapMode: Text.WordWrap; width: parent.width; color: \"{fg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+        fg = q(&style.fg), fs = style.font_px, ff = q(&style.font_family)
+    );
+
+    // Contacts.
+    let _ = write!(
+        o,
+        "Text {{ text: \"Contacts\"; color: \"{ac}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+        ac = q(&style.accent), fs = style.font_px, ff = q(&style.font_family)
+    );
+    if contacts.is_empty() {
+        push_empty_notice(&mut o, style, "No contacts yet.");
+    }
+    for (i, (handle, pubkey)) in contacts.iter().enumerate() {
+        let fp: String = pubkey.chars().take(12).collect();
+        let _ = write!(
+            o,
+            "Rectangle {{\nwidth: parent.width\nheight: childrenRect.height + 12\ncolor: \"transparent\"\nborder.color: \"{border}\"\nborder.width: 1\nradius: 4\nRow {{\nx: 8; y: 6\nwidth: parent.width - 16\nspacing: 8\nColumn {{\nwidth: parent.width - _rm_{i}.width - 8\nText {{ text: \"{handle}\"; color: \"{fg}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\"; elide: Text.ElideRight; width: parent.width }}\nText {{ text: \"{fp}\\u2026\"; color: \"{muted}\"; font.pixelSize: {fss}; font.family: \"{ff}\" }}\n}}\nRectangle {{ id: _rm_{i}; radius: 4; color: \"{btnbg}\"; border.color: \"{border}\"; border.width: 1; implicitWidth: _rmt_{i}.width + 18; implicitHeight: _rmt_{i}.height + 10; anchors.verticalCenter: parent.verticalCenter\nText {{ id: _rmt_{i}; anchors.centerIn: parent; text: \"Remove\"; color: \"{btnfg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\nMouseArea {{ anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: {{ if (backend) _setStatus(backend.peer_remove_contact(\"{handle}\")) }} }}\n}}\n}}\n}}\n",
+            border = q(&style.border), i = i, handle = q(handle), fg = q(&style.fg),
+            fs = style.font_px, ff = q(&style.font_family), fp = q(&fp), muted = q(&style.muted),
+            fss = style.font_px - 2, btnbg = q(&style.button_bg), btnfg = q(&style.button_fg)
+        );
+    }
+
+    // --- Encrypted messaging. These drive peer_seal_to / peer_open_envelope
+    // so the in-house messaging is usable from the UI, not just the qt_method
+    // layer. Both need the crypto build; otherwise the backend returns an
+    // honest "needs the crypto build" status, surfaced on _mstatus below.
+    let _ = write!(
+        o,
+        "Rectangle {{ width: parent.width; height: 1; color: \"{border}\" }}\n\
+         Text {{ text: \"Send an encrypted message\"; color: \"{ac}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n\
+         TextField {{ objectName: \"peer_msg_to\"; width: parent.width; placeholderText: \"To (contact handle)\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\n\
+         TextField {{ objectName: \"peer_msg_subject\"; width: parent.width; placeholderText: \"Subject\"; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\n\
+         TextArea {{ objectName: \"peer_msg_body\"; width: parent.width; height: 120; placeholderText: \"Message\"; wrapMode: TextArea.Wrap; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fs} }}\n",
+        border = q(&style.border), ac = q(&style.accent), fg = q(&style.fg),
+        fs = style.font_px, ff = q(&style.font_family)
+    );
+    push_button(&mut o, style, "Seal message", "_sealMsg()");
+    let _ = write!(
+        o,
+        "TextArea {{ id: _sealOut; objectName: \"peer_seal_out\"; width: parent.width; height: 100; readOnly: true; visible: text.length>0; selectByMouse: true; wrapMode: TextArea.WrapAnywhere; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fss} }}\n",
+        fg = q(&style.fg), ff = q(&style.font_family), fss = style.font_px - 1
+    );
+    push_button(
+        &mut o, style, "Copy sealed message",
+        "if (backend && backend.clipboard_set && _sealOut.text.length>0) backend.clipboard_set(_sealOut.text)",
+    );
+
+    let _ = write!(
+        o,
+        "Rectangle {{ width: parent.width; height: 1; color: \"{border}\" }}\n\
+         Text {{ text: \"Open a received message\"; color: \"{ac}\"; font.bold: true; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n\
+         TextArea {{ id: _openIn; objectName: \"peer_open_in\"; width: parent.width; height: 90; placeholderText: \"Paste a sealed message here\"; wrapMode: TextArea.WrapAnywhere; color: \"{fg}\"; font.family: \"{ff}\"; font.pixelSize: {fss} }}\n",
+        border = q(&style.border), ac = q(&style.accent), fg = q(&style.fg),
+        fs = style.font_px, ff = q(&style.font_family), fss = style.font_px - 1
+    );
+    push_button(&mut o, style, "Open message", "_openMsg()");
+    let _ = write!(
+        o,
+        "Text {{ id: _openOut; text: \"\"; visible: text.length>0; wrapMode: Text.WordWrap; width: parent.width; textFormat: Text.PlainText; color: \"{fg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n\
+         Text {{ id: _mstatus; text: \"\"; visible: text.length>0; wrapMode: Text.WordWrap; width: parent.width; color: \"{fg}\"; font.pixelSize: {fs}; font.family: \"{ff}\" }}\n",
+        fg = q(&style.fg), fs = style.font_px, ff = q(&style.font_family)
+    );
+
+    // Helpers: status line + field reader. After a write the keyring is
+    // on disk; the pane re-renders when refocused (web panes refresh on
+    // focus), so the status nudges the user to reopen for the new list.
+    o.push_str(
+        "function _setStatus(r) { if(!r){_pstatus.text=\"\";return} var p=r.split(\"\\t\"); if(p[0]===\"ok\"){_pstatus.color=\"#86c986\";_pstatus.text=(p[1]||\"Done\")+\" \\u2014 reopen Peers to refresh\"} else {_pstatus.color=\"#e0928f\";_pstatus.text=(p[1]||\"Failed\")} }\n\
+         function _pf(n){ for(var i=0;i<children.length;i++){var c=children[i];if(c.objectName===n)return c.text||\"\"} return \"\" }\n\
+         function _note(ok,msg){ _mstatus.color = ok ? \"#86c986\" : \"#e0928f\"; _mstatus.text = msg }\n\
+         function _sealMsg(){ if(!backend||!backend.peer_seal_to){_note(false,\"Messaging unavailable\");return}\
+           var r=backend.peer_seal_to(_pf(\"peer_msg_to\"),_pf(\"peer_msg_subject\"),_pf(\"peer_msg_body\")); var p=r.split(\"\\t\");\
+           if(p[0]===\"ok\"){_sealOut.text=p[1]||\"\";_note(true,\"Sealed \\u2014 copy and send it\")} else {_sealOut.text=\"\";_note(false,p[1]||\"Couldn't seal\")} }\n\
+         function _openMsg(){ if(!backend||!backend.peer_open_envelope){_note(false,\"Messaging unavailable\");return}\
+           var r=backend.peer_open_envelope(_openIn.text||\"\"); var p=r.split(\"\\t\");\
+           if(p[0]===\"ok\"){_openOut.text=\"From: \"+(p[1]||\"?\")+\"\\nSubject: \"+(p[2]||\"(none)\")+\"\\n\\n\"+(p[3]||\"\");_note(true,\"Opened\")} else {_openOut.text=\"\";_note(false,p[1]||\"Couldn't open\")} }\n",
+    );
+
+    o.push_str("}\n}\n}\n"); // Column + header Column + root Item
     o
 }
 
@@ -763,5 +914,43 @@ mod tests {
         assert_eq!(nifty_id("bob@proton.me"), "bob_proton_me");
         assert_eq!(nifty_id(""), "n");
         assert_eq!(nifty_id("123"), "n123");
+    }
+
+    #[test]
+    fn peers_pane_renders_address_contacts_and_balances() {
+        let contacts = vec![
+            ("alice".to_string(), "QUJD".to_string()),
+            ("bob".to_string(), "WFla".to_string()),
+        ];
+        let qml = peers_pane_qml(&PaneStyle::dark_default(), Some("MY_ADDR_B64"), &contacts);
+        assert!(qml.contains("MY_ADDR_B64"));
+        assert!(qml.contains("peer_add_contact"));
+        assert!(qml.contains("peer_remove_contact(\"alice\")"));
+        assert!(qml.contains("peer_remove_contact(\"bob\")"));
+        // per-contact remove buttons get unique ids (no dup-id at runtime)
+        assert!(qml.contains("id: _rm_0"));
+        assert!(qml.contains("id: _rm_1"));
+        assert!(!qml.contains("_rm_2"));
+        // v0.1.897: encrypted-messaging UI drives the seal/open primitives
+        assert!(qml.contains("peer_msg_to"));
+        assert!(qml.contains("peer_msg_subject"));
+        assert!(qml.contains("peer_msg_body"));
+        assert!(qml.contains("backend.peer_seal_to("));
+        assert!(qml.contains("backend.peer_open_envelope("));
+        assert!(qml.contains("function _sealMsg()"));
+        assert!(qml.contains("function _openMsg()"));
+        assert!(qml.contains("id: _sealOut"));
+        assert!(qml.contains("id: _openIn"));
+        // brace balance
+        assert_eq!(qml.matches('{').count(), qml.matches('}').count());
+
+        // no-identity path shows the notice, not a fake address
+        let empty = peers_pane_qml(&PaneStyle::dark_default(), None, &[]);
+        assert!(empty.contains("No identity yet"));
+        assert!(empty.contains("No contacts yet"));
+        // messaging UI is present even with no identity/contacts (it just
+        // reports the crypto-build status when used)
+        assert!(empty.contains("function _sealMsg()"));
+        assert_eq!(empty.matches('{').count(), empty.matches('}').count());
     }
 }

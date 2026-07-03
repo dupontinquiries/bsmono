@@ -11,7 +11,6 @@ name = "logscope-filter"
 path = "src/bin/filter.rs"
 
 [dependencies]
-core-kit = { path = "../../../../shared/core-kit" }
 # GTK4 + Adwaita (GUI only — filter binary uses a separate minimal set)
 gtk4 = { version = "0.9", features = ["v4_12"], optional = true }
 libadwaita = { version = "0.7", features = ["v1_4"], optional = true }
@@ -64,8 +63,10 @@ zstd     = { version = "0.13", optional = true }
 
 base64 = "0.22"  # image encoding for multimodal Ollama
 
-# Local GGML/GGUF inference (the ollama->ggml path) — optional, behind `llamacpp`
-llama-cpp-2 = { version = "0.1.146", optional = true }
+# Local GGML/GGUF inference (the ollama->ggml path) — optional, behind `llamacpp`.
+# 0.1.150 vendors a llama.cpp new enough for the gemma4 arch (hybrid sliding-window attention,
+# MoE, PLE) + Gemma 4's tool tokens. Rebuild needs clang + Vulkan SDK (see the `llamacpp` feature).
+llama-cpp-2 = { version = "0.1.150", optional = true }
 encoding_rs = { version = "0.8", optional = true }
 
 # Tree-sitter — syntax-aware bloc scoring and AST navigation
