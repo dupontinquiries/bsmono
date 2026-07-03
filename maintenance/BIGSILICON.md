@@ -381,3 +381,29 @@ Re-scanned for cohesive cross-crate patterns (recurrence in parens):
 - **hash-kit** (11 crates) — non-crypto hashing (FNV/CRC32); I hand-rolled FNV in rendezvous
   and account_id — good first consumer.
 - hex/base64 codec (12) — likely subsumed by net-kit/core-kit; check before extracting.
+
+## Cross-app settings — "update the gesture feel" → all apps change
+
+Today gesture feel is a compile-time default; changing it means recompiling. This adds a live
+cross-app settings layer on the sharemd bus so a central app changes it once and every egui-kit
+app updates — while keeping its own overrides.
+
+- **`settings-kit`** (4 tests): one `Prefs` schema (gesture feel: sensitivity/commit_fraction/
+  flick_velocity; touch: min_target/scale; palette; a11y: voice/tts) that maps onto the kit
+  knobs. `to_kv`/`from_kv` (flat keys for the bus + config file), `apply_kv` (partial — the
+  mechanism for both live changes *and* per-app overrides), and `apply_to_gesture`/
+  `gesture_config` so applying prefs actually changes `uikit_gesture::GestureConfig`. Proven:
+  a central change yields identical gesture feel across apps; higher sensitivity fires sooner.
+- **`bigsilicon-client::Settings`** (live-sync tested): connects to sharemd, subscribes to the
+  `settings` namespace, seeds from a snapshot, and keeps a `Prefs` in sync. `set(k,v)` publishes
+  (the settings app); `poll()` picks up others' changes; `with_overrides` layers app uniqueness
+  on top. Integration test: central `set` → another app's `poll()` updates its prefs live.
+
+**So: yes.** With this, "update the touch gesture feel" in a central settings app publishes to
+`settings/gesture.*` and every app applies it next frame — apps still keep bespoke overrides.
+
+**Remaining:** the central **settings app** (an egui UI on uikit-egui that edits `Prefs` and
+`set`s them) + a small **settingsd**/sharemd persistence via config-kit (survive restarts); and
+a uikit-egui `apply_prefs(ctx, &mut Adaptive, &Prefs)` for the theme/touch side (gesture side is
+done). Apps opt in with ~3 lines: `Settings::connect()`, `poll()` each frame, feed
+`prefs().gesture_config(w)` into their `GestureLayer`.

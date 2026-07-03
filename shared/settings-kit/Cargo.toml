@@ -1,0 +1,12 @@
+[package]
+name = "settings-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-app preferences for the egui-kit apps: one Prefs schema (gesture feel, touch targets, palette, a11y) that maps onto the shared kit knobs, serialized as flat key/values so it rides the sharemd data bus. A central settings app publishes a change → every app applies it live, while keeping its own overrides. std-only (+ uikit-gesture for the gesture apply)."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+uikit-gesture = { path = "../uikit/crates/uikit-gesture" }

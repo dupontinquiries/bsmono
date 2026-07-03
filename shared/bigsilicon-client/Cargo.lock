@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "coord-core",
  "ipc-kit",
+ "settings-kit",
 ]
 
 [[package]]
@@ -31,3 +32,14 @@ version = "0.1.0"
 dependencies = [
  "core-kit",
 ]
+
+[[package]]
+name = "settings-kit"
+version = "0.1.0"
+dependencies = [
+ "uikit-gesture",
+]
+
+[[package]]
+name = "uikit-gesture"
+version = "0.1.0"
