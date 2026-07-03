@@ -1,0 +1,15 @@
+[package]
+name = "bot-arena-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "bot-arena's dashboard, ported from GTK4/libadwaita to egui on uikit-egui. Views (Arena / Standings / Replays) are swipe-paged via the shared gesture layer (uikit-gesture), laid out by the adaptive layer, and voice/a11y-navigable. bot-arena's engine.rs/fsm.rs are already GTK-free; on-device this front-end drives them directly."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
