@@ -1726,3 +1726,29 @@ VERIFIED: cockpit 78 tests (reclaim.rs -2 removed, artifacts +3; net +1 vs 77); 
 clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck gui+cockpit CLEAN; all QML balanced;
 Settings backend.* (16) resolve. Safety: only validated regeneratable output ever deleted; source/manifests
 never touched; .git/.gitmind skipped; build_base never reclaimed.
+
+── cross-distro Python system deps (pygame across Alpine/Fedora/Debian…) built into the build ──
+USER: cover Python deps across alpine/fedora/etc (venv or nix), built into gitmind's build, or an array of
+fallbacks.
+INSIGHT: venv covers PYTHON pkgs; pygame needs SYSTEM libs (SDL2) that differ per distro + musl has no wheel
+(compiles from source → needs dev headers). Answer = fallback array + distro detection in the build.
+[cockpit::pydeps NEW, 3 tests] PkgManager{Apk,Dnf,Apt,Pacman,Zypper,Brew,Nix,None}. detect_pkg_manager(pe)=
+which() of apk/dnf/apt-get/pacman/zypper/brew/nix-env. install_argv (apk add --no-cache / dnf install -y /
+apt-get install -y --no-install-recommends / pacman -S --needed --noconfirm / zypper / brew). system_deps(
+pip_pkg, mgr): table for pygame(+ce), pillow, pyaudio, cryptography, lxml, numpy/scipy → per-distro dev pkgs
+(pygame Apk: python3-dev gcc musl-dev sdl2-dev sdl2_image/mixer/ttf-dev freetype-dev portmidi-dev; Dnf: SDL2-
+devel…; Apt: libsdl2-dev…; Pacman: sdl2…). install_system(mgr,pkgs,pe)=best-effort, tries no-prefix→sudo -n→
+doas (no uid detection). install_hint=copy-pasteable command (nix suggestion if mgr None). TESTS: pygame map
+per distro (musl needs musl-dev; requests→empty); detect this box=Apt + argv/hint; REAL install_system apt of
+ca-certificates (already present) succeeds.
+[buildsystem::build_python] REWORKED deps → install_python_deps fallback chain: (1) pip install --prefer-binary
+(wheels; glibc happy path) → (2) map named pkgs→system_deps, install_system(best-effort), pip install from
+source → (3) Err with distro-correct hint. named pkgs from requirements.txt (requirement_names strips version
+specs) or scanned imports; pyproject/setup → pip install . (no map). REAL TEST: build a `import pygame` app →
+prefer-binary installs the wheel → venv/bin/python -c "import pygame" succeeds (SDL_VIDEODRIVER=dummy). Error
+branch asserts actionable message. This flows automatically through import→run / add-to-apps / suites (build
+errors already surfaced in GUI/CLI).
+VERIFIED: cockpit 82 tests (+4: 3 pydeps, 1 real pygame build; 15s incl. wheel download); cargo test/build -p
+cockpit clean (0 warnings); cargo check -p gitmind-cli --lib clean; rustcheck cockpit CLEAN. No GUI/CLI surface
+changes — the coverage is inside the build; on Alpine it will apk-add SDL2 dev + compile (best-effort, needs
+root/doas), else the error names the exact `apk add …`.
