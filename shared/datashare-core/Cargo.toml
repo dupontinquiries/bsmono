@@ -1,0 +1,9 @@
+[package]
+name = "datashare-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-app data bus: a namespaced key/value store with pub-sub that every app reads and writes through one system daemon (over ipc-kit), so shared state (snapclone contacts, unendlich sessions, voiceterm drafts, now-playing, clipboard-like handoff) lives in one place instead of N private copies. In-memory hub here; share-kit (DHT mailbox) is the durable/federated backend. Pure, std-only."
+
+[dependencies]
+ipc-kit = { path = "../ipc-kit" }
