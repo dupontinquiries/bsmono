@@ -174,6 +174,7 @@ struct Backend {
     delete_suite: qt_method!(fn(&self, name: QString) -> QString),
     store_groups: qt_method!(fn(&self) -> QString),
     build_group: qt_method!(fn(&self, name: QString) -> QString),
+    build_group_remote: qt_method!(fn(&self, name: QString, user: QString, host: QString, target: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1657,6 +1658,39 @@ impl Backend {
             let items: Vec<_> = results.iter()
                 .map(|r| json!({"name": r.name, "ok": r.ok, "message": r.message})).collect();
             job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "results": items}).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
+    }
+
+    /// Build every app in a group here (for the device's target) and install them on a
+    /// remote device — the "desktop builds, phone runs" flow for a whole group. Async job
+    /// "buildgroup". Auto-detects the device's Rust triple over ssh when `target` is empty.
+    fn build_group_remote(&self, name: QString, user: QString, host: QString, target: QString) -> QString {
+        let group = match cockpit::flow::group_by_name(&name.to_string()) {
+            Some(g) => g,
+            None => return err_json("unknown app-store group"),
+        };
+        let (user, host, mut target) = (user.to_string(), host.to_string(), target.to_string());
+        if user.is_empty() || host.is_empty() {
+            return err_json("choose a device (user + host) to install onto");
+        }
+        if !self.job.start("buildgroup") {
+            return err_json("a build job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            if target.trim().is_empty() {
+                // detect the device's triple over ssh so we cross-build correctly
+                if let Ok(o) = cockpit::deploy::remote_capture(&user, &host, "export PATH=\"$HOME/.cargo/bin:$PATH\" && rustc -vV") {
+                    target = cockpit::buildflags::host_triple_from_rustc(&o)
+                        .map(|h| cockpit::buildflags::normalize_native(&h))
+                        .unwrap_or_default();
+                }
+            }
+            let results = cockpit::flow::install_group_remote(&group, &target, &user, &host);
+            let ok = results.iter().filter(|r| r.ok).count();
+            let items: Vec<_> = results.iter().map(|r| json!({"name": r.name, "ok": r.ok, "message": r.message})).collect();
+            job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "host": host, "results": items}).to_string());
         });
         QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
     }

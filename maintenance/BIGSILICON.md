@@ -434,3 +434,18 @@ group. Now:
 on the desktop and drops runnable launchers on the phone. (Prereq on the desktop: the phone's
 Rust target for cross-libc builds — `rustup target add <triple>`; both are aarch64 so it's a
 static-musl cross, not a full arch cross.) cockpit + cli compile clean, rustcheck clean.
+
+## GUI parity check
+
+Audited the GUI against this session's backend features:
+- **In the GUI:** app-store groups (local `build all`), single-app push-to-phone
+  (`push_install`/`send_binary`), device-target detection (`remote_target`), reclaim/
+  prepare-ingest, suites, downloads, rollup/merge, keys.
+- **Added this turn — group remote deploy:** the store card now has a `user@host` field and a
+  **"→ device"** button per group → `build_group_remote` (build all here for the device's
+  auto-detected triple, push+install each on the phone). Same first-priority flow as the CLI's
+  `--to`. rustcheck clean; QML balanced; all `backend.*` calls resolve.
+- **Still CLI-only (GUI TODO):** packaging/repos (`fleet package`, `fleet repo serve`) and
+  DHT rendezvous (`fleet account|advertise|resolve|reach`). These are newer and secondary to
+  the build→install flow; a "Publish" card and a "Reach across networks" affordance are the
+  next GUI additions.
