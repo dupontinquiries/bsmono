@@ -198,3 +198,39 @@ faster AND typing stays snappy. Re-run WEB2QML_PROFILE: during a helix
 open you should see FEWER republish lines (deferred frames collapsed),
 with gen jumps showing the coalescing. If typing feels laggy, lower
 MAX_DEFER or require a larger gen_delta to trigger deferral.
+
+---
+
+## SUPERSEDED (v0.1.786/788/809) — the HTML render path this doc targets no longer exists
+
+Everything above (the per-row HTML cache / row-keyed QML model / the
+hidden termText RichText layer / the v0.1.629 burst-coalesce) described
+optimizing the single-HTML-string `TextEdit` terminal. That path is
+GONE: v0.1.786 added an opt-in native Canvas renderer (packed styled
+runs, not HTML), v0.1.788 made it the DEFAULT, and v0.1.809 deleted the
+HTML terminal layers entirely — `render_html`/`term_output` still exist
+in `pty_term.rs` as the `WEB2QML_HTML_TERM=1` fallback path, but nothing
+in the shipped default build reads them. Nothing here is wrong, it's
+just describing an architecture that was replaced rather than patched.
+See `docs/design/terminal_render_perf.md`'s v0.1.892+ notes and
+`TODO_terminal_native_render_snapshot.md` for the native path's own
+(now largely closed) perf arc.
+
+## v0.1.902 — the native path's own "should be snapshot-backed" TODO, closed
+
+The native Canvas path had its OWN version of this doc's original sin:
+`term_screen_runs()` (called every UI poll tick, ≤20/sec while a
+terminal tab is visible) built the packed-runs payload by `try_lock`ing
+the grid directly on the UI thread — flagged since v0.1.786 as "FIRST
+CUT... once native is the default this should be snapshot-backed like
+render_html". It never was, until now: the reader thread (and
+`PtyTerminal::republish`, for the scroll/resize path outside the byte
+stream) now build the packed-runs string off-thread and publish it on
+`RenderSnapshot.runs`, exactly like `html` always worked. `term_screen_runs`
+is now a cheap `Arc::clone` read — no more UI-thread grid lock, and no
+more contending with the reader thread for that lock during the exact
+output bursts (helix redraw, fast build log) where a fresh frame matters
+most. See `TODO_terminal_native_render_snapshot.md` for the full writeup
+and what's still open (the `WEB2QML_HTML_TERM=1` fallback path's
+`republish` used to build `html` unconditionally even in native mode —
+also fixed, now gated the same way as the reader thread).

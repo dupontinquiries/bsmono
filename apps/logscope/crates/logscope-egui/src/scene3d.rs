@@ -20,27 +20,67 @@ use crate::texgen::mat as M;
 /// Recursive triplet branch (trunk → 3 → 9): a tapering wooden tube that splits into three children
 /// splayed around the parent direction, with a leaf tuft at each tip. Stout + leaning is the caller's job
 /// (the trunk direction). Matches the prototype's `branch()`.
-fn tree_branch(s: &mut Scene, origin: Vec3, dir: Vec3, len: f32, rad: f32, depth: u32, seed: i32) {
+/// Per-scene TREE BEND POLICY (set before a scene's tree loop): (lean_x, lean_z, variety, bend_boost). `variety`
+/// scales how widely each tree's bow direction scatters horizontally (Forest high, Canopy low); (lean_x,lean_z)
+/// is a preferred horizontal lean the bow biases toward (Alley leans its trees out over the lane); `bend_boost`
+/// adds to the arc strength (Alley bends hard). Default (0,0,1.0,0) reproduces the original varied look.
+thread_local! { static TREE_BEND: std::cell::Cell<(f32, f32, f32, f32)> = const { std::cell::Cell::new((0.0, 0.0, 1.0, 0.0)) }; }
+fn set_tree_bend(lean_x: f32, lean_z: f32, variety: f32, boost: f32) { TREE_BEND.with(|c| c.set((lean_x, lean_z, variety, boost))); }
+fn tree_bend() -> (f32, f32, f32, f32) { TREE_BEND.with(|c| c.get()) }
+
+/// Per-scene FOLIAGE TINT (low, high) read by tree_branch's leaf clusters, so a scene can shift its canopy colour
+/// — e.g. Forest tints the whole canopy by season (spring/summer/autumn/winter). Default = the standard green.
+thread_local! { static FOLIAGE_TINT: std::cell::Cell<(Color32, Color32)> = std::cell::Cell::new((c(0x4c, 0x66, 0x26), c(0x9a, 0xb0, 0x46))); }
+fn set_foliage_tint(lo: Color32, hi: Color32) { FOLIAGE_TINT.with(|cl| cl.set((lo, hi))); }
+fn foliage_tint() -> (Color32, Color32) { FOLIAGE_TINT.with(|cl| cl.get()) }
+
+fn tree_branch(s: &mut Scene, origin: Vec3, dir: Vec3, len: f32, rad: f32, depth: u32, seed: i32, nb: usize, spread: f32) {
     let dir = normv(dir);
-    let end = addv(origin, mulv(dir, len));
-    let mut br = m3::tube(origin, end, rad, 9, c(0x5b, 0x42, 0x28));
+    // a bend direction, slightly up-biased, so the limb ARCS instead of standing like a pillar. The horizontal
+    // scatter + a scene-preferred lean + an arc boost come from the per-scene TREE BEND POLICY.
+    let (lean_x, lean_z, variety, boost) = tree_bend();
+    let bax = v(lean_x + (hash(seed, 11) - 0.5) * variety, 0.20 + hash(seed, 12) * 0.45, lean_z + (hash(seed, 13) - 0.5) * variety);
+    let bend = 0.14 + hash(seed, 14) * 0.20 + boost;
+    let (ftlo, fthi) = foliage_tint(); let fbase = mix_rgb(ftlo, fthi, 0.45); // per-scene canopy colour (e.g. Forest seasons)
+    let r1 = rad * 0.62; // taper toward the tip
+    let (mut br, end, end_dir) = m3::branch_curved(origin, dir, len, rad, r1, bax, bend, seed as u32, c(0x5b, 0x42, 0x28));
     m3::tint_height(&mut br, origin.y, end.y, c(0x3a, 0x28, 0x16), c(0x70, 0x55, 0x34)); br.mat = M::WOOD;
     s.add(br, Float::STILL);
     if depth == 0 {
-        let mut puff = m3::leaf_cluster(end, len * 0.85, (seed as u32).wrapping_mul(131).wrapping_add(7), c(0x6e, 0x88, 0x34));
-        m3::tint_up(&mut puff, c(0x9a, 0xb0, 0x46), c(0x4c, 0x66, 0x26)); puff.mat = M::MOSS;
-        s.add(puff, Float { amp: 0.10, speed: 0.7, phase: hash(seed, 7) * 6.28, drift: 0.06 });
+        // TWIGS: a few thin curved twigs fan off the tip, each carrying a small leaf cluster, so the foliage
+        // visibly HANGS OFF the wood instead of floating — and the extra clusters add leaf volume
+        let up = if end_dir.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+        let tu = normv(crossv(end_dir, up)); let tv = crossv(end_dir, tu);
+        let nt = 3 + (hash(seed, 20) * 2.99) as usize; // 3..5 twigs
+        for tw in 0..nt {
+            let twf = tw as i32;
+            let ta = std::f32::consts::TAU * tw as f32 / nt as f32 + hash(seed + twf, 21) * 0.8;
+            let tdir = normv(addv(end_dir, addv(mulv(tu, ta.cos() * 0.85), mulv(tv, ta.sin() * 0.85))));
+            let tlen = len * (0.32 + hash(seed + twf, 22) * 0.24);
+            let tside = v(hash(seed + twf, 23) - 0.5, 0.35, hash(seed + twf, 24) - 0.5);
+            let (mut twg, tend, _) = m3::branch_curved(end, tdir, tlen, r1 * 0.55, r1 * 0.18, tside, 0.22, (seed + twf * 7) as u32, c(0x6a, 0x52, 0x34));
+            twg.mat = M::WOOD; s.add(twg, Float { amp: 0.05, speed: 0.8, phase: hash(seed + twf, 25) * 6.28, drift: 0.04 });
+            let mut puff = m3::leaf_cluster(tend, tlen * 0.7, (seed as u32).wrapping_mul(131).wrapping_add(tw as u32 + 7), fbase);
+            m3::tint_up(&mut puff, fthi, ftlo); puff.mat = M::MOSS;
+            s.add(puff, Float { amp: 0.12, speed: 0.7, phase: hash(seed + twf, 26) * 6.28, drift: 0.07 });
+        }
+        // a cluster right at the fork fills the join where the twigs meet the branch
+        let mut core = m3::leaf_cluster(end, len * 0.34, (seed as u32).wrapping_mul(977).wrapping_add(3), fbase);
+        m3::tint_up(&mut core, fthi, ftlo); core.mat = M::MOSS;
+        s.add(core, Float { amp: 0.10, speed: 0.7, phase: hash(seed, 7) * 6.28, drift: 0.06 });
         return;
     }
-    // a frame perpendicular to the branch to splay three children around it
-    let up = if dir.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
-    let ax = normv(crossv(dir, up));
-    let ay = crossv(dir, ax);
-    let spread = 0.6; // how far children lean off the parent
-    for k in 0..3 {
-        let ang = std::f32::consts::TAU * k as f32 / 3.0 + hash(seed + k, 5) * 0.6;
-        let nd = normv(addv(dir, addv(mulv(ax, ang.cos() * spread), mulv(ay, ang.sin() * spread))));
-        tree_branch(s, end, nd, len * 0.72, rad * 0.66, depth - 1, seed * 3 + k + 1);
+    // children splay from the curved END, continuing the bent tip heading. The branching FACTOR (children per
+    // fork) and `spread` (how wide they splay) are the two env-driven branching factors for Forest.
+    let up = if end_dir.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+    let ax = normv(crossv(end_dir, up));
+    let ay = crossv(end_dir, ax);
+    for k in 0..nb.max(2) {
+        let kf = k as i32;
+        let ang = std::f32::consts::TAU * k as f32 / nb as f32 + hash(seed + kf, 5) * 0.6;
+        let nd = normv(addv(end_dir, addv(mulv(ax, ang.cos() * spread), mulv(ay, ang.sin() * spread))));
+        let jit = 0.86 + hash(seed + kf, 9) * 0.30; // per-child length variation → less uniform
+        tree_branch(s, end, nd, len * 0.72 * jit, r1, depth - 1, seed.wrapping_mul(7) + kf + 1, nb, spread);
     }
 }
 #[inline] fn c(r: u8, g: u8, b: u8) -> Color32 { Color32::from_rgb(r, g, b) }
@@ -63,15 +103,59 @@ impl Float {
 }
 
 /// A baked environment: parallel meshes + their float motions.
-pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float> }
+pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3> }
 impl Scene {
-    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new() } }
-    fn add(&mut self, m: Mesh3, f: Float) { self.meshes.push(m); self.floats.push(f); }
-    fn add_all(&mut self, ms: Vec<Mesh3>, f: Float) { for m in ms { self.add(m, f); } }
-    /// Update every object's float offset for time `t` (seconds). Cheap — no geometry rebuild.
-    pub fn animate(&mut self, t: f32) {
-        for (m, f) in self.meshes.iter_mut().zip(&self.floats) { m.offset = f.offset(t); }
+    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new() } }
+    fn add(&mut self, m: Mesh3, f: Float) {
+        // wind only sways FOLIAGE (MOSS) that already floats; for those we cache a centroid anchor so the gust
+        // wave can sweep across the scene. Everything else stores a zero anchor (skipped at animate time).
+        let anchor = if m.mat == M::MOSS && (f.amp != 0.0 || f.drift != 0.0) && !m.verts.is_empty() {
+            let s = m.verts.iter().fold(v(0.0, 0.0, 0.0), |a, &p| addv(a, p));
+            mulv(s, 1.0 / m.verts.len() as f32)
+        } else { v(0.0, 0.0, 0.0) };
+        self.meshes.push(m); self.floats.push(f); self.anchors.push(anchor);
     }
+    fn add_all(&mut self, ms: Vec<Mesh3>, f: Float) { for m in ms { self.add(m, f); } }
+    /// Update every object's float offset for time `t` (seconds). Cheap — no geometry rebuild. Foliage also
+    /// gets a WIND sway on top of its idle bob.
+    pub fn animate(&mut self, t: f32) {
+        let (wdir, wstr) = (wind_dir(), wind_strength(t));
+        for ((m, f), &anchor) in self.meshes.iter_mut().zip(&self.floats).zip(self.anchors.iter()) {
+            let base = f.offset(t);
+            // sway susceptibility derived from the object's own idle motion → leaves sway most, twigs least,
+            // rigid wood/stone (STILL) not at all. anchor==0 marks a non-foliage object (no wind).
+            if (anchor.x != 0.0 || anchor.y != 0.0 || anchor.z != 0.0) && wstr > 1e-3 {
+                let sway = (f.amp + f.drift) * 3.0;
+                m.offset = addv(base, wind_offset(wdir, wstr, anchor, t, sway));
+            } else {
+                m.offset = base;
+            }
+        }
+    }
+}
+
+/// WIND ENGINE — a single global breeze that gusts over time and travels across the scene as a wave, so foliage
+/// bends in sequence rather than all at once. Direction (degrees) and base strength are env-tunable
+/// (LOGSCOPE_WIND_DIR, LOGSCOPE_WIND); per-object amplitude is the `sway` susceptibility passed by the caller.
+fn wind_dir() -> Vec3 {
+    let deg = std::env::var("LOGSCOPE_WIND_DIR").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(28.0);
+    let r = deg.to_radians();
+    normv(v(r.cos(), 0.0, r.sin()))
+}
+fn wind_strength(t: f32) -> f32 {
+    let base = std::env::var("LOGSCOPE_WIND").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 2.5);
+    // gusting: a slow swell + faster ripples, never negative
+    let gust = 0.55 + 0.30 * (t * 0.21).sin() + 0.18 * (t * 0.63 + 1.7).sin() + 0.10 * (t * 1.5).sin();
+    base * gust.max(0.05)
+}
+fn wind_offset(dir: Vec3, strength: f32, anchor: Vec3, t: f32, sway: f32) -> Vec3 {
+    // phase advances along the wind direction so gusts SWEEP through (trees bend one after another)
+    let along = anchor.x * dir.x + anchor.z * dir.z;
+    let phase = along * 0.10 - t * 1.8;
+    let bend = (phase.sin() * 0.62 + (phase * 2.6 + 1.0).sin() * 0.38) * strength;
+    let perp = v(-dir.z, 0.0, dir.x);
+    let flutter = (phase * 3.3 + along * 0.4).sin() * 0.22 * strength;
+    addv(mulv(dir, bend * sway), mulv(perp, flutter * sway))
 }
 
 // ── themed builders ───────────────────────────────────────────────────────────
@@ -210,7 +294,8 @@ fn canopy() -> Scene {
     let mut s = Scene::new();
     let yf = -3.2_f32;
     // dark polished stone floor — the chamber is enclosed + cozy, lit mostly by the skylight's coloured light
-    let mut floor = m3::disc(v(0.0, yf, 0.0), 30.0, 110, c(0x24, 0x20, 0x1c));
+    let cf = scene_fit(25.0); // EXPAND the labyrinth to contain the graph
+    let mut floor = m3::disc(v(0.0, yf, 0.0), 30.0 * cf, 110, c(0x24, 0x20, 0x1c));
     m3::tint_up(&mut floor, c(0x3a, 0x32, 0x28), c(0x16, 0x13, 0x10)); floor.mat = M::STONE; floor.emissive = 0.03; s.add(floor, Float::STILL);
 
     // stained-glass palette (cobalt / ruby / gold / emerald / amethyst) — the angels read pale among these
@@ -220,7 +305,8 @@ fn canopy() -> Scene {
     // blew out fully white at night, so the canopy is now natural non-emissive foliage sitting ABOVE the trunk
     // divergence (no more white bloomy clump at the fork).
     let tdir = normv(v(0.45, 1.0, 0.12)); let tlen = 6.0; // Canopy-only: ~24° lean off axis, short + wide trunk
-    tree_branch(&mut s, v(0.0, yf, 0.0), tdir, tlen, 1.3, 2, 7);
+    set_tree_bend(0.0, 0.0, 0.45, 0.04); // enclosed canopy: a calmer, more uniform bow (less varied than Forest)
+    tree_branch(&mut s, v(0.0, yf, 0.0), tdir, tlen, 1.3, 2, 7, 3, 0.6);
     let cc = addv(v(0.0, yf, 0.0), addv(mulv(tdir, tlen), v(0.0, 0.6, 0.0))); // canopy rides the lean
     for k in 0..22 {
         let a = TAU * k as f32 / 22.0;
@@ -235,7 +321,7 @@ fn canopy() -> Scene {
     // TALL CURVED PETRIFIED-STONE shelf-walls — concentric arcs that hug the circle (widened courtyard so the
     // central tree + graph have room). ~1 in 8 segments carries a raw "natural face" (seed-driven).
     let nat = |k: u32| -> bool { let mut h = pr.seed ^ k.wrapping_mul(0x9E37_79B9); h ^= h >> 13; (h & 7) == 0 };
-    let radii = [16.0_f32, 20.5, 25.0]; // inner courtyard widened ~2x (8.5→16)
+    let radii = [16.0_f32 * cf, 20.5 * cf, 25.0 * cf]; // inner courtyard widened ~2x, now also grows with the graph
     for (ri, &rad) in radii.iter().enumerate() {
         let segs = 7 + ri * 2;
         for k in 0..segs {
@@ -250,12 +336,12 @@ fn canopy() -> Scene {
     let osegs = 20;
     for k in 0..osegs {
         let a_mid = TAU * (k as f32 + 0.5) / osegs as f32;
-        petrified_arc(&mut s, 28.0, a_mid, (TAU / osegs as f32) * 0.97, 11.25, yf, 800 + k as u32, nat(800 + k as u32));
+        petrified_arc(&mut s, 28.0 * cf, a_mid, (TAU / osegs as f32) * 0.97, 11.25, yf, 800 + k as u32, nat(800 + k as u32));
     }
     // STEPPING STONES to walk the halls on — flat slabs scattered along the corridors + courtyard
     for k in 0..40 {
         let a = hash(k, 71) * TAU;
-        let rad = 3.0 + (hash(k, 72)).sqrt() * 26.0;
+        let rad = (3.0 + (hash(k, 72)).sqrt() * 26.0) * cf;
         let (px, pz) = (a.cos() * rad, a.sin() * rad);
         let mut st = m3::disc(v(px, yf + 0.04, pz), 0.5 + hash(k, 73) * 0.55, 7, c(0x4a, 0x46, 0x40));
         m3::scale_xz(&mut st, 1.0, 0.7 + hash(k, 74) * 0.5);
@@ -273,9 +359,23 @@ fn canopy() -> Scene {
     }
     // dust motes drifting in the coloured shafts
     for k in 0..16 { let a = hash(k, 46) * TAU; let rad = hash(k, 47) * 11.0; firefly(&mut s, v(a.cos() * rad, yf + 1.0 + hash(k, 48) * 6.0, a.sin() * rad), 950 + k as u32); }
+    // GROUND WEAR — cracks + shallow hollows on the clearing floor so it reads with depth, not a flat plate
+    ground_wear(&mut s, 0.0, 0.0, 13.0, 16, 4, pr.seed as i32 ^ 0x5E, |_x, _z| yf, c(0x2c, 0x22, 0x16), c(0x3e, 0x32, 0x22));
+
+    // FUNKY GNARLED TREES — every now and then an old, twisted character tree at the edge of the clearing:
+    // heavy bend, scattered bow directions, low splay, a thick short trunk. They lean and knuckle like old oaks.
+    let ngnarl = 2 + (pr.seed % 3) as usize; // 2..4
+    for g in 0..ngnarl {
+        let a = std::f32::consts::TAU * g as f32 / ngnarl as f32 + hash(g as i32, 80) * 1.2;
+        let rad = 7.0 + hash(g as i32, 81) * 5.0;
+        let (gx, gz) = (a.cos() * rad, a.sin() * rad);
+        let lean = normv(v((hash(g as i32, 82) - 0.5) * 0.6, 1.0, (hash(g as i32, 83) - 0.5) * 0.6));
+        set_tree_bend((hash(g as i32, 84) - 0.5) * 1.2, (hash(g as i32, 85) - 0.5) * 1.2, 0.9, 0.22 + hash(g as i32, 86) * 0.18); // gnarled: strong scattered bends
+        tree_branch(&mut s, v(gx, yf, gz), lean, 5.0 + hash(g as i32, 87) * 2.5, 1.0 + hash(g as i32, 88) * 0.5, 2, 1500 + g as i32 * 53, 4 + (hash(g as i32, 89) * 2.0) as usize, 0.45);
+    }
+    set_tree_bend(0.0, 0.0, 1.0, 0.0);
     s
 }
-/// floating stone islands topped with cairns.
 /// A far-off ANTIGRAVITY waterfall: instead of falling to the ground the stream loops back on itself in a
 /// vertical ring and recondenses at the top — a closed loop of flowing water + droplets, with a brighter
 /// "recondense" knot at the crown. Sits out in the mist (fog blots the far side). `face_ang` aims the loop plane.
@@ -284,25 +384,47 @@ fn antigrav_fall(s: &mut Scene, cx: f32, cz: f32, base_y: f32, r: f32, face_ang:
     let cen = v(cx, base_y + r, cz);
     let tang = v(face_ang.cos(), 0.0, face_ang.sin());
     let up = v(0.0, 1.0, 0.0);
-    let pt = |th: f32| addv(cen, addv(mulv(tang, r * th.cos()), mulv(up, r * th.sin())));
-    let n = 30;
-    let mut prev = pt(0.0);
-    for i in 1..=n {
-        let th = TAU * i as f32 / n as f32;
-        let p = pt(th);
-        let mut seg = m3::tube(prev, p, 0.05 + 0.04 * th.sin().abs(), 5, col); // thins toward the bottom of the loop
-        seg.mat = M::WATER; seg.emissive = 0.22;
-        s.add(seg, Float { amp: 0.05, speed: 0.7, phase: hash(seed as i32, 1) * 6.28 + th, drift: 0.1 });
-        prev = p;
-        if i % 3 == 0 { // droplets streaming along the loop (the "falling" water)
-            let di = (seed as i32).wrapping_add(i);
-            let mut d = m3::uv_sphere(p, 0.10 + hash(di, 2) * 0.1, 10, 7, col);
-            m3::tint_up(&mut d, c(0x9a, 0xd0, 0xdc), c(0x2c, 0x50, 0x58)); d.mat = M::WATER; d.emissive = 0.3;
-            s.add(d, Float { amp: 0.25, speed: 0.8 + hash(di, 3) * 0.5, phase: hash(di, 4) * 6.28, drift: 0.35 });
+    let binorm = crossv(tang, up);
+    let pt = |th: f32, rr: f32| addv(cen, addv(mulv(tang, rr * th.cos()), mulv(up, rr * th.sin())));
+    let n = 48;
+    // BRAIDED RIPPLING STRANDS — three offset strands whose radius undulates and that weave off the loop plane,
+    // so the ring reads as a body of flowing, rippling water rather than a smooth pipe. Foam-bright where it
+    // crashes (crown + base), deep teal along the sweep.
+    for strand in 0..3 {
+        let phase_s = strand as f32 * 2.1;
+        let mut prev = pt(0.0, r);
+        for i in 1..=n {
+            let th = TAU * i as f32 / n as f32;
+            let ripple = (th * 7.0 + phase_s + hash(seed as i32, 1) * TAU).sin() * 0.12 * r;
+            let weave = (th * 5.0 + phase_s).cos() * 0.10 * r;
+            let rr = r + ripple + (strand as f32 - 1.0) * 0.06 * r;
+            let p = addv(pt(th, rr), mulv(binorm, weave));
+            let foam = (th * 2.0).sin().abs().powf(3.0);
+            let scol = mix_rgb(col, c(0xe0, 0xf2, 0xf6), foam * 0.7);
+            let mut seg = m3::tube(prev, p, 0.04 + 0.05 * foam + 0.03 * th.sin().abs(), 5, scol);
+            seg.mat = M::WATER; seg.emissive = 0.18 + foam * 0.22;
+            s.add(seg, Float { amp: 0.04, speed: 0.9, phase: hash(seed as i32, strand) * 6.28 + th, drift: 0.12 });
+            prev = p;
         }
     }
-    let mut knot = m3::uv_sphere(pt(TAU * 0.25), r * 0.16, 12, 9, c(0xb6, 0xe2, 0xec)); // recondense at the crown
-    knot.mat = M::WATER; knot.emissive = 0.5; s.add(knot, Float { amp: 0.1, speed: 0.5, phase: 0.0, drift: 0.0 });
+    // DENSE DROPLET FLOW streaming along the loop
+    for i in 0..26 {
+        let di = (seed as i32).wrapping_add(i);
+        let th = TAU * hash(di, 5);
+        let rr = r + (th * 7.0).sin() * 0.12 * r;
+        let mut d = m3::uv_sphere(pt(th, rr), 0.06 + hash(di, 2) * 0.1, 8, 6, col);
+        m3::tint_up(&mut d, c(0x9a, 0xd0, 0xdc), c(0x2c, 0x50, 0x58)); d.mat = M::WATER; d.emissive = 0.3;
+        s.add(d, Float { amp: 0.3, speed: 0.8 + hash(di, 3) * 0.6, phase: hash(di, 4) * 6.28, drift: 0.4 });
+    }
+    let mut knot = m3::uv_sphere(pt(TAU * 0.25, r), r * 0.17, 12, 9, c(0xcc, 0xee, 0xf4)); // recondense at the crown
+    knot.mat = M::WATER; knot.emissive = 0.55; s.add(knot, Float { amp: 0.1, speed: 0.5, phase: 0.0, drift: 0.0 });
+    for k in 0..7 { // CRASH SPRAY where the loop bottoms out — misty puffs spat off the turn
+        let bp = pt(TAU * 0.75, r);
+        let a = hash(seed as i32 + k, 6) * TAU; let rr = hash(seed as i32 + k, 7) * r * 0.5;
+        let mut sp = m3::uv_sphere(addv(bp, addv(mulv(binorm, a.cos() * rr), v(0.0, a.sin() * rr * 0.4, 0.0))), 0.18 + hash(seed as i32 + k, 8) * 0.3, 7, 5, c(0xc4, 0xda, 0xe2));
+        sp.mat = M::STONE; sp.emissive = 0.06; m3::set_alpha(&mut sp, 50);
+        s.add(sp, Float { amp: 0.4, speed: 0.5, phase: hash(seed as i32 + k, 9) * 6.28, drift: 0.5 });
+    }
 }
 
 fn mistfall() -> Scene {
@@ -319,8 +441,12 @@ fn mistfall() -> Scene {
     }
     let mut water = m3::disc(v(0.0, -6.3, 0.0), 22.0 * ms, 110, c(0x12, 0x1e, 0x22)); // a low contained POOL (not a frame-filling sea) so it reads at the cavern bottom, well below the floating scene
     m3::tint_up(&mut water, c(0x1c, 0x30, 0x36), c(0x0a, 0x14, 0x16)); water.mat = M::WATER;
-    water.emissive = 0.04; m3::set_alpha(&mut water, 104); // translucent → the deep bed + low objects show through as depth
+    water.emissive = 0.035; m3::set_alpha(&mut water, 72); // MORE transparent → the deep bed + sunk boulders read clearly through the lake surface as depth
     s.add(water, Float::STILL);
+    for k in 0..7 { // RIPPLES — concentric rings spreading across the lake surface so it reads as living water
+        let a = hash(k, 96) * std::f32::consts::TAU; let rr = hash(k, 97).sqrt() * 18.0 * ms;
+        ripple_rings(&mut s, a.cos() * rr, a.sin() * rr, -6.3, (1.5 + hash(k, 98) * 2.5) * ms, 4, c(0x6a, 0x9a, 0xa6));
+    }
     // drifting MIST LAYERS — faint translucent sheets at varied heights for depth + atmosphere (height variation)
     for k in 0..((6.0 * ms) as i32) {
         let yy = -3.0 + hash(k, 90) * 9.0;
@@ -345,7 +471,7 @@ fn mistfall() -> Scene {
     for i in 1..n_portals {
         let ang = hash(i, 40) * std::f32::consts::TAU;
         let rad_out = (7.0 + hash(i, 41) * 5.0) * (1.0 + (ms - 1.0) * 0.55); // spaced out, still near enough for the fog
-        let py = 0.6 + (hash(i, 42) - 0.35) * 5.0;     // across heights → the vertical archipelago
+        let py = 3.0 + (hash(i, 42) - 0.35) * 6.0;     // across heights → the vertical archipelago, lifted off the water
         portal(&mut s, ang.cos() * rad_out, py, -2.0 + ang.sin() * rad_out, 1.8 + hash(i, 43) * 1.4, i);
     }
 
@@ -354,7 +480,7 @@ fn mistfall() -> Scene {
     for k in 0..n_isle {
         let ang = std::f32::consts::TAU * k as f32 / n_isle as f32 + hash(k, 1) * 0.5;
         let rad = (3.4 + hash(k, 2) * 8.0) * ms.min(2.0);
-        let p = v(ang.cos() * rad, -1.0 + hash(k, 4) * 7.5, ang.sin() * rad * 0.8 + 0.5); // varied heights
+        let p = v(ang.cos() * rad, 1.6 + hash(k, 4) * 8.0, ang.sin() * rad * 0.8 + 0.5); // varied heights, lifted clear of the lake
         let mut isle = m3::rock(p, 0.9 + hash(k, 6) * 0.9, 200 + k as u32, c(0x3c, 0x46, 0x4a));
         m3::tint_up(&mut isle, c(0x4a, 0x60, 0x42), c(0x2c, 0x34, 0x38)); isle.mat = M::STONE; // mossy top, wet stone sides
         let fl = Float { amp: 0.22 + hash(k, 8) * 0.12, speed: 0.5 + hash(k, 10) * 0.3, phase: hash(k, 12) * 6.28, drift: 0.14 };
@@ -369,25 +495,25 @@ fn mistfall() -> Scene {
     for k in 0..16 {
         let ang = hash(k as i32, 60) * std::f32::consts::TAU;
         let rad = 1.0 + hash(k as i32, 61) * 6.0;
-        let p = v(ang.cos() * rad, -3.0 + hash(k as i32, 62) * 4.8, ang.sin() * rad * 0.8);
+        let p = v(ang.cos() * rad, -4.6 + hash(k as i32, 62) * 9.6, ang.sin() * rad * 0.8); // rise from the lake up through the deep void
         let mut bub = m3::uv_sphere(p, 0.12 + hash(k as i32, 63) * 0.22, 18, 12, c(0x2a, 0x4c, 0x52));
         m3::tint_up(&mut bub, c(0x52, 0x86, 0x90), c(0x16, 0x2e, 0x34)); bub.mat = M::WATER; // shiny → wet
         s.add(bub, Float { amp: 0.5 + hash(k as i32, 64) * 0.6, speed: 0.6 + hash(k as i32, 65) * 0.7, phase: hash(k as i32, 66) * 6.28, drift: 0.45 });
     }
-    waterfall(&mut s, -2.0, -1.5, 3.4, -5.1, 1.9, c(0x7a, 0xb0, 0xc0));
-    waterfall(&mut s, 2.6, 0.4, 2.4, -5.1, 1.3, c(0x86, 0xc0, 0xcc));
+    waterfall(&mut s, -2.0, 2.6, 4.2, -5.6, 2.1, c(0x7a, 0xb0, 0xc0), 0);
+    waterfall(&mut s, 2.6, 3.6, 3.6, -5.6, 1.5, c(0x86, 0xc0, 0xcc), 0);
     // a ring of weathered STANDING STONES / ruins around the water — some tall, some broken short, a couple
     // half-sunk near the shore. Gives Mistfall a megalithic, ancient-site feel rising from the mist.
     for k in 0..((14.0 * ms) as i32) {
         let a = hash(k, 79) * std::f32::consts::TAU;          // randomized angle (no longer an even ring)
-        let rad = (5.0 + (hash(k, 80)).sqrt() * 11.0) * ms;   // spread out, scaled to the room
+        let rad = (14.0 + (hash(k, 80)).sqrt() * 12.0) * ms;  // ring the pool's outer field, clear of the central strand lane
         let (sx, sz) = (a.cos() * rad, a.sin() * rad * 0.9);
         let broken = hash(k, 81) < 0.38;
         let h = if broken { 1.0 + hash(k, 82) * 1.2 } else { 2.6 + hash(k, 83) * 3.2 };
         standing_stone(&mut s, sx, sz, -3.4, h, 700 + k as u32);
     }
     // two low half-submerged stones near the centre
-    for k in 0..2 { let a = 1.2 + k as f32 * 3.0; standing_stone(&mut s, a.cos() * 2.6, a.sin() * 2.0, -3.55, 0.9, 760 + k as u32); }
+    for k in 0..2 { let a = 1.2 + k as f32 * 3.0; standing_stone(&mut s, a.cos() * 19.0 * ms, a.sin() * 17.0 * ms, -3.55, 0.9, 760 + k as u32); }
 
     // CAVE WALLS — a rough rock enclosure rising around the misty pool (Mistfall is a cavern, not open sky).
     // Tall irregular rock buttresses ringing the water; the fog blots their far side so there's no hard wall.
@@ -395,7 +521,7 @@ fn mistfall() -> Scene {
     let wall_lo = c(0x20, 0x2a, 0x30); let wall_hi = c(0x3e, 0x4c, 0x54);
     for k in 0..30 {
         let a = TAU * k as f32 / 30.0 + hash(k, 90) * 0.2;
-        let rad = 28.0 + hash(k, 91) * 6.0;
+        let rad = (26.0 + hash(k, 91) * 6.0) * ms; // scale the enclosure with the room so walls ring OUTSIDE the pool + strand
         let (wx, wz) = (a.cos() * rad, a.sin() * rad);
         let h = 9.0 + hash(k, 92) * 12.0;
         let rock_r = 3.0 + hash(k, 93) * 2.6;
@@ -406,7 +532,7 @@ fn mistfall() -> Scene {
         m3::tint_height(&mut wall, foot, foot + h, wall_lo, wall_hi); wall.mat = M::STONE; s.add(wall, Float::STILL);
     }
     // a dark cavern CEILING the stalactites actually hang from (flat dark roof, faded by the upper mist)
-    let ceil_y = 13.5_f32;
+    let ceil_y = 20.0_f32; // raised cavern roof → more headroom so the camera FSM can frame the floating graph without the ceiling between
     let mut ceil = m3::disc(v(0.0, ceil_y, 0.0), 34.0, 72, c(0x12, 0x18, 0x1c));
     m3::tint_up(&mut ceil, c(0x18, 0x20, 0x24), c(0x0a, 0x0e, 0x12)); ceil.mat = M::STONE;
     for nn in ceil.norms.iter_mut() { nn.x = -nn.x; nn.y = -nn.y; nn.z = -nn.z; } // face DOWN into the cavern
@@ -417,7 +543,7 @@ fn mistfall() -> Scene {
         let a = TAU * hash(k, 95);
         let rad = (hash(k, 96)).sqrt() * 26.0;
         let (sx, sz) = (a.cos() * rad, a.sin() * rad);
-        let len = 3.0 + hash(k, 98) * 5.0;        // longer
+        let len = 4.0 + hash(k, 98) * 7.0;        // longer (reach down from the higher roof)
         let wdt = 0.32 + hash(k, 99) * 0.34;      // narrow base → pointier
         stalactite(&mut s, sx, sz, ceil_y - 0.15, len, wdt, tite_lo, tite_hi);
     }
@@ -476,7 +602,7 @@ fn mistfall() -> Scene {
 /// an upward spiral).
 fn archive() -> Scene {
     let mut s = Scene::new();
-    let asf = (map_radius() / 40.0).clamp(1.0, 2.4); // scale the nave footprint to fill the doubled shell
+    let asf = scene_fit(12.0); // EXPAND the nave footprint to contain the graph (base = nave depth half)
     let yf = -3.2_f32;
     let (half, depth, h) = (6.5_f32 * asf, 12.0_f32 * asf, 9.2_f32 * (0.8 + 0.2 * asf));
     let yc = yf + h;
@@ -582,7 +708,7 @@ fn reading_room() -> Scene {
     use std::f32::consts::TAU;
     let mut s = Scene::new();
     let mr = map_radius();
-    let rs = (mr / 40.0).clamp(1.0, 2.8);          // scale the fit-out to fill the doubled room
+    let _ = mr; let rs = scene_fit(12.0);          // EXPAND the fit-out to contain the graph (base = reading-floor radius)
     let yf = -3.0_f32;
     let warm_lo = c(0x6a, 0x60, 0x50);
     let warm_hi = c(0x86, 0x7c, 0x68);
@@ -624,7 +750,18 @@ fn reading_room() -> Scene {
     let mut balc = m3::annulus(v(0.0, y_mezz, 0.0), 9.0 * rs, 11.5 * rs, 80, stone_lo);
     m3::tint_up(&mut balc, stone_hi, stone_lo); balc.mat = M::STONE; s.add(balc, Float::STILL);
     let mut rail = m3::torus(v(0.0, y_mezz + 0.7, 0.0), 9.3 * rs, 0.07, 80, 6, stone_hi); rail.mat = M::STONE; s.add(rail, Float::STILL);
-    colonnade_ring(&mut s, (10.0 * rs) as usize, 10.8 * rs, y_mezz, 5.5, stone_lo, stone_hi, M::STONE);
+    // NB: the upper level is a railed BOOK GALLERY (perimeter shelves below), NOT a second free-standing colonnade
+    // ring — two stacked identical colonnades read as a colosseum arcade. The ground columns rise to y_mezz and
+    // carry the balcony, so the gallery needs no second ring; slim posts just punctuate the rail.
+    {
+        let posts = ((9.0 * rs) as usize).max(8);
+        for k in 0..posts {
+            let a = k as f32 / posts as f32 * TAU + 0.31;
+            let (px, pz) = (a.cos() * 9.3 * rs, a.sin() * 9.3 * rs);
+            let mut post = m3::tube(v(px, y_mezz, pz), v(px, y_mezz + 0.7, pz), 0.06, 8, stone_hi);
+            post.mat = M::STONE; s.add(post, Float::STILL);
+        }
+    }
     // PERIMETER BOOKSHELVES ringing the wall on BOTH levels — the room reads as a deep library
     for lvl in 0..2u32 {
         let (yb, rad, hh) = if lvl == 0 { (yf, mr * 0.80, 6.4) } else { (y_mezz, mr * 0.86, 5.0) };
@@ -691,7 +828,7 @@ fn reading_room() -> Scene {
 fn foldingathome() -> Scene {
     use std::f32::consts::{PI, TAU};
     let mut s = Scene::new();
-    let ms = (map_radius() / 40.0).clamp(1.0, 2.6);
+    let ms = (map_radius() / 40.0).clamp(1.0, 2.6); // floating-protein field: keep its tuned map_radius scaling
     let res = [c(0x6e, 0xc6, 0xff), c(0x8b, 0xe0, 0x9b), c(0xc9, 0x8f, 0xff), c(0xff, 0x9b, 0x8a), c(0xe6, 0xb4, 0x5c)];
     // membrane bed scaled to the room + a lipid-bilayer speckle
     let mut membrane = m3::disc(v(0.0, -5.6, 0.0), 16.0 * ms, 64, c(0x1c, 0x22, 0x2e));
@@ -817,6 +954,84 @@ fn enclose(s: &mut Scene, wall_mat: f32, wall_lo: Color32, wall_hi: Color32, she
 /// dome, a colonnade of marble columns, turquoise pools + a moat, palms/ferns around the edges (centre kept clear
 /// for the graph), GOLD VEINS the shader sweeps light-pulses along at night, and GOLDEN RAIN that falls and
 /// re-stains the "memory marble" floor (which slowly returns to white). `sc` scales the whole conservatory.
+/// Concentric expanding RIPPLE rings on a water surface — reads as gentle ripples spreading out. Reused by the
+/// Mansion's rivers/pools and Mistfall's pools to make flat water read as a living, rippling surface.
+fn ripple_rings(s: &mut Scene, cx: f32, cz: f32, y: f32, maxr: f32, n: usize, col: Color32) {
+    for i in 0..n {
+        let t = (i as f32 + 1.0) / n as f32;
+        let r = maxr * t;
+        let mut ring = m3::annulus(v(cx, y + 0.02, cz), r * 0.92, r, 40, col);
+        ring.mat = M::WATER; ring.emissive = 0.14 * (1.0 - t);
+        m3::set_alpha(&mut ring, (95.0 * (1.0 - t * 0.55)) as u8);
+        s.add(ring, Float { amp: 0.025, speed: 0.6 + t * 0.8, phase: t * 6.28, drift: 0.0 });
+    }
+}
+
+/// A single marble PILLAR of varied form for the Mansion world's scattered clusters.
+/// style: 0 plain column · 1 fluted column with a torus capital + base · 2 broken short stub · 3 tapered obelisk.
+fn marble_pillar(s: &mut Scene, x: f32, z: f32, yf: f32, h: f32, r: f32, style: u8, mlo: Color32, mhi: Color32, mem: f32) {
+    let mut shaft = m3::tube(v(x, yf, z), v(x, yf + h, z), r, 12, mlo);
+    m3::tint_up(&mut shaft, mhi, mlo); shaft.mat = M::STONE; shaft.emissive = mem; s.add(shaft, Float::STILL);
+    match style {
+        1 => {
+            let mut cap = m3::torus(v(x, yf + h, z), r * 1.5, r * 0.35, 16, 8, mhi); cap.mat = M::STONE; cap.emissive = mem; s.add(cap, Float::STILL);
+            let mut base = m3::tube(v(x, yf, z), v(x, yf + 0.4, z), r * 1.5, 12, mhi); m3::tint_up(&mut base, mhi, mlo); base.mat = M::STONE; base.emissive = mem; s.add(base, Float::STILL);
+        }
+        3 => { let mut tip = m3::tube(v(x, yf + h, z), v(x, yf + h + r * 3.0, z), r * 0.12, 6, mhi); m3::tint_up(&mut tip, mhi, mlo); tip.mat = M::STONE; tip.emissive = mem; s.add(tip, Float::STILL); }
+        _ => {}
+    }
+}
+
+/// A LAZY RIVER — a wide, slow water channel that meanders across the marble plain (a chain of overlapping water
+/// discs following a wandering sine path, with ripples), winding through the grand world.
+fn lazy_river(s: &mut Scene, x0: f32, z0: f32, x1: f32, z1: f32, seed: i32, sc: f32, yf: f32) {
+    use std::f32::consts::TAU;
+    let (dx, dz) = (x1 - x0, z1 - z0);
+    let len = (dx * dx + dz * dz).sqrt().max(0.01);
+    let (ux, uz) = (dx / len, dz / len);
+    let (perpx, perpz) = (-uz, ux);
+    let steps = 28;
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;
+        let wander = (t * 6.0 + hash(seed, 1) * TAU).sin() * 3.2 * sc + (t * 13.0 + hash(seed, 2) * TAU).sin() * 1.3 * sc;
+        let cx = x0 + dx * t + perpx * wander;
+        let cz = z0 + dz * t + perpz * wander;
+        let w = (2.0 + (t * std::f32::consts::PI).sin() * 1.2) * sc;
+        let mut seg = m3::disc(v(cx, yf + 0.05, cz), w, 20, c(0x3c, 0xb0, 0xb8));
+        m3::tint_up(&mut seg, c(0x6a, 0xdc, 0xe0), c(0x16, 0x6c, 0x76)); seg.mat = M::WATER; seg.emissive = 0.13; m3::set_alpha(&mut seg, 198); s.add(seg, Float::STILL);
+        if i % 7 == 0 { ripple_rings(s, cx, cz, yf + 0.05, w * 0.8, 3, c(0x9a, 0xe0, 0xe4)); }
+    }
+}
+
+/// A marble STRUCTURE CLUSTER set out on the plain — solo or grouped. Picks a formation: a grove of varied-height
+/// pillars, a planted grove with lively foliage, or a small waterfall pouring into a rippling pool.
+fn marble_cluster(s: &mut Scene, cx: f32, cz: f32, seed: i32, sc: f32, yf: f32, mlo: Color32, mhi: Color32, mem: f32) {
+    use std::f32::consts::TAU;
+    let kind = (hash(seed, 1) * 3.0) as u32;
+    let npil = 2 + (hash(seed, 2) * 4.0) as usize;
+    for p in 0..npil {
+        let a = hash(seed + p as i32, 3) * TAU; let rr = hash(seed + p as i32, 4) * 3.0 * sc;
+        let (px, pz) = (cx + a.cos() * rr, cz + a.sin() * rr);
+        let h = (3.0 + hash(seed + p as i32, 5) * 8.0) * sc;       // varied heights
+        let r = (0.3 + hash(seed + p as i32, 6) * 0.45) * sc;      // varied girth
+        let style = (hash(seed + p as i32, 7) * 4.0) as u8;        // varied form
+        marble_pillar(s, px, pz, yf, h, r, style, mlo, mhi, mem);
+    }
+    if kind == 1 { // lively plants among the pillars
+        for q in 0..3 {
+            let a = hash(seed + q, 8) * TAU; let rr = hash(seed + q, 9) * 2.6 * sc;
+            let (px, pz) = (cx + a.cos() * rr, cz + a.sin() * rr);
+            let mut top = m3::leaf_cluster(v(px, yf + 1.3 * sc, pz), (0.7 + hash(seed + q, 10) * 0.6) * sc, (seed + q) as u32, c(0x3a, 0x5e, 0x32));
+            m3::tint_up(&mut top, c(0x52, 0x80, 0x42), c(0x22, 0x40, 0x20)); top.mat = M::MOSS; s.add(top, Float { amp: 0.03, speed: 0.4, phase: hash(seed + q, 11) * 6.28, drift: 0.03 });
+        }
+    } else if kind == 2 { // a waterfall + rippling catch-pool
+        let mut pool = m3::disc(v(cx, yf + 0.06, cz), 3.0 * sc, 32, c(0x4c, 0xc4, 0xc8));
+        m3::tint_up(&mut pool, c(0x6a, 0xdc, 0xe0), c(0x16, 0x6c, 0x76)); pool.mat = M::WATER; pool.emissive = 0.14; m3::set_alpha(&mut pool, 198); s.add(pool, Float::STILL);
+        ripple_rings(s, cx, cz, yf + 0.06, 2.7 * sc, 4, c(0x9a, 0xe0, 0xe4));
+        waterfall(s, cx, cz - 2.2 * sc, yf + 5.0 * sc.min(2.6), yf + 0.1, 2.0 * sc, c(0x9a, 0xc8, 0xcc), 1);
+    }
+}
+
 fn mansion_garden() -> Scene {
     use std::f32::consts::TAU;
     let mut s = Scene::new();
@@ -828,16 +1043,16 @@ fn mansion_garden() -> Scene {
     let mem = 0.22_f32;               // "memory marble" flag read by the shader (golden-rain re-texturing)
 
     // MARBLE FLOOR (memory marble) + a deep water layer beneath
-    let mut floor = m3::disc(v(0.0, yf, 0.0), 24.0 * sc, 112, mlo);
+    let mut floor = m3::disc(v(0.0, yf, 0.0), 30.0 * sc, 128, mlo);
     m3::tint_up(&mut floor, mhi, mlo); floor.mat = M::STONE; floor.emissive = mem; s.add(floor, Float::STILL);
-    let mut deep = m3::disc(v(0.0, yf - 1.2, 0.0), 24.0 * sc, 80, c(0x06, 0x2e, 0x36));
+    let mut deep = m3::disc(v(0.0, yf - 1.2, 0.0), 30.0 * sc, 90, c(0x06, 0x2e, 0x36));
     deep.mat = M::WATER; deep.emissive = 0.02; s.add(deep, Float::STILL);
 
     // WATER: scattered pools toward the edges (the central MOAT RING was removed per request — varied pools instead)
-    for k in 0..8 {
+    for k in 0..3 {
         let a = hash(k, 21) * TAU; let r = (12.0 + hash(k, 22) * 9.0) * sc;
         let mut pool = m3::disc(v(a.cos() * r, yf + 0.05, a.sin() * r), (1.6 + hash(k, 23) * 2.2) * sc, 44, water);
-        m3::tint_up(&mut pool, c(0x4c, 0xc4, 0xc8), c(0x16, 0x6c, 0x76)); pool.mat = M::WATER; pool.emissive = 0.10; m3::set_alpha(&mut pool, 205); s.add(pool, Float::STILL);
+        m3::tint_up(&mut pool, c(0x4c, 0xc4, 0xc8), c(0x16, 0x6c, 0x76)); pool.mat = M::WATER; pool.emissive = 0.14; m3::set_alpha(&mut pool, 198); s.add(pool, Float::STILL);
     }
 
     // CENTRAL TIERED DAIS (memory marble; low so the graph floats above it)
@@ -981,6 +1196,81 @@ fn mansion_garden() -> Scene {
         m3::tint_up(&mut chan, c(0x4c, 0xc4, 0xc8), c(0x16, 0x6c, 0x76)); chan.mat = M::WATER; chan.emissive = 0.10; m3::set_alpha(&mut chan, 200);
         m3::scale_xz(&mut chan, 1.0, 0.30); s.add(chan, Float::STILL); // elongated → channel
     }
+
+    // REFLECTIVE SHEEN — a still water-film over the marble so the whole terrace mirrors the dome, colonnade and
+    // sky like a reflecting pool. Low alpha keeps the marble veining visible through the mirror.
+    let mut sheen = m3::disc(v(0.0, yf + 0.03, 0.0), 29.0 * sc, 110, c(0x9a, 0xc8, 0xcc));
+    sheen.mat = M::WATER; sheen.emissive = 0.18; m3::set_alpha(&mut sheen, 55); s.add(sheen, Float::STILL);
+
+    // EXPANDED GARDEN — topiary, flowering urns and small fountains set out on the terrace among the pools
+    // (all kept clear of the centre so the conversation graph still flows through the heart of the hall).
+    for k in 0..6 { // TOPIARY — clipped boxwood spheres + cones on marble plinths
+        let a = hash(k, 300) * TAU; let r = (8.0 + hash(k, 301) * 12.0) * sc;
+        let (tx, tz) = (a.cos() * r, a.sin() * r);
+        let mut plinth = m3::tube(v(tx, yf, tz), v(tx, yf + 0.6, tz), 0.42 * sc, 10, mlo); m3::tint_up(&mut plinth, mhi, mlo); plinth.mat = M::STONE; plinth.emissive = mem; s.add(plinth, Float::STILL);
+        let mut top = m3::leaf_cluster(v(tx, yf + 1.3, tz), 0.8 + hash(k, 303) * 0.5, (3000 + k) as u32, c(0x3a, 0x5e, 0x32));
+        if hash(k, 302) > 0.5 { m3::scale3(&mut top, 0.8, 1.7, 0.8); } // cone vs sphere
+        m3::tint_up(&mut top, c(0x52, 0x80, 0x42), c(0x22, 0x40, 0x20)); top.mat = M::MOSS; s.add(top, Float { amp: 0.02, speed: 0.4, phase: hash(k, 304) * 6.28, drift: 0.02 });
+    }
+    for k in 0..4 { // FLOWERING URNS — marble urns spilling blossom near the pools
+        let a = hash(k, 310) * TAU + 0.4; let r = (10.0 + hash(k, 311) * 9.0) * sc;
+        let (px, pz) = (a.cos() * r, a.sin() * r);
+        let mut urn = m3::tube(v(px, yf, pz), v(px, yf + 1.0, pz), 0.5 * sc, 12, mhi); m3::tint_up(&mut urn, mhi, mlo); urn.mat = M::STONE; urn.emissive = mem; s.add(urn, Float::STILL);
+        let fcol = [c(0xe0, 0x8a, 0xb0), c(0xe6, 0xc4, 0x6a), c(0xc8, 0x8a, 0xd8), c(0xe0, 0x9a, 0x7a)][(hash(k, 312) * 4.0) as usize % 4];
+        let mut bloom = m3::leaf_cluster(v(px, yf + 1.35, pz), 0.6, (3100 + k) as u32, fcol); m3::tint_up(&mut bloom, fcol, c(0x4a, 0x70, 0x40)); bloom.mat = M::MOSS; bloom.emissive = 0.06; s.add(bloom, Float { amp: 0.04, speed: 0.6, phase: hash(k, 313) * 6.28, drift: 0.05 });
+    }
+    for k in 0..3 { // SMALL FOUNTAINS — tiered marble basins with a golden jet, off-centre among the pools
+        let a = hash(k, 320) * TAU + 1.0; let r = 13.0 * sc;
+        let (fx, fz) = (a.cos() * r, a.sin() * r);
+        let mut basin = m3::tube(v(fx, yf, fz), v(fx, yf + 0.5, fz), 1.6 * sc, 24, mhi); m3::tint_up(&mut basin, mhi, mlo); basin.mat = M::STONE; basin.emissive = mem; s.add(basin, Float::STILL);
+        let mut bw = m3::disc(v(fx, yf + 0.52, fz), 1.45 * sc, 28, c(0x4c, 0xc4, 0xc8)); bw.mat = M::WATER; bw.emissive = 0.16; m3::set_alpha(&mut bw, 200); s.add(bw, Float::STILL);
+        let mut stem = m3::tube(v(fx, yf + 0.5, fz), v(fx, yf + 1.7, fz), 0.22 * sc, 10, mhi); m3::tint_up(&mut stem, mhi, mlo); stem.mat = M::STONE; stem.emissive = mem; s.add(stem, Float::STILL);
+        let mut upper = m3::disc(v(fx, yf + 1.7, fz), 0.7 * sc, 20, mhi); m3::tint_up(&mut upper, mhi, mlo); upper.mat = M::STONE; upper.emissive = mem; s.add(upper, Float::STILL);
+        let mut jet = m3::tube(v(fx, yf + 1.7, fz), v(fx, yf + 2.7, fz), 0.07 * sc, 6, gold); jet.mat = M::WATER; jet.emissive = 7.0; s.add(jet, Float::STILL);
+    }
+    // MARBLE CASCADES — elegant gold-lit waterfalls pouring over carved marble lips into catch-pools at the edge
+    // of the terrace (their own refined, sparkling character — distinct from Mistfall's ghostly veils).
+    for k in 0..3 {
+        let a = hash(k, 330) * TAU + 2.0; let r = 16.0 * sc;
+        let (wx, wz) = (a.cos() * r, a.sin() * r);
+        let mut ledge = m3::tube(v(wx - 1.5 * sc, yf + 5.5, wz), v(wx + 1.5 * sc, yf + 5.5, wz), 0.5 * sc, 8, mhi);
+        m3::tint_up(&mut ledge, mhi, mlo); ledge.mat = M::STONE; ledge.emissive = mem; s.add(ledge, Float::STILL);
+        waterfall(&mut s, wx, wz, yf + 5.4, yf + 0.1, 2.2 * sc, c(0x9a, 0xc8, 0xcc), 1);
+        let mut pool = m3::disc(v(wx, yf + 0.06, wz), 2.6 * sc, 36, c(0x4c, 0xc4, 0xc8));
+        m3::tint_up(&mut pool, c(0x6a, 0xdc, 0xe0), c(0x16, 0x6c, 0x76)); pool.mat = M::WATER; pool.emissive = 0.14; m3::set_alpha(&mut pool, 198); s.add(pool, Float::STILL);
+    }
+
+    // ════════ 10× WORLD EXPANSION ════════ the domed plaza above is the heart; the marble world now extends a
+    // vast distance around it — a giant flat plain threaded by many lazy rivers and dotted with structure clusters
+    // (varied scale: distant grand monuments down to little pillar groves), so it reads as a grand-sized world.
+    let ws = 10.0_f32;                       // world scale factor
+    let world_r = 30.0 * sc * ws;            // radius of the expanded marble plain
+    let mut plain = m3::disc(v(0.0, yf - 0.04, 0.0), world_r, 220, mlo);
+    m3::tint_up(&mut plain, mhi, mlo); plain.mat = M::STONE; plain.emissive = mem * 0.85; s.add(plain, Float::STILL);
+    let mut osheen = m3::disc(v(0.0, yf + 0.025, 0.0), world_r * 0.97, 180, c(0x9a, 0xc8, 0xcc));
+    osheen.mat = M::WATER; osheen.emissive = 0.16; m3::set_alpha(&mut osheen, 42); s.add(osheen, Float::STILL); // world-wide reflecting film
+    // many LAZY RIVERS winding across the vast plain
+    for k in 0..10 {
+        let a0 = hash(k, 400) * TAU; let a1 = a0 + 1.8 + hash(k, 401) * 2.4;
+        let r = (0.45 + hash(k, 402) * 0.5) * world_r;
+        lazy_river(&mut s, a0.cos() * r, a0.sin() * r, a1.cos() * r, a1.sin() * r, 900 + k, sc * (1.0 + hash(k, 403) * 3.0), yf);
+    }
+    // STRUCTURE CLUSTERS scattered across the whole world — varied scale: closer/smaller groves, far grand monuments
+    for k in 0..44 {
+        let a = hash(k, 410) * TAU + hash(k, 414); 
+        let rr = (9.0 * sc + hash(k, 411).sqrt() * (world_r * 0.92 - 9.0 * sc));   // sqrt → even areal spread
+        let cscale = sc * (0.8 + hash(k, 412) * 2.8 + (rr / world_r) * 3.0);       // bigger the farther out → grand distant monuments
+        marble_cluster(&mut s, a.cos() * rr, a.sin() * rr, 1300 + k, cscale, yf, mlo, mhi, mem);
+    }
+    // a few towering OBELISK landmarks far out, marking the reach of the world
+    for k in 0..6 {
+        let a = hash(k, 420) * TAU; let rr = (0.7 + hash(k, 421) * 0.25) * world_r;
+        marble_pillar(&mut s, a.cos() * rr, a.sin() * rr, yf, (40.0 + hash(k, 422) * 50.0) * sc, (2.0 + hash(k, 423) * 2.0) * sc, 3, mlo, mhi, mem);
+    }
+    // ROUGH-MARBLE CLIFF RIM — the polished terrace gives way to a ring of eroded marble escarpments (matte, strata
+    // -banded, talus spilling in) so the vast plain ends in geology, not a fog-cut edge — and the rough stone
+    // contrasts the mirror floor (material variety, not monotone). The world reads as continuing into the haze.
+    organic_boundary(&mut s, world_r * 0.96, yf, 7000, c(0x9e, 0x92, 0x76), c(0xd2, 0xc6, 0xa6), M::STONE, c(0x5a, 0x80, 0x42), false, sc);
     s
 }
 
@@ -1001,9 +1291,39 @@ fn islands() -> Scene {
 
 /// Old Library: instead of stones, a great lectern with an open, faintly-glowing tome at the centre, and
 /// loose pages drifting up around it (a page turning itself — presence). Enclosed by bookshelf walls.
+/// A spiral staircase: a helix of flat wedge treads winding from y0 to y1 around a central newel post, with
+/// balusters and a helical handrail. Connects the library's gallery floors so the tall graph has real storeys.
+fn spiral_stair(s: &mut Scene, cx: f32, cz: f32, y0: f32, y1: f32, radius: f32, turns: f32, seed: u32, wlo: Color32, whi: Color32) {
+    use std::f32::consts::TAU;
+    let nsteps = (((y1 - y0) / 0.42).max(10.0)) as usize;
+    let ph = hash(seed as i32, 1) * TAU;
+    let mut post = m3::tube(v(cx, y0, cz), v(cx, y1 + 0.4, cz), 0.22, 8, c(0x3a, 0x28, 0x16)); post.mat = M::WOOD; s.add(post, Float::STILL);
+    for i in 0..nsteps {
+        let t = i as f32 / nsteps as f32;
+        let ang = t * turns * TAU + ph;
+        let y = y0 + t * (y1 - y0);
+        let dir = v(ang.cos(), 0.0, ang.sin());
+        let tan = v(-ang.sin(), 0.0, ang.cos());
+        let mid = v(cx + dir.x * radius * 0.55, y, cz + dir.z * radius * 0.55);
+        let mut step = m3::panel(mid, dir, tan, radius * 0.92, 0.72, wlo); // flat tread (normal vertical)
+        m3::tint_up(&mut step, whi, wlo); step.mat = M::WOOD; s.add(step, Float::STILL);
+        let rim = v(cx + dir.x * radius, y, cz + dir.z * radius);
+        let mut bal = m3::tube(rim, addv(rim, v(0.0, 0.95, 0.0)), 0.04, 4, c(0x46, 0x32, 0x1c)); bal.mat = M::WOOD; s.add(bal, Float::STILL);
+    }
+    let mut prev: Option<Vec3> = None; // helical handrail
+    for i in 0..=nsteps {
+        let t = i as f32 / nsteps as f32;
+        let ang = t * turns * TAU + ph;
+        let p = v(cx + ang.cos() * radius, y0 + t * (y1 - y0) + 0.95, cz + ang.sin() * radius);
+        if let Some(pp) = prev { let mut r = m3::tube(pp, p, 0.05, 4, c(0x5a, 0x42, 0x26)); r.mat = M::WOOD; s.add(r, Float::STILL); }
+        prev = Some(p);
+    }
+}
+
 fn old_library() -> Scene {
     let mut s = Scene::new();
-    let mut floor = m3::disc(v(0.0, -3.0, 0.0), 34.0, 120, c(0x2e, 0x22, 0x14));
+    let ol = scene_fit(26.0); // EXPAND the library footprint to contain the graph — spread wider in XZ
+    let mut floor = m3::disc(v(0.0, -3.0, 0.0), 34.0 * ol, 120, c(0x2e, 0x22, 0x14));
     m3::tint_up(&mut floor, c(0x4a, 0x38, 0x20), c(0x20, 0x18, 0x0e)); floor.mat = M::WOOD;
     s.add(floor, Float::STILL);
     // CENTERPIECES SCALE WITH THE CONVERSATION: a big chat earns several lecterns (focal "open tomes") spread
@@ -1040,7 +1360,7 @@ fn old_library() -> Scene {
     for i in 1..n_centers {
         // satellites sit in the diagonal gaps BETWEEN the four bookshelf corridors, so they never block an aisle
         let ang = std::f32::consts::FRAC_PI_4 + (i as f32 - 1.0) * std::f32::consts::FRAC_PI_2;
-        let rad = 10.5 + i as f32 * 2.4; // pushed well out into the diagonal gaps, staggered so they don't ring up
+        let rad = (10.5 + i as f32 * 2.4) * ol; // pushed well out into the diagonal gaps, staggered so they don't ring up
         lectern(&mut s, ang.cos() * rad, ang.sin() * rad, 0.7, i);
     }
     // RECTANGULAR BOOKSHELF HALLWAYS radiating from the lectern — wooden stacks lining each corridor, capped at
@@ -1050,7 +1370,7 @@ fn old_library() -> Scene {
     let (cw, bw, bh) = (2.8_f32, 2.2_f32, 4.2_f32);
     let pr = env_params();
     let filled = ((pr.nodes as f32 / 6.0).round() as usize).clamp(3, 9); // how far the graph has filled the stacks
-    let ncases = 12usize;
+    let ncases = (12.0 * ol).round() as usize; // longer aisles as the conversation grows
     for (d, (tx, tz)) in [(0usize, (1.0_f32, 0.0_f32)), (1, (-1.0, 0.0)), (2, (0.0, 1.0)), (3, (0.0, -1.0))] {
         let (px, pz) = (-tz, tx); // across-corridor axis
         // MAIN aisle: packed near the lectern, then EMPTY shelves further out (room for the graph to grow into)
@@ -1080,6 +1400,37 @@ fn old_library() -> Scene {
                     bookcase_fill(&mut s, base, inward, tangent, bw, bh, (d * 1000 + i * 10 + sidx as usize + (poff > 0.0) as usize * 7) as u32, wlo, whi, 0.0);
                 }
             }
+        }
+    }
+
+    // GALLERY FLOORS + SPIRAL STAIRS — rising mezzanine rings of bookshelves so the tall graph climbs through
+    // stacked storeys with a high ceiling, reached by spiral staircases. Storeys scale with the conversation.
+    let fr = 34.0 * ol; // floor radius
+    let nlevels = (pr.nodes / 60).clamp(1, 3) as usize;
+    use std::f32::consts::TAU;
+    for level in 1..=nlevels {
+        let y = -3.0 + level as f32 * 6.5; // storey height
+        let r_out = fr * 0.96;
+        let r_in = fr * (0.60 - level as f32 * 0.03); // upper rings open a touch wider over the centre
+        let mut walk = m3::annulus(v(0.0, y, 0.0), r_in, r_out, 96, c(0x46, 0x34, 0x1e));
+        m3::tint_up(&mut walk, c(0x5e, 0x46, 0x28), c(0x32, 0x24, 0x14)); walk.mat = M::WOOD; s.add(walk, Float::STILL);
+        let mut rail = m3::wall_ring(v(0.0, y, 0.0), r_in, 1.0, 96, c(0x3a, 0x2a, 0x18)); rail.mat = M::WOOD; s.add(rail, Float::STILL);
+        let ncase = (TAU * r_out / 4.2) as usize;
+        for i in 0..ncase {
+            if hash((level * 100 + i) as i32, 9) < 0.32 { continue; } // a few gaps (reading nooks)
+            let ang = TAU * i as f32 / ncase as f32;
+            let dir = v(ang.cos(), 0.0, ang.sin());
+            let base = v(dir.x * (r_out - 0.7), y, dir.z * (r_out - 0.7));
+            let inward = v(-dir.x, 0.0, -dir.z);
+            let tangent = v(-dir.z, 0.0, dir.x);
+            let fill = if hash((level * 137 + i) as i32, 7) > 0.4 { 0.6 } else { 0.0 };
+            bookcase_fill(&mut s, base, inward, tangent, 2.8, 3.0, (level * 7000 + i) as u32, wlo, whi, fill);
+        }
+    }
+    if nlevels >= 1 { // spiral staircases at two opposite corners, ground → top gallery
+        let top_y = -3.0 + nlevels as f32 * 6.5;
+        for &(sx, sz) in &[(fr * 0.70, fr * 0.70), (-fr * 0.70, -fr * 0.70)] {
+            spiral_stair(&mut s, sx, sz, -3.0, top_y, 3.2, nlevels as f32 + 0.5, (sx.abs() as i32) as u32 ^ 0x5A, wlo, whi);
         }
     }
     s
@@ -1135,34 +1486,66 @@ fn colonnade_ring(s: &mut Scene, count: usize, radius: f32, y_floor: f32, height
 
 /// A WATERFALL sheet: a tall thin curved slab on the WATER material falling from `top` to `base_y`, given a
 /// downward flow by the water shader. A first water-feature for Mistfall (pairs with the lake disc).
-fn waterfall(s: &mut Scene, x: f32, z: f32, top_y: f32, base_y: f32, width: f32, color: Color32) {
+fn waterfall(s: &mut Scene, x: f32, z: f32, top_y: f32, base_y: f32, width: f32, color: Color32, style: u8) {
     use std::f32::consts::TAU;
     let h = (top_y - base_y).max(0.5);
-    // TURBULENT sheet: three overlapping translucent strands that sway out of phase (reads as churning water)
-    for i in 0..3 {
-        let off = (i as f32 - 1.0) * width * 0.26;
-        let mut sheet = m3::panel(v(x + off * 0.5, (top_y + base_y) * 0.5, z + off * 0.18), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), width * 0.6, h, color);
-        m3::tint_height(&mut sheet, base_y, top_y, c(0x2c, 0x52, 0x5e), c(0xbf, 0xe6, 0xf0)); // foam-bright at the lip
-        sheet.mat = M::WATER; sheet.emissive = 0.07; m3::set_alpha(&mut sheet, 128);
-        s.add(sheet, Float { amp: 0.0, speed: 0.9, phase: i as f32 * 1.3, drift: 0.12 });
+    let seed0 = (x * 7.3 + z * 3.1) as i32;
+    let mansion = style == 1;
+    let drop_col = if mansion { c(0xf0, 0xe6, 0xc0) } else { c(0xd8, 0xee, 0xf4) };
+    let mist_col = if mansion { c(0xe8, 0xde, 0xc4) } else { c(0xc4, 0xda, 0xe2) };
+
+    // BODY VEIL — translucent sheets giving the fall mass. MISTFALL: wispier, more transparent, and stops short of
+    // the base (it dissolves into spray). MANSION: a cleaner, brighter sheet with a gold-lit marble lip.
+    let nsheet = if mansion { 2 } else { 3 };
+    for i in 0..nsheet {
+        let off = (i as f32 - (nsheet as f32 - 1.0) * 0.5) * width * 0.3;
+        let sh = if mansion { h } else { h * 0.62 };          // mistfall sheet dissolves before the pool
+        let cy = top_y - sh * 0.5;
+        let mut sheet = m3::panel(v(x + off * 0.5, cy, z + off * 0.18), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), width * (if mansion { 0.72 } else { 0.5 }), sh, color);
+        let (lo, hi) = if mansion { (c(0x6a, 0xa6, 0xb0), c(0xe8, 0xd8, 0x9a)) } else { (c(0x2c, 0x52, 0x5e), c(0xcf, 0xe6, 0xf0)) };
+        m3::tint_height(&mut sheet, cy - sh * 0.5, cy + sh * 0.5, lo, hi);
+        sheet.mat = M::WATER; sheet.emissive = if mansion { 0.12 } else { 0.05 };
+        m3::set_alpha(&mut sheet, if mansion { 150 } else { 88 });
+        s.add(sheet, Float { amp: 0.0, speed: 0.9, phase: i as f32 * 1.3, drift: if mansion { 0.08 } else { 0.16 } });
     }
-    // BUBBLES / foam gobs tumbling down the fall
-    for k in 0..14 {
-        let py = base_y + hash((x * 7.0 + z * 3.0) as i32 + k, 1) * h;
-        let px = x + (hash(k, 2) - 0.5) * width * 0.85;
-        let mut bub = m3::uv_sphere(v(px, py, z + (hash(k, 3) - 0.5) * 0.3), 0.05 + hash(k, 4) * 0.09, 7, 6, c(0xd8, 0xee, 0xf4));
-        bub.mat = M::WATER; bub.emissive = 0.10;
-        s.add(bub, Float { amp: 0.6, speed: 1.4 + hash(k, 5), phase: hash(k, 6) * 6.28, drift: 0.2 });
+
+    // PARTICLE STREAM — many small droplets streaming down (the particle-based body). MISTFALL scatters them wider
+    // + denser toward the base (the fall breaks up into spray); MANSION keeps a tight sparkling ribbon.
+    let ndrop = if mansion { 26 } else { 42 };
+    for k in 0..ndrop {
+        let t = hash(seed0 + k, 1);                          // height fraction (0 = base)
+        let py = base_y + t * h;
+        let spread = if mansion { width * 0.42 } else { width * (0.3 + (1.0 - t) * 0.95) }; // mist widens near base
+        let px = x + (hash(k, 2) - 0.5) * spread;
+        let pz = z + (hash(k, 3) - 0.5) * (if mansion { 0.3 } else { 0.4 + (1.0 - t) * 0.9 });
+        let sz = if mansion { 0.05 + hash(k, 4) * 0.07 } else { 0.04 + hash(k, 4) * 0.10 };
+        let mut drop = m3::uv_sphere(v(px, py, pz), sz, 6, 5, drop_col);
+        drop.mat = M::WATER; drop.emissive = if mansion { 0.16 } else { 0.10 };
+        s.add(drop, Float { amp: 0.7 + hash(k, 5), speed: 1.3 + hash(k, 6) * 0.8, phase: hash(k, 7) * 6.28, drift: if mansion { 0.15 } else { 0.3 } });
     }
-    // plunge-pool foam ring where it lands
-    let mut foam = m3::annulus(v(x, base_y + 0.04, z), width * 0.3, width * 0.8, 28, c(0xcf, 0xe8, 0xf0));
-    foam.mat = M::WATER; foam.emissive = 0.14; m3::set_alpha(&mut foam, 120); s.add(foam, Float::STILL);
-    // MISTING — lots of translucent puffs billowing up off the plunge pool (taller, denser)
-    for k in 0..18 {
-        let a = hash(k, 7) * TAU; let r = hash(k, 8) * width * 0.95;
-        let mut mist = m3::uv_sphere(v(x + a.cos() * r, base_y + 0.2 + hash(k, 9) * 2.4, z + a.sin() * r), 0.42 + hash(k, 10) * 0.6, 8, 6, c(0xc4, 0xda, 0xe2));
-        mist.mat = M::STONE; mist.emissive = 0.06; m3::set_alpha(&mut mist, 48);
-        s.add(mist, Float { amp: 0.45, speed: 0.4, phase: hash(k, 11) * 6.28, drift: 0.6 });
+
+    // PLUNGE foam ring where it lands
+    let mut foam = m3::annulus(v(x, base_y + 0.04, z), width * 0.3, width * 0.85, 28, if mansion { c(0xe8, 0xdc, 0xb0) } else { c(0xcf, 0xe8, 0xf0) });
+    foam.mat = M::WATER; foam.emissive = if mansion { 0.16 } else { 0.12 }; m3::set_alpha(&mut foam, 120); s.add(foam, Float::STILL);
+    ripple_rings(s, x, z, base_y, width * (if mansion { 1.3 } else { 1.8 }), if mansion { 4 } else { 6 }, if mansion { c(0xe8, 0xdc, 0xb0) } else { c(0xa6, 0xcc, 0xd6) }); // ripples spread from the plunge
+
+    // MIST — billowing puffs. MISTFALL: a tall, dense, ghostly column (the fall literally becomes mist). MANSION:
+    // a light sparkle haze just above the basin.
+    let nmist = if mansion { 10 } else { 28 };
+    for k in 0..nmist {
+        let a = hash(k, 7) * TAU; let r = hash(k, 8) * width * (if mansion { 0.8 } else { 1.15 });
+        let my = base_y + 0.2 + hash(k, 9) * (if mansion { 1.6 } else { 3.6 });
+        let msz = if mansion { 0.3 + hash(k, 10) * 0.4 } else { 0.5 + hash(k, 10) * 0.85 };
+        let mut mist = m3::uv_sphere(v(x + a.cos() * r, my, z + a.sin() * r), msz, 8, 6, mist_col);
+        mist.mat = M::STONE; mist.emissive = if mansion { 0.05 } else { 0.07 }; m3::set_alpha(&mut mist, if mansion { 40 } else { 52 });
+        s.add(mist, Float { amp: if mansion { 0.3 } else { 0.6 }, speed: 0.4, phase: hash(k, 11) * 6.28, drift: if mansion { 0.4 } else { 0.7 } });
+    }
+
+    if mansion { // MARBLE SPILL-LIP + golden glint at the crown — the Mansion fall pours over a carved marble edge
+        let mut lip = m3::tube(v(x - width * 0.5, top_y, z), v(x + width * 0.5, top_y, z), 0.18, 6, c(0xd8, 0xcc, 0xb0));
+        lip.mat = M::STONE; lip.emissive = 0.04; s.add(lip, Float::STILL);
+        let mut glint = m3::tube(v(x - width * 0.45, top_y + 0.03, z + 0.06), v(x + width * 0.45, top_y + 0.03, z + 0.06), 0.05, 4, c(0xf0, 0xd2, 0x7a));
+        glint.mat = M::WATER; glint.emissive = 3.5; s.add(glint, Float::STILL);
     }
 }
 
@@ -1860,7 +2243,8 @@ fn rock_arch(s: &mut Scene, center: Vec3, dir: Vec3, scale: f32, seed: u32, lo: 
 /// LOGSCOPE_QUALITY lowers it for weak GPUs / raises it for stills. (Frame-update + optical-effect LODs hook
 /// elsewhere — see TODO.)
 fn render_quality() -> f32 {
-    std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.6, 1.3)
+    let p = crate::theme::power_mode(); // battery-saver thins procedural scatter density (smarter LOD/cull)
+    (std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0) * (0.6 + 0.4 * p)).clamp(0.45, 1.3)
 }
 
 /// Value-noise fractal (3 octaves), 0..1. Cheap hills for the sea floor.
@@ -1931,6 +2315,59 @@ fn seafloor(s: &mut Scene, r_inner: f32, r_outer: f32, y_base: f32, sz: f32, see
     }
     for nrm in norms.iter_mut() { *nrm = normv(*nrm); }
     s.add(Mesh3 { verts, norms, tris, color: sand, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat: M::STONE, emissive: 0.0 }, Float::STILL);
+}
+
+/// Generic ground RELIEF — layered fbm displacing a flat ground into gentle rolling terrain. Shared by land
+/// scenes that want a varied (non-flat) floor that grows with the expanded map. `amp`=peak height, `freq`=scale.
+fn relief(x: f32, z: f32, seed: u32, amp: f32, freq: f32) -> f32 {
+    // multi-octave terrain: a broad swell sets the big landform, hills + fine noise add roll + texture, and a
+    // RIDGE octave (abs-folded noise) carves crests/valleys so the ground isn't just lumpy blobs. Octaves are
+    // random-signed so the summed amplitude stays close to `amp` (terrain doesn't grow into the strand).
+    let swell = (fbm2(x * freq * 0.45 + 2.0, z * freq * 0.45 + 8.0, seed ^ 0xA3) - 0.5) * amp * 0.85;
+    let hills = (fbm2(x * freq, z * freq, seed) - 0.5) * amp * 0.70;
+    let fine  = (fbm2(x * freq * 2.7 + 9.0, z * freq * 2.7 + 5.0, seed ^ 0x55) - 0.5) * amp * 0.28;
+    let ridge = (0.5 - (fbm2(x * freq * 1.5 + 3.0, z * freq * 1.5 + 1.0, seed ^ 0x7E) - 0.5).abs()) * amp * 0.30;
+    swell + hills + fine + ridge
+}
+
+/// A TESSELLATED terrain DISC displaced by relief(), vertex-coloured low→high, far rim dipped so it reads as
+/// open ground falling into fog (not a plate). For land scenes that want rolling terrain out to `r`. Seat
+/// scenery on it with the same relief() call: gy(x,z) = y_base + relief(x, z, seed, amp, freq).
+fn terrain_disc(s: &mut Scene, r: f32, y_base: f32, seed: u32, amp: f32, freq: f32, lo: Color32, hi: Color32, mat: f32) {
+    use std::f32::consts::TAU;
+    let q = render_quality();
+    let rings = ((26.0 * q) as usize).max(12);
+    let spokes = ((90.0 * q) as usize).max(44);
+    let mut verts = Vec::with_capacity((rings + 1) * spokes);
+    let mut vcol = Vec::with_capacity((rings + 1) * spokes);
+    for ri in 0..=rings {
+        let rr = r * ri as f32 / rings as f32;
+        for si in 0..spokes {
+            let a = si as f32 / spokes as f32 * TAU;
+            let (x, z) = (a.cos() * rr, a.sin() * rr);
+            let d = relief(x, z, seed, amp, freq);
+            let edge = (rr / r).powi(3) * (amp * 0.9);          // dip the far rim so the ground falls away into fog
+            verts.push(v(x, y_base + d - edge, z));
+            let t = (d / amp + 0.5).clamp(0.0, 1.0);
+            vcol.push(mix_rgb(lo, hi, t * t));
+        }
+    }
+    let idx = |ri: usize, si: usize| (ri * spokes + (si % spokes)) as u32;
+    let mut tris = Vec::with_capacity(rings * spokes * 2);
+    for ri in 0..rings {
+        for si in 0..spokes {
+            let (a, b, cc, d) = (idx(ri, si), idx(ri, si + 1), idx(ri + 1, si), idx(ri + 1, si + 1));
+            tris.push([a, cc, b]); tris.push([b, cc, d]);
+        }
+    }
+    let mut norms = vec![v(0.0, 0.0, 0.0); verts.len()];
+    for t in &tris {
+        let (p0, p1, p2) = (verts[t[0] as usize], verts[t[1] as usize], verts[t[2] as usize]);
+        let nrm = crossv(v(p1.x - p0.x, p1.y - p0.y, p1.z - p0.z), v(p2.x - p0.x, p2.y - p0.y, p2.z - p0.z));
+        for &i in t.iter() { norms[i as usize] = addv(norms[i as usize], nrm); }
+    }
+    for nrm in norms.iter_mut() { *nrm = normv(*nrm); }
+    s.add(Mesh3 { verts, norms, tris, color: lo, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat, emissive: 0.0 }, Float::STILL);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -2352,8 +2789,13 @@ fn atlantis() -> Scene {
     // COMPACT DOMED ROTUNDA (the heart): sized by node count, not the full spine. The conversation's linear
     // CONTINUATION extends OUT of the rotunda into HALLWAYS (built below) along the spine axis (x) — so the
     // graph reads as "rotunda + corridors", and the rotunda never balloons to a giant empty oval.
-    let r_hall = (13.0 + 1.0 * (pr.nodes.max(1) as f32).sqrt()).clamp(15.0, 26.0);
-    let sz = 1.0_f32;                          // circular rotunda; hallways carry the long axis
+    // OVAL ROTUNDA that EXPANDS to contain the conversation (map expansion): the x-radius tracks the graph's
+    // spine extent and the z-radius its branch span (hall_dims, aspect-capped 2.6:1). Long convos elongate the
+    // oval and short halls carry any overflow; compact ones stay near-circular. This replaces the old clamp-26
+    // rotunda that forced the strand to be laterally squished to fit — the structure now grows with the graph.
+    let (rx_h, rz_h) = hall_dims(&pr);
+    let r_hall = rx_h;
+    let sz = (rz_h / rx_h).clamp(0.45, 2.4);   // z-aspect → oval (sz<1 elongates the rotunda along the spine)
     let ez = |z: f32| z * sz;
     let y_floor = -3.2_f32;
     let y_cap = (5.6 + 0.10 * r_hall).clamp(6.2, 8.6);
@@ -2402,6 +2844,12 @@ fn atlantis() -> Scene {
         let a = (k as f32 / cols as f32) * TAU;
         if near_axis(a) { continue; }          // gap the colonnade where a hallway joins
         let (cx, cz) = (a.cos() * r_col, ez(a.sin() * r_col));
+        // CLEAR A CENTRAL LANE: the conversation strand routes down the x-axis (compressed in z), so drop the
+        // colonnade columns within ±4u of that axis — the strand then threads an OPEN corridor instead of the
+        // columned rotunda (drops obj_clip while keeping strand_aspect high). The cap keeps the outer columns on
+        // small halls so the colonnade never fully vanishes. Atlantis-only (inside atlantis()); Mansion untouched.
+        let lane = 4.0_f32.min(r_col * sz * 0.6);
+        if cz.abs() <= lane { continue; }
         let mut shaft = m3::tube(v(cx, y_floor, cz), v(cx, y_cap - 0.3, cz), 0.5, 26, stone_lo);
         m3::tint_height(&mut shaft, y_floor, y_cap, stone_lo, stone_hi); shaft.mat = M::STONE; s.add(shaft, Float::STILL);
         let mut base = m3::tube(v(cx, y_floor, cz), v(cx, y_floor + 0.5, cz), 0.72, 22, stone_hi); base.mat = M::STONE; s.add(base, Float::STILL);
@@ -2821,6 +3269,7 @@ fn critter_m(s: &mut Scene, kind: u32, pos: Vec3, face: f32, seed: u32, bob: Flo
 fn forest() -> Scene {
     use std::f32::consts::TAU;
     let mut s = Scene::new();
+    set_tree_bend(0.0, 0.0, 1.45, 0.0); // open woodland: trees bow in widely VARIED directions
     let yf = -3.2_f32;
     // SEASON — from LOGSCOPE_SEASON (spring|summer|autumn|winter) or seed-derived; drives crown colour + winter barrenness
     let pr = env_params();
@@ -2835,6 +3284,7 @@ fn forest() -> Scene {
         _ => &[c(0x8a, 0x76, 0x54), c(0x9a, 0x86, 0x60), c(0xc4, 0xc4, 0xcc)],                                 // winter: brown + snow
     };
     let keep_p: f32 = if season == 3 { 0.28 } else { 1.0 };                                                    // winter barrenness
+    { let (flo, fhi) = match season { 0 => (c(0x58,0x80,0x30), c(0xa4,0xc4,0x5c)), 2 => (c(0x8a,0x44,0x1e), c(0xd6,0x9e,0x42)), 3 => (c(0x6a,0x60,0x4e), c(0xb4,0xac,0x98)), _ => (c(0x36,0x56,0x20), c(0x74,0x96,0x40)) }; set_foliage_tint(flo, fhi); } // canopy colour follows the season
     let shade = |col: Color32, f: f32| -> Color32 {
         c((col.r() as f32 * f).min(255.0) as u8, (col.g() as f32 * f).min(255.0) as u8, (col.b() as f32 * f).min(255.0) as u8)
     };
@@ -2843,14 +3293,63 @@ fn forest() -> Scene {
     };
     // larger floor + a darker far apron so the ground reads out to the tree line instead of ending in a rim
     // rolling TERRAIN — layered noise displaces the ground so it isn't a flat plate (gentle, so trees still read seated)
-    let terrain = |x: f32, z: f32| -> f32 {
-        0.30 * (x * 0.10).sin() * (z * 0.085).cos()
-            + 0.18 * (x * 0.22 + z * 0.17).sin()
-            + 0.10 * (x * 0.5 - z * 0.4).sin()
+    // GROUND DEPTH via the shared relief() abstraction — the SAME heightfield every land scene uses (terrain_disc),
+    // so the floor rolls with real depth rather than reading flat, and gy(x,z) seats every ground element on it
+    // (matching terrain_disc's rim dip exactly, so nothing floats or sinks).
+    let g_seed = pr.seed ^ 0x5F0E;
+    let big = (pr.nodes as f32 / 130.0).clamp(1.0, 2.4);   // larger conversations ⇒ a bigger, denser forest world
+    let (g_amp, g_freq, g_r) = (2.4_f32, 0.045_f32, 100.0_f32 * big); // more pronounced ROLLING HILLS (was 1.35)
+    let terrain = move |x: f32, z: f32| -> f32 { relief(x, z, g_seed, g_amp, g_freq) };
+    let gy = move |x: f32, z: f32| {
+        let rr = (x * x + z * z).sqrt();
+        yf + relief(x, z, g_seed, g_amp, g_freq) - (rr / g_r).powi(3).min(1.0) * (g_amp * 0.9)
     };
-    let mut ground = m3::disc(v(0.0, yf, 0.0), 100.0, 140, c(0x2a, 0x3a, 0x1c));
-    for vtx in ground.verts.iter_mut() { vtx.y += terrain(vtx.x, vtx.z); }
-    m3::tint_up(&mut ground, c(0x46, 0x5e, 0x26), c(0x1c, 0x28, 0x12)); ground.mat = M::MOSS; s.add(ground, Float::STILL);
+    terrain_disc(&mut s, g_r, yf, g_seed, g_amp, g_freq, c(0x22, 0x30, 0x16), c(0x50, 0x68, 0x2c), M::MOSS);
+
+    // WINDING FOREST STREAM — a creek meanders through the trees, sitting in the rolling ground, with ripples and
+    // reedy/rocky banks: a small natural water system the eye follows through the woods (grows with the forest).
+    {
+        use std::f32::consts::PI;
+        let sa = hash(1, 500) * TAU;
+        let (x0, z0) = (sa.cos() * g_r * 0.72, sa.sin() * g_r * 0.72);
+        let (x1, z1) = (-x0 * 0.5, -z0 * 0.5);
+        let (dx, dz) = (x1 - x0, z1 - z0);
+        let len = (dx * dx + dz * dz).sqrt().max(0.01);
+        let (ux, uz) = (dx / len, dz / len);
+        let (perpx, perpz) = (-uz, ux);
+        let steps = (40.0 * big) as i32;
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let wander = (t * 7.0 + hash(2, 501) * TAU).sin() * 8.0 + (t * 16.0).sin() * 3.0;
+            let cx = x0 + dx * t + perpx * wander;
+            let cz = z0 + dz * t + perpz * wander;
+            let wy = yf + terrain(cx, cz) - 0.28;            // creek bed sits below the ground surface
+            let w = 1.5 + (t * PI).sin() * 0.9;
+            let mut seg = m3::disc(v(cx, wy, cz), w, 16, c(0x2c, 0x5c, 0x5e));
+            m3::tint_up(&mut seg, c(0x52, 0x8e, 0x86), c(0x14, 0x38, 0x3a)); seg.mat = M::WATER; seg.emissive = 0.07; m3::set_alpha(&mut seg, 156);
+            s.add(seg, Float::STILL);
+            if i % 6 == 0 { ripple_rings(&mut s, cx, cz, wy, w * 0.85, 3, c(0x70, 0xa6, 0x9e)); }
+            if i % 3 == 0 { // reedy + rocky banks
+                for &side in &[-1.0f32, 1.0] {
+                    let (bx, bz) = (cx + perpx * side * (w + 0.4), cz + perpz * side * (w + 0.4));
+                    let bgy = yf + terrain(bx, bz);
+                    if hash(i * 9 + (side > 0.0) as i32, 7) > 0.4 { // reed tuft
+                        for b in 0..4 {
+                            let (rx, rz) = (bx + (hash(i * 13 + b, 1) - 0.5) * 0.6, bz + (hash(i * 13 + b, 2) - 0.5) * 0.6);
+                            let bh = 0.7 + hash(i * 13 + b, 3) * 0.9;
+                            let mut reed = m3::tube(v(rx, bgy, rz), v(rx + (hash(i * 13 + b, 4) - 0.5) * 0.3, bgy + bh, rz + (hash(i * 13 + b, 5) - 0.5) * 0.3), 0.04, 3, c(0x4a, 0x60, 0x2c));
+                            reed.mat = M::MOSS; s.add(reed, Float { amp: 0.07, speed: 0.8, phase: hash(i * 13 + b, 6) * 6.28, drift: 0.10 });
+                        }
+                    } else { // wet bank rock
+                        let mut rock = m3::rock(v(bx, bgy, bz), 0.3 + hash(i * 7, 8) * 0.4, (i * 5) as u32, c(0x4c, 0x4e, 0x48));
+                        rock.mat = M::STONE; s.add(rock, Float::STILL);
+                    }
+                }
+            }
+        }
+    }
+    // TREE DIMENSIONS from the conversation (env): overall size x height, and overall size x girth
+    let (hf, gf) = (pr.tree_size * pr.tree_height, pr.tree_size * pr.tree_girth);
 
     // GROUND LEAF LITTER — flat fallen leaves scattered across the floor (greens fading to autumn ambers/browns)
     let leafcols: &[Color32] = match season {
@@ -2859,7 +3358,7 @@ fn forest() -> Scene {
         2 => &[c(0x6e, 0x8a, 0x36), c(0x8a, 0x96, 0x34), c(0xb0, 0x86, 0x30), c(0xc0, 0x6a, 0x28), c(0x9a, 0x5a, 0x26), c(0x52, 0x6e, 0x28)],
         _ => &[c(0x7a, 0x6a, 0x4e), c(0x8a, 0x7a, 0x5c), c(0xc4, 0xc4, 0xcc), c(0x6a, 0x5c, 0x44)],
     };
-    for k in 0..320 {
+    for k in 0..480 {
         let a = hash(k, 70) * TAU; let rad = (hash(k, 71)).sqrt() * 72.0; // sqrt → even areal density
         let (lx, lz) = (a.cos() * rad, a.sin() * rad);
         let r = 0.16 + hash(k, 72) * 0.22;
@@ -2873,16 +3372,16 @@ fn forest() -> Scene {
         let a = TAU * hash(k, 1);
         let rad = 5.0 + hash(k, 2) * 9.0;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
-        let hgt = 5.0 + hash(k, 3) * 3.5;
+        let hgt = (5.0 + hash(k, 3) * 3.5) * hf;
         let origin = v(tx, yf + terrain(tx, tz), tz);
         let lean = normv(v((hash(k, 4) - 0.5) * 0.2, 1.0, (hash(k, 5) - 0.5) * 0.2));
-        tree_branch(&mut s, origin, lean, hgt, 0.5 + hash(k, 6) * 0.3, 2, 7);
+        tree_branch(&mut s, origin, lean, hgt, (0.5 + hash(k, 6) * 0.3) * gf, 2, 7, 3, 0.6);
         let cc = addv(origin, mulv(lean, hgt + 0.4));
         for j in 0..7 {
             let aa = TAU * j as f32 / 7.0;
             let p = addv(cc, v(aa.cos() * 1.7, hash(k * 7 + j, 1) * 0.9 - 0.3, aa.sin() * 1.7));
             if let Some(bc) = crown((k * 7 + j) as i32) {
-                let mut puff = m3::leaf_cluster(p, 1.15, (k * 7 + j) as u32, bc);
+                let mut puff = m3::leaf_cluster_lod(p, 0.98, (k * 7 + j) as u32, bc, 1.0);
                 m3::tint_up(&mut puff, shade(bc, 1.25), shade(bc, 0.6)); puff.mat = M::MOSS;
                 s.add(puff, Float { amp: 0.08, speed: 0.6, phase: hash(k * 7 + j, 2) * 6.28, drift: 0.05 });
             }
@@ -2890,21 +3389,23 @@ fn forest() -> Scene {
         contact_shadow(&mut s, tx, tz, 1.5, yf + terrain(tx, tz), 110);
     }
 
-    // MANY TALL THIN trees — slender trunks rising high with a small high canopy (the "way more tall thin trees")
-    for k in 0..80 {
+    // MANY TALL THIN trees — slender trunks rising high with a small high canopy; count + spread grow with the
+    // conversation so a big graph gets a genuinely bigger forest (density still trimmed by render_quality/LOD).
+    for k in 0..((80.0 * big * render_quality()) as i32) {
         let a = hash(k, 10) * TAU;
-        let rad = 8.0 + (hash(k, 11)).sqrt() * 56.0;
+        let rad = (8.0 + (hash(k, 11)).sqrt() * 56.0) * big;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
-        let hgt = 8.0 + hash(k, 12) * 6.0;
-        let thin = 0.18 + hash(k, 13) * 0.16;          // slender
+        let hgt = (8.0 + hash(k, 12) * 6.0) * hf;
+        let thin = (0.18 + hash(k, 13) * 0.16) * gf;          // slender
         let lean = normv(v((hash(k, 14) - 0.5) * 0.08, 1.0, (hash(k, 15) - 0.5) * 0.08));
-        tree_branch(&mut s, v(tx, yf + terrain(tx, tz), tz), lean, hgt, thin, 1, 70 + k);
+        tree_branch(&mut s, v(tx, yf + terrain(tx, tz), tz), lean, hgt, thin, 1, 70 + k, pr.tree_branch as usize, pr.branch_spread);
         let cc = v(tx, yf + terrain(tx, tz) + hgt, tz);
         for j in 0..4 {                                 // small tight crown high up
             let aa = TAU * j as f32 / 4.0 + hash(k, 16) * 6.28;
             let p = addv(cc, v(aa.cos() * 1.0, hash(k * 4 + j, 1) * 0.7, aa.sin() * 1.0));
             if let Some(bc) = crown((k * 4 + j) as i32 + 5000) {
-                let mut puff = m3::leaf_cluster(p, 0.55 + hash(k, 17) * 0.3, (k * 4 + j) as u32, bc);
+                let det = m3::lod_detail(rad, 16.0, 80.0, 0.32); // background trees: distance density falloff
+                let mut puff = m3::leaf_cluster_lod(p, 0.55 + hash(k, 17) * 0.3, (k * 4 + j) as u32, bc, det);
                 m3::tint_up(&mut puff, shade(bc, 1.25), shade(bc, 0.6)); puff.mat = M::MOSS;
                 s.add(puff, Float { amp: 0.12, speed: 0.7, phase: hash(k * 4 + j, 2) * 6.28, drift: 0.08 });
             }
@@ -2917,10 +3418,10 @@ fn forest() -> Scene {
         let a = hash(k, 80) * TAU;
         let rad = 56.0 + hash(k, 81) * 42.0;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
-        let hgt = 7.0 + hash(k, 82) * 7.0;
-        tree_branch(&mut s, v(tx, yf, tz), v(0.0, 1.0, 0.0), hgt, 0.16 + hash(k, 83) * 0.12, 0, 200 + k);
+        let hgt = (7.0 + hash(k, 82) * 7.0) * hf;
+        tree_branch(&mut s, v(tx, yf, tz), v(0.0, 1.0, 0.0), hgt, (0.16 + hash(k, 83) * 0.12) * gf, 0, 200 + k, 3, 0.6);
         if let Some(bc) = crown(k as i32 + 9000) {
-            let mut puff = m3::leaf_cluster(v(tx, yf + hgt, tz), 0.8 + hash(k, 84) * 0.5, 800 + k as u32, bc); // LOD: smaller distant crowns
+            let mut puff = m3::leaf_cluster_lod(v(tx, gy(tx, tz) + hgt, tz), 0.8 + hash(k, 84) * 0.5, 800 + k as u32, bc, m3::lod_detail(rad, 18.0, 42.0, 0.14)); // LOD: distant band ⇒ near-zero detail (few blades), dissolves into fog (perf cull)
             m3::tint_up(&mut puff, shade(bc, 1.2), shade(bc, 0.55)); puff.mat = M::MOSS;
             s.add(puff, Float { amp: 0.06, speed: 0.5, phase: hash(k, 85) * 6.28, drift: 0.04 });
         }
@@ -2931,11 +3432,12 @@ fn forest() -> Scene {
         let a = hash(k, 120) * TAU; let rad = 6.0 + hash(k, 121) * 40.0;
         let (lx, lz) = (a.cos() * rad, a.sin() * rad);
         let dir = hash(k, 122) * TAU; let len = 2.5 + hash(k, 123) * 3.0; let rr = 0.32 + hash(k, 124) * 0.18;
-        let p0 = v(lx, yf + rr, lz);
-        let p1 = v(lx + dir.cos() * len, yf + rr, lz + dir.sin() * len);
+        let (ex, ez) = (lx + dir.cos() * len, lz + dir.sin() * len);
+        let p0 = v(lx, gy(lx, lz) + rr, lz);
+        let p1 = v(ex, gy(ex, ez) + rr, ez);
         let mut log = m3::tube(p0, p1, rr, 8, c(0x52, 0x3e, 0x26));
         m3::tint_up(&mut log, c(0x6e, 0x54, 0x34), c(0x36, 0x28, 0x18)); log.mat = M::WOOD; s.add(log, Float::STILL);
-        let mut moss = m3::leaf_cluster(v((p0.x + p1.x) * 0.5, yf + rr + 0.22, (p0.z + p1.z) * 0.5), 0.5 + len * 0.06, 130 + k as u32, c(0x4e, 0x70, 0x2e));
+        let mut moss = m3::leaf_cluster(v((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5 + 0.22, (p0.z + p1.z) * 0.5), 0.5 + len * 0.06, 130 + k as u32, c(0x4e, 0x70, 0x2e));
         m3::scale_xz(&mut moss, len * 0.32, 0.4); m3::tint_up(&mut moss, c(0x68, 0x8c, 0x38), c(0x32, 0x4e, 0x20)); moss.mat = M::MOSS; s.add(moss, Float::STILL);
         contact_shadow(&mut s, (p0.x + p1.x) * 0.5, (p0.z + p1.z) * 0.5, len * 0.4, yf, 90);
     }
@@ -2951,14 +3453,14 @@ fn forest() -> Scene {
             m3::scale3(&mut blade, 0.6, 1.5, 0.6); m3::tint_up(&mut blade, c(0x56, 0x86, 0x30), c(0x28, 0x46, 0x1a)); blade.mat = M::MOSS;
             s.add(blade, Float { amp: 0.04, speed: 0.5, phase: hash(k * 5 + b, 3) * 6.28, drift: 0.05 });
         }
-        let mut spathe = m3::uv_sphere(v(sx, yf + 0.5, sz), 0.3, 8, 6, c(0x5a, 0x2e, 0x52));
+        let mut spathe = m3::uv_sphere(v(sx, gy(sx, sz) + 0.5, sz), 0.3, 8, 6, c(0x5a, 0x2e, 0x52));
         m3::scale3(&mut spathe, 0.7, 1.3, 0.7); m3::tint_up(&mut spathe, c(0x74, 0x3e, 0x6a), c(0x3a, 0x1e, 0x36)); spathe.mat = M::MOSS; s.add(spathe, Float::STILL);
     }
     // ROCKS — occasional weathered stones
     for k in 0..14 {
         let a = hash(k, 160) * TAU; let rad = 4.0 + (hash(k, 161)).sqrt() * 50.0;
         let (rx, rz) = (a.cos() * rad, a.sin() * rad); let rs = 0.5 + hash(k, 162) * 1.4;
-        let mut rock = m3::rock(v(rx, yf + rs * 0.4, rz), rs, 170 + k as u32, c(0x52, 0x56, 0x52));
+        let mut rock = m3::rock(v(rx, gy(rx, rz) + rs * 0.4, rz), rs, 170 + k as u32, c(0x52, 0x56, 0x52));
         m3::tint_up(&mut rock, c(0x70, 0x74, 0x70), c(0x32, 0x36, 0x34)); m3::scale_xz(&mut rock, 1.0, 0.85); rock.mat = M::STONE; s.add(rock, Float::STILL);
         contact_shadow(&mut s, rx, rz, rs * 0.6, yf, 90);
     }
@@ -2994,11 +3496,28 @@ fn forest() -> Scene {
         bushes.push((bx, bz));
         for j in 0..3 {
             let off = v((hash(k * 3 + j, 1) - 0.5) * 1.1, 0.2 + hash(k * 3 + j, 2) * 0.4, (hash(k * 3 + j, 3) - 0.5) * 1.1);
-            let mut bush = m3::leaf_cluster(addv(v(bx, yf, bz), off), 0.9 + hash(k * 3 + j, 4) * 0.5, (900 + k * 3 + j) as u32, c(0x3a, 0x5a, 0x24));
+            let mut bush = m3::leaf_cluster(addv(v(bx, gy(bx, bz), bz), off), 0.9 + hash(k * 3 + j, 4) * 0.5, (900 + k * 3 + j) as u32, c(0x3a, 0x5a, 0x24));
             m3::tint_up(&mut bush, c(0x5e, 0x80, 0x32), c(0x28, 0x40, 0x1c)); bush.mat = M::MOSS;
             s.add(bush, Float { amp: 0.05, speed: 0.8, phase: hash(k * 3 + j, 5) * 6.28, drift: 0.03 });
         }
         contact_shadow(&mut s, bx, bz, 1.1, yf, 90);
+    }
+
+    // GROUND WEAR — soil cracks + shallow dirt hollows so the forest floor reads with depth and age
+    ground_wear(&mut s, 0.0, 0.0, 46.0, 26, 7, pr.seed as i32 ^ 0x3C, &gy, c(0x2c, 0x22, 0x16), c(0x3e, 0x32, 0x22));
+
+    // TALL GRASS PATCHES — clumps of long blades swaying in the gaps between the trees
+    for k in 0..(16 + (pr.nodes / 30).min(14)) as u32 {
+        let a = hash(k as i32, 130) * TAU; let rad = 3.0 + hash(k as i32, 131).sqrt() * 50.0;
+        let (px, pz) = (a.cos() * rad, a.sin() * rad);
+        for j in 0..(4 + (hash(k as i32, 132) * 4.0) as u32) {
+            let bx = px + (hash((k * 7 + j) as i32, 1) - 0.5) * 1.7;
+            let bz = pz + (hash((k * 7 + j) as i32, 2) - 0.5) * 1.7;
+            let mut blade = m3::leaf_cluster(v(bx, gy(bx, bz) + 0.7, bz), 0.3 + hash((k * 7 + j) as i32, 3) * 0.25, (1300 + k * 7 + j) as u32, c(0x4e, 0x70, 0x2a));
+            m3::scale3(&mut blade, 0.34, 2.6, 0.34); // tall + narrow → reads as a grass tuft
+            m3::tint_up(&mut blade, c(0x74, 0x96, 0x3c), c(0x36, 0x52, 0x20)); blade.mat = M::MOSS;
+            s.add(blade, Float { amp: 0.10, speed: 0.9, phase: hash((k * 7 + j) as i32, 4) * 6.28, drift: 0.10 });
+        }
     }
 
     // CRITTERS — rabbits + cats tucked beside the bushes (a basic placement; random wander is a later pass)
@@ -3010,14 +3529,50 @@ fn forest() -> Scene {
         critter(&mut s, if k % 3 == 0 { 1 } else { 0 }, v(cx, yf, cz), face, 1000 + k as u32);
     }
 
-    for k in 0..110 { let a = hash(k, 20) * TAU; let rad = (hash(k, 21)).sqrt() * 66.0; grass_tuft(&mut s, a.cos() * rad, a.sin() * rad, yf, 300 + k as u32, c(0x5a, 0x7e, 0x30)); }
+    for k in 0..110 { let a = hash(k, 20) * TAU; let rad = (hash(k, 21)).sqrt() * 66.0; let (gx, gz) = (a.cos() * rad, a.sin() * rad); grass_tuft(&mut s, gx, gz, gy(gx, gz), 300 + k as u32, c(0x5a, 0x7e, 0x30)); }
     for k in 0..24 {
         let a = hash(k, 30) * TAU; let rad = 1.5 + (hash(k, 31)).sqrt() * 52.0;
         let cols = [c(0xff, 0x6a, 0x8a), c(0xff, 0xd0, 0x40), c(0xa0, 0x86, 0xff), c(0xff, 0xa0, 0x50)];
-        flower(&mut s, a.cos() * rad, a.sin() * rad, yf, 400 + k as u32, cols[k as usize % 4]);
+        let (fx, fz) = (a.cos() * rad, a.sin() * rad);
+        flower(&mut s, fx, fz, gy(fx, fz), 400 + k as u32, cols[k as usize % 4]);
     }
     for k in 0..6 { let a = hash(k, 40) * TAU; let rad = 3.0 + hash(k, 41) * 12.0; bird(&mut s, v(a.cos() * rad, yf + 5.5 + hash(k, 42) * 5.0, a.sin() * rad), 500 + k as u32); }
     for k in 0..10 { let a = hash(k, 50) * TAU; let rad = 1.5 + hash(k, 51) * 16.0; bee(&mut s, v(a.cos() * rad, yf + 0.5 + hash(k, 52) * 1.2, a.sin() * rad), 600 + k as u32); }
+
+    // FALLING / BLOWING LEAVES + WEATHER — particles drifting and gusting through the air column, keyed by season:
+    // autumn rains leaves, winter snows, spring drifts blossom, summer the odd leaf. The wind engine carries them.
+    let (np, pcols, is_snow): (i32, &[Color32], bool) = match season {
+        2 => (240, crown_pal, false),                                                   // autumn: lots of leaves
+        3 => (230, &[c(0xf2, 0xf4, 0xf8), c(0xe2, 0xe8, 0xf0), c(0xff, 0xff, 0xff)], true), // winter: snow
+        0 => (110, &[c(0xe2, 0xb8, 0xd2), c(0x96, 0xc0, 0x5e), c(0xf0, 0xd2, 0xe2)], false),  // spring: blossom + leaf
+        _ => (55, &[c(0x5a, 0x82, 0x34), c(0x6e, 0x90, 0x3e)], false),                  // summer: a few leaves
+    };
+    for k in 0..np {
+        let a = hash(k, 300) * TAU; let rad = hash(k, 301).sqrt() * 46.0;
+        let (px, pz) = (a.cos() * rad, a.sin() * rad);
+        let p = v(px, yf + 1.0 + hash(k, 302) * 17.0, pz);
+        let col = pcols[(hash(k, 303) * pcols.len() as f32) as usize % pcols.len()];
+        if is_snow {
+            let mut flake = m3::uv_sphere(p, 0.12 + hash(k, 304) * 0.08, 5, 4, col); flake.mat = M::MOSS; flake.emissive = 0.35;
+            s.add(flake, Float { amp: 1.0 + hash(k, 305) * 1.4, speed: 0.35 + hash(k, 306) * 0.3, phase: hash(k, 307) * 6.28, drift: 1.3 });
+        } else {
+            let mut leaf = m3::leaf_single(p, 0.34 + hash(k, 304) * 0.22, k as u32, col); leaf.mat = M::MOSS;
+            s.add(leaf, Float { amp: 1.6 + hash(k, 305) * 2.0, speed: 0.45 + hash(k, 306) * 0.5, phase: hash(k, 307) * 6.28, drift: 1.6 });
+        }
+    }
+
+    // PILE-UPS — drifts of fallen leaves heaped at tree bases + in hollows (autumn/winter)
+    if season == 2 || season == 3 {
+        let pile_col = if season == 3 { c(0x9a, 0x96, 0x80) } else { c(0xb0, 0x72, 0x2e) };
+        for k in 0..28 {
+            let a = hash(k, 320) * TAU; let rad = 2.0 + hash(k, 321).sqrt() * 46.0;
+            let (px, pz) = (a.cos() * rad, a.sin() * rad);
+            let mut pile = m3::leaf_cluster(v(px, gy(px, pz) + 0.18, pz), 0.7 + hash(k, 322) * 0.9, (1900 + k) as u32, pile_col);
+            m3::scale3(&mut pile, 1.5, 0.32, 1.5); // flat heaped drift
+            m3::tint_up(&mut pile, shade(pile_col, 1.25), shade(pile_col, 0.6)); pile.mat = M::MOSS;
+            s.add(pile, Float { amp: 0.03, speed: 0.5, phase: hash(k, 323) * 6.28, drift: 0.05 });
+        }
+    }
     s
 }
 
@@ -3054,15 +3609,17 @@ fn treehouse() -> Scene {
     let hsh = |k: u32| -> f32 { let mut h = pr.seed ^ k.wrapping_mul(0x9E37_79B9); h ^= h >> 15; h = h.wrapping_mul(0x2C1B_3C6D); h ^= h >> 13; (h & 0xFFFF) as f32 / 65535.0 };
     let canopy_lift = -1.0 + hsh(1) * 3.0;   // base height of the walk (global, graph-derived)
     let canopy_spread = 1.6 + hsh(2) * 2.2;  // platform height stagger (global)
+    let tsf = scene_fit(8.0).clamp(1.0, 2.4); // EXPAND the platform ring outward so the graph clears the cabins/bridges (net clip 37.6→24%; below_floor is the floating-walk artifact)
     let mut s = Scene::new();
     // dim forest floor far below — you sense the height of the walk
     let mut floor = m3::disc(v(0.0, -8.0, 0.0), 48.0, 84, c(0x18, 0x1e, 0x12)); // doubled map
     m3::tint_up(&mut floor, c(0x28, 0x30, 0x1a), c(0x10, 0x14, 0x0c)); floor.mat = M::MOSS; floor.emissive = 0.02; s.add(floor, Float::STILL);
     // big trees rising from the floor up through the canopy
-    let trees = [(-6.0_f32, -3.0_f32), (5.5, -4.0), (6.0, 4.5), (-5.0, 5.0)]; // central tree removed → room for the graph
+    let trees = [(-6.0_f32 * tsf, -3.0_f32 * tsf), (5.5 * tsf, -4.0 * tsf), (6.0 * tsf, 4.5 * tsf), (-5.0 * tsf, 5.0 * tsf)]; // central tree removed → room for the graph
+    set_tree_bend(0.0, 0.0, 0.25, -0.14); // STRAIGHTER trunks (low bend) so the platforms snap cleanly onto them
     for (i, (tx, tz)) in trees.iter().enumerate() {
         let th = 13.5 + (hsh(i as u32 * 5 + 10) - 0.5) * 4.0 + canopy_lift; // tree height varies w/ graph + global lift
-        tree_branch(&mut s, v(*tx, -8.0, *tz), normv(v(0.04 * (i as f32 - 2.0), 1.0, 0.03)), th, 0.9, 2, 7);
+        tree_branch(&mut s, v(*tx, -8.0, *tz), normv(v(0.04 * (i as f32 - 2.0), 1.0, 0.03)), th, 0.95, 2, 7 + i as i32 * 41, 3, 0.6);
         let cc = v(*tx, -8.0 + th - 2.0, *tz);
         for j in 0..6 {
             let a = TAU * j as f32 / 6.0;
@@ -3079,7 +3636,7 @@ fn treehouse() -> Scene {
         let rad = 14.0 + hash(k, 41) * 36.0;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
         let hgt = 10.0 + hash(k, 42) * 6.0 + canopy_lift * 1.2; // whole canopy rises/falls with the global factor
-        tree_branch(&mut s, v(tx, -8.0, tz), normv(v((hash(k, 43) - 0.5) * 0.12, 1.0, (hash(k, 44) - 0.5) * 0.12)), hgt, 0.55 + hash(k, 45) * 0.5, 2, 6);
+        tree_branch(&mut s, v(tx, -8.0, tz), normv(v((hash(k, 43) - 0.5) * 0.12, 1.0, (hash(k, 44) - 0.5) * 0.12)), hgt, 0.55 + hash(k, 45) * 0.5, 2, 6, 3, 0.6);
         let cc = v(tx, -8.0 + hgt - 1.0, tz);
         for j in 0..6 {
             let aa = TAU * j as f32 / 6.0;
@@ -3091,18 +3648,25 @@ fn treehouse() -> Scene {
     }
     // treehouse platforms — heights from the GLOBAL canopy lift + a per-platform stagger (graph-derived), so the
     // walk steps up and down through the trees differently for each conversation.
-    let pxz = [(-6.0_f32, -3.0_f32), (5.5, -4.0), (6.0, 4.5), (-5.0, 5.0)];
+    let pxz = [(-6.0_f32 * tsf, -3.0_f32 * tsf), (5.5 * tsf, -4.0 * tsf), (6.0 * tsf, 4.5 * tsf), (-5.0 * tsf, 5.0 * tsf)];
     let mut plats = [(0.0_f32, 0.0_f32, 0.0_f32); 4];
     for (i, (px, pz)) in pxz.iter().enumerate() {
-        let py = canopy_lift + (hsh(i as u32 * 7 + 3) - 0.5) * canopy_spread;
-        plats[i] = (*px, *pz, py);
-        tree_platform(&mut s, *px, *pz, py, 2.2, (i * 17) as u32);
+        // platform height is a fraction UP the trunk (so it clearly sits on the tree), then snapped to where the
+        // LEANING trunk actually is at that height — the trunks lean, so the base xz drifts as you go up.
+        let th = 13.5 + (hsh(i as u32 * 5 + 10) - 0.5) * 4.0 + canopy_lift; // matches the tree loop
+        let py = -8.0 + th * (0.42 + hsh(i as u32 * 7 + 3) * 0.18);
+        let dir = normv(v(0.04 * (i as f32 - 2.0), 1.0, 0.03)); // same lean as the tree
+        let sx = px + dir.x / dir.y * (py + 8.0);
+        let sz = pz + dir.z / dir.y * (py + 8.0);
+        plats[i] = (sx, sz, py);
+        tree_platform(&mut s, sx, sz, py, 2.6, (i * 17) as u32);
     }
     // swinging rope bridges connecting the platforms in a loop (the sag spans the height differences)
     for i in 0..4 {
         let a = plats[i]; let b = plats[(i + 1) % 4];
         rope_bridge(&mut s, v(a.0, a.2, a.1), v(b.0, b.2, b.1), (i * 31) as u32);
     }
+    set_tree_bend(0.0, 0.0, 1.0, 0.0); // restore varied bow for the surrounding forest
     // MORE TREEHOUSES — extra platforms perched on the surrounding trees (canopy leans toward structures, not orbs)
     for k in 0..24 {
         if hash(k, 47) < 0.68 { continue; }
@@ -3130,7 +3694,7 @@ fn treehouse() -> Scene {
         let a = hash(k, 95) * TAU; let rad = 56.0 + hash(k, 96) * 36.0;
         let (tx, tz) = (a.cos() * rad, a.sin() * rad);
         let hgt = 11.0 + hash(k, 97) * 7.0 + canopy_lift;
-        tree_branch(&mut s, v(tx, -8.0, tz), v(0.0, 1.0, 0.0), hgt, 0.2 + hash(k, 98) * 0.14, 0, 300 + k);
+        tree_branch(&mut s, v(tx, -8.0, tz), v(0.0, 1.0, 0.0), hgt, 0.2 + hash(k, 98) * 0.14, 0, 300 + k, 3, 0.6);
         let mut puff = m3::leaf_cluster(v(tx, -8.0 + hgt, tz), 0.9 + hash(k, 99) * 0.5, 1200 + k as u32, c(0x34, 0x54, 0x22));
         m3::tint_up(&mut puff, c(0x56, 0x76, 0x30), c(0x24, 0x3c, 0x18)); puff.mat = M::MOSS;
         s.add(puff, Float { amp: 0.06, speed: 0.5, phase: hash(k, 100) * 6.28, drift: 0.04 });
@@ -3317,53 +3881,62 @@ fn slate() -> Scene {
     let hi = c(0x72, 0x7e, 0x8c);
     let vein = c(0x7a, 0xb6, 0xd0);
     let rh = |k: u32| -> f32 { let x = (k.wrapping_mul(2_654_435_761).wrapping_add(pr.seed)).wrapping_mul(40_503); ((x >> 8) & 0xFF_FFFF) as f32 / 16_777_215.0 };
+    // ROCKY MOOR — rolling slate terrain so the henge sits on ground that GROWS with the map, not a void.
+    // Scenery below is seated on it via gy(x,z). (terrain variation)
+    let gy = |x: f32, z: f32| y0 + relief(x, z, pr.seed ^ 0x6017, 2.0, 0.05);
+    let slf = scene_fit(26.0); // EXPAND the henge field to contain the graph
+    terrain_disc(&mut s, (map_radius() * 0.6).clamp(40.0, 160.0), y0, pr.seed ^ 0x6017, 2.0, 0.05,
+                 c(0x2c, 0x31, 0x37), c(0x58, 0x5e, 0x66), M::STONE);
     // a loose HENGE of standing stones (menhirs)
     let menhirs = (8 + pr.nodes / 12).clamp(8, 14);
     for k in 0..menhirs {
         let a = k as f32 / menhirs as f32 * TAU + rh(k * 7) * 0.3;
-        let rr = 15.0 + (rh(k * 13) - 0.5) * 5.0;
-        standing_stone(&mut s, a.cos() * rr, a.sin() * rr, y0, 3.2 + rh(k * 17) * 3.2, pr.seed ^ (k * 0x51));
+        let rr = (15.0 + (rh(k * 13) - 0.5) * 5.0) * slf;
+        let (mx, mz) = (a.cos() * rr, a.sin() * rr);
+        standing_stone(&mut s, mx, mz, gy(mx, mz), 3.2 + rh(k * 17) * 3.2, pr.seed ^ (k * 0x51));
     }
     // scattered BOULDERS, each with a little scree skirt
     let boulders = (16 + pr.nodes / 3).clamp(16, 40);
     for k in 0..boulders {
         let a = rh(k * 3 + 1) * TAU;
-        let rr = 4.0 + rh(k * 5 + 2) * 26.0;
+        let rr = (4.0 + rh(k * 5 + 2) * 26.0) * slf;
         let (x, z) = (a.cos() * rr, a.sin() * rr);
         let rad = 0.6 + rh(k * 9 + 3).powi(2) * 2.0;
-        let mut bo = m3::rock(v(x, y0 + rad * 0.35, z), rad, pr.seed ^ (k * 0x9E37), mix_rgb(lo, hi, rh(k * 11)));
+        let gyb = gy(x, z);
+        let mut bo = m3::rock(v(x, gyb + rad * 0.35, z), rad, pr.seed ^ (k * 0x9E37), mix_rgb(lo, hi, rh(k * 11)));
         bo.mat = M::STONE; s.add(bo, Float::STILL);
-        contact_shadow(&mut s, x, z, rad * 1.3, y0, 110);
+        contact_shadow(&mut s, x, z, rad * 1.3, gyb, 110);
         for j in 0..3u32 {
             let aj = rh(k * 23 + j) * TAU;
             let dj = rad + 0.3 + rh(k * 31 + j) * 0.8;
-            let mut sc = m3::rock(v(x + aj.cos() * dj, y0 + 0.12, z + aj.sin() * dj), 0.18 + rh(k * 37 + j) * 0.22, pr.seed ^ (k * 7 + j), lo);
+            let (scx, scz) = (x + aj.cos() * dj, z + aj.sin() * dj);
+            let mut sc = m3::rock(v(scx, gy(scx, scz) + 0.12, scz), 0.18 + rh(k * 37 + j) * 0.22, pr.seed ^ (k * 7 + j), lo);
             sc.mat = M::STONE; s.add(sc, Float::STILL);
         }
     }
     // CAIRNS — tapered stacks of stones
     for k in 0..5u32 {
         let a = k as f32 / 5.0 * TAU + 0.4;
-        let rr = 9.0 + rh(k * 41) * 14.0;
+        let rr = (9.0 + rh(k * 41) * 14.0) * slf;
         let (cx, cz) = (a.cos() * rr, a.sin() * rr);
         let stack = 3 + (rh(k * 43) * 3.0) as u32;
-        let mut yy = y0;
+        let mut yy = gy(cx, cz);
         for j in 0..stack {
             let rad = (0.7 - j as f32 * 0.12).max(0.22);
             let mut st = m3::rock(v(cx, yy + rad * 0.6, cz), rad, pr.seed ^ (k * 100 + j), mix_rgb(lo, hi, 0.4 + j as f32 * 0.12));
             st.mat = M::STONE; s.add(st, Float::STILL);
             yy += rad * 1.05;
         }
-        contact_shadow(&mut s, cx, cz, 1.0, y0, 120);
+        contact_shadow(&mut s, cx, cz, 1.0, gy(cx, cz), 120);
     }
     // STRATA LEDGES — stepped slab shelves near the rim
     for k in 0..4u32 {
         let a = k as f32 / 4.0 * TAU + 0.8;
-        let (lx, lz) = (a.cos() * 30.0, a.sin() * 30.0);
+        let (lx, lz) = (a.cos() * 30.0 * slf, a.sin() * 30.0 * slf);
         for j in 0..4u32 {
             let rad = 4.5 - j as f32 * 0.9;
             let f = 1.0 - j as f32 * 0.04;
-            let mut slab = m3::disc(v(lx * f, y0 + 0.2 + j as f32 * 0.45, lz * f), rad, 28, mix_rgb(lo, hi, 0.3 + j as f32 * 0.15));
+            let mut slab = m3::disc(v(lx * f, gy(lx * f, lz * f) + 0.2 + j as f32 * 0.45, lz * f), rad, 28, mix_rgb(lo, hi, 0.3 + j as f32 * 0.15));
             slab.mat = M::STONE; s.add(slab, Float::STILL);
         }
     }
@@ -3393,6 +3966,19 @@ fn slate() -> Scene {
         let mut mote = mote; mote.emissive = 0.5;
         s.add(mote, Float { amp: 0.4 + hash(k, 214) * 0.7, speed: 0.25 + hash(k, 215) * 0.4, phase: hash(k, 216) * 6.28, drift: 0.5 });
     }
+
+    // HEATHER + TUSSOCK GRASS — clumps of moorland grass and purple heather tufted between the slate outcrops
+    for k in 0..(40.0 * slf) as i32 {
+        let a = hash(k, 220) * std::f32::consts::TAU; let rad = (hash(k, 221)).sqrt() * 30.0 * slf;
+        let (gx, gz) = (a.cos() * rad, a.sin() * rad);
+        let heather = hash(k, 222) > 0.6;
+        let base = if heather { c(0x5a, 0x3e, 0x62) } else { c(0x55, 0x5e, 0x36) }; // purple heather / olive tussock
+        let mut tuft = m3::leaf_cluster(v(gx, gy(gx, gz) + 0.5, gz), 0.28 + hash(k, 223) * 0.22, (1700 + k) as u32, base);
+        m3::scale3(&mut tuft, 0.4, if heather { 1.5 } else { 2.3 }, 0.4);
+        let hi = if heather { c(0x86, 0x5e, 0x96) } else { c(0x82, 0x90, 0x4c) };
+        m3::tint_up(&mut tuft, hi, c(0x32, 0x38, 0x22)); tuft.mat = M::MOSS;
+        s.add(tuft, Float { amp: 0.09, speed: 0.85, phase: hash(k, 224) * 6.28, drift: 0.09 });
+    }
     s
 }
 
@@ -3400,6 +3986,17 @@ fn slate() -> Scene {
 /// along x (and ~±nodes·0.5 for a long chain); we size the shell/terrain to enclose that with generous margin,
 /// so the room scales up as the chat grows and the graph always fits. Self-enclosing scenes derive radii from
 /// this too. Clamped so a tiny chat still gets a real room and a huge one stays bounded.
+/// Scene EXPANSION factor for a scene whose base fit-out radius is `base`: grow it to CONTAIN the conversation
+/// graph (its larger half-extent + a margin), so a bigger conversation gets a bigger room instead of overflowing
+/// a fixed shell. Balanced against the obstacle-flex that compacts the strand — the room expands to MEET the
+/// graph, the flex only fine-tunes collisions. Lightly capped so a 3-turn chat doesn't get a cathedral, floored
+/// at 1.0 so the room never shrinks below its hand-tuned base.
+fn scene_fit(base: f32) -> f32 {
+    let pr = env_params();
+    let reach = (pr.ext_x.max(pr.ext_z) as f32) + 9.0; // graph half-extent + clearance
+    (reach / base).clamp(1.0, 5.0)
+}
+
 fn map_radius() -> f32 {
     let pr = env_params();
     let reach = (pr.ext_x.max(pr.ext_z) as f32).max(pr.nodes as f32 * 0.55);
@@ -3413,7 +4010,1138 @@ fn tune_density() -> f32 {
     std::env::var("LOGSCOPE_TUNE_DENSITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.3, 3.0)
 }
 
+/// Alley: a rain-soaked overgrown service lane reimagined as a mind palace — weathered timber + damp brick
+/// walls hung with ivy enclose a narrow wet-stone passage; trees lean in overhead for dappled light; hand-made
+/// notice boards swing from wires (the neighbourhood-bulletin graph motif); cats doze on crates. Cozy, lived-in.
+// ── Alley street props ──────────────────────────────────────────────────────
+
+/// A bench. kind 0 = plain plank bench; 1 = Montréal slat park bench (dark cast legs); 2 = a repurposed
+/// SKI-LIFT chair on a post (the neighbourhood's salvaged whimsy). Faces `face`, length runs across it.
+fn bench(s: &mut Scene, pos: Vec3, face: f32, seed: u32, kind: u32) {
+    let fwd = v(face.cos(), 0.0, face.sin());
+    let right = v(-face.sin(), 0.0, face.cos());
+    let up = v(0.0, 1.0, 0.0);
+    let lw = move |lx: f32, ly: f32, lz: f32| addv(pos, addv(mulv(fwd, lx), addv(mulv(up, ly), mulv(right, lz))));
+    let wood = c(0x5a, 0x44, 0x2c);
+    let mut seat = m3::panel(lw(0.0, 0.5, 0.0), right, fwd, 1.8, 0.5, wood);
+    m3::tint_up(&mut seat, c(0x70, 0x58, 0x3a), c(0x44, 0x32, 0x20)); seat.mat = M::WOOD; s.add(seat, Float::STILL);
+    let mut back = m3::panel(lw(-0.24, 0.86, 0.0), right, up, 1.8, 0.55, wood);
+    m3::tint_up(&mut back, c(0x70, 0x58, 0x3a), c(0x44, 0x32, 0x20)); back.mat = M::WOOD; s.add(back, Float::STILL);
+    let legcol = if kind == 1 { c(0x22, 0x22, 0x24) } else { c(0x3e, 0x2e, 0x1c) }; // park bench = cast iron
+    let legmat = if kind == 1 { M::STONE } else { M::WOOD };
+    for &lz in &[-0.8f32, 0.8] {
+        let mut l = m3::tube(lw(0.18, 0.0, lz), lw(0.18, 0.5, lz), 0.05, 4, legcol); l.mat = legmat; s.add(l, Float::STILL);
+        let mut l2 = m3::tube(lw(-0.18, 0.0, lz), lw(-0.18, 0.5, lz), 0.05, 4, legcol); l2.mat = legmat; s.add(l2, Float::STILL);
+    }
+    if kind == 1 { for &lz in &[-0.9f32, 0.9] { // armrests
+        let mut a = m3::tube(lw(0.22, 0.5, lz), lw(-0.22, 0.86, lz), 0.04, 4, legcol); a.mat = legmat; s.add(a, Float::STILL);
+    }}
+    if kind == 2 { // SKI-LIFT chair: a post + arm + two hanger bars holding the chair, faded lift paint
+        let metal = c(0x86, 0x42, 0x3e);
+        let mut post = m3::tube(lw(-1.1, 0.0, 0.0), lw(-1.1, 3.0, 0.0), 0.09, 6, c(0x4a, 0x4c, 0x50)); post.mat = M::STONE; s.add(post, Float::STILL);
+        let mut arm = m3::tube(lw(-1.1, 2.9, 0.0), lw(0.1, 2.9, 0.0), 0.07, 5, c(0x4a, 0x4c, 0x50)); arm.mat = M::STONE; s.add(arm, Float::STILL);
+        for &lz in &[-0.85f32, 0.85] {
+            let mut h = m3::tube(lw(0.0, 2.85, lz * 0.6), lw(0.2, 0.95, lz), 0.05, 4, metal); h.mat = M::STONE;
+            s.add(h, Float { amp: 0.04, speed: 0.5, phase: hash(seed as i32, 3) * 6.28, drift: 0.05 }); // gentle creak-sway
+        }
+    }
+}
+
+/// A bicycle leaning on its kickstand — thin tube frame + two fat-cylinder wheels, painted by seed.
+fn bicycle(s: &mut Scene, pos: Vec3, face: f32, seed: u32) {
+    let fwd = v(face.cos(), 0.0, face.sin());
+    let right = v(-face.sin(), 0.0, face.cos());
+    let up = v(0.0, 1.0, 0.0);
+    let lw = move |lx: f32, ly: f32, lz: f32| addv(pos, addv(mulv(fwd, lx), addv(mulv(up, ly), mulv(right, lz))));
+    let lean = 0.12; // tipped onto the kickstand
+    let frame = [c(0x9a, 0x3c, 0x34), c(0x2c, 0x5e, 0x86), c(0x2e, 0x86, 0x74), c(0xc2, 0x9a, 0x32)][(seed % 4) as usize];
+    let tire = c(0x1a, 0x18, 0x16);
+    for &fx in &[0.55f32, -0.55] { // wheels (fat short cylinders, axle along `right`)
+        let mut w = m3::tube(lw(fx, 0.34, -0.04 + lean), lw(fx, 0.34, 0.04 + lean), 0.34, 14, tire); w.mat = M::STONE; s.add(w, Float::STILL);
+        let mut hub = m3::tube(lw(fx, 0.34, -0.05 + lean), lw(fx, 0.34, 0.05 + lean), 0.05, 6, c(0x8a, 0x8c, 0x90)); hub.mat = M::STONE; s.add(hub, Float::STILL);
+    }
+    let bars = [ // frame tubes (local x=fwd, y=up, z=side)
+        (lw(-0.2, 0.36, lean), lw(-0.26, 0.95, lean)), // seat tube
+        (lw(-0.26, 0.92, lean), lw(0.42, 0.94, lean)), // top tube
+        (lw(-0.05, 0.36, lean), lw(0.42, 0.94, lean)), // down tube
+        (lw(-0.55, 0.34, lean), lw(-0.05, 0.36, lean)),// chain stay
+        (lw(0.55, 0.34, lean), lw(0.46, 0.98, lean)),  // fork
+    ];
+    for (a, b) in bars { let mut t = m3::tube(a, b, 0.035, 5, frame); t.mat = M::STONE; s.add(t, Float::STILL); }
+    let mut hbar = m3::tube(lw(0.46, 1.0, -0.18 + lean), lw(0.46, 1.0, 0.18 + lean), 0.03, 4, c(0x2a, 0x28, 0x26)); hbar.mat = M::WOOD; s.add(hbar, Float::STILL);
+    let mut saddle = m3::panel(lw(-0.26, 1.0, lean), fwd, right, 0.3, 0.16, c(0x2a, 0x22, 0x1c)); saddle.mat = M::WOOD; s.add(saddle, Float::STILL);
+}
+
+/// A Montréal-style street sign: a tall pole with a green name plate (white border). Glyphs can't be rendered in
+/// raw geometry, so the made-up street name is conceptual (chosen from a list); a pale stripe hints at lettering.
+fn street_sign(s: &mut Scene, pos: Vec3, seed: u32) {
+    // conceptual names: ["Rue des Songes","Av. du Murmure","Rue Rose-de-Mai","Pl. des Lanternes","Rue du Chat-Gris","Av. des Ormes-Penchés"]
+    let mut pole = m3::tube(pos, addv(pos, v(0.0, 3.2, 0.0)), 0.05, 6, c(0x4a, 0x4e, 0x52)); pole.mat = M::STONE; s.add(pole, Float::STILL);
+    for (i, &ang) in [0.0f32, std::f32::consts::FRAC_PI_2].iter().enumerate() {
+        if i == 1 && seed % 2 == 0 { continue; } // sometimes a single plate
+        let dir = v(ang.cos(), 0.0, ang.sin());
+        let perp = v(-ang.sin(), 0.0, ang.cos());
+        let ctr = addv(pos, addv(v(0.0, 2.95, 0.0), mulv(dir, 0.7)));
+        let mut border = m3::panel(ctr, dir, v(0.0, 1.0, 0.0), 1.5, 0.42, c(0xea, 0xee, 0xe6)); border.mat = M::PAPER; s.add(border, Float::STILL);
+        let mut plate = m3::panel(addv(ctr, mulv(perp, 0.01)), dir, v(0.0, 1.0, 0.0), 1.38, 0.32, c(0x1e, 0x5e, 0x3a)); // Montréal green
+        plate.mat = M::PAPER; plate.emissive = 0.05; s.add(plate, Float::STILL);
+        let mut txt = m3::panel(addv(ctr, mulv(perp, 0.02)), dir, v(0.0, 1.0, 0.0), 1.1, 0.08, c(0xe8, 0xee, 0xe4)); // stripe hinting lettering
+        txt.mat = M::PAPER; s.add(txt, Float::STILL);
+    }
+}
+
+/// A brick building facade rising behind the fence line — damp brick with a grid of dark windows + a cornice.
+/// A little BRICK DUPLEX — a 3D box (front/back/sides/roof) lining the lane like a German-Village row house, with
+/// two ground-floor doors + stoops, upper-floor windows in pale frames, occasional projecting BALCONIES (barred
+/// or solid parapet, sometimes a potted plant), a cornice, and a chimney. Brick STONE; some windows lit.
+fn brick_building(s: &mut Scene, x: f32, zc: f32, h: f32, seclen: f32, seed: u32, rh: &dyn Fn(u32) -> f32) {
+    let yf = -3.2_f32;
+    let (lo, hi) = (c(0x52, 0x3a, 0x32), c(0x7e, 0x5c, 0x4e));
+    let face_n = if zc > 0.0 { -1.0 } else { 1.0 };          // +face_n points toward the lane
+    let depth = 4.5 + rh(seed) * 3.0;
+    let backz = zc - face_n * depth;                          // box extends AWAY from the lane
+    let midz = (zc + backz) * 0.5;
+    let w = seclen;
+    let mut brick = |s: &mut Scene, ctr: Vec3, right: Vec3, up: Vec3, ww: f32, hh: f32, col: Color32| {
+        let mut p = m3::panel(ctr, right, up, ww, hh, col);
+        m3::tint_height(&mut p, ctr.y - hh * 0.5, ctr.y + hh * 0.5, col, hi); p.mat = M::STONE; s.add(p, Float::STILL);
+    };
+    brick(s, v(x, yf + h * 0.5, zc), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), w, h, lo);          // front
+    brick(s, v(x, yf + h * 0.5, backz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), w, h, lo);       // back
+    for sx in [-1.0f32, 1.0] {
+        brick(s, v(x + sx * w * 0.5, yf + h * 0.5, midz), v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0), depth, h, lo); // sides
+    }
+    let mut roof = m3::panel(v(x, yf + h + 0.05, midz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), w, depth, c(0x3a, 0x32, 0x2c)); roof.mat = M::STONE; s.add(roof, Float::STILL);
+    let mut cornice = m3::panel(v(x, yf + h - 0.15, zc + face_n * 0.14), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), w, 0.55, hi); cornice.mat = M::STONE; s.add(cornice, Float::STILL);
+    let chx = x + (rh(seed * 3) - 0.5) * w * 0.5;
+    let mut chim = m3::tube(v(chx, yf + h, midz), v(chx, yf + h + 1.5, midz), 0.4, 4, c(0x46, 0x36, 0x30)); chim.mat = M::STONE; s.add(chim, Float::STILL);
+
+    let storeys = ((h - 1.0) / 3.0).max(2.0) as usize;
+    for u in 0..2usize { // two duplex units
+        let ux = x - w * 0.5 + (u as f32 + 0.5) / 2.0 * w;
+        let unitw = w / 2.0;
+        let mut door = m3::panel(v(ux, yf + 1.4, zc + face_n * 0.06), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 1.0, 2.8, c(0x2c, 0x22, 0x18)); door.mat = M::WOOD; s.add(door, Float::STILL);
+        let mut stoop = m3::panel(v(ux, yf + 0.12, zc + face_n * 0.45), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 1.3, 0.85, c(0x6a, 0x64, 0x5c)); stoop.mat = M::STONE; s.add(stoop, Float::STILL);
+        for storey in 1..storeys {
+            let wy = yf + 1.6 + storey as f32 * 3.0;
+            if wy + 1.0 > yf + h { break; }
+            for wofs in [-0.42f32, 0.42] {
+                let wx = ux + wofs * unitw;
+                let mut frame = m3::panel(v(wx, wy, zc + face_n * 0.04), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 1.0, 1.6, c(0xc8, 0xbc, 0xa6)); frame.mat = M::PAPER; s.add(frame, Float::STILL);
+                let lit = rh(seed.wrapping_add((u * 7 + storey * 13 + (wofs > 0.0) as usize) as u32)) > 0.6;
+                let mut win = m3::panel(v(wx, wy, zc + face_n * 0.06), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 0.85, 1.4, if lit { c(0xe8, 0xc8, 0x82) } else { c(0x22, 0x28, 0x2e) });
+                win.mat = M::PAPER; if lit { win.emissive = 0.5; } s.add(win, Float::STILL);
+            }
+            if rh(seed.wrapping_add((u * 100 + storey) as u32)) > 0.5 { // BALCONY
+                let by = wy - 0.7; let bd = 1.0; let rwidth = unitw * 0.8;
+                let rfront = zc + face_n * (bd + 0.05);
+                let mut slab = m3::panel(v(ux, by, zc + face_n * (bd * 0.5 + 0.05)), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), rwidth + 0.2, bd, c(0x4a, 0x42, 0x3a)); slab.mat = M::STONE; s.add(slab, Float::STILL);
+                if (rh(seed.wrapping_add((u * 200 + storey) as u32)) * 2.0) as u32 == 0 { // barred railing
+                    let nbar = (rwidth / 0.22) as usize;
+                    for b in 0..=nbar { let bx = ux - rwidth * 0.5 + b as f32 / nbar as f32 * rwidth; let mut bar = m3::tube(v(bx, by, rfront), v(bx, by + 0.9, rfront), 0.025, 3, c(0x2a, 0x28, 0x26)); bar.mat = M::STONE; s.add(bar, Float::STILL); }
+                } else { // solid parapet
+                    let mut par = m3::panel(v(ux, by + 0.45, rfront), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), rwidth, 0.9, c(0x52, 0x46, 0x3c)); par.mat = M::STONE; s.add(par, Float::STILL);
+                }
+                let mut toprail = m3::tube(v(ux - rwidth * 0.5, by + 0.9, rfront), v(ux + rwidth * 0.5, by + 0.9, rfront), 0.04, 3, c(0x3a, 0x32, 0x2c)); toprail.mat = M::STONE; s.add(toprail, Float::STILL);
+                let mut fdoor = m3::panel(v(ux, by + 0.95, zc + face_n * 0.06), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 0.9, 2.2, c(0x2c, 0x32, 0x36)); fdoor.mat = M::PAPER; fdoor.emissive = 0.1; s.add(fdoor, Float::STILL);
+                if rh(seed.wrapping_add((u * 300 + storey) as u32)) > 0.5 {
+                    let mut plant = m3::leaf_cluster(v(ux + rwidth * 0.3, by + 0.35, rfront - face_n * 0.2), 0.4, seed.wrapping_add(storey as u32), c(0x4a, 0x70, 0x30));
+                    m3::tint_up(&mut plant, c(0x66, 0x90, 0x40), c(0x30, 0x4c, 0x22)); plant.mat = M::MOSS; s.add(plant, Float { amp: 0.06, speed: 0.7, phase: 0.0, drift: 0.05 });
+                }
+            }
+        }
+    }
+}
+
+/// Café Rose de Mai — a corner café storefront: warm facade, a rose-pink awning + valance, a name board, a
+/// little terrace of round tables with chairs, and flower planters. Built from the concept (the real photo
+/// isn't fetchable); evokes a Montréal neighbourhood café. Faces +`face_n` in z.
+fn cafe(s: &mut Scene, x: f32, zc: f32, face_n: f32, seed: u32, rh: &dyn Fn(u32) -> f32) {
+    let yf = -3.2_f32;
+    // facade
+    let mut fac = m3::panel(v(x, yf + 3.0, zc), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 9.0, 6.0, c(0x6e, 0x5a, 0x44));
+    m3::tint_height(&mut fac, yf, yf + 6.0, c(0x5a, 0x48, 0x36), c(0x82, 0x6c, 0x52)); fac.mat = M::STONE; s.add(fac, Float::STILL);
+    // big shopfront window
+    let mut win = m3::panel(v(x, yf + 2.0, zc + face_n * 0.06), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 6.0, 2.6, c(0x2c, 0x3a, 0x3e));
+    win.mat = M::PAPER; win.emissive = 0.18; s.add(win, Float::STILL);
+    // rose-pink AWNING (tilted) + darker valance
+    let aw_y = yf + 4.0;
+    let mut awn = m3::panel(v(x, aw_y, zc + face_n * 1.3), v(1.0, 0.0, 0.0), addv(v(0.0, 0.6, 0.0), mulv(v(0.0, 0.0, face_n), 0.8)), 7.5, 1.9, c(0xc8, 0x6a, 0x78));
+    m3::tint_up(&mut awn, c(0xd8, 0x84, 0x90), c(0xb0, 0x52, 0x60)); awn.mat = M::PAPER; awn.emissive = 0.06; s.add(awn, Float::STILL);
+    let mut val = m3::panel(v(x, aw_y - 0.7, zc + face_n * 2.0), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 7.5, 0.4, c(0xb0, 0x52, 0x60)); val.mat = M::PAPER; s.add(val, Float::STILL);
+    // name board above the awning
+    let mut board = m3::panel(v(x, aw_y + 1.2, zc + face_n * 0.1), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 5.0, 0.8, c(0x3a, 0x2a, 0x22));
+    board.mat = M::WOOD; board.emissive = 0.05; s.add(board, Float::STILL);
+    let mut name = m3::panel(v(x, aw_y + 1.2, zc + face_n * 0.16), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 4.2, 0.18, c(0xe8, 0xc6, 0x96)); name.mat = M::PAPER; name.emissive = 0.1; s.add(name, Float::STILL); // "Café Rose de Mai" (conceptual)
+    // terrace: round tables + chairs + planters
+    for t in 0..2u32 {
+        let tx = x - 2.4 + t as f32 * 4.8;
+        let tz = zc + face_n * (3.2 + rh(seed + t) * 0.8);
+        let mut top = m3::disc(v(tx, yf + 1.05, tz), 0.62, 18, c(0x3a, 0x2c, 0x20)); top.mat = M::WOOD; s.add(top, Float::STILL);
+        let mut stem = m3::tube(v(tx, yf, tz), v(tx, yf + 1.05, tz), 0.06, 5, c(0x2c, 0x2c, 0x2e)); stem.mat = M::STONE; s.add(stem, Float::STILL);
+        for ch in 0..3u32 {
+            let a = ch as f32 / 3.0 * std::f32::consts::TAU + rh(seed + t * 7 + ch);
+            let (cx, cz) = (tx + a.cos() * 1.1, tz + a.sin() * 1.1);
+            let mut cs = m3::panel(v(cx, yf + 0.55, cz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 0.5, 0.5, c(0x3c, 0x4a, 0x52)); cs.mat = M::STONE; s.add(cs, Float::STILL);
+            let mut cb = m3::tube(v(cx, yf + 0.55, cz - 0.22), v(cx, yf + 1.05, cz - 0.22), 0.03, 4, c(0x3c, 0x4a, 0x52)); cb.mat = M::STONE; s.add(cb, Float::STILL);
+        }
+    }
+    // flower planters flanking the door
+    for &px in &[x - 3.4f32, x + 3.4] {
+        let pz = zc + face_n * 0.9;
+        let mut pot = m3::tube(v(px, yf, pz), v(px, yf + 0.7, pz), 0.45, 8, c(0x7a, 0x5a, 0x42)); pot.mat = M::STONE; s.add(pot, Float::STILL);
+        let mut fl = m3::leaf_cluster(v(px, yf + 0.95, pz), 0.7, seed.wrapping_add(px as u32), c(0x4a, 0x70, 0x30));
+        m3::tint_up(&mut fl, c(0x66, 0x90, 0x40), c(0x30, 0x4c, 0x22)); fl.mat = M::MOSS; s.add(fl, Float { amp: 0.07, speed: 0.7, phase: rh(seed) * 6.28, drift: 0.06 });
+        for fk in 0..5u32 { let fa = fk as f32 / 5.0 * std::f32::consts::TAU;
+            let mut bloom = m3::uv_sphere(v(px + fa.cos() * 0.4, yf + 1.05 + rh(fk) * 0.2, pz + fa.sin() * 0.4), 0.1, 6, 5, c(0xe2, 0x7a, 0x96)); bloom.mat = M::MOSS; bloom.emissive = 0.12; s.add(bloom, Float { amp: 0.06, speed: 0.8, phase: fa, drift: 0.05 }); }
+    }
+}
+
+/// Surface WEAR for a ground plane — hairline branching CRACKS (dark filaments) + shallow POTHOLES (a recessed
+/// dark bowl with a raised rim), so flat floors read with depth and age. `gy` samples local ground height.
+fn ground_wear<G: Fn(f32, f32) -> f32>(s: &mut Scene, cx: f32, cz: f32, span: f32, ncrack: u32, npot: u32, seed: i32, gy: G, crack_col: Color32, rim_col: Color32) {
+    use std::f32::consts::TAU;
+    for k in 0..ncrack {
+        let mut x = cx + (hash(seed + k as i32, 1) - 0.5) * 2.0 * span;
+        let mut z = cz + (hash(seed + k as i32, 2) - 0.5) * 2.0 * span;
+        let mut a = hash(seed + k as i32, 3) * TAU;
+        for sgi in 0..(3 + (hash(seed + k as i32, 4) * 4.0) as u32) {
+            a += (hash(seed + k as i32, 5 + sgi as i32) - 0.5) * 1.1;
+            let len = 0.5 + hash(seed + k as i32, 9 + sgi as i32) * 1.5;
+            let nx = x + a.cos() * len; let nz = z + a.sin() * len;
+            let mid = v((x + nx) * 0.5, gy((x + nx) * 0.5, (z + nz) * 0.5) + 0.02, (z + nz) * 0.5);
+            let dir = normv(v(nx - x, 0.0, nz - z));
+            let mut cr = m3::panel(mid, dir, crossv(dir, v(0.0, 1.0, 0.0)), len, 0.05 + hash(seed + k as i32, 13 + sgi as i32) * 0.05, crack_col);
+            cr.mat = M::STONE; s.add(cr, Float::STILL);
+            x = nx; z = nz;
+        }
+    }
+    for k in 0..npot {
+        let px = cx + (hash(seed + 100 + k as i32, 1) - 0.5) * 2.0 * span;
+        let pz = cz + (hash(seed + 100 + k as i32, 2) - 0.5) * 2.0 * span;
+        let pr = 0.5 + hash(seed + 100 + k as i32, 3) * 1.1;
+        let gyv = gy(px, pz);
+        let mut hole = m3::disc(v(px, gyv - 0.13, pz), pr, 16, c(0x15, 0x13, 0x11)); hole.mat = M::STONE; s.add(hole, Float::STILL); // recessed dark bowl
+        let mut wall = m3::tube(v(px, gyv - 0.13, pz), v(px, gyv + 0.01, pz), pr, 16, c(0x20, 0x1c, 0x18)); wall.mat = M::STONE; s.add(wall, Float::STILL); // bowl wall → depth
+        let mut rim = m3::annulus(v(px, gyv + 0.02, pz), pr, pr + 0.2, 16, rim_col); rim.mat = M::STONE; s.add(rim, Float::STILL); // raised rim
+    }
+}
+
+fn alley() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let pr = env_params();
+    let yf = -3.2_f32;
+    let af = scene_fit(30.0);
+    let half_len = (26.0 * af).clamp(26.0, 150.0);                       // lane runs ±half_len along X (the spine)
+    let wz = ((4.0 + pr.ext_z as f32 * 0.55) * 0.75).clamp(3.0, 12.0);   // lane half-width — ~75% width, opens to contain the graph
+    let g_seed = pr.seed ^ 0x4A11;
+    let rh = |k: u32| -> f32 { let x = (k.wrapping_mul(2_654_435_761).wrapping_add(pr.seed)).wrapping_mul(40_503); ((x >> 8) & 0xFF_FFFF) as f32 / 16_777_215.0 };
+    let gy = |x: f32, z: f32| yf + relief(x, z, g_seed, 0.5, 0.05) * 0.45; // nearly-flat damp ground, faint dips
+    let pd = pr.prop_density;
+
+    // WET GROUND — damp asphalt grading to cool wet gray; the shared terrain gives gentle relief, walls hide the rim
+    terrain_disc(&mut s, (half_len + 20.0).max(54.0), yf, g_seed, 0.5, 0.05,
+                 c(0x40, 0x3e, 0x3a), c(0x70, 0x71, 0x6c), M::STONE);
+
+    // PUDDLES — flat sky-mirroring discs nestled in the dips after the rain
+    for k in 0..(10.0 * af * pd) as u32 {
+        let x = (rh(k * 7 + 1) - 0.5) * 2.0 * (half_len - 4.0);
+        let z = (rh(k * 7 + 2) - 0.5) * 2.0 * (wz - 1.2);
+        let mut pud = m3::disc(v(x, gy(x, z) + 0.03, z), 0.9 + rh(k * 7 + 3) * 2.2, 18, c(0x86, 0xa2, 0xc0));
+        m3::scale_xz(&mut pud, 1.0, 0.6 + rh(k * 7 + 4) * 0.5);
+        m3::set_alpha(&mut pud, 150); pud.mat = M::WATER; pud.emissive = 0.10;
+        s.add(pud, Float::STILL);
+    }
+
+    // CRACKED ASPHALT — a procedural web of fine dark cracks branching across the road surface (the texture
+    // gives the grain/bump; these add the macro fracture pattern). Each crack is a short jointed dark filament.
+    for k in 0..(22.0 * af * pd) as u32 {
+        let mut cx = (rh(k * 31 + 1) - 0.5) * 2.0 * (half_len - 2.0);
+        let mut cz = (rh(k * 31 + 2) - 0.5) * 2.0 * (wz - 0.5);
+        let mut ca = rh(k * 31 + 3) * std::f32::consts::TAU;
+        let nseg = 3 + (rh(k * 31 + 4) * 4.0) as u32;
+        for sgi in 0..nseg {
+            ca += (rh(k * 31 + 5 + sgi) - 0.5) * 1.1; // wander
+            let len = 0.5 + rh(k * 31 + 9 + sgi) * 1.3;
+            let nx = cx + ca.cos() * len; let nz = cz + ca.sin() * len;
+            let mid = v((cx + nx) * 0.5, gy((cx + nx) * 0.5, (cz + nz) * 0.5) + 0.02, (cz + nz) * 0.5);
+            let dir = normv(v(nx - cx, 0.0, nz - cz));
+            let mut crack = m3::panel(mid, dir, crossv(dir, v(0.0, 1.0, 0.0)), len, 0.05 + rh(k * 31 + 13 + sgi) * 0.05, c(0x20, 0x20, 0x1e));
+            crack.mat = M::STONE; s.add(crack, Float::STILL);
+            cx = nx; cz = nz;
+        }
+    }
+
+    // YELLOW SPEEDBUMPS — the occasional low painted ridge across the lane (faded traffic yellow)
+    for k in 0..(1.0 + 1.2 * pd) as u32 {
+        let bx = -half_len * 0.6 + (k as f32 + 0.5) / (1.0 + 2.0 * pd).max(1.0) * half_len * 1.2;
+        let mut bump = m3::tube(v(bx, yf - 0.05, -wz + 0.4), v(bx, yf - 0.05, wz - 0.4), 0.28, 10, c(0xc6, 0xa0, 0x34));
+        m3::scale3(&mut bump, 1.0, 0.5, 1.0); // flatten into a low rounded ridge
+        m3::tint_up(&mut bump, c(0xd2, 0xae, 0x40), c(0x86, 0x6a, 0x22)); bump.mat = M::STONE;
+        s.add(bump, Float::STILL);
+        // worn paint scuffs (dark gaps) so it isn't a solid bar
+        for g in 0..4u32 {
+            let gz = -wz + 0.8 + g as f32 / 4.0 * (2.0 * wz - 1.6);
+            let mut scuff = m3::panel(v(bx, yf + 0.18, gz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 0.6, 0.18, c(0x4a, 0x46, 0x40)); scuff.mat = M::STONE; s.add(scuff, Float::STILL);
+        }
+    }
+
+    // ROAD SURFACE DETAIL — faded centre-line dashes, tar-seam repair patches, manhole covers, oil stains, so
+    // the asphalt reads as worn and storied rather than a blank slab.
+    let ndash = (half_len / 2.4) as u32; // faded yellow centre line, broken into worn dashes
+    for k in 0..ndash {
+        let dx = -half_len + (k as f32 + 0.5) / ndash as f32 * 2.0 * half_len;
+        if rh(k * 61 + 3) < 0.25 { continue; } // worn-away gaps
+        let dz = (rh(k * 61 + 1) - 0.5) * 0.6; // wobbles a little off-centre
+        let mut dash = m3::panel(v(dx, gy(dx, dz) + 0.02, dz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 1.1, 0.18, c(0x96, 0x7e, 0x34));
+        m3::tint_up(&mut dash, c(0xa8, 0x8e, 0x3c), c(0x6a, 0x58, 0x26)); dash.mat = M::STONE; s.add(dash, Float::STILL);
+    }
+    for k in 0..(8.0 * af * pd) as u32 { // tar-seam REPAIR PATCHES — darker rectangles where the road was cut + filled
+        let px = (rh(k * 71 + 1) - 0.5) * 2.0 * (half_len - 2.0);
+        let pz = (rh(k * 71 + 2) - 0.5) * 2.0 * (wz - 0.8);
+        let mut patch = m3::panel(v(px, gy(px, pz) + 0.015, pz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 1.2 + rh(k * 71 + 3) * 2.4, 0.9 + rh(k * 71 + 4) * 1.8, c(0x2e, 0x2c, 0x2a));
+        m3::tint_up(&mut patch, c(0x38, 0x36, 0x32), c(0x24, 0x22, 0x20)); patch.mat = M::STONE; s.add(patch, Float::STILL);
+    }
+    for k in 0..(2.0 * af) as u32 { // MANHOLE COVERS — dark iron discs with a raised rim
+        let mx = (rh(k * 83 + 1) - 0.5) * 2.0 * (half_len - 5.0);
+        let mz = (rh(k * 83 + 2) - 0.5) * 2.0 * (wz - 1.5);
+        let mut cover = m3::disc(v(mx, gy(mx, mz) + 0.03, mz), 0.55, 18, c(0x2a, 0x28, 0x26)); cover.mat = M::STONE; s.add(cover, Float::STILL);
+        let mut rim = m3::annulus(v(mx, gy(mx, mz) + 0.04, mz), 0.55, 0.66, 18, c(0x3e, 0x3a, 0x34)); rim.mat = M::STONE; s.add(rim, Float::STILL);
+    }
+    for k in 0..(5.0 * af * pd) as u32 { // OIL STAINS — soft dark irregular blotches
+        let ox = (rh(k * 97 + 1) - 0.5) * 2.0 * (half_len - 3.0);
+        let oz = (rh(k * 97 + 2) - 0.5) * 2.0 * (wz - 1.0);
+        let mut stain = m3::disc(v(ox, gy(ox, oz) + 0.012, oz), 0.5 + rh(k * 97 + 3) * 1.1, 14, c(0x1c, 0x1c, 0x1e));
+        m3::scale_xz(&mut stain, 1.0, 0.5 + rh(k * 97 + 4) * 0.6); m3::set_alpha(&mut stain, 120); stain.mat = M::STONE; s.add(stain, Float::STILL);
+    }
+    // POTHOLES — shallow recessed bowls broken into the worn asphalt (depth, not just surface marks)
+    ground_wear(&mut s, 0.0, 0.0, half_len - 3.0, 0, (3.0 + 3.0 * pd) as u32, pr.seed as i32 ^ 0x9A, |x, z| gy(x, z), c(0x18, 0x18, 0x16), c(0x3c, 0x38, 0x32));
+
+    // GERMAN-VILLAGE BRICK PAVING — stretches where the asphalt gives way to old red-brick setts, with a faint
+    // mortar grid, so the road's texture varies along its length (a brick band, a brick crossing).
+    for k in 0..(1.0 + 1.6 * pd) as u32 {
+        let bx = -half_len * 0.55 + (k as f32 + 0.5) / (1.0 + 1.6 * pd).max(1.0) * half_len * 1.1;
+        let blen = 4.0 + rh(k * 51) * 5.0;
+        let mut pave = m3::panel(v(bx, gy(bx, 0.0) + 0.014, 0.0), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), blen, 2.0 * wz - 0.6, c(0x8a, 0x46, 0x34));
+        m3::tint_up(&mut pave, c(0xa4, 0x58, 0x3e), c(0x6e, 0x38, 0x2a)); pave.mat = M::STONE; s.add(pave, Float::STILL);
+        for g in 0..(blen / 0.62) as u32 { // transverse mortar courses
+            let gx = bx - blen * 0.5 + g as f32 * 0.62;
+            let mut line = m3::panel(v(gx, gy(gx, 0.0) + 0.02, 0.0), v(0.0, 0.0, 1.0), v(1.0, 0.0, 0.0), 2.0 * wz - 0.7, 0.05, c(0x52, 0x2c, 0x22)); line.mat = M::STONE; s.add(line, Float::STILL);
+        }
+        for &lz in &[-wz * 0.5, 0.0, wz * 0.5] { // a few longitudinal courses
+            let mut line = m3::panel(v(bx, gy(bx, lz) + 0.02, lz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), blen, 0.05, c(0x52, 0x2c, 0x22)); line.mat = M::STONE; s.add(line, Float::STILL);
+        }
+    }
+
+    // CLOTHESLINES strung across the lane between the buildings, hung with laundry that flaps in the breeze
+    for k in 0..(1.0 + 1.5 * pd) as u32 {
+        let cx = -half_len + (k as f32 + 0.8) / (1.0 + 1.5 * pd).max(1.0) * 2.0 * half_len;
+        let cy = yf + 6.5 + rh(k * 55) * 1.8;
+        let mut line = m3::tube(v(cx, cy, -wz + 0.5), v(cx, cy - 0.7, wz - 0.5), 0.02, 3, c(0x18, 0x16, 0x12)); line.mat = M::WOOD; s.add(line, Float::STILL);
+        let ncl = 4 + (rh(k * 57) * 4.0) as u32;
+        for ci in 0..ncl {
+            let t = (ci as f32 + 0.5) / ncl as f32;
+            let lz = (-wz + 0.5) + t * (2.0 * wz - 1.0);
+            let ly = cy - 0.7 * t;
+            let col = [c(0xc8, 0x6a, 0x78), c(0x6a, 0x8c, 0xc0), c(0xe0, 0xd0, 0x9a), c(0x8a, 0xc0, 0x8a), c(0xd6, 0xd6, 0xde)][(rh(k * 60 + ci) * 5.0) as usize % 5];
+            let (cw, ch) = (0.5 + rh(k * 61 + ci) * 0.4, 0.7 + rh(k * 62 + ci) * 0.6);
+            let mut cloth = m3::panel(v(cx, ly - ch * 0.5 - 0.1, lz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), cw, ch, col);
+            cloth.mat = M::PAPER; s.add(cloth, Float { amp: 0.1, speed: 0.7, phase: rh(k * 63 + ci) * 6.28, drift: 0.12 });
+        }
+    }
+
+    // CATS PROWLING the lane + a few PARKED BICYCLES leaning along the edges
+    for k in 0..(3.0 * af * pd).clamp(3.0, 10.0) as u32 {
+        let cx = (rh(k * 73 + 1) - 0.5) * 2.0 * (half_len - 3.0);
+        let cz = (rh(k * 73 + 2) - 0.5) * 2.0 * (wz - 0.8);
+        critter(&mut s, 1, v(cx, gy(cx, cz), cz), rh(k * 73 + 3) * TAU, 1800 + k); // prowling ginger cat
+    }
+    for k in 0..(2.0 * af * pd).clamp(2.0, 8.0) as u32 {
+        let sgn = if rh(k * 79) > 0.5 { 1.0 } else { -1.0 };
+        let bx = -half_len + (k as f32 + 0.6) / ((2.0 * af * pd) as u32).max(1) as f32 * 2.0 * half_len;
+        bicycle(&mut s, v(bx, gy(bx, sgn * (wz - 0.8)), sgn * (wz - 0.8)), if sgn > 0.0 { 3.14 } else { 0.0 }, 1250 + k); // parked at the kerb
+    }
+
+    // SIDE SECTIONS — each stretch of the lane edge is one of: timber fence · picket fence · low hedge · damp
+    // brick wall · brick BUILDING facade · or a PARK BREAKOUT (the fence drops away to a grassy yard with a
+    // tree + park bench). Type chosen by seed per section so every alley differs. Ivy drapes the solid ones.
+    let nsec = ((half_len / 5.0) as usize).max(6);
+    for &sgn in &[-1.0f32, 1.0] {
+        let zc = sgn * wz;
+        for i in 0..nsec {
+            let x = -half_len + (i as f32 + 0.5) / nsec as f32 * 2.0 * half_len;
+            let seclen = 2.0 * half_len / nsec as f32 * 0.96;
+            let kind = (hash(i as i32 * 7 + (sgn > 0.0) as i32 * 53, pr.seed as i32 ^ 0x5C3D) * 6.0) as u32; // 0..5 section type (well-mixed)
+            let post_x = x - seclen * 0.5;
+            // gate posts at section ends (skipped for park breakouts)
+            if kind != 5 {
+                let mut post = m3::tube(v(post_x, yf, zc), v(post_x, yf + 5.0, zc), 0.16, 6, c(0x2e, 0x24, 0x1c));
+                post.mat = M::WOOD; s.add(post, Float::STILL);
+            }
+            match kind {
+                0 | 1 => { // timber fence (0) / picket fence (1) — vertical planks
+                    let h = 6.0 + rh(i as u32 * 5) * 2.5;
+                    let nplank = if kind == 1 { (seclen / 0.4) as usize } else { (seclen / 1.2) as usize };
+                    if kind == 1 { // picket: gapped slats + a top rail
+                        for p in 0..nplank {
+                            let px = x - seclen * 0.5 + (p as f32 + 0.5) / nplank as f32 * seclen;
+                            let ph = h * 0.6;
+                            let mut sl = m3::panel(v(px, yf + ph * 0.5, zc), v(0.18, 0.0, 0.0), v(0.0, 1.0, 0.0), 0.18, ph, c(0xb6, 0xb0, 0xa2));
+                            m3::tint_height(&mut sl, yf, yf + ph, c(0x8a, 0x84, 0x76), c(0xc4, 0xc0, 0xb2)); sl.mat = M::PAPER; s.add(sl, Float::STILL);
+                        }
+                        let mut rail = m3::panel(v(x, yf + h * 0.5, zc), v(1.0, 0.0, 0.0), v(0.0, 0.06, 0.0), seclen, 0.16, c(0xa8, 0xa2, 0x94)); rail.mat = M::PAPER; s.add(rail, Float::STILL);
+                    } else {
+                        let mut wall = m3::panel(v(x, yf + h * 0.5, zc), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), seclen, h, c(0x3a, 0x2e, 0x25));
+                        m3::tint_height(&mut wall, yf, yf + h, c(0x3a, 0x2e, 0x25), c(0x52, 0x3f, 0x30)); wall.mat = M::WOOD; s.add(wall, Float::STILL);
+                    }
+                }
+                2 => { // low hedge — a leafy run of clipped greenery
+                    let nh = (seclen / 1.3) as usize;
+                    for hk in 0..nh {
+                        let hx = x - seclen * 0.5 + (hk as f32 + 0.5) / nh as f32 * seclen;
+                        let mut hedge = m3::leaf_cluster(v(hx, yf + 1.5, zc), 1.5, 300 + i as u32 * 9 + hk as u32, c(0x32, 0x52, 0x26));
+                        m3::scale3(&mut hedge, 1.0, 1.3, 1.0); m3::tint_up(&mut hedge, c(0x4c, 0x74, 0x32), c(0x26, 0x42, 0x1c)); hedge.mat = M::MOSS;
+                        s.add(hedge, Float { amp: 0.06, speed: 0.6, phase: rh(hk as u32) * 6.28, drift: 0.06 });
+                    }
+                }
+                3 => { // damp brick wall (garage height)
+                    let h = 8.0 + rh(i as u32 * 3) * 3.0;
+                    let mut wall = m3::panel(v(x, yf + h * 0.5, zc), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), seclen, h, c(0x5a, 0x44, 0x3c));
+                    m3::tint_height(&mut wall, yf, yf + h, c(0x5a, 0x44, 0x3c), c(0x86, 0x66, 0x56)); wall.mat = M::STONE; s.add(wall, Float::STILL);
+                }
+                4 => { // BRICK DUPLEX lining the lane (German-Village row house: doors, balconies, chimney)
+                    brick_building(&mut s, x, zc, 9.0 + rh(i as u32 * 7) * 5.0, seclen, 800 + i as u32 * 3, &rh);
+                }
+                _ => { // PARK BREAKOUT — fence drops to a grassy yard with a tree + a bench
+                    let gx = x; let gz = sgn * (wz + 7.0);
+                    let mut grass = m3::disc(v(gx, yf + 0.05, gz), seclen * 0.7, 26, c(0x3a, 0x5e, 0x2c));
+                    m3::scale_xz(&mut grass, 1.0, 1.6); m3::tint_up(&mut grass, c(0x52, 0x7c, 0x34), c(0x2c, 0x4a, 0x20)); grass.mat = M::MOSS; s.add(grass, Float::STILL);
+                    set_tree_bend(0.0, -sgn * 0.6, 0.22, 0.12); // park tree leans gently back over its yard
+                    tree_branch(&mut s, v(gx, yf, gz), normv(v((rh(i as u32) - 0.5) * 0.2, 1.0, -sgn * 0.15)), 11.0 + rh(i as u32 * 4) * 4.0, 0.7, 2, 900 + i as i32 * 5, 3, 0.6);
+                    bench(&mut s, v(gx, gy(gx, sgn * (wz + 2.5)), sgn * (wz + 2.5)), if sgn > 0.0 { -1.57 } else { 1.57 }, 950 + i as u32, (rh(i as u32 * 11) * 3.0) as u32);
+                    let mut lowh = m3::leaf_cluster(v(gx, yf + 0.8, zc), 1.0, 320 + i as u32, c(0x3a, 0x5a, 0x28)); m3::scale3(&mut lowh, 1.0, 0.9, 1.0); m3::tint_up(&mut lowh, c(0x52, 0x7c, 0x34), c(0x2c, 0x48, 0x1e)); lowh.mat = M::MOSS; s.add(lowh, Float { amp: 0.05, speed: 0.6, phase: rh(i as u32) * 6.28, drift: 0.05 });
+                }
+            }
+            // IVY draped on solid sections (not hedge/park)
+            if matches!(kind, 0 | 3 | 4) {
+                for vk in 0..(2 + (rh(i as u32 * 17) * 3.0) as usize) {
+                    let vx = x + (rh(i as u32 * 7 + vk as u32) - 0.5) * seclen * 0.8;
+                    let vy = yf + (3.0 + rh(i as u32 * 9 + vk as u32) * 4.0);
+                    let mut ivy = m3::leaf_cluster(v(vx, vy, zc - sgn * 0.3), 0.8 + rh(vk as u32) * 0.7, 400 + i as u32 * 5 + vk as u32, c(0x3c, 0x5e, 0x2e));
+                    m3::tint_up(&mut ivy, c(0x58, 0x8c, 0x4a), c(0x2a, 0x46, 0x1e)); ivy.mat = M::MOSS;
+                    s.add(ivy, Float { amp: 0.08, speed: 0.6, phase: rh(vk as u32) * 6.28, drift: 0.06 });
+                }
+            }
+        }
+    }
+
+    // STREET SIGNS at a couple of corners + the CAFÉ ROSE DE MAI storefront partway along
+    for k in 0..(2.0 + 2.0 * pd) as u32 {
+        let sx = -half_len + (k as f32 + 0.5) / ((2.0 + 2.0 * pd) as u32).max(1) as f32 * 2.0 * half_len;
+        let sgn = if rh(k * 31) > 0.5 { 1.0 } else { -1.0 };
+        street_sign(&mut s, v(sx, yf, sgn * (wz - 0.5)), 70 + k);
+    }
+    {
+        let cx = -half_len * 0.15;
+        cafe(&mut s, cx, wz - 0.1, -1.0, pr.seed ^ 0x0CAF, &rh);
+    }
+
+    // BENCHES + BICYCLES along the lane edges (count scales with prop_density)
+    for k in 0..(4.0 * pd * af).clamp(3.0, 14.0) as u32 {
+        let bx = -half_len + (k as f32 + 0.3) / ((4.0 * pd * af) as u32).max(1) as f32 * 2.0 * half_len;
+        let sgn = if rh(k * 41) > 0.5 { 1.0 } else { -1.0 };
+        let bz = sgn * (wz - 1.0);
+        if rh(k * 43) > 0.45 {
+            bench(&mut s, v(bx, gy(bx, bz), bz), if sgn > 0.0 { -1.57 } else { 1.57 }, 1100 + k, (rh(k * 7) * 3.0) as u32);
+        } else {
+            bicycle(&mut s, v(bx, gy(bx, bz), bz), if sgn > 0.0 { 3.14 } else { 0.0 }, 1200 + k);
+        }
+    }
+
+
+    // TREES leaning IN — an overhanging canopy that closes over the lane. Each tree has CHARACTER: random side
+    // (not strict L-R), jittered spacing, and per-tree height / girth / branch-count / splay / lean / leaf size,
+    // so the canopy reads as an organic overgrown tunnel rather than a repeating pattern.
+    let ntrees = (3.2 * af * pd).clamp(4.0, 10.0) as u32;
+    let mut last_sgn = 1.0_f32;
+    for k in 0..ntrees {
+        let t = (k as f32 + 0.5) / ntrees as f32;
+        let x = -half_len + (t + (rh(k * 9) - 0.5) * 0.13) * 2.0 * half_len; // jittered, uneven spacing
+        let sgn = if rh(k * 5) > 0.62 { -last_sgn } else if rh(k * 5) > 0.5 { last_sgn } else if rh(k * 7) > 0.5 { 1.0 } else { -1.0 };
+        last_sgn = sgn;
+        let h = 8.0 + rh(k * 11) * 12.0;                // 8..20 — much wider height range
+        let girth = 0.5 + rh(k * 13) * 0.95;            // 0.5..1.45 — slim saplings to thick old trunks
+        let nb = 3 + (rh(k * 17) * 2.99) as usize;      // 3..5 branches → varied crown fullness
+        let spread = 0.65 + rh(k * 19) * 0.6;           // 0.65..1.25 wide, varied splay
+        let twist = (rh(k * 47) - 0.5) * 1.4;           // per-tree rotation of the whole crown about vertical
+        let leanz = -sgn * (0.3 + rh(k * 23) * 0.3);    // varied lean OUT over the lane
+        let lean = normv(v(twist.sin() * 0.3 + (rh(k * 3) - 0.5) * 0.2, 1.0, leanz));
+        set_tree_bend((rh(k * 29) - 0.5) * 0.4, leanz * 0.9, 0.22 + rh(k * 53) * 0.18, 0.08 + rh(k * 31) * 0.07); // varied arch + scatter
+        tree_branch(&mut s, v(x, yf, sgn * (wz + 2.6)), lean, h, girth, 2, 700 + k as i32 * 13, nb, spread); // varied seed stride
+        if rh(k * 37) > 0.62 { // an occasional HIGH side-bough reaching across well above the graph
+            let bdir = normv(v((rh(k * 41) - 0.5) * 0.5, 0.8, leanz * 1.5));
+            set_tree_bend(0.0, leanz, 0.2, 0.13);
+            tree_branch(&mut s, v(x, yf + h * 0.72, sgn * (wz + 2.6)), bdir, h * 0.42, girth * 0.42, 1, 760 + k as i32, nb, spread + 0.1);
+        }
+    }
+    set_tree_bend(0.0, 0.0, 1.0, 0.0); // reset after the alley's per-tree policy
+
+    // HANGING NOTICE BOARDS on wires — the neighbourhood-bulletin graph motif, swinging in the breeze
+    let nboards = (5.0 * af * pd).clamp(5.0, 20.0) as u32;
+    for k in 0..nboards {
+        let x = -half_len + (k as f32 + 0.7) / nboards as f32 * 2.0 * half_len;
+        let wy = yf + 7.5 + rh(k * 2) * 2.0;
+        let mut wire = m3::tube(v(x, wy, -wz + 0.3), v(x, wy - 0.4, wz - 0.3), 0.03, 4, c(0x20, 0x1c, 0x16));
+        wire.mat = M::WOOD; s.add(wire, Float::STILL);
+        // warm LANTERNS strung along the wire — glowing pinpoints, the "graph nodes as little lanterns" motif
+        for lz in 0..3u32 {
+            let t = (lz as f32 + 0.5) / 3.0;
+            let lx = x; let lzp = (-wz + 0.3) + t * (2.0 * wz - 0.6);
+            let mut lan = m3::uv_sphere(v(lx, wy - 0.4 * t - 0.25, lzp), 0.13, 8, 6, c(0xff, 0xcf, 0x86));
+            lan.mat = M::MOSS; lan.emissive = 1.6;
+            s.add(lan, Float { amp: 0.05, speed: 0.6, phase: rh(k * 9 + lz) * 6.28, drift: 0.05 });
+        }
+        let (bw, bh) = (1.4 + rh(k * 3) * 1.0, 1.0 + rh(k * 4) * 0.7);
+        let (bz, by) = ((rh(k * 5) - 0.5) * 2.0 * (wz - 2.0), wy - 1.6 - rh(k * 6) * 1.2);
+        for rs in [-1.0f32, 1.0] {
+            let mut rope = m3::tube(v(x + rs * bw * 0.4, wy - 0.2, bz), v(x + rs * bw * 0.4, by + bh * 0.5, bz), 0.025, 4, c(0x3a, 0x2c, 0x1e));
+            rope.mat = M::WOOD; s.add(rope, Float { amp: 0.03, speed: 0.5, phase: rh(k) * 6.28, drift: 0.04 });
+        }
+        let mut board = m3::panel(v(x, by, bz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), bw, bh, c(0x4a, 0x38, 0x26));
+        m3::tint_up(&mut board, c(0x60, 0x4a, 0x32), c(0x36, 0x28, 0x1a)); board.mat = M::WOOD; board.emissive = 0.04;
+        s.add(board, Float { amp: 0.05, speed: 0.6, phase: rh(k * 8) * 6.28, drift: 0.05 });
+    }
+
+    // UTILITY POLES + sagging overhead wires running the lane's length — decades of quiet settlement
+    let npole = (half_len / 12.0).max(3.0) as usize;
+    let pole_z = wz + 0.8;
+    for &sgn in &[-1.0f32, 1.0] {
+        let mut prev: Option<Vec3> = None;
+        for i in 0..=npole {
+            let x = -half_len + i as f32 / npole as f32 * 2.0 * half_len;
+            let ptop = v(x, yf + 11.0, sgn * pole_z);
+            let mut pole = m3::tube(v(x, yf, sgn * pole_z), ptop, 0.13, 6, c(0x36, 0x2c, 0x22));
+            pole.mat = M::WOOD; s.add(pole, Float::STILL);
+            let mut arm = m3::tube(v(x, ptop.y - 0.5, sgn * pole_z - 0.8), v(x, ptop.y - 0.5, sgn * pole_z + 0.8), 0.07, 4, c(0x36, 0x2c, 0x22));
+            arm.mat = M::WOOD; s.add(arm, Float::STILL);
+            if let Some(pp) = prev { // two segments dipping at the midpoint → a catenary sag
+                let mid = v((pp.x + ptop.x) * 0.5, (pp.y + ptop.y) * 0.5 - 0.9, sgn * pole_z);
+                let mut w1 = m3::tube(pp, mid, 0.02, 3, c(0x18, 0x14, 0x10)); w1.mat = M::WOOD; s.add(w1, Float::STILL);
+                let mut w2 = m3::tube(mid, ptop, 0.02, 3, c(0x18, 0x14, 0x10)); w2.mat = M::WOOD; s.add(w2, Float::STILL);
+            }
+            prev = Some(ptop);
+        }
+    }
+
+    // CRATES + CATS — lived-in corners; a ginger cat dozes on each crate
+    let ncats = (3.0 * af).clamp(3.0, 8.0) as u32;
+    for k in 0..ncats {
+        let x = -half_len + (k as f32 + 0.4) / ncats as f32 * 2.0 * half_len;
+        let z = (if rh(k * 21) > 0.5 { 1.0 } else { -1.0 }) * (wz - 1.2);
+        let cs = 0.9 + rh(k * 4) * 0.4;
+        let cy = gy(x, z);
+        for (ctr, rt, upx) in [
+            (v(x, cy + cs * 0.5, z + cs * 0.5), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)),
+            (v(x, cy + cs * 0.5, z - cs * 0.5), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0)),
+            (v(x, cy + cs, z), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0)),
+        ] {
+            let mut face = m3::panel(ctr, rt, upx, cs, cs, c(0x6a, 0x52, 0x36));
+            m3::tint_up(&mut face, c(0x7e, 0x62, 0x42), c(0x4a, 0x38, 0x24)); face.mat = M::WOOD;
+            s.add(face, Float::STILL);
+        }
+        critter(&mut s, 1, v(x, cy + cs, z), TAU * rh(k * 9), 1500 + k);
+    }
+
+    // INSECTS hovering over the wet lane + birds disturbing the leaves overhead (after the rain)
+    for k in 0..(7.0 * af * pd) as u32 {
+        let x = (rh(k * 13 + 5) - 0.5) * 2.0 * (half_len - 3.0);
+        let z = (rh(k * 13 + 6) - 0.5) * 2.0 * (wz - 1.0);
+        firefly(&mut s, v(x, gy(x, z) + 0.5 + rh(k * 13 + 7) * 1.0, z), 2000 + k); // gnats glinting in the light
+    }
+    for k in 0..(6.0 * af) as u32 {
+        let x = (rh(k * 17 + 1) - 0.5) * 2.0 * (half_len - 6.0);
+        let sgn = if rh(k * 17 + 2) > 0.5 { 1.0 } else { -1.0 };
+        bird(&mut s, v(x, yf + 7.0 + rh(k * 17 + 3) * 6.0, sgn * (wz + 1.0)), 2100 + k);
+    }
+
+    // WEEDS in the cracks — grass tufts + volunteer saplings negotiating with the pavement
+    for k in 0..(28.0 * af * pd) as u32 {
+        let x = (rh(k * 11 + 1) - 0.5) * 2.0 * half_len;
+        let z = (rh(k * 11 + 2) - 0.5) * 2.0 * (wz - 0.4);
+        let mut tuft = m3::leaf_cluster(v(x, gy(x, z) + 0.16, z), 0.2 + rh(k * 11 + 3) * 0.16, 600 + k, c(0x4a, 0x6e, 0x2e));
+        m3::scale3(&mut tuft, 0.4, 1.7, 0.4); m3::tint_up(&mut tuft, c(0x6a, 0x90, 0x40), c(0x32, 0x4e, 0x22)); tuft.mat = M::MOSS;
+        s.add(tuft, Float { amp: 0.05, speed: 0.8, phase: rh(k) * 6.28, drift: 0.05 });
+    }
+
+    s
+}
+
+/// PHYSICAL UI SURFACE — a per-scene "context lectern": the reading panel where a selected node's content is
+/// meant to surface, built from the scene's OWN materials instead of a floating window. This is the START of the
+/// physical-UI concept (the frame, stand, material, and a few content "lines" per scene); wiring live node text
+/// onto the surface is future work. style: 0 wood board · 1 stone tablet · 2 glass pane · 3 marble plaque.
+fn physical_ui_panel(s: &mut Scene, style: u32, pos: Vec3, face: f32, w: f32, h: f32, floating: bool, seed: u32) {
+    let right = v(-face.sin(), 0.0, face.cos());
+    let up = v(0.0, 1.0, 0.0);
+    let n = v(face.cos(), 0.0, face.sin()); // surface faces `face`
+    let stand_h = if floating { 0.0 } else { 1.5 };
+    let ctr = addv(pos, mulv(up, stand_h + h * 0.5));
+    let (surface, frame, fmat, smat, emiss) = match style {
+        1 => (c(0x6e, 0x6a, 0x60), c(0x45, 0x42, 0x3a), M::STONE, M::STONE, 0.05), // stone tablet
+        2 => (c(0x86, 0xb6, 0xc6), c(0x9a, 0xc6, 0xd2), M::WATER, M::STONE, 0.12), // glass pane
+        3 => (c(0xd8, 0xd0, 0xba), c(0xc2, 0x98, 0x40), M::STONE, M::STONE, 0.10), // marble + gold trim
+        _ => (c(0x55, 0x40, 0x2a), c(0x34, 0x26, 0x16), M::WOOD, M::WOOD, 0.06),   // wood board
+    };
+    // frame (slightly larger panel set just behind the surface)
+    let mut fr = m3::panel(addv(ctr, mulv(n, -0.04)), right, up, w + 0.28, h + 0.28, frame); fr.mat = fmat; fr.emissive = emiss * 0.5; s.add(fr, Float::STILL);
+    // surface
+    let mut sf = m3::panel(ctr, right, up, w, h, surface); sf.mat = smat; sf.emissive = emiss;
+    if style == 2 { m3::set_alpha(&mut sf, 130); } // glass = translucent
+    s.add(sf, Float::STILL);
+    // content "lines" — thin pale stripes hinting at the text/graph that surfaces here
+    let ink = if style == 2 { c(0xf0, 0xfa, 0xff) } else { mix_rgb(surface, c(0xff, 0xff, 0xf4), 0.55) };
+    for li in 0..4u32 {
+        let ly = h * 0.30 - li as f32 * h * 0.16;
+        let lw = w * (0.74 - li as f32 * 0.09);
+        let mut line = m3::panel(addv(ctr, addv(mulv(up, ly), mulv(n, 0.02))), right, up, lw, h * 0.045, ink);
+        line.mat = M::PAPER; line.emissive = emiss * 0.6; s.add(line, Float::STILL);
+    }
+    // a small "active" node bead in the corner (the selection marker), warm/glowing
+    let mut bead = m3::uv_sphere(addv(ctr, addv(mulv(up, h * 0.34), mulv(right, -w * 0.42))), 0.1, 8, 6, c(0xff, 0xcf, 0x86));
+    bead.mat = M::MOSS; bead.emissive = 1.4; s.add(bead, Float { amp: 0.04, speed: 0.7, phase: hash(seed as i32, 2) * 6.28, drift: 0.04 });
+    // STAND per style
+    if floating {
+        let mut mnt = m3::tube(addv(ctr, mulv(up, -h * 0.5)), addv(ctr, mulv(up, -h * 0.5 - 0.5)), 0.05, 4, frame); mnt.mat = fmat; mnt.emissive = emiss; s.add(mnt, Float::STILL);
+    } else {
+        match style {
+            3 => { let mut ped = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.42, 10, mix_rgb(surface, frame, 0.3)); ped.mat = M::STONE; s.add(ped, Float::STILL); }
+            1 => { let mut pl = m3::tube(pos, addv(pos, mulv(up, stand_h)), 0.36, 6, frame); pl.mat = M::STONE; s.add(pl, Float::STILL); }
+            2 => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.4)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h)), 0.045, 4, frame); p.mat = M::STONE; p.emissive = 0.25; s.add(p, Float::STILL); } }
+            _ => { for sx in [-1.0f32, 1.0] { let a = addv(pos, mulv(right, sx * w * 0.42)); let mut p = m3::tube(a, addv(a, mulv(up, stand_h + 0.1)), 0.08, 5, c(0x3a, 0x2a, 0x18)); p.mat = M::WOOD; s.add(p, Float::STILL); } }
+        }
+    }
+}
+
+/// RECURSIVE spire generator — the heart of the Fractal Spires world. Draws a tapered crystal shaft, then spawns
+/// a few child shafts from near its crown, each shorter/thinner and bent outward, and recurses. Because every
+/// generation reuses this one rule, detail STACKS on its own: raise `depth` and the whole tower gains finer
+/// self-similar crystal growth with zero extra planning. Tips glow; the dynamic LOD/cull drop far generations.
+fn recurse_spire(s: &mut Scene, base: Vec3, dir: Vec3, len: f32, rad: f32, depth: u32, seed: i32, lo: Color32, hi: Color32, glow: Color32) {
+    use std::f32::consts::TAU;
+    let top = addv(base, mulv(dir, len));
+    let midp = addv(base, mulv(dir, len * 0.5));
+    let mut seg0 = m3::tube(base, midp, rad, 6, lo); m3::tint_up(&mut seg0, hi, lo); seg0.mat = M::STONE; seg0.emissive = 0.16; s.add(seg0, Float::STILL);
+    let mut seg1 = m3::tube(midp, top, rad * 0.62, 6, mix_rgb(lo, hi, 0.5)); m3::tint_up(&mut seg1, hi, lo); seg1.mat = M::STONE; seg1.emissive = 0.24; s.add(seg1, Float::STILL);
+    if depth == 0 || len < 0.7 {
+        let mut tip = m3::uv_sphere(top, rad * 1.9, 6, 5, glow); tip.mat = M::STONE; tip.emissive = 2.2; s.add(tip, Float { amp: 0.05, speed: 0.6, phase: hash(seed, 9) * 6.28, drift: 0.0 });
+        return;
+    }
+    let up = if dir.y.abs() < 0.92 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+    let px = normv(crossv(dir, up));
+    let pz = normv(crossv(dir, px));
+    let nch = 2 + (hash(seed, 1) * 1.9) as u32; // 2..3 children — keeps the recursion affordable
+    for ci in 0..nch {
+        let a = TAU * ci as f32 / nch as f32 + hash(seed, 2) * TAU;
+        let bend = 0.42 + hash(seed + ci as i32, 3) * 0.7;
+        let perp = addv(mulv(px, a.cos()), mulv(pz, a.sin()));
+        let cdir = normv(addv(dir, mulv(perp, bend)));
+        let clen = len * (0.5 + hash(seed + ci as i32, 4) * 0.22);
+        let cbase = addv(base, mulv(dir, len * (0.62 + hash(seed + ci as i32, 5) * 0.34)));
+        recurse_spire(s, cbase, cdir, clen, rad * 0.6, depth - 1, seed.wrapping_mul(7).wrapping_add(ci as i32 * 13 + 1), lo, hi, glow);
+    }
+}
+
+/// FRACTAL SPIRES — a supersized nocturnal crystal world built almost entirely by `recurse_spire`. A vast dark
+/// reflective plain scattered with self-similar crystal towers at varied scale (sqrt areal spread, bigger the
+/// farther out → distant monuments), each tower a single recursive call. The recursion stacks the detail; the
+/// frustum cull + dynamic LOD keep it cheap (far generations dissolve into the dark).
+/// RECURSIVE citadel tower — a subdivision-style recursion (counterpart to recurse_spire's branching). Draws a
+/// cylindrical drum with a cornice + lit windows, then stacks a SMALLER drum on its crown and (at upper levels)
+/// rings the crown with corner turrets, each of which recurses. One rule → a whole self-similar castle that
+/// stacks finer detail every time `depth` rises, no hand-placement.
+fn recurse_citadel(s: &mut Scene, cx: f32, cz: f32, base_y: f32, rad: f32, h: f32, depth: u32, seed: i32, lo: Color32, hi: Color32, flag: Color32) {
+    use std::f32::consts::TAU;
+    let mut drum = m3::tube(v(cx, base_y, cz), v(cx, base_y + h, cz), rad, 14, lo);
+    m3::tint_up(&mut drum, hi, lo); drum.mat = M::STONE; drum.emissive = 0.05; s.add(drum, Float::STILL);
+    let mut cor = m3::torus(v(cx, base_y + h, cz), rad * 1.12, rad * 0.12, 16, 7, hi); cor.mat = M::STONE; cor.emissive = 0.05; s.add(cor, Float::STILL);
+    let nwin = (rad * 2.0) as u32 + 3;
+    for w in 0..nwin {
+        let a = TAU * w as f32 / nwin as f32 + hash(seed, 30);
+        let lit = hash(seed + w as i32, 31) > 0.5;
+        let (wx, wz) = (cx + a.cos() * rad * 1.01, cz + a.sin() * rad * 1.01);
+        let mut win = m3::panel(v(wx, base_y + h * 0.55, wz), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), 0.34 * rad, h * 0.3, if lit { c(0xf0, 0xce, 0x82) } else { c(0x3a, 0x2c, 0x1c) });
+        win.mat = M::PAPER; if lit { win.emissive = 0.6; } s.add(win, Float::STILL);
+    }
+    if depth == 0 || rad < 0.5 {
+        let mut roof = m3::dome_cap(v(cx, base_y + h, cz), rad * 1.1, rad * 1.6, 0.0, 14, 6, mix_rgb(lo, hi, 0.4)); roof.mat = M::STONE; roof.emissive = 0.06; s.add(roof, Float::STILL);
+        let ptop = base_y + h + rad * 1.6 + rad * 1.3;
+        let mut pole = m3::tube(v(cx, base_y + h + rad * 1.6, cz), v(cx, ptop, cz), 0.04, 3, hi); pole.mat = M::STONE; s.add(pole, Float::STILL);
+        let mut pen = m3::panel(v(cx + 0.42, ptop - 0.28, cz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 0.8, 0.45, flag); pen.mat = M::PAPER; pen.emissive = 0.22; s.add(pen, Float { amp: 0.08, speed: 0.9, phase: hash(seed, 9) * 6.28, drift: 0.14 });
+        return;
+    }
+    recurse_citadel(s, cx, cz, base_y + h, rad * (0.58 + hash(seed, 4) * 0.12), h * (0.82 + hash(seed, 5) * 0.1), depth - 1, seed.wrapping_mul(7).wrapping_add(1), lo, hi, flag);
+    if depth >= 2 { // corner turrets ring the crown at upper levels, each recursing one generation down
+        let nt = 2 + (hash(seed, 6) * 2.0) as u32; // 2..3
+        for t in 0..nt {
+            let a = TAU * t as f32 / nt as f32 + hash(seed, 7) * TAU;
+            let tr = rad * 0.82;
+            recurse_citadel(s, cx + a.cos() * tr, cz + a.sin() * tr, base_y + h, rad * 0.32, h * 0.72, depth - 1, seed.wrapping_mul(13).wrapping_add(t as i32 * 5 + 3), lo, hi, flag);
+        }
+    }
+}
+
+/// RECURSIVE CITADEL — a supersized sunlit world built by `recurse_citadel`. A warm sandstone plain scattered with
+/// fractal castle-towers at varied scale (sqrt areal spread, scale grows with distance → near keeps to far
+/// citadels), low ringing courtyard walls, date-palms, and soft dunes. The recursion stacks the detail; cull+LOD
+/// keep it affordable.
+fn citadel() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let yf = -3.4_f32;
+    let pr = env_params();
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.4);
+    let (lo, hi) = (c(0x9a, 0x7e, 0x52), c(0xe2, 0xc8, 0x98)); // sandstone body → sunlit crown
+    let flags = [c(0x4a, 0x74, 0xb0), c(0xc0, 0x5a, 0x42), c(0xd0, 0xb0, 0x50)];
+    let world_r = 110.0 * sc;
+    let mut plain = m3::disc(v(0.0, yf, 0.0), world_r, 150, c(0xc2, 0xa8, 0x78));
+    m3::tint_up(&mut plain, c(0xd8, 0xc0, 0x90), c(0xa6, 0x8c, 0x60)); plain.mat = M::STONE; plain.emissive = 0.03; s.add(plain, Float::STILL);
+    for k in 0..40 { // soft DUNES — low broad humps for desert texture
+        let a = hash(k, 60) * TAU; let rr = hash(k, 61).sqrt() * world_r * 0.92;
+        let (dx, dz) = (a.cos() * rr, a.sin() * rr);
+        let mut dune = m3::uv_sphere(v(dx, yf - 1.6, dz), (3.0 + hash(k, 62) * 6.0) * sc, 10, 6, c(0xcc, 0xb2, 0x80));
+        m3::scale3(&mut dune, 1.0, 0.28, 1.0); m3::tint_up(&mut dune, c(0xdc, 0xc4, 0x94), c(0xb0, 0x96, 0x66)); dune.mat = M::STONE; s.add(dune, Float::STILL);
+    }
+    let nciti = (15.0 + pr.nodes as f32 / 24.0).min(38.0) as u32;
+    for k in 0..nciti {
+        let a = hash(k as i32, 10) * TAU;
+        let rr = 9.0 * sc + hash(k as i32, 11).sqrt() * (world_r * 0.88 - 9.0 * sc);
+        let (sx, sz) = (a.cos() * rr, a.sin() * rr);
+        let dscale = sc * (0.85 + (rr / world_r) * 3.2 + hash(k as i32, 12) * 1.0);
+        let rad = (1.8 + hash(k as i32, 13) * 1.6) * dscale;
+        let h = (3.0 + hash(k as i32, 14) * 2.5) * dscale;
+        let depth = 3 + (hash(k as i32, 15) > 0.7) as u32; // mostly 3, some 4 generations
+        let flag = flags[(hash(k as i32, 16) * 3.0) as usize % 3];
+        recurse_citadel(&mut s, sx, sz, yf, rad, h, depth, 200 + k as i32 * 37, lo, hi, flag);
+        if hash(k as i32, 17) > 0.45 { // a low ringing courtyard wall around some keeps
+            let mut ring = m3::wall_ring(v(sx, yf, sz), rad * 2.4, 1.2 * dscale.min(2.0), 40, lo);
+            m3::tint_up(&mut ring, hi, lo); ring.mat = M::STONE; ring.emissive = 0.04; s.add(ring, Float::STILL);
+        }
+        if hash(k as i32, 18) > 0.5 { // a date-palm or two at the base
+            for p in 0..(1 + (hash(k as i32, 19) * 2.0) as u32) {
+                let pa = hash(k as i32 + p as i32, 20) * TAU; let pr2 = rad * (1.6 + hash(k as i32 + p as i32, 21));
+                let (px, pz) = (sx + pa.cos() * pr2, sz + pa.sin() * pr2);
+                let ph = (4.0 + hash(k as i32 + p as i32, 22) * 3.0) * sc;
+                let mut trunk = m3::tube(v(px, yf, pz), v(px, yf + ph, pz), 0.22 * sc, 6, c(0x7a, 0x5e, 0x3a)); trunk.mat = M::WOOD; s.add(trunk, Float::STILL);
+                let mut fronds = m3::leaf_cluster(v(px, yf + ph, pz), 1.6 * sc, (700 + k + p) as u32, c(0x5a, 0x80, 0x36));
+                m3::tint_up(&mut fronds, c(0x76, 0x9c, 0x44), c(0x3a, 0x56, 0x24)); fronds.mat = M::MOSS; s.add(fronds, Float { amp: 0.06, speed: 0.6, phase: hash(k as i32 + p as i32, 23) * 6.28, drift: 0.07 });
+            }
+        }
+    }
+    organic_boundary(&mut s, world_r * 0.95, yf, 6000, c(0x86, 0x6e, 0x46), c(0xcc, 0xae, 0x7e), M::STONE, c(0x86, 0xa0, 0x52), true, sc); // sandstone mesa cliffs ringing the desert, scrub clinging
+    s
+}
+
+fn fractal_spires() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let yf = -3.4_f32;
+    let pr = env_params();
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.4);
+    let (lo, hi) = (c(0x26, 0x34, 0x52), c(0x7a, 0xb6, 0xe0)); // crystal body: indigo → ice
+    let glows = [c(0x6a, 0xe6, 0xd2), c(0xa6, 0x8c, 0xff), c(0x66, 0xc0, 0xf0)];
+    let world_r = 120.0 * sc;
+    let mut plain = m3::disc(v(0.0, yf, 0.0), world_r, 160, c(0x0c, 0x12, 0x20));
+    m3::tint_up(&mut plain, c(0x18, 0x22, 0x38), c(0x08, 0x0d, 0x18)); plain.mat = M::STONE; plain.emissive = 0.04; s.add(plain, Float::STILL);
+    let mut film = m3::disc(v(0.0, yf + 0.02, 0.0), world_r * 0.98, 140, c(0x2a, 0x4a, 0x66)); film.mat = M::WATER; film.emissive = 0.12; m3::set_alpha(&mut film, 40); s.add(film, Float::STILL); // reflecting film
+    // SCATTERED RECURSIVE SPIRES — sqrt areal spread; scale grows with distance (near crystals → far monuments)
+    let nspire = (24.0 + pr.nodes as f32 / 18.0).min(54.0) as u32;
+    for k in 0..nspire {
+        let a = hash(k as i32, 10) * TAU;
+        let rr = 8.0 * sc + hash(k as i32, 11).sqrt() * (world_r * 0.9 - 8.0 * sc);
+        let (sx, sz) = (a.cos() * rr, a.sin() * rr);
+        let dscale = sc * (0.8 + (rr / world_r) * 4.5 + hash(k as i32, 12) * 1.4);
+        let len = (6.0 + hash(k as i32, 13) * 6.0) * dscale;
+        let rad = (0.5 + hash(k as i32, 14) * 0.4) * dscale;
+        let depth = 3 + (hash(k as i32, 15) > 0.66) as u32; // mostly 3, some 4 generations
+        let lean = normv(v((hash(k as i32, 16) - 0.5) * 0.3, 1.0, (hash(k as i32, 17) - 0.5) * 0.3));
+        let glow = glows[(hash(k as i32, 18) * 3.0) as usize % 3];
+        recurse_spire(&mut s, v(sx, yf, sz), lean, len, rad, depth, 100 + k as i32 * 31, lo, hi, glow);
+        if hash(k as i32, 19) > 0.6 { // some spires rise from a rippling pool of glow
+            let mut pool = m3::disc(v(sx, yf + 0.05, sz), rad * 4.0, 24, c(0x1a, 0x3a, 0x48)); pool.mat = M::WATER; pool.emissive = 0.2; m3::set_alpha(&mut pool, 150); s.add(pool, Float::STILL);
+            ripple_rings(&mut s, sx, sz, yf + 0.06, rad * 3.5, 3, glow);
+        }
+    }
+    // DRIFTING MOTES — faint glowing dust rising through the dark, density-scaled by quality/power
+    for k in 0..(70.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 20) * TAU; let rr = hash(k as i32, 21).sqrt() * world_r * 0.5;
+        let (mx, mz) = (a.cos() * rr, a.sin() * rr);
+        let my = yf + 1.0 + hash(k as i32, 22) * 14.0 * sc;
+        let mut mote = m3::uv_sphere(v(mx, my, mz), 0.12 + hash(k as i32, 23) * 0.16, 5, 4, glows[(hash(k as i32, 24) * 3.0) as usize % 3]);
+        mote.mat = M::STONE; mote.emissive = 1.6; s.add(mote, Float { amp: 0.5 + hash(k as i32, 25), speed: 0.3, phase: hash(k as i32, 26) * 6.28, drift: 0.4 });
+    }
+    organic_boundary(&mut s, world_r * 0.95, yf, 5000, c(0x1a, 0x22, 0x36), c(0x46, 0x5e, 0x82), M::STONE, c(0x3a, 0x6a, 0x70), false, sc); // dark crystal escarpment ring → the world falls into void beyond
+    s
+}
+
+/// RECURSIVE jungle tree — branching recursion with foliage. A bark shaft, then 2-3 child branches fanning via a
+/// perpendicular frame, each recursing; leafy canopy clusters bloom at the tips and sometimes mid-branch. One
+/// rule grows a full self-similar tree; detail stacks with depth. Used to clothe the hollow planet's inner shell.
+/// ORGANIC BOUNDARY — terminate an open world the way real geography does, not with a flat rim or a fog cut. An
+/// irregular ring of eroded CLIFF masses rises OUTWARD (strata shading dark base → lit crown), TALUS rubble spills
+/// inward from each (the debris of erosion), and VEGETATION clings to the ledges. Gaps + radial jitter keep it
+/// asymmetric. The cliffs occlude the hard disc edge and imply an uncrossable void beyond — the world reads as
+/// continuing past the player's reach instead of sitting on a table. (Applied to the supersized open maps.)
+fn organic_boundary(s: &mut Scene, ring_r: f32, yf: f32, seed: i32, lo: Color32, hi: Color32, mat: f32, veg: Color32, has_veg: bool, sc: f32) {
+    use std::f32::consts::TAU;
+    let n = 56;
+    for k in 0..n {
+        if hash(k, 70) > 0.93 { continue; } // occasional GAP in the rim (a pass / ravine) → not a continuous wall
+        let a = TAU * k as f32 / n as f32 + (hash(k, 1) - 0.5) * 0.14;
+        let rj = ring_r + (hash(k, 2) - 0.5) * 9.0 * sc;
+        let (cx, cz) = (a.cos() * rj, a.sin() * rj);
+        let h = (9.0 + hash(k, 3) * 24.0) * sc;
+        let w = (5.0 + hash(k, 4) * 8.0) * sc;
+        let mut cliff = m3::rock(v(cx, yf - 1.0, cz), w, (seed + k) as u32, lo);
+        m3::scale3(&mut cliff, 1.0, (h / w).max(1.2), 1.0);           // stretch into an escarpment
+        m3::tint_height(&mut cliff, yf, yf + h, lo, hi);              // strata: eroded dark base → lit crown
+        cliff.mat = mat; cliff.emissive = 0.04; s.add(cliff, Float::STILL);
+        for t in 0..(3 + (hash(k, 5) * 4.0) as u32) {                // TALUS rubble spilling inward
+            let tr = w * 0.6 + hash(k + t as i32, 6) * w * 1.3;
+            let ta = a + (hash(k + t as i32, 7) - 0.5) * 0.4;
+            let (tx, tz) = (ta.cos() * (rj - tr), ta.sin() * (rj - tr));
+            let mut rub = m3::rock(v(tx, yf, tz), (0.6 + hash(k + t as i32, 8) * 1.5) * sc, (seed + k * 7 + t as i32) as u32, mix_rgb(lo, hi, 0.3)); rub.mat = mat; rub.emissive = 0.03; s.add(rub, Float::STILL);
+        }
+        if has_veg && hash(k, 9) > 0.4 {                             // VEGETATION clinging to the ledges
+            let mut v0 = m3::leaf_cluster(v(cx, yf + h * 0.62, cz), (1.2 + hash(k, 10)) * sc, (seed + k * 3) as u32, veg);
+            m3::tint_up(&mut v0, veg, mix_rgb(veg, lo, 0.5)); v0.mat = M::MOSS; s.add(v0, Float { amp: 0.05, speed: 0.6, phase: hash(k, 11) * 6.28, drift: 0.06 });
+        }
+    }
+}
+
+fn recurse_tree(s: &mut Scene, base: Vec3, dir: Vec3, len: f32, rad: f32, depth: u32, seed: i32, blo: Color32, bhi: Color32, llo: Color32, lhi: Color32) {
+    use std::f32::consts::TAU;
+    let top = addv(base, mulv(dir, len));
+    let mut trunk = m3::tube(base, top, rad, 6, blo); m3::tint_up(&mut trunk, bhi, blo); trunk.mat = M::WOOD; s.add(trunk, Float::STILL);
+    if depth == 0 || len < 1.3 {
+        let lc = mix_rgb(llo, lhi, hash(seed, 8));
+        let mut leaves = m3::leaf_cluster(top, len * 0.9 + rad * 2.2, seed as u32, lc);
+        m3::tint_up(&mut leaves, lhi, llo); leaves.mat = M::MOSS; leaves.emissive = 0.08;
+        s.add(leaves, Float { amp: 0.08, speed: 0.7, phase: hash(seed, 9) * 6.28, drift: 0.1 });
+        return;
+    }
+    let up = if dir.y.abs() < 0.92 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+    let px = normv(crossv(dir, up));
+    let pz = normv(crossv(dir, px));
+    let nch = 2 + (hash(seed, 1) * 2.0) as u32; // 2..3
+    for ci in 0..nch {
+        let a = TAU * ci as f32 / nch as f32 + hash(seed, 2) * TAU;
+        let bend = 0.4 + hash(seed + ci as i32, 3) * 0.7;
+        let perp = addv(mulv(px, a.cos()), mulv(pz, a.sin()));
+        let cdir = normv(addv(dir, mulv(perp, bend)));
+        let clen = len * (0.6 + hash(seed + ci as i32, 4) * 0.2);
+        let cbase = addv(base, mulv(dir, len * (0.6 + hash(seed + ci as i32, 5) * 0.35)));
+        recurse_tree(s, cbase, cdir, clen, rad * 0.62, depth - 1, seed.wrapping_mul(7).wrapping_add(ci as i32 * 13 + 1), blo, bhi, llo, lhi);
+    }
+    if hash(seed, 6) > 0.5 {
+        let mut leaves = m3::leaf_cluster(addv(base, mulv(dir, len * 0.85)), len * 0.5, (seed.wrapping_add(99)) as u32, mix_rgb(llo, lhi, 0.5));
+        m3::tint_up(&mut leaves, lhi, llo); leaves.mat = M::MOSS; s.add(leaves, Float { amp: 0.06, speed: 0.6, phase: hash(seed, 7) * 6.28, drift: 0.08 });
+    }
+}
+
+/// HOLLOW JUNGLE — a supersized world inside a hollow rock planet. The "ground" is the inner face of a vast stone
+/// shell (normals flipped inward), clothed with recursive jungle trees that grow inward toward the open hollow,
+/// plus grass and boulders. A translucent OCEAN floats free at the heart — rippling, glowing, shedding drifting
+/// droplets and a couple of falls — lit by a small suspended sun. The recursion stacks the canopy; cull/LOD drop
+/// the far side of the shell so only the hemisphere around you is drawn.
+fn hollow_jungle() -> Scene {
+    use std::f32::consts::{TAU, PI};
+    let mut s = Scene::new();
+    let pr = env_params();
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.2);
+    let rr = 78.0 * sc;                 // interior radius
+    let cen = v(0.0, 0.0, 0.0);
+    // INNER SHELL — a big stone sphere; flip its normals inward so the interior lights toward the central sun
+    let mut shell = m3::uv_sphere(cen, rr, 56, 40, c(0x3c, 0x46, 0x38));
+    for n in &mut shell.norms { *n = mulv(*n, -1.0); }
+    m3::tint_height(&mut shell, -rr, rr, c(0x2e, 0x38, 0x2a), c(0x52, 0x5e, 0x4a)); shell.mat = M::STONE; shell.emissive = 0.05; s.add(shell, Float::STILL);
+    // a green inner "moss skin" sphere just inside the rock → reads as jungle ground curving up all around
+    let mut skin = m3::uv_sphere(cen, rr - 0.5, 48, 34, c(0x3a, 0x60, 0x30));
+    for n in &mut skin.norms { *n = mulv(*n, -1.0); }
+    m3::tint_height(&mut skin, -rr, rr, c(0x2c, 0x4c, 0x24), c(0x58, 0x84, 0x40)); skin.mat = M::MOSS; skin.emissive = 0.05; m3::set_alpha(&mut skin, 235); s.add(skin, Float::STILL);
+    // RECURSIVE JUNGLE — trees evenly spread over the inner surface (golden-angle spiral), each growing inward
+    let (blo, bhi) = (c(0x4a, 0x36, 0x22), c(0x7a, 0x5e, 0x3c));
+    let (llo, lhi) = (c(0x2e, 0x52, 0x22), c(0x74, 0xa6, 0x46));
+    let ntree = (44.0 + pr.nodes as f32 / 12.0).min(78.0) as u32;
+    for k in 0..ntree {
+        let i = k as f32 + 0.5;
+        let phi = (1.0 - 2.0 * i / ntree as f32).clamp(-1.0, 1.0).acos();
+        let theta = PI * (1.0 + 5.0_f32.sqrt()) * i + hash(k as i32, 40);
+        let n = v(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin()); // unit dir on sphere
+        let base = mulv(n, rr - 0.4);
+        let dir = mulv(n, -1.0);                 // grow inward
+        let len = (11.0 + hash(k as i32, 41) * 10.0) * sc;
+        let rad = (0.4 + hash(k as i32, 42) * 0.4) * sc;
+        let depth = 3 + (hash(k as i32, 43) > 0.62) as u32;
+        recurse_tree(&mut s, base, dir, len, rad, depth, 300 + k as i32 * 29, blo, bhi, llo, lhi);
+        // grass tuft + a boulder near the base, lying on the shell
+        let mut grass = m3::leaf_cluster(mulv(n, rr - 0.6), 1.0 * sc, (600 + k) as u32, c(0x4c, 0x7a, 0x34));
+        m3::tint_up(&mut grass, c(0x6e, 0x9c, 0x44), c(0x34, 0x54, 0x24)); grass.mat = M::MOSS; s.add(grass, Float { amp: 0.05, speed: 0.7, phase: hash(k as i32, 44) * 6.28, drift: 0.06 });
+        if hash(k as i32, 45) > 0.6 {
+            let bn = addv(mulv(n, rr - 0.5), mulv(dir, 0.0));
+            let mut rock = m3::rock(bn, (0.8 + hash(k as i32, 46) * 1.2) * sc, (700 + k) as u32, c(0x5a, 0x56, 0x4a)); rock.mat = M::STONE; s.add(rock, Float::STILL);
+        }
+    }
+    // FLOATING OCEAN — a translucent water sphere suspended in the hollow, off-centre, glowing + rippling
+    let oc = v(rr * 0.30, rr * 0.16, -rr * 0.22);
+    let orad = rr * 0.24;
+    let mut glowcore = m3::uv_sphere(oc, orad * 0.7, 18, 14, c(0x9a, 0xe0, 0xe6)); glowcore.mat = M::WATER; glowcore.emissive = 0.6; s.add(glowcore, Float::STILL); // inner glow seen through the water
+    let mut ocean = m3::uv_sphere(oc, orad, 36, 28, c(0x2c, 0x88, 0xa0));
+    m3::tint_up(&mut ocean, c(0x66, 0xc6, 0xd2), c(0x10, 0x52, 0x66)); ocean.mat = M::WATER; ocean.emissive = 0.22; m3::set_alpha(&mut ocean, 140);
+    s.add(ocean, Float { amp: 0.25, speed: 0.4, phase: 0.0, drift: 0.0 }); // the whole ocean bobs gently
+    for r in 0..3 { ripple_rings(&mut s, oc.x, oc.z, oc.y + orad * (0.7 - 0.2 * r as f32), orad * (0.9 - 0.2 * r as f32), 3, c(0x9a, 0xe0, 0xe6)); }
+    for d in 0..2 { waterfall(&mut s, oc.x + (hash(d, 50) - 0.5) * orad, oc.z + (hash(d, 51) - 0.5) * orad, oc.y - orad * 0.7, oc.y - orad * 2.6, 1.4 * sc, c(0x8a, 0xc8, 0xd6), 0); } // falls dripping off the floating sea
+    for k in 0..(28.0 * render_quality()) as u32 { // droplets drifting off the floating ocean
+        let a = hash(k as i32, 52) * TAU; let el = (hash(k as i32, 53) - 0.5) * PI; let dr = orad * (1.15 + hash(k as i32, 54) * 0.7);
+        let p = addv(oc, v(a.cos() * el.cos() * dr, el.sin() * dr, a.sin() * el.cos() * dr));
+        let mut drop = m3::uv_sphere(p, 0.18 + hash(k as i32, 55) * 0.3, 6, 5, c(0x9a, 0xe0, 0xe6)); drop.mat = M::WATER; drop.emissive = 0.5;
+        s.add(drop, Float { amp: 0.6, speed: 0.4, phase: hash(k as i32, 56) * 6.28, drift: 0.4 });
+    }
+    // small suspended SUN lighting the interior (offset from the graph at centre)
+    let sunp = v(-rr * 0.34, rr * 0.3, rr * 0.18);
+    let mut sun = m3::uv_sphere(sunp, 2.4 * sc, 16, 12, c(0xff, 0xe6, 0xa0)); sun.mat = M::STONE; sun.emissive = 6.0; s.add(sun, Float { amp: 0.2, speed: 0.3, phase: 0.0, drift: 0.0 });
+    // drifting POLLEN motes in the hollow air
+    for k in 0..(40.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 60) * TAU; let el = (hash(k as i32, 61) - 0.5) * PI; let dr = hash(k as i32, 62).sqrt() * rr * 0.6;
+        let p = addv(cen, v(a.cos() * el.cos() * dr, el.sin() * dr, a.sin() * el.cos() * dr));
+        let mut mote = m3::uv_sphere(p, 0.1 + hash(k as i32, 63) * 0.14, 4, 4, c(0xe6, 0xe0, 0x9a)); mote.mat = M::STONE; mote.emissive = 1.2;
+        s.add(mote, Float { amp: 0.5 + hash(k as i32, 64), speed: 0.25, phase: hash(k as i32, 65) * 6.28, drift: 0.4 });
+    }
+    s
+}
+
+/// RECURSIVE yellow-brick road — lays a gently wandering ribbon of golden brick, then at its end branches into
+/// one or two narrower side-roads that wander and branch again, down to `depth`. One rule grows a whole forking
+/// road network. Returns the trunk's end point (where the Emerald City is planted).
+fn recurse_road(s: &mut Scene, x0: f32, z0: f32, ang: f32, len: f32, width: f32, depth: u32, seed: i32, yf: f32, sc: f32) -> (f32, f32) {
+    let step = 1.7 * sc;
+    let steps = (len / step).max(2.0) as usize;
+    let (mut x, mut z, mut a) = (x0, z0, ang);
+    for i in 0..steps {
+        a += (hash(seed, i as i32) - 0.5) * 0.34;
+        let (nx, nz) = (x + a.cos() * step, z + a.sin() * step);
+        let dir = v(a.cos(), 0.0, a.sin());
+        let perp = v(-a.sin(), 0.0, a.cos());
+        let mut brick = m3::panel(v((x + nx) * 0.5, yf + 0.1, (z + nz) * 0.5), dir, perp, step * 1.06, width, c(0xf0, 0xcc, 0x40));
+        m3::tint_up(&mut brick, c(0xf8, 0xe0, 0x66), c(0xcc, 0xa6, 0x32)); brick.mat = M::STONE; brick.emissive = 0.1; s.add(brick, Float::STILL);
+        if i % 2 == 0 { let mut line = m3::panel(v(x, yf + 0.07, z), perp, dir, width, 0.08, c(0xb0, 0x8a, 0x2c)); line.mat = M::STONE; s.add(line, Float::STILL); } // mortar courses
+        x = nx; z = nz;
+    }
+    if depth > 0 {
+        let nb = 1 + (hash(seed, 900) > 0.55) as u32;
+        for b in 0..nb {
+            let ba = a + (hash(seed, 901 + b as i32) - 0.5) * 1.5;
+            recurse_road(s, x, z, ba, len * 0.58, (width * 0.78).max(1.1), depth - 1, seed.wrapping_mul(7).wrapping_add(b as i32 * 13 + 1), yf, sc);
+        }
+    }
+    (x, z)
+}
+
+/// A simple SCARECROW for the cornfields — cross-post, straw head + hands, a tattered shirt.
+fn scarecrow(s: &mut Scene, x: f32, z: f32, yf: f32, seed: i32, sc: f32) {
+    let h = 3.2 * sc;
+    let mut post = m3::tube(v(x, yf, z), v(x, yf + h, z), 0.12 * sc, 4, c(0x6a, 0x52, 0x32)); post.mat = M::WOOD; s.add(post, Float::STILL);
+    let arm = h * 0.66;
+    let mut cross = m3::tube(v(x - 1.1 * sc, yf + arm, z), v(x + 1.1 * sc, yf + arm, z), 0.1 * sc, 4, c(0x6a, 0x52, 0x32)); cross.mat = M::WOOD; s.add(cross, Float::STILL);
+    let mut shirt = m3::panel(v(x, yf + arm - 0.5 * sc, z), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), 1.9 * sc, 1.5 * sc, c(0xb0, 0x5a, 0x46)); shirt.mat = M::PAPER; s.add(shirt, Float { amp: 0.05, speed: 0.8, phase: hash(seed, 1) * 6.28, drift: 0.08 });
+    let mut head = m3::uv_sphere(v(x, yf + h + 0.2 * sc, z), 0.45 * sc, 8, 6, c(0xd8, 0xb0, 0x54)); head.mat = M::MOSS; s.add(head, Float::STILL);
+    for hx in [-1.1f32, 1.1] { let mut straw = m3::leaf_cluster(v(x + hx * sc, yf + arm, z), 0.4 * sc, (seed + (hx > 0.0) as i32) as u32, c(0xd0, 0xae, 0x52)); straw.mat = M::MOSS; s.add(straw, Float::STILL); }
+}
+
+/// YELLOW BRICK ROAD — a storybook Oz world. A recursive forking yellow-brick road winds out from the graph across
+/// rolling green fields (poppies, corn, wildflowers) and recursive forests, to a distant glowing EMERALD CITY of
+/// recursive green towers. Rolling-hill organic boundary; recursion stacks the forests, road, and city.
+fn oz() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let yf = -3.4_f32;
+    let pr = env_params();
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.2);
+    let world_r = 95.0 * sc;
+    let mut plain = m3::disc(v(0.0, yf, 0.0), world_r, 150, c(0x3e, 0x68, 0x2e));
+    m3::tint_up(&mut plain, c(0x52, 0x7e, 0x38), c(0x30, 0x52, 0x22)); plain.mat = M::MOSS; plain.emissive = 0.02; s.add(plain, Float::STILL);
+    // EMERALD CITY direction + position (off-centre); the road leads to it
+    let cang = 0.6_f32; // fixed bearing so the road + city compose reliably
+    let (city_x, city_z) = (cang.cos() * world_r * 0.6, cang.sin() * world_r * 0.6);
+    // RECURSIVE YELLOW BRICK ROAD — from just outside the graph, winding out toward the city, branching
+    recurse_road(&mut s, cang.cos() * 11.0 * sc, cang.sin() * 11.0 * sc, cang, world_r * 0.55, 4.2 * sc, 3, 40, yf, sc);
+    // FIELDS — patches of poppies, corn, wildflowers across the meadow
+    let (blo, bhi) = (c(0x4a, 0x36, 0x22), c(0x76, 0x5a, 0x38));
+    let (llo, lhi) = (c(0x2c, 0x58, 0x24), c(0x6c, 0xa4, 0x44));
+    for k in 0..(34.0 + pr.nodes as f32 / 20.0).min(60.0) as u32 {
+        let a = hash(k as i32, 10) * TAU; let rr = 12.0 * sc + hash(k as i32, 11).sqrt() * (world_r * 0.86 - 12.0 * sc);
+        let (fx, fz) = (a.cos() * rr, a.sin() * rr);
+        if (fx - city_x).hypot(fz - city_z) < world_r * 0.18 { continue; } // leave room for the city
+        let kind = (hash(k as i32, 12) * 3.0) as u32;
+        if kind == 0 { // POPPY field — low scarlet clusters
+            for p in 0..(8 + (hash(k as i32, 13) * 8.0) as u32) {
+                let (px, pz) = (fx + (hash(k as i32 + p as i32, 14) - 0.5) * 7.0 * sc, fz + (hash(k as i32 + p as i32, 15) - 0.5) * 7.0 * sc);
+                let mut pop = m3::leaf_cluster(v(px, yf + 0.5 * sc, pz), 0.55 * sc, (k * 9 + p) as u32, c(0xd2, 0x42, 0x3a));
+                m3::tint_up(&mut pop, c(0xe6, 0x60, 0x52), c(0x9a, 0x2c, 0x28)); pop.mat = M::MOSS; pop.emissive = 0.05; s.add(pop, Float { amp: 0.05, speed: 0.8, phase: hash(k as i32 + p as i32, 16) * 6.28, drift: 0.06 });
+            }
+        } else if kind == 1 { // CORN field — tall golden stalks + a scarecrow
+            for p in 0..(7 + (hash(k as i32, 17) * 7.0) as u32) {
+                let (px, pz) = (fx + (hash(k as i32 + p as i32, 18) - 0.5) * 7.0 * sc, fz + (hash(k as i32 + p as i32, 19) - 0.5) * 7.0 * sc);
+                let ch = (2.4 + hash(k as i32 + p as i32, 20) * 1.4) * sc;
+                let mut stalk = m3::tube(v(px, yf, pz), v(px, yf + ch, pz), 0.08 * sc, 4, c(0x8a, 0x9c, 0x40)); stalk.mat = M::MOSS; s.add(stalk, Float { amp: 0.06, speed: 0.9, phase: hash(k as i32 + p as i32, 21) * 6.28, drift: 0.1 });
+                let mut tassel = m3::leaf_cluster(v(px, yf + ch, pz), 0.4 * sc, (k * 11 + p) as u32, c(0xd8, 0xc0, 0x5a)); tassel.mat = M::MOSS; s.add(tassel, Float { amp: 0.06, speed: 0.9, phase: hash(k as i32 + p as i32, 22) * 6.28, drift: 0.1 });
+            }
+            if hash(k as i32, 23) > 0.5 { scarecrow(&mut s, fx, fz, yf, k as i32, sc); }
+        } else { // WILDFLOWER meadow — mixed bright dots
+            for p in 0..(10 + (hash(k as i32, 24) * 8.0) as u32) {
+                let (px, pz) = (fx + (hash(k as i32 + p as i32, 25) - 0.5) * 7.0 * sc, fz + (hash(k as i32 + p as i32, 26) - 0.5) * 7.0 * sc);
+                let fc = [c(0xe6, 0xd0, 0x5a), c(0xc8, 0x6a, 0xc0), c(0xe0, 0x9a, 0x4a), c(0x6a, 0x9c, 0xe0)][(hash(k as i32 + p as i32, 27) * 4.0) as usize % 4];
+                let mut fl = m3::leaf_cluster(v(px, yf + 0.35 * sc, pz), 0.3 * sc, (k * 13 + p) as u32, fc); fl.mat = M::MOSS; fl.emissive = 0.05; s.add(fl, Float { amp: 0.04, speed: 0.7, phase: hash(k as i32 + p as i32, 28) * 6.28, drift: 0.05 });
+            }
+        }
+    }
+    // RECURSIVE FORESTS — clusters of recursive trees in groves
+    for k in 0..(8.0 + pr.nodes as f32 / 60.0).min(16.0) as u32 {
+        let a = hash(k as i32, 30) * TAU + 0.5; let rr = 16.0 * sc + hash(k as i32, 31).sqrt() * (world_r * 0.82 - 16.0 * sc);
+        let (gx, gz) = (a.cos() * rr, a.sin() * rr);
+        if (gx - city_x).hypot(gz - city_z) < world_r * 0.2 { continue; }
+        for t in 0..(3 + (hash(k as i32, 32) * 4.0) as u32) {
+            let (tx, tz) = (gx + (hash(k as i32 + t as i32, 33) - 0.5) * 9.0 * sc, gz + (hash(k as i32 + t as i32, 34) - 0.5) * 9.0 * sc);
+            let len = (6.0 + hash(k as i32 + t as i32, 35) * 5.0) * sc;
+            recurse_tree(&mut s, v(tx, yf, tz), v(0.0, 1.0, 0.0), len, 0.5 * sc, 4, 400 + (k * 17 + t) as i32, blo, bhi, llo, lhi);
+        }
+    }
+    // EMERALD CITY — a tight cluster of glowing green recursive towers behind a wall, at the road's end
+    let emlo = c(0x1c, 0x6e, 0x4a); let emhi = c(0x52, 0xd0, 0x8a);
+    for t in 0..7 {
+        let a = hash(t, 40) * TAU; let rr = hash(t, 41).sqrt() * 9.0 * sc;
+        let th = (8.0 + hash(t, 42) * 9.0) * sc;
+        recurse_citadel(&mut s, city_x + a.cos() * rr, city_z + a.sin() * rr, yf, (1.6 + hash(t, 43) * 1.4) * sc, th * 0.32, 3, 500 + t * 23, emlo, emhi, c(0xc8, 0xe0, 0x70));
+    }
+    let mut wall = m3::wall_ring(v(city_x, yf, city_z), 12.0 * sc, 3.0 * sc, 48, emlo); m3::tint_up(&mut wall, emhi, emlo); wall.mat = M::STONE; wall.emissive = 0.14; s.add(wall, Float::STILL);
+    let mut glow = m3::disc(v(city_x, yf + 0.1, city_z), 12.0 * sc, 32, emhi); glow.mat = M::WATER; glow.emissive = 0.3; m3::set_alpha(&mut glow, 60); s.add(glow, Float::STILL); // emerald ground-glow
+    // ROLLING-HILL organic boundary (green downs with clinging woods)
+    organic_boundary(&mut s, world_r * 0.96, yf, 8000, c(0x46, 0x6a, 0x34), c(0x70, 0x9c, 0x4c), M::MOSS, c(0x3a, 0x60, 0x2c), true, sc);
+    s
+}
+
+/// FROZEN BIFROST BUNKER — a POI set-piece: a raised basalt dais (knotwork cornice) ringed by a sunken glacial-ice
+/// trench, centred on a shattered hexagonal glass pane whose upward dagger-shards glow with white energy bleeding
+/// from below, all under a shifting magenta/cyan aurora. Verticality (high ground vs moat) + storytelling light.
+fn bifrost() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let yf = -3.4_f32;
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.0);
+    let dais_r = 26.0 * sc;
+    // SUNKEN TRENCH RING — translucent glacial ice moat around the dais, scratched grooves, ash-water floor
+    let mut moat = m3::disc(v(0.0, yf - 3.0, 0.0), dais_r * 1.7, 80, c(0x16, 0x26, 0x34)); moat.mat = M::WATER; moat.emissive = 0.05; s.add(moat, Float::STILL);
+    for k in 0..40 {
+        let a = TAU * k as f32 / 40.0;
+        let mut ice = m3::panel(v(a.cos() * dais_r * 1.45, yf - 1.5, a.sin() * dais_r * 1.45), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), dais_r * 0.24, 3.0 * sc, c(0x6a, 0xa6, 0xc8));
+        m3::tint_up(&mut ice, c(0x9a, 0xd0, 0xe6), c(0x3a, 0x6e, 0x90)); ice.mat = M::WATER; ice.emissive = 0.1; m3::set_alpha(&mut ice, 180); s.add(ice, Float::STILL);
+    }
+    // CENTRAL BASALT DAIS — dark blue-grey, knotwork cornice torus, frost-packed
+    let mut dais = m3::tube(v(0.0, yf - 1.0, 0.0), v(0.0, yf + 0.4, 0.0), dais_r, 64, c(0x24, 0x2e, 0x42));
+    m3::tint_up(&mut dais, c(0x36, 0x44, 0x5e), c(0x18, 0x20, 0x30)); dais.mat = M::STONE; dais.emissive = 0.04; s.add(dais, Float::STILL);
+    let mut top = m3::disc(v(0.0, yf + 0.42, 0.0), dais_r, 64, c(0x2e, 0x3a, 0x52)); m3::tint_up(&mut top, c(0x3e, 0x4e, 0x6c), c(0x22, 0x2c, 0x40)); top.mat = M::STONE; top.emissive = 0.05; s.add(top, Float::STILL);
+    let mut cornice = m3::torus(v(0.0, yf + 0.4, 0.0), dais_r * 1.01, 0.8 * sc, 64, 8, c(0xc6, 0xd6, 0xe6)); cornice.mat = M::STONE; cornice.emissive = 0.06; s.add(cornice, Float::STILL); // frost-packed knotwork rim
+    // SHATTERED IRIDESCENT GLASS — a field of upward dagger-shards over a glowing white core, hue-shifting
+    let mut core = m3::uv_sphere(v(0.0, yf + 0.3, 0.0), dais_r * 0.34, 20, 14, c(0xe8, 0xf2, 0xff)); core.mat = M::WATER; core.emissive = 1.4; m3::set_alpha(&mut core, 150); s.add(core, Float { amp: 0.1, speed: 0.5, phase: 0.0, drift: 0.0 }); // white energy bleeding up
+    let irid = [c(0x7a, 0xe6, 0xf0), c(0xa6, 0x8c, 0xf0), c(0xe0, 0x7c, 0xe0), c(0xc6, 0xf0, 0xe6), c(0x8c, 0xb6, 0xf0)];
+    for k in 0..(60.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 1) * TAU; let rr = hash(k as i32, 2).sqrt() * dais_r * 0.62;
+        let (gx, gz) = (a.cos() * rr, a.sin() * rr);
+        let hgt = (1.4 + hash(k as i32, 3) * 3.4) * sc;
+        let col = irid[(hash(k as i32, 4) * 5.0) as usize % 5];
+        let mut shard = m3::rock(v(gx, yf + 0.4, gz), (0.5 + hash(k as i32, 5) * 0.5) * sc, (k + 7) as u32, col);
+        m3::scale3(&mut shard, 0.32, hgt, 0.32);                          // thin tall dagger
+        m3::tint_up(&mut shard, c(0xf0, 0xfa, 0xff), col); shard.mat = M::WATER; shard.emissive = 0.9 + hash(k as i32, 6) * 0.8; s.add(shard, Float { amp: 0.05, speed: 0.4, phase: hash(k as i32, 7) * 6.28, drift: 0.0 });
+    }
+    // AURORA — broad waving emissive ribbons high overhead in magenta/cyan: non-uniform storytelling light
+    for k in 0..7 {
+        let a = TAU * k as f32 / 7.0 + hash(k, 8) * 0.5;
+        let rr = (40.0 + hash(k, 9) * 36.0) * sc;
+        let hy = (26.0 + hash(k, 10) * 18.0) * sc;
+        let col = if k % 2 == 0 { c(0x46, 0xc8, 0xc0) } else { c(0xc0, 0x52, 0xc8) };
+        let mut band = m3::panel(v(a.cos() * rr, hy, a.sin() * rr), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), (30.0 + hash(k, 11) * 24.0) * sc, (10.0 + hash(k, 12) * 12.0) * sc, col);
+        m3::tint_up(&mut band, col, c(0x10, 0x18, 0x2c)); band.mat = M::WATER; band.emissive = 0.7; m3::set_alpha(&mut band, 70); s.add(band, Float { amp: 1.4, speed: 0.18, phase: hash(k, 13) * 6.28, drift: 0.6 });
+    }
+    for k in 0..(36.0 * render_quality()) as u32 { // frozen motes glinting in the aurora
+        let a = hash(k as i32, 20) * TAU; let rr = hash(k as i32, 21).sqrt() * dais_r * 1.6; let hy = yf + 1.0 + hash(k as i32, 22) * 22.0 * sc;
+        let mut m = m3::uv_sphere(v(a.cos() * rr, hy, a.sin() * rr), 0.1 + hash(k as i32, 23) * 0.12, 4, 4, irid[(hash(k as i32, 24) * 5.0) as usize % 5]); m.mat = M::WATER; m.emissive = 1.2; s.add(m, Float { amp: 0.6 + hash(k as i32, 25), speed: 0.25, phase: hash(k as i32, 26) * 6.28, drift: 0.4 });
+    }
+    s
+}
+
+/// TITAN'S RIBCAGE ALLEYWAY — a POI set-piece: a wide overgrown lane straddled by the colossal fossilised ribs of
+/// a fallen giant (chalky limestone bone, gouged to grey marrow), erupting from fractured marble paving strangled
+/// by algae fig-roots, flanked by dense recursive jungle, under knee-level yellow-green fog.
+fn titan_ribcage() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let yf = -3.4_f32;
+    let pr = env_params();
+    let sc = (map_radius() / 64.0).clamp(1.0, 2.0);
+    let half_w = 70.0 * sc; let half_l = 90.0 * sc;
+    // GROUND — fractured white Parian marble half-buried in black loamy soil
+    let mut soil = m3::disc(v(0.0, yf - 0.05, 0.0), (half_w.max(half_l)) * 1.3, 120, c(0x1c, 0x1a, 0x12)); soil.mat = M::MOSS; soil.emissive = 0.02; s.add(soil, Float::STILL);
+    for k in 0..(70.0 * render_quality()) as u32 { // cracked marble slabs poking through the soil
+        let (mx, mz) = ((hash(k as i32, 1) - 0.5) * 2.0 * half_w, (hash(k as i32, 2) - 0.5) * 2.0 * half_l);
+        let mut slab = m3::panel(v(mx, yf, mz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), (3.0 + hash(k as i32, 3) * 5.0) * sc, (3.0 + hash(k as i32, 4) * 5.0) * sc, c(0xc6, 0xc2, 0xb0));
+        m3::tint_up(&mut slab, c(0xdc, 0xd8, 0xc6), c(0x9a, 0x96, 0x84)); slab.mat = M::STONE; s.add(slab, Float::STILL);
+    }
+    // THE THREE COLOSSAL RIBS — fossilised bone arches straddling the central lane, pitted, gouged to grey marrow
+    let (bone_lo, bone_hi, marrow) = (c(0xb6, 0xae, 0x7e), c(0xe4, 0xdc, 0xae), c(0x86, 0x82, 0x74));
+    for r in 0..3 {
+        let lz = (r as f32 - 1.0) * half_l * 0.52;                       // three ribs down the lane
+        let span = half_w * 1.5; let rise = (44.0 + hash(r, 5) * 12.0) * sc;
+        let segs = 22;
+        for i in 0..segs {                                              // arch as a chain of tapered bone segments
+            let t0 = i as f32 / segs as f32; let t1 = (i + 1) as f32 / segs as f32;
+            let arc = |t: f32| { let ang = std::f32::consts::PI * t; v(-span * (ang).cos() * 0.5, yf + (ang).sin() * rise, lz + (hash(r, 6 + i as i32) - 0.5) * 2.0 * sc) };
+            let (p0, p1) = (arc(t0), arc(t1));
+            let rad = (3.4 - 2.0 * (t0 - 0.5).abs() * 2.0).max(1.2) * sc; // thicker at the base, taper to crown
+            let gouged = hash(r, 40 + i as i32) > 0.7;
+            let mut seg = m3::tube(p0, p1, rad, 8, if gouged { marrow } else { bone_lo });
+            m3::tint_up(&mut seg, bone_hi, bone_lo); seg.mat = M::STONE; seg.emissive = 0.05; s.add(seg, Float::STILL);
+        }
+    }
+    // STRANGLING FIG ROOTS + algae, erupting through the marble down the lane
+    for k in 0..(40.0 * render_quality()) as u32 {
+        let (rx, rz) = ((hash(k as i32, 10) - 0.5) * half_w, (hash(k as i32, 11) - 0.5) * 2.0 * half_l);
+        let h = (2.0 + hash(k as i32, 12) * 4.0) * sc;
+        let mut root = m3::tube(v(rx, yf, rz), v(rx + (hash(k as i32, 13) - 0.5) * 4.0 * sc, yf + h, rz + (hash(k as i32, 14) - 0.5) * 4.0 * sc), (0.3 + hash(k as i32, 15) * 0.4) * sc, 5, c(0x4a, 0x3e, 0x2c));
+        m3::tint_up(&mut root, c(0x5c, 0x7e, 0x3a), c(0x3a, 0x30, 0x22)); root.mat = M::MOSS; root.emissive = 0.04; s.add(root, Float::STILL); // algae-green sheen up top
+    }
+    // FLANKING JUNGLE CANOPY — dense recursive trees walling both sides of the lane
+    let (blo, bhi) = (c(0x3e, 0x2e, 0x1c), c(0x6a, 0x52, 0x32));
+    let (llo, lhi) = (c(0x32, 0x52, 0x22), c(0x6a, 0x9c, 0x40));
+    for side in [-1.0f32, 1.0] {
+        for k in 0..(16.0 + pr.nodes as f32 / 26.0).min(30.0) as u32 {
+            let tx = side * (half_w * 0.7 + hash(k as i32, 20) * half_w * 0.5);
+            let tz = (hash(k as i32 + (side > 0.0) as i32 * 99, 21) - 0.5) * 2.0 * half_l;
+            let len = (10.0 + hash(k as i32, 22) * 9.0) * sc;
+            recurse_tree(&mut s, v(tx, yf, tz), v(side * 0.18, 1.0, 0.0), len, 0.6 * sc, 4, 700 + k as i32 + (side > 0.0) as i32 * 333, blo, bhi, llo, lhi);
+        }
+    }
+    // KNEE-LEVEL yellow-green FOG — flat translucent haze sheets hanging low over the lane
+    for k in 0..14 {
+        let mut fog = m3::disc(v((hash(k, 30) - 0.5) * 2.0 * half_w, yf + 1.4 + hash(k, 31) * 1.2, (hash(k, 32) - 0.5) * 2.0 * half_l), (10.0 + hash(k, 33) * 10.0) * sc, 18, c(0xb6, 0xc2, 0x6a));
+        fog.mat = M::WATER; fog.emissive = 0.16; m3::set_alpha(&mut fog, 36); s.add(fog, Float { amp: 0.3, speed: 0.12, phase: hash(k, 34) * 6.28, drift: 0.5 });
+    }
+    organic_boundary(&mut s, (half_w.max(half_l)) * 1.18, yf, 9000, c(0x3a, 0x42, 0x28), c(0x60, 0x6c, 0x40), M::MOSS, c(0x4a, 0x70, 0x2c), true, sc);
+    s
+}
+
 fn build(palette_name: &str) -> Scene {
+    set_tree_bend(0.0, 0.0, 1.0, 0.0); // default varied bow; scenes override before their tree loops
+    set_foliage_tint(c(0x4c, 0x66, 0x26), c(0x9a, 0xb0, 0x46)); // default green; Forest overrides by season
     clear_colliders(); // the generator repopulates (only halls with solids emit any)
     // ROOM-VARIETY MODE: LOGSCOPE_ROOM=<n> bypasses the themed scene and builds one of the procedural
     // "inspired rooms" so we can survey a broad range of mind-spaces to choose from.
@@ -3469,11 +5197,46 @@ fn build(palette_name: &str) -> Scene {
         "Forest" => forest(),
         "Treehouse" => treehouse(),
         "Mansion Garden" => mansion_garden(),
+        "Alley" => alley(),
+        "Fractal Spires" => fractal_spires(),
+        "Recursive Citadel" => citadel(),
+        "Hollow Jungle" => hollow_jungle(),
+        "Yellow Brick Road" => oz(),
+        "Frozen Bifrost" => bifrost(),
+        "Titan's Ribcage" => titan_ribcage(),
         _ => islands(),
     };
+    // PHYSICAL UI — a scene-styled "context surface" set just outside the graph's footprint, facing it. The
+    // material + stand match the world (wood board / stone tablet / glass pane / marble plaque). Start on the
+    // physical-UI concept; the graph already renders as physical beads, this gives the reading panel a home too.
+    {
+        let ep = env_params();
+        let (ui_style, ui_floor, floating) = match palette_name {
+            "Alley" | "Forest" | "Canopy" => (0u32, -3.2f32, false),
+            "Treehouse" => (0, -1.0, true),
+            "Slate" => (1, -4.4, false),
+            "Old Library" => (1, -3.0, false),
+            "Archive" | "Reading Room" => (1, -3.1, false),
+            "Mansion Garden" => (3, -3.4, false),
+            "Atlantis" => (2, -3.0, false),
+            "Fractal Spires" => (1, -3.4, false),
+            "Recursive Citadel" => (1, -3.4, false),
+            "Hollow Jungle" => (0, -3.4, true),
+            "Yellow Brick Road" => (1, -3.4, false),
+            "Frozen Bifrost" => (2, -3.0, true),
+            "Titan's Ribcage" => (1, -3.4, false),
+            "Mistfall" => (2, -1.6, false),
+            "Cloudscape" | "Folding@home" => (2, -0.6, true),
+            _ => (1, -3.0, false),
+        };
+        let px = -(ep.ext_x as f32 * 0.5 + 5.0);
+        let pz = ep.ext_z as f32 * 0.5 + 3.0;
+        let face = (-pz).atan2(-px); // face back toward the graph at the origin
+        physical_ui_panel(&mut s, ui_style, v(px, ui_floor, pz), face, 3.4, 2.1, floating, 0x5151);
+    }
     // Atlantis is SELF-ENCLOSING (its own ribbed glass dome + perimeter wall + open ocean beyond), so it does
     // NOT get the generic outer room — that second shell was the "giant structure" dominating every overview.
-    if palette_name != "Atlantis" && palette_name != "Cloudscape" && palette_name != "Forest" && palette_name != "Treehouse" && palette_name != "Canopy" && palette_name != "Mansion Garden" {
+    if palette_name != "Atlantis" && palette_name != "Cloudscape" && palette_name != "Forest" && palette_name != "Treehouse" && palette_name != "Canopy" && palette_name != "Mansion Garden" && palette_name != "Alley" && palette_name != "Fractal Spires" && palette_name != "Recursive Citadel" && palette_name != "Hollow Jungle" && palette_name != "Yellow Brick Road" && palette_name != "Frozen Bifrost" && palette_name != "Titan's Ribcage" {
         let (mat, lo, hi, shelf) = match palette_name {
             "Canopy" | "Old Library" => (M::WOOD, c(0x2c, 0x20, 0x12), c(0x5a, 0x44, 0x28), true),
             "Archive" => (M::STONE, c(0x66, 0x5e, 0x4e), c(0xa8, 0x9e, 0x88), false), // cathedral: pale marble shell, no shelves
@@ -3632,9 +5395,14 @@ fn room_variant(idx: usize) -> Scene {
 // Conversation-derived parameters that drive PROCEDURAL layout of the hall (size, colonnade, tint, life).
 // Set per-frame from the live graph before building the env; the baked scene is re-generated when they change.
 #[derive(Clone, Copy, PartialEq)]
-pub struct EnvParams { pub nodes: u32, pub branches: u32, pub segments: u32, pub seed: u32, pub ext_x: u32, pub ext_z: u32, pub bear: [u16; 6], pub color_salience: f32 }
-impl Default for EnvParams { fn default() -> Self { Self { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0 } } }
-thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cell::Cell::new(EnvParams { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0 }) }; }
+pub struct EnvParams { pub nodes: u32, pub branches: u32, pub segments: u32, pub seed: u32, pub ext_x: u32, pub ext_z: u32, pub bear: [u16; 6], pub color_salience: f32,
+    /// Procedural TREE character (Forest): overall size, trunk height (length) factor, trunk girth (radius) factor,
+    /// and the per-node branching factor (children per fork). Seed-derived per conversation so each wood differs.
+    pub tree_size: f32, pub tree_height: f32, pub tree_girth: f32, pub tree_branch: u32, pub branch_spread: f32,
+    /// Street-scene prop density (Alley): scales benches, puddles, cracks, wires, bikes per conversation.
+    pub prop_density: f32 }
+impl Default for EnvParams { fn default() -> Self { Self { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0 } } }
+thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cell::Cell::new(EnvParams { nodes: 40, branches: 3, segments: 5, seed: 0x51A7_C0DE, ext_x: 18, ext_z: 14, bear: [0; 6], color_salience: 0.0, tree_size: 1.0, tree_height: 1.0, tree_girth: 1.0, tree_branch: 3, branch_spread: 0.6, prop_density: 1.0 }) }; }
 /// Feed the live conversation's shape to the environment generator (call before `with_env`/`render_env`).
 pub fn set_env_params(p: EnvParams) { ENV_PARAMS.with(|c| c.set(p)); }
 pub fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
@@ -3738,7 +5506,7 @@ mod tests {
 
     #[test]
     fn region_plan_counts_and_is_stable() {
-        let pr = EnvParams { nodes: 136, branches: 5, segments: 7, seed: 0x51A7_C0DE, ext_x: 68, ext_z: 22, bear: [0; 6], color_salience: 0.0 };
+        let pr = EnvParams { nodes: 136, branches: 5, segments: 7, seed: 0x51A7_C0DE, ext_x: 68, ext_z: 22, bear: [0; 6], color_salience: 0.0, ..Default::default() };
         let a = region_plan(&pr, 5, 24.0);
         let b = region_plan(&pr, 5, 24.0);
         assert_eq!(a.len(), 5, "one region per door");
@@ -3757,7 +5525,7 @@ mod tests {
         use std::collections::HashSet;
         let mut seen = HashSet::new();
         for seed in [0x51A7_C0DEu32, 0xDEAD_BEEF, 1234, 0xFACE, 777, 42, 0x1357] {
-            let pr = EnvParams { nodes: 80, branches: 6, segments: 6, seed, ext_x: 40, ext_z: 24, bear: [0; 6], color_salience: 0.0 };
+            let pr = EnvParams { nodes: 80, branches: 6, segments: 6, seed, ext_x: 40, ext_z: 24, bear: [0; 6], color_salience: 0.0, ..Default::default() };
             for r in region_plan(&pr, 6, 24.0) { seen.insert(r.kind); }
         }
         for k in [RegionType::Rotunda, RegionType::Stairs, RegionType::Terrace, RegionType::Chamber, RegionType::SealedCave] {
@@ -3769,12 +5537,12 @@ mod tests {
     fn branchy_atlantis_emits_wing_geometry_and_colliders() {
         // a branchy conversation builds doors→wings, each emitting column/statue/plinth COLLIDERS — the
         // unambiguous branch signal (total mesh count is confounded by the door-gapped bookshelf ring).
-        set_env_params(EnvParams { nodes: 60, branches: 1, segments: 5, seed: 7, ext_x: 30, ext_z: 20, bear: [0; 6], color_salience: 0.0 });
+        set_env_params(EnvParams { nodes: 60, branches: 1, segments: 5, seed: 7, ext_x: 30, ext_z: 20, bear: [0; 6], color_salience: 0.0, ..Default::default() });
         let linear = build("Atlantis");
         let linear_meshes = linear.meshes.len();
         let linear_cols = env_colliders().len();
 
-        set_env_params(EnvParams { nodes: 60, branches: 6, segments: 5, seed: 7, ext_x: 30, ext_z: 20, bear: [0; 6], color_salience: 0.0 });
+        set_env_params(EnvParams { nodes: 60, branches: 6, segments: 5, seed: 7, ext_x: 30, ext_z: 20, bear: [0; 6], color_salience: 0.0, ..Default::default() });
         let branchy = build("Atlantis");
         assert!(linear_meshes > 0 && branchy.meshes.len() > 0, "both palaces build geometry");
         assert!(env_colliders().len() > linear_cols, "more branches → more wings → more colliders the fly evades");
@@ -3787,5 +5555,25 @@ mod tests {
         let gapped = m3::wall_ring_gapped(v(0.0, 0.0, 0.0), 20.0, 8.0, 110, c(0, 0, 0), &[(0.0, 0.16), (1.5, 0.16)]);
         assert_eq!(full.verts.len(), gapped.verts.len(), "same vertex ring");
         assert!(gapped.tris.len() < full.tris.len(), "doorways remove wall quads");
+    }
+
+    #[test]
+    fn atlantis_central_lane_cleared_for_strand() {
+        // Pass 63 routes the Atlantis conversation strand down the x-axis (compressed in z). The colonnade must
+        // leave a ±4u corridor along that axis so the strand threads open space instead of clipping columns.
+        // Colonnade columns push Pillar colliders at radius ~r_col; after lane-clearing none should sit in the
+        // central lane (|z| ≤ 4) away from the centre — while the colonnade as a whole still exists.
+        set_env_params(EnvParams { nodes: 220, branches: 4, segments: 8, seed: 7, ext_x: 64, ext_z: 22, bear: [0; 6], color_salience: 0.0, ..Default::default() });
+        let _ = build("Atlantis");
+        // Colonnade columns emit Pillar colliders with r=0.8 (distinct from wing/region landmarks). Count how
+        // many the ring emits and how many sit in the central lane (|z| ≤ 4, away from the centre).
+        let colonnade: Vec<(f32, f32)> = env_colliders().iter().filter_map(|c| match c {
+            Collider::Pillar { x, z, r, .. } if (*r - 0.8).abs() < 0.05 => Some((*x, *z)),
+            _ => None,
+        }).collect();
+        assert!(colonnade.len() >= 6, "colonnade still standing ({} columns)", colonnade.len());
+        let in_lane = colonnade.iter().filter(|(x, z)| z.abs() <= 4.0 && x.abs() > 6.0).count();
+        assert_eq!(in_lane, 0, "central lane (|z|≤4) must be clear of colonnade columns, found {in_lane}");
+        set_env_params(EnvParams::default()); // restore
     }
 }

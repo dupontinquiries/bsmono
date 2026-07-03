@@ -569,7 +569,9 @@ fn split_sentences(text: &str) -> Vec<String> {
     crate::textrank::split_sentences(text)
 }
 
-fn epoch_secs() -> u64 { core_kit::time::now_secs() }
+fn epoch_secs() -> u64 {
+    crate::util::epoch_secs()
+}
 
 #[cfg(test)]
 mod tests {

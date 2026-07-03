@@ -94,6 +94,29 @@ else
     fi
 fi
 
+# --- Step 5: golden output check (v0.1.890) ---
+# The behavior safety net. Compiles the fixture corpus through
+# generate_safe_qml and diffs byte-for-byte against committed goldens —
+# catches OUTPUT drift the compile + syntactic checks above can't see, AND
+# (since the harness build is exercised here) catches the harness itself
+# silently failing to build, which is what let v0.1.884→888 drift unnoticed.
+# Staging build is cached under /tmp, so it's cold only on the first run of a
+# session (~60s) and ~5s warm. Set WEB2QML_SKIP_GOLDEN=1 to skip during fast
+# iteration (prints a visible notice — never silent).
+log "golden output check"
+if [ "${WEB2QML_SKIP_GOLDEN:-0}" = "1" ]; then
+    printf "\033[1;33m• skipped (WEB2QML_SKIP_GOLDEN=1)\033[0m\n"
+elif [ ! -f scripts/qml_golden.sh ]; then
+    err "qml_golden.sh not found"
+else
+    if bash scripts/qml_golden.sh > /tmp/golden_gate.log 2>&1; then
+        ok "golden output matches"
+    else
+        err "golden output DIFF or harness build failure (see below)"
+        tail -25 /tmp/golden_gate.log
+    fi
+fi
+
 # --- Optional: cargo test (commented out by default — slower) ---
 # Uncomment to run the test suite as part of validation.
 # log "cargo test"

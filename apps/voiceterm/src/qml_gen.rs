@@ -173,14 +173,12 @@ pub fn extract_title(doc: &scraper::Html) -> String {
         return String::new();
     }
 
-    // Cap length, unicode-safe.
+    // Cap length, unicode-safe (see util::safe_byte_truncate).
     const MAX: usize = 200;
     if cleaned.len() <= MAX {
         return cleaned;
     }
-    let mut cut = MAX;
-    while cut > 0 && !cleaned.is_char_boundary(cut) { cut -= 1; }
-    format!("{}…", &cleaned[..cut])
+    format!("{}…", crate::util::safe_byte_truncate(&cleaned, MAX))
 }
 
 pub struct RenderStyle {
@@ -762,6 +760,80 @@ pub fn detect_spa(html: &str) -> Option<String> {
 }
 
 fn best_srcset(ss: &str) -> Option<&str> { ss.split(',').filter_map(|e| e.trim().split_whitespace().next()).last() }
+
+/// Extract the image URL from an inline `background-image: url(...)` (or the
+/// `background:` shorthand) declaration. Returns None when there's no `url()`,
+/// when the style isn't a background property, or when the URL is empty / a
+/// `data:` URI / the keyword `none`. Surrounding quotes and whitespace are
+/// stripped. Gradients (`linear-gradient(...)` etc.) carry no `url()` token, so
+/// they're naturally excluded; requiring a `background` property keeps us from
+/// grabbing `url()` out of unrelated declarations like `cursor`, `mask`, or
+/// `list-style-image`.
+///
+/// All matching is on ASCII tokens (`url(`, `background`, `data:`), so the
+/// lowercase index maps 1:1 onto the original string — the slices land on char
+/// boundaries even when the URL itself contains multibyte characters.
+fn extract_bg_image_url(style: &str) -> Option<String> {
+    let lower = style.to_ascii_lowercase();
+    if !lower.contains("background") || !lower.contains("url(") {
+        return None;
+    }
+    let idx = lower.find("url(")?;
+    let after = &style[idx + 4..];
+    let end = after.find(')')?;
+    let inner = after[..end]
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .trim();
+    if inner.is_empty() || inner.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    if inner.len() >= 5 && inner[..5].eq_ignore_ascii_case("data:") {
+        return None;
+    }
+    Some(inner.to_string())
+}
+
+/// Resolve the best image URL for an element, consolidating the lazy-load
+/// patterns the `img` and `picture` handlers used to carry separately
+/// (v0.1.174). Priority:
+///   1. The element's own src-like attributes, in lazy-load order:
+///      `src`, `data-src`, `data-lazy-src`, `data-original`, `data-srcset`,
+///      `srcset` — the first candidate that isn't a known placeholder wins.
+///   2. Failing that, `<source>` descendants (the `<picture>` pattern): skip
+///      `data-empty` sources and `data:`/empty srcsets; keep the LAST viable
+///      one (authors order sources small → large).
+/// Returns the raw URL (the caller resolves it against the page base). New
+/// lazy-load patterns get added here, in one place, instead of being copied
+/// into each handler. Behavior matches the previous inline logic for real
+/// inputs: an `<img>` resolves from its attrs (it has no `<source>` children),
+/// a `<picture>` has no src attrs so it resolves from its sources.
+fn extract_image_url(el: &ElementRef) -> Option<String> {
+    let candidates: [Option<&str>; 6] = [
+        el.value().attr("src"),
+        el.value().attr("data-src"),
+        el.value().attr("data-lazy-src"),
+        el.value().attr("data-original"),
+        el.value().attr("data-srcset").and_then(best_srcset),
+        el.value().attr("srcset").and_then(best_srcset),
+    ];
+    if let Some(u) = candidates.iter().filter_map(|o| *o).find(|s| !is_placeholder(s)) {
+        if !u.is_empty() {
+            return Some(u.to_string());
+        }
+    }
+    // <source> descendants — the picture pattern. Last viable non-data srcset.
+    let mut chosen: Option<String> = None;
+    for src_el in el.select(s(&S5, "source")) {
+        if src_el.value().attr("data-empty").is_some() { continue; }
+        let Some(ss) = src_el.value().attr("srcset") else { continue; };
+        if ss.starts_with("data:") { continue; }
+        let Some(url) = best_srcset(ss) else { continue; };
+        if url.starts_with("data:") { continue; }
+        chosen = Some(url.to_string());
+    }
+    chosen
+}
 
 /// v0.1.375 (JS-rendering arc, Option 2): extract hydration
 /// data blobs from SPA HTML. Many JS-rendered sites embed the
@@ -2084,7 +2156,7 @@ pub fn generate_safe_qml_with_stats(n: &ElementRef, d: usize, mx: usize, base: &
             o.push_str("\nheight: 36\nRectangle {\nanchors.fill: parent\ncolor: \"");
             o.push_str(&sty.input_bg); o.push_str("\"\nradius: 4\nborder.color: \"");
             o.push_str(&sty.border_color); o.push_str("\"\nborder.width: 1\n}\nText {\nanchors.centerIn: parent\ntext: \"[embed] ");
-            write_esc(&mut o, &r[..r.len().min(50)]);
+            write_esc(&mut o, crate::util::safe_byte_truncate(&r, 50));
             o.push_str("\"\ncolor: \""); o.push_str(&sty.link_color);
             o.push_str("\"\nfont.pixelSize: "); o.push_str(&sty.font_size_str);
             o.push_str("\n}");
@@ -2294,7 +2366,7 @@ pub fn generate_safe_qml_with_stats(n: &ElementRef, d: usize, mx: usize, base: &
             // as <a> — see notes there.
             let mut o = String::with_capacity(220);
             let _ = write!(o, "Item {{\nwidth: {W}\nheight: 36\nRectangle {{\nanchors.fill: parent\ncolor: \"{}\"\nradius: 4\nborder.color: \"{}\"\nborder.width: 1\n}}\nText {{\nanchors.centerIn: parent\ntext: \"{icon} {tag} ", sty.input_bg, sty.border_color);
-            write_esc(&mut o, &r[..r.len().min(40)]);
+            write_esc(&mut o, crate::util::safe_byte_truncate(&r, 40));
             let _ = write!(o, "\"\ncolor: \"{}\"\nfont.pixelSize: {}\n}}", sty.link_color, sty.font_size);
             emit_link_mousearea(&mut o, &r);
             o.push_str("\n}"); return o;
@@ -2580,33 +2652,14 @@ pub fn generate_safe_qml_with_stats(n: &ElementRef, d: usize, mx: usize, base: &
 
     // img
     if tag == "img" {
-        // v0.1.374: source resolution order, tried in turn:
-        //   1. src (current value — may be placeholder)
-        //   2. data-src (lazy-load pattern A)
-        //   3. data-lazy-src (lazy-load pattern B)
-        //   4. data-original (lazy-load pattern C, jQuery lazyload)
-        //   5. data-srcset (responsive lazy variant)
-        //   6. srcset (responsive non-lazy)
-        // If the chosen src is a known placeholder, try the next
-        // candidate in turn. This handles sites that fill src
-        // with a base64 transparent png while keeping the real
-        // URL in data-src.
-        let src_candidates: [Option<&str>; 6] = [
-            n.value().attr("src"),
-            n.value().attr("data-src"),
-            n.value().attr("data-lazy-src"),
-            n.value().attr("data-original"),
-            n.value().attr("data-srcset").and_then(best_srcset),
-            n.value().attr("srcset").and_then(best_srcset),
-        ];
-        let src = src_candidates.iter()
-            .filter_map(|opt| *opt)
-            .find(|s| !is_placeholder(s))
-            .unwrap_or("");
-        if src.is_empty() {
-            return String::new();
-        }
-        let r = resolve_url(src, base);
+        // v0.1.374 lazy-load resolution + v0.1.888 consolidation: the
+        // candidate priority order now lives in extract_image_url, shared
+        // with the picture handler. Returns the first non-placeholder src.
+        let src = match extract_image_url(n) {
+            Some(u) => u,
+            None => return String::new(),
+        };
+        let r = resolve_url(&src, base);
         let alt = n.value().attr("alt").unwrap_or("");
 
         // Parse width/height attributes (CSS sizing hints)
@@ -2650,21 +2703,13 @@ pub fn generate_safe_qml_with_stats(n: &ElementRef, d: usize, mx: usize, base: &
         //     <img src="data:image/gif;..." onload="window.__lp?.(event)">
         //   </picture>
         //
-        // We scan the `<source>` children, skip any with `data-empty`
-        // attribute or `data:` srcset, and pick the LAST viable one
-        // (Apple's convention is small → medium → large ordering).
-        // Synthesize an <img> with the resolved real URL and let the
-        // existing img-tag emission path produce QML for it.
-        let mut chosen_src: Option<String> = None;
-        for src_el in n.select(s(&S5, "source")) {
-            if src_el.value().attr("data-empty").is_some() { continue; }
-            let Some(ss) = src_el.value().attr("srcset") else { continue; };
-            if ss.starts_with("data:") { continue; }
-            let Some(url) = best_srcset(ss) else { continue; };
-            if url.starts_with("data:") { continue; }
-            // Keep the LAST viable one — Apple orders sources small-to-large.
-            chosen_src = Some(url.to_string());
-        }
+        // v0.1.888: source resolution now lives in extract_image_url (shared
+        // with the img handler). For a <picture> it falls straight through to
+        // the <source> scan — skip `data-empty`/`data:` srcsets, keep the LAST
+        // viable URL (authors order sources small → large) — then we synthesize
+        // an <img>-style emission from the resolved URL plus the inner <img>'s
+        // alt/width/height.
+        let chosen_src = extract_image_url(n);
         // Find the inner <img> for alt text + width/height attributes.
         let inner_img = n.select(s(&S1, "img")).next();
         if let Some(url) = chosen_src {
@@ -2968,7 +3013,24 @@ pub fn generate_safe_qml_with_stats(n: &ElementRef, d: usize, mx: usize, base: &
         if !anchor.is_empty() { parts.push(anchor); }
         if !tc.is_empty() { parts.push(text_qml(&tc, sty)); }
         parts.extend(ch);
-        if parts.is_empty() { String::new() }
+        if parts.is_empty() {
+            // v0.1.887: a leaf element carrying `background-image: url(...)`
+            // with no rendering children currently emits nothing — the image
+            // is invisible to us. Surface it as an Image. Scoped to the empty
+            // case so (a) there's no `<img>` child to double up with and (b)
+            // hero sections that already render text/children are untouched.
+            // Gradients and data: URIs are excluded by extract_bg_image_url;
+            // transparent-placeholder URLs by is_placeholder.
+            if let Some(bg) = n.value().attr("style").and_then(extract_bg_image_url) {
+                if !is_placeholder(&bg) {
+                    let r = resolve_url(&bg, base);
+                    let mut o = String::with_capacity(280);
+                    emit_image(&mut o, &r, "", None, None, sty);
+                    return maybe_animate(o, &anim);
+                }
+            }
+            String::new()
+        }
         else {
             // v0.1.417 (page-overflow fix): a Qt `Row` lays out
             // children left-to-right at THEIR OWN widths. Our
@@ -5005,6 +5067,99 @@ mod tests {
     fn placeholder_data_jpeg_not_flagged() {
         // Real inline JPEG embedded — should NOT match.
         assert!(!is_placeholder("data:image/jpeg;base64,/9j/4AAQSkZJRgABA..."));
+    }
+
+    #[test]
+    fn bg_image_url_basic_and_quotes() {
+        assert_eq!(extract_bg_image_url("background-image: url(https://x.com/a.jpg)").as_deref(),
+                   Some("https://x.com/a.jpg"));
+        assert_eq!(extract_bg_image_url("background-image: url('https://x.com/a.jpg')").as_deref(),
+                   Some("https://x.com/a.jpg"));
+        assert_eq!(extract_bg_image_url("background-image: url(\"/img/b.png\")").as_deref(),
+                   Some("/img/b.png"));
+        // no spaces around the colon / inside url()
+        assert_eq!(extract_bg_image_url("background-image:url(x.jpg)").as_deref(), Some("x.jpg"));
+    }
+
+    #[test]
+    fn bg_image_url_shorthand_and_extra_props() {
+        // `background` shorthand with color + position + repeat around the url()
+        assert_eq!(extract_bg_image_url("background: #fff url(  /img/c.jpg  ) no-repeat center").as_deref(),
+                   Some("/img/c.jpg"));
+        // url() preceded by an unrelated property in the same style string
+        assert_eq!(extract_bg_image_url("color: red; background-image: url(d.webp)").as_deref(),
+                   Some("d.webp"));
+    }
+
+    #[test]
+    fn bg_image_url_rejects_non_images() {
+        // data: URI background → excluded (we don't surface inline blobs here)
+        assert_eq!(extract_bg_image_url("background-image: url(data:image/png;base64,iVBOR)"), None);
+        // gradients carry no url() token
+        assert_eq!(extract_bg_image_url("background: linear-gradient(#000, #fff)"), None);
+        // explicit none
+        assert_eq!(extract_bg_image_url("background-image: none"), None);
+        // url() in a NON-background property must not be grabbed
+        assert_eq!(extract_bg_image_url("cursor: url(cursor.png), auto"), None);
+        assert_eq!(extract_bg_image_url("list-style-image: url(bullet.png)"), None);
+        // no url at all
+        assert_eq!(extract_bg_image_url("background-color: #abc"), None);
+        // empty url
+        assert_eq!(extract_bg_image_url("background-image: url()"), None);
+    }
+
+    #[test]
+    fn bg_image_url_multibyte_safe() {
+        // A URL with multibyte characters must not panic and must round-trip:
+        // the ASCII anchors (`url(`, `background`) keep the slices on char
+        // boundaries.
+        assert_eq!(extract_bg_image_url("background-image: url(/imgs/café-señor.jpg)").as_deref(),
+                   Some("/imgs/café-señor.jpg"));
+    }
+
+    fn img_url(html: &str, sel: &str) -> Option<String> {
+        let frag = scraper::Html::parse_fragment(html);
+        let s = scraper::Selector::parse(sel).unwrap();
+        let el = frag.select(&s).next().expect("a matching element");
+        extract_image_url(&el)
+    }
+
+    #[test]
+    fn image_url_img_candidate_priority() {
+        // plain src wins
+        assert_eq!(img_url(r#"<img src="/real.jpg">"#, "img").as_deref(), Some("/real.jpg"));
+        // placeholder src (empty) falls through to data-src
+        assert_eq!(img_url(r#"<img src="" data-src="/lazy.jpg">"#, "img").as_deref(),
+                   Some("/lazy.jpg"));
+        // lazy-load variants
+        assert_eq!(img_url(r#"<img data-lazy-src="/b.jpg">"#, "img").as_deref(), Some("/b.jpg"));
+        assert_eq!(img_url(r#"<img data-original="/c.jpg">"#, "img").as_deref(), Some("/c.jpg"));
+        // srcset → best_srcset picks the last entry's URL
+        assert_eq!(img_url(r#"<img srcset="/a.jpg 1x, /b.jpg 2x">"#, "img").as_deref(),
+                   Some("/b.jpg"));
+        // nothing usable → None (handler then skips emission)
+        assert_eq!(img_url(r#"<img alt="x">"#, "img"), None);
+        assert_eq!(img_url(r#"<img src="">"#, "img"), None);
+    }
+
+    #[test]
+    fn image_url_picture_source_scan() {
+        // last viable source wins (authors order small → large)
+        assert_eq!(
+            img_url(r#"<picture><source srcset="/s.jpg"><source srcset="/l.jpg"><img src="/fb.jpg"></picture>"#, "picture").as_deref(),
+            Some("/l.jpg"));
+        // data-empty sources are skipped
+        assert_eq!(
+            img_url(r#"<picture><source data-empty="" srcset="/skip.jpg"><source srcset="/keep.jpg"></picture>"#, "picture").as_deref(),
+            Some("/keep.jpg"));
+        // data: srcsets are skipped, real one kept
+        assert_eq!(
+            img_url(r#"<picture><source srcset="data:image/gif;base64,R0lGOD"><source srcset="/real.jpg"></picture>"#, "picture").as_deref(),
+            Some("/real.jpg"));
+        // a picture with only data/empty sources → None
+        assert_eq!(
+            img_url(r#"<picture><source data-empty="" srcset="data:image/gif;base64,x"></picture>"#, "picture"),
+            None);
     }
 
     // v0.1.875: dead/JS link detection + the non-navigable cue.

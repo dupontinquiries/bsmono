@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>unendlich · dragon forge (3D)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=Spectral:ital,wght@0,400;0,500;1,400&family=Space+Mono&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --el:#9bd66b; --el-soft:#aef07a; --el-deep:#1a2a12;
+    --ink:#e9e4d6; --ink-dim:#9a9382; --panel:rgba(14,15,17,.72); --line:rgba(255,255,255,.10);
+    --bg0:#070707; --bg1:#0d0f10;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg0);color:var(--ink);
+    font-family:"Spectral",Georgia,serif;}
+  #stage{position:fixed;inset:0;
+    background:
+      radial-gradient(120% 90% at 50% 8%, color-mix(in srgb,var(--el) 9%, transparent) 0%, transparent 55%),
+      radial-gradient(100% 80% at 50% 120%, var(--el-deep) 0%, transparent 60%),
+      linear-gradient(180deg,var(--bg1),var(--bg0));
+    transition:background .6s ease;}
+  canvas{display:block}
+  /* film grain */
+  #grain{position:fixed;inset:0;pointer-events:none;opacity:.05;mix-blend-mode:overlay;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");}
+  header{position:fixed;top:0;left:0;right:0;padding:18px 22px 26px;pointer-events:none;
+    display:flex;justify-content:space-between;align-items:flex-start;
+    background:linear-gradient(180deg,rgba(0,0,0,.55),transparent);}
+  h1{font-family:"Cinzel",serif;font-weight:700;margin:0;font-size:clamp(16px,2.4vw,24px);
+    letter-spacing:.32em;text-transform:uppercase;color:var(--ink);
+    text-shadow:0 0 18px color-mix(in srgb,var(--el) 40%,transparent);}
+  h1 small{display:block;font-family:"Spectral";font-weight:400;font-style:italic;
+    letter-spacing:.02em;text-transform:none;font-size:12px;color:var(--ink-dim);margin-top:6px;text-shadow:none}
+  .hint{font-family:"Space Mono",monospace;font-size:10.5px;color:var(--ink-dim);text-align:right;line-height:1.7;
+    letter-spacing:.04em}
+  .hint b{color:var(--el-soft);font-weight:400}
+
+  /* control dock */
+  #dock{position:fixed;left:14px;bottom:14px;width:min(330px,calc(100vw - 28px));max-height:calc(100vh - 120px);
+    overflow:auto;background:var(--panel);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+    border:1px solid var(--line);border-radius:14px;padding:14px 14px 16px;
+    box-shadow:0 18px 50px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);}
+  .sec{font-family:"Space Mono",monospace;font-size:9.5px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--ink-dim);margin:4px 2px 9px;display:flex;align-items:center;gap:8px}
+  .sec::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  .els{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin-bottom:14px}
+  .el{font-family:"Cinzel",serif;font-weight:500;font-size:10px;letter-spacing:.06em;
+    padding:9px 0;text-align:center;border-radius:9px;cursor:pointer;color:var(--ink-dim);
+    border:1px solid var(--line);background:rgba(255,255,255,.015);transition:.18s;user-select:none}
+  .el:hover{color:var(--ink)}
+  .el.on{color:#0a0a0a;background:var(--el);border-color:var(--el);
+    box-shadow:0 0 16px color-mix(in srgb,var(--el) 55%,transparent);font-weight:700}
+
+  .row{display:flex;align-items:center;gap:10px;margin:9px 2px}
+  .row label{flex:0 0 84px;font-size:12.5px;color:var(--ink)}
+  .row output{flex:0 0 38px;text-align:right;font-family:"Space Mono",monospace;font-size:10.5px;color:var(--el-soft)}
+  input[type=range]{flex:1;-webkit-appearance:none;appearance:none;height:3px;border-radius:3px;
+    background:linear-gradient(90deg,var(--el) var(--p,40%),rgba(255,255,255,.14) var(--p,40%));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;
+    background:var(--ink);border:2px solid var(--el);cursor:pointer;box-shadow:0 0 10px color-mix(in srgb,var(--el) 60%,transparent)}
+  input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--ink);
+    border:2px solid var(--el);cursor:pointer}
+  input[type=range]:disabled{opacity:.35}
+
+  .toggles{display:flex;gap:8px;margin:12px 2px 4px;flex-wrap:wrap}
+  .tog{flex:1;min-width:96px;display:flex;border:1px solid var(--line);border-radius:9px;overflow:hidden;
+    font-family:"Space Mono",monospace;font-size:10px;letter-spacing:.05em}
+  .tog span{flex:1;text-align:center;padding:8px 4px;cursor:pointer;color:var(--ink-dim);transition:.15s;user-select:none}
+  .tog span.on{background:var(--el);color:#0a0a0a}
+  .btns{display:flex;gap:8px;margin-top:12px}
+  button.act{flex:1;font-family:"Cinzel",serif;letter-spacing:.12em;font-size:11px;padding:11px;border-radius:10px;
+    cursor:pointer;color:var(--ink);background:rgba(255,255,255,.02);border:1px solid var(--line);transition:.18s}
+  button.act:hover{border-color:var(--el);color:var(--el-soft)}
+  .note{font-size:11px;font-style:italic;color:var(--ink-dim);line-height:1.5;margin:13px 2px 2px;
+    padding-top:11px;border-top:1px solid var(--line)}
+  .note b{color:var(--el-soft);font-style:normal;font-weight:500}
+  ::-webkit-scrollbar{width:8px}::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:8px}
+</style>
+</head>
+<body>
+<div id="stage"><canvas id="c"></canvas></div>
+<div id="grain"></div>
+
+<header>
+  <h1>Dragon Forge<small>form &amp; pose — drag to turn, scroll to zoom</small></h1>
+  <div class="hint">drag · <b>rotate</b><br>scroll · <b>zoom</b><br>smooth ↔ <b>voxel</b></div>
+</header>
+
+<div id="dock">
+  <div class="sec">element</div>
+  <div class="els" id="els"></div>
+
+  <div class="sec">proportion &amp; pose</div>
+  <div id="sliders"></div>
+
+  <div class="toggles">
+    <div class="tog" id="mode"><span data-v="smooth" class="on">smooth</span><span data-v="voxel">voxel</span></div>
+    <div class="tog" id="glow"><span data-v="on" class="on">glow</span><span data-v="off">no glow</span></div>
+  </div>
+  <div class="row" id="resRow"><label>voxel res</label>
+    <input type="range" id="res" min="14" max="140" step="1" value="140"><output id="resOut">140</output></div>
+
+  <div class="btns">
+    <button class="act" id="reroll">⟲ Re-roll</button>
+    <button class="act" id="reset">Reset</button>
+    <button class="act" id="copygene">⧉ Copy genome</button>
+  </div>
+  <div id="genomeWrap" style="display:none">
+    <div class="sec" style="display:flex;justify-content:space-between;align-items:center">genome <span id="genomeStatus" style="font-weight:400;opacity:.7;font-size:11px"></span></div>
+    <textarea id="genomeJson" readonly spellcheck="false" style="width:100%;height:158px;background:#0d0b12;color:#cdbfe0;border:1px solid var(--el,#555);border-radius:6px;font:11px/1.45 ui-monospace,monospace;padding:8px;box-sizing:border-box;resize:vertical;margin-top:6px"></textarea>
+  </div>
+
+  <div class="note">What you settle here becomes the <b>gene ranges</b> the entity pass renders —
+    pose included. The open question in your backlog (upright vs quadruped, does the head read a
+    face) lives on the <b>Pose</b> and <b>Horns</b> dials.</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const PAL = {
+  Wood:  {body:0x46532f, scale:0x6f7d45, em:0xb4f06a, deep:'#16240e', rim:0x8fd35a},
+  Water: {body:0x2b4456, scale:0x3f6f86, em:0x6ff0ff, deep:'#0c2230', rim:0x49cfe0},
+  Air:   {body:0x5b626c, scale:0x868ea0, em:0xeaf6ff, deep:'#1b232c', rim:0xc8dcf0},
+  Dust:  {body:0x6a5636, scale:0x9c7d44, em:0xffcf7a, deep:'#241a0c', rim:0xd8a657},
+  Fire:  {body:0x59302a, scale:0x8a3f30, em:0xffae5a, deep:'#2a0f0c', rim:0xff7a3c},
+  Storm: {body:0x382d54, scale:0x5a4f86, em:0xc39bff, deep:'#1a1230', rim:0x9a6cff},
+};
+const SPECS = [
+  ['pose','Pose',0,1.25,0.0],['bulk','Bulk',0.6,1.98,0.87],
+  ['neckLen','Neck',0.6,1.98,1.7],['neckArch','Neck arch',0,1.25,0.5],
+  ['tailLen','Tail',0.6,2.1,1.46],['legLen','Legs',0.6,1.73,1.05],
+  ['wingSpan','Wings',0.4,2.03,1.41],['wingSpread','Wing spread',0,1.25,0.62],
+  ['snout','Muzzle len',0.5,1.9,1.01,'face'],['jawDepth','Jaw depth',0.4,2.1,1.0,'face'],
+  ['snoutCurve','Snout curve',-0.6,1.0,0.2,'face'],['brow','Brow ridge',0,1.6,0.7,'face'],
+  ['cheek','Cheek shield',0,1.6,0.6,'face'],['teeth','Teeth',0,1.6,0.85,'face'],
+  ['crest','Crest',0,1.6,0.4,'face'],['horns','Horns',0,4,3,'face'],
+  ['hornSweep','Horn sweep',-0.5,1.2,0.6,'face'],
+];
+let P = {}, element='Storm', mode='smooth', glow=true, res=140;
+SPECS.forEach(s=>P[s[0]]=s[4]);
+
+/* ---------- three.js scaffold ---------- */
+const canvas=document.getElementById('c');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.shadowMap.enabled=true; renderer.shadowMap.type=THREE.PCFSoftShadowMap;
+const scene=new THREE.Scene();
+const camera=new THREE.PerspectiveCamera(42,1,0.1,200);
+const target=new THREE.Vector3(0,2.0,0);
+let azim=-0.7, polar=1.32, radius=13.5;
+
+const key=new THREE.DirectionalLight(0xfff2dc,1.45);
+key.position.set(6,11,7); key.castShadow=true;
+key.shadow.mapSize.set(1024,1024); key.shadow.camera.near=1; key.shadow.camera.far=40;
+key.shadow.camera.left=-9;key.shadow.camera.right=9;key.shadow.camera.top=9;key.shadow.camera.bottom=-9;
+scene.add(key);
+const fill=new THREE.DirectionalLight(0x8090b0,0.35); fill.position.set(-7,4,-3); scene.add(fill);
+const rim=new THREE.DirectionalLight(0xffffff,0.9); rim.position.set(-4,5,-8); scene.add(rim);
+scene.add(new THREE.HemisphereLight(0x9fb6d6,0x2a2418,0.55));
+scene.add(new THREE.AmbientLight(0x404040,0.4));
+
+// ground shadow catcher
+const ground=new THREE.Mesh(new THREE.CircleGeometry(11,64),
+  new THREE.ShadowMaterial({opacity:0.34}));
+ground.rotation.x=-Math.PI/2; ground.position.y=0; ground.receiveShadow=true; scene.add(ground);
+const disc=new THREE.Mesh(new THREE.RingGeometry(0.1,10.6,72),
+  new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:0.18,side:THREE.DoubleSide}));
+disc.rotation.x=-Math.PI/2; disc.position.y=-0.002; scene.add(disc);
+
+const dragon=new THREE.Group(); scene.add(dragon);
+
+/* ---------- materials ---------- */
+let matBody,matScale,matEye,matMemb;
+function makeMaterials(){
+  const p=PAL[element];
+  matBody=new THREE.MeshStandardMaterial({color:p.body,roughness:0.72,metalness:0.18,flatShading:false});
+  matScale=new THREE.MeshStandardMaterial({color:p.scale,roughness:0.55,metalness:0.32});
+  matEye=new THREE.MeshStandardMaterial({color:p.em,emissive:p.em,emissiveIntensity:glow?2.4:0.15,roughness:0.3});
+  matMemb=new THREE.MeshStandardMaterial({color:p.scale,roughness:0.85,metalness:0.05,
+    transparent:true,opacity:0.82,side:THREE.DoubleSide,
+    emissive:p.em,emissiveIntensity:glow?0.18:0.0});
+  rim.color.setHex(p.rim);
+}
+
+/* ---------- geometry helpers ---------- */
+const V=(x,y,z)=>new THREE.Vector3(x,y,z);
+function rotX(pt,piv,a){ // rotate pt around pivot on X axis
+  const y=pt.y-piv.y,z=pt.z-piv.z,c=Math.cos(a),s=Math.sin(a);
+  return V(pt.x, piv.y + y*c - z*s, piv.z + y*s + z*c);
+}
+// add a capsule (cyl+2 spheres) to a group AND push solids for voxelization
+function capsule(group,solids,a,b,r,mat){
+  const dir=new THREE.Vector3().subVectors(b,a); const len=dir.length();
+  const cyl=new THREE.Mesh(new THREE.CylinderGeometry(r,r,len,12),mat);
+  cyl.position.copy(a).addScaledVector(dir,0.5);
+  cyl.quaternion.setFromUnitVectors(V(0,1,0),dir.clone().normalize());
+  cyl.castShadow=true; group.add(cyl);
+  sphere(group,null,a,r,mat); sphere(group,null,b,r,mat);
+  if(solids) solids.push({t:'c',a:a.clone(),b:b.clone(),r});
+}
+function sphere(group,solids,c,r,mat){
+  const m=new THREE.Mesh(new THREE.SphereGeometry(r,16,12),mat);
+  m.position.copy(c); m.castShadow=true; group.add(m);
+  if(solids) solids.push({t:'s',c:c.clone(),r});
+}
+function box3(group,solids,c,u,v,w,half,mat){           // oriented bone box (voxelizes)
+  const uu=u.clone().normalize(),vv=v.clone().normalize(),ww=w.clone().normalize();
+  const m=new THREE.Mesh(new THREE.BoxGeometry(half[0]*2,half[1]*2,half[2]*2),mat);
+  m.position.copy(c); m.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(uu,vv,ww));
+  m.castShadow=true; group.add(m);
+  if(solids) solids.push({t:'b',c:c.clone(),u:uu,v:vv,w:ww,half:[half[0],half[1],half[2]]});
+}
+
+/* ---------- the dragon ---------- */
+function buildSolids(){
+  const solids=[], emis=[]; // emis = eye/glow spheres
+  const B=P.bulk;
+  // base spine control points (z forward, y up) : {p, r}
+  let ctrl=[
+    {p:V(0, 0.55, -3.3*P.tailLen), r:0.10*B},
+    {p:V(0, 0.78, -2.25*P.tailLen),r:0.20*B},
+    {p:V(0, 1.05, -1.15),          r:0.42*B},   // hips  (idx2)
+    {p:V(0, 1.22,  0.0),           r:0.56*B},   // torso
+    {p:V(0, 1.16,  1.0),           r:0.50*B},   // shoulders (idx4)
+  ];
+  // neck + head, built forward then arched/reared by pose
+  const sh=ctrl[4].p, hips=ctrl[2].p;
+  const NL=P.neckLen;
+  let neck=[
+    {p:V(0,1.30,1.55), r:0.40*B},
+    {p:V(0,1.52,1.55+0.55*NL), r:0.33*B},
+    {p:V(0,1.74,1.55+1.05*NL), r:0.27*B},
+    {p:V(0,1.92,1.55+1.45*NL), r:0.23*B},   // head base (last)
+  ];
+  // arch the neck: lift mid points up/back as a gentle S
+  neck=neck.map((n,i)=>{
+    const t=i/(neck.length-1);
+    const lift=P.neckArch*Math.sin(t*Math.PI)*0.9;
+    return {p:V(n.p.x, n.p.y+lift, n.p.z - lift*0.5), r:n.r};
+  });
+  let front=ctrl.slice(4).concat(neck); // shoulders + neck = the reared portion
+  // rear the front about the hips by pose
+  const ang=-P.pose*1.15; // negative => chest/neck swing upward & back
+  front=front.map(n=>({p:rotX(n.p,hips,ang), r:n.r}));
+  const allCtrl=ctrl.slice(0,4).concat(front);
+
+  // smooth curve through control positions, sampled with interpolated radius
+  const curve=new THREE.CatmullRomCurve3(allCtrl.map(c=>c.p),false,'catmullrom',0.5);
+  const N=72, pts=curve.getSpacedPoints(N);
+  // radius per sample by mapping to nearest control u
+  const rad=[];
+  for(let i=0;i<=N;i++){
+    const u=i/N*(allCtrl.length-1);
+    const lo=Math.floor(Math.min(u,allCtrl.length-2)), f=u-lo;
+    rad.push(allCtrl[lo].r*(1-f)+allCtrl[lo+1].r*f);
+  }
+  // body spheres
+  for(let i=0;i<=N;i++) sphere(dragon,solids,pts[i],rad[i],matBody);
+
+  // anchors
+  const hipP=pts[Math.round(0.30*N)], hipR=rad[Math.round(0.30*N)];
+  const shP =pts[Math.round(0.52*N)], shR =rad[Math.round(0.52*N)];
+  const headP=pts[N], headTan=curve.getTangent(1).normalize();
+
+  // ---- legs (2 segment, reach toward ground) ----
+  const reared=P.pose;
+  function leg(root,side,front_){
+    const LL=(1.5+0.4)*P.legLen* (root.y/1.1);
+    const rootS=V(root.x+side*(hipR*0.85), root.y-0.05, root.z);
+    // foot target
+    let footY=0.0, footZ=root.z + (front_?0.35:-0.25);
+    if(front_){ // fold front legs up when rearing
+      const fold=Math.max(0,(reared-0.3)/0.7);
+      footY = 0.0*(1-fold) + (root.y+0.4)*fold;
+      footZ = (root.z+0.35)*(1-fold) + (root.z+0.9)*fold;
+    }
+    const foot=V(root.x+side*(hipR*0.9), footY, footZ);
+    const knee=V((rootS.x+foot.x)/2 + side*0.18,
+                 (rootS.y+foot.y)/2 - 0.15,
+                 (rootS.z+foot.z)/2 + (front_?0.28:-0.28));
+    const r1=0.16*P.bulk, r2=0.12*P.bulk;
+    capsule(dragon,solids,rootS,knee,r1,matBody);
+    capsule(dragon,solids,knee,foot,r2,matBody);
+    // foot toes
+    for(let k=-1;k<=1;k++){
+      const toe=V(foot.x+side*0.04, 0.04, foot.z+0.18+k*0.07);
+      if(footY<0.2) capsule(dragon,solids,foot,toe,0.05*P.bulk,matScale);
+    }
+  }
+  leg(hipP,-1,false); leg(hipP,1,false);
+  leg(shP,-1,true);   leg(shP,1,true);
+
+  // ---- wings (bones + membrane), from shoulders ----
+  const span=P.wingSpan, spread=P.wingSpread;
+  function wing(side){
+    const base=V(shP.x+side*shR*0.8, shP.y+0.25, shP.z-0.1);
+    const elbow=V(base.x+side*(1.1*span), base.y+0.9*spread+0.5, base.z-0.5*spread-0.3);
+    const wrist=V(elbow.x+side*(1.5*span), elbow.y+0.3*spread, elbow.z-1.4*span*spread-0.2);
+    capsule(dragon,solids,base,elbow,0.10*P.bulk,matScale);
+    capsule(dragon,solids,elbow,wrist,0.075*P.bulk,matScale);
+    // fingers fan from wrist
+    const fingers=[];
+    for(let f=0;f<4;f++){
+      const t=f/3;
+      const ln=(1.3-0.5*t)*span;
+      const ft=V(wrist.x+side*ln*(0.3+0.7*spread),
+                 wrist.y - t*1.6 - (1-spread)*0.8,
+                 wrist.z - ln*(0.2+spread*0.9) + t*0.9*span);
+      fingers.push(ft);
+      capsule(dragon,solids,wrist,ft,0.05*P.bulk,matScale);
+    }
+    // membrane between base/wrist/fingers
+    const anchor=V(base.x, base.y-0.4, base.z-0.3);
+    const ring=[anchor,wrist,...fingers];
+    const g=new THREE.BufferGeometry(); const verts=[];
+    const hub=wrist;
+    function tri(a,b,c){verts.push(a.x,a.y,a.z,b.x,b.y,b.z,c.x,c.y,c.z);}
+    tri(anchor,wrist,fingers[0]);
+    for(let f=0;f<fingers.length-1;f++) tri(hub,fingers[f],fingers[f+1]);
+    tri(anchor,fingers[0],V(anchor.x,anchor.y-0.2,anchor.z+0.4));
+    g.setAttribute('position',new THREE.Float32BufferAttribute(verts,3));
+    g.computeVertexNormals();
+    const mem=new THREE.Mesh(g,matMemb); mem.castShadow=false; dragon.add(mem);
+  }
+  wing(-1); wing(1);
+
+  // ---- head : skull bones, jaw, nose ridge, teeth, brow/cheek shields, horns ----
+  const B2=P.bulk;
+  const fwd2=headTan.clone().normalize();
+  const upH=V(0,1,0).addScaledVector(fwd2,-fwd2.y).normalize();        // up ⟂ fwd
+  const rightH=new THREE.Vector3().crossVectors(fwd2,upH).normalize();
+  const P3=(o,a,b,c)=>V(o.x+fwd2.x*a+upH.x*b+rightH.x*c,
+                        o.y+fwd2.y*a+upH.y*b+rightH.y*c,
+                        o.z+fwd2.z*a+upH.z*b+rightH.z*c);
+  const sk=0.30*B2;
+  const skull=P3(headP,0.12,0.0,0.0);
+  sphere(dragon,solids,skull,sk,matBody);                              // cranium
+  box3(dragon,solids,P3(skull,-0.16,0.04,0),fwd2,upH,rightH,[0.12*B2,0.20*B2,0.26*B2],matBody); // occipital plate
+
+  const ML=0.95*P.snout, JD=0.16*P.jawDepth, JW=0.15*B2, crv=P.snoutCurve;
+  // upper jaw — two bone boxes (taper), pitched down toward the tip by snout-curve
+  const ujMid=P3(skull,0.30+ML*0.30,-0.02,0);
+  const ujTip=P3(skull,0.30+ML*0.85,-0.02-0.22*crv,0);
+  const ujF=new THREE.Vector3().subVectors(ujTip,skull).normalize();
+  const ujU=V(0,1,0).addScaledVector(ujF,-ujF.y).normalize();
+  const ujR=new THREE.Vector3().crossVectors(ujF,ujU).normalize();
+  box3(dragon,solids,P3(skull,0.30+ML*0.28,-0.02,0),ujF,ujU,ujR,[ML*0.34,JD*1.05,JW*1.05],matBody);
+  box3(dragon,solids,V((ujMid.x+ujTip.x)/2,(ujMid.y+ujTip.y)/2,(ujMid.z+ujTip.z)/2),ujF,ujU,ujR,[ML*0.30,JD*0.8,JW*0.82],matBody);
+  // nose ridge — raised bony line along the top of the muzzle
+  box3(dragon,solids,P3(skull,0.30+ML*0.42,JD*0.9,0),ujF,ujU,ujR,[ML*0.5,JD*0.3,JW*0.28],matScale);
+  for(const s of [-1,1]) box3(dragon,solids,P3(ujTip,-0.06,JD*0.5,s*JW*0.5),ujF,ujU,ujR,[0.05*B2,0.05*B2,0.05*B2],matScale); // nostrils
+
+  // lower jaw — hinged at the skull base, opens slightly
+  const hinge=P3(skull,0.05,-JD*1.3,0);
+  const ljTip=P3(skull,0.30+ML*0.78,-JD*1.6-0.04,0);
+  const ljF=new THREE.Vector3().subVectors(ljTip,hinge).normalize();
+  const ljU=V(0,1,0).addScaledVector(ljF,-ljF.y).normalize();
+  const ljR=new THREE.Vector3().crossVectors(ljF,ljU).normalize();
+  box3(dragon,solids,V((hinge.x+ljTip.x)/2,(hinge.y+ljTip.y)/2,(hinge.z+ljTip.z)/2),ljF,ljU,ljR,[ML*0.42,JD*0.55,JW*0.9],matBody);
+
+  // teeth — rows of small pointed blocks along both jaw edges
+  const tN=6, tSz=0.05*B2*(0.4+P.teeth);
+  if(P.teeth>0.02) for(let i=0;i<tN;i++){ const f=0.30+ML*(0.30+0.5*i/tN);
+    for(const s of [-1,1]){
+      box3(dragon,solids,P3(skull,f,-JD*0.95,s*JW*0.8),ujF,ujU,ujR,[tSz*0.5,tSz*1.4,tSz*0.5],matScale);
+      box3(dragon,solids,P3(skull,f,-JD*1.5,s*JW*0.8),ljF,ljU,ljR,[tSz*0.5,tSz*1.2,tSz*0.5],matScale);
+    }
+  }
+  // brow ridge — bony shield over the eyes (the "shielded expression")
+  if(P.brow>0.02) for(const s of [-1,1])
+    box3(dragon,solids,P3(skull,0.18,0.16+0.06*P.brow,s*0.16),fwd2,upH,rightH,[0.16*B2,0.05*B2+0.05*P.brow,0.13*B2],matScale);
+  // cheek shields — flared jaw plates on the sides
+  if(P.cheek>0.02) for(const s of [-1,1])
+    box3(dragon,solids,P3(skull,0.12,-JD*0.6,s*(sk*0.7+0.05*P.cheek)),fwd2,upH,rightH,[0.16*B2,0.14*B2,0.04*B2+0.05*P.cheek],matScale);
+
+  // eyes — set into sockets beneath the brow (emissive)
+  for(const s of [-1,1]){
+    const eye=P3(skull,sk*0.55,sk*0.18,s*sk*0.62);
+    const m=new THREE.Mesh(new THREE.SphereGeometry(0.07*B2,12,10),matEye);
+    m.position.copy(eye); dragon.add(m); emis.push({c:eye.clone(),r:0.08*B2});
+  }
+  // crest — cranial frill rising up/back from the skull top
+  if(P.crest>0.02) for(let i=0;i<3;i++){ const s=(i-1);
+    box3(dragon,solids,P3(skull,-0.05-0.04*i,sk*0.7+0.18*P.crest,s*0.10),fwd2,upH,rightH,[0.03*B2,0.10*B2+0.12*P.crest,0.05*B2],matScale);
+  }
+  // horns — count P.horns, curvature from P.hornSweep (back-swept ↔ forward), tapered 2-segment
+  const nH=Math.round(P.horns), sweep=P.hornSweep;
+  for(let h=0;h<nH;h++) for(const s of [-1,1]){
+    const base=P3(skull,-0.10+0.02*h,sk*0.5+0.05*h,s*(0.12+0.05*h));
+    const mid =P3(base,-0.18*sweep,0.26+0.06*h,s*0.06);
+    const tip =P3(mid,-0.30*sweep-0.06,0.30+0.10*h,s*0.10);
+    capsule(dragon,solids,base,mid,0.055*B2,matScale);
+    capsule(dragon,solids,mid,tip,0.035*B2,matScale);
+  }
+  // a few spine ridge plates (glow target)
+  for(let i=Math.round(0.34*N); i<Math.round(0.62*N); i+=3){
+    const p=pts[i], r=rad[i];
+    const top=V(p.x, p.y+r+0.12, p.z);
+    const m=new THREE.Mesh(new THREE.ConeGeometry(0.09*P.bulk,0.26*P.bulk,6),
+      glow?matEye:matScale);
+    m.position.copy(top); dragon.add(m);
+    if(glow) emis.push({c:top.clone(),r:0.10});
+  }
+  return {solids,emis};
+}
+
+/* ---------- voxelizer (same solids → cubes) ---------- */
+let voxBody=null,voxEye=null;
+function pointInSolids(x,y,z,solids){
+  for(const s of solids){
+    if(s.t==='s'){const dx=x-s.c.x,dy=y-s.c.y,dz=z-s.c.z;if(dx*dx+dy*dy+dz*dz<=s.r*s.r)return true;}
+    else{ // capsule: dist point->segment
+      const ax=s.a.x,ay=s.a.y,az=s.a.z, bx=s.b.x,by=s.b.y,bz=s.b.z;
+      const ux=bx-ax,uy=by-ay,uz=bz-az; const wx=x-ax,wy=y-ay,wz=z-az;
+      let t=(wx*ux+wy*uy+wz*uz)/(ux*ux+uy*uy+uz*uz); t=t<0?0:t>1?1:t;
+      const dx=wx-t*ux,dy=wy-t*uy,dz=wz-t*uz;
+      if(dx*dx+dy*dy+dz*dz<=s.r*s.r)return true;
+    }
+  }
+  return false;
+}
+function buildVoxels(solids,emis){
+  // bounding box over all solids
+  let mn=V(1e9,1e9,1e9),mx=V(-1e9,-1e9,-1e9);
+  for(const s of solids){
+    if(s.t==='b'){
+      const ex=Math.abs(s.u.x)*s.half[0]+Math.abs(s.v.x)*s.half[1]+Math.abs(s.w.x)*s.half[2];
+      const ey=Math.abs(s.u.y)*s.half[0]+Math.abs(s.v.y)*s.half[1]+Math.abs(s.w.y)*s.half[2];
+      const ez=Math.abs(s.u.z)*s.half[0]+Math.abs(s.v.z)*s.half[1]+Math.abs(s.w.z)*s.half[2];
+      mn.min(V(s.c.x-ex,s.c.y-ey,s.c.z-ez)); mx.max(V(s.c.x+ex,s.c.y+ey,s.c.z+ez)); continue;
+    }
+    const pts=s.t==='s'?[s.c]:[s.a,s.b];
+    for(const p of pts){mn.min(V(p.x-s.r,p.y-s.r,p.z-s.r));mx.max(V(p.x+s.r,p.y+s.r,p.z+s.r));}
+  }
+  const dim=Math.max(mx.x-mn.x,mx.y-mn.y,mx.z-mn.z)||1;
+  const cell=dim/res, half=cell*0.46;
+  const gx=Math.max(1,Math.ceil((mx.x-mn.x)/cell)+1),
+        gy=Math.max(1,Math.ceil((mx.y-mn.y)/cell)+1),
+        gz=Math.max(1,Math.ceil((mx.z-mn.z)/cell)+1);
+  const occ=new Uint8Array(gx*gy*gz);              // 0 empty · 1 body · 2 glow
+  const at=(ix,iy,iz)=>((ix*gy)+iy)*gz+iz;
+  // rasterize one solid into occ, looping only its local bbox
+  function stamp(s,v){
+    let lo,hi;
+    if(s.t==='s'){lo=[s.c.x-s.r,s.c.y-s.r,s.c.z-s.r];hi=[s.c.x+s.r,s.c.y+s.r,s.c.z+s.r];}
+    else if(s.t==='b'){
+      const ex=Math.abs(s.u.x)*s.half[0]+Math.abs(s.v.x)*s.half[1]+Math.abs(s.w.x)*s.half[2];
+      const ey=Math.abs(s.u.y)*s.half[0]+Math.abs(s.v.y)*s.half[1]+Math.abs(s.w.y)*s.half[2];
+      const ez=Math.abs(s.u.z)*s.half[0]+Math.abs(s.v.z)*s.half[1]+Math.abs(s.w.z)*s.half[2];
+      lo=[s.c.x-ex,s.c.y-ey,s.c.z-ez];hi=[s.c.x+ex,s.c.y+ey,s.c.z+ez];
+    }
+    else{lo=[Math.min(s.a.x,s.b.x)-s.r,Math.min(s.a.y,s.b.y)-s.r,Math.min(s.a.z,s.b.z)-s.r];
+         hi=[Math.max(s.a.x,s.b.x)+s.r,Math.max(s.a.y,s.b.y)+s.r,Math.max(s.a.z,s.b.z)+s.r];}
+    const ix0=Math.max(0,Math.floor((lo[0]-mn.x)/cell)), ix1=Math.min(gx-1,Math.ceil((hi[0]-mn.x)/cell));
+    const iy0=Math.max(0,Math.floor((lo[1]-mn.y)/cell)), iy1=Math.min(gy-1,Math.ceil((hi[1]-mn.y)/cell));
+    const iz0=Math.max(0,Math.floor((lo[2]-mn.z)/cell)), iz1=Math.min(gz-1,Math.ceil((hi[2]-mn.z)/cell));
+    const r2=s.r*s.r;
+    for(let ix=ix0;ix<=ix1;ix++){const x=mn.x+(ix+0.5)*cell;
+     for(let iy=iy0;iy<=iy1;iy++){const y=mn.y+(iy+0.5)*cell;
+      for(let iz=iz0;iz<=iz1;iz++){const z=mn.z+(iz+0.5)*cell;
+        let inside;
+        if(s.t==='s'){const dx=x-s.c.x,dy=y-s.c.y,dz=z-s.c.z;inside=dx*dx+dy*dy+dz*dz<=r2;}
+        else if(s.t==='b'){const px=x-s.c.x,py=y-s.c.y,pz=z-s.c.z;
+          const du=px*s.u.x+py*s.u.y+pz*s.u.z, dv=px*s.v.x+py*s.v.y+pz*s.v.z, dw=px*s.w.x+py*s.w.y+pz*s.w.z;
+          inside=Math.abs(du)<=s.half[0]&&Math.abs(dv)<=s.half[1]&&Math.abs(dw)<=s.half[2];}
+        else{const ux=s.b.x-s.a.x,uy=s.b.y-s.a.y,uz=s.b.z-s.a.z,wx=x-s.a.x,wy=y-s.a.y,wz=z-s.a.z;
+          let t=(wx*ux+wy*uy+wz*uz)/(ux*ux+uy*uy+uz*uz);t=t<0?0:t>1?1:t;
+          const dx=wx-t*ux,dy=wy-t*uy,dz=wz-t*uz;inside=dx*dx+dy*dy+dz*dz<=r2;}
+        if(inside){const k=at(ix,iy,iz); if(v>occ[k]) occ[k]=v;}
+      }}}
+  }
+  for(const s of solids) stamp(s,1);
+  for(const e of emis) stamp({t:'s',c:e.c,r:e.r+cell*0.5},2);   // glow cells
+  // shell extraction: keep only occupied cells touching empty / boundary (the visible surface)
+  const geo=new THREE.BoxGeometry(cell*0.96,cell*0.96,cell*0.96);
+  const mats=makeMatPair(); const M=new THREE.Matrix4();
+  const bodyM=[],eyeM=[]; const CAP=300000;
+  for(let ix=0;ix<gx;ix++)for(let iy=0;iy<gy;iy++)for(let iz=0;iz<gz;iz++){
+    const v=occ[at(ix,iy,iz)]; if(!v)continue;
+    const y=mn.y+(iy+0.5)*cell; if(y<half)continue;            // clip below ground
+    const shell = ix===0||iy===0||iz===0||ix===gx-1||iy===gy-1||iz===gz-1
+      || !occ[at(ix-1,iy,iz)]||!occ[at(ix+1,iy,iz)]
+      || !occ[at(ix,iy-1,iz)]||!occ[at(ix,iy+1,iz)]
+      || !occ[at(ix,iy,iz-1)]||!occ[at(ix,iy,iz+1)];
+    if(!shell)continue;
+    (v===2?eyeM:bodyM).push([mn.x+(ix+0.5)*cell,y,mn.z+(iz+0.5)*cell]);
+    if(bodyM.length+eyeM.length>CAP)break;
+  }
+  voxBody=new THREE.InstancedMesh(geo,mats.body,Math.max(1,bodyM.length)); voxBody.castShadow=true;
+  bodyM.forEach((p,i)=>{M.makeTranslation(p[0],p[1],p[2]);voxBody.setMatrixAt(i,M);});
+  voxBody.instanceMatrix.needsUpdate=true; dragon.add(voxBody);
+  if(eyeM.length){
+    voxEye=new THREE.InstancedMesh(geo,mats.eye,eyeM.length);
+    eyeM.forEach((p,i)=>{M.makeTranslation(p[0],p[1],p[2]);voxEye.setMatrixAt(i,M);});
+    voxEye.instanceMatrix.needsUpdate=true; dragon.add(voxEye);
+  }
+}
+function makeMatPair(){
+  const p=PAL[element];
+  return {
+    body:new THREE.MeshStandardMaterial({color:p.body,roughness:0.85,metalness:0.12}),
+    eye:new THREE.MeshStandardMaterial({color:p.em,emissive:p.em,emissiveIntensity:glow?2.2:0.2,roughness:0.4})
+  };
+}
+
+/* ---------- (re)build ---------- */
+function clearDragon(){
+  for(let i=dragon.children.length-1;i>=0;i--){
+    const c=dragon.children[i]; if(c.geometry)c.geometry.dispose();
+    dragon.remove(c);
+  }
+  voxBody=voxEye=null;
+}
+let rebuildT=null;
+function rebuild(now){
+  const go=()=>{
+    clearDragon(); makeMaterials();
+    const r=buildSolids();             // builds the smooth meshes + returns the solid list
+    if(mode==='voxel'){
+      clearDragon();                   // drop the smooth meshes, keep the solid data
+      buildVoxels(r.solids,r.emis);    // re-express the same body as cubes
+    }
+  };
+  if(now){go();return;}
+  clearTimeout(rebuildT); rebuildT=setTimeout(go, mode==='voxel'?90:0);
+}
+
+/* ---------- UI ---------- */
+const elsEl=document.getElementById('els');
+Object.keys(PAL).forEach(k=>{
+  const d=document.createElement('div'); d.className='el'+(k===element?' on':''); d.textContent=k;
+  d.onclick=()=>{element=k;document.querySelectorAll('.el').forEach(e=>e.classList.toggle('on',e.textContent===k));applyTheme();rebuild(true);};
+  elsEl.appendChild(d);
+});
+const slEl=document.getElementById('sliders'); const grpSeen={};
+SPECS.forEach(([key,label,mn,mx,def,grp])=>{
+  if(grp && !grpSeen[grp]){grpSeen[grp]=1;const hd=document.createElement('div');hd.className='sec';hd.textContent='skull & face — finch-beak morphospace';slEl.appendChild(hd);}
+  const row=document.createElement('div'); row.className='row';
+  row.innerHTML=`<label>${label}</label><input type="range" id="s_${key}" min="${mn}" max="${mx}" step="0.01" value="${def}"><output id="o_${key}"></output>`;
+  slEl.appendChild(row);
+  const inp=row.querySelector('input'),out=row.querySelector('output');
+  const upd=()=>{P[key]=parseFloat(inp.value);
+    out.textContent=(key==='horns')?Math.round(P[key]):P[key].toFixed(2);
+    inp.style.setProperty('--p',((P[key]-mn)/(mx-mn)*100)+'%'); };
+  inp.addEventListener('input',()=>{upd();rebuild(false);}); upd();
+});
+function setMode(v){mode=v;document.querySelectorAll('#mode span').forEach(s=>s.classList.toggle('on',s.dataset.v===v));
+  document.getElementById('res').disabled=(v!=='voxel');rebuild(true);}
+document.querySelectorAll('#mode span').forEach(s=>s.onclick=()=>setMode(s.dataset.v));
+document.querySelectorAll('#glow span').forEach(s=>s.onclick=()=>{glow=s.dataset.v==='on';
+  document.querySelectorAll('#glow span').forEach(x=>x.classList.toggle('on',x.dataset.v===s.dataset.v));rebuild(true);});
+const resI=document.getElementById('res');
+resI.addEventListener('input',()=>{res=+resI.value;document.getElementById('resOut').textContent=res;if(mode==='voxel')rebuild(false);});
+document.getElementById('res').disabled=true;
+document.getElementById('reroll').onclick=()=>{
+  SPECS.forEach(([k,l,mn,mx])=>{const v=mn+Math.random()*(mx-mn);P[k]=v;
+    const i=document.getElementById('s_'+k);i.value=v;i.dispatchEvent(new Event('input'));});
+  rebuild(true);
+};
+document.getElementById('reset').onclick=()=>{
+  SPECS.forEach(([k,l,mn,mx,def])=>{P[k]=def;const i=document.getElementById('s_'+k);i.value=def;i.dispatchEvent(new Event('input'));});
+  rebuild(true);
+};
+function applyTheme(){
+  const p=PAL[element]; const r=document.documentElement.style;
+  r.setProperty('--el','#'+p.rim.toString(16).padStart(6,'0'));
+  r.setProperty('--el-soft','#'+p.em.toString(16).padStart(6,'0'));
+  r.setProperty('--el-deep',p.deep);
+}
+applyTheme();
+
+/* ---------- genome export ---------- */
+// The viewer's parametric space IS the canonical dragon genome
+// (handoff/DRAGON_GENOME.md). Export the dialed-in dragon as a
+// normalized [0,1] gene vector keyed by the canonical gene names, so it
+// can seed the engine (egg_genome::breed / hybrid_rules operate on this).
+function buildGenome(){
+  const MAP={pose:'pose_bias',bulk:'bulk',neckLen:'neck_len',neckArch:'neck_arch',
+    tailLen:'tail_len',legLen:'leg_len',wingSpan:'wing_span',wingSpread:'wing_spread',
+    snout:'muzzle_len',jawDepth:'jaw_depth',snoutCurve:'snout_curve',brow:'brow',
+    cheek:'cheek',teeth:'teeth',crest:'crest',horns:'horns',hornSweep:'horn_sweep'};
+  const genes={}, vector=[], order=[];
+  for(const [key,,mn,mx] of SPECS){
+    const name=MAP[key]||key;
+    let g=(P[key]-mn)/(mx-mn); g=Math.max(0,Math.min(1,g)); g=Math.round(g*1000)/1000;
+    genes[name]=g; vector.push(g); order.push(name);
+  }
+  return {format:'unendlich-dragon-genome/v1',element:element,
+    material:{glow:glow},genes:genes,vector:vector,order:order,
+    derived:{horn_pairs:Math.round(P.horns)}};
+}
+function copyGenome(){
+  const j=JSON.stringify(buildGenome(),null,2);
+  const wrap=document.getElementById('genomeWrap'),
+        ta=document.getElementById('genomeJson'),
+        st=document.getElementById('genomeStatus');
+  wrap.style.display='block'; ta.value=j; ta.focus(); ta.select();
+  const done=ok=>{st.textContent=ok?'copied ✓':'select all + ⌘/Ctrl-C';
+    setTimeout(()=>{st.textContent='';},2500);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(j).then(()=>done(true)).catch(()=>done(false));
+  } else { done(false); }
+}
+document.getElementById('copygene').onclick=copyGenome;
+
+/* ---------- orbit + render ---------- */
+let drag=false,lx=0,ly=0,idle=0;
+function onDown(e){drag=true;idle=0;const t=e.touches?e.touches[0]:e;lx=t.clientX;ly=t.clientY;}
+function onMove(e){if(!drag)return;const t=e.touches?e.touches[0]:e;
+  azim-=(t.clientX-lx)*0.01; polar-=(t.clientY-ly)*0.01;
+  polar=Math.max(0.25,Math.min(Math.PI-0.15,polar)); lx=t.clientX;ly=t.clientY;e.preventDefault?.();}
+function onUp(){drag=false;}
+canvas.addEventListener('mousedown',onDown);addEventListener('mousemove',onMove);addEventListener('mouseup',onUp);
+canvas.addEventListener('touchstart',onDown,{passive:false});addEventListener('touchmove',onMove,{passive:false});addEventListener('touchend',onUp);
+canvas.addEventListener('wheel',e=>{radius=Math.max(6,Math.min(30,radius+e.deltaY*0.012));e.preventDefault();},{passive:false});
+function resize(){const w=innerWidth,h=innerHeight;renderer.setSize(w,h);camera.aspect=w/h;camera.updateProjectionMatrix();}
+addEventListener('resize',resize); resize();
+function loop(){
+  requestAnimationFrame(loop);
+  if(!drag){idle++; if(idle>90) azim+=0.0016;}
+  camera.position.set(target.x+radius*Math.sin(polar)*Math.sin(azim),
+                      target.y+radius*Math.cos(polar),
+                      target.z+radius*Math.sin(polar)*Math.cos(azim));
+  camera.lookAt(target);
+  renderer.render(scene,camera);
+}
+rebuild(true); loop();
+</script>
+</body>
+</html>

@@ -463,9 +463,11 @@ fn style_emphasis(s: &str) -> String {
                 continue;
             }
         }
-        // bold: ** or __
-        if i + 1 < s.len() && (&s[i..i + 2] == "**" || &s[i..i + 2] == "__") {
-            let marker = &s[i..i + 2];
+        // bold: ** or __  (byte compare — never slice across a char
+        // boundary; `i` walks raw bytes, so `&s[i..i+2]` panicked when
+        // i+2 landed inside a multibyte char like '—').
+        if i + 1 < s.len() && b[i] == b[i + 1] && (b[i] == b'*' || b[i] == b'_') {
+            let marker = if b[i] == b'*' { "**" } else { "__" };
             if let Some(c) = s[i + 2..].find(marker) {
                 out.push_str("<b>");
                 out.push_str(&style_emphasis(&s[i + 2..i + 2 + c]));
@@ -733,5 +735,20 @@ mod tests {
         let _ = style_emphasis("a **b");
         let _ = style_emphasis("a `b");
         let _ = style_emphasis("*");
+    }
+
+    #[test]
+    fn no_panic_on_multibyte_chars() {
+        // Regression: `i` walks raw bytes, so a 2-byte marker probe
+        // (`&s[i..i+2]`) used to split a multibyte char (e.g. '—',
+        // 3 bytes) and panic on a char-boundary error. These must all
+        // pass through cleanly.
+        assert_eq!(style_emphasis("word—word"), "word—word");
+        assert_eq!(style_emphasis("a — b — c"), "a — b — c");
+        // multibyte right where a bold probe happens, then real bold
+        assert_eq!(style_emphasis("é**x**"), "é<b>x</b>");
+        // emoji (4-byte) and accents shouldn't trip it either
+        let _ = style_emphasis("café — déjà vu 🚀 _italic_ done");
+        assert_eq!(style_emphasis("naïve __bold__"), "naïve <b>bold</b>");
     }
 }

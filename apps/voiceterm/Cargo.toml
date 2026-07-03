@@ -1,12 +1,9 @@
 [package]
 name = "web2qml"
-version = "0.1.879"
+version = "0.1.900"
 edition = "2021"
 
 [dependencies]
-voice-kit = { path = "../../shared/voice-kit" }
-core-kit = { path = "../../shared/core-kit" }
-audio-kit = { path = "../../shared/audio-kit" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }
@@ -105,7 +102,12 @@ llamacpp = ["llama-cpp-2", "llama-cpp-2/vulkan", "encoding_rs"]
 wavenet = ["candle-core", "candle-nn"]
 
 [profile.release]
-opt-level = "z"
+# v0.1.882: was "z" (aggressive size-over-speed — unusual for a desktop
+# app and a suspect in the terminal-feels-slow-vs-Konsole reports). The
+# Rust release default is 3; with lto + codegen-units=1 + strip already
+# on, the binary stays lean while the Rust hot paths (grid diffing,
+# parsing, render) run at full speed.
+opt-level = 3
 lto = true
 codegen-units = 1
 strip = true

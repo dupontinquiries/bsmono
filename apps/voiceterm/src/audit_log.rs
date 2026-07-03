@@ -264,7 +264,11 @@ fn unescape(s: &str) -> String {
     out
 }
 
-fn now_ms() -> u64 { core_kit::time::now_millis() }
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Compute SHA-256 of a string, return lowercase hex.
 ///
@@ -973,8 +977,8 @@ pub fn verify_chain() -> VerifyResult {
                 message: format!(
                     "Hash chain broken at line {}: expected prev={}, got prev={}",
                     idx + 1,
-                    if expected_prev.is_empty() { "<empty>" } else { &expected_prev[..8.min(expected_prev.len())] },
-                    if prev_claim.is_empty() { "<empty>" } else { &prev_claim[..8.min(prev_claim.len())] },
+                    if expected_prev.is_empty() { "<empty>" } else { crate::util::safe_byte_truncate(&expected_prev, 8) },
+                    if prev_claim.is_empty() { "<empty>" } else { crate::util::safe_byte_truncate(&prev_claim, 8) },
                 ),
             };
         }

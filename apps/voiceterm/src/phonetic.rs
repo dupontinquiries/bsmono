@@ -240,7 +240,9 @@ fn db() -> &'static Mutex<Vec<Fingerprint>> {
     FP_DB.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn now_secs() -> u64 { core_kit::time::now_secs() }
+fn now_secs() -> u64 {
+    crate::util::epoch_secs()
+}
 
 /// Add a fingerprint to the in-memory db. Allows up to MAX_PER_LABEL recordings
 /// of the same phrase. When over cap, drops the oldest with the lowest match_count.
@@ -983,7 +985,13 @@ fn top_matches_inner(
                 } else {
                     true  // can't track, log anyway
                 };
-                if first_miss {
+                // v0.1.882: don't emit the "miss → full scan" line when
+                // there's nothing to scan (empty fingerprint DB). A full
+                // scan of zero fingerprints is a no-op; the log was pure
+                // noise on fresh installs. The empty-DB state is announced
+                // once at load time instead (see speaker-matching startup
+                // notice), so the user knows the feature is dark.
+                if first_miss && !g.is_empty() {
                     crate::clog!("phonetic", "pitch index miss for bin {}, falling back to full scan (suppressing further misses for this bin)", q_bin);
                 }
                 (0..g.len()).collect()
@@ -1317,6 +1325,12 @@ pub fn load_from_disk() {
     if let Ok(mut g) = db().lock() {
         *g = loaded;
         eprintln!("Phonetic: loaded {} fingerprints from {}", g.len(), path.display());
+        // v0.1.882: tell the user once, up front, when speaker matching is
+        // dark because no fingerprints exist yet — otherwise the feature
+        // silently does nothing and the per-lookup "miss" logs are gone too.
+        if g.is_empty() {
+            eprintln!("Phonetic: fingerprint DB empty — speaker matching disabled until voices are enrolled");
+        }
     }
     rebuild_pitch_index();
 }

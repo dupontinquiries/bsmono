@@ -83,7 +83,12 @@ fn snippet(body: &str, max: usize) -> String {
 static DRAFT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Unix milliseconds now (0 if the clock is before the epoch).
-fn now_millis() -> i64 { core_kit::time::now_millis() as i64 }
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 /// A fresh draft id: millis + a process-local sequence so two saves in
 /// the same millisecond don't collide. Slug-safe (filename-safe).

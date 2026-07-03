@@ -44,6 +44,23 @@ write blind — auth crypto with silent, security-relevant failure modes.
   `MailHub::handle_phrase` + `PaneAction`→pane mapping (see
   `BACKEND-WIRING.md`), and the notifier timer (`poll_new_mail` /
   `prime_notifications`).
+  - v0.1.893 — built the message-VIEWING voice grammar ahead of the panes:
+    `mail_intent::parse_message_nav` + `NavDir{Next,Previous,Back,Close}` turn
+    spoken "next message" / "go back one" / "back to the list" / "close this"
+    into a direction the UI maps onto its message-pane stack once those panes
+    exist. Pure + unit-tested (incl. the "back one"=Previous vs bare "back"=
+    Back-to-list overlap). Not session-gated — navigation is stateless pane
+    movement, so it'll wire the moment the message pane lands (no auth needed
+    for the nav itself). Still TODO: a `mail_message_nav` qt_method + an
+    executeIntent branch that calls it only while a message pane is focused.
+  - v0.1.893 — also broadened the LIVE sign-in voice command
+    (`parse_register_email` / the `mail_register_email` qt_method, wired in
+    executeIntent today): it matched only the exact strings "sign in to email"
+    / "log in to email", so "sign into my email", "log in to proton", "sign me
+    in to my inbox" fell through. Now a sign-in verb + a mail-specific noun
+    matches (currency-/bank-safe: "sign in to my account" with no mail noun is
+    deliberately excluded). Opens the Proton login form — the one mail UX that
+    works pre-auth.
 - [ ] **S — async login** so `mail_login`'s blocking ureq round-trip
   doesn't run on the UI thread (spawn + signal the result wire back).
 
@@ -3026,6 +3043,26 @@ OR from compositor-level issues we've already flagged.
    rendering in pty_term.rs is the most suspect for the
    terminal-specific slowness.
 
+   - [x] ~~Dirty-rect arc stage c — per-row packed cache for the native
+     renderer.~~ DONE v0.1.892. The native Canvas path (`term_screen_runs`)
+     re-packed the WHOLE visible screen every frame — `row_runs_packed(r)`
+     for every row, each doing render_row_runs (run coalescing + a Vec + a
+     String per run) + a `format!` per run. Now a per-visible-row cache
+     (`row_pack_cache` on TermGrid) holds each row's packed string and
+     `row_runs_packed_cached` recomputes only on a miss; `term_screen_runs`
+     reuses the rest. So a frame that touches K of N rows does O(K) packing
+     work instead of O(N). Correct by construction: the cache is invalidated
+     in `mark_row_dirty` (one row) and `mark_all_dirty` (all), the exact hooks
+     the existing render-gating already trusts — and every content change
+     (cell write, scroll/scrollback shift, resize, alt-screen swap, bulk
+     erase) already routes through one of them, verified at their call sites.
+     Safety net: a unit test asserts the cached output is byte-identical to a
+     fresh `row_runs_packed` across miss/hit/invalidate/mark-all paths, so a
+     hit can't drift from the truth. This is the localized form of the win
+     Option G chases at the QML-item layer; the two are complementary (G still
+     reduces scene-graph item count). Doesn't touch the HTML path or the
+     snapshot migration the code comments flag as the next native cleanup.
+
 4. **Memory pressure causing swap.**
    If web2qml's resident memory has grown over many ships
    and the user's RAM is pressured, kernel swap-in/out shows
@@ -3770,9 +3807,15 @@ filed as observations for future ships where appropriate.
   multiplier applies" in both `src/qml_gen.rs` and
   `qml/main.qml`.
 
-- [ ] **S — Cargo opt-level is "z" (size); investigate whether
-  "s" or "3" affects perceived runtime perf.** From v0.1.247
-  audit pass 3:
+- [x] ~~**S — Cargo opt-level is "z" (size); investigate whether
+  "s" or "3" affects perceived runtime perf.**~~ Done v0.1.882:
+  switched `[profile.release]` `opt-level` from `"z"` to `3` (the
+  Rust release default). `"z"` aggressively optimizes for binary
+  SIZE at the cost of runtime speed — unusual for a desktop Qt app
+  and a plausible contributor to the terminal-feels-slow-vs-Konsole
+  reports. With `lto = true`, `codegen-units = 1`, and `strip = true`
+  already set, the binary stays lean while the Rust hot paths (grid
+  diffing, parsing, render) run at full speed. Original note:
   
   ```
   [profile.release]
@@ -5195,6 +5238,13 @@ that landing first.
   pipe-escape edge cases. Need to ask user for the actual file
   content next session.
 
+  v0.1.882: added regression tests for every named hypothesis —
+  single-column tables, escaped pipes (`\|` → literal), and inline
+  markup in cells (`*`/`` ` ``/links kept verbatim at parse, styled
+  at render). All pass. The parser is confirmed robust on these
+  axes, so this report can't be reproduced without the user's
+  actual file; closing the speculative angles, awaiting the file.
+
 - [x] **L — Raw `.md` URL serves raw text, not rendered
   markdown.** **Landed v0.1.265.** Detection branch in
   `load_page` triggers when URL path ends in `.md`/`.markdown`
@@ -6040,7 +6090,14 @@ plus one larger arc proposal:
 
 #### Broken — phonetic DB empty (CONSEQUENCE of persistence bug)
 
-- [ ] **M — Phonetic match fallback when DB is empty.**
+- [x] ~~**M — Phonetic match fallback when DB is empty.**~~
+  Done v0.1.882: the per-lookup "pitch index miss → full scan"
+  line is now suppressed when the fingerprint gallery is empty (a
+  full scan of zero fingerprints is a no-op, so the log was pure
+  noise on fresh installs), and the loader prints a one-time
+  "fingerprint DB empty — speaker matching disabled until voices
+  are enrolled" at startup so the user knows the feature is dark.
+  Original note:
   Logs show `[phonetic] pitch index miss for bin N, falling
   back to full scan` consistently — but the full scan also
   has nothing to match against because the DB never persisted
@@ -7281,7 +7338,26 @@ user-settable + persisted via settings.conf. See power-features.md.
   0-3600 seconds; 0 disables. Shows a live "≈ Xm" hint to the
   right when the value is over a minute. Persists via existing
   save_settings on edit-finished.
-- [ ] **M — Capture exit codes from prompt markers.** Currently
+- [x] ~~**M — Capture exit codes from prompt markers.**~~ Done
+  v0.1.883. OSC 133 `D;<code>` shell-integration markers are now
+  parsed in `pty_term.rs` (`parse_osc133_exit` + an `osc_dispatch`
+  `b"133"` arm) and captured onto `TermGrid.osc133_exit`. Each pty
+  tick, `pty_read_screen` drains it via `PtyTerminal::take_osc133_exit`
+  (non-blocking `try_lock`) into `BlockTracker::note_exit_code`. On the
+  next command submission the code is attached to the block that just
+  finished and rides the `pending_notifications` tuple (now
+  `(id, cmd, dur, Option<i32>)`) out to `long_command_finished`, which
+  surfaces it as a real exit code instead of the hardcoded -1 — unlocking
+  "Build failed (✗)" vs "Build done (✓)" toasts. Shells without OSC 133
+  integration carry `None` → the legacy -1 (unknown), so behavior is
+  unchanged for them. Tested end to end: OSC-133 parse table (D;0/D;1/
+  D;130/bare-D/A-B-C/non-numeric), VTE-level capture onto the grid, and
+  the BlockTracker attach-on-next-submit path. The QML/signal hop
+  (drain → note → toast) compiles clean but its on-screen ✓/✗ wants a
+  runtime confirm with a shell-integration-enabled shell.
+  Original note follows.
+
+  Currently
   the BlockTracker never sets `exit_code` (always `None`), so
   the notification's exit_code arg is always -1. Most modern
   shells emit OSC 133 prompt markers including the exit code
@@ -7546,15 +7622,62 @@ shipped surface.
   check `.git/hooks/pre-commit`, run it visibly, surface
   failures before invoking `git commit`. Or refuse politely:
   "pre-commit failed (3 issues); run anyway?"
-- [ ] **S — Git command output detection.** When the user just
-  ran a `git` command, the next pty_read_screen tick should
-  request a status refresh even if cwd didn't change (catches
-  `git commit`, `git stash`, `git reset` etc. mutating state).
-  Currently we refresh on EVERY block-close which is more
-  conservative than needed; could narrow to git-prefixed
-  blocks for a small efficiency win.
+- [x] ~~**S — Git command output detection.**~~ Done v0.1.885,
+  but corrected from the original framing. The literal idea —
+  "narrow to git-prefixed blocks" — is wrong: a non-git command
+  like `echo x >> tracked.txt`, `rm file`, or `mv` also mutates
+  git state, so gating on `git ` would miss real changes. Instead
+  the block-close refresh is now gated on `cmd_classifier::classify(
+  closed_command).should_snapshot()` — i.e. it fires for Mutating
+  and Unknown commands but skips the `git status` subprocess after
+  the short, authoritative ReadOnly set (ls/cat/grep/cd/...). Because
+  the classifier bumps redirections and pipes-to-file to Mutating,
+  `echo x >> tracked` still triggers a refresh. cwd changes still
+  refresh unconditionally, and any stale status self-heals on the
+  next mutating command or cd. BlockTracker flags `git_relevant_close`
+  at block close (where it already classifies for snapshots) and
+  main.rs `take()`s it each pty tick. Tested: read-only closes don't
+  request a refresh, mutating closes do, and the redirect case is
+  covered explicitly. Saves a `git status` fork after the most common
+  interactive commands (the prior code forked on EVERY block-close,
+  deduped only by an in-flight guard).
 
 ### Validation suite gaps
+
+- [x] ~~**S — Golden harness build broke silently (qml_gen output safety
+  net down since v0.1.884).**~~ FIXED v0.1.888. `scripts/qml_golden.sh`
+  stages a dependency-free copy of qml_gen + its sibling modules and diffs
+  the emitted QML byte-for-byte against committed goldens — the intended
+  safety net before any qml_gen refactor. But it stages a fixed module
+  list, and it stopped compiling once qml_gen gained `crate::util::
+  safe_byte_truncate` (v0.1.884) and `crate::clog!` calls that weren't in
+  the staged closure — so it had been failing to BUILD (and thus silently
+  not running) for several versions. Because it isn't wired into
+  `validate.sh`, nothing flagged it. Fix: stage `util.rs` (std-only, clean)
+  and add the same `clog!` stub the pure-test harness uses. Reconciled the
+  one resulting drift — `edge_cases.html` rendered a `javascript:void(0)`
+  href as a clickable link in the stale golden, but current code (v0.1.875
+  `is_dead_href`) correctly renders dead/JS hrefs as a de-emphasized label
+  + ⚡ marker (unit-tested) — so the golden was stale, not the code; updated
+  it. Also added a `bg_image.html` fixture so v0.1.887's background-image
+  extraction gains coverage (verified the emitted output: 3 leaf bg-image
+  divs → 3 Images; hero-with-text → Text only; gradient/data:/cursor →
+  nothing). Harness now green, 10/10.
+
+  - [x] ~~Follow-up: harden so it can't silently rot~~ DONE v0.1.890, both
+    halves: (1) **Auto-derive** — the staged module list is no longer
+    hand-written; qml_golden.sh walks `crate::<mod>::` references
+    transitively from qml_gen and stages the closure (derived: qml_gen +
+    ad_filter + anim_detect + layout_detect + table_ops + util). A new
+    pure-module ref is picked up automatically; a ref to a module needing
+    external deps fails the build loudly instead of rotting. (2) **Wired
+    into the gate** — validate.sh runs the harness as its final step, so
+    output drift OR a harness build-break now fails the ship gate. Staging
+    build cache persisted under /tmp (was wiped every run) → ~60s cold (first
+    run of a session), ~5s warm; `WEB2QML_SKIP_GOLDEN=1` skips with a visible
+    notice. Caught + fixed a bug the persistence introduced (the awk split
+    appends, so got/ must be wiped each run), proved idempotency, and proved
+    the gate fails on injected drift and recovers on revert.
 
 - [x] ~~**XS — Verify `table_with_bold_in_cell` test assertion
   (manpages.rs:~2485).**~~ DONE v0.1.871. Confirmed: the test WAS
@@ -7587,7 +7710,31 @@ shipped surface.
   site in qml_gen.rs. Still also want the temp QML
   (`/tmp/web2qml_pv_*.qml`) if available.
 
-- [ ] **S — Char-boundary slicing audit of remaining sites.**
+- [x] ~~**S — Char-boundary slicing audit of remaining sites.**~~
+  Done v0.1.884. Centralized a `util::safe_byte_truncate(s, n) -> &str`
+  helper (snap the cut down to the nearest char boundary; returns the
+  whole string when it fits, `""` at n=0) with multibyte tests (é, em-
+  dash, 🎉, and the historical `havenât` mojibake — none panic, every
+  result is valid UTF-8). Audit findings on the listed sites:
+  - `qml_gen.rs` URL byte-caps (the v0.1.396-era `1751`/`1945`, now
+    `&r[..r.len().min(50/40)]`) — GENUINELY unsafe (`r` is a resolved
+    URL/`&str`; an internationalized or mojibake URL could split at the
+    cut). Fixed → `safe_byte_truncate`.
+  - `audit_log.rs:980-981` SHA-hex truncation — defensive only (hex is
+    ASCII) but switched to the helper anyway; a corrupted log can't
+    panic the chain-verify path now.
+  - `security.rs:926` and `qml_gen.rs:1452/1476` (`is_tracking_attr`) —
+    NOT a risk: these operate on `&[u8]` byte slices, where indexing is
+    always valid. The original concern assumed `&str`; left as-is.
+  - `audit_log.rs:1337` (`&line[..line.len()-1]`) — test-only and guarded
+    by a preceding `ends_with('\n')` assert (the stripped byte is always
+    the 1-byte newline). Left as-is.
+  Also DRY'd the original snap-back loop in `qml_gen.rs:183` (the
+  reference implementation) to call the shared helper. Two extra
+  find/depth-scan sites surfaced by a broad grep (`qml_gen.rs:1239`,
+  `4500`) were checked and are boundary-safe (indices land just past an
+  ASCII brace / come from `find`). No remaining unsafe `&str` byte
+  slices in these files.
   v0.1.396 fixed archive.rs:302 and js_analyze.rs:80 (real
   user-hit panics on The Verge article with mojibake
   `havenât`). Remaining sites that do byte-arithmetic
@@ -8432,6 +8579,38 @@ specification.
 - [ ] **v0.1.37x — Link graph foundation** (M-L). `[[wikilink]]`
   convention. Forward/back-link index. Centrality. Voice "what
   links to this?"
+  - `[[wikilink]]` + forward/back-link index: DONE earlier (`link_graph.rs`
+    `LinkGraph`, `backlinks.rs`). "what links to this?" data is `backlinks()`.
+  - Centrality + walkthrough: DONE v0.1.894. `degree_centrality` /
+    `centrality_ranking` (hubs first, stable ties) and `walkthrough()` — a
+    deterministic guided tour that starts at the densest hub, walks its
+    neighbourhood breadth-first in centrality order, then jumps to the next
+    cluster's hub (disconnected components covered, no interleaving). Exposed
+    LIVE via the `manpage_graph_walkthrough` qt_method
+    (`{"order":[...],"hubs":[...]}`) over the help corpus — first real consumer
+    of the walkthrough. 8 unit tests (hub ranking, full coverage, component
+    ordering, json/empty).
+  - The walkthrough is **parser-agnostic**: anything that feeds (node, links)
+    into a `LinkGraph` gets a tour for free. Two follow-ups this unlocks, both
+    requested:
+    - **Graph-walkthrough × email**: DONE v0.1.895. `LinkGraph::from_niftyplot`
+      turns any niftyplot graph source into a link graph (node ids → slugs,
+      directed edges → forward links), reusing `add_document`'s index logic; it
+      normalizes endpoint ids to absorb the parser's `: "label"` edge-suffix
+      quirk. Exposed LIVE via the `niftyplot_walkthrough` qt_method, which
+      returns `{"order":[{slug,label}...],"hubs":[{slug,label,degree}...]}`.
+      Feed it `mail_panes::sender_graph_niftyplot` / `attachment_graph_niftyplot`
+      and it tours the inbox from "You" outward to each correspondent. Pure over
+      its input string → runs on note/terminal niftyplot blocks today, and on the
+      live inbox graph the moment that (auth-gated) source is produced. Unit test
+      drives the real inbox-sender DSL end-to-end. Still TODO: a QML affordance
+      that calls it from the niftyplot canvas / a "walk me through this graph"
+      voice phrase.
+    - **Multi-user**: when cards/notes carry a speaker id (see "Speaker id in
+      cards", 918), centrality can be computed per-author or the walkthrough
+      seeded from a chosen author's hub, so a shared device can tour "Dad's
+      notes" vs "Mara's notes" over the same graph. Attribution arc is the
+      gate; the graph side is ready.
 
 - [ ] **v0.1.37x — Link metadata in exports** (S). Published
   Gemtext gains a metadata footer with strength scores. Private
@@ -8742,12 +8921,22 @@ multi-month tree):
     then route into the same renderer that handles HTML
     tables. This is a small piece extractable from the larger
     DocNode tree.
-  - [ ] **M — Math passthrough as styled monospace.** Until
-    full math rendering lands, recognize `$...$` and `$$...$$`
-    blocks and render them in a distinguishable mono style so
-    the user can at least *see* they're meant to be math, even
-    if not properly typeset. Cheap pre-render alternative to
-    full KaTeX integration.
+  - [x] ~~**M — Math passthrough as styled monospace.**~~ Done v0.1.891.
+    `$…$` and `$$…$$` now render as a distinguishable monospace span across
+    all three inline paths (the strikethrough precedent — keep them in sync):
+    `inline_to_richtext` (QML) emits a mono `<span>`, `render_inline` (HTML)
+    emits `<code>`, both KEEPING the `$` delimiters inside so math reads as
+    math rather than as inline code; `strip_inline_markup` (read-aloud/titles)
+    drops the delimiters and keeps the expression as plain text, without
+    re-parsing it as markdown (so `a_b` stays `a_b`, not italic). New pure
+    `detect_math` helper with strict, currency-safe delimiter rules (Pandoc-
+    style, slightly stricter): inline open `$` must be followed by a non-space
+    AND non-digit char, close `$` must be preceded by a non-space char and not
+    followed by a digit, no newline crossing; `$$…$$` matched first (the
+    doubled delimiter is unambiguous). 9 unit tests incl. the currency cases
+    that motivated the strict rules ("$5 to $10", "from $1,000 to $2,000" all
+    stay plain) and a multibyte check. Still a pre-render, not typesetting —
+    KaTeX integration remains the eventual upgrade.
 
 ### Non-HTML document sources (markdown, mermaid, math) — original framing
 
@@ -9304,22 +9493,34 @@ Patterns identified (in order of priority):
   5. SVG `<image href>` (not handled)
   6. Canvas/WebGL (unrenderable without JS runtime)
 
-- [ ] **M — Generic `extract_image_url` function.** Replace
-  scattered URL-extraction conditions across the img and
-  picture handlers (v0.1.174) with a single site-agnostic
-  function. Try patterns 1, 2, 3 in priority order. Returns
-  `Option<String>` of the best URL found. Both handlers
-  call the same function. New lazy-load patterns get added
-  in one place instead of scattered.
+- [x] ~~**M — Generic `extract_image_url` function.**~~ Done v0.1.889.
+  New `extract_image_url(el)` in qml_gen.rs consolidates the lazy-load
+  resolution the img and picture handlers carried separately: (1) the
+  element's own src-like attrs in priority order (`src`, `data-src`,
+  `data-lazy-src`, `data-original`, `data-srcset`, `srcset`), first
+  non-placeholder wins; (2) failing that, `<source>` descendants (picture
+  pattern) — skip `data-empty`/`data:` srcsets, keep the last viable. Both
+  handlers now call it; new lazy-load patterns get added in one place.
+  Proven behavior-preserving: the byte-for-byte golden harness (img via
+  article.html, picture via media.html) is identical before/after. 2 new
+  unit tests cover the candidate priority and the picture source scan.
+  (Minor, documented: for the pathological case of a `<picture>` carrying
+  its own src-like attr, candidates now win over its sources — can't occur
+  with valid markup, and is arguably more correct for lazy-loaded pictures.)
 
-- [ ] **S — Honor `<source media>` queries for picture
-  sizing.** Currently we always take the last/largest
-  source URL. When media attributes are present
-  (`media="(max-width:734px)"`), we could match against
-  our actual render width and pick the right size.
-  Saves bandwidth on phones; uses less RAM. Apple's pattern
-  always includes a `(min-width:0px)` catch-all so we can
-  fall back when we can't match.
+- [ ] **S→M — Honor `<source media>` queries for picture sizing.**
+  REASSESSED v0.1.887: not a clean S. The premise assumes a render width
+  is known at generation time, but qml_gen is width-agnostic — width is
+  resolved at QML *runtime* via `parent.width` (there's no viewport-width
+  value threaded into generation). So matching `media=(max-width:734px)`
+  against "our render width" can't happen at emit time. The correct fix
+  is one of: (a) emit a runtime source-selection binding keyed on
+  `parent.width` (proper CSS `<picture>` semantics: first source whose
+  media matches), or (b) plumb a target/pane width into qml_gen and select
+  at generation time. Both are M. The current "pick last viable" is the
+  Apple small→large convention and stays correct-but-largest until then.
+  Note the right selection rule is *first matching source in document
+  order*, not last.
 
 - ✅ **`<noscript>` fallback parsing for picture/img** —
   addressed v0.1.374. Originally framed as "parse noscript
@@ -9335,14 +9536,23 @@ Patterns identified (in order of priority):
   resolution candidate list to include `data-original` and
   `data-srcset`. 8 unit tests.
 
-- [ ] **M — CSS `background-image: url(...)` extraction.**
-  Common pattern: a `<div>` with `style="background-image:
-  url(...)"` and no `<img>` child. Currently invisible to
-  our renderer. Parse inline styles, emit an Image when
-  found. Caveat: CSS `background-position`, `background-
-  size`, `background-repeat` can dramatically affect how
-  the image is rendered — for v1, just show the image at
-  div-bounds size and accept some incorrect rendering.
+- [x] ~~**M — CSS `background-image: url(...)` extraction.**~~ Done
+  v0.1.887 (v1 scope). New pure `extract_bg_image_url(style)` in
+  qml_gen.rs parses `background-image`/`background`-shorthand `url(...)`,
+  stripping quotes/whitespace and rejecting `data:` URIs, the `none`
+  keyword, and gradients (no `url()` token); it requires a `background`
+  property so `url()` in `cursor`/`mask`/`list-style-image` isn't grabbed.
+  Wired into the generic-element emitter, but deliberately scoped to the
+  `parts.is_empty()` arm — a leaf element with a background image and no
+  rendering children, which is exactly the "currently invisible" case.
+  That scoping means (a) no `<img>` child to double up with and (b) hero
+  sections that already render text/children are left untouched, so it's
+  strictly additive. Such a leaf now emits an `Image` (placeholder URLs
+  filtered by `is_placeholder`). 4 unit tests incl. quotes, shorthand,
+  rejections, and a multibyte-URL char-boundary check. The position/size/
+  repeat caveat stands — image shows at the emitter's default width.
+  Broadening to non-leaf elements (background + overlaid content) is a
+  future call once it can be visually verified.
 
 ### Rendering fidelity arc (v0.1.174 strategic question)
 
@@ -9444,15 +9654,14 @@ This is a *separate* perf contributor from image decode
 hitches — modals are layout work, images are decode work,
 both cost real frames.
 
-- [ ] **S — Skip emission of `aria-modal="true"` subtrees by
-  default.** When the renderer encounters an element with
-  `aria-modal="true"` AND no explicit `open` attribute
-  (`<dialog open>` semantically means "currently open"),
-  emit a placeholder marker instead of the full subtree.
-  Same for elements with computed-style `opacity: 0` or
-  `display: none` from inline `style` attribute — these
-  are author-declared "not visible right now," respect
-  the declaration.
+- [x] ~~**S — Skip emission of `aria-modal="true"` subtrees by
+  default.**~~ Already done (v0.1.172), verified this pass. `is_hidden`
+  (qml_gen.rs) returns true for `aria-modal="true"` without an `open`
+  attr, and for inline `display:none` / `visibility:hidden` / `opacity:0`
+  (the opacity check guards against `0.5`/`0.1` false-positives). The
+  caller skips the whole subtree (returns `""`) rather than emitting a
+  placeholder marker — skipping is cleaner than a marker and matches the
+  intent. No code change needed.
 - [ ] **M — Inline-style visibility heuristics in `qml_gen`.**
   Currently we read `style` attribute for some hints but
   not all. Add a pre-walk that resolves `display: none`,
@@ -10393,3 +10602,15 @@ cases. Need a call on the intended behavior:
   which trips the ==threshold one-shot proactive suggestion. Decide:
   should the N-gram windower ignore wrap-arounds, or should the
   proactive suggestion require the dominant (max-occurrence) sequence?
+
+## Voice: sub-path nav vs web search (pending decision) — v0.1.900
+`resolve_known_site` stitches spoken words after a known-site key into a URL
+path: "open github torvalds linux" → github.com/torvalds/linux (intended). The
+same logic turns "open rust async docs" → rust-lang.org/async/docs instead of a
+web search for the phrase. For platform sites (github: user/repo) the sub-path
+is meaningful; for content sites (rust-lang.org, wikipedia, apple) appending
+arbitrary spoken words as a path is usually a wrong URL and a search would serve
+the user better. Decision needed: restrict sub-path stitching to an allowlist of
+platform sites (and route the rest to SearchWeb), or keep the current broad
+behavior. Test `narration_open_tail_not_searched` currently asserts only the
+weaker invariant (navigate OR search) pending this call.

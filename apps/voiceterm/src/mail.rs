@@ -814,7 +814,12 @@ pub fn password_mode_label(mode: PasswordModeRepr) -> &'static str {
     }
 }
 
-fn now_secs() -> u64 { core_kit::time::now_secs() }
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 #[cfg(test)]
 mod tests {

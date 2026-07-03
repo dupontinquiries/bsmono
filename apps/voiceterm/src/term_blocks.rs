@@ -240,7 +240,26 @@ pub struct BlockTracker {
     /// Cleared on each drain. The queue should never grow more
     /// than a few entries between drains (drain runs every
     /// pty poll tick, typically 50ms on the active tab).
-    pub pending_notifications: std::collections::VecDeque<(u32, String, u32)>,
+    ///
+    /// v0.1.883: tuple is `(id, command, duration_ms, exit_code)`. The
+    /// exit code is `Some` only when an OSC 133 `D;<code>` marker was
+    /// captured for that command (shells with integration); `None`
+    /// otherwise, which the drain surfaces as the legacy `-1` (unknown).
+    pub pending_notifications: std::collections::VecDeque<(u32, String, u32, Option<i32>)>,
+
+    /// v0.1.883: exit code captured from the most recent OSC 133
+    /// `D;<code>` shell-integration marker, awaiting attachment to the
+    /// block that just finished. Consumed (taken) when the next command
+    /// is submitted and the previous block is closed. `None` for shells
+    /// without OSC 133 integration.
+    pub pending_exit_code: Option<i32>,
+
+    /// v0.1.885: set when a just-closed block's command could have
+    /// mutated the working tree (anything not confirmed read-only by
+    /// cmd_classifier). main.rs takes this each pty tick to decide
+    /// whether a git-status refresh is worth the subprocess; read-only
+    /// commands (ls/cat/grep/...) leave it false and skip the refresh.
+    pub git_relevant_close: bool,
 
     /// v0.1.363: SSH-session detection. Set true when the
     /// most-recently-submitted command starts with `ssh `,
@@ -276,6 +295,22 @@ pub struct BlockTracker {
 
 impl BlockTracker {
     pub fn new() -> Self { Self::default() }
+
+    /// v0.1.883: record an exit code captured from an OSC 133 `D;<code>`
+    /// shell-integration marker. Stored until the next command is
+    /// submitted, at which point it is attached to the block that just
+    /// finished (see `submit_command`). Called by main.rs after draining
+    /// the grid's captured code each pty tick.
+    pub fn note_exit_code(&mut self, code: i32) {
+        self.pending_exit_code = Some(code);
+    }
+
+    /// v0.1.885: take (and reset) the "a mutating command just closed"
+    /// flag. Returns true if any non-read-only command closed since the
+    /// last call. Used by main.rs to gate the git-status refresh.
+    pub fn take_git_relevant_close(&mut self) -> bool {
+        std::mem::take(&mut self.git_relevant_close)
+    }
 
     /// v0.1.363: read the current SSH-session state. Public so
     /// main.rs's pty_read_screen worker can emit the
@@ -374,6 +409,14 @@ impl BlockTracker {
                 let now = epoch_secs();
                 last.duration_ms = Some(((now - last.started_at).saturating_mul(1000)) as u32);
             }
+            // v0.1.883: attach the OSC 133 exit code captured since this
+            // block's command finished. `take()` so it can't leak onto a
+            // later block; `None` for shells without shell integration,
+            // which downstream surfaces as the legacy -1 (unknown).
+            let exit = self.pending_exit_code.take();
+            if last.exit_code.is_none() {
+                last.exit_code = exit;
+            }
             // v0.1.350: queue a possible long-command notification.
             // main.rs's pty_read_screen drains the queue and checks
             // each entry against the configured threshold. We push
@@ -385,7 +428,18 @@ impl BlockTracker {
             // frequency.
             if let Some(d) = last.duration_ms {
                 self.pending_notifications.push_back(
-                    (last.id, last.command.clone(), d));
+                    (last.id, last.command.clone(), d, last.exit_code));
+            }
+            // v0.1.885: flag whether this just-closed command could have
+            // mutated the working tree, so pty_read_screen can skip the
+            // git-status subprocess after confirmed read-only commands
+            // (ls/cat/grep/...). cmd_classifier bumps redirections and
+            // pipes-to-file to Mutating, so `echo x >> tracked` still
+            // counts; only its short authoritative ReadOnly set is skipped.
+            // Any stale status self-heals on the next mutating command or
+            // cwd change (both still refresh).
+            if crate::cmd_classifier::classify(&last.command).should_snapshot() {
+                self.git_relevant_close = true;
             }
             crate::log_summary::request_summary(last.id, &last.command, &last.output);
             // Scan for missing-package signals (command not found,
@@ -792,7 +846,9 @@ fn escape_field(s: &str) -> String {
     s.replace('\x1F', " ").replace('\n', " ").replace('\r', "")
 }
 
-fn epoch_secs() -> u64 { core_kit::time::now_secs() }
+fn epoch_secs() -> u64 {
+    crate::util::epoch_secs()
+}
 
 /// Strip ANSI/VT escape sequences for clean output capture
 fn strip_ansi(s: &str) -> String {
@@ -1062,6 +1118,72 @@ mod tests {
         // The is_ssh_session is now false because the block
         // that opened it has closed.
         assert!(!t.is_ssh_session());
+    }
+
+    #[test]
+    fn osc133_exit_code_attaches_to_finished_block() {
+        // v0.1.883: note_exit_code (fed from an OSC 133 D;<code> marker)
+        // is attached to the block that just finished, on the NEXT
+        // command submission, and rides along in the notification queue.
+        let mut t = BlockTracker::new();
+        t.submit_command("make", 0);
+        // make's block must have a duration so it queues a notification.
+        if let Some(b) = t.blocks.last_mut() {
+            b.duration_ms = Some(5000);
+        }
+        // Shell reports make finished with exit 2 (✗) via OSC 133.
+        t.note_exit_code(2);
+        // Next command submitted → the make block closes and takes the code.
+        t.submit_command("ls", 0);
+
+        let make_block = t.blocks.iter().find(|b| b.command == "make")
+            .expect("make block exists");
+        assert_eq!(make_block.exit_code, Some(2),
+            "captured exit code attaches to the finished block");
+        // And the queued notification carries it for the toast.
+        let n = t.pending_notifications.iter()
+            .find(|(_, cmd, _, _)| cmd == "make")
+            .expect("make notification queued");
+        assert_eq!(n.3, Some(2), "notification carries the exit code");
+        // The pending slot is now empty (single-shot; won't leak to ls).
+        assert_eq!(t.pending_exit_code, None,
+            "exit code is consumed, not reused for the next block");
+    }
+
+    #[test]
+    fn git_refresh_skips_read_only_but_not_mutating_or_redirects() {
+        // v0.1.885: the git-status refresh on block-close is gated on
+        // whether the closed command could mutate the tree. A submitted
+        // command closes the PREVIOUS block, so we drive it pairwise.
+        let mut t = BlockTracker::new();
+        t.submit_command("ls", 0); // opens ls (no prior block to close)
+        let _ = t.take_git_relevant_close();
+
+        // Close ls (read-only) → no refresh warranted.
+        t.submit_command("cat notes.txt", 0);
+        assert!(!t.take_git_relevant_close(),
+            "read-only `ls` closing must not request a git refresh");
+
+        // Close cat (read-only) with a mutating command.
+        t.submit_command("rm notes.txt", 0);
+        assert!(!t.take_git_relevant_close(),
+            "read-only `cat` closing must not request a git refresh");
+
+        // Close rm (mutating) → refresh warranted.
+        t.submit_command("ls", 0);
+        assert!(t.take_git_relevant_close(),
+            "mutating `rm` closing must request a git refresh");
+
+        // The correctness case the TODO's literal "git-prefixed only" idea
+        // would miss: a redirect to a tracked file mutates git state even
+        // though the base command (`echo`) is read-only. cmd_classifier
+        // bumps redirects to Mutating, so it must trigger a refresh.
+        let _ = t.take_git_relevant_close();
+        t.submit_command("echo hi >> README.md", 0);
+        let _ = t.take_git_relevant_close(); // closing the prior `ls`
+        t.submit_command("ls", 0); // closes the redirect command
+        assert!(t.take_git_relevant_close(),
+            "`echo >> tracked` is mutating → must request a git refresh");
     }
 
     // v0.1.375: block-shape detection.
