@@ -187,6 +187,83 @@ pub fn serve(listener: UnixListener, handler: impl Fn(Message, &mut Conn) + Send
     }
 }
 
+/// A stable per-connection id assigned by [`serve_hub`]. Doubles as the pub-sub subscriber
+/// id, so a service can address notifications to specific connections.
+pub type ConnId = u64;
+
+/// A stateful daemon service: one instance shared across all connections. `handle` returns
+/// messages addressed to connection ids — reply to `from`, or push to any other connection
+/// (that's how a pub-sub daemon notifies subscribers).
+pub trait Service: Send {
+    fn handle(&mut self, from: ConnId, msg: Message) -> Vec<(ConnId, Message)>;
+    /// A connection closed (drop its subscriptions).
+    fn disconnect(&mut self, _id: ConnId) {}
+}
+
+/// Serve a stateful [`Service`] with addressed routing. Each connection gets a `ConnId` and
+/// a writer thread draining an mpsc queue to its socket; inbound messages are handed to the
+/// (locked) service, whose outputs are routed to the target connections' queues. This is
+/// the model `voiced` and `sharemd` use — unlike [`serve`], a service can push to
+/// connections other than the caller. Blocks forever.
+pub fn serve_hub(listener: UnixListener, service: impl Service + 'static) {
+    use std::collections::HashMap;
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::{Arc, Mutex};
+
+    let service = Arc::new(Mutex::new(service));
+    let conns: Arc<Mutex<HashMap<ConnId, Sender<Message>>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut next_id: ConnId = 0;
+
+    for incoming in listener.incoming() {
+        let Ok(stream) = incoming else { continue };
+        next_id += 1;
+        let id = next_id;
+
+        // per-connection writer: drains a channel to the socket
+        let (tx, rx) = channel::<Message>();
+        let write_stream = match stream.try_clone() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        conns.lock().unwrap().insert(id, tx);
+        std::thread::spawn(move || {
+            let mut w = write_stream;
+            for msg in rx {
+                if w.write_all(msg.encode().as_bytes()).is_err() || w.flush().is_err() {
+                    break;
+                }
+            }
+        });
+
+        // reader: inbound → service.handle → route outputs to target connections
+        let svc = service.clone();
+        let conns_r = conns.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if let Some(msg) = Message::decode(&line) {
+                            let outs = svc.lock().unwrap().handle(id, msg);
+                            let map = conns_r.lock().unwrap();
+                            for (target, m) in outs {
+                                if let Some(s) = map.get(&target) {
+                                    let _ = s.send(m);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            svc.lock().unwrap().disconnect(id);
+            conns_r.lock().unwrap().remove(&id);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
