@@ -1,0 +1,30 @@
+{
+  "name": "group-games",
+  "description": "Games & interactive worlds",
+  "apps": [
+    {
+      "name": "unendlich",
+      "path": "apps/unendlich",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "cybertron",
+      "path": "apps/cybertron",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "paperbound",
+      "path": "apps/paperbound",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}
