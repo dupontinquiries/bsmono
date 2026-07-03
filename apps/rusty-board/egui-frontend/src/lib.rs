@@ -80,6 +80,74 @@ impl Layout {
             ],
         }
     }
+
+    /// A symbols/numbers layout, reached by swiping the keyboard sideways.
+    pub fn symbols() -> Layout {
+        fn row(keys: &[&str]) -> Row {
+            Row { keys: keys.iter().map(|k| Key::new(k)).collect(), weight: 1.0 }
+        }
+        Layout {
+            name: "symbols".into(),
+            rows: vec![
+                row(&["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]),
+                row(&["!", "@", "#", "$", "%", "&", "*", "(", ")"]),
+                Row {
+                    keys: vec![
+                        Key::wide("=\\<", 1.5),
+                        Key::new("-"),
+                        Key::new("_"),
+                        Key::new("+"),
+                        Key::new("/"),
+                        Key::new(":"),
+                        Key::new(";"),
+                        Key::new("?"),
+                        Key::emitting("⌫", "\u{8}", 1.5),
+                    ],
+                    weight: 1.0,
+                },
+                Row {
+                    keys: vec![Key::emitting("space", " ", 6.0), Key::emitting("⏎", "\n", 2.0)],
+                    weight: 1.0,
+                },
+            ],
+        }
+    }
+}
+
+/// A keyboard with multiple layouts you swipe between (qwerty ↔ symbols), using the shared
+/// gesture layer — mirroring rusty-board's swipe layout-switching.
+pub struct Board {
+    layouts: Vec<Layout>,
+    idx: usize,
+    gesture: uikit_egui::GestureLayer,
+}
+
+impl Board {
+    /// Default board: qwerty + symbols.
+    pub fn new() -> Board {
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
+    }
+    pub fn current(&self) -> &Layout {
+        &self.layouts[self.idx]
+    }
+    /// Switch layout by a swipe sign (wraps, since there are only a couple).
+    pub fn swipe(&mut self, sign: i32) {
+        let n = self.layouts.len() as i32;
+        self.idx = (((self.idx as i32 + sign) % n + n) % n) as usize;
+    }
+    /// Read a committed swipe from the gesture layer (call each frame with the board rect).
+    pub fn poll_swipe(&mut self, ui: &egui::Ui, surface: Rect) {
+        let frame = self.gesture.update(ui, surface, true);
+        if let Some(dir) = frame.page_jump {
+            self.swipe(dir.sign());
+        }
+    }
+}
+
+impl Default for Board {
+    fn default() -> Self {
+        Board::new()
+    }
 }
 
 /// Apply the shared palette to the egui context (call once at startup).
@@ -232,6 +300,18 @@ mod tests {
         // top-left of the first row should land on 'q'
         let hit = hit_test(&l, board, &a, egui::pos2(6.0, 5.0));
         assert_eq!(hit.as_deref(), Some("q"));
+    }
+
+    #[test]
+    fn swipe_switches_layout() {
+        let mut b = Board::new();
+        assert_eq!(b.current().name, "qwerty");
+        b.swipe(1);
+        assert_eq!(b.current().name, "symbols");
+        b.swipe(1); // wraps back
+        assert_eq!(b.current().name, "qwerty");
+        b.swipe(-1);
+        assert_eq!(b.current().name, "symbols");
     }
 
     #[test]

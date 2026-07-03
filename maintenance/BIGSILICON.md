@@ -105,6 +105,16 @@ Already egui: **logscope**, **unendlich** (these seeded the kit). To port:
 | bo-suite   | Qt          | control panel over the mux daemon                             |
 | snapclone  | Qt          | camera/preview UI; egui + the carved surface                  |
 
+### Port progress — bot-arena → egui (DONE) + swipe gestures wired in
+- `apps/bot-arena/egui-frontend` (`bot-arena-egui`): the GTK4/libadwaita dashboard ported to
+  egui. Views (Arena/Standings/Replays) are **swipe-paged** via the shared gesture layer
+  (`GestureLayer` over uikit-gesture), laid out adaptively (desktop shows a tab row; phone
+  swipes), themed from snapclone-theme, with the barrier indicator painted mid-swipe.
+  Compiles vs egui 0.29; 3 tests. bot-arena's engine.rs/fsm.rs are GTK-free → drop-in on-device.
+- `rusty-board-egui`: now uses the gesture layer too — `Board` swipes between qwerty ↔ symbols
+  layouts (mirrors rusty-board's swipe layout-switching). Test `swipe_switches_layout`.
+- **Swipe-gesture shared libs (uikit-gesture + gesture_layer) are now adopted in two ports.**
+
 Port recipe: keep the Rust core crates as-is, replace the UI crate with an egui front-end
 built on `uikit-egui` (skin + carved widgets + theme bridge) and `adaptive` (so one binary
 adapts phone↔desktop), reusing `examples/logscope_touch.rs` as the pattern. Do them one at
