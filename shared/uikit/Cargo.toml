@@ -1,0 +1,22 @@
+# shared/uikit — the egui UI-kit family (G2), lifted from the egui-kit exploration.
+#
+# Three library crates, no demo binary here (the demo lives in the exploration):
+#   * uikit-gesture   — dependency-free two-tier gesture model (swipe/fling/pinch/…)
+#   * snapclone-theme — the 9 palettes + design tokens, dependency-free
+#   * uikit-egui      — carved widgets + gesture adapter + theme bridge (egui 0.29)
+#
+# The gesture + theme crates are std-only so they cross-compile trivially to
+# aarch64 / musl / x86_64 / riscv64 — the point of lifting them into shared/.
+# This is the shared layer apps port their Qt/GTK UIs onto.
+
+[workspace]
+members = ["crates/uikit-gesture", "crates/uikit-egui", "crates/snapclone-theme"]
+resolver = "2"
+
+[workspace.dependencies]
+egui = "0.29"
+uikit-gesture = { path = "crates/uikit-gesture" }
+snapclone-theme = { path = "crates/snapclone-theme" }
+
+[profile.dev]
+opt-level = 1

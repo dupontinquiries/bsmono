@@ -1,0 +1,28 @@
+[package]
+name = "uikit-egui"
+version = "0.1.0"
+edition = "2021"
+description = "The shared egui UI kit: logscope's carved-material widget surface (Skin L4 + carved painters L2), snapclone's TwoTierGesture wired to egui::InputState, and a snapclone-theme -> egui Visuals bridge. The substrate every app's egui front-end builds on."
+license = "MIT OR Apache-2.0"
+
+# What this crate IS, and why it sits in shared/:
+#   · L4 Skin tokens + L2 carved painters are ported from
+#     apps/logscope/crates/logscope-egui/src/theme.rs (the "carved material"
+#     look) — generalized so it is no longer logscope-private.
+#   · GestureLayer adapts egui::InputState (pointer drag + scroll) to
+#     uikit-gesture::TwoTierGesture, so the FP5-tuned swipe feel works in any
+#     egui app with no per-app gesture code.
+#   · theme_bridge maps snapclone-theme::Palette -> egui::Visuals so the 9
+#     palettes (Dark = the SnapClone look) drive egui directly.
+#
+# Consumers: apps/snapclone-egui (the port), and — as a reverse-port — a touch
+# layer for apps/logscope (see examples/logscope_touch.rs).
+
+[dependencies]
+egui = "0.29"
+uikit-gesture = { path = "../uikit-gesture" }
+
+# snapclone-theme already advertises egui compatibility in its own docs
+# ("compatible with egui Color32::from_hex"); we consume it directly rather
+# than re-defining colors.
+snapclone-theme = { path = "../snapclone-theme" }

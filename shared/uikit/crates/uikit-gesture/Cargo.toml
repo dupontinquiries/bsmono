@@ -1,0 +1,25 @@
+[package]
+name = "uikit-gesture"
+version = "0.1.0"
+edition = "2021"
+description = "Two-tier scroll/swipe gesture model (sub-page detent + page-jump flick), lifted from snapclone-gesture so any egui/Qt/Slint app can reuse it. Pure logic, no deps, with a C FFI seam."
+license = "MIT OR Apache-2.0"
+
+# Promoted verbatim-in-spirit from system/snapclone/rust/snapclone-gesture.
+# Kept dependency-free on purpose: it is the reverse-port candidate (logscope
+# wants it for touch), so it must compile for every target with nothing to drag
+# in. The C FFI seam below is what the remaining C++ Qt callers use until the
+# oxidation in apps/snapclone-egui finishes.
+
+[lib]
+# rlib for Rust kit consumers; cdylib/staticlib so the existing C++ SwipeNavigator
+# can keep calling the SAME tuned logic during the C++ -> Rust transition.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[dependencies]
+
+[features]
+default = []
+# `ffi` is always available (it is unconditional in lib.rs) — exposed here only
+# so a downstream that wants the rlib without the C symbols can opt the cdylib
+# build out at the workspace level if desired.
