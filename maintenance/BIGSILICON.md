@@ -279,3 +279,27 @@ works if widgets carry semantic labels — which is the real per-app work.
 - The `register_with_voiced` helper is now a 2-liner over the client: `for (e,p) in
   a11y::standard_grammar() { voice.register(e, Scope::Always, &[p]); }`. Remaining: TTS sink;
   then the other ports.
+
+## Fedora RPM + Alpine apk repositories (gitmind as host/builder)
+
+gitmind can now package a project and host a repo for the fleet: RPM for the Asahi/Fedora
+desktop, apk for the Alpine/postmarketOS phone. It builds *on the device* with the native
+tools and serves the repo over HTTP.
+
+- **`cockpit::packaging`** (pure, tested): `PkgMeta`; `rpm_spec()` and `apkbuild()`
+  generators (install prebuilt binaries — no recompile); command builders (`rpmbuild_cmd`,
+  `createrepo_cmd`, `abuild_cmd`, `apk_index_cmd`); client configs (`dnf_repo_file`,
+  `apk_repo_line`, `apk_add_cmd`); arch mapping; and a traversal-safe `resolve_in_root` for
+  the repo server. 6 tests.
+- **`flow` orchestration** (3 tests): `package_project(dir, format, out)` builds the binary
+  (any language, via buildsystem), stages the RPM/apk tree (spec/APKBUILD + sources), and
+  runs the native packager best-effort (absent tool → returns the staged tree + a hint);
+  `repo_add` copies + reindexes; `serve_repo` is a minimal GET server dnf/apk fetch from;
+  `repo_client_config` prints the exact dnf/apk setup; `host_repo_format` auto-detects.
+- **CLI**: `gitmind fleet package <dir> [--rpm|--apk] [--out <dir>]`,
+  `gitmind fleet repo add <pkg> --to <dir> [--rpm|--apk]`,
+  `gitmind fleet repo serve <dir> [--port N] [--rpm|--apk]` (prints client config + serves).
+
+Remaining (on-device, needs the native tools present): run rpmbuild/abuild/createrepo/apk
+end-to-end on the fleet; optional GPG/abuild-sign signing (currently unsigned →
+gpgcheck=0 / --allow-untrusted); a GUI "Publish" card.

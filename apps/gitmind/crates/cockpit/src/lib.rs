@@ -18,6 +18,7 @@ pub mod installer;
 pub mod merge;
 pub mod netshare;
 pub mod ops;
+pub mod packaging;
 pub mod places;
 pub mod preview;
 pub mod pydeps;
