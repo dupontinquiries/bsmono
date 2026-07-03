@@ -1,0 +1,9 @@
+[package]
+name = "voiced-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The routing brain of the unified voice daemon (voiced): apps register intents per event-type with an Always/Active scope, and the daemon dispatches recognised intents to the right app — always-listeners get theirs even when backgrounded, active-only intents go to the focused app, and system intents (switch to <app>, open <doc> in <app>) are handled centrally. Transport is ipc-kit; the audio/whisper stage is voice-kit + audio-kit + voiceterm's pipeline. Pure, std-only routing logic."
+
+[dependencies]
+ipc-kit = { path = "../ipc-kit" }
