@@ -257,9 +257,11 @@ works if widgets carry semantic labels — which is the real per-app work.
 - A one-call helper `a11y::register_with_voiced(client)` that sends `standard_grammar()` to
   voiced at `Always` scope, and a default `on_intent` that feeds `a11y.*` events into
   `A11yScene::apply` — so a uikit app opts in with ~2 lines and can override.
-- uikit-egui's own semantic widgets (button/toggle/field helpers) auto-`add()` their
-  Semantics, so most apps get labels without extra code; custom widgets tag manually.
+- **DONE:** `a11y::semantic_button` / `semantic_toggle` render an egui widget and auto-`add()`
+  its Semantics + rect — apps using kit widgets get labels without hand-tagging.
 - A TTS sink for `Outcome::Speak` (piper/espeak via a small audio-kit/voice path, model in
   `~/models` via models-kit).
-- Adopt in the rusty-board egui port first (keys → `Semantics::button`, voice "next"/
-  "activate" drives the keyboard), then the other ports.
+- **DONE:** rusty-board egui port adopts a11y — `register_a11y` tags every key, `voice_key`
+  drives focus/activation (voice "next"/"activate" types the focused key). The ported
+  keyboard is now both touch-adaptive *and* voice-navigable. Test: `keyboard_is_voice_navigable`.
+- Remaining: the `register_with_voiced` one-call helper + TTS sink; then the other ports.

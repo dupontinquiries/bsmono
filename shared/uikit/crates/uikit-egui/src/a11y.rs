@@ -267,6 +267,22 @@ impl A11yScene {
     }
 }
 
+/// Render an egui button and auto-register its accessibility semantics + rect into `scene`.
+/// This is the "automatic" path: apps that use the kit's widgets get voice/description
+/// support for free, without hand-tagging. Returns true on click.
+pub fn semantic_button(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str) -> bool {
+    let resp = ui.button(label);
+    scene.add(id, Semantics::button(label), Some(resp.rect));
+    resp.clicked()
+}
+
+/// Same, for a toggle (checkbox): reflects on/off in the spoken value.
+pub fn semantic_toggle(ui: &mut Ui, scene: &mut A11yScene, id: u64, label: &str, on: &mut bool) -> bool {
+    let resp = ui.checkbox(on, label);
+    scene.add(id, Semantics::toggle(label, *on), Some(resp.rect));
+    resp.changed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
