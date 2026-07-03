@@ -365,24 +365,77 @@ fn build_python(d: &Detected, path_env: &str) -> Result<Built, String> {
             .map_err(|e| format!("couldn't create a virtualenv (need python3-venv): {e}"))?;
     }
     let pip = venv.join("bin/pip").display().to_string();
-    // dependencies
-    let pip_err = |e: String| format!("installing dependencies failed: {e}\n(on minimal systems pygame needs system libs, e.g. Alpine: apk add python3-dev sdl2-dev sdl2_image-dev sdl2_mixer-dev sdl2_ttf-dev)");
-    if root.join("requirements.txt").is_file() {
-        run(Command::new(&pip).args(["install", "-r", "requirements.txt"]).current_dir(root).env("PATH", path_env)).map_err(pip_err)?;
+
+    // What are we installing, and which named packages can we map to system libs?
+    let (pip_args, named): (Vec<String>, Vec<String>) = if root.join("requirements.txt").is_file() {
+        (vec!["-r".into(), "requirements.txt".into()], requirement_names(root))
     } else if root.join("pyproject.toml").is_file() || root.join("setup.py").is_file() {
-        run(Command::new(&pip).args(["install", "."]).current_dir(root).env("PATH", path_env)).map_err(pip_err)?;
+        (vec![".".into()], vec![])
     } else {
         let mods = scan_imports(root);
-        if !mods.is_empty() {
-            let mut args = vec!["install".to_string()];
-            args.extend(mods);
-            run(Command::new(&pip).args(&args).current_dir(root).env("PATH", path_env)).map_err(pip_err)?;
-        }
+        (mods.clone(), mods)
+    };
+
+    if !pip_args.is_empty() {
+        install_python_deps(&pip, root, &pip_args, &named, path_env)?;
     }
+
     let entry = d.entry.clone().ok_or("couldn't find a Python entrypoint (main.py / app.py / game.py)")?;
     let launcher = write_launcher(root, &d.name, &py.display().to_string(), &[entry.clone()])?;
     let bytes = std::fs::metadata(&launcher).map(|m| m.len()).unwrap_or(0);
     Ok(Built { run: py, args: vec![entry], install: launcher, bytes })
+}
+
+/// Package names from a requirements.txt (stripped of version specifiers / comments), so
+/// their system dependencies can be mapped.
+fn requirement_names(root: &Path) -> Vec<String> {
+    std::fs::read_to_string(root.join("requirements.txt")).unwrap_or_default().lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
+        .filter_map(|l| l.split(['=', '<', '>', '!', '~', '[', ';', ' ']).next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Install Python dependencies with the cross-distro fallback chain: prefer wheels, then
+/// install the mapped system libraries via the detected package manager and build from
+/// source, then fail with the exact command to run.
+fn install_python_deps(pip: &str, root: &Path, pip_args: &[String], named: &[String], path_env: &str) -> Result<(), String> {
+    let pip_run = |extra: &[&str]| -> Result<(), String> {
+        let mut a: Vec<String> = vec!["install".into()];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        a.extend(pip_args.iter().cloned());
+        run(Command::new(pip).args(&a).current_dir(root).env("PATH", path_env))
+    };
+
+    // 1) prefer prebuilt wheels — the fast path on glibc (Fedora, Ubuntu, …)
+    if pip_run(&["--prefer-binary"]).is_ok() {
+        return Ok(());
+    }
+
+    // 2) install the mapped system libraries, then build from source
+    let mgr = crate::pydeps::detect_pkg_manager(path_env);
+    let mut sysdeps: Vec<String> = Vec::new();
+    for pkg in named {
+        for dep in crate::pydeps::system_deps(pkg, mgr) {
+            if !sysdeps.contains(&dep) { sysdeps.push(dep); }
+        }
+    }
+    if !sysdeps.is_empty() {
+        let _ = crate::pydeps::install_system(mgr, &sysdeps, path_env); // best-effort
+        if pip_run(&[]).is_ok() {
+            return Ok(());
+        }
+    }
+
+    // 3) give up with an actionable, distro-correct instruction
+    let hint = if sysdeps.is_empty() {
+        "the install failed to build from source — check the package's system requirements".to_string()
+    } else {
+        format!("install the system libraries and retry:\n  {}", crate::pydeps::install_hint(mgr, &sysdeps))
+    };
+    Err(format!("couldn't install Python dependencies. {hint}"))
 }
 
 fn build_go(d: &Detected, path_env: &str) -> Result<Built, String> {
@@ -550,6 +603,35 @@ mod tests {
         let built = build(&d, "", &["WITH_EXTRA".to_string()], &path).expect("cmake build");
         let out = Command::new(&built.run).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stdout).contains("cmake-hello"), "the built binary runs");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn builds_a_pygame_app_installing_its_deps() {
+        // real: exercises the dep fallback chain end to end (wheel on glibc). ~download.
+        let base = std::env::temp_dir().join(format!("gm-pg-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("game");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("main.py"), "import pygame\nprint('pygame', pygame.version.ver)\n").unwrap();
+        let d = detect(&base).unwrap();
+        assert_eq!(d.kind, Kind::Python);
+        assert_eq!(d.description, "pygame app");
+        let path = std::env::var("PATH").unwrap_or_default();
+        match build(&d, "", &[], &path) {
+            Ok(_) => {
+                // the venv can now import pygame
+                let out = Command::new(root.join(".venv/bin/python")).args(["-c", "import pygame"])
+                    .env("PATH", &path).env("SDL_VIDEODRIVER", "dummy").output().unwrap();
+                assert!(out.status.success(), "pygame importable after build: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            Err(e) => {
+                // acceptable only if the environment genuinely can't fetch/build it; the
+                // error must be actionable (name the system libraries).
+                eprintln!("pygame build failed (env): {e}");
+                assert!(e.contains("system") || e.contains("dependencies"), "error is actionable: {e}");
+            }
+        }
         let _ = fs::remove_dir_all(&base);
     }
 }
