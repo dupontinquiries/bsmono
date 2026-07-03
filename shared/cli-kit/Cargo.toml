@@ -1,0 +1,9 @@
+[package]
+name = "cli-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Tiny std-only command-line parsing the whole portfolio hand-rolls ~11 times: flags, --opt value / --opt=value options (repeatable), positionals, and subcommand splitting. Lifted from gitmind's CLI so every app parses args the same way instead of re-writing the env::args loop. Zero-dependency."
+
+[lib]
+path = "src/lib.rs"

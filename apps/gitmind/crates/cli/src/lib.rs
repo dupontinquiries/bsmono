@@ -131,22 +131,8 @@ fn open_store(repo: &GitCli) -> Result<ChunkStore, String> {
     ChunkStore::open(dir.join("store.redb"))
 }
 
-fn flag(rest: &[String], name: &str) -> bool {
-    rest.iter().any(|a| a == name)
-}
-
-fn opt<'a>(rest: &'a [String], name: &str) -> Option<&'a str> {
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        if a == name {
-            return it.next().map(|s| s.as_str());
-        }
-        if let Some(v) = a.strip_prefix(&format!("{name}=")) {
-            return Some(v);
-        }
-    }
-    None
-}
+// arg helpers now come from cli-kit (lifted from here) — one implementation, shared.
+use cli_kit::{flag, opt};
 
 fn err(msg: &str) -> i32 {
     eprintln!("error: {msg}");
