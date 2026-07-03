@@ -16,17 +16,18 @@
 
 use ipc_kit::{serve_hub, ConnId, Message, Scope, Service};
 use std::collections::HashMap;
-use voiced_core::{Dispatch, Intent, Registry};
+use voiced_core::{Dispatch, Intent, Match, Matcher, Registry};
 
 struct VoiceService {
     reg: Registry,
+    matcher: Matcher,
     app_of: HashMap<ConnId, String>,
     conn_of: HashMap<String, ConnId>,
 }
 
 impl VoiceService {
     fn new() -> Self {
-        VoiceService { reg: Registry::new(), app_of: HashMap::new(), conn_of: HashMap::new() }
+        VoiceService { reg: Registry::new(), matcher: Matcher::new(), app_of: HashMap::new(), conn_of: HashMap::new() }
     }
 
     /// Turn a routing decision into an addressed message to the target app's connection.
@@ -72,7 +73,13 @@ impl Service for VoiceService {
             }
             "register" => {
                 if let Some(app) = self.app_of.get(&from).cloned() {
-                    self.reg.register(&app, &a(0), Scope::parse(&a(1)));
+                    let event_type = a(0);
+                    self.reg.register(&app, &event_type, Scope::parse(&a(1)));
+                    // args after scope are the grammar phrase (e.g. play {track})
+                    let phrase: Vec<String> = msg.args.iter().skip(2).cloned().collect();
+                    if !phrase.is_empty() {
+                        self.matcher.register_rule(&app, &event_type, &phrase);
+                    }
                     vec![(from, Message::verb("ok"))]
                 } else {
                     vec![(from, Message::new("err", vec!["say hello first".into()]))]
@@ -80,6 +87,7 @@ impl Service for VoiceService {
             }
             "focus" => {
                 self.reg.set_active(&a(0));
+                self.matcher.set_active(&a(0));
                 vec![(from, Message::verb("ok"))]
             }
             "intent" => {
@@ -87,6 +95,21 @@ impl Service for VoiceService {
                 let slots: Vec<String> = msg.args.iter().skip(1).cloned().collect();
                 let dispatches = self.reg.route(&Intent::App { event_type, slots });
                 self.deliver(dispatches)
+            }
+            "transcript" => {
+                // the audio stage's cleaned/finalized transcript → match → route
+                let text = msg.args.join(" ");
+                match self.matcher.match_utterance(&text) {
+                    Match::System(intent) => {
+                        let dispatches = self.reg.route(&intent);
+                        self.deliver(dispatches)
+                    }
+                    Match::App { event_type, slots } => {
+                        let dispatches = self.reg.route(&Intent::App { event_type, slots });
+                        self.deliver(dispatches)
+                    }
+                    Match::None => vec![],
+                }
             }
             "say" => {
                 let utterance = msg.args.join(" ");
@@ -105,6 +128,7 @@ impl Service for VoiceService {
     fn disconnect(&mut self, id: ConnId) {
         if let Some(app) = self.app_of.remove(&id) {
             self.reg.unregister_app(&app);
+            self.matcher.remove_app(&app);
             if self.conn_of.get(&app) == Some(&id) {
                 self.conn_of.remove(&app);
             }
@@ -172,5 +196,32 @@ mod tests {
         audio.send(&Message::new("say", vec!["switch".into(), "to".into(), "voiceterm".into()])).unwrap();
         let f = voiceterm.recv().expect("voiceterm focused");
         assert_eq!(f.verb, "focus");
+    }
+
+    #[test]
+    fn transcript_runs_clean_match_route() {
+        let name = format!("voiced-tr-{}", std::process::id());
+        let listener = ipc_kit::bind(&name).expect("bind");
+        std::thread::spawn(move || serve_hub(listener, VoiceService::new()));
+        std::thread::sleep(Duration::from_millis(50));
+
+        // beatspace registers a slot grammar and is focused
+        let mut beatspace = Client::connect(&name).expect("connect");
+        beatspace.request(&Message::new("hello", vec!["beatspace".into()])).unwrap();
+        beatspace
+            .request(&Message::new("register", vec!["play_track".into(), "active".into(), "play".into(), "{track}".into()]))
+            .unwrap();
+
+        let mut audio = Client::connect(&name).expect("audio");
+        audio.request(&Message::new("hello", vec!["_audio".into()])).unwrap();
+        audio.send(&Message::new("focus", vec!["beatspace".into()])).unwrap();
+
+        // a whisper hallucination is dropped (no event)…
+        audio.send(&Message::new("transcript", vec!["thank".into(), "you".into()])).unwrap();
+        // …and a real utterance matches the slot grammar and routes with the captured slot
+        audio.send(&Message::new("transcript", vec!["play".into(), "koyopper".into(), "bass".into()])).unwrap();
+        let ev = beatspace.recv().expect("beatspace gets play_track");
+        assert_eq!(ev.verb, "event");
+        assert_eq!(ev.args, vec!["play_track".to_string(), "koyopper bass".to_string()]);
     }
 }
