@@ -66,6 +66,11 @@ Item {
         if (!r.ok) { root.note = "error: " + r.error; return }
         root.busy = true; root.jobKind = "keyclean"; root.note = ""; poller.start()
     }
+    function unbreakSsh() {
+        if (picker.selHost.length === 0) { root.note = "pick a device first"; return }
+        var r = JSON.parse(backend.unbreak_ssh(picker.selHost, picker.user))
+        root.note = r.ok ? ("✓ " + r.msg) : ("✗ " + r.error)
+    }
 
     Timer {
         id: poller; interval: 250; repeat: true; running: false
@@ -409,6 +414,11 @@ Item {
                     text: root.jobKind === "keyclean" ? "cleaning…" : "clean up expired + duplicates"
                     enabled: !root.busy && root.keys.length > 0
                     onClicked: root.cleanupKeys()
+                }
+                Button {
+                    text: "restore SSH (PTY)"
+                    enabled: !root.busy
+                    onClicked: root.unbreakSsh()
                 }
             }
             Label {

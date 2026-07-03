@@ -148,6 +148,7 @@ struct Backend {
     remote_repo_candidates: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     remote_target: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     list_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
+    unbreak_ssh: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     cleanup_keys: qt_method!(fn(&self, host: QString, user: QString) -> QString),
     reclaimable: qt_method!(fn(&self) -> QString),
     reclaim: qt_method!(fn(&self) -> QString),
@@ -1279,6 +1280,19 @@ impl Backend {
             job.finish(payload);
         });
         QString::from(json!({"ok": true, "started": "keys"}).to_string())
+    }
+
+    /// Repair a device whose interactive ssh was broken by a restricted gitmind key
+    /// (PTY refused). Strips the restrictive options over ssh; key auth still works.
+    fn unbreak_ssh(&self, host: QString, user: QString) -> QString {
+        let (host, user) = (host.to_string(), user.to_string());
+        if host.is_empty() || user.is_empty() {
+            return err_json("pick a device first");
+        }
+        match cockpit::deploy::unbreak_ssh(&user, &host) {
+            Ok(msg) => QString::from(json!({"ok": true, "msg": msg}).to_string()),
+            Err(e) => err_json(&e),
+        }
     }
 
     /// Remove expired + duplicate gitmind-managed keys from a device's authorized_keys

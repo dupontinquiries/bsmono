@@ -874,6 +874,42 @@ pub fn restricted_key_line(options: &str, pubkey: &str) -> String {
     format!("{} {}\n", options, pubkey.trim())
 }
 
+/// The authorized_keys line for the interactive "set up SSH key" convenience: the user's
+/// own key on their own account, installed PLAIN — no `restrict`/`no-pty`/expiry — exactly
+/// like `ssh-copy-id`, so interactive shells keep working. The trailing `gitmind` comment
+/// makes it identifiable for pruning. Pure — tested.
+///
+/// (The hardened `restrict` + forced-command + expiry form is `restricted_key_line`, used
+/// ONLY for the dedicated, non-interactive fleet user — never an interactive account,
+/// because `restrict` implies `no-pty` and would break `ssh user@host`.)
+pub fn plain_key_line(pubkey: &str) -> String {
+    let parts: Vec<&str> = pubkey.split_whitespace().collect();
+    if parts.len() >= 2 {
+        format!("{} {} gitmind\n", parts[0], parts[1])
+    } else {
+        format!("{}\n", pubkey.trim())
+    }
+}
+
+/// Command (run over ssh) that removes gitmind's restrictive options from an
+/// authorized_keys line — restoring interactive PTY access — after backing up the file.
+pub fn unrestrict_command() -> &'static str {
+    "cp ~/.ssh/authorized_keys ~/.ssh/authorized_keys.gm-bak 2>/dev/null; \
+     sed -i -E 's/^[^ ]*(restrict|no-pty)[^ ]* +(ssh-|ecdsa-|sk-)/\\2/' ~/.ssh/authorized_keys && echo gitmind-ssh-unbroken"
+}
+
+/// Repair an account whose interactive ssh was broken by a restricted key: strip the
+/// restrictive options over ssh. Key auth still works (only the PTY was refused), so a
+/// non-interactive command connects fine.
+pub fn unbreak_ssh(user: &str, host: &str) -> Result<String, String> {
+    let out = remote_capture(user, host, unrestrict_command())?;
+    if out.contains("gitmind-ssh-unbroken") {
+        Ok(format!("restored interactive ssh for {user}@{host} — try `ssh {user}@{host}` again"))
+    } else {
+        Err(format!("couldn't repair it automatically: {}", out.trim()))
+    }
+}
+
 /// Install our public key into `user@host`'s `authorized_keys` using password auth,
 /// fed non-interactively through SSH_ASKPASS (the GUI has no TTY). This is the
 /// "set up SSH key" wizard: you enter the device password *once*, then every later
@@ -886,14 +922,12 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
         return Err("enter the device password to install the key".into());
     }
     let pubkey = ensure_local_pubkey()?;
-    // Defence in depth: install the key restricted (no pivot if the device is later
-    // compromised) AND with a weekly expiry so a stale key dies on its own.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let expiry = key_expiry_time(now, KEY_EXPIRY_DAYS);
-    let key_line = restricted_key_line(&authorized_keys_options(host, Some(&expiry)), &pubkey);
+    // This is the user's own key on their own interactive account, so install it PLAIN —
+    // like ssh-copy-id. It must NOT be `restrict`ed: `restrict` implies `no-pty`, which
+    // would break `ssh user@host` ("PTY allocation request failed"). Hardening (restrict +
+    // forced command + expiry) is reserved for the dedicated fleet user, which is never
+    // used interactively.
+    let key_line = plain_key_line(&pubkey);
     // temp askpass helper (0700, current pid in the name, removed after)
     let script = std::env::temp_dir().join(format!("gm-askpass-{}", std::process::id()));
     std::fs::write(&script, ASKPASS_BODY).map_err(|e| format!("write askpass: {e}"))?;
@@ -902,7 +936,11 @@ pub fn setup_key(user: &str, host: &str, password: &str) -> Result<String, Strin
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
             .map_err(|e| format!("chmod askpass: {e}"))?;
     }
-    let remote = "umask 077; mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys && echo gitmind-key-installed";
+    // Ensure the file ends with a newline before appending, so our line never fuses onto a
+    // previous key line (which would silently apply our comment/options to that key).
+    let remote = "umask 077; mkdir -p ~/.ssh; f=~/.ssh/authorized_keys; \
+                  [ -s \"$f\" ] && [ \"$(tail -c1 \"$f\" | wc -l)\" -eq 0 ] && echo >> \"$f\"; \
+                  cat >> \"$f\" && echo gitmind-key-installed";
     let spawned = Command::new("ssh")
         .env("GM_SSH_PW", password)
         .env("SSH_ASKPASS", &script)
@@ -1209,6 +1247,13 @@ mod tests {
         let line = restricted_key_line("restrict,from=\"192.168.1.0/24\"", "ssh-ed25519 AAAAC3xyz gitmind-fleet\n");
         assert!(line.starts_with("restrict,from=\"192.168.1.0/24\" ssh-ed25519 "));
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
+        // the interactive user's key is PLAIN — no restrict/no-pty/expiry (that would break
+        // `ssh user@host` with "PTY allocation request failed")
+        let plain = plain_key_line("ssh-ed25519 AAAAC3xyz user@laptop");
+        assert_eq!(plain, "ssh-ed25519 AAAAC3xyz gitmind\n");
+        assert!(!plain.contains("restrict") && !plain.contains("no-pty") && !plain.contains("expiry-time"));
+        // recovery command strips restrictive options and backs up
+        assert!(unrestrict_command().contains("authorized_keys.gm-bak") && unrestrict_command().contains("restrict"));
     }
 
     #[test]
