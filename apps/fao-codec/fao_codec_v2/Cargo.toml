@@ -1,0 +1,10 @@
+[package]
+name = "fao-codec-v2"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "fao_v2"
+
+[dependencies]
+fao-codec-lib = { path = "../fao_codec_lib" }
