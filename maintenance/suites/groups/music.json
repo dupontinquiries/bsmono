@@ -1,0 +1,38 @@
+{
+  "name": "group-music",
+  "description": "Audio synthesis, codecs & music tools",
+  "apps": [
+    {
+      "name": "beatspace",
+      "path": "apps/beatspace",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "krapper",
+      "path": "apps/krapper",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "bo-suite",
+      "path": "apps/bo-suite",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "fao-codec",
+      "path": "apps/fao-codec",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}

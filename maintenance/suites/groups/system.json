@@ -1,0 +1,14 @@
+{
+  "name": "group-system",
+  "description": "System utilities (input methods, etc.)",
+  "apps": [
+    {
+      "name": "rusty-board",
+      "path": "apps/rusty-board",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}

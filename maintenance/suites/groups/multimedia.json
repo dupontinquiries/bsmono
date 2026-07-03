@@ -1,0 +1,30 @@
+{
+  "name": "group-multimedia",
+  "description": "Video, camera & imaging",
+  "apps": [
+    {
+      "name": "av1tuner",
+      "path": "apps/av1tuner",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "av1tuner-m1",
+      "path": "apps/av1tuner-m1",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    },
+    {
+      "name": "snapclone",
+      "path": "apps/snapclone",
+      "features": [],
+      "no_default": false,
+      "target": "",
+      "run_flags": ""
+    }
+  ]
+}
