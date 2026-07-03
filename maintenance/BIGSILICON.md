@@ -139,9 +139,9 @@ directional, but the strong signals:
   their own. Highest-confidence, small, universal. Build first.
 - **cli-kit** — arg parsing + subcommand dispatch. ~11 apps hand-roll `std::env::args`
   loops. A thin shared parser (the style gitmind's CLI already uses) removes a lot of it.
-- **device-kit** — PipeWire / v4l2 / ALSA device bridging. ~7 apps (snapclone, bo-suite,
-  voiceterm, krapper, logscope, rusty-board, beatspace). snapclone's camera-bridge is the
-  reference; generalize the device plumbing.
+- **device-kit** — DONE. Device model + selection-by-preference, video/audio format
+  negotiation (nearest supported), v4l2loopback setup + `v4l2-ctl` enumeration parser.
+  std-only; PipeWire/v4l2 capture behind a feature on-device. 6 tests.
 
 **Existing kits with un-adopted consumers** (the integration backlog, biggest first):
 - **uikit** → the 9 egui apps (this is the port program).
@@ -365,3 +365,19 @@ crypto: every stream is bound to the one authenticated session.
 **Remaining (on-device):** frame the muxed streams over the real peer link (net-kit
 transport), bridge each stream to a local socket/fd the app reads/writes (the "hand out a
 socket" part), and add session rekey/expiry. The security model and mux bookkeeping are done.
+
+
+## More kit candidates (fresh scan) + built
+
+Re-scanned for cohesive cross-crate patterns (recurrence in parens):
+- **proc-kit** — DONE. Run + capture subprocesses with a privilege-escalation ladder
+  (direct → `sudo -n` → `doas`), plus `which`, root detection, and permission-error
+  sniffing. Unifies the ladder hand-rolled in pydeps/device-kit/packaging/deploy (7 crates).
+  6 tests. Adoption: point `pydeps::install_system`, device-kit modprobe, and packaging's
+  rpmbuild/abuild at `proc_kit::run_escalated`.
+- **fs-kit** (atomic write, 10 crates) — write-temp-then-rename + safe read-or-default; small.
+- **time-kit** (14 crates) — unix-secs/millis, monotonic elapsed, and a tiny RFC3339 format
+  (several places want a real changelog/log timestamp — e.g. packaging's rpm_date stub).
+- **hash-kit** (11 crates) — non-crypto hashing (FNV/CRC32); I hand-rolled FNV in rendezvous
+  and account_id — good first consumer.
+- hex/base64 codec (12) — likely subsumed by net-kit/core-kit; check before extracting.
