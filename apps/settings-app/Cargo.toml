@@ -1,0 +1,15 @@
+[package]
+name = "bigsilicon-settings"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The central settings app for the egui-kit apps: an egui UI (on uikit-egui) that edits the shared Prefs — gesture feel, touch targets, palette, accessibility — and publishes each change to the sharemd 'settings' namespace, so every app updates live. Uses settings-kit for the schema and the diff that decides what to publish."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../shared/settings-kit" }
