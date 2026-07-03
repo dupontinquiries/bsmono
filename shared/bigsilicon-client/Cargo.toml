@@ -11,3 +11,4 @@ path = "src/lib.rs"
 [dependencies]
 ipc-kit = { path = "../ipc-kit" }
 coord-core = { path = "../coord-core" }
+settings-kit = { path = "../settings-kit" }
