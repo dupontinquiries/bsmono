@@ -1,0 +1,9 @@
+[package]
+name = "coord-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Cross-app coordination brain: when apps contend for shared resources (mic, call audio, attention), the Arbiter decides who owns them and what each app should do — Own, Yield, Duck (momentarily quiet), or Share. Drives the 'user is in a snapclone call' scenario: voiceterm can duck the call while composing, unendlich can share/pipe the call audio, all without apps knowing about each other. Presence rides sharemd; mic claims ride voiced. Pure, std-only."
+
+[lib]
+path = "src/lib.rs"
