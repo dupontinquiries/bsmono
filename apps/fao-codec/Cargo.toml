@@ -1,0 +1,3 @@
+[workspace]
+members = ["fao_codec_core", "fao_codec_lib", "fao_codec_v1", "fao_codec_v2", "fao_app", "fao_cli"]
+resolver = "2"
