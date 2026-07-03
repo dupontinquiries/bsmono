@@ -1,0 +1,9 @@
+[package]
+name = "device-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Audio/video device plumbing shared across the portfolio (snapclone camera-bridge, bo-suite, voiceterm, krapper, logscope, beatspace): a device model + selection-by-preference, video/audio format negotiation (pick the closest supported format), v4l2loopback virtual-camera setup, and enumeration command builders + parsers (v4l2-ctl). The version-agnostic core is std-only; PipeWire/v4l2 capture is on-device behind a feature."
+
+[lib]
+path = "src/lib.rs"
