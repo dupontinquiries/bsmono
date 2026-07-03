@@ -1,0 +1,14 @@
+[package]
+name = "voiced"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "The unified voice daemon: binds the 'voiced' Unix socket and routes recognised intents to apps via voiced-core (Always to backgrounded apps, Active to the focused app, system intents like 'switch to X' centrally). The audio stage (mic + whisper via voice-kit/audio-kit/voiceterm) feeds intents in; apps connect, say hello, and register the events they want."
+
+[[bin]]
+name = "voiced"
+path = "src/main.rs"
+
+[dependencies]
+ipc-kit = { path = "../../shared/ipc-kit" }
+voiced-core = { path = "../../shared/voiced-core" }
