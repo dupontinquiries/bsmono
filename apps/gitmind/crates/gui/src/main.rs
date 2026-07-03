@@ -172,6 +172,8 @@ struct Backend {
     create_default_suite: qt_method!(fn(&self) -> QString),
     install_suite_app: qt_method!(fn(&self, name: QString, path: QString, features: QString, target: QString, flags: QString) -> QString),
     delete_suite: qt_method!(fn(&self, name: QString) -> QString),
+    store_groups: qt_method!(fn(&self) -> QString),
+    build_group: qt_method!(fn(&self, name: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1626,6 +1628,37 @@ impl Backend {
             json!({"name": s.name, "description": s.description, "apps": apps})
         }).collect();
         QString::from(json!({"ok": true, "suites": suites}).to_string())
+    }
+
+    /// The curated BigSilicon app-store groups (coding / media / music / work +
+    /// bigsilicons-apps). Sync — just the catalogue for the store page.
+    fn store_groups(&self) -> QString {
+        let groups: Vec<_> = cockpit::flow::store_groups().iter().map(|g| {
+            let apps: Vec<_> = g.apps.iter().map(|a| json!({"name": a.name, "path": a.path})).collect();
+            json!({"name": g.name, "description": g.description, "count": g.apps.len(), "apps": apps})
+        }).collect();
+        QString::from(json!({"ok": true, "groups": groups}).to_string())
+    }
+
+    /// Build + install every app in a store group ("build all in one go"). Async job
+    /// "buildgroup"; poll for the per-app results. Never aborts on one app's failure.
+    fn build_group(&self, name: QString) -> QString {
+        let group = match cockpit::flow::group_by_name(&name.to_string()) {
+            Some(g) => g,
+            None => return err_json("unknown app-store group"),
+        };
+        if !self.job.start("buildgroup") {
+            return err_json("a build job is already running");
+        }
+        let job = std::sync::Arc::clone(&self.job);
+        std::thread::spawn(move || {
+            let results = cockpit::flow::install_suite(&group);
+            let ok = results.iter().filter(|r| r.ok).count();
+            let items: Vec<_> = results.iter()
+                .map(|r| json!({"name": r.name, "ok": r.ok, "message": r.message})).collect();
+            job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "results": items}).to_string());
+        });
+        QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
     }
 
     /// Scan $HOME for binary crates and save a default "all" suite with sane defaults.
