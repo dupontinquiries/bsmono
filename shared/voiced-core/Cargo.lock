@@ -21,8 +21,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "voice-kit"
+version = "0.1.0"
+
+[[package]]
 name = "voiced-core"
 version = "0.1.0"
 dependencies = [
  "ipc-kit",
+ "voice-kit",
 ]

@@ -18,6 +18,9 @@
 use ipc_kit::Scope;
 use std::collections::HashMap;
 
+pub mod grammar;
+pub use grammar::{Grammar, Match, Matcher, Rule, Transcriber};
+
 /// A recognised, structured intent coming out of the audio stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Intent {

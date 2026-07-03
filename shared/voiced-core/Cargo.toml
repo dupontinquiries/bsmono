@@ -7,3 +7,4 @@ description = "The routing brain of the unified voice daemon (voiced): apps regi
 
 [dependencies]
 ipc-kit = { path = "../ipc-kit" }
+voice-kit = { path = "../voice-kit" }
