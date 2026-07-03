@@ -17,29 +17,29 @@ Item {
     property color accent: "#C8A04B"
     signal back()
 
-    onArtistIdChanged: if (artistId >= 0) qtobj.load_by_artist(artistId)
+    onArtistIdChanged: {
+        root.trackList = []
+        if (artistId >= 0) qtobj.load_by_artist(artistId)
+    }
 
-    property var trackList: {
-        // We only adopt the list when the worker's context matches this
-        // artist id; otherwise the library_json might be showing recent
-        // tracks or another artist's drill-down.
+    // Plain property (NOT a binding) — the Connections handler is the sole
+    // writer. A declarative binding mixed with the imperative assignment
+    // below breaks after the first load and stops re-evaluating, which is
+    // why the artist list stopped populating.
+    property var trackList: []
+
+    function adoptIfMine() {
         var ctx = qtobj.library_context || ""
         if (ctx === "artist:" + root.artistId) {
-            try { return JSON.parse(qtobj.library_json || "[]") }
-            catch (e) { return [] }
+            try { root.trackList = JSON.parse(qtobj.library_json || "[]") }
+            catch (e) { root.trackList = [] }
         }
-        return []
     }
     Connections {
         target: qtobj
-        function onLibrary_changed() {
-            var ctx = qtobj.library_context || ""
-            if (ctx === "artist:" + root.artistId) {
-                try { root.trackList = JSON.parse(qtobj.library_json || "[]") }
-                catch (e) { root.trackList = [] }
-            }
-        }
+        function onLibrary_changed() { root.adoptIfMine() }
     }
+    onVisibleChanged: if (visible) adoptIfMine()
 
     Column {
         anchors.fill: parent
@@ -120,6 +120,9 @@ Item {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight
@@ -203,6 +206,9 @@ Item {
                     id: rowMa
                     anchors.fill: parent
                     onClicked: qtobj.enqueue_or_play(modelData.id)
+                    onPressAndHold: {
+                        if (window.editDialog) window.editDialog.open(modelData)
+                    }
                 }
             }
         }

@@ -170,12 +170,12 @@ impl SettingsPanel {
         // ================================================================
         // Section: Layout
         // ================================================================
-        scroll_inner.append(&section_header("Layout"));
+        let body_layout = collapsible_section(&scroll_inner, "Layout", true);
 
         // Letters — QWERTY ↔ Dvorak. Base letter system only;
         // experimental modes (cardinal, stenotype) are a separate
         // picker in the Experimental section.
-        scroll_inner.append(&build_setting_row(
+        body_layout.append(&build_setting_row(
             "Letters",
             "Base letter layout. QWERTY or Dvorak.",
             &["QWERTY", "Dvorak"],
@@ -199,7 +199,7 @@ impl SettingsPanel {
         ));
 
         // Geometry — Staggered ↔ Ortholinear.
-        scroll_inner.append(&build_setting_row(
+        body_layout.append(&build_setting_row(
             "Geometry",
             "Staggered matches a physical keyboard; ortholinear is a strict grid.",
             &["Staggered", "Ortholinear"],
@@ -223,7 +223,7 @@ impl SettingsPanel {
         ));
 
         // Density — Normal vs Compact.
-        scroll_inner.append(&build_setting_row(
+        body_layout.append(&build_setting_row(
             "Density",
             "Compact reduces vertical padding for one-handed reach.",
             &["Normal", "Compact"],
@@ -257,7 +257,7 @@ impl SettingsPanel {
                 crate::config::ThumbAnchor::BottomLeft => 2,
             },
         };
-        scroll_inner.append(&build_setting_row(
+        body_layout.append(&build_setting_row(
             "Single-hand mode",
             "Compacts the keyboard into your thumb's reachable arc.",
             &["Off", "Right", "Left"],
@@ -313,13 +313,19 @@ impl SettingsPanel {
         // ================================================================
         // Section: Colors
         // ================================================================
-        scroll_inner.append(&section_header("Colors"));
-        scroll_inner.append(&build_color_section(cfg_state.clone(), notify.clone()));
+        let body_colors = collapsible_section(&scroll_inner, "Colors", false);
+        body_colors.append(&build_color_section(cfg_state.clone(), notify.clone()));
+
+        // ================================================================
+        // Section: Keyboards (import / export custom layouts)
+        // ================================================================
+        let body_keyboards = collapsible_section(&scroll_inner, "Keyboards", false);
+        body_keyboards.append(&build_keyboards_section());
 
         // ================================================================
         // Section: Experimental
         // ================================================================
-        scroll_inner.append(&section_header("Experimental"));
+        let body_exp = collapsible_section(&scroll_inner, "Experimental", false);
 
         // Experimental keyboard mode — None / Cardinal / Stenotype.
         // Only available when the `input-modes` feature is compiled
@@ -327,7 +333,7 @@ impl SettingsPanel {
         // entirely so the user can't select a surface the build
         // doesn't support.
         #[cfg(feature = "input-modes")]
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Keyboard mode",
             "Off = normal keyboard. Cardinal = 3×3 swipe grid. Stenotype = 4-button steno (very experimental). Words = 5-col cardinal with prose / C / Rust / Python clusters (cycle via the lang button in the bottom row).",
             &["Off", "Cardinal", "Stenotype", "Words"],
@@ -356,7 +362,7 @@ impl SettingsPanel {
         ));
 
         // Voice input.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Voice input",
             "Show 🎤 key. Requires a Whisper model.",
             &["Off", "On"],
@@ -378,7 +384,7 @@ impl SettingsPanel {
         // CPU-heavy on phone — off may be preferable if the device
         // overheats or you only want the final result. The final
         // transcription (on tap-to-stop) is unaffected by this toggle.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Live transcription",
             "Show partial text while recording. Higher CPU usage.",
             &["Off", "On"],
@@ -404,7 +410,7 @@ impl SettingsPanel {
             .iter()
             .position(|c| *c == current_lang)
             .unwrap_or(0);
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Whisper language",
             "Bias decoding. \"auto\" is slowest. Restart to take effect.",
             &lang_options,
@@ -426,7 +432,7 @@ impl SettingsPanel {
         // When on, every transcription is written to
         // ~/.local/share/rusty-board/voice-log.jsonl. The /history
         // slash command reads this file.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Voice transcript log",
             "Save voice text to ~/.local/share/rusty-board/voice-log.jsonl. Off for privacy.",
             &["Off", "On"],
@@ -448,7 +454,7 @@ impl SettingsPanel {
         // wrapped-context display. Useful when dictating long
         // text, code, or want to see more of what you're editing.
         // Not stored in config — it's a session toggle.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Voice-type mode",
             "Shrink the keys to half height to see more text. Good for dictating code blocks.",
             &["Off", "On"],
@@ -467,7 +473,7 @@ impl SettingsPanel {
         // hold the spacebar to recognize and commit. The path
         // database is built-in and covers Greek lowercase +
         // common math operators.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Character drawing",
             "Draw Greek/math symbols on the spacebar. Tap-and-hold space to recognize.",
             &["Off", "On"],
@@ -490,7 +496,7 @@ impl SettingsPanel {
         // Auto-capitalize. Off by default — many users find it
         // intrusive, especially when typing names, code, or
         // anything where the first letter should NOT be capitalized.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Auto-capitalize",
             "Capitalize the first letter after a period or at start of input.",
             &["Off", "On"],
@@ -511,7 +517,7 @@ impl SettingsPanel {
         // mode. Some users find this fires accidentally when they
         // course-correct mid-swipe. This toggle disables the
         // hairpin classifier; tapping shift still works.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Swipe-back capitalize",
             "Cardinal: swipe out and back to capitalize. Disable if too sensitive.",
             &["Off", "On"],
@@ -533,7 +539,7 @@ impl SettingsPanel {
         // frequency more heavily. Good for fast, sloppy, or
         // circular-ish swipes; bad for distinguishing very similar
         // words. Off by default.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Lenient swipe",
             "Accept faster, sloppier swipes. Trades precision for forgiveness.",
             &["Off", "On"],
@@ -557,7 +563,7 @@ impl SettingsPanel {
         // via context). When off, the recognizer uses only the
         // shape-based dictionary matching with no personalization.
         // Defaults on; users can opt out here.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "AI swipe assist",
             "Learn your vocabulary & disambiguate ambiguous swipes via context. Off uses the plain shape recognizer only.",
             &["Off", "On"],
@@ -580,7 +586,7 @@ impl SettingsPanel {
         // (more forgiving). Only meaningful in cardinal mode, so
         // gated with the rest of the experimental input surfaces.
         #[cfg(feature = "input-modes")]
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Cardinal diagonals",
             "8-way swipes: diagonal flicks (↗ ↘ ↙ ↖) reach extra keys. Off folds them to N/E/S/W.",
             &["Off", "On"],
@@ -607,7 +613,7 @@ impl SettingsPanel {
                 "fast" => 2,
                 _ => 1,
             };
-            scroll_inner.append(&build_setting_row(
+            body_exp.append(&build_setting_row(
                 "Swipe speed",
                 "How hard you pause to mark a letter. Slow = gentle pauses count; Fast = only near-stops.",
                 &["Slow", "Normal", "Fast"],
@@ -632,7 +638,7 @@ impl SettingsPanel {
         // Auto-space between swipes — insert a space automatically
         // when one swipe-typed word follows another, so you can swipe
         // word after word without tapping space.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Auto-space swipes",
             "Add a space automatically between consecutive swipe-typed words.",
             &["Off", "On"],
@@ -657,7 +663,7 @@ impl SettingsPanel {
         // transparent keyboard so the wallpaper/app behind shows
         // through with visual interest. Default off — solid is
         // more legible for typing.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Glass effect",
             "Translucent keyboard with refraction gradient. Wallpaper shows through.",
             &["Off", "On"],
@@ -679,7 +685,7 @@ impl SettingsPanel {
         // taps "ABC" in the tray to summon the full keyboard.
         // Applies on the NEXT focus-in after toggling — not the
         // current focus state.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Focus-tray mode",
             "On focus, show arrows-only tray; tap ABC to summon full keyboard.",
             &["Off", "On"],
@@ -699,7 +705,7 @@ impl SettingsPanel {
         // Auto-hide on no focus: when off, the keyboard stays
         // visible even when no text field is focused. Useful for
         // debugging or always-on usage. Default on.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Auto-hide on no focus",
             "Hide the keyboard when no text field has focus.",
             &["Off", "On"],
@@ -719,7 +725,7 @@ impl SettingsPanel {
         // Number row: prepend a row of digits (1234567890) above
         // the letters. Adds a full row of height; nice for those
         // who type a lot of mixed text + numbers.
-        scroll_inner.append(&build_setting_row(
+        body_exp.append(&build_setting_row(
             "Number row",
             "Show a digit row above the letters.",
             &["Off", "On"],
@@ -735,8 +741,8 @@ impl SettingsPanel {
         ));
 
         // ---- LLM settings ----
-        scroll_inner.append(&section_header("LLM"));
-        scroll_inner.append(&build_setting_row(
+        let body_llm = collapsible_section(&scroll_inner, "LLM", false);
+        body_llm.append(&build_setting_row(
             "LLM assistant",
             "Enable the ✨ key. Sends prompts to an OpenAI-compatible API \
              (ollama, llama.cpp, etc).",
@@ -754,7 +760,7 @@ impl SettingsPanel {
             },
         ));
 
-        scroll_inner.append(&build_text_row(
+        body_llm.append(&build_text_row(
             "LLM endpoint",
             "URL of an OpenAI-compatible chat completions API.",
             &cfg_state.borrow().llm.endpoint,
@@ -802,13 +808,13 @@ impl SettingsPanel {
                     }
                 },
             );
-            scroll_inner.append(&model_row.widget);
+            body_llm.append(&model_row.widget);
             // Kick off async fetch. The dropdown will update if
             // the endpoint responds with a model list.
             spawn_ollama_model_fetch(endpoint, current_model, model_row.update_fn);
         }
 
-        scroll_inner.append(&build_text_row(
+        body_llm.append(&build_text_row(
             "LLM API key",
             "Bearer token (leave blank for local servers).",
             &cfg_state.borrow().llm.api_key,
@@ -830,7 +836,7 @@ impl SettingsPanel {
         // into the engine yet. The toggle persists so it's there when
         // we implement it, but right now every key emits once per
         // press regardless of this setting.
-        scroll_inner.append(&build_setting_row(
+        body_llm.append(&build_setting_row(
             "Key repeat",
             "When on, holding a key repeats it (currently unimplemented; off is the de-facto behavior).",
             &["Off", "On"],
@@ -856,7 +862,7 @@ impl SettingsPanel {
         // drags from letter keys become tap-or-cancel. Useful for users
         // who want predictable tap typing + spacebar cursor navigation
         // without the chance of an accidental word commit.
-        scroll_inner.append(&build_setting_row(
+        body_llm.append(&build_setting_row(
             "Swipe typing",
             "Drag across letters to type whole words. Off → spacebar drag becomes arrow keys.",
             &["Off", "On"],
@@ -882,7 +888,7 @@ impl SettingsPanel {
         // which dispatch branch a gesture takes: dotted = cardinal,
         // striped = swipe-word, desaturated = normal/ignored. Off by
         // default; this is a debugging tool, not a daily-use feature.
-        scroll_inner.append(&build_setting_row(
+        body_llm.append(&build_setting_row(
             "Debug trail styling",
             "Color/dash the swipe trail by gesture type (dotted=cardinal, striped=word, faded=ignored). For visual debugging.",
             &["Off", "On"],
@@ -910,7 +916,7 @@ impl SettingsPanel {
         // adds the bar conditionally at construction). The on_done
         // callback rebuilds via rebuild_view, which is good enough —
         // user just has to hit Done to see the change.
-        scroll_inner.append(&build_setting_row(
+        body_llm.append(&build_setting_row(
             "Suggestion bar",
             "Reserve a top strip for future word suggestions (currently empty).",
             &["Off", "On"],
@@ -936,13 +942,13 @@ impl SettingsPanel {
         // = the destructive or expensive action. This matches the
         // voiceterm UX and gives the user a visible commitment
         // (progress bar) before anything dangerous happens.
-        scroll_inner.append(&section_header("Maintenance"));
+        let body_maint = collapsible_section(&scroll_inner, "Maintenance", false);
 
         // Width adjustment slider: ±50% (50-150%). Live-applies to
         // the keyboard via set_width_scale; notify rebuilds the
         // layout so the new size takes immediate effect. Widened
         // from ±25% on user request.
-        scroll_inner.append(&build_slider_row(
+        body_maint.append(&build_slider_row(
             "Key width",
             "Adjust how wide each key is. Useful for finger size.",
             50.0,
@@ -962,7 +968,7 @@ impl SettingsPanel {
         ));
 
         // Height adjustment slider: ±50% (50-150%).
-        scroll_inner.append(&build_slider_row(
+        body_maint.append(&build_slider_row(
             "Key height",
             "Adjust how tall the keyboard is.",
             50.0,
@@ -984,7 +990,7 @@ impl SettingsPanel {
         // Bottom padding slider: 0-240px (doubled from 0-120). For
         // users who hold the phone low or want more room for the
         // bottom-pad horizontal-swipe cursor-nav feature.
-        scroll_inner.append(&build_slider_row(
+        body_maint.append(&build_slider_row(
             "Bottom padding",
             "Reserve space below the keyboard. Useful if your hands sit low on the phone, or if you want room for the bottom-pad cursor-swipe gesture.",
             0.0,
@@ -1023,7 +1029,7 @@ impl SettingsPanel {
                 *cfg_state_for_hold.borrow_mut() = Config::default();
                 notify_for_hold();
             });
-            scroll_inner.append(btn.widget());
+            body_maint.append(btn.widget());
         }
 
         // Test LLM endpoint. Tap = quick HEAD-style check (we just
@@ -1096,7 +1102,7 @@ impl SettingsPanel {
                     })
                     .ok();
             });
-            scroll_inner.append(btn.widget());
+            body_maint.append(btn.widget());
         }
 
         // Show LLM prompt history. Tap → most recent 3 prompts;
@@ -1155,7 +1161,7 @@ impl SettingsPanel {
                     }
                 }
             });
-            scroll_inner.append(btn.widget());
+            body_maint.append(btn.widget());
         }
 
             } // end build_deferred closure
@@ -1200,6 +1206,308 @@ fn section_header(text: &str) -> gtk4::Label {
         .halign(gtk4::Align::Start)
         .margin_top(4)
         .build()
+}
+
+/// Build the Keyboards section: import / export custom layouts, and a
+/// list of saved layouts with delete buttons. Entirely clipboard- and
+/// inline-based — no modal file dialogs, which would steal focus and
+/// dismiss the keyboard's layer surface on phone.
+fn build_keyboards_section() -> gtk4::Box {
+    use crate::layouts::{io as layout_io, Layout};
+
+    let root = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(8)
+        .build();
+
+    // --- Status line (shared) ---
+    let status = gtk4::Label::builder()
+        .label("")
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .build();
+
+    // --- Saved layouts list (refreshable) ---
+    let list_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(4)
+        .build();
+
+    let refresh_list = {
+        let list_box = list_box.clone();
+        let status = status.clone();
+        std::rc::Rc::new(move || {
+            // Clear existing rows.
+            while let Some(child) = list_box.first_child() {
+                list_box.remove(&child);
+            }
+            let entries = layout_io::list_user_layouts();
+            if entries.is_empty() {
+                let empty = gtk4::Label::builder()
+                    .label("No saved layouts yet. Import one below or build one.")
+                    .css_classes(["caption", "dim-label"])
+                    .halign(gtk4::Align::Start)
+                    .wrap(true)
+                    .build();
+                list_box.append(&empty);
+                return;
+            }
+            for entry in entries {
+                let row = gtk4::Box::builder()
+                    .orientation(gtk4::Orientation::Horizontal)
+                    .spacing(6)
+                    .build();
+                let label = gtk4::Label::builder()
+                    .label(if entry.error.is_some() {
+                        format!("⚠ {} (broken)", entry.name)
+                    } else {
+                        entry.display_name.clone()
+                    })
+                    .halign(gtk4::Align::Start)
+                    .hexpand(true)
+                    .ellipsize(gtk4::pango::EllipsizeMode::End)
+                    .build();
+                row.append(&label);
+
+                // Copy-to-clipboard button (export this saved layout).
+                if entry.error.is_none() {
+                    let copy_btn = gtk4::Button::builder()
+                        .label("Copy")
+                        .css_classes(["flat"])
+                        .build();
+                    let path = entry.path.clone();
+                    let status_c = status.clone();
+                    copy_btn.connect_clicked(move |btn| {
+                        match Layout::load_from_file(&path)
+                            .and_then(|l| layout_io::export_to_string(&l))
+                        {
+                            Ok(json) => {
+                                let disp = gtk4::prelude::WidgetExt::display(btn);
+                                disp.clipboard().set_text(&json);
+                                status_c.set_label("Copied layout JSON to clipboard.");
+                            }
+                            Err(e) => status_c
+                                .set_label(&format!("Copy failed: {}", e)),
+                        }
+                    });
+                    row.append(&copy_btn);
+                }
+
+                // Delete button.
+                let del_btn = gtk4::Button::builder()
+                    .label("Delete")
+                    .css_classes(["flat", "destructive-action"])
+                    .build();
+                let path = entry.path.clone();
+                let status_d = status.clone();
+                del_btn.connect_clicked(move |_| {
+                    match layout_io::delete_user_layout(&path) {
+                        Ok(()) => status_d.set_label("Deleted. Reopen settings to refresh the list."),
+                        Err(e) => status_d.set_label(&format!("Delete failed: {}", e)),
+                    }
+                });
+                row.append(&del_btn);
+                list_box.append(&row);
+            }
+        })
+    };
+    refresh_list();
+
+    // --- Export starter template ---
+    let export_row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(3)
+        .build();
+    let export_label = gtk4::Label::builder()
+        .label("Export")
+        .css_classes(["heading"])
+        .halign(gtk4::Align::Start)
+        .build();
+    let export_sub = gtk4::Label::builder()
+        .label("Copy a QWERTY starter template to the clipboard to edit and re-import, or copy a saved layout above.")
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .build();
+    let export_btn = gtk4::Button::builder()
+        .label("Copy starter template")
+        .css_classes(["flat"])
+        .halign(gtk4::Align::Start)
+        .build();
+    {
+        let status = status.clone();
+        export_btn.connect_clicked(move |btn| {
+            match layout_io::export_to_string(&Layout::default_qwerty()) {
+                Ok(json) => {
+                    let disp = gtk4::prelude::WidgetExt::display(btn);
+                    disp.clipboard().set_text(&json);
+                    status.set_label("Starter template copied to clipboard.");
+                }
+                Err(e) => status.set_label(&format!("Export failed: {}", e)),
+            }
+        });
+    }
+    export_row.append(&export_label);
+    export_row.append(&export_sub);
+    export_row.append(&export_btn);
+
+    // --- Import from pasted JSON ---
+    let import_row = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(3)
+        .build();
+    let import_label = gtk4::Label::builder()
+        .label("Import")
+        .css_classes(["heading"])
+        .halign(gtk4::Align::Start)
+        .build();
+    let import_sub = gtk4::Label::builder()
+        .label("Paste layout JSON below and tap Import to save it.")
+        .css_classes(["caption", "dim-label"])
+        .halign(gtk4::Align::Start)
+        .wrap(true)
+        .build();
+    let import_view = gtk4::TextView::builder()
+        .css_classes(["settings-import-box"])
+        .monospace(true)
+        .wrap_mode(gtk4::WrapMode::Char)
+        .height_request(80)
+        .build();
+    let import_scroll = gtk4::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk4::PolicyType::Never)
+        .vscrollbar_policy(gtk4::PolicyType::Automatic)
+        .min_content_height(80)
+        .max_content_height(160)
+        .child(&import_view)
+        .build();
+    let import_btn = gtk4::Button::builder()
+        .label("Import")
+        .css_classes(["suggested-action"])
+        .halign(gtk4::Align::Start)
+        .build();
+    {
+        let status = status.clone();
+        let import_view = import_view.clone();
+        let refresh_list = refresh_list.clone();
+        import_btn.connect_clicked(move |_| {
+            let buf = import_view.buffer();
+            let (start, end) = buf.bounds();
+            let text = buf.text(&start, &end, false).to_string();
+            if text.trim().is_empty() {
+                status.set_label("Paste layout JSON first.");
+                return;
+            }
+            match layout_io::import_from_string(&text) {
+                Ok(layout) => match layout_io::save_user_layout(&layout) {
+                    Ok(path) => {
+                        status.set_label(&format!(
+                            "Imported '{}' → {}",
+                            layout.display_name,
+                            path.file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("?")
+                        ));
+                        buf.set_text("");
+                        refresh_list();
+                    }
+                    Err(e) => status.set_label(&format!("Save failed: {}", e)),
+                },
+                Err(e) => status.set_label(&format!("Invalid layout: {}", e)),
+            }
+        });
+    }
+    import_row.append(&import_label);
+    import_row.append(&import_sub);
+    import_row.append(&import_scroll);
+    import_row.append(&import_btn);
+
+    // Assemble.
+    let saved_label = gtk4::Label::builder()
+        .label("Saved layouts")
+        .css_classes(["heading"])
+        .halign(gtk4::Align::Start)
+        .build();
+    root.append(&saved_label);
+    root.append(&list_box);
+    root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    root.append(&export_row);
+    root.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+    root.append(&import_row);
+    root.append(&status);
+    root
+}
+
+/// Build a collapsible section: a clickable header row (chevron + title)
+/// that toggles the visibility of a body box. Appends both header and
+/// body to `parent` and returns the body box, so the caller routes that
+/// section's rows into it via `body.append(...)`.
+///
+/// This replaces the flat run-on settings list with clear, independently
+/// collapsible sections. `expanded` sets the initial state — default the
+/// most-used section open and the rest closed so the panel is short on a
+/// phone screen and the user expands only what they need.
+fn collapsible_section(
+    parent: &gtk4::Box,
+    title: &str,
+    expanded: bool,
+) -> gtk4::Box {
+    let header = gtk4::Button::builder()
+        .css_classes(["settings-section-toggle", "flat"])
+        .hexpand(true)
+        .build();
+    let header_box = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Horizontal)
+        .spacing(8)
+        .hexpand(true)
+        .build();
+    // Chevron icon — rotates via the .expanded class (CSS transform).
+    let chevron = gtk4::Image::from_icon_name("go-next-symbolic");
+    chevron.add_css_class("settings-chevron");
+    let title_label = gtk4::Label::builder()
+        .label(title)
+        .css_classes(["heading"])
+        .halign(gtk4::Align::Start)
+        .hexpand(true)
+        .build();
+    header_box.append(&chevron);
+    header_box.append(&title_label);
+    header.set_child(Some(&header_box));
+
+    let body = gtk4::Box::builder()
+        .orientation(gtk4::Orientation::Vertical)
+        .spacing(6)
+        .margin_start(4)
+        .margin_bottom(6)
+        .build();
+
+    // A Revealer gives a smooth slide rather than an abrupt show/hide.
+    let revealer = gtk4::Revealer::builder()
+        .transition_type(gtk4::RevealerTransitionType::SlideDown)
+        .transition_duration(180)
+        .reveal_child(expanded)
+        .child(&body)
+        .build();
+
+    if expanded {
+        chevron.add_css_class("expanded");
+    }
+
+    let revealer_for_toggle = revealer.clone();
+    let chevron_for_toggle = chevron.clone();
+    header.connect_clicked(move |_| {
+        let now = !revealer_for_toggle.reveals_child();
+        revealer_for_toggle.set_reveal_child(now);
+        if now {
+            chevron_for_toggle.add_css_class("expanded");
+        } else {
+            chevron_for_toggle.remove_css_class("expanded");
+        }
+    });
+
+    parent.append(&header);
+    parent.append(&revealer);
+    body
 }
 
 /// Build one labeled row: title, description, and a row of toggle
@@ -1884,6 +2192,37 @@ const SWATCH_PALETTE: &[(&str, &str)] = &[
     ("Muted indigo", "9b96c9"),
     ("Muted purple", "b08fb8"),
     ("Muted pink", "d9b3cf"),
+    // Row 3: DEEP / DARK tier — rich, low-lightness shades for
+    // dark-mode and OLED keyboards. "OLED black" is true #000 so the
+    // panels can switch off pixels entirely on AMOLED phone displays.
+    // The rest are ~30-40% lightness saturated colors that read as
+    // "dark but colored" rather than muted/grayed.
+    ("OLED black", "000000"),
+    ("Near black", "0d0d0d"),
+    ("Charcoal", "1c1f26"),
+    ("Deep slate", "23303d"),
+    ("Deep red", "7a1218"),
+    ("Deep orange", "8a3d00"),
+    ("Deep amber", "8a6000"),
+    ("Deep green", "16632f"),
+    ("Deep teal", "0c5a4c"),
+    ("Deep blue", "13345e"),
+    ("Deep indigo", "2a2566"),
+    ("Deep purple", "4a1a57"),
+    ("Deep magenta", "6e1453"),
+    ("Deep brown", "4a2f1a"),
+    // Row 4: extra vibrant hues not covered above, for more accent
+    // variety (cyan/lime/amber/magenta/brown/slate families).
+    ("Cyan", "00bcd4"),
+    ("Sky", "4ea3ff"),
+    ("Lime", "9ccc2e"),
+    ("Amber", "ffb300"),
+    ("Coral", "ff6f61"),
+    ("Magenta", "d81b8c"),
+    ("Violet", "7c4dff"),
+    ("Brown", "8d6e63"),
+    ("Slate", "607d8b"),
+    ("Forest", "2e7d32"),
 ];
 
 /// CSS for every swatch class. Installed once globally rather than 14

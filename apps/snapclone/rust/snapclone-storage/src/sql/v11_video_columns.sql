@@ -1,0 +1,4 @@
+ALTER TABLE snaps ADD COLUMN encoded_duration_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE snaps ADD COLUMN thumbnail_path      TEXT    NOT NULL DEFAULT '';
+ALTER TABLE snaps ADD COLUMN has_audio           INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE snaps ADD COLUMN is_looping          INTEGER NOT NULL DEFAULT 0;

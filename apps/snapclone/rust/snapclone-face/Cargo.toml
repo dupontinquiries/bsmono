@@ -1,0 +1,35 @@
+[package]
+name        = "snapclone-face"
+version     = "0.1.0"
+edition     = "2021"
+description = "Face detection (real) and face embedding/identity matching (scaffolded) for SnapClone"
+
+[lib]
+name       = "snapclone_face"
+# rlib for Rust consumers (workspace crates that depend on snapclone-face).
+# staticlib for the C++ side to link against — exposes the extern "C"
+# symbols in src/ffi.rs as a `.a` archive.
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+# Core
+anyhow     = "1"
+thiserror  = "1"
+serde      = { version = "1", features = ["derive"] }
+log        = "0.4"
+
+# Image handling — matches the version camera-bridge uses so we don't
+# fragment the dep graph.
+image     = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+ndarray   = "0.16"
+
+# Real ONNX inference for the detection path. The "embedding" path
+# uses the same runtime but its weights are not yet committed (see
+# embedding.rs).
+tract-onnx = { version = "0.21", optional = true }
+
+[features]
+default = ["onnx"]
+# onnx — compile real inference paths. Off in test/CI builds where
+# we don't want the 50MB tract dep tree just to typecheck.
+onnx = ["dep:tract-onnx"]

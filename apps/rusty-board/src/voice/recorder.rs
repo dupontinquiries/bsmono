@@ -1,15 +1,85 @@
-//! Audio capture via `cpal`, written into a `HeapRb` ring buffer for the
+//! Audio capture via `cpal`, written into a growable buffer for the
 //! transcriber to consume.
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
-use ringbuf::{traits::*, HeapRb};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-pub type AudioRing = Arc<Mutex<HeapRb<f32>>>;
+/// Growable audio buffer for captured samples.
+///
+/// Replaces the old fixed-capacity ring. The ring had two bugs that
+/// combined to cut off long dictation while the transcribing indicator
+/// kept running:
+///
+///   1. It was sized `16_000 * seconds`, but samples are stored at the
+///      device's NATIVE rate (often 44.1/48 kHz), so a "30 second"
+///      buffer actually held ~10 s on a 48 kHz device.
+///   2. On overflow it dropped the NEWEST samples (`try_push` fails when
+///      full and the error was ignored), so everything after the cap was
+///      silently lost while recording continued.
+///
+/// `GrowBuf` grows with the recording, so it only uses memory
+/// proportional to what's actually captured (a few MB for typical
+/// dictation). A generous safety ceiling caps runaway recording, and
+/// when hit it drops the OLDEST audio — keeping the most recent speech,
+/// the opposite of the old behavior.
+pub struct GrowBuf {
+    data: Vec<f32>,
+    /// Hard ceiling in samples. Only reached by pathological non-stop
+    /// recording; normal dictation never approaches it.
+    max_samples: usize,
+}
+
+impl GrowBuf {
+    fn new(max_samples: usize) -> Self {
+        Self {
+            data: Vec::new(),
+            max_samples,
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, s: f32) {
+        self.data.push(s);
+        if self.data.len() > self.max_samples {
+            // Drop the oldest samples to get back under the ceiling,
+            // plus a slack chunk so this O(n) shift amortizes (it
+            // happens at most ~once per second of overflow rather than
+            // every sample). Keeps the most recent audio.
+            let overflow = self.data.len() - self.max_samples;
+            let drop = (overflow + 16_000).min(self.data.len());
+            self.data.drain(0..drop);
+        }
+    }
+
+    /// Take all samples, leaving the buffer empty.
+    fn drain_all(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.data)
+    }
+
+    /// Copy all samples without consuming them.
+    fn snapshot(&self) -> Vec<f32> {
+        self.data.clone()
+    }
+
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+/// Safety ceiling for the capture buffer, in seconds. Computed against a
+/// conservative worst-case native rate so the time bound holds even on
+/// high-rate devices. This is NOT a dictation cap users will hit in
+/// normal use — it only bounds runaway recording (e.g. a stuck stream).
+/// 5 minutes at 48 kHz ≈ 14.4M samples ≈ 58 MB worst case; typical
+/// dictation of a few seconds uses a few MB.
+const MAX_BUFFER_SECONDS: usize = 300;
+const ASSUMED_MAX_RATE: usize = 48_000;
+
+pub type AudioRing = Arc<Mutex<GrowBuf>>;
 
 /// Shared atomic peak-level meter. The cpal input callback updates
 /// it on each buffer; the UI polls it from the main thread. Stored
@@ -35,13 +105,18 @@ pub struct AudioRecorder {
 
 impl AudioRecorder {
     pub fn new(buffer_seconds: usize) -> Self {
-        // Allocate a ring sized for `buffer_seconds` of 16-bit-equivalent f32
-        // samples at 16 kHz.
-        let capacity = 16_000 * buffer_seconds.max(1);
-        let ring = HeapRb::<f32>::new(capacity);
+        // The buffer GROWS with the recording, so buffer_seconds is no
+        // longer a hard cap — it just seeds the safety ceiling. We size
+        // the ceiling against a conservative worst-case native rate so
+        // the time bound holds on high-rate (44.1/48 kHz) devices, and
+        // honor an unusually large requested buffer_seconds if it
+        // exceeds the default ceiling.
+        let ceiling_seconds = buffer_seconds.max(MAX_BUFFER_SECONDS);
+        let max_samples = ASSUMED_MAX_RATE * ceiling_seconds;
+        let buf = GrowBuf::new(max_samples);
         Self {
             stream: None,
-            ring: Arc::new(Mutex::new(ring)),
+            ring: Arc::new(Mutex::new(buf)),
             level: Arc::new(AtomicU32::new(0)),
             running: false,
             input_sample_rate: 16_000,
@@ -170,16 +245,7 @@ impl AudioRecorder {
     /// device's native sample rate.
     pub fn drain(&self) -> Vec<f32> {
         let mut ring = self.ring.lock();
-        let len = ring.occupied_len();
-        let mut out = Vec::with_capacity(len);
-        for _ in 0..len {
-            if let Some(s) = ring.try_pop() {
-                out.push(s);
-            } else {
-                break;
-            }
-        }
-        out
+        ring.drain_all()
     }
 
     /// Non-destructive snapshot of the current ring contents. Returns
@@ -210,7 +276,7 @@ impl AudioRecorder {
 /// Arc<Mutex<>> is unaffected — it's just a thread-safe ringbuf.
 pub fn snapshot_ring(ring: &AudioRing) -> Vec<f32> {
     let r = ring.lock();
-    r.iter().copied().collect()
+    r.snapshot()
 }
 
 impl Drop for AudioRecorder {
@@ -248,17 +314,19 @@ fn push_samples_mono(
         }
     }
 
-    // Push to ring (mono mixdown).
+    // Push to buffer (mono mixdown). GrowBuf::push appends without
+    // dropping newest samples; it only drops OLDEST if the safety
+    // ceiling is hit, which normal dictation never reaches.
     {
         let mut r = ring.lock();
         if channels == 1 {
             for &s in data {
-                let _ = r.try_push(s);
+                r.push(s);
             }
         } else {
             for frame in data.chunks_exact(channels) {
                 let mean: f32 = frame.iter().sum::<f32>() / channels as f32;
-                let _ = r.try_push(mean);
+                r.push(mean);
             }
         }
     }
@@ -337,5 +405,67 @@ mod tests {
         let rec = AudioRecorder::new(1);
         assert_eq!(rec.drain().len(), 0);
         assert!(!rec.is_running());
+    }
+
+    #[test]
+    fn growbuf_grows_past_old_fixed_cap() {
+        // The old fixed ring capped at 16_000 * buffer_seconds samples
+        // and dropped NEWEST on overflow. GrowBuf must accept far more
+        // than that without losing samples — here 10x the old "30s"
+        // sizing (480k) to prove the cut-off is gone.
+        let mut buf = GrowBuf::new(ASSUMED_MAX_RATE * MAX_BUFFER_SECONDS);
+        let n = 16_000 * 300; // 5 min @ 16k = 4.8M samples
+        for i in 0..n {
+            buf.push((i % 7) as f32 * 0.01);
+        }
+        assert_eq!(buf.len(), n, "all pushed samples retained");
+    }
+
+    #[test]
+    fn growbuf_drops_oldest_at_ceiling_not_newest() {
+        // Small ceiling to exercise overflow quickly. The MOST RECENT
+        // samples must survive; the oldest get dropped.
+        let ceiling = 1000;
+        let mut buf = GrowBuf::new(ceiling);
+        // Push a ramp so each sample is identifiable by value.
+        let total = ceiling + 16_000 + 500; // forces at least one drop pass
+        for i in 0..total {
+            buf.push(i as f32);
+        }
+        let snap = buf.snapshot();
+        assert!(snap.len() <= ceiling + 16_000, "stays bounded");
+        // The LAST sample pushed must be present and last — newest kept.
+        assert_eq!(*snap.last().unwrap(), (total - 1) as f32);
+        // The very first sample (0.0) must have been dropped.
+        assert!(snap[0] > 0.0, "oldest dropped, not newest");
+    }
+
+    #[test]
+    fn growbuf_drain_empties_snapshot_does_not() {
+        let mut buf = GrowBuf::new(100_000);
+        for i in 0..100 {
+            buf.push(i as f32);
+        }
+        let snap = buf.snapshot();
+        assert_eq!(snap.len(), 100);
+        assert_eq!(buf.len(), 100, "snapshot is non-destructive");
+        let drained = buf.drain_all();
+        assert_eq!(drained.len(), 100);
+        assert_eq!(buf.len(), 0, "drain empties");
+    }
+
+    #[test]
+    fn recorder_buffer_seconds_seeds_generous_ceiling() {
+        // Even a tiny requested buffer gets at least the default
+        // ceiling, so a small buffer_seconds can't reintroduce a cap.
+        let rec = AudioRecorder::new(1);
+        let ring = rec.ring();
+        let mut g = ring.lock();
+        // Push 2 minutes of 48k audio (5.76M samples) — would have
+        // overflowed the old 16k*1 = 16k ring instantly.
+        for i in 0..(48_000 * 120) {
+            g.push((i & 1) as f32);
+        }
+        assert_eq!(g.len(), 48_000 * 120, "no cut-off at the old cap");
     }
 }

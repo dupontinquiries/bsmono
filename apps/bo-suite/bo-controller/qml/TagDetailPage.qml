@@ -17,26 +17,34 @@ Item {
     property color accent: "#C8A04B"
     signal back()
 
-    onTagIdChanged: if (tagId >= 0) qtobj.load_tracks_by_tag(tagId)
+    onTagIdChanged: {
+        // Clear immediately so stale tracks from a previously-open tag
+        // don't linger while the new load is in flight, then request.
+        root.trackList = []
+        if (tagId >= 0) qtobj.load_tracks_by_tag(tagId)
+    }
 
-    property var trackList: {
+    // Plain property (NOT a binding) — the Connections handler is the sole
+    // writer. A declarative binding here would be clobbered by that
+    // imperative assignment on the first load and then never re-evaluate,
+    // which is exactly why the list stopped populating.
+    property var trackList: []
+
+    function adoptIfMine() {
         var ctx = qtobj.library_context || ""
         if (ctx === "tag:" + root.tagId) {
-            try { return JSON.parse(qtobj.library_json || "[]") }
-            catch (e) { return [] }
+            try { root.trackList = JSON.parse(qtobj.library_json || "[]") }
+            catch (e) { root.trackList = [] }
         }
-        return []
     }
     Connections {
         target: qtobj
-        function onLibrary_changed() {
-            var ctx = qtobj.library_context || ""
-            if (ctx === "tag:" + root.tagId) {
-                try { root.trackList = JSON.parse(qtobj.library_json || "[]") }
-                catch (e) { root.trackList = [] }
-            }
-        }
+        function onLibrary_changed() { root.adoptIfMine() }
     }
+    // Also adopt when the page first appears with an id already set (the
+    // result may have arrived before this page became current, so the
+    // signal won't fire again — pull the current state on show).
+    onVisibleChanged: if (visible) adoptIfMine()
 
     Column {
         anchors.fill: parent
@@ -139,6 +147,11 @@ Item {
             clip: true
             model: root.trackList
             cacheBuffer: 240
+            flickDeceleration: Bo.flickDecel
+            maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             ScrollIndicator.vertical: ScrollIndicator {}
 
             delegate: Rectangle {
@@ -216,6 +229,9 @@ Item {
                     id: rowMa
                     anchors.fill: parent
                     onClicked: qtobj.enqueue_or_play(modelData.id)
+                    onPressAndHold: {
+                        if (window.editDialog) window.editDialog.open(modelData)
+                    }
                 }
             }
         }

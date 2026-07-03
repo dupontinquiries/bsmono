@@ -1,0 +1,24 @@
+[Unit]
+Description=Camera Bridge — feeds virtual PipeWire camera nodes
+Documentation=https://gitlab.postmarketos.org/postmarketOS
+After=pipewire.service
+Wants=pipewire.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=3
+
+# All configuration lives in the env file written by setup_backend.sh.
+EnvironmentFile=%h/.config/camera-bridge/env
+
+ExecStart=%h/.local/bin/camera-bridge
+
+# Cap CPU so the three pipeline threads don't starve other apps.
+CPUQuota=60%
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,19 @@
+[package]
+name        = "snapclone-net-intel"
+version     = "0.1.0"
+edition     = "2021"
+description = """
+Reachability memory and traversal intelligence for SnapClone.
+Learns which paths succeed and biases future attempts toward warm paths.
+Based on NETWORK_ARCHITECTURE.md opportunistic networking design.
+"""
+
+[lib]
+name       = "snapclone_net_intel"
+crate-type = ["rlib"]
+
+[dependencies]
+anyhow  = "1"
+chrono  = { version = "0.4", features = ["serde"] }
+serde   = { version = "1", features = ["derive"] }
+tracing = "0.1"

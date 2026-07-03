@@ -1,0 +1,14 @@
+[package]
+name        = "snapclone-identity"
+version     = "0.1.0"
+edition     = "2021"
+description = "sc-ID generation and peer identity for SnapClone"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+rand   = "0.8"
+hex    = "0.4"
+sha2   = "0.10"

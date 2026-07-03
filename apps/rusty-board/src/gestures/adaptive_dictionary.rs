@@ -322,8 +322,11 @@ fn default_path() -> PathBuf {
 }
 
 fn now_secs() -> i64 {
-        core_kit::time::now_secs() as i64
-    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Effective count with exponential decay applied. Half-life
 /// is `DECAY_HALF_LIFE_SECS`.

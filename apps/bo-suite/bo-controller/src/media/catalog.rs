@@ -671,16 +671,89 @@ pub fn all_tracks_page(
     offset: i64,
     limit: i64,
 ) -> rusqlite::Result<(Vec<TrackSummary>, i64)> {
-    let mut stmt = conn.prepare(r#"
+    all_tracks_page_sorted(conn, offset, limit, TrackSort::Title)
+}
+
+/// Sort modes for the all-tracks browse list. Mapped to a fixed,
+/// non-injectable ORDER BY clause by `order_clause` — the value never
+/// comes from user text, so there's no SQL-injection surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackSort {
+    Title,
+    Artist,
+    Album,
+    RecentlyAdded,
+    RatingDesc,
+}
+
+impl TrackSort {
+    /// Parse the QML tag. Unknown → Title (safe default).
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "artist" => TrackSort::Artist,
+            "album"  => TrackSort::Album,
+            "recent" => TrackSort::RecentlyAdded,
+            "rating" => TrackSort::RatingDesc,
+            _         => TrackSort::Title,
+        }
+    }
+
+    /// The stable tag for persistence / the Qt bridge (inverse of from_tag).
+    pub fn to_tag(self) -> &'static str {
+        match self {
+            TrackSort::Title         => "title",
+            TrackSort::Artist        => "artist",
+            TrackSort::Album         => "album",
+            TrackSort::RecentlyAdded => "recent",
+            TrackSort::RatingDesc    => "rating",
+        }
+    }
+
+    /// The literal ORDER BY body. `pa` is the correlated primary-artist
+    /// subquery alias available in the SELECT. All branches end with a
+    /// stable tiebreak (title, then id) so paging is deterministic.
+    fn order_clause(self) -> &'static str {
+        match self {
+            TrackSort::Title =>
+                "t.title COLLATE NOCASE, t.id",
+            TrackSort::Artist =>
+                "pa COLLATE NOCASE, t.title COLLATE NOCASE, t.id",
+            TrackSort::Album =>
+                "COALESCE(t.album,'') COLLATE NOCASE, t.title COLLATE NOCASE, t.id",
+            // Newest first. tracks.id is monotonic with insertion, a good
+            // proxy for "recently added" without needing a timestamp col.
+            TrackSort::RecentlyAdded =>
+                "t.id DESC",
+            // Highest rated first, unrated (0) last; then title.
+            TrackSort::RatingDesc =>
+                "t.rating DESC, t.title COLLATE NOCASE, t.id",
+        }
+    }
+}
+
+/// Paginated all-tracks list with a chosen sort order. Backs the browse
+/// list's sort toggle.
+pub fn all_tracks_page_sorted(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+    sort: TrackSort,
+) -> rusqlite::Result<(Vec<TrackSummary>, i64)> {
+    // The primary-artist subquery is aliased `pa` so the Artist sort can
+    // order by it. ORDER BY is a fixed literal from the enum (never user
+    // text) — concatenating it is injection-safe.
+    let sql = format!(r#"
         SELECT t.id, t.path, t.title, t.album, t.year, t.bpm, t.camelot, t.key_text,
                COALESCE((SELECT a.name FROM artists a
                           JOIN track_artists ta ON ta.artist_id = a.id
                          WHERE ta.track_id = t.id AND ta.role = 'primary'
-                         ORDER BY ta.ord LIMIT 1), 'Unknown Artist')
+                         ORDER BY ta.ord LIMIT 1), 'Unknown Artist') AS pa,
+               t.rating AS rating
         FROM tracks t
-        ORDER BY t.title COLLATE NOCASE
+        ORDER BY {}
         LIMIT ?1 OFFSET ?2
-    "#)?;
+    "#, sort.order_clause());
+    let mut stmt = conn.prepare(&sql)?;
     let mut summaries = rows_to_summaries(&mut stmt, params![limit, offset])?;
     apply_overrides(conn, &mut summaries)?;
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0))?;
@@ -923,19 +996,51 @@ pub fn artists_with_counts_page(
     offset: i64,
     limit: i64,
 ) -> rusqlite::Result<(Vec<GroupCount>, i64)> {
-    // Page query: same shape as the unpaginated version, with
-    // LIMIT/OFFSET appended. SQLite handles LIMIT/OFFSET efficiently
-    // because the ORDER BY column (a.norm) is indexed — it can scan
-    // the index in order, skip `offset` rows, and stop after `limit`.
-    let mut stmt = conn.prepare(r#"
+    artists_with_counts_page_sorted(conn, offset, limit, ArtistPageSort::Name)
+}
+
+/// Sort modes for the paginated artists browse list. Only Name and
+/// TrackCount are available here (the paged query aggregates a track
+/// count but not play counts); the order clause is a fixed literal, so
+/// there's no injection surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtistPageSort {
+    Name,
+    TrackCount,
+}
+
+impl ArtistPageSort {
+    pub fn from_tag(s: &str) -> Self {
+        match s {
+            "tracks" => ArtistPageSort::TrackCount,
+            _         => ArtistPageSort::Name,
+        }
+    }
+    fn order_clause(self) -> &'static str {
+        match self {
+            ArtistPageSort::Name       => "a.norm",
+            // Most tracks first, then name for a stable tiebreak.
+            ArtistPageSort::TrackCount => "n DESC, a.norm",
+        }
+    }
+}
+
+pub fn artists_with_counts_page_sorted(
+    conn: &Connection,
+    offset: i64,
+    limit: i64,
+    sort: ArtistPageSort,
+) -> rusqlite::Result<(Vec<GroupCount>, i64)> {
+    let sql = format!(r#"
         SELECT a.id, a.name, COUNT(ta.track_id) AS n
         FROM artists a
         JOIN track_artists ta ON ta.artist_id = a.id
         WHERE ta.role = 'primary'
         GROUP BY a.id
-        ORDER BY a.norm
+        ORDER BY {}
         LIMIT ?1 OFFSET ?2
-    "#)?;
+    "#, sort.order_clause());
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![limit, offset], |r| Ok(GroupCount {
         id: r.get(0)?, name: r.get(1)?, count: r.get(2)?,
     }))?;

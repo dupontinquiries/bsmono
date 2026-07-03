@@ -1,0 +1,8 @@
+{
+  "name": "snapclone-relay",
+  "version": "1.0.0",
+  "description": "SnapClone WebSocket relay for symmetric-NAT traversal",
+  "main": "relay.js",
+  "scripts": { "start": "node relay.js" },
+  "dependencies": { "ws": "^8.18.0" }
+}

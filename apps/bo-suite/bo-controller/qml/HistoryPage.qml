@@ -348,6 +348,9 @@ Item {
             // Stronger scroll feel (momentum-y flings).
             flickDeceleration: Bo.flickDecel
             maximumFlickVelocity: Bo.flickMaxVel
+            boundsBehavior: Flickable.DragOverBounds
+            pressDelay: Bo.pressDelay
+            rebound: BoRebound {}
             // Clear the BottomTransportBar so the final row isn't
             // hidden behind it (bottom-cutoff fix).
             bottomMargin: Bo.bottomChromeHeight

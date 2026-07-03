@@ -1,0 +1,95 @@
+[package]
+name = "camera-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "PipeWire camera bridge with YOLO face tracking — FairPhone 5 / postmarketOS sc7280"
+
+# Standalone workspace root — prevents rust/ workspace from absorbing this.
+[workspace]
+
+[lib]
+name    = "camera_bridge_lib"
+path    = "src/lib.rs"
+
+[[bin]]
+name = "camera-bridge"
+path = "src/main.rs"
+
+[[bin]]
+name = "camera-view"
+path = "src/view.rs"
+
+[[bin]]
+name = "camera-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "camera-client"
+path = "src/client.rs"
+
+[dependencies]
+# GStreamer — capture + output pipelines
+gstreamer       = "0.22"
+gstreamer-app   = "0.22"
+gstreamer-video = "0.22"
+
+# YOLO inference — pure Rust, no C++ runtime, ARM-friendly
+tract-onnx = "0.21"
+
+# ndarray pinned to match tract-onnx 0.21's internal dep.
+# If you see "two versions of ndarray", run: cargo tree -i ndarray
+# and update this to the version tract resolved to.
+ndarray = "0.16"
+
+# Image processing
+image = "0.25"
+
+# GUI — fullscreen camera view
+# eframe is egui's application framework; supports Wayland natively
+eframe  = { version = "0.29", default-features = false, features = [
+    "wayland",         # Wayland display (postmarketOS / Phosh)
+    "wgpu",            # GPU rendering via wgpu (Adreno 635 via Vulkan/GLES)
+    # "accesskit",     # optional — requires libatk; disable if build fails
+] }
+egui    = "0.29"
+
+# Shared frame buffer between GStreamer thread and egui render thread
+# arc-swap gives us lock-free reads on the hot path
+arc-swap = "1"
+
+# Error handling
+anyhow    = "1"
+
+# Logging
+log        = "0.4"
+env_logger = "0.11"
+
+# .env support for local dev
+dotenvy = "0.15"
+
+# V32.34+: parent-death watchdog via prctl(PR_SET_PDEATHSIG). Linux-
+# only; the bridge is Linux-only (libcamera / pipewire) so the
+# target_os gate is mostly belt-and-braces.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+
+# Network camera streaming — server + client
+tokio         = { version = "1", features = ["full"] }
+tokio-rustls  = "0.26"
+rustls        = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+rcgen         = { version = "0.13", features = ["pem"] }   # self-signed TLS cert generation
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand          = "0.8"
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+base64        = "0.22"
+clap          = { version = "4", features = ["derive"] }
+directories   = "5"                                          # XDG dirs (config, data)
+
+[profile.release]
+opt-level     = 3
+lto           = true
+codegen-units = 1
+strip         = true

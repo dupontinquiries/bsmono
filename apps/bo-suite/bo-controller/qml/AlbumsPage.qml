@@ -131,6 +131,56 @@ Item {
             }
         }
 
+        // Sort chips — only meaningful in ALPHA (full-library) mode.
+        Flow {
+            width: parent.width
+            spacing: 4
+            visible: root.mode === "alpha"
+            Text {
+                text: "SORT"
+                color: Bo.slate
+                font.pixelSize: 9
+                font.weight: Font.DemiBold
+                font.letterSpacing: 1.0
+                height: 24
+                verticalAlignment: Text.AlignVCenter
+            }
+            Repeater {
+                model: [
+                    { tag: "title",  label: "Title"  },
+                    { tag: "artist", label: "Artist" },
+                    { tag: "year",   label: "Year"   },
+                    { tag: "plays",  label: "Most played" }
+                ]
+                delegate: Rectangle {
+                    property bool sel: qtobj.album_sort === modelData.tag
+                    width: albSortLabel.implicitWidth + 14
+                    height: 24
+                    radius: 12
+                    color: sel ? Qt.rgba(0.78, 0.63, 0.29, 0.25) : "transparent"
+                    border.color: sel ? "#C8A04B" : Bo.hairline
+                    border.width: sel ? 2 : 1
+                    Text {
+                        id: albSortLabel
+                        anchors.centerIn: parent
+                        text: modelData.label
+                        color: sel ? Bo.bone : Bo.silver
+                        font.pixelSize: 10
+                        font.weight: sel ? Font.DemiBold : Font.Normal
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (!parent.sel) {
+                                qtobj.set_album_sort(modelData.tag)
+                                qtobj.load_all_albums_alpha()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Empty state — gracefully tells the user when there's
         // nothing to show, with mode-aware guidance.
         Text {
@@ -146,6 +196,7 @@ Item {
 
         // ── Album card grid ───────────────────────────────────
         ScrollView {
+            id: albumsScroll
             // Reserve space for the BottomTransportBar so the last
             // row/card isn't clipped or overlapped (bottom-cutoff fix).
             bottomPadding: Bo.bottomChromeHeight
@@ -153,6 +204,17 @@ Item {
             height: parent.height - 60
             clip: true
             visible: root.albums.length > 0
+            // ScrollView wraps an internal Flickable as its contentItem;
+            // tune its fling there for the same momentum feel as the
+            // ListView pages.
+            Component.onCompleted: {
+                if (contentItem) {
+                    contentItem.flickDeceleration = Bo.flickDecel
+                    contentItem.maximumFlickVelocity = Bo.flickMaxVel
+                    contentItem.boundsBehavior = Flickable.DragOverBounds
+                    contentItem.pressDelay = Bo.pressDelay
+                }
+            }
 
             Flow {
                 width: root.width - Bo.gapMD * 2

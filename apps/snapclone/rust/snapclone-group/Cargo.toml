@@ -1,0 +1,35 @@
+[package]
+name        = "snapclone-group"
+version     = "0.1.0"
+edition     = "2021"
+description = "Group messaging crypto for SnapClone: sender-key ratchet, membership epochs, per-recipient sealed key distribution, and sealed group mailbox entries. See docs/GROUP_AND_SERVER_DESIGN.md."
+
+[lib]
+name       = "snapclone_group"
+# staticlib for C/C++ linking of the sc_group_* FFI; rlib so cargo test can
+# build the crate as a normal library and run the in-source #[test]s.
+crate-type = ["staticlib", "rlib"]
+
+# Only VETTED primitives already in the workspace lockfile — no new dep surface,
+# no homegrown crypto. Ratchet = HKDF chains; per-recipient seal + group content
+# = AES-256-GCM; auth = Ed25519. (See §3 of the design doc.)
+[dependencies]
+hkdf          = "0.12"
+sha2          = "0.10"
+aes-gcm       = { version = "0.10", features = ["aes"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek  = { version = "2", features = ["static_secrets"] }
+# getrandom feature pulls getrandom 0.2.15 (the working one, NOT the 0.4.2
+# edition2024 build that breaks this sandbox) so the C FFI can use OsRng for
+# real entropy without the caller passing an RNG across the boundary. Same trick
+# as snapclone-mailbox.
+rand_core     = { version = "0.6", features = ["getrandom"] }
+zeroize       = "1"
+hex           = "0.4"
+subtle        = "2"
+
+[dev-dependencies]
+# Integration test: a full group message round-trip through the local
+# micro-DHT (seal+sign → PUT to feed bucket → GET → verify+open). Dev-only, so
+# it never affects what the app links.
+snapclone-microdht = { path = "../snapclone-microdht" }

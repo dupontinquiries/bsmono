@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24"
+     fill="none" stroke="currentColor" stroke-width="2"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- Classic Feather "edit-3" style: diagonal pencil with tip pointing
+         to the bottom-left.  Stroke="currentColor" so SvgIcon::secondary
+         can tint to TEXT_SECONDARY at render time. -->
+    <!-- Pencil body (parallelogram) from top-right to mid -->
+    <path d="M18 2 L22 6 L8 20 L4 20 L4 16 Z"/>
+    <!-- Cap line separating eraser from body -->
+    <path d="M14 6 L18 10"/>
+</svg>

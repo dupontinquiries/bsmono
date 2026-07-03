@@ -1,0 +1,1 @@
+-- Migration v06_dht_cache (stub — copy from kMigrations[] in StorageManager.cpp)

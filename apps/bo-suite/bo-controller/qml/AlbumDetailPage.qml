@@ -143,6 +143,16 @@ Item {
             height: parent.height - 90
             clip: true
             visible: root.tracks.length > 0
+            // ScrollView wraps an internal Flickable; tune its fling for
+            // the same momentum feel as the ListView pages.
+            Component.onCompleted: {
+                if (contentItem) {
+                    contentItem.flickDeceleration = Bo.flickDecel
+                    contentItem.maximumFlickVelocity = Bo.flickMaxVel
+                    contentItem.boundsBehavior = Flickable.DragOverBounds
+                    contentItem.pressDelay = Bo.pressDelay
+                }
+            }
 
             Column {
                 width: root.width - Bo.gapMD * 2

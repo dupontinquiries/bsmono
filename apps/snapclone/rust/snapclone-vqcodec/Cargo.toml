@@ -1,0 +1,15 @@
+[package]
+name        = "snapclone-vqcodec"
+version     = "0.1.0"
+edition     = "2021"
+description = "Shared-codebook (vector-quantization) luma image codec for ultra-low-bandwidth snap transmission (LoRa / Bluetooth sneakernet)."
+
+[lib]
+name       = "snapclone_vqcodec"
+# rlib for Rust consumers (workspace crates); staticlib for the C++ side to link
+# against — exposes the extern "C" symbols in src/ffi.rs as a `.a` archive
+# (mirrors snapclone-face). The C header is include/vqcodec/snapclone_vqcodec_ffi.h.
+crate-type = ["rlib", "staticlib"]
+
+[dependencies]
+# none — std only, so this builds and tests offline.
