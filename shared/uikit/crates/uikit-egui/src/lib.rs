@@ -32,6 +32,20 @@ pub use skin::Skin;
 pub use theme_bridge::{apply_palette, PaletteColors};
 pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTierGesture};
 
+/// Apply the theme + touch parts of cross-app [`settings_kit::Prefs`] to an egui context:
+/// select the palette and, if set, widen the minimum interactive size. (The gesture part is
+/// applied to a `GestureConfig` via `Prefs::apply_to_gesture`.) Call this after
+/// `Settings::poll()` reports a change so the whole UI reflects new prefs live.
+pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
+    let pid = snapclone_theme::PaletteId::from_str(&prefs.palette);
+    apply_palette(ctx, snapclone_theme::palette_for(pid));
+    if prefs.touch.min_target > 0.0 {
+        let mut style = (*ctx.style()).clone();
+        style.spacing.interact_size.y = style.spacing.interact_size.y.max(prefs.touch.min_target);
+        ctx.set_style(style);
+    }
+}
+
 use egui::{Color32, Pos2, Rect, Stroke, Ui, Vec2};
 
 // ── L1 · common egui patterns, written once (mirrors logscope ui::row/combo) ──

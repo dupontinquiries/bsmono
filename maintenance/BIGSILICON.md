@@ -402,8 +402,16 @@ app updates — while keeping its own overrides.
 **So: yes.** With this, "update the touch gesture feel" in a central settings app publishes to
 `settings/gesture.*` and every app applies it next frame — apps still keep bespoke overrides.
 
-**Remaining:** the central **settings app** (an egui UI on uikit-egui that edits `Prefs` and
-`set`s them) + a small **settingsd**/sharemd persistence via config-kit (survive restarts); and
-a uikit-egui `apply_prefs(ctx, &mut Adaptive, &Prefs)` for the theme/touch side (gesture side is
-done). Apps opt in with ~3 lines: `Settings::connect()`, `poll()` each frame, feed
-`prefs().gesture_config(w)` into their `GestureLayer`.
+**DONE this pass:**
+- `apps/settings/egui-frontend` (`settings-egui`): the central settings app — an egui editor on
+  uikit-egui (sliders for gesture feel, touch targets, palette combo, a11y checkboxes) that
+  returns changed keys; `SettingsApp` forwards them to a publish closure (→ `Settings::set`).
+  3 tests; builds vs egui 0.29.
+- `settings_kit::diff(old,new)` — publish only what changed. `uikit_egui::apply_prefs(ctx,&Prefs)`
+  — applies palette + touch (gesture applied via `Prefs::apply_to_gesture`). uikit-egui lib green.
+
+**The full loop, proven:** settings-egui edits `Prefs` → `diff` → `Settings::set` → sharemd
+fans out → every app's `Settings::poll()` → `apply_prefs` + `gesture_config()` live.
+
+**Remaining:** a tiny **settingsd**/sharemd persistence via config-kit (survive restarts); wire
+each app's frame loop (`Settings::connect`/`poll`/apply) — ~3 lines using bigsilicon-client.
