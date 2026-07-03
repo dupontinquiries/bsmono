@@ -1,0 +1,14 @@
+[package]
+name = "rusty-board-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "rusty-board's on-screen keyboard, ported from GTK4 to egui on the shared uikit-egui + adaptive layer. The renderer sizes keys by device class (bigger touch targets on the FP5, tighter on desktop) and themes from snapclone-theme. Keeps a small standalone Layout so the front-end is buildable on its own; on-device it consumes rusty-board's GTK-free `layouts` module and drives keyboard/engine.rs."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
