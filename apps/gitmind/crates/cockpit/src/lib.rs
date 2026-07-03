@@ -21,6 +21,7 @@ pub mod ops;
 pub mod packaging;
 pub mod places;
 pub mod preview;
+pub mod rendezvous;
 pub mod pydeps;
 pub mod artifacts;
 pub mod suite;

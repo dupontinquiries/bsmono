@@ -1068,6 +1068,72 @@ pub fn host_repo_format() -> RepoFormat {
     }
 }
 
+// ── DHT rendezvous: reach fleet devices across networks ──────────────────────
+
+use crate::rendezvous::{self, Advert, AdvertStore};
+
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "device".to_string())
+}
+
+/// This device's fleet account, derived from its ssh identity public key.
+pub fn self_account() -> Option<String> {
+    let pubkey = crate::deploy::local_identity_pubkey()?;
+    Some(rendezvous::account_id(pubkey.as_bytes()))
+}
+
+/// The default advert store: a file drop under the gitmind config dir. This works as a
+/// local cache and over a shared mount; on-device the snapcore DHT store is primary (it
+/// implements the same `AdvertStore` seam via announce/discover).
+pub fn default_advert_store() -> rendezvous::FileStore {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    rendezvous::FileStore::new(format!("{home}/.config/gitmind/rendezvous"))
+}
+
+/// Build this device's advertisement from locally-known addresses.
+pub fn build_self_advert(
+    ssh_port: u16,
+    public: Option<(String, u16)>,
+    relay: Option<(String, u16)>,
+    ttl_secs: u64,
+) -> Option<Advert> {
+    let account = self_account()?;
+    let user = crate::netshare::current_user();
+    let host = hostname();
+    let lan = crate::netshare::local_ip().map(|ip| (ip, ssh_port));
+    Some(rendezvous::build_local_advert(
+        &account,
+        &user,
+        &host,
+        lan.as_ref().map(|(h, p)| (h.as_str(), *p)),
+        public.as_ref().map(|(h, p)| (h.as_str(), *p)),
+        relay.as_ref().map(|(h, p)| (h.as_str(), *p)),
+        ttl_secs,
+    ))
+}
+
+/// Publish our advert to the DHT/store so others can reach us off-LAN.
+pub fn advertise(store: &mut dyn AdvertStore, advert: &Advert) -> Result<(), String> {
+    rendezvous::publish(store, advert)
+}
+
+/// Resolve a peer account to its advert.
+pub fn resolve_peer(store: &dyn AdvertStore, account: &str) -> Option<Advert> {
+    rendezvous::resolve(store, account)
+}
+
+/// Resolve + pick the best `(user, host, port)` to reach a peer from here (LAN if same
+/// subnet, else public/NAT, else relay).
+pub fn reach(store: &dyn AdvertStore, account: &str) -> Option<(String, String, u16)> {
+    let advert = rendezvous::resolve(store, account)?;
+    rendezvous::best_target(&advert, crate::netshare::local_ip().as_deref())
+}
+
 // ── Downloads scanning + bundle import ──
 
 /// The user's Downloads folder.

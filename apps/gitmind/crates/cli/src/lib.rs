@@ -1774,6 +1774,62 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 _ => err("usage: gitmind fleet repo <add|serve> …"),
             }
         }
+        "account" => {
+            match flow::self_account() {
+                Some(a) => { println!("this device's fleet account: {a}"); 0 }
+                None => err("no ssh identity key found (~/.ssh/id_ed25519) to derive an account"),
+            }
+        }
+        "advertise" => {
+            let port: u16 = opt(rest, "--port").and_then(|p| p.parse().ok()).unwrap_or(22);
+            let parse_hp = |s: &str| -> Option<(String, u16)> {
+                let (h, p) = s.rsplit_once(':')?;
+                Some((h.to_string(), p.parse().ok()?))
+            };
+            let public = opt(rest, "--public").and_then(parse_hp);
+            let relay = opt(rest, "--relay").and_then(parse_hp);
+            let ttl: u64 = opt(rest, "--ttl").and_then(|t| t.parse().ok()).unwrap_or(3600);
+            let advert = match flow::build_self_advert(port, public, relay, ttl) {
+                Some(a) => a,
+                None => return err("could not build advert (no ssh identity key?)"),
+            };
+            let mut store = flow::default_advert_store();
+            match flow::advertise(&mut store, &advert) {
+                Ok(()) => {
+                    println!("advertised account {} ({} endpoint(s), ttl {}s)", advert.account, advert.endpoints.len(), advert.ttl_secs);
+                    for e in &advert.endpoints { println!("  {}  {}:{}", e.kind.as_str(), e.host, e.port); }
+                    if advert.endpoints.iter().all(|e| e.kind == cockpit::rendezvous::EndpointKind::Lan) {
+                        eprintln!("note: only a LAN endpoint — pass --public <host:port> so off-network peers can reach you (or run snapcore DHT)");
+                    }
+                    0
+                }
+                Err(e) => err(&e),
+            }
+        }
+        "resolve" => {
+            let account = match pos.first() { Some(a) => a, None => return err("usage: gitmind fleet resolve <account>") };
+            let store = flow::default_advert_store();
+            match flow::resolve_peer(&store, account) {
+                Some(a) => {
+                    println!("{} @ {} — {} endpoint(s):", a.account, a.hostname, a.endpoints.len());
+                    for e in &a.endpoints { println!("  {}  {}:{}", e.kind.as_str(), e.host, e.port); }
+                    0
+                }
+                None => err("account not found in the rendezvous store (not advertised, or DHT not reachable)"),
+            }
+        }
+        "reach" => {
+            let account = match pos.first() { Some(a) => a, None => return err("usage: gitmind fleet reach <account> [-- <remote cmd>]") };
+            let store = flow::default_advert_store();
+            match flow::reach(&store, account) {
+                Some((user, host, port)) => {
+                    println!("best route to {account}: {user}@{host}:{port}");
+                    println!("  ssh -p {port} {user}@{host}");
+                    0
+                }
+                None => err("could not resolve a reachable endpoint for that account"),
+            }
+        }
         "build-dir" => {
             if let Some(p) = pos.first() {
                 match cockpit::set_build_base(p) {

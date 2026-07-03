@@ -313,3 +313,28 @@ tools and serves the repo over HTTP.
 Remaining (on-device, needs the native tools present): run rpmbuild/abuild/createrepo/apk
 end-to-end on the fleet; optional GPG/abuild-sign signing (currently unsigned →
 gpgcheck=0 / --allow-untrusted); a GUI "Publish" card.
+
+## DHT rendezvous — reach the fleet across networks
+
+Off-LAN (phone on cellular, desktop behind another NAT), netshare's LAN discovery can't find
+a peer. gitmind now has a **DHT account + advertisement** layer so any fleet device can be
+reached by account regardless of network.
+
+- **`cockpit::rendezvous`** (8 tests): `account_id` (stable, derived from the device's ssh
+  identity key) + `account_key`; `Advert` (user/hostname/endpoints/ttl) with a line record
+  format; `Endpoint{Lan|Public|Relay}`; `resolve_order`/`best_target` (LAN if same /24, else
+  Public→Relay); `same_subnet`; freshness; and the `AdvertStore` trait with an in-memory +
+  `FileStore` impl.
+- **`flow`**: `self_account`, `build_self_advert` (from netshare local_ip + user + hostname),
+  `advertise`/`resolve_peer`/`reach`, `default_advert_store` (file drop under the config dir).
+- **CLI**: `gitmind fleet account`, `fleet advertise [--port --public host:port --relay --ttl]`,
+  `fleet resolve <account>`, `fleet reach <account>` (prints the best ssh route).
+
+**DHT backend (on-device):** `AdvertStore` is the seam. The production store is **snapcore**
+— `put(key,record)` → `announce`/`store` under `hash(account_key)`, `get(key)` →
+`find_value`/`discover` — which needs a UDP `Transport` + bootstrap nodes (can't run in the
+sandbox). share-kit's mailbox is an alternative backend. The `FileStore` works today over any
+shared drop and as a cache of DHT results. Deploy integration: `reach` yields a
+`(user,host,port)` that scp_push/ssh use, so pushing a build to a phone on cellular resolves
+via the DHT advert instead of the LAN. Remaining: the snapcore UDP transport + a periodic
+advertise loop (publish self every ttl/2), and public-IP discovery (STUN/echo).
