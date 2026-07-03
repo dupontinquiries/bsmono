@@ -1,0 +1,12 @@
+[package]
+name = "peermux-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Connection-broker brain: keep ONE authenticated session per peer (a single X25519+Ed25519 handshake via crypto-kit) and multiplex many app-level streams over it, each with an isolated key derived from the session (HKDF, no new handshake). Lets snapclone hand out sockets/streams to already-connected peers so apps stop each creating DHT entries + handshakes — one DHT presence per device, reliable crypto per stream."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+crypto-kit = { path = "../crypto-kit" }
