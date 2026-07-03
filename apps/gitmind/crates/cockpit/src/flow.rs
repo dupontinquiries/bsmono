@@ -3,7 +3,7 @@
 //! jobs, the CLI prints them. No Qt, no JSON, no threading here.
 
 use std::path::{Path, PathBuf};
-use crate::{buildflags, importer, merge, places, reclaim};
+use crate::{buildflags, importer, merge, places};
 use crate::ops::{build_locally, ensure_gitignore, native_triple_local, now_stamp, tool_path_env};
 
 /// What an imported zip turned out to be.
@@ -112,7 +112,7 @@ pub fn place(crate_path: &Path, dest: &str, base: &str, init: &str) -> Result<Pa
     if init == "git" || gitmind {
         let _ = std::process::Command::new("git").args(["init", "-q"])
             .current_dir(&dpath).env("PATH", tool_path_env()).status();
-        ensure_gitignore(&dpath, &places::gitignore_lines(gitmind));
+        ensure_gitignore(&dpath, &crate::artifacts::gitignore_lines(gitmind));
         if gitmind {
             let gmdir = dpath.join(".gitmind");
             let _ = std::fs::create_dir_all(&gmdir);
@@ -270,36 +270,43 @@ pub fn duplicates(root: &Path) -> Vec<crate::identity::DupGroup> {
     crate::identity::group_duplicates(entries)
 }
 
-/// Reclaimable per-crate target dirs under `root`.
+/// Reclaimable build junk under `root` (all systems), biggest first.
 pub struct ReclaimScan {
-    pub items: Vec<(String, u64)>, // (path, bytes)
+    pub items: Vec<(String, u64, String)>, // (path, bytes, label)
     pub total_bytes: u64,
 }
 
 pub fn reclaim_scan(root: &Path) -> ReclaimScan {
     let keep = crate::ops::build_base();
-    let dirs = reclaim::find_reclaimable(root, &keep);
-    let mut total = 0u64;
-    let items = dirs.iter().map(|p| {
-        let b = reclaim::dir_size(p);
-        total += b;
-        (p.display().to_string(), b)
-    }).collect();
+    let junk = crate::artifacts::scan(root, &keep);
+    let total = junk.iter().map(|j| j.bytes).sum();
+    let items = junk.into_iter().map(|j| (j.path.display().to_string(), j.bytes, j.label)).collect();
     ReclaimScan { items, total_bytes: total }
 }
 
-/// Delete the reclaimable target dirs (re-validated per dir). Returns (count, freed).
+/// Delete reclaimable build junk under `root` (re-validated per entry). Returns (count, freed).
 pub fn reclaim_apply(root: &Path) -> (usize, u64) {
-    let keep = crate::ops::build_base();
-    let mut freed = 0u64;
-    let mut count = 0usize;
-    for p in reclaim::find_reclaimable(root, &keep) {
-        if reclaim::is_safe_target(&p, root, &keep) {
-            let b = reclaim::dir_size(&p);
-            if std::fs::remove_dir_all(&p).is_ok() { freed += b; count += 1; }
-        }
-    }
-    (count, freed)
+    crate::artifacts::clean(root, &crate::ops::build_base())
+}
+
+/// Prepare a project to ingest: remove regeneratable build junk and make sure .gitignore
+/// excludes it (so a venv / node_modules / target tree never lands in git or the store).
+pub struct IngestPrep {
+    pub system: String,
+    pub cleaned: usize,
+    pub freed: u64,
+    pub ignored: usize,
+}
+
+pub fn prepare_ingest(dir: &Path) -> IngestPrep {
+    let system = crate::buildsystem::detect(dir).map(|d| d.kind.label().to_string()).unwrap_or_else(|| "project".into());
+    let (cleaned, freed) = crate::artifacts::clean(dir, &crate::ops::build_base());
+    let lines = crate::artifacts::gitignore_lines(dir.join(".gitmind").exists());
+    let before = std::fs::read_to_string(dir.join(".gitignore")).unwrap_or_default();
+    ensure_gitignore(dir, &lines);
+    let after = std::fs::read_to_string(dir.join(".gitignore")).unwrap_or_default();
+    let ignored = after.lines().count().saturating_sub(before.lines().count());
+    IngestPrep { system, cleaned, freed, ignored }
 }
 
 // ── add an imported/built app to the local apps list, runnable from the GUI/CLI ──

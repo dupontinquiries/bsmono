@@ -1328,7 +1328,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
     use cockpit::flow;
     let sub = match rest.first() {
         Some(s) => s.as_str(),
-        None => return err("usage: gitmind fleet <import|downloads|suite-install|build|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
+        None => return err("usage: gitmind fleet <import|downloads|suite-install|build|clean|prepare|apply|merge|rollup|reclaim|dedup|scope|suite|build-dir> ..."),
     };
     let args = &rest[1..];
     let pos: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
@@ -1396,6 +1396,30 @@ fn cmd_fleet(rest: &[String]) -> i32 {
             }
             println!("{ok}/{} installed", suite.apps.len());
             if ok == suite.apps.len() { 0 } else { 1 }
+        }
+        "clean" => {
+            let dir = pos.first().map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+            let scan = flow::reclaim_scan(&dir);
+            if scan.items.is_empty() { println!("nothing to clean under {}", dir.display()); return 0; }
+            for (path, bytes, label) in &scan.items {
+                println!("  {:>9}  {:<20} {path}", cockpit::appcatalog::human_size(*bytes), label);
+            }
+            println!("{} reclaimable in {} item(s)", cockpit::appcatalog::human_size(scan.total_bytes), scan.items.len());
+            if flag(args, "--apply") {
+                let (n, freed) = flow::reclaim_apply(&dir);
+                println!("removed {n} item(s), freed {}", cockpit::appcatalog::human_size(freed));
+            } else {
+                println!("add --apply to remove");
+            }
+            0
+        }
+        "prepare" => {
+            let dir = pos.first().map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("."));
+            let p = flow::prepare_ingest(&dir);
+            println!("prepared {} ({}): cleaned {} item(s), freed {}, +{} gitignore rule(s)",
+                dir.display(), p.system, p.cleaned, cockpit::appcatalog::human_size(p.freed), p.ignored);
+            println!("ready to `git add` / ingest — build junk is removed and gitignored");
+            0
         }
         "build" => {
             let path = match pos.first() {
@@ -1553,7 +1577,7 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 println!("reclaimed {} from {n} dir(s)", cockpit::appcatalog::human_size(freed));
             } else {
                 let scan = flow::reclaim_scan(&root);
-                for (p, b) in &scan.items { println!("  {:>10}  {p}", cockpit::appcatalog::human_size(*b)); }
+                for (p, b, label) in &scan.items { println!("  {:>10}  {:<18} {p}", cockpit::appcatalog::human_size(*b), label); }
                 println!("{} reclaimable in {} dir(s) — add --apply to remove", cockpit::appcatalog::human_size(scan.total_bytes), scan.items.len());
             }
             0

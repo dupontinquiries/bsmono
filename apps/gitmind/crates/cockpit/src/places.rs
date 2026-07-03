@@ -138,9 +138,10 @@ pub fn gitmind_config_toml() -> String {
      zstd_level = 9\n".to_string()
 }
 
-/// Lines that should be present in .gitignore for an initialized repo. Pure.
+/// Lines that should be present in .gitignore for an initialized repo. Delegates to the
+/// build-artifact catalog so there's a single source of truth. Pure.
 pub fn gitignore_lines(gitmind: bool) -> Vec<&'static str> {
-    if gitmind { vec!["/target/", "/.gitmind/store.redb"] } else { vec!["/target/"] }
+    crate::artifacts::gitignore_lines(gitmind)
 }
 
 #[cfg(test)]
