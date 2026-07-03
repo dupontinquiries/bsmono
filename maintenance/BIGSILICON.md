@@ -415,3 +415,22 @@ fans out → every app's `Settings::poll()` → `apply_prefs` + `gesture_config(
 
 **Remaining:** a tiny **settingsd**/sharemd persistence via config-kit (survive restarts); wire
 each app's frame loop (`Settings::connect`/`poll`/apply) — ~3 lines using bigsilicon-client.
+
+## Desktop-builds → phone-runs, for ALL apps (the first-priority flow)
+
+Gap found + closed: `install_suite`/`group build` built + installed **locally**; the single-app
+"desktop builds, phone runs" path (`push_install`) existed but nothing did it for a whole
+group. Now:
+- `flow::deploy_app_remote(app, target, user, host)` — build one app *here* for the device's
+  target (cross-compiling if its libc differs), scp the binary, then install it on the phone
+  (`~/.local/bin` + `.desktop` launcher via `installer::push_install_script`).
+- `flow::install_group_remote(group, target, user, host)` — do that for every app in a group.
+- CLI: `gitmind fleet group build <name> --to user@host [--target T]`. With `--to`, gitmind
+  builds all the apps on the desktop, auto-detects the phone's triple over ssh (`rustc -vV`),
+  and pushes+installs each. Without `--to`, it installs locally as before.
+
+**Your flow:** clone the exported bundle on the desktop → `cargo build -p gitmind-cli` →
+`gitmind fleet group build bigsilicons-apps --to user@192.168.2.223`. That builds all 16 apps
+on the desktop and drops runnable launchers on the phone. (Prereq on the desktop: the phone's
+Rust target for cross-libc builds — `rustup target add <triple>`; both are aarch64 so it's a
+static-musl cross, not a full arch cross.) cockpit + cli compile clean, rustcheck clean.

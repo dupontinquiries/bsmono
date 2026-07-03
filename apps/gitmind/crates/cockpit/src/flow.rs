@@ -722,6 +722,30 @@ pub fn install_suite(suite: &crate::suite::Suite) -> Vec<SuiteAppResult> {
     }).collect()
 }
 
+/// Build one app **here** for `target` (cross-compiling if the device's libc differs) and
+/// install it on a remote device: push the binary, then drop it into `~/.local/bin` with a
+/// `.desktop` launcher. This is the "desktop builds, phone runs" path for a single app.
+pub fn deploy_app_remote(app: &crate::suite::SuiteApp, target: &str, user: &str, host: &str) -> Result<String, String> {
+    let tgt = if target.trim().is_empty() { native_triple_local() } else { target.to_string() };
+    let (bin, _) = build_locally(&app.name, Path::new(&app.path), &tgt, &app.features, app.no_default)
+        .map_err(|e| format!("build: {e}"))?;
+    crate::deploy::scp_push(&bin.display().to_string(), user, host, &format!("/tmp/{}", app.name))
+        .map_err(|e| format!("push: {e}"))?;
+    crate::deploy::remote_capture(user, host, &crate::installer::push_install_script(&app.name, false))
+        .map(|_| format!("installed {} on {host}", app.name))
+        .map_err(|e| format!("install: {e}"))
+}
+
+/// Build **every** app in a group here and install them all on a remote device — the
+/// "export a bundle, desktop builds all the apps, run through them on the phone" flow. Never
+/// aborts on one app's failure.
+pub fn install_group_remote(group: &crate::suite::Suite, target: &str, user: &str, host: &str) -> Vec<SuiteAppResult> {
+    group.apps.iter().map(|a| match deploy_app_remote(a, target, user, host) {
+        Ok(msg) => SuiteAppResult { name: a.name.clone(), ok: true, message: msg },
+        Err(e) => SuiteAppResult { name: a.name.clone(), ok: false, message: e },
+    }).collect()
+}
+
 /// Generate the default suite from `root` and save it, returning it.
 pub fn create_default_suite(root: &Path) -> Result<crate::suite::Suite, String> {
     let s = default_suite(root);
