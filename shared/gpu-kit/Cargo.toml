@@ -1,0 +1,16 @@
+[package]
+name = "gpu-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Reduce GPU (wgpu) management boilerplate across the portfolio. v0.1 is the version-agnostic policy core — the adapter/surface/present decisions ~7 wgpu apps each re-derive (power preference, sRGB, present mode, MSAA), plus pure selection helpers over the app's own capability lists. A feature-gated context builder wraps the actual instance->adapter->device->queue dance for a pinned wgpu version. Core is std-only."
+
+[dependencies]
+# The context builder is opt-in and version-pinned; the apps span wgpu 0.19/27/29, so the
+# default (policy core) stays wgpu-free and usable from any of them.
+wgpu = { version = "29", optional = true }
+
+[features]
+default = []
+# Real instance/adapter/device/queue construction against wgpu 29. Verify on-device.
+wgpu29 = ["dep:wgpu"]
