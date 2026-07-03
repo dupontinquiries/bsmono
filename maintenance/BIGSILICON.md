@@ -118,3 +118,40 @@ layer).
 3. `voiced` (biggest UX win; voiceterm already has every piece).
 4. Port rusty-board → egui (proves the adaptive kit on a real touch app).
 5. `dhtmboxd`, then the remaining ports.
+
+## Analysis findings (kit opportunities)
+
+Re-ran the duplication scan across all 16 apps. Keyword-based, so treat counts as
+directional, but the strong signals:
+
+**New kits worth extracting** (recurring, not yet a kit):
+- **config-kit** — TOML config load + XDG config/data dir resolution. ~11 apps each roll
+  their own. Highest-confidence, small, universal. Build first.
+- **cli-kit** — arg parsing + subcommand dispatch. ~11 apps hand-roll `std::env::args`
+  loops. A thin shared parser (the style gitmind's CLI already uses) removes a lot of it.
+- **device-kit** — PipeWire / v4l2 / ALSA device bridging. ~7 apps (snapclone, bo-suite,
+  voiceterm, krapper, logscope, rusty-board, beatspace). snapclone's camera-bridge is the
+  reference; generalize the device plumbing.
+
+**Existing kits with un-adopted consumers** (the integration backlog, biggest first):
+- **uikit** → the 9 egui apps (this is the port program).
+- **audio-kit** → beatspace, krapper, bo-suite, fao-codec (DSP/mel).
+- **models-kit** → voiceterm, beatspace, snapclone, bot-arena (model loaders → `~/models`).
+- **voice-kit** → voiceterm, rusty-board, logscope (whisper post-proc).
+- **net-kit / snapcore** → voiceterm, unendlich, snapclone, bo-suite (transport/DHT).
+- **crypto-kit** → voiceterm, snapclone (sealing/envelopes).
+
+## Daemon substrate added this turn
+
+- **ipc-kit** — local app↔daemon IPC over a Unix socket, socket-first fallback
+  (`try_connect` → `None` when no daemon → app uses its own code), per-event Scope
+  (Always/Active). Reuses net-kit's line codec.
+- **voiced-core** — the voice daemon's routing brain (register intents per event-type +
+  scope; deliver Always to backgrounded apps, Active to the focused app; own switch/open
+  system intents). Audio stage still to wire from voice-kit + voiceterm.
+- **datashare-core** — cross-app data bus (namespaced KV + pub-sub Hub). share-kit is the
+  durable/federated backend.
+
+Remaining to make the daemons real: bind ipc-kit sockets in a `voiced` and a `sharemd`
+binary, wire voiced's audio stage (voice-kit + audio-kit + voiceterm's mic/whisper pool),
+back datashare with share-kit, and have apps call `try_connect` before their own path.
