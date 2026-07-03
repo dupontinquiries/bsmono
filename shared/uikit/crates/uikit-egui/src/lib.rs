@@ -17,6 +17,7 @@
 //! `examples/logscope_touch.rs` for the reverse port (logscope's scene gaining
 //! the touch layer).
 
+pub mod a11y;
 pub mod adaptive;
 pub mod carved;
 pub mod gesture_layer;
@@ -24,6 +25,7 @@ pub mod skin;
 pub mod theme_bridge;
 pub mod tokens;
 
+pub use a11y::{Action as A11yAction, A11yScene, Outcome as A11yOutcome, Role, Semantics};
 pub use adaptive::{Adaptive, DeviceClass, SafeArea};
 pub use gesture_layer::{Axis, GestureFrame, GestureLayer};
 pub use skin::Skin;

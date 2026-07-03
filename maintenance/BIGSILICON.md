@@ -235,3 +235,31 @@ snapclone. The substrate is in place; `coord-core` is the arbitration brain.
   pipe/invite), and publish presence. snapclone's busy notifier + mute hook; unendlich's
   audio-pipe + invite; voiceterm's compose-duck.
 - Route the unendlich→peer invite through share-kit's mailbox.
+
+## TODO — automatic accessibility voice via the kits
+
+**Verdict: worth doing, and cheap here.** Because voiced already routes intents system-wide
+and uikit-egui is the shared UI layer, accessibility voice lives *in the kit*: an app gets
+voice focus-navigation, activation, and spoken descriptions almost for free. Guardrail:
+on-by-default but **overridable** (a game like unendlich needs custom handling), and it only
+works if widgets carry semantic labels — which is the real per-app work.
+
+**Built (first cut):** `uikit-egui::a11y`.
+- `Semantics` (role + label + value) with spoken `describe()` ("Mute, toggle, on").
+- `A11yScene` — immediate-mode focusable-widget collector; voice `Action`s move focus /
+  activate / describe; focus persists across frames by id; `describe_screen()` overview;
+  `paint_focus_ring()`.
+- `standard_grammar()` — the universal voice commands (activate/next/previous/first/last/
+  what-is-this/read-screen/scroll/go-back) as (event_type, phrase) pairs, and
+  `Action::from_event`. Tested (5).
+
+**Remaining wiring (the "automatic" part):**
+- A one-call helper `a11y::register_with_voiced(client)` that sends `standard_grammar()` to
+  voiced at `Always` scope, and a default `on_intent` that feeds `a11y.*` events into
+  `A11yScene::apply` — so a uikit app opts in with ~2 lines and can override.
+- uikit-egui's own semantic widgets (button/toggle/field helpers) auto-`add()` their
+  Semantics, so most apps get labels without extra code; custom widgets tag manually.
+- A TTS sink for `Outcome::Speak` (piper/espeak via a small audio-kit/voice path, model in
+  `~/models` via models-kit).
+- Adopt in the rusty-board egui port first (keys → `Semantics::button`, voice "next"/
+  "activate" drives the keyboard), then the other ports.
