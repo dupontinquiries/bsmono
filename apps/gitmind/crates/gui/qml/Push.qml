@@ -26,6 +26,8 @@ Item {
     property bool busy: false
     property string jobKind: ""
     property string pushState: "idle" // idle | working | done | failed
+    property string buildLog: ""
+    property int logIdx: 0
     property string note: ""
 
     Component.onCompleted: root.loadApps()
@@ -74,12 +76,17 @@ Item {
         if (picker.selHost.length === 0) { root.note = "pick a device first"; return }
         var r = JSON.parse(backend.push_install(root.selApp, root.selPath, root.target, root.chosen.join(","), picker.selHost, picker.user))
         if (!r.ok) { root.note = "error: " + r.error; return }
-        root.pushState = "working"; root.busy = true; root.jobKind = "push"; root.note = ""; poller.start()
+        root.pushState = "working"; root.busy = true; root.jobKind = "push"; root.note = ""; root.buildLog = ""; root.logIdx = 0; poller.start()
     }
 
     Timer {
         id: poller; interval: 250; repeat: true; running: false
         onTriggered: {
+            var lg = JSON.parse(backend.job_log(root.logIdx))
+            if (lg.lines && lg.lines.length) {
+                root.logIdx = lg.next
+                for (var i = 0; i < lg.lines.length; i++) root.buildLog += lg.lines[i] + "\n"
+            }
             var j = JSON.parse(backend.poll_job())
             if (!j.done) return
             poller.stop(); root.busy = false
@@ -102,6 +109,35 @@ Item {
             Label {
                 width: parent.width; visible: root.note.length > 0
                 text: root.note; color: "#a6adc8"; font.pixelSize: 12; wrapMode: Text.WrapAnywhere
+            }
+
+            // ── live remote build log (streamed over SSH) ──
+            Rectangle {
+                visible: root.buildLog.length > 0
+                width: parent.width; radius: 10; color: "#0d1117"; border.color: "#3a4566"
+                height: 220
+                Column {
+                    anchors.fill: parent; anchors.margins: 8; spacing: 4
+                    Row {
+                        width: parent.width; spacing: 8
+                        Label { text: root.busy ? "building on device…" : "build log"; color: "#7aa2f7"; font.bold: true }
+                        Item { width: parent.width - pCopy.width - pClear.width - 150; height: 1 }
+                        Button { id: pCopy; text: "copy"; onClicked: { pLog.selectAll(); pLog.copy(); pLog.deselect() } }
+                        Button { id: pClear; text: "clear"; enabled: !root.busy; onClicked: root.buildLog = "" }
+                    }
+                    ScrollView {
+                        width: parent.width; height: parent.height - 34; clip: true
+                        TextArea {
+                            id: pLog
+                            readOnly: true; wrapMode: TextArea.NoWrap
+                            text: root.buildLog
+                            color: "#c9d1d9"; font.family: "monospace"; font.pixelSize: 11
+                            selectByMouse: true
+                            background: Rectangle { color: "transparent" }
+                            onTextChanged: cursorPosition = length
+                        }
+                    }
+                }
             }
             Row {
                 width: parent.width
