@@ -541,6 +541,15 @@ Item {
                                         enabled: root.selPath.length > 0
                                         onClicked: { var r = JSON.parse(backend.show_in_folder(root.selPath)); if (!r.ok) root.note = r.error }
                                     }
+                                    Button {
+                                        // hand the likely fix to voiceterm (staged, not run)
+                                        text: "→ fix in terminal"
+                                        onClicked: {
+                                            var cmd = "gitmind fleet deps --build-essentials"
+                                            var r = JSON.parse(backend.stage_in_terminal(cmd))
+                                            root.note = r.staged ? "✓ sent to terminal — review and press enter" : "voiceterm isn't running — run: " + cmd
+                                        }
+                                    }
                                 }
                             }
                         }

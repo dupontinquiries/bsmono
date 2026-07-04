@@ -176,6 +176,7 @@ struct Backend {
     build_group: qt_method!(fn(&self, name: QString) -> QString),
     build_group_remote: qt_method!(fn(&self, name: QString, user: QString, host: QString, target: QString) -> QString),
     show_in_folder: qt_method!(fn(&self, path: QString) -> QString),
+    stage_in_terminal: qt_method!(fn(&self, cmd: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1661,6 +1662,18 @@ impl Backend {
             job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "results": items}).to_string());
         });
         QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
+    }
+
+    /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
+    /// prompt without running it, so the user reviews and hits enter. Socket-first — if
+    /// voiceterm isn't running, reports staged:false and the caller keeps showing the command.
+    fn stage_in_terminal(&self, cmd: QString) -> QString {
+        let cmd = cmd.to_string();
+        if cmd.trim().is_empty() {
+            return err_json("no command to send");
+        }
+        let staged = bigsilicon_client::Terminal::stage(&cmd);
+        QString::from(json!({"ok": true, "staged": staged}).to_string())
     }
 
     /// Open a path in the native file manager via xdg-open (the containing directory if it's
