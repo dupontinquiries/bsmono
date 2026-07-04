@@ -353,3 +353,130 @@ mod tests {
         assert_eq!(emit_for_id(&l, bs_id).as_deref(), Some("\u{8}"));
     }
 }
+
+// ── voice mode (dictation) — mic-kit fallback chain + voice-kit pipeline ──────
+// The keyboard's voice mode: read the mic through a graceful FallbackChain, accumulate in the
+// voice pipeline, and on release transcribe + filter (at the user's VoiceFilter level) into
+// text to type. The mic is a step-up — if it's silent/stale the status shows it and no text is
+// forced. Same pipeline voiceterm's voice pane and logscope voice commands will use.
+
+/// Keyboard dictation state.
+pub struct VoiceMode {
+    pipeline: voice_kit::pipeline::VoicePipeline,
+    active: bool,
+    status: mic_kit::InputStatus,
+    scratch: Vec<f32>,
+}
+
+impl VoiceMode {
+    pub fn new() -> VoiceMode {
+        VoiceMode {
+            pipeline: voice_kit::pipeline::VoicePipeline::new(1600), // ~0.1s @16k before a flush is worthwhile
+            active: false,
+            status: mic_kit::InputStatus::Silent,
+            scratch: vec![0.0; 320],
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub fn status(&self) -> mic_kit::InputStatus {
+        self.status
+    }
+
+    /// Start/stop dictation. Returns the new active state.
+    pub fn toggle(&mut self) -> bool {
+        self.active = !self.active;
+        if !self.active {
+            self.pipeline.cancel();
+        }
+        self.active
+    }
+
+    /// Sync the filter strength from cross-app settings (VoiceFilter level).
+    pub fn apply_settings(&mut self, prefs: &settings_kit::Prefs) {
+        let vf = prefs.a11y.voice_filter;
+        self.pipeline.set_filter(vf.strips_artifacts(), vf.filters_hallucinations(), vf.requires_speech_like());
+    }
+
+    /// Per-frame while active: pull a frame from the mic chain and accumulate it. Records the
+    /// mic status (Live/Fallback/Silent) so the UI can show it. Cheap; never blocks.
+    pub fn pump(&mut self, mic: &mut dyn mic_kit::AudioInput) {
+        if !self.active {
+            return;
+        }
+        let n = self.scratch.len();
+        let mut frame = std::mem::take(&mut self.scratch);
+        frame.resize(n, 0.0);
+        self.status = mic.read(&mut frame);
+        if self.status != mic_kit::InputStatus::Silent {
+            self.pipeline.push(&frame);
+        }
+        self.scratch = frame;
+    }
+
+    /// End the utterance: transcribe + filter into text to type. Also deactivates.
+    pub fn finish(&mut self, transcriber: &mut dyn voice_kit::pipeline::Transcriber) -> Option<String> {
+        self.active = false;
+        self.pipeline.flush(transcriber)
+    }
+}
+
+impl Default for VoiceMode {
+    fn default() -> Self {
+        VoiceMode::new()
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    struct Stub(&'static str);
+    impl voice_kit::pipeline::Transcriber for Stub {
+        fn transcribe(&mut self, _audio: &[f32]) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
+    #[test]
+    fn toggle_and_filter_from_settings() {
+        let mut v = VoiceMode::new();
+        assert!(!v.is_active());
+        assert!(v.toggle());
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.a11y.voice_filter = settings_kit::VoiceFilter::Strict;
+        v.apply_settings(&prefs); // Strict → require_speech; just shouldn't panic
+        assert!(v.is_active());
+    }
+
+    #[test]
+    fn pump_live_mic_accumulates_then_finish_types_text() {
+        let mut v = VoiceMode::new();
+        v.toggle(); // active
+        // a live mic feeding audio
+        let mut mic = mic_kit::BufferedInput::new(2048, 4);
+        mic.feed(&vec![0.2f32; 1800]);
+        v.pump(&mut mic);
+        assert_eq!(v.status(), mic_kit::InputStatus::Live);
+        let text = v.finish(&mut Stub("hello world  "));
+        assert_eq!(text.as_deref(), Some("hello world"));
+        assert!(!v.is_active(), "finish deactivates");
+    }
+
+    #[test]
+    fn pump_silent_mic_reports_silent_and_no_forced_text() {
+        let mut v = VoiceMode::new();
+        v.toggle();
+        // a mic that never got fed → silent/stale
+        let mut mic = mic_kit::BufferedInput::new(64, 1);
+        for _ in 0..3 {
+            v.pump(&mut mic);
+        }
+        assert_eq!(v.status(), mic_kit::InputStatus::Silent);
+        // nothing accumulated → finish yields no text (graceful, not an error)
+        assert!(v.finish(&mut Stub("phantom")).is_none());
+    }
+}
