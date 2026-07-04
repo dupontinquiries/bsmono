@@ -16,3 +16,4 @@ serde_json = "1"
 gitmind-core = { path = "../core" }
 peek = { path = "../peek" }
 net-kit = { path = "../../../../shared/net-kit" }
+proc-kit = { path = "../../../../shared/proc-kit" }

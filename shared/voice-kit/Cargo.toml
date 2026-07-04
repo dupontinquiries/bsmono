@@ -9,3 +9,4 @@ description = "Shared whisper-voice post-processing + model resolution for the m
 path = "src/lib.rs"
 
 [dependencies]
+models-kit = { path = "../models-kit" }

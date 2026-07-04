@@ -110,12 +110,14 @@ fn run_ok(argv: &[String], path_env: &str) -> bool {
 pub fn install_system(mgr: PkgManager, pkgs: &[String], path_env: &str) -> bool {
     if pkgs.is_empty() { return true; }
     let Some(base) = mgr.install_argv(pkgs) else { return false };
-    let mut prefixes: Vec<Vec<String>> = vec![vec![]];
-    if which("sudo", path_env) { prefixes.push(vec!["sudo".into(), "-n".into()]); }
-    if which("doas", path_env) { prefixes.push(vec!["doas".into()]); }
-    for pre in prefixes {
-        let mut argv = pre;
-        argv.extend(base.clone());
+    let (prog, args) = (base[0].clone(), base[1..].to_vec());
+    // Escalation ladder lives in proc-kit now: try direct, then sudo -n, then doas — using
+    // whichever escalators this host actually has. (run_ok stays path_env-aware.)
+    let mut ladder = vec![proc_kit::Escalation::None];
+    if which("sudo", path_env) { ladder.push(proc_kit::Escalation::Sudo); }
+    if which("doas", path_env) { ladder.push(proc_kit::Escalation::Doas); }
+    for esc in ladder {
+        let argv = proc_kit::escalate_argv(&prog, &args, esc);
         if run_ok(&argv, path_env) { return true; }
     }
     false

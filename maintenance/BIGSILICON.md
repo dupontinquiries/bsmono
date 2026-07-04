@@ -474,3 +474,20 @@ Confirmed placement: a "Publish / Repos" card on the Network page (alongside DHT
 Pick a group → build packages (`package_project`) → Serve locally (`repo serve`, shows the
 dnf/apk client line) and Serve over DHT (advertise the repo endpoint so a gitmind on another
 network resolves+pulls — gitmind2gitmind). Backend exists CLI-only; the card is the wiring.
+
+
+## Realized kit adoption (turning built kits into used kits)
+
+Started closing the adoption gap (kits with 0 consumers → real consumers):
+- **proc-kit → cockpit::pydeps** (first proc-kit consumer): `install_system`'s hand-rolled
+  root→`sudo -n`→`doas` prefix ladder replaced with `proc_kit::Escalation` +
+  `escalate_argv`. The escalator literals now live only in proc-kit; pydeps keeps its
+  path_env-aware `which`/`run_ok`. pydeps 3 tests still green.
+- **models-kit → voice-kit** (first models-kit consumer): `voice_kit::find_whisper_model`
+  routes whisper discovery through `models_kit::search_dirs("whisper")` — the canonical
+  ~/models store every app shares — instead of callers guessing dirs. voice-kit 11 tests.
+
+Remaining 0-consumer kits: peermux-core, share-kit, registry-kit (peermux/share land when
+snapclone's broker + durable sharemd backend are wired on-device). Next verifiable in-cockpit
+adoptions: packaging tool-runs → proc_kit::run (needs a cwd-aware run_in), and
+config-kit/cli-kit into more apps as the version bumps arrive.
