@@ -762,3 +762,19 @@ Scanned the kits for hot-path costs. Findings + fixes:
   frame, so not hot. Fine.
 - **[noted] crypto-kit seal/open per mic frame** (mic-kit) is the real cost if every frame is
   encrypted; encrypt per *utterance*/chunk, not per 320-sample frame, on-device.
+
+## gitmind polish + daemon/installer update
+
+gitmind had no daemon registry, so the new settingsd (and the others) weren't installed/started:
+- **cockpit::daemons (NEW, 5 tests):** the source of truth — `Daemon { name, socket, description }`
+  + `all()` (voiced/sharemd/coordd/**settingsd**) + `find`. Service-unit generation for **both**
+  init systems in the fleet: `systemd_user_unit` (Fedora desktop) and `openrc_service`
+  (Alpine/postmarketOS phone), `InitSystem::detect_from_os_release`, and
+  `install_daemons_script` (writes the right unit, enables it, **skips missing binaries** so a
+  partial deploy still starts what it can).
+- **cockpit::flow:** `detect_init_remote`, `install_daemons_remote` (init-aware install+enable
+  over SSH), `daemons_status_remote` (active/inactive per daemon). Adding a daemon to `all()` is
+  now all that's needed for deploy to handle it.
+- **GUI polish:** a **Daemons card** on the Network page — lists the four daemons (name · socket ·
+  description) from `daemons_list`, with "install + enable on <device>" and "status" buttons
+  wired to the flow. gui rustcheck CLEAN, Network.qml 96/96.
