@@ -13,6 +13,7 @@
 //! rather than mis-rendered.
 
 pub mod web;
+pub mod viz;
 
 // ── colours + style ──────────────────────────────────────────────────────────
 
