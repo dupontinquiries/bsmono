@@ -525,3 +525,22 @@ Added to the settings system (schema → app UI → live/persisted):
   handedness are read by apps for layout (uikit-egui pass is the next small step). double-tilt
   detection is on-device (accelerometer) → calls `double_tilt_action` → publishes the new
   handedness, which fans out to every app.
+
+
+## Ports now consume the settings system (apply surface + adoption)
+
+Closed the long-standing "apply surface" gap and wired it into the ports:
+- **uikit-egui**: `apply_prefs(ctx, &Prefs)` now applies palette **+ text size + button/control
+  size** (was palette + min_target only); new `filter_color(Color32, &DisplayPrefs)` applies
+  the display accessibility filter (lowered white point + colour filter) per colour. 14 lib
+  tests (incl. apply_prefs scales text; grayscale collapses channels).
+- **bot-arena-egui** + **rusty-board-egui**: each gains `apply_settings(ctx, &Prefs)` →
+  `uikit_egui::apply_prefs` for theme/text/button + `*gesture.config_mut() =
+  prefs.gesture_config(px)` so the swipe feel *and* detent animation track the fleet. Tests
+  prove the port adopts the shared feel (bot-arena: Heavy → 220ms takeover lock).
+
+So both ports are now full kit citizens: adaptive + a11y + gesture + **live cross-app
+settings** (palette, text/button size, gesture feel, detent animation). Apps opt in with
+`Settings::connect()` → each frame `apply_settings(ctx, settings.prefs())`. Remaining ports
+(voiceterm/bo-suite/snapclone) follow the same recipe; full-screen display-filter coverage of
+images/video is still a compositor/shader concern (per-colour `filter_color` is available now).
