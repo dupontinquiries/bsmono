@@ -59,6 +59,30 @@ impl SettingsEditor {
         ui.add(Slider::new(&mut self.prefs.gesture.flick_velocity, 0.3..=2.0).text("flick velocity"));
         ui.add_space(6.0);
 
+        ui.label("Swipe & interaction");
+        ui.horizontal_wrapped(|ui| {
+            ui.label("detent animation:");
+            for a in settings_kit::AnimationStyle::all() {
+                let selected = self.prefs.gesture.animation == a;
+                if ui.selectable_label(selected, a.label()).clicked() {
+                    self.prefs.gesture.animation = a;
+                }
+            }
+        });
+        ui.add(Slider::new(&mut self.prefs.touch.text_scale, 0.8..=1.8).text("text size"));
+        ui.add(Slider::new(&mut self.prefs.touch.button_scale, 0.8..=1.8).text("button size"));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("handedness:");
+            for h in settings_kit::Handedness::all() {
+                let selected = self.prefs.input.handedness == h;
+                if ui.selectable_label(selected, h.label()).clicked() {
+                    self.prefs.input.handedness = h;
+                }
+            }
+        });
+        semantic_toggle(ui, &mut self.a11y, 3, "double-tilt device to flip handedness", &mut self.prefs.input.double_tilt);
+        ui.add_space(6.0);
+
         ui.label("Touch");
         ui.add(Slider::new(&mut self.prefs.touch.min_target, 0.0..=72.0).text("min target (pt, 0 = auto)"));
         ui.add(Slider::new(&mut self.prefs.touch.scale, 0.8..=1.6).text("ui scale"));
@@ -139,6 +163,21 @@ mod tests {
         let d = diff(&old, &new);
         assert!(d.iter().any(|(k, v)| k == "display.white_point" && v == "0.6"));
         assert!(d.iter().any(|(k, v)| k == "display.color_filter" && v == "tritanopia"));
+    }
+
+    #[test]
+    fn diff_reports_swipe_interaction_changes() {
+        let old = Prefs::default();
+        let mut new = old.clone();
+        new.gesture.animation = settings_kit::AnimationStyle::Snappy;
+        new.touch.text_scale = 1.4;
+        new.input.handedness = settings_kit::Handedness::Left;
+        new.input.double_tilt = true;
+        let d = diff(&old, &new);
+        assert!(d.iter().any(|(k, v)| k == "gesture.animation" && v == "snappy"));
+        assert!(d.iter().any(|(k, v)| k == "touch.text_scale" && v == "1.4"));
+        assert!(d.iter().any(|(k, v)| k == "input.handedness" && v == "left"));
+        assert!(d.iter().any(|(k, v)| k == "input.double_tilt" && v == "true"));
     }
 
     #[test]
