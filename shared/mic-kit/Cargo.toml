@@ -1,0 +1,12 @@
+[package]
+name = "mic-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared microphone access across apps (bo-suite / logscope voice / voiceterm), profile-gated + encrypted, with graceful realtime fallback. A mic is a step-up, never a guarantee: the AudioInput fallback chain always yields a frame (silence at worst) and never blocks, so audio input/output degrade gracefully when a device drops, a profile stops matching, or a mic is busy."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+crypto-kit = { path = "../crypto-kit" }
