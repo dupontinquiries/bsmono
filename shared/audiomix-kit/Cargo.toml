@@ -1,0 +1,9 @@
+[package]
+name = "audiomix-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure audio channel routing + stream mixing, generalized from bo-suite's soundscape router so the whole fleet can share it: channel Layouts, a RouteMatrix (in-layout -> out-layout gains, incl. standard downmix), and stream merging (mix/mix_into/soft_clip). No hardware, no codec — f32 samples in, f32 samples out. Opus codec lives in the (feature-gated) opus-kit."
+
+[lib]
+path = "src/lib.rs"
