@@ -19,6 +19,7 @@ license = "MIT OR Apache-2.0"
 # layer for apps/logscope (see examples/logscope_touch.rs).
 
 [dependencies]
+touchkit = { path = "../../../touchkit", features = ["egui"] }
 egui = "0.29"
 uikit-gesture = { path = "../uikit-gesture" }
 

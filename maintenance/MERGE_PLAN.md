@@ -57,3 +57,21 @@ add under apps/, then adopt kits as they settle. This is incremental, one app pe
   / `whisper_pool.rs` are the **mature originals** my voice-kit `context`/`pipeline`/`fastpath`
   abstracted this session. The right direction is voice-kit adopting logscope's real logic, not
   replacing it. Left as a noted follow-up (needs the real fastpath source diffed into voice-kit).
+
+## voiceterm (egui-kit adoption — done, first uikit-egui multitouch consumer)
+Chosen over logscope for the egui-kit work: voiceterm-egui + the kits are **both egui 0.29** (no
+version gap, unlike logscope's 0.34), and it's the right touch target. Sequencing per the user:
+land the adoption on the *stable* kit now, add transparency kit-side afterward so it flows to
+every adopter.
+- **Kit-side (benefits all egui apps):** promoted touchkit's egui bridge into
+  `uikit-egui::touch` — `TouchSource` folds each frame's egui input (touch events + mouse-as-1-
+  finger + trackpad wheel/zoom) into touchkit gestures (swipe/fling+momentum/pinch/tap/long-
+  press). uikit-egui now deps touchkit (egui feature, 0.29). Builds.
+- **voiceterm-egui adopts it:** App gains `TouchSource` + `GestureRecognizer`; `handle_gestures`
+  polls per frame and pinch-zooms the terminal font (`apply_pinch`, clamped 7–48px, tested);
+  fling momentum reports `gliding` so the driver repaints. Graceful: no touch → no-op. 29 tests.
+  The on-device eframe main calls `handle_gestures(ctx)` then `render(ui)` (this crate is a lib).
+- **Next (kit-side, then it flows):** add **transparency** to uikit-egui (palette alpha / a
+  translucent surface token) — do it once in the kit and voiceterm + every port picks it up.
+  Then the other egui-0.29 ports (rusty-board/bot-arena/bo-suite/snapclone) adopt `touch` the
+  same way voiceterm did.
