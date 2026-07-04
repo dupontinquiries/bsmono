@@ -22,6 +22,8 @@ pub mod adaptive;
 pub mod carved;
 pub mod gesture_layer;
 pub mod skin;
+pub mod livebg;
+pub mod nav;
 pub mod theme_bridge;
 pub mod tokens;
 
@@ -29,6 +31,8 @@ pub use a11y::{Action as A11yAction, A11yScene, Outcome as A11yOutcome, Role, Se
 pub use adaptive::{Adaptive, DeviceClass, SafeArea};
 pub use gesture_layer::{Axis, GestureFrame, GestureLayer};
 pub use skin::Skin;
+pub use livebg::{BgStyle, LiveBackground};
+pub use nav::Nav;
 pub use theme_bridge::{apply_palette, filter_color, PaletteColors};
 pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTierGesture};
 
