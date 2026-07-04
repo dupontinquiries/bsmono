@@ -75,3 +75,22 @@ every adopter.
   translucent surface token) — do it once in the kit and voiceterm + every port picks it up.
   Then the other egui-0.29 ports (rusty-board/bot-arena/bo-suite/snapclone) adopt `touch` the
   same way voiceterm did.
+
+## egui version unification (logscope unblock — feasibility PROVEN, plan de-risked)
+logscope-egui is on egui/eframe **0.34**; the kits + 5 ports are on **0.29**. To let logscope
+adopt uikit-egui + the new `touch` multitouch, everything must land on one egui. Probed it:
+- **egui 0.34 builds with rust 1.96** (verified in a scratch crate, ~47s).
+- **The one real API break is `Rounding` → `CornerRadius`** (`::same(f32)` → `::same(u8)`; the
+  probe confirmed `CornerRadius::same(4)` compiles on 0.34). Everything else the kits use
+  (Color32/Stroke/Visuals/Painter/from_id_salt/zoom_delta/TouchPhase) is unchanged.
+- **Scope: 10 crates** on egui 0.29, **~13 Rounding sites**: uikit-egui (a11y 2, theme_bridge 2,
+  carved 5), rusty-board (2), snapclone (1), voiceterm/viz (1).
+- **Why it's atomic:** bumping uikit-egui breaks all its 0.29 consumers at once, so the bump must
+  land together: uikit-egui + snapclone-theme + touchkit(egui feature) + the 5 egui-frontends +
+  settings-app, all 0.29→0.34, fixing the Rounding sites, verifying each. uikit-gesture is
+  std-only (no bump). Then logscope drops the `uikit-egui`/`touch` deps in and adopts like
+  voiceterm did.
+- **Status:** feasibility + exact change nailed down; this is now a bounded mechanical PR, not an
+  unknown. Left as the next focused task (needs the whole set green in one pass — not safe to
+  half-land). Transparency + touch already landed on 0.29, and both port straight across (no
+  Rounding involved), so no rework lost by bumping after.
