@@ -813,3 +813,14 @@ Swept the GUI for unfinished sections:
   log panel already tails every job. 
 - Remaining `.status()` calls are scp/rsync transfers that *do* capture success/failure (only
   the progress bar goes to the terminal) — not the silent-failure bug.
+
+## tomerge_18 upload — reconciliation (touchkit landed)
+
+Hefty cross-app update uploaded (app zips + egui-kit exploration). Key result: the exploration
+**converged** with my kits — its uikit-gesture == mine, its uikit-egui is a subset of mine
+(mine adds a11y/adaptive/livebg/nav). The one genuinely new piece, **touchkit** (multitouch
+recognizer: swipe/fling/momentum/pinch/tap/long-press, complementing uikit-gesture's pager), is
+now shared/touchkit (26th kit) — compiles + 5 tests + doctest PASS (their session had no
+toolchain; they'd flagged it as read-verified only). Full map + per-app re-apply plan in
+maintenance/MERGE_PLAN.md. The **apps** get rebased onto the kits (thin re-exports + additive
+egui-frontends), not the kits — they're shared + ahead.
