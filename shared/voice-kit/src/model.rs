@@ -48,6 +48,19 @@ pub fn find_model_in(dirs: &[PathBuf], env_override: Option<&str>) -> Option<Pat
     None
 }
 
+/// Find a whisper model in the **canonical model store** (via models-kit), honoring a
+/// `GITMIND_MODELS`-style env override. This routes voice model discovery through the shared
+/// `~/models` layout that every app uses, instead of each caller guessing directories.
+pub fn find_whisper_model(env_override: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = env_override {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    find_model_in(&models_kit::search_dirs("whisper"), None)
+}
+
 /// Whisper model size class.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelSize {
@@ -111,6 +124,19 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn find_whisper_model_uses_override_then_models_kit() {
+        // a valid override file wins
+        let dir = scratch("wm");
+        let m = dir.join("model.bin");
+        std::fs::write(&m, b"x").unwrap();
+        assert_eq!(find_whisper_model(Some(m.to_str().unwrap())), Some(m.clone()));
+        // a bogus override falls through to models-kit's canonical whisper dirs without panic
+        assert!(find_whisper_model(Some("/no/such/model.bin")).is_none());
+        // models-kit always offers at least the canonical whisper dir to search
+        assert!(!models_kit::search_dirs("whisper").is_empty());
     }
 
     #[test]
