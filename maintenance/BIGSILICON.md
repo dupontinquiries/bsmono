@@ -745,3 +745,20 @@ share one pipeline: mic (mic-kit fallback chain) → transcribe → filter (sett
   construction: a silent/stale mic → status Silent and **no forced text** (tested), a live mic →
   filtered dictation ("hello world"). Same recipe drops into voiceterm's voice pane +
   logscope-voice (they own their mic chain + a Transcriber; the pipeline is shared).
+
+## Performance audit (kits)
+
+Scanned the kits for hot-path costs. Findings + fixes:
+- **[FIXED] audiomix-kit `Layout::channels()` allocated a Vec every call** — and count/contains/
+  index_of/pan_gains all call it, so per-frame routing allocated repeatedly. Now returns
+  `&'static [Channel]` (const slices) → zero alloc.
+- **[FIXED] audiomix-kit `RouteMatrix::apply` allocated per frame.** Added `apply_into(frame,
+  out)` (no alloc, realtime path); `apply` kept as a convenience wrapper.
+- **[noted] uikit-egui `livebg::paint`** builds small point Vecs per frame (waves/starfield).
+  Fine for 60fps UI; if it ever shows up, reuse a scratch buffer on the struct.
+- **[noted] mic-kit `BufferedInput::feed`** does per-sample modulo; correct + O(n). Could copy in
+  ≤2 slices for big frames, but not hot at typical frame sizes.
+- **[noted] voice-kit `context` hints/rank** allocate + sort — called per *utterance*, not per
+  frame, so not hot. Fine.
+- **[noted] crypto-kit seal/open per mic frame** (mic-kit) is the real cost if every frame is
+  encrypted; encrypt per *utterance*/chunk, not per 320-sample frame, on-device.
