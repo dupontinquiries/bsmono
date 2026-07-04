@@ -222,6 +222,15 @@ impl RouteMatrix {
         out
     }
 
+    /// Multiply every gain by `k` (e.g. an item's level in a soundscape).
+    pub fn scale(&mut self, k: f32) {
+        for row in &mut self.gains {
+            for g in row {
+                *g *= k;
+            }
+        }
+    }
+
     /// As a channel→gains map for one output channel (interop with bo-suite's ResolvedRouting).
     pub fn contributions_to(&self, out_ch: Channel) -> HashMap<Channel, f32> {
         let mut m = HashMap::new();
@@ -267,6 +276,122 @@ pub fn mix(streams: &[&[f32]], gains: &[f32]) -> Vec<f32> {
         *v = soft_clip(*v);
     }
     out
+}
+
+// ── spatial panning + soundscape placement ───────────────────────────────────
+//
+// The bridge for placing sources in space: a 2D position (x: 0=left … 1=right,
+// y: 0=front … 1=rear) maps to per-channel gains. This lets a *spatial layout in one app* drive
+// a *spatial soundscape in another* — e.g. logscope "mind palace" items (each at a place on the
+// palace canvas) become positioned sources in a bo-suite soundscape.
+
+/// Normalized speaker position (x: left→right, y: front→rear) for equal-power proximity panning.
+fn channel_pos(ch: Channel) -> (f32, f32) {
+    match ch {
+        Channel::FL => (0.0, 0.0),
+        Channel::FR => (1.0, 0.0),
+        Channel::C => (0.5, 0.0),
+        Channel::RL => (0.0, 1.0),
+        Channel::RR => (1.0, 1.0),
+        Channel::SL => (0.0, 0.5),
+        Channel::SR => (1.0, 0.5),
+        Channel::LFE => (0.5, 0.5),
+    }
+}
+
+/// Per-channel gains for a mono source panned to `(x, y)` within `layout`, equal-power
+/// (Σgain² ≈ 1). LFE is non-directional and excluded. Positions clamp to [0,1].
+pub fn pan_gains(x: f32, y: f32, layout: Layout) -> Vec<(Channel, f32)> {
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    let chs: Vec<Channel> = layout.channels().into_iter().filter(|c| *c != Channel::LFE).collect();
+    let raw: Vec<f32> = chs
+        .iter()
+        .map(|c| {
+            let (cx, cy) = channel_pos(*c);
+            let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+            (1.0 - d).max(0.0)
+        })
+        .collect();
+    let norm = raw.iter().map(|g| g * g).sum::<f32>().sqrt().max(1e-6);
+    chs.into_iter().zip(raw).map(|(c, g)| (c, g / norm)).collect()
+}
+
+/// A [`RouteMatrix`] (Mono → `layout`) that spatializes a mono source at `(x, y)`.
+pub fn pan2d(x: f32, y: f32, layout: Layout) -> RouteMatrix {
+    let mut m = RouteMatrix::zeros(Layout::Mono, layout);
+    for (ch, g) in pan_gains(x, y, layout) {
+        m.set_gain(Channel::C, ch, g); // Mono's single channel is C
+    }
+    m
+}
+
+/// A placed mono source — one item in a spatial scene (a mind-palace item, a soundscape voice).
+#[derive(Debug, Clone)]
+pub struct Placement {
+    pub id: String,
+    /// 0 = left … 1 = right.
+    pub x: f32,
+    /// 0 = front … 1 = rear.
+    pub y: f32,
+    /// Source level 0..1.
+    pub level: f32,
+}
+
+/// Turn placed sources into per-item routing into `layout` — the "spatial scene → soundscape"
+/// step. logscope hands its mind-palace item positions in; bo-suite plays each item's audio
+/// through the returned matrix so it sounds where it sits in the palace.
+pub fn soundscape(items: &[Placement], layout: Layout) -> Vec<(String, RouteMatrix)> {
+    items
+        .iter()
+        .map(|it| {
+            let mut m = pan2d(it.x, it.y, layout);
+            m.scale(it.level.clamp(0.0, 1.0));
+            (it.id.clone(), m)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod spatial_tests {
+    use super::*;
+
+    #[test]
+    fn pan_hard_left_front_favours_fl() {
+        let g = pan_gains(0.0, 0.0, Layout::Quad);
+        let map: std::collections::HashMap<_, _> = g.into_iter().collect();
+        assert!(map[&Channel::FL] > 0.99);
+        assert!(map[&Channel::FR].abs() < 1e-3);
+        assert!(map[&Channel::RR].abs() < 1e-3);
+    }
+
+    #[test]
+    fn pan_center_is_balanced_and_equal_power() {
+        let g = pan_gains(0.5, 0.0, Layout::Stereo);
+        let map: std::collections::HashMap<_, _> = g.into_iter().collect();
+        assert!((map[&Channel::FL] - map[&Channel::FR]).abs() < 1e-4, "L/R balanced");
+        let power: f32 = map.values().map(|v| v * v).sum();
+        assert!((power - 1.0).abs() < 1e-3, "equal power");
+    }
+
+    #[test]
+    fn lfe_excluded_from_pan() {
+        let g = pan_gains(0.5, 0.5, Layout::FivePointOne);
+        assert!(!g.iter().any(|(c, _)| *c == Channel::LFE));
+    }
+
+    #[test]
+    fn soundscape_places_items_with_level() {
+        let items = vec![
+            Placement { id: "left".into(), x: 0.0, y: 0.0, level: 1.0 },
+            Placement { id: "quiet".into(), x: 1.0, y: 1.0, level: 0.25 },
+        ];
+        let scene = soundscape(&items, Layout::Quad);
+        assert_eq!(scene.len(), 2);
+        let (_, left) = &scene[0];
+        assert!(left.gain(Channel::C, Channel::FL) > 0.9);
+        let (_, quiet) = &scene[1];
+        assert!(quiet.gain(Channel::C, Channel::RR) <= 0.25 + 1e-3);
+    }
 }
 
 #[cfg(test)]
