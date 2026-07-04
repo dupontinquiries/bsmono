@@ -645,3 +645,23 @@ beyond it, so they became shared uikit-egui capabilities (localweather, av1tuner
 **Port program COMPLETE (egui + kits):** rusty-board, bot-arena, bo-suite, voiceterm (terminal +
 web + viz + cell renderer), snapclone — all full kit citizens. Reusable extractions from the
 founder now in the kit for the rest of the fleet.
+
+## Audio playback kit set
+
+Audio playback is reimplemented across bo-suite/snapclone/av1tuner/ambient-learner; extracting it:
+- **audiomix-kit (NEW, 7 tests)** — pure channel routing + stream mixing, generalized from
+  bo-suite's soundscape router (bo-mux channel_layout/mux, all Qt-free). `Channel` +
+  `Layout` (Mono/Stereo/Quad/5.1/7.1: channels/count/contains/parse), `RouteMatrix`
+  (input→output gains: `identity`, `downmix` with standard fold coeffs — 5.1→stereo folds
+  centre+rears, stereo→mono averages, LFE dropped —, `set_gain`, `apply(frame)`,
+  `contributions_to` for interop with bo-suite's `ResolvedRouting`), and stream merging
+  (`mix`/`mix_into`/`soft_clip`). No hardware, no codec → f32 in, f32 out. This is the
+  "routing mechanism integrated across the ecosystem" — bo-suite keeps its DSP upmix filters
+  and delegates the routing/mixing; other apps get the same primitive.
+- **opus-kit (proposed)** — the libopus/audiopus boilerplate is duplicated across the opus
+  users (encoder/decoder setup, frame-size math, packet TOC). Pure parts (frame duration ↔
+  sample count, valid frame sizes, TOC config) are testable; the FFI calls stay feature-gated
+  (needs system libopus + pkg-config, can't build in-sandbox). Design only for now.
+- **audio-kit** stays the *analysis* side (gen/goertzel/level/pitch/window); audiomix-kit is the
+  *playback/routing* side. Adoption: bo-suite → RouteMatrix; snapclone-audio + ambient-learner →
+  mix/mix_into for stream merging; av1tuner mux → Layout/downmix.
