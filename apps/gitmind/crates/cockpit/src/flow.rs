@@ -754,6 +754,33 @@ pub fn deploy_app_remote(app: &crate::suite::SuiteApp, target: &str, user: &str,
 /// Build **every** app in a group here and install them all on a remote device — the
 /// "export a bundle, desktop builds all the apps, run through them on the phone" flow. Never
 /// aborts on one app's failure.
+/// Like [`deploy_app_remote`] but streams the build log to `on_line`.
+pub fn deploy_app_remote_logged(app: &crate::suite::SuiteApp, target: &str, user: &str, host: &str, on_line: &mut dyn FnMut(&str)) -> Result<String, String> {
+    let tgt = if target.trim().is_empty() { native_triple_local() } else { target.to_string() };
+    let (bin, _) = crate::ops::build_locally_logged(&app.name, &crate::ops::resolve_app_dir(&app.path), &tgt, &app.features, app.no_default, on_line)
+        .map_err(|e| format!("build: {e}"))?;
+    on_line(&format!("• pushing {} → {host}…", app.name));
+    crate::deploy::scp_push(&bin.display().to_string(), user, host, &format!("/tmp/{}", app.name)).map_err(|e| format!("push: {e}"))?;
+    crate::deploy::remote_capture(user, host, &crate::installer::push_install_script(&app.name, false))
+        .map(|_| format!("installed {} on {host}", app.name))
+        .map_err(|e| format!("install: {e}"))
+}
+
+/// Like [`install_group_remote`] but streams per-app progress + build output to `on_line`.
+pub fn install_group_remote_logged(group: &crate::suite::Suite, target: &str, user: &str, host: &str, on_line: &mut dyn FnMut(&str)) -> Vec<SuiteAppResult> {
+    let n = group.apps.len();
+    group.apps.iter().enumerate().map(|(i, a)| {
+        on_line(&format!("── [{}/{}] {} ──", i + 1, n, a.name));
+        match deploy_app_remote_logged(a, target, user, host, on_line) {
+            Ok(msg) => SuiteAppResult { name: a.name.clone(), ok: true, message: msg },
+            Err(e) => {
+                on_line(&format!("  ✗ {} — {e}", a.name));
+                SuiteAppResult { name: a.name.clone(), ok: false, message: e }
+            }
+        }
+    }).collect()
+}
+
 pub fn install_group_remote(group: &crate::suite::Suite, target: &str, user: &str, host: &str) -> Vec<SuiteAppResult> {
     group.apps.iter().map(|a| match deploy_app_remote(a, target, user, host) {
         Ok(msg) => SuiteAppResult { name: a.name.clone(), ok: true, message: msg },

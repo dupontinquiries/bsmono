@@ -73,7 +73,7 @@ Item {
         var user = root.groupDevice.substring(0, at)
         var host = root.groupDevice.substring(at + 1)
         var r = JSON.parse(backend.build_group_remote(g.name, user, host, ""))
-        if (r.ok) { root.busy = true; root.jobKind = "buildgroup"; root.note = "building " + g.name + " here for " + host + "…"; suitePoller.start() }
+        if (r.ok) { root.busy = true; root.jobKind = "buildgroup"; root.buildLog = ""; root.logIdx = 0; root.note = "building " + g.name + " here for " + host + "…"; suitePoller.start() }
         else root.note = "✗ " + r.error
     }
     function makeDefaultSuite() {

@@ -527,6 +527,46 @@ pub fn deploy_app(user: &str, host: &str, dir: &str, app: &str) -> Result<String
     }
 }
 
+/// Like [`deploy_app`] but **captures** the remote build output and streams it line-by-line to
+/// `on_line` (so the GUI shows a live log instead of sending it to gitmind's own terminal), and
+/// surfaces the real failure text. Drains stdout on a thread while reading stderr to avoid a
+/// pipe-buffer deadlock on a chatty build.
+pub fn deploy_app_logged(user: &str, host: &str, dir: &str, app: &str, on_line: &mut dyn FnMut(&str)) -> Result<String, String> {
+    use std::io::{BufRead, BufReader, Read};
+    let cmd = remote_deploy_cmd(dir, app);
+    on_line(&format!("$ ssh {host}: build + install {app} (in {dir})"));
+    let mut child = Command::new("ssh")
+        .args(ssh_argv(user, host, &cmd))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    let out = child.stdout.take();
+    let drain = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(o) = out {
+            let _ = BufReader::new(o).read_to_string(&mut s);
+        }
+        s
+    });
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            on_line(&line);
+        }
+    }
+    let stdout_text = drain.join().unwrap_or_default();
+    for line in stdout_text.lines() {
+        on_line(line);
+    }
+    let status = child.wait().map_err(|e| format!("ssh wait failed: {e}"))?;
+    if status.success() {
+        on_line(&format!("✓ {app} installed on {host}"));
+        Ok(format!("{app} built + installed on {host}; launcher created"))
+    } else {
+        Err(format!("remote build/install failed (exit {}) — see the log above", status.code().unwrap_or(-1)))
+    }
+}
+
 // ───────────────────────── host-key trust ─────────────────────────
 
 /// Is `host` already in `~/.ssh/known_hosts`? Fast + local (`ssh-keygen -F`), so
