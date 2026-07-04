@@ -20,6 +20,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 touchkit = { path = "../../../touchkit", features = ["egui"] }
+eframe = { version = "0.29", optional = true, default-features = false, features = ["glow"] }
 egui = "0.29"
 uikit-gesture = { path = "../uikit-gesture" }
 
@@ -28,3 +29,11 @@ uikit-gesture = { path = "../uikit-gesture" }
 # than re-defining colors.
 snapclone-theme = { path = "../snapclone-theme" }
 settings-kit = { path = "../../../settings-kit" }
+
+[features]
+# Runnable eframe demos (examples/); off by default so `cargo test` stays light + headless.
+demo = ["dep:eframe"]
+
+[[example]]
+name = "logscope_touch"
+required-features = ["demo"]

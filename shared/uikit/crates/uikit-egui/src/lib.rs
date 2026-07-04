@@ -55,6 +55,30 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         style.spacing.button_padding = egui::vec2(8.0 * btn, 4.0 * btn);
         style.spacing.interact_size.y = (24.0 * btn).max(prefs.touch.min_target);
     });
+    // surface transparency: make panels/cards translucent so a LiveBackground (or the desktop,
+    // if the window is transparent) shows through. Applied once here → every adopter gets it.
+    let opacity = prefs.display.opacity.clamp(0.3, 1.0);
+    if opacity < 0.999 {
+        let a = (opacity * 255.0) as u8;
+        ctx.style_mut(|style| {
+            let v = &mut style.visuals;
+            v.panel_fill = with_alpha(v.panel_fill, a);
+            v.window_fill = with_alpha(v.window_fill, a);
+            v.extreme_bg_color = with_alpha(v.extreme_bg_color, a);
+            v.widgets.noninteractive.bg_fill = with_alpha(v.widgets.noninteractive.bg_fill, a);
+        });
+    }
+}
+
+/// Replace a colour's alpha (0..255), preserving RGB — the primitive behind translucent surfaces.
+pub fn with_alpha(c: egui::Color32, alpha: u8) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), alpha)
+}
+
+/// A translucent version of a colour at `opacity` (0.0..1.0) — for apps drawing their own cards
+/// or panels over a live background. Pairs with `DisplayPrefs::opacity`.
+pub fn translucent(c: egui::Color32, opacity: f32) -> egui::Color32 {
+    with_alpha(c, (opacity.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
 use egui::{Color32, Pos2, Rect, Stroke, Ui, Vec2};
