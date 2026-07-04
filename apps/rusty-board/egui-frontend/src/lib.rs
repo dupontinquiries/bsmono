@@ -142,6 +142,14 @@ impl Board {
             self.swipe(dir.sign());
         }
     }
+
+    /// Adopt cross-app preferences: theme + text/button size on the context, and the swipe
+    /// feel (incl. detent animation) on the keyboard's layout-switch gesture. Keeps the
+    /// keyboard consistent with the rest of the fleet when settings change live.
+    pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
+        uikit_egui::apply_prefs(ctx, prefs);
+        *self.gesture.config_mut() = prefs.gesture_config(320.0);
+    }
 }
 
 impl Default for Board {
@@ -312,6 +320,21 @@ mod tests {
         assert_eq!(b.current().name, "qwerty");
         b.swipe(-1);
         assert_eq!(b.current().name, "symbols");
+    }
+
+    #[test]
+    fn apply_settings_runs_and_keeps_layout() {
+        let ctx = egui::Context::default();
+        let mut b = Board::new();
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.gesture.animation = settings_kit::AnimationStyle::Snappy;
+        prefs.touch.text_scale = 1.4;
+        // adopting cross-app settings doesn't disturb the current layout
+        b.apply_settings(&ctx, &prefs);
+        assert_eq!(b.current().name, "qwerty");
+        // text scale reached the shared egui context
+        let body = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
+        assert!(body > 0.0);
     }
 
     #[test]

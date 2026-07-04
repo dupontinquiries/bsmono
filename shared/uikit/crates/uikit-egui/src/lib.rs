@@ -29,7 +29,7 @@ pub use a11y::{Action as A11yAction, A11yScene, Outcome as A11yOutcome, Role, Se
 pub use adaptive::{Adaptive, DeviceClass, SafeArea};
 pub use gesture_layer::{Axis, GestureFrame, GestureLayer};
 pub use skin::Skin;
-pub use theme_bridge::{apply_palette, PaletteColors};
+pub use theme_bridge::{apply_palette, filter_color, PaletteColors};
 pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTierGesture};
 
 /// Apply the theme + touch parts of cross-app [`settings_kit::Prefs`] to an egui context:
@@ -39,11 +39,17 @@ pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTi
 pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     let pid = snapclone_theme::PaletteId::from_str(&prefs.palette);
     apply_palette(ctx, snapclone_theme::palette_for(pid));
-    if prefs.touch.min_target > 0.0 {
-        let mut style = (*ctx.style()).clone();
-        style.spacing.interact_size.y = style.spacing.interact_size.y.max(prefs.touch.min_target);
-        ctx.set_style(style);
-    }
+    let text = prefs.touch.text_scale.max(0.5);
+    let btn = prefs.touch.button_scale.max(0.5);
+    ctx.style_mut(|style| {
+        // text size across the app
+        for (_, font) in style.text_styles.iter_mut() {
+            font.size *= text;
+        }
+        // control/button size (respect an explicit min target too)
+        style.spacing.button_padding = egui::vec2(8.0 * btn, 4.0 * btn);
+        style.spacing.interact_size.y = (24.0 * btn).max(prefs.touch.min_target);
+    });
 }
 
 use egui::{Color32, Pos2, Rect, Stroke, Ui, Vec2};
