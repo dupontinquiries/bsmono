@@ -11,6 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 egui = "0.29"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
 
