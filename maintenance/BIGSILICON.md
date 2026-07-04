@@ -623,3 +623,25 @@ viz(with real nifty engines) cores done (25 crate tests); snapclone remaining. R
   monospace cell to the text-size pref; `render` draws the grid. The on-device `main` wires a
   PTY to `terminal.feed_bytes` and calls `render` each frame; voice/mail panes attach here.
   28 crate tests (terminal + renderer + web + viz + real nifty).
+
+
+## snapclone port + extracting the founder's reusable systems
+
+snapclone was the founder of several systems; two of its UI systems lived in QML and are useful
+beyond it, so they became shared uikit-egui capabilities (localweather, av1tuner-mobile can adopt):
+- **`uikit_egui::livebg`** (5 tests): live animated backgrounds — Aurora / Waves / Starfield /
+  Gradient. Immediate-mode: `LiveBackground::tick(dt)` advances a phase, `paint` draws the frame
+  with palette colours (re-themes + display-filter via caller). Pure motion math tested
+  (wave_y, mix_factor, star_pos, phase wrap).
+- **`uikit_egui::nav`** (3 tests): page + subpage navigation — top-level pages, each with a
+  drill-down subpage stack; `go_page`/`push_subpage`/`back`/`can_go_back`/`title_bar`. One model
+  serves phone (full-screen + back) and desktop (master–detail). The localweather Today→details
+  and av1tuner presets→per-encode cases.
+- **`apps/snapclone/egui-frontend` (DONE):** the port *consumes* both — pages Camera/Peers/Settings
+  with a live background, swipe between pages (disabled inside a subpage so content wins), peer
+  drill-down, a background-style picker, adaptive + a11y + apply_settings. 4 tests. snapclone-* engine
+  crates (audio/proto/net-intel, Qt-free) drive it on-device; camera on the carved surface.
+
+**Port program COMPLETE (egui + kits):** rusty-board, bot-arena, bo-suite, voiceterm (terminal +
+web + viz + cell renderer), snapclone — all full kit citizens. Reusable extractions from the
+founder now in the kit for the rest of the fleet.

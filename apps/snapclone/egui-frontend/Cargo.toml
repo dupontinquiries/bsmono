@@ -1,0 +1,18 @@
+[package]
+name = "snapclone-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "snapclone's UI ported to egui on uikit-egui. The founder app now *consumes* the systems it originated: live backgrounds (uikit-egui::livebg) and page/subpage navigation (uikit-egui::nav), plus adaptive + a11y + gesture + live settings. Camera/peer panes on the carved surface; the snapclone-* engine crates (audio/proto/net-intel, all Qt-free) drive it on-device."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../../shared/settings-kit" }
+
+[workspace]
