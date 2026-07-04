@@ -665,3 +665,21 @@ Audio playback is reimplemented across bo-suite/snapclone/av1tuner/ambient-learn
 - **audio-kit** stays the *analysis* side (gen/goertzel/level/pitch/window); audiomix-kit is the
   *playback/routing* side. Adoption: bo-suite → RouteMatrix; snapclone-audio + ambient-learner →
   mix/mix_into for stream merging; av1tuner mux → Layout/downmix.
+
+## audiomix-kit adoption + logscope mind-palace → bo-suite soundscape
+
+- **Spatial bridge (audiomix-kit, +4 tests → 11):** `pan_gains(x,y,layout)` (equal-power
+  proximity pan; LFE excluded), `pan2d` (Mono→layout RouteMatrix), `RouteMatrix::scale`, and
+  `soundscape(items, layout)` — placed sources (`Placement { id, x, y, level }`) → per-item
+  routing. x: left→right, y: front→rear.
+- **bo-suite adoption (realized):** bo-mux `ResolvedRouting::from_pan(x,y,layout)` delegates the
+  pan to `audiomix_kit::pan_gains`; `Channel`/`Layout` gain `to_mix`/`from_mix`. First
+  audiomix-kit consumer (the app it was extracted from). bo-mux builds; from_pan tested
+  (hard-left → FL dominant).
+- **Step-up path (logscope mind palace → bo-suite soundscape):** a mind palace already places
+  items on a spatial canvas. Normalize each item's canvas position to (x,y)∈[0,1] →
+  `audiomix_kit::soundscape(placements, layout)` (or bo-suite `ResolvedRouting::from_pan` per
+  item) → each item's audio is positioned in the soundscape where it sits in the palace. The
+  shared primitive lives in audiomix-kit; logscope wires its palace-item positions in, bo-suite
+  renders via from_pan. So "walking" the palace pans the soundscape. (logscope-side adapter is
+  the thin remaining wiring; the spatialization + bo-suite end are done + tested.)
