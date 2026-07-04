@@ -572,9 +572,15 @@ The terminal is the hard port; started with the portable, tested core (no egui/P
   the C0 controls, and CSI: cursor moves (A/B/C/D, H/f CUP), erase (J/K), and SGR
   (colour/bold/inverse + bright). `Terminal { grid, parser, input }` with feed_bytes/feed and
   `stage(cmd)` — the cross-app `stage_command` lands on the input line without running.
-- **Next:** the egui cell renderer (monospace grid, palette + `filter_color` for colours,
-  apply_settings for feel), PTY process I/O (on-device), the voice pane (voice-kit +
-  voiced/whisper) and mail pane. The emulation heart — the part that's easy to get subtly
-  wrong — is done and covered.
+- **web → egui** (8 tests): the old path rendered web content into **QML (retained** scene
+  graph); egui is immediate-mode, so re-parsing per frame is wasteful. Inverted the assumption:
+  `web::parse_html` builds a flat **display list** (`RichDoc` = blocks of styled inline runs)
+  **once** on content change; `web::render` walks it into egui each frame (cheap, no parse).
+  Tolerant subset — block tags (p/h1–6/li/pre/blockquote/hr), inline (b/strong,i/em,code,a),
+  HTML entities, ws-collapse (preserved in pre); unknown tags degrade to their text. This is
+  the assumption change the QML→egui move forces, handled at the data-model level.
+- **Next:** the egui cell renderer (monospace grid, palette + `filter_color`, apply_settings),
+  PTY I/O (on-device), voice pane (voice-kit + voiced/whisper), mail pane. The two hard,
+  easy-to-get-wrong parts — VT emulation + web rendering — are done and covered.
 
 **Ports:** rusty-board, bot-arena, bo-suite (complete); voiceterm (core started); snapclone remaining.
