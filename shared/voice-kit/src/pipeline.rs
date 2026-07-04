@@ -16,6 +16,51 @@ pub trait Transcriber {
     fn transcribe(&mut self, audio: &[f32]) -> Option<String>;
 }
 
+/// A fast, learned recogniser: returns candidate texts with acoustic scores (0..1), or empty if
+/// it has nothing confident. On-device this is voiceterm's fastpath (learned command index +
+/// acoustic match) — cheap, and after learning your vocabulary, often better than cold whisper.
+pub trait Recognizer {
+    fn recognize(&mut self, audio: &[f32]) -> Vec<(String, f32)>;
+}
+
+/// Fastpath-first transcription. Runs the fast [`Recognizer`], biases its candidates with the
+/// learned [`ContextModel`](crate::context::ContextModel), and accepts a confident learned match
+/// **without running whisper**; only on a miss does it fall back to the slow [`Transcriber`].
+/// `learn` folds confirmed results back into the context so the fastpath keeps improving. This
+/// is why the pipeline must not be whisper-only.
+pub struct FastpathTranscriber<R: Recognizer, S: Transcriber> {
+    pub fast: R,
+    pub slow: S,
+    pub context: crate::context::ContextModel,
+    /// Minimum blended (acoustic + learned-prior) score to accept the fastpath and skip whisper.
+    pub accept: f32,
+}
+
+impl<R: Recognizer, S: Transcriber> FastpathTranscriber<R, S> {
+    pub fn new(fast: R, slow: S) -> Self {
+        FastpathTranscriber { fast, slow, context: crate::context::ContextModel::new(), accept: 0.6 }
+    }
+    /// Learn a confirmed utterance (call when the user accepts the result).
+    pub fn learn(&mut self, confirmed: &str) {
+        self.context.record(confirmed);
+    }
+}
+
+impl<R: Recognizer, S: Transcriber> Transcriber for FastpathTranscriber<R, S> {
+    fn transcribe(&mut self, audio: &[f32]) -> Option<String> {
+        let cands = self.fast.recognize(audio);
+        if !cands.is_empty() {
+            let ranked = self.context.rank(cands);
+            if let Some((text, score)) = ranked.first() {
+                if *score >= self.accept {
+                    return Some(text.clone()); // fastpath win — no whisper
+                }
+            }
+        }
+        self.slow.transcribe(audio) // fall back to whisper
+    }
+}
+
 /// Accumulates mic audio for one utterance, then transcribes + filters it.
 pub struct VoicePipeline {
     buf: Vec<f32>,
@@ -126,5 +171,47 @@ mod tests {
         p.cancel();
         assert_eq!(p.buffered(), 0);
         assert!(p.flush(&mut Stub("late")).is_none());
+    }
+
+    struct FastStub(Vec<(String, f32)>);
+    impl Recognizer for FastStub {
+        fn recognize(&mut self, _audio: &[f32]) -> Vec<(String, f32)> {
+            self.0.clone()
+        }
+    }
+    struct Whisper(std::rc::Rc<std::cell::Cell<u32>>);
+    impl Transcriber for Whisper {
+        fn transcribe(&mut self, _audio: &[f32]) -> Option<String> {
+            self.0.set(self.0.get() + 1); // count how often whisper actually ran
+            Some("whisper result".into())
+        }
+    }
+
+    #[test]
+    fn fastpath_wins_after_learning_and_skips_whisper() {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        let mut ft = FastpathTranscriber::new(
+            FastStub(vec![("git status".into(), 0.7)]),
+            Whisper(ran.clone()),
+        );
+        // learn the phrase so the prior lifts it over `accept`
+        for _ in 0..4 {
+            ft.learn("git status");
+        }
+        assert_eq!(ft.transcribe(&[0.1; 8]).as_deref(), Some("git status"));
+        assert_eq!(ran.get(), 0, "whisper was skipped on the fastpath");
+    }
+
+    #[test]
+    fn falls_back_to_whisper_on_weak_or_empty_fastpath() {
+        let ran = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        // fast recogniser has nothing → whisper runs
+        let mut ft = FastpathTranscriber::new(FastStub(vec![]), Whisper(ran.clone()));
+        assert_eq!(ft.transcribe(&[0.1; 8]).as_deref(), Some("whisper result"));
+        assert_eq!(ran.get(), 1);
+        // fast candidate but unlearned + low score → still whisper
+        let mut ft2 = FastpathTranscriber::new(FastStub(vec![("unknown cmd".into(), 0.2)]), Whisper(ran.clone()));
+        assert_eq!(ft2.transcribe(&[0.1; 8]).as_deref(), Some("whisper result"));
+        assert_eq!(ran.get(), 2);
     }
 }
