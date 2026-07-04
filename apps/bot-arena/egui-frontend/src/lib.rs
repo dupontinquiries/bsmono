@@ -51,6 +51,19 @@ impl Dashboard {
         self.view_idx = page(self.view_idx, sign, VIEWS.len());
     }
 
+    /// Adopt cross-app preferences: theme + text/button size on the context, and the swipe
+    /// feel (sensitivity / commit / flick / detent animation) on this dashboard's gesture
+    /// layer. Call after `Settings::poll()` reports a change so bot-arena tracks the fleet.
+    pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
+        uikit_egui::apply_prefs(ctx, prefs);
+        *self.gesture.config_mut() = prefs.gesture_config(320.0);
+    }
+
+    /// Test/introspection: the gesture layer's current takeover-lock (reflects detent animation).
+    pub fn detent_lock_ms(&mut self) -> f64 {
+        self.gesture.config_mut().takeover_lock_ms
+    }
+
     pub fn current(&self) -> &'static str {
         VIEWS[self.view_idx]
     }
@@ -163,5 +176,19 @@ mod tests {
         let mut ranked = bots.clone();
         ranked.sort_by(|x, y| y.score.cmp(&x.score));
         assert_eq!(ranked[0].name, "b");
+    }
+
+    #[test]
+    fn apply_settings_adopts_gesture_feel_and_theme() {
+        use settings_kit::{AnimationStyle, Prefs};
+        let ctx = egui::Context::default();
+        let mut d = Dashboard::new(vec![], vec![]);
+        let mut prefs = Prefs::default();
+        prefs.gesture.animation = AnimationStyle::Heavy;
+        d.apply_settings(&ctx, &prefs);
+        // heavy detent animation → a long takeover lock came through from the shared settings
+        assert_eq!(d.detent_lock_ms(), 220.0);
+        // and applying doesn't disturb the current view
+        assert_eq!(d.current(), "Arena");
     }
 }
