@@ -1271,3 +1271,47 @@ pub fn install_zip_app(zip: &str) -> Result<(Installed, bool), String> {
     let inst = build_and_add(&imp.crate_path, &imp.app, "")?;
     Ok((inst, was_installed))
 }
+
+// ── daemon lifecycle (install + status), init-system aware ───────────────────
+
+/// Detect the target's init system from its os-release over SSH.
+pub fn detect_init_remote(user: &str, host: &str) -> crate::daemons::InitSystem {
+    let os = crate::deploy::remote_capture(user, host, "cat /etc/os-release 2>/dev/null || true").unwrap_or_default();
+    crate::daemons::InitSystem::detect_from_os_release(&os)
+}
+
+/// Install + enable every gitmind daemon whose binary is present on the target, writing the
+/// right service units for its init system (systemd user units on desktop, OpenRC on the phone).
+/// Graceful: missing daemon binaries are skipped, so a partial deploy still starts what it can.
+pub fn install_daemons_remote(user: &str, host: &str, bin_dir: &str, home: &str) -> Result<String, String> {
+    let init = detect_init_remote(user, host);
+    let script = crate::daemons::install_daemons_script(bin_dir, home, init);
+    crate::deploy::remote_capture(user, host, &script)
+}
+
+/// A one-line status per daemon on the target (active / inactive), init-system aware.
+pub fn daemons_status_remote(user: &str, host: &str) -> Result<String, String> {
+    let init = detect_init_remote(user, host);
+    let names: Vec<&str> = crate::daemons::all().iter().map(|d| d.name).collect();
+    let cmd = match init {
+        crate::daemons::InitSystem::Systemd => format!(
+            "for s in {}; do printf '%s: ' \"$s\"; systemctl --user is-active \"$s\" 2>/dev/null || echo inactive; done",
+            names.join(" ")
+        ),
+        crate::daemons::InitSystem::OpenRc => format!(
+            "for s in {}; do printf '%s: ' \"$s\"; rc-service \"$s\" status >/dev/null 2>&1 && echo started || echo stopped; done",
+            names.join(" ")
+        ),
+    };
+    crate::deploy::remote_capture(user, host, &cmd)
+}
+
+#[cfg(test)]
+mod daemon_flow_tests {
+    #[test]
+    fn status_script_lists_all_daemons() {
+        // (pure check of the naming that feeds the remote command)
+        let names: Vec<&str> = crate::daemons::all().iter().map(|d| d.name).collect();
+        assert!(names.contains(&"settingsd") && names.contains(&"voiced"));
+    }
+}

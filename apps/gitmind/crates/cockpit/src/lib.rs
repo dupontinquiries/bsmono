@@ -9,6 +9,7 @@ pub mod browse;
 pub mod bttransfer;
 pub mod buildflags;
 pub mod buildsystem;
+pub mod daemons;
 pub mod deploy;
 pub mod fleet;
 pub mod flow;

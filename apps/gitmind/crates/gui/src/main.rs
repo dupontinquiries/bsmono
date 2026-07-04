@@ -177,6 +177,9 @@ struct Backend {
     build_group_remote: qt_method!(fn(&self, name: QString, user: QString, host: QString, target: QString) -> QString),
     show_in_folder: qt_method!(fn(&self, path: QString) -> QString),
     stage_in_terminal: qt_method!(fn(&self, cmd: QString) -> QString),
+    daemons_list: qt_method!(fn(&self) -> QString),
+    install_daemons: qt_method!(fn(&self, user: QString, host: QString, bin_dir: QString, home: QString) -> QString),
+    daemons_status: qt_method!(fn(&self, user: QString, host: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1662,6 +1665,31 @@ impl Backend {
             job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "results": items}).to_string());
         });
         QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
+    }
+
+    /// The fleet's daemons (registry), for the Daemons card.
+    fn daemons_list(&self) -> QString {
+        let arr: Vec<_> = cockpit::daemons::all()
+            .iter()
+            .map(|d| json!({"name": d.name, "socket": d.socket, "description": d.description}))
+            .collect();
+        QString::from(json!({"ok": true, "daemons": arr}).to_string())
+    }
+
+    /// Install + enable all present daemons on a target (init-system aware, graceful skips).
+    fn install_daemons(&self, user: QString, host: QString, bin_dir: QString, home: QString) -> QString {
+        match cockpit::flow::install_daemons_remote(&user.to_string(), &host.to_string(), &bin_dir.to_string(), &home.to_string()) {
+            Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// One-line status per daemon on a target.
+    fn daemons_status(&self, user: QString, host: QString) -> QString {
+        match cockpit::flow::daemons_status_remote(&user.to_string(), &host.to_string()) {
+            Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
+            Err(e) => err_json(&e),
+        }
     }
 
     /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
