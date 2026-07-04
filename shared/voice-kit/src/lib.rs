@@ -20,6 +20,7 @@
 
 pub mod hallucination;
 pub mod model;
+pub mod pipeline;
 
 pub use hallucination::{
     is_hallucination, looks_like_speech, strip_trailing_artifacts, trim_hallucination_loop,
