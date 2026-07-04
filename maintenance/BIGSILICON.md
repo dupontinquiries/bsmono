@@ -712,3 +712,21 @@ spatial-audio consumer: sim entities have world positions, so normalize each to 
 primitive as the logscope mind-palace path; the thin adapter (entity → `Placement`) lands
 on-device where unendlich's `audio` feature builds. Per the fallback rule, the soundscape is a
 step-up: if the audio device/feature is absent it simply isn't rendered — the sim is unaffected.
+
+## Fallback-chain wiring (capture bridge + bo-suite)
+
+Made the fallback chains real by bridging hardware capture to the `AudioInput` contract:
+- **mic-kit `BufferedInput`** (capture bridge, +3 tests → 8): a fixed ring buffer an OS capture
+  callback `feed`s, drained by `read` (no alloc in the audio path; overflow drops oldest).
+  Liveness tracks feed recency — stop feeding and it goes not-live after `stale_limit` reads, so
+  the chain moves on. `mic_chain(sources)` builds a `FallbackChain` always terminated by
+  `Silence`. Tested: feed/read/stale, overflow-keeps-newest, and a stalled capture falling
+  through to silence.
+- **bo-suite wiring (real, builds):** bo-mux `MicCaptureInput` wraps the pull-based `MicCapture`
+  as an `AudioInput`, deriving liveness from the monotonic `samples_written` (stalls → drops out
+  of the chain). `bo_mux::mic_capture::input_chain(captures)` builds a prioritized chain
+  (preferred mic → fallbacks → silence). bo-mux compiles with mic-kit; the adapter can't *run*
+  in-sandbox (MicCapture needs parec/arecord) but mirrors the tested liveness pattern.
+- **voiceterm / logscope-voice:** same recipe — wrap each app's capture as an `AudioInput`, hand
+  the prioritized list to `mic_chain`; requests go through `MicBroker` with the app's profile.
+  Those adapters are the thin on-device remainder.
