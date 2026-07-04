@@ -730,3 +730,18 @@ Made the fallback chains real by bridging hardware capture to the `AudioInput` c
 - **voiceterm / logscope-voice:** same recipe — wrap each app's capture as an `AudioInput`, hand
   the prioritized list to `mic_chain`; requests go through `MicBroker` with the app's profile.
   Those adapters are the thin on-device remainder.
+
+## Voice-input pipeline + keyboard voice mode
+
+The voice-mode surfaces (keyboard dictation, voiceterm voice pane, logscope voice commands)
+share one pipeline: mic (mic-kit fallback chain) → transcribe → filter (settings VoiceFilter).
+- **voice-kit `pipeline`** (4 tests): `Transcriber` trait (whisper on-device; stub in tests) +
+  `VoicePipeline` (`push` accumulates mic frames, `flush` transcribes then runs
+  `filter_transcript` at the chosen level, `cancel`/`ready`/`buffered`). Filter flags come from
+  settings-kit's `VoiceFilter` booleans → no kit coupling.
+- **rusty-board `VoiceMode`** (3 tests): pulls the mic through a `mic_kit::AudioInput` (graceful
+  FallbackChain), accumulates in the pipeline, tracks `InputStatus` for the UI, `apply_settings`
+  syncs the filter level, `finish` transcribes+filters into text to type. Graceful by
+  construction: a silent/stale mic → status Silent and **no forced text** (tested), a live mic →
+  filtered dictation ("hello world"). Same recipe drops into voiceterm's voice pane +
+  logscope-voice (they own their mic chain + a Transcriber; the pipeline is shared).
