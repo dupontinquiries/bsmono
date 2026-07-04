@@ -449,3 +449,28 @@ Audited the GUI against this session's backend features:
   DHT rendezvous (`fleet account|advertise|resolve|reach`). These are newer and secondary to
   the build→install flow; a "Publish" card and a "Reach across networks" affordance are the
   next GUI additions.
+
+## Apps helping the user — cross-app actions (gitmind → voiceterm)
+
+"If gitmind says 'you need to run this', can it hand the command to the terminal?" — yes, built.
+- **`bigsilicon_client::action`** — a small deep-link vocabulary (open_tab, stage_command,
+  run_command, open_doc, open_url). `send_action(target_socket, verb, args)` is socket-first
+  (false if the target app is down → caller falls back). `Terminal::stage(cmd)` opens a
+  voiceterm tab and **prefills** the command without running it (user reviews + presses enter);
+  `run`/`open_tab` too. Server side: `parse_terminal_action(&Message) -> TerminalAction`
+  (OpenTab/Stage/Run) — voiceterm calls this in its ipc-kit service. Tested: socket-first
+  fallback + a staged command round-trips to a stub voiceterm.
+- **GUI wiring:** the failed-build panel gains "→ fix in terminal" (stages
+  `gitmind fleet deps --build-essentials` in voiceterm; falls back to showing it if voiceterm
+  is down), via a `stage_in_terminal` qt_method over `Terminal::stage`.
+- **voiceterm's job (on-device):** serve an ipc-kit socket named "voiceterm", and on each
+  message call `parse_terminal_action`; Stage(cmd) → new tab + put cmd on the prompt (no
+  enter), Run(cmd) → new tab + execute, OpenTab → new tab. Then any app can hand the user a
+  ready-to-run command through the terminal.
+
+## GUI: Network page → RPM/apk repos (agreed, next)
+
+Confirmed placement: a "Publish / Repos" card on the Network page (alongside DHT rendezvous).
+Pick a group → build packages (`package_project`) → Serve locally (`repo serve`, shows the
+dnf/apk client line) and Serve over DHT (advertise the repo endpoint so a gitmind on another
+network resolves+pulls — gitmind2gitmind). Backend exists CLI-only; the card is the wiring.
