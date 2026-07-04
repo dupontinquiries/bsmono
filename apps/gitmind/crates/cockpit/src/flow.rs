@@ -709,8 +709,23 @@ pub struct SuiteAppResult {
 /// launcher). Native target unless the app pins one.
 pub fn install_suite_app(app: &crate::suite::SuiteApp) -> Result<Installed, String> {
     let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
-    let (bin, _) = build_locally(&app.name, Path::new(&app.path), &target, &app.features, app.no_default)
+    let (bin, _) = build_locally(&app.name, &crate::ops::resolve_app_dir(&app.path), &target, &app.features, app.no_default)
         .map_err(|e| format!("build: {e}"))?;
+    add_to_apps(&bin, &app.name, "suite", &app.run_flags)
+}
+
+/// Like [`install_suite_app`] but streams the build log to `on_line`.
+pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn FnMut(&str)) -> Result<Installed, String> {
+    let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
+    let (bin, _) = crate::ops::build_locally_logged(
+        &app.name,
+        &crate::ops::resolve_app_dir(&app.path),
+        &target,
+        &app.features,
+        app.no_default,
+        on_line,
+    )
+    .map_err(|e| format!("build: {e}"))?;
     add_to_apps(&bin, &app.name, "suite", &app.run_flags)
 }
 
@@ -727,7 +742,7 @@ pub fn install_suite(suite: &crate::suite::Suite) -> Vec<SuiteAppResult> {
 /// `.desktop` launcher. This is the "desktop builds, phone runs" path for a single app.
 pub fn deploy_app_remote(app: &crate::suite::SuiteApp, target: &str, user: &str, host: &str) -> Result<String, String> {
     let tgt = if target.trim().is_empty() { native_triple_local() } else { target.to_string() };
-    let (bin, _) = build_locally(&app.name, Path::new(&app.path), &tgt, &app.features, app.no_default)
+    let (bin, _) = build_locally(&app.name, &crate::ops::resolve_app_dir(&app.path), &tgt, &app.features, app.no_default)
         .map_err(|e| format!("build: {e}"))?;
     crate::deploy::scp_push(&bin.display().to_string(), user, host, &format!("/tmp/{}", app.name))
         .map_err(|e| format!("push: {e}"))?;
