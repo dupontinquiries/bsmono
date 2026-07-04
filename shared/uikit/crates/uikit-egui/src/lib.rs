@@ -21,6 +21,7 @@ pub mod a11y;
 pub mod adaptive;
 pub mod carved;
 pub mod gesture_layer;
+pub mod touch;
 pub mod skin;
 pub mod livebg;
 pub mod nav;
