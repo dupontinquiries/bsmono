@@ -12,5 +12,6 @@ path = "src/lib.rs"
 egui = "0.29"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 settings-kit = { path = "../../../shared/settings-kit" }
+nifty-core = { path = "../../../shared/nifty-core" }
 
 [workspace]

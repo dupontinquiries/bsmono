@@ -106,6 +106,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nifty-core"
+version = "0.1.0"
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -280,6 +284,7 @@ name = "voiceterm-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "nifty-core",
  "settings-kit",
  "uikit-egui",
 ]

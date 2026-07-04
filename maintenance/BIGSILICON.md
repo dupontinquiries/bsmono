@@ -593,3 +593,23 @@ The terminal is the hard port; started with the portable, tested core (no egui/P
   VT emulation, web rendering, and the shared diagram/plot render target — are done + covered.
 
 **Ports:** rusty-board, bot-arena, bo-suite (complete); voiceterm (core started); snapclone remaining.
+
+
+## Wiring — real engines → the render targets (nifty-core extraction)
+
+Wired voiceterm's actual diagram engines to the new egui Scene renderer, via a clean extraction:
+- **`shared/nifty-core`** (NEW lib) — moved voiceterm's three self-contained, Qt-free engines
+  out of the bin: `niftyplot` (source → GraphDoc of nodes/edges/planes), `graph_layout`
+  (force-directed positioning), `mermaid`. Builds standalone; **106 of the engines' own tests
+  pass** post-move. No duplication — both the Qt app and the egui front-end share it.
+- **voiceterm bin** re-points at nifty-core: `mod niftyplot;` → `pub use nifty_core::niftyplot;`
+  (+ graph_layout, mermaid), preserving every `crate::niftyplot::…` path. *(Can't build the Qt
+  bin here — no Qt6 — so this re-export edit is unverified but is the standard extraction shape
+  and trivially revertible.)*
+- **voiceterm-egui `viz::nifty_scene(source)`** — the real end-to-end path: parse via niftyplot
+  → position via graph_layout::layout_force_directed → build a `Scene` → render. Tested:
+  `"A -> B\nB -> C"` → 3 boxes + 2 arrows with finite bounds. Not a mock — the shipping engines.
+
+Ports/wiring status: rusty-board/bot-arena/bo-suite complete; voiceterm has terminal + web +
+viz(with real nifty engines) cores done (25 crate tests); snapclone remaining. Remaining
+voiceterm: egui cell renderer, PTY I/O, voice/mail panes (on-device).
