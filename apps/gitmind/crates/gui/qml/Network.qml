@@ -30,7 +30,7 @@ Item {
     property string dUser: "user"
     property string dBinDir: "/home/user/.local/bin"
     property string dHome: "/home/user"
-    Component.onCompleted: {
+    function loadDaemons() {
         try {
             var r = JSON.parse(backend.daemons_list())
             if (r.ok) root.daemonModel = r.daemons
@@ -96,7 +96,7 @@ Item {
         else if (root.jobKind === "btsend") root.note = res.ok ? ("✓ " + res.msg) : ("error: " + res.error)
         root.jobKind = ""
     }
-    Component.onCompleted: { refreshAdvertise(); loadFingerprint() }
+    Component.onCompleted: { refreshAdvertise(); loadFingerprint(); loadDaemons() }
 
     Timer {
         id: poller
