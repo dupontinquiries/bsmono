@@ -4,6 +4,7 @@ version = "0.1.900"
 edition = "2021"
 
 [dependencies]
+nifty-core = { path = "../../shared/nifty-core" }
 qmetaobject = "0.2"
 scraper = "0.14"
 ureq = { version = "2", features = ["gzip"] }

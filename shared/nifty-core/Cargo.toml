@@ -1,0 +1,9 @@
+[package]
+name = "nifty-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "voiceterm's pure diagram/graph engines, extracted from the Qt bin so both it and the egui front-end share them: niftyplot (source -> GraphDoc of nodes/edges/planes), graph_layout (force-directed positioning), and mermaid parsing. std-only, no UI."
+
+[lib]
+path = "src/lib.rs"
