@@ -39,3 +39,21 @@ Kits are shared + ahead, so they DON'T get rebased — the **apps** do. Per bump
 diff its engines against my kit-adopted version → re-apply the thin adoption edits (mostly
 `mod X` → `pub use kit::X` re-exports + egui-frontend crates, which are additive). New projects:
 add under apps/, then adopt kits as they settle. This is incremental, one app per pass.
+
+## logscope (done — first rebase)
+- **Already integrated:** my monorepo's `apps/logscope/crates/logscope-egui` is byte-identical to
+  the bump's voice-nav-complete variant (diff empty). The 4 variants differ only in
+  mic-pearl-view.rs / chat.rs / voice_intent.rs sizes. So logscope didn't need re-importing.
+- **egui version gap:** logscope-egui is on **egui/eframe 0.34** (kits are 0.29) with default
+  features gui+gpu-scene. Direct uikit-egui/touchkit-egui adoption is **blocked until egui is
+  unified** (bump kits → 0.34, or logscope → 0.29). The std-only kits adopt fine regardless.
+- **Applied — the soundscape step-up:** `logscope-egui::spatial_audio::graph_soundscape` bridges
+  the 3D conversation-graph layout (`spatial::layout` → Vec3 per node) to `audiomix_kit::soundscape`
+  (project world-x→L/R, world-z depth→front/rear, normalize to the graph bounds). So a spatial
+  view can *sound* where nodes sit. audiomix-kit is std-only → no egui conflict. Logic verified
+  against audiomix-kit in isolation (leftmost node → front-left); full-crate build is on-device
+  (egui 0.34 + gpu). gui-gated (uses spatial).
+- **Flow-BACK, not push-in:** logscope's `fastpath.rs` (220) / `voice_intent*.rs` (multi-language)
+  / `whisper_pool.rs` are the **mature originals** my voice-kit `context`/`pipeline`/`fastpath`
+  abstracted this session. The right direction is voice-kit adopting logscope's real logic, not
+  replacing it. Left as a noted follow-up (needs the real fastpath source diffed into voice-kit).
