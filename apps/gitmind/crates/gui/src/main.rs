@@ -121,6 +121,7 @@ struct Backend {
     start_push: qt_method!(fn(&self, user: QString, host: QString, dir: QString) -> QString),
     start_deploy: qt_method!(fn(&self, user: QString, host: QString, dir: QString, app: QString) -> QString),
     poll_job: qt_method!(fn(&self) -> QString),
+    job_log: qt_method!(fn(&self, from: i32) -> QString),
     // SSH identity + host-key trust, surfaced so the GUI never assumes a username
     // and never trusts a key in the terminal behind the GUI's back.
     current_user: qt_method!(fn(&self) -> QString),
@@ -827,6 +828,12 @@ impl Backend {
     fn poll_job(&self) -> QString {
         let (running, done, kind, result) = self.job.poll();
         QString::from(json!({"running": running, "done": done, "kind": kind, "result": result}).to_string())
+    }
+
+    /// Tail the running job's live log from line `from` → { next, lines } for a streaming view.
+    fn job_log(&self, from: i32) -> QString {
+        let (next, lines) = self.job.tail(from.max(0) as usize);
+        QString::from(json!({"next": next, "lines": lines}).to_string())
     }
 
     /// The local login name, so the deploy/network tabs can default the SSH user
@@ -1788,9 +1795,14 @@ impl Backend {
         }
         let job = std::sync::Arc::clone(&self.job);
         std::thread::spawn(move || {
-            match cockpit::flow::install_suite_app(&app) {
+            let job2 = std::sync::Arc::clone(&job);
+            let mut on = move |l: &str| job2.log_line(l);
+            match cockpit::flow::install_suite_app_logged(&app, &mut on) {
                 Ok(i) => job.finish(json!({"ok": true, "name": app.name, "label": i.label}).to_string()),
-                Err(e) => job.finish(json!({"ok": false, "name": app.name, "error": e}).to_string()),
+                Err(e) => {
+                    on(&format!("✗ {}: {e}", app.name));
+                    job.finish(json!({"ok": false, "name": app.name, "error": e}).to_string());
+                }
             }
         });
         QString::from(json!({"ok": true, "started": "sapp"}).to_string())

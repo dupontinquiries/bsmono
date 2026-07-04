@@ -778,3 +778,20 @@ gitmind had no daemon registry, so the new settingsd (and the others) weren't in
 - **GUI polish:** a **Daemons card** on the Network page — lists the four daemons (name · socket ·
   description) from `daemons_list`, with "install + enable on <device>" and "status" buttons
   wired to the flow. gui rustcheck CLEAN, Network.qml 96/96.
+
+## gitmind build fixes: repo-root resolution + live build log
+
+Two on-device bugs (builds "too fast, no CPU, no error"):
+- **Root cause — relative app paths.** Store-group/suite app paths are repo-relative (`apps/<name>`)
+  but `build_locally` used them as `current_dir` directly, so launched from anywhere but the repo
+  root, cargo ran in a nonexistent dir and failed instantly. Fixed: `ops::repo_root()` (GITMIND_ROOT
+  → walk up for a dir with `apps/` + `.git`/`.gitmind` → cwd) + `ops::resolve_app_dir()`, used in
+  `install_suite_app` + `deploy_app_remote`. `build_locally` now also **errors clearly** ("no
+  Cargo.toml at … — set GITMIND_ROOT") instead of a silent no-op. 2 tests.
+- **Live build log.** `deploy::Job` gains a log buffer (`log_line`/`tail`, retained after done);
+  `ops::build_locally_logged` streams cargo stderr line-by-line; `flow::install_suite_app_logged`
+  wires it; GUI `job_log(from)` qt_method + a streaming **build-log panel** in Apps.qml (monospace,
+  autoscroll, copy/clear) fed by the suite poller. "Build All" now shows real progress + errors.
+- **Still to wire:** the Push page's `start_deploy` uses `deploy::deploy_app` (not the logged
+  builder), so its live log is the same one-line change (a `deploy_app` logged variant + Push.qml
+  tailing job_log). The path fix already makes the push *build* run + surface errors.
