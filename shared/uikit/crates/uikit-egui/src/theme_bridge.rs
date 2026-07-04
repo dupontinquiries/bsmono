@@ -117,3 +117,39 @@ mod tests {
         assert_eq!(a.a(), 0x80);
     }
 }
+
+/// Apply the display accessibility filter (lowered white point + colour filter) to a single
+/// colour — use on app content colours. `is_active()==false` returns the colour unchanged.
+pub fn filter_color(c: Color32, d: &settings_kit::DisplayPrefs) -> Color32 {
+    if !d.is_active() {
+        return c;
+    }
+    let (r, g, b) = d.apply((c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0));
+    Color32::from_rgba_unmultiplied((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8, c.a())
+}
+
+#[cfg(test)]
+mod prefs_tests {
+    use super::*;
+
+    #[test]
+    fn apply_prefs_scales_text() {
+        let ctx = Context::default();
+        let before = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.touch.text_scale = 2.0;
+        crate::apply_prefs(&ctx, &prefs);
+        let after = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
+        assert!(after > before * 1.5, "text_scale 2.0 should roughly double body text ({before} -> {after})");
+    }
+
+    #[test]
+    fn filter_color_grayscale_collapses_channels() {
+        let d = settings_kit::DisplayPrefs { white_point: 1.0, color_filter: settings_kit::ColorFilter::Grayscale };
+        let out = filter_color(Color32::from_rgb(255, 0, 0), &d);
+        assert!((out.r() as i32 - out.g() as i32).abs() <= 1 && (out.g() as i32 - out.b() as i32).abs() <= 1);
+        // inactive filter is a no-op
+        let none = settings_kit::DisplayPrefs::default();
+        assert_eq!(filter_color(Color32::from_rgb(10, 20, 30), &none), Color32::from_rgb(10, 20, 30));
+    }
+}

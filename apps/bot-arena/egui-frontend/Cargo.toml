@@ -13,3 +13,4 @@ egui = "0.29"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../../shared/settings-kit" }

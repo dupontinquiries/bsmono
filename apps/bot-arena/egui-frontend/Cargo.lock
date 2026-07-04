@@ -41,6 +41,7 @@ name = "bot-arena-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "settings-kit",
  "snapclone-theme",
  "uikit-egui",
  "uikit-gesture",
@@ -223,6 +224,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "settings-kit"
+version = "0.1.0"
+dependencies = [
+ "uikit-gesture",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,6 +265,7 @@ name = "uikit-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "settings-kit",
  "snapclone-theme",
  "uikit-gesture",
 ]
