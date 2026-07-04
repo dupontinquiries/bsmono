@@ -491,3 +491,19 @@ Remaining 0-consumer kits: peermux-core, share-kit, registry-kit (peermux/share 
 snapclone's broker + durable sharemd backend are wired on-device). Next verifiable in-cockpit
 adoptions: packaging tool-runs → proc_kit::run (needs a cwd-aware run_in), and
 config-kit/cli-kit into more apps as the version bumps arrive.
+
+## Accessibility → Display (white point + colour filters)
+
+Cross-app display accessibility, added to the settings system end to end:
+- **settings-kit** (9 tests): `DisplayPrefs { white_point: 0.4..1.0, color_filter }` +
+  `ColorFilter` (None/Grayscale/Protanopia/Deuteranopia/Tritanopia/Warm) with `label()`/kv.
+  Pure transforms `apply_white_point` (scales luminance → dims bright whites),
+  `apply_color_filter` (standard colour-vision matrices + grayscale + warm), and
+  `DisplayPrefs::apply`/`is_active`. Wired into Prefs to_kv/from_kv/apply_kv.
+- **settings-app** (5 tests): Accessibility → **Display** section — a white-point slider and a
+  colour-filter picker. Publishes `display.white_point` / `display.color_filter` like any
+  other pref → live across the fleet; settingsd persists them (seeded from Prefs defaults).
+- **Apply path:** apps run their palette colours through `DisplayPrefs::apply` (uikit-egui
+  theme). Full-screen coverage of images/video is a shader or compositor pass (Plasma has
+  night-colour) — the preference + colour math live here; a uikit-egui
+  `apply_display(ctx,&Prefs)` palette pass is the next small step.
