@@ -3,13 +3,29 @@ name = "bigsilicon-settings"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "The central settings app for the egui-kit apps: an egui UI (on uikit-egui) that edits the shared Prefs — gesture feel, touch targets, palette, accessibility — and publishes each change to the sharemd 'settings' namespace, so every app updates live. Uses settings-kit for the schema and the diff that decides what to publish."
+description = "The central settings app for the egui-kit apps. A shared SettingsEditor (egui UI on uikit-egui) plus two front-ends onto settingsd: the `bsettings` GUI and the `bsettings-cli` command line — both read the current Prefs from the daemon and publish changes to the 'settings' namespace so every app updates live. Uses settings-kit for the schema/diff and bigsilicon-client for the daemon link."
 
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "bsettings-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "bsettings"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[features]
+default = []
+# The graphical app needs a windowing backend; the CLI + lib don't.
+gui = ["dep:eframe"]
+
 [dependencies]
 egui = "0.29"
+eframe = { version = "0.29", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../shared/settings-kit" }
+bigsilicon-client = { path = "../../shared/bigsilicon-client" }

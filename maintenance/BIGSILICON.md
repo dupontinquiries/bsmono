@@ -824,3 +824,19 @@ now shared/touchkit (26th kit) — compiles + 5 tests + doctest PASS (their sess
 toolchain; they'd flagged it as read-verified only). Full map + per-app re-apply plan in
 maintenance/MERGE_PLAN.md. The **apps** get rebased onto the kits (thin re-exports + additive
 egui-frontends), not the kits — they're shared + ahead.
+
+## bsettings — graphical + CLI front-ends to settingsd
+
+settingsd was running but had no user-facing front-end. Added both, sharing one daemon link:
+- **bsettings-cli** (builds, runs): `list` / `get <key>` / `set <key> <value>` over the
+  `settings` socket via `bigsilicon_client::Settings` — changes persist (daemon writes
+  ~/.config/gitmind/settings.conf) and fan out to every running app. Clear error if settingsd
+  isn't up.
+- **bsettings** (GUI, eframe, `gui` feature — builds with windowing libs present): the reusable
+  `SettingsEditor` (egui on uikit-egui) connected to settingsd — loads the current Prefs on
+  connect, publishes each change live so every app updates immediately. Graceful: if the daemon
+  isn't reachable it runs as a local editor (edits apply but don't persist), with a status line
+  saying so.
+- Both go through the **same `Settings` client**, so the CLI and GUI stay in lock-step with the
+  daemon (and each other). The crate (`bigsilicon-settings`) keeps the `SettingsEditor` lib +
+  now ships the two bins; eframe is gated behind `gui` so the CLI/lib build without windowing.
