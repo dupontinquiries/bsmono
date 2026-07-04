@@ -1,0 +1,16 @@
+[package]
+name = "voiceterm-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "voiceterm ported to egui — starting with the portable terminal core: a screen-grid model + a VT/ANSI parser (printable text, C0 controls, CSI cursor/erase/SGR), both pure and unit-tested. The egui cell renderer, PTY I/O, and voice/mail panes build on top. Ties into the cross-app action protocol: staged commands land on the input line."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+settings-kit = { path = "../../../shared/settings-kit" }
+
+[workspace]
