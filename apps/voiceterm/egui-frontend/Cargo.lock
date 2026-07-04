@@ -286,6 +286,7 @@ dependencies = [
  "egui",
  "nifty-core",
  "settings-kit",
+ "snapclone-theme",
  "uikit-egui",
 ]
 

@@ -611,5 +611,15 @@ Wired voiceterm's actual diagram engines to the new egui Scene renderer, via a c
   `"A -> B\nB -> C"` → 3 boxes + 2 arrows with finite bounds. Not a mock — the shipping engines.
 
 Ports/wiring status: rusty-board/bot-arena/bo-suite complete; voiceterm has terminal + web +
-viz(with real nifty engines) cores done (25 crate tests); snapclone remaining. Remaining
-voiceterm: egui cell renderer, PTY I/O, voice/mail panes (on-device).
+viz(with real nifty engines) cores done (25 crate tests); snapclone remaining. Remaining voiceterm: PTY I/O, voice/mail panes (on-device).
+
+## voiceterm — terminal cell renderer + App (done)
+- **`render_grid`**: draws the `Grid` as a monospace cell grid, grouping same-style runs per
+  row into one text galley (efficient, not one draw per cell), with a cursor block. Colours
+  come from `ansi_color` (standard 16-colour ANSI) + palette defaults, routed through
+  `filter_color` so the display-accessibility settings (white point / colour filter) apply live.
+- **`resolve_colors`**: cell style → (fg, bg), honouring inverse video + theme defaults.
+- **`App { terminal, prefs, cell, font_size }`**: `apply_settings` themes the ctx and scales the
+  monospace cell to the text-size pref; `render` draws the grid. The on-device `main` wires a
+  PTY to `terminal.feed_bytes` and calls `render` each frame; voice/mail panes attach here.
+  28 crate tests (terminal + renderer + web + viz + real nifty).

@@ -389,6 +389,131 @@ impl Terminal {
     }
 }
 
+// ── egui cell renderer + colour resolution ───────────────────────────────────
+
+/// The standard 16-colour ANSI palette (0–7 normal, 8–15 bright), as egui colours.
+pub fn ansi_color(idx: u8) -> egui::Color32 {
+    use egui::Color32 as C;
+    match idx {
+        0 => C::from_rgb(0x1c, 0x1c, 0x1c),
+        1 => C::from_rgb(0xcc, 0x33, 0x33),
+        2 => C::from_rgb(0x33, 0xaa, 0x33),
+        3 => C::from_rgb(0xcc, 0xaa, 0x33),
+        4 => C::from_rgb(0x33, 0x66, 0xcc),
+        5 => C::from_rgb(0xaa, 0x33, 0xaa),
+        6 => C::from_rgb(0x33, 0xaa, 0xaa),
+        7 => C::from_rgb(0xcc, 0xcc, 0xcc),
+        8 => C::from_rgb(0x55, 0x55, 0x55),
+        9 => C::from_rgb(0xff, 0x55, 0x55),
+        10 => C::from_rgb(0x55, 0xff, 0x55),
+        11 => C::from_rgb(0xff, 0xff, 0x55),
+        12 => C::from_rgb(0x55, 0x99, 0xff),
+        13 => C::from_rgb(0xff, 0x55, 0xff),
+        14 => C::from_rgb(0x55, 0xff, 0xff),
+        _ => C::from_rgb(0xff, 0xff, 0xff),
+    }
+}
+
+/// Resolve a cell's `(foreground, background)` egui colours, honouring inverse video and the
+/// theme default (default fg = the palette text colour, default bg = the base background).
+pub fn resolve_colors(style: Style, colors: &uikit_egui::PaletteColors) -> (egui::Color32, egui::Color32) {
+    let fg = match style.fg {
+        TermColor::Default => colors.text,
+        TermColor::Ansi(i) => ansi_color(i),
+    };
+    let bg = match style.bg {
+        TermColor::Default => colors.bg_base,
+        TermColor::Ansi(i) => ansi_color(i),
+    };
+    if style.inverse {
+        (bg, fg)
+    } else {
+        (fg, bg)
+    }
+}
+
+/// Render the terminal grid into `ui` as a monospace cell grid. Efficient: per row, cells are
+/// grouped into runs of identical style and drawn as one text galley (not one per cell).
+/// Colours route through `filter_color` so the display-accessibility settings apply live.
+pub fn render_grid(
+    ui: &egui::Ui,
+    grid: &Grid,
+    colors: &uikit_egui::PaletteColors,
+    display: &settings_kit::DisplayPrefs,
+    origin: egui::Pos2,
+    cell_w: f32,
+    cell_h: f32,
+    font_size: f32,
+) {
+    let painter = ui.painter();
+    let filt = |c: egui::Color32| uikit_egui::filter_color(c, display);
+    let font = egui::FontId::monospace(font_size);
+
+    for r in 0..grid.rows {
+        let y = origin.y + r as f32 * cell_h;
+        let mut c = 0;
+        while c < grid.cols {
+            let start = grid.cell(r, c);
+            // extend a run of identical style
+            let mut end = c + 1;
+            while end < grid.cols && grid.cell(r, end).style == start.style {
+                end += 1;
+            }
+            let text: String = (c..end).map(|cc| grid.cell(r, cc).ch).collect();
+            let (fg, bg) = resolve_colors(start.style, colors);
+            let x0 = origin.x + c as f32 * cell_w;
+            let rect = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2((end - c) as f32 * cell_w, cell_h));
+            // paint background only when it differs from the base
+            if start.style.bg != TermColor::Default || start.style.inverse {
+                painter.rect_filled(rect, 0.0, filt(bg));
+            }
+            if !text.trim().is_empty() {
+                painter.text(egui::pos2(x0, y), egui::Align2::LEFT_TOP, text, font.clone(), filt(fg));
+            }
+            c = end;
+        }
+    }
+    // cursor block
+    let cx = origin.x + grid.cur_col as f32 * cell_w;
+    let cy = origin.y + grid.cur_row as f32 * cell_h;
+    painter.rect_filled(
+        egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cell_w, cell_h)),
+        0.0,
+        filt(colors.accent).gamma_multiply(0.6),
+    );
+}
+
+/// A minimal voiceterm view: the terminal, current prefs, and settings adoption. The egui
+/// `main` connects a PTY to `terminal.feed_bytes` and calls `render` each frame; the voice and
+/// mail panes attach here later.
+pub struct App {
+    pub terminal: Terminal,
+    pub prefs: settings_kit::Prefs,
+    pub cell: (f32, f32),
+    pub font_size: f32,
+}
+
+impl App {
+    pub fn new(cols: usize, rows: usize) -> App {
+        App { terminal: Terminal::new(cols, rows), prefs: settings_kit::Prefs::default(), cell: (8.5, 17.0), font_size: 13.0 }
+    }
+
+    /// Adopt cross-app settings (theme/text/button + gesture feel handled by the kit).
+    pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
+        self.prefs = prefs.clone();
+        uikit_egui::apply_prefs(ctx, prefs);
+        // scale the monospace cell to the text-size preference
+        self.font_size = 13.0 * prefs.touch.text_scale.max(0.5);
+        self.cell = (self.font_size * 0.62, self.font_size * 1.3);
+    }
+
+    /// Draw the terminal into the current UI region.
+    pub fn render(&self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
+        let origin = ui.min_rect().min;
+        render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,5 +616,42 @@ mod tests {
         t.resize(6, 2);
         assert_eq!(t.grid.row_text(0), "hi");
         assert_eq!((t.grid.cols, t.grid.rows), (6, 2));
+    }
+
+    #[test]
+    fn ansi_colors_are_distinct_and_red_is_reddish() {
+        let red = ansi_color(1);
+        assert!(red.r() > red.g() && red.r() > red.b());
+        assert_ne!(ansi_color(2), ansi_color(4)); // green vs blue differ
+        assert_ne!(ansi_color(1), ansi_color(9)); // normal vs bright red differ
+    }
+
+    #[test]
+    fn resolve_colors_handles_default_and_inverse() {
+        let colors = uikit_egui::PaletteColors::from_palette(snapclone_theme_palette());
+        let plain = Style::default();
+        let (fg, bg) = resolve_colors(plain, &colors);
+        assert_eq!(fg, colors.text);
+        assert_eq!(bg, colors.bg_base);
+        // inverse swaps them
+        let inv = Style { inverse: true, ..Style::default() };
+        let (ifg, ibg) = resolve_colors(inv, &colors);
+        assert_eq!(ifg, bg);
+        assert_eq!(ibg, fg);
+    }
+
+    #[test]
+    fn app_applies_text_scale_to_cell() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(20, 5);
+        let base = app.font_size;
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.touch.text_scale = 2.0;
+        app.apply_settings(&ctx, &prefs);
+        assert!(app.font_size > base, "text scale grows the monospace cell");
+    }
+
+    fn snapclone_theme_palette() -> &'static snapclone_theme::Palette {
+        snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0])
     }
 }
