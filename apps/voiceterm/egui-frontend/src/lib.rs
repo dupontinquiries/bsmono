@@ -12,6 +12,8 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod web;
+
 // ── colours + style ──────────────────────────────────────────────────────────
 
 /// A terminal colour: the theme default, or an ANSI palette index (0–7 normal, 8–15 bright).
