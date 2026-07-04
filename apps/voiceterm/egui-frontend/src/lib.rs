@@ -491,11 +491,21 @@ pub struct App {
     pub prefs: settings_kit::Prefs,
     pub cell: (f32, f32),
     pub font_size: f32,
+    /// Multitouch input (pinch-to-zoom the terminal, swipe, fling) via the shared kit bridge.
+    pub touch: uikit_egui::touch::TouchSource,
+    pub recognizer: uikit_egui::touch::GestureRecognizer,
 }
 
 impl App {
     pub fn new(cols: usize, rows: usize) -> App {
-        App { terminal: Terminal::new(cols, rows), prefs: settings_kit::Prefs::default(), cell: (8.5, 17.0), font_size: 13.0 }
+        App {
+            terminal: Terminal::new(cols, rows),
+            prefs: settings_kit::Prefs::default(),
+            cell: (8.5, 17.0),
+            font_size: 13.0,
+            touch: uikit_egui::touch::TouchSource::new(),
+            recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
+        }
     }
 
     /// Adopt cross-app settings (theme/text/button + gesture feel handled by the kit).
@@ -505,6 +515,26 @@ impl App {
         // scale the monospace cell to the text-size preference
         self.font_size = 13.0 * prefs.touch.text_scale.max(0.5);
         self.cell = (self.font_size * 0.62, self.font_size * 1.3);
+    }
+
+    /// Apply a pinch scale factor to the terminal font (pure; clamped to a readable range).
+    pub fn apply_pinch(&mut self, rel: f32) {
+        let f = (self.font_size * rel).clamp(7.0, 48.0);
+        self.font_size = f;
+        self.cell = (f * 0.62, f * 1.3);
+    }
+
+    /// Poll multitouch for this frame and apply it: pinch zooms the terminal font. Returns whether
+    /// fling momentum is still gliding, so the caller can `ctx.request_repaint()`. Graceful — no
+    /// touch input means no gestures and a no-op.
+    pub fn handle_gestures(&mut self, ctx: &egui::Context) -> bool {
+        let (gestures, gliding) = self.touch.poll(ctx, &mut self.recognizer);
+        for g in gestures {
+            if let uikit_egui::touch::Gesture::Pinch { rel, .. } = g {
+                self.apply_pinch(rel);
+            }
+        }
+        gliding
     }
 
     /// Draw the terminal into the current UI region.
@@ -517,6 +547,24 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinch_zooms_font_within_bounds() {
+        let mut app = App::new(80, 24);
+        let base = app.font_size;
+        app.apply_pinch(1.5);
+        assert!(app.font_size > base, "pinch out grows the font");
+        assert!((app.cell.0 - app.font_size * 0.62).abs() < 1e-3, "cell tracks font");
+        // clamps: repeated zoom-in saturates at 48, zoom-out at 7
+        for _ in 0..20 {
+            app.apply_pinch(2.0);
+        }
+        assert!(app.font_size <= 48.0);
+        for _ in 0..20 {
+            app.apply_pinch(0.1);
+        }
+        assert!(app.font_size >= 7.0);
+    }
 
     fn term() -> Terminal {
         Terminal::new(20, 5)
