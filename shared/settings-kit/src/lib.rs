@@ -26,11 +26,13 @@ pub struct GesturePrefs {
     pub commit_fraction: f64,
     /// Min flick velocity (px/ms) to page on release.
     pub flick_velocity: f64,
+    /// Detent/transition animation feel.
+    pub animation: AnimationStyle,
 }
 
 impl Default for GesturePrefs {
     fn default() -> Self {
-        GesturePrefs { sensitivity: 1.0, commit_fraction: 0.35, flick_velocity: 0.9 }
+        GesturePrefs { sensitivity: 1.0, commit_fraction: 0.35, flick_velocity: 0.9, animation: AnimationStyle::Smooth }
     }
 }
 
@@ -41,12 +43,126 @@ pub struct TouchPrefs {
     pub min_target: f32,
     /// Extra UI scale multiplier (1.0 = adaptive default).
     pub scale: f32,
+    /// Text size multiplier across apps (1.0 = default).
+    pub text_scale: f32,
+    /// Button/control size multiplier across apps (1.0 = default).
+    pub button_scale: f32,
 }
 
 impl Default for TouchPrefs {
     fn default() -> Self {
-        TouchPrefs { min_target: 0.0, scale: 1.0 }
+        TouchPrefs { min_target: 0.0, scale: 1.0, text_scale: 1.0, button_scale: 1.0 }
     }
+}
+
+/// Detent/transition animation feel — the "snappy vs smooth vs heavy" choice. Maps onto the
+/// gesture engine's timing so every app animates the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnimationStyle {
+    /// Fast, minimal settle — immediate response.
+    Snappy,
+    /// Balanced, framerate-friendly (default).
+    Smooth,
+    /// Weighty, more inertia and settle.
+    Heavy,
+    /// Minimal motion (reduce-motion accessibility) — near-instant detents.
+    Reduced,
+}
+
+impl AnimationStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnimationStyle::Snappy => "snappy",
+            AnimationStyle::Smooth => "smooth",
+            AnimationStyle::Heavy => "heavy",
+            AnimationStyle::Reduced => "reduced",
+        }
+    }
+    pub fn parse(s: &str) -> AnimationStyle {
+        match s {
+            "snappy" => AnimationStyle::Snappy,
+            "heavy" => AnimationStyle::Heavy,
+            "reduced" => AnimationStyle::Reduced,
+            _ => AnimationStyle::Smooth,
+        }
+    }
+    pub fn all() -> [AnimationStyle; 4] {
+        [AnimationStyle::Snappy, AnimationStyle::Smooth, AnimationStyle::Heavy, AnimationStyle::Reduced]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            AnimationStyle::Snappy => "Snappy",
+            AnimationStyle::Smooth => "Smooth (fps)",
+            AnimationStyle::Heavy => "Heavy",
+            AnimationStyle::Reduced => "Reduced motion",
+        }
+    }
+    /// Apply the animation timing to a `GestureConfig` (arm window, rate, takeover lock).
+    pub fn apply_to_gesture(self, cfg: &mut GestureConfig) {
+        let (arm, rate, lock) = match self {
+            AnimationStyle::Snappy => (180.0, 2.5, 60.0),
+            AnimationStyle::Smooth => (280.0, 1.5, 120.0),
+            AnimationStyle::Heavy => (420.0, 1.0, 220.0),
+            AnimationStyle::Reduced => (120.0, 4.0, 0.0),
+        };
+        cfg.detent_arm_window_ms = arm;
+        cfg.detent_rate_per_ms = rate;
+        cfg.takeover_lock_ms = lock;
+    }
+}
+
+/// Which hand the UI favours — controls/handles sit on the dominant side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handedness {
+    Right,
+    Left,
+}
+
+impl Handedness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Handedness::Right => "right",
+            Handedness::Left => "left",
+        }
+    }
+    pub fn parse(s: &str) -> Handedness {
+        if s == "left" { Handedness::Left } else { Handedness::Right }
+    }
+    pub fn all() -> [Handedness; 2] {
+        [Handedness::Right, Handedness::Left]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Handedness::Right => "Right-handed",
+            Handedness::Left => "Left-handed",
+        }
+    }
+    pub fn flipped(self) -> Handedness {
+        match self {
+            Handedness::Right => Handedness::Left,
+            Handedness::Left => Handedness::Right,
+        }
+    }
+}
+
+/// Input/handedness prefs, incl. the toggleable double-tilt gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputPrefs {
+    pub handedness: Handedness,
+    /// Whether a double physical tilt of the device flips handedness (on-device gesture).
+    pub double_tilt: bool,
+}
+
+impl Default for InputPrefs {
+    fn default() -> Self {
+        InputPrefs { handedness: Handedness::Right, double_tilt: false }
+    }
+}
+
+/// The action a double-tilt performs when enabled: flip handedness. Pure so the on-device
+/// accelerometer handler (which detects the tilt) can call it and publish the new value.
+pub fn double_tilt_action(prefs: &InputPrefs) -> Option<Handedness> {
+    if prefs.double_tilt { Some(prefs.handedness.flipped()) } else { None }
 }
 
 /// Accessibility toggles (see uikit-egui::a11y).
@@ -187,6 +303,7 @@ pub struct Prefs {
     pub touch: TouchPrefs,
     pub a11y: A11yPrefs,
     pub display: DisplayPrefs,
+    pub input: InputPrefs,
     /// snapclone-theme palette id (e.g. "Dark").
     pub palette: String,
 }
@@ -198,6 +315,7 @@ impl Default for Prefs {
             touch: TouchPrefs::default(),
             a11y: A11yPrefs::default(),
             display: DisplayPrefs::default(),
+            input: InputPrefs::default(),
             palette: "Dark".to_string(),
         }
     }
@@ -210,12 +328,17 @@ impl Prefs {
             ("gesture.sensitivity".into(), self.gesture.sensitivity.to_string()),
             ("gesture.commit_fraction".into(), self.gesture.commit_fraction.to_string()),
             ("gesture.flick_velocity".into(), self.gesture.flick_velocity.to_string()),
+            ("gesture.animation".into(), self.gesture.animation.as_str().to_string()),
             ("touch.min_target".into(), self.touch.min_target.to_string()),
             ("touch.scale".into(), self.touch.scale.to_string()),
+            ("touch.text_scale".into(), self.touch.text_scale.to_string()),
+            ("touch.button_scale".into(), self.touch.button_scale.to_string()),
             ("a11y.voice".into(), self.a11y.voice.to_string()),
             ("a11y.tts".into(), self.a11y.tts.to_string()),
             ("display.white_point".into(), self.display.white_point.to_string()),
             ("display.color_filter".into(), self.display.color_filter.as_str().to_string()),
+            ("input.handedness".into(), self.input.handedness.as_str().to_string()),
+            ("input.double_tilt".into(), self.input.double_tilt.to_string()),
             ("theme.palette".into(), self.palette.clone()),
         ]
     }
@@ -235,12 +358,17 @@ impl Prefs {
                 "gesture.sensitivity" => if let Ok(x) = v.parse() { self.gesture.sensitivity = x },
                 "gesture.commit_fraction" => if let Ok(x) = v.parse() { self.gesture.commit_fraction = x },
                 "gesture.flick_velocity" => if let Ok(x) = v.parse() { self.gesture.flick_velocity = x },
+                "gesture.animation" => self.gesture.animation = AnimationStyle::parse(v),
                 "touch.min_target" => if let Ok(x) = v.parse() { self.touch.min_target = x },
                 "touch.scale" => if let Ok(x) = v.parse() { self.touch.scale = x },
+                "touch.text_scale" => if let Ok(x) = v.parse() { self.touch.text_scale = x },
+                "touch.button_scale" => if let Ok(x) = v.parse() { self.touch.button_scale = x },
                 "a11y.voice" => if let Ok(x) = v.parse() { self.a11y.voice = x },
                 "a11y.tts" => if let Ok(x) = v.parse() { self.a11y.tts = x },
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
+                "input.handedness" => self.input.handedness = Handedness::parse(v),
+                "input.double_tilt" => if let Ok(x) = v.parse() { self.input.double_tilt = x },
                 "theme.palette" => self.palette = v.clone(),
                 _ => {}
             }
@@ -254,6 +382,7 @@ impl Prefs {
         cfg.commit_fraction = self.gesture.commit_fraction;
         cfg.flick_velocity_px_ms = self.gesture.flick_velocity;
         cfg.detent_threshold = BASE_DETENT_PX / self.gesture.sensitivity.max(0.1);
+        self.gesture.animation.apply_to_gesture(cfg);
     }
 
     /// A `GestureConfig` for `page_size` with these prefs applied — the one-call path apps use.
@@ -333,6 +462,45 @@ mod tests {
         let back = Prefs::from_kv(&p.to_kv());
         assert_eq!(back.display.white_point, 0.6);
         assert_eq!(back.display.color_filter, ColorFilter::Deuteranopia);
+    }
+
+    #[test]
+    fn swipe_and_interaction_prefs_roundtrip() {
+        let mut p = Prefs::default();
+        p.gesture.animation = AnimationStyle::Heavy;
+        p.touch.text_scale = 1.3;
+        p.touch.button_scale = 1.5;
+        p.input.handedness = Handedness::Left;
+        p.input.double_tilt = true;
+        let back = Prefs::from_kv(&p.to_kv());
+        assert_eq!(back.gesture.animation, AnimationStyle::Heavy);
+        assert_eq!(back.touch.text_scale, 1.3);
+        assert_eq!(back.touch.button_scale, 1.5);
+        assert_eq!(back.input.handedness, Handedness::Left);
+        assert!(back.input.double_tilt);
+    }
+
+    #[test]
+    fn animation_styles_change_gesture_timing() {
+        let mut sp = Prefs::default();
+        sp.gesture.animation = AnimationStyle::Snappy;
+        let snappy = sp.gesture_config(320.0);
+        let mut hp = Prefs::default();
+        hp.gesture.animation = AnimationStyle::Heavy;
+        let heavy = hp.gesture_config(320.0);
+        assert!(heavy.takeover_lock_ms > snappy.takeover_lock_ms);
+        assert!(heavy.detent_rate_per_ms < snappy.detent_rate_per_ms);
+        let mut rp = Prefs::default();
+        rp.gesture.animation = AnimationStyle::Reduced;
+        assert_eq!(rp.gesture_config(320.0).takeover_lock_ms, 0.0);
+    }
+
+    #[test]
+    fn double_tilt_flips_handedness_only_when_enabled() {
+        let mut input = InputPrefs { handedness: Handedness::Right, double_tilt: false };
+        assert_eq!(double_tilt_action(&input), None, "disabled → no effect");
+        input.double_tilt = true;
+        assert_eq!(double_tilt_action(&input), Some(Handedness::Left), "flips when enabled");
     }
 
     #[test]
