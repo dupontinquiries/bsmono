@@ -79,6 +79,19 @@ impl SettingsEditor {
         // semantic toggles → this settings app is itself a11y-navigable
         semantic_toggle(ui, &mut self.a11y, 1, "voice control", &mut self.prefs.a11y.voice);
         semantic_toggle(ui, &mut self.a11y, 2, "spoken feedback (TTS)", &mut self.prefs.a11y.tts);
+        ui.add_space(6.0);
+
+        ui.label("Display");
+        ui.add(Slider::new(&mut self.prefs.display.white_point, 0.4..=1.0).text("white point (lower dims bright whites)"));
+        ui.horizontal_wrapped(|ui| {
+            ui.label("color filter:");
+            for f in settings_kit::ColorFilter::all() {
+                let selected = self.prefs.display.color_filter == f;
+                if ui.selectable_label(selected, f.label()).clicked() {
+                    self.prefs.display.color_filter = f;
+                }
+            }
+        });
         ui.add_space(8.0);
 
         if ui.button("reset to defaults").clicked() {
@@ -115,6 +128,17 @@ mod tests {
         assert!(d.contains(&("gesture.sensitivity".to_string(), "2".to_string())));
         assert!(d.contains(&("theme.palette".to_string(), "Nord".to_string())));
         assert_eq!(d.len(), 2);
+    }
+
+    #[test]
+    fn diff_reports_display_changes() {
+        let old = Prefs::default();
+        let mut new = old.clone();
+        new.display.white_point = 0.6;
+        new.display.color_filter = settings_kit::ColorFilter::Tritanopia;
+        let d = diff(&old, &new);
+        assert!(d.iter().any(|(k, v)| k == "display.white_point" && v == "0.6"));
+        assert!(d.iter().any(|(k, v)| k == "display.color_filter" && v == "tritanopia"));
     }
 
     #[test]
