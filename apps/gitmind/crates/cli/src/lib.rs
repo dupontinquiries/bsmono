@@ -1852,6 +1852,26 @@ fn cmd_fleet(rest: &[String]) -> i32 {
                 None => err("could not resolve a reachable endpoint for that account"),
             }
         }
+        "deps" => {
+            let pe = cockpit::ops::tool_path_env();
+            // ensure a cross target if asked
+            if let Some(t) = opt(rest, "--target") {
+                match cockpit::sysdeps::ensure_rust_target(t, &pe) {
+                    Ok(true) => println!("✓ installed rust target {t}"),
+                    Ok(false) => println!("✓ rust target {t} already present"),
+                    Err(e) => return err(&e),
+                }
+            }
+            if flag(rest, "--build-essentials") || pos.is_empty() && opt(rest, "--target").is_none() {
+                let extra: Vec<String> = pos.iter().map(|s| s.to_string()).collect();
+                match cockpit::sysdeps::ensure_build_essentials(&extra) {
+                    Ok(msg) => { println!("✓ {msg}"); 0 }
+                    Err(e) => err(&e),
+                }
+            } else {
+                0
+            }
+        }
         "build-dir" => {
             if let Some(p) = pos.first() {
                 match cockpit::set_build_base(p) {

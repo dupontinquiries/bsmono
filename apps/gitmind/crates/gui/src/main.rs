@@ -175,6 +175,7 @@ struct Backend {
     store_groups: qt_method!(fn(&self) -> QString),
     build_group: qt_method!(fn(&self, name: QString) -> QString),
     build_group_remote: qt_method!(fn(&self, name: QString, user: QString, host: QString, target: QString) -> QString),
+    show_in_folder: qt_method!(fn(&self, path: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1660,6 +1661,21 @@ impl Backend {
             job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "results": items}).to_string());
         });
         QString::from(json!({"ok": true, "started": "buildgroup"}).to_string())
+    }
+
+    /// Open a path in the native file manager via xdg-open (the containing directory if it's
+    /// a file). Lets "show in folder" work across GNOME/KDE/etc.
+    fn show_in_folder(&self, path: QString) -> QString {
+        let p = path.to_string();
+        if p.trim().is_empty() {
+            return err_json("no path to open");
+        }
+        let pb = std::path::PathBuf::from(&p);
+        let dir = if pb.is_dir() { pb.clone() } else { pb.parent().map(|x| x.to_path_buf()).unwrap_or(pb) };
+        match std::process::Command::new("xdg-open").arg(&dir).spawn() {
+            Ok(_) => QString::from(json!({"ok": true, "opened": dir.display().to_string()}).to_string()),
+            Err(e) => err_json(&format!("couldn't open the file manager (xdg-open): {e}")),
+        }
     }
 
     /// Build every app in a group here (for the device's target) and install them on a

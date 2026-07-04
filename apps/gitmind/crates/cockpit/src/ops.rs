@@ -144,6 +144,12 @@ pub fn build_locally(app: &str, app_dir: &Path, target: &str, feats: &[String], 
     let native = native_triple_local();
     let path_env = tool_path_env();
     let cargo_target = if crate::buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
+    // Cross-build? Make sure the target's std is installed first, so we don't fail with
+    // "can't find crate for std" — gitmind runs `rustup target add <triple>` for you.
+    if !cargo_target.is_empty() {
+        crate::sysdeps::ensure_rust_target(&cargo_target, &path_env)
+            .map_err(|e| format!("cross-build setup: {e}"))?;
+    }
     // one canonical build dir per project identity — no target/ spilled into the repo, and
     // every copy of the project shares it. Fall back to /tmp if ~/.var isn't writable.
     let want = build_dir_for(app_dir, &path_env);

@@ -25,5 +25,6 @@ pub mod rendezvous;
 pub mod pydeps;
 pub mod artifacts;
 pub mod suite;
+pub mod sysdeps;
 
 pub use ops::*;
