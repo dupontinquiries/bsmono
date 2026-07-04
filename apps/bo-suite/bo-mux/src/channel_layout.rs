@@ -484,3 +484,80 @@ mod tests {
         assert!((p - 0.5).abs() < 1e-6, "power should be 0.5, got {}", p);
     }
 }
+
+// ── audiomix-kit bridge: delegate channel semantics + spatial panning ────────
+// bo-suite's routing was the origin of audiomix-kit; now it delegates to the shared kit so the
+// same panning drives voiceterm/snapclone/ambient-learner — and so a logscope "mind palace"
+// (spatial item positions) can place sources in a soundscape via audiomix_kit::soundscape.
+
+impl Channel {
+    /// Map to the shared-kit channel.
+    pub fn to_mix(self) -> audiomix_kit::Channel {
+        use audiomix_kit::Channel as M;
+        match self {
+            Channel::FL => M::FL,
+            Channel::FR => M::FR,
+            Channel::C => M::C,
+            Channel::LFE => M::LFE,
+            Channel::RL => M::RL,
+            Channel::RR => M::RR,
+            Channel::SL => M::SL,
+            Channel::SR => M::SR,
+        }
+    }
+    /// Map from the shared-kit channel.
+    pub fn from_mix(c: audiomix_kit::Channel) -> Channel {
+        use audiomix_kit::Channel as M;
+        match c {
+            M::FL => Channel::FL,
+            M::FR => Channel::FR,
+            M::C => Channel::C,
+            M::LFE => Channel::LFE,
+            M::RL => Channel::RL,
+            M::RR => Channel::RR,
+            M::SL => Channel::SL,
+            M::SR => Channel::SR,
+        }
+    }
+}
+
+impl Layout {
+    /// Map to the shared-kit layout.
+    pub fn to_mix(self) -> audiomix_kit::Layout {
+        match self {
+            Layout::Stereo => audiomix_kit::Layout::Stereo,
+            Layout::Quad => audiomix_kit::Layout::Quad,
+            Layout::FivePointOne => audiomix_kit::Layout::FivePointOne,
+            Layout::SevenPointOne => audiomix_kit::Layout::SevenPointOne,
+        }
+    }
+}
+
+impl ResolvedRouting {
+    /// Spatialize a mono source at `(x, y)` (x: 0=left…1=right, y: 0=front…1=rear) into
+    /// `layout`, delegating the equal-power pan to audiomix-kit. This is how a spatial layout in
+    /// another app (e.g. a logscope mind-palace item's position) becomes a positioned source in
+    /// the soundscape.
+    pub fn from_pan(x: f32, y: f32, layout: Layout) -> ResolvedRouting {
+        let channel_gains = audiomix_kit::pan_gains(x, y, layout.to_mix())
+            .into_iter()
+            .map(|(c, g)| (Channel::from_mix(c), g))
+            .collect();
+        ResolvedRouting { channel_gains }
+    }
+}
+
+#[cfg(test)]
+mod audiomix_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn from_pan_delegates_to_audiomix() {
+        // hard-left/front source → FL dominant, FR silent
+        let r = ResolvedRouting::from_pan(0.0, 0.0, Layout::Quad);
+        assert!(r.gain(Channel::FL) > 0.9);
+        assert!(r.gain(Channel::FR) < 1e-3);
+        // channel conversion round-trips
+        assert_eq!(Channel::from_mix(Channel::RR.to_mix()), Channel::RR);
+    }
+}
