@@ -300,11 +300,14 @@ pub struct DisplayPrefs {
     /// 0.4 (strongly dimmed whites) … 1.0 (normal). Scales luminance so white → grey.
     pub white_point: f32,
     pub color_filter: ColorFilter,
+    /// Surface opacity: 1.0 = opaque, down to ~0.6 = translucent panels/cards (lets a live
+    /// background or the desktop show through). Applied by uikit-egui to panel/window fills.
+    pub opacity: f32,
 }
 
 impl Default for DisplayPrefs {
     fn default() -> Self {
-        DisplayPrefs { white_point: 1.0, color_filter: ColorFilter::None }
+        DisplayPrefs { white_point: 1.0, color_filter: ColorFilter::None, opacity: 1.0 }
     }
 }
 
@@ -350,7 +353,7 @@ impl DisplayPrefs {
     }
     /// Is any display adjustment active (worth doing the per-colour work)?
     pub fn is_active(&self) -> bool {
-        self.white_point < 0.999 || self.color_filter != ColorFilter::None
+        self.white_point < 0.999 || self.color_filter != ColorFilter::None || self.opacity < 0.999
     }
 }
 
@@ -396,6 +399,7 @@ impl Prefs {
             ("a11y.voice_filter".into(), self.a11y.voice_filter.as_str().to_string()),
             ("display.white_point".into(), self.display.white_point.to_string()),
             ("display.color_filter".into(), self.display.color_filter.as_str().to_string()),
+            ("display.opacity".into(), self.display.opacity.to_string()),
             ("input.handedness".into(), self.input.handedness.as_str().to_string()),
             ("input.double_tilt".into(), self.input.double_tilt.to_string()),
             ("theme.palette".into(), self.palette.clone()),
@@ -427,6 +431,7 @@ impl Prefs {
                 "a11y.voice_filter" => self.a11y.voice_filter = VoiceFilter::parse(v),
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
+                "display.opacity" => if let Ok(x) = v.parse::<f32>() { self.display.opacity = x.clamp(0.3, 1.0) },
                 "input.handedness" => self.input.handedness = Handedness::parse(v),
                 "input.double_tilt" => if let Ok(x) = v.parse() { self.input.double_tilt = x },
                 "theme.palette" => self.palette = v.clone(),
@@ -599,7 +604,7 @@ mod tests {
 
     #[test]
     fn display_apply_combines_filter_and_white_point() {
-        let d = DisplayPrefs { white_point: 0.5, color_filter: ColorFilter::Grayscale };
+        let d = DisplayPrefs { white_point: 0.5, color_filter: ColorFilter::Grayscale, opacity: 1.0 };
         assert!(d.is_active());
         let (r, g, b) = d.apply((1.0, 1.0, 1.0));
         // grayscale(white)=white, then wp 0.5 → 0.5 grey

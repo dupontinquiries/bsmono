@@ -145,7 +145,7 @@ mod prefs_tests {
 
     #[test]
     fn filter_color_grayscale_collapses_channels() {
-        let d = settings_kit::DisplayPrefs { white_point: 1.0, color_filter: settings_kit::ColorFilter::Grayscale };
+        let d = settings_kit::DisplayPrefs { white_point: 1.0, color_filter: settings_kit::ColorFilter::Grayscale, opacity: 1.0 };
         let out = filter_color(Color32::from_rgb(255, 0, 0), &d);
         assert!((out.r() as i32 - out.g() as i32).abs() <= 1 && (out.g() as i32 - out.b() as i32).abs() <= 1);
         // inactive filter is a no-op
