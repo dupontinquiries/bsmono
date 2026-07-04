@@ -561,3 +561,20 @@ images/video is still a compositor/shader concern (per-colour `filter_color` is 
 
 **Ports now:** rusty-board, bot-arena, bo-suite (all full kit citizens: adaptive+a11y+gesture+
 live settings). Remaining: voiceterm, snapclone.
+
+
+## voiceterm port — started (the tall one)
+
+The terminal is the hard port; started with the portable, tested core (no egui/PTY in it):
+- **`apps/voiceterm/egui-frontend`** terminal core (11 tests): `Grid` (fixed grid + cursor +
+  pen style + scrollback; put/wrap/scroll, line_feed/CR/tab/backspace, move_to, erase
+  line/display, resize) and a `Parser` (Ground/Esc/Csi state machine) handling printable UTF-8,
+  the C0 controls, and CSI: cursor moves (A/B/C/D, H/f CUP), erase (J/K), and SGR
+  (colour/bold/inverse + bright). `Terminal { grid, parser, input }` with feed_bytes/feed and
+  `stage(cmd)` — the cross-app `stage_command` lands on the input line without running.
+- **Next:** the egui cell renderer (monospace grid, palette + `filter_color` for colours,
+  apply_settings for feel), PTY process I/O (on-device), the voice pane (voice-kit +
+  voiced/whisper) and mail pane. The emulation heart — the part that's easy to get subtly
+  wrong — is done and covered.
+
+**Ports:** rusty-board, bot-arena, bo-suite (complete); voiceterm (core started); snapclone remaining.
