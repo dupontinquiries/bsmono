@@ -372,3 +372,53 @@ mod tests {
         assert_eq!(snap, vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]);
     }
 }
+
+// ── mic-kit bridge: MicCapture as a fallback-chain AudioInput ─────────────────
+// Wraps the pull-based MicCapture as a mic_kit::AudioInput. Liveness tracks the monotonic
+// samples_written counter: if capture stalls (device unplugged, backend died) the counter
+// stops advancing and this source drops out of the FallbackChain — so bo-suite's audio path
+// degrades to the next mic or silence in realtime, per the step-up rule.
+pub struct MicCaptureInput {
+    cap: MicCapture,
+    last_written: usize,
+    stale: u32,
+    stale_limit: u32,
+}
+
+impl MicCaptureInput {
+    pub fn new(cap: MicCapture) -> Self {
+        MicCaptureInput { cap, last_written: 0, stale: 0, stale_limit: 8 }
+    }
+}
+
+impl mic_kit::AudioInput for MicCaptureInput {
+    fn read(&mut self, out: &mut [f32]) -> mic_kit::InputStatus {
+        let w = self.cap.samples_written();
+        let advanced = w > self.last_written;
+        self.last_written = w;
+        self.stale = if advanced { 0 } else { self.stale.saturating_add(1) };
+        let s = self.cap.latest_samples(out.len());
+        let n = s.len().min(out.len());
+        out[..n].copy_from_slice(&s[..n]);
+        for slot in out.iter_mut().skip(n) {
+            *slot = 0.0;
+        }
+        if advanced && n > 0 {
+            mic_kit::InputStatus::Live
+        } else {
+            mic_kit::InputStatus::Silent
+        }
+    }
+    fn is_live(&self) -> bool {
+        self.stale < self.stale_limit
+    }
+}
+
+/// Build a fallback chain from prioritized live mic captures (preferred first), terminated by
+/// silence. This is how bo-suite shares mics with the rest of the fleet: each app wraps its
+/// grant/capture and hands it in; a dead mic just yields to the next or to silence.
+pub fn input_chain(captures: Vec<MicCapture>) -> mic_kit::FallbackChain {
+    let sources: Vec<Box<dyn mic_kit::AudioInput + Send>> =
+        captures.into_iter().map(|c| Box::new(MicCaptureInput::new(c)) as Box<dyn mic_kit::AudioInput + Send>).collect();
+    mic_kit::mic_chain(sources)
+}
