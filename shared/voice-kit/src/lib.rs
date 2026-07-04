@@ -20,6 +20,7 @@
 
 pub mod hallucination;
 pub mod model;
+pub mod context;
 pub mod pipeline;
 
 pub use hallucination::{
