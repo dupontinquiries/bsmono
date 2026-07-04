@@ -13,7 +13,7 @@ name = "gitmind-gui"
 path = "src/main.rs"
 
 [dependencies]
-bigsilicon-client = { path = "../../../shared/bigsilicon-client" }
+bigsilicon-client = { path = "../../../../shared/bigsilicon-client" }
 qmetaobject = "0.2"
 cstr = "0.2"
 serde_json = "1"
