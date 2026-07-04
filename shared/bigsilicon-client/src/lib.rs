@@ -261,6 +261,86 @@ impl Coord {
     }
 }
 
+// ── cross-app actions: one app asking another to do something ────────────────
+
+/// A small deep-link vocabulary so apps can help the user through each other. An app serves
+/// these on its own ipc-kit socket (named after the app); any other app sends one via
+/// [`send_action`]. This is how gitmind says "oh, you need to run this" and hands the command
+/// straight to the terminal.
+pub mod action {
+    /// Open a fresh tab/view.
+    pub const OPEN_TAB: &str = "open_tab";
+    /// Place a command on the prompt but **do not run it** — the user reviews and presses
+    /// enter. The safe default for "you need to run this".
+    pub const STAGE_COMMAND: &str = "stage_command";
+    /// Place a command and run it (use sparingly; prefer staging for anything mutating).
+    pub const RUN_COMMAND: &str = "run_command";
+    /// Open a document/path.
+    pub const OPEN_DOC: &str = "open_doc";
+    /// Open a URL.
+    pub const OPEN_URL: &str = "open_url";
+}
+
+/// Send a one-shot action to another app's socket. **Socket-first**: returns `false` if the
+/// target app isn't running, so the caller falls back (e.g. gitmind just prints the command).
+/// Fire-and-forget — no reply is awaited.
+pub fn send_action(target_socket: &str, verb: &str, args: &[&str]) -> bool {
+    use std::io::Write;
+    match UnixStream::connect(socket_path(target_socket)) {
+        Ok(mut s) => {
+            let m = Message::new(verb, args.iter().map(|x| x.to_string()).collect());
+            s.write_all(m.encode().as_bytes()).and_then(|_| s.flush()).is_ok()
+        }
+        Err(_) => false,
+    }
+}
+
+/// Client for driving the terminal app (voiceterm) from another app.
+pub struct Terminal;
+
+impl Terminal {
+    /// The socket voiceterm serves its actions on.
+    pub fn socket() -> &'static str {
+        "voiceterm"
+    }
+    /// Open a new terminal tab and place `cmd` on the prompt **without running it** — the
+    /// user reviews and hits enter. Returns `false` if voiceterm isn't running (fall back to
+    /// showing the command). This is the "gitmind → run this for me" hand-off.
+    pub fn stage(cmd: &str) -> bool {
+        send_action(Self::socket(), action::STAGE_COMMAND, &[cmd])
+    }
+    /// Open a new tab and run `cmd` immediately (prefer [`stage`] for anything that changes
+    /// the system).
+    pub fn run(cmd: &str) -> bool {
+        send_action(Self::socket(), action::RUN_COMMAND, &[cmd])
+    }
+    /// Just open a new tab.
+    pub fn open_tab() -> bool {
+        send_action(Self::socket(), action::OPEN_TAB, &[])
+    }
+}
+
+/// Server-side: a decoded terminal action, for the app *receiving* the request (voiceterm).
+/// voiceterm's ipc-kit service calls this on each inbound message and acts on the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalAction {
+    OpenTab,
+    /// Prefill this command (do not run).
+    Stage(String),
+    /// Run this command.
+    Run(String),
+}
+
+/// Decode an inbound action `Message` into a [`TerminalAction`] (or `None` if it isn't one).
+pub fn parse_terminal_action(m: &Message) -> Option<TerminalAction> {
+    match m.verb.as_str() {
+        action::OPEN_TAB => Some(TerminalAction::OpenTab),
+        action::STAGE_COMMAND => m.args.first().map(|c| TerminalAction::Stage(c.clone())),
+        action::RUN_COMMAND => m.args.first().map(|c| TerminalAction::Run(c.clone())),
+        _ => None,
+    }
+}
+
 /// Connect to all three daemons at once; each field is `None` if that daemon is down.
 pub struct BigSilicon {
     pub voice: Option<Voice>,
@@ -361,6 +441,37 @@ mod tests {
         // … the other app picks it up live
         assert!(app.poll());
         assert_eq!(app.prefs().gesture.sensitivity, 2.0, "app updated from the central change");
+    }
+
+    #[test]
+    fn terminal_stage_delivers_and_decodes() {
+        use std::sync::{Arc, Mutex};
+        // stub voiceterm: records the terminal actions it receives
+        #[derive(Clone)]
+        struct TermStub(Arc<Mutex<Vec<TerminalAction>>>);
+        impl Service for TermStub {
+            fn handle(&mut self, _from: ConnId, msg: Message) -> Vec<(ConnId, Message)> {
+                if let Some(a) = parse_terminal_action(&msg) {
+                    self.0.lock().unwrap().push(a);
+                }
+                vec![]
+            }
+        }
+        // socket-first: nothing running → stage returns false (caller falls back)
+        assert!(!Terminal::stage("echo before-server"));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let listener = bind(Terminal::socket()).expect("bind voiceterm");
+        let stub = TermStub(seen.clone());
+        std::thread::spawn(move || serve_hub(listener, stub));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // gitmind hands the install command to the terminal
+        assert!(Terminal::stage("rustup target add aarch64-unknown-linux-musl"));
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got, vec![TerminalAction::Stage("rustup target add aarch64-unknown-linux-musl".to_string())]);
     }
 
     #[test]
