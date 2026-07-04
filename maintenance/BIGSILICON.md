@@ -507,3 +507,21 @@ Cross-app display accessibility, added to the settings system end to end:
   theme). Full-screen coverage of images/video is a shader or compositor pass (Plasma has
   night-colour) — the preference + colour math live here; a uikit-egui
   `apply_display(ctx,&Prefs)` palette pass is the next small step.
+
+## Swipe & Interaction preferences page
+
+Added to the settings system (schema → app UI → live/persisted):
+- **settings-kit** (12 tests): `AnimationStyle` (Snappy/Smooth-fps/Heavy/Reduced) mapping onto
+  the gesture engine's timing (detent_arm_window_ms / detent_rate_per_ms / takeover_lock_ms) —
+  applied by `Prefs::apply_to_gesture`, so "detents snappy vs fps vs heavy" changes every app's
+  feel. `TouchPrefs` gains `text_scale` + `button_scale` (size across apps). New `InputPrefs`
+  { `handedness` (Right/Left), `double_tilt` } + `double_tilt_action` (a pure toggle the
+  on-device accelerometer handler calls to flip handedness). All wired into kv.
+- **settings-app** (6 tests): a **Swipe & interaction** section — detent-animation picker,
+  text-size + button-size sliders, handedness picker, and a "double-tilt to flip handedness"
+  toggle (via semantic_toggle, so it's a11y-navigable). Publishes the keys like any pref →
+  live cross-app, persisted by settingsd.
+- **Apply path:** animation + gesture already apply via `gesture_config`; text/button scale and
+  handedness are read by apps for layout (uikit-egui pass is the next small step). double-tilt
+  detection is on-device (accelerometer) → calls `double_tilt_action` → publishes the new
+  handedness, which fans out to every app.
