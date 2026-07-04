@@ -579,8 +579,17 @@ The terminal is the hard port; started with the portable, tested core (no egui/P
   Tolerant subset — block tags (p/h1–6/li/pre/blockquote/hr), inline (b/strong,i/em,code,a),
   HTML entities, ws-collapse (preserved in pre); unknown tags degrade to their text. This is
   the assumption change the QML→egui move forces, handled at the data-model level.
-- **Next:** the egui cell renderer (monospace grid, palette + `filter_color`, apply_settings),
-  PTY I/O (on-device), voice pane (voice-kit + voiced/whisper), mail pane. The two hard,
-  easy-to-get-wrong parts — VT emulation + web rendering — are done and covered.
+- **viz — diagram/plot render layer** (5 tests): voiceterm's geometry engines (mermaid,
+  layered/graph layout, niftyplot) are already Qt-free — they compute positions; only the
+  drawing was QML. Instead of a renderer per engine, they all target one IR: a `Scene` (flat
+  display list of 2D `Prim`s — Line/Polyline/Rect/Circle/Arrow/Text — in world coords, with
+  palette *roles* resolved at draw time). `render_scene` fits world bounds to the target rect
+  and draws via egui's Painter (cheap per frame; layout cached in the Scene). Adapters built:
+  `graph_scene` (nodes→boxes+labels, edges→arrows) and `plot_scene` (data series→axes+polyline,
+  the niftyplot role, y-flipped). mermaid/sequence follow: their pure layout → `Scene`.
+- **Next:** the egui cell renderer (monospace grid), PTY I/O (on-device), voice pane
+  (voice-kit + voiced/whisper), mail pane; and wiring the real mermaid/graph_layout/niftyplot
+  engine outputs into `graph_scene`/`plot_scene`. The genuinely hard, easy-to-get-wrong parts —
+  VT emulation, web rendering, and the shared diagram/plot render target — are done + covered.
 
 **Ports:** rusty-board, bot-arena, bo-suite (complete); voiceterm (core started); snapclone remaining.
