@@ -795,3 +795,21 @@ Two on-device bugs (builds "too fast, no CPU, no error"):
 - **Still to wire:** the Push page's `start_deploy` uses `deploy::deploy_app` (not the logged
   builder), so its live log is the same one-line change (a `deploy_app` logged variant + Push.qml
   tailing job_log). The path fix already makes the push *build* run + surface errors.
+
+## gitmind GUI audit + Push/group build streaming
+
+Swept the GUI for unfinished sections:
+- **Audit clean:** every `backend.X` call in QML resolves to a declared+implemented qt_method;
+  no undefined `root.X()` functions; no empty onClicked handlers; all pages wired in main.qml
+  (Timeline/Branches/Files/Apps/Fleet/Import/Push/Settings/Network). The "placeholder" hits were
+  all legit `placeholderText` field hints.
+- **Push page fixed (the earlier gap):** `deploy::deploy_app` used `.status()` with inherited
+  stdio — the remote build output went to gitmind's own terminal and errors vanished (why Push
+  "cleared with no error"). New `deploy_app_logged` **captures** it, streams stderr live (drains
+  stdout on a thread to avoid pipe deadlock), and surfaces the real failure text. Push.qml gains
+  the streaming build-log panel + tails `job_log`.
+- **Group build streams too:** `deploy_app_remote_logged` / `install_group_remote_logged` emit
+  per-app `[i/n]` headers + live cargo output; `build_group_remote` wires them, and the Apps
+  log panel already tails every job. 
+- Remaining `.status()` calls are scp/rsync transfers that *do* capture success/failure (only
+  the progress bar goes to the terminal) — not the silent-failure bug.

@@ -814,9 +814,14 @@ impl Backend {
         let job = std::sync::Arc::clone(&self.job);
         let (u, h, d, a) = (user.to_string(), host.to_string(), dir.to_string(), app.to_string());
         std::thread::spawn(move || {
-            let result = match deploy::deploy_app(&u, &h, &d, &a) {
+            let job2 = std::sync::Arc::clone(&job);
+            let mut on = move |l: &str| job2.log_line(l);
+            let result = match deploy::deploy_app_logged(&u, &h, &d, &a, &mut on) {
                 Ok(msg) => json!({"ok": true, "msg": msg}).to_string(),
-                Err(e) => json!({"ok": false, "error": e}).to_string(),
+                Err(e) => {
+                    on(&format!("✗ {e}"));
+                    json!({"ok": false, "error": e}).to_string()
+                }
             };
             job.finish(result);
         });
@@ -1751,7 +1756,11 @@ impl Backend {
                         .unwrap_or_default();
                 }
             }
-            let results = cockpit::flow::install_group_remote(&group, &target, &user, &host);
+            let results = {
+                let job2 = std::sync::Arc::clone(&job);
+                let mut on = move |l: &str| job2.log_line(l);
+                cockpit::flow::install_group_remote_logged(&group, &target, &user, &host, &mut on)
+            };
             let ok = results.iter().filter(|r| r.ok).count();
             let items: Vec<_> = results.iter().map(|r| json!({"name": r.name, "ok": r.ok, "message": r.message})).collect();
             job.finish(json!({"ok": true, "installed": ok, "total": items.len(), "host": host, "results": items}).to_string());
