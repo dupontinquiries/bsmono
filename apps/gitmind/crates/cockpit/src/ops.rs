@@ -139,7 +139,124 @@ pub fn resolve_binary(cargo: &str, app_dir: &Path, cargo_target: &str, app: &str
 /// Build `app` in `app_dir` for `target` and return the binary path + byte size. Native
 /// (no --target) when the libc matches this device; cross otherwise. gitmind repos share
 /// the cargo target cache.
+/// The monorepo root, so repo-relative app paths (`apps/<name>`) resolve no matter what
+/// directory gitmind was launched from. Order: `$GITMIND_ROOT`, then walk up from the current
+/// dir looking for the repo root (a dir with an `apps/` subdir plus a `.git`/`.gitmind` marker),
+/// then fall back to the current dir.
+pub fn repo_root() -> PathBuf {
+    if let Ok(r) = std::env::var("GITMIND_ROOT") {
+        let p = PathBuf::from(r);
+        if p.join("apps").is_dir() {
+            return p;
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: &Path = &cwd;
+        loop {
+            let has_apps = cur.join("apps").is_dir();
+            let marked = cur.join(".git").exists() || cur.join(".gitmind").exists();
+            if has_apps && marked {
+                return cur.to_path_buf();
+            }
+            match cur.parent() {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        return cwd;
+    }
+    PathBuf::from(".")
+}
+
+/// Resolve an app directory that may be repo-relative (`apps/foo`) to an absolute path against
+/// [`repo_root`]. Absolute paths pass through unchanged.
+pub fn resolve_app_dir(path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        repo_root().join(p)
+    }
+}
+
+/// Like [`build_locally`] but streams cargo's output line-by-line to `on_line` as it runs, so a
+/// UI can show a live build log. Returns the built binary path + size on success.
+pub fn build_locally_logged(
+    app: &str,
+    app_dir: &Path,
+    target: &str,
+    feats: &[String],
+    no_default: bool,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(PathBuf, u64), String> {
+    use std::io::{BufRead, BufReader};
+    if !app_dir.join("Cargo.toml").exists() {
+        return Err(format!(
+            "no Cargo.toml at {} — the app path didn't resolve to a crate (launch dir: {}). Set GITMIND_ROOT or run from the repo.",
+            app_dir.display(),
+            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        ));
+    }
+    let cargo = cargo_bin();
+    let native = native_triple_local();
+    let path_env = tool_path_env();
+    let cargo_target = if crate::buildflags::is_native_build(target, &native) { String::new() } else { target.to_string() };
+    if !cargo_target.is_empty() {
+        on_line(&format!("• ensuring rust target {cargo_target}…"));
+        crate::sysdeps::ensure_rust_target(&cargo_target, &path_env).map_err(|e| format!("cross-build setup: {e}"))?;
+    }
+    let want = build_dir_for(app_dir, &path_env);
+    let build_dir = if std::fs::create_dir_all(&want).is_ok() {
+        want
+    } else {
+        let fb = PathBuf::from("/tmp/gitmind/build").join(crate::identity::build_slug(app_dir, &path_env));
+        let _ = std::fs::create_dir_all(&fb);
+        fb
+    };
+    let argv = crate::buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
+    on_line(&format!("$ cargo {}", argv[1..].join(" ")));
+    on_line(&format!("  (in {})", app_dir.display()));
+    let mut child = std::process::Command::new(&cargo)
+        .args(&argv[1..])
+        .current_dir(app_dir)
+        .env("PATH", &path_env)
+        .env("CARGO_TERM_COLOR", "never")
+        .env("CARGO_TARGET_DIR", &build_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "couldn't find cargo. Install Rust, or run from a shell where cargo is on PATH (~/.cargo/bin).".to_string()
+            } else {
+                format!("couldn't run the build: {e}")
+            }
+        })?;
+    // cargo writes progress + errors to stderr; stream it live
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            on_line(&line);
+        }
+    }
+    let status = child.wait().map_err(|e| format!("build wait failed: {e}"))?;
+    if status.success() {
+        let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, Some(&build_dir.display().to_string()));
+        let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
+        on_line(&format!("✓ built {} ({} KB)", app, size / 1024));
+        Ok((bin, size))
+    } else {
+        Err(format!("build failed (exit {})", status.code().unwrap_or(-1)))
+    }
+}
+
 pub fn build_locally(app: &str, app_dir: &Path, target: &str, feats: &[String], no_default: bool) -> Result<(PathBuf, u64), String> {
+    if !app_dir.join("Cargo.toml").exists() {
+        return Err(format!(
+            "no Cargo.toml at {} — the app path didn't resolve to a crate (launch dir: {}). Set GITMIND_ROOT or run from the repo.",
+            app_dir.display(),
+            std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default()
+        ));
+    }
     let cargo = cargo_bin();
     let native = native_triple_local();
     let path_env = tool_path_env();
@@ -232,5 +349,31 @@ pub fn provision_fleet_user(admin: &str, host: &str, password: &str) -> Result<S
         Ok(format!("created fleet user '{user}' on {host} — set the user to '{user}' to connect"))
     } else {
         Err("provisioning didn't confirm — does that account have sudo rights?".into())
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn repo_root_finds_monorepo_and_resolves_app_paths() {
+        // running under cargo, CWD is the crate dir; walking up must find the repo root
+        // (a dir with apps/ + a .git/.gitmind marker).
+        let root = repo_root();
+        assert!(root.join("apps").is_dir(), "repo_root has an apps/ dir: {}", root.display());
+        // a repo-relative app path resolves to an existing crate with a Cargo.toml
+        let gm = resolve_app_dir("apps/gitmind");
+        assert!(gm.is_absolute());
+        assert!(gm.join("Cargo.toml").exists(), "resolved {} should be a crate", gm.display());
+        // absolute paths pass through
+        assert_eq!(resolve_app_dir("/tmp/x"), std::path::PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn build_locally_errors_clearly_on_bad_path() {
+        // a path with no Cargo.toml fails fast with a helpful message, not a silent no-op
+        let err = build_locally("nope", Path::new("/definitely/not/a/crate"), "", &[], false).unwrap_err();
+        assert!(err.contains("no Cargo.toml"), "clear error: {err}");
     }
 }

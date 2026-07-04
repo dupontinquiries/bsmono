@@ -21,6 +21,9 @@ Item {
     property int installOk: 0
     property int installTotal: 0
     property string installingSuite: ""
+    // live build log (streamed from the running job)
+    property string buildLog: ""
+    property int logIdx: 0
 
     // BigSilicon app store groups
     property var groups: []
@@ -83,6 +86,7 @@ Item {
     }
     function installSuite(s) {
         if (root.busy) return
+        root.buildLog = ""; root.logIdx = 0
         root.installQueue = s.apps || []; root.installIdx = 0; root.installOk = 0
         root.installTotal = root.installQueue.length; root.installingSuite = s.name
         root.installNext()
@@ -119,6 +123,12 @@ Item {
     Timer {
         id: suitePoller; interval: 350; repeat: true; running: false
         onTriggered: {
+            // stream the live build log
+            var lg = JSON.parse(backend.job_log(root.logIdx))
+            if (lg.lines && lg.lines.length) {
+                root.logIdx = lg.next
+                for (var i = 0; i < lg.lines.length; i++) root.buildLog += lg.lines[i] + "\n"
+            }
             var j = JSON.parse(backend.poll_job())
             if (!j.done) return
             suitePoller.stop()
@@ -158,6 +168,35 @@ Item {
             Button { text: "⟳"; onClicked: root.reload() }
         }
         Label { text: root.note; color: "#8a93a6"; visible: root.note.length > 0; wrapMode: Text.WrapAnywhere; width: parent.width }
+
+        // ── live build log (streamed from the running job) ──
+        Rectangle {
+            visible: root.buildLog.length > 0
+            width: parent.width; radius: 10; color: "#0d1117"; border.color: "#3a4566"
+            height: 210
+            Column {
+                anchors.fill: parent; anchors.margins: 8; spacing: 4
+                Row {
+                    width: parent.width; spacing: 8
+                    Label { text: root.busy ? "building…" : "build log"; color: "#7aa2f7"; font.bold: true }
+                    Item { width: parent.width - copyBtn.width - clearBtn.width - 120; height: 1 }
+                    Button { id: copyBtn; text: "copy"; onClicked: { logArea.selectAll(); logArea.copy(); logArea.deselect() } }
+                    Button { id: clearBtn; text: "clear"; enabled: !root.busy; onClicked: root.buildLog = "" }
+                }
+                ScrollView {
+                    width: parent.width; height: parent.height - 34; clip: true
+                    TextArea {
+                        id: logArea
+                        readOnly: true; wrapMode: TextArea.NoWrap
+                        text: root.buildLog
+                        color: "#c9d1d9"; font.family: "monospace"; font.pixelSize: 11
+                        selectByMouse: true
+                        background: Rectangle { color: "transparent" }
+                        onTextChanged: cursorPosition = length
+                    }
+                }
+            }
+        }
 
         // ── from Downloads: zips & bundles ready to install/update ──
         Rectangle {

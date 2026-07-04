@@ -1051,6 +1051,8 @@ struct JobInner {
     kind: String,
     done: bool,
     result: String,
+    /// Live log lines (build output etc.), for a streaming view while the job runs.
+    log: Vec<String>,
 }
 
 impl Job {
@@ -1061,8 +1063,27 @@ impl Job {
         if g.running {
             return false;
         }
-        *g = JobInner { running: true, kind: kind.to_string(), done: false, result: String::new() };
+        *g = JobInner { running: true, kind: kind.to_string(), done: false, result: String::new(), log: Vec::new() };
         true
+    }
+
+    /// Worker thread appends a live log line (build output). Cheap; the GUI tails it.
+    pub fn log_line(&self, line: &str) {
+        let mut g = self.inner.lock().unwrap();
+        g.log.push(line.to_string());
+        // cap so a huge build can't grow the buffer without bound
+        let len = g.log.len();
+        if len > 2000 {
+            g.log.drain(0..len - 2000);
+        }
+    }
+
+    /// GUI poll for new log lines since index `from` → (next_index, new_lines). Survives across
+    /// polls (only cleared on the next `start`), so the final output stays visible after `done`.
+    pub fn tail(&self, from: usize) -> (usize, Vec<String>) {
+        let g = self.inner.lock().unwrap();
+        let start = from.min(g.log.len());
+        (g.log.len(), g.log[start..].to_vec())
     }
 
     /// Worker thread reports the finished JSON result.
@@ -1073,13 +1094,17 @@ impl Job {
         g.result = result;
     }
 
-    /// GUI poll → (running, done, kind, result). When `done`, the state is
-    /// consumed (reset to idle) so a result is delivered to the UI exactly once.
+    /// GUI poll → (running, done, kind, result). When `done`, the *status* is consumed (so a
+    /// result is delivered once) but the log is retained until the next `start`.
     pub fn poll(&self) -> (bool, bool, String, String) {
         let mut g = self.inner.lock().unwrap();
         let out = (g.running, g.done, g.kind.clone(), g.result.clone());
         if g.done {
-            *g = JobInner::default();
+            g.running = false;
+            g.done = false;
+            g.kind = String::new();
+            g.result = String::new();
+            // keep g.log so the finished build output stays on screen
         }
         out
     }
