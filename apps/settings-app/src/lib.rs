@@ -103,6 +103,17 @@ impl SettingsEditor {
         // semantic toggles → this settings app is itself a11y-navigable
         semantic_toggle(ui, &mut self.a11y, 1, "voice control", &mut self.prefs.a11y.voice);
         semantic_toggle(ui, &mut self.a11y, 2, "spoken feedback (TTS)", &mut self.prefs.a11y.tts);
+        if self.prefs.a11y.voice {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("voice filtering:");
+                for f in settings_kit::VoiceFilter::all() {
+                    let selected = self.prefs.a11y.voice_filter == f;
+                    if ui.selectable_label(selected, f.label()).clicked() {
+                        self.prefs.a11y.voice_filter = f;
+                    }
+                }
+            });
+        }
         ui.add_space(6.0);
 
         ui.label("Display");

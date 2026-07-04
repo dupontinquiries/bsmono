@@ -165,16 +165,74 @@ pub fn double_tilt_action(prefs: &InputPrefs) -> Option<Handedness> {
     if prefs.double_tilt { Some(prefs.handedness.flipped()) } else { None }
 }
 
+/// How aggressively to filter voice input (noise / whisper hallucinations / non-speech).
+/// The levels map onto voice-kit's filtering, which voiced applies to each transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceFilter {
+    /// Accept transcripts as-is.
+    Off,
+    /// Trim trailing artifacts only.
+    Light,
+    /// Also drop obvious whisper hallucinations (default).
+    Standard,
+    /// Also require the text to look like real speech.
+    Strict,
+}
+
+impl VoiceFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoiceFilter::Off => "off",
+            VoiceFilter::Light => "light",
+            VoiceFilter::Standard => "standard",
+            VoiceFilter::Strict => "strict",
+        }
+    }
+    pub fn parse(s: &str) -> VoiceFilter {
+        match s {
+            "off" => VoiceFilter::Off,
+            "light" => VoiceFilter::Light,
+            "strict" => VoiceFilter::Strict,
+            _ => VoiceFilter::Standard,
+        }
+    }
+    pub fn all() -> [VoiceFilter; 4] {
+        [VoiceFilter::Off, VoiceFilter::Light, VoiceFilter::Standard, VoiceFilter::Strict]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            VoiceFilter::Off => "Off",
+            VoiceFilter::Light => "Light (trim artifacts)",
+            VoiceFilter::Standard => "Standard (drop hallucinations)",
+            VoiceFilter::Strict => "Strict (speech only)",
+        }
+    }
+    /// Should trailing whisper artifacts be stripped?
+    pub fn strips_artifacts(self) -> bool {
+        self != VoiceFilter::Off
+    }
+    /// Should obvious hallucinations be dropped?
+    pub fn filters_hallucinations(self) -> bool {
+        matches!(self, VoiceFilter::Standard | VoiceFilter::Strict)
+    }
+    /// Should the text be required to look like real speech?
+    pub fn requires_speech_like(self) -> bool {
+        self == VoiceFilter::Strict
+    }
+}
+
 /// Accessibility toggles (see uikit-egui::a11y).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct A11yPrefs {
     pub voice: bool,
     pub tts: bool,
+    /// Voice input filtering strength.
+    pub voice_filter: VoiceFilter,
 }
 
 impl Default for A11yPrefs {
     fn default() -> Self {
-        A11yPrefs { voice: true, tts: false }
+        A11yPrefs { voice: true, tts: false, voice_filter: VoiceFilter::Standard }
     }
 }
 
@@ -335,6 +393,7 @@ impl Prefs {
             ("touch.button_scale".into(), self.touch.button_scale.to_string()),
             ("a11y.voice".into(), self.a11y.voice.to_string()),
             ("a11y.tts".into(), self.a11y.tts.to_string()),
+            ("a11y.voice_filter".into(), self.a11y.voice_filter.as_str().to_string()),
             ("display.white_point".into(), self.display.white_point.to_string()),
             ("display.color_filter".into(), self.display.color_filter.as_str().to_string()),
             ("input.handedness".into(), self.input.handedness.as_str().to_string()),
@@ -365,6 +424,7 @@ impl Prefs {
                 "touch.button_scale" => if let Ok(x) = v.parse() { self.touch.button_scale = x },
                 "a11y.voice" => if let Ok(x) = v.parse() { self.a11y.voice = x },
                 "a11y.tts" => if let Ok(x) = v.parse() { self.a11y.tts = x },
+                "a11y.voice_filter" => self.a11y.voice_filter = VoiceFilter::parse(v),
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
                 "input.handedness" => self.input.handedness = Handedness::parse(v),
@@ -501,6 +561,18 @@ mod tests {
         assert_eq!(double_tilt_action(&input), None, "disabled → no effect");
         input.double_tilt = true;
         assert_eq!(double_tilt_action(&input), Some(Handedness::Left), "flips when enabled");
+    }
+
+    #[test]
+    fn voice_filter_roundtrip_and_levels() {
+        let mut p = Prefs::default();
+        p.a11y.voice_filter = VoiceFilter::Strict;
+        assert_eq!(Prefs::from_kv(&p.to_kv()).a11y.voice_filter, VoiceFilter::Strict);
+        // level semantics voiced uses to pick voice-kit filters
+        assert!(!VoiceFilter::Off.strips_artifacts());
+        assert!(VoiceFilter::Light.strips_artifacts() && !VoiceFilter::Light.filters_hallucinations());
+        assert!(VoiceFilter::Standard.filters_hallucinations() && !VoiceFilter::Standard.requires_speech_like());
+        assert!(VoiceFilter::Strict.requires_speech_like());
     }
 
     #[test]

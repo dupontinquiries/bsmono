@@ -259,3 +259,47 @@ mod tests {
         assert!(!looks_like_speech("please subscribe to my channel")); // bad phrase
     }
 }
+
+/// Apply voice input filtering at a chosen strength (the flags come from a settings-kit
+/// `VoiceFilter` level, mapped by voiced so this crate stays UI-agnostic). Returns the
+/// cleaned transcript, or `None` if it was filtered out entirely.
+///
+/// * `strip_artifacts` — trim trailing whisper artifacts + de-loop repeats.
+/// * `drop_hallucinations` — reject transcripts that look like whisper hallucinations.
+/// * `require_speech` — reject transcripts that don't look like real speech.
+pub fn filter_transcript(
+    text: &str,
+    strip_artifacts: bool,
+    drop_hallucinations: bool,
+    require_speech: bool,
+) -> Option<String> {
+    let mut t = text.trim().to_string();
+    if strip_artifacts {
+        t = trim_hallucination_loop(&strip_trailing_artifacts(&t)).trim().to_string();
+    }
+    if t.is_empty() {
+        return None;
+    }
+    if drop_hallucinations && is_hallucination(&t) {
+        return None;
+    }
+    if require_speech && !looks_like_speech(&t) {
+        return None;
+    }
+    Some(t)
+}
+
+#[cfg(test)]
+mod filter_transcript_tests {
+    use super::*;
+
+    #[test]
+    fn levels_filter_progressively() {
+        // a normal phrase always passes
+        assert_eq!(filter_transcript("open the settings", true, true, true).as_deref(), Some("open the settings"));
+        // Off (all false) passes anything non-empty as-is
+        assert_eq!(filter_transcript("  hi  ", false, false, false).as_deref(), Some("hi"));
+        // empty after trimming → None
+        assert!(filter_transcript("   ", true, false, false).is_none());
+    }
+}
