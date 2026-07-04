@@ -307,6 +307,31 @@ pub fn plot_scene(series: &[Series]) -> Scene {
     scene
 }
 
+/// Wire the **real** niftyplot engine end to end: parse a diagram source into a `GraphDoc`,
+/// position it with graph_layout's force-directed layout, and build a [`Scene`]. This is the
+/// full on-device path (parse + layout **once**, render the Scene each frame). mermaid feeds
+/// the same `Scene` after its own parse/layout.
+pub fn nifty_scene(source: &str) -> Scene {
+    use nifty_core::graph_layout::{layout_force_directed, CardPos, LayoutConfig, LayoutEdge};
+    let doc = nifty_core::niftyplot::parse(source);
+    let mut cards: Vec<CardPos> = doc.nodes.iter().map(|n| CardPos::new(n.id.clone())).collect();
+    let ledges: Vec<LayoutEdge> = doc.edges.iter().map(|e| LayoutEdge::new(e.from.clone(), e.to.clone())).collect();
+    layout_force_directed(&mut cards, &ledges, &LayoutConfig::default());
+    let gnodes: Vec<GNode> = doc
+        .nodes
+        .iter()
+        .zip(cards.iter())
+        .map(|(n, c)| GNode {
+            id: n.id.clone(),
+            label: n.label.clone().unwrap_or_else(|| n.id.clone()),
+            pos: (c.x, c.y),
+            size: (64.0, 32.0),
+        })
+        .collect();
+    let gedges: Vec<GEdge> = doc.edges.iter().map(|e| GEdge { from: e.from.clone(), to: e.to.clone() }).collect();
+    graph_scene(&gnodes, &gedges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +391,17 @@ mod tests {
     #[test]
     fn empty_plot_is_empty() {
         assert!(plot_scene(&[]).prims.is_empty());
+    }
+
+    #[test]
+    fn nifty_scene_parses_layouts_and_builds_scene() {
+        // real niftyplot source: A -> B -> C  (3 nodes, 2 edges)
+        let scene = nifty_scene("A -> B\nB -> C\n");
+        let rects = scene.prims.iter().filter(|p| matches!(p, Prim::Rect { .. })).count();
+        let arrows = scene.prims.iter().filter(|p| matches!(p, Prim::Arrow { .. })).count();
+        assert_eq!(rects, 3, "one box per node");
+        assert_eq!(arrows, 2, "one arrow per edge");
+        // layout gave finite, non-degenerate bounds
+        assert!(scene.width().is_finite() && scene.width() > 0.0);
     }
 }

@@ -389,7 +389,7 @@ mod connections;
 // v0.1.317 (Mermaid+/cards arc 2.7.0 foundation): force-directed
 // layout engine for the cards graph view. Parser-agnostic — feeds
 // both the connections graph and the future Mermaid+ renderer.
-mod graph_layout;
+pub use nifty_core::graph_layout;
 // v0.1.324 (Mermaid+/cards arc 2.5.3): user-assigned tags. Sits
 // alongside connections.rs's auto-derived tags; merged at
 // snapshot-build time.
@@ -397,7 +397,7 @@ mod user_tags;
 // v0.1.326 (Mermaid+/cards arc 2.7.0): Mermaid flowchart parser
 // subset. Independent track from the connections canvas; feeds
 // the same graph_layout engine for rendering.
-mod mermaid;
+pub use nifty_core::mermaid;
 mod sequence_diagram;
 // v0.1.343 (niftyplot arc): the next-generation diagram format
 // that replaces Mermaid for web2qml-authored content. Parses
@@ -405,7 +405,7 @@ mod sequence_diagram;
 // docs/niftyplot-spec.md. This ship implements the GRAPH kind
 // + suggestion helper + scope detection; other kinds are
 // stubbed for v0.1.344+.
-mod niftyplot;
+pub use nifty_core::niftyplot;
 // v0.1.341 (sidecar transforms arc): per-source-file persistence
 // of view overrides (pin positions, tilt angle, zoom) for
 // markdown files loaded via [md] routing.
