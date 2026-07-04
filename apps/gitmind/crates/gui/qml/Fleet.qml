@@ -480,6 +480,11 @@ Item {
                                 enabled: !root.busy
                                 onClicked: root.capturePreview()
                             }
+                            Button {
+                                text: "show in folder"
+                                enabled: root.selPath.length > 0
+                                onClicked: { var r = JSON.parse(backend.show_in_folder(root.selPath)); if (!r.ok) root.note = r.error }
+                            }
                         }
                         Label {
                             width: parent.width; visible: !root.selIsCargo
@@ -508,11 +513,34 @@ Item {
                                     text: root.builtBinary; color: "#8a93a6"; font.pixelSize: 11
                                     font.family: "monospace"; wrapMode: Text.WrapAnywhere
                                 }
-                                Label {
+                                // scrollable, selectable, copyable build error — see every line
+                                Rectangle {
                                     width: parent.width; visible: root.buildState === "failed"
-                                    text: root.buildError; color: "#cdd6f4"; font.pixelSize: 11
-                                    font.family: "monospace"; wrapMode: Text.WrapAnywhere
-                                    maximumLineCount: 12; elide: Text.ElideRight
+                                    height: Math.min(errEdit.contentHeight + 8, 260)
+                                    radius: 6; color: "#00000040"; border.color: "#3a4566"; clip: true
+                                    Flickable {
+                                        id: errFlick; anchors.fill: parent; anchors.margins: 4
+                                        contentWidth: width; contentHeight: errEdit.contentHeight; clip: true
+                                        ScrollBar.vertical: ScrollBar { active: true }
+                                        TextEdit {
+                                            id: errEdit
+                                            width: errFlick.width; text: root.buildError
+                                            color: "#cdd6f4"; font.pixelSize: 11; font.family: "monospace"
+                                            wrapMode: TextEdit.WrapAnywhere; readOnly: true; selectByMouse: true
+                                        }
+                                    }
+                                }
+                                Row {
+                                    visible: root.buildState === "failed"; spacing: 8
+                                    Button {
+                                        text: "copy error"
+                                        onClicked: { errEdit.selectAll(); errEdit.copy(); errEdit.deselect(); root.note = "✓ error copied to clipboard" }
+                                    }
+                                    Button {
+                                        text: "show in folder"
+                                        enabled: root.selPath.length > 0
+                                        onClicked: { var r = JSON.parse(backend.show_in_folder(root.selPath)); if (!r.ok) root.note = r.error }
+                                    }
                                 }
                             }
                         }
