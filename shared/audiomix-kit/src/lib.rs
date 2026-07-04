@@ -81,15 +81,16 @@ pub enum Layout {
 }
 
 impl Layout {
-    /// Channels in canonical order (a frame is one sample per channel, this order).
-    pub fn channels(self) -> Vec<Channel> {
+    /// Channels in canonical order (a frame is one sample per channel, this order). Returns a
+    /// `'static` slice — no allocation, so it's cheap to call in per-frame audio paths.
+    pub fn channels(self) -> &'static [Channel] {
         use Channel::*;
         match self {
-            Layout::Mono => vec![C],
-            Layout::Stereo => vec![FL, FR],
-            Layout::Quad => vec![FL, FR, RL, RR],
-            Layout::FivePointOne => vec![FL, FR, C, LFE, RL, RR],
-            Layout::SevenPointOne => vec![FL, FR, C, LFE, RL, RR, SL, SR],
+            Layout::Mono => &[C],
+            Layout::Stereo => &[FL, FR],
+            Layout::Quad => &[FL, FR, RL, RR],
+            Layout::FivePointOne => &[FL, FR, C, LFE, RL, RR],
+            Layout::SevenPointOne => &[FL, FR, C, LFE, RL, RR, SL, SR],
         }
     }
     pub fn count(self) -> usize {
@@ -210,15 +211,25 @@ impl RouteMatrix {
 
     /// Route one frame (`input.count()` samples, in the input layout's channel order) to an
     /// output frame (`output.count()` samples).
-    pub fn apply(&self, frame_in: &[f32]) -> Vec<f32> {
-        let mut out = vec![0.0f32; self.output.count()];
+    /// Route one frame into a caller-provided buffer — **no allocation**, for realtime paths.
+    pub fn apply_into(&self, frame_in: &[f32], out: &mut [f32]) {
         for (o, row) in self.gains.iter().enumerate() {
+            if o >= out.len() {
+                break;
+            }
             let mut acc = 0.0;
             for (i, &g) in row.iter().enumerate() {
                 acc += g * frame_in.get(i).copied().unwrap_or(0.0);
             }
             out[o] = acc;
         }
+    }
+
+    /// Route one frame (`input.count()` samples) to a fresh output frame. Convenience wrapper
+    /// over [`apply_into`](RouteMatrix::apply_into); prefer that in the audio thread.
+    pub fn apply(&self, frame_in: &[f32]) -> Vec<f32> {
+        let mut out = vec![0.0f32; self.output.count()];
+        self.apply_into(frame_in, &mut out);
         out
     }
 
@@ -303,7 +314,7 @@ fn channel_pos(ch: Channel) -> (f32, f32) {
 /// (Σgain² ≈ 1). LFE is non-directional and excluded. Positions clamp to [0,1].
 pub fn pan_gains(x: f32, y: f32, layout: Layout) -> Vec<(Channel, f32)> {
     let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
-    let chs: Vec<Channel> = layout.channels().into_iter().filter(|c| *c != Channel::LFE).collect();
+    let chs: Vec<Channel> = layout.channels().iter().copied().filter(|c| *c != Channel::LFE).collect();
     let raw: Vec<f32> = chs
         .iter()
         .map(|c| {
@@ -401,7 +412,7 @@ mod tests {
     #[test]
     fn layouts_report_channels() {
         assert_eq!(Layout::Stereo.count(), 2);
-        assert_eq!(Layout::Stereo.channels(), vec![Channel::FL, Channel::FR]);
+        assert_eq!(Layout::Stereo.channels(), &[Channel::FL, Channel::FR]);
         assert_eq!(Layout::FivePointOne.count(), 6);
         assert!(Layout::FivePointOne.contains(Channel::LFE));
         assert!(!Layout::Stereo.contains(Channel::C));
