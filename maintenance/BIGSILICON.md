@@ -544,3 +544,20 @@ settings** (palette, text/button size, gesture feel, detent animation). Apps opt
 `Settings::connect()` → each frame `apply_settings(ctx, settings.prefs())`. Remaining ports
 (voiceterm/bo-suite/snapclone) follow the same recipe; full-screen display-filter coverage of
 images/video is still a compositor/shader concern (per-colour `filter_color` is available now).
+
+
+## Voice filtering + bo-suite port
+
+- **Voice filtering (settings):** settings-kit `VoiceFilter` (Off/Light/Standard/Strict) on
+  A11yPrefs with level semantics (strips_artifacts/filters_hallucinations/requires_speech_like);
+  settings-app shows a voice-filtering picker under Accessibility (when voice is on);
+  voice-kit `filter_transcript(text, strip, drop_halluc, require_speech)` composes the
+  hallucination filters by level (voiced maps the setting → these flags). Live cross-app + persisted.
+- **bo-suite → egui (DONE):** `apps/bo-suite/egui-frontend` — the B&O controller ported: per-device
+  volume + playback and scene presets, swipe-paged (Devices/Scenes/Library), adaptive,
+  a11y-navigable, and `apply_settings` so it tracks the fleet feel. 3 tests, egui 0.29.
+  bo-suite's mixer/routing engine is Qt-free → drop-in on-device. Detached as its own workspace
+  (bo-suite is a cargo workspace) via an empty `[workspace]`.
+
+**Ports now:** rusty-board, bot-arena, bo-suite (all full kit citizens: adaptive+a11y+gesture+
+live settings). Remaining: voiceterm, snapclone.

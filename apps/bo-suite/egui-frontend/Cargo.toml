@@ -1,0 +1,18 @@
+[package]
+name = "bo-suite-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "bo-controller's Qt/QML control panel ported to egui on uikit-egui: device volume/playback controls and scene presets, swipe-paged (Devices / Scenes / Library) via the shared gesture layer, adaptive, a11y-navigable, and live cross-app settings. bo-suite's engine (realtime_mixer / channel_routing / bo-mux) is Qt-free, so on-device this front-end drives it directly."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.29"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
+snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../../shared/settings-kit" }
+
+[workspace]
