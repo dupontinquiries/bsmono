@@ -24,6 +24,18 @@ Item {
     property var btDevices: []
     property string btAddr: ""
     property string btName: ""
+    // daemons card
+    property var daemonModel: []
+    property string daemonNote: ""
+    property string dUser: "user"
+    property string dBinDir: "/home/user/.local/bin"
+    property string dHome: "/home/user"
+    Component.onCompleted: {
+        try {
+            var r = JSON.parse(backend.daemons_list())
+            if (r.ok) root.daemonModel = r.daemons
+        } catch (e) {}
+    }
     property string btFile: ""
 
     function loadFingerprint() {
@@ -265,6 +277,46 @@ Item {
                     width: parent.width
                     text: "OBEX push — the device must be paired and accepting files. Needs bluez-tools (bt-obex) or obexftp on this end."
                     color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+            }
+
+            // ── daemons: the fleet's background services ─────────────────
+            Column {
+                width: col.width; spacing: 6
+                Label { text: "daemons"; color: "#7aa2f7"; font.bold: true }
+                Repeater {
+                    model: root.daemonModel
+                    delegate: Row {
+                        width: parent.width; spacing: 8
+                        Label { text: "●"; color: "#8a93a6"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                        Column {
+                            Label { text: modelData.name + "  ·  " + modelData.socket; color: "#e6e6e6"; font.pixelSize: 12 }
+                            Label { text: modelData.description; color: "#8a93a6"; font.pixelSize: 10; width: col.width - 40; wrapMode: Text.WordWrap }
+                        }
+                    }
+                }
+                Row {
+                    width: parent.width; spacing: 8
+                    Button {
+                        text: "install + enable on " + (root.btName.length ? root.btName : "device")
+                        enabled: !root.busy && root.btAddr.length > 0
+                        onClicked: {
+                            var r = JSON.parse(backend.install_daemons(root.dUser, root.btAddr, root.dBinDir, root.dHome))
+                            root.daemonNote = r.ok ? r.output : r.error
+                        }
+                    }
+                    Button {
+                        text: "status"
+                        enabled: !root.busy && root.btAddr.length > 0
+                        onClicked: {
+                            var r = JSON.parse(backend.daemons_status(root.dUser, root.btAddr))
+                            root.daemonNote = r.ok ? r.output : r.error
+                        }
+                    }
+                }
+                Label {
+                    width: parent.width; visible: root.daemonNote.length > 0
+                    text: root.daemonNote; color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
                 }
             }
         }
