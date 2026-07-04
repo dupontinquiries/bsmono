@@ -817,12 +817,26 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     let music = ["beatspace", "krapper", "bo-suite", "fao-codec"];
     let work = ["voiceterm", "ambient-learner", "rusty-board"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
+    // bsettings: crate `bigsilicon-settings` at apps/settings-app, GUI bin needs the `gui` feature.
+    // Its path/features differ from the simple apps/<name> convention, so it's a custom entry.
+    let bsettings = || crate::suite::SuiteApp {
+        name: "bsettings".into(),
+        path: "apps/settings-app".into(),
+        features: vec!["gui".into()],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+    };
+    let mut work_group = group("work", "Productivity, comms & input", &work);
+    work_group.apps.push(bsettings());
+    let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
+    all_group.apps.push(bsettings());
     vec![
         group("coding", "Development & analysis tools", &coding),
         group("media", "Video, camera, imaging & games", &media),
         group("music", "Audio synthesis, codecs & music", &music),
-        group("work", "Productivity, comms & input", &work),
-        group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all),
+        work_group,
+        all_group,
     ]
 }
 
@@ -837,8 +851,9 @@ mod store_group_tests {
     fn bigsilicons_is_the_union_and_paths_are_app_relative() {
         let groups = super::store_groups();
         let all = super::group_by_name("bigsilicons-apps").expect("all group");
-        assert_eq!(all.apps.len(), 16, "every app is in the all group");
+        assert_eq!(all.apps.len(), 17, "every app is in the all group (incl. bsettings)");
         assert!(all.apps.iter().all(|a| a.path.starts_with("apps/")));
+        assert!(all.apps.iter().any(|a| a.name == "bsettings" && a.path == "apps/settings-app" && a.features == vec!["gui".to_string()]), "bsettings registered with its real path + gui feature");
         // the four categories partition into the union
         let cat_total: usize = groups.iter().filter(|g| g.name != "bigsilicons-apps").map(|g| g.apps.len()).sum();
         assert_eq!(cat_total, all.apps.len(), "categories cover exactly the all-group");
