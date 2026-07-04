@@ -683,3 +683,32 @@ Audio playback is reimplemented across bo-suite/snapclone/av1tuner/ambient-learn
   shared primitive lives in audiomix-kit; logscope wires its palace-item positions in, bo-suite
   renders via from_pan. So "walking" the palace pans the soundscape. (logscope-side adapter is
   the thin remaining wiring; the spatialization + bo-suite end are done + tested.)
+
+## mic-kit — shared, secured mic access with graceful realtime fallback
+
+Mics become a shared, gated resource across apps (bo-suite multi-mic, logscope voice commands
+[pending upload], voiceterm), with a hard rule the user set: **audio is a step-up, not a
+guarantee — graceful realtime fallback is required for input AND output.**
+- **mic-kit (NEW, 5 tests, 25th kit):**
+  - *Profile gating:* `MicPolicy` (default-deny; `allow`/`permits`), `MicBroker`
+    (`request` grants only when the profile is permitted AND the mic is present; `set_present`
+    for hotplug; `sharers` tracks multi-app sharing; `release`).
+  - *Encryption:* `MicGrant` seals/opens frames with a key derived (crypto-kit
+    `derive_session_key`) from the profile secret + mic — so a different profile **can't decrypt
+    another's stream** (tested).
+  - *Graceful realtime fallback (the centerpiece):* `AudioInput` trait whose `read` never blocks
+    and **always fills the buffer** (silence at worst). `FallbackChain` tries sources in order —
+    live primary → `Live`, live fallback → `Fallback`, none → `Silent`+zeros. `Silence` is the
+    floor. `AudioOutput`/`OutputFallback`/`NullSink` do the same for playback (drop, don't stall).
+- **Adoption:** bo-suite `MicCapture` → wrap as an `AudioInput` behind a `FallbackChain`;
+  logscope voice + voiceterm request via the broker with their profile; a busy/absent mic just
+  degrades to the next source or silence.
+
+## unendlich soundscape step-up (documented)
+
+unendlich (sim engine, heavy: build.rs + linkme + feature-gated rodio/opus audio) is another
+spatial-audio consumer: sim entities have world positions, so normalize each to (x,y)∈[0,1] →
+`audiomix_kit::soundscape(placements, layout)` → entities sound where they are in the sim. Same
+primitive as the logscope mind-palace path; the thin adapter (entity → `Placement`) lands
+on-device where unendlich's `audio` feature builds. Per the fallback rule, the soundscape is a
+step-up: if the audio device/feature is absent it simply isn't rendered — the sim is unaffected.
