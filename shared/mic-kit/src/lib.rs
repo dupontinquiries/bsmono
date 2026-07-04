@@ -244,6 +244,88 @@ impl AudioOutput for OutputFallback {
     }
 }
 
+// ── capture bridge: hardware → AudioInput ────────────────────────────────────
+
+/// A realtime capture bridge: a fixed ring buffer an OS capture callback `feed`s, drained by
+/// `read`. Liveness tracks feed recency — if the callback stops delivering (device unplugged,
+/// stream died), `is_live` flips false after `stale_limit` reads and the [`FallbackChain`]
+/// moves on automatically. Fixed capacity → no allocation in the audio path; overflow drops the
+/// oldest samples (favour fresh audio).
+pub struct BufferedInput {
+    ring: Vec<f32>,
+    cap: usize,
+    head: usize,
+    len: usize,
+    stale: u32,
+    stale_limit: u32,
+}
+
+impl BufferedInput {
+    /// `capacity` samples of buffer; `stale_limit` reads-without-a-feed before it's "not live".
+    pub fn new(capacity: usize, stale_limit: u32) -> BufferedInput {
+        let cap = capacity.max(1);
+        BufferedInput { ring: vec![0.0; cap], cap, head: 0, len: 0, stale: stale_limit, stale_limit }
+    }
+
+    /// Push freshly captured samples (called from the capture callback). Marks the source live.
+    pub fn feed(&mut self, samples: &[f32]) {
+        for &s in samples {
+            let tail = (self.head + self.len) % self.cap;
+            if self.len == self.cap {
+                // full: drop oldest by advancing head
+                self.ring[self.head] = s;
+                self.head = (self.head + 1) % self.cap;
+            } else {
+                self.ring[tail] = s;
+                self.len += 1;
+            }
+        }
+        self.stale = 0;
+    }
+
+    fn pop(&mut self, out: &mut [f32]) -> usize {
+        let n = out.len().min(self.len);
+        for slot in out.iter_mut().take(n) {
+            *slot = self.ring[self.head];
+            self.head = (self.head + 1) % self.cap;
+            self.len -= 1;
+        }
+        for slot in out.iter_mut().skip(n) {
+            *slot = 0.0;
+        }
+        n
+    }
+
+    /// Buffered sample count (for tests/metrics).
+    pub fn buffered(&self) -> usize {
+        self.len
+    }
+}
+
+impl AudioInput for BufferedInput {
+    fn read(&mut self, out: &mut [f32]) -> InputStatus {
+        let n = self.pop(out);
+        self.stale = self.stale.saturating_add(1);
+        if n > 0 {
+            InputStatus::Live
+        } else {
+            InputStatus::Silent
+        }
+    }
+    fn is_live(&self) -> bool {
+        self.stale < self.stale_limit
+    }
+}
+
+/// Build a standard mic fallback chain from prioritized sources, always terminated by
+/// [`Silence`] so `read` can never fail to produce a frame. The first argument is the preferred
+/// mic, then fallbacks in order.
+pub fn mic_chain(sources: Vec<Box<dyn AudioInput + Send>>) -> FallbackChain {
+    let mut all = sources;
+    all.push(Box::new(Silence));
+    FallbackChain::new(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +438,50 @@ mod tests {
         let mut out = OutputFallback::new(vec![Box::new(NullSink), Box::new(NullSink)]);
         assert!(!out.write(&[0.1, 0.2]), "no live sink → frame dropped, not an error");
         assert!(!out.is_live());
+    }
+
+    #[test]
+    fn buffered_input_feeds_reads_and_goes_stale() {
+        let mut b = BufferedInput::new(8, 3);
+        assert!(!b.is_live(), "starts not-live until fed");
+        b.feed(&[1.0, 1.0, 1.0, 1.0]);
+        assert!(b.is_live());
+        let mut out = [0.0f32; 4];
+        assert_eq!(b.read(&mut out), InputStatus::Live);
+        assert_eq!(out, [1.0; 4]);
+        // reading past what's buffered pads with silence
+        let mut out2 = [9.0f32; 4];
+        assert_eq!(b.read(&mut out2), InputStatus::Silent);
+        assert_eq!(out2, [0.0; 4]);
+        // keep reading with no feed → goes stale (not live) so a chain would move on
+        for _ in 0..4 {
+            let _ = b.read(&mut out2);
+        }
+        assert!(!b.is_live());
+    }
+
+    #[test]
+    fn buffered_input_overflow_keeps_newest() {
+        let mut b = BufferedInput::new(4, 3);
+        b.feed(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]); // cap 4 → keeps 3,4,5,6
+        let mut out = [0.0f32; 4];
+        b.read(&mut out);
+        assert_eq!(out, [3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn mic_chain_falls_through_stale_capture_to_silence() {
+        // a fed-once BufferedInput that has since gone stale, then Silence floor
+        let mut primary = BufferedInput::new(4, 1);
+        primary.feed(&[0.5, 0.5]);
+        // drain + go stale
+        let mut scratch = [0.0f32; 2];
+        let _ = primary.read(&mut scratch);
+        let _ = primary.read(&mut scratch);
+        assert!(!primary.is_live());
+        let mut chain = mic_chain(vec![Box::new(primary)]);
+        let mut out = [7.0f32; 2];
+        assert_eq!(chain.read(&mut out), InputStatus::Silent);
+        assert_eq!(out, [0.0; 2]);
     }
 }
