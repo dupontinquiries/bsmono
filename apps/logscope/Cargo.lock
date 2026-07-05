@@ -513,6 +513,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "audiomix-kit"
+version = "0.1.0"
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -796,6 +800,10 @@ dependencies = [
  "libc",
  "libloading",
 ]
+
+[[package]]
+name = "cli-kit"
+version = "0.1.0"
 
 [[package]]
 name = "clipboard-win"
@@ -2577,6 +2585,7 @@ dependencies = [
  "aho-corasick",
  "base64",
  "chrono",
+ "cli-kit",
  "crossbeam-channel",
  "dirs",
  "encoding_rs",
@@ -2612,7 +2621,9 @@ name = "logscope-egui"
 version = "0.1.0"
 dependencies = [
  "async-std",
+ "audiomix-kit",
  "chrono",
+ "cli-kit",
  "cpal",
  "eframe",
  "egui",
@@ -2622,9 +2633,11 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "touchkit",
  "tree-sitter",
  "tree-sitter-rust",
  "twox-hash",
+ "uikit-egui",
  "whisper-rs",
 ]
 
@@ -4017,6 +4030,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "settings-kit"
+version = "0.1.0"
+dependencies = [
+ "uikit-gesture",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4174,6 +4194,13 @@ name = "smol_str"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "snapclone-theme"
+version = "0.1.0"
 dependencies = [
  "serde",
 ]
@@ -4440,6 +4467,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
+name = "touchkit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4580,6 +4614,21 @@ dependencies = [
  "tempfile",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "uikit-egui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "settings-kit",
+ "snapclone-theme",
+ "touchkit",
+ "uikit-gesture",
+]
+
+[[package]]
+name = "uikit-gesture"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"
