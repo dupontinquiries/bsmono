@@ -148,3 +148,20 @@ concrete and mostly *adoption* rather than new code:
   value (→ usage). Added `Cli::positionals_with_values(&[value_opts])` — the caller declares which
   options take values, removing the ambiguity. logscope-cli uses it; `--mock <script>` now runs.
   cli-kit +1 test. Benefits every CLI mixing boolean flags with positionals.
+
+## logscope chat tab — mobile/physical-UI adoption (step 1: layout core, verified)
+The chat tab is a 4592-line egui render module behind the `gui` feature (eframe + rfd), which
+can't build headless — so rather than hand-edit it blind, step 1 is the **adaptive layout
+decision core**, which builds lean and is tested:
+- **chat_layout (NEW, 4 tests, lean-buildable):** `chat_layout(DeviceClass, width, touch) ->
+  ChatLayout { split, scene_as_backdrop, input_docked_bottom, touch_target, transcript_max_width,
+  gutter, controls_overflow }` on uikit-egui's `DeviceClass`. Phone → single column + scene as a
+  translucent backdrop + input docked to thumb reach + controls collapse to overflow + 44pt
+  targets; desktop → scene/transcript split + capped width + inline controls. The physical-UI
+  panel reports compact/touch, so it gets the phone layout for free.
+- **On-device wiring (step 2, where chat.rs compiles):** at the top of the chat tab's `ui()`,
+  compute `let cl = chat_layout_for_width(ui.available_width(), ui.input(|i| i.any_touches()));`
+  then branch the existing layout points on it: line ~1409 (scene-aware columns) → `if cl.split`;
+  the input row → dock bottom + `translucent()` bar when `cl.input_docked_bottom`; the placeholder
+  button cluster → overflow menu when `cl.controls_overflow`, sized to `cl.touch_target`. No new
+  rendering — just reading these flags. Then the same treatment tab-by-tab.
