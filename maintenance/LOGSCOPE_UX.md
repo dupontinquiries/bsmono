@@ -120,27 +120,31 @@ The `workbench` model now encodes this: `Workbench::{Diagnose, Palace, Forge}`, 
 tool's natural flow (Diagnose: load→inspect→rotate→tokens; Forge: view→bloc→modify→check→palette).
 Open: confirm Tokens (placed with Diagnose) and Blocks (placed with Forge) once they're built out.
 
+
 ---
 
-## North star: the desert camper (field-repair tool)
-A framing that unifies the recurring principles: **broken hardware in your hands, little power, no
-cloud, and you need to fix it.** That scenario is the stress test that explains *why* logscope is
-built the way it is — and it turns "graceful degradation" from an audio rule into a whole-app one.
-- **Everything local already.** logscope runs its own LLM stack (llm_backend/moe/rope/kvcache),
-  reads local logs (journald, /var/log), and `model_selector` is memory-pressure aware (reads
-  /proc/meminfo, downshifts the model when free RAM < 20%). No network required.
-- **Frugal by design.** The learned fastpath beats cold whisper (less compute), the no-alloc audio
-  work, mock backends — all of it matters more when power is scarce than when it isn't.
-- **Built: `field_tier`** (4 tests) — the degradation ladder for the *whole* tool, keyed on RAM +
-  battery, extending model_selector from just-the-model to every heavy feature:
-  - **Full** (plugged / ample): Large model, mind-palace scene, whisper, live FX.
-  - **Frugal** (on battery / RAM tight): Small model, **no scene**, fastpath instead of whisper,
-    FX off — keep the *workflow*, drop the hogs.
-  - **Survival** (dying battery / very low RAM / forced): **no LLM at all** — pure-heuristic
-    diagnosis (the format-sniff + severity + shorten/probe cores from the log research, all
-    offline, all cheap). Triage the hardware; don't think about it. A manual floor can pull the
-    tier *down* ("make it last") but never force it up past the hardware reality.
-- **Implication for the bridge:** the Diagnose→dev bridge must work at **Survival** — i.e. entirely
-  offline, model-free — which the research already anticipated (the heuristic fallback floor). The
-  palace/Forge LLM steps are the *step-up* when power allows; the heuristic triage is the
-  guarantee. This is the "step-up, not guarantee" rule, now spanning compute + power, not just audio.
+## North star: the survival tool (self-sufficiency, not austerity)
+*(Corrected from an earlier over-reach.)* "Survival tool" = a desert camper **on their own** with
+broken hardware and no cloud — the property that matters is **autonomy**, not running on the fewest
+resources. Two consequences:
+- **Don't ration RAM or power at the app layer.** The kernel already does memory-pressure handling
+  and energy-aware scheduling, and does them better; an app-level "frugal/survival mode" that drops
+  features to save power is futile duplication. (The earlier `field_tier` ladder was that mistake;
+  it's been replaced.) The one honest hardware question — can a model physically *fit* in available
+  RAM — is `model_selector`'s job, and it already does it.
+- **Optimize *utilization*, not scarcity.** On a computer, doing *more* is often the efficient
+  path: a warm KV cache beats re-prefilling every turn, a prefix tree beats recomputation, spending
+  cycles to save cycles is the whole point. The real levers are **memory utilization, cache reuse,
+  and algorithmic efficiency** — all app-layer, all worth the effort. logscope already leans this
+  way (the KV prefix-tree behind `--kv-tree`, model_selector's warm handoff); that's the direction
+  to push, not artificial limits.
+
+**Built: `autonomy`** (2 tests) — the one thing worth asserting in code: the *self-sufficiency
+invariant*. Every core capability (Diagnose / Chat-palace / Forge) runs with **no external
+services** — Diagnose is strictly `LocalOnly` (works even model-free), the palace/Forge
+`PrefersLocal` (remote is an optional step-up, never a requirement). The test guards against a
+future cloud dependency sneaking into a core path — a regression against the whole premise.
+
+**Efficiency direction (the actual work):** hot-path allocation + cache behaviour in the pure cores
+(like the audiomix no-alloc pass), and leaning into the KV prefix-tree reuse. Not power/memory
+gating — the kernel owns that.
