@@ -10,6 +10,10 @@ edition = "2021"
 name = "logscope-filter"
 path = "src/bin/filter.rs"
 
+[[bin]]
+name = "logscope-tools"
+path = "src/bin/logscope-tools.rs"
+
 [dependencies]
 # GTK4 + Adwaita (GUI only — filter binary uses a separate minimal set)
 gtk4 = { version = "0.9", features = ["v4_12"], optional = true }
@@ -19,6 +23,7 @@ gio = { version = "0.20", optional = true }
 
 # Hashing
 twox-hash = "1.6"
+cli-kit = { path = "../../../../shared/cli-kit" }
 
 # Chart generation → SVG
 plotters = { version = "0.3", default-features = false, features = [
