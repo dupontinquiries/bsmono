@@ -25,48 +25,61 @@ pub enum WbTab {
     Chat,
 }
 
-/// The group a tab lives in. `Palace` is Chat alone (the only tab with a mind-palace).
+/// The group a tab lives in — logscope is really **three tools**. Two are *surgical* (fast,
+/// quick-access, no spatial layer); one is the *palace* (spatial thinking).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Workbench {
-    /// Log ingest + inspection (pre-patterned viewers).
-    Logs,
-    /// Code generation / editing.
-    Code,
-    /// Build + block tooling.
-    Build,
-    /// The Chat mind-palace — spatial, standalone.
+    /// Surgical tool #1: log rotation + quick system diagnosis. Meant to get you *started*, not to
+    /// hand you a full solution.
+    Diagnose,
+    /// The Chat mind-palace — large development, fan-out exploration, research. The only tool with
+    /// a physical space, because it's where you *think*.
     Palace,
+    /// Surgical tool #2: the LLM + touch "super-keyboard" — functional block analysis, like coding
+    /// in Scratch but for big-boy programs (AST blocs, block actions, cargo diagnostics). Still
+    /// unfinished, but surgical in spirit, so it keeps the quick-access UI, not the palace.
+    Forge,
 }
 
 impl Workbench {
     pub fn label(self) -> &'static str {
         match self {
-            Workbench::Logs => "Logs",
-            Workbench::Code => "Code",
-            Workbench::Build => "Build",
+            Workbench::Diagnose => "Diagnose",
             Workbench::Palace => "Chat",
+            Workbench::Forge => "Forge",
         }
+    }
+    /// Surgical tools get the fast, gesture-navigated UI; the palace does not.
+    pub fn is_surgical(self) -> bool {
+        !matches!(self, Workbench::Palace)
     }
 }
 
-/// Which workbench a tab belongs to.
+/// Which workbench a tab belongs to. (Tokens/Blocks have no dedicated module yet — placed by
+/// affinity: Tokens with Diagnose, Blocks with Forge; confirm when they're built out.)
 pub fn workbench_of(tab: WbTab) -> Workbench {
     match tab {
-        WbTab::Sources | WbTab::Peek | WbTab::Tokens | WbTab::Blocks | WbTab::Rotate => Workbench::Logs,
-        WbTab::Code | WbTab::Modify => Workbench::Code,
-        WbTab::Cargo | WbTab::Bloc => Workbench::Build,
+        WbTab::Sources | WbTab::Peek | WbTab::Rotate | WbTab::Tokens => Workbench::Diagnose,
         WbTab::Chat => Workbench::Palace,
+        WbTab::Code | WbTab::Bloc | WbTab::Modify | WbTab::Cargo | WbTab::Blocks => Workbench::Forge,
     }
 }
 
 /// Ordered members of a workbench — the swipe order between related functions.
 pub fn members(wb: Workbench) -> &'static [WbTab] {
     match wb {
-        Workbench::Logs => &[WbTab::Sources, WbTab::Peek, WbTab::Tokens, WbTab::Blocks, WbTab::Rotate],
-        Workbench::Code => &[WbTab::Code, WbTab::Modify],
-        Workbench::Build => &[WbTab::Cargo, WbTab::Bloc],
+        // load → inspect → rotate → token stats
+        Workbench::Diagnose => &[WbTab::Sources, WbTab::Peek, WbTab::Rotate, WbTab::Tokens],
         Workbench::Palace => &[WbTab::Chat],
+        // block view → bloc regions → transform → build check → block palette
+        Workbench::Forge => &[WbTab::Code, WbTab::Bloc, WbTab::Modify, WbTab::Cargo, WbTab::Blocks],
     }
+}
+
+/// True for the two surgical tools (Diagnose, Forge) — the ones that get fast gesture navigation
+/// and no 3D scene. False only for the Chat palace.
+pub fn is_surgical(tab: WbTab) -> bool {
+    workbench_of(tab).is_surgical()
 }
 
 /// Only Chat uses the mind-palace (3D scene + pearl). Everything else is flat/fast — the render
@@ -139,25 +152,32 @@ mod tests {
     use touchkit::Vec2;
 
     #[test]
-    fn only_chat_is_the_palace() {
+    fn three_tools_two_surgical_one_palace() {
+        // Chat is the only palace; the two surgical tools get the fast UI
         assert!(uses_mind_palace(WbTab::Chat));
-        for t in [WbTab::Sources, WbTab::Peek, WbTab::Code, WbTab::Cargo, WbTab::Bloc] {
-            assert!(!uses_mind_palace(t), "{t:?} is flat/fast, no scene");
-        }
         assert_eq!(workbench_of(WbTab::Chat), Workbench::Palace);
+        assert!(!is_surgical(WbTab::Chat));
+        // Diagnose (log tool) + Forge (block super-keyboard) are surgical
+        assert_eq!(workbench_of(WbTab::Rotate), Workbench::Diagnose);
+        assert_eq!(workbench_of(WbTab::Bloc), Workbench::Forge);
+        for t in [WbTab::Sources, WbTab::Peek, WbTab::Rotate, WbTab::Code, WbTab::Bloc, WbTab::Cargo] {
+            assert!(is_surgical(t) && !uses_mind_palace(t), "{t:?} is surgical/flat, no scene");
+        }
     }
 
     #[test]
     fn swipe_pages_within_a_workbench() {
-        // Logs: Sources -> Peek -> Tokens -> Blocks -> Rotate
+        // Diagnose: Sources -> Peek -> Rotate -> Tokens
         assert_eq!(swipe(WbTab::Sources, SwipeDir::Next), Some(WbTab::Peek));
-        assert_eq!(swipe(WbTab::Peek, SwipeDir::Next), Some(WbTab::Tokens));
+        assert_eq!(swipe(WbTab::Peek, SwipeDir::Next), Some(WbTab::Rotate));
         assert_eq!(swipe(WbTab::Peek, SwipeDir::Prev), Some(WbTab::Sources));
-        // ends return None (no wrap, so you can't swipe out of a workbench by accident)
+        // ends return None (no wrap → can't swipe out of a tool by accident)
         assert_eq!(swipe(WbTab::Sources, SwipeDir::Prev), None);
-        assert_eq!(swipe(WbTab::Rotate, SwipeDir::Next), None);
-        // Code workbench is its own little pair
-        assert_eq!(swipe(WbTab::Code, SwipeDir::Next), Some(WbTab::Modify));
+        assert_eq!(swipe(WbTab::Tokens, SwipeDir::Next), None);
+        // Forge: Code -> Bloc -> Modify -> Cargo -> Blocks
+        assert_eq!(swipe(WbTab::Code, SwipeDir::Next), Some(WbTab::Bloc));
+        assert_eq!(swipe(WbTab::Cargo, SwipeDir::Next), Some(WbTab::Blocks));
+        assert_eq!(swipe(WbTab::Code, SwipeDir::Prev), None);
     }
 
     #[test]
