@@ -48,28 +48,24 @@ fn mock_reply(prompt: &str, id: &str) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let (mut model_args, mut mock, mut script_path) = (Vec::<String>::new(), false, None::<String>);
-    let mut system = "You are a terse Rust coding assistant. Prefer code, keep replies short.".to_string();
-    let mut max_tokens = 512usize; // reasoning models (R1-Distill) need 1024-2048; raise with --max
-    let mut final_fmt = "md".to_string();
-    let (mut check_cmd, mut check_file, mut no_kv) = (None::<String>, None::<String>, false);
-    let mut kv_tree = None::<String>;
-    let mut it = args.iter().skip(1);
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--mock" => mock = true,
-            "--model" => { if let Some(m) = it.next() { model_args.push(m.clone()); } } // repeatable: name=path (bare path → "default")
-            "--system" => system = it.next().cloned().unwrap_or(system),
-            "--max" => max_tokens = it.next().and_then(|s| s.parse().ok()).unwrap_or(max_tokens),
-            "--final" => final_fmt = it.next().cloned().unwrap_or(final_fmt),
-            "--check" => check_cmd = it.next().cloned(),         // shell cmd that compiles a node's code
-            "--check-file" => check_file = it.next().cloned(),   // where to drop the code (for a real-crate check)
-            "--no-kv" => no_kv = true,                            // disable the KV-prefix-tree speedup (full prefill each turn)
-            "--kv-tree" => kv_tree = it.next().cloned(),          // keep N branch tips warm (the prefix tree); needed for branchy reuse
-            s if !s.starts_with("--") => script_path = Some(s.to_string()),
-            other => eprintln!("# ignoring unknown flag {other}"),
-        }
-    }
+    // arg parsing via cli-kit (shared across the fleet's CLIs)
+    let cli = cli_kit::Cli::from(args.iter().skip(1).cloned().collect::<Vec<String>>());
+    let mut model_args: Vec<String> = cli.opt_all("model").iter().map(|s| s.to_string()).collect();
+    let mock = cli.flag("mock");
+    let system = cli
+        .opt("system")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "You are a terse Rust coding assistant. Prefer code, keep replies short.".to_string());
+    let max_tokens = cli.opt("max").and_then(|s| s.parse().ok()).unwrap_or(512usize); // reasoning models (R1-Distill) need 1024-2048
+    let final_fmt = cli.opt("final").unwrap_or("md").to_string();
+    let check_cmd = cli.opt("check").map(|s| s.to_string());        // shell cmd that compiles a node's code
+    let check_file = cli.opt("check-file").map(|s| s.to_string());  // where to drop the code (for a real-crate check)
+    let no_kv = cli.flag("no-kv");                                  // disable the KV-prefix-tree speedup
+    let kv_tree = cli.opt("kv-tree").map(|s| s.to_string());        // keep N branch tips warm (the prefix tree)
+    let script_path = cli
+        .positionals_with_values(&["model", "system", "max", "final", "check", "check-file", "kv-tree"])
+        .first()
+        .map(|s| s.to_string());
     if no_kv { std::env::set_var("LOGSCOPE_KV_OFF", "1"); std::env::remove_var("LOGSCOPE_KV_TREE"); }
     else if let Some(n) = kv_tree.as_ref() { std::env::set_var("LOGSCOPE_KV_TREE", n); }
     let script_path = script_path.unwrap_or_else(|| {
