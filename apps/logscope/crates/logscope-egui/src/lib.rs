@@ -78,6 +78,7 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod convograph;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod spatial;
+pub mod chat_layout;
 #[cfg(feature = "gui")] pub mod spatial_audio;
 #[cfg(feature = "gui")] pub mod touch_nav;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
