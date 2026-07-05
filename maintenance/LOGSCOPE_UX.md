@@ -100,3 +100,22 @@ The Chat tab keeps everything it has.
 
 **Still open (from the questions above):** the log→code bridge shape (Q1), which Chat controls are
 everyday vs dev (Q2), and your lived friction (Q6).
+
+---
+
+## logscope is three tools (the real mental model)
+Not a flat tab pile — three distinct tools, two surgical + one spatial:
+1. **Diagnose (surgical):** log rotation + quick system diagnosis. Meant to get you *started*, not
+   to hand a full solution. Tabs: Sources, Peek, Rotate, Tokens. → fast, gesture-navigated UI.
+2. **Chat (palace):** large development, fan-out exploration, research — the LLM-assisted thinking
+   space. The *only* tool with a physical/spatial layer (it's where you think; e.g. the same
+   engine built a "mind-palace of the body" in another session). Tabs: Chat.
+3. **Forge (surgical, unfinished):** an LLM + touch + "super-keyboard" — functional block analysis,
+   like coding in Scratch but for big-boy programs. Replaces the keyboard with block manipulation
+   (AST blocs, block actions, cargo diagnostics). Tabs: Code, Bloc, Modify, Cargo, Blocks. →
+   surgical, so it keeps the quick-access UI, **not** the palace.
+
+The `workbench` model now encodes this: `Workbench::{Diagnose, Palace, Forge}`, `is_surgical(tab)`
+(true for Diagnose + Forge), and `uses_mind_palace(tab)` (Chat only). Swipe order follows each
+tool's natural flow (Diagnose: load→inspect→rotate→tokens; Forge: view→bloc→modify→check→palette).
+Open: confirm Tokens (placed with Diagnose) and Blocks (placed with Forge) once they're built out.
