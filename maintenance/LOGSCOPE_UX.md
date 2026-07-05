@@ -119,3 +119,28 @@ The `workbench` model now encodes this: `Workbench::{Diagnose, Palace, Forge}`, 
 (true for Diagnose + Forge), and `uses_mind_palace(tab)` (Chat only). Swipe order follows each
 tool's natural flow (Diagnose: load→inspect→rotate→tokens; Forge: view→bloc→modify→check→palette).
 Open: confirm Tokens (placed with Diagnose) and Blocks (placed with Forge) once they're built out.
+
+---
+
+## North star: the desert camper (field-repair tool)
+A framing that unifies the recurring principles: **broken hardware in your hands, little power, no
+cloud, and you need to fix it.** That scenario is the stress test that explains *why* logscope is
+built the way it is — and it turns "graceful degradation" from an audio rule into a whole-app one.
+- **Everything local already.** logscope runs its own LLM stack (llm_backend/moe/rope/kvcache),
+  reads local logs (journald, /var/log), and `model_selector` is memory-pressure aware (reads
+  /proc/meminfo, downshifts the model when free RAM < 20%). No network required.
+- **Frugal by design.** The learned fastpath beats cold whisper (less compute), the no-alloc audio
+  work, mock backends — all of it matters more when power is scarce than when it isn't.
+- **Built: `field_tier`** (4 tests) — the degradation ladder for the *whole* tool, keyed on RAM +
+  battery, extending model_selector from just-the-model to every heavy feature:
+  - **Full** (plugged / ample): Large model, mind-palace scene, whisper, live FX.
+  - **Frugal** (on battery / RAM tight): Small model, **no scene**, fastpath instead of whisper,
+    FX off — keep the *workflow*, drop the hogs.
+  - **Survival** (dying battery / very low RAM / forced): **no LLM at all** — pure-heuristic
+    diagnosis (the format-sniff + severity + shorten/probe cores from the log research, all
+    offline, all cheap). Triage the hardware; don't think about it. A manual floor can pull the
+    tier *down* ("make it last") but never force it up past the hardware reality.
+- **Implication for the bridge:** the Diagnose→dev bridge must work at **Survival** — i.e. entirely
+  offline, model-free — which the research already anticipated (the heuristic fallback floor). The
+  palace/Forge LLM steps are the *step-up* when power allows; the heuristic triage is the
+  guarantee. This is the "step-up, not guarantee" rule, now spanning compute + power, not just audio.
