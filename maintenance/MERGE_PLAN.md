@@ -94,3 +94,20 @@ adopt uikit-egui + the new `touch` multitouch, everything must land on one egui.
   unknown. Left as the next focused task (needs the whole set green in one pass — not safe to
   half-land). Transparency + touch already landed on 0.29, and both port straight across (no
   Rounding involved), so no rework lost by bumping after.
+
+## egui unification + logscope adoption — DONE
+- **Unified on egui/eframe 0.34** (atomic, 11 crates). Migration was exactly as scoped plus a few
+  0.34 painter changes: Rounding→CornerRadius (same(f32)→same(u8)), Margin::same(f32)→same(i8),
+  painter rect/rect_stroke gained a StrokeKind arg (::Inside), raw_scroll_delta→smooth_scroll_delta.
+  All green: uikit-egui 22, voiceterm 29, rusty-board 9, snapclone 4, bot-arena 4, bo-suite 3,
+  settings/egui-frontend 3, settings-app builds. touch + transparency carried across unchanged.
+- **logscope adopts the kit:** logscope-egui now deps uikit-egui + touchkit (all 0.34). Added
+  `touch_nav::apply_gesture/apply_all` — maps touchkit gestures to `spatial::OrbitCam` (pinch →
+  zoom, drag → orbit yaw/pitch). Pure mapping, gui-gated; verified against real touchkit in
+  isolation (pinch→closer, drag→yaw). The frontend wires it by polling
+  `uikit_egui::touch::TouchSource` and calling `touch_nav::apply_all(&mut cam, &gestures)` — the
+  thin on-device remainder (full logscope-egui build needs gui+gpu). logscope already had the
+  spatial_audio soundscape bridge; now it shares the multitouch input half too.
+- **Remaining (logscope):** wire the TouchSource poll into the scene view's update; adopt
+  uikit-egui theme/transparency for its panels if desired (now version-compatible); flow-back
+  logscope's mature fastpath/voice_intent into voice-kit.
