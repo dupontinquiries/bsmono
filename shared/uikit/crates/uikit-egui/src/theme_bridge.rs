@@ -7,7 +7,7 @@
 //! Neon, Minimal, Modern, Earth, Pastels, Metallic) therefore drive the egui
 //! front-end with no duplicated color tables.
 
-use egui::{Color32, Context, Rounding, Stroke, Visuals};
+use egui::{Color32, Context, CornerRadius, Stroke, Visuals};
 use snapclone_theme::Palette;
 
 use crate::tokens;
@@ -77,7 +77,7 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     v.selection.bg_fill = c.accent.linear_multiply(0.35);
     v.selection.stroke = Stroke::new(1.0, c.accent);
 
-    let r = Rounding::same(tokens::RADIUS_SM as f32);
+    let r = CornerRadius::same(tokens::RADIUS_SM as u8);
     let widgets = &mut v.widgets;
     for (state, fill) in [
         (&mut widgets.noninteractive, c.bg_card),
@@ -90,7 +90,7 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
         state.weak_bg_fill = fill;
         state.bg_stroke = Stroke::new(1.0, c.border);
         state.fg_stroke = Stroke::new(1.0, c.text);
-        state.rounding = r;
+        state.corner_radius = r;
     }
     widgets.hovered.fg_stroke = Stroke::new(1.0, c.text);
     widgets.active.bg_stroke = Stroke::new(1.0, c.accent);

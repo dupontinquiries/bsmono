@@ -7,7 +7,7 @@
 //! feeds taps/swipes into the engine. Here it carries a small standalone [`Layout`] so the
 //! crate builds and can be checked against egui 0.29 on its own.
 
-use egui::{Align2, FontId, Rect, Rounding, Sense, Stroke, Ui, Vec2};
+use egui::{Align2, FontId, Rect, CornerRadius, Sense, Stroke, Ui, Vec2};
 use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
 /// A single key: what it shows and its relative width within the row.
@@ -203,9 +203,9 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors)
     } else {
         c.bg_raised
     };
-    let rounding = Rounding::same(size.y * 0.18);
+    let rounding = CornerRadius::same((size.y * 0.18) as u8);
     painter.rect_filled(rect, rounding, fill);
-    painter.rect_stroke(rect, rounding, Stroke::new(1.0, c.bg_base));
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0, c.bg_base), egui::StrokeKind::Inside);
     let text_color = if resp.is_pointer_button_down_on() { c.bg_base } else { c.text };
     painter.text(
         rect.center(),

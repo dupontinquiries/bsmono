@@ -14,7 +14,7 @@ members = ["crates/uikit-gesture", "crates/uikit-egui", "crates/snapclone-theme"
 resolver = "2"
 
 [workspace.dependencies]
-egui = "0.29"
+egui = "0.34"
 uikit-gesture = { path = "crates/uikit-gesture" }
 snapclone-theme = { path = "crates/snapclone-theme" }
 

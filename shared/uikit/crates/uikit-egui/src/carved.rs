@@ -11,7 +11,7 @@
 //! whole point of the sandwich.
 
 use egui::{
-    Align2, Color32, FontId, Pos2, Rect, Response, Rounding, Sense, Stroke, Ui, Vec2,
+    Align2, Color32, FontId, Pos2, Rect, Response, CornerRadius, Sense, Stroke, Ui, Vec2,
 };
 
 use crate::skin::Skin;
@@ -63,7 +63,7 @@ pub fn paint_carved(
     sheen_phase: f32,
 ) {
     let painter = ui.painter_at(rect);
-    let rounding = Rounding::same(skin.radius as f32);
+    let rounding = CornerRadius::same(skin.radius as u8);
 
     // 1) translucent fill, lifted toward white then tinted toward accent
     let op = fill_opacity(skin, state) as f32 / 255.0;
@@ -100,7 +100,7 @@ pub fn paint_carved(
     }
 
     // 4) outer hairline so adjacent carved tiles read as separate
-    painter.rect_stroke(rect, rounding, Stroke::new(1.0, Color32::from_black_alpha(40)));
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0, Color32::from_black_alpha(40)), egui::StrokeKind::Inside);
 }
 
 /// L2: carved (engraved) text — a dark shadow below the ink and a lit lip above
@@ -159,8 +159,9 @@ pub fn pill(ui: &mut Ui, text: &str, base: Color32, accent: Color32, ink: Color3
     if on {
         ui.painter().rect_stroke(
             rect,
-            Rounding::same(rect.height() / 2.0),
+            CornerRadius::same((rect.height() / 2.0) as u8),
             Stroke::new(1.0, accent),
+            egui::StrokeKind::Inside,
         );
     }
     let label_ink = if on { accent } else { ink };
@@ -178,9 +179,9 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, border: Color32) 
     let galley = ui.painter().layout_no_wrap(text.to_owned(), font, fg);
     let size = Vec2::new(galley.size().x + 18.0, galley.size().y + 6.0);
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let r = Rounding::same(rect.height() / 2.0);
+    let r = CornerRadius::same((rect.height() / 2.0) as u8);
     ui.painter().rect_filled(rect, r, bg);
-    ui.painter().rect_stroke(rect, r, Stroke::new(1.0, border));
+    ui.painter().rect_stroke(rect, r, Stroke::new(1.0, border), egui::StrokeKind::Inside);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
 }
@@ -188,9 +189,9 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, border: Color32) 
 /// A titled carved panel; runs `body` inside it.
 pub fn panel(ui: &mut Ui, title: &str, base: Color32, accent: Color32, ink: Color32, skin: &Skin, body: impl FnOnce(&mut Ui)) {
     egui::Frame::none()
-        .rounding(Rounding::same(tokens::RADIUS_MD as f32))
+        .corner_radius(CornerRadius::same(tokens::RADIUS_MD as u8))
         .fill(base)
-        .inner_margin(egui::Margin::same(tokens::SPACE_MD as f32))
+        .inner_margin(egui::Margin::same(tokens::SPACE_MD as i8))
         .show(ui, |ui| {
             if !title.is_empty() {
                 let _ = accent; // available for a future titled accent rule
