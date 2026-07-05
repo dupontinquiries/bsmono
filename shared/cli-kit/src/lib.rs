@@ -77,6 +77,18 @@ impl Cli {
     /// excluded. Conservative: unknown `--opt value` pairs are still skipped so stray
     /// values don't masquerade as positionals.
     pub fn positionals(&self) -> Vec<&str> {
+        self.positionals_impl(None)
+    }
+
+    /// Positionals when the caller knows exactly which options take a value. This removes the
+    /// heuristic's ambiguity: a boolean flag (e.g. `--mock`) followed by a bare token no longer
+    /// swallows that token as its value, so `--mock script.txt` yields `["script.txt"]`. List the
+    /// value-taking option names *without* dashes.
+    pub fn positionals_with_values(&self, value_opts: &[&str]) -> Vec<&str> {
+        self.positionals_impl(Some(value_opts))
+    }
+
+    fn positionals_impl(&self, value_opts: Option<&[&str]>) -> Vec<&str> {
         let mut out = Vec::new();
         let mut skip_next = false;
         for (i, a) in self.args.iter().enumerate() {
@@ -85,8 +97,17 @@ impl Cli {
                 continue;
             }
             if a.starts_with('-') && a.len() > 1 {
-                // an --opt with a following value (no '=') consumes the next token
-                if !a.contains('=') {
+                // does this option consume the next token as its value?
+                let takes_value = if let Some(known) = value_opts {
+                    // precise: only the declared value-options consume a value
+                    let name = a.trim_start_matches('-');
+                    let name = name.split('=').next().unwrap_or(name);
+                    known.contains(&name)
+                } else {
+                    // heuristic (back-compat): any `--opt` (no '=') followed by a non-dash token
+                    true
+                };
+                if takes_value && !a.contains('=') {
                     if let Some(next) = self.args.get(i + 1) {
                         if !next.starts_with('-') {
                             skip_next = true;
@@ -171,5 +192,25 @@ mod tests {
     fn eq_form_does_not_consume_next() {
         let c = Cli::from(["run", "--mode=fast", "target1", "target2"]);
         assert_eq!(c.positionals(), vec!["run", "target1", "target2"]);
+    }
+}
+
+#[cfg(test)]
+mod value_opt_tests {
+    use super::Cli;
+
+    #[test]
+    fn positionals_with_values_distinguishes_boolean_flags() {
+        // boolean flag before a positional: heuristic wrongly eats it...
+        let cli = Cli::from(vec!["--mock", "script.txt"]);
+        assert!(cli.positionals().is_empty());
+        // ...value-aware knows --mock takes no value, so the script is the positional
+        assert_eq!(cli.positionals_with_values(&["model", "system"]), vec!["script.txt"]);
+        // a declared value-opt still consumes its value
+        let cli2 = Cli::from(vec!["--model", "big.gguf", "script.txt"]);
+        assert_eq!(cli2.positionals_with_values(&["model"]), vec!["script.txt"]);
+        // '=' form is always unambiguous
+        let cli3 = Cli::from(vec!["--mock=1", "script.txt"]);
+        assert_eq!(cli3.positionals_with_values(&["model"]), vec!["script.txt"]);
     }
 }

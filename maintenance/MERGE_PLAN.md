@@ -139,3 +139,12 @@ concrete and mostly *adoption* rather than new code:
   swap ad-hoc panels for uikit-egui `carved`/theme so they inherit palette + transparency.
 - **Sequence:** chat tab first (physical-UI + highest clutter), then per-tab adaptive reflow. All
   verifiable only on-device (egui 0.34 + gpu), so land incrementally with on-device checks.
+
+## logscope CLIs onto cli-kit (done) + a cli-kit fix
+- **logscope-filter** + **logscope-cli** both refactored from hand-rolled arg loops to cli-kit.
+  Both build (RUSTFLAGS='' to bypass the mold pin) and smoke-tested.
+- **Surfaced + fixed a real cli-kit bug:** its `positionals()` heuristic couldn't tell a boolean
+  flag from a value-option, so `logscope-cli --mock <script>` wrongly ate the script as --mock's
+  value (→ usage). Added `Cli::positionals_with_values(&[value_opts])` — the caller declares which
+  options take values, removing the ambiguity. logscope-cli uses it; `--mock <script>` now runs.
+  cli-kit +1 test. Benefits every CLI mixing boolean flags with positionals.
