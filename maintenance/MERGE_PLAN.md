@@ -111,3 +111,31 @@ adopt uikit-egui + the new `touch` multitouch, everything must land on one egui.
 - **Remaining (logscope):** wire the TouchSource poll into the scene view's update; adopt
   uikit-egui theme/transparency for its panels if desired (now version-compatible); flow-back
   logscope's mature fastpath/voice_intent into voice-kit.
+
+## logscope CLI + UX direction
+The user's call: keep chat embedded in the suite; improve UX with what's there; add CLI versions
+of features. Done + planned:
+- **logscope-tools (NEW bin, builds + smoke-tested):** CLI for the log-analysis primitives that
+  predate the GUI — `probe <log>` (tier/rotation/owner/perms/notes) and `shorten [<log>]
+  [--min-prefix/--min-repeat/--window] [--stats]` (collapse repeated line-prefixes; stdin if no
+  file). Uses **cli-kit** for parsing (the kit integration). First step toward branching these
+  primitives into focused standalone tools. (Build note: logscope's .cargo/config pins the `mold`
+  linker; build with `RUSTFLAGS=""` where mold is absent.)
+- **Existing CLIs to hammer out next (same cli-kit treatment):** `logscope-cli` (the AI/chat
+  `.logscope` script runner — hand-rolled flags → cli-kit) and `logscope-filter` (filter/rotate/
+  probe for logrotate hooks). Both work; folding them onto cli-kit unifies flag handling.
+
+### UX / mobile / physical-UI plan (kit is now ready to carry it)
+logscope's tabs have functional-but-placeholder buttons (great for exercising heavy backends,
+never designed for touch). Now that logscope is on egui 0.34 with the kit, the upgrade path is
+concrete and mostly *adoption* rather than new code:
+- **Chat tab (physical-UI target):** biggest UX win. Adopt `uikit_egui::adaptive` (phone vs
+  desktop layout), `nav` (one page model for both), `touch` (already wired via touch_nav for the
+  scene; add pinch/scroll to the transcript), and `transparency` for a translucent input bar over
+  the scene. Voice entry uses the shared `voice-kit` pipeline + `ContextModel` hints (the live
+  viewer pattern) — this is the physical-UI on-ramp.
+- **Other tabs:** wrap placeholder button rows in `adaptive` so they reflow to a single column +
+  larger touch targets on the phone (settings-kit `button_scale`/`min_target` already exist);
+  swap ad-hoc panels for uikit-egui `carved`/theme so they inherit palette + transparency.
+- **Sequence:** chat tab first (physical-UI + highest clutter), then per-tab adaptive reflow. All
+  verifiable only on-device (egui 0.34 + gpu), so land incrementally with on-device checks.
