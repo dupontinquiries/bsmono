@@ -100,7 +100,7 @@ impl Snapclone {
         self.nav.title_bar(ui, "Camera");
         // the carved preview surface (on-device: device-kit camera feed)
         let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::hover());
-        ui.painter().rect(rect, egui::Rounding::same(10.0), c.bg_card, egui::Stroke::new(1.0, c.accent_soft));
+        ui.painter().rect(rect, egui::CornerRadius::same(10), c.bg_card, egui::Stroke::new(1.0, c.accent_soft), egui::StrokeKind::Inside);
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "live preview", egui::FontId::proportional(14.0), c.text_weak);
     }
 

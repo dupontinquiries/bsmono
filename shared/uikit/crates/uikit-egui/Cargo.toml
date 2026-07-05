@@ -20,8 +20,8 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 touchkit = { path = "../../../touchkit", features = ["egui"] }
-eframe = { version = "0.29", optional = true, default-features = false, features = ["glow"] }
-egui = "0.29"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
+egui = "0.34"
 uikit-gesture = { path = "../uikit-gesture" }
 
 # snapclone-theme already advertises egui compatibility in its own docs

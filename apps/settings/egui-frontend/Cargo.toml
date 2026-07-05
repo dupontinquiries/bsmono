@@ -9,7 +9,7 @@ description = "The central BigSilicon settings app: an egui UI on uikit-egui tha
 path = "src/lib.rs"
 
 [dependencies]
-egui = "0.29"
+egui = "0.34"
 settings-kit = { path = "../../../shared/settings-kit" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }

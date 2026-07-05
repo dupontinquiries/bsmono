@@ -9,7 +9,7 @@ description = "bo-controller's Qt/QML control panel ported to egui on uikit-egui
 path = "src/lib.rs"
 
 [dependencies]
-egui = "0.29"
+egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }

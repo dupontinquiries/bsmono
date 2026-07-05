@@ -179,7 +179,7 @@ pub fn render_scene(ui: &egui::Ui, scene: &Scene, target: egui::Rect, colors: &u
             Prim::Rect { min, max, rounding, style } => {
                 let r = egui::Rect::from_two_pos(map(*min), map(*max));
                 let fill = style.fill.map(|f| role_color(f, colors)).unwrap_or(egui::Color32::TRANSPARENT);
-                painter.rect(r, egui::Rounding::same(*rounding), fill, stroke(style));
+                painter.rect(r, egui::CornerRadius::same(*rounding as u8), fill, stroke(style), egui::StrokeKind::Inside);
             }
             Prim::Circle { center, radius, style } => {
                 let fill = style.fill.map(|f| role_color(f, colors)).unwrap_or(egui::Color32::TRANSPARENT);
