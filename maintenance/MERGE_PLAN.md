@@ -165,3 +165,19 @@ decision core**, which builds lean and is tested:
   the input row → dock bottom + `translucent()` bar when `cl.input_docked_bottom`; the placeholder
   button cluster → overflow menu when `cl.controls_overflow`, sized to `cl.touch_target`. No new
   rendering — just reading these flags. Then the same treatment tab-by-tab.
+
+## logscope other tabs — layout cores (verified) + cli-kit round-out
+- **cli-kit rounded out** (8 tests): dash-tolerant flag/opt/opt_all (bare `model` matches
+  `--model`, so a missing dash can't silently drop an option — the bug the logscope refactor hit),
+  plus `opt_parse<T>(name, default)`, `require(name)->Result`, `count(name)` (verbosity),
+  `wants_help()`. Retroactively fixed the logscope CLIs (bare-name calls now resolve).
+- **tab_layout (NEW, 4 tests, lean-buildable):** the non-chat tabs are two archetypes:
+  - `master_detail(class, width, touch)` → { split, list_fraction, drill_navigation, row_height }
+    for **sources / rotate / cargo** (list + detail): phone drills in (nav push), desktop splits,
+    tablet gives the list more room, touch enlarges rows.
+  - `content_layout(class, width)` → { toolbar: Side|BottomDocked|Overflow, content_max_width,
+    gutter } for **peek / code / charts / bloc / modify** (main view + controls): toolbar migrates
+    Overflow(phone)→BottomDocked(medium)→Side(wide), content capped on desktop / full on phone.
+- **All layout cores now exist + tested** (chat_layout + tab_layout). On-device step per tab: read
+  the flags at the tab's existing layout points (same as chat: `if split`, dock/overflow the
+  toolbar, size to touch targets, `nav` for drill-in). No new rendering.
