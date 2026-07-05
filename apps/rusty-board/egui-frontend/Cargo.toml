@@ -9,7 +9,7 @@ description = "rusty-board's on-screen keyboard, ported from GTK4 to egui on the
 path = "src/lib.rs"
 
 [dependencies]
-egui = "0.29"
+egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }

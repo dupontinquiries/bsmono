@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 # version your workspace uses (cargo-hakari / a workspace dep keeps it unified);
 # the conversions below only touch egui's Vec2/Pos2 { x, y } shape, which has been
 # stable across many releases, so the exact minor rarely matters.
-egui = { version = "0.29", optional = true }
+egui = { version = "0.34", optional = true }
 
 [features]
 default = []

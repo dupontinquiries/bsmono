@@ -46,12 +46,12 @@ image = "0.25"
 
 # GUI — fullscreen camera view
 # eframe is egui's application framework; supports Wayland natively
-eframe  = { version = "0.29", default-features = false, features = [
+eframe  = { version = "0.34", default-features = false, features = [
     "wayland",         # Wayland display (postmarketOS / Phosh)
     "wgpu",            # GPU rendering via wgpu (Adreno 635 via Vulkan/GLES)
     # "accesskit",     # optional — requires libatk; disable if build fails
 ] }
-egui    = "0.29"
+egui    = "0.34"
 
 # Shared frame buffer between GStreamer thread and egui render thread
 # arc-swap gives us lock-free reads on the hot path

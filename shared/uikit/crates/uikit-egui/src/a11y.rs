@@ -11,7 +11,7 @@
 //! the descriptions are plain strings a TTS stage speaks. The only egui touch is painting
 //! the focus ring.
 
-use egui::{Color32, Rect, Rounding, Stroke, Ui};
+use egui::{Color32, Rect, CornerRadius, Stroke, Ui};
 
 /// The kind of a widget, for spoken descriptions ("Play, button").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,7 +261,7 @@ impl A11yScene {
     pub fn paint_focus_ring(&self, ui: &Ui, accent: Color32) {
         if let Some(it) = self.focused() {
             if let Some(rect) = it.rect {
-                ui.painter().rect_stroke(rect.expand(2.0), Rounding::same(4.0), Stroke::new(2.0, accent));
+                ui.painter().rect_stroke(rect.expand(2.0), CornerRadius::same(4), Stroke::new(2.0, accent), egui::StrokeKind::Inside);
             }
         }
     }

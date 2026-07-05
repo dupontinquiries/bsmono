@@ -63,7 +63,7 @@ impl TouchSource {
         if touches.is_empty() {
             let (scroll, zoom, ctrl, ptr) = ctx.input(|i| {
                 (
-                    i.raw_scroll_delta,
+                    i.smooth_scroll_delta,
                     i.zoom_delta(),
                     i.modifiers.ctrl || i.modifiers.command,
                     i.pointer.interact_pos().unwrap_or(egui::Pos2::ZERO),
