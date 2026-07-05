@@ -72,3 +72,31 @@ master/detail drill-in covers Sources/Peek/etc. The tab grouping (#2) matters mo
 - The log→code bridge action (small; `set_input` + tab switch already exist) — on-device wiring.
 - Fold theme/variant/folder into `bsettings` (kit-integrated; partly headless-testable).
 - The tab-grouping model as a pure, tested helper (like the layout cores).
+
+---
+
+## Direction (decided) + what's built
+Your call: **the mind-palace is Chat-only** — it's the LLM-assisted planning workflow where a
+spatial memory earns its keep. Every other tab is a pre-patterned action on a file type, so it
+gets **speed, near-invisible chrome, and rich touch navigation between related functions** — the
+snapclone/voiceterm feel. Branching elsewhere is intriguing but stays a **toggle that's unwired**
+for now.
+
+**Built this session (pure + tested, lean build): `workbench` model.**
+- `uses_mind_palace(tab)` → true only for Chat; the render code skips the whole 3D scene/pearl
+  layer on every other tab.
+- Tabs group into workbenches — **Logs** (Sources/Peek/Tokens/Blocks/Rotate), **Code**
+  (Code/Modify), **Build** (Cargo/Bloc) — with an ordered swipe sequence.
+- `swipe(tab, dir)` = snapclone swipe-paging between *related* functions (no wrap, so you can't
+  swipe out of a workbench by accident); `gesture_nav(tab, gesture)` maps touchkit SwipeLeft/Right
+  to next/prev (voiceterm quick-access), leaves pinch to the tab for content zoom, and is inert on
+  Chat (the scene owns drags).
+- `BranchToggle` — flips, no effect yet (the deliberately-unwired affordance).
+
+**On-device wiring (next, where the gui compiles):** on non-chat tabs, poll
+`uikit_egui::touch::TouchSource` → `workbench::gesture_nav` → switch tab; gate the scene render on
+`uses_mind_palace`; render the workbench label + swipe affordance; show the (inert) branch toggle.
+The Chat tab keeps everything it has.
+
+**Still open (from the questions above):** the log→code bridge shape (Q1), which Chat controls are
+everyday vs dev (Q2), and your lived friction (Q6).
