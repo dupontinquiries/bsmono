@@ -64,6 +64,7 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Network => pages::network::ui(self, ui),
             Tab::Fleet => pages::fleet::ui(self, ui),
+            Tab::Settings => pages::settings::ui(self, ui),
             other => {
                 ui.heading(other.label());
                 ui.label("port in progress");
