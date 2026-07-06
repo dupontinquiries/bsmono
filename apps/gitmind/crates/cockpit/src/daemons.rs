@@ -152,6 +152,16 @@ pub fn logs_cmd(d: &Daemon, init: InitSystem, lines: u32) -> String {
     }
 }
 
+/// The command to *follow* a daemon's logs live (for a streaming view). systemd follows the user
+/// journal; OpenRC `tail -F`s the service log (capital -F re-opens across rotation). Starts with a
+/// small backlog so the view isn't empty.
+pub fn follow_cmd(d: &Daemon, init: InitSystem) -> String {
+    match init {
+        InitSystem::Systemd => format!("journalctl --user -u {}.service -n 50 -f --no-pager", d.name),
+        InitSystem::OpenRc => format!("tail -n 50 -F /var/log/{}.log", d.name),
+    }
+}
+
 /// Parse a per-daemon status block (as produced by `daemons_status_remote`: one `name: state` per
 /// line, where state is systemd's `active`/`inactive` or OpenRC's `started`/`stopped`) into
 /// `(daemon, up)` pairs. Pure, so the fleet-health rollup is testable without a network.
@@ -296,6 +306,13 @@ mod tests {
         assert!(rc.contains(&format!("/var/log/{}.log", d.name)) && rc.contains("tail -n 200"));
         // the openrc service now writes to that same path so the tail has something to read
         assert!(openrc_service(d, "/usr/local/bin/x").contains(&format!("output_log=\"/var/log/{}.log\"", d.name)));
+    }
+
+    #[test]
+    fn follow_cmd_follows_live() {
+        let d = &all()[0];
+        assert!(follow_cmd(d, InitSystem::Systemd).contains("-f") && follow_cmd(d, InitSystem::Systemd).contains("journalctl --user"));
+        assert!(follow_cmd(d, InitSystem::OpenRc).contains("tail -n 50 -F"));
     }
 
     #[test]

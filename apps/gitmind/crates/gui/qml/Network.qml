@@ -40,6 +40,25 @@ Item {
             if (r.ok) root.daemonModel = r.daemons
         } catch (e) {}
     }
+    // live daemon-log stream
+    property string daemonLog: ""
+    property int logFrom: 0
+    property bool streaming: false
+    property string streamName: ""
+    function startStream(name) {
+        var r = JSON.parse(backend.start_daemon_logs(root.dUser, root.btAddr, name))
+        if (!r.ok) { root.daemonNote = "error: " + r.error; return }
+        root.daemonLog = ""; root.logFrom = 0; root.streaming = true; root.streamName = name
+        logPoller.start()
+    }
+    function stopStream() {
+        backend.stop_daemon_logs()
+        root.streaming = false
+        logPoller.stop()
+        // one last drain so the tail end is visible
+        var j = JSON.parse(backend.job_log(root.logFrom))
+        if (j.lines) for (var i = 0; i < j.lines.length; i++) root.daemonLog += j.lines[i] + "\n"
+    }
     function addHealthTarget() {
         if (root.btAddr.length === 0) { root.healthNote = "select a device first"; return }
         var nm = root.btName.length ? root.btName : root.btAddr
@@ -127,6 +146,19 @@ Item {
             poller.stop(); root.busy = false
             var res = (j.result && j.result.length) ? JSON.parse(j.result) : { ok: false, error: "no result" }
             root.applyJobResult(res)
+        }
+    }
+
+    // tails the live daemon-log stream while it runs
+    Timer {
+        id: logPoller
+        interval: 400; repeat: true; running: false
+        onTriggered: {
+            var j = JSON.parse(backend.job_log(root.logFrom))
+            if (j.lines && j.lines.length) {
+                for (var i = 0; i < j.lines.length; i++) root.daemonLog += j.lines[i] + "\n"
+                root.logFrom = j.next
+            }
         }
     }
 
@@ -339,6 +371,34 @@ Item {
                                     root.daemonNote = r.ok ? r.output : r.error
                                 }
                             }
+                            Button {
+                                text: (root.streaming && root.streamName === dRow.dname) ? "◼ stop" : "▶ stream"
+                                font.pixelSize: 10
+                                enabled: root.btAddr.length > 0 && (!root.busy || (root.streaming && root.streamName === dRow.dname))
+                                onClicked: {
+                                    if (root.streaming && root.streamName === dRow.dname) root.stopStream()
+                                    else root.startStream(dRow.dname)
+                                }
+                            }
+                        }
+                    }
+                }
+                // live log stream panel (visible while streaming or with captured output)
+                Rectangle {
+                    width: parent.width; height: 160
+                    visible: root.streaming || root.daemonLog.length > 0
+                    color: "#0c0e14"; radius: 4; border.color: "#1f2430"; border.width: 1
+                    Flickable {
+                        id: logFlick
+                        anchors.fill: parent; anchors.margins: 6; clip: true
+                        contentHeight: logText.height; contentWidth: width
+                        Label {
+                            id: logText
+                            width: logFlick.width
+                            text: root.daemonLog.length > 0 ? root.daemonLog : "streaming " + root.streamName + "…"
+                            color: "#c0caf5"; font.family: "monospace"; font.pixelSize: 10
+                            wrapMode: Text.WrapAnywhere
+                            onTextChanged: logFlick.contentY = Math.max(0, logText.height - logFlick.height)
                         }
                     }
                 }
