@@ -27,6 +27,7 @@ members = [
     "crates/peek",
     "crates/cockpit",
     "crates/gui",
+    "crates/gui-egui",
 ]
 # `cargo build` builds the whole toolbox EXCEPT the Qt GUI (which needs Qt6
 # present). Build the GUI explicitly with `cargo build -p gitmind-gui`.
