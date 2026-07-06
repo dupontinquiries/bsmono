@@ -188,6 +188,7 @@ struct Backend {
     ensure_rust_target: qt_method!(fn(&self, triple: QString) -> QString),
     start_daemon_logs: qt_method!(fn(&self, user: QString, host: QString, name: QString) -> QString),
     stop_daemon_logs: qt_method!(fn(&self) -> QString),
+    deploy_strategy: qt_method!(fn(&self, target: QString, remote_reachable: bool) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1824,6 +1825,33 @@ impl Backend {
     fn stop_daemon_logs(&self) -> QString {
         self.log_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         QString::from(json!({"ok": true}).to_string())
+    }
+
+    /// Recommend how to build+deploy for `target`, explaining why: local-native, cross-compile, or
+    /// build-on-the-device. Cross-capability is judged by whether the rust std target is installed
+    /// (a musl phone needs its target added; without it and if the device is reachable we build
+    /// there instead). `remote_reachable` comes from the UI (host trust / discovery).
+    fn deploy_strategy(&self, target: QString, remote_reachable: bool) -> QString {
+        let host = cockpit::buildflags::normalize_native(&cockpit::ops::native_triple_local());
+        let path = std::env::var("PATH").unwrap_or_default();
+        let tgt = target.to_string();
+        let have_cross = cockpit::sysdeps::rust_target_installed(&tgt, &path);
+        let choice = cockpit::buildflags::recommend_strategy(&host, &tgt, have_cross, remote_reachable);
+        let strat = match choice.strategy {
+            cockpit::buildflags::DeployStrategy::LocalNative => "local-native",
+            cockpit::buildflags::DeployStrategy::CrossCompile => "cross-compile",
+            cockpit::buildflags::DeployStrategy::RemoteNative => "remote-native",
+        };
+        QString::from(
+            json!({
+                "ok": true,
+                "strategy": strat,
+                "reason": choice.reason,
+                "needs_cross_linker": choice.needs_cross_linker,
+                "host": host, "target": tgt,
+            })
+            .to_string(),
+        )
     }
 
     /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
