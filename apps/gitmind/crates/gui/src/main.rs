@@ -184,6 +184,8 @@ struct Backend {
     daemon_control: qt_method!(fn(&self, user: QString, host: QString, name: QString, action: QString) -> QString),
     daemon_logs: qt_method!(fn(&self, user: QString, host: QString, name: QString, lines: u32) -> QString),
     fleet_health: qt_method!(fn(&self, targets_json: QString) -> QString),
+    build_env_status: qt_method!(fn(&self) -> QString),
+    ensure_rust_target: qt_method!(fn(&self, triple: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1755,6 +1757,42 @@ impl Backend {
             })
             .collect();
         QString::from(json!({"ok": true, "devices": devices}).to_string())
+    }
+
+    /// Build-environment readiness: the detected package manager, its build-essential packages, and
+    /// which cross-compile targets rustup has (the phone needs an aarch64 musl target).
+    fn build_env_status(&self) -> QString {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mgr = cockpit::pydeps::detect_pkg_manager(&path);
+        let essentials = cockpit::sysdeps::build_essential_packages(mgr);
+        let targets = [
+            "aarch64-unknown-linux-musl",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+        ];
+        let tstatus: Vec<_> = targets
+            .iter()
+            .map(|t| json!({"triple": t, "installed": cockpit::sysdeps::rust_target_installed(t, &path)}))
+            .collect();
+        QString::from(
+            json!({
+                "ok": true,
+                "pkg_manager": mgr.name(),
+                "build_essentials": essentials,
+                "rust_targets": tstatus,
+            })
+            .to_string(),
+        )
+    }
+
+    /// Install a rustup std target (e.g. aarch64-unknown-linux-musl) so cross-builds to the phone
+    /// stop failing with "can't find crate for std". Returns added:true if it was just installed.
+    fn ensure_rust_target(&self, triple: QString) -> QString {
+        let path = std::env::var("PATH").unwrap_or_default();
+        match cockpit::sysdeps::ensure_rust_target(&triple.to_string(), &path) {
+            Ok(added) => QString::from(json!({"ok": true, "added": added, "triple": triple.to_string()}).to_string()),
+            Err(e) => err_json(&e),
+        }
     }
 
     /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
