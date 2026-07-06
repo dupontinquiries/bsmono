@@ -27,9 +27,11 @@ as a fallback.
 4. Layout via uikit-egui `Adaptive` (columns/pick), touch via `uikit_egui::touch` where useful.
 
 ## Ported so far
-Network (daemon registry + status/install), Settings (animation/palette/text/opacity, live),
+Network (daemon registry + **per-daemon start/stop/restart, one-shot + live streaming logs, fleet
+health rollup**), Settings (animation/palette/text/opacity, live),
 **Fleet** (app catalog from store_groups → build+install locally), **Push** (app picker + target +
-device + deploy_strategy hint + build & push). All on the Task pattern; lib builds on egui 0.34.
+device + deploy_strategy hint + build & push). Fleet + Push now **stream build/deploy logs live**
+(Task::run_logged over the *_logged cockpit variants, stick-to-bottom panel). All on the Task pattern; lib builds on egui 0.34.
 
 ## Remaining pages to port (from the Qt QML set)
 Apps (install/build-log), Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),

@@ -38,9 +38,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         let can = !app.task.is_running();
         if ui.add_enabled(can, egui::Button::new("build + install locally")).clicked() {
             let a = sel.clone();
-            app.task.run(move || match cockpit::flow::install_suite_app(&a) {
-                Ok(i) => format!("✓ installed {} → {}", i.name, i.path),
-                Err(e) => format!("error: {e}"),
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                match cockpit::flow::install_suite_app_logged(&a, &mut on_line) {
+                    Ok(i) => format!("✓ installed {} → {}", i.name, i.path),
+                    Err(e) => format!("error: {e}"),
+                }
             });
         }
     } else {
@@ -56,6 +59,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.label("building…");
         });
         ui.ctx().request_repaint();
+    }
+    let log = app.task.log();
+    if !log.is_empty() {
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for l in &log {
+                    ui.label(egui::RichText::new(l).monospace().small());
+                }
+            });
     }
     if !app.fleet.note.is_empty() {
         ui.add_space(6.0);

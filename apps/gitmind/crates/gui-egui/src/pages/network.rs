@@ -11,6 +11,8 @@ pub struct State {
     pub note: String,
     /// Which daemon is currently streaming ("" = none), so the toggle knows its label.
     pub streaming_name: String,
+    /// A session roster of devices (name, user, host) to roll daemon health up across.
+    pub health_targets: Vec<(String, String, String)>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -93,7 +95,45 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         }
     });
 
-    // live log panel (streaming daemon logs or captured output)
+    // fleet health: roll daemon status up across a roster of devices
+    ui.add_space(6.0);
+    ui.label(egui::RichText::new("fleet health").strong());
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!app.net.host.trim().is_empty(), egui::Button::new("add this device").small())
+            .clicked()
+        {
+            let (n, u, h) = (app.net.host.clone(), app.net.user.clone(), app.net.host.clone());
+            if !app.net.health_targets.iter().any(|(_, _, hh)| *hh == h) {
+                app.net.health_targets.push((n, u, h));
+            }
+        }
+        if ui
+            .add_enabled(idle && !app.net.health_targets.is_empty(), egui::Button::new("refresh").small())
+            .clicked()
+        {
+            let targets = app.net.health_targets.clone();
+            app.task.run(move || {
+                let mut out = String::new();
+                for d in cockpit::flow::fleet_health_remote(&targets) {
+                    if d.reachable {
+                        let up = d.daemons.iter().filter(|(_, u)| *u).count();
+                        out.push_str(&format!("[up] {} — {}/{} up\n", d.name, up, d.daemons.len()));
+                    } else {
+                        out.push_str(&format!("[!!] {} — unreachable\n", d.name));
+                    }
+                }
+                if out.is_empty() {
+                    out.push_str("(no devices in roster)");
+                }
+                out
+            });
+        }
+    });
+    if !app.net.health_targets.is_empty() {
+        let roster: Vec<&str> = app.net.health_targets.iter().map(|(n, _, _)| n.as_str()).collect();
+        ui.label(egui::RichText::new(format!("roster: {}", roster.join(", "))).weak().small());
+    }
     let lines = app.task.log();
     if !lines.is_empty() || !app.net.streaming_name.is_empty() {
         ui.add_space(6.0);
