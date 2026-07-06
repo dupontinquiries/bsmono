@@ -37,9 +37,13 @@ device + deploy_strategy hint + build & push). Fleet + Push now **stream build/d
 Fleet, Push, Network, **Apps** (installed apps: run/remove via binpin + run_local), **Timeline**
 (CheckpointEngine over git history), Settings. Shell = adaptive nav + theme + Task.
 
-## Remaining pages (specialised, not top-level tabs)
-Files/PeekViewer (browse + peek), Import (bundle/zip), Branches + merge_preview, DevicePicker
-(discovery component used by Push). Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
+## Ported (8 tabs)
+Fleet, Push, Network, Apps, **Import** (bundle/zip via cockpit::flow), **Branches** (native-store
+branch list), Timeline, Settings.
+
+## Remaining
+Files/PeekViewer (browse + peek), DevicePicker (discovery component to embed in Push, replacing
+its manual user/host fields), merge_preview action on Branches. Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
 Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
 port of an existing QML page onto the pattern above; the cockpit functions all exist already.
 
