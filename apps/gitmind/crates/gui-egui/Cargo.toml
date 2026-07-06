@@ -18,6 +18,7 @@ cockpit = { path = "../cockpit" }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
 settings-kit = { path = "../../../../shared/settings-kit" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 serde_json = "1"
 
 [features]
