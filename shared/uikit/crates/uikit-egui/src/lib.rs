@@ -54,6 +54,9 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         // control/button size (respect an explicit min target too)
         style.spacing.button_padding = egui::vec2(8.0 * btn, 4.0 * btn);
         style.spacing.interact_size.y = (24.0 * btn).max(prefs.touch.min_target);
+        // animation feel: the "snappy / smooth / heavy / reduced" picker. Scales egui's global
+        // animation_time so every animate_bool() across the kit respects it (Reduced → 0 = instant).
+        style.animation_time = BASE_ANIM_SECS * prefs.gesture.animation.time_scale();
     });
     // surface transparency: make panels/cards translucent so a LiveBackground (or the desktop,
     // if the window is transparent) shows through. Applied once here → every adopter gets it.
@@ -68,6 +71,18 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
             v.widgets.noninteractive.bg_fill = with_alpha(v.widgets.noninteractive.bg_fill, a);
         });
     }
+}
+
+/// The baseline egui `animation_time` at `Smooth` (scale 1.0). Snappy halves it, Heavy lengthens
+/// it, Reduced zeroes it.
+pub const BASE_ANIM_SECS: f32 = 0.15;
+
+/// Scale an *explicit* animation duration (e.g. a carved sheen's) by the active AnimationStyle, so
+/// hard-coded `animate_bool_with_time` durations track the picker too. Returns 0 under Reduced
+/// motion (instant). Reads the scale back from the `animation_time` that `apply_prefs` set.
+pub fn anim_secs(ctx: &egui::Context, base: f32) -> f32 {
+    let scale = ctx.style().animation_time / BASE_ANIM_SECS;
+    (base * scale).max(0.0)
 }
 
 /// Replace a colour's alpha (0..255), preserving RGB — the primitive behind translucent surfaces.
@@ -130,4 +145,22 @@ pub fn paint_barrier(ui: &Ui, surface: Rect, fraction: f32, edge: Direction, acc
     let tip = center + Vec2::new(dir * s, 0.0);
     painter.line_segment([center + Vec2::new(-dir * s, -s), tip], Stroke::new(2.0, col));
     painter.line_segment([center + Vec2::new(-dir * s, s), tip], Stroke::new(2.0, col));
+}
+
+#[cfg(test)]
+mod anim_apply_tests {
+    use super::*;
+    #[test]
+    fn animation_style_drives_context_animation_time() {
+        let ctx = egui::Context::default();
+        let mut prefs = settings_kit::Prefs::default();
+        prefs.gesture.animation = settings_kit::AnimationStyle::Reduced;
+        apply_prefs(&ctx, &prefs);
+        assert_eq!(ctx.style().animation_time, 0.0, "reduced motion is instant");
+        assert_eq!(anim_secs(&ctx, 0.25), 0.0, "explicit durations collapse too");
+        prefs.gesture.animation = settings_kit::AnimationStyle::Heavy;
+        apply_prefs(&ctx, &prefs);
+        assert!(ctx.style().animation_time > BASE_ANIM_SECS, "heavy lingers");
+        assert!(anim_secs(&ctx, 0.25) > 0.25, "carved sheen lengthens under heavy");
+    }
 }
