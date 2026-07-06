@@ -68,16 +68,23 @@ impl Default for App {
 
 impl App {
     /// One frame. Called from the eframe `update`.
+    ///
+    /// `#[allow(deprecated)]`: egui 0.34 deprecates the top-level `Panel::show(ctx)` in favour of
+    /// `show_inside(ui)`, but eframe hands app code only a `Context` (no root `Ui`), so there is no
+    /// non-deprecated way to render top-level panels yet. Using `Panel::left/bottom` (not the
+    /// deprecated `SidePanel`/`TopBottomPanel` aliases) is as clean as 0.34 allows here; revisit
+    /// when eframe exposes a root Ui.
+    #[allow(deprecated)]
     pub fn ui(&mut self, ctx: &egui::Context) {
         uikit_egui::apply_prefs(ctx, &self.prefs);
         let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
 
         if adaptive.is_compact() {
-            egui::TopBottomPanel::bottom("nav").show(ctx, |ui| {
+            egui::Panel::bottom("nav").show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| self.nav_buttons(ui));
             });
         } else {
-            egui::SidePanel::left("nav").resizable(false).show(ctx, |ui| {
+            egui::Panel::left("nav").resizable(false).show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.heading("gitmind");
                 ui.add_space(6.0);
@@ -95,10 +102,6 @@ impl App {
             Tab::Fleet => pages::fleet::ui(self, ui),
             Tab::Push => pages::push::ui(self, ui),
             Tab::Settings => pages::settings::ui(self, ui),
-            other => {
-                ui.heading(other.label());
-                ui.label("port in progress");
-            }
         });
     }
 

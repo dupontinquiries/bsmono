@@ -188,7 +188,7 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, border: Color32) 
 
 /// A titled carved panel; runs `body` inside it.
 pub fn panel(ui: &mut Ui, title: &str, base: Color32, accent: Color32, ink: Color32, skin: &Skin, body: impl FnOnce(&mut Ui)) {
-    egui::Frame::none()
+    egui::Frame::new()
         .corner_radius(CornerRadius::same(tokens::RADIUS_MD as u8))
         .fill(base)
         .inner_margin(egui::Margin::same(tokens::SPACE_MD as i8))

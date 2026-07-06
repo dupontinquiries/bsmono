@@ -46,7 +46,7 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     apply_palette(ctx, snapclone_theme::palette_for(pid));
     let text = prefs.touch.text_scale.max(0.5);
     let btn = prefs.touch.button_scale.max(0.5);
-    ctx.style_mut(|style| {
+    ctx.global_style_mut(|style| {
         // text size across the app
         for (_, font) in style.text_styles.iter_mut() {
             font.size *= text;
@@ -63,7 +63,7 @@ pub fn apply_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
     let opacity = prefs.display.opacity.clamp(0.3, 1.0);
     if opacity < 0.999 {
         let a = (opacity * 255.0) as u8;
-        ctx.style_mut(|style| {
+        ctx.global_style_mut(|style| {
             let v = &mut style.visuals;
             v.panel_fill = with_alpha(v.panel_fill, a);
             v.window_fill = with_alpha(v.window_fill, a);
@@ -81,7 +81,7 @@ pub const BASE_ANIM_SECS: f32 = 0.15;
 /// hard-coded `animate_bool_with_time` durations track the picker too. Returns 0 under Reduced
 /// motion (instant). Reads the scale back from the `animation_time` that `apply_prefs` set.
 pub fn anim_secs(ctx: &egui::Context, base: f32) -> f32 {
-    let scale = ctx.style().animation_time / BASE_ANIM_SECS;
+    let scale = ctx.global_style().animation_time / BASE_ANIM_SECS;
     (base * scale).max(0.0)
 }
 
@@ -156,11 +156,11 @@ mod anim_apply_tests {
         let mut prefs = settings_kit::Prefs::default();
         prefs.gesture.animation = settings_kit::AnimationStyle::Reduced;
         apply_prefs(&ctx, &prefs);
-        assert_eq!(ctx.style().animation_time, 0.0, "reduced motion is instant");
+        assert_eq!(ctx.global_style().animation_time, 0.0, "reduced motion is instant");
         assert_eq!(anim_secs(&ctx, 0.25), 0.0, "explicit durations collapse too");
         prefs.gesture.animation = settings_kit::AnimationStyle::Heavy;
         apply_prefs(&ctx, &prefs);
-        assert!(ctx.style().animation_time > BASE_ANIM_SECS, "heavy lingers");
+        assert!(ctx.global_style().animation_time > BASE_ANIM_SECS, "heavy lingers");
         assert!(anim_secs(&ctx, 0.25) > 0.25, "carved sheen lengthens under heavy");
     }
 }
