@@ -7,16 +7,18 @@ use crate::task::Task;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Fleet,
+    Push,
     Network,
     Timeline,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 4] = [Tab::Fleet, Tab::Network, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 5] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
+            Tab::Push => "Push",
             Tab::Network => "Network",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
@@ -29,6 +31,8 @@ pub struct App {
     pub prefs: settings_kit::Prefs,
     pub task: Task,
     pub net: pages::network::State,
+    pub fleet: pages::fleet::State,
+    pub push: pages::push::State,
 }
 
 impl Default for App {
@@ -38,6 +42,8 @@ impl Default for App {
             prefs: settings_kit::Prefs::default(),
             task: Task::default(),
             net: pages::network::State::default(),
+            fleet: pages::fleet::State::default(),
+            push: pages::push::State::default(),
         }
     }
 }
@@ -64,6 +70,7 @@ impl App {
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Network => pages::network::ui(self, ui),
             Tab::Fleet => pages::fleet::ui(self, ui),
+            Tab::Push => pages::push::ui(self, ui),
             Tab::Settings => pages::settings::ui(self, ui),
             other => {
                 ui.heading(other.label());
