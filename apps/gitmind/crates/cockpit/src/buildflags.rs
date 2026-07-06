@@ -222,6 +222,82 @@ pub fn is_native_build(requested: &str, native: &str) -> bool {
     target_libc(requested) == target_libc(native)
 }
 
+/// The architecture of a triple (the part before the first `-`), e.g. `aarch64`.
+pub fn arch_of(triple: &str) -> &str {
+    triple.split('-').next().unwrap_or("")
+}
+
+/// How gitmind should build for a given target device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeployStrategy {
+    /// Build locally with no cross toolchain (same arch + libc as this host). Fastest.
+    LocalNative,
+    /// Build locally with `--target` + a cross-linker, then copy the binary over.
+    CrossCompile,
+    /// Build on the target device itself (native there) — the fallback when we can't cross-compile
+    /// (e.g. no musl linker on the desktop) but can reach the device over ssh.
+    RemoteNative,
+}
+
+/// A chosen strategy plus the reasoning, so the UI can explain *why* a device deploys the way it
+/// does instead of silently picking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrategyChoice {
+    pub strategy: DeployStrategy,
+    pub reason: String,
+    /// Whether this path needs a cross-linker to be present (a precondition to check/install).
+    pub needs_cross_linker: bool,
+}
+
+/// Recommend a deploy strategy for a target device given this host's native triple, whether a
+/// cross-linker for the target is available, and whether the device is reachable over ssh.
+///
+/// The fleet's common case is same-arch (aarch64) but different libc (gnu desktop → musl phone):
+/// with a musl linker present we cross-compile and copy; without one we build on the phone itself
+/// (native there), which is slower but needs no cross toolchain. Pure — unit-tested.
+pub fn recommend_strategy(
+    host_native: &str,
+    target: &str,
+    have_cross_linker: bool,
+    remote_reachable: bool,
+) -> StrategyChoice {
+    let same_arch = arch_of(host_native) == arch_of(target);
+    let same_libc = target_libc(host_native) == target_libc(target);
+    if same_arch && same_libc {
+        return StrategyChoice {
+            strategy: DeployStrategy::LocalNative,
+            reason: "same arch + libc as this host — no cross toolchain needed".to_string(),
+            needs_cross_linker: false,
+        };
+    }
+    let mismatch = if !same_arch {
+        format!("{} vs {}", arch_of(host_native), arch_of(target))
+    } else {
+        format!("{} vs {} libc", target_libc(host_native), target_libc(target))
+    };
+    if have_cross_linker {
+        StrategyChoice {
+            strategy: DeployStrategy::CrossCompile,
+            reason: format!("differs from host ({mismatch}); cross-linker present → cross-compile + copy"),
+            needs_cross_linker: true,
+        }
+    } else if remote_reachable {
+        StrategyChoice {
+            strategy: DeployStrategy::RemoteNative,
+            reason: format!("differs from host ({mismatch}) and no cross-linker → build on the device (native there)"),
+            needs_cross_linker: false,
+        }
+    } else {
+        // can't cross, can't reach — surface the blocker; cross-compile is the only path once a
+        // linker is installed.
+        StrategyChoice {
+            strategy: DeployStrategy::CrossCompile,
+            reason: format!("differs from host ({mismatch}), device unreachable, no cross-linker — install a {} linker to cross-compile", target_libc(target)),
+            needs_cross_linker: true,
+        }
+    }
+}
+
 /// `cmake -S . -B <build_dir> -D…` argv for configuring a CMake app for a target.
 /// A toolchain file (per-arch) is how CMake cross-compiles; it's optional here so
 /// the command is well-formed even before one exists. Pure — unit-tested.
@@ -431,5 +507,27 @@ logging = []
     fn paths() {
         assert_eq!(built_binary_path("v", "aarch64-unknown-linux-musl"), "target/aarch64-unknown-linux-musl/release/v");
         assert_eq!(install_dir("/home/kesslerd/"), "/home/kesslerd/.local/bin");
+    }
+
+    #[test]
+    fn strategy_for_fleet_scenarios() {
+        let desktop = "aarch64-unknown-linux-gnu"; // Asahi Fedora
+        let phone = "aarch64-unknown-linux-musl"; // postmarketOS/Alpine
+        // desktop -> desktop: local native
+        assert_eq!(recommend_strategy(desktop, desktop, false, true).strategy, DeployStrategy::LocalNative);
+        // desktop -> phone with a musl linker: cross-compile + copy
+        let cc = recommend_strategy(desktop, phone, true, true);
+        assert_eq!(cc.strategy, DeployStrategy::CrossCompile);
+        assert!(cc.needs_cross_linker);
+        // desktop -> phone, no linker but reachable: build on the phone (native there)
+        assert_eq!(recommend_strategy(desktop, phone, false, true).strategy, DeployStrategy::RemoteNative);
+        // desktop -> phone, no linker AND unreachable: surface the blocker (cross is the only path)
+        let blocked = recommend_strategy(desktop, phone, false, false);
+        assert_eq!(blocked.strategy, DeployStrategy::CrossCompile);
+        assert!(blocked.reason.contains("musl"));
+        // cross-arch (x86 desktop -> aarch64 phone) with a linker: cross-compile, reason names the arch gap
+        let xarch = recommend_strategy("x86_64-unknown-linux-gnu", phone, true, true);
+        assert_eq!(xarch.strategy, DeployStrategy::CrossCompile);
+        assert!(xarch.reason.contains("x86_64") && xarch.reason.contains("aarch64"));
     }
 }
