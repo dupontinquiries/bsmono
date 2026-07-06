@@ -15,6 +15,7 @@ path = "src/lib.rs"
 egui = "0.34"
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 cockpit = { path = "../cockpit" }
+gitmind-core = { path = "../core" }
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
 touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
 settings-kit = { path = "../../../../shared/settings-kit" }

@@ -9,17 +9,19 @@ pub enum Tab {
     Fleet,
     Push,
     Network,
+    Apps,
     Timeline,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 6] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
             Tab::Push => "Push",
             Tab::Network => "Network",
+            Tab::Apps => "Apps",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
         }
@@ -33,6 +35,8 @@ pub struct App {
     pub net: pages::network::State,
     pub fleet: pages::fleet::State,
     pub push: pages::push::State,
+    pub apps: pages::apps::State,
+    pub timeline: pages::timeline::State,
 }
 
 impl Default for App {
@@ -44,6 +48,8 @@ impl Default for App {
             net: pages::network::State::default(),
             fleet: pages::fleet::State::default(),
             push: pages::push::State::default(),
+            apps: pages::apps::State::default(),
+            timeline: pages::timeline::State::default(),
         }
     }
 }
@@ -69,6 +75,8 @@ impl App {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Network => pages::network::ui(self, ui),
+            Tab::Apps => pages::apps::ui(self, ui),
+            Tab::Timeline => pages::timeline::ui(self, ui),
             Tab::Fleet => pages::fleet::ui(self, ui),
             Tab::Push => pages::push::ui(self, ui),
             Tab::Settings => pages::settings::ui(self, ui),
