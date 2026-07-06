@@ -27,6 +27,10 @@ Item {
     // daemons card
     property var daemonModel: []
     property string daemonNote: ""
+    // fleet health: a session roster of devices to roll daemon status up across
+    property var healthTargets: []   // [{name,user,host}]
+    property var healthDevices: []   // fleet_health result
+    property string healthNote: ""
     property string dUser: "user"
     property string dBinDir: "/home/user/.local/bin"
     property string dHome: "/home/user"
@@ -35,6 +39,22 @@ Item {
             var r = JSON.parse(backend.daemons_list())
             if (r.ok) root.daemonModel = r.daemons
         } catch (e) {}
+    }
+    function addHealthTarget() {
+        if (root.btAddr.length === 0) { root.healthNote = "select a device first"; return }
+        var nm = root.btName.length ? root.btName : root.btAddr
+        var t = root.healthTargets.slice()
+        for (var i = 0; i < t.length; i++)
+            if (t[i].host === root.btAddr) { root.healthNote = nm + " already in the roster"; return }
+        t.push({ name: nm, user: root.dUser, host: root.btAddr })
+        root.healthTargets = t
+        root.healthNote = "added " + nm + " — " + t.length + " device(s) in roster"
+    }
+    function refreshHealth() {
+        if (root.healthTargets.length === 0) { root.healthNote = "add a device first"; return }
+        var r = JSON.parse(backend.fleet_health(JSON.stringify(root.healthTargets)))
+        if (r.ok) { root.healthDevices = r.devices; root.healthNote = "" }
+        else { root.healthNote = "error: " + r.error }
     }
     property string btFile: ""
 
@@ -344,6 +364,48 @@ Item {
                 Label {
                     width: parent.width; visible: root.daemonNote.length > 0
                     text: root.daemonNote; color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
+                }
+            }
+
+            // ── fleet health: daemon status rolled up across the roster ──────
+            Column {
+                width: col.width; spacing: 6
+                Label { text: "fleet health"; color: "#7aa2f7"; font.bold: true }
+                Repeater {
+                    model: root.healthDevices
+                    delegate: Column {
+                        width: parent.width; spacing: 2
+                        Row {
+                            spacing: 8
+                            Label {
+                                text: (modelData.reachable ? "🟢 " : "🔴 ") + modelData.name
+                                color: "#e6e6e6"; font.pixelSize: 12
+                            }
+                            Label {
+                                text: modelData.reachable ? (modelData.up + "/" + modelData.total + " up") : "unreachable"
+                                color: modelData.reachable ? "#8a93a6" : "#f7768e"; font.pixelSize: 11
+                            }
+                        }
+                        Flow {
+                            width: col.width - 20; spacing: 8
+                            Repeater {
+                                model: modelData.daemons
+                                delegate: Label {
+                                    text: (modelData.up ? "● " : "○ ") + modelData.name
+                                    color: modelData.up ? "#9ece6a" : "#f7768e"; font.pixelSize: 10
+                                }
+                            }
+                        }
+                    }
+                }
+                Row {
+                    spacing: 8
+                    Button { text: "add this device"; enabled: root.btAddr.length > 0; onClicked: root.addHealthTarget() }
+                    Button { text: "refresh health"; enabled: root.healthTargets.length > 0 && !root.busy; onClicked: root.refreshHealth() }
+                }
+                Label {
+                    width: parent.width; visible: root.healthNote.length > 0
+                    text: root.healthNote; color: "#8a93a6"; font.pixelSize: 11; wrapMode: Text.WordWrap
                 }
             }
         }
