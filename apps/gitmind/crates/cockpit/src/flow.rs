@@ -1374,6 +1374,56 @@ pub fn daemon_control_remote(user: &str, host: &str, name: &str, action: &str) -
     crate::deploy::remote_capture(user, host, &cmd)
 }
 
+/// Stream a daemon's logs live from a target, calling `on_line` per line until `cancel` is set.
+/// A watcher thread kills the ssh child when `cancel` flips, so the blocking read returns promptly
+/// instead of hanging on `journalctl -f`. Runs on a worker thread (the GUI feeds lines into a Job).
+pub fn stream_daemon_logs(
+    user: &str,
+    host: &str,
+    name: &str,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::sync::atomic::Ordering;
+    let d = crate::daemons::find(name).ok_or_else(|| format!("unknown daemon {name}"))?;
+    let init = detect_init_remote(user, host);
+    let cmd = crate::daemons::follow_cmd(d, init);
+    on_line(&format!("$ streaming {name} logs from {host} …"));
+    let mut child = std::process::Command::new("ssh")
+        .args(crate::deploy::ssh_argv(user, host, &cmd))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("ssh failed: {e}"))?;
+    let stdout = child.stdout.take().ok_or("no stdout from ssh")?;
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+    // watcher: when cancelled, kill the ssh child so the read loop below unblocks
+    let (cw, cf) = (child.clone(), cancel.clone());
+    let watcher = std::thread::spawn(move || {
+        while !cf.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if let Ok(mut c) = cw.lock() {
+            let _ = c.kill();
+        }
+    });
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        on_line(&line);
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    cancel.store(true, Ordering::Relaxed); // release the watcher if the stream ended on its own
+    let _ = watcher.join();
+    if let Ok(mut c) = child.lock() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    on_line(&format!("— {name} log stream ended —"));
+    Ok(())
+}
+
 /// Health of one device: whether it answered, and its per-daemon up/down.
 #[derive(Debug, Clone)]
 pub struct DeviceHealth {

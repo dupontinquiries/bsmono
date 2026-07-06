@@ -38,7 +38,7 @@ pub const SSH_OPTS: [&str; 12] = [
 ];
 
 /// `ssh <SSH_OPTS> user@host <remote_cmd>` as an argv (no shell).
-fn ssh_argv(user: &str, host: &str, remote_cmd: &str) -> Vec<String> {
+pub(crate) fn ssh_argv(user: &str, host: &str, remote_cmd: &str) -> Vec<String> {
     let mut a: Vec<String> = SSH_OPTS.iter().map(|s| (*s).to_string()).collect();
     a.push(format!("{user}@{host}"));
     a.push(remote_cmd.to_string());
