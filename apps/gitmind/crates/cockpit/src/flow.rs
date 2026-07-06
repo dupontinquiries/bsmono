@@ -1374,6 +1374,41 @@ pub fn daemon_control_remote(user: &str, host: &str, name: &str, action: &str) -
     crate::deploy::remote_capture(user, host, &cmd)
 }
 
+/// Health of one device: whether it answered, and its per-daemon up/down.
+#[derive(Debug, Clone)]
+pub struct DeviceHealth {
+    pub name: String,
+    pub user: String,
+    pub host: String,
+    pub reachable: bool,
+    pub daemons: Vec<(String, bool)>,
+}
+
+/// Roll daemon status up across the whole fleet in one pass: for each `(name, user, host)` target,
+/// query its daemons and parse them. An unreachable device is reported (`reachable:false`) rather
+/// than failing the whole rollup, so one dead phone doesn't blank the dashboard.
+pub fn fleet_health_remote(targets: &[(String, String, String)]) -> Vec<DeviceHealth> {
+    targets
+        .iter()
+        .map(|(name, user, host)| match daemons_status_remote(user, host) {
+            Ok(out) => DeviceHealth {
+                name: name.clone(),
+                user: user.clone(),
+                host: host.clone(),
+                reachable: true,
+                daemons: crate::daemons::parse_status(&out),
+            },
+            Err(_) => DeviceHealth {
+                name: name.clone(),
+                user: user.clone(),
+                host: host.clone(),
+                reachable: false,
+                daemons: Vec::new(),
+            },
+        })
+        .collect()
+}
+
 /// Fetch the most recent `lines` of a single daemon's logs from the target (user journal on
 /// systemd, the service's log file on OpenRC).
 pub fn daemon_logs_remote(user: &str, host: &str, name: &str, lines: u32) -> Result<String, String> {
