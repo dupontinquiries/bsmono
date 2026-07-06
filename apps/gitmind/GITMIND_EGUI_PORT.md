@@ -45,8 +45,13 @@ branch list), Timeline, Settings.
 Fleet, Push, Network, Apps, Import, Branches, **Files** (browse tree + peek file contents),
 Timeline, Settings.
 
-## Remaining (enhancements, not standalone pages)
-DevicePicker (discovery component to embed in Push, replacing
+## Done
+Warning-clean on egui 0.34 (uikit-egui Context renames + gitmind-egui Panel::* with one documented
+allow(deprecated) for eframe's top-level show(ctx)). **DevicePicker** embedded in Push (scan the LAN
+via deploy::scan_ssh, pick a device to fill the host).
+
+## Remaining (minor)
+merge_preview action on Branches; other DevicePicker (discovery component to embed in Push, replacing
 its manual user/host fields), merge_preview action on Branches. Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
 Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
 port of an existing QML page onto the pattern above; the cockpit functions all exist already.
