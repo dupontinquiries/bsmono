@@ -81,6 +81,7 @@ pub mod voice_lang;
 pub mod chat_layout;
 pub mod tab_layout;
 pub mod workbench;
+pub mod log_gestures;
 #[cfg(feature = "gui")] pub mod spatial_audio;
 #[cfg(feature = "gui")] pub mod touch_nav;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
