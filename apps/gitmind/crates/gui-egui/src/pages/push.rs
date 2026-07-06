@@ -14,6 +14,7 @@ pub struct State {
     pub subnet: String,
     pub discovered: Vec<(String, String)>, // (ip, hostname)
     pub discovering: bool,
+    pub trusted: Option<bool>, // SSH trust status of the selected host (None = unknown/unchecked)
 }
 
 impl Default for State {
@@ -28,6 +29,7 @@ impl Default for State {
             subnet: String::new(),
             discovered: Vec::new(),
             discovering: false,
+            trusted: None,
         }
     }
 }
@@ -75,6 +77,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         for (ip, hostname) in app.push.discovered.clone() {
             let label = if hostname.is_empty() { ip.clone() } else { format!("{ip}  ·  {hostname}") };
             if ui.selectable_label(app.push.host == ip, label).clicked() {
+                app.push.trusted = Some(cockpit::deploy::host_trusted(&ip));
                 app.push.host = ip;
             }
         }
@@ -86,6 +89,30 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.label("host");
         ui.text_edit_singleline(&mut app.push.host);
     });
+    if !app.push.host.trim().is_empty() {
+        ui.horizontal(|ui| {
+            if ui.button("check trust").clicked() {
+                app.push.trusted = Some(cockpit::deploy::host_trusted(&app.push.host));
+            }
+            match app.push.trusted {
+                Some(true) => {
+                    ui.colored_label(egui::Color32::from_rgb(0x9e, 0xce, 0x6a), "✓ host key trusted");
+                }
+                Some(false) => {
+                    ui.colored_label(egui::Color32::from_rgb(0xe0, 0xaf, 0x68), "host key not in known_hosts");
+                    if ui.add_enabled(!app.task.is_running(), egui::Button::new("trust host key")).clicked() {
+                        let h = app.push.host.clone();
+                        app.task.run(move || match cockpit::deploy::trust_host(&h) {
+                            Ok(m) => format!("trusted host key: {m}"),
+                            Err(e) => format!("error: {e}"),
+                        });
+                        app.push.trusted = None; // re-check after the keyscan finishes
+                    }
+                }
+                None => {}
+            }
+        });
+    }
     ui.horizontal(|ui| {
         ui.label("target");
         ui.text_edit_singleline(&mut app.push.target);
