@@ -16,7 +16,6 @@
 //!   ^^device *dev = minor->dev;
 //!   ^^master *master;
 
-use std::collections::HashMap;
 
 /// Configuration for the shortener.
 #[derive(Clone)]
@@ -52,97 +51,57 @@ pub struct ShortenStats {
 
 /// Shorten a slice of log lines.
 pub fn shorten(lines: &[&str], cfg: &ShortenConfig) -> ShortenResult {
-    let mut out: Vec<String>  = Vec::with_capacity(lines.len());
-    let mut map: Vec<usize>   = Vec::with_capacity(lines.len());
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut map: Vec<usize>  = Vec::with_capacity(lines.len());
     let mut stats = ShortenStats { original_lines: lines.len(), ..Default::default() };
 
-    // Track the last N prefixes we've seen, with how many times each appeared.
-    // key: leading token(s), value: (last_output_idx, count)
-    let mut prefix_table: HashMap<String, (usize, usize)> = HashMap::new();
+    // Collapse the *longest prefix a line shares with the previous line* (snapped to a word
+    // boundary): the shared part is the repeated structure, and whatever follows is the part that
+    // *changed* — which is what you're actually scanning a log for. No prefix table / hashing:
+    // just a byte-level common-prefix check against the previous line (cheaper than the old
+    // per-line String key, and correct for arbitrary repeated structure, not just 2 tokens).
+    let mut prev: Option<&str> = None;
+    let mut run_len = 0usize;
 
     for (orig_idx, &line) in lines.iter().enumerate() {
-        // compute the prefix once per line (was computed twice — for lookup + table update)
-        let leading = leading_tokens(line, 3);
+        let shared = prev.map(|p| shared_prefix_len(p, line)).unwrap_or(0);
 
-        // Check if this leading token sequence was seen recently
-        let shortened = if let Some(prefix) = leading.as_deref() {
-            if let Some((last_idx, count)) = prefix_table.get(prefix).copied() {
-                // Only collapse if within the look-back window and repeated enough
-                if orig_idx.saturating_sub(last_idx) <= cfg.window
-                    && count >= cfg.min_repeat_count - 1
-                    && prefix.len() >= cfg.min_prefix_len
-                {
-                    // Find the first token after the repeated prefix and use ^^ notation
-                    let rest = line.trim_start()
-                        .trim_start_matches(prefix)
-                        .trim_start();
-                    // Extract next identifier (the type name that changes)
-                    let indent = leading_whitespace(line);
-                    let shortened_line = format!("{}^^{}", indent, rest);
-                    stats.chars_removed += prefix.len().saturating_sub(2); // ^^ is 2 chars
-                    Some(shortened_line)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
+        // a run is >= 2 consecutive lines sharing a long-enough prefix; the first line of a run is
+        // kept in full as its "header", the rest collapse.
+        if shared >= cfg.min_prefix_len {
+            run_len += 1;
         } else {
-            None
-        };
+            run_len = 1;
+        }
+        let collapse = shared >= cfg.min_prefix_len && run_len >= cfg.min_repeat_count;
 
-        let output_line = shortened.unwrap_or_else(|| line.to_owned());
+        let output_line = if collapse {
+            let indent = leading_whitespace(line);
+            stats.chars_removed += shared.saturating_sub(indent.len() + 2); // replaced by indent + ^^
+            format!("{}^^{}", indent, &line[shared..])
+        } else {
+            line.to_owned()
+        };
         out.push(output_line);
         map.push(orig_idx);
-
-        // Update prefix table — reuse `leading` (no second leading_tokens call / alloc)
-        if let Some(prefix) = leading {
-            let entry = prefix_table.entry(prefix).or_insert((orig_idx, 0));
-            entry.0 = orig_idx;
-            entry.1 += 1;
-        }
-
-        // Evict old entries beyond the window
-        if orig_idx % 50 == 0 {
-            prefix_table.retain(|_, (last, _)| orig_idx.saturating_sub(*last) <= cfg.window);
-        }
+        prev = Some(line);
     }
 
     stats.output_lines = out.len();
     ShortenResult { lines: out, line_map: map, stats }
 }
 
-/// Extract the first `n` whitespace-separated tokens from a line as a
-/// canonical prefix string, or None if fewer than 2 tokens.
-fn leading_tokens(line: &str, _n: usize) -> Option<String> {
-    let trimmed = line.trim();
-    // Skip pure noise lines (empty, just punctuation, very short)
-    if trimmed.len() < 8 { return None; }
-
-    // Pull the first two tokens straight off the iterator — no Vec allocation, and we never
-    // needed the 3rd token (the prefix is always the first two).
-    let mut it = trimmed.split_whitespace();
-    let first = it.next()?;
-    let second = it.next()?; // require at least 2 tokens
-
-    // Only consider lines that start with a keyword or type identifier
-    let is_type_keyword = matches!(first,
-        "struct" | "enum" | "union" | "class" | "typedef" | "const" |
-        "static" | "extern" | "inline" | "unsigned" | "signed" |
-        "let" | "fn" | "pub" | "use" | "impl" | "type" | "trait"
-    ) || (first.chars().next().map(|c| c.is_ascii_lowercase()).unwrap_or(false)
-          && !first.starts_with("//")
-          && !first.starts_with("/*")
-          && !first.starts_with('*'));
-
-    if !is_type_keyword { return None; }
-
-    // The collapsible prefix is the first two tokens; build it directly (one sized alloc).
-    let mut prefix = String::with_capacity(first.len() + 1 + second.len());
-    prefix.push_str(first);
-    prefix.push(' ');
-    prefix.push_str(second);
-    Some(prefix)
+/// Longest common prefix of `a` and `b`, in bytes, snapped back to the last word boundary
+/// (whitespace) so the collapse cuts *between whole tokens* rather than mid-word — that keeps the
+/// changing values intact and readable. Returns 0 when no whole leading word is shared.
+fn shared_prefix_len(a: &str, b: &str) -> usize {
+    let raw = a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count();
+    // `raw` is a valid byte index in `a` (it's a common-prefix length), and rfind on the ASCII
+    // whitespace keeps us on a char boundary.
+    match a[..raw].rfind(|c: char| c.is_whitespace()) {
+        Some(pos) => pos + 1, // include the boundary whitespace in the shared prefix
+        None => 0,
+    }
 }
 
 fn leading_whitespace(line: &str) -> &str {
@@ -167,6 +126,31 @@ mod tests {
         assert_eq!(result.lines[0], lines[0]); // first not shortened
         assert!(result.lines[1].contains("^^"), "line 1 should be shortened: {}", result.lines[1]);
         assert!(result.lines[2].contains("^^"), "line 2 should be shortened: {}", result.lines[2]);
+    }
+
+    #[test]
+    fn collapses_shared_structure_and_surfaces_the_change() {
+        // the whole point: fold the repeated structure, leave the changing value whole + visible
+        let lines = vec![
+            "INFO worker started id=1",
+            "INFO worker started id=2",
+            "INFO worker started id=3",
+        ];
+        let cfg = ShortenConfig { min_repeat_count: 2, ..Default::default() };
+        let r = shorten(&lines, &cfg);
+        assert_eq!(r.lines[0], lines[0], "run header shown in full");
+        assert!(r.lines[1].contains("^^"));
+        assert!(r.lines[1].ends_with("id=2"), "changing value stays whole: {}", r.lines[1]);
+        assert!(!r.lines[1].contains("worker"), "repeated structure collapsed away");
+    }
+
+    #[test]
+    fn unrelated_lines_are_left_alone() {
+        let lines = vec!["alpha one two three", "beta four five six"];
+        let cfg = ShortenConfig { min_repeat_count: 2, ..Default::default() };
+        let r = shorten(&lines, &cfg);
+        assert_eq!(r.lines[0], lines[0]);
+        assert_eq!(r.lines[1], lines[1], "no shared prefix, nothing collapsed");
     }
 }
 
