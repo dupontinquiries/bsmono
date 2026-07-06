@@ -30,6 +30,7 @@ Item {
     // ── build ────────────────────────────────────────────────────────────
     property string target: ""        // triple to build for
     property string localTarget: ""   // this device's native triple
+    property var buildEnv: ({})       // {pkg_manager, build_essentials, rust_targets}
     property var allFeatures: []       // [name]
     property var features: []          // [{name, on}]
     property var defaultsByTarget: ({})
@@ -68,6 +69,16 @@ Item {
         var t = JSON.parse(backend.local_target())
         if (t.target) { root.localTarget = t.target; root.target = t.target }
         root.loadApps()
+        root.loadBuildEnv()
+    }
+
+    function loadBuildEnv() {
+        try { var r = JSON.parse(backend.build_env_status()); if (r.ok) root.buildEnv = r } catch (e) {}
+    }
+    function ensureTarget(triple) {
+        var r = JSON.parse(backend.ensure_rust_target(triple))
+        root.note = r.ok ? (r.added ? ("installed " + triple) : (triple + " already present")) : ("error: " + r.error)
+        root.loadBuildEnv()
     }
 
     // ── app list / page ──────────────────────────────────────────────────
@@ -260,6 +271,36 @@ Item {
             Label {
                 width: parent.width; visible: root.note.length > 0
                 text: root.note; color: "#a6adc8"; font.pixelSize: 12; wrapMode: Text.WrapAnywhere
+            }
+
+            // ── BUILD ENVIRONMENT (pkg manager + cross-compile targets) ──
+            Column {
+                width: parent.width; spacing: 6
+                visible: root.buildEnv.pkg_manager !== undefined
+                Label { text: "build environment"; color: "#7aa2f7"; font.bold: true }
+                Label {
+                    text: "package manager: " + (root.buildEnv.pkg_manager || "?")
+                    color: "#a6adc8"; font.pixelSize: 11
+                }
+                Flow {
+                    width: parent.width; spacing: 10
+                    Repeater {
+                        model: root.buildEnv.rust_targets || []
+                        delegate: Row {
+                            spacing: 4
+                            Label {
+                                text: (modelData.installed ? "● " : "○ ") + modelData.triple
+                                color: modelData.installed ? "#9ece6a" : "#8a93a6"; font.pixelSize: 10
+                                anchors.verticalCenter: parent.verticalCenter
+                            }
+                            Button {
+                                visible: !modelData.installed
+                                text: "add"; font.pixelSize: 9
+                                onClicked: root.ensureTarget(modelData.triple)
+                            }
+                        }
+                    }
+                }
             }
 
             // ── APP LIST ─────────────────────────────────────────────────
