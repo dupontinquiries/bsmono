@@ -12,12 +12,13 @@ pub enum Tab {
     Apps,
     Import,
     Branches,
+    Files,
     Timeline,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 8] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Import, Tab::Branches, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 9] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
@@ -26,6 +27,7 @@ impl Tab {
             Tab::Apps => "Apps",
             Tab::Import => "Import",
             Tab::Branches => "Branches",
+            Tab::Files => "Files",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
         }
@@ -43,6 +45,7 @@ pub struct App {
     pub timeline: pages::timeline::State,
     pub import: pages::import::State,
     pub branches: pages::branches::State,
+    pub files: pages::files::State,
 }
 
 impl Default for App {
@@ -58,6 +61,7 @@ impl Default for App {
             timeline: pages::timeline::State::default(),
             import: pages::import::State::default(),
             branches: pages::branches::State::default(),
+            files: pages::files::State::default(),
         }
     }
 }
@@ -86,6 +90,7 @@ impl App {
             Tab::Apps => pages::apps::ui(self, ui),
             Tab::Import => pages::import::ui(self, ui),
             Tab::Branches => pages::branches::ui(self, ui),
+            Tab::Files => pages::files::ui(self, ui),
             Tab::Timeline => pages::timeline::ui(self, ui),
             Tab::Fleet => pages::fleet::ui(self, ui),
             Tab::Push => pages::push::ui(self, ui),

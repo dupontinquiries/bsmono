@@ -41,8 +41,12 @@ Fleet, Push, Network, **Apps** (installed apps: run/remove via binpin + run_loca
 Fleet, Push, Network, Apps, **Import** (bundle/zip via cockpit::flow), **Branches** (native-store
 branch list), Timeline, Settings.
 
-## Remaining
-Files/PeekViewer (browse + peek), DevicePicker (discovery component to embed in Push, replacing
+## Ported (9 tabs — every standalone Qt page)
+Fleet, Push, Network, Apps, Import, Branches, **Files** (browse tree + peek file contents),
+Timeline, Settings.
+
+## Remaining (enhancements, not standalone pages)
+DevicePicker (discovery component to embed in Push, replacing
 its manual user/host fields), merge_preview action on Branches. Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
 Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
 port of an existing QML page onto the pattern above; the cockpit functions all exist already.
