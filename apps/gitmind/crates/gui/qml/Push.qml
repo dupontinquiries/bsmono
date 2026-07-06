@@ -16,6 +16,8 @@ Item {
     property string selPath: ""
     property string selOid: ""
     property string target: "aarch64-unknown-linux-musl"
+    property string strategyName: ""
+    property string strategyReason: ""
 
     // build features (cargo [features]) for the selected app
     property var features: []
@@ -64,12 +66,22 @@ Item {
     function setTarget(t) {
         root.target = t
         root.applyDefaults()
+        root.loadStrategy()
+    }
+    // ask the backend how it'll build for this target+device, and why
+    function loadStrategy() {
+        if (root.target.length === 0) { root.strategyName = ""; return }
+        var reachable = picker.selHost.length > 0
+        var r = JSON.parse(backend.deploy_strategy(root.target, reachable))
+        if (r.ok) { root.strategyName = r.strategy; root.strategyReason = r.reason }
+        else { root.strategyName = ""; root.strategyReason = "" }
     }
     // when a device is chosen, default the build target to its libc
     function detectTarget() {
         if (picker.selHost.length === 0) return
         var t = JSON.parse(backend.remote_target(picker.selHost, picker.user))
         if (t.ok && t.target && t.target.length) { root.target = t.target; root.applyDefaults() }
+        root.loadStrategy()
     }
     function doPush() {
         if (root.selApp.length === 0) { root.note = "pick an app first"; return }
@@ -244,6 +256,13 @@ Item {
                             width: parent.width; color: "#5b6477"; font.pixelSize: 11; wrapMode: Text.WordWrap
                             text: root.chosen.length ? ("building with: " + root.chosen.join(", ")) : "no features (—no-default-features)"
                         }
+                    }
+                    Label {
+                        width: parent.width
+                        visible: root.strategyName.length > 0
+                        wrapMode: Text.WordWrap; font.pixelSize: 11
+                        color: root.strategyName === "remote-native" ? "#e0af68" : "#7aa2f7"
+                        text: "deploy: " + root.strategyName + " — " + root.strategyReason
                     }
                     Button {
                         text: root.pushState === "working" ? "working…" : (root.pushState === "done" ? "pushed ✓" : "Build & push")
