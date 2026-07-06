@@ -1,0 +1,26 @@
+[package]
+name = "gitmind-egui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gitmind-egui"
+path = "src/main.rs"
+required-features = ["app"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+cockpit = { path = "../cockpit" }
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+touchkit = { path = "../../../../shared/touchkit", features = ["egui"] }
+settings-kit = { path = "../../../../shared/settings-kit" }
+serde_json = "1"
+
+[features]
+# the runnable eframe app; off by default so the lib (App + pages) builds + tests headless.
+default = []
+app = ["dep:eframe"]
