@@ -11,6 +11,9 @@ pub struct State {
     pub target: String,
     pub strategy: String,
     pub note: String,
+    pub subnet: String,
+    pub discovered: Vec<(String, String)>, // (ip, hostname)
+    pub discovering: bool,
 }
 
 impl Default for State {
@@ -22,6 +25,9 @@ impl Default for State {
             target: "aarch64-unknown-linux-musl".to_string(),
             strategy: String::new(),
             note: String::new(),
+            subnet: String::new(),
+            discovered: Vec::new(),
+            discovering: false,
         }
     }
 }
@@ -38,6 +44,38 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 if ui.selectable_label(false, &a.name).clicked() {
                     app.push.selected = Some(a);
                 }
+            }
+        }
+    });
+
+    // discover devices on the LAN and pick one (fills host), instead of typing it
+    egui::CollapsingHeader::new("discover devices").show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("subnet");
+            ui.text_edit_singleline(&mut app.push.subnet);
+            ui.label(egui::RichText::new("(blank = auto)").weak().small());
+            if ui.add_enabled(!app.task.is_running(), egui::Button::new("scan")).clicked() {
+                app.push.discovering = true;
+                let subnet = app.push.subnet.clone();
+                app.task.run(move || {
+                    let prefix = if subnet.trim().is_empty() {
+                        cockpit::deploy::local_subnet24().unwrap_or_default()
+                    } else {
+                        subnet.trim().to_string()
+                    };
+                    if prefix.is_empty() {
+                        return serde_json::json!({"error": "could not detect subnet — type one like 192.168.1"}).to_string();
+                    }
+                    let devs = cockpit::deploy::scan_ssh(&prefix, std::time::Duration::from_millis(300), 64);
+                    let arr: Vec<_> = devs.iter().map(|d| serde_json::json!({"ip": d.ip, "hostname": d.hostname})).collect();
+                    serde_json::json!({"devices": arr}).to_string()
+                });
+            }
+        });
+        for (ip, hostname) in app.push.discovered.clone() {
+            let label = if hostname.is_empty() { ip.clone() } else { format!("{ip}  ·  {hostname}") };
+            if ui.selectable_label(app.push.host == ip, label).clicked() {
+                app.push.host = ip;
             }
         }
     });
@@ -78,7 +116,27 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
 
     if let Some(r) = app.task.take_result() {
-        app.push.note = r;
+        if app.push.discovering {
+            app.push.discovering = false;
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&r) {
+                if let Some(devs) = v.get("devices").and_then(|d| d.as_array()) {
+                    app.push.discovered = devs
+                        .iter()
+                        .filter_map(|d| {
+                            Some((
+                                d.get("ip")?.as_str()?.to_string(),
+                                d.get("hostname")?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect();
+                    app.push.note = format!("found {} device(s)", app.push.discovered.len());
+                } else if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                    app.push.note = e.to_string();
+                }
+            }
+        } else {
+            app.push.note = r;
+        }
     }
     if app.task.is_running() {
         ui.horizontal(|ui| {
