@@ -88,6 +88,8 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
          command=\"{exec}\"\n\
          command_background=true\n\
          pidfile=\"/run/{name}.pid\"\n\
+         output_log=\"/var/log/{name}.log\"\n\
+         error_log=\"/var/log/{name}.log\"\n\
          \n\
          depend() {{\n\
          \tneed net\n\
@@ -96,6 +98,58 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
         desc = d.description,
         exec = exec_path,
     )
+}
+
+/// A lifecycle action on a running daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl DaemonAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DaemonAction::Start => "start",
+            DaemonAction::Stop => "stop",
+            DaemonAction::Restart => "restart",
+        }
+    }
+    /// Parse from a UI string; unknown → None.
+    pub fn parse(s: &str) -> Option<DaemonAction> {
+        match s {
+            "start" => Some(DaemonAction::Start),
+            "stop" => Some(DaemonAction::Stop),
+            "restart" => Some(DaemonAction::Restart),
+            _ => None,
+        }
+    }
+}
+
+/// The command to start/stop/restart a daemon now, for the given init system. (`start`, `stop`,
+/// and `restart` are all valid verbs for both `systemctl --user` and `rc-service`.)
+pub fn control_cmd(d: &Daemon, init: InitSystem, action: DaemonAction) -> String {
+    let a = action.as_str();
+    match init {
+        InitSystem::Systemd => format!("systemctl --user {a} {}.service", d.name),
+        InitSystem::OpenRc => format!("rc-service {} {a}", d.name),
+    }
+}
+
+/// The command to fetch a daemon's most recent `lines` of logs. systemd reads the user journal;
+/// OpenRC tails the service's `output_log` (see `openrc_service`), with a friendly note if the
+/// daemon predates the log path or logs to syslog instead.
+pub fn logs_cmd(d: &Daemon, init: InitSystem, lines: u32) -> String {
+    match init {
+        InitSystem::Systemd => {
+            format!("journalctl --user -u {}.service -n {lines} --no-pager", d.name)
+        }
+        InitSystem::OpenRc => format!(
+            "tail -n {lines} /var/log/{name}.log 2>/dev/null || echo '(no log file yet for {name})'",
+            name = d.name
+        ),
+    }
 }
 
 /// The unit file path a daemon's service lands at, for the given init system.
@@ -195,5 +249,34 @@ mod tests {
         // openrc variant chmods the init script
         let rc = install_daemons_script("/usr/local/bin", "/root", InitSystem::OpenRc);
         assert!(rc.contains("chmod +x") && rc.contains("rc-update add"));
+    }
+
+    #[test]
+    fn control_cmd_is_init_aware() {
+        let d = &all()[0];
+        assert_eq!(
+            control_cmd(d, InitSystem::Systemd, DaemonAction::Restart),
+            format!("systemctl --user restart {}.service", d.name)
+        );
+        assert_eq!(
+            control_cmd(d, InitSystem::OpenRc, DaemonAction::Stop),
+            format!("rc-service {} stop", d.name)
+        );
+        // action round-trips through parse/as_str
+        for a in [DaemonAction::Start, DaemonAction::Stop, DaemonAction::Restart] {
+            assert_eq!(DaemonAction::parse(a.as_str()), Some(a));
+        }
+        assert_eq!(DaemonAction::parse("frobnicate"), None);
+    }
+
+    #[test]
+    fn logs_cmd_reads_journal_or_tails_log() {
+        let d = &all()[0];
+        let sd = logs_cmd(d, InitSystem::Systemd, 200);
+        assert!(sd.contains("journalctl --user -u") && sd.contains("-n 200"));
+        let rc = logs_cmd(d, InitSystem::OpenRc, 200);
+        assert!(rc.contains(&format!("/var/log/{}.log", d.name)) && rc.contains("tail -n 200"));
+        // the openrc service now writes to that same path so the tail has something to read
+        assert!(openrc_service(d, "/usr/local/bin/x").contains(&format!("output_log=\"/var/log/{}.log\"", d.name)));
     }
 }
