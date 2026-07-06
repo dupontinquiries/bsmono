@@ -109,6 +109,19 @@ impl AnimationStyle {
         cfg.detent_rate_per_ms = rate;
         cfg.takeover_lock_ms = lock;
     }
+
+    /// A multiplier on visual (egui) animation durations, matching the same feel as
+    /// `apply_to_gesture`: Snappy is quick, Heavy lingers, Reduced is instant. uikit-egui uses this
+    /// to scale `Context::animation_time` (and its carved sheen etc.) so every app that draws with
+    /// the kit animates the way the picker says.
+    pub fn time_scale(self) -> f32 {
+        match self {
+            AnimationStyle::Snappy => 0.5,
+            AnimationStyle::Smooth => 1.0,
+            AnimationStyle::Heavy => 1.8,
+            AnimationStyle::Reduced => 0.0,
+        }
+    }
 }
 
 /// Which hand the UI favours — controls/handles sit on the dominant side.
@@ -623,5 +636,17 @@ mod tests {
         assert!(d.contains(&("gesture.sensitivity".to_string(), "1.8".to_string())));
         assert!(d.contains(&("theme.palette".to_string(), "Nord".to_string())));
         assert!(diff(&old, &old).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod anim_scale_tests {
+    use super::AnimationStyle;
+    #[test]
+    fn time_scale_orders_and_reduced_is_instant() {
+        assert_eq!(AnimationStyle::Reduced.time_scale(), 0.0);
+        assert_eq!(AnimationStyle::Smooth.time_scale(), 1.0);
+        assert!(AnimationStyle::Snappy.time_scale() < AnimationStyle::Smooth.time_scale());
+        assert!(AnimationStyle::Smooth.time_scale() < AnimationStyle::Heavy.time_scale());
     }
 }

@@ -154,7 +154,7 @@ pub fn pill(ui: &mut Ui, text: &str, base: Color32, accent: Color32, ink: Color3
     let pill_skin = Skin { radius: tokens::RADIUS_FULL as u8, ..*skin };
     let phase = ui
         .ctx()
-        .animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.25);
+        .animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), crate::anim_secs(ui.ctx(), 0.25));
     paint_carved(ui, rect, base, accent, &pill_skin, s, phase);
     if on {
         ui.painter().rect_stroke(
@@ -226,7 +226,7 @@ fn carved_clickable(
     // that ~0.25s transition and then parks — no idle cost.
     let phase = ui
         .ctx()
-        .animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), 0.25);
+        .animate_bool_with_time(resp.id, resp.hovered() || resp.is_pointer_button_down_on(), crate::anim_secs(ui.ctx(), 0.25));
     paint_carved(ui, rect, base, acc, skin, s, phase);
     carved_text(ui, rect.center(), text, font, ink, skin);
     resp
