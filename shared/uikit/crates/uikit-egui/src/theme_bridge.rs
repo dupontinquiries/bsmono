@@ -97,7 +97,7 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
 
     // token-driven spacing so the egui app matches the FP5-tuned C++ metrics
     ctx.set_visuals(v);
-    ctx.style_mut(|s| {
+    ctx.global_style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(tokens::SPACE_SM as f32, tokens::SPACE_SM as f32);
         s.spacing.button_padding = egui::vec2(tokens::SPACE_MD as f32, tokens::SPACE_SM as f32);
         s.spacing.interact_size.y = tokens::TOUCH_MIN as f32; // touch targets >= 40px
@@ -135,11 +135,11 @@ mod prefs_tests {
     #[test]
     fn apply_prefs_scales_text() {
         let ctx = Context::default();
-        let before = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
+        let before = ctx.global_style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
         let mut prefs = settings_kit::Prefs::default();
         prefs.touch.text_scale = 2.0;
         crate::apply_prefs(&ctx, &prefs);
-        let after = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
+        let after = ctx.global_style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
         assert!(after > before * 1.5, "text_scale 2.0 should roughly double body text ({before} -> {after})");
     }
 

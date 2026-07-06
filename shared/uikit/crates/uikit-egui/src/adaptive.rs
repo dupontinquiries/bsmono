@@ -101,7 +101,7 @@ impl Adaptive {
     /// that bumps phones up slightly for legibility. Everything here is a *default* — see
     /// the `with_*` overrides.
     pub fn detect(ctx: &Context) -> Self {
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let w = screen.width();
         let h = screen.height();
         let class = DeviceClass::from_width(w);
@@ -167,7 +167,7 @@ impl Adaptive {
     /// How many columns of `min_col_width` fit in the available content width (after
     /// safe-area), at least one. Apps drive their own grid with this.
     pub fn columns(&self, ctx: &Context, min_col_width: f32) -> usize {
-        let avail = (ctx.screen_rect().width() - self.safe_area.left - self.safe_area.right).max(0.0);
+        let avail = (ctx.content_rect().width() - self.safe_area.left - self.safe_area.right).max(0.0);
         ((avail + self.gutter) / (min_col_width + self.gutter)).floor().max(1.0) as usize
     }
 
@@ -180,7 +180,7 @@ impl Adaptive {
     /// this once at startup, then customize `ctx.style_mut()` freely. Returns nothing so
     /// it composes with the app's own styling.
     pub fn apply_touch_defaults(&self, ctx: &Context) {
-        let mut style = (*ctx.style()).clone();
+        let mut style = (*ctx.global_style()).clone();
         // Only widen the interaction size; never shrink what an app already set larger.
         let t = self.min_touch_target;
         style.spacing.interact_size.y = style.spacing.interact_size.y.max(t);
@@ -191,7 +191,7 @@ impl Adaptive {
             // touch scrolling likes a touch more slop before a drag is a drag
             style.interaction.resize_grab_radius_side = style.interaction.resize_grab_radius_side.max(10.0);
         }
-        ctx.set_style(style);
+        ctx.set_global_style(style);
     }
 }
 
