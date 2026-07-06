@@ -26,9 +26,13 @@ as a fallback.
 3. Blocking calls → `app.task.run(move || …)`, poll with `take_result()`.
 4. Layout via uikit-egui `Adaptive` (columns/pick), touch via `uikit_egui::touch` where useful.
 
+## Ported so far
+Network (daemon registry + status/install), Settings (animation/palette/text/opacity, live),
+**Fleet** (app catalog from store_groups → build+install locally), **Push** (app picker + target +
+device + deploy_strategy hint + build & push). All on the Task pattern; lib builds on egui 0.34.
+
 ## Remaining pages to port (from the Qt QML set)
-Fleet (apps/build/deploy + deploy_strategy hint), Push (build & push + strategy), Apps (install/
-build-log), Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
+Apps (install/build-log), Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
 Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
 port of an existing QML page onto the pattern above; the cockpit functions all exist already.
 
