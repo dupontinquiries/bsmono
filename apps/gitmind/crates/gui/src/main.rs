@@ -181,6 +181,8 @@ struct Backend {
     daemons_list: qt_method!(fn(&self) -> QString),
     install_daemons: qt_method!(fn(&self, user: QString, host: QString, bin_dir: QString, home: QString) -> QString),
     daemons_status: qt_method!(fn(&self, user: QString, host: QString) -> QString),
+    daemon_control: qt_method!(fn(&self, user: QString, host: QString, name: QString, action: QString) -> QString),
+    daemon_logs: qt_method!(fn(&self, user: QString, host: QString, name: QString, lines: u32) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1699,6 +1701,26 @@ impl Backend {
     /// One-line status per daemon on a target.
     fn daemons_status(&self, user: QString, host: QString) -> QString {
         match cockpit::flow::daemons_status_remote(&user.to_string(), &host.to_string()) {
+            Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Start / stop / restart a single daemon on a target (init-system aware).
+    fn daemon_control(&self, user: QString, host: QString, name: QString, action: QString) -> QString {
+        match cockpit::flow::daemon_control_remote(
+            &user.to_string(), &host.to_string(), &name.to_string(), &action.to_string(),
+        ) {
+            Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
+            Err(e) => err_json(&e),
+        }
+    }
+
+    /// Recent logs for a single daemon on a target (journal on systemd, log file on OpenRC).
+    fn daemon_logs(&self, user: QString, host: QString, name: QString, lines: u32) -> QString {
+        match cockpit::flow::daemon_logs_remote(
+            &user.to_string(), &host.to_string(), &name.to_string(), lines,
+        ) {
             Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
             Err(e) => err_json(&e),
         }
