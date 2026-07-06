@@ -183,6 +183,7 @@ struct Backend {
     daemons_status: qt_method!(fn(&self, user: QString, host: QString) -> QString),
     daemon_control: qt_method!(fn(&self, user: QString, host: QString, name: QString, action: QString) -> QString),
     daemon_logs: qt_method!(fn(&self, user: QString, host: QString, name: QString, lines: u32) -> QString),
+    fleet_health: qt_method!(fn(&self, targets_json: QString) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -1724,6 +1725,36 @@ impl Backend {
             Ok(out) => QString::from(json!({"ok": true, "output": out}).to_string()),
             Err(e) => err_json(&e),
         }
+    }
+
+    /// Roll daemon status across a set of devices at once for the fleet health view.
+    /// `targets_json` is `[{"name","user","host"}, ...]`; an unreachable device is reported as
+    /// such rather than failing the whole rollup.
+    fn fleet_health(&self, targets_json: QString) -> QString {
+        let parsed: Vec<serde_json::Value> =
+            serde_json::from_str(&targets_json.to_string()).unwrap_or_default();
+        let targets: Vec<(String, String, String)> = parsed
+            .iter()
+            .filter_map(|v| {
+                Some((
+                    v.get("name")?.as_str()?.to_string(),
+                    v.get("user")?.as_str()?.to_string(),
+                    v.get("host")?.as_str()?.to_string(),
+                ))
+            })
+            .collect();
+        let devices: Vec<_> = cockpit::flow::fleet_health_remote(&targets)
+            .iter()
+            .map(|d| {
+                let up = d.daemons.iter().filter(|(_, u)| *u).count();
+                json!({
+                    "name": d.name, "user": d.user, "host": d.host, "reachable": d.reachable,
+                    "daemons": d.daemons.iter().map(|(n, u)| json!({"name": n, "up": u})).collect::<Vec<_>>(),
+                    "up": up, "total": d.daemons.len(),
+                })
+            })
+            .collect();
+        QString::from(json!({"ok": true, "devices": devices}).to_string())
     }
 
     /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
