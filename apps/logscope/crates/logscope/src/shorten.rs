@@ -61,11 +61,12 @@ pub fn shorten(lines: &[&str], cfg: &ShortenConfig) -> ShortenResult {
     let mut prefix_table: HashMap<String, (usize, usize)> = HashMap::new();
 
     for (orig_idx, &line) in lines.iter().enumerate() {
+        // compute the prefix once per line (was computed twice — for lookup + table update)
         let leading = leading_tokens(line, 3);
 
         // Check if this leading token sequence was seen recently
-        let shortened = if let Some(prefix) = leading {
-            if let Some((last_idx, count)) = prefix_table.get(&prefix).copied() {
+        let shortened = if let Some(prefix) = leading.as_deref() {
+            if let Some((last_idx, count)) = prefix_table.get(prefix).copied() {
                 // Only collapse if within the look-back window and repeated enough
                 if orig_idx.saturating_sub(last_idx) <= cfg.window
                     && count >= cfg.min_repeat_count - 1
@@ -73,7 +74,7 @@ pub fn shorten(lines: &[&str], cfg: &ShortenConfig) -> ShortenResult {
                 {
                     // Find the first token after the repeated prefix and use ^^ notation
                     let rest = line.trim_start()
-                        .trim_start_matches(&prefix)
+                        .trim_start_matches(prefix)
                         .trim_start();
                     // Extract next identifier (the type name that changes)
                     let indent = leading_whitespace(line);
@@ -94,8 +95,8 @@ pub fn shorten(lines: &[&str], cfg: &ShortenConfig) -> ShortenResult {
         out.push(output_line);
         map.push(orig_idx);
 
-        // Update prefix table
-        if let Some(prefix) = leading_tokens(line, 3) {
+        // Update prefix table — reuse `leading` (no second leading_tokens call / alloc)
+        if let Some(prefix) = leading {
             let entry = prefix_table.entry(prefix).or_insert((orig_idx, 0));
             entry.0 = orig_idx;
             entry.1 += 1;
@@ -113,16 +114,18 @@ pub fn shorten(lines: &[&str], cfg: &ShortenConfig) -> ShortenResult {
 
 /// Extract the first `n` whitespace-separated tokens from a line as a
 /// canonical prefix string, or None if fewer than 2 tokens.
-fn leading_tokens(line: &str, n: usize) -> Option<String> {
+fn leading_tokens(line: &str, _n: usize) -> Option<String> {
     let trimmed = line.trim();
     // Skip pure noise lines (empty, just punctuation, very short)
     if trimmed.len() < 8 { return None; }
 
-    let tokens: Vec<&str> = trimmed.split_whitespace().take(n).collect();
-    if tokens.len() < 2 { return None; }
+    // Pull the first two tokens straight off the iterator — no Vec allocation, and we never
+    // needed the 3rd token (the prefix is always the first two).
+    let mut it = trimmed.split_whitespace();
+    let first = it.next()?;
+    let second = it.next()?; // require at least 2 tokens
 
     // Only consider lines that start with a keyword or type identifier
-    let first = tokens[0];
     let is_type_keyword = matches!(first,
         "struct" | "enum" | "union" | "class" | "typedef" | "const" |
         "static" | "extern" | "inline" | "unsigned" | "signed" |
@@ -134,8 +137,12 @@ fn leading_tokens(line: &str, n: usize) -> Option<String> {
 
     if !is_type_keyword { return None; }
 
-    // Use first 2 tokens as the collapsible prefix
-    Some(tokens[..2.min(tokens.len())].join(" "))
+    // The collapsible prefix is the first two tokens; build it directly (one sized alloc).
+    let mut prefix = String::with_capacity(first.len() + 1 + second.len());
+    prefix.push_str(first);
+    prefix.push(' ');
+    prefix.push_str(second);
+    Some(prefix)
 }
 
 fn leading_whitespace(line: &str) -> &str {
