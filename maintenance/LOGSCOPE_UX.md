@@ -148,3 +148,33 @@ future cloud dependency sneaking into a core path — a regression against the w
 **Efficiency direction (the actual work):** hot-path allocation + cache behaviour in the pure cores
 (like the audiomix no-alloc pass), and leaning into the KV prefix-tree reuse. Not power/memory
 gating — the kernel owns that.
+
+---
+
+## Fast log viewer — default touch gestures (built: `log_gestures`)
+Picked opinionated defaults for the Diagnose/Peek viewer and encoded them as a pure map
+(`map_gesture(mode, gesture, hit) -> LogAction`, 4 tests). Constraint: touchkit has no finger
+count, so cross-cutting nav (jump-to-error) is a nav-rail button, not a phantom two-finger gesture;
+gestures are for direct manipulation. Horizontal swipe stays "switch related tab" (delegates to
+workbench nav) for fleet-wide consistency.
+
+| gesture | on… | action | why |
+|---|---|---|---|
+| Tap | fold chevron | toggle fold | conventional tree control |
+| Double-tap | any line | toggle that line's section | big target vs the tiny chevron |
+| Pinch in / out | anywhere | fold-all / unfold-all | **semantic zoom** — less/more detail |
+| Long-press | line | begin area selection (→ Select) | mobile convention |
+| Long-press | section header | select whole section | logscope-specific |
+| Pan (Select) | over rows | extend selection | area select by drag |
+| Tap (Select) | line | extend range A→B | range select |
+| Long-press (Select) | — | copy (→ Read) | selection → copy |
+| Vertical Pan/Swipe (Read) | — | scroll + flick momentum | conventional |
+| Horizontal swipe | — | switch related tab | delegates to workbench |
+
+Copy/paste: a log view is read-only, so **Copy** is the selection action (also a toolbar button
+for discoverability) and **Paste** targets the filter/search field, not the canvas — so it isn't a
+canvas gesture. **Jump-to-severity** (next/prev ERROR/FATAL) is a nav-rail button (`JumpSeverity`
+is in the action vocabulary so it shares one command set with the gestures). Semantic-zoom folding
+pairs with `shorten`: a collapsed `^^` run is a foldable section, so pinch-to-fold and the shorten
+collapse are the same mental model. All defaults are opinionated starting points to feel on-device
+and tune (thresholds, whether Select-mode long-press should copy vs open a menu).
