@@ -68,9 +68,12 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if ui.add_enabled(can, egui::Button::new("Build & push")).clicked() {
         let a = app.push.selected.clone().unwrap();
         let (t, u, h) = (app.push.target.clone(), app.push.user.clone(), app.push.host.clone());
-        app.task.run(move || match cockpit::flow::deploy_app_remote(&a, &t, &u, &h) {
-            Ok(o) => format!("✓ {o}"),
-            Err(e) => format!("error: {e}"),
+        app.task.run_logged(move |sink| {
+            let mut on_line = |l: &str| sink.push(l);
+            match cockpit::flow::deploy_app_remote_logged(&a, &t, &u, &h, &mut on_line) {
+                Ok(o) => format!("✓ {o}"),
+                Err(e) => format!("error: {e}"),
+            }
         });
     }
 
@@ -83,6 +86,17 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             ui.label("building + pushing…");
         });
         ui.ctx().request_repaint();
+    }
+    let log = app.task.log();
+    if !log.is_empty() {
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for l in &log {
+                    ui.label(egui::RichText::new(l).monospace().small());
+                }
+            });
     }
     if !app.push.note.is_empty() {
         ui.add_space(6.0);
