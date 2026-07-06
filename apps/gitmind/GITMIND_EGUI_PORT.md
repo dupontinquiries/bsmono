@@ -33,8 +33,13 @@ health rollup**), Settings (animation/palette/text/opacity, live),
 device + deploy_strategy hint + build & push). Fleet + Push now **stream build/deploy logs live**
 (Task::run_logged over the *_logged cockpit variants, stick-to-bottom panel). All on the Task pattern; lib builds on egui 0.34.
 
-## Remaining pages to port (from the Qt QML set)
-Apps (install/build-log), Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
+## Ported (all six main tabs done)
+Fleet, Push, Network, **Apps** (installed apps: run/remove via binpin + run_local), **Timeline**
+(CheckpointEngine over git history), Settings. Shell = adaptive nav + theme + Task.
+
+## Remaining pages (specialised, not top-level tabs)
+Files/PeekViewer (browse + peek), Import (bundle/zip), Branches + merge_preview, DevicePicker
+(discovery component used by Push). Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
 Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
 port of an existing QML page onto the pattern above; the cockpit functions all exist already.
 
