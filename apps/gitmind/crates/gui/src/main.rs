@@ -186,6 +186,8 @@ struct Backend {
     fleet_health: qt_method!(fn(&self, targets_json: QString) -> QString),
     build_env_status: qt_method!(fn(&self) -> QString),
     ensure_rust_target: qt_method!(fn(&self, triple: QString) -> QString),
+    start_daemon_logs: qt_method!(fn(&self, user: QString, host: QString, name: QString) -> QString),
+    stop_daemon_logs: qt_method!(fn(&self) -> QString),
     downloads: qt_method!(fn(&self) -> QString),
     install_zip_app: qt_method!(fn(&self, path: QString) -> QString),
     import_bundle: qt_method!(fn(&self, path: QString) -> QString),
@@ -222,6 +224,8 @@ struct Backend {
     job: std::sync::Arc<deploy::Job>,
     // HTTP advertiser state (serving this repo's card to peers).
     advertiser: std::sync::Arc<netshare::Advertiser>,
+    // Cancel flag for the live daemon-log stream (flipped by stop_daemon_logs).
+    log_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Open the repo from the process working directory (the GUI may be launched
@@ -1793,6 +1797,33 @@ impl Backend {
             Ok(added) => QString::from(json!({"ok": true, "added": added, "triple": triple.to_string()}).to_string()),
             Err(e) => err_json(&e),
         }
+    }
+
+    /// Start a live log stream for one daemon on a target. Claims the shared Job, streams lines into
+    /// its log (tail via job_log / poll_job), and runs until stop_daemon_logs flips the cancel flag.
+    fn start_daemon_logs(&self, user: QString, host: QString, name: QString) -> QString {
+        if !self.job.start("daemonlog") {
+            return err_json("a job is already running");
+        }
+        self.log_cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+        let job = std::sync::Arc::clone(&self.job);
+        let cancel = std::sync::Arc::clone(&self.log_cancel);
+        let (u, h, n) = (user.to_string(), host.to_string(), name.to_string());
+        std::thread::spawn(move || {
+            let mut on_line = |l: &str| job.log_line(l);
+            let result = match cockpit::flow::stream_daemon_logs(&u, &h, &n, cancel, &mut on_line) {
+                Ok(()) => json!({"ok": true}).to_string(),
+                Err(e) => json!({"ok": false, "error": e}).to_string(),
+            };
+            job.finish(result);
+        });
+        QString::from(json!({"ok": true, "streaming": true}).to_string())
+    }
+
+    /// Stop the live daemon-log stream (kills the ssh child via the cancel flag).
+    fn stop_daemon_logs(&self) -> QString {
+        self.log_cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        QString::from(json!({"ok": true}).to_string())
     }
 
     /// Hand a command to the terminal app (voiceterm): open a tab and place `cmd` on the
