@@ -286,12 +286,39 @@ Item {
                 Label { text: "daemons"; color: "#7aa2f7"; font.bold: true }
                 Repeater {
                     model: root.daemonModel
-                    delegate: Row {
-                        width: parent.width; spacing: 8
-                        Label { text: "●"; color: "#8a93a6"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
-                        Column {
-                            Label { text: modelData.name + "  ·  " + modelData.socket; color: "#e6e6e6"; font.pixelSize: 12 }
-                            Label { text: modelData.description; color: "#8a93a6"; font.pixelSize: 10; width: col.width - 40; wrapMode: Text.WordWrap }
+                    delegate: Column {
+                        id: dRow
+                        property string dname: modelData.name
+                        width: parent.width; spacing: 3
+                        Row {
+                            width: parent.width; spacing: 8
+                            Label { text: "●"; color: "#8a93a6"; font.pixelSize: 11; anchors.verticalCenter: parent.verticalCenter }
+                            Column {
+                                Label { text: modelData.name + "  ·  " + modelData.socket; color: "#e6e6e6"; font.pixelSize: 12 }
+                                Label { text: modelData.description; color: "#8a93a6"; font.pixelSize: 10; width: col.width - 40; wrapMode: Text.WordWrap }
+                            }
+                        }
+                        Row {
+                            spacing: 6
+                            Repeater {
+                                model: ["start", "stop", "restart"]
+                                delegate: Button {
+                                    text: modelData; font.pixelSize: 10
+                                    enabled: !root.busy && root.btAddr.length > 0
+                                    onClicked: {
+                                        var r = JSON.parse(backend.daemon_control(root.dUser, root.btAddr, dRow.dname, modelData))
+                                        root.daemonNote = r.ok ? (dRow.dname + " " + modelData + ": ok") : r.error
+                                    }
+                                }
+                            }
+                            Button {
+                                text: "logs"; font.pixelSize: 10
+                                enabled: !root.busy && root.btAddr.length > 0
+                                onClicked: {
+                                    var r = JSON.parse(backend.daemon_logs(root.dUser, root.btAddr, dRow.dname, 200))
+                                    root.daemonNote = r.ok ? r.output : r.error
+                                }
+                            }
                         }
                     }
                 }

@@ -1363,6 +1363,26 @@ pub fn daemons_status_remote(user: &str, host: &str) -> Result<String, String> {
     crate::deploy::remote_capture(user, host, &cmd)
 }
 
+/// Start / stop / restart a single daemon on the target, init-system aware. `action` is one of
+/// "start", "stop", "restart"; an unknown verb is rejected before touching the network.
+pub fn daemon_control_remote(user: &str, host: &str, name: &str, action: &str) -> Result<String, String> {
+    let d = crate::daemons::find(name).ok_or_else(|| format!("unknown daemon {name}"))?;
+    let act = crate::daemons::DaemonAction::parse(action)
+        .ok_or_else(|| format!("unknown action {action} (want start/stop/restart)"))?;
+    let init = detect_init_remote(user, host);
+    let cmd = crate::daemons::control_cmd(d, init, act);
+    crate::deploy::remote_capture(user, host, &cmd)
+}
+
+/// Fetch the most recent `lines` of a single daemon's logs from the target (user journal on
+/// systemd, the service's log file on OpenRC).
+pub fn daemon_logs_remote(user: &str, host: &str, name: &str, lines: u32) -> Result<String, String> {
+    let d = crate::daemons::find(name).ok_or_else(|| format!("unknown daemon {name}"))?;
+    let init = detect_init_remote(user, host);
+    let cmd = crate::daemons::logs_cmd(d, init, lines.clamp(1, 2000));
+    crate::deploy::remote_capture(user, host, &cmd)
+}
+
 #[cfg(test)]
 mod daemon_flow_tests {
     #[test]
