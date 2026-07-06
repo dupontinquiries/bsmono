@@ -152,6 +152,24 @@ pub fn logs_cmd(d: &Daemon, init: InitSystem, lines: u32) -> String {
     }
 }
 
+/// Parse a per-daemon status block (as produced by `daemons_status_remote`: one `name: state` per
+/// line, where state is systemd's `active`/`inactive` or OpenRC's `started`/`stopped`) into
+/// `(daemon, up)` pairs. Pure, so the fleet-health rollup is testable without a network.
+pub fn parse_status(output: &str) -> Vec<(String, bool)> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let (name, state) = l.split_once(':')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let up = matches!(state.trim(), "active" | "started" | "running");
+            Some((name.to_string(), up))
+        })
+        .collect()
+}
+
 /// The unit file path a daemon's service lands at, for the given init system.
 pub fn unit_path(d: &Daemon, init: InitSystem, home: &str) -> String {
     match init {
@@ -278,5 +296,16 @@ mod tests {
         assert!(rc.contains(&format!("/var/log/{}.log", d.name)) && rc.contains("tail -n 200"));
         // the openrc service now writes to that same path so the tail has something to read
         assert!(openrc_service(d, "/usr/local/bin/x").contains(&format!("output_log=\"/var/log/{}.log\"", d.name)));
+    }
+
+    #[test]
+    fn parse_status_handles_both_init_vocabularies() {
+        let systemd = "voiced: active\nsharemd: inactive\ncoordd: active\n";
+        let got = parse_status(systemd);
+        assert_eq!(got, vec![("voiced".into(), true), ("sharemd".into(), false), ("coordd".into(), true)]);
+        // openrc vocabulary + stray blank lines
+        let openrc = "voiced: started\n\nsettingsd: stopped\n";
+        let got = parse_status(openrc);
+        assert_eq!(got, vec![("voiced".into(), true), ("settingsd".into(), false)]);
     }
 }
