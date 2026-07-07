@@ -60,6 +60,29 @@ pub fn stt_host<'a>(origin: &str, devices: &'a [VoiceDevice]) -> Option<&'a Voic
         .find(|d| d.id == origin && d.stt == SttClass::Heavy)
 }
 
+/// Like [`stt_host`], but honour a preference-ordered partner list (the bsettings voice tier list):
+/// walk the tiers and take the first trusted, reachable, Heavy partner that isn't the origin. Falls
+/// back to [`stt_host`]'s default pick (including local-heavy) when no listed partner qualifies, so
+/// an out-of-date tier list never blocks recognition.
+pub fn stt_host_ranked<'a>(
+    origin: &str,
+    devices: &'a [VoiceDevice],
+    partners: &[String],
+) -> Option<&'a VoiceDevice> {
+    for pid in partners {
+        if pid == origin {
+            continue;
+        }
+        if let Some(d) = devices
+            .iter()
+            .find(|d| &d.id == pid && d.usable() && d.stt == SttClass::Heavy)
+        {
+            return Some(d);
+        }
+    }
+    stt_host(origin, devices)
+}
+
 /// Can this utterance be *offloaded* (a trusted heavy host other than the origin exists)? When
 /// false the origin recognizes locally (heavy if it can, else fastpath).
 pub fn can_offload(origin: &str, devices: &[VoiceDevice]) -> bool {
@@ -141,6 +164,27 @@ mod tests {
         let mesh = vec![dev("desktop", true, true, SttClass::Heavy)];
         assert_eq!(stt_host("desktop", &mesh).unwrap().id, "desktop");
         assert_eq!(recog_path("desktop", &mesh), RecogPath::LocalHeavy);
+    }
+
+    #[test]
+    fn ranked_picker_honours_tier_list_then_falls_back() {
+        let mesh = vec![
+            dev("phone", true, true, SttClass::Fast),
+            dev("laptop", true, true, SttClass::Heavy),
+            dev("desktop", true, true, SttClass::Heavy),
+        ];
+        // tier list prefers desktop over laptop even though laptop sorts first by id
+        let tiers = vec!["desktop".to_string(), "laptop".to_string()];
+        assert_eq!(stt_host_ranked("phone", &mesh, &tiers).unwrap().id, "desktop");
+        // an unreachable top tier falls through to the next tier
+        let mesh2 = vec![
+            dev("phone", true, true, SttClass::Fast),
+            dev("desktop", true, false, SttClass::Heavy), // offline
+            dev("laptop", true, true, SttClass::Heavy),
+        ];
+        assert_eq!(stt_host_ranked("phone", &mesh2, &tiers).unwrap().id, "laptop");
+        // empty/irrelevant tier list → falls back to the default pick
+        assert_eq!(stt_host_ranked("phone", &mesh, &[]).unwrap().id, stt_host("phone", &mesh).unwrap().id);
     }
 
     #[test]

@@ -380,10 +380,13 @@ pub struct VoicePrefs {
     pub offload_enabled: bool,
     pub compute_host: String,
     pub speaker_id: bool,
+    /// Preference-ordered trusted voice-compute partners (tier list, best first). Managed in
+    /// bsettings' voice sub-page; the mesh prefers the highest-ranked reachable Heavy partner.
+    pub partners: Vec<String>,
 }
 impl Default for VoicePrefs {
     fn default() -> Self {
-        VoicePrefs { mic_enabled: true, offload_enabled: true, compute_host: String::new(), speaker_id: false }
+        VoicePrefs { mic_enabled: true, offload_enabled: true, compute_host: String::new(), speaker_id: false, partners: Vec::new() }
     }
 }
 
@@ -439,6 +442,7 @@ impl Prefs {
             ("voice.offload_enabled".into(), self.voice.offload_enabled.to_string()),
             ("voice.compute_host".into(), self.voice.compute_host.clone()),
             ("voice.speaker_id".into(), self.voice.speaker_id.to_string()),
+            ("voice.partners".into(), self.voice.partners.join(",")),
         ]
     }
 
@@ -469,6 +473,7 @@ impl Prefs {
                 "voice.offload_enabled" => if let Ok(x) = v.parse() { self.voice.offload_enabled = x },
                 "voice.compute_host" => self.voice.compute_host = v.to_string(),
                 "voice.speaker_id" => if let Ok(x) = v.parse() { self.voice.speaker_id = x },
+                "voice.partners" => self.voice.partners = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
                 "display.opacity" => if let Ok(x) = v.parse::<f32>() { self.display.opacity = x.clamp(0.3, 1.0) },
@@ -688,6 +693,7 @@ mod voice_prefs_tests {
         p.voice.offload_enabled = false;
         p.voice.compute_host = "desktop".into();
         p.voice.speaker_id = true;
+        p.voice.partners = vec!["desktop".into(), "laptop".into()];
         let back = Prefs::from_kv(&p.to_kv());
         assert_eq!(back.voice, p.voice);
     }
