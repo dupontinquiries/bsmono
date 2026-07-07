@@ -13,17 +13,32 @@ use egui::{Slider, Ui};
 use settings_kit::Prefs;
 use uikit_egui::{a11y::semantic_toggle, A11yScene, Adaptive, PaletteColors};
 
+/// Which screen the editor is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    Main,
+    Voice,
+}
+
 /// The settings editor: a working `Prefs` plus the last-published snapshot for diffing.
 pub struct SettingsEditor {
     pub prefs: Prefs,
     published: Prefs,
     a11y: A11yScene,
+    page: Page,
+    new_partner: String,
 }
 
 impl SettingsEditor {
     /// Start from the current central prefs (e.g. what `Settings::prefs()` reports on connect).
     pub fn new(initial: Prefs) -> SettingsEditor {
-        SettingsEditor { prefs: initial.clone(), published: initial, a11y: A11yScene::new() }
+        SettingsEditor {
+            prefs: initial.clone(),
+            published: initial,
+            a11y: A11yScene::new(),
+            page: Page::Main,
+            new_partner: String::new(),
+        }
     }
 
     /// The changes (key, value) since the last time they were published. The caller publishes
@@ -48,6 +63,11 @@ impl SettingsEditor {
     pub fn ui(&mut self, ui: &mut Ui, _adaptive: &Adaptive) -> Vec<(String, String)> {
         let colors = PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
         self.a11y.begin_frame();
+
+        if self.page == Page::Voice {
+            self.voice_page(ui, &colors);
+            return self.pending();
+        }
 
         ui.heading("BigSilicon Settings");
         ui.colored_label(colors.text_weak, "Changes apply live to every app.");
@@ -133,7 +153,72 @@ impl SettingsEditor {
             self.prefs = Prefs::default();
         }
 
+        ui.separator();
+        if ui.button("🎙  Voice partners  →").clicked() {
+            self.page = Page::Voice;
+        }
+
         self.pending()
+    }
+
+    /// The voice sub-page: mesh toggles + a reorderable trusted-partner tier list. Edits
+    /// `self.prefs.voice.*`; the caller publishes the diff exactly as on the main page.
+    fn voice_page(&mut self, ui: &mut Ui, colors: &PaletteColors) {
+        if ui.button("←  back").clicked() {
+            self.page = Page::Main;
+        }
+        ui.heading("Voice mesh");
+        ui.colored_label(colors.text_weak, "Speech across the fleet — offload heavy compute to trusted partners.");
+        ui.separator();
+
+        ui.checkbox(&mut self.prefs.voice.mic_enabled, "This device's mic joins the mesh");
+        ui.checkbox(&mut self.prefs.voice.offload_enabled, "Offload heavy transcription to a trusted partner");
+        ui.checkbox(&mut self.prefs.voice.speaker_id, "Recognize who is speaking (multi-user)");
+        ui.add_space(8.0);
+
+        ui.label("Trusted voice partners (tier list — best first)");
+        ui.colored_label(colors.text_weak, "The mesh prefers the highest reachable partner for heavy speech compute.");
+
+        let partners = self.prefs.voice.partners.clone();
+        let n = partners.len();
+        let mut swap: Option<(usize, usize)> = None;
+        let mut remove: Option<usize> = None;
+        for (i, p) in partners.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.label(format!("{}.", i + 1));
+                ui.label(p);
+                if i > 0 && ui.small_button("↑").clicked() {
+                    swap = Some((i, i - 1));
+                }
+                if i + 1 < n && ui.small_button("↓").clicked() {
+                    swap = Some((i, i + 1));
+                }
+                if ui.small_button("✕").clicked() {
+                    remove = Some(i);
+                }
+            });
+        }
+        if let Some((a, b)) = swap {
+            self.prefs.voice.partners.swap(a, b);
+        }
+        if let Some(i) = remove {
+            self.prefs.voice.partners.remove(i);
+        }
+        if partners.is_empty() {
+            ui.colored_label(colors.text_weak, "No partners yet — add a trusted device id below.");
+        }
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.new_partner);
+            if ui.button("add partner").clicked() {
+                let id = self.new_partner.trim().to_string();
+                if !id.is_empty() && !self.prefs.voice.partners.contains(&id) {
+                    self.prefs.voice.partners.push(id);
+                }
+                self.new_partner.clear();
+            }
+        });
     }
 }
 
@@ -210,5 +295,19 @@ mod tests {
     #[test]
     fn palettes_are_available() {
         assert!(!SettingsEditor::palettes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod voice_page_tests {
+    use super::*;
+    #[test]
+    fn voice_edits_are_published_as_diff() {
+        let mut ed = SettingsEditor::new(Prefs::default());
+        ed.prefs.voice.partners = vec!["desktop".into(), "laptop".into()];
+        ed.prefs.voice.offload_enabled = false;
+        let changes = ed.pending();
+        assert!(changes.iter().any(|(k, v)| k == "voice.partners" && v == "desktop,laptop"));
+        assert!(changes.iter().any(|(k, v)| k == "voice.offload_enabled" && v == "false"));
     }
 }
