@@ -19,6 +19,7 @@
 //! place voice-kit would gain an audio-kit dependency.
 
 pub mod mesh;
+pub mod reconcile;
 pub mod hallucination;
 pub mod model;
 pub mod context;

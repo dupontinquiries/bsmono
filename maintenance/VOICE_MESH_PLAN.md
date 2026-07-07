@@ -76,3 +76,31 @@ bsettings controls the mesh.
 - Speaker-id model: on-device embeddings vs a shared model on the Heavy host?
 - Arbitration policy when two mics hear the same command (nearest? focused device? explicit owner?).
 - Relay transport: extend `voiced`'s ipc socket over the net (peermux) vs a dedicated TCP relay.
+
+---
+
+## Refinement: speculative local execution + async reference correction (built: `reconcile`)
+The command is **decided on-device and executed immediately** — never delayed for a heavy or remote
+model. When a reference (Heavy host, possibly offloaded) is available, it's computed in the
+background and reconciled against what we served:
+- **agree** → reinforce; after `CONFIRM_THRESHOLD` confirmations the local mapping is
+  **Authoritative** and we stop requesting the reference (the *issuing device's own DB* is the source
+  of truth for that utterance);
+- **differ** → the reference **wins**, the local DB is rewritten, and re-validation restarts.
+
+So we keep the best-model quality *and* full local speed, and never wait on the cloud. Implemented
+as `voice_kit::reconcile` (`Entry`, `Authority`, `Reconciliation`, `reconcile`, `needs_reference`;
+4 tests). Wiring: fastpath serves + runs the command; if `needs_reference()`, fire the (offloaded)
+reference and call `reconcile` when it returns; persist the updated `Entry` in the ContextModel.
+
+## Refinement: trusted voice-partner tier list (built: prefs + ranked picker)
+Voice compute partners are a **separate, ordered tier list** from general SSH trust — managed in a
+bsettings voice sub-page. `settings_kit::VoicePrefs.partners: Vec<String>` (best-first, kv
+round-trips). `voice_kit::mesh::stt_host_ranked(origin, devices, partners)` walks the tiers and
+picks the first trusted+reachable+Heavy partner, falling back to the default pick so a stale list
+never blocks recognition (5 mesh tests incl. ranking).
+
+### bsettings voice sub-page (next)
+A dedicated sub-page: mic-on toggle, offload toggle, speaker-id toggle, and a **reorderable tier
+list** of trusted voice partners (drawn from discovered/trusted devices; up/down to rank, add/remove).
+Writes `voice.*` prefs (incl. `voice.partners`) through settingsd to the whole fleet.
