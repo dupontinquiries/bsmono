@@ -2,6 +2,15 @@
 // The GUI binary (main.rs) declares its own mod tree independently.
 // This lib only needs to expose the headless-safe modules.
 
+pub mod vision_encoder;
+pub mod vision_preprocess;
+pub mod guardrails;
+pub mod synthesis;
+pub mod persona;
+pub mod blackboard;
+pub mod budget;
+pub mod toolreg;
+pub mod lang;
 pub mod analyzer;
 pub mod charts;
 pub mod pipeline;
