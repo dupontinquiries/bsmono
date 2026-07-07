@@ -8,6 +8,7 @@ description = "Unified fleet game netcode: player profiles + presence over a DHT
 path = "src/lib.rs"
 
 [dependencies]
+snapcore = { path = "../../../shared/snapcore" }
 
 [features]
 default = []

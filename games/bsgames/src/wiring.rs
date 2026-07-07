@@ -3,7 +3,6 @@
 //!   launching a game shows up fleet-wide, not just in bsgames;
 //! * **chat** rides share-kit's `Mailbox` over snapcore's `Store` — the fleet's Kademlia DHT — so
 //!   messages are sealed, content-addressed, and delivered exactly like every other fleet share.
-use netcode::microdht::NodeId;
 use netcode::profile::Presence;
 use share_kit::{Backend, Lifetime, Mailbox};
 
@@ -36,7 +35,20 @@ pub fn dm_mailbox(a: &str, b: &str) -> Mailbox {
 /// fixed per-conversation key, adequate to wire + test the path; swap in the ratchet for forward
 /// secrecy.
 pub fn dm_key(a: &str, b: &str) -> [u8; 32] {
-    NodeId::from_key(&dm_id(a, b)).0
+    // 32-byte sealing key (crypto-kit seal needs 32) derived from the DM id — separate from the
+    // DHT's 20-byte NodeId. Stand-in for crypto-kit's SenderChain ratchet.
+    let mut out = [0u8; 32];
+    let bytes = dm_id(a, b);
+    for (i, slot) in out.iter_mut().enumerate() {
+        let mut h: u64 = 0xcbf29ce484222325 ^ (i as u64).wrapping_mul(0x100000001b3);
+        for &c in bytes.as_bytes() {
+            h ^= c as u64;
+            h = h.wrapping_mul(0x100000001b3);
+            h = h.rotate_left(5);
+        }
+        *slot = (h ^ (h >> 32)) as u8;
+    }
+    out
 }
 
 /// Send a chat line into the DM feed. Sender is embedded in the sealed payload so the receiver can

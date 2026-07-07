@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "netcode"
 version = "0.1.0"
+dependencies = [
+ "snapcore",
+]
+
+[[package]]
+name = "snapcore"
+version = "0.1.0"
