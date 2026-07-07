@@ -60,6 +60,14 @@ impl ImageGen {
         self
     }
 
+    pub fn from_image(mut self, init: &std::path::Path, strength: f32) -> Self {
+        self.extra.push("-i".to_string());
+        self.extra.push(init.to_string_lossy().into_owned());
+        self.extra.push("--strength".to_string());
+        self.extra.push(fmt_num(strength.clamp(0.0, 1.0)));
+        self
+    }
+
     /// The full command line, program first. Mirrors the validated z_image.md example; a short float like
     /// `1` is emitted for cfg 1.0 so it matches the docs exactly.
     pub fn argv(&self) -> Vec<String> {
