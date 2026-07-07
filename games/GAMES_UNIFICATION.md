@@ -25,7 +25,26 @@ cybertron's Vulkan engine — picking the strongest primitive from each (e.g. cy
 frame-graph, wgpu's portability, unendlich's material system). Large, cross-language; do it last
 with all four in view.
 
+## Built: unified profiles + micro-DHT (games/shared/netcode, 11 tests)
+- `profile`: Profile{id,name,presence,friends} + Presence{Offline,Online,InGame{game,session}},
+  versioned length-prefixed wire (round-trips through any backend as bytes).
+- `microdht`: Kademlia-lite fallback — 256-bit NodeId, XOR distance, k-buckets, closest-node
+  selection, local key→value store. Pure routing math, tested.
+- `store`: ProfileBackend trait; MicroDhtStore (always-on) + OpenDHT (FFI, feature `opendht`);
+  ProfileService composes them with the fleet's graceful floor — try OpenDHT (global), fall back to
+  micro-DHT (LAN), always mirror writes locally so same-network friends resolve instantly. Reach
+  {OpenDht,MicroDht,Miss} surfaced. friends_of() resolves a roster across both.
+
+## Built: bsgames centre (games/bsgames — backend 2 tests + egui GUI)
+Backend: registry() (the 4 games + launch kind), launch_argv() (cargo run / cmake bin), friend_rows()
+(presence → joinable rows, online-first). GUI (bsettings mould): game grid with launch, friends
+roster over the profile service, snapclone chat panel. I/O seams marked (spawn, presence publish,
+join transport, snapclone deliver).
+
 ## Sequence
 1. ✅ land the 4 games in-tree
-2. shared netcode crate (enet seam) — the tractable unification first
-3. render abstraction + backends — the hard one, last
+2. ✅ shared netcode: unified profiles over OpenDHT + micro-DHT fallback
+3. ✅ bsgames centre (launch + friends/presence + chat scaffold)
+4. wire the I/O seams: OpenDHT FFI backend, enet session join, snapclone chat delivery, per-game
+   presence publish on launch/quit
+5. render abstraction + backends — the hard one, last
