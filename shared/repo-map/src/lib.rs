@@ -5,6 +5,7 @@
 //! from their own dir (the games, gpu-gemm), and some are C++/CMake (blackstar). This crate is that
 //! answer: a pure command model + a filesystem scan.
 
+pub mod matrix;
 use std::path::Path;
 
 /// How a crate is built.
