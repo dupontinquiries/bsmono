@@ -17,7 +17,9 @@ pub struct GameCentre {
     pub status: String,
     pub chat_to: Option<String>,
     pub chat_input: String,
-    pub chat_log: Vec<(String, String)>,
+    /// The fleet DHT store the chat Mailbox rides on (real share-kit/snapcore path).
+    pub store: snapcore::store::Store,
+    pub now: u64,
 }
 
 impl GameCentre {
@@ -30,7 +32,8 @@ impl GameCentre {
             status: String::new(),
             chat_to: None,
             chat_input: String::new(),
-            chat_log: Vec::new(),
+            store: snapcore::store::Store::new(),
+            now: 1,
         }
     }
 
@@ -75,9 +78,12 @@ impl GameCentre {
         match spawned {
             Ok(_) => {
                 self.status = format!("launched {}", g.name);
-                // presence I/O seam: mark ourselves in-game + republish so friends see it.
+                // presence: mark in-game + republish to the DHT for remote friends…
                 self.me.presence = netcode::profile::Presence::InGame { game: g.name.clone(), session: None };
                 self.svc.publish(&self.me);
+                // …and map to the fleet-wide coord-core Activity (published via the Coord client on
+                // device, so voiced/media/etc. also see we're in a game).
+                let _activity = crate::wiring::activity_of(&self.me.presence);
             }
             Err(e) => self.status = format!("couldn't launch {}: {e}", g.name),
         }
@@ -117,8 +123,11 @@ impl GameCentre {
         };
         ui.add_space(8.0);
         ui.label(egui::RichText::new(format!("chat · {to}")).strong());
+        let mb = crate::wiring::dm_mailbox(&self.me.id, &to);
+        let key = crate::wiring::dm_key(&self.me.id, &to);
+        let log = crate::wiring::recv_chat(&self.store, &mb, &key, 0, self.now);
         egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
-            for (from, text) in &self.chat_log {
+            for (from, text) in &log {
                 ui.label(egui::RichText::new(format!("{from}: {text}")).small());
             }
         });
@@ -126,8 +135,9 @@ impl GameCentre {
             ui.text_edit_singleline(&mut self.chat_input);
             if ui.button("send").clicked() && !self.chat_input.trim().is_empty() {
                 let msg = std::mem::take(&mut self.chat_input);
-                self.chat_log.push((self.me.name.clone(), msg));
-                // snapclone I/O seam: deliver the message to `to` over snapclone/share-kit.
+                // real path: sealed posting into the DM feed on the fleet DHT store
+                crate::wiring::send_chat(&mut self.store, &mb, &self.me.id, &key, &msg, 0, self.now);
+                self.now += 1;
             }
         });
     }

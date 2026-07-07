@@ -3,6 +3,7 @@
 //! view** over the netcode profile service (presence → joinable rows). The egui GUI (behind `gui`)
 //! renders these; `main` (behind `app`) is the eframe shell.
 pub mod centre;
+pub mod wiring;
 #[cfg(feature = "gui")]
 pub mod ui;
 

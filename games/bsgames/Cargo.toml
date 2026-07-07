@@ -14,6 +14,9 @@ required-features = ["app"]
 
 [dependencies]
 netcode = { path = "../shared/netcode" }
+coord-core = { path = "../../shared/coord-core" }
+share-kit = { path = "../../shared/share-kit" }
+snapcore = { path = "../../shared/snapcore" }
 egui = { version = "0.34", optional = true }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
