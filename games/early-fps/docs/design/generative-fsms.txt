@@ -1,0 +1,115 @@
+To generate highly detailed Points of Interest (POIs) from a sparse pool of basic primitives (Cubes, Cylinders, Planes, Spheres), we must design Generative FSMs (Finite State Machines). These FSMs act as "DNA sequencers" for architecture. A single primitive enters the machine, is queried for its environmental context, and systematically spawns, deforms, and textures additional primitives until a complex, logical structure emerges.
+
+Here are four rule-based FSMs designed to turn a handful of basic shapes into rich, combat-ready POIs.
+
+1. The "Sentinel Node" FSM
+Seed Primitive: A single Cube.
+Target POI: A fortified machine-gun nest or observation post.
+
+State 0 (Environmental Query): The Cube evaluates the terrain normal. If it is placed on a downward slope facing an open plane (a classic kill-zone), it transitions to State 1. Otherwise, it deletes itself.
+State 1 (Macro-Expansion - The Bunker): The Cube scales its Z-axis (depth) by 1.5 and scales its Y-axis (height) down to 0.6. It spawns a second, identical Cube, intersects it by 50%, and rotates it 90 degrees to form an L-shape. It then spawns a flat Plane and positions it on top of the L-shape at a 10-degree angle to act as a sloped roof.
+State 2 (Functional Sub-Assembly - The Aperture): The FSM identifies the face of the L-shape facing the downward slope. It runs a Boolean subtraction (a smaller cube) to punch a horizontal, rectangular slit through that wall.
+State 3 (Micro-Detail Cascading):
+Sandbag Logic: The FSM spawns a grid of 20 tiny, slightly randomized Cubes. It applies a "Soft Body" vertex displacement to make them look like stuffed fabric. It stacks them in two staggered rows along the top edge of the firing slit.
+Material Binding: The concrete L-shape receives a "Pocked Concrete" material. The roof receives a "Corrugated Tin" material (a Plane with a repeating sine-wave normal map).
+Scatter Logic: It spawns 3 tiny Cylinders (ammo cans) and 1 flattened Sphere (helmet) on the interior floor.
+Output: A multi-geometric, heavily fortified fighting position that looks hand-placed, built entirely from cubes, planes, and spheres.
+2. The "Logistics Spine" FSM
+Seed Primitive: A single Cylinder.
+Target POI: A vertical fluid pump-jack or comms relay towering over the battlefield.
+
+State 0 (Void Detection): The Cylinder scans upward. If it detects open sky for at least 15 meters, it transitions to State 1 (it wants to be tall).
+State 1 (Macro-Expansion - The Tower): The original Cylinder scales its Y-axis to 8 meters and its X/Z radius to 0.5 meters. It spawns 4 identical, thin Cylinders, positions them at 90-degree intervals 1 meter away, and scales them down by 20% to act as structural support legs. It connects them by spawning 4 horizontal thin Cylinders (cross-bracing) at the midpoint.
+State 2 (Functional Sub-Assembly - The Reservoir): The FSM spawns a Sphere at the top of the central Cylinder. It flattens the Sphere by 50% on the Y-axis to create a pressurized tank. It spawns 3 more thin Cylinders, routing them from the tank downward at 45-degree angles to the ground (pipe flow).
+State 3 (Micro-Detail Cascading):
+Gravity Logic: The FSM applies a rust gradient material to the central tank—heavily rusted (orange/brown) at the bottom, faded paint (grey/red) at the top.
+Drip Logic: At the lowest point of the angled pipe elbows, the FSM spawns a small Plane with an alpha-blended "drip" texture, and places a dark, glossy decal on the ground directly beneath it (oil/water stain).
+Warning Logic: It spawns a tiny yellow Cone on top of the tank, topped with a small blinking emissive Sphere.
+Output: A towering, highly detailed industrial structure that acts as a perfect vertical landmark and sniper roost.
+3. The "Kinetic Wreckage" FSM
+Seed Primitive: An elongated Cube (Box).
+Target POI: A crashed transport vehicle or downed aircraft forming a central map obstacle.
+
+State 0 (Trajectory Simulation): The Box calculates an incoming vector from the map boundary. It rotates to align with this vector and translates itself until it intersects another primitive or the ground plane.
+State 1 (Macro-Expansion - The Fracture): The Box splits into three separate primitives along its local Z-axis. The front section rotates wildly (random pitch/yaw/roll). The middle section remains relatively straight. The rear section shears upward at a 30-degree angle, breaking the line of sight directly through the center.
+State 2 (Functional Sub-Assembly - The Ejection): The FSM identifies the "cockpit" (the front rotated Box). It spawns a large, transparent, lightly tinted Plane in front of it, then violently fragments this plane into 20 jagged triangular shapes (shattered glass) scattered in a cone shape.
+State 3 (Micro-Detail Cascading):
+Kinetic Scarring: The leading edges of the front Box receive a "Stripped Metal" material (silver/chrome). The rest of the Boxes receive a "Matte Olive Polymer" material.
+Ground Impact: Where the middle Box touches the ground, the FSM runs a Boolean subtraction on the terrain plane, creating a shallow trench. It spawns 5-10 tiny, randomly scaled Cubes (rubble) and scatters them along the edge of the trench.
+Fire/Smoke: It spawns two small Planes perpendicular to the rear sheared Box, applying an animated, noisy, black-and-orange alpha texture to simulate an engine fire.
+Output: A chaotic, dynamic centerpiece that tells a story of violent impact, creating irregular, high-quality cover.
+4. The "Ad-Hoc Shelter" FSM
+Seed Primitive: A single Plane.
+Target POI: A makeshift civilian dwelling or military forward operating tent.
+
+State 0 (Surface Adhesion): The Plane casts a ray downward. If it hits a walkable slope or uneven terrain, it conforms its vertices to the terrain shape and transitions to State 1. If it is perfectly flat, it deletes itself (tents look weird on perfectly flat ground).
+State 1 (Macro-Expansion - The Envelope): The Plane extrudes upward by 2 meters. The FSM takes the top row of vertices and pulls them inward and upward to form a peaked roof ridge. It cuts out a Boolean Cube on one face to create a doorway.
+State 2 (Functional Sub-Assembly - The Anchors): Tents need to be held down. The FSM traces the bottom edges of the Plane. Every 1.5 meters, it spawns a small Cube, rotates it 45 degrees, and drives it halfway into the ground (tent stakes). It then spawns thin Cylinders (rope) connecting the roof peak to the stakes.
+State 3 (Micro-Detail Cascading):
+Canvas Weathering: The Plane receives a "Dirty Canvas" material. However, the FSM applies a vertex color map: the areas directly under the roof peak are dark grey/black (mold from water pooling), while the areas near the stakes are bleached white (sun exposure).
+Interior Scenography: Through the doorway cutout, the FSM spawns a tiny Cube on the floor (a stove) with a tiny red emissive Plane on top (fire). It spawns a flattened Cylinder against the wall (sleeping roll).
+Environmental Reaction: It spawns 3 flat Planes leaning against the outside wall, applying a "Plywood" material to simulate scavenged scrap wood patching a hole.
+Output: A highly believable, weathered structure that provides incredible close-quarters cover and breaks up the monotony of natural terrain.
+The Systemic Loop
+By running these four FSMs simultaneously across a blank map seeded with 100 random Cubes, Cylinders, Planes, and Spheres, the algorithm will automatically discard the ones that don't make sense, and aggressively compound the ones that do. A single Cylinder near a slope becomes a Water Tower. A Cube near the Water Tower becomes a Bunker guarding it. An elongated Box crashes into the Water Tower, breaking it. The result is an organic, interconnected map of highly detailed POIs, built entirely from pure mathematical logic.
+To solve the problem of generating complex, highly detailed, non-repetitive maps from simple primitives (Cubes, Cylinders, Planes, Spheres), we must abandon traditional "scatter and scale" algorithms. Instead, we need Intent-Driven Finite State Machines (FSMs).
+
+In this system, a primitive is not just geometry; it is an uninitialized agent. When placed in the world, it enters an FSM that queries its environment, makes logical decisions based on level design principles (sightlines, flow, risk/reward), and transitions through states until it becomes a fully realized architectural feature.
+
+Here are five rule-based FSM abstractions that turn basic shapes into master-class map geometry.
+
+1. The "Sightline Breaker" FSM
+Input Primitive: A single Cube.
+Purpose: To organically generate cover that is logically sized and positioned relative to player sightlines, eliminating the "randomly scattered boxes" look.
+
+State 0 (Raycast Query): The Cube is invisible. It casts rays in a 180-degree arc forward. If it detects a long, unobstructed sightline (>30 meters) from a high-traffic area, it transitions to State 1. If the sightline is already short, it deletes itself.
+State 1 (Dimensional Scaling): The Cube scales its Y-axis (height) to perfectly obscure the bottom 40% of the detected sightline, forcing players to crouch or go around. It scales its X-axis to provide cover for at least two player-widths.
+State 2 (Contextual Materialization): The Cube queries the floor material.
+If Floor = Dirt/Mud: The Cube becomes a Wooden Crate. It applies a splintered edge map to the faces facing the sightline, and spawns micro-cubes (debris) at its base.
+If Floor = Asphalt/Concrete: The Cube becomes a Jersey Barrier or Smashed Vehicle. It applies a chipped paint layer and spawns a dark oil-slick decal beneath it.
+If Floor = Sand: The Cube becomes a Sandbag Wall, deforming its top vertices to look like soft, sagging fabric filled with volume.
+Output: A perfectly placed, contextually accurate piece of cover that had to be there.
+2. The "Flank Funnel" FSM
+Input Primitive: Two parallel Planes (representing the outer walls of a street or canyon).
+Purpose: To prevent long, boring straight lanes by dynamically generating L-shaped flanking routes.
+
+State 0 (Proximity Check): The FSM monitors the distance between Plane A and Plane B. If the distance remains constant for >15 meters, it triggers a "Lane Boredom" threshold and transitions to State 1.
+State 1 (Intervention Spawning): The FSM spawns a new Cube perpendicular to the planes, connecting them and completely blocking the straight path.
+State 2 (Routing Logic): The blocked path is now a chokepoint. The FSM analyzes the geometry to the left and right of the new Cube. It chooses the side with the most existing spatial volume.
+State 3 (Flank Carving): The FSM spawns a series of angled Planes on the chosen side, forming a hard 90-degree or 120-degree turn. It then runs the "Sightline Breaker" FSM inside this new turn to populate it with cover.
+Output: A straight road is organically broken up by a building or barricade, forcing a tactical Z-turn or L-flank, built entirely from 3 primitives.
+3. The "Vertical Risk/Reward" FSM
+Input Primitive: A Cylinder.
+Purpose: To generate sniper towers, elevated platforms, and vertical elements that follow strict rules of engagement (high reward, high vulnerability).
+
+State 0 (Elevation Query): The Cylinder queries nearby geometry. If it is the highest point in a 20-meter radius, it transitions to State 1.
+State 1 (Access Penalty): High ground must be earned. The FSM checks for ramps or stairs. If none exist, it generates a "Pain Point"—a highly exposed, narrow staircase made of angled planes leading up to the Cylinder.
+State 2 (Exposure Rule): The Cylinder attempts to build walls around its top face (to protect the player). The FSM casts rays outward from the top. If a wall would block more than 50% of the surrounding map's sightlines, the wall is deleted.
+State 3 (The Gladiator Treatment): The Cylinder is left as an open platform. It applies a "railing" material—either waist-high concrete or rusted pipes—around 70% of the edge, leaving a deliberate 30% gap facing the most dangerous sightline.
+Output: A towering vantage point that offers great vision but guarantees the player standing on it will be flanked, preventing "camper" safe-spots.
+4. The "Boundary Dissolver" FSM
+Input Primitive: A massive, invisible bounding Box (the map limit).
+Purpose: To erase the "boxed in" feeling by turning hard map edges into logical, immersive environmental hazards.
+
+State 0 (Edge Detection): The FSM identifies the outermost playable geometry.
+State 1 (Topography Generation): Instead of a wall, the FSM spawns a massive Sphere or scaled Cube outside the boundary.
+State 2 (Boolean Subtraction): It subtracts the playable area from this massive shape, creating a cliff face, a deep trench, or a cavern wall that perfectly contours to the map's edge.
+State 3 (Lethal Material Assignment): The FSM looks at the bottom edge of this new boundary. It fills the void below the playable floor with a lethal material plane.
+If Map Theme = Industrial: Spawns a "Lava/Magma" plane with an emissive orange glow and rising particle smoke.
+If Map Theme = Water/Coastal: Lowers the floor plane drastically and spawns a "Water" plane with animated UVs and fog volume.
+If Map Theme = Urban: Spawns a "Deep Abyss" plane with dark fog and jagged rebar meshes dangling over the edge.
+Output: The player reaches the edge and sees a natural, terrifying environmental hazard, entirely forgetting they just hit an invisible wall.
+5. The "Decay Cascader" FSM
+Input Primitive: Any primitive that has already been processed by the above FSMs.
+Purpose: To apply the "square-foot detail" and environmental storytelling automatically, based on proximity to high-traffic areas.
+
+State 0 (Traffic Heatmap): The finalized primitive checks how many optimal sightlines intersect with it. High intersection = High Traffic.
+State 1 (Directed Damage): If High Traffic, the FSM identifies the direction the traffic is coming from. It applies a vertex-displacement map (destructive warping) only to the faces facing the traffic. A pristine wall becomes a wall with a massive, blown-out crater on one side.
+State 2 (Sub-layer Exposure): Based on the material assigned in earlier FSMs, the FSM swaps the texture inside the crater. Concrete exposes jagged rebar meshes. Metal exposes glowing orange sub-surface. Wood exposes splintered fibrous strands.
+State 3 (Micro-Debris Scatter): The FSM calculates the volume of the crater. It spawns a proportional amount of micro-primitives (tiny cubes and tetrahedrons) at the base of the wall, applying physics constraints so they settle naturally into a small, localized pile of rubble.
+Output: A map that looks like a war actually happened there, where damage is logically directed toward the areas where players fight the most.
+How They Link Together (The Pipeline)
+To build a map, you don't draw a layout. You place a ground Plane. You drop 50 Cubes and 20 Cylinders.
+The Flank Funnel shapes the ground. The Sightline Breaker sizes the Cubes. The Vertical Risk/Reward shapes the Cylinders. The Boundary Dissolver wraps the edges. Finally, the Decay Cascader passes over everything, blowing holes in the high-traffic sightline covers and leaving the flanks relatively pristine.
+
+Through pure logic and simple shapes, a masterpiece emerges.

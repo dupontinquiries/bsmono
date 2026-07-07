@@ -1,0 +1,64 @@
+{
+  "type": "minecraft:biome",
+  "_id": "arenas:mid_lane",
+  "_comment": "Central lane: paved causeway flanked by low walls and turrets.",
+  "surface_block": "tuff",
+  "subsurface_block": "slate",
+  "has_precipitation": false,
+  "temperature": 0.9,
+  "downfall": 0.2,
+  "effects": {
+    "sky_color": 8233593,
+    "fog_color": 10462952,
+    "water_color": 4159204,
+    "water_fog_color": 329011,
+    "grass_color": 5263184,
+    "foliage_color": 5263184,
+    "ambient_light": 0.15
+  },
+  "spawners": {
+    "monster": [
+      {
+        "type": "arenas:lane_minion_melee",
+        "weight": 20,
+        "minCount": 3,
+        "maxCount": 5
+      },
+      {
+        "type": "arenas:lane_minion_ranged",
+        "weight": 12,
+        "minCount": 2,
+        "maxCount": 3
+      },
+      {
+        "type": "arenas:lane_minion_siege",
+        "weight": 3,
+        "minCount": 1,
+        "maxCount": 1
+      }
+    ]
+  },
+  "features": [
+    [],
+    [
+      "arenas:lane_lane_stone_floor"
+    ],
+    [],
+    [
+      "arenas:lane_mid_wall_segment"
+    ],
+    [
+      "arenas:lane_ancient_archway",
+      "arenas:lane_banner_post"
+    ],
+    [],
+    [],
+    [
+      "arenas:lane_lane_torch_pair"
+    ],
+    [],
+    [
+      "arenas:lane_mid_shrine"
+    ]
+  ]
+}

@@ -1,0 +1,136 @@
+#version 450
+
+// unendlich GPU view derivation (v0.24.0b).
+//
+// Reads CPU-written `view` and `projection` matrices from a ViewParam
+// slot, derives `view_proj`, `inverse_view_proj`, and the 6 frustum
+// planes, writes them all back into the same slot.
+//
+// Why this exists
+//
+// v0.24.0a.1 moved frustum planes from push constants into a host-
+// visible SSBO. CPU still authored the planes. v0.24.0b moves the
+// derivation onto the GPU itself: CPU only writes the primitives
+// (view + projection matrices), GPU computes everything else.
+//
+// This locks in the pattern that views are GPU-derived. Future
+// physics-backed cameras can write `view` from a physics compute pass
+// without round-tripping through CPU. The cull shader downstream
+// reads the planes unchanged from the same slot.
+//
+// Workgroup: 1 invocation. Dispatch (1, 1, 1) per active view per
+// frame. Push constant carries which slot to derive. Cheap — at
+// most ~8 dispatches per frame for the foreseeable future.
+//
+// Synchronization
+//
+// SSBO writes need a shader-write → shader-read barrier between this
+// pass and the cull pass. CPU host-coherent writes of `view` and
+// `projection` are visible to this shader by submit-order (CPU writes
+// complete before vkQueueSubmit returns).
+//
+// Plane convention
+//
+// Gribb-Hartmann method, applied to the rows of `view_proj`. Plane
+// `(a, b, c, d)` satisfies `ax + by + cz + d >= 0` for points inside
+// the frustum. Order: left, right, bottom, top, near, far.
+//
+// We use depth-zero-to-one (Vulkan convention), so the near plane is
+// just row 2 of `view_proj`, not row 3 + row 2.
+//
+// IMPORTANT: GLSL matrix indexing is `m[col][row]` (column-major
+// access). Rust's `m[(row, col)]` is element access. The CPU
+// implementation in `world_renderer.rs::Frustum::from_view_projection`
+// uses Rust indexing; this shader's `r(row, col)` helper bridges the
+// difference so the math reads identically.
+
+layout(local_size_x = 1) in;
+
+// ---- ViewParam struct (must match `view_params.rs` exactly) -----
+//
+// std430 layout. See `view_params.rs` for the offset table.
+struct ViewParam {
+    mat4 view;
+    mat4 projection;
+    mat4 view_proj;
+    mat4 inverse_view_proj;
+    vec4 camera_pos;
+    vec4 near_far_aspect;
+    vec4 planes[6];
+};
+
+layout(std430, set = 0, binding = 0) buffer ViewParams {
+    ViewParam view_params[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint view_index;
+} pc;
+
+// Element access matching Rust's `m[(row, col)]`. In GLSL, mat[c][r]
+// reads column c, row r — so swap the args.
+float r(mat4 m, int row, int col) {
+    return m[col][row];
+}
+
+void main() {
+    uint i = pc.view_index;
+
+    // Read inputs. View and projection are CPU-authored.
+    mat4 v = view_params[i].view;
+    mat4 p = view_params[i].projection;
+
+    // Derive view_proj. Both v and p are stored in std430 column-major;
+    // GLSL's mat4 * mat4 uses the standard right-multiply convention.
+    mat4 vp = p * v;
+
+    // Write back view_proj for downstream readers (currently unused
+    // in v0.24.0b but reserved for screen-to-world reconstruction in
+    // future increments).
+    view_params[i].view_proj = vp;
+
+    // Derive inverse_view_proj. GLSL's `inverse()` works on mat4.
+    // Cost: a few dozen ALU ops. Trivial at 1-invocation scale.
+    view_params[i].inverse_view_proj = inverse(vp);
+
+    // Frustum plane extraction (Gribb-Hartmann).
+    //
+    // For a point P in world space, the clip-space position is
+    // `vp * vec4(P, 1)`. The point is inside the frustum iff each
+    // clip-space coordinate satisfies the homogeneous-clip-test
+    // (e.g. -w <= x <= w for x in [-1,1] conventions, or 0 <= z <= w
+    // for depth in [0,1]).
+    //
+    // The signed distance from P to plane i is
+    //   plane[i].xyz · P + plane[i].w
+    // which equals
+    //   (row_3 ± row_k) · (P, 1)
+    // for some sign and row k. Each clip-test rearranges into one of
+    // these row-combinations.
+
+    vec4 row0 = vec4(r(vp,0,0), r(vp,0,1), r(vp,0,2), r(vp,0,3));
+    vec4 row1 = vec4(r(vp,1,0), r(vp,1,1), r(vp,1,2), r(vp,1,3));
+    vec4 row2 = vec4(r(vp,2,0), r(vp,2,1), r(vp,2,2), r(vp,2,3));
+    vec4 row3 = vec4(r(vp,3,0), r(vp,3,1), r(vp,3,2), r(vp,3,3));
+
+    vec4 planes[6];
+    planes[0] = row3 + row0;  // Left
+    planes[1] = row3 - row0;  // Right
+    planes[2] = row3 + row1;  // Bottom
+    planes[3] = row3 - row1;  // Top
+    planes[4] = row2;         // Near (depth in [0,1] form: just row 2)
+    planes[5] = row3 - row2;  // Far
+
+    // Normalize each plane so distances are in world units. Not
+    // strictly required for visibility-only tests, but matches the
+    // CPU implementation bit-for-bit so existing test thresholds and
+    // future debug overlays don't have to special-case raw vs
+    // normalized planes.
+    for (int j = 0; j < 6; j++) {
+        float len = length(planes[j].xyz);
+        if (len > 1e-6) {
+            planes[j] /= len;
+        }
+        view_params[i].planes[j] = planes[j];
+    }
+}

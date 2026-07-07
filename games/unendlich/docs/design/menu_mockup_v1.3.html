@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>unendlich · menu mockup v1.3 (r214)</title>
+<!--
+  Standalone menu mockup for rapid, browser-side iteration on the menu
+  aesthetic — decoupled from the engine build cycle (operator: "mock
+  something in HTML for rapid parallel devel"). Encodes the design tokens
+  from 08_UI_and_UX/bending_character_menu_ui_v2.docx:
+    - "panels are atmospheres, not surfaces": frosted, tinted, blurred bg.
+    - thin chrome, no high-contrast borders; legible via sharp text.
+    - depth: background void heavily blurred (28-40px), panel chrome ~8px.
+    - per-element colour grading; soft light; optical (defocus) transitions.
+  This is a reference for what the egui liquid-glass should converge to.
+  Pure HTML/CSS/JS, no deps. Open in any browser.
+-->
+<style>
+  /* v1.3: custom fonts built from this design language (docs/design/fonts/
+     build_fonts.py). UnendlichBlocks = blocky voxel game font for titles/
+     labels; UnendlichGlyphs = UI/bending marks. Body text stays on the
+     system sans (the operator liked it) — the blocky face is used for
+     accent headings only, "a bit more character". */
+  @font-face { font-family: 'UnendlichBlocks'; src: url('UnendlichBlocks-Regular.ttf') format('truetype'); font-display: swap; }
+  @font-face { font-family: 'UnendlichGlyphs'; src: url('UnendlichGlyphs-Regular.ttf') format('truetype'); font-display: swap; }
+  /* r208.1: the fill widens in WITHOUT @property (which some engines don't
+     transition). A fixed-size radial pseudo is SCALED from 0 -> 1 on hover;
+     transform+opacity transitions are universally supported. */
+  :root {
+    /* element colour-grading anchors (per-discipline tints in the doc) */
+    --void-0: #0a0e16;
+    --void-1: #121a28;
+    --glass-tint: rgba(120,160,200,0.10);
+    --glass-edge: rgba(190,225,255,0.22);
+    --glass-hi:  rgba(215,240,255,0.85);
+    --text:      #e8f0f8;
+    --text-dim:  #9fb2c6;
+    --accent:    #6fc3ff;
+    --accent-warm:#ffd27f;
+    --panel-blur: 14px;
+    --void-blur:  34px;
+    --corner: 3px; /* v1.1: sharp, block/voxel corners (was ~12-16px round) */
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+  body {
+    background: radial-gradient(1200px 800px at 50% 35%, var(--void-1), var(--void-0) 70%);
+    color: var(--text);
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+
+  /* The blurred "atmosphere" behind everything — drifts slowly on its own
+     AND parallaxes with the mouse (JS sets --px/--py in px). Heavy blur =
+     depth, so it should move the MOST of any layer. */
+  .void {
+    position: fixed; inset: -14%;
+    filter: blur(var(--void-blur));
+    opacity: 0.7;
+    z-index: 0;
+    --px: 0px; --py: 0px;
+    transform: translate3d(var(--px), var(--py), 0);
+    transition: transform 220ms cubic-bezier(.2,.7,.2,1);
+    will-change: transform;
+  }
+  .blob { position: absolute; border-radius: 50%; mix-blend-mode: screen; animation: drift 26s ease-in-out infinite; }
+  .blob.a { width: 600px; height: 600px; left: 10%; top: 20%; background: #1d4e7a; }
+  .blob.b { width: 520px; height: 520px; right: 8%; top: 30%; background: #4a2d6e; animation-delay: -8s; }
+  .blob.c { width: 480px; height: 480px; left: 40%; bottom: 5%; background: #1f6e63; animation-delay: -15s; }
+  @keyframes drift {
+    0%,100% { transform: translate(0,0) scale(1); }
+    33%     { transform: translate(40px,-30px) scale(1.08); }
+    66%     { transform: translate(-30px,20px) scale(0.96); }
+  }
+
+  .stage { position: relative; z-index: 1; width: 1080px; max-width: 96vw; display: grid; grid-template-columns: 240px 1fr; gap: 22px; }
+
+  .title { grid-column: 1 / -1; text-align: center; margin-bottom: 6px; }
+  .title h1 { font-family: 'UnendlichBlocks', monospace; font-weight: 400; letter-spacing: 0.18em; font-size: 40px; text-indent: 0.18em;
+    background: linear-gradient(180deg, #fff, var(--accent)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .title p { color: var(--text-dim); font-size: 13px; letter-spacing: 0.3em; margin-top: 2px; }
+
+  /* A glass panel: frosted, tinted, thin bright top edge, soft bottom glow.
+     The bottom inner-glow is the "liquid" tell the egui fresnel also uses. */
+  .glass {
+    position: relative;
+    background: var(--glass-tint);
+    backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    border-radius: var(--corner);
+    border: 1px solid var(--glass-edge);
+    overflow: hidden;
+    /* v1.1: GLOBAL SPECULAR — a soft highlight whose origin (--spec-x/y,
+       set in JS from the biggest/brightest element on screen) rakes across
+       every glass border, as if one light source lit the whole scene. The
+       tint (--spec-tint) is taken from that dominant element. */
+    --spec-x: 50%; --spec-y: 0%; --spec-tint: rgba(200,230,255,0.5);
+    /* r209: glass parallaxes by TRANSLATION ONLY (rotation removed — it
+       was disorienting). The offset comes from the cone-projection model
+       in JS, which writes --px/--py. */
+    --px: 0px; --py: 0px;
+    transform: translate(var(--px), var(--py));
+    transition: transform 600ms cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform;
+    /* v1.2: EDGE-WEIGHTED GLASS — a strong inset glow hugging the
+       perimeter that fades toward the centre, so the glass reads THICKER
+       at the edges than in the middle (the operator's note). Layered with
+       the existing top-rim + bottom inner-glow. */
+    box-shadow:
+      0 10px 40px rgba(0,0,0,0.35),
+      inset 0 1px 0 var(--glass-hi),
+      inset 0 0 0 1px rgba(190,220,255,0.10),
+      inset 0 0 18px -2px rgba(180,210,255,0.28),
+      inset 0 -30px 40px -30px rgba(120,180,230,0.5);
+  }
+  /* v1.2: BORDER-FILL — when a glass panel appears, a thick bright edge
+     animates from the OUTER rim INWARD then settles thin. Done with an
+     inset box-shadow ring whose spread shrinks (animatable, unlike border
+     gradients). Tricky in CSS — flagged for a cleaner egui port — but this
+     reads as "the frame draws itself in". */
+  .glass.fill-edges::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 2;
+    animation: borderFill 620ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes borderFill {
+    0%   { box-shadow: inset 0 0 0 10px var(--accent); opacity: 0.9; }
+    60%  { box-shadow: inset 0 0 0 3px var(--accent); opacity: 0.7; }
+    100% { box-shadow: inset 0 0 0 1px transparent; opacity: 0; }
+  }
+  /* v1.1: the global specular gleam — a radial highlight at the light
+     origin, masked to a thin band so it reads as a lit BORDER/edge rather
+     than a blob. Sits above the panel fill, below the content. */
+  .glass::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: radial-gradient(circle 280px at var(--spec-x) var(--spec-y),
+      var(--spec-tint), transparent 60%);
+    opacity: 0.6; mix-blend-mode: screen;
+    transition: background 400ms ease;
+  }
+  .glass > * { position: relative; z-index: 1; }
+  /* r208: moving sheen sweeps removed — operator found them distracting,
+     and real item/feedback content will animate the panels instead. The
+     glass keeps its static top rim + bottom inner-glow (the box-shadow on
+     .glass above), which read as glass without motion. */
+
+  .nav { padding: 18px 16px; display: flex; flex-direction: column; gap: 8px; align-self: start; }
+  .nav button {
+    appearance: none; border: none; cursor: pointer; text-align: left;
+    font-family: 'UnendlichBlocks', monospace;
+    color: var(--text); font-size: 14px; letter-spacing: 0.06em;
+    padding: 12px 16px; border-radius: var(--corner); background: transparent;
+    position: relative; overflow: hidden;
+    transition: color 180ms ease, transform 220ms cubic-bezier(.34,1.7,.5,1);
+    --mx: 50%; --my: 50%;
+  }
+  /* the fill: a radial pseudo centred on the cursor (--mx/--my), SCALED
+     from 0 to full on hover so it grows out of the point. transform +
+     opacity only — no custom-property transition (max compatibility). */
+  .nav button::before {
+    content: ""; position: absolute; inset: -20%; border-radius: inherit;
+    /* v1.3: bright spot tracks the cursor (--mx/--my); scale grows from
+       centre. Hue from the page accent. */
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%),
+      var(--accent), var(--page-wash) 42%, transparent 68%);
+    opacity: 0; transform: scale(0.2); transform-origin: center;
+    transition: opacity 320ms ease, transform 560ms cubic-bezier(0.16, 1, 0.3, 1);
+    pointer-events: none; mix-blend-mode: screen;
+  }
+  .nav button:hover::before { opacity: 0.5; transform: scale(1); }
+  .nav button:hover { transform: translateX(3px); }
+  .nav button:active { transform: translateX(3px) scale(0.97, 0.92); }
+  .nav button span { position: relative; z-index: 1; }
+  .nav button.active { color: #fff; }
+  .nav button.active::before { opacity: 0.5; transform: scale(1); }
+  .nav button.active::after {
+    content: ""; position: absolute; left: 0; top: 18%; bottom: 18%; width: 2px;
+    background: var(--accent); border-radius: 2px; z-index: 1;
+  }
+
+  .panel { padding: 26px 28px; min-height: 360px; }
+  /* optical transition: content defocuses then resolves (doc: "defocus into
+     blur, then resolve from blur into sharpness") */
+  .panel .content { animation: resolve 620ms cubic-bezier(0.16, 1, 0.3, 1); }
+  @keyframes resolve { from { filter: blur(12px); opacity: 0; transform: scale(0.98); } to { filter: blur(0); opacity: 1; transform: none; } }
+  .panel h2 { font-family: 'UnendlichBlocks', monospace; font-weight: 400; font-size: 22px; letter-spacing: 0.06em; margin-bottom: 6px;
+    color: var(--accent); /* r210: deterministic per-page/slider accent */ }
+  /* r210: a faint wash bar under the heading whose colour is the
+     slider+page hash — the most visible "sliders feed the content" tell. */
+  .panel .content::before {
+    content: ""; display: block; height: 3px; width: 60px; border-radius: 3px;
+    background: var(--accent); margin-bottom: 14px; opacity: 0.8;
+    box-shadow: 0 0 16px 2px var(--page-wash); }
+  .panel .sub { color: var(--text-dim); font-size: 13px; margin-bottom: 22px; }
+
+  .row { display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 4px; border-bottom: 1px solid rgba(160,200,240,0.08); }
+  .row:last-child { border-bottom: none; }
+  .row .label { font-size: 14px; }
+  .row .hint { color: var(--text-dim); font-size: 12px; }
+
+  /* v1.1: RUNE-MORPH text entry — typed chars first appear as a blocky
+     bending rune, then morph into the Latin letter. The field is a styled
+     box; characters are spans we animate. */
+  .runefield { display: inline-flex; align-items: center; min-width: 200px; min-height: 38px;
+    background: rgba(160,200,240,.08); border: 1px solid var(--glass-edge);
+    border-radius: var(--corner); padding: 6px 12px; cursor: text; gap: 1px;
+    font-size: 18px; letter-spacing: 0.02em; }
+  .runefield:focus-within { border-color: var(--accent); box-shadow: 0 0 12px var(--page-wash); }
+  .runefield .rch { position: relative; display: inline-grid; }
+  /* both glyphs stacked; we cross-fade rune -> letter */
+  .runefield .rch .rune, .runefield .rch .latin {
+    grid-area: 1/1; transition: opacity 420ms ease, filter 420ms ease, transform 420ms cubic-bezier(.2,.7,.2,1); }
+  .runefield .rch .rune { color: var(--accent); font-family: "Segoe UI Symbol", "Noto Sans Runic", monospace; }
+  .runefield .rch.resolved .rune  { opacity: 0; filter: blur(6px); transform: scale(1.3) rotate(8deg); }
+  .runefield .rch.resolved .latin { opacity: 1; filter: blur(0);  transform: none; }
+  .runefield .rch:not(.resolved) .rune  { opacity: 1; }
+  .runefield .rch:not(.resolved) .latin { opacity: 0; filter: blur(6px); }
+  .runefield .caret { width: 2px; height: 22px; background: var(--accent); animation: caretBlink 1s steps(2) infinite; }
+  @keyframes caretBlink { 50% { opacity: 0; } }
+
+
+  /* v1.3: BLOCKY, THICK, TOUCH-FRIENDLY sliders. Square thumb (not a
+     circle), bigger hit area, and a PIXELIZED stepped fill (blocky
+     segments) rather than a smooth gradient. */
+  input[type=range] { -webkit-appearance: none; width: 180px; height: 12px; border-radius: 0;
+    /* pixelized fill: hard-edged stepped blocks of accent fading to dim */
+    background:
+      repeating-linear-gradient(90deg,
+        var(--accent) 0, var(--accent) 8px,
+        rgba(160,200,240,0.18) 8px, rgba(160,200,240,0.18) 10px);
+    border: 1px solid rgba(0,0,0,0.4);
+    box-shadow: inset 0 0 0 1px rgba(190,220,255,0.12);
+    outline: none; image-rendering: pixelated;
+    transition: box-shadow 220ms ease, filter 220ms ease, transform 160ms cubic-bezier(.34,1.7,.5,1); }
+  input[type=range]:hover { box-shadow: inset 0 0 0 1px rgba(190,220,255,0.12), 0 0 12px var(--page-wash);
+    filter: brightness(1.18); }
+  input[type=range]:active { transform: scaleY(1.15); }    /* track squish on grab */
+  /* square block thumb */
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 22px; height: 22px; border-radius: 2px;
+    background: linear-gradient(150deg, #fff, var(--accent));
+    border: 1px solid rgba(0,0,0,0.5); cursor: pointer; margin-top: -6px;
+    box-shadow: 0 0 8px rgba(111,195,255,0.5), inset 0 1px 0 rgba(255,255,255,0.6);
+    transition: transform 220ms cubic-bezier(.34,1.7,.5,1), box-shadow 200ms ease; }
+  /* hover grows + glows; active SQUISHES (squash) then springs back */
+  input[type=range]:hover::-webkit-slider-thumb { transform: scale(1.25); box-shadow: 0 0 18px 3px var(--accent), inset 0 1px 0 rgba(255,255,255,0.6); }
+  input[type=range]:active::-webkit-slider-thumb { transform: scale(1.3, 0.85); box-shadow: 0 0 24px 5px var(--accent); }
+  input[type=range]::-moz-range-thumb { width: 22px; height: 22px; border-radius: 2px;
+    background: linear-gradient(150deg, #fff, var(--accent)); border: 1px solid rgba(0,0,0,0.5); cursor: pointer;
+    box-shadow: 0 0 8px rgba(111,195,255,0.5); transition: transform 220ms cubic-bezier(.34,1.7,.5,1); }
+  input[type=range]:hover::-moz-range-thumb { transform: scale(1.25); }
+  input[type=range]:active::-moz-range-thumb { transform: scale(1.3, 0.85); }
+
+  /* v1.3: toggle on-fill is a DIAMOND-TILE pattern (matches the diamond
+     knob) instead of diagonal stripes — no triangle wedges in the corners.
+     Two crossed repeating gradients tile clean diamonds. */
+  /* v1.3: toggle shaped like <[[[[[[[[[> — chevron end-caps via clip-path,
+     bracket segments via a repeating vertical-bar overlay. Infill is a
+     HIGH-RES DITHER (fine ~2px checker) rather than the coarse crosshatch. */
+  /* v1.3: the holder SHRINK-WRAPS the diamond knob — its left/right caps
+     are at 45° (cap depth = half the height) so they match the diamond's
+     edge angle exactly, giving two diamond-edge pairs hugging the knob. */
+  .toggle { width: 56px; height: 26px; border-radius: 0;
+    background: rgba(120,150,180,0.12);
+    clip-path: polygon(0 50%, 13px 0, calc(100% - 13px) 0, 100% 50%, calc(100% - 13px) 100%, 13px 100%);
+    position: relative; cursor: pointer; overflow: hidden;
+    transition: background 320ms ease, box-shadow 320ms ease, transform 240ms cubic-bezier(.34,1.7,.5,1); }
+  /* the infill fills the ENTIRE holder (same 45° chevron shape, not a
+     small diamond). Fractal/multi-octave dither; reveals left->right via
+     a scaleX anchored at the left (growing out from behind the knob). */
+  .toggle::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 1;
+    clip-path: polygon(0 50%, 13px 0, calc(100% - 13px) 0, 100% 50%, calc(100% - 13px) 100%, 13px 100%);
+    background:
+      radial-gradient(circle at 1px 1px, var(--accent) 0.5px, transparent 1.0px) 0 0 / 2px 2px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.6px, transparent 1.2px) 1px 1px / 4px 4px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.8px, transparent 1.6px) 2px 0 / 8px 8px,
+      var(--page-wash);
+    opacity: 0; transform: scaleX(0); transform-origin: left center;
+    transition: opacity 300ms ease, transform 460ms cubic-bezier(0.16, 1, 0.3, 1); }
+  .toggle.on::before { opacity: 0.95; transform: scaleX(1); }
+  .toggle.on { box-shadow: 0 0 12px var(--page-wash); }
+  /* SQUISH: the whole track briefly squashes horizontally when toggled */
+  .toggle:active { transform: scaleX(0.92); }
+  /* switch-on flash: a fading diamond bloom in the centre */
+  .toggle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 28px; height: 28px; z-index: 1;
+    background: radial-gradient(circle, rgba(255,255,255,0.6), transparent 60%);
+    transform: translate(-50%,-50%) scale(0.2); opacity: 0; }
+  .toggle.on::after { animation: toggleBloom 520ms ease-out; }
+  @keyframes toggleBloom {
+    0% { transform: translate(-50%,-50%) scale(0.2); opacity: .9; }
+    100% { transform: translate(-50%,-50%) scale(1.6); opacity: 0; } }
+
+  /* diamond knob — bigger spring + a fade-pop on switch. Hugs the edges
+     (3px inset) so there's no inner L/R padding. */
+  .toggle .knob { position: absolute; top: 4px; left: 4px; width: 18px; height: 18px; border-radius: 2px; z-index: 3;
+    background: radial-gradient(circle at 35% 30%, #fff, #dfeaf5);
+    transform: rotate(45deg);
+    transition: left 420ms cubic-bezier(.5,1.8,.5,1), box-shadow 320ms ease, transform 240ms cubic-bezier(.5,1.8,.5,1);
+    box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+  .toggle.on .knob { left: 34px; box-shadow: 0 1px 4px rgba(0,0,0,.4), 0 0 12px rgba(255,255,255,.7); }
+  /* squish on press: knob squashes along its travel axis then springs */
+  .toggle:active .knob { transform: rotate(45deg) scale(1.25, 0.7); }
+
+
+
+  .worlds { display: flex; flex-direction: column; gap: 10px; }
+  .world { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: var(--corner);
+    background: rgba(140,180,220,0.06); cursor: pointer; position: relative; overflow: hidden;
+    --mx: 50%; --my: 50%; }
+  .world::before {
+    content: ""; position: absolute; inset: -20%; border-radius: inherit; pointer-events: none;
+    /* v1.3: the bright spot TRACKS THE CURSOR (--mx/--my) again — the
+       cursor-follow regressed when this went static at 50% 50%. The
+       SCALE still grows from centre (origin center), but the gradient
+       focus follows the pointer for a responsive spotlight. */
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%),
+      var(--accent), var(--page-wash) 45%, transparent 70%);
+    opacity: 0; transform: scale(0.2); transform-origin: center;
+    transition: opacity 320ms ease, transform 560ms cubic-bezier(0.16, 1, 0.3, 1);
+    mix-blend-mode: screen; }
+  .world:hover::before { opacity: 0.45; transform: scale(1); }
+  .world > * { position: relative; z-index: 1; }
+  .world .thumb { width: 48px; height: 48px; border-radius: 2px; flex: none;
+    background: linear-gradient(135deg, #2a6e5a, #1d4e7a); box-shadow: inset 0 1px 0 rgba(255,255,255,.2); }
+  .world .meta { flex: 1; }
+  .world .meta .n { font-size: 15px; }
+  .world .meta .d { font-size: 12px; color: var(--text-dim); }
+  .world .acts button { appearance: none; border: 1px solid var(--glass-edge); background: transparent; color: var(--text-dim);
+    border-radius: 2px; padding: 5px 10px; font-size: 12px; cursor: pointer; margin-left: 6px; transition: all 140ms; }
+  .world .acts button:hover { color: var(--text); border-color: var(--accent); }
+  .world .acts button.danger:hover { color: #ff9a9a; border-color: #ff6a6a; }
+
+  .timeline { display: flex; gap: 0; align-items: stretch; margin-top: 8px; position: relative; padding: 18px 0; }
+  .timeline .track { position: absolute; left: 0; right: 0; top: 50%; height: 2px; background: rgba(160,200,240,0.2); }
+  .tp { position: relative; flex: 1; display: flex; flex-direction: column; align-items: center; cursor: pointer; }
+  /* v1.3: history-point diamonds — on hover the INNER fill expands only
+     slightly, while a DECOUPLED border ring expands more, on its own
+     timing, and SHARPENS (soft glow -> crisp thin edge). */
+  .tp .dot { position: relative; width: 13px; height: 13px; border-radius: 2px;
+    background: var(--accent); z-index: 1; transform: rotate(45deg);
+    transition: transform 220ms cubic-bezier(.34,1.7,.5,1); }
+  /* the decoupled border ring (its own pseudo, its own transition) */
+  .tp .dot::before {
+    content: ""; position: absolute; inset: -3px; border-radius: 2px;
+    border: 2px solid var(--accent); opacity: 0.25;
+    box-shadow: 0 0 6px 2px var(--page-wash);
+    transition: inset 320ms cubic-bezier(.2,.7,.2,1), opacity 320ms ease,
+                box-shadow 320ms ease, border-width 320ms ease, border-color 320ms ease; }
+  /* inner: tiny expand. border: bigger expand + sharpen (thin crisp, no glow). */
+  .tp:hover .dot { transform: rotate(45deg) scale(1.12); }
+  .tp:hover .dot::before { inset: -7px; opacity: 0.9; border-width: 1px;
+    border-color: #fff; box-shadow: 0 0 0 0 transparent; }
+  .tp .cap { font-size: 11px; color: var(--text-dim); margin-top: 12px; text-align: center; }
+  .tp.warm .dot { background: var(--accent-warm); }
+  .tp.warm .dot::before { border-color: var(--accent-warm); }
+
+  /* ── inventory + crafting · v1.3 ─────────────────────────────────────
+     NEUTRAL hollow-border cells: no fancy corner accents, no colour
+     splash, no hover-scale. Just a clean border + a sharp inner hairline
+     (pixel-art × sharp-edge hybrid). Hover drives a CROSSHAIR highlight
+     across the row and column (JS-propagated), not a per-cell zoom. */
+  .cell {
+    position: relative; aspect-ratio: 1; border-radius: 0;
+    background: transparent;                       /* inner stays clear */
+    border: 1px solid rgba(150,170,190,0.28);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.45);  /* sharp inner hairline = double line */
+    display: grid; place-items: center;
+    transition: border-color 140ms linear, box-shadow 140ms linear, background 140ms linear; cursor: pointer;
+  }
+  /* the hovered cell: crisp bright border, no fill, no scale */
+  .cell.x-hover { border-color: #eef3e8; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.45), inset 0 0 0 2px rgba(238,243,232,0.5); }
+  /* row/col crosshair members: border brightens, faint hollow wash */
+  .cell.x-line { border-color: rgba(200,220,240,0.6); background: rgba(160,190,220,0.05); }
+  .cell.empty { cursor: default; }
+  .cell .ico { font-size: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); z-index: 1; }
+  .cell .qty { position: absolute; right: 4px; bottom: 2px; font-size: 10px; color: var(--text-dim); z-index: 1; }
+
+  /* category sidebar (8 filters) — neutral hollow borders, no corners */
+  .cats { display: flex; flex-direction: column; gap: 8px; }
+  .cat { width: 46px; height: 46px; border-radius: 0; display: grid; place-items: center;
+    background: transparent;
+    border: 1px solid rgba(150,170,190,0.26);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4);
+    font-size: 18px; cursor: pointer; position: relative; transition: border-color 150ms, color 150ms; color: var(--text-dim); }
+  .cat:hover { color: var(--text); border-color: rgba(220,235,250,0.7); }
+  .cat.active { color: #fff; border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4), inset 0 0 0 2px var(--accent); }
+  .cat.active::after { content: "\25c6"; position: absolute; left: -11px; font-size: 8px; color: var(--accent); }
+
+  /* crafting layout: sidebar | 3x3 grid | chevron | result column */
+  .craft { display: grid; grid-template-columns: auto auto auto 1fr; gap: 20px; align-items: center; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 64px); gap: 8px; }
+  .chev { font-size: 32px; color: var(--accent-warm); animation: chevpulse 1.6s ease-in-out infinite; }
+  @keyframes chevpulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
+  .result-col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .result {
+    width: 132px; height: 132px; border-radius: 3px; display: grid; place-items: center; position: relative;
+    background: radial-gradient(120% 120% at 50% 40%, rgba(60,80,110,0.3), rgba(12,18,28,0.85));
+    border: 2px solid rgba(220,180,90,0.7);
+    box-shadow: 0 0 0 1px rgba(255,220,140,0.3), 0 8px 30px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,240,200,.4);
+  }
+  /* element-matched glow ring around the manifested result (blue = Water) */
+  .result::after { content: ""; position: absolute; inset: -6px; border-radius: 5px;
+    box-shadow: 0 0 24px 2px rgba(111,195,255,0.5); pointer-events: none; }
+  .result .ico { font-size: 46px; }
+  .station { width: 64px; height: 64px; border-radius: 2px; display: grid; place-items: center;
+    background: rgba(12,18,28,0.85); border: 1px solid var(--accent); box-shadow: inset 0 0 12px rgba(111,195,255,0.2); font-size: 22px; }
+  .station .lbl { position: absolute; }
+  .invgrid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 7px; margin-top: 4px; }
+  .craft-foot { display: flex; justify-content: space-between; align-items: baseline; margin-top: 16px; }
+  .recipe-name { font-size: 16px; color: var(--accent); letter-spacing: .06em; }
+
+  /* ── r211: CHARACTER sheet — glass × the green-tactical reference ───── */
+  /* the merge: keep the frosted-glass depth + inner-glow, but recolour to
+     the reference's forest-green tactical palette with gold accents and
+     SHARP angular (clipped-corner) frames instead of round ones. */
+  .char {
+    --gold: #d9bc6a; --sage: #7d9b6f; --green-deep: #0d1a12;
+    --frame: rgba(150,180,130,0.35);
+    display: grid; grid-template-columns: 76px 200px 1fr 196px; gap: 14px;
+    align-items: stretch;           /* v1.1: every column fills the row height */
+    color: #d8e4d2; min-height: 420px;
+  }
+  /* v1.1: the right column's three panels share the row height evenly so
+     the sheet reads as one aligned grid, not three independent stacks. */
+  .char > .side { display: grid; grid-template-rows: auto auto 1fr; gap: 12px; }
+  .char > .gear-col { display: grid; grid-auto-rows: 1fr; gap: 8px; }
+  /* an angular glass sub-panel (clipped corners, sage border, green tint) */
+  .gpanel {
+    position: relative; padding: 12px;
+    background: linear-gradient(160deg, rgba(20,34,24,0.55), rgba(10,18,12,0.65));
+    backdrop-filter: blur(10px) saturate(1.1); -webkit-backdrop-filter: blur(10px) saturate(1.1);
+    border: 1px solid var(--frame);
+    box-shadow: inset 0 1px 0 rgba(190,220,170,0.18), inset 0 -22px 30px -26px rgba(120,160,90,0.5);
+    clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  }
+  .gpanel .ph { font-family: 'UnendlichBlocks', monospace; font-size: 10px; letter-spacing: 0.14em; color: var(--sage); margin-bottom: 10px; text-transform: uppercase; }
+
+  /* left: equipment slots with corner brackets + durability + rank diamond */
+  .gear-col { display: flex; flex-direction: column; gap: 9px; }
+  .eslot { position: relative; aspect-ratio: 1; background: rgba(10,18,12,0.6);
+    border: 1px solid var(--frame); display: grid; place-items: center; cursor: pointer;
+    transition: border-color 200ms, box-shadow 200ms; }
+  .eslot:hover { border-color: var(--gold); box-shadow: 0 0 14px rgba(217,188,106,0.3); }
+  .eslot .ico { font-size: 26px; }
+  /* corner brackets */
+  .eslot::before, .eslot::after { content: ""; position: absolute; width: 8px; height: 8px; border: 1px solid var(--gold); opacity: .8; }
+  .eslot::before { left: -1px; top: -1px; border-right: none; border-bottom: none; }
+  .eslot::after { right: -1px; bottom: -1px; border-left: none; border-top: none; }
+  .eslot .dura { position: absolute; bottom: 2px; right: 4px; font-size: 9px; color: var(--sage); }
+  .eslot .rank { position: absolute; top: -4px; left: 50%; transform: translateX(-50%) rotate(45deg);
+    width: 7px; height: 7px; background: var(--gold); }
+
+  /* stats column: power (gold, big) + diamond-glyph stat rows */
+  .pname { font-family: 'UnendlichBlocks', monospace; font-size: 20px; letter-spacing: 0.05em; color: #eef3e8; }
+  .psub { font-size: 11px; color: var(--sage); letter-spacing: 0.14em; margin-bottom: 14px; }
+  .pwr-label { font-size: 11px; color: var(--sage); letter-spacing: 0.2em; }
+  .pwr { font-family: 'UnendlichBlocks', monospace; font-size: 38px; font-weight: 400; color: var(--gold); line-height: 1; margin-bottom: 16px;
+    text-shadow: 0 0 18px rgba(217,188,106,0.4); }
+  .stat { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+  .stat .dia { width: 16px; height: 16px; background: var(--sage); transform: rotate(45deg); flex: none; opacity: .85; }
+  .stat .sname { color: var(--sage); flex: 1; letter-spacing: 0.08em; }
+  .stat .sval { color: #eef3e8; font-size: 15px; }
+
+  /* centre: voxel character stage (placeholder block art vibe) */
+  .char-stage { position: relative; display: grid; place-items: center;
+    background: radial-gradient(120% 90% at 50% 35%, rgba(30,50,34,0.4), rgba(8,14,10,0.5));
+    border: 1px solid var(--frame); overflow: hidden;
+    clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px)); }
+  .char-stage .silhouette { font-size: 120px; filter: drop-shadow(0 6px 18px rgba(0,0,0,.5)); opacity: .92; }
+  .char-stage .disc { position: absolute; left: 14px; bottom: 12px; font-size: 11px; color: var(--sage); letter-spacing: 0.14em; }
+  .char-stage .disc b { color: var(--gold); display:block; font-size: 14px; letter-spacing: 0.1em; }
+
+  /* right: companions, bond pips, resonance hex */
+  .side { display: flex; flex-direction: column; gap: 12px; }
+  .comp { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .comp .cthumb { width: 34px; height: 34px; border: 1px solid var(--frame); display: grid; place-items: center; font-size: 18px; flex: none; }
+  .comp .cname { font-size: 12px; letter-spacing: 0.08em; }
+  .abil { display: flex; gap: 5px; }
+  .abil span { width: 22px; height: 22px; border: 1px solid var(--frame); display: grid; place-items: center; font-size: 12px;
+    transition: border-color 160ms, box-shadow 160ms; cursor: pointer; }
+  .abil span:hover { border-color: var(--gold); box-shadow: 0 0 8px rgba(217,188,106,0.4); }
+  .pips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .pip { width: 9px; height: 9px; background: var(--gold); transform: rotate(45deg); }
+  .pip.empty { background: transparent; border: 1px solid var(--frame); }
+  .hexwheel { display: grid; place-items: center; padding: 8px; }
+  .hexwheel .core { width: 64px; height: 64px; display: grid; place-items: center; font-size: 28px;
+    background: radial-gradient(circle, rgba(125,155,111,0.3), transparent);
+    border: 1px solid var(--sage); border-radius: 50%; box-shadow: 0 0 20px rgba(125,155,111,0.3); }
+
+  .footer { grid-column: 1 / -1; text-align: center; color: var(--text-dim); font-size: 11px; letter-spacing: 0.15em; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <div class="void"><div class="blob a"></div><div class="blob b"></div><div class="blob c"></div></div>
+
+  <div class="stage">
+    <div class="title">
+      <h1>UNENDLICH</h1>
+      <p>MENU AESTHETIC MOCKUP · v1.3</p>
+    </div>
+
+    <nav class="glass nav" id="nav">
+      <button data-panel="play" class="active"><span>Play</span></button>
+      <button data-panel="character"><span>Character</span></button>
+      <button data-panel="load"><span>Load World</span></button>
+      <button data-panel="inventory"><span>Inventory</span></button>
+      <button data-panel="crafting"><span>Crafting</span></button>
+      <button data-panel="history"><span>World History</span></button>
+      <button data-panel="settings"><span>Settings</span></button>
+      <button data-panel="quit"><span>Quit</span></button>
+    </nav>
+
+    <section class="glass panel" id="panel"></section>
+
+    <div class="footer">FROSTED GLASS · HEXAGONAL BOKEH DEPTH · OPTICAL TRANSITIONS · PER-ELEMENT GRADING</div>
+  </div>
+
+<script>
+const panels = {
+  play: `<div class="content"><h2>New World</h2><div class="sub">configure a world, then drop in</div>
+    <div class="row"><span class="label">World name</span><div class="runefield" id="worldname" tabindex="0"><span class="caret"></span></div></div>
+    <div class="row"><span class="label">Seed</span><input style="background:rgba(160,200,240,.1);border:1px solid var(--glass-edge);color:var(--text);border-radius:2px;padding:8px 12px;width:200px" value="auto"></div>
+    <div class="row"><span class="label">Mode</span><span class="hint">Survival · Creative</span></div>
+    <div class="row"><span class="label">Render distance</span><input type="range" min="2" max="12" value="6"></div></div>`,
+  load: `<div class="content"><h2>Load World</h2><div class="sub">your saved worlds</div>
+    <div class="worlds">
+      ${[['Highland Vale','seed 4821 · survival'],['Coral Drift','seed 99120 · creative'],['Ashfen','seed 217 · survival']].map(w=>`
+      <div class="world"><div class="thumb"></div><div class="meta"><div class="n">${w[0]}</div><div class="d">${w[1]}</div></div>
+        <div class="acts"><button>history</button><button class="danger">🗑</button></div></div>`).join('')}
+    </div></div>`,
+  history: `<div class="content"><h2>World History <span style="font-size:13px;color:var(--text-dim)">ⓘ</span></h2>
+    <div class="sub">step back through snapshots — screenshot timeline</div>
+    <div class="timeline"><div class="track"></div>
+      ${[['20s','manual',0],['2m','travel',0],['6m','craft',1],['11m','timer',0],['18m','manual',0]].map(t=>`
+      <div class="tp ${t[2]?'warm':''}"><div class="dot"></div><div class="cap">${t[0]}<br>${t[1]}</div></div>`).join('')}
+    </div>
+    <div class="row" style="margin-top:18px"><span class="label">＋ create history point now</span><span class="hint">dev</span></div>
+    <div class="row"><span class="label">Each point snapshots your world</span><span class="hint">restore · delete</span></div></div>`,
+  settings: `<div class="content"><h2>Settings</h2><div class="sub">video · audio · controls · performance</div>
+    <div class="row"><span class="label">GUI scale</span><input type="range" min="1" max="1.66" step="0.11" value="1"></div>
+    <div class="row"><span class="label">Fog</span><div class="toggle on" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div>
+    <div class="row"><span class="label">Shadows</span><div class="toggle on" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div>
+    <div class="row"><span class="label">Dev banner (UNENDLICH_DEV)</span><div class="toggle" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div></div>`,
+  quit: `<div class="content"><h2>Quit unendlich?</h2><div class="sub">your world is saved automatically</div>
+    <div class="row"><span class="label">Return to desktop</span><span class="hint">esc to cancel</span></div></div>`,
+
+  // r211: CHARACTER — the glass×green-tactical merge (character_panel_reference.docx
+  // + the RootBender reference image). Grounded in that art: Root discipline,
+  // Builder Dragon + Water Ocelot companions, Power + 3 stats, bond pips, resonance hex.
+  character: (() => {
+    const gear = [['\ud83d\udc79','helm'],['\ud83e\udde5','chest'],['\ud83e\uddbe','arms'],['\ud83e\udd7e','boots'],['\ud83d\udcff','amulet']];
+    const gearCells = gear.map(g=>`<div class="eslot"><span class="rank"></span><span class="ico">${g[0]}</span><span class="dura">10/10</span></div>`).join('');
+    const stats = [['MOBILITY','34'],['RESILIENCE','102'],['RECOVERY','68']];
+    const statRows = stats.map(s=>`<div class="stat"><span class="dia"></span><span class="sname">${s[0]}</span><span class="sval">${s[1]}</span></div>`).join('');
+    const pips = Array.from({length:10},(_,i)=>`<span class="pip ${i===0?'empty':''}"></span>`).join('');
+    return `<div class="content"><div class="char">
+      <div class="gear-col">${gearCells}</div>
+      <div class="gpanel"><div class="ph">Profile</div>
+        <div class="pname">ROOTBENDER</div>
+        <div class="psub">LVL 50 \u00b7 GRAND GROVE</div>
+        <div class="pwr-label">POWER</div><div class="pwr">1560</div>
+        ${statRows}
+      </div>
+      <div class="char-stage">
+        <div class="silhouette">\ud83c\udf33</div>
+        <div class="disc">ROOT DISCIPLINE<b>Harness the living weave</b></div>
+      </div>
+      <div class="side">
+        <div class="gpanel"><div class="ph">Companions</div>
+          <div class="comp"><div class="cthumb">\ud83d\udc09</div><div class="cname">Builder Dragon</div></div>
+          <div class="abil"><span>\ud83c\udf3f</span><span>\u2728</span><span>\ud83c\udf31</span></div>
+          <div style="height:10px"></div>
+          <div class="comp"><div class="cthumb">\ud83d\udc31</div><div class="cname">Water Ocelot</div></div>
+          <div class="abil"><span>\u2744</span><span>\ud83d\udca7</span><span>\ud83c\udf0a</span></div>
+        </div>
+        <div class="gpanel"><div class="ph">Bond \u00b7 Max Rank</div><div class="pips">${pips}</div></div>
+        <div class="gpanel"><div class="ph">Resonance</div><div class="hexwheel"><div class="core">\ud83c\udf33</div></div></div>
+      </div>
+    </div></div>`;
+  })(),
+
+
+  inventory: (() => {
+    const cats = ['\u25c6','\ud83c\udf3f','\u2726','\ud83d\udd28','\u2744','\ud83c\udf43','\u2299','\ud83d\udc5d'];
+    const items = [
+      ['\ud83d\udd37',''],['\ud83d\udfea',''],['\ud83d\udd36',''],['\ud83e\uddea','3'],['\u2728',''],['\ud83c\udf3f','12'],
+      ['\u2694\ufe0f',''],['\ud83e\udeb5','4'],['\ud83d\udc1a','7'],['\ud83e\udea8','22'],['\ud83d\udd31',''],['\ud83e\uddf1','48'],
+      ['\ud83d\udca0',''],['\ud83e\udd56','9'],['\ud83c\udf56','3'],['\ud83e\uddca','5'],['\u26a1',''],['\ud83c\udf6f','2'],
+    ];
+    const cell = (it) => it
+      ? `<div class="cell"><span class="c2"></span><span class="ico">${it[0]}</span>${it[1]?`<span class="qty">${it[1]}</span>`:''}</div>`
+      : `<div class="cell empty"><span class="c2"></span></div>`;
+    let grid = '';
+    for (let i = 0; i < 36; i++) grid += cell(items[i] || null);
+    const sidebar = cats.map((g,i)=>`<div class="cat ${i===0?'active':''}">${g}</div>`).join('');
+    return `<div class="content"><h2>Inventory</h2><div class="sub">4 \u00d7 9 grid \u00b7 category filters \u00b7 hover a slot for its genome tooltip</div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:18px">
+        <div class="cats">${sidebar}</div>
+        <div class="invgrid">${grid}</div>
+      </div></div>`;
+  })(),
+
+  // r208: CRAFTING — sidebar + 3x3 grid + chevron + gold result + station.
+  crafting: (() => {
+    const cats = ['\u25c6','\ud83c\udf3f','\u2726','\ud83d\udd28','\u2744','\ud83c\udf43','\u2299','\ud83d\udc5d'];
+    // the doc's Tidal Blade recipe, slot by slot
+    const recipe = ['\ud83d\udd37','\ud83d\udfea','\ud83d\udd36','\ud83e\uddea','\u2728','\ud83c\udf3f','\ud83d\udc1a','\u2694\ufe0f','\ud83d\udd31'];
+    const grid = recipe.map(ic=>`<div class="cell"><span class="c2"></span><span class="ico">${ic}</span></div>`).join('');
+    const sidebar = cats.map((g,i)=>`<div class="cat ${i===0?'active':''}">${g}</div>`).join('');
+    return `<div class="content"><h2>Crafting</h2><div class="sub">3 \u00d7 3 grid \u00b7 result \u00b7 station indicator</div>
+      <div class="craft">
+        <div class="cats">${sidebar}</div>
+        <div class="grid3">${grid}</div>
+        <div class="chev">\u00bb\u00bb</div>
+        <div class="result-col">
+          <div class="result"><span class="ico">\ud83d\udde1\ufe0f</span></div>
+          <div class="station" title="Tidal Anvil required">\ud83e\udded</div>
+        </div>
+      </div>
+      <div class="craft-foot"><span class="recipe-name">Tidal Blade</span><span class="hint">Water affinity \u00b7 Tidal Anvil</span></div></div>`;
+  })(),
+};
+const panelEl = document.getElementById('panel');
+// ── r210: sliders FEED the page content — deterministic variation ───────
+// tune is declared up here (above show/applyContentTint, which read it).
+// Cone parallax + tuner below reuse this same object.
+const tune = { voidZ: 0.10, glassZ: 0.03, smooth: 0.03 };
+// The tuner values + page name are hashed into a reproducible accent
+// colour so the content "plays" with the parallax values: same sliders +
+// same page => same look, every time; move a slider or switch pages and
+// the tint shifts deterministically across the range.
+//
+// text hash: FNV-1a over the string (stable, fast, well-distributed).
+function hashStr(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+// colour-max: build an RGB where one channel is driven to MAX by the hash
+// (which channel = hash % 3), the other two are damped by the slider
+// magnitudes. Returns an [r,g,b] in a cool palette so it stays on-brand.
+function colorMax(seedStr, mags) {
+  const h = hashStr(seedStr);
+  const dom = h % 3;                       // dominant channel
+  const t = ((h >>> 3) & 0xff) / 255;      // hue jitter within the channel
+  const m = Math.min(1, mags.reduce((a, b) => a + Math.abs(b), 0)); // 0..1 from sliders
+  // cool base, push the dominant channel up, damp others by (1 - m*0.5)
+  const base = [80, 150, 210];
+  const damp = 1 - m * 0.5;
+  const out = base.map((c, i) => {
+    if (i === dom) return Math.round(Math.min(255, c + 70 + t * 50));
+    return Math.round(c * damp);
+  });
+  return out;
+}
+let curPage = 'play';
+function applyContentTint() {
+  const mags = [tune.voidZ, tune.glassZ, tune.smooth * 8];
+  const [r, g, b] = colorMax(curPage + ':' + mags.map(v=>v.toFixed(2)).join(','), mags);
+  // drive the page's accent + a faint heading wash via CSS vars on #panel
+  panelEl.style.setProperty('--accent', `rgb(${r},${g},${b})`);
+  panelEl.style.setProperty('--page-wash', `rgba(${r},${g},${b},0.10)`);
+}
+function show(name){
+  curPage = name; panelEl.innerHTML = panels[name] || '';
+  applyContentTint(); updateSpecular();
+  if (name === 'play') wireRuneField();
+  if (name === 'inventory' || name === 'crafting') wireCrosshair();
+  // v1.2: replay the outer->inner border-fill on the panel each navigation
+  panelEl.classList.remove('fill-edges'); void panelEl.offsetWidth; panelEl.classList.add('fill-edges');
+}
+
+// v1.1: RUNE-MORPH text entry behaviour. Typed characters are inserted as
+// a bending rune (Unicode Runic block) and, after a brief beat, cross-fade
+// /morph into the real Latin letter. Spaces and backspace handled.
+const RUNES = '\u16A0\u16A2\u16A6\u16A8\u16B1\u16B2\u16B7\u16B9\u16BA\u16C1\u16C3\u16C7\u16C8\u16CB\u16CF\u16D2\u16D6\u16D7\u16DA\u16DD\u16DE\u16DF\u16E0\u16E3\u16E5\u16E6';
+function runeFor(ch){
+  const c = ch.toUpperCase().charCodeAt(0);
+  if (c >= 65 && c <= 90) return RUNES[(c - 65) % RUNES.length];
+  return ch; // non-letters keep their glyph
+}
+function wireRuneField(){
+  const field = document.getElementById('worldname');
+  if (!field || field._wired) return;
+  field._wired = true;
+  const caret = field.querySelector('.caret');
+  // seed with "New World" so the page isn't empty (each pre-resolved)
+  'New World'.split('').forEach(ch => addChar(ch, true));
+  function addChar(ch, instant){
+    const span = document.createElement('span');
+    span.className = 'rch';
+    const rune = document.createElement('span'); rune.className = 'rune'; rune.textContent = runeFor(ch);
+    const latin = document.createElement('span'); latin.className = 'latin'; latin.textContent = ch;
+    span.appendChild(rune); span.appendChild(latin);
+    span.dataset.ch = ch;
+    field.insertBefore(span, caret);
+    if (instant) { span.classList.add('resolved'); }
+    else {
+      // morph rune -> letter after a short, slightly random beat
+      setTimeout(() => span.classList.add('resolved'), 130 + Math.random()*120);
+    }
+  }
+  field.addEventListener('keydown', e => {
+    if (e.key === 'Backspace') {
+      const last = caret.previousElementSibling;
+      if (last && last.classList.contains('rch')) last.remove();
+      e.preventDefault();
+    } else if (e.key === 'Enter') {
+      field.blur(); e.preventDefault();
+    } else if (e.key.length === 1) {
+      addChar(e.key, false); e.preventDefault();
+    }
+  });
+  field.addEventListener('click', () => field.focus());
+}
+
+// v1.3: CROSSHAIR row×col propagation on the inventory/crafting grids.
+// Hovering a cell lights its whole row and column, with the highlight
+// PROPAGATING outward from the hovered cell (delay ∝ distance) so it reads
+// as a crosshair sweeping out. Pure border/wash expression — no zoom.
+function wireCrosshair(){
+  const grid = panelEl.querySelector('.invgrid, .grid3');
+  if (!grid || grid._cross) return;
+  grid._cross = true;
+  // column count from the computed grid-template-columns
+  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length || 9;
+  const cells = [...grid.querySelectorAll('.cell')];
+  cells.forEach((c, i) => { c.dataset.r = Math.floor(i / cols); c.dataset.c = i % cols; });
+  function clearAll(){ cells.forEach(c => { c.classList.remove('x-hover','x-line'); c.style.transitionDelay = ''; }); }
+  grid.addEventListener('pointerover', e => {
+    const cell = e.target.closest('.cell'); if (!cell) return;
+    const hr = +cell.dataset.r, hc = +cell.dataset.c;
+    clearAll();
+    cell.classList.add('x-hover');
+    cells.forEach(c => {
+      const r = +c.dataset.r, cc = +c.dataset.c;
+      if (c === cell) return;
+      if (r === hr || cc === hc) {
+        c.classList.add('x-line');
+        // propagation delay = manhattan distance from the hovered cell
+        const dist = Math.abs(r - hr) + Math.abs(cc - hc);
+        c.style.transitionDelay = (dist * 28) + 'ms';
+      }
+    });
+  });
+  grid.addEventListener('pointerleave', clearAll);
+}
+
+// v1.1: GLOBAL SPECULAR — find the biggest element on screen and treat its
+// centre as the scene's light origin; rake a tinted highlight across every
+// glass border from there. Recomputed on page change (and lightly on a
+// timer) — not per frame, since the dominant element rarely changes.
+function updateSpecular() {
+  const candidates = document.querySelectorAll('.char-stage, .result, .silhouette, .panel, .glass, .world, img');
+  let big = null, bigArea = 0;
+  candidates.forEach(el => {
+    const r = el.getBoundingClientRect();
+    const a = r.width * r.height;
+    if (a > bigArea && r.width > 40 && r.height > 40) { bigArea = a; big = r; }
+  });
+  if (!big) return;
+  // light origin = centre of the biggest element, in viewport coords
+  const lx = big.left + big.width / 2, ly = big.top + big.height / 2;
+  // tint from the current deterministic accent (the page's colour-max)
+  const tint = getComputedStyle(panelEl).getPropertyValue('--accent').trim() || 'rgba(200,230,255,0.5)';
+  document.querySelectorAll('.glass').forEach(g => {
+    const r = g.getBoundingClientRect();
+    // project the light origin into this panel's local % space
+    const px = ((lx - r.left) / Math.max(1, r.width)) * 100;
+    const py = ((ly - r.top)  / Math.max(1, r.height)) * 100;
+    g.style.setProperty('--spec-x', px.toFixed(1) + '%');
+    g.style.setProperty('--spec-y', py.toFixed(1) + '%');
+    g.style.setProperty('--spec-tint', tint.startsWith('rgb') ? tint.replace('rgb(', 'rgba(').replace(')', ',0.35)') : tint);
+  });
+}
+
+// ── r210/v1.3: MORPHING GEOMETRIES (not stutter) ────────────────────────
+// Operator's spec: "take all the boxes in the last frame and pull/
+// transition the one closest to the next UI." FLIP morph. Two bugs fixed
+// in v1.3:
+//   (a) it was reading ALREADY-SHRUNK rects — when you navigate fast the
+//       previous morph hasn't settled, so the live DOM rects are mid-
+//       transform. Fix: keep a TEMPORAL HISTORY of box centres recorded
+//       only while the panel is at rest (untransformed), over the last
+//       ~10s, and pick the nearest from THAT, never from a transforming
+//       frame.
+//   (b) the scale was pinned TOP-LEFT (transformOrigin top left) so it
+//       grew out of the corner. Fix: CENTRE origin — it expands from the
+//       middle of the chosen box.
+const boxHistory = [];           // { x, y, t } recent box centres
+const BOX_HISTORY_MS = 10000;    // remember the last 10 seconds
+let morphing = false;
+function recordBoxes() {
+  // only record when the panel is settled (no transform in flight), so we
+  // capture true layout positions, not shrunken in-animation ones.
+  if (morphing) return;
+  const content = panelEl.querySelector('.content');
+  if (!content || content.style.transform && content.style.transform !== 'none') return;
+  const t = performance.now();
+  panelEl.querySelectorAll('.content > *, .row, .world, .cell, .result, .tp, .eslot, .gpanel')
+    .forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return;
+      boxHistory.push({ x: r.left + r.width/2, y: r.top + r.height/2, t });
+    });
+  // prune anything older than the window
+  const cutoff = t - BOX_HISTORY_MS;
+  while (boxHistory.length && boxHistory[0].t < cutoff) boxHistory.shift();
+}
+function nearestHistoricCentre(tx, ty) {
+  let best = null, bestD = Infinity;
+  for (const b of boxHistory) {
+    const d = Math.hypot(b.x - tx, b.y - ty);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  return best;
+}
+function morphTo(name){
+  if (name === curPage) return;
+  // record the OUTGOING boxes one more time while they're still at rest
+  recordBoxes();
+  // incoming anchor = centre of where the new heading will land
+  const panelRect = panelEl.getBoundingClientRect();
+  const tx = panelRect.left + 60, ty = panelRect.top + 50;
+  // nearest box centre from the temporal history (NOT the live shrunk DOM)
+  const from = nearestHistoricCentre(tx, ty) || { x: tx, y: ty };
+  morphing = true;
+  show(name);
+  const content = panelEl.querySelector('.content');
+  if (!content) { morphing = false; return; }
+  // INVERT: offset so the new content STARTS centred on the chosen box,
+  // scaled down — then springs to identity. Centre origin (no corner pin).
+  const now = content.getBoundingClientRect();
+  const dx = from.x - (now.left + now.width/2);
+  const dy = from.y - (now.top  + now.height/2);
+  content.style.animation = 'none';
+  content.style.transformOrigin = 'center';
+  content.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(0.82)`;
+  content.style.opacity = '0.3';
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    content.style.transition = 'transform 620ms cubic-bezier(0.16, 1, 0.3, 1), opacity 360ms ease';
+    content.style.transform = 'none';
+    content.style.opacity = '1';
+    // clear the morph lock + clean the inline transform once settled, so
+    // recordBoxes() can capture the true rest layout afterward.
+    setTimeout(() => {
+      content.style.transition = ''; content.style.transform = ''; content.style.transformOrigin = '';
+      morphing = false; recordBoxes();
+    }, 660);
+  }));
+}
+// record rest-state boxes on a steady cadence (feeds the 10s history)
+setInterval(recordBoxes, 500);
+
+document.getElementById('nav').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(!b) return;
+  document.querySelectorAll('#nav button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); morphTo(b.dataset.panel);
+});
+show('play');
+
+// Everything below is presentational polish (parallax, cursor fills, the
+// tuner). It's wrapped so that if any of it ever fails on a given browser,
+// navigation above still works and the menu remains fully usable.
+try {
+
+// ── Mouse-as-cone-anchor parallax (algorithm dev) ───────────────────────
+// Model: the cursor is the APEX of a viewing cone — the point the eye-ray
+// pierces the screen. The scene is a STACK of layers, each at a fixed
+// signed depth z along the view axis:
+//     z < 0  → BEHIND the screen (background void)
+//     z = 0  → the screen plane itself (the focal plane — does not move)
+//     z > 0  → IN FRONT, toward the viewer (foreground glass)
+// As the cursor (anchor) moves off centre by `a` px, every layer projects
+// through that apex by similar triangles: shift = -a * (z / D), where D is
+// the viewer distance. Background (z<0) lags opposite the cursor; near
+// layers (z>0) lead with it; the magnitude grows with |z|. One projection,
+// one anchor — no per-layer hand-tuned directions, so motion is coherent.
+//
+// We express each layer's depth as a unitless ratio (z/D). The tuner edits
+// these ratios live. (`tune` is declared above, near show().)
+// anchor offset from screen centre, in PIXELS (the cone apex displacement)
+let aTgt = { x: 0, y: 0 };
+let aCur = { x: 0, y: 0 };
+const voidEl = document.querySelector('.void');
+const glassEls = () => document.querySelectorAll('.glass');
+
+window.addEventListener('pointermove', e => {
+  aTgt.x = e.clientX - window.innerWidth  / 2;   // px right of centre
+  aTgt.y = e.clientY - window.innerHeight / 2;    // px below centre
+});
+window.addEventListener('pointerleave', () => { aTgt.x = 0; aTgt.y = 0; });
+
+// project the anchor displacement onto a layer at depth ratio z.
+// r210: layers move TOWARD the cursor (operator: "everything is moving
+// away... flip your thinking, toward not away"). The cursor is an
+// ATTRACTOR — each layer leans toward the apex by its depth ratio. Larger
+// z = pulled further toward the cursor. shift = +a * z does this: cursor
+// right (a>0) shifts the layer right (toward it), scaled by z.
+function projShift(z) {
+  return { x: aCur.x * z, y: aCur.y * z };
+}
+
+function frame() {
+  // smooth the anchor toward the cursor (heavier = more lag/weight)
+  aCur.x += (aTgt.x - aCur.x) * tune.smooth;
+  aCur.y += (aTgt.y - aCur.y) * tune.smooth;
+
+  // background void: z<0 → projects OPPOSITE the cursor, the largest swim
+  const v = projShift(tune.voidZ);
+  voidEl.style.setProperty('--px', v.x.toFixed(2) + 'px');
+  voidEl.style.setProperty('--py', v.y.toFixed(2) + 'px');
+
+  // foreground glass: z>0 → projects WITH the cursor, gently (translation
+  // only; the focal plane is the content, so this stays subtle and stable)
+  const g = projShift(tune.glassZ);
+  glassEls().forEach(el => {
+    el.style.setProperty('--px', g.x.toFixed(2) + 'px');
+    el.style.setProperty('--py', g.y.toFixed(2) + 'px');
+  });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+// FEEL: voidZ (negative) is the background swim; glassZ (small positive)
+// the foreground lead. Equal-and-opposite isn't required — the cone makes
+// any z set coherent because they all project from the same apex.
+
+// ── Cursor-driven radial fade-fill on buttons + world rows ──────────────
+// Real centerpoint fill: the radial gradient's centre is the cursor's
+// position INSIDE the element (not a left-edge shadow), and --fill ramps
+// the opacity on enter/leave. Delegated so it covers dynamically-rendered
+// rows too.
+// Cursor-driven radial fade-fill: JS only updates the gradient CENTRE
+// (--mx/--my) to the cursor position inside the element; the grow-in and
+// fade are pure CSS :hover (robust across browsers). Delegated so it
+// covers dynamically-rendered rows.
+function wireFill(selector) {
+  document.addEventListener('pointermove', e => {
+    const el = e.target.closest(selector);
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    el.style.setProperty('--mx', ((e.clientX - r.left) / r.width  * 100) + '%');
+    el.style.setProperty('--my', ((e.clientY - r.top)  / r.height * 100) + '%');
+  });
+}
+wireFill('.nav button');
+wireFill('.world');
+
+// ── Live tuning panel (algorithm dev) ───────────────────────────────────
+const tuner = document.createElement('div');
+tuner.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:5;font:11px/1.6 monospace;'+
+  'background:rgba(10,16,24,.7);backdrop-filter:blur(8px);border:1px solid var(--glass-edge);'+
+  'border-radius:3px;padding:12px 14px;color:var(--text-dim);min-width:190px';
+tuner.innerHTML = '<div style="color:var(--text);letter-spacing:.1em;margin-bottom:6px">PARALLAX CONE</div>';
+// v1.1: sliders now LERP TO DETENTS. The input is fine-grained; on change
+// we find the nearest of N evenly-spaced detents and EASE both the applied
+// value and the visual thumb toward it (rAF lerp), so the slider "clicks"
+// into notches with a little glide rather than snapping hard. Tick marks
+// are drawn under each slider so the detents are visible.
+//   key      label          min    max    detents
+[['voidZ',  'bg pull (z)',   0.0,  0.17,  5],
+ ['glassZ', 'fg pull (z)',   0.0,  0.05,  5],
+ ['smooth', 'smoothing',     0.02, 0.053, 4]].forEach(([k,label,min,max,detents])=>{
+  const id='t_'+k;
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;flex-direction:column;gap:2px;margin-bottom:4px';
+  // tick marks (detent positions) rendered as a faint gradient under the slider
+  const ticks = Array.from({length:detents},(_,i)=>`${(i/(detents-1)*100).toFixed(1)}%`).join(', ');
+  row.innerHTML =
+    `<div style="display:flex;justify-content:space-between;align-items:center;gap:8px">`+
+    `<span>${label}</span>`+
+    `<input id="${id}" type="range" min="${min}" max="${max}" step="${((max-min)/200).toPrecision(2)}" value="${tune[k]}" style="width:90px"></div>`;
+  tuner.appendChild(row);
+  const input = row.querySelector('input');
+  // detent value list
+  const dv = Array.from({length:detents},(_,i)=> min + (max-min)*i/(detents-1));
+  let animTo = tune[k], animing = false;
+  function lerpTo(target){
+    animTo = target; if (animing) return; animing = true;
+    const stepAnim = () => {
+      const cur = parseFloat(input.value);
+      const next = cur + (animTo - cur) * 0.25;
+      if (Math.abs(animTo - next) < (max-min)/400) {
+        input.value = animTo; tune[k] = animTo; animing = false;
+      } else {
+        input.value = next; tune[k] = next; requestAnimationFrame(stepAnim);
+      }
+      applyContentTint();
+    };
+    requestAnimationFrame(stepAnim);
+  }
+  input.addEventListener('input', ev => {
+    const raw = parseFloat(ev.target.value);
+    tune[k] = raw; applyContentTint();        // live while dragging
+    // snap target = nearest detent
+    let nearest = dv[0];
+    for (const d of dv) if (Math.abs(d-raw) < Math.abs(nearest-raw)) nearest = d;
+    // only ease to the detent once the drag settles (on change), but we
+    // also nudge during input so it feels magnetic
+    clearTimeout(input._t);
+    input._t = setTimeout(() => lerpTo(nearest), 90);
+  });
+});
+document.body.appendChild(tuner);
+// v1.1: keep the specular light origin fresh (page transitions move the
+// biggest element; the morph settles after ~620ms). Cheap timer.
+updateSpecular();
+setInterval(updateSpecular, 800);
+} catch (err) {
+  console.warn('menu polish disabled (navigation still works):', err);
+}
+
+</script>
+</body>
+</html>

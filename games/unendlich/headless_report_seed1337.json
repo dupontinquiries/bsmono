@@ -1,0 +1,17 @@
+{
+  "seed": 1337,
+  "ticks": 200,
+  "wall_ms": 10688,
+  "ticks_per_sec": 19,
+  "edits_total": 1043870,
+  "edits_by_cat": {"block": 1914, "state": 1041956, "transition": 0, "tree_root": 15000},
+  "coral_blocks": 0,
+  "final_pos": [4.2, 96.5, 4.4],
+  "biomes_visited": 1,
+  "handler_coverage": [
+    {"handler": "plant_lifecycle", "fired_ticks": 200, "of": 200},
+    {"handler": "leaf_decay", "fired_ticks": 200, "of": 200},
+    {"handler": "reef_seeder", "fired_ticks": 200, "of": 200}
+  ],
+  "butterfly": {"enabled": false, "flip_at": 50, "divergence_tick": -1, "curve": ""}
+}

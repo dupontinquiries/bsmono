@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>CLAWBOUND — web test client</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #dccfb3; overflow: hidden; }
+    #wrap { position: fixed; inset: 0; display: grid; place-items: center; }
+    canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    #hint { position: fixed; top: 8px; left: 8px; font: 12px system-ui; color: #4a3b28; opacity: .7; }
+  </style>
+</head>
+<body>
+  <div id="wrap"><canvas id="clawbound"></canvas></div>
+  <div id="hint">CLAWBOUND · low-fi web test build</div>
+  <script type="module">
+    // wasm-bindgen emits ./pkg/clawbound_rs.js next to this file (see BUILD_WEB.md).
+    import init from "./pkg/clawbound_rs.js";
+    init().catch((e) => {
+      // WebGPU first; browsers without it fall back to WebGL if the crate enables it.
+      console.error(e);
+      document.getElementById("hint").textContent =
+        "This build needs WebGPU (Chrome/Edge 113+, or Safari TP). See console.";
+    });
+  </script>
+</body>
+</html>

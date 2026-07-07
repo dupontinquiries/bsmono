@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:birch_forest",
+  "_comment": "white-bark groves (r174 registry parity set)",
+  "temperature": 0.6,
+  "downfall": 0.55,
+  "has_precipitation": true,
+  "effects": {},
+  "_legacy_enum": "BirchForest"
+}

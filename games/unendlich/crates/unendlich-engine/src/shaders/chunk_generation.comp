@@ -1,0 +1,1616 @@
+#version 450
+
+// Meinkraft chunk generation — 3D-density, 32^3 chunks, WorldModel-equivalent.
+//
+// IMPORTANT: every formula here MUST match `world_model.rs` and `cpu_generator.rs`
+// exactly. The CPU and GPU paths produce byte-identical chunks; that's a
+// determinism contract callers depend on. If you change a constant or a
+// noise function in one place, change it in both.
+//
+// Workgroup: 8x8x8 = 512 invocations per workgroup. M2's max is 1024;
+// this leaves headroom and works on weaker GPUs too. One workgroup
+// generates one full 32x32x32 = 32,768-block chunk via 64 sub-blocks
+// (4x4x4 of 8x8x8 sub-tiles) iterated by each invocation.
+
+// FP32-only — no FP64 extension required (Honeykrisp/M2 etc.)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+// ---- Output buffers ------------------------------------------------------
+//
+// Block ID array, flat-indexed `x + z*32 + y*32*32` for chunk-local (x, y, z).
+// One u8 per block, but Vulkan storage buffers want 32-bit alignment so we
+// pack 4 blocks per uint and unpack/repack with bitwise ops.
+//
+// RC41: buffer dropped `writeonly` so the post-main fluid passes can
+// read neighbors. The existing atomicAnd/atomicOr write path is
+// unchanged. `coherent` is not needed because workgroup barrier() +
+// memoryBarrierBuffer() between phases provides sufficient ordering.
+
+layout(std430, binding = 0) buffer Blocks {
+    uint blocks_packed[]; // length = 32*32*32 / 4 = 8192 uints per chunk * batch
+};
+
+// ---- Push constants ------------------------------------------------------
+
+layout(push_constant) uniform PushConstants {
+    ivec3 chunk_coord;     // 3D chunk coordinate
+    uint seed;             // world seed (32-bit)
+    uint chunk_index;      // index within the batch (which output chunk slot)
+} pc;
+
+// ============================================================================
+// Hash & noise — must match `noise.rs` byte-for-byte.
+// ============================================================================
+
+uint hash_u32(uint x) {
+    x = ((x >> 16) ^ x) * 0x45d9f3bu;
+    x = ((x >> 16) ^ x) * 0x45d9f3bu;
+    return (x >> 16) ^ x;
+}
+
+uint hash_3d(int x, int y, int z, uint seed) {
+    return hash_u32(
+        uint(x) * 374761393u
+      + uint(y) * 668265263u
+      + uint(z) * 1274126177u
+      + seed
+    );
+}
+
+float hash_to_float(uint h) {
+    return float(h) / 4294967295.0;
+}
+
+float smoothstep_d(float t) {
+    // Quintic fade 6t^5 - 15t^4 + 10t^3 (Perlin "improved noise"). Must match
+    // noise.rs::smoothstep byte-for-byte — the C2 fade removes grid creasing.
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
+float lerp(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float noise_3d(float x, float y, float z, uint seed) {
+    int xi = int(floor(x));
+    int yi = int(floor(y));
+    int zi = int(floor(z));
+    float xf = x - floor(x);
+    float yf = y - floor(y);
+    float zf = z - floor(z);
+
+    float u = smoothstep_d(xf);
+    float v = smoothstep_d(yf);
+    float w = smoothstep_d(zf);
+
+    float n000 = hash_to_float(hash_3d(xi,     yi,     zi,     seed));
+    float n100 = hash_to_float(hash_3d(xi + 1, yi,     zi,     seed));
+    float n010 = hash_to_float(hash_3d(xi,     yi + 1, zi,     seed));
+    float n110 = hash_to_float(hash_3d(xi + 1, yi + 1, zi,     seed));
+    float n001 = hash_to_float(hash_3d(xi,     yi,     zi + 1, seed));
+    float n101 = hash_to_float(hash_3d(xi + 1, yi,     zi + 1, seed));
+    float n011 = hash_to_float(hash_3d(xi,     yi + 1, zi + 1, seed));
+    float n111 = hash_to_float(hash_3d(xi + 1, yi + 1, zi + 1, seed));
+
+    return lerp(
+        lerp(lerp(n000, n100, u), lerp(n010, n110, u), v),
+        lerp(lerp(n001, n101, u), lerp(n011, n111, u), v),
+        w
+    );
+}
+
+float fbm_3d(float x, float y, float z, uint seed, int octaves, float frequency, float amplitude) {
+    float value = 0.0;
+    float total = 0.0;
+    float freq = frequency;
+    float amp = amplitude;
+    for (int i = 0; i < octaves; i++) {
+        value += noise_3d(x * freq, y * freq, z * freq, seed + uint(i)) * amp;
+        total += amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return total > 0.0 ? value / total : 0.0;
+}
+
+// ----------------------------------------------------------------------------
+// RC39: 2D noise functions for hills + biome erosion.
+// Must match `noise.rs::hash_2d`, `noise_2d`, `fbm_2d` byte-for-byte.
+// The 2D hash family is DISTINCT from hash_3d — it omits the z*1274126177
+// term, so 2D and 3D noise sampled at the same (x, y) produce different
+// values. This is intentional and matches CPU.
+// ----------------------------------------------------------------------------
+
+uint hash_2d(int x, int y, uint seed) {
+    return hash_u32(
+        uint(x) * 374761393u
+      + uint(y) * 668265263u
+      + seed
+    );
+}
+
+float noise_2d(float x, float y, uint seed) {
+    int xi = int(floor(x));
+    int yi = int(floor(y));
+    float xf = x - floor(x);
+    float yf = y - floor(y);
+
+    float u = smoothstep_d(xf);
+    float v = smoothstep_d(yf);
+
+    float a = hash_to_float(hash_2d(xi,     yi,     seed));
+    float b = hash_to_float(hash_2d(xi + 1, yi,     seed));
+    float c = hash_to_float(hash_2d(xi,     yi + 1, seed));
+    float d = hash_to_float(hash_2d(xi + 1, yi + 1, seed));
+
+    return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+float fbm_2d(float x, float y, uint seed, int octaves, float frequency, float amplitude) {
+    float value = 0.0;
+    float total = 0.0;
+    float freq = frequency;
+    float amp = amplitude;
+    for (int i = 0; i < octaves; i++) {
+        value += noise_2d(x * freq, y * freq, seed + uint(i)) * amp;
+        total += amp;
+        freq *= 2.0;
+        amp *= 0.5;
+    }
+    return total > 0.0 ? value / total : 0.0;
+}
+
+// ============================================================================
+// WorldModel constants — must match `world_model.rs::anchors` and
+// `world_model.rs::seeds` and `world_model.rs::region_sizes`.
+// ============================================================================
+
+const int CHUNK_SIZE = 32;
+
+// anchors
+const float SEA_LEVEL_BASELINE     = 64.0;
+const float SEA_LEVEL_AMPLITUDE    = 8.0;
+const float PRESSURE_BASELINE      = 1.0;
+const float PRESSURE_SCALE_HEIGHT  = 200.0;
+const float HUMIDITY_BASELINE      = 0.5;
+const float TEMPERATURE_BASELINE   = 0.5;
+const float DENSITY_THRESHOLD      = 0.0;
+const float VERTICAL_BIAS_SCALE    = 40.0;
+
+// seeds — XOR'd into the world seed to make each field independent
+const uint SEED_SEA_LEVEL  = 0x5EA10000u;
+const uint SEED_HUMIDITY   = 0x4D015700u;
+const uint SEED_PRESSURE   = 0x9255AA01u;
+const uint SEED_TEMPERATURE = 0x7E400000u;
+const uint SEED_CONTINENTAL = 0xC0471AEAu;
+const uint SEED_TERRAIN_3D = 0x3DAA0001u;
+const uint SEED_CAVE       = 0xCA0E0000u;
+// RC39: mid-frequency rolling-hills seed. Matches `world_model::seeds::HILLS`.
+// Without this, terrain is either flat plains or whole-mountain — no in-between.
+const uint SEED_HILLS      = 0x41115000u;
+// RC39: erosion field seed for biome selection. Matches
+// `world_model::seeds::EROSION`.
+const uint SEED_EROSION    = 0xE1050000u;
+const uint SEED_BIOME_JITTER = 0xB10E0001u;
+
+// region sizes (in chunks)
+const int REGION_SEA_LEVEL  = 50;
+const int REGION_PRESSURE   = 20;
+const int REGION_HUMIDITY   = 10;
+const int REGION_TEMPERATURE = 10;
+const int REGION_CONTINENTAL = 80;
+
+// ore seeds — match `cpu_generator.rs::ore_seeds`
+const uint SEED_ORE_COAL = 0xC0410001u;
+const uint SEED_ORE_IRON = 0x14040002u;
+const uint SEED_ORE_GOLD = 0x60140003u;
+// RC41: lava noise seed. Matches `cpu_generator::ore_seeds::LAVA`.
+// (LAVA is grouped with ores in CPU layout — lava placement runs in
+// Phase 3.5 after ore replacement.)
+const uint SEED_LAVA     = 0x1ABA0004u;
+
+// block IDs — match `blocks.rs::BlockId` exactly
+const uint BLOCK_AIR        = 0u;
+const uint BLOCK_STONE      = 1u;
+const uint BLOCK_GRASS      = 2u;
+const uint BLOCK_DIRT       = 3u;
+const uint BLOCK_BEDROCK    = 7u;
+// RC41: water + lava block IDs.
+const uint BLOCK_WATER      = 9u;
+const uint BLOCK_LAVA       = 11u;
+const uint BLOCK_SAND       = 12u;
+const uint BLOCK_GOLD_ORE   = 14u;
+const uint BLOCK_IRON_ORE   = 15u;
+const uint BLOCK_COAL_ORE   = 16u;
+// RC40: tree blocks. Must match `blocks.rs::BlockId` enum repr.
+const uint BLOCK_OAK_LOG      = 17u;
+const uint BLOCK_OAK_LEAVES   = 18u;
+const uint BLOCK_BIRCH_LOG    = 19u;
+const uint BLOCK_BIRCH_LEAVES = 20u;
+const uint BLOCK_MOSS       = 23u;
+const uint BLOCK_RED_SAND   = 24u; // RedSandstone
+const uint BLOCK_ICE        = 31u;
+const uint BLOCK_SNOW_BLOCK = 80u;
+// r462: surfaces for the biome→surface map (mirrors biomes.rs::surface_block).
+const uint BLOCK_CLAY          = 22u;
+const uint BLOCK_RED_SANDSTONE = 24u;
+const uint BLOCK_BASALT        = 38u;
+
+// RC39: Biome IDs — must match `biomes.rs::Biome` repr exactly.
+// Used by `biome_at_2d` -> `biome_height_modifier` for mountain elevation.
+const uint BIOME_PLAINS                = 0u;
+const uint BIOME_TEMPERATE_FOREST      = 1u;
+const uint BIOME_TEMPERATE_HIGHLANDS   = 2u;
+const uint BIOME_BIRCH_FOREST          = 3u;
+const uint BIOME_MAPLE_FOREST          = 4u;
+const uint BIOME_CLOUD_FOREST          = 5u;
+const uint BIOME_MISTY_MOUNTAINS       = 6u;
+const uint BIOME_ALPINE_HIGHLANDS      = 7u;
+const uint BIOME_DESERT                = 8u;
+const uint BIOME_RED_SANDSTONE_CANYON  = 9u;
+const uint BIOME_BLOOMING_CANYON       = 10u;
+const uint BIOME_OCEAN                 = 11u;
+const uint BIOME_BEACH                 = 12u;
+const uint BIOME_SWAMP                 = 13u;
+const uint BIOME_TUNDRA                = 14u;
+const uint BIOME_SKYLANDS              = 15u;
+const uint BIOME_ICE_CAVE              = 16u;
+const uint BIOME_FUNGAL_CAVE           = 17u;
+const uint BIOME_THERMAL_CAVE          = 18u;
+// r458: biomes 19..27 ported from biomes.rs so they generate on GPU (were CPU-only).
+const uint BIOME_SAVANNA               = 19u;
+const uint BIOME_JUNGLE                = 20u;
+const uint BIOME_TAIGA                 = 21u;
+const uint BIOME_CRYSTAL_CAVE          = 22u;
+const uint BIOME_LUSH_CAVE             = 23u;
+const uint BIOME_MESA                  = 24u;
+const uint BIOME_MANGROVE              = 25u;
+const uint BIOME_VOLCANIC_WASTES       = 26u;
+const uint BIOME_FROZEN_OCEAN          = 27u;
+// r457: HighlandSteppe (28). Its determine_biome arm below mirrors the CPU exactly.
+const uint BIOME_HIGHLAND_STEPPE       = 28u;
+
+// RC40: tree-pass constants. CPU's tree placement uses TREE_MAX_RADIUS=4
+// because canopy_radius max + 1 margin = 4. Trees originating up to 4
+// columns outside the chunk can have canopy reaching IN, so the
+// neighborhood we precompute tree decisions for is 32+2*4 = 40 cols
+// per side.
+const int TREE_PADDING = 4;
+const int NEIGHBORHOOD_SIZE = CHUNK_SIZE + 2 * TREE_PADDING; // 40
+const int NEIGHBORHOOD_COLS = NEIGHBORHOOD_SIZE * NEIGHBORHOOD_SIZE; // 1600
+// Max trunk height. CPU's TREE_MAX_HEIGHT = 8 but profiles allow up to 13
+// (CloudForest). We cap at 15 (4-bit pack budget) and clamp trunk_height.
+const int TREE_MAX_HEIGHT = 15;
+// Max canopy radius. CPU's CloudForest profile says 4. We have 3 bits.
+const int TREE_MAX_CANOPY = 7;
+
+// ============================================================================
+// RegionGrid sampling — inlined trilinear blend.
+// ============================================================================
+
+// Sample a region-grid value at world position (wx, wy, wz). Each region's
+// CENTER value is computed via fbm_3d at that center. Result is in [-1, 1].
+//
+// `region_size_chunks` gives the region edge length in chunks.
+float region_sample_blended(float wx, float wy, float wz, int region_size_chunks, uint seed) {
+    float region_blocks = float(region_size_chunks) * float(CHUNK_SIZE);
+    float fx = wx / region_blocks;
+    float fy = wy / region_blocks;
+    float fz = wz / region_blocks;
+    int xi = int(floor(fx));
+    int yi = int(floor(fy));
+    int zi = int(floor(fz));
+    float tx = fx - floor(fx);
+    float ty = fy - floor(fy);
+    float tz = fz - floor(fz);
+
+    // For each of the 8 corners, compute the noise at that corner's center.
+    float scale = 1.0 / region_blocks;
+    float v[8];
+    int corner = 0;
+    for (int dz = 0; dz <= 1; dz++) {
+        for (int dy = 0; dy <= 1; dy++) {
+            for (int dx = 0; dx <= 1; dx++) {
+                int cx = xi + dx;
+                int cy = yi + dy;
+                int cz = zi + dz;
+                // Region center in block-space:
+                float sx = float(cx) * region_blocks + region_blocks * 0.5;
+                float sy = float(cy) * region_blocks + region_blocks * 0.5;
+                float sz = float(cz) * region_blocks + region_blocks * 0.5;
+                float raw = fbm_3d(sx * scale, sy * scale, sz * scale, seed, 3, 1.0, 1.0);
+                v[corner] = raw * 2.0 - 1.0; // [0,1] -> [-1,1]
+                corner++;
+            }
+        }
+    }
+
+    // Trilinear blend — order matches the loop above:
+    //   v[0] = (0,0,0), v[1] = (1,0,0), v[2] = (0,1,0), v[3] = (1,1,0),
+    //   v[4] = (0,0,1), v[5] = (1,0,1), v[6] = (0,1,1), v[7] = (1,1,1).
+    return lerp(
+        lerp(lerp(v[0], v[1], tx), lerp(v[2], v[3], tx), ty),
+        lerp(lerp(v[4], v[5], tx), lerp(v[6], v[7], tx), ty),
+        tz
+    );
+}
+
+// ============================================================================
+// WorldModel-equivalent field functions.
+// All take world coords in blocks. Match `world_model.rs` formulas.
+// ============================================================================
+
+float model_pressure(float x, float y, float z, uint world_seed) {
+    float raw = region_sample_blended(x, y, z, REGION_PRESSURE, world_seed + SEED_PRESSURE);
+    // GLSL's exp() has no float overload; promote through float for the
+    // altitude-drop term. PRESSURE_SCALE_HEIGHT is an order-1000 magnitude,
+    // and y is bounded by world height, so the float-precision intermediate
+    // is fine for this slowly-varying envelope.
+    float altitude_drop = clamp(float(exp(float(-y / PRESSURE_SCALE_HEIGHT))), 0.1, 1.5);
+    return PRESSURE_BASELINE * altitude_drop + raw * 0.1;
+}
+
+float model_humidity(float x, float y, float z, uint world_seed) {
+    float base = region_sample_blended(x, y, z, REGION_HUMIDITY, world_seed + SEED_HUMIDITY);
+    float p = model_pressure(x, y, z, world_seed);
+    float pressure_offset = (PRESSURE_BASELINE - p) * 0.2;
+    return clamp(HUMIDITY_BASELINE + base * 0.3 + pressure_offset, 0.0, 1.0);
+}
+
+float model_temperature(float x, float y, float z, uint world_seed) {
+    float base = region_sample_blended(x, y, z, REGION_TEMPERATURE, world_seed + SEED_TEMPERATURE);
+    float altitude_cooling = (y - SEA_LEVEL_BASELINE) / 200.0 * -0.3;
+    return clamp(TEMPERATURE_BASELINE + base * 0.3 + altitude_cooling, 0.0, 1.0);
+}
+
+float model_continental(float x, float z, uint world_seed) {
+    return region_sample_blended(x, 0.0, z, REGION_CONTINENTAL, world_seed + SEED_CONTINENTAL);
+}
+
+float model_sea_level(float x, float z, uint world_seed) {
+    float base = region_sample_blended(x, 0.0, z, REGION_SEA_LEVEL, world_seed + SEED_SEA_LEVEL);
+    float cont = model_continental(x, z, world_seed);
+    float h = model_humidity(x, SEA_LEVEL_BASELINE, z, world_seed);
+    return SEA_LEVEL_BASELINE
+         + base * SEA_LEVEL_AMPLITUDE
+         + cont * 4.0
+         + (h - HUMIDITY_BASELINE) * 6.0;
+}
+
+// RC39: density variant that takes a precomputed surface_target.
+// Used by the per-block loop in main() with a workgroup-shared cache
+// (`cached_surface_target`) so we only compute biome/hills ONCE per
+// column instead of per-block. Surface_target is invariant in y, so
+// this is a clean separation.
+//
+// Without this split, model_density would call biome_at_2d (which
+// itself calls 4+ noise functions) once per block — 32^3 = 32K calls
+// per chunk PLUS the "above" probes and surface probes. With the
+// cache, it's 32*32 = 1024 calls per chunk total.
+float model_density_with_target(float x, float y, float z, uint world_seed, float surface_target) {
+    float vertical_bias = clamp((surface_target - y) / VERTICAL_BIAS_SCALE, -1.5, 1.5);
+    float detail = fbm_3d(x * 0.025, y * 0.025, z * 0.025,
+                           world_seed + SEED_TERRAIN_3D, 3, 1.0, 1.0) - 0.5;
+    // Detail amplitude kept small relative to the vertical-bias gradient
+    // so density crosses the surface ONCE (no stacked solid/air slabs /
+    // horizontal striping). Must stay byte-identical with
+    // world_model.rs::density. See docs/v0.24.NEXT+12-striping-fix.md.
+    return vertical_bias + detail * 0.15;
+}
+
+// RC39: mid-frequency rolling hills. Adds ±15 blocks of variation on top
+// of the continental shape. Without this, plains are pancake-flat.
+// Matches `world_model::hills` byte-for-byte.
+float model_hills(float x, float z, uint world_seed) {
+    float raw = fbm_2d(x * 0.005, z * 0.005,
+                       world_seed + SEED_HILLS, 3, 1.0, 1.0);
+    return raw * 2.0 - 1.0; // [0, 1] -> [-1, 1]
+}
+
+// RC39: biome height_modifier table. Matches `biomes.rs::Biome::height_modifier`
+// exactly. MistyMountains +50, Skylands +80, Ocean -30, etc.
+float biome_height_modifier(uint biome) {
+    if (biome == BIOME_MISTY_MOUNTAINS)        return 50.0;
+    if (biome == BIOME_ALPINE_HIGHLANDS)       return 35.0;
+    if (biome == BIOME_TEMPERATE_HIGHLANDS)    return 25.0;
+    if (biome == BIOME_SKYLANDS)               return 80.0;
+    if (biome == BIOME_OCEAN)                  return -30.0;
+    if (biome == BIOME_BEACH)                  return -5.0;
+    if (biome == BIOME_RED_SANDSTONE_CANYON)   return 15.0;
+    if (biome == BIOME_BLOOMING_CANYON)        return 12.0;
+    if (biome == BIOME_TEMPERATE_FOREST
+        || biome == BIOME_MAPLE_FOREST
+        || biome == BIOME_BIRCH_FOREST)        return 5.0;
+    if (biome == BIOME_CLOUD_FOREST)           return 18.0;
+    if (biome == BIOME_SWAMP)                  return -8.0;
+    if (biome == BIOME_HIGHLAND_STEPPE)        return 22.0; // r457
+    // r458: ported height modifiers (match biomes.rs); Savanna/Jungle/Taiga/caves are 0 (default).
+    if (biome == BIOME_MESA)                   return 15.0;
+    if (biome == BIOME_VOLCANIC_WASTES)        return 8.0;
+    if (biome == BIOME_FROZEN_OCEAN)           return -30.0;
+    if (biome == BIOME_MANGROVE)               return -7.0;
+    return 0.0;
+}
+
+// RC39: biome classification from climate. Matches `biomes.rs::determine_biome`.
+// Pure function of (temperature, humidity, erosion); deterministic.
+uint determine_biome(float temperature, float humidity, float erosion) {
+    if (erosion > 0.85) return BIOME_SKYLANDS;
+
+    // r458: extreme hot + arid + highly eroded → scorched basalt flats (mirrors CPU).
+    if (temperature > 0.9 && humidity < 0.12 && erosion > 0.72) return BIOME_VOLCANIC_WASTES;
+
+    if (temperature < 0.25) {
+        if (temperature < 0.18 && erosion < 0.25 && humidity > 0.55) return BIOME_FROZEN_OCEAN;
+        if (erosion > 0.6) return BIOME_ICE_CAVE;
+        return BIOME_TUNDRA;
+    }
+
+    // r458: cool conifer forest between tundra and temperate woods.
+    if (temperature < 0.42 && humidity > 0.45 && erosion < 0.55) return BIOME_TAIGA;
+
+    if (temperature > 0.75) {
+        // r458: hot + very dry + eroded (below canyon) → red-rock badlands plateau.
+        if (humidity < 0.22 && erosion > 0.4 && erosion <= 0.65) return BIOME_MESA;
+        if (erosion > 0.65) {
+            return (humidity > 0.5) ? BIOME_BLOOMING_CANYON : BIOME_RED_SANDSTONE_CANYON;
+        }
+        if (humidity > 0.7) return BIOME_JUNGLE; // r458: hot + very wet
+        if (humidity < 0.3) return BIOME_DESERT;
+    }
+
+    if (erosion > 0.7 && temperature > 0.3 && temperature < 0.7) {
+        return BIOME_MISTY_MOUNTAINS;
+    }
+
+    if (erosion > 0.55 && erosion <= 0.7) {
+        // r458: eroded rock hides caverns — dry warm → crystal, humid temperate → lush.
+        if (temperature > 0.45 && humidity < 0.32) return BIOME_CRYSTAL_CAVE;
+        if (temperature >= 0.4 && temperature < 0.7 && humidity > 0.6) return BIOME_LUSH_CAVE;
+        return (temperature < 0.45) ? BIOME_ALPINE_HIGHLANDS : BIOME_TEMPERATE_HIGHLANDS;
+    }
+
+    // r457: elevated dry grassland — mirrors CPU determine_biome exactly.
+    if (temperature >= 0.45 && temperature <= 0.7 && humidity < 0.30 && erosion >= 0.40 && erosion <= 0.55) {
+        return BIOME_HIGHLAND_STEPPE;
+    }
+
+    if (humidity > 0.6) {
+        // r458: warm/hot + very wet + low-lying → tidal mangrove (before cloud/swamp split).
+        if (temperature > 0.6 && humidity > 0.75 && erosion < 0.3) return BIOME_MANGROVE;
+        if (temperature < 0.4) return BIOME_BIRCH_FOREST;
+        if (temperature > 0.6) {
+            return (erosion > 0.5) ? BIOME_CLOUD_FOREST : BIOME_SWAMP;
+        }
+        return (erosion < 0.3) ? BIOME_MAPLE_FOREST : BIOME_TEMPERATE_FOREST;
+    }
+
+    // r458: warm semi-dry grassland with scattered trees.
+    if (temperature > 0.55 && humidity < 0.48 && erosion < 0.4) return BIOME_SAVANNA;
+
+    if (humidity < 0.25 && erosion < 0.3) return BIOME_BEACH;
+
+    return BIOME_PLAINS;
+}
+
+// RC39: biome at world (x, z). Samples climate at the surface band
+// (sea_level + 10) so biome boundaries respect actual surface position.
+// Matches `world_model::biome_at_2d`.
+uint biome_at_2d(float x, float z, uint world_seed) {
+    // r192: TRULY topographic veto (parity with cpu biome_at_3d): the
+    // biome-free base terrain (sea + continental + hills) decides
+    // Ocean/Beach before climate logic runs.
+    {
+        float sl = model_sea_level(x, z, world_seed);
+        float st = sl + model_continental(x, z, world_seed) * 30.0
+                      + model_hills(x, z, world_seed) * 15.0;
+        if (st < sl - 2.0) return BIOME_OCEAN;
+        if (st < sl + 2.0) return BIOME_BEACH;
+    }
+    float surface_y = model_sea_level(x, z, world_seed) + 10.0;
+    float temp = model_temperature(x, surface_y, z, world_seed);
+    float humid = model_humidity(x, surface_y, z, world_seed);
+    // v0.24.NEXT-biome-jitter: small high-freq jitter so biome thresholds in
+    // determine_biome cross inside a ~3-block fuzzy band instead of a straight
+    // line. Identical to CPU world_model::biome_at_2d (same seed, freq,
+    // amplitude, offset on the second sample).
+    float jx = (noise_2d(x * 0.18, z * 0.18, world_seed + SEED_BIOME_JITTER) - 0.5) * 0.06;
+    float jy = (noise_2d(x * 0.18 + 137.7, z * 0.18 + 91.3, world_seed + SEED_BIOME_JITTER) - 0.5) * 0.06;
+    temp  = clamp(temp + jx, 0.0, 1.0);
+    humid = clamp(humid + jy, 0.0, 1.0);
+    float erosion_raw = (fbm_2d(x * 0.0008, z * 0.0008,
+                                 world_seed + SEED_EROSION, 2, 1.0, 1.0) - 0.5) * 2.0;
+    float erosion_unit = (erosion_raw + 1.0) * 0.5;
+    return determine_biome(temp, humid, erosion_unit);
+}
+
+// ============================================================================
+// RC40: Tree placement plumbing.
+//
+// Per-column tree spawn decision + per-block tree footprint check. The
+// algorithm mirrors `cpu_generator.rs::place_trees` semantically (origin-
+// based, deterministic, no cross-chunk sync needed) but uses
+// uint32-friendly hash functions (CPU uses u64). The hash output is
+// well-distributed but NOT byte-identical to CPU. With GPU-canonical
+// strategy this is acceptable.
+//
+// Pipeline:
+//   Phase A: for each column in 40x40 neighborhood, decide if a tree
+//   spawns. If yes, derive trunk_height / canopy_radius / lean / blocks.
+//   Pack into shared memory.
+//
+//   Phase B (per block): if wy is in the workgroup's tree-band y range,
+//   scan 9x9 neighborhood of origins. For each origin with a tree, check
+//   if (wx, wy, wz) is inside this tree's footprint (trunk, branch, or
+//   canopy). Apply log > leaves priority. Result overwrites the base
+//   block IF the base block is BLOCK_AIR (matches CPU's try_write rule).
+// ============================================================================
+
+// Uint32 hash for tree origin. Well-distributed but not equal to CPU's u64
+// version. Returns float in [0, 1).
+float tree_origin_hash(int wx, int wz, uint world_seed) {
+    uint h = uint(wx) * 0x5ce343e9u
+           ^ uint(wz) * 0x5f782d11u
+           ^ world_seed * 0x7f4a7c15u;
+    h ^= h >> 16;
+    h *= 0xed558ccdu;
+    h ^= h >> 13;
+    h *= 0x1a85ec53u;
+    h ^= h >> 16;
+    return float(h) / 4294967295.0;
+}
+
+// Uint32 hash for per-cell tree detail (branch placement, leaf
+// perforation). `salt` distinguishes call sites so different decisions
+// at the same (x, y, z) are uncorrelated.
+float tree_detail_hash(int wx, int wy, int wz, uint salt, uint world_seed) {
+    uint h = uint(wx) * 0x5ce343e9u
+           ^ uint(wy) * 0x4c957f2du
+           ^ uint(wz) * 0x5f782d11u
+           ^ salt * 0xf767814fu
+           ^ world_seed * 0x7f4a7c15u;
+    h ^= h >> 16;
+    h *= 0xed558ccdu;
+    h ^= h >> 13;
+    h *= 0x1a85ec53u;
+    h ^= h >> 16;
+    return float(h) / 4294967295.0;
+}
+
+// Climate-driven tree density multiplier. Matches CPU's
+// `climate_tree_factor` — bell on temperature, linear on humidity, hard
+// cutoff in hot+dry.
+float climate_tree_factor(float temperature, float humidity) {
+    if (temperature > 0.75 && humidity < 0.25) return 0.0;
+    float t_d = temperature - 0.5;
+    float temp_factor = max(1.0 - 1.4 * t_d * t_d, 0.2);
+    float humid_factor = 0.3 + humidity * 1.2;
+    return temp_factor * humid_factor;
+}
+
+// Per-biome tree profile lookup. Returns:
+//   .x = base_density (0 if biome has no trees)
+//   .y = trunk_min_height
+//   .z = trunk_max_height
+//   .w = canopy_radius
+// Plus block IDs via two more outs (packed below).
+// Matches `biomes.rs::Biome::tree_profile`.
+struct TreeProfile {
+    float base_density;
+    int   trunk_min;
+    int   trunk_max;
+    int   canopy_radius;
+    uint  trunk_block;
+    uint  leaves_block;
+    bool  has_trees;
+};
+
+TreeProfile biome_tree_profile(uint biome) {
+    TreeProfile p;
+    p.has_trees = false;
+    p.base_density = 0.0;
+    p.trunk_min = 0; p.trunk_max = 0; p.canopy_radius = 0;
+    p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES;
+
+    if (biome == BIOME_TEMPERATE_FOREST) {
+        p.base_density = 0.04; p.trunk_min = 5; p.trunk_max = 9; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_BIRCH_FOREST) {
+        p.base_density = 0.035; p.trunk_min = 6; p.trunk_max = 11; p.canopy_radius = 2;
+        p.trunk_block = BLOCK_BIRCH_LOG; p.leaves_block = BLOCK_BIRCH_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_MAPLE_FOREST) {
+        p.base_density = 0.04; p.trunk_min = 5; p.trunk_max = 8; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_CLOUD_FOREST) {
+        p.base_density = 0.06; p.trunk_min = 7; p.trunk_max = 13; p.canopy_radius = 4;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_TEMPERATE_HIGHLANDS) {
+        p.base_density = 0.012; p.trunk_min = 3; p.trunk_max = 5; p.canopy_radius = 2;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_ALPINE_HIGHLANDS) {
+        p.base_density = 0.008; p.trunk_min = 3; p.trunk_max = 6; p.canopy_radius = 1;
+        p.trunk_block = BLOCK_BIRCH_LOG; p.leaves_block = BLOCK_BIRCH_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_PLAINS) {
+        p.base_density = 0.005; p.trunk_min = 4; p.trunk_max = 7; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_SWAMP) {
+        p.base_density = 0.025; p.trunk_min = 4; p.trunk_max = 6; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_JUNGLE) { // r458
+        p.base_density = 0.07; p.trunk_min = 7; p.trunk_max = 14; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_TAIGA) { // r458
+        p.base_density = 0.03; p.trunk_min = 7; p.trunk_max = 13; p.canopy_radius = 2;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_MANGROVE) { // r458
+        p.base_density = 0.05; p.trunk_min = 4; p.trunk_max = 7; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    } else if (biome == BIOME_SAVANNA) { // r458
+        p.base_density = 0.006; p.trunk_min = 4; p.trunk_max = 7; p.canopy_radius = 3;
+        p.trunk_block = BLOCK_OAK_LOG; p.leaves_block = BLOCK_OAK_LEAVES; p.has_trees = true;
+    }
+    return p;
+}
+
+// Tree decision returned by Phase A's per-column computation.
+// `has_tree` false means this column doesn't spawn a tree; everything
+// else is don't-care. `has_tree` true: trunk_height, canopy_radius,
+// lean_dx/dz, blocks fields are valid.
+struct TreeDecision {
+    bool  has_tree;
+    int   surface_y;
+    int   trunk_height;
+    int   canopy_radius;
+    float lean_dx;
+    float lean_dz;
+    uint  trunk_block;
+    uint  leaves_block;
+};
+
+// Pack a TreeDecision into (uint, int). Fixed-point lean uses 8 bits
+// signed offset by 128 → range [-1.28, 1.27]; CPU lean magnitude is
+// bounded ~0.4, so 0.01 quantization is plenty.
+//
+// uint pack layout:
+//   bit 0:        has_tree (1 bit)
+//   bits 1..6:    biome ID (unused, reserved for future)
+//   bits 6..10:   trunk_height (4 bits, 0..15)
+//   bits 10..13:  canopy_radius (3 bits, 0..7)
+//   bit 13:       trunk_block (0=Oak, 1=Birch)
+//   bit 14:       leaves_block (0=Oak, 1=Birch)
+//   bits 15..23:  lean_dx_q (8 bits, signed offset by 128)
+//   bits 23..31:  lean_dz_q (8 bits, signed offset by 128)
+uint pack_tree_decision_uint(TreeDecision d) {
+    uint h = uint(d.has_tree ? 1u : 0u);
+    uint th = uint(clamp(d.trunk_height, 0, 15));
+    uint cr = uint(clamp(d.canopy_radius, 0, 7));
+    uint tb = (d.trunk_block == BLOCK_BIRCH_LOG) ? 1u : 0u;
+    uint lb = (d.leaves_block == BLOCK_BIRCH_LEAVES) ? 1u : 0u;
+    int lean_dx_q = clamp(int(round(d.lean_dx * 100.0)) + 128, 0, 255);
+    int lean_dz_q = clamp(int(round(d.lean_dz * 100.0)) + 128, 0, 255);
+    return h
+         | (th << 6)
+         | (cr << 10)
+         | (tb << 13)
+         | (lb << 14)
+         | (uint(lean_dx_q) << 15)
+         | (uint(lean_dz_q) << 23);
+}
+
+TreeDecision unpack_tree_decision(uint packed, int surface_y) {
+    TreeDecision d;
+    d.has_tree = (packed & 1u) != 0u;
+    d.trunk_height = int((packed >> 6) & 0xFu);
+    d.canopy_radius = int((packed >> 10) & 0x7u);
+    uint tb_bit = (packed >> 13) & 1u;
+    uint lb_bit = (packed >> 14) & 1u;
+    d.trunk_block = (tb_bit == 1u) ? BLOCK_BIRCH_LOG : BLOCK_OAK_LOG;
+    d.leaves_block = (lb_bit == 1u) ? BLOCK_BIRCH_LEAVES : BLOCK_OAK_LEAVES;
+    int lean_dx_q = int((packed >> 15) & 0xFFu) - 128;
+    int lean_dz_q = int((packed >> 23) & 0xFFu) - 128;
+    d.lean_dx = float(lean_dx_q) / 100.0;
+    d.lean_dz = float(lean_dz_q) / 100.0;
+    d.surface_y = surface_y;
+    return d;
+}
+
+// Compute tree decision for one origin column. Mirrors CPU's place_trees
+// per-column block. surface_target is the column's expected surface
+// elevation (from cached_surface_target's formula).
+//
+// `slope_neighbors` are surface_target values at the 4 cardinal +2
+// neighbors (W, E, N, S). Use the same column's surface_target as a
+// fallback if a neighbor is outside the cache (gives 0 lean — matches
+// "flat ground assumption" for edge trees).
+// r447: forward declaration so the tree-surface scan below can call it (definition is later).
+bool model_is_cave(float x, float y, float z, uint world_seed);
+
+TreeDecision compute_tree_decision(
+    int wx_origin, int wz_origin,
+    float surface_target,
+    uint biome,
+    float temperature, float humidity,
+    float s_w, float s_e, float s_n, float s_s,
+    uint world_seed
+) {
+    TreeDecision d;
+    d.has_tree = false;
+    d.surface_y = int(floor(surface_target));
+    d.trunk_height = 0;
+    d.canopy_radius = 0;
+    d.lean_dx = 0.0;
+    d.lean_dz = 0.0;
+    d.trunk_block = BLOCK_OAK_LOG;
+    d.leaves_block = BLOCK_OAK_LEAVES;
+
+    // Quick reject: hash threshold. 0.06 is CloudForest's base_density
+    // (the densest biome); higher than this can't spawn anywhere.
+    float pos_hash = tree_origin_hash(wx_origin, wz_origin, world_seed);
+    if (pos_hash >= 0.06) return d;
+
+    // r447: FLOATING-TREES FIX. The trunk base was the analytic surface_target, but the actual
+    // filled terrain (density crossing, cave-aware) sits a few blocks off it because of detail
+    // noise — so on the GPU path trees hung in the air over the real (lower) ground. The CPU path
+    // already scans density (surface_y_at → topmost_standable); do the same here so both agree.
+    // Scan down through the detail band for the topmost solid cell that has air directly above it.
+    {
+        int scan_hi = int(floor(surface_target)) + 16;
+        int scan_lo = int(floor(surface_target)) - 24;
+        bool prev_air = true; // treat everything above scan_hi as air
+        for (int y = scan_hi; y >= scan_lo; y--) {
+            float dens = model_density_with_target(
+                float(wx_origin), float(y), float(wz_origin), world_seed, surface_target);
+            bool solid = (dens > DENSITY_THRESHOLD)
+                && !model_is_cave(float(wx_origin), float(y), float(wz_origin), world_seed);
+            if (solid && prev_air) {
+                d.surface_y = y; // topmost standable surface
+                break;
+            }
+            prev_air = !solid;
+        }
+    }
+
+    // v0.24.NEXT-submerged-trees: skip submerged origins. Mirrors CPU
+    // cpu_generator's surface_y < SEA_LEVEL_BASELINE skip — Pass A floods
+    // those columns with water, so trees there would otherwise drown.
+    if (float(d.surface_y) < model_sea_level(float(wx_origin), float(wz_origin), world_seed)) return d; // r188 varying
+
+    TreeProfile profile = biome_tree_profile(biome);
+    if (!profile.has_trees) return d;
+
+    // Climate-modulated density.
+    float climate = climate_tree_factor(temperature, humidity);
+    float effective = profile.base_density * climate;
+    if (pos_hash >= effective) return d;
+
+    // Surface must be tree-friendly. CPU checks Grass/Moss. Without a
+    // full pick_surface_block port on GPU, we conservatively allow any
+    // forest/plains/etc. biome (already gated by tree_profile being
+    // present) — equivalent under GPU-canonical strategy.
+
+    // Climate quality drives trunk height + canopy size.
+    float climate_quality = clamp(climate / 1.5, 0.0, 1.0);
+    // Stochastic ±20% from sub-bits of pos_hash.
+    float stochastic = (fract(pos_hash * 1.0e7) - 0.5) * 0.4;
+    float growth_quality = clamp(climate_quality + stochastic, 0.0, 1.0);
+
+    int height_range = profile.trunk_max - profile.trunk_min;
+    d.trunk_height = profile.trunk_min + int(round(float(height_range) * growth_quality));
+    if (d.trunk_height > TREE_MAX_HEIGHT - 1) { return d; } // d.has_tree still false
+    if (d.trunk_height < 1) { return d; }
+
+    int r_max_full = profile.canopy_radius;
+    d.canopy_radius = max(int(round(float(r_max_full) * (0.5 + 0.5 * growth_quality))), 1);
+
+    // Slope-driven lean. CPU samples ±2 neighbors. We use cached
+    // surface_target at neighbors when available, else 0 (flat).
+    float dh_x = (s_e - s_w) / 4.0;
+    float dh_z = (s_s - s_n) / 4.0;
+    float slope_mag = sqrt(dh_x * dh_x + dh_z * dh_z);
+    if (slope_mag > 0.4) {
+        float cap = min(slope_mag, 2.0);
+        float lean_factor = (cap - 0.4) * 0.25;
+        d.lean_dx = -(dh_x / slope_mag) * lean_factor;
+        d.lean_dz = -(dh_z / slope_mag) * lean_factor;
+    }
+
+    d.trunk_block = profile.trunk_block;
+    d.leaves_block = profile.leaves_block;
+    d.has_tree = true;
+    return d;
+}
+
+// Per-block tree footprint check. Iterates origins within
+// TREE_PADDING radius, returns BLOCK_AIR if no tree, otherwise returns
+// trunk_block (log) or leaves_block. Log always wins; first leaves
+// match wins (matches CPU iteration order: outer dz, inner dx).
+uint tree_block_at(int wx, int wy, int wz,
+                   int chunk_origin_x, int chunk_origin_z,
+                   uint world_seed);
+
+// Tree-band y range across the workgroup. Updated in Phase A via
+// atomicMin/Max. If wy is outside [min_tree_y, max_tree_y], NO tree
+// affects this block (we skip the whole 81-origin scan).
+shared int min_tree_y;
+shared int max_tree_y;
+
+// Packed tree decisions for the 40x40 neighborhood. tree_flags_dims_packed
+// encodes has_tree + dimensions + blocks + lean; tree_surface_y_cache
+// stores the column's surface_y in int form.
+shared uint tree_flags_dims_packed[NEIGHBORHOOD_COLS];
+shared int  tree_surface_y_cache[NEIGHBORHOOD_COLS];
+
+// RC39: full density. All callers that have a cached surface_target should
+// use `model_density_with_target` instead — same math, skips the biome /
+// hills / sea_level recomputation. This entrypoint is here for callers
+// that don't have a cache (none in main; reserved for future use / tests).
+float model_density(float x, float y, float z, uint world_seed) {
+    float sea = model_sea_level(x, z, world_seed);
+    float cont_height = model_continental(x, z, world_seed) * 30.0;
+    uint biome = biome_at_2d(x, z, world_seed);
+    float biome_height = biome_height_modifier(biome);
+    float hills_height = model_hills(x, z, world_seed) * 15.0;
+    float surface_target = sea + cont_height + biome_height + hills_height;
+    return model_density_with_target(x, y, z, world_seed, surface_target);
+}
+
+bool model_is_cave(float x, float y, float z, uint world_seed) {
+    if (y < 4.0) return false;
+    // 2-octave fbm cave noise (CPU/GPU symmetric). Threshold tunable via the
+    // CPU env var UNENDLICH_CAVE_THRESHOLD_FBM; GPU uses the default 0.70 (a
+    // mismatch only if the env var is set to something other than 0.70).
+    // 0.70 matches the original single-noise 0.78 cave volume (~7%); the prior
+    // 0.58 gave ~27% and swiss-cheesed the surface (see world_model::is_cave).
+    float cave = fbm_3d(x * 0.05, y * 0.05, z * 0.05, world_seed + SEED_CAVE, 2, 1.0, 1.0);
+    return cave > 0.70;
+}
+
+// ── r116b: deep multi-scale cave field — GLSL port of world/cave_field.rs.
+// Structure matches the CPU function exactly (worm tunnels = intersection of
+// two ridged iso-surfaces, depth-blended morphology, chambers, abyssal chasm
+// fissures, crust/floor gates). f32 here vs f64 on the CPU is the same
+// tolerance the rest of this shader already accepts. The CPU side is also
+// default-ON since r116, so both generators carve the same caves.
+const float CF_SURFACE_BUFFER = 6.0;
+const float CF_WORLD_FLOOR_Y  = -1024.0;
+const float CF_FLOOR_TAPER    = 48.0;
+const float CF_DEPTH_RAMP     = 18.0;
+const float CF_WORM_FREQ      = 0.045;
+const float CF_Y_SHALLOW      = 40.0;
+const float CF_Y_CHASM        = -288.0;
+const float CF_Y_DEEP         = -800.0;
+const uint  CF_SALT_WORM_A    = 0xCA0E1A01u;
+const uint  CF_SALT_WORM_B    = 0xCA0E1B02u;
+const uint  CF_SALT_CHAMBER   = 0xCA0E2C03u;
+const uint  CF_SALT_CHASM     = 0xCA0E3D04u;
+
+float cf_ridged_3d(float x, float y, float z, uint seed) {
+    return 1.0 - abs(2.0 * noise_3d(x, y, z, seed) - 1.0);
+}
+float cf_ridged_2d(float x, float z, uint seed) {
+    return 1.0 - abs(2.0 * noise_2d(x, z, seed) - 1.0);
+}
+float cf_inv_down(float y, float hi, float lo) {
+    if (hi <= lo) return 0.0;
+    return clamp((hi - y) / (hi - lo), 0.0, 1.0);
+}
+float cf_depth_gate(float y, float surface_y) {
+    float ceiling = surface_y - CF_SURFACE_BUFFER;
+    if (y >= ceiling || y <= CF_WORLD_FLOOR_Y) return 0.0;
+    float top_ramp = clamp((ceiling - y) / CF_DEPTH_RAMP, 0.0, 1.0);
+    float floor_ramp = clamp((y - CF_WORLD_FLOOR_Y) / CF_FLOOR_TAPER, 0.0, 1.0);
+    return min(top_ramp, floor_ramp);
+}
+bool cave_field_at(uint seed, float x, float y, float z, float surface_y) {
+    float gate = cf_depth_gate(y, surface_y);
+    if (gate <= 0.0) return false;
+    // Morphology blend (shallow -> chasm -> deep); matches cave_field::morph.
+    float a = cf_inv_down(y, CF_Y_SHALLOW, CF_Y_CHASM);
+    float b = cf_inv_down(y, CF_Y_CHASM, CF_Y_DEEP);
+    float tube_r  = mix(mix(0.07,  0.095, a), 0.13,   b);
+    float ch_freq = mix(mix(0.013, 0.010, a), 0.0075, b);
+    float ch_thr  = mix(mix(0.82,  0.74,  a), 0.66,   b);
+    float chasm_w = a * (1.0 - b);
+    // Worm tunnels: intersection of two ridged fields => connected tubes.
+    float wxn = x * CF_WORM_FREQ;
+    float wyn = y * CF_WORM_FREQ;
+    float wzn = z * CF_WORM_FREQ;
+    float ra = cf_ridged_3d(wxn, wyn, wzn, seed + CF_SALT_WORM_A);
+    float rb = cf_ridged_3d(wxn, wyn, wzn, seed + CF_SALT_WORM_B);
+    float tube_cut = 1.0 - tube_r * (0.6 + 0.4 * gate);
+    if (ra >= tube_cut && rb >= tube_cut) return true;
+    // Chambers: low-freq blobs, only where the gate is near full.
+    if (gate > 0.5) {
+        float chamber = noise_3d(x * ch_freq, y * ch_freq, z * ch_freq, seed + CF_SALT_CHAMBER);
+        if (chamber > ch_thr) return true;
+    }
+    // Abyssal chasm fissures: near-vertical fault voids in the mid band.
+    if (chasm_w > 0.05 && gate > 0.5) {
+        float cf = cf_ridged_2d(x * 0.02, z * 0.02, seed + CF_SALT_CHASM);
+        float cut = 1.0 - 0.04 * chasm_w;
+        if (cf >= cut) return true;
+    }
+    return false;
+}
+
+// RC40: per-block tree footprint check.
+//
+// For each origin in the TREE_PADDING-radius neighborhood:
+//   1. Read packed decision from shared memory
+//   2. If has_tree: test if (wx, wy, wz) is in this tree's trunk /
+//      branch / canopy footprint
+//   3. Apply log > leaves priority
+//
+// Returns BLOCK_AIR if no tree affects this block. Otherwise returns
+// the appropriate trunk_block or leaves_block.
+//
+// IMPORTANT: only call this for blocks where the base block is AIR
+// (matching CPU's try_write rule). For solid blocks, the tree never
+// overwrites — there'd be no leaves in the side of a hill the tree
+// can't pierce.
+uint tree_block_at(int wx, int wy, int wz,
+                   int chunk_origin_x, int chunk_origin_z,
+                   uint world_seed)
+{
+    // Compute neighborhood origin range. We need origins whose tree
+    // footprint could reach (wx, wy, wz). Footprint extends up to
+    // TREE_PADDING in xz (canopy radius max + lean reach).
+    int lx_block = wx - chunk_origin_x;
+    int lz_block = wz - chunk_origin_z;
+
+    uint best_block = BLOCK_AIR;
+    // Iterate ORIGIN positions in 9x9 neighborhood (±TREE_PADDING).
+    // Outer dz, inner dx matches CPU's iteration → first-leaves
+    // priority is stable across CPU/GPU.
+    for (int dz = -TREE_PADDING; dz <= TREE_PADDING; dz++) {
+        for (int dx = -TREE_PADDING; dx <= TREE_PADDING; dx++) {
+            int lx_origin_nb = lx_block + dx + TREE_PADDING;
+            int lz_origin_nb = lz_block + dz + TREE_PADDING;
+            // Defensive bounds: only valid if origin neighborhood index
+            // is in [0, NEIGHBORHOOD_SIZE). For blocks well inside the
+            // chunk this is always true; for blocks near chunk edges
+            // dx/dz might push us out (shouldn't happen if TREE_PADDING
+            // is consistent, but guard against future drift).
+            if (lx_origin_nb < 0 || lx_origin_nb >= NEIGHBORHOOD_SIZE) continue;
+            if (lz_origin_nb < 0 || lz_origin_nb >= NEIGHBORHOOD_SIZE) continue;
+            int col_nb = lx_origin_nb + lz_origin_nb * NEIGHBORHOOD_SIZE;
+
+            uint packed = tree_flags_dims_packed[col_nb];
+            if ((packed & 1u) == 0u) continue; // has_tree=false, fast skip
+
+            int surface_y = tree_surface_y_cache[col_nb];
+            TreeDecision d = unpack_tree_decision(packed, surface_y);
+            int wx_origin = wx - dx;
+            int wz_origin = wz - dz;
+
+            int h = wy - d.surface_y;
+
+            // ---- Trunk check ----
+            // Trunk occupies (wx_origin + lean*h, surface_y + h, wz_origin + lean*h)
+            // for h in [1, trunk_height].
+            if (h >= 1 && h <= d.trunk_height) {
+                int trunk_x = wx_origin + int(round(d.lean_dx * float(h)));
+                int trunk_z = wz_origin + int(round(d.lean_dz * float(h)));
+                if (wx == trunk_x && wz == trunk_z) {
+                    return d.trunk_block; // log always wins
+                }
+            }
+
+            // ---- Branch check (only trees of height >= 4) ----
+            if (d.trunk_height >= 4) {
+                float branch_gate = tree_detail_hash(
+                    wx_origin, d.surface_y, wz_origin,
+                    0x7E1FA001u, world_seed);
+                if (branch_gate < 0.40) {
+                    // Two potential branch heights and per-level gates.
+                    int branch_h_arr[2];
+                    branch_h_arr[0] = int(round(float(d.trunk_height) * 0.40));
+                    branch_h_arr[1] = int(round(float(d.trunk_height) * 0.70));
+                    float thresholds[2];
+                    thresholds[0] = 0.80;
+                    thresholds[1] = 0.50;
+                    uint level_salts[2];
+                    level_salts[0] = 0x7E1FB002u;
+                    level_salts[1] = 0x7E1FB003u;
+
+                    for (int i = 0; i < 2; i++) {
+                        int bh = branch_h_arr[i];
+                        if (bh < 1 || bh >= d.trunk_height) continue;
+                        // Only check this branch level if the candidate
+                        // block could BE a branch at this level.
+                        if (wy != d.surface_y + bh) continue;
+                        float level_gate = tree_detail_hash(
+                            wx_origin, d.surface_y + bh, wz_origin,
+                            level_salts[i], world_seed);
+                        if (level_gate > thresholds[i]) continue;
+                        // Trunk position at this branch height.
+                        int trunk_x_bh = wx_origin + int(round(d.lean_dx * float(bh)));
+                        int trunk_z_bh = wz_origin + int(round(d.lean_dz * float(bh)));
+                        int trunk_y_bh = d.surface_y + bh;
+                        // Cardinal direction from hash.
+                        float dir_hash = tree_detail_hash(
+                            trunk_x_bh, trunk_y_bh, trunk_z_bh,
+                            0x7E1FC003u, world_seed);
+                        int dir_idx = int(dir_hash * 4.0);
+                        int bdx = 0, bdz = 0;
+                        if (dir_idx == 0)      { bdx = 1;  bdz = 0; }
+                        else if (dir_idx == 1) { bdx = 0;  bdz = 1; }
+                        else if (dir_idx == 2) { bdx = -1; bdz = 0; }
+                        else                   { bdx = 0;  bdz = -1; }
+                        if (wx == trunk_x_bh + bdx && wz == trunk_z_bh + bdz) {
+                            return d.trunk_block; // branch is a log
+                        }
+                    }
+                }
+            }
+
+            // ---- Canopy check ----
+            int canopy_off_x = int(round(d.lean_dx * float(d.trunk_height)));
+            int canopy_off_z = int(round(d.lean_dz * float(d.trunk_height)));
+            int canopy_cx = wx_origin + canopy_off_x;
+            int canopy_cz = wz_origin + canopy_off_z;
+            int canopy_cy = d.surface_y + d.trunk_height;
+            int v_extent = max(d.canopy_radius, 1);
+            int dy_can = wy - canopy_cy;
+            if (abs(dy_can) > v_extent) continue;
+
+            // Per-y canopy radius. Matches CPU's "round-ish footprint".
+            int r_at_y;
+            if (v_extent <= 1) {
+                r_at_y = 1;
+            } else {
+                float frac = 1.0 - float(abs(dy_can)) / float(v_extent);
+                r_at_y = max(int(round(float(d.canopy_radius) * frac)), 1);
+            }
+            int dx_can = wx - canopy_cx;
+            int dz_can = wz - canopy_cz;
+            if (abs(dx_can) > r_at_y) continue;
+            if (abs(dz_can) > r_at_y) continue;
+            // Skip outermost corners for round look.
+            if (r_at_y >= 2 && abs(dx_can) == r_at_y && abs(dz_can) == r_at_y) continue;
+
+            // Perforation: outer-cell hash skip (~18% drop). Gated to
+            // canopy_radius >= 2 (small canopies need every leaf).
+            if (d.canopy_radius >= 2) {
+                bool on_edge = (abs(dx_can) == r_at_y
+                             || abs(dz_can) == r_at_y
+                             || abs(dy_can) == v_extent);
+                bool is_center_column = (dx_can == 0 && dz_can == 0);
+                if (on_edge && !is_center_column) {
+                    float perf_hash = tree_detail_hash(
+                        wx, wy, wz, 0x7E1FD004u, world_seed);
+                    if (perf_hash < 0.18) continue;
+                }
+            }
+            // Skip the trunk position at this cy (trunks lean, so check
+            // the lean-adjusted column).
+            if (wy <= d.surface_y + d.trunk_height) {
+                int h_at_cy = wy - d.surface_y;
+                int trunk_at_cy_x = wx_origin + int(round(d.lean_dx * float(h_at_cy)));
+                int trunk_at_cy_z = wz_origin + int(round(d.lean_dz * float(h_at_cy)));
+                if (wx == trunk_at_cy_x && wz == trunk_at_cy_z) continue;
+            }
+
+            // This origin's canopy claims (wx, wy, wz). Record leaves
+            // if we haven't already (first leaves wins).
+            if (best_block == BLOCK_AIR) {
+                best_block = d.leaves_block;
+            }
+        }
+    }
+
+    return best_block;
+}
+
+// ============================================================================
+// Surface decoration — biome-driven block-type selection at the surface.
+// Simplified GPU-side: we don't compute biomes (those need a different
+// translation later). Placeholder rule: grass on top, dirt for 3 below,
+// stone deeper. Snow above y=90.
+// ============================================================================
+
+uint surface_block_type(int wy, float humidity, float temperature, uint biome) {
+    // r462: biome-characteristic surfaces (mirrors biomes.rs::surface_block) so the GPU shows proper
+    // ground for the r458 biomes instead of climate-only sand/grass.
+    if (biome == BIOME_MESA || biome == BIOME_RED_SANDSTONE_CANYON) return BLOCK_RED_SANDSTONE;
+    if (biome == BIOME_VOLCANIC_WASTES) return BLOCK_BASALT;
+    if (biome == BIOME_FROZEN_OCEAN) return BLOCK_ICE;
+    if (biome == BIOME_MANGROVE) return BLOCK_CLAY;
+    if (biome == BIOME_DESERT || biome == BIOME_BEACH || biome == BIOME_OCEAN) return BLOCK_SAND;
+    if (biome == BIOME_TUNDRA) return BLOCK_SNOW_BLOCK;
+    if (biome == BIOME_SWAMP) return BLOCK_MOSS;
+    if (biome == BIOME_ICE_CAVE || biome == BIOME_FUNGAL_CAVE || biome == BIOME_THERMAL_CAVE
+        || biome == BIOME_CRYSTAL_CAVE || biome == BIOME_LUSH_CAVE) return BLOCK_STONE;
+    // Default grassy surface + the shader's climate overlays (altitude snow, hot-dry sand).
+    if (wy > 90 && temperature < 0.4) return BLOCK_SNOW_BLOCK;
+    if (temperature > 0.7 && humidity < 0.4) return BLOCK_SAND;
+    return BLOCK_GRASS;
+}
+
+uint subsurface_block_type(float humidity, float temperature) {
+    if (temperature > 0.7 && humidity < 0.4) return BLOCK_SAND;
+    return BLOCK_DIRT;
+}
+
+uint roll_ore(int wx, int wy, int wz, uint world_seed) {
+    if (wy < 128) {
+        float coal = noise_3d(float(wx) * 0.1, float(wy) * 0.1, float(wz) * 0.1,
+                                world_seed + SEED_ORE_COAL);
+        if (coal > 0.85) return BLOCK_COAL_ORE;
+    }
+    if (wy < 64) {
+        float iron = noise_3d(float(wx) * 0.08, float(wy) * 0.08, float(wz) * 0.08,
+                                world_seed + SEED_ORE_IRON);
+        if (iron > 0.88) return BLOCK_IRON_ORE;
+    }
+    if (wy < 32) {
+        float gold = noise_3d(float(wx) * 0.07, float(wy) * 0.07, float(wz) * 0.07,
+                                world_seed + SEED_ORE_GOLD);
+        if (gold > 0.92) return BLOCK_GOLD_ORE;
+    }
+    return 0u; // sentinel: no ore
+}
+
+// ============================================================================
+// Per-block packing helpers.
+// blocks_packed[] packs 4 blocks per uint, little-endian byte order.
+// ============================================================================
+
+void write_block(uint chunk_index, int local_idx, uint block_id) {
+    // chunk_index * blocks-per-chunk + local_idx
+    const int BLOCKS_PER_CHUNK = 32 * 32 * 32; // 32768
+    uint global_idx = chunk_index * uint(BLOCKS_PER_CHUNK) + uint(local_idx);
+    uint word_idx = global_idx / 4u;
+    uint byte_in_word = global_idx & 3u;
+    uint shift = byte_in_word * 8u;
+    uint mask = 0xFFu << shift;
+    uint val = (block_id & 0xFFu) << shift;
+    // Atomic OR is safe because a fresh batch zeros the buffer beforehand
+    // and each invocation writes a unique byte. But OR isn't enough if
+    // we ever overwrite — and surface decoration overwrites stone with
+    // grass/dirt. So we need atomic min/max or a different pack strategy.
+    //
+    // Simpler approach: each invocation owns a unique global_idx so we can
+    // do non-atomic byte-level writes via a CAS loop. But uint-level writes
+    // race with neighbors. Solution: dispatch one invocation per BLOCK,
+    // not per workgroup — 8x8x8 invocations per chunk processes 512
+    // blocks per workgroup, then we dispatch (32^3 / 512) = 64 workgroups
+    // per chunk. That's the design.
+    //
+    // For now we do an atomicAnd then atomicOr to guarantee correctness.
+    atomicAnd(blocks_packed[word_idx], ~mask);
+    atomicOr(blocks_packed[word_idx], val);
+}
+
+// ============================================================================
+// RC41: fluid-pass helpers.
+//
+// `read_block_local` returns the byte at (chunk_index, lx, ly, lz). Out-of-
+// chunk reads return BLOCK_AIR — matches CPU's worldgen sampler. Used only
+// in Pass A (water fill) and Pass B (freeze thermal-mass sampling), AFTER
+// the main loop's barrier so reads see committed writes.
+//
+// `temperature_at_celsius` is the *physical* Celsius temperature for the
+// freezing rule — DISTINCT from `model_temperature` (which is a unitless
+// climate [0,1] for biome selection). Mirrors `temperature.rs::temperature_at`
+// byte-for-byte: latitude cos × swing + altitude lapse + sin/cos noise.
+//
+// `thermal_mass_factor` and `freezes_at` mirror `thermal_mass.rs` — 6 face
+// neighbors weighted [+X, -X, +Y, -Y, +Z, -Z] = [1, 1, 2, 0.5, 1, 1]
+// (warm air rises, +Y face loses heat fastest).
+//
+// `roll_lava` mirrors `cpu_generator.rs::roll_lava` — low-freq 3D noise
+// (period ~25 blocks) with a depth-modulated threshold.
+// ============================================================================
+
+uint read_block_local(uint chunk_index, int lx, int ly, int lz) {
+    if (lx < 0 || lx >= CHUNK_SIZE) return BLOCK_AIR;
+    if (ly < 0 || ly >= CHUNK_SIZE) return BLOCK_AIR;
+    if (lz < 0 || lz >= CHUNK_SIZE) return BLOCK_AIR;
+    int local_idx = lx + lz * CHUNK_SIZE + ly * CHUNK_SIZE * CHUNK_SIZE;
+    const int BLOCKS_PER_CHUNK = 32 * 32 * 32;
+    uint global_idx = chunk_index * uint(BLOCKS_PER_CHUNK) + uint(local_idx);
+    uint word_idx = global_idx / 4u;
+    uint byte_in_word = global_idx & 3u;
+    uint shift = byte_in_word * 8u;
+    return (blocks_packed[word_idx] >> shift) & 0xFFu;
+}
+
+// Physical Celsius temperature. Used by the freezing rule.
+const float LAPSE_RATE_PER_BLOCK_C = 6.5e-3;
+const float BASE_TEMPERATURE_C     = 22.0;
+const float LATITUDE_SPAN          = 16384.0;
+const float LATITUDE_SWING_C       = 25.0;
+const float TAU_F                  = 6.28318530717958647692;
+
+float temperature_at_celsius(int wx, int wy, int wz) {
+    float lat_phase = float(wz) / LATITUDE_SPAN * TAU_F;
+    float polar_factor = (1.0 - cos(lat_phase)) * 0.5;
+    float lat_temp = BASE_TEMPERATURE_C - polar_factor * LATITUDE_SWING_C;
+    float altitude_drop = (float(wy) - 64.0) * LAPSE_RATE_PER_BLOCK_C;
+    float noise = (sin(float(wx) * 0.07)
+                 + cos(float(wz) * 0.11)
+                 + sin(float(wy) * 0.05) * 0.7) * 1.25;
+    return lat_temp - altitude_drop + noise;
+}
+
+float material_contribution(uint b) {
+    if (b == BLOCK_AIR) return 0.0;
+    // Water + Ice + Lava all act as thermal reservoirs (contribution 1.0).
+    // Lava is a heat SOURCE but also resists cooling so adjacent water
+    // doesn't freeze — same effect for the freezing rule.
+    if (b == BLOCK_WATER || b == BLOCK_ICE || b == BLOCK_LAVA) return 1.0;
+    // Solid insulator (stone, dirt, sand, ore, etc.) — moderate.
+    return 0.5;
+}
+
+float thermal_mass_factor(uint chunk_index, int lx, int ly, int lz) {
+    uint nb_xp = read_block_local(chunk_index, lx + 1, ly,     lz);
+    uint nb_xn = read_block_local(chunk_index, lx - 1, ly,     lz);
+    uint nb_yp = read_block_local(chunk_index, lx,     ly + 1, lz);
+    uint nb_yn = read_block_local(chunk_index, lx,     ly - 1, lz);
+    uint nb_zp = read_block_local(chunk_index, lx,     ly,     lz + 1);
+    uint nb_zn = read_block_local(chunk_index, lx,     ly,     lz - 1);
+    // Per-face heat-loss weights: +Y heaviest (warm air rises).
+    // Σ weights = 1 + 1 + 2 + 0.5 + 1 + 1 = 6.5
+    float weighted =
+          material_contribution(nb_xp) * 1.0
+        + material_contribution(nb_xn) * 1.0
+        + material_contribution(nb_yp) * 2.0
+        + material_contribution(nb_yn) * 0.5
+        + material_contribution(nb_zp) * 1.0
+        + material_contribution(nb_zn) * 1.0;
+    return clamp(weighted / 6.5, 0.0, 1.0);
+}
+
+bool freezes_at(uint chunk_index,
+                int wx, int wy, int wz,
+                int lx, int ly, int lz)
+{
+    const float FREEZE_BASELINE_C = 0.0;
+    const float MASS_BUFFER_C = 8.0;
+    float temp = temperature_at_celsius(wx, wy, wz);
+    float mass = thermal_mass_factor(chunk_index, lx, ly, lz);
+    float freeze_threshold = FREEZE_BASELINE_C - mass * MASS_BUFFER_C;
+    return temp < freeze_threshold;
+}
+
+bool roll_lava(int wx, int wy, int wz, uint world_seed) {
+    // Low-freq 3D noise — blob radius ~8-12 blocks.
+    float raw = noise_3d(
+        float(wx) * 0.04, float(wy) * 0.04, float(wz) * 0.04,
+        world_seed + SEED_LAVA);
+    // Depth ramp: rare near sea level, slowly more common deeper.
+    // Threshold drops by 0.035 per 32 blocks of depth, capped at 0.07.
+    float depth_below_sea = max(64.0 - float(wy), 0.0);
+    float threshold = 0.92 - min(depth_below_sea / 32.0 * 0.035, 0.07);
+    return raw > threshold;
+}
+
+// ============================================================================
+// Main kernel.
+//
+// Each workgroup handles one chunk. Each invocation handles one block within
+// that chunk. Workgroup is 8x8x8 = 512 invocations, but the chunk is 32x32x32
+// = 32,768 blocks, so each invocation handles 64 blocks (a 4x4x4 stride).
+// ============================================================================
+
+// RC39/40: workgroup-shared cache for per-column surface_target.
+//
+// Surface_target = sea_level + cont_height + biome_height_modifier + hills.
+// All four terms depend only on (x, z) — invariant in y. The per-block loop
+// hammers model_density up to 5 times per block (self, above, 3 probes),
+// and biome_at_2d alone does ~7 noise calls. Without this cache, the
+// extra mountain/biome plumbing would multiply shader cost ~3×.
+//
+// RC40: expanded from 32×32 (chunk-only) to 40×40 (neighborhood) so the
+// tree-pass slope computation can read ±2 neighbors. Phase B accesses
+// chunk columns at offset (lx + TREE_PADDING, lz + TREE_PADDING).
+//
+// Total shared memory budget across both caches:
+//   cached_surface_target: 40×40 × 4 =  6.4 KB
+//   tree_flags_dims_packed: 40×40 × 4 = 6.4 KB
+//   tree_surface_y_cache:   40×40 × 4 = 6.4 KB
+//   = 19.2 KB, well under M2's 32 KB workgroup limit.
+shared float cached_surface_target[NEIGHBORHOOD_COLS];
+
+void main() {
+    uvec3 local = gl_LocalInvocationID; // [0,8) x [0,8) x [0,8)
+    ivec3 chunk_origin = pc.chunk_coord * CHUNK_SIZE;
+    uint world_seed = pc.seed;
+    uint inv_idx = gl_LocalInvocationIndex;
+
+    // ---- Phase A0: init tree-band y range ----
+    if (inv_idx == 0u) {
+        min_tree_y = 2147483647;   // INT32_MAX
+        max_tree_y = -2147483648;  // INT32_MIN
+    }
+    barrier();
+
+    // ---- Phase A1: surface_target for neighborhood ----
+    //
+    // 1600 columns over 512 invocations → 4 cols per invocation (final
+    // invocation does 3 if you're counting precisely; the `break` guards).
+    //
+    // We compute this BEFORE Phase A2 (tree decisions) so the tree
+    // decision can read its ±2 slope neighbors from the cache.
+    for (int i = 0; i < 4; i++) {
+        int col = int(inv_idx) * 4 + i;
+        if (col >= NEIGHBORHOOD_COLS) break;
+        int lx_nb = col % NEIGHBORHOOD_SIZE - TREE_PADDING; // -4..35
+        int lz_nb = col / NEIGHBORHOOD_SIZE - TREE_PADDING;
+        float wx = float(chunk_origin.x + lx_nb);
+        float wz = float(chunk_origin.z + lz_nb);
+        float sea = model_sea_level(wx, wz, world_seed);
+        float cont_height = model_continental(wx, wz, world_seed) * 30.0;
+        uint  biome = biome_at_2d(wx, wz, world_seed);
+        float biome_height = biome_height_modifier(biome);
+        float hills_height = model_hills(wx, wz, world_seed) * 15.0;
+        cached_surface_target[col] = sea + cont_height + biome_height + hills_height;
+    }
+    barrier();
+
+    // ---- Phase A2: tree decisions for neighborhood ----
+    //
+    // Reads slope neighbors from cached_surface_target (in-bounds only;
+    // out-of-bounds neighbors fall back to this column's own value,
+    // which yields zero lean — acceptable for edge trees).
+    for (int i = 0; i < 4; i++) {
+        int col = int(inv_idx) * 4 + i;
+        if (col >= NEIGHBORHOOD_COLS) break;
+        int lx_nb_int = col % NEIGHBORHOOD_SIZE; // 0..39
+        int lz_nb_int = col / NEIGHBORHOOD_SIZE;
+        int lx_nb = lx_nb_int - TREE_PADDING;    // -4..35
+        int lz_nb = lz_nb_int - TREE_PADDING;
+        float surface_target = cached_surface_target[col];
+
+        // Recompute biome + climate for this column. We could cache
+        // these too, but it's cheap and uncomplicates the layout.
+        float wx = float(chunk_origin.x + lx_nb);
+        float wz = float(chunk_origin.z + lz_nb);
+        uint  biome = biome_at_2d(wx, wz, world_seed);
+        float surface_y_f = model_sea_level(wx, wz, world_seed) + 10.0;
+        float temp = model_temperature(wx, surface_y_f, wz, world_seed);
+        float humid = model_humidity(wx, surface_y_f, wz, world_seed);
+
+        // Slope neighbors (±2). Falls back to own value when OOB.
+        float s_w = surface_target;
+        float s_e = surface_target;
+        float s_n = surface_target;
+        float s_s = surface_target;
+        if (lx_nb_int >= 2)
+            s_w = cached_surface_target[col - 2];
+        if (lx_nb_int < NEIGHBORHOOD_SIZE - 2)
+            s_e = cached_surface_target[col + 2];
+        if (lz_nb_int >= 2)
+            s_n = cached_surface_target[col - 2 * NEIGHBORHOOD_SIZE];
+        if (lz_nb_int < NEIGHBORHOOD_SIZE - 2)
+            s_s = cached_surface_target[col + 2 * NEIGHBORHOOD_SIZE];
+
+        TreeDecision d = compute_tree_decision(
+            chunk_origin.x + lx_nb,
+            chunk_origin.z + lz_nb,
+            surface_target,
+            biome, temp, humid,
+            s_w, s_e, s_n, s_s,
+            world_seed);
+
+        tree_flags_dims_packed[col] = pack_tree_decision_uint(d);
+        tree_surface_y_cache[col] = d.surface_y;
+
+        if (d.has_tree) {
+            atomicMin(min_tree_y, d.surface_y);
+            atomicMax(max_tree_y,
+                d.surface_y + d.trunk_height + d.canopy_radius);
+        }
+    }
+    barrier();
+
+    // ---- Phase B: per-block density / surface / ore / TREE loop ----
+
+    // Each invocation iterates over its 4x4x4 = 64 blocks.
+    for (int dz_b = 0; dz_b < 4; dz_b++) {
+        for (int dy = 0; dy < 4; dy++) {
+            for (int dx_b = 0; dx_b < 4; dx_b++) {
+                int lx = int(local.x) * 4 + dx_b;
+                int ly = int(local.y) * 4 + dy;
+                int lz = int(local.z) * 4 + dz_b;
+                int wx = chunk_origin.x + lx;
+                int wy = chunk_origin.y + ly;
+                int wz = chunk_origin.z + lz;
+
+                int local_idx = lx + lz * CHUNK_SIZE + ly * CHUNK_SIZE * CHUNK_SIZE;
+
+                // Bedrock at world y == 0.
+                if (wy == 0 && pc.chunk_coord.y == 0) {
+                    write_block(pc.chunk_index, local_idx, BLOCK_BEDROCK);
+                    continue;
+                }
+
+                float dxf = float(wx);
+                float dyf = float(wy);
+                float dzf = float(wz);
+
+                // RC39/40: read precomputed surface_target. Index uses
+                // TREE_PADDING offset since the cache is now neighborhood-sized.
+                int col_chunk_nb = (lx + TREE_PADDING)
+                                 + (lz + TREE_PADDING) * NEIGHBORHOOD_SIZE;
+                float surface_target = cached_surface_target[col_chunk_nb];
+
+                float dens = model_density_with_target(dxf, dyf, dzf, world_seed, surface_target);
+                bool is_cave = model_is_cave(dxf, dyf, dzf, world_seed)
+                            || cave_field_at(world_seed, dxf, dyf, dzf, surface_target);
+                bool solid = (dens > DENSITY_THRESHOLD) && !is_cave;
+
+                if (!solid) {
+                    // RC40: tree pass — if this air block is in the
+                    // workgroup's tree-band y range, check whether any
+                    // nearby tree's footprint claims this block.
+                    if (wy >= min_tree_y - 1 && wy <= max_tree_y + 1) {
+                        uint tree_b = tree_block_at(wx, wy, wz,
+                            chunk_origin.x, chunk_origin.z, world_seed);
+                        if (tree_b != BLOCK_AIR) {
+                            write_block(pc.chunk_index, local_idx, tree_b);
+                            continue;
+                        }
+                    }
+                    write_block(pc.chunk_index, local_idx, BLOCK_AIR);
+                    continue;
+                }
+
+                // Solid. Decide what kind. Surface decoration: if the block
+                // directly above is air, this is a surface block.
+                // RC39: "above" is the same column, so the same surface_target.
+                float dens_above = model_density_with_target(dxf, dyf + 1.0, dzf, world_seed, surface_target);
+                bool above_solid = (dens_above > DENSITY_THRESHOLD)
+                                && !model_is_cave(dxf, dyf + 1.0, dzf, world_seed)
+                                && !cave_field_at(world_seed, dxf, dyf + 1.0, dzf, surface_target);
+
+                uint block_id;
+                if (!above_solid) {
+                    // Surface.
+                    float h = model_humidity(dxf, dyf, dzf, world_seed);
+                    float t = model_temperature(dxf, dyf, dzf, world_seed);
+                    uint sbiome = biome_at_2d(dxf, dzf, world_seed); // r462: biome→surface map
+                    block_id = surface_block_type(wy, h, t, sbiome);
+                } else {
+                    // Subsurface or deep. Look up: is there air within 3 above?
+                    // RC39: all probes are same column → same cached surface_target.
+                    bool near_surface = false;
+                    for (int probe = 1; probe <= 3; probe++) {
+                        float pdens = model_density_with_target(dxf, dyf + float(probe) + 1.0, dzf, world_seed, surface_target);
+                        bool psolid = (pdens > DENSITY_THRESHOLD)
+                                    && !model_is_cave(dxf, dyf + float(probe) + 1.0, dzf, world_seed)
+                                    && !cave_field_at(world_seed, dxf, dyf + float(probe) + 1.0, dzf, surface_target);
+                        if (!psolid) { near_surface = true; break; }
+                    }
+                    if (near_surface) {
+                        float h = model_humidity(dxf, dyf, dzf, world_seed);
+                        float t = model_temperature(dxf, dyf, dzf, world_seed);
+                        block_id = subsurface_block_type(h, t);
+                    } else {
+                        // Deep stone — try ore.
+                        // Match CPU: only place ores below baseline sea level.
+                        if (float(wy) < SEA_LEVEL_BASELINE) {
+                            uint ore = roll_ore(wx, wy, wz, world_seed);
+                            block_id = (ore != 0u) ? ore : BLOCK_STONE;
+                        } else {
+                            block_id = BLOCK_STONE;
+                        }
+                        // RC41: Phase 3.5 — lava replaces remaining Stone
+                        // below sea_level - 30. CPU runs lava AFTER ore so
+                        // ores aren't overwritten by lava; we mirror by
+                        // only checking when block_id == BLOCK_STONE.
+                        if (block_id == BLOCK_STONE
+                            && wy < int(SEA_LEVEL_BASELINE) - 30)
+                        {
+                            if (roll_lava(wx, wy, wz, world_seed)) {
+                                block_id = BLOCK_LAVA;
+                            }
+                        }
+                    }
+                }
+
+                write_block(pc.chunk_index, local_idx, block_id);
+            }
+        }
+    }
+
+    // ---- Phase 2.5 fluid passes (RC41) -----------------------------------
+    //
+    // Run as two post-main passes so the freeze check has all the water
+    // visible to thermal-mass neighbor sampling. Workgroup barriers
+    // separate the phases:
+    //   barrier + memoryBarrierBuffer   — ensure main-loop writes are
+    //                                      visible to all invocations
+    //   Pass A: air below sea_level -> Water
+    //   barrier + memoryBarrierBuffer   — ensure Pass A writes visible
+    //   Pass B: water in freeze band, thermal-mass check -> Ice
+    //
+    // Sea level here is SEA_LEVEL_BASELINE (64) — a constant, matching
+    // CPU. The per-column sea_level variations are absorbed into the
+    // density surface, not into the water-fill height.
+    //
+    // Skip the whole fluid block when the chunk is well above sea level
+    // (no water, no freeze possible). Pass B is further gated to the
+    // freeze band y ∈ [59, 64] which is only 5 layers.
+
+    if (chunk_origin.y <= int(SEA_LEVEL_BASELINE)) {
+        memoryBarrierBuffer();
+        barrier();
+
+        // ---- Pass A: water fill ----
+        // Each invocation iterates its 4×4×4 area; air cells with wy ≤ 64
+        // become Water. Trees / leaves / stone are left as-is.
+        for (int dz_b = 0; dz_b < 4; dz_b++) {
+            for (int dy = 0; dy < 4; dy++) {
+                for (int dx_b = 0; dx_b < 4; dx_b++) {
+                    int lx = int(local.x) * 4 + dx_b;
+                    int ly = int(local.y) * 4 + dy;
+                    int lz = int(local.z) * 4 + dz_b;
+                    int wy = chunk_origin.y + ly;
+                    // r188: varying sea level (parity with CPU sl_col) —
+                    // flat 64 vs model 64+-8 was the double water layer.
+                    if (wy > int(SEA_LEVEL_BASELINE) + 9) continue;
+                    int local_idx = lx + lz * CHUNK_SIZE + ly * CHUNK_SIZE * CHUNK_SIZE;
+                    uint current = read_block_local(pc.chunk_index, lx, ly, lz);
+                    if (current == BLOCK_AIR) {
+                        // v0.24.NEXT-cave-flood-fix: only flood OPEN water (air
+                        // above the terrain surface, density <= threshold). A
+                        // carved cave is air with density > threshold; flooding
+                        // it drowns the cave. Identical gate to the CPU Pass A
+                        // (density is CPU<->GPU parity-verified) so the two paths
+                        // agree. See docs/NOISE-QUALITY.md.
+                        int wx = chunk_origin.x + lx;
+                        int wz = chunk_origin.z + lz;
+                        // r195: identical biased-floor on the f32 sea level
+                        // (CPU casts its f64 to f32 first, so both floor the
+                        // same bits). seam_probe.rs: 0 disagreements / 1.05M.
+                        float slv = model_sea_level(float(wx), float(wz), world_seed);
+                        int sl_i = int(floor(slv + 0.5 - 1e-3));
+                        if (wy > sl_i) {
+                            // r188: above this column's water line.
+                        } else if (model_density(float(wx), float(wy), float(wz), world_seed) <= DENSITY_THRESHOLD) {
+                            write_block(pc.chunk_index, local_idx, BLOCK_WATER);
+                        }
+                    }
+                }
+            }
+        }
+
+        memoryBarrierBuffer();
+        barrier();
+
+        // ---- Pass B: freeze water in surface band ----
+        // CPU optimisation: only cells in [sea_level - 5, sea_level] are
+        // ever freezable. Deeper cells have thermal_mass ≈ 1.0 (all
+        // neighbors water/solid) requiring temp < -8°C which doesn't
+        // happen at those depths in our climate model.
+        const int FREEZE_BAND_TOP = int(SEA_LEVEL_BASELINE);
+        const int FREEZE_BAND_BOTTOM = FREEZE_BAND_TOP - 5;
+        if (chunk_origin.y + CHUNK_SIZE > FREEZE_BAND_BOTTOM
+            && chunk_origin.y <= FREEZE_BAND_TOP)
+        {
+            for (int dz_b = 0; dz_b < 4; dz_b++) {
+                for (int dy = 0; dy < 4; dy++) {
+                    for (int dx_b = 0; dx_b < 4; dx_b++) {
+                        int lx = int(local.x) * 4 + dx_b;
+                        int ly = int(local.y) * 4 + dy;
+                        int lz = int(local.z) * 4 + dz_b;
+                        int wx = chunk_origin.x + lx;
+                        int wy = chunk_origin.y + ly;
+                        int wz = chunk_origin.z + lz;
+                        if (wy < FREEZE_BAND_BOTTOM || wy > FREEZE_BAND_TOP) continue;
+                        int local_idx = lx + lz * CHUNK_SIZE + ly * CHUNK_SIZE * CHUNK_SIZE;
+                        uint current = read_block_local(pc.chunk_index, lx, ly, lz);
+                        if (current != BLOCK_WATER) continue;
+                        if (freezes_at(pc.chunk_index, wx, wy, wz, lx, ly, lz)) {
+                            write_block(pc.chunk_index, local_idx, BLOCK_ICE);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

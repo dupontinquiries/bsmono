@@ -1,0 +1,213 @@
+#version 450
+
+// unendlich GPU cascade fitter (v0.24.2b).
+//
+// Computes the orthographic light-space view-projection for one shadow
+// cascade. Writes results into a ViewParam slot (`view` = light_view,
+// `projection` = ortho). The downstream `view_compute.comp` then
+// derives `view_proj`, `inverse_view_proj`, and the cull planes from
+// that slot — same code path as the main camera view.
+//
+// Mirrors the CPU `single_cascade` in `src/render/light.rs` line-for-
+// line: 8-corner frustum slice → bounding sphere → light-space AABB
+// → texel-snapped orthographic projection.
+//
+// Why GPU
+//
+// (a) Same principle as v0.24.0b: anything the GPU consumes should
+// originate from GPU-derivable inputs. Cascade matrices feed the
+// shadow render pass; future GPU-side camera animation needs to be
+// able to write a camera basis and have shadows respond without a
+// CPU round-trip.
+//
+// (b) v0.24.2c renders 4 cascades. 4 CPU `single_cascade` calls per
+// frame is fine but the work is trivially parallel — one workgroup
+// per cascade — and consolidating it as one compute pass is cleaner
+// than four CPU memcpys.
+//
+// Workgroup
+//
+// local_size_x = 1, dispatched once per cascade (4 dispatches per
+// frame). The math is sequential and the work is tiny; running 1
+// invocation is simpler than coordinating multiple.
+//
+// Convention notes
+//
+// - Matrices in std430 layout, column-major (GLSL `mat4` natively).
+// - Right-handed look_at: light eye is up-sun from frustum center,
+//   target is frustum center.
+// - Depth zero-to-one (Vulkan): ortho_rh_zo, not ortho_rh.
+// - Output: write `view` and `projection` separately into the
+//   chosen ViewParam slot. The next stage (`view_compute.comp`)
+//   composes them as `view_proj = projection * view` and extracts
+//   planes via Gribb-Hartmann.
+
+layout(local_size_x = 1) in;
+
+struct ViewParam {
+    mat4 view;
+    mat4 projection;
+    mat4 view_proj;
+    mat4 inverse_view_proj;
+    vec4 camera_pos;
+    vec4 near_far_aspect;
+    vec4 planes[6];
+};
+
+layout(std430, set = 0, binding = 0) buffer ViewParams {
+    ViewParam view_params[];
+};
+
+layout(push_constant) uniform PC {
+    vec4 cam_pos_fov;      // xyz = camera world-space position, w = fov_y in radians
+    vec4 cam_forward_asp;  // xyz = camera forward (unit), w = aspect (w/h)
+    vec4 cam_up_pad;       // xyz = camera up (unit)
+    vec4 cam_right_pad;    // xyz = camera right (unit)
+    vec4 sun_dir_pad;      // xyz = sun direction (unit, ground-bound)
+    vec4 splits_idx;       // x = near_meters, y = far_meters,
+                           // z = shadow_map_size (float, for texel snap),
+                           // w = cascade_index reinterpreted as uint
+} pc;
+
+// Manual look_at_rh — matches glm::look_at_rh exactly. The resulting
+// matrix transforms world-space points into light-view-space where:
+// - +X = right of light
+// - +Y = up
+// - -Z = forward (along sun direction)
+//
+// This matches glm's RH look_at semantics so it's bit-compatible with
+// the CPU `single_cascade` reference.
+mat4 look_at_rh(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = normalize(target - eye);
+    vec3 s = normalize(cross(f, up));
+    vec3 u = cross(s, f);
+
+    mat4 m = mat4(1.0);
+    m[0][0] =  s.x; m[1][0] =  s.y; m[2][0] =  s.z;
+    m[0][1] =  u.x; m[1][1] =  u.y; m[2][1] =  u.z;
+    m[0][2] = -f.x; m[1][2] = -f.y; m[2][2] = -f.z;
+    m[3][0] = -dot(s, eye);
+    m[3][1] = -dot(u, eye);
+    m[3][2] =  dot(f, eye);
+    return m;
+}
+
+// Manual ortho_rh_zo — matches glm::ortho_rh_zo. Maps the box
+// [left, right] × [bottom, top] × [near, far] (with near/far being
+// VIEW-space Z values, negative-Z is forward) to clip-space:
+// X in [-1, 1], Y in [-1, 1], Z in [0, 1].
+mat4 ortho_rh_zo(float left, float right, float bottom, float top, float zn, float zf) {
+    mat4 m = mat4(1.0);
+    m[0][0] =  2.0 / (right - left);
+    m[1][1] =  2.0 / (top - bottom);
+    m[2][2] = -1.0 / (zf - zn);
+    m[3][0] = -(right + left) / (right - left);
+    m[3][1] = -(top + bottom) / (top - bottom);
+    m[3][2] = -zn / (zf - zn);
+    return m;
+}
+
+void main() {
+    // Unpack push constants.
+    vec3  cam_pos     = pc.cam_pos_fov.xyz;
+    float fov_y       = pc.cam_pos_fov.w;
+    vec3  cam_forward = pc.cam_forward_asp.xyz;
+    float aspect      = pc.cam_forward_asp.w;
+    vec3  cam_up      = pc.cam_up_pad.xyz;
+    vec3  cam_right   = pc.cam_right_pad.xyz;
+    vec3  sun_dir     = pc.sun_dir_pad.xyz;
+    float near_m      = pc.splits_idx.x;
+    float far_m       = pc.splits_idx.y;
+    float shadow_size = pc.splits_idx.z;
+    // The destination slot into which view+projection are written.
+    // For PRIMARY ViewGroup's cascades this is 1..=4; for hypothetical
+    // multi-camera setups it could be elsewhere. Shader is agnostic.
+    uint  dest_slot   = floatBitsToUint(pc.splits_idx.w);
+
+    // Step 1: 8 corners of the camera frustum slice [near_m, far_m]
+    // in world space. Matches `frustum_corners_world` in light.rs.
+    float half_v_near = tan(fov_y * 0.5) * near_m;
+    float half_h_near = half_v_near * aspect;
+    float half_v_far  = tan(fov_y * 0.5) * far_m;
+    float half_h_far  = half_v_far  * aspect;
+
+    vec3 near_center = cam_pos + cam_forward * near_m;
+    vec3 far_center  = cam_pos + cam_forward * far_m;
+
+    vec3 corners[8];
+    corners[0] = near_center - cam_right * half_h_near - cam_up * half_v_near;
+    corners[1] = near_center + cam_right * half_h_near - cam_up * half_v_near;
+    corners[2] = near_center - cam_right * half_h_near + cam_up * half_v_near;
+    corners[3] = near_center + cam_right * half_h_near + cam_up * half_v_near;
+    corners[4] = far_center  - cam_right * half_h_far  - cam_up * half_v_far;
+    corners[5] = far_center  + cam_right * half_h_far  - cam_up * half_v_far;
+    corners[6] = far_center  - cam_right * half_h_far  + cam_up * half_v_far;
+    corners[7] = far_center  + cam_right * half_h_far  + cam_up * half_v_far;
+
+    // Step 2: light-space orthonormal basis. world_up = +Y unless sun
+    // is near-vertical, in which case +Z. (Matches CPU branch.)
+    vec3 sun_forward = normalize(sun_dir);
+    vec3 world_up    = (abs(sun_forward.y) > 0.99) ? vec3(0.0, 0.0, 1.0)
+                                                   : vec3(0.0, 1.0, 0.0);
+
+    // Step 3: frustum center & AABB diagonal (for light eye distance).
+    vec3 center = vec3(0.0);
+    for (int i = 0; i < 8; i++) center += corners[i];
+    center /= 8.0;
+
+    vec3 aabb_min = corners[0];
+    vec3 aabb_max = corners[0];
+    for (int i = 1; i < 8; i++) {
+        aabb_min = min(aabb_min, corners[i]);
+        aabb_max = max(aabb_max, corners[i]);
+    }
+    float aabb_diag = length(aabb_max - aabb_min);
+
+    // Step 4: light view matrix. Eye is up-sun from center; target is
+    // center. Look_at_rh matches glm's RH semantics.
+    vec3 light_eye = center - sun_forward * aabb_diag;
+    mat4 light_view = look_at_rh(light_eye, center, world_up);
+
+    // Step 5: bounding-sphere fit. Radius = max corner distance from
+    // center. Rounded up to nearest 1/16 to quantize against tiny
+    // numerical wobble (matches CPU `radius = (radius * 16).ceil() / 16`).
+    float radius = 0.0;
+    for (int i = 0; i < 8; i++) {
+        radius = max(radius, length(corners[i] - center));
+    }
+    radius = ceil(radius * 16.0) / 16.0;
+
+    // Step 6: sphere center in light space.
+    vec3 center_ls = (light_view * vec4(center, 1.0)).xyz;
+
+    // Step 7: sphere bounds in light space — a cube of side 2r centered
+    // on center_ls.
+    vec3 min_ls = center_ls - vec3(radius);
+    vec3 max_ls = center_ls + vec3(radius);
+
+    // Step 8: ortho near/far in light view space, with shadow-caster
+    // margin (50m each side, matches CPU). Note: glm::ortho_rh_zo's
+    // near/far refer to VIEW-space Z values where the box of interest
+    // is in the range [near, far] before mapping to [0, 1]. We negate
+    // because light-view -Z is the look direction.
+    float z_near = -max_ls.z - 50.0;
+    float z_far  = -min_ls.z + 50.0;
+
+    // Step 9: texel-snap X/Y bounds. Quantum = (2r) / shadow_map_size.
+    float texel = (2.0 * radius) / shadow_size;
+    if (texel > 0.0) {
+        min_ls.x = floor(min_ls.x / texel) * texel;
+        min_ls.y = floor(min_ls.y / texel) * texel;
+        max_ls.x = min_ls.x + 2.0 * radius;
+        max_ls.y = min_ls.y + 2.0 * radius;
+    }
+
+    // Step 10: ortho projection from the snapped light-space AABB.
+    mat4 ortho = ortho_rh_zo(min_ls.x, max_ls.x, min_ls.y, max_ls.y, z_near, z_far);
+
+    // Step 11: write to the destination slot. The next stage's
+    // view_compute.comp will derive view_proj = projection * view and
+    // frustum planes downstream.
+    view_params[dest_slot].view       = light_view;
+    view_params[dest_slot].projection = ortho;
+}
