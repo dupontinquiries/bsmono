@@ -371,6 +371,22 @@ impl DisplayPrefs {
 }
 
 /// The full cross-app preference set.
+/// Fleet voice-mesh preferences (surfaced in bsettings): whether this device's mic joins the mesh,
+/// whether heavy STT may be offloaded to a trusted host, the preferred host id ("" = auto-pick the
+/// best trusted heavy device), and whether multi-user speaker recognition is on.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VoicePrefs {
+    pub mic_enabled: bool,
+    pub offload_enabled: bool,
+    pub compute_host: String,
+    pub speaker_id: bool,
+}
+impl Default for VoicePrefs {
+    fn default() -> Self {
+        VoicePrefs { mic_enabled: true, offload_enabled: true, compute_host: String::new(), speaker_id: false }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Prefs {
     pub gesture: GesturePrefs,
@@ -380,6 +396,8 @@ pub struct Prefs {
     pub input: InputPrefs,
     /// snapclone-theme palette id (e.g. "Dark").
     pub palette: String,
+    /// Fleet voice-mesh preferences.
+    pub voice: VoicePrefs,
 }
 
 impl Default for Prefs {
@@ -391,6 +409,7 @@ impl Default for Prefs {
             display: DisplayPrefs::default(),
             input: InputPrefs::default(),
             palette: "Dark".to_string(),
+            voice: VoicePrefs::default(),
         }
     }
 }
@@ -416,6 +435,10 @@ impl Prefs {
             ("input.handedness".into(), self.input.handedness.as_str().to_string()),
             ("input.double_tilt".into(), self.input.double_tilt.to_string()),
             ("theme.palette".into(), self.palette.clone()),
+            ("voice.mic_enabled".into(), self.voice.mic_enabled.to_string()),
+            ("voice.offload_enabled".into(), self.voice.offload_enabled.to_string()),
+            ("voice.compute_host".into(), self.voice.compute_host.clone()),
+            ("voice.speaker_id".into(), self.voice.speaker_id.to_string()),
         ]
     }
 
@@ -442,6 +465,10 @@ impl Prefs {
                 "a11y.voice" => if let Ok(x) = v.parse() { self.a11y.voice = x },
                 "a11y.tts" => if let Ok(x) = v.parse() { self.a11y.tts = x },
                 "a11y.voice_filter" => self.a11y.voice_filter = VoiceFilter::parse(v),
+                "voice.mic_enabled" => if let Ok(x) = v.parse() { self.voice.mic_enabled = x },
+                "voice.offload_enabled" => if let Ok(x) = v.parse() { self.voice.offload_enabled = x },
+                "voice.compute_host" => self.voice.compute_host = v.to_string(),
+                "voice.speaker_id" => if let Ok(x) = v.parse() { self.voice.speaker_id = x },
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
                 "display.opacity" => if let Ok(x) = v.parse::<f32>() { self.display.opacity = x.clamp(0.3, 1.0) },
@@ -648,5 +675,20 @@ mod anim_scale_tests {
         assert_eq!(AnimationStyle::Smooth.time_scale(), 1.0);
         assert!(AnimationStyle::Snappy.time_scale() < AnimationStyle::Smooth.time_scale());
         assert!(AnimationStyle::Smooth.time_scale() < AnimationStyle::Heavy.time_scale());
+    }
+}
+
+#[cfg(test)]
+mod voice_prefs_tests {
+    use super::Prefs;
+    #[test]
+    fn voice_prefs_round_trip_through_kv() {
+        let mut p = Prefs::default();
+        p.voice.mic_enabled = false;
+        p.voice.offload_enabled = false;
+        p.voice.compute_host = "desktop".into();
+        p.voice.speaker_id = true;
+        let back = Prefs::from_kv(&p.to_kv());
+        assert_eq!(back.voice, p.voice);
     }
 }
