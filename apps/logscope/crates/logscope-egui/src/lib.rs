@@ -4,6 +4,7 @@
 //! treeexport, script, runner — so those stay ungated; everything that touches egui/eframe/rfd is behind
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
+pub mod repo;
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
 #[allow(dead_code)] pub mod filescan;
 #[allow(dead_code)] pub mod swarmview;
