@@ -72,6 +72,10 @@ pub const SPECS: &[CmdSpec] = &[
         help: "switch to the 3D spatial/branching view", example: ":spatial" },
     CmdSpec { name: "stop", aliases: &["st", "qa"], usage: ":stop", arg: ArgKind::None,
         help: "cancel the running generation", example: ":stop" },
+    CmdSpec { name: "load-gitmind", aliases: &["lgm"], usage: ":load-gitmind <path>", arg: ArgKind::Path,
+        help: "mirror a .gitmind project to an isolated /tmp work session for editing", example: ":load-gitmind ~/work/monorepo" },
+    CmdSpec { name: "reapply", aliases: &["ra"], usage: ":reapply", arg: ArgKind::None,
+        help: "reapply the loaded session's changes over the project as one new commit", example: ":reapply" },
 ];
 
 /// Look up a command by its name or any alias (a leading `:` is tolerated).
