@@ -1,0 +1,25 @@
+[package]
+name = "bsgames"
+version = "0.1.0"
+edition = "2021"
+description = "BigSilicon Games centre — launch the fleet's games, see friends' presence over the netcode DHT, and chat via snapclone. Backend + egui GUI, in the bsettings mould."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bsgames"
+path = "src/bin/bsgames.rs"
+required-features = ["app"]
+
+[dependencies]
+netcode = { path = "../shared/netcode" }
+egui = { version = "0.34", optional = true }
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
+settings-kit = { path = "../../shared/settings-kit", optional = true }
+
+[features]
+default = []
+app = ["dep:eframe", "dep:egui", "dep:uikit-egui", "dep:settings-kit"]
+gui = ["dep:egui", "dep:uikit-egui", "dep:settings-kit"]
