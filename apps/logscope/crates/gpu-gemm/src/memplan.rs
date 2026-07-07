@@ -60,6 +60,11 @@ impl Residency {
     pub fn label(self) -> &'static str {
         match self { Residency::F32 => "f32", Residency::Int8 => "int8", Residency::Q4 => "q4" }
     }
+    /// The next-smaller resident format to fall back to when this one won't allocate on the GPU. int8 → q4,
+    /// q4 → None (past q4, the answer is layer streaming, not a smaller weight format).
+    pub fn downgrade(self) -> Option<Residency> {
+        match self { Residency::F32 => Some(Residency::Int8), Residency::Int8 => Some(Residency::Q4), Residency::Q4 => None }
+    }
 }
 
 /// Resident weight bytes if the projection layers are stored as `fmt`. The embedding is kept f32 (it's
@@ -115,8 +120,96 @@ pub fn plan(s: &ModelShape, budget_bytes: u64, ctx_len: usize, kv_dtype_bytes: u
     Fit::TooBig { min_needed: fixed + per_layer * 2 }
 }
 
+/// The resident formats that fit `budget_bytes`, best-quality first (int8, then q4) — the DOWNGRADE LADDER
+/// the loader walks: try each in order, and if the GPU refuses the allocation (BO/VMA exhaustion the byte
+/// budget didn't predict), drop to the next. Empty ⇒ nothing fits resident (stream or refuse).
+pub fn fitting_residencies(s: &ModelShape, budget_bytes: u64, ctx_len: usize, kv_dtype_bytes: usize, overhead_bytes: u64) -> Vec<Residency> {
+    let kv = kv_cache_bytes(s, ctx_len, kv_dtype_bytes);
+    [Residency::Int8, Residency::Q4].into_iter()
+        .filter(|&fmt| resident_weight_bytes(s, fmt) + kv + overhead_bytes <= budget_bytes)
+        .collect()
+}
+
+/// A concrete layer-streaming plan: pin as many transformer blocks resident as the budget allows, stream the
+/// rest from the mmap through a small rotating buffer, double-buffered so block i+1 prefetches while block i
+/// computes. The fallback when a model won't fit even at q4 AND zero-copy import isn't available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamPlan {
+    pub residency: Residency,          // format the layer weights are stored/streamed in (q4 = less bandwidth)
+    pub total_layers: u32,
+    pub pinned_layers: u32,            // permanently resident (never re-streamed)
+    pub ring_slots: u32,               // rotating buffers for the streamed layers (≥2 for double-buffering)
+    pub layer_bytes: u64,              // bytes for one block at `residency`
+    pub streamed_bytes_per_token: u64, // reloaded from mmap every DECODE token (the throughput bottleneck)
+    pub resident_bytes: u64,           // total GPU residency: fixed overhead + (pinned + ring) blocks
+}
+impl StreamPlan {
+    pub fn streamed_layers(&self) -> u32 { self.total_layers - self.pinned_layers }
+    /// Lower bound on decode ms/token from streaming bandwidth alone — every non-pinned block is reloaded
+    /// each decode step, so `streamed_bytes / bandwidth` dominates. Feed it the GiB/s caps-probe measured.
+    pub fn decode_ms_per_token(&self, gib_per_s: f64) -> f64 {
+        if gib_per_s <= 0.0 { return f64::INFINITY; }
+        (self.streamed_bytes_per_token as f64 / GIB) / gib_per_s * 1000.0
+    }
+}
+
+/// Plan layer streaming for a model that won't fit resident. Pins as many blocks as the budget holds after
+/// the fixed residency (f32 embedding + output + KV + transient staging), keeps a 2-slot ring for the rest.
+/// `fmt` is the streamed weight format — q4 is recommended (half the bandwidth of int8). Returns None if not
+/// even the fixed overhead plus a 2-block ring fits (genuinely too big → TooBig).
+pub fn plan_streaming(s: &ModelShape, budget: u64, fmt: Residency, ctx_len: usize, kv_dtype_bytes: usize, transient_overhead: u64) -> Option<StreamPlan> {
+    let layer_bytes = (s.layer_params() as f64 * fmt.bytes_per_param()) as u64;
+    if layer_bytes == 0 { return None; }
+    let kv = kv_cache_bytes(s, ctx_len, kv_dtype_bytes);
+    let embed = (s.embed_params() as f64 * 4.0) as u64;                 // embedding kept f32
+    let output = (s.output_params() as f64 * fmt.bytes_per_param()) as u64;
+    let fixed = embed + output + kv + transient_overhead;
+    let total = s.layers as u32;
+    if fixed + 2 * layer_bytes > budget { return None; }                // can't hold even a 2-block ring
+    let slots = ((budget - fixed) / layer_bytes) as u32;               // layer buffers that fit
+    if slots >= total {
+        // everything actually fits pinned (caller normally uses Resident; report a no-streaming plan)
+        return Some(StreamPlan { residency: fmt, total_layers: total, pinned_layers: total, ring_slots: 0,
+            layer_bytes, streamed_bytes_per_token: 0, resident_bytes: fixed + total as u64 * layer_bytes });
+    }
+    let ring = 2u32;                                                    // double-buffer
+    let pinned = slots - ring;                                          // slots ≥ 2 here (guarded above)
+    let streamed = total - pinned;
+    Some(StreamPlan {
+        residency: fmt, total_layers: total, pinned_layers: pinned, ring_slots: ring, layer_bytes,
+        streamed_bytes_per_token: streamed as u64 * layer_bytes,
+        resident_bytes: fixed + (pinned as u64 + ring as u64) * layer_bytes,
+    })
+}
+
+/// Which rotating buffer a streamed block uses (consecutive streamed blocks alternate so i+1 can prefetch
+/// while i computes). `streamed_index` counts only the non-pinned blocks in traversal order.
+pub fn ring_slot(streamed_index: u32, ring_slots: u32) -> u32 { streamed_index % ring_slots.max(1) }
+
+/// A GPU buffer-allocation budget, which on unified-memory drivers (Asahi/Honeykrisp) is far below system
+/// RAM: the driver caps total buffer-object address space, so a plan sized to RAM greenlights an int8
+/// residency the GPU then can't allocate (the "70B → Failed to allocate BO VMA" crash). Takes the smaller
+/// of the RAM budget and this cap. `LOGSCOPE_MAX_GPU_GB` overrides; otherwise a conservative fraction of RAM
+/// that the loader's OOM-downgrade ladder tightens further at runtime.
+pub fn gpu_buffer_budget(ram_budget: u64) -> u64 {
+    if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
+        if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
+    }
+    // conservative default: half of RAM budget, capped at 48 GiB — big enough for most quants, small enough
+    // that a 70B-int8 (~70 GiB) is rejected up front (→ q4) instead of crashing mid-upload. Tune per box.
+    (ram_budget / 2).min((48.0 * GIB) as u64)
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 pub fn gib(bytes: u64) -> f64 { bytes as f64 / GIB }
+
+/// Turn an EMPIRICAL allocation ceiling (the total STORAGE bytes the GPU accepted before it OOM'd, found by
+/// caps-probe) into a recommended resident-weight budget: leave 15% headroom for the KV cache + transient
+/// staging buffers that also come out of the same GPU budget. This is the number to feed LOGSCOPE_MAX_GPU_GB
+/// once the probe has measured the real ceiling — replacing the static 48 GiB guess with the box's truth.
+pub fn recommend_gpu_budget(ceiling_bytes: u64) -> u64 {
+    (ceiling_bytes as f64 * 0.85) as u64
+}
 
 #[cfg(test)]
 mod tests {
@@ -194,5 +287,83 @@ mod tests {
         let small = kv_cache_bytes(&s, 2048, 2);
         let big = kv_cache_bytes(&s, 32768, 2);
         assert_eq!(big, small * 16, "kv scales linearly with context");
+    }
+
+    #[test]
+    fn residency_downgrade_ladder() {
+        assert_eq!(Residency::Int8.downgrade(), Some(Residency::Q4));
+        assert_eq!(Residency::Q4.downgrade(), None); // past q4 → streaming, not a smaller weight
+        assert_eq!(Residency::F32.downgrade(), Some(Residency::Int8));
+    }
+
+    #[test]
+    fn fitting_residencies_is_the_ordered_ladder() {
+        // a budget where int8 fits → both int8 and q4 are options, int8 first
+        let big = (39_500u64) * (1 << 20);
+        assert_eq!(fitting_residencies(&llama_8b(), big, 8192, 2, (400 * (1 << 20)) as u64), vec![Residency::Int8, Residency::Q4]);
+        // a 70B on 39.5 GiB: int8 doesn't fit, q4 might — int8 must not appear
+        let opts = fitting_residencies(&llama_70b(), big, 4096, 2, (500 * (1 << 20)) as u64);
+        assert!(!opts.contains(&Residency::Int8), "70B int8 doesn't fit 39.5 GiB");
+        // a tiny budget: nothing fits resident
+        assert!(fitting_residencies(&llama_70b(), (4.0 * GIB) as u64, 4096, 2, 0).is_empty());
+    }
+
+    #[test]
+    fn gpu_budget_is_capped_below_ram() {
+        std::env::remove_var("LOGSCOPE_MAX_GPU_GB");
+        // 170 GiB of RAM (M2 Ultra) → GPU budget capped at 48 GiB, so a 70B-int8 (~70 GiB) is rejected up
+        // front instead of crashing the driver mid-upload.
+        let ram = (170.0 * GIB) as u64;
+        let gpu = gpu_buffer_budget(ram);
+        assert!(gpu <= (48.0 * GIB) as u64 && gpu < ram, "GPU budget {} capped below RAM {}", gib(gpu), gib(ram));
+        assert!(fitting_residencies(&llama_70b(), gpu, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8),
+                "under the GPU budget the 70B won't attempt int8");
+        // explicit override wins
+        std::env::set_var("LOGSCOPE_MAX_GPU_GB", "96");
+        assert_eq!(gpu_buffer_budget(ram), (96.0 * GIB) as u64);
+        std::env::remove_var("LOGSCOPE_MAX_GPU_GB");
+    }
+
+    #[test]
+    fn recommended_budget_leaves_headroom() {
+        // if the probe found the GPU accepts 60 GiB of buffers, budget the weights at ~51 GiB (15% for
+        // KV + staging), and a 70B then fits int8 (~70? no) — check it's below the ceiling and non-zero.
+        let ceiling = (60.0 * GIB) as u64;
+        let b = recommend_gpu_budget(ceiling);
+        assert!(b < ceiling && b > (50.0 * GIB) as u64, "budget {:.1} leaves headroom under {:.1}", gib(b), gib(ceiling));
+        // and it feeds straight into the ladder: at a 60 GiB ceiling the 70B still can't do int8 (~70) → q4
+        assert!(fitting_residencies(&llama_70b(), b, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8));
+    }
+
+    #[test]
+    fn streaming_pins_what_fits_and_streams_the_rest() {
+        let s = llama_70b();
+        let budget = (24.0 * GIB) as u64;
+        let plan = plan_streaming(&s, budget, Residency::Q4, 4096, 2, (512 * (1 << 20)) as u64).expect("70B streams into 24 GiB");
+        assert_eq!(plan.total_layers, s.layers as u32);
+        assert!(plan.pinned_layers < plan.total_layers, "not everything fits pinned");
+        assert!(plan.streamed_layers() > 0, "some layers stream");
+        assert_eq!(plan.pinned_layers + plan.streamed_layers(), plan.total_layers);
+        assert_eq!(plan.ring_slots, 2, "double-buffered");
+        assert!(plan.resident_bytes <= budget, "within budget: {:.1} ≤ {:.1} GiB", gib(plan.resident_bytes), gib(budget));
+        let ms = plan.decode_ms_per_token(100.0);
+        assert!(ms > 0.0 && ms.is_finite(), "bandwidth-bound decode: {ms:.1} ms/tok");
+        // fatter budget pins more → streams fewer bytes → faster
+        let plan2 = plan_streaming(&s, (36.0 * GIB) as u64, Residency::Q4, 4096, 2, (512 * (1 << 20)) as u64).unwrap();
+        assert!(plan2.streamed_bytes_per_token < plan.streamed_bytes_per_token, "more budget streams less");
+        assert!(plan2.decode_ms_per_token(100.0) < ms);
+    }
+
+    #[test]
+    fn streaming_refuses_when_even_the_ring_wont_fit() {
+        assert!(plan_streaming(&llama_70b(), (4.0 * GIB) as u64, Residency::Q4, 4096, 2, 0).is_none());
+    }
+
+    #[test]
+    fn ring_slot_alternates_for_double_buffering() {
+        assert_eq!(ring_slot(0, 2), 0);
+        assert_eq!(ring_slot(1, 2), 1);
+        assert_eq!(ring_slot(2, 2), 0);
+        assert_eq!(ring_slot(5, 1), 0);
     }
 }
