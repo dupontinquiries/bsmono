@@ -18,6 +18,7 @@
 //! VAD gate would bridge to audio-kit's [`level::rms`](https://docs.rs) — the one
 //! place voice-kit would gain an audio-kit dependency.
 
+pub mod mesh;
 pub mod hallucination;
 pub mod model;
 pub mod context;
