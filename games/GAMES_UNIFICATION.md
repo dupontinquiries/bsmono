@@ -4,9 +4,9 @@
 | game | lang/build | engine | multiplayer | LOC |
 |---|---|---|---|---|
 | clawbound | Rust/cargo | wgpu + winit | enet, WebRTC, netcode | 4.4K |
-| early-fps | Rust/cargo | wgpu + winit | enet, netcode | 45K |
+| soldier (Soldier) | Rust/cargo | wgpu + winit | enet, netcode | 45K |
 | unendlich | Rust/cargo (workspace) | custom | enet, netcode | 326K |
-| cybertron | C++/CMake | Vulkan + OpenGL + SDL2 | enet, netcode | 137K |
+| blackstar (Blackstar) | C++/CMake | Vulkan + OpenGL + SDL2 | enet, netcode | 137K |
 
 *Note:* unendlich `docs/art-targets` (29M reference renders) omitted to keep git lean —
 `docs/ART_TARGETS_OMITTED.txt` marks it; re-add from the upload if wanted.
@@ -45,6 +45,18 @@ join transport, snapclone deliver).
 1. ✅ land the 4 games in-tree
 2. ✅ shared netcode: unified profiles over OpenDHT + micro-DHT fallback
 3. ✅ bsgames centre (launch + friends/presence + chat scaffold)
-4. wire the I/O seams: OpenDHT FFI backend, enet session join, snapclone chat delivery, per-game
-   presence publish on launch/quit
+4. ✅ wire the seams to EXISTING fleet code (not reinvented):
+   - **presence** → coord-core `Activity::InGame` (the bus every fleet app already publishes to);
+     `wiring::activity_of` bridges netcode Presence → Activity; bsgames publishes on launch.
+   - **chat** → share-kit `Mailbox` over **snapcore's `Store`** (snapcore IS the fleet Kademlia DHT —
+     `Key = NodeId`, RoutingTable, node.rs). `wiring::{dm_mailbox,dm_key,send_chat,recv_chat}`;
+     messages sealed (crypto-kit) + content-addressed; GUI chat panel uses the real path.
+   - **cross-application tests** (bsgames × coord-core × share-kit × snapcore × crypto-kit): presence
+     bridge; chat round-trips through the Mailbox+Store attributed + ordered. 5 tests.
+   - remaining seams (I/O, on-device): OpenDHT FFI primary; enet session join; SenderChain ratchet
+     for chat forward-secrecy (currently a fixed per-DM key); coord-core publish via the Coord client.
+
+   *Note (shared-code find):* snapcore already provides a Kademlia DHT — netcode's `microdht` now
+   overlaps it. Follow-up: back netcode's ProfileService fallback with snapcore's Store/node so
+   profiles ride the same DHT as chat, and keep `microdht` only as the zero-dep option.
 5. render abstraction + backends — the hard one, last
