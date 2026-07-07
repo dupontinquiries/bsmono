@@ -263,8 +263,10 @@ dependencies = [
 name = "gpu-gemm"
 version = "0.1.0"
 dependencies = [
+ "ash",
  "bytemuck",
  "memmap2",
+ "naga",
  "pollster",
  "wgpu",
 ]

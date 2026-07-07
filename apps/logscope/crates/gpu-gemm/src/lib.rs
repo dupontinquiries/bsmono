@@ -8,7 +8,12 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 pub mod gguf;
+pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
+#[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
+#[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
+pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
+#[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
 pub mod netserve;
 pub mod store;
@@ -107,26 +112,63 @@ pub struct Gpu {
     /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
     pool: std::sync::Arc<BufferPool>,
     arena: Mutex<Option<ResidentArena>>,
+    subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
+    sg_ok: std::sync::atomic::AtomicBool, // sg kernel passed the load-time self-check on THIS driver
+    gemm_ok: std::sync::atomic::AtomicBool, // tiled prefill GEMM compiles + matches naive on THIS backend
+    valid_gemm_tiles: std::sync::RwLock<Vec<u32>>, // GEMM tiles whose shader actually compiles here (load probe)
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
 /// width) as fields here — the autotuner sweeps the whole matrix and the hot path stays a single
 /// profile lookup, so optimizations never accrete as scattered branches on the decode path.
+/// Which decode mat-vec kernel a profile uses. The autotuner measures all of these per shape and keeps the
+/// fastest ON THIS GPU — so the optimum (which differs by platform: wg128@4 won on M2 Ultra, but another
+/// GPU may prefer v2@8 or the plain v1) is discovered at runtime, not hardcoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DecodeConfig { pub tile: u32 }
+pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3 }
+impl MatvecKernel {
+    fn from_id(id: u32) -> MatvecKernel { match id { 0 => MatvecKernel::V1, 2 => MatvecKernel::V2Wg128, 3 => MatvecKernel::V2WgSg, _ => MatvecKernel::V2 } }
+    pub fn id(self) -> u32 { self as u32 }
+    pub fn label(self) -> &'static str { match self { MatvecKernel::V1 => "v1", MatvecKernel::V2 => "v2", MatvecKernel::V2Wg128 => "v2-wg128", MatvecKernel::V2WgSg => "v2-wg128-sg" } }
+    /// Whether this kernel needs the SUBGROUP device feature (so the autotuner can skip it where unsupported).
+    pub fn needs_subgroups(self) -> bool { matches!(self, MatvecKernel::V2WgSg) }
+}
 
-/// The matrix of KNOWN decode profiles the autotuner chooses among. The selected index is the
-/// system profile. (Today one dimension — the column tile; profile i == DECODE_PROFILES[i].)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeConfig { pub kernel: MatvecKernel, pub tile: u32 }
+impl DecodeConfig {
+    /// Pack into the u32 the per-shape cache + system profile already carry. The high bit marks a PACKED
+    /// value (vs a legacy bare tile), so V1 (kernel id 0) doesn't collide with an old cached tile.
+    pub fn pack(self) -> u32 { 0x8000_0000 | (self.kernel.id() << 16) | (self.tile & 0xffff) }
+    pub fn unpack(u: u32) -> DecodeConfig {
+        if u & 0x8000_0000 != 0 {
+            DecodeConfig { kernel: MatvecKernel::from_id((u >> 16) & 0x7fff), tile: (u & 0xffff).max(1) }
+        } else {
+            // legacy cache stored a bare tile → the pre-wg128 default kernel (v2)
+            DecodeConfig { kernel: MatvecKernel::V2, tile: (u & 0xffff).clamp(1, 8) }
+        }
+    }
+}
+
+/// The matrix of KNOWN decode profiles the autotuner chooses among — now TWO dimensions (kernel × tile).
+/// v2-wg128 and v2 across tiles, plus a v1 baseline; v3/t16 are excluded (measured losers everywhere). The
+/// autotuner times each per shape and caches the fastest, so performance auto-adapts across platforms.
 pub const DECODE_PROFILES: &[DecodeConfig] = &[
-    DecodeConfig { tile: 1 }, DecodeConfig { tile: 2 }, DecodeConfig { tile: 4 }, DecodeConfig { tile: 8 },
+    // index 0 is the no-autotune DEFAULT → must be a kernel that compiles everywhere (NOT subgroup).
+    DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 8 },
+    DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 8 },
+    DecodeConfig { kernel: MatvecKernel::V2, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2, tile: 8 },
+    DecodeConfig { kernel: MatvecKernel::V1, tile: 1 }, DecodeConfig { kernel: MatvecKernel::V1, tile: 4 },
 ];
-/// Autotune probes at a capped output width: the best tile transfers across n (it's set by k + kernel
+/// Autotune probes at a capped output width: the best config transfers across n (it's set by k + kernel
 /// overhead, given enough workgroups to saturate the GPU), and full-width probes on a 14B (n up to
 /// ~152k) cost seconds apiece. 4096 saturates while keeping each probe cheap.
 const PROBE_N_CAP: usize = 4096;
-/// The profile whose tile matches `tile` (or the closest), as a matrix index.
+/// The profile index whose tile matches `tile` (or the closest) — used only by the manual tile override
+/// (`set_matvec_tile`); prefers a v2-wg128 profile since that's the common best.
 fn profile_for_tile(tile: u32) -> u32 {
-    DECODE_PROFILES.iter().position(|c| c.tile == tile)
+    DECODE_PROFILES.iter().position(|c| c.tile == tile && c.kernel == MatvecKernel::V2Wg128)
+        .or_else(|| DECODE_PROFILES.iter().position(|c| c.tile == tile))
         .or_else(|| DECODE_PROFILES.iter().enumerate().min_by_key(|(_, c)| c.tile.abs_diff(tile)).map(|(i, _)| i))
         .unwrap_or(0) as u32
 }
@@ -136,12 +178,6 @@ fn env_decode_tile() -> Option<u32> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<u32>> = OnceLock::new();
     *T.get_or_init(|| std::env::var("LOGSCOPE_DECODE_TILE").ok().and_then(|s| s.parse::<u32>().ok()).map(|t| t.clamp(1, 8)))
-}
-/// LOGSCOPE_PREFILL_TILED=1 → use the shared-memory-tiled prefill GEMM (read once, cached).
-fn env_prefill_tiled() -> bool {
-    use std::sync::OnceLock;
-    static T: OnceLock<bool> = OnceLock::new();
-    *T.get_or_init(|| std::env::var("LOGSCOPE_PREFILL_TILED").is_ok())
 }
 /// Fused-QKV decode is now the DEFAULT (one wqkv matmul instead of three projections, −2 compute
 /// dispatches/layer — the dispatch-count lever on the ~210/token decode cost that dominates wall time
@@ -226,17 +262,81 @@ impl Gpu {
         // defaults (which cap buffers at 256 MiB / storage bindings at 128 MiB —
         // far too small for a real model's large vocab projections, e.g. a 128k×2048
         // output weight is ~1 GiB). Requesting the adapter's own limits is always valid.
+        // Enable subgroup ops when the adapter supports them — lets the decode kernel replace its
+        // shared-memory barrier reduction with subgroupAdd (fewer barriers, far less workgroup memory →
+        // higher occupancy, the diagnosed decode bottleneck). Harmless where unsupported (flag stays false).
+        let want_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
+        let backend = adapter.get_info().backend;
+        let req_features = if want_subgroup { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("kernels"), required_features: wgpu::Features::empty(),
+            label: Some("kernels"), required_features: req_features,
             required_limits: adapter.limits(), experimental_features: wgpu::ExperimentalFeatures::default(),
             memory_hints: wgpu::MemoryHints::Performance, trace: wgpu::Trace::Off,
         })).expect("no device");
+        let subgroups = want_subgroup;
         let env_tile = std::env::var("LOGSCOPE_MATVEC_TILE").ok().and_then(|v| v.parse::<u32>().ok());
         let profile_forced = env_tile.is_some();
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None) }
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()) };
+        // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
+        // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
+        // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
+        // probe which tiles compile+match there. GL (e.g. llvmpipe CI) stays on the naive kernel.
+        if !matches!(backend, wgpu::Backend::Gl) {
+            let valid = gpu.probe_valid_gemm_tiles();
+            gpu.gemm_ok.store(!valid.is_empty(), std::sync::atomic::Ordering::Relaxed);
+            *gpu.valid_gemm_tiles.write().unwrap() = valid;
+        }
+        // If the driver has subgroups, verify the subgroup decode kernel matches the reference on a tiny
+        // shape before ever trusting it — a buggy subgroupAdd (driver bugs are real) is caught here instead
+        // of corrupting a token. Cheap (one small mat-vec pair); disable with LOGSCOPE_MATVEC_NOSG.
+        if subgroups && std::env::var_os("LOGSCOPE_MATVEC_NOSG").is_none() {
+            let ok = gpu.self_check_sg();
+            gpu.sg_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
+            if !ok { eprintln!("wgpu-engine: subgroup decode kernel failed its load-time self-check on {} — using the barrier-reduction kernel instead", gpu.adapter_name); }
+        }
+        gpu
+    }
+
+    /// Probe which tiled-GEMM tiles COMPILE on this backend and match the naive kernel on a small shape.
+    /// Each tile's shader is created inside a validation error scope so a compile failure (e.g. a workgroup
+    /// size the backend rejects) is caught, not fatal. Returns the usable subset (may be empty → naive only).
+    fn probe_valid_gemm_tiles(&self) -> Vec<u32> {
+        let (m, k, n) = (16usize, 64usize, 32usize);
+        let mut rng = 0x6E4D_1122_3344_5566u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let qw = self.quantize_q8_resident(&w, n, k);
+        let a = self.upload(&act, m, k);
+        let naive = self.download(&self.linear_q8_0_naive(&a, &qw, m));
+        let scale = naive.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+        self.gemm_tile_candidates().into_iter().filter(|&t| {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let tiled = self.download(&self.linear_q8_0_gemm(&a, &qw, m, t));
+            if pollster::block_on(scope.pop()).is_some() { return false; } // shader didn't compile here
+            let worst = naive.iter().zip(&tiled).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            worst / scale < 1e-2
+        }).collect()
+    }
+
+    /// Run the subgroup decode kernel against the plain (byte-per-thread) reference on a tiny random shape;
+    /// true iff they agree within f32-reassociation tolerance. Gates whether the autotuner may pick sg.
+    fn self_check_sg(&self) -> bool {
+        let (k, n) = (256usize, 128usize);
+        let mut rng = 0x00C0_FFEE_1234_5678u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let qw = self.quantize_q8_resident(&w, n, k);
+        let a = self.upload(&act, 1, k);
+        let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
+        let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
+        let scale = base.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+        let worst = base.iter().zip(&sg).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        worst / scale < 1e-3
     }
 
     /// Generic compute dispatch. Convention: storage inputs at bindings 0..n
@@ -767,6 +867,15 @@ impl Gpu {
         let a = guard.as_mut().expect("arena active");
         let mut off = a.used.next_multiple_of(ALIGN);
         if a.slabs.is_empty() || off + len > a.slab_size {
+            // Drain the PREVIOUS slab's staged writes before allocating the next. wgpu's write_buffer stages
+            // through internal buffers that are only reclaimed after a submit+poll; without this, staging for
+            // every slab accumulates ON TOP OF the growing arena, so the load-time peak is ~2× the resident
+            // size — that's what overran the ~56 GiB GPU VA ceiling loading the 70B (40 GiB arena + ~40 GiB
+            // un-drained staging). Flushing per slab caps staging at roughly one slab.
+            if !a.slabs.is_empty() {
+                self.queue.submit(std::iter::empty());
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            }
             let size = a.slab_size.max(len.next_multiple_of(ALIGN)); // size up for a rare oversized weight
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -900,9 +1009,88 @@ impl Gpu {
     /// >1 = tiled, reusing each activation read across `tile` columns). Split out so the tiled and
     /// untiled paths can be A/B-validated on one device.
     pub fn matvec_decode(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        // Env escapes force a kernel for A/B (LOGSCOPE_MATVEC_V1/V2/V3); otherwise this entry point defaults
+        // to v2-wg128. The forward path doesn't come through here — it uses matvec_decode_cfg with the
+        // per-shape AUTOTUNED (kernel, tile), so the winning kernel is chosen at runtime per platform.
+        if std::env::var_os("LOGSCOPE_MATVEC_V1").is_some() { return self.matvec_decode_v1(a, w, tile); }
+        if std::env::var_os("LOGSCOPE_MATVEC_V2").is_some() { return self.matvec_decode_v2(a, w, tile); }
+        if std::env::var_os("LOGSCOPE_MATVEC_V3").is_some() { return self.matvec_decode_v3(a, w, tile); }
+        self.matvec_decode_v2wg128(a, w, tile)
+    }
+
+    /// Dispatch the decode mat-vec for an explicit (kernel, tile) config — the runtime-autotuned entry the
+    /// forward path uses. `matvec_decode_v*` are the concrete kernels; this just routes.
+    pub fn matvec_decode_cfg(&self, a: &Tensor, w: &QWeight, cfg: DecodeConfig) -> Tensor {
+        match cfg.kernel {
+            MatvecKernel::V1 => self.matvec_decode_v1(a, w, cfg.tile),
+            MatvecKernel::V2 => self.matvec_decode_v2(a, w, cfg.tile),
+            MatvecKernel::V2Wg128 => self.matvec_decode_v2wg128(a, w, cfg.tile),
+            MatvecKernel::V2WgSg => self.matvec_decode_v2sg(a, w, cfg.tile),
+        }
+    }
+
+    /// Whether subgroup ops are available (the SUBGROUP feature was enabled on the device).
+    pub fn subgroups(&self) -> bool { self.subgroups }
+    /// Whether the tiled prefill GEMM compiled + validated on this backend (else prefill uses naive).
+    pub fn gemm_ok(&self) -> bool { self.gemm_ok.load(std::sync::atomic::Ordering::Relaxed) }
+
+    /// v2-wg128 with a subgroup reduction (needs the SUBGROUP feature). Same math; bench candidate.
+    pub fn matvec_decode_v2sg(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let t = tile.clamp(1, 8);
+        let cols_wg = (w.n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_TILED_V2_WG128_SG, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+
+    /// Explicit v2 decode (for validation) — same math as `matvec_decode` with LOGSCOPE_MATVEC_V2 set.
+    pub fn matvec_decode_v2(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let t = tile.max(1);
+        let cols_wg = (w.n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_TILED_V2, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+
+    /// Explicit v3 decode (vec4 128-bit wide loads). Requires k % 16 == 0 (always true for q8). Same math as
+    /// the others up to f32 reassociation. The bench compares this against v1/v2 to find the fastest on the
+    /// real GPU.
+    pub fn matvec_decode_v3(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        debug_assert_eq!(w.k % 16, 0, "v3 needs k % 16 == 0");
+        let out = self.alloc(1, w.n);
+        let t = tile.max(1);
+        let cols_wg = (w.n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_TILED_V3, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+
+    /// v2 with tile up to 16 (bigger acc/red). Same math; bench candidate vs v2@8.
+    pub fn matvec_decode_v2t16(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let t = tile.clamp(1, 16);
+        let cols_wg = (w.n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_TILED_V2_T16, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+
+    /// Explicit v1 decode (the original byte-per-thread kernel) — for honest A/B in the bench, since
+    /// `matvec_decode` no longer routes to it by default.
+    pub fn matvec_decode_v1(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
         let out = self.alloc(1, w.n);
         if tile > 1 {
-            let cols_wg = (w.n as u32).div_ceil(tile); // workgroups along the column axis
+            let cols_wg = (w.n as u32).div_ceil(tile);
             let gx = cols_wg.min(32768);
             let gy = cols_wg.div_ceil(gx);
             let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, tile, 0, 0];
@@ -913,6 +1101,18 @@ impl Gpu {
             let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
             self.dispatch(MATVEC_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         }
+        out
+    }
+
+    /// v2 with 128-thread workgroups (more k-parallelism per column). Same math; bench candidate.
+    pub fn matvec_decode_v2wg128(&self, a: &Tensor, w: &QWeight, tile: u32) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let t = tile.clamp(1, 8);
+        let cols_wg = (w.n as u32).div_ceil(t);
+        let gx = cols_wg.min(32768);
+        let gy = cols_wg.div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, t, 0, 0];
+        self.dispatch(MATVEC_Q8_0_TILED_V2_WG128, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
     /// Residual fold (m=1 decode): c = W·a + resid in one dispatch, folding the post-projection
@@ -938,15 +1138,27 @@ impl Gpu {
     pub fn matvec_tile(&self) -> u32 { self.decode_profile().tile }
     pub fn profile_forced(&self) -> bool { self.profile_forced }
     pub fn set_matvec_tile(&self, t: u32) { self.profile.store(profile_for_tile(t), std::sync::atomic::Ordering::Relaxed); }
+    /// Set the system profile from a PACKED (kernel, tile) config (what autotune_matvec returns) — matches
+    /// the closest DECODE_PROFILES entry so the global fallback uses the autotuned kernel, not just its tile.
+    pub fn set_matvec_cfg(&self, packed: u32) {
+        let want = DecodeConfig::unpack(packed);
+        let idx = DECODE_PROFILES.iter().position(|c| *c == want)
+            .or_else(|| DECODE_PROFILES.iter().position(|c| c.kernel == want.kernel && c.tile == want.tile))
+            .or_else(|| DECODE_PROFILES.iter().position(|c| c.tile == want.tile))
+            .unwrap_or(0);
+        self.profile.store(idx as u32, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// Sweep the KNOWN decode-profile matrix on a representative FFN-sized mat-vec and return the
     /// fastest profile's tile for THIS adapter. Frame-batched so per-dispatch GPU time accrues in one
     /// submit, median-of-reps to shrug off scheduler noise. Pure timing — every profile is
     /// output-equivalent (bit-exact for the tile dimension; see `--gate-matvec`), so a mis-timed pick
     /// can only cost speed, never correctness. Returns a tile value (semantic, survives matrix edits).
+    /// Autotune the decode mat-vec for a (k,n) shape: times every (kernel, tile) profile and returns the
+    /// fastest, PACKED (see DecodeConfig::pack). This is where the optimal kernel is discovered per platform.
     pub fn autotune_matvec(&self, k: usize, n: usize) -> u32 {
         use std::time::Instant;
-        // The best tile is set by k (activation-reuse) and kernel overhead, not by the output width n
+        // The best config is set by k (activation-reuse) and kernel overhead, not by the output width n
         // (as long as enough workgroups saturate the GPU), so probe at a CAPPED width — full-width probes
         // on a 14B's output (n=152064) cost seconds each and were the bulk of a ~3-minute load.
         let n = n.min(PROBE_N_CAP);
@@ -957,23 +1169,27 @@ impl Gpu {
         let qw = self.quantize_q8_resident(&w, n, k);
         let a = self.upload(&act, 1, k);
         let iters = 48usize; let reps = 5usize;
-        let mut best = (DECODE_PROFILES[0].tile, f64::MAX);
-        for cfg in DECODE_PROFILES {
-            let _ = self.download(&self.matvec_decode(&a, &qw, cfg.tile)); // warm pipeline
+        let mut best = (DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 4 }, f64::MAX);
+        for &cfg in DECODE_PROFILES {
+            // Subgroup kernel: auto-searched only once it PASSED the load-time self_check_sg() on this
+            // driver (sg_ok) — so a correct-subgroup GPU gets it automatically, a buggy one silently doesn't,
+            // and no manual opt-in is needed. (llvmpipe/GL has no subgroups, so this is simply skipped in CI.)
+            if cfg.kernel.needs_subgroups() && !self.sg_ok.load(std::sync::atomic::Ordering::Relaxed) { continue; }
+            let _ = self.download(&self.matvec_decode_cfg(&a, &qw, cfg)); // warm pipeline
             let mut times = Vec::with_capacity(reps);
             for _ in 0..reps {
                 self.begin_frame();
                 let mut last = self.alloc(1, n);
-                for _ in 0..iters { last = self.matvec_decode(&a, &qw, cfg.tile); }
+                for _ in 0..iters { last = self.matvec_decode_cfg(&a, &qw, cfg); }
                 let t0 = Instant::now();
                 let _ = self.download(&last); // flushes the frame (one submit) and syncs
                 times.push(t0.elapsed().as_secs_f64() / iters as f64);
             }
             times.sort_by(|x, y| x.partial_cmp(y).unwrap());
             let med = times[times.len() / 2];
-            if med < best.1 { best = (cfg.tile, med); }
+            if med < best.1 { best = (cfg, med); }
         }
-        best.0
+        best.0.pack()
     }
 
     /// Probe each DISTINCT (n,k) weight shape in a model and cache the best decode tile per shape, instead
@@ -991,23 +1207,34 @@ impl Gpu {
             if self.shape_tiles.read().unwrap().contains_key(&(n as u32, k as u32)) { continue; } // already cached
             if deadline.is_some_and(|d| std::time::Instant::now() >= d) { break; }              // time-boxed
             let t0 = std::time::Instant::now();
-            let tile = self.autotune_matvec(k, n); // warm + median-of-reps, reused from the global path
+            let packed = self.autotune_matvec(k, n); // packed (kernel,tile); reused from the global path
             let ms = t0.elapsed().as_secs_f32() * 1000.0;
-            self.shape_tiles.write().unwrap().insert((n as u32, k as u32), tile);
-            out.push((n, k, tile, ms));
+            self.shape_tiles.write().unwrap().insert((n as u32, k as u32), packed);
+            out.push((n, k, packed, ms));
         }
         out
     }
-    /// Manually pin the decode tile for one shape (override / testing). Clamped to the kernel's max.
+    /// Manually pin the decode config for one shape (override / testing). Stores a packed (kernel, tile);
+    /// a bare tile keeps the current default kernel (v2-wg128).
     pub fn set_shape_tile(&self, n: usize, k: usize, tile: u32) {
-        self.shape_tiles.write().unwrap().insert((n as u32, k as u32), tile.clamp(1, 8));
+        let cfg = DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: tile.clamp(1, 16) };
+        self.shape_tiles.write().unwrap().insert((n as u32, k as u32), cfg.pack());
     }
-    /// The decode tile for a given shape: env override wins (manual A/B), then the per-shape autotune
-    /// cache, then the global profile. Single map read on the hot path (writes happen only at load).
+    /// The decode CONFIG (kernel + tile) for a shape: env override wins (manual A/B), then the per-shape
+    /// autotune cache (packed), then the global profile. Single map read on the hot path.
+    pub fn decode_cfg_for(&self, n: usize, k: usize) -> DecodeConfig {
+        if let Some(t) = env_decode_tile() { return DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: t }; }
+        let cfg = if let Some(&p) = self.shape_tiles.read().unwrap().get(&(n as u32, k as u32)) { DecodeConfig::unpack(p) } else { self.decode_profile() };
+        // Never dispatch the subgroup kernel on a backend that didn't self-check it (no SUBGROUP feature, or
+        // it failed the check) — e.g. the default profile or a cache from another GPU. Downgrade to wg128.
+        if cfg.kernel.needs_subgroups() && !self.sg_ok.load(std::sync::atomic::Ordering::Relaxed) {
+            return DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: cfg.tile };
+        }
+        cfg
+    }
+    /// The decode tile for a shape (compat; prefer `decode_cfg_for`).
     pub fn decode_tile_for(&self, n: usize, k: usize) -> u32 {
-        if let Some(t) = env_decode_tile() { return t; }
-        if let Some(&t) = self.shape_tiles.read().unwrap().get(&(n as u32, k as u32)) { return t; }
-        self.decode_profile().tile
+        self.decode_cfg_for(n, k).tile
     }
     /// Distinct shapes worth tuning are read off a loaded model so the caller doesn't hand-enumerate them.
     pub fn model_decode_shapes(&self, m: &Model) -> Vec<(usize, usize)> {
@@ -1025,7 +1252,7 @@ impl Gpu {
         let dec = self.shape_tiles.read().unwrap();
         let gem = self.gemm_tiles.read().unwrap();
         let mut buf = Vec::with_capacity(8 + (dec.len() + gem.len()) * 12);
-        buf.extend_from_slice(&0x4C4154_31u32.to_le_bytes()); // "LAT1"
+        buf.extend_from_slice(&0x4C4154_35u32.to_le_bytes()); // "LAT5" (subgroup kernel now a candidate: re-tune)
         for map in [&*dec, &*gem] {
             buf.extend_from_slice(&(map.len() as u32).to_le_bytes());
             for (&(n, k), &t) in map.iter() { buf.extend_from_slice(&n.to_le_bytes()); buf.extend_from_slice(&k.to_le_bytes()); buf.extend_from_slice(&t.to_le_bytes()); }
@@ -1049,17 +1276,17 @@ impl Gpu {
             }
             o
         };
-        if rd(&buf, 0) == 0x4C4154_31 {
+        if rd(&buf, 0) == 0x4C4154_35 {
             let mut o = 4;
             let mut dec = self.shape_tiles.write().unwrap();
-            let n0 = dec.len(); o = read_section(&buf, o, &mut dec, 8); let dl = dec.len() - n0; drop(dec);
+            let n0 = dec.len(); o = read_section(&buf, o, &mut dec, u32::MAX); let dl = dec.len() - n0; drop(dec);
             let mut gem = self.gemm_tiles.write().unwrap();
             let g0 = gem.len(); read_section(&buf, o, &mut gem, 32); let gl = gem.len() - g0;
             Ok((dl, gl))
         } else {
-            let mut dec = self.shape_tiles.write().unwrap();
-            let n0 = dec.len(); read_section(&buf, 0, &mut dec, 8);
-            Ok((dec.len() - n0, 0))
+            // Not the current magic (e.g. a v1-tuned LAT1 file): ignore it so the tiles are re-probed with
+            // the current default kernel, rather than reusing stale tile choices from a different kernel.
+            Ok((0, 0))
         }
     }
 
@@ -1068,16 +1295,22 @@ impl Gpu {
     /// device rather than failing pipeline creation.
     pub fn gemm_tile_candidates(&self) -> Vec<u32> {
         let l = self.device.limits();
-        [8u32, 16, 32].into_iter()
+        let base: Vec<u32> = [8u32, 16, 32].into_iter()
             .filter(|&t| t * t <= l.max_compute_invocations_per_workgroup && t <= l.max_compute_workgroup_size_x && t <= l.max_compute_workgroup_size_y)
-            .collect()
+            .collect();
+        // Once the load probe has run, restrict to tiles that ACTUALLY compiled here (the limit query can
+        // over-report — GL accepts the 32×32 limit but rejects the shader). Empty valid list = pre-probe.
+        let valid = self.valid_gemm_tiles.read().unwrap();
+        if valid.is_empty() { base } else { base.into_iter().filter(|t| valid.contains(t)).collect() }
     }
     /// The prefill GEMM tile for a shape: env override → autotuned per-shape cache → 16 (the prior fixed
     /// default). Clamped to a candidate the device supports.
     pub fn gemm_tile_for(&self, n: usize, k: usize) -> u32 {
         if let Some(t) = env_gemm_tile() { return t; }
-        if let Some(&t) = self.gemm_tiles.read().unwrap().get(&(n as u32, k as u32)) { return t; }
         let cands = self.gemm_tile_candidates();
+        if let Some(&t) = self.gemm_tiles.read().unwrap().get(&(n as u32, k as u32)) {
+            if cands.contains(&t) { return t; } // ignore a stale cached tile that doesn't compile here
+        }
         if cands.contains(&16) { 16 } else { cands.last().copied().unwrap_or(16) }
     }
     /// Manually pin the prefill GEMM tile for one shape (override / testing).
@@ -1122,12 +1355,19 @@ impl Gpu {
 
     pub fn linear_q8_0_t(&self, a: &Tensor, w: &QWeight, m: usize) -> Tensor {
         if m == 1 {
-            // tile: env override (manual A/B) → per-shape autotune cache → global profile.
-            return self.matvec_decode(a, w, self.decode_tile_for(w.n, w.k));
+            // decode: env override (manual A/B) → per-shape autotuned (kernel, tile) → global profile.
+            // The KERNEL is chosen at runtime per shape+platform, not hardcoded (matvec_decode_cfg dispatches).
+            if std::env::var_os("LOGSCOPE_MATVEC_V1").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V2").is_some() || std::env::var_os("LOGSCOPE_MATVEC_V3").is_some() {
+                return self.matvec_decode(a, w, self.decode_tile_for(w.n, w.k)); // env forces a kernel
+            }
+            return self.matvec_decode_cfg(a, w, self.decode_cfg_for(w.n, w.k));
         }
-        if m > 8 && env_prefill_tiled() { return self.linear_q8_0_tiled_t(a, w, m); }
-        let out = self.alloc(m, w.n);
+        // prefill (m>1): the shared-memory-TILED GEMM is the default (validated bit-exact-to-tol via
+        // --gate-gemm-spec; it's the classic compute-bound win over the naive 8x8 kernel that made the
+        // first-token latency huge). Escapes: LOGSCOPE_PREFILL_NAIVE forces the old path; LOGSCOPE_GEMM_TILE
+        // pins the tile. Small batches (m≤8, spec-decode verify) stay on the coalesced mat-vec.
         if m <= 8 {
+            let out = self.alloc(m, w.n);
             // small batch (speculative verify block, batched decode at small N): coalesced
             // mat-vec that reads each weight once and accumulates all m rows — memory-bound cost
             // stays near the m=1 pass instead of riding the strided GEMM.
@@ -1135,11 +1375,34 @@ impl Gpu {
             let gy = (w.n as u32).div_ceil(gx);
             let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
             self.dispatch(MATVEC_SMALL_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
-        } else {
-            let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32];
-            self.dispatch(LINEAR_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims),
-                ((w.n as u32).div_ceil(8), (m as u32).div_ceil(8), 1));
+            return out;
         }
+        if std::env::var_os("LOGSCOPE_PREFILL_NAIVE").is_some() { return self.linear_q8_0_naive(a, w, m); }
+        // register-blocked GEMM is the DEFAULT prefill kernel: measured 2795 GFLOP/s on M2 (2.8× the
+        // override-tiled kernel, 5.6× naive), and it has no override constants so it compiles on every
+        // backend (GL included) — no gemm_ok gate needed. Escape to the tiled kernel with LOGSCOPE_PREFILL_TILED.
+        if std::env::var_os("LOGSCOPE_PREFILL_TILED").is_some() && self.gemm_ok() {
+            return self.linear_q8_0_gemm(a, w, m, self.gemm_tile_for(w.n, w.k));
+        }
+        self.linear_q8_0_gemm_rb(a, w, m)
+    }
+
+    /// Register-blocked q8 prefill GEMM (4×4 outputs per thread). Fixed 64×64 blocks; grid covers m,n.
+    pub fn linear_q8_0_gemm_rb(&self, a: &Tensor, w: &QWeight, m: usize) -> Tensor {
+        let out = self.alloc(m, w.n);
+        let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32];
+        let gx = (w.n as u32).div_ceil(64);
+        let gy = (m as u32).div_ceil(64);
+        self.dispatch(LINEAR_Q8_0_RB, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+
+    /// The naive (un-tiled) 8x8 prefill GEMM — kept as the fallback/reference and for A/B benching.
+    pub fn linear_q8_0_naive(&self, a: &Tensor, w: &QWeight, m: usize) -> Tensor {
+        let out = self.alloc(m, w.n);
+        let dims = [m as u32, w.n as u32, w.k as u32, (w.k / 32) as u32];
+        self.dispatch(LINEAR_Q8_0, &[a, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims),
+            ((w.n as u32).div_ceil(8), (m as u32).div_ceil(8), 1));
         out
     }
     /// Shared-memory-tiled prefill GEMM, specialized to a workgroup `tile` via an override constant.
@@ -1583,6 +1846,68 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if(row<d.m && col<d.n){ c[row*d.n+col]=acc; }
 }"#;
 
+// Register-blocked q8 prefill GEMM: each thread computes a 4×4 micro-tile of C (16 outputs), so each value
+// loaded from the shared A/W tiles feeds 4 MACs instead of 1 — the arithmetic-intensity lever that takes a
+// GEMM from single-digit % of peak toward tens of % ON NVIDIA/AMD. MEASURED RESULT: on the M2 Ultra (AGX)
+// it LOST badly — 170 GFLOP/s vs the many-thread tiled@32's 999 — because AGX hides latency with high
+// thread counts (tiled@32 = 1024 threads/wg), not per-thread ILP (RB = 256 threads, 24 live registers). So
+// tiled stays the prefill default; RB is kept as a bench/portability option (it may still win on discrete
+// GPUs that reward register blocking, which is why it's an autotune-eligible candidate elsewhere).
+// Fixed params (no `override`) so it compiles on GL too and stays CI-validatable.
+const LINEAR_Q8_0_RB: &str = r#"
+const BM:u32=64u; const BN:u32=64u; const BK:u32=16u;
+struct D { m:u32,n:u32,k:u32,kb:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> As: array<f32,1024>; // BM*BK
+var<workgroup> Ws: array<f32,1024>; // BK*BN
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let brow=wg.y*BM; let bcol=wg.x*BN;
+  let tx=lid.x; let ty=lid.y; let tid=ty*16u+tx;
+  // 4×4 register tile as four vec4 rows — NAMED (constant-indexed) so they stay in registers, not spilled
+  // local memory (a dynamically-indexed array<f32,16> would spill and kill the whole point of blocking).
+  var acc0=vec4<f32>(0.0,0.0,0.0,0.0); var acc1=vec4<f32>(0.0,0.0,0.0,0.0);
+  var acc2=vec4<f32>(0.0,0.0,0.0,0.0); var acc3=vec4<f32>(0.0,0.0,0.0,0.0);
+  let ntiles=(d.k+BK-1u)/BK;
+  for(var t=0u;t<ntiles;t=t+1u){
+    let kbase=t*BK;
+    for(var i=tid;i<1024u;i=i+256u){
+      let r=i/BK; let kk=i%BK; let gk=kbase+kk;
+      As[i]=select(0.0, a[(brow+r)*d.k+gk], (brow+r)<d.m && gk<d.k);
+    }
+    for(var i=tid;i<1024u;i=i+256u){
+      let kk=i/BN; let cc=i%BN; let gk=kbase+kk; let gc=bcol+cc;
+      var wv=0.0;
+      if(gc<d.n && gk<d.k){
+        let scale=qs[gc*d.kb+(gk/32u)];
+        let word=qw[gc*(d.k/4u)+(gk/4u)];
+        let ub=extractBits(word,(gk%4u)*8u,8u);
+        let q=select(i32(ub), i32(ub)-256, ub>=128u);
+        wv=scale*f32(q);
+      }
+      Ws[i]=wv;
+    }
+    workgroupBarrier();
+    for(var kk=0u;kk<BK;kk=kk+1u){
+      let wb=kk*BN+tx*4u;
+      let br=vec4<f32>(Ws[wb],Ws[wb+1u],Ws[wb+2u],Ws[wb+3u]);
+      let ab=ty*4u;
+      let a0=As[(ab+0u)*BK+kk]; let a1=As[(ab+1u)*BK+kk]; let a2=As[(ab+2u)*BK+kk]; let a3=As[(ab+3u)*BK+kk];
+      acc0=acc0+a0*br; acc1=acc1+a1*br; acc2=acc2+a2*br; acc3=acc3+a3*br;
+    }
+    workgroupBarrier();
+  }
+  let r0=brow+ty*4u; let c0=bcol+tx*4u;
+  if(r0<d.m){ if(c0<d.n){c[r0*d.n+c0]=acc0.x;} if(c0+1u<d.n){c[r0*d.n+c0+1u]=acc0.y;} if(c0+2u<d.n){c[r0*d.n+c0+2u]=acc0.z;} if(c0+3u<d.n){c[r0*d.n+c0+3u]=acc0.w;} }
+  if(r0+1u<d.m){ let rr=r0+1u; if(c0<d.n){c[rr*d.n+c0]=acc1.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc1.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc1.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc1.w;} }
+  if(r0+2u<d.m){ let rr=r0+2u; if(c0<d.n){c[rr*d.n+c0]=acc2.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc2.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc2.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc2.w;} }
+  if(r0+3u<d.m){ let rr=r0+3u; if(c0<d.n){c[rr*d.n+c0]=acc3.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc3.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc3.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc3.w;} }
+}"#;
+
 const MATVEC_Q4: &str = r#"
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -1770,6 +2095,262 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       }
     }
     kk=kk+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
+
+// V3 decode mat-vec: 128-bit (vec4<u32>) wide loads — each thread pulls 4 words (16 q8 values) per memory
+// transaction instead of one. The profile says decode is latency/occupancy-bound (≈6% BW, ≈1% ALU — the
+// GPU idles on memory latency), and wider loads put more bytes in flight per request, the textbook fix.
+// Requires k % 16 == 0 (always true for q8: k is a multiple of the 32-wide block). Same math as the others;
+// results differ only by f32 reassociation.
+const MATVEC_Q8_0_TILED_V3: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw4: array<vec4<u32>>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words4=d.k/16u;               // vec4<u32> per column-row (16 q8 values each)
+  var w=tid;
+  loop {
+    if(w>=words4){break;}
+    let kk0=w*16u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let v=qw4[col*words4+w];     // ONE 128-bit load = 16 q8 values
+        let base=col*d.kb;
+        for(var jj=0u;jj<4u;jj=jj+1u){
+          let word=v[jj];
+          let kkw=kk0+jj*4u;
+          let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+          let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+          let q0=select(i32(u0),i32(u0)-256,u0>=128u);
+          let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+          let q2=select(i32(u2),i32(u2)-256,u2>=128u);
+          let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+          acc[ci]=acc[ci]
+            + a[kkw]*qs[base+kkw/32u]*f32(q0)
+            + a[kkw+1u]*qs[base+(kkw+1u)/32u]*f32(q1)
+            + a[kkw+2u]*qs[base+(kkw+2u)/32u]*f32(q2)
+            + a[kkw+3u]*qs[base+(kkw+3u)/32u]*f32(q3);
+        }
+      }
+    }
+    w=w+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
+
+// V2-T16: v2 with acc/red sized for tile up to 16 (more columns share each weight-word read). Costs 4 KiB
+// workgroup memory (red[16*64]) — may lower occupancy, so it's a bench candidate vs v2@8, not a given win.
+const MATVEC_Q8_0_TILED_V2_T16: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤16) x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,16>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
+
+// V2-WG128: v2 with 128-thread workgroups — more threads per column split the k-reduction, exposing more
+// memory parallelism per workgroup to hide latency (at the cost of a 7-step reduction and fewer workgroups).
+const MATVEC_Q8_0_TILED_V2_WG128: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]; } } }
+}"#;
+
+// V2-WG128-SG: v2-wg128 with a SUBGROUP reduction. subgroupAdd collapses each 32-lane subgroup in one op
+// (no barriers), and only the per-subgroup partials (nsg × tile) touch workgroup memory — vs the full
+// red[tile*128] array + 7-step barrier tree. That frees shared memory and removes barriers, lifting
+// occupancy — the diagnosed decode bottleneck. Requires the SUBGROUP device feature (Gpu.subgroups).
+const MATVEC_Q8_0_TILED_V2_WG128_SG: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> part: array<f32,64>; // nsg(≤8) x tile(≤8) partials — tiny vs red[tile*128]
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(subgroup_invocation_id) sglid:u32, @builtin(subgroup_size) sgsz:u32){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  let sgid=tid/sgsz;            // which subgroup
+  let nsg=128u/sgsz;           // subgroups per workgroup (4 at size 32)
+  for(var ci=0u;ci<d.tile;ci=ci+1u){
+    let s=subgroupAdd(acc[ci]); // reduce this subgroup's 32 lanes in one op, no barrier
+    if(sglid==0u){ part[sgid*d.tile+ci]=s; }
+  }
+  workgroupBarrier();
+  if(tid==0u){
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      var sum=0.0;
+      for(var g=0u;g<nsg;g=g+1u){ sum=sum+part[g*d.tile+ci]; }
+      let col=col0+ci; if(col<d.n){ c[col]=sum; }
+    }
+  }
+}"#;
+
+// V2 decode mat-vec: each thread owns WHOLE 32-bit weight words (4 quantized values), reading each word
+// exactly once and using all four bytes — vs the original, where 4 threads read the SAME word (widx=kk/4)
+// and extract one byte each. On drivers that don't coalesce same-address subgroup loads (a real risk on
+// Asahi/AGX), that was up to 4× redundant weight traffic — the leading suspect for the decode running at
+// ~6% of memory bandwidth. Fully coalesced (64 threads → 64 consecutive words). Bit-results differ from the
+// original only by f32 reassociation (4-per-word accumulation order), far below q8 quant error.
+const MATVEC_Q8_0_TILED_V2: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // tile(≤8) x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;             // 32-bit words per column-row (4 q8 values each)
+  var w=tid;                    // each thread owns whole words → one global read per word, no redundancy
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u; // block index per value
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];         // ONE read, all four bytes consumed
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u);
+        let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u);
+        let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]
+          + a0*qs[base+b0]*f32(q0)
+          + a1*qs[base+b1]*f32(q1)
+          + a2*qs[base+b2]*f32(q2)
+          + a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+64u;
   }
   for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
   workgroupBarrier();
@@ -2133,6 +2714,13 @@ impl Gpu {
     }
     pub fn load_gguf_opt(&self, bytes: &[u8], q: bool) -> Result<Model, String> {
         let g = gguf::parse(bytes)?;
+        // Guard the LLM path: a diffusion checkpoint (z-image, flux, SD) or an mmproj has no tokenizer and
+        // would die deep in tokenizer loading with a cryptic error. Classify up front and refuse with a
+        // message that points at the right subsystem (the image pipeline) instead.
+        let kind = crate::model_kind::classify(&g);
+        if !kind.is_llm() {
+            return Err(format!("not a language model: {}", kind.guidance()));
+        }
         // llama-family + Qwen2. Qwen2's only delta is a bias add on Q/K/V (loaded below, applied in
         // Lin::apply) and reading qwen2.* metadata (incl. its RoPE θ); everything else is shared. Other
         // arches (gemma2 geglu/soft-cap, phi3) would produce WRONG outputs, so refuse with guidance.
@@ -2164,16 +2752,29 @@ impl Gpu {
             if let Some(budget) = store::resident_budget_bytes() {
                 let shape = crate::memplan::ModelShape { d, ffn: h, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
                 if q {
-                    use crate::memplan::{Fit, Residency, gib, plan};
-                    match plan(&shape, budget, 4096, 2, 256 * (1 << 20)) {
+                    use crate::memplan::{Fit, Residency, gib, plan, gpu_buffer_budget};
+                    // Weights live in GPU BUFFERS, whose total is capped far below RAM on unified-memory
+                    // drivers (Asahi/Honeykrisp). Plan against that cap, not RAM — otherwise int8 for a 70B
+                    // (~70 GiB) "fits" the ~170 GiB RAM budget and then the driver refuses the allocation
+                    // mid-upload ("Failed to allocate BO VMA"). The cap makes it pick q4 (or refuse) up front.
+                    let gpu_budget = gpu_buffer_budget(budget);
+                    match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
                         Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
                             auto_q4 = true;
-                            eprintln!("loader: int8 won't fit ~{:.1} GiB budget → auto-selecting q4-resident (~{:.1} GiB)", gib(budget), gib(weight_bytes));
+                            eprintln!("loader: int8 won't fit the ~{:.1} GiB GPU-buffer budget → auto-selecting q4-resident (~{:.1} GiB)", gib(gpu_budget), gib(weight_bytes));
                         }
                         Fit::Resident { fmt: Residency::F32, .. } => {}
-                        Fit::Streaming { per_layer_bytes, .. } => return Err(format!("model won't fit even at q4 in the ~{:.1} GiB budget (largest layer ~{:.2} GiB); layer streaming (not yet implemented) or the llama.cpp backend is required (set LOGSCOPE_MAX_RESIDENT_GB to override).", gib(budget), gib(per_layer_bytes))),
-                        Fit::TooBig { min_needed } => return Err(format!("model won't fit at any quant — needs ~{:.1} GiB, only ~{:.1} GiB available (set LOGSCOPE_MAX_RESIDENT_GB to override).", gib(min_needed), gib(budget))),
+                        Fit::Streaming { .. } => {
+                            // report what streaming WOULD do so it's actionable, even though execution isn't wired
+                            let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s); streaming isn't implemented yet, use the llama.cpp backend or raise LOGSCOPE_MAX_GPU_GB.",
+                                    gib(gpu_budget), p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
+                                None => format!("won't fit even a streaming ring in ~{:.1} GiB; use the llama.cpp backend.", gib(gpu_budget)),
+                            };
+                            return Err(msg);
+                        }
+                        Fit::TooBig { min_needed } => return Err(format!("model won't fit at any quant — needs ~{:.1} GiB, GPU-buffer budget is ~{:.1} GiB (raise LOGSCOPE_MAX_GPU_GB to override).", gib(min_needed), gib(gpu_budget))),
                     }
                 } else {
                     use crate::memplan::{gib, kv_cache_bytes, resident_weight_bytes, Residency};
@@ -4386,5 +4987,33 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
         if let Some((b, _)) = self.warm.iter().find(|(b, _)| b.id == id) { return Some(&b.emitted); }
         if let Some(b) = self.done.iter().find(|b| b.id == id) { return Some(&b.emitted); }
         None
+    }
+}
+
+#[cfg(test)]
+mod decode_cfg_tests {
+    use super::*;
+    #[test]
+    fn decode_config_pack_roundtrips() {
+        for kernel in [MatvecKernel::V1, MatvecKernel::V2, MatvecKernel::V2Wg128] {
+            for tile in [1u32, 2, 4, 8, 16] {
+                let c = DecodeConfig { kernel, tile };
+                let u = DecodeConfig::unpack(c.pack());
+                assert_eq!(u.kernel, kernel);
+                assert_eq!(u.tile, tile);
+            }
+        }
+        // legacy bare tiles (no kernel bits) decode as V2 (the pre-wg128 default), tile preserved
+        assert_eq!(DecodeConfig::unpack(4), DecodeConfig { kernel: MatvecKernel::V2, tile: 4 });
+        // every profile in the search matrix round-trips
+        for &cfg in DECODE_PROFILES { assert_eq!(DecodeConfig::unpack(cfg.pack()), cfg); }
+    }
+
+    #[test]
+    fn subgroup_kernel_is_valid_wgsl() {
+        // naga must accept the subgroup reduction shader (enable subgroups; subgroupAdd; subgroup builtins).
+        // This proves it COMPILES even though llvmpipe here can't RUN subgroups — the M2 validates results.
+        let (ok, msg) = crate::wgsl_validate::check_wgsl(MATVEC_Q8_0_TILED_V2_WG128_SG);
+        assert!(ok, "subgroup kernel failed naga validation:\n{msg}");
     }
 }
