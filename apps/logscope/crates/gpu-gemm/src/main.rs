@@ -809,8 +809,124 @@ fn main() {
             let pass = worst == 0.0;
             ok &= pass;
             println!("  [{}] {name:>12} k={k} n={n}: tiled vs untiled max|Δ|={worst:.3e}", if pass { "\u{2713}" } else { "\u{2717} FAIL" });
+            // V2 (one-word-per-thread) is NOT bit-identical — it reassociates the accumulation (4 values per
+            // word) — but must match within f32 reassociation error, which is far below q8 quant error.
+            let mut worst_v2 = 0.0f32;
+            let scale = base.iter().map(|x| x.abs()).fold(0.0, f32::max).max(1e-6);
+            for tile in [1u32, 2, 4, 8] {
+                let t = gpu.download(&gpu.matvec_decode_v2(&a, &qw, tile));
+                let d = base.iter().zip(&t).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                worst_v2 = worst_v2.max(d);
+            }
+            let rel = worst_v2 / scale;
+            let pass_v2 = rel < 1e-3; // generous: reassociation only, well under q8 error (~1/127)
+            ok &= pass_v2;
+            println!("  [{}] {name:>12} k={k} n={n}: V2 vs untiled max|Δ|={worst_v2:.3e} (rel {rel:.1e})", if pass_v2 { "\u{2713}" } else { "\u{2717} FAIL" });
+            // V3 (vec4 wide loads) — also reassociation-only; needs k%16==0 (true here).
+            let mut worst_v3 = 0.0f32;
+            for tile in [1u32, 2, 4, 8] {
+                let t = gpu.download(&gpu.matvec_decode_v3(&a, &qw, tile));
+                let d = base.iter().zip(&t).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                worst_v3 = worst_v3.max(d);
+            }
+            let rel3 = worst_v3 / scale;
+            let pass_v3 = rel3 < 1e-3;
+            ok &= pass_v3;
+            println!("  [{}] {name:>12} k={k} n={n}: V3 vs untiled max|Δ|={worst_v3:.3e} (rel {rel3:.1e})", if pass_v3 { "\u{2713}" } else { "\u{2717} FAIL" });
+            // V2-T16 (tile≤16) and V2-WG128 (128-thread) — same math, reassociation-only.
+            let mut worst_t16 = 0.0f32;
+            for tile in [8u32, 16] { let t = gpu.download(&gpu.matvec_decode_v2t16(&a, &qw, tile)); worst_t16 = worst_t16.max(base.iter().zip(&t).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)); }
+            let mut worst_wg = 0.0f32;
+            for tile in [1u32, 4, 8] { let t = gpu.download(&gpu.matvec_decode_v2wg128(&a, &qw, tile)); worst_wg = worst_wg.max(base.iter().zip(&t).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)); }
+            let (r16, rwg) = (worst_t16 / scale, worst_wg / scale);
+            let (p16, pwg) = (r16 < 1e-3, rwg < 1e-3);
+            ok &= p16 & pwg;
+            println!("  [{}] {name:>12} k={k} n={n}: V2-T16 rel {r16:.1e} · V2-WG128 rel {rwg:.1e}", if p16 && pwg { "\u{2713}" } else { "\u{2717} FAIL" });
+            if gpu.subgroups() {
+                let mut worst_sg = 0.0f32;
+                for tile in [1u32, 4, 8] { let t = gpu.download(&gpu.matvec_decode_v2sg(&a, &qw, tile)); worst_sg = worst_sg.max(base.iter().zip(&t).map(|(x,y)|(x-y).abs()).fold(0.0,f32::max)); }
+                let rsg = worst_sg / scale; let psg = rsg < 1e-3; ok &= psg;
+                println!("  [{}] {name:>12} k={k} n={n}: V2-WG128-SG (subgroup) rel {rsg:.1e}", if psg { "\u{2713}" } else { "\u{2717} FAIL" });
+            } else {
+                println!("  [·] {name:>12} k={k} n={n}: V2-WG128-SG skipped (no SUBGROUP feature on {})", gpu.adapter_name);
+            }
         }
-        println!("gate-matvec: {}", if ok { "tiled mat-vec is bit-identical to untiled \u{2713}" } else { "FAIL \u{2717}" });
+        println!("gate-matvec: {}", if ok { "all decode variants match the reference \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--bench-matvec") {
+        // Time each decode variant at a big FFN shape to find the fastest ON THIS GPU. The decode is
+        // latency/occupancy-bound (~6% BW on the M2 Ultra), so this sweep answers which memory strategy —
+        // byte-per-thread (v1), word-per-thread (v2), or vec4 wide loads (v3) — actually wins on Honeykrisp.
+        use gpu_kernels::Gpu;
+        let gpu = Gpu::new();
+        eprintln!("bench-matvec: adapter = {}", gpu.adapter_name);
+        let mut rng = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let (k, n) = (8192usize, 8192usize); // a representative large FFN/attention projection
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+        let qw = gpu.quantize_q8_resident(&w, n, k);
+        let a = gpu.upload(&act, 1, k);
+        let bytes = (n * k) as f64; // q8: 1 byte/weight read once
+        let iters = 200u32;
+        // variants: (label, closure, tile). tile from the per-shape sweep of what each supports.
+        let run = |label: &str, f: &dyn Fn() -> gpu_kernels::Tensor| {
+            let _ = gpu.download(&f()); // warm
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters { let _ = f(); }
+            let _ = gpu.download(&f()); // fence the last
+            let secs = t0.elapsed().as_secs_f64();
+            let gibs = (bytes * iters as f64) / (1u64 << 30) as f64 / secs;
+            println!("  {label:>16}: {:.3} ms/call · {:.1} GiB/s", secs / iters as f64 * 1000.0, gibs);
+        };
+        for tile in [1u32, 2, 4, 8] {
+            println!("— tile {tile} —");
+            run(&format!("v1 (byte/thd) t{tile}"), &|| gpu.matvec_decode_v1(&a, &qw, tile));
+            run(&format!("v2 (word/thd) t{tile}"), &|| gpu.matvec_decode_v2(&a, &qw, tile));
+            run(&format!("v3 (vec4)     t{tile}"), &|| gpu.matvec_decode_v3(&a, &qw, tile));
+            run(&format!("v2-wg128      t{tile}"), &|| gpu.matvec_decode_v2wg128(&a, &qw, tile));
+            if gpu.subgroups() { run(&format!("v2-wg128-sg   t{tile}"), &|| gpu.matvec_decode_v2sg(&a, &qw, tile)); }
+        }
+        if !gpu.subgroups() { println!("(v2-wg128-sg skipped — no SUBGROUP feature on this adapter)"); }
+        println!("— tile 16 (v2-t16 only; others cap at 8) —");
+        run("v2-t16 t8", &|| gpu.matvec_decode_v2t16(&a, &qw, 8));
+        run("v2-t16 t16", &|| gpu.matvec_decode_v2t16(&a, &qw, 16));
+        println!("bench-matvec: higher GiB/s = faster decode. Peak is ~800 GB/s; the winner's %-of-peak is the ceiling for this kernel family.");
+        return;
+    }
+    if args.iter().any(|a| a == "--bench-gemm") {
+        // Prefill is a compute-bound GEMM (m prompt tokens × k × n). Compare the naive 8x8 kernel (the old
+        // default that made first-token latency huge) against the shared-memory-tiled GEMM across tiles, at
+        // a realistic prefill shape. Reports GFLOP/s — the tiled kernel should win by multiples.
+        use gpu_kernels::Gpu;
+        let gpu = Gpu::new();
+        eprintln!("bench-gemm: adapter = {}", gpu.adapter_name);
+        let mut rng = 0xBEEF_1234_5678_9abcu64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let (m, k, n) = (512usize, 8192usize, 8192usize); // ~a 512-token prefill through a big FFN
+        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+        let act: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        let qw = gpu.quantize_q8_resident(&w, n, k);
+        let a = gpu.upload(&act, m, k);
+        let flop = 2.0 * m as f64 * k as f64 * n as f64; // MACs ×2
+        let iters = 30u32;
+        let run = |label: &str, f: &dyn Fn() -> gpu_kernels::Tensor| {
+            let _ = gpu.download(&f());
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters { let _ = f(); }
+            let _ = gpu.download(&f());
+            let secs = t0.elapsed().as_secs_f64();
+            println!("  {label:>16}: {:.2} ms/call · {:.0} GFLOP/s", secs / iters as f64 * 1000.0, (flop * iters as f64) / secs / 1e9);
+        };
+        run("naive 8x8", &|| gpu.linear_q8_0_naive(&a, &qw, m));
+        run("reg-blocked 4x4", &|| gpu.linear_q8_0_gemm_rb(&a, &qw, m));
+        if gpu.gemm_ok() {
+            for t in gpu.gemm_tile_candidates() { run(&format!("tiled t{t}"), &|| gpu.linear_q8_0_gemm(&a, &qw, m, t)); }
+        } else {
+            println!("  (override-tiled GEMM unavailable on this backend — {} — reg-blocked + naive still run)", gpu.adapter_name);
+        }
+        println!("bench-gemm: higher GFLOP/s = faster prefill (lower first-token latency). M2 Ultra fp32 peak ~27 TFLOP/s.");
         return;
     }
     if args.iter().any(|a| a == "--gate-vit-block") {
@@ -1006,6 +1122,10 @@ fn main() {
             }
             ck(&format!("GEMM all tiles match naive within tol [{m}×{n}×{k}] (max|Δ|={max_naive:.2e})"), max_naive < 1e-2);
             ck(&format!("GEMM tiles {cands:?} BIT-EXACT to each other [{m}×{n}×{k}]"), tiles_match);
+            // register-blocked GEMM (4×4 per thread) must also match naive within tol (reassociation)
+            let rb = gpu.download(&gpu.linear_q8_0_gemm_rb(&at, &qw, m));
+            let rb_d = naive.iter().zip(&rb).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            ck(&format!("GEMM reg-blocked matches naive [{m}×{n}×{k}] (max|Δ|={rb_d:.2e})"), rb_d < 1e-2);
         }
 
         // autotune populates the per-shape GEMM cache, and the lookup returns a supported tile

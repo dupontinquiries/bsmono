@@ -19,5 +19,27 @@ path = "src/serve.rs"
 [dependencies]
 memmap2 = "0.9"  # mmap GGUFs (big-model loading) — scoped infra dep, not RAM-loading 40GB files
 wgpu = "29"
+naga = "29"  # in-process WGSL validation (the shader fitness gate) — pure Rust, no GPU
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+
+# Optional: UNSAFE zero-copy weight residency (import mmap'd GGUF pages as GPU memory via
+# VK_EXT_external_memory_host). Behind a feature so the default upload path is untouched.
+ash = { version = "0.38", optional = true }
+
+[[bin]]
+name = "zerocopy-probe"
+path = "src/bin/zerocopy-probe.rs"
+required-features = ["zerocopy"]
+
+[[bin]]
+name = "caps-probe"
+path = "src/bin/caps-probe.rs"
+
+[features]
+# scoped experiment: does NOT wire into the live loader — a self-contained import path + probe you can
+# compile and run on the M2 to see whether Honeykrisp supports external-memory-host import at all.
+zerocopy = ["dep:ash", "wgpu/vulkan"]
+# sparse residency: one giant buffer backed by physical blocks via vkQueueBindSparse (the arena's
+# architectural replacement). Gated like zerocopy — pure planner is always on; the binder needs this.
+sparse = ["dep:ash", "wgpu/vulkan"]
