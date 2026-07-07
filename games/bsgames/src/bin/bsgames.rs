@@ -1,15 +1,11 @@
 #[cfg(feature = "app")]
 fn main() -> eframe::Result<()> {
-    use netcode::microdht::{MicroDht, NodeId};
     use netcode::profile::Profile;
-    use netcode::store::{MicroDhtStore, ProfileService};
+    use netcode::store::{ProfileService, SnapcoreStore};
 
-    // identity + LAN service (OpenDHT primary swaps in behind the feature later)
+    // identity + snapcore-DHT service (OpenDHT primary swaps into the first slot behind its feature)
     let me = Profile::new("me@local", whoami_name());
-    let svc = ProfileService::new(
-        MicroDhtStore::new(MicroDht::new(NodeId::from_key("primary"), 20)),
-        MicroDhtStore::new(MicroDht::new(NodeId::from_key(&me.id), 20)),
-    );
+    let svc = ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new());
     let mut centre = bsgames::ui::GameCentre::new(me, svc);
 
     eframe::run_native(
@@ -26,15 +22,11 @@ fn whoami_name() -> String {
 
 #[cfg(feature = "app")]
 fn dummy() -> bsgames::ui::GameCentre {
-    use netcode::microdht::{MicroDht, NodeId};
     use netcode::profile::Profile;
-    use netcode::store::{MicroDhtStore, ProfileService};
+    use netcode::store::{ProfileService, SnapcoreStore};
     bsgames::ui::GameCentre::new(
         Profile::new("x", "x"),
-        ProfileService::new(
-            MicroDhtStore::new(MicroDht::new(NodeId::from_key("a"), 20)),
-            MicroDhtStore::new(MicroDht::new(NodeId::from_key("b"), 20)),
-        ),
+        ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new()),
     )
 }
 
