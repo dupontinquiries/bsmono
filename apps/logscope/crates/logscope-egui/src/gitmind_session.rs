@@ -5,7 +5,7 @@
 //!
 //! Reuses the fleet's own pieces: `sandbox::copy_tree` (the tested mirror that skips `.git`/`target`)
 //! and plain `git` for the commit (the same porcelain gitmind's GitCli drives).
-use crate::sandbox::copy_tree;
+use crate::mount::{self, Workspace};
 use std::path::{Path, PathBuf};
 
 /// A `.gitmind` project is marked by `.gitmind/config.toml` carrying a `[gitmind]` section.
@@ -15,12 +15,19 @@ pub fn is_gitmind_project(project: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// A loaded work session: the original project, the session name, and the `/tmp` copy to edit.
+/// A loaded work session: the original project, the session name, and the isolated `/tmp` scratch
+/// (a `mount::Workspace` — mirrored with a fresh git baseline, so a session can commit/diff there).
 #[derive(Debug, Clone)]
 pub struct Session {
     pub project: PathBuf,
     pub name: String,
-    pub work_dir: PathBuf,
+    pub ws: Workspace,
+}
+impl Session {
+    /// The scratch directory the session edits.
+    pub fn work_dir(&self) -> &Path {
+        &self.ws.dir
+    }
 }
 
 /// Filesystem-safe form of a session name for a directory.
@@ -35,19 +42,17 @@ pub fn commit_message(session: &str) -> String {
     format!("logscope session: {session}")
 }
 
-/// Load: verify it's a `.gitmind` project and mirror it into `tmp_root/<session>` (skipping
-/// `.git`/`target`, so the copy is clean working files).
+/// Load: verify it's a `.gitmind` project, then isolate it into `tmp_root/<session>/…` via
+/// `mount::isolate` (the fleet's tested mirror-with-git-baseline — no second implementation).
 pub fn load_gitmind(project: &Path, session: &str, tmp_root: &Path) -> Result<Session, String> {
     if !is_gitmind_project(project) {
         return Err(format!("{} is not a .gitmind project (no .gitmind/config.toml)", project.display()));
     }
-    let work_dir = tmp_root.join(sanitize(session));
-    if work_dir.exists() {
-        std::fs::remove_dir_all(&work_dir).map_err(|e| e.to_string())?;
-    }
-    std::fs::create_dir_all(&work_dir).map_err(|e| e.to_string())?;
-    copy_tree(project, &work_dir).map_err(|e| e.to_string())?;
-    Ok(Session { project: project.to_path_buf(), name: session.to_string(), work_dir })
+    let m = mount::detect(project).map_err(|e| e.to_string())?;
+    let scratch_root = tmp_root.join(sanitize(session));
+    std::fs::create_dir_all(&scratch_root).map_err(|e| e.to_string())?;
+    let ws = mount::isolate(&m, &scratch_root).map_err(|e| e.to_string())?;
+    Ok(Session { project: project.to_path_buf(), name: session.to_string(), ws })
 }
 
 /// Relative paths of files that were added or modified in the work copy vs the project. (Deletions
@@ -86,12 +91,12 @@ pub fn changed_files(work_dir: &Path, project: &Path) -> Vec<String> {
 /// Reapply the session: copy its changed files back over the project, then `git add -A` + commit so
 /// the work lands as one new commit. Returns the new commit hash.
 pub fn reapply(session: &Session) -> Result<String, String> {
-    let changed = changed_files(&session.work_dir, &session.project);
+    let changed = changed_files(session.work_dir(), &session.project);
     if changed.is_empty() {
         return Err("no changes to reapply".into());
     }
     for rel in &changed {
-        let src = session.work_dir.join(rel);
+        let src = session.work_dir().join(rel);
         let dst = session.project.join(rel);
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -173,9 +178,9 @@ mod tests {
 
         let tmp_root = base.join("tmp");
         let session = load_gitmind(&proj, "add-greeting", &tmp_root).unwrap();
-        assert!(session.work_dir.ends_with("add-greeting"));
+        assert!(session.work_dir().starts_with(tmp_root.join("add-greeting")), "scratch under the session name");
         // work happens in /tmp, never touching the project
-        write(&session.work_dir.join("src/lib.rs"), "fn main() { println!(\"hi\"); }\n");
+        write(&session.work_dir().join("src/lib.rs"), "fn main() { println!(\"hi\"); }\n");
         assert_eq!(std::fs::read_to_string(proj.join("src/lib.rs")).unwrap(), "fn main() {}\n", "project untouched pre-reapply");
 
         let hash = reapply(&session).unwrap();
