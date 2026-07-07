@@ -1,0 +1,13 @@
+[package]
+name = "rust_fsm"
+version = "0.1.0"
+edition = "2021"
+
+# A C-ABI dynamic library so the C engine can call the real fsm.rs gating.
+# staticlib is also emitted so the engine can link it directly if preferred.
+[lib]
+name = "rust_fsm"
+crate-type = ["cdylib", "staticlib"]
+
+[profile.release]
+opt-level = 3

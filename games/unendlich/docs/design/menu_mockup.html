@@ -1,0 +1,1205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>unendlich · menu mockup v3 (r219)</title>
+<!--
+  Standalone menu mockup for rapid, browser-side iteration on the menu
+  aesthetic — decoupled from the engine build cycle (operator: "mock
+  something in HTML for rapid parallel devel"). Encodes the design tokens
+  from 08_UI_and_UX/bending_character_menu_ui_v2.docx:
+    - "panels are atmospheres, not surfaces": frosted, tinted, blurred bg.
+    - thin chrome, no high-contrast borders; legible via sharp text.
+    - depth: background void heavily blurred (28-40px), panel chrome ~8px.
+    - per-element colour grading; soft light; optical (defocus) transitions.
+  This is a reference for what the egui liquid-glass should converge to.
+  Pure HTML/CSS/JS, no deps. Open in any browser.
+-->
+<style>
+  /* v1.3: custom fonts built from this design language (docs/design/fonts/
+     build_fonts.py). UnendlichBlocks = blocky voxel game font for titles/
+     labels; UnendlichGlyphs = UI/bending marks. Body text stays on the
+     system sans (the operator liked it) — the blocky face is used for
+     accent headings only, "a bit more character". */
+  /* v2: fonts EMBEDDED as base64 data URIs so the file is fully self-
+     contained — they load no matter where the HTML is opened from (the
+     relative-url version silently failed when the .ttf wasn't colocated). */
+  @font-face { font-family: 'UnendlichBlocks'; font-display: block;
+    src: url('data:font/truetype;charset=utf-8;base64,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') format('truetype'); }
+  @font-face { font-family: 'UnendlichGlyphs'; font-display: block;
+    src: url('data:font/truetype;charset=utf-8;base64,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') format('truetype'); }
+  /* r208.1: the fill widens in WITHOUT @property (which some engines don't
+     transition). A fixed-size radial pseudo is SCALED from 0 -> 1 on hover;
+     transform+opacity transitions are universally supported. */
+  :root {
+    /* element colour-grading anchors (per-discipline tints in the doc) */
+    --void-0: #0a0e16;
+    --void-1: #121a28;
+    --glass-tint: rgba(120,160,200,0.10);
+    --glass-edge: rgba(190,225,255,0.22);
+    --glass-hi:  rgba(215,240,255,0.85);
+    --text:      #e8f0f8;
+    --text-dim:  #9fb2c6;
+    --accent:    #6fc3ff;
+    --accent-warm:#ffd27f;
+    --panel-blur: 14px;
+    --void-blur:  34px;
+    --corner: 3px; /* v1.1: sharp, block/voxel corners (was ~12-16px round) */
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+  body {
+    background: radial-gradient(1200px 800px at 50% 35%, var(--void-1), var(--void-0) 70%);
+    color: var(--text);
+    overflow: hidden;
+    display: grid;
+    place-items: center;
+  }
+
+  /* The blurred "atmosphere" behind everything — drifts slowly on its own
+     AND parallaxes with the mouse (JS sets --px/--py in px). Heavy blur =
+     depth, so it should move the MOST of any layer. */
+  .void {
+    position: fixed; inset: -14%;
+    filter: blur(var(--void-blur));
+    opacity: 0.7;
+    z-index: 0;
+    --px: 0px; --py: 0px;
+    transform: translate3d(var(--px), var(--py), 0);
+    transition: transform 220ms cubic-bezier(.2,.7,.2,1);
+    will-change: transform;
+  }
+  .blob { position: absolute; border-radius: 50%; mix-blend-mode: screen; animation: drift 26s ease-in-out infinite; }
+  .blob.a { width: 600px; height: 600px; left: 10%; top: 20%; background: #1d4e7a; }
+  .blob.b { width: 520px; height: 520px; right: 8%; top: 30%; background: #4a2d6e; animation-delay: -8s; }
+  .blob.c { width: 480px; height: 480px; left: 40%; bottom: 5%; background: #1f6e63; animation-delay: -15s; }
+  @keyframes drift {
+    0%,100% { transform: translate(0,0) scale(1); }
+    33%     { transform: translate(40px,-30px) scale(1.08); }
+    66%     { transform: translate(-30px,20px) scale(0.96); }
+  }
+
+  .stage { position: relative; z-index: 1; width: 1080px; max-width: 96vw; display: grid; grid-template-columns: 240px 1fr; gap: 22px; }
+
+  .title { grid-column: 1 / -1; text-align: center; margin-bottom: 6px; }
+  .title h1 { font-family: 'UnendlichBlocks', monospace; font-weight: 400; letter-spacing: 0.18em; font-size: 40px; text-indent: 0.18em;
+    background: linear-gradient(180deg, #fff, var(--accent)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .title p { color: var(--text-dim); font-size: 13px; letter-spacing: 0.3em; margin-top: 2px; }
+
+  /* A glass panel: frosted, tinted, thin bright top edge, soft bottom glow.
+     The bottom inner-glow is the "liquid" tell the egui fresnel also uses. */
+  .glass {
+    position: relative;
+    background: var(--glass-tint);
+    backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    border-radius: var(--corner);
+    border: 1px solid var(--glass-edge);
+    overflow: hidden;
+    /* v1.1: GLOBAL SPECULAR — a soft highlight whose origin (--spec-x/y,
+       set in JS from the biggest/brightest element on screen) rakes across
+       every glass border, as if one light source lit the whole scene. The
+       tint (--spec-tint) is taken from that dominant element. */
+    --spec-x: 50%; --spec-y: 0%; --spec-tint: rgba(200,230,255,0.5);
+    /* r209: glass parallaxes by TRANSLATION ONLY (rotation removed — it
+       was disorienting). The offset comes from the cone-projection model
+       in JS, which writes --px/--py. */
+    --px: 0px; --py: 0px;
+    transform: translate(var(--px), var(--py));
+    transition: transform 600ms cubic-bezier(0.16, 1, 0.3, 1);
+    will-change: transform;
+    /* v1.2: EDGE-WEIGHTED GLASS — a strong inset glow hugging the
+       perimeter that fades toward the centre, so the glass reads THICKER
+       at the edges than in the middle (the operator's note). Layered with
+       the existing top-rim + bottom inner-glow. */
+    box-shadow:
+      0 10px 40px rgba(0,0,0,0.35),
+      inset 0 1px 0 var(--glass-hi),
+      inset 0 0 0 1px rgba(190,220,255,0.10),
+      inset 0 0 18px -2px rgba(180,210,255,0.28),
+      inset 0 -30px 40px -30px rgba(120,180,230,0.5);
+  }
+  /* v1.2: BORDER-FILL — when a glass panel appears, a thick bright edge
+     animates from the OUTER rim INWARD then settles thin. Done with an
+     inset box-shadow ring whose spread shrinks (animatable, unlike border
+     gradients). Tricky in CSS — flagged for a cleaner egui port — but this
+     reads as "the frame draws itself in". */
+  .glass.fill-edges::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; z-index: 2;
+    animation: borderFill 620ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes borderFill {
+    0%   { box-shadow: inset 0 0 0 10px var(--accent); opacity: 0.9; }
+    60%  { box-shadow: inset 0 0 0 3px var(--accent); opacity: 0.7; }
+    100% { box-shadow: inset 0 0 0 1px transparent; opacity: 0; }
+  }
+  /* v1.1: the global specular gleam — a radial highlight at the light
+     origin, masked to a thin band so it reads as a lit BORDER/edge rather
+     than a blob. Sits above the panel fill, below the content. */
+  .glass::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: radial-gradient(circle 280px at var(--spec-x) var(--spec-y),
+      var(--spec-tint), transparent 60%);
+    opacity: 0.6; mix-blend-mode: screen;
+    transition: background 400ms ease;
+  }
+  .glass > * { position: relative; z-index: 1; }
+  /* r208: moving sheen sweeps removed — operator found them distracting,
+     and real item/feedback content will animate the panels instead. The
+     glass keeps its static top rim + bottom inner-glow (the box-shadow on
+     .glass above), which read as glass without motion. */
+
+  .nav { padding: 18px 16px; display: flex; flex-direction: column; gap: 8px; align-self: start; }
+  .nav button {
+    appearance: none; border: none; cursor: pointer; text-align: left;
+    font-family: 'UnendlichBlocks', monospace;
+    color: var(--text); font-size: 14px; letter-spacing: 0.06em;
+    padding: 12px 16px; border-radius: var(--corner); background: transparent;
+    position: relative; overflow: hidden;
+    transition: color 180ms ease, transform 220ms cubic-bezier(.34,1.7,.5,1);
+    --mx: 50%; --my: 50%;
+  }
+  /* the fill: a radial pseudo centred on the cursor (--mx/--my), SCALED
+     from 0 to full on hover so it grows out of the point. transform +
+     opacity only — no custom-property transition (max compatibility). */
+  .nav button::before {
+    content: ""; position: absolute; inset: -20%; border-radius: inherit;
+    /* v1.3: bright spot tracks the cursor (--mx/--my); scale grows from
+       centre. Hue from the page accent. */
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%),
+      var(--accent), var(--page-wash) 42%, transparent 68%);
+    opacity: 0; transform: scale(0.2); transform-origin: center;
+    transition: opacity 320ms ease, transform 560ms cubic-bezier(0.16, 1, 0.3, 1);
+    pointer-events: none; mix-blend-mode: screen;
+  }
+  .nav button:hover::before { opacity: 0.5; transform: scale(1); }
+  .nav button:hover { transform: translateX(3px); }
+  .nav button:active { transform: translateX(3px) scale(0.97, 0.92); }
+  .nav button span { position: relative; z-index: 1; }
+  .nav button.active { color: #fff; }
+  .nav button.active::before { opacity: 0.5; transform: scale(1); }
+  .nav button.active::after {
+    content: ""; position: absolute; left: 0; top: 18%; bottom: 18%; width: 2px;
+    background: var(--accent); border-radius: 2px; z-index: 1;
+  }
+
+  .panel { padding: 26px 28px; min-height: 360px; }
+  /* optical transition: content defocuses then resolves (doc: "defocus into
+     blur, then resolve from blur into sharpness") */
+  .panel .content { animation: resolve 620ms cubic-bezier(0.16, 1, 0.3, 1); }
+  @keyframes resolve { from { filter: blur(12px); opacity: 0; transform: scale(0.98); } to { filter: blur(0); opacity: 1; transform: none; } }
+  .panel h2 { font-family: 'UnendlichBlocks', monospace; font-weight: 400; font-size: 22px; letter-spacing: 0.06em; margin-bottom: 6px;
+    color: var(--accent); /* r210: deterministic per-page/slider accent */ }
+  /* r210: a faint wash bar under the heading whose colour is the
+     slider+page hash — the most visible "sliders feed the content" tell. */
+  .panel .content::before {
+    content: ""; display: block; height: 3px; width: 60px; border-radius: 3px;
+    background: var(--accent); margin-bottom: 14px; opacity: 0.8;
+    box-shadow: 0 0 16px 2px var(--page-wash); }
+  .panel .sub { color: var(--text-dim); font-size: 13px; margin-bottom: 22px; }
+
+  .row { display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 4px; border-bottom: 1px solid rgba(160,200,240,0.08); }
+  .row:last-child { border-bottom: none; }
+  .row .label { font-size: 14px; }
+  .row .hint { color: var(--text-dim); font-size: 12px; }
+
+  /* v1.1: RUNE-MORPH text entry — typed chars first appear as a blocky
+     bending rune, then morph into the Latin letter. The field is a styled
+     box; characters are spans we animate. */
+  .runefield { display: inline-flex; align-items: center; min-width: 200px; min-height: 38px;
+    background: rgba(160,200,240,.08); border: 1px solid var(--glass-edge);
+    border-radius: var(--corner); padding: 6px 12px; cursor: text; gap: 1px;
+    font-size: 18px; letter-spacing: 0.02em; }
+  .runefield:focus-within { border-color: var(--accent); box-shadow: 0 0 12px var(--page-wash); }
+  .runefield .rch { position: relative; display: inline-block; width: 0.62em; height: 1em; vertical-align: middle; }
+  .runefield .rch svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .runefield .rch svg path { fill: none; stroke: var(--accent); stroke-width: 3.5;
+    stroke-linecap: square; stroke-linejoin: miter; vector-effect: non-scaling-stroke; }
+  .runefield .rch.resolved svg path { stroke: var(--text); }
+  /* v2: blocky terminal caret — a solid filled block, hard blink (no fade) */
+  .runefield .caret { width: 11px; height: 20px; background: var(--accent); margin-left: 1px;
+    box-shadow: 0 0 6px var(--page-wash); animation: caretBlink 1.06s steps(1) infinite; }
+  @keyframes caretBlink { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }
+
+
+  /* ── v3: CUSTOM SLIDER (replaces native range) ───────────────────────
+     The fill WRAPS the knob (ends exactly at it); the knob is a SQUARE
+     (unrotated); the FILLED side carries the fractal dither + a push/pull
+     stretch on grab; the UNFILLED (right) side is just a hairline border
+     with the accent faded to GRAYSCALE. */
+  .uslider { position: relative; width: 180px; height: 22px; cursor: pointer;
+    display: inline-flex; align-items: center; touch-action: none; }
+  .uslider .utrack { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+    height: 10px; border: 1px solid rgba(150,170,190,0.30);
+    /* unfilled = grayscale-faded accent hairline, very dim */
+    background: rgba(170,180,190,0.06); image-rendering: pixelated; }
+  .uslider .ufill { position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+    height: 10px; width: 0;
+    background:
+      radial-gradient(circle at 1px 1px, var(--accent) 0.5px, transparent 1.0px) 0 0 / 2px 2px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.6px, transparent 1.2px) 1px 1px / 4px 4px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.8px, transparent 1.6px) 2px 0 / 8px 8px,
+      var(--page-wash);
+    image-rendering: pixelated;
+    box-shadow: inset 0 0 0 1px rgba(190,220,255,0.14);
+    transition: filter 200ms ease; }
+  /* push/pull stretch on grab — the fill momentarily scales along X from
+     the left anchor, like it's being tugged toward/!from the knob */
+  .uslider .ufill { transform-origin: left center; }
+  .uslider.grab .ufill { animation: fillStretch 360ms cubic-bezier(.34,1.7,.5,1); }
+  @keyframes fillStretch {
+    0% { transform: translateY(-50%) scaleX(0.93); }
+    55% { transform: translateY(-50%) scaleX(1.04); }
+    100% { transform: translateY(-50%) scaleX(1); } }
+  /* SQUARE knob (not a diamond) — the fill ends right at its left edge so
+     the fill "wraps" it. */
+  .uslider .uknob { position: absolute; top: 50%; width: 18px; height: 18px; border-radius: 2px;
+    transform: translate(-50%, -50%);
+    background: radial-gradient(circle at 35% 30%, #fff, #dfeaf5);
+    border: 1px solid rgba(0,0,0,0.5);
+    box-shadow: 0 0 8px var(--page-wash), inset 0 1px 0 rgba(255,255,255,0.6);
+    transition: box-shadow 200ms ease, width 160ms cubic-bezier(.34,1.7,.5,1), height 160ms cubic-bezier(.34,1.7,.5,1); }
+  .uslider:hover .uknob { box-shadow: 0 0 16px 2px var(--accent), inset 0 1px 0 rgba(255,255,255,0.6); }
+  .uslider.grab .uknob { width: 22px; height: 16px; }   /* squish on grab */
+
+  /* v1.3: toggle on-fill is a DIAMOND-TILE pattern (matches the diamond
+     knob) instead of diagonal stripes — no triangle wedges in the corners.
+     Two crossed repeating gradients tile clean diamonds. */
+  /* v1.3: toggle shaped like <[[[[[[[[[> — chevron end-caps via clip-path,
+     bracket segments via a repeating vertical-bar overlay. Infill is a
+     HIGH-RES DITHER (fine ~2px checker) rather than the coarse crosshatch. */
+  /* v1.3: the holder SHRINK-WRAPS the diamond knob — its left/right caps
+     are at 45° (cap depth = half the height) so they match the diamond's
+     edge angle exactly, giving two diamond-edge pairs hugging the knob. */
+  .toggle { width: 56px; height: 26px; border-radius: 0;
+    background: rgba(120,150,180,0.12);
+    clip-path: polygon(0 50%, 13px 0, calc(100% - 13px) 0, 100% 50%, calc(100% - 13px) 100%, 13px 100%);
+    position: relative; cursor: pointer; overflow: hidden;
+    transition: background 320ms ease, box-shadow 320ms ease, transform 240ms cubic-bezier(.34,1.7,.5,1); }
+  /* the infill fills the ENTIRE holder (same 45° chevron shape, not a
+     small diamond). Fractal/multi-octave dither; reveals left->right via
+     a scaleX anchored at the left (growing out from behind the knob). */
+  .toggle::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none; z-index: 1;
+    clip-path: polygon(0 50%, 13px 0, calc(100% - 13px) 0, 100% 50%, calc(100% - 13px) 100%, 13px 100%);
+    background:
+      radial-gradient(circle at 1px 1px, var(--accent) 0.5px, transparent 1.0px) 0 0 / 2px 2px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.6px, transparent 1.2px) 1px 1px / 4px 4px,
+      radial-gradient(circle at 1px 1px, var(--accent) 0.8px, transparent 1.6px) 2px 0 / 8px 8px,
+      var(--page-wash);
+    opacity: 0; transform: scaleX(0); transform-origin: left center;
+    transition: opacity 300ms ease, transform 460ms cubic-bezier(0.16, 1, 0.3, 1); }
+  .toggle.on::before { opacity: 0.95; transform: scaleX(1); }
+  .toggle.on { box-shadow: 0 0 12px var(--page-wash); }
+  /* SQUISH: the whole track briefly squashes horizontally when toggled */
+  .toggle:active { transform: scaleX(0.92); }
+  /* switch-on flash: a fading diamond bloom in the centre */
+  .toggle::after { content: ""; position: absolute; left: 50%; top: 50%; width: 28px; height: 28px; z-index: 1;
+    background: radial-gradient(circle, rgba(255,255,255,0.6), transparent 60%);
+    transform: translate(-50%,-50%) scale(0.2); opacity: 0; }
+  .toggle.on::after { animation: toggleBloom 520ms ease-out; }
+  @keyframes toggleBloom {
+    0% { transform: translate(-50%,-50%) scale(0.2); opacity: .9; }
+    100% { transform: translate(-50%,-50%) scale(1.6); opacity: 0; } }
+
+  /* diamond knob — bigger spring + a fade-pop on switch. Hugs the edges
+     (3px inset) so there's no inner L/R padding. */
+  .toggle .knob { position: absolute; top: 4px; left: 4px; width: 18px; height: 18px; border-radius: 2px; z-index: 3;
+    background: radial-gradient(circle at 35% 30%, #fff, #dfeaf5);
+    transform: rotate(45deg);
+    transition: left 420ms cubic-bezier(.5,1.8,.5,1), box-shadow 320ms ease, transform 240ms cubic-bezier(.5,1.8,.5,1);
+    box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+  .toggle.on .knob { left: 34px; box-shadow: 0 1px 4px rgba(0,0,0,.4), 0 0 12px rgba(255,255,255,.7); }
+  /* squish on press: knob squashes along its travel axis then springs */
+  .toggle:active .knob { transform: rotate(45deg) scale(1.25, 0.7); }
+
+
+
+  .worlds { display: flex; flex-direction: column; gap: 10px; }
+  .world { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: var(--corner);
+    background: rgba(140,180,220,0.06); cursor: pointer; position: relative; overflow: hidden;
+    --mx: 50%; --my: 50%; }
+  .world::before {
+    content: ""; position: absolute; inset: -20%; border-radius: inherit; pointer-events: none;
+    /* v1.3: the bright spot TRACKS THE CURSOR (--mx/--my) again — the
+       cursor-follow regressed when this went static at 50% 50%. The
+       SCALE still grows from centre (origin center), but the gradient
+       focus follows the pointer for a responsive spotlight. */
+    background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%),
+      var(--accent), var(--page-wash) 45%, transparent 70%);
+    opacity: 0; transform: scale(0.2); transform-origin: center;
+    transition: opacity 320ms ease, transform 560ms cubic-bezier(0.16, 1, 0.3, 1);
+    mix-blend-mode: screen; }
+  .world:hover::before { opacity: 0.45; transform: scale(1); }
+  .world > * { position: relative; z-index: 1; }
+  .world .thumb { width: 48px; height: 48px; border-radius: 2px; flex: none;
+    background: linear-gradient(135deg, #2a6e5a, #1d4e7a); box-shadow: inset 0 1px 0 rgba(255,255,255,.2); }
+  .world .meta { flex: 1; }
+  .world .meta .n { font-size: 15px; }
+  .world .meta .d { font-size: 12px; color: var(--text-dim); }
+  .world .acts button { appearance: none; border: 1px solid var(--glass-edge); background: transparent; color: var(--text-dim);
+    border-radius: 2px; padding: 5px 10px; font-size: 12px; cursor: pointer; margin-left: 6px; transition: all 140ms; }
+  .world .acts button:hover { color: var(--text); border-color: var(--accent); }
+  .world .acts button.danger:hover { color: #ff9a9a; border-color: #ff6a6a; }
+
+  .timeline { display: flex; gap: 0; align-items: flex-end; margin-top: 8px; position: relative; padding: 18px 0 18px; }
+  .timeline .track { position: absolute; left: 0; right: 0; bottom: 52px; height: 2px; background: rgba(160,200,240,0.2); }
+  .tp { position: relative; flex: 1; display: flex; flex-direction: column; align-items: center; cursor: pointer; }
+  /* v2: each point shows the SCREENSHOT saved at that world snapshot
+     (pixelated noise placeholder for now). Neutral hollow frame + sharp
+     hairline to match the inventory cell language. */
+  .tp .shot { width: 84px; height: 50px; margin-bottom: 12px; image-rendering: pixelated;
+    border: 1px solid rgba(150,170,190,0.32); box-shadow: inset 0 0 0 1px rgba(0,0,0,0.5);
+    transition: border-color 220ms ease, transform 220ms cubic-bezier(.34,1.7,.5,1), box-shadow 220ms ease; }
+  .tp:hover .shot { border-color: #eef3e8; transform: translateY(-3px) scale(1.04);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.5), 0 4px 14px rgba(0,0,0,0.4); }
+  .tp.warm .shot:hover { border-color: var(--accent-warm); }
+  /* v1.3: history-point diamonds — on hover the INNER fill expands only
+     slightly, while a DECOUPLED border ring expands more, on its own
+     timing, and SHARPENS (soft glow -> crisp thin edge). */
+  .tp .dot { position: relative; width: 13px; height: 13px; border-radius: 2px;
+    background: var(--accent); z-index: 1; transform: rotate(45deg);
+    transition: transform 220ms cubic-bezier(.34,1.7,.5,1); }
+  /* the decoupled border ring (its own pseudo, its own transition) */
+  .tp .dot::before {
+    content: ""; position: absolute; inset: -3px; border-radius: 2px;
+    border: 2px solid var(--accent); opacity: 0.25;
+    box-shadow: 0 0 6px 2px var(--page-wash);
+    transition: inset 320ms cubic-bezier(.2,.7,.2,1), opacity 320ms ease,
+                box-shadow 320ms ease, border-width 320ms ease, border-color 320ms ease; }
+  /* inner: tiny expand. border: bigger expand + sharpen (thin crisp, no glow). */
+  .tp:hover .dot { transform: rotate(45deg) scale(1.12); }
+  .tp:hover .dot::before { inset: -7px; opacity: 0.9; border-width: 1px;
+    border-color: #fff; box-shadow: 0 0 0 0 transparent; }
+  .tp .cap { font-size: 11px; color: var(--text-dim); margin-top: 12px; text-align: center; }
+  .tp.warm .dot { background: var(--accent-warm); }
+  .tp.warm .dot::before { border-color: var(--accent-warm); }
+
+  /* ── inventory + crafting · v1.3 ─────────────────────────────────────
+     NEUTRAL hollow-border cells: no fancy corner accents, no colour
+     splash, no hover-scale. Just a clean border + a sharp inner hairline
+     (pixel-art × sharp-edge hybrid). Hover drives a CROSSHAIR highlight
+     across the row and column (JS-propagated), not a per-cell zoom. */
+  .cell {
+    position: relative; aspect-ratio: 1; border-radius: 0;
+    background: transparent;                       /* inner stays clear */
+    border: 1px solid rgba(150,170,190,0.28);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.45);  /* sharp inner hairline = double line */
+    display: grid; place-items: center;
+    transition: border-color 140ms linear, box-shadow 140ms linear, background 140ms linear; cursor: pointer;
+  }
+  /* the hovered cell: crisp bright border, no fill, no scale */
+  .cell.x-hover { border-color: #eef3e8; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.45), inset 0 0 0 2px rgba(238,243,232,0.5); }
+  /* row/col crosshair members: border brightens, faint hollow wash */
+  .cell.x-line { border-color: rgba(200,220,240,0.6); background: rgba(160,190,220,0.05); }
+  .cell.empty { cursor: default; }
+  .cell .ico { font-size: 22px; filter: drop-shadow(0 1px 2px rgba(0,0,0,.6)); z-index: 1; }
+  .cell .qty { position: absolute; right: 4px; bottom: 2px; font-size: 10px; color: var(--text-dim); z-index: 1; }
+
+  /* category sidebar (8 filters) — neutral hollow borders, no corners */
+  .cats { display: flex; flex-direction: column; gap: 8px; }
+  .cat { width: 46px; height: 46px; border-radius: 0; display: grid; place-items: center;
+    background: transparent;
+    border: 1px solid rgba(150,170,190,0.26);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4);
+    font-size: 18px; cursor: pointer; position: relative; transition: border-color 150ms, color 150ms; color: var(--text-dim); }
+  .cat:hover { color: var(--text); border-color: rgba(220,235,250,0.7); }
+  .cat.active { color: #fff; border-color: var(--accent);
+    box-shadow: inset 0 0 0 1px rgba(0,0,0,0.4), inset 0 0 0 2px var(--accent); }
+  .cat.active::after { content: "\25c6"; position: absolute; left: -11px; font-size: 8px; color: var(--accent); }
+
+  /* crafting layout: sidebar | 3x3 grid | chevron | result column */
+  .craft { display: grid; grid-template-columns: auto auto auto 1fr; gap: 20px; align-items: center; }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 64px); gap: 8px; }
+  .chev { font-size: 32px; color: var(--accent-warm); animation: chevpulse 1.6s ease-in-out infinite; }
+  @keyframes chevpulse { 0%,100% { opacity: .45; } 50% { opacity: 1; } }
+  .result-col { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+  .result {
+    width: 132px; height: 132px; border-radius: 3px; display: grid; place-items: center; position: relative;
+    background: radial-gradient(120% 120% at 50% 40%, rgba(60,80,110,0.3), rgba(12,18,28,0.85));
+    border: 2px solid rgba(220,180,90,0.7);
+    box-shadow: 0 0 0 1px rgba(255,220,140,0.3), 0 8px 30px rgba(0,0,0,.4), inset 0 1px 0 rgba(255,240,200,.4);
+  }
+  /* element-matched glow ring around the manifested result (blue = Water) */
+  .result::after { content: ""; position: absolute; inset: -6px; border-radius: 5px;
+    box-shadow: 0 0 24px 2px rgba(111,195,255,0.5); pointer-events: none; }
+  .result .ico { font-size: 46px; }
+  .station { width: 64px; height: 64px; border-radius: 2px; display: grid; place-items: center;
+    background: rgba(12,18,28,0.85); border: 1px solid var(--accent); box-shadow: inset 0 0 12px rgba(111,195,255,0.2); font-size: 22px; }
+  .station .lbl { position: absolute; }
+  .invgrid { display: grid; grid-template-columns: repeat(9, 1fr); gap: 7px; margin-top: 4px; }
+  .craft-foot { display: flex; justify-content: space-between; align-items: baseline; margin-top: 16px; }
+  .recipe-name { font-size: 16px; color: var(--accent); letter-spacing: .06em; }
+
+  /* ── r211: CHARACTER sheet — glass × the green-tactical reference ───── */
+  /* the merge: keep the frosted-glass depth + inner-glow, but recolour to
+     the reference's forest-green tactical palette with gold accents and
+     SHARP angular (clipped-corner) frames instead of round ones. */
+  .char {
+    --gold: #d9bc6a; --sage: #7d9b6f; --green-deep: #0d1a12;
+    --frame: rgba(150,180,130,0.35);
+    display: grid; grid-template-columns: 76px 200px 1fr 196px; gap: 14px;
+    align-items: stretch;           /* v1.1: every column fills the row height */
+    color: #d8e4d2; min-height: 420px;
+  }
+  /* v1.1: the right column's three panels share the row height evenly so
+     the sheet reads as one aligned grid, not three independent stacks. */
+  .char > .side { display: grid; grid-template-rows: auto auto 1fr; gap: 12px; }
+  .char > .gear-col { display: grid; grid-auto-rows: 1fr; gap: 8px; }
+  /* an angular glass sub-panel (clipped corners, sage border, green tint) */
+  .gpanel {
+    position: relative; padding: 12px;
+    background: linear-gradient(160deg, rgba(20,34,24,0.55), rgba(10,18,12,0.65));
+    backdrop-filter: blur(10px) saturate(1.1); -webkit-backdrop-filter: blur(10px) saturate(1.1);
+    border: 1px solid var(--frame);
+    box-shadow: inset 0 1px 0 rgba(190,220,170,0.18), inset 0 -22px 30px -26px rgba(120,160,90,0.5);
+    clip-path: polygon(0 0, calc(100% - 12px) 0, 100% 12px, 100% 100%, 12px 100%, 0 calc(100% - 12px));
+  }
+  .gpanel .ph { font-family: 'UnendlichBlocks', monospace; font-size: 10px; letter-spacing: 0.14em; color: var(--sage); margin-bottom: 10px; text-transform: uppercase; }
+
+  /* left: equipment slots with corner brackets + durability + rank diamond */
+  .gear-col { display: flex; flex-direction: column; gap: 9px; }
+  .eslot { position: relative; aspect-ratio: 1; background: rgba(10,18,12,0.6);
+    border: 1px solid var(--frame); display: grid; place-items: center; cursor: pointer;
+    transition: border-color 200ms, box-shadow 200ms; }
+  .eslot:hover { border-color: var(--gold); box-shadow: 0 0 14px rgba(217,188,106,0.3); }
+  .eslot .ico { font-size: 26px; }
+  /* corner brackets */
+  .eslot::before, .eslot::after { content: ""; position: absolute; width: 8px; height: 8px; border: 1px solid var(--gold); opacity: .8; }
+  .eslot::before { left: -1px; top: -1px; border-right: none; border-bottom: none; }
+  .eslot::after { right: -1px; bottom: -1px; border-left: none; border-top: none; }
+  .eslot .dura { position: absolute; bottom: 2px; right: 4px; font-size: 9px; color: var(--sage); }
+  .eslot .rank { position: absolute; top: -4px; left: 50%; transform: translateX(-50%) rotate(45deg);
+    width: 7px; height: 7px; background: var(--gold); }
+
+  /* stats column: power (gold, big) + diamond-glyph stat rows */
+  .pname { font-family: 'UnendlichBlocks', monospace; font-size: 20px; letter-spacing: 0.05em; color: #eef3e8; }
+  .psub { font-size: 11px; color: var(--sage); letter-spacing: 0.14em; margin-bottom: 14px; }
+  .pwr-label { font-size: 11px; color: var(--sage); letter-spacing: 0.2em; }
+  .pwr { font-family: 'UnendlichBlocks', monospace; font-size: 38px; font-weight: 400; color: var(--gold); line-height: 1; margin-bottom: 16px;
+    text-shadow: 0 0 18px rgba(217,188,106,0.4); }
+  .stat { display: flex; align-items: center; gap: 10px; padding: 6px 0; font-size: 13px; }
+  .stat .dia { width: 16px; height: 16px; background: var(--sage); transform: rotate(45deg); flex: none; opacity: .85; }
+  .stat .sname { color: var(--sage); flex: 1; letter-spacing: 0.08em; }
+  .stat .sval { color: #eef3e8; font-size: 15px; }
+
+  /* centre: voxel character stage (placeholder block art vibe) */
+  .char-stage { position: relative; display: grid; place-items: center;
+    background: radial-gradient(120% 90% at 50% 35%, rgba(30,50,34,0.4), rgba(8,14,10,0.5));
+    border: 1px solid var(--frame); overflow: hidden;
+    clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 16px 100%, 0 calc(100% - 16px)); }
+  .char-stage .silhouette { font-size: 120px; filter: drop-shadow(0 6px 18px rgba(0,0,0,.5)); opacity: .92; }
+  .char-stage .disc { position: absolute; left: 14px; bottom: 12px; font-size: 11px; color: var(--sage); letter-spacing: 0.14em; }
+  .char-stage .disc b { color: var(--gold); display:block; font-size: 14px; letter-spacing: 0.1em; }
+
+  /* right: companions, bond pips, resonance hex */
+  .side { display: flex; flex-direction: column; gap: 12px; }
+  .comp { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .comp .cthumb { width: 34px; height: 34px; border: 1px solid var(--frame); display: grid; place-items: center; font-size: 18px; flex: none; }
+  .comp .cname { font-size: 12px; letter-spacing: 0.08em; }
+  .abil { display: flex; gap: 5px; }
+  .abil span { width: 22px; height: 22px; border: 1px solid var(--frame); display: grid; place-items: center; font-size: 12px;
+    transition: border-color 160ms, box-shadow 160ms; cursor: pointer; }
+  .abil span:hover { border-color: var(--gold); box-shadow: 0 0 8px rgba(217,188,106,0.4); }
+  .pips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .pip { width: 9px; height: 9px; background: var(--gold); transform: rotate(45deg); }
+  .pip.empty { background: transparent; border: 1px solid var(--frame); }
+  .hexwheel { display: grid; place-items: center; padding: 8px; }
+  .hexwheel .core { width: 64px; height: 64px; display: grid; place-items: center; font-size: 28px;
+    background: radial-gradient(circle, rgba(125,155,111,0.3), transparent);
+    border: 1px solid var(--sage); border-radius: 50%; box-shadow: 0 0 20px rgba(125,155,111,0.3); }
+
+  .footer { grid-column: 1 / -1; text-align: center; color: var(--text-dim); font-size: 11px; letter-spacing: 0.15em; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <div class="void"><div class="blob a"></div><div class="blob b"></div><div class="blob c"></div></div>
+
+  <div class="stage">
+    <div class="title">
+      <h1>UNENDLICH</h1>
+      <p>MENU AESTHETIC MOCKUP · v3</p>
+    </div>
+
+    <nav class="glass nav" id="nav">
+      <button data-panel="play" class="active"><span>Play</span></button>
+      <button data-panel="character"><span>Character</span></button>
+      <button data-panel="load"><span>Load World</span></button>
+      <button data-panel="inventory"><span>Inventory</span></button>
+      <button data-panel="crafting"><span>Crafting</span></button>
+      <button data-panel="history"><span>World History</span></button>
+      <button data-panel="settings"><span>Settings</span></button>
+      <button data-panel="quit"><span>Quit</span></button>
+    </nav>
+
+    <section class="glass panel" id="panel"></section>
+
+    <div class="footer">FROSTED GLASS · HEXAGONAL BOKEH DEPTH · OPTICAL TRANSITIONS · PER-ELEMENT GRADING</div>
+  </div>
+
+<script>
+const panels = {
+  play: `<div class="content"><h2>New World</h2><div class="sub">configure a world, then drop in</div>
+    <div class="row"><span class="label">World name</span><div class="runefield" id="worldname" tabindex="0"><span class="caret"></span></div></div>
+    <div class="row"><span class="label">Seed</span><input style="background:rgba(160,200,240,.1);border:1px solid var(--glass-edge);color:var(--text);border-radius:2px;padding:8px 12px;width:200px" value="auto"></div>
+    <div class="row"><span class="label">Mode</span><span class="hint">Survival · Creative</span></div>
+    <div class="row"><span class="label">Render distance</span><span class="uslider-mount" data-min="2" data-max="12" data-val="6" data-detents="6"></span></div></div>`,
+  load: `<div class="content"><h2>Load World</h2><div class="sub">your saved worlds</div>
+    <div class="worlds">
+      ${[['Highland Vale','seed 4821 · survival'],['Coral Drift','seed 99120 · creative'],['Ashfen','seed 217 · survival']].map(w=>`
+      <div class="world"><div class="thumb"></div><div class="meta"><div class="n">${w[0]}</div><div class="d">${w[1]}</div></div>
+        <div class="acts"><button>history</button><button class="danger">🗑</button></div></div>`).join('')}
+    </div></div>`,
+  history: `<div class="content"><h2>World History <span style="font-size:13px;color:var(--text-dim)">ⓘ</span></h2>
+    <div class="sub">step back through snapshots — screenshot timeline</div>
+    <div class="timeline"><div class="track"></div>
+      ${[['20s','manual',0],['2m','travel',0],['6m','craft',1],['11m','timer',0],['18m','manual',0]].map(t=>`
+      <div class="tp ${t[2]?'warm':''}"><canvas class="shot" width="96" height="56"></canvas><div class="dot"></div><div class="cap">${t[0]}<br>${t[1]}</div></div>`).join('')}
+    </div>
+    <div class="row" style="margin-top:18px"><span class="label">＋ create history point now</span><span class="hint">dev</span></div>
+    <div class="row"><span class="label">Each point snapshots your world</span><span class="hint">restore · delete</span></div></div>`,
+  settings: `<div class="content"><h2>Settings</h2><div class="sub">video · audio · controls · performance</div>
+    <div class="row"><span class="label">GUI scale</span><span class="uslider-mount" data-min="1" data-max="1.66" data-val="1" data-detents="7"></span></div>
+    <div class="row"><span class="label">Fog</span><div class="toggle on" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div>
+    <div class="row"><span class="label">Shadows</span><div class="toggle on" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div>
+    <div class="row"><span class="label">Dev banner (UNENDLICH_DEV)</span><div class="toggle" onclick="this.classList.toggle('on')"><div class="knob"></div></div></div></div>`,
+  quit: `<div class="content"><h2>Quit unendlich?</h2><div class="sub">your world is saved automatically</div>
+    <div class="row"><span class="label">Return to desktop</span><span class="hint">esc to cancel</span></div></div>`,
+
+  // r211: CHARACTER — the glass×green-tactical merge (character_panel_reference.docx
+  // + the RootBender reference image). Grounded in that art: Root discipline,
+  // Builder Dragon + Water Ocelot companions, Power + 3 stats, bond pips, resonance hex.
+  character: (() => {
+    const gear = [['\ud83d\udc79','helm'],['\ud83e\udde5','chest'],['\ud83e\uddbe','arms'],['\ud83e\udd7e','boots'],['\ud83d\udcff','amulet']];
+    const gearCells = gear.map(g=>`<div class="eslot"><span class="rank"></span><span class="ico">${g[0]}</span><span class="dura">10/10</span></div>`).join('');
+    const stats = [['MOBILITY','34'],['RESILIENCE','102'],['RECOVERY','68']];
+    const statRows = stats.map(s=>`<div class="stat"><span class="dia"></span><span class="sname">${s[0]}</span><span class="sval">${s[1]}</span></div>`).join('');
+    const pips = Array.from({length:10},(_,i)=>`<span class="pip ${i===0?'empty':''}"></span>`).join('');
+    return `<div class="content"><div class="char">
+      <div class="gear-col">${gearCells}</div>
+      <div class="gpanel"><div class="ph">Profile</div>
+        <div class="pname">ROOTBENDER</div>
+        <div class="psub">LVL 50 \u00b7 GRAND GROVE</div>
+        <div class="pwr-label">POWER</div><div class="pwr">1560</div>
+        ${statRows}
+      </div>
+      <div class="char-stage">
+        <div class="silhouette">\ud83c\udf33</div>
+        <div class="disc">ROOT DISCIPLINE<b>Harness the living weave</b></div>
+      </div>
+      <div class="side">
+        <div class="gpanel"><div class="ph">Companions</div>
+          <div class="comp"><div class="cthumb">\ud83d\udc09</div><div class="cname">Builder Dragon</div></div>
+          <div class="abil"><span>\ud83c\udf3f</span><span>\u2728</span><span>\ud83c\udf31</span></div>
+          <div style="height:10px"></div>
+          <div class="comp"><div class="cthumb">\ud83d\udc31</div><div class="cname">Water Ocelot</div></div>
+          <div class="abil"><span>\u2744</span><span>\ud83d\udca7</span><span>\ud83c\udf0a</span></div>
+        </div>
+        <div class="gpanel"><div class="ph">Bond \u00b7 Max Rank</div><div class="pips">${pips}</div></div>
+        <div class="gpanel"><div class="ph">Resonance</div><div class="hexwheel"><div class="core">\ud83c\udf33</div></div></div>
+      </div>
+    </div></div>`;
+  })(),
+
+
+  inventory: (() => {
+    const cats = ['\u25c6','\ud83c\udf3f','\u2726','\ud83d\udd28','\u2744','\ud83c\udf43','\u2299','\ud83d\udc5d'];
+    const items = [
+      ['\ud83d\udd37',''],['\ud83d\udfea',''],['\ud83d\udd36',''],['\ud83e\uddea','3'],['\u2728',''],['\ud83c\udf3f','12'],
+      ['\u2694\ufe0f',''],['\ud83e\udeb5','4'],['\ud83d\udc1a','7'],['\ud83e\udea8','22'],['\ud83d\udd31',''],['\ud83e\uddf1','48'],
+      ['\ud83d\udca0',''],['\ud83e\udd56','9'],['\ud83c\udf56','3'],['\ud83e\uddca','5'],['\u26a1',''],['\ud83c\udf6f','2'],
+    ];
+    const cell = (it) => it
+      ? `<div class="cell"><span class="c2"></span><span class="ico">${it[0]}</span>${it[1]?`<span class="qty">${it[1]}</span>`:''}</div>`
+      : `<div class="cell empty"><span class="c2"></span></div>`;
+    let grid = '';
+    for (let i = 0; i < 36; i++) grid += cell(items[i] || null);
+    const sidebar = cats.map((g,i)=>`<div class="cat ${i===0?'active':''}">${g}</div>`).join('');
+    return `<div class="content"><h2>Inventory</h2><div class="sub">4 \u00d7 9 grid \u00b7 category filters \u00b7 hover a slot for its genome tooltip</div>
+      <div style="display:grid;grid-template-columns:auto 1fr;gap:18px">
+        <div class="cats">${sidebar}</div>
+        <div class="invgrid">${grid}</div>
+      </div></div>`;
+  })(),
+
+  // r208: CRAFTING — sidebar + 3x3 grid + chevron + gold result + station.
+  crafting: (() => {
+    const cats = ['\u25c6','\ud83c\udf3f','\u2726','\ud83d\udd28','\u2744','\ud83c\udf43','\u2299','\ud83d\udc5d'];
+    // the doc's Tidal Blade recipe, slot by slot
+    const recipe = ['\ud83d\udd37','\ud83d\udfea','\ud83d\udd36','\ud83e\uddea','\u2728','\ud83c\udf3f','\ud83d\udc1a','\u2694\ufe0f','\ud83d\udd31'];
+    const grid = recipe.map(ic=>`<div class="cell"><span class="c2"></span><span class="ico">${ic}</span></div>`).join('');
+    const sidebar = cats.map((g,i)=>`<div class="cat ${i===0?'active':''}">${g}</div>`).join('');
+    return `<div class="content"><h2>Crafting</h2><div class="sub">3 \u00d7 3 grid \u00b7 result \u00b7 station indicator</div>
+      <div class="craft">
+        <div class="cats">${sidebar}</div>
+        <div class="grid3">${grid}</div>
+        <div class="chev">\u00bb\u00bb</div>
+        <div class="result-col">
+          <div class="result"><span class="ico">\ud83d\udde1\ufe0f</span></div>
+          <div class="station" title="Tidal Anvil required">\ud83e\udded</div>
+        </div>
+      </div>
+      <div class="craft-foot"><span class="recipe-name">Tidal Blade</span><span class="hint">Water affinity \u00b7 Tidal Anvil</span></div></div>`;
+  })(),
+};
+const panelEl = document.getElementById('panel');
+// ── r210: sliders FEED the page content — deterministic variation ───────
+// tune is declared up here (above show/applyContentTint, which read it).
+// Cone parallax + tuner below reuse this same object.
+const tune = { voidZ: 0.10, glassZ: 0.03, smooth: 0.03 };
+// The tuner values + page name are hashed into a reproducible accent
+// colour so the content "plays" with the parallax values: same sliders +
+// same page => same look, every time; move a slider or switch pages and
+// the tint shifts deterministically across the range.
+//
+// text hash: FNV-1a over the string (stable, fast, well-distributed).
+function hashStr(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+// colour-max: build an RGB where one channel is driven to MAX by the hash
+// (which channel = hash % 3), the other two are damped by the slider
+// magnitudes. Returns an [r,g,b] in a cool palette so it stays on-brand.
+function colorMax(seedStr, mags) {
+  const h = hashStr(seedStr);
+  const dom = h % 3;                       // dominant channel
+  const t = ((h >>> 3) & 0xff) / 255;      // hue jitter within the channel
+  const m = Math.min(1, mags.reduce((a, b) => a + Math.abs(b), 0)); // 0..1 from sliders
+  // cool base, push the dominant channel up, damp others by (1 - m*0.5)
+  const base = [80, 150, 210];
+  const damp = 1 - m * 0.5;
+  const out = base.map((c, i) => {
+    if (i === dom) return Math.round(Math.min(255, c + 70 + t * 50));
+    return Math.round(c * damp);
+  });
+  return out;
+}
+let curPage = 'play';
+function applyContentTint() {
+  const mags = [tune.voidZ, tune.glassZ, tune.smooth * 8];
+  const [r, g, b] = colorMax(curPage + ':' + mags.map(v=>v.toFixed(2)).join(','), mags);
+  // drive the page's accent + a faint heading wash via CSS vars on #panel
+  panelEl.style.setProperty('--accent', `rgb(${r},${g},${b})`);
+  panelEl.style.setProperty('--page-wash', `rgba(${r},${g},${b},0.10)`);
+}
+function show(name){
+  curPage = name; panelEl.innerHTML = panels[name] || '';
+  applyContentTint(); updateSpecular();
+  if (name === 'play') wireRuneField();
+  if (name === 'inventory' || name === 'crafting') wireCrosshair();
+  if (name === 'history') wireShots();
+  wireSliders();
+  // v1.2: replay the outer->inner border-fill on the panel each navigation
+  panelEl.classList.remove('fill-edges'); void panelEl.offsetWidth; panelEl.classList.add('fill-edges');
+}
+
+// v3: custom slider builder (top-level so show()/tuner both reach it).
+// Fill WRAPS a SQUARE knob; push/pull stretch on grab; the unfilled (right)
+// side is a dim grayscale-faded hairline; lerp-to-detents on release.
+function makeSlider({min, max, value, detents, onChange}){
+  const el = document.createElement('div'); el.className = 'uslider';
+  el.innerHTML = '<div class="utrack"></div><div class="ufill"></div><div class="uknob"></div>';
+  const fill = el.querySelector('.ufill'), knob = el.querySelector('.uknob');
+  const dv = detents ? Array.from({length:detents},(_,i)=> min + (max-min)*i/(detents-1)) : null;
+  let val = value, animing = false, animTo = value;
+  const frac = v => (v - min) / (max - min);
+  function layout(){
+    const f = Math.max(0, Math.min(1, frac(val)));
+    const w = el.clientWidth || 90;
+    const px = f * w;
+    fill.style.width = px + 'px';
+    knob.style.left = px + 'px';
+    // grayscale-fade the accent toward the right as it fills
+    fill.style.filter = `saturate(${0.45 + 0.55*(1-f)}) brightness(${0.9 + 0.22*(1-f)})`;
+  }
+  function set(v, stretch){
+    val = Math.max(min, Math.min(max, v)); layout();
+    if (stretch){ el.classList.remove('grab'); void el.offsetWidth; el.classList.add('grab'); }
+    onChange && onChange(val);
+  }
+  function lerpTo(target){
+    animTo = target; if (animing) return; animing = true;
+    const step = () => {
+      const next = val + (animTo - val) * 0.25;
+      if (Math.abs(animTo - next) < (max-min)/400){ val = animTo; layout(); onChange && onChange(val); animing = false; }
+      else { val = next; layout(); onChange && onChange(val); requestAnimationFrame(step); }
+    };
+    requestAnimationFrame(step);
+  }
+  const fromX = cx => { const r = el.getBoundingClientRect(); return min + Math.max(0,Math.min(1,(cx-r.left)/r.width))*(max-min); };
+  let dragging = false;
+  el.addEventListener('pointerdown', e => { dragging = true; el.setPointerCapture(e.pointerId); el.classList.add('grab'); set(fromX(e.clientX), true); e.preventDefault(); });
+  el.addEventListener('pointermove', e => { if (dragging) set(fromX(e.clientX)); });
+  el.addEventListener('pointerup', () => { dragging = false; el.classList.remove('grab'); if (dv){ let n=dv[0]; for (const d of dv) if (Math.abs(d-val)<Math.abs(n-val)) n=d; lerpTo(n); } });
+  requestAnimationFrame(layout);
+  return { el, set: v => set(v,false), get: () => val, relayout: layout };
+}
+// replace any .uslider-mount placeholders in the current panel with sliders
+function wireSliders(){
+  panelEl.querySelectorAll('.uslider-mount').forEach(m => {
+    if (m._wired) return; m._wired = true;
+    const s = makeSlider({
+      min: +m.dataset.min, max: +m.dataset.max, value: +m.dataset.val,
+      detents: m.dataset.detents ? +m.dataset.detents : null,
+      onChange: () => {}
+    });
+    s.el.style.width = '180px';
+    m.appendChild(s.el);
+    requestAnimationFrame(() => s.relayout());
+  });
+}
+
+// v1.1: RUNE-MORPH text entry behaviour. Typed characters are inserted as
+// a bending rune (Unicode Runic block) and, after a brief beat, cross-fade
+// /morph into the real Latin letter. Spaces and backspace handled.
+// ── v2: SVG STROKE-MORPH text entry ─────────────────────────────────────
+// Each glyph is a set of LINE SEGMENTS (polylines) on a 0..100 grid. A
+// typed character first shows a "bending rune" skeleton, then MORPHS into
+// the Latin letter by routing+interpolating line-segment endpoints (a
+// stroke transform/transpose), animated per-frame — NOT a gaussian-blur
+// cross-fade. The path's points lerp from the rune's to the letter's; if
+// the counts differ we pad the shorter by repeating its last point
+// (collapsed zero-length segments), so every segment has a partner.
+//
+// Letter skeletons — arrays of polylines; each polyline is [x0,y0,x1,y1,…].
+// Coordinate space: x 10..90, y 5..95 (y grows downward).
+const STROKES = {
+ 'A': [[12,95, 50,8, 88,95],[28,60, 72,60]],
+ 'B': [[20,5, 20,95],[20,5, 70,5, 78,28, 20,48],[20,48, 74,48, 82,72, 20,95]],
+ 'C': [[85,18, 50,5, 18,28, 18,72, 50,95, 85,82]],
+ 'D': [[20,5, 20,95],[20,5, 60,5, 85,40, 85,60, 60,95, 20,95]],
+ 'E': [[82,5, 20,5, 20,95, 82,95],[20,50, 66,50]],
+ 'F': [[82,5, 20,5, 20,95],[20,50, 66,50]],
+ 'G': [[85,18, 50,5, 18,28, 18,72, 50,95, 85,82, 85,55, 60,55]],
+ 'H': [[20,5, 20,95],[80,5, 80,95],[20,50, 80,50]],
+ 'I': [[30,5, 70,5],[50,5, 50,95],[30,95, 70,95]],
+ 'J': [[70,5, 70,78, 45,95, 22,80]],
+ 'K': [[20,5, 20,95],[78,5, 20,52],[40,42, 80,95]],
+ 'L': [[20,5, 20,95, 80,95]],
+ 'M': [[15,95, 15,5, 50,55, 85,5, 85,95]],
+ 'N': [[18,95, 18,5, 82,95, 82,5]],
+ 'O': [[50,5, 18,28, 18,72, 50,95, 82,72, 82,28, 50,5]],
+ 'P': [[20,95, 20,5, 72,5, 80,30, 20,52]],
+ 'Q': [[50,5, 18,28, 18,72, 50,95, 82,72, 82,28, 50,5],[58,68, 88,98]],
+ 'R': [[20,95, 20,5, 72,5, 80,30, 20,52],[42,46, 82,95]],
+ 'S': [[85,18, 50,5, 18,25, 50,50, 82,72, 50,95, 15,82]],
+ 'T': [[10,5, 90,5],[50,5, 50,95]],
+ 'U': [[18,5, 18,72, 50,95, 82,72, 82,5]],
+ 'V': [[12,5, 50,95, 88,5]],
+ 'W': [[10,5, 28,95, 50,40, 72,95, 90,5]],
+ 'X': [[15,5, 85,95],[85,5, 15,95]],
+ 'Y': [[15,5, 50,50, 85,5],[50,50, 50,95]],
+ 'Z': [[15,5, 85,5, 15,95, 85,95]],
+ '0': [[50,5, 22,28, 22,72, 50,95, 78,72, 78,28, 50,5],[34,75, 66,25]],
+ '1': [[30,22, 52,5, 52,95],[30,95, 74,95]],
+ '2': [[18,22, 50,5, 80,28, 18,95, 82,95]],
+ '3': [[20,5, 78,5, 45,45, 82,68, 50,95, 18,82]],
+ '4': [[68,95, 68,5, 15,62, 85,62]],
+ '5': [[80,5, 25,5, 20,45, 55,40, 82,62, 55,95, 18,85]],
+ '6': [[78,12, 45,5, 20,40, 18,75, 48,95, 80,75, 60,48, 22,55]],
+ '7': [[15,5, 85,5, 40,95]],
+ '8': [[50,50, 22,30, 50,5, 78,30, 50,50, 22,72, 50,95, 78,72, 50,50]],
+ '9': [[80,55, 42,48, 22,25, 55,5, 80,25, 82,60, 52,95, 20,85]],
+ ' ': [[]],
+ '.': [[48,90, 52,90, 52,94, 48,94, 48,90]],
+ ',': [[52,88, 44,98]],
+ ':': [[50,30, 50,34],[50,66, 50,70]],
+ '-': [[25,50, 75,50]],
+ '/': [[20,95, 80,5]],
+ "'": [[50,5, 46,22]],
+};
+// bending runes — angular skeletons (used as the pre-morph state)
+const RUNE_STROKES = [
+ [[50,5, 50,95],[50,30, 80,5],[50,55, 80,30]],         // ᚠ-ish
+ [[30,5, 30,95],[30,5, 75,28, 30,50]],                  // ᚢ-ish
+ [[25,95, 50,5, 75,95],[35,55, 65,55]],                 // ᚦ-ish
+ [[30,5, 30,95],[30,5, 72,5],[30,50, 60,50]],           // ᚨ-ish
+ [[30,5, 30,95],[30,50, 75,5],[30,50, 75,95]],          // ᚱ-ish
+ [[30,5, 30,95, 70,95]],                                // ᚲ-ish
+ [[20,5, 50,95, 80,5],[35,50, 65,50]],                  // ᚷ-ish
+ [[25,5, 25,95],[75,5, 75,95],[25,40, 75,60]],          // ᚺ-ish
+ [[50,5, 50,95],[25,20, 75,20]],                        // ᛁ-ish
+ [[30,5, 70,5, 30,50, 70,95, 30,95]],                   // ᛃ-ish
+ [[25,5, 25,95],[25,30, 70,5],[40,42, 72,95]],          // ᚴ-ish
+ [[30,5, 30,95, 72,95]],                                // ᛚ-ish
+ [[20,95, 20,5, 50,55, 80,5, 80,95]],                   // ᛗ-ish
+ [[20,95, 20,5, 80,95, 80,5]],                          // ᚾ-ish
+];
+function flat(polys){ return polys; }
+function resampleToPath(polys, n){
+  // sample a polyline set into n points along its total length
+  const pts = [];
+  polys.forEach(poly => { for (let i=0;i<poly.length;i+=2) pts.push([poly[i],poly[i+1]]); });
+  if (pts.length === 0) return Array.from({length:n},()=>[50,50]);
+  // pad/truncate to n by repeating the last point
+  const out = pts.slice(0, n);
+  while (out.length < n) out.push(pts[pts.length-1]);
+  return out;
+}
+function strokesFor(ch){
+  const up = ch.toUpperCase();
+  return STROKES[up] || STROKES[ch] || [[20,80,80,20]];
+}
+function pathFromPts(pts){
+  // draw as one path with moveTo on the first point of each original poly;
+  // here we just connect sequentially (the skeletons are mostly single
+  // strokes; multi-stroke glyphs use M breaks inserted by buildPath).
+  if (!pts.length) return '';
+  let d = `M ${pts[0][0]} ${pts[0][1]}`;
+  for (let i=1;i<pts.length;i++) d += ` L ${pts[i][0]} ${pts[i][1]}`;
+  return d;
+}
+function buildMultiPath(polys){
+  return polys.map(poly => {
+    if (!poly.length) return '';
+    let d = `M ${poly[0]} ${poly[1]}`;
+    for (let i=2;i<poly.length;i+=2) d += ` L ${poly[i]} ${poly[i+1]}`;
+    return d;
+  }).join(' ');
+}
+
+function wireRuneField(){
+  const field = document.getElementById('worldname');
+  if (!field || field._wired) return;
+  field._wired = true;
+  const caret = field.querySelector('.caret');
+  'New World'.split('').forEach(ch => addChar(ch, true));
+
+  function addChar(ch, instant){
+    const span = document.createElement('span');
+    span.className = 'rch'; span.dataset.ch = ch;
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS,'svg'); svg.setAttribute('viewBox','0 0 100 100');
+    const path = document.createElementNS(NS,'path');
+    svg.appendChild(path); span.appendChild(svg);
+    field.insertBefore(span, caret);
+
+    const letterPolys = strokesFor(ch);
+    if (instant || ch === ' ') {
+      path.setAttribute('d', buildMultiPath(letterPolys));
+      span.classList.add('resolved');
+      return;
+    }
+    // pick a rune skeleton as the START state
+    const runePolys = RUNE_STROKES[(ch.toUpperCase().charCodeAt(0)) % RUNE_STROKES.length];
+    // resample both to the SAME point count so segments have partners,
+    // then lerp endpoint-by-endpoint (the "transpose" routing).
+    const N = Math.max(
+      runePolys.reduce((a,p)=>a+p.length/2,0),
+      letterPolys.reduce((a,p)=>a+p.length/2,0), 6);
+    const from = resampleToPath(runePolys, N);
+    const to   = resampleToPath(letterPolys, N);
+    path.setAttribute('d', pathFromPts(from));
+    const t0 = performance.now(), DUR = 460 + Math.random()*160;
+    function step(now){
+      let k = Math.min(1, (now - t0) / DUR);
+      const e = 1 - Math.pow(1 - k, 3);     // ease-out cubic
+      const cur = from.map((p,i)=>[ p[0]+(to[i][0]-p[0])*e, p[1]+(to[i][1]-p[1])*e ]);
+      path.setAttribute('d', pathFromPts(cur));
+      if (k < 1) requestAnimationFrame(step);
+      else { path.setAttribute('d', buildMultiPath(letterPolys)); span.classList.add('resolved'); }
+    }
+    requestAnimationFrame(step);
+  }
+
+  field.addEventListener('keydown', e => {
+    if (e.key === 'Backspace') {
+      const last = caret.previousElementSibling;
+      if (last && last.classList.contains('rch')) last.remove();
+      e.preventDefault();
+    } else if (e.key === 'Enter') { field.blur(); e.preventDefault(); }
+    else if (e.key.length === 1) { addChar(e.key, false); e.preventDefault(); }
+  });
+  field.addEventListener('click', () => field.focus());
+}
+
+// v1.3: CROSSHAIR row×col propagation on the inventory/crafting grids.
+// Hovering a cell lights its whole row and column, with the highlight
+// PROPAGATING outward from the hovered cell (delay ∝ distance) so it reads
+// as a crosshair sweeping out. Pure border/wash expression — no zoom.
+function wireCrosshair(){
+  const grid = panelEl.querySelector('.invgrid, .grid3');
+  if (!grid || grid._cross) return;
+  grid._cross = true;
+  // column count from the computed grid-template-columns
+  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length || 9;
+  const cells = [...grid.querySelectorAll('.cell')];
+  cells.forEach((c, i) => { c.dataset.r = Math.floor(i / cols); c.dataset.c = i % cols; });
+  function clearAll(){ cells.forEach(c => { c.classList.remove('x-hover','x-line'); c.style.transitionDelay = ''; }); }
+  grid.addEventListener('pointerover', e => {
+    const cell = e.target.closest('.cell'); if (!cell) return;
+    const hr = +cell.dataset.r, hc = +cell.dataset.c;
+    clearAll();
+    cell.classList.add('x-hover');
+    cells.forEach(c => {
+      const r = +c.dataset.r, cc = +c.dataset.c;
+      if (c === cell) return;
+      if (r === hr || cc === hc) {
+        c.classList.add('x-line');
+        // propagation delay = manhattan distance from the hovered cell
+        const dist = Math.abs(r - hr) + Math.abs(cc - hc);
+        c.style.transitionDelay = (dist * 28) + 'ms';
+      }
+    });
+  });
+  grid.addEventListener('pointerleave', clearAll);
+}
+
+// v2: fill each history-point screenshot pane with pixelated noise (a
+// stand-in for the real per-snapshot thumbnail the engine will capture).
+// Tinted toward the page accent so it sits in the palette.
+function wireShots(){
+  panelEl.querySelectorAll('canvas.shot').forEach((cv, idx) => {
+    if (cv._noise) return; cv._noise = true;
+    const ctx = cv.getContext('2d'); const W = cv.width, H = cv.height;
+    const img = ctx.createImageData(W, H);
+    // a per-pane seed so each thumbnail differs
+    let s = (idx + 1) * 2654435761 >>> 0;
+    const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 4294967296;
+    for (let i = 0; i < W * H; i++) {
+      const n = rnd();
+      // cool base with occasional warm/green flecks → reads as "terrain"
+      const r = 30 + n * 90, g = 50 + n * 110, b = 70 + n * 130;
+      const j = i * 4;
+      img.data[j] = r; img.data[j+1] = g; img.data[j+2] = b; img.data[j+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  });
+}
+
+// v1.1: GLOBAL SPECULAR — find the biggest element on screen and treat its
+// centre as the scene's light origin; rake a tinted highlight across every
+// glass border from there. Recomputed on page change (and lightly on a
+// timer) — not per frame, since the dominant element rarely changes.
+function updateSpecular() {
+  const candidates = document.querySelectorAll('.char-stage, .result, .silhouette, .panel, .glass, .world, img');
+  let big = null, bigArea = 0;
+  candidates.forEach(el => {
+    const r = el.getBoundingClientRect();
+    const a = r.width * r.height;
+    if (a > bigArea && r.width > 40 && r.height > 40) { bigArea = a; big = r; }
+  });
+  if (!big) return;
+  // light origin = centre of the biggest element, in viewport coords
+  const lx = big.left + big.width / 2, ly = big.top + big.height / 2;
+  // tint from the current deterministic accent (the page's colour-max)
+  const tint = getComputedStyle(panelEl).getPropertyValue('--accent').trim() || 'rgba(200,230,255,0.5)';
+  document.querySelectorAll('.glass').forEach(g => {
+    const r = g.getBoundingClientRect();
+    // project the light origin into this panel's local % space
+    const px = ((lx - r.left) / Math.max(1, r.width)) * 100;
+    const py = ((ly - r.top)  / Math.max(1, r.height)) * 100;
+    g.style.setProperty('--spec-x', px.toFixed(1) + '%');
+    g.style.setProperty('--spec-y', py.toFixed(1) + '%');
+    g.style.setProperty('--spec-tint', tint.startsWith('rgb') ? tint.replace('rgb(', 'rgba(').replace(')', ',0.35)') : tint);
+  });
+}
+
+// ── r210/v1.3: MORPHING GEOMETRIES (not stutter) ────────────────────────
+// Operator's spec: "take all the boxes in the last frame and pull/
+// transition the one closest to the next UI." FLIP morph. Two bugs fixed
+// in v1.3:
+//   (a) it was reading ALREADY-SHRUNK rects — when you navigate fast the
+//       previous morph hasn't settled, so the live DOM rects are mid-
+//       transform. Fix: keep a TEMPORAL HISTORY of box centres recorded
+//       only while the panel is at rest (untransformed), over the last
+//       ~10s, and pick the nearest from THAT, never from a transforming
+//       frame.
+//   (b) the scale was pinned TOP-LEFT (transformOrigin top left) so it
+//       grew out of the corner. Fix: CENTRE origin — it expands from the
+//       middle of the chosen box.
+const boxHistory = [];           // { x, y, t } recent box centres
+const BOX_HISTORY_MS = 10000;    // remember the last 10 seconds
+let morphing = false;
+function recordBoxes() {
+  // only record when the panel is settled (no transform in flight), so we
+  // capture true layout positions, not shrunken in-animation ones.
+  if (morphing) return;
+  const content = panelEl.querySelector('.content');
+  if (!content || content.style.transform && content.style.transform !== 'none') return;
+  const t = performance.now();
+  panelEl.querySelectorAll('.content > *, .row, .world, .cell, .result, .tp, .eslot, .gpanel')
+    .forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) return;
+      boxHistory.push({ x: r.left + r.width/2, y: r.top + r.height/2, t });
+    });
+  // prune anything older than the window
+  const cutoff = t - BOX_HISTORY_MS;
+  while (boxHistory.length && boxHistory[0].t < cutoff) boxHistory.shift();
+}
+function nearestHistoricCentre(tx, ty) {
+  let best = null, bestD = Infinity;
+  for (const b of boxHistory) {
+    const d = Math.hypot(b.x - tx, b.y - ty);
+    if (d < bestD) { bestD = d; best = b; }
+  }
+  return best;
+}
+function morphTo(name){
+  if (name === curPage) return;
+  // record the OUTGOING boxes one more time while they're still at rest
+  recordBoxes();
+  // incoming anchor = centre of where the new heading will land
+  const panelRect = panelEl.getBoundingClientRect();
+  const tx = panelRect.left + 60, ty = panelRect.top + 50;
+  // nearest box centre from the temporal history (NOT the live shrunk DOM)
+  const from = nearestHistoricCentre(tx, ty) || { x: tx, y: ty };
+  morphing = true;
+  show(name);
+  const content = panelEl.querySelector('.content');
+  if (!content) { morphing = false; return; }
+  // INVERT: offset so the new content STARTS centred on the chosen box,
+  // scaled down — then springs to identity. Centre origin (no corner pin).
+  const now = content.getBoundingClientRect();
+  const dx = from.x - (now.left + now.width/2);
+  const dy = from.y - (now.top  + now.height/2);
+  content.style.animation = 'none';
+  content.style.transformOrigin = 'center';
+  content.style.transform = `translate(${dx.toFixed(1)}px, ${dy.toFixed(1)}px) scale(0.82)`;
+  content.style.opacity = '0.3';
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    content.style.transition = 'transform 620ms cubic-bezier(0.16, 1, 0.3, 1), opacity 360ms ease';
+    content.style.transform = 'none';
+    content.style.opacity = '1';
+    // clear the morph lock + clean the inline transform once settled, so
+    // recordBoxes() can capture the true rest layout afterward.
+    setTimeout(() => {
+      content.style.transition = ''; content.style.transform = ''; content.style.transformOrigin = '';
+      morphing = false; recordBoxes();
+    }, 660);
+  }));
+}
+// record rest-state boxes on a steady cadence (feeds the 10s history)
+setInterval(recordBoxes, 500);
+
+document.getElementById('nav').addEventListener('click', e => {
+  const b = e.target.closest('button'); if(!b) return;
+  document.querySelectorAll('#nav button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); morphTo(b.dataset.panel);
+});
+show('play');
+
+// Everything below is presentational polish (parallax, cursor fills, the
+// tuner). It's wrapped so that if any of it ever fails on a given browser,
+// navigation above still works and the menu remains fully usable.
+try {
+
+// ── Mouse-as-cone-anchor parallax (algorithm dev) ───────────────────────
+// Model: the cursor is the APEX of a viewing cone — the point the eye-ray
+// pierces the screen. The scene is a STACK of layers, each at a fixed
+// signed depth z along the view axis:
+//     z < 0  → BEHIND the screen (background void)
+//     z = 0  → the screen plane itself (the focal plane — does not move)
+//     z > 0  → IN FRONT, toward the viewer (foreground glass)
+// As the cursor (anchor) moves off centre by `a` px, every layer projects
+// through that apex by similar triangles: shift = -a * (z / D), where D is
+// the viewer distance. Background (z<0) lags opposite the cursor; near
+// layers (z>0) lead with it; the magnitude grows with |z|. One projection,
+// one anchor — no per-layer hand-tuned directions, so motion is coherent.
+//
+// We express each layer's depth as a unitless ratio (z/D). The tuner edits
+// these ratios live. (`tune` is declared above, near show().)
+// anchor offset from screen centre, in PIXELS (the cone apex displacement)
+let aTgt = { x: 0, y: 0 };
+let aCur = { x: 0, y: 0 };
+const voidEl = document.querySelector('.void');
+const glassEls = () => document.querySelectorAll('.glass');
+
+window.addEventListener('pointermove', e => {
+  aTgt.x = e.clientX - window.innerWidth  / 2;   // px right of centre
+  aTgt.y = e.clientY - window.innerHeight / 2;    // px below centre
+});
+window.addEventListener('pointerleave', () => { aTgt.x = 0; aTgt.y = 0; });
+
+// project the anchor displacement onto a layer at depth ratio z.
+// r210: layers move TOWARD the cursor (operator: "everything is moving
+// away... flip your thinking, toward not away"). The cursor is an
+// ATTRACTOR — each layer leans toward the apex by its depth ratio. Larger
+// z = pulled further toward the cursor. shift = +a * z does this: cursor
+// right (a>0) shifts the layer right (toward it), scaled by z.
+function projShift(z) {
+  return { x: aCur.x * z, y: aCur.y * z };
+}
+
+function frame() {
+  // smooth the anchor toward the cursor (heavier = more lag/weight)
+  aCur.x += (aTgt.x - aCur.x) * tune.smooth;
+  aCur.y += (aTgt.y - aCur.y) * tune.smooth;
+
+  // background void: z<0 → projects OPPOSITE the cursor, the largest swim
+  const v = projShift(tune.voidZ);
+  voidEl.style.setProperty('--px', v.x.toFixed(2) + 'px');
+  voidEl.style.setProperty('--py', v.y.toFixed(2) + 'px');
+
+  // foreground glass: z>0 → projects WITH the cursor, gently (translation
+  // only; the focal plane is the content, so this stays subtle and stable)
+  const g = projShift(tune.glassZ);
+  glassEls().forEach(el => {
+    el.style.setProperty('--px', g.x.toFixed(2) + 'px');
+    el.style.setProperty('--py', g.y.toFixed(2) + 'px');
+  });
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+// FEEL: voidZ (negative) is the background swim; glassZ (small positive)
+// the foreground lead. Equal-and-opposite isn't required — the cone makes
+// any z set coherent because they all project from the same apex.
+
+// ── Cursor-driven radial fade-fill on buttons + world rows ──────────────
+// Real centerpoint fill: the radial gradient's centre is the cursor's
+// position INSIDE the element (not a left-edge shadow), and --fill ramps
+// the opacity on enter/leave. Delegated so it covers dynamically-rendered
+// rows too.
+// Cursor-driven radial fade-fill: JS only updates the gradient CENTRE
+// (--mx/--my) to the cursor position inside the element; the grow-in and
+// fade are pure CSS :hover (robust across browsers). Delegated so it
+// covers dynamically-rendered rows.
+function wireFill(selector) {
+  document.addEventListener('pointermove', e => {
+    const el = e.target.closest(selector);
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    el.style.setProperty('--mx', ((e.clientX - r.left) / r.width  * 100) + '%');
+    el.style.setProperty('--my', ((e.clientY - r.top)  / r.height * 100) + '%');
+  });
+}
+wireFill('.nav button');
+wireFill('.world');
+
+// ── Live tuning panel (algorithm dev) ───────────────────────────────────
+const tuner = document.createElement('div');
+tuner.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:5;font:11px/1.6 monospace;'+
+  'background:rgba(10,16,24,.7);backdrop-filter:blur(8px);border:1px solid var(--glass-edge);'+
+  'border-radius:3px;padding:12px 14px;color:var(--text-dim);min-width:190px';
+tuner.innerHTML = '<div style="color:var(--text);letter-spacing:.1em;margin-bottom:6px">PARALLAX CONE</div>';
+//   key      label          min    max    detents
+[['voidZ',  'bg pull (z)',   0.0,  0.17,  5],
+ ['glassZ', 'fg pull (z)',   0.0,  0.05,  5],
+ ['smooth', 'smoothing',     0.02, 0.053, 4]].forEach(([k,label,min,max,detents])=>{
+  const row=document.createElement('div');
+  row.style.cssText='display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:4px';
+  const lab=document.createElement('span'); lab.textContent=label; row.appendChild(lab);
+  const s = makeSlider({ min, max, value: tune[k], detents, onChange: v => { tune[k]=v; applyContentTint(); } });
+  s.el.style.width = '90px';
+  row.appendChild(s.el);
+  tuner.appendChild(row);
+});
+document.body.appendChild(tuner);
+// v1.1: keep the specular light origin fresh (page transitions move the
+// biggest element; the morph settles after ~620ms). Cheap timer.
+updateSpecular();
+setInterval(updateSpecular, 800);
+} catch (err) {
+  console.warn('menu polish disabled (navigation still works):', err);
+}
+
+</script>
+</body>
+</html>

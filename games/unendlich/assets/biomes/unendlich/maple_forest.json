@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:maple_forest",
+  "_comment": "red canopy (r174 registry parity set)",
+  "temperature": 0.5,
+  "downfall": 0.7,
+  "has_precipitation": true,
+  "effects": {},
+  "_legacy_enum": "MapleForest"
+}

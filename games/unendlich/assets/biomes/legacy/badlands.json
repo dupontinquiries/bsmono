@@ -1,0 +1,18 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:badlands",
+  "_comment": "Red sandstone canyon and mesa biome — arid, hot, sparse vegetation. Inspired by US Southwest (Bryce Canyon, Painted Desert). Surface is red-tinted sand variant; very low humidity drives plant lifecycle to Drying/Withered fast.",
+  "surface_block": "sand",
+  "subsurface_block": "stone",
+  "_legacy_enum": "Desert",
+  "has_precipitation": false,
+  "temperature": 1.4,
+  "downfall": 0.0,
+  "effects": {
+    "sky_color": 11919910,
+    "fog_color": 13284270,
+    "grass_color": 11106915,
+    "foliage_color": 10387789,
+    "ambient_light": 0.55
+  }
+}

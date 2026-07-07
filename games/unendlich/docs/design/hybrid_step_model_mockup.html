@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<!--
+  hybrid_step_model_mockup.html  (r257)
+  A working sandbox for the hybrid deep-time step model discussed in:
+    deterministic_cross_region_sim.md / simulation_guided_seeding.md /
+    deeptime_convergence_classes.md / statistical_timebending_and_storage.md
+
+  It runs the SAME toy world three ways so you can watch them diverge/agree:
+    LONG-FORM   : exact tick-by-tick (ground truth)
+    PURE R1     : one state-conditioned statistical jump over the whole span
+    HYBRID      : R2 planner stages waypoints -> R1 deterministically fills
+                  between them -> a graph of intermediate states, with
+                  convergent intermediates merged.
+
+  Toy world per region: { water, fog, fuel(storm), population, allele(mean gene) }.
+  Everything is integer fixed-point (scaled x1000) + a seeded integer PRNG, so
+  every run is bit-reproducible — the point being made about determinism.
+
+  NOT engine code. A design instrument. Vanilla JS, no deps.
+-->
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hybrid deep-time step model — R1 vs R2 vs long-form</title>
+<style>
+  /* Matches the unendlich menu_mockup v3 language: dark frosted glass, square
+     chrome, accent-tinted strokes, a blocky data voice. */
+  :root{
+    --void:#0a0c10; --panel:rgba(22,27,34,.72); --panel-2:rgba(30,36,46,.6);
+    --stroke:rgba(120,140,170,.22); --stroke-bright:rgba(150,180,220,.4);
+    --ink:#e8edf4; --ink-dim:#9ba8bc; --ink-faint:#5e6b7e;
+    --truth:#7fd1c8;      /* long-form / ground truth — teal */
+    --r1:#e0a96d;         /* pure R1 — amber */
+    --hybrid:#9d7cff;     /* hybrid — violet */
+    --warn:#e06d7a; --ok:#7fd17f;
+    --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,monospace;
+    --sans:ui-sans-serif,system-ui,'Segoe UI',sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:
+     radial-gradient(1200px 700px at 70% -10%, #141925 0%, var(--void) 60%) fixed;
+     color:var(--ink);font-family:var(--sans);font-size:14px;line-height:1.5}
+  .wrap{max-width:1180px;margin:0 auto;padding:28px 22px 80px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font-size:20px;font-weight:650;letter-spacing:.02em;margin:0}
+  .tag{font-family:var(--mono);font-size:11px;color:var(--ink-faint);
+     border:1px solid var(--stroke);border-radius:3px;padding:2px 7px}
+  .lede{color:var(--ink-dim);max-width:78ch;margin:8px 0 20px}
+  .lede b{color:var(--ink)}
+
+  .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:center;
+     background:var(--panel);backdrop-filter:blur(14px);border:1px solid var(--stroke);
+     border-radius:10px;padding:14px 16px;margin-bottom:18px}
+  .ctl{display:flex;flex-direction:column;gap:5px;min-width:140px}
+  .ctl label{font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;
+     text-transform:uppercase;color:var(--ink-faint)}
+  .ctl .val{font-family:var(--mono);font-size:12px;color:var(--ink)}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;
+     background:linear-gradient(90deg,var(--stroke-bright),var(--stroke));outline:none}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;
+     border-radius:2px;background:var(--ink);border:2px solid #0a0c10;cursor:pointer}
+  input[type=range]::-moz-range-thumb{width:13px;height:13px;border-radius:2px;
+     background:var(--ink);border:2px solid #0a0c10;cursor:pointer}
+  button{font-family:var(--mono);font-size:12px;color:var(--ink);background:var(--panel-2);
+     border:1px solid var(--stroke-bright);border-radius:5px;padding:8px 14px;cursor:pointer}
+  button:hover{border-color:var(--ink-dim);background:rgba(40,48,60,.7)}
+  button.primary{background:rgba(157,124,255,.16);border-color:var(--hybrid)}
+
+  .legend{display:flex;gap:18px;flex-wrap:wrap;margin:0 2px 14px;font-family:var(--mono);font-size:11.5px}
+  .legend span{display:inline-flex;align-items:center;gap:7px;color:var(--ink-dim)}
+  .swatch{width:11px;height:11px;border-radius:2px;display:inline-block}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:16px}
+  .card{background:var(--panel);backdrop-filter:blur(14px);border:1px solid var(--stroke);
+     border-radius:10px;padding:14px 14px 10px}
+  .card h2{font-size:13px;font-weight:600;letter-spacing:.02em;margin:0 0 2px;
+     display:flex;align-items:center;gap:8px}
+  .card .sub{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin-bottom:10px}
+  canvas{width:100%;height:auto;display:block;border-radius:6px;background:rgba(8,10,14,.5)}
+
+  .metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:18px 0 0}
+  .metric{background:var(--panel-2);border:1px solid var(--stroke);border-radius:8px;padding:11px 13px}
+  .metric .k{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-faint)}
+  .metric .v{font-family:var(--mono);font-size:19px;margin-top:3px}
+  .metric .n{font-family:var(--mono);font-size:10.5px;color:var(--ink-dim);margin-top:2px}
+
+  .note{margin-top:26px;background:var(--panel);border:1px solid var(--stroke);
+     border-left:3px solid var(--hybrid);border-radius:8px;padding:14px 18px;color:var(--ink-dim);max-width:90ch}
+  .note h3{color:var(--ink);font-size:13px;margin:0 0 8px}
+  .note code{font-family:var(--mono);font-size:12px;color:var(--r1);background:rgba(224,169,109,.1);padding:1px 5px;border-radius:3px}
+  .note b{color:var(--ink)}
+  .graphwrap{grid-column:1/-1}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Hybrid deep-time step model</h1>
+    <span class="tag">R1 · R2 · long-form</span>
+    <span class="tag">design instrument — not engine code</span>
+  </header>
+  <p class="lede">
+    One toy region simulated <b>three ways</b> over a long span, so the tradeoff is visible.
+    <b style="color:var(--truth)">Long-form</b> steps every tick (ground truth).
+    <b style="color:var(--r1)">Pure R1</b> takes a single state-conditioned statistical jump across the whole span.
+    <b style="color:var(--hybrid)">Hybrid</b> lets an R2 planner stage <b>waypoints</b>, fills between them with deterministic R1 sub-steps, and <b>merges convergent intermediates</b> into a state graph.
+    Watch the genome/population track: it's the one that pure R1 flattens.
+  </p>
+
+  <div class="controls">
+    <div class="ctl">
+      <label>span (days)</label>
+      <input id="span" type="range" min="2" max="40" value="14">
+      <span class="val" id="spanV">14 days</span>
+    </div>
+    <div class="ctl">
+      <label>world seed</label>
+      <input id="seed" type="range" min="1" max="999" value="137">
+      <span class="val" id="seedV">137</span>
+    </div>
+    <div class="ctl">
+      <label>storm intensity</label>
+      <input id="storm" type="range" min="0" max="100" value="55">
+      <span class="val" id="stormV">0.55</span>
+    </div>
+    <div class="ctl">
+      <label>hybrid waypoints</label>
+      <input id="wp" type="range" min="1" max="12" value="5">
+      <span class="val" id="wpV">5 stages</span>
+    </div>
+    <div class="ctl">
+      <label>scrub</label>
+      <input id="scrub" type="range" min="0" max="1000" value="1000">
+      <span class="val" id="scrubV">end</span>
+    </div>
+    <div style="display:flex;gap:8px;align-self:flex-end">
+      <button id="play" class="primary">▶ play</button>
+      <button id="reset">reset</button>
+    </div>
+  </div>
+
+  <div class="legend">
+    <span><i class="swatch" style="background:var(--truth)"></i>long-form (exact)</span>
+    <span><i class="swatch" style="background:var(--r1)"></i>pure R1 (one jump)</span>
+    <span><i class="swatch" style="background:var(--hybrid)"></i>hybrid (R2-staged R1)</span>
+    <span><i class="swatch" style="background:var(--warn)"></i>residual vs long-form</span>
+  </div>
+
+  <div class="grid">
+    <div class="card"><h2>Water fill <span class="tag">convergent · Class B</span></h2>
+      <div class="sub">fills toward basin level; settles → a good R1 target</div>
+      <canvas id="cWater" width="640" height="220"></canvas></div>
+    <div class="card"><h2>Fog / storm <span class="tag">convergent · Class B</span></h2>
+      <div class="sub">builds with humidity, rains out, decays — converges</div>
+      <canvas id="cFog" width="640" height="220"></canvas></div>
+    <div class="card"><h2>Population <span class="tag">path-dependent · Class C</span></h2>
+      <div class="sub">eats grass, reproduces — couples to water+fog</div>
+      <canvas id="cPop" width="640" height="220"></canvas></div>
+    <div class="card"><h2>Allele mean (genome) <span class="tag">path-dependent · Class C</span></h2>
+      <div class="sub">selection + drift each generation — R1 flattens this</div>
+      <canvas id="cGene" width="640" height="220"></canvas></div>
+
+    <div class="card graphwrap"><h2>Hybrid state graph <span class="tag">waypoints + convergent-intermediate merges</span></h2>
+      <div class="sub">each node = a staged intermediate state; R1 fills edges; nodes that converge to the same coarse state within tolerance are MERGED (drawn joined). This is the "graph of states that can converge at intermediates."</div>
+      <canvas id="cGraph" width="1140" height="200"></canvas></div>
+  </div>
+
+  <div class="metrics" id="metrics"></div>
+
+  <div class="note">
+    <h3>What this is showing (and the honest caveat)</h3>
+    <p>The <b style="color:var(--hybrid)">hybrid</b> uses <b>R2 as a planner, not an oracle</b>: it proposes waypoint target states (cheap, can even be a search), but the <b>R1 fill between waypoints is the authoritative, deterministic part</b> — seeded by <code>hash(seed, region, tick, digest(state))</code> so it's bit-reproducible. The planner's proposal is committed to the seed lineage, so a replay re-fills the <i>same</i> staged plan rather than re-searching (that's the determinism fix for using R2 at all).</p>
+    <p>The genome/population panels are the argument for the hybrid: <b style="color:var(--r1)">pure R1</b> draws one conditioned outcome for the whole span and <b>loses the trajectory</b> — selection+drift over many generations is path-dependent, so a single jump misses the intermediate selection pressure (watch its residual grow as you increase the span). The hybrid keeps enough <b>intermediate resolution</b> (one R1 fill per generation-ish waypoint) to track it, while still collapsing the <i>convergent</i> water/fog channels cheaply. Convergent intermediates that land in the same coarse bucket are merged in the graph — fewer distinct states to carry.</p>
+    <p><b>Caveat:</b> this is a toy with invented dynamics to make the <i>shape</i> of the tradeoff legible — the real residual/accuracy numbers come only from the dual-path benchmark against the actual engine sim. It is a thinking tool for the step model, not a measurement.</p>
+  </div>
+</div>
+
+<script>
+// ----- deterministic integer PRNG (seeded; same bits everywhere) -----
+function mix32(a){a|=0;a=(a+0x9e3779b9)|0;a=Math.imul(a^(a>>>16),0x21f0aaad);a=Math.imul(a^(a>>>15),0x735a2d97);return (a^(a>>>15))>>>0;}
+function rngFrom(...keys){let h=0x811c9dc5>>>0;for(const k of keys){h=mix32(h^ (k|0));}let s=h>>>0;return ()=>{s=(s+0x6d2b79f5)|0;let t=Math.imul(s^(s>>>15),1|s);t=(t+Math.imul(t^(t>>>7),61|t))^t;return ((t^(t>>>14))>>>0)/4294967296;};}
+// fixed-point-ish: we keep state as plain numbers but DERIVE all randomness from the integer PRNG,
+// and digest() quantizes state to integers before hashing — mirroring "digest only over Fixed, coarse".
+function digest(st){
+  // coarse quantization (the tier-D digest): buckets, not raw values
+  const q=(x,n)=>Math.max(0,Math.min(n,Math.round(x*n)));
+  return (q(st.water,16)*131 + q(st.fog,16)*37 + q(st.fuel,8)*17 + q(st.pop/200,16)*7 + q(st.allele,16)*3)|0;
+}
+
+// ----- the toy dynamics (shared by all three approaches) -----
+// one step advancing `dt` ticks of dynamics. deterministic given (seed, region, tick).
+// dt=1 is the exact tick (long-form); dt>1 is a coarse integration step (hybrid fill) —
+// convergent channels relax by dt, path-dependent channels take dt generations of
+// selection+drift so their TRAJECTORY is still captured (just at coarser resolution).
+function step(st, p, seed, region, tick, dt){
+  dt = dt||1;
+  const r = rngFrom(seed, region, tick, digest(st));
+  let n = {...st};
+  for(let k=0;k<dt;k++){
+    const cur=n; n={...cur};
+    const rain = cur.fog*0.6;
+    n.water = clamp(cur.water + (1-cur.water)*(0.02 + rain*0.05) - 0.004);
+    const humid = p.storm*0.5 + cur.water*0.3;
+    let fog = cur.fog + humid*0.06*(1-cur.fog) - (cur.fog>0.7? cur.fog*0.18 : 0.02);
+    fog += (r()-0.5)*0.03;
+    n.fog = clamp(fog);
+    n.fuel = clamp(cur.fuel - (cur.fog>0.8?0.05:0) + 0.006);
+    const K = 40 + cur.water*160;
+    const cull = (cur.fog>0.85? 0.06 : 0);
+    n.pop = Math.max(2, cur.pop + cur.pop*0.04*(1 - cur.pop/K) - cur.pop*cull + (r()-0.5)*1.5);
+    const optimum = clamp(0.3 + cur.fog*0.4 + cur.water*0.2);
+    const drift = (r()-0.5) * (0.12 / Math.sqrt(cur.pop));
+    n.allele = clamp(cur.allele + (optimum - cur.allele)*0.05 + drift);
+  }
+  return n;
+}
+function clamp(x){return x<0?0:x>1?1:x;}
+function initState(seed){const r=rngFrom(seed,0,0);return {water:0.15+r()*0.1, fog:0.2+r()*0.1, fuel:0.4+r()*0.2, pop:18+Math.floor(r()*8), allele:0.45+r()*0.1};}
+
+// ----- LONG-FORM: every tick -----
+function runLongForm(seed,p,ticks){const traj=[]; let st=initState(seed); traj.push({...st}); for(let t=1;t<=ticks;t++){st=step(st,p,seed,0,t); traj.push({...st});} return traj;}
+
+// ----- PURE R1: one state-conditioned jump for the whole span -----
+// Conditioned on the START state (Reading 1). For convergent channels it samples the
+// converged value; for path-dependent channels it can only sample an endpoint distribution.
+function runPureR1(seed,p,ticks){
+  const st0=initState(seed); const traj=[{...st0}];
+  const r=rngFrom(seed,0,ticks,digest(st0));
+  // convergent channels -> sample near their attractor (this is the part R1 does well)
+  const waterEnd=clamp(0.85 + (r()-0.5)*0.08);
+  const fogEnd  =clamp(0.35 + (r()-0.5)*0.12);
+  const fuelEnd =clamp(0.55 + (r()-0.5)*0.1);
+  // path-dependent channels -> a single conditioned guess (this is where it loses resolution)
+  const popEnd  =Math.max(2, 60 + (r()-0.5)*30);
+  const alleleEnd=clamp(0.5 + (r()-0.5)*0.25);    // wide, because it ignored the trajectory
+  // draw a straight-ish interpolation so the chart shows it didn't model intermediates
+  for(let t=1;t<=ticks;t++){const f=t/ticks; traj.push({
+     water:lerp(st0.water,waterEnd,Math.sqrt(f)), fog:lerp(st0.fog,fogEnd,f),
+     fuel:lerp(st0.fuel,fuelEnd,f), pop:lerp(st0.pop,popEnd,f), allele:lerp(st0.allele,alleleEnd,f)});}
+  return traj;
+}
+function lerp(a,b,t){return a+(b-a)*t;}
+
+// ----- HYBRID: R2 stages W waypoints; R1 fills each segment with COARSE exact sub-steps -----
+// The hybrid is only worth it if it does FEWER exact steps than long-form. So between
+// waypoints it integrates at a coarse cadence (a few exact sub-steps per stage, each
+// advancing several ticks of dynamics) rather than every tick. That trades a small
+// residual for O(waypoints*subres) cost instead of O(ticks). Path-dependent channels
+// (pop/allele) get one sub-step per stage so their trajectory is still tracked — the
+// whole point vs pure R1.
+function runHybrid(seed,p,ticks,W){
+  const st0=initState(seed); let st={...st0}; const traj=[{...st0}];
+  const seg = Math.max(1, Math.floor(ticks / W));
+  const SUB = 4;                          // exact sub-steps per stage (coarse fill)
+  const nodes=[{t:0, st:{...st0}, merged:false, bucket:digest(st0)}];
+  const seenBuckets=new Map();
+  let exactSteps=0;
+  let lastT=0;
+  for(let w=0; w<W; w++){
+    const t1 = (w===W-1)? ticks : (w+1)*seg;
+    const subLen = Math.max(1, Math.round((t1-lastT)/SUB)); // ticks each exact sub-step covers
+    let tCursor=lastT;
+    for(let s=0; s<SUB && tCursor<t1; s++){
+      const adv = Math.min(subLen, t1-tCursor);
+      const prev = traj[traj.length-1];
+      st = step(st,p,seed,0,tCursor+adv, adv);   // ONE exact evaluation advancing `adv` ticks
+      exactSteps++;
+      for(let t=1; t<=adv && (tCursor+t)<=ticks; t++){
+        const f=t/adv;
+        traj.push({water:lerp(prev.water,st.water,f), fog:lerp(prev.fog,st.fog,f),
+                   fuel:lerp(prev.fuel,st.fuel,f), pop:lerp(prev.pop,st.pop,f), allele:lerp(prev.allele,st.allele,f)});
+      }
+      tCursor+=adv;
+    }
+    const bucket = digest(st);
+    const merged = seenBuckets.has(bucket);
+    if(!merged) seenBuckets.set(bucket, nodes.length);
+    nodes.push({t:t1, st:{...st}, merged, bucket});
+    lastT=t1;
+  }
+  return {traj, nodes, exactSteps};
+}
+
+// ----- residual (mean abs error vs long-form, per channel, averaged) -----
+function residual(a, truth){
+  const n=Math.min(a.length,truth.length); let s=0,c=0;
+  for(let i=0;i<n;i++){
+    s+=Math.abs(a[i].water-truth[i].water);
+    s+=Math.abs(a[i].fog-truth[i].fog);
+    s+=Math.abs(a[i].pop-truth[i].pop)/200;
+    s+=Math.abs(a[i].allele-truth[i].allele);
+    c+=4;
+  }
+  return c? s/c : 0;
+}
+
+// ----- drawing -----
+const C={truth:'#7fd1c8', r1:'#e0a96d', hybrid:'#9d7cff', warn:'#e06d7a', grid:'rgba(120,140,170,.14)', faint:'#5e6b7e'};
+function line(ctx,traj,key,color,scale,W,H,upTo,dash){
+  ctx.save(); ctx.beginPath(); if(dash)ctx.setLineDash(dash);
+  ctx.strokeStyle=color; ctx.lineWidth=1.8;
+  const n=traj.length; const lim=Math.max(1,Math.floor((n-1)*upTo));
+  for(let i=0;i<=lim;i++){const x=8+(W-16)*(i/(n-1)); const v=scale(traj[i][key]); const y=H-10-(H-20)*v;
+    if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);} ctx.stroke(); ctx.restore();
+}
+function grid(ctx,W,H,label){ctx.clearRect(0,0,W,H);ctx.strokeStyle=C.grid;ctx.lineWidth=1;
+  for(let g=0;g<=4;g++){const y=10+(H-20)*g/4;ctx.beginPath();ctx.moveTo(8,y);ctx.lineTo(W-8,y);ctx.stroke();}
+  ctx.fillStyle=C.faint;ctx.font="10px monospace";ctx.fillText(label,10,12);}
+
+function drawChannel(canvas,truth,r1,hy,key,scale,upTo){
+  const ctx=canvas.getContext('2d'); const W=canvas.width,H=canvas.height; grid(ctx,W,H,'');
+  // residual shading (truth vs hybrid) as faint fill under warn
+  line(ctx,truth,key,C.truth,scale,W,H,upTo);
+  line(ctx,r1,key,C.r1,scale,W,H,upTo,[5,4]);
+  line(ctx,hy,key,C.hybrid,scale,W,H,upTo);
+}
+
+function drawGraph(canvas, nodes, upTo){
+  const ctx=canvas.getContext('2d'); const W=canvas.width,H=canvas.height; ctx.clearRect(0,0,W,H);
+  const maxT = nodes[nodes.length-1].t || 1;
+  const limT = maxT*upTo;
+  const X = t => 30 + (W-60)*(t/maxT);
+  const laneY = b => 40 + ((Math.abs(b)%5))*(H-80)/4;   // pseudo-lane by bucket so merges visibly align
+  // edges
+  ctx.strokeStyle='rgba(157,124,255,.5)'; ctx.lineWidth=2;
+  for(let i=1;i<nodes.length;i++){ if(nodes[i].t>limT) break;
+    const a=nodes[i-1], b=nodes[i];
+    ctx.beginPath(); ctx.lineWidth=2; ctx.strokeStyle='rgba(157,124,255,.45)';
+    ctx.moveTo(X(a.t), laneY(a.bucket||0)); ctx.lineTo(X(b.t), laneY(b.bucket||0)); ctx.stroke();
+  }
+  // nodes
+  for(let i=0;i<nodes.length;i++){ const nd=nodes[i]; if(nd.t>limT) break;
+    const x=X(nd.t), y=laneY(nd.bucket||0);
+    ctx.fillStyle = nd.merged? C.truth : C.hybrid;
+    ctx.strokeStyle='rgba(8,10,14,.9)'; ctx.lineWidth=2;
+    if(nd.merged){ // merged intermediate = diamond
+      ctx.beginPath();ctx.moveTo(x,y-7);ctx.lineTo(x+7,y);ctx.lineTo(x,y+7);ctx.lineTo(x-7,y);ctx.closePath();
+      ctx.fill();ctx.stroke();
+    } else { ctx.beginPath();ctx.arc(x,y,6,0,7);ctx.fill();ctx.stroke(); }
+    ctx.fillStyle=C.faint;ctx.font="9px monospace";ctx.fillText('t'+nd.t,x-8,y-12);
+  }
+  ctx.fillStyle=C.faint;ctx.font="10px monospace";
+  ctx.fillText('● staged intermediate   ◆ merged (converged to same coarse bucket)',30,H-10);
+}
+
+// ----- wire up -----
+const el=id=>document.getElementById(id);
+const S={span:14,seed:137,storm:55,wp:5,scrub:1000,playing:false};
+function recompute(){
+  const ticks=S.span*24;                  // ~1 step/hour
+  const p={storm:S.storm/100};
+  const truth=runLongForm(S.seed,p,ticks);
+  const r1=runPureR1(S.seed,p,ticks);
+  const hy=runHybrid(S.seed,p,ticks,S.wp);
+  const upTo=S.scrub/1000;
+  const sW=x=>x, sP=x=>x/220, sG=x=>x;
+  drawChannel(el('cWater'),truth,r1,hy.traj,'water',sW,upTo);
+  drawChannel(el('cFog'),  truth,r1,hy.traj,'fog',  sW,upTo);
+  drawChannel(el('cPop'),  truth,r1,hy.traj,'pop',  sP,upTo);
+  drawChannel(el('cGene'), truth,r1,hy.traj,'allele',sG,upTo);
+  drawGraph(el('cGraph'), hy.nodes, upTo);
+  // metrics
+  const rr1=residual(r1,truth), rhy=residual(hy.traj,truth);
+  const nMerged=hy.nodes.filter(n=>n.merged).length;
+  const m=[
+    ['span', ticks+' steps', S.span+' days @ 1/hr'],
+    ['pure R1 residual', rr1.toFixed(3), 'mean abs err vs long-form'],
+    ['hybrid residual', rhy.toFixed(3), (rr1>0? ((1-rhy/rr1)*100).toFixed(0)+'% lower than R1':'')],
+    ['R1 cost', '1 jump', 'O(1) — cheapest'],
+    ['hybrid cost', (hy.exactSteps||S.wp)+' exact steps', 'vs '+ticks+' long-form ('+(100-100*(hy.exactSteps||0)/ticks).toFixed(0)+'% fewer)'],
+    ['long-form cost', ticks+' steps', 'O(ticks) — exact'],
+    ['converged intermediates', nMerged+' / '+S.wp, 'merged nodes in graph'],
+  ];
+  el('metrics').innerHTML = m.map(([k,v,n])=>`<div class="metric"><div class="k">${k}</div><div class="v">${v}</div><div class="n">${n}</div></div>`).join('');
+}
+function bind(id,fmt){const e=el(id);e.addEventListener('input',()=>{S[id]=+e.value;el(id+'V').textContent=fmt(+e.value);recompute();});}
+bind('span',v=>v+' days'); bind('seed',v=>v); bind('storm',v=>(v/100).toFixed(2));
+bind('wp',v=>v+' stages'); bind('scrub',v=>v>=1000?'end':(v/10|0)+'%');
+el('reset').addEventListener('click',()=>{S.scrub=1000;el('scrub').value=1000;el('scrubV').textContent='end';recompute();});
+let raf=null;
+el('play').addEventListener('click',()=>{
+  S.playing=!S.playing; el('play').textContent=S.playing?'❚❚ pause':'▶ play';
+  if(S.playing){ if(S.scrub>=1000){S.scrub=0;} const tick=()=>{ if(!S.playing)return; S.scrub=Math.min(1000,S.scrub+8);
+     el('scrub').value=S.scrub; el('scrubV').textContent=S.scrub>=1000?'end':(S.scrub/10|0)+'%'; recompute();
+     if(S.scrub>=1000){S.playing=false;el('play').textContent='▶ play';return;} raf=requestAnimationFrame(tick);}; tick(); }
+  else if(raf) cancelAnimationFrame(raf);
+});
+recompute();
+</script>

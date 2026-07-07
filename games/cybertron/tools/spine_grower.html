@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Cybertron — Spine Grower</title>
+<style>
+  :root{ --bg:#080b10; --panel:#111722; --line:#223044; --ink:#cdd9ea; --dim:#7c90ab; --accent:#5f86bd; --hot:#c8894a; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.45 system-ui,sans-serif;overflow:hidden}
+  #app{display:flex;height:100vh}
+  #view{flex:1;position:relative}
+  #side{width:290px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column;overflow:auto}
+  h1{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--dim);margin:0;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .sec{padding:10px 14px;border-bottom:1px solid var(--line)}
+  .sec h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:0 0 8px}
+  .k{display:flex;justify-content:space-between;margin:3px 0;font-size:12px}
+  .k b{display:inline-block;min-width:44px;background:#1b2432;border:1px solid var(--line);border-radius:4px;padding:1px 6px;color:#dfe9f6;text-align:center;font-family:ui-monospace,monospace}
+  .k span{color:var(--dim);text-align:right}
+  button{background:#1b2432;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:7px 10px;cursor:pointer;font-size:12px;width:100%}
+  button:hover{border-color:var(--accent)}
+  button.prim{background:var(--accent);border-color:var(--accent);color:#06101d;font-weight:600}
+  button.hot{background:var(--hot);border-color:var(--hot);color:#160c04;font-weight:600}
+  .row{display:flex;gap:6px;margin-bottom:6px}
+  label{display:flex;justify-content:space-between;align-items:center;gap:8px;color:var(--dim);font-size:11px;margin:5px 0}
+  input[type=range]{flex:1}
+  select,input[type=text]{background:#0d131c;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:3px}
+  #hud{position:absolute;left:12px;top:10px;font:12px/1.5 ui-monospace,monospace;color:var(--dim);pointer-events:none;text-shadow:0 1px 2px #000}
+  #hud b{color:#e6d3b0}
+  #big{position:absolute;left:50%;bottom:16px;transform:translateX(-50%);color:var(--dim);font-size:11px;letter-spacing:.08em;pointer-events:none}
+
+  /* ---- touch mode: hide the keyboard sidebar, dock compact controls at the
+         bottom so the viewport stays clear (esp. portrait) ---- */
+  #modeToggle{position:absolute;right:10px;top:10px;z-index:30;width:auto;padding:8px 12px}
+  #touch{display:none}
+  body.touch #side{display:none}
+  body.touch #touch{display:block}
+  body.touch #big{display:none}
+  #touch{position:absolute;left:0;right:0;bottom:0;z-index:20;
+    background:linear-gradient(to top,#0b0f16 70%,transparent);
+    padding:10px 10px calc(10px + env(safe-area-inset-bottom));
+    display:flex;flex-direction:column;gap:8px;touch-action:none}
+  #tpad{position:absolute;left:14px;bottom:150px;width:120px;height:120px;border-radius:50%;
+    background:radial-gradient(circle,#1b2432 0%,#141a24 70%);border:1px solid var(--line);z-index:22;touch-action:none}
+  #tnub{position:absolute;left:40px;top:40px;width:40px;height:40px;border-radius:50%;background:var(--accent);opacity:.85}
+  #tbar{display:flex;gap:6px;flex-wrap:wrap;justify-content:center}
+  #tbar button{width:auto;min-width:46px;padding:9px 8px;font-size:13px}
+  #tbar2{display:flex;gap:6px;justify-content:center;flex-wrap:wrap}
+  #tbar2 button{width:auto;padding:9px 11px;font-weight:600}
+  .tbtn.on{background:var(--accent);border-color:var(--accent);color:#06101d}
+  #trow-hint{color:var(--dim);font-size:10px;text-align:center;letter-spacing:.05em}
+  @media (orientation:portrait){ #tpad{bottom:170px} }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="hud"></div>
+    <div id="big">click the canvas, then drive with the keys — the spine keeps growing</div>
+    <button id="modeToggle">☰ Touch mode</button>
+    <div id="tpad"><div id="tnub"></div></div>
+    <div id="touch">
+      <div id="trow-hint">joystick = steer · buttons = shape the stroke</div>
+      <div id="tbar2">
+        <button class="hot" id="tPlay">⏸</button>
+        <button id="tSeed">Seed</button>
+        <button id="tReset">Reset</button>
+        <button class="tbtn" id="tMirror">Mirror</button>
+        <button id="tBranch">Branch ⑂</button>
+        <button id="tReturn">↰ Parent</button>
+      </div>
+      <div id="tbar">
+        <button data-op="w">＋thick</button>
+        <button data-op="b">－thin</button>
+        <button data-op="twm">twist−</button>
+        <button data-op="twp">twist＋</button>
+        <button class="tbtn" data-op="e">ridge</button>
+        <button data-op="p">pinch</button>
+        <button data-op="f">flare</button>
+        <button class="tbtn" data-op="wob">wobble</button>
+        <button data-op="node">node</button>
+        <button data-sec="1">○</button>
+        <button data-sec="2">□</button>
+        <button data-sec="3">△</button>
+        <button data-sec="4">✦</button>
+        <button data-sec="5">⬡</button>
+        <button class="prim" id="tExport">Export .iqm</button>
+      </div>
+    </div>
+  </div>
+  <div id="side">
+    <h1>Spine Grower</h1>
+    <div class="sec">
+      <div class="row"><button class="hot" id="playBtn">⏸ Pause growth</button></div>
+      <div class="row"><button id="seedBtn">Seed a curl</button><button id="resetBtn">Reset</button></div>
+      <label>growth speed <input id="spd" type="range" min="0.2" max="3" step="0.1" value="1"></label>
+      <label>ring detail <input id="seg" type="range" min="3" max="16" step="1" value="8"></label>
+    </div>
+    <div class="sec"><h2>Steer</h2>
+      <div class="k"><span>yaw left / right</span><b>h l</b></div>
+      <div class="k"><span>pitch down / up</span><b>j k</b></div>
+      <div class="k"><span>roll ccw / cw</span><b>H L</b></div>
+      <div class="k"><span>helix twist −/+</span><b>[ ]</b></div>
+      <div class="k"><span>straighten heading</span><b>0</b></div>
+    </div>
+    <div class="sec"><h2>Shape the stroke</h2>
+      <div class="k"><span>thicken / narrow</span><b>w b</b></div>
+      <div class="k"><span>extrude ridge (spike)</span><b>e</b></div>
+      <div class="k"><span>taper pinch (waist)</span><b>p</b></div>
+      <div class="k"><span>flare (bell out)</span><b>f</b></div>
+      <div class="k"><span>section: ○ □ △ ✦ ⬡</span><b>1-5</b></div>
+      <div class="k"><span>wobble flow on/off</span><b>~</b></div>
+      <div class="k"><span>drop a NODE (bulge)</span><b>space</b></div>
+      <div class="k"><span>BRANCH off tip</span><b>t</b></div>
+      <div class="k"><span>return to parent</span><b>y</b></div>
+      <div class="k"><span>MIRROR (symmetry)</span><b>m</b></div>
+    </div>
+    <div class="sec"><h2>Export</h2>
+      <label>name <input id="pname" type="text" value="spine_part" style="width:120px"></label>
+      <label>texture <select id="ptex"><option>plate_blue.png</option><option>obsidian.png</option><option>wall.png</option><option>white.png</option></select></label>
+      <div class="row" style="margin-top:6px"><button class="prim" id="exportIqm">Export .iqm</button></div>
+      <div class="row"><button id="exportJson">Save recording (.json)</button></div>
+    </div>
+    <div class="sec" style="color:var(--dim);font-size:11px">
+      Inspiration: helical title-ribbon motion + a snake that never stops. Form
+      emerges from flow — you nudge, it grows. Exports the same IQM the game loads.
+    </div>
+  </div>
+</div>
+
+<script type="importmap">{ "imports": { "three":"https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js" }}</script>
+<script type="module">
+import * as THREE from "three";
+
+const view=document.getElementById("view");
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x080b10);
+const cam=new THREE.PerspectiveCamera(50, view.clientWidth/view.clientHeight,0.05,200); cam.position.set(4,3,6);
+const rnd=new THREE.WebGLRenderer({antialias:true}); rnd.setSize(view.clientWidth,view.clientHeight); rnd.setPixelRatio(devicePixelRatio); view.appendChild(rnd.domElement);
+scene.add(new THREE.HemisphereLight(0x93aed0,0x1a2028,1.0));
+const key=new THREE.DirectionalLight(0xd6e4ff,1.15); key.position.set(5,7,4); scene.add(key);
+scene.add(new THREE.GridHelper(20,20,0x223044,0x161d28));
+
+// gentle auto-orbit that follows the growing tip
+let az=0.6, el=0.45, rad=8; const tgt=new THREE.Vector3(0,0.6,0);
+function place(){ cam.position.set(tgt.x+rad*Math.cos(el)*Math.sin(az), tgt.y+rad*Math.sin(el), tgt.z+rad*Math.cos(el)*Math.cos(az)); cam.lookAt(tgt); }
+let drag=false,px,py;
+rnd.domElement.addEventListener("pointerdown",e=>{drag=true;px=e.clientX;py=e.clientY;view.focus();});
+addEventListener("pointerup",()=>drag=false);
+addEventListener("pointermove",e=>{ if(!drag)return; az-=(e.clientX-px)*0.01; el=Math.max(-1.3,Math.min(1.3,el+(e.clientY-py)*0.01)); px=e.clientX;py=e.clientY; });
+rnd.domElement.addEventListener("wheel",e=>{ rad=Math.max(2,Math.min(40,rad+e.deltaY*0.004)); e.preventDefault(); },{passive:false});
+addEventListener("resize",()=>{ cam.aspect=view.clientWidth/view.clientHeight; cam.updateProjectionMatrix(); rnd.setSize(view.clientWidth,view.clientHeight); });
+
+// ---- spine state ----
+const SECTIONS={1:circleSec,2:squareSec,3:triSec,4:starSec,5:hexSec};
+function circleSec(n){return ring(n,i=>[Math.cos(i),Math.sin(i)]);}
+function squareSec(){return [[1,1],[-1,1],[-1,-1],[1,-1]];}
+function triSec(){return [[0,1.15],[-1,-0.8],[1,-0.8]];}
+function hexSec(){return ring(6,i=>[Math.cos(i),Math.sin(i)]);}
+function starSec(){const p=[];for(let i=0;i<10;i++){const a=i/10*Math.PI*2,r=i%2?0.5:1.1;p.push([Math.cos(a)*r,Math.sin(a)*r]);}return p;}
+function ring(n,f){const p=[];for(let i=0;i<n;i++){const a=i/n*Math.PI*2;p.push(f(a));}return p;}
+
+let S, mesh=null, playing=true;
+let SPINES=[], branchStack=[], mirror=false, mirrorMesh=null;
+function newSpine(from){
+  const s = from ? {
+      pos: from.pos.clone(), dir: from.dir.clone(), up: from.up.clone(),
+      radius: from.radius*0.7, twist: from.twist, wobble: from.wobble, wob:0,
+      section: from.section, taper: from.taper, ridge: from.ridge,
+      rings: [], t:0, seg: from.seg, twistAccum: from.twistAccum||0, mesh:null
+    } : {
+      pos:new THREE.Vector3(0,0.6,0), dir:new THREE.Vector3(0,0,1), up:new THREE.Vector3(0,1,0),
+      radius:0.35, twist:0, wobble:false, wob:0, section:1, taper:1, ridge:0,
+      rings:[], t:0, seg:8, twistAccum:0, mesh:null
+    };
+  return s;
+}
+function fresh(){
+  SPINES=[newSpine()]; branchStack=[]; S=SPINES[0];
+  pushRing();
+}
+function pushRingOf(sp, extra){
+  const side=new THREE.Vector3().crossVectors(sp.dir,sp.up).normalize();
+  const up=new THREE.Vector3().crossVectors(side,sp.dir).normalize();
+  const sec = SECTIONS[sp.section](sp.seg);
+  const r = sp.radius*sp.taper*(extra||1);
+  const ca=Math.cos(sp.twistAccum||0), sa=Math.sin(sp.twistAccum||0);
+  const pts = sec.map(([x,y])=>{
+    const rx=x*ca-y*sa, ry=x*sa+y*ca;
+    const spike = (sp.ridge>0 && Math.abs(rx)<0.35)? (1+sp.ridge):1;
+    return new THREE.Vector3().copy(sp.pos).addScaledVector(side, rx*r*spike).addScaledVector(up, ry*r);
+  });
+  sp.rings.push(pts);
+}
+function pushRing(extra){ pushRingOf(S, extra); }
+
+function ringsToGeom(rings){
+  if(rings.length<2) return null;
+  const n=rings[0].length, m=rings.length, V=[],T=[];
+  for(const r of rings) for(const p of r) V.push(p.x,p.y,p.z);
+  for(let i=0;i<m-1;i++) for(let j=0;j<n;j++){
+    const a=i*n+j,b=i*n+(j+1)%n,c=(i+1)*n+j,d=(i+1)*n+(j+1)%n; T.push(a,c,b,b,c,d);
+  }
+  const g=new THREE.BufferGeometry(); g.setAttribute("position",new THREE.Float32BufferAttribute(V,3)); g.setIndex(T); g.computeVertexNormals(); return g;
+}
+const spineMat=new THREE.MeshStandardMaterial({color:0x6f8bb2,metalness:0.55,roughness:0.5,flatShading:true});
+const mirrorMat=new THREE.MeshStandardMaterial({color:0x7d93b8,metalness:0.55,roughness:0.5,flatShading:true});
+function rebuildAll(){
+  for(const sp of SPINES){
+    const g=ringsToGeom(sp.rings); if(!g) continue;
+    if(sp.mesh){ sp.mesh.geometry.dispose(); sp.mesh.geometry=g; }
+    else { sp.mesh=new THREE.Mesh(g,spineMat); scene.add(sp.mesh); }
+    if(mirror){
+      // reflected twin across X=0
+      const gm=g.clone(); const pos=gm.attributes.position; for(let i=0;i<pos.count;i++) pos.setX(i,-pos.getX(i)); gm.computeVertexNormals();
+      if(sp.mmesh){ sp.mmesh.geometry.dispose(); sp.mmesh.geometry=gm; }
+      else { sp.mmesh=new THREE.Mesh(gm,mirrorMat); scene.add(sp.mmesh); }
+      sp.mmesh.visible=true;
+    } else if(sp.mmesh) sp.mmesh.visible=false;
+  }
+  mesh = S.mesh;   // keep legacy ref for export-first-check
+}
+function rebuild(){ rebuildAll(); }
+function growOne(sp, dt){
+  const step=0.06*dt;
+  if(sp.wobble){ sp.wob+=dt*3; const w=Math.sin(sp.wob)*0.05; rotate(sp.dir,sp.up,w); }
+  sp.twistAccum=(sp.twistAccum||0)+sp.twist*dt;
+  sp.pos.addScaledVector(sp.dir, step);
+  sp.t+=dt;
+  pushRingOf(sp);
+  if(sp.rings.length>1600) sp.rings.shift();
+}
+function grow(dt){
+  for(const sp of SPINES) growOne(sp, dt);
+  rebuildAll();
+  tgt.lerp(S.pos,0.05);
+}
+function rotate(vec,axis,ang){ vec.applyAxisAngle(axis,ang).normalize(); }
+
+// ---- key operators ----
+const held={};
+addEventListener("keydown",e=>{
+  const k=e.key;
+  held[k]=true;
+  if(k==="w") S.radius=Math.min(1.4,S.radius+0.03);
+  else if(k==="b") S.radius=Math.max(0.06,S.radius-0.03);
+  else if(k==="p") S.taper=Math.max(0.25,S.taper-0.06);
+  else if(k==="f") S.taper=Math.min(2.2,S.taper+0.06);
+  else if(k==="e") S.ridge=S.ridge>0?0:0.6;
+  else if(k==="[") S.twist-=0.6;
+  else if(k==="]") S.twist+=0.6;
+  else if(k==="0"){ S.twist=0; S.up.set(0,1,0); }
+  else if(k==="~"||k==="`") S.wobble=!S.wobble;
+  else if(k===" "){ pushRing(1.8); pushRing(1.8); e.preventDefault(); }   // NODE bulge
+  else if(k>="1"&&k<="5") S.section=+k;
+  else if(k==="t"){ // BRANCH: fork a child spine off the current tip, steer it instead
+    const child=newSpine(S); SPINES.push(child); branchStack.push(S); S=child;
+    // kick the child off at an angle so it visibly diverges
+    rotate(S.dir,S.up,0.6); pushRingOf(S);
+    e.preventDefault();
+  }
+  else if(k==="y"){ // RETURN to the parent spine (tip of the branch you came from)
+    if(branchStack.length){ S=branchStack.pop(); }
+  }
+  else if(k==="m"){ mirror=!mirror; rebuildAll(); }   // symmetry twin across X
+  if(["h","l","j","k","H","L","[","]"," "].includes(k)) e.preventDefault();
+});
+addEventListener("keyup",e=>{ held[e.key]=false; });
+function steer(dt){
+  const yaw=0.9*dt, pit=0.9*dt, rol=1.2*dt;
+  const side=new THREE.Vector3().crossVectors(S.dir,S.up).normalize();
+  if(held["h"]) rotate(S.dir,S.up, yaw);
+  if(held["l"]) rotate(S.dir,S.up,-yaw);
+  if(held["j"]){ rotate(S.dir,side,-pit); rotate(S.up,side,-pit); }
+  if(held["k"]){ rotate(S.dir,side, pit); rotate(S.up,side, pit); }
+  if(held["H"]) rotate(S.up,S.dir, rol);
+  if(held["L"]) rotate(S.up,S.dir,-rol);
+  // touch joystick: continuous yaw (x) + pitch (y)
+  if(touchSteer.x||touchSteer.y){
+    rotate(S.dir,S.up, -touchSteer.x*yaw);
+    rotate(S.dir,side,  touchSteer.y*pit); rotate(S.up,side, touchSteer.y*pit);
+  }
+}
+
+// ---- seed a pre-grown curl so you start with something to react to ----
+function seedCurl(){
+  fresh(); S.twist=1.6; S.section=1; S.twistAccum=0;
+  for(let i=0;i<90;i++){ if(i%22<11) rotate(S.dir,S.up,0.05); else rotate(S.dir,new THREE.Vector3().crossVectors(S.dir,S.up).normalize(),0.04); S.twistAccum=(S.twistAccum||0)+0.06; S.pos.addScaledVector(S.dir,0.05); pushRingOf(S); }
+  rebuildAll();
+}
+
+// ---- IQM export (same layout the engine loads) ----
+function bakeMesh(){
+  // combine every spine (and its mirror twin, if on) into one vertex/tri soup,
+  // then recenter + normalize so the whole part drops into a slot.
+  const geoms=[];
+  for(const sp of SPINES){ if(sp.mesh) geoms.push(sp.mesh.geometry); if(mirror && sp.mmesh && sp.mmesh.visible) geoms.push(sp.mmesh.geometry); }
+  if(!geoms.length) return null;
+  const V=[],N=[],U=[],T=[]; let base=0;
+  // first pass: bounds
+  const bb=new THREE.Box3();
+  for(const g of geoms){ const p=g.attributes.position; for(let i=0;i<p.count;i++) bb.expandByPoint(new THREE.Vector3(p.getX(i),p.getY(i),p.getZ(i))); }
+  const c=new THREE.Vector3(); bb.getCenter(c); const sz=new THREE.Vector3(); bb.getSize(sz); const s=Math.max(sz.x,sz.y,sz.z)||1;
+  for(const g of geoms){
+    const p=g.attributes.position, nr=g.attributes.normal;
+    for(let i=0;i<p.count;i++){ V.push((p.getX(i)-c.x)/s*2,(p.getY(i)-c.y)/s*2,(p.getZ(i)-c.z)/s*2); N.push(nr.getX(i),nr.getY(i),nr.getZ(i)); U.push(0.5,0.5); }
+    const idx=g.index.array; for(let i=0;i<idx.length;i++) T.push(base+idx[i]);
+    base += p.count;
+  }
+  return {V,N,U,T};
+}
+function writeIqm(tex){
+  const b=bakeMesh(); if(!b) return null; const {V,N,U,T}=b; const nv=V.length/3, nt=T.length/3;
+  const enc=new TextEncoder(); const matBytes=enc.encode(tex+"\0");
+  const text=new Uint8Array([0,...matBytes,...enc.encode("prop\0")]);
+  const mat_off=1,name_off=1+matBytes.length;
+  let ofs=16+4+4*26; const ofs_text=ofs; ofs+=text.length; ofs+=(-ofs)%4;
+  const ofs_meshes=ofs; ofs+=6*4; const ofs_va=ofs; ofs+=15*4;
+  const ofs_pos=ofs; ofs+=nv*12; const ofs_uv=ofs; ofs+=nv*8; const ofs_nrm=ofs; ofs+=nv*12; const ofs_tri=ofs; ofs+=nt*12;
+  const filesize=ofs; const dv=new DataView(new ArrayBuffer(filesize)); let o=0;
+  const u32=v=>{dv.setUint32(o,v,true);o+=4;}, f32=v=>{dv.setFloat32(o,v,true);o+=4;};
+  for(const c of "INTERQUAKEMODEL\0") dv.setUint8(o++,c.charCodeAt(0));
+  u32(2);u32(filesize);u32(0);u32(text.length);u32(ofs_text);u32(1);u32(ofs_meshes);
+  u32(3);u32(nv);u32(ofs_va);u32(nt);u32(ofs_tri);u32(0);
+  for(let i=0;i<14;i++) u32(0);
+  o=ofs_text; for(const b of text) dv.setUint8(o++,b);
+  o=ofs_meshes; u32(name_off);u32(mat_off);u32(0);u32(nv);u32(0);u32(nt);
+  o=ofs_va; u32(0);u32(0);u32(7);u32(3);u32(ofs_pos); u32(1);u32(0);u32(7);u32(2);u32(ofs_uv); u32(2);u32(0);u32(7);u32(3);u32(ofs_nrm);
+  o=ofs_pos; for(const v of V) f32(v); o=ofs_uv; for(const v of U) f32(v); o=ofs_nrm; for(const v of N) f32(v); o=ofs_tri; for(const t of T) u32(t);
+  return new Blob([dv.buffer],{type:"application/octet-stream"});
+}
+// ---- robust export that WORKS ON MOBILE. Programmatic downloads often fail
+//      silently on phones, so we try, in order: native Web Share (share sheet) ->
+//      file download -> a copyable base64 text box the user can paste anywhere. ----
+function blobToB64(blob){ return new Promise(res=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(",")[1]); r.readAsDataURL(blob); }); }
+
+function showCopyBox(title, text, note){
+  let ov=document.getElementById("copyOv");
+  if(!ov){ ov=document.createElement("div"); ov.id="copyOv"; document.body.appendChild(ov);
+    ov.style.cssText="position:fixed;inset:0;z-index:100;background:rgba(4,7,12,.92);display:flex;flex-direction:column;padding:16px;gap:10px";
+  }
+  ov.innerHTML="";
+  const h=document.createElement("div"); h.textContent=title; h.style.cssText="color:#cdd9ea;font:600 14px system-ui"; ov.appendChild(h);
+  const n=document.createElement("div"); n.innerHTML=note; n.style.cssText="color:#7c90ab;font:12px/1.4 system-ui"; ov.appendChild(n);
+  const ta=document.createElement("textarea"); ta.value=text; ta.readOnly=true;
+  ta.style.cssText="flex:1;background:#0d131c;color:#cdd9ea;border:1px solid #223044;border-radius:8px;padding:10px;font:11px/1.3 ui-monospace,monospace;resize:none";
+  ov.appendChild(ta);
+  const row=document.createElement("div"); row.style.cssText="display:flex;gap:8px";
+  const copy=document.createElement("button"); copy.textContent="Copy to clipboard"; copy.className="prim";
+  copy.style.cssText="flex:1;background:#5f86bd;border:none;border-radius:8px;padding:12px;color:#06101d;font-weight:700";
+  copy.onclick=async()=>{ ta.select(); try{ await navigator.clipboard.writeText(text); }catch(_){ document.execCommand("copy"); } copy.textContent="Copied ✓"; };
+  const close=document.createElement("button"); close.textContent="Close";
+  close.style.cssText="background:#1b2432;border:1px solid #223044;border-radius:8px;padding:12px;color:#cdd9ea";
+  close.onclick=()=>ov.remove();
+  row.appendChild(copy); row.appendChild(close); ov.appendChild(row);
+}
+
+async function exportBlob(blob, fname, kind){
+  const isCoarse = matchMedia("(pointer:coarse)").matches;
+  // 1) native share sheet (best on phones) -- lets you AirDrop / save to Files / send to yourself
+  try{
+    const file=new File([blob], fname, {type:blob.type});
+    if(navigator.canShare && navigator.canShare({files:[file]})){
+      await navigator.share({files:[file], title:fname});
+      return;
+    }
+  }catch(_){ /* user cancelled or unsupported -> fall through */ }
+  // 2) plain download (works on desktop, sometimes mobile)
+  if(!isCoarse){
+    try{ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=fname; document.body.appendChild(a); a.click(); a.remove(); return; }catch(_){}
+  }
+  // 3) ALWAYS-works fallback: copyable base64. Paste into a note / message to
+  //    yourself, then decode on the desktop (a tiny decoder is printed too).
+  const b64=await blobToB64(blob);
+  const note = kind==="iqm"
+    ? `Couldn't auto-save on this device. Copy this base64 and get it to your desktop, then run:<br><code style="color:#9fb4d0">python3 -c "import base64,sys;open('${fname}','wb').write(base64.b64decode(sys.stdin.read()))" &lt; paste.txt</code><br>-> drops <b>${fname}</b> into engine_src/data/.`
+    : `Copy this and save it as <b>${fname}</b> on your desktop.`;
+  showCopyBox("Export: "+fname, b64, note);
+}
+
+function dl(blob,fn){ exportBlob(blob,fn,fn.endsWith(".iqm")?"iqm":"json"); }
+
+// ---- ui ----
+const hud=document.getElementById("hud");
+document.getElementById("playBtn").onclick=e=>{ playing=!playing; e.target.textContent=playing?"⏸ Pause growth":"▶ Resume growth"; };
+document.getElementById("seedBtn").onclick=()=>{ seedCurl(); };
+document.getElementById("resetBtn").onclick=()=>{ fresh(); rebuild(); };
+document.getElementById("spd").oninput=e=>SPD=+e.target.value;
+document.getElementById("seg").oninput=e=>{ S.seg=+e.target.value; };
+document.getElementById("exportIqm").onclick=()=>{ const blob=writeIqm(document.getElementById("ptex").value); if(!blob){alert("Grow a spine first.");return;} dl(blob,(document.getElementById("pname").value||"spine")+".iqm"); };
+document.getElementById("exportJson").onclick=()=>{ dl(new Blob([JSON.stringify({spines:SPINES.map(sp=>sp.rings.map(r=>r.map(p=>[+p.x.toFixed(3),+p.y.toFixed(3),+p.z.toFixed(3)]))),mirror})],{type:"application/json"}),"spine.json"); };
+
+// ---- TOUCH MODE: joystick steering + docked operator buttons (viewport-friendly,
+//      especially portrait where a sidebar would obscure the view) ----
+let touchSteer={x:0,y:0};   // -1..1 joystick, drives yaw (x) + pitch (y)
+function applyOp(op){
+  if(op==="w") S.radius=Math.min(1.4,S.radius+0.05);
+  else if(op==="b") S.radius=Math.max(0.06,S.radius-0.05);
+  else if(op==="p") S.taper=Math.max(0.25,S.taper-0.08);
+  else if(op==="f") S.taper=Math.min(2.2,S.taper+0.08);
+  else if(op==="e") S.ridge=S.ridge>0?0:0.6;
+  else if(op==="twm") S.twist-=0.6;
+  else if(op==="twp") S.twist+=0.6;
+  else if(op==="wob") S.wobble=!S.wobble;
+  else if(op==="node"){ pushRing(1.8); pushRing(1.8); }
+}
+function enterTouch(on){
+  document.body.classList.toggle("touch",on);
+  document.getElementById("modeToggle").textContent = on?"⌨ Keyboard mode":"☰ Touch mode";
+}
+document.getElementById("modeToggle").onclick=()=>enterTouch(!document.body.classList.contains("touch"));
+// auto-enable on touch devices
+if(matchMedia("(pointer:coarse)").matches) enterTouch(true);
+
+// joystick
+const pad=document.getElementById("tpad"), nub=document.getElementById("tnub");
+let padId=null;
+function nubTo(dx,dy){ const R=40, l=Math.hypot(dx,dy); if(l>R){dx*=R/l;dy*=R/l;} nub.style.left=(40+dx)+"px"; nub.style.top=(40+dy)+"px"; touchSteer.x=dx/R; touchSteer.y=dy/R; }
+pad.addEventListener("pointerdown",e=>{ padId=e.pointerId; pad.setPointerCapture(e.pointerId); const r=pad.getBoundingClientRect(); nubTo(e.clientX-r.left-60,e.clientY-r.top-60); e.preventDefault(); });
+pad.addEventListener("pointermove",e=>{ if(e.pointerId!==padId)return; const r=pad.getBoundingClientRect(); nubTo(e.clientX-r.left-60,e.clientY-r.top-60); });
+function padEnd(e){ if(e.pointerId!==padId)return; padId=null; nub.style.left="40px";nub.style.top="40px"; touchSteer.x=touchSteer.y=0; }
+pad.addEventListener("pointerup",padEnd); pad.addEventListener("pointercancel",padEnd);
+
+// operator + section buttons
+document.querySelectorAll("#tbar [data-op]").forEach(b=>b.onclick=()=>{ applyOp(b.dataset.op);
+  if(b.dataset.op==="e") b.classList.toggle("on",S.ridge>0);
+  if(b.dataset.op==="wob") b.classList.toggle("on",S.wobble); });
+document.querySelectorAll("#tbar [data-sec]").forEach(b=>b.onclick=()=>{ S.section=+b.dataset.sec;
+  document.querySelectorAll("#tbar [data-sec]").forEach(x=>x.classList.remove("on")); b.classList.add("on"); });
+document.getElementById("tPlay").onclick=e=>{ playing=!playing; e.target.textContent=playing?"⏸":"▶"; };
+document.getElementById("tSeed").onclick=()=>seedCurl();
+document.getElementById("tReset").onclick=()=>{ SPINES.forEach(sp=>{if(sp.mesh)scene.remove(sp.mesh);if(sp.mmesh)scene.remove(sp.mmesh);}); fresh(); rebuildAll(); };
+document.getElementById("tMirror").onclick=e=>{ mirror=!mirror; e.target.classList.toggle("on",mirror); rebuildAll(); };
+document.getElementById("tBranch").onclick=()=>{ const child=newSpine(S); SPINES.push(child); branchStack.push(S); S=child; rotate(S.dir,S.up,0.6); pushRingOf(S); };
+document.getElementById("tReturn").onclick=()=>{ if(branchStack.length) S=branchStack.pop(); };
+document.getElementById("tExport").onclick=()=>document.getElementById("exportIqm").click();
+
+let SPD=1;
+fresh(); rebuild(); place();
+let last=performance.now();
+(function loop(now){
+  requestAnimationFrame(loop);
+  const dt=Math.min(0.05,(now-last)/1000)*SPD; last=now;
+  if(playing){ steer(dt); grow(dt); }
+  place();
+  hud.innerHTML=`spines <b>${SPINES.length}</b> · depth <b>${branchStack.length}</b> · mirror <b>${mirror?"on":"off"}</b> · r <b>${S.radius.toFixed(2)}</b> · twist <b>${S.twist.toFixed(1)}</b> · sec <b>${["","○","□","△","✦","⬡"][S.section]}</b>`;
+  rnd.render(scene,cam);
+})(last);
+</script>
+</body>
+</html>

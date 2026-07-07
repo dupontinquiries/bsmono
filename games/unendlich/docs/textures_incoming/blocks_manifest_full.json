@@ -1,0 +1,6699 @@
+{
+  "version": "2.1",
+  "tile_px": 512,
+  "total_textures": 325,
+  "palette": {
+    "file": "block_palette.png",
+    "index": "block_palette.json",
+    "families": [
+      {
+        "row": 0,
+        "name": "grey_neutral",
+        "category": "stone",
+        "base_hex": "#808080"
+      },
+      {
+        "row": 1,
+        "name": "grey_warm",
+        "category": "stone",
+        "base_hex": "#736e6a"
+      },
+      {
+        "row": 2,
+        "name": "grey_cool",
+        "category": "stone",
+        "base_hex": "#646c76"
+      },
+      {
+        "row": 3,
+        "name": "blue_grey",
+        "category": "deepslate",
+        "base_hex": "#343c46"
+      },
+      {
+        "row": 4,
+        "name": "brown_dark",
+        "category": "earth",
+        "base_hex": "#372618"
+      },
+      {
+        "row": 5,
+        "name": "brown_mid",
+        "category": "earth",
+        "base_hex": "#644832"
+      },
+      {
+        "row": 6,
+        "name": "brown_sandy",
+        "category": "sand",
+        "base_hex": "#a5916e"
+      },
+      {
+        "row": 7,
+        "name": "brown_red",
+        "category": "earth",
+        "base_hex": "#8c4830"
+      },
+      {
+        "row": 8,
+        "name": "green_lush",
+        "category": "foliage",
+        "base_hex": "#3c6926"
+      },
+      {
+        "row": 9,
+        "name": "green_dry",
+        "category": "foliage",
+        "base_hex": "#787d37"
+      },
+      {
+        "row": 10,
+        "name": "green_teal",
+        "category": "foliage",
+        "base_hex": "#2d6e55"
+      },
+      {
+        "row": 11,
+        "name": "wood_dark",
+        "category": "wood",
+        "base_hex": "#3e2818"
+      },
+      {
+        "row": 12,
+        "name": "wood_mid",
+        "category": "wood",
+        "base_hex": "#8e663e"
+      },
+      {
+        "row": 13,
+        "name": "wood_light",
+        "category": "wood",
+        "base_hex": "#c39e6e"
+      },
+      {
+        "row": 14,
+        "name": "red_nether",
+        "category": "nether",
+        "base_hex": "#731c1a"
+      },
+      {
+        "row": 15,
+        "name": "orange_nether",
+        "category": "nether",
+        "base_hex": "#af5a1e"
+      },
+      {
+        "row": 16,
+        "name": "purple_dark",
+        "category": "special",
+        "base_hex": "#34263c"
+      },
+      {
+        "row": 17,
+        "name": "blue_ice",
+        "category": "ice",
+        "base_hex": "#a0c8eb"
+      },
+      {
+        "row": 18,
+        "name": "white_snow",
+        "category": "ice",
+        "base_hex": "#ebeef5"
+      },
+      {
+        "row": 19,
+        "name": "gold_ore",
+        "category": "ore",
+        "base_hex": "#c8ac28"
+      },
+      {
+        "row": 20,
+        "name": "copper_ore",
+        "category": "ore",
+        "base_hex": "#3c825f"
+      },
+      {
+        "row": 21,
+        "name": "iron_ore",
+        "category": "ore",
+        "base_hex": "#c3beb6"
+      },
+      {
+        "row": 22,
+        "name": "diamond_ore",
+        "category": "ore",
+        "base_hex": "#41dae4"
+      },
+      {
+        "row": 23,
+        "name": "emerald_ore",
+        "category": "ore",
+        "base_hex": "#1eaf50"
+      },
+      {
+        "row": 24,
+        "name": "lapis_ore",
+        "category": "ore",
+        "base_hex": "#1e32aa"
+      },
+      {
+        "row": 25,
+        "name": "red_ore",
+        "category": "ore",
+        "base_hex": "#c31c1c"
+      },
+      {
+        "row": 26,
+        "name": "amethyst",
+        "category": "ore",
+        "base_hex": "#8c50cd"
+      },
+      {
+        "row": 27,
+        "name": "terracotta_base",
+        "category": "terracotta",
+        "base_hex": "#945f44"
+      },
+      {
+        "row": 28,
+        "name": "concrete_light",
+        "category": "concrete",
+        "base_hex": "#c8c8c8"
+      },
+      {
+        "row": 29,
+        "name": "moss_dark",
+        "category": "foliage",
+        "base_hex": "#414e2a"
+      },
+      {
+        "row": 30,
+        "name": "overlay_warm",
+        "category": "overlay",
+        "base_hex": "#a07850"
+      },
+      {
+        "row": 31,
+        "name": "overlay_cool",
+        "category": "overlay",
+        "base_hex": "#6482a0"
+      }
+    ]
+  },
+  "categories": [
+    "bending",
+    "building",
+    "concrete",
+    "deepslate",
+    "earth",
+    "foliage",
+    "ice",
+    "mining",
+    "nether",
+    "ore",
+    "ore_block",
+    "overlay",
+    "sand",
+    "stone",
+    "surface",
+    "survival",
+    "weathered",
+    "weathering",
+    "wood"
+  ],
+  "overlay_compositing": {
+    "note": "Overlay textures are RGBA. Composite over base using Porter-Duff 'over'. Stack order: age \u2192 wet \u2192 crack \u2192 moss \u2192 frost \u2192 snow.",
+    "stack_order": [
+      "overlay_age",
+      "overlay_wet",
+      "overlay_crack_light",
+      "overlay_crack_heavy",
+      "overlay_moss_light",
+      "overlay_moss_heavy",
+      "overlay_frost",
+      "overlay_char",
+      "overlay_snow"
+    ]
+  },
+  "material_defaults": {
+    "roughness": 0.85,
+    "metalness": 0.0,
+    "emission": 0.0,
+    "is_opaque": true,
+    "absorbency": 60
+  },
+  "textures": [
+    {
+      "id": "stone",
+      "file": "stone.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "grey_neutral_shadow"
+      ],
+      "variants": [
+        "stone_polished",
+        "stone_bricks",
+        "stone_bricks_mossy",
+        "stone_bricks_cracked",
+        "stone_chiseled",
+        "stone_weathered",
+        "stone_aged"
+      ],
+      "overlays": [
+        "overlay_snow",
+        "overlay_moss_light",
+        "overlay_frost",
+        "overlay_crack_light"
+      ],
+      "note": ""
+    },
+    {
+      "id": "stone_polished",
+      "file": "stone_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_bricks",
+      "file": "stone_bricks.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_bricks_mossy",
+      "file": "stone_bricks_mossy.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_bricks_cracked",
+      "file": "stone_bricks_cracked.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "grey_neutral_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_chiseled",
+      "file": "stone_chiseled.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "grey_neutral_dark3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cracked_stone_bricks",
+      "file": "cracked_stone_bricks.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mossy_stone_bricks",
+      "file": "mossy_stone_bricks.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cobblestone",
+      "file": "cobblestone.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_shadow",
+        "grey_neutral_dark4"
+      ],
+      "variants": [
+        "cobblestone_mossy",
+        "cobblestone_weathered"
+      ],
+      "overlays": [
+        "overlay_moss_light",
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "cobblestone_mossy",
+      "file": "cobblestone_mossy.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_shadow",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cobblestone_weathered",
+      "file": "cobblestone_weathered.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_shadow"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "granite",
+      "file": "granite.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_warm_mid",
+        "grey_warm_dark4"
+      ],
+      "variants": [
+        "granite_polished",
+        "granite_weathered"
+      ],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "granite_polished",
+      "file": "granite_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_warm_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "granite_weathered",
+      "file": "granite_weathered.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_warm_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "andesite",
+      "file": "andesite.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_cool_mid",
+        "grey_cool_dark4"
+      ],
+      "variants": [
+        "andesite_polished"
+      ],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "andesite_polished",
+      "file": "andesite_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "diorite",
+      "file": "diorite.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_lightest",
+        "grey_neutral_mid"
+      ],
+      "variants": [
+        "diorite_polished"
+      ],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "diorite_polished",
+      "file": "diorite_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate",
+      "file": "deepslate.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "blue_grey_dark4"
+      ],
+      "variants": [
+        "deepslate_polished",
+        "deepslate_cobbled",
+        "deepslate_tiles",
+        "deepslate_bricks",
+        "deepslate_chiseled"
+      ],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_polished",
+      "file": "deepslate_polished.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "blue_grey_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_cobbled",
+      "file": "deepslate_cobbled.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "blue_grey_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_tiles",
+      "file": "deepslate_tiles.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "blue_grey_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_bricks",
+      "file": "deepslate_bricks.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "blue_grey_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_chiseled",
+      "file": "deepslate_chiseled.png",
+      "category": "deepslate",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "blue_grey_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "tuff",
+      "file": "tuff.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_cool_mid",
+        "green_dry_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "tuff_polished",
+      "file": "tuff_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "tuff_bricks",
+      "file": "tuff_bricks.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "grey_cool_mid",
+        "grey_cool_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "tuff_chiseled",
+      "file": "tuff_chiseled.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "calcite",
+      "file": "calcite.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "white_snow_light",
+        "white_snow_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dripstone_block",
+      "file": "dripstone_block.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "basalt",
+      "file": "basalt.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_dark4",
+        "blue_grey_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "basalt_polished",
+      "file": "basalt_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_dark3",
+        "blue_grey_dark3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blackstone",
+      "file": "blackstone.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "purple_dark_dark4",
+        "grey_neutral_dark6"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blackstone_polished",
+      "file": "blackstone_polished.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "purple_dark_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blackstone_bricks",
+      "file": "blackstone_bricks.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 55
+      },
+      "palette_refs": [
+        "purple_dark_dark4",
+        "grey_neutral_dark6"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bedrock",
+      "file": "bedrock.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_shadow",
+        "grey_neutral_dark6"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "UNBREAKABLE"
+    },
+    {
+      "id": "dirt",
+      "file": "dirt.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "brown_dark_mid",
+        "brown_mid_dark5"
+      ],
+      "variants": [
+        "dirt_coarse",
+        "dirt_rooted"
+      ],
+      "overlays": [
+        "overlay_snow",
+        "overlay_wet",
+        "overlay_moss_light"
+      ],
+      "note": ""
+    },
+    {
+      "id": "coarse_dirt",
+      "file": "coarse_dirt.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "brown_mid_mid",
+        "brown_sandy_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "rooted_dirt",
+      "file": "rooted_dirt.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 200
+      },
+      "palette_refs": [
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "podzol_top",
+      "file": "podzol_top.png",
+      "category": "earth",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "brown_mid_mid",
+        "brown_mid_light5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "podzol_side",
+      "file": "podzol_side.png",
+      "category": "earth",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "brown_dark_mid",
+        "brown_mid_light5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mycelium_top",
+      "file": "mycelium_top.png",
+      "category": "earth",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "grey_warm_mid",
+        "purple_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mycelium_side",
+      "file": "mycelium_side.png",
+      "category": "earth",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "grey_warm_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "clay",
+      "file": "clay.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "grey_cool_mid",
+        "grey_cool_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mud",
+      "file": "mud.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "brown_dark_mid",
+        "brown_dark_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "packed_mud",
+      "file": "packed_mud.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mud_bricks",
+      "file": "mud_bricks.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "brown_mid_dark5",
+        "brown_dark_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta",
+      "file": "terracotta.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_white",
+      "file": "terracotta_white.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_orange",
+      "file": "terracotta_orange.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_magenta",
+      "file": "terracotta_magenta.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_light_blue",
+      "file": "terracotta_light_blue.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_yellow",
+      "file": "terracotta_yellow.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_lime",
+      "file": "terracotta_lime.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_pink",
+      "file": "terracotta_pink.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_gray",
+      "file": "terracotta_gray.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_light_gray",
+      "file": "terracotta_light_gray.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_cyan",
+      "file": "terracotta_cyan.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_purple",
+      "file": "terracotta_purple.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_blue",
+      "file": "terracotta_blue.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_brown",
+      "file": "terracotta_brown.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_green",
+      "file": "terracotta_green.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_red",
+      "file": "terracotta_red.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "terracotta_black",
+      "file": "terracotta_black.png",
+      "category": "earth",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sand",
+      "file": "sand.png",
+      "category": "sand",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [
+        "red_sand"
+      ],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "red_sand",
+      "file": "red_sand.png",
+      "category": "sand",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "brown_red_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sandstone",
+      "file": "sandstone.png",
+      "category": "sand",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "brown_sandy_light3",
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "side face"
+    },
+    {
+      "id": "sandstone_top",
+      "file": "sandstone_top.png",
+      "category": "sand",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "chiseled_sandstone",
+      "file": "chiseled_sandstone.png",
+      "category": "sand",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "red_sandstone",
+      "file": "red_sandstone.png",
+      "category": "sand",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "brown_red_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "red_sandstone_top",
+      "file": "red_sandstone_top.png",
+      "category": "sand",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_red_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "gravel",
+      "file": "gravel.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [
+        "gravel_fine"
+      ],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "gravel_fine",
+      "file": "gravel_fine.png",
+      "category": "stone",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_warm_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "soul_sand",
+      "file": "soul_sand.png",
+      "category": "nether",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "soul_soil",
+      "file": "soul_soil.png",
+      "category": "nether",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_dark_light5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top",
+      "file": "grass_block_top.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side",
+      "file": "grass_block_side.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top_jungle",
+      "file": "grass_block_top_jungle.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side_jungle",
+      "file": "grass_block_side_jungle.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top_savanna",
+      "file": "grass_block_top_savanna.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side_savanna",
+      "file": "grass_block_side_savanna.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top_taiga",
+      "file": "grass_block_top_taiga.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side_taiga",
+      "file": "grass_block_side_taiga.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top_swamp",
+      "file": "grass_block_top_swamp.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_snow"
+      ],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side_swamp",
+      "file": "grass_block_side_swamp.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_top_snowy",
+      "file": "grass_block_top_snowy.png",
+      "category": "surface",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "grass_block_side_snowy",
+      "file": "grass_block_side_snowy.png",
+      "category": "surface",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 90
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "coal_ore",
+      "file": "coal_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "grey_neutral_dark6"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_coal_ore",
+      "file": "deepslate_coal_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "grey_neutral_dark6"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "iron_ore",
+      "file": "iron_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "iron_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_iron_ore",
+      "file": "deepslate_iron_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "iron_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_ore",
+      "file": "copper_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "copper_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_copper_ore",
+      "file": "deepslate_copper_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "copper_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "gold_ore",
+      "file": "gold_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_gold_ore",
+      "file": "deepslate_gold_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "lapis_ore",
+      "file": "lapis_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "lapis_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_lapis_ore",
+      "file": "deepslate_lapis_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "lapis_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "emerald_ore",
+      "file": "emerald_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "emerald_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_emerald_ore",
+      "file": "deepslate_emerald_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "emerald_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "diamond_ore",
+      "file": "diamond_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "diamond_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_diamond_ore",
+      "file": "deepslate_diamond_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "diamond_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "redstone_ore",
+      "file": "redstone_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "red_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_redstone_ore",
+      "file": "deepslate_redstone_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "red_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "quartz_ore",
+      "file": "quartz_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "white_snow_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "coal_block",
+      "file": "coal_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "iron_block",
+      "file": "iron_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "iron_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "gold_block",
+      "file": "gold_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "gold_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "diamond_block",
+      "file": "diamond_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "diamond_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "emerald_block",
+      "file": "emerald_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "emerald_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "lapis_block",
+      "file": "lapis_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "lapis_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "redstone_block",
+      "file": "redstone_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "red_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "amethyst_block",
+      "file": "amethyst_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "amethyst_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "quartz_block",
+      "file": "quartz_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.65,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "white_snow_light"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_block",
+      "file": "copper_block.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.6,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "gold_ore_mid",
+        "copper_ore_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_block_exposed",
+      "file": "copper_block_exposed.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.72,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "copper_ore_mid",
+        "copper_ore_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_block_weathered",
+      "file": "copper_block_weathered.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "copper_ore_mid",
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_block_oxidized",
+      "file": "copper_block_oxidized.png",
+      "category": "ore_block",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "green_teal_mid",
+        "green_teal_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "oak_log",
+      "file": "oak_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "oak_log_top",
+      "file": "oak_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "oak_planks",
+      "file": "oak_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "oak_leaves",
+      "file": "oak_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "birch_log",
+      "file": "birch_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "birch_log_top",
+      "file": "birch_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "birch_planks",
+      "file": "birch_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "birch_leaves",
+      "file": "birch_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spruce_log",
+      "file": "spruce_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spruce_log_top",
+      "file": "spruce_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spruce_planks",
+      "file": "spruce_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spruce_leaves",
+      "file": "spruce_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "jungle_log",
+      "file": "jungle_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "jungle_log_top",
+      "file": "jungle_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "jungle_planks",
+      "file": "jungle_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "jungle_leaves",
+      "file": "jungle_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "acacia_log",
+      "file": "acacia_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "acacia_log_top",
+      "file": "acacia_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "acacia_planks",
+      "file": "acacia_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "acacia_leaves",
+      "file": "acacia_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_oak_log",
+      "file": "dark_oak_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_oak_log_top",
+      "file": "dark_oak_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_oak_planks",
+      "file": "dark_oak_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_oak_leaves",
+      "file": "dark_oak_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mangrove_log",
+      "file": "mangrove_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mangrove_log_top",
+      "file": "mangrove_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mangrove_planks",
+      "file": "mangrove_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mangrove_leaves",
+      "file": "mangrove_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cherry_log",
+      "file": "cherry_log.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cherry_log_top",
+      "file": "cherry_log_top.png",
+      "category": "wood",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cherry_planks",
+      "file": "cherry_planks.png",
+      "category": "wood",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_light_mid",
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cherry_leaves",
+      "file": "cherry_leaves.png",
+      "category": "foliage",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 90,
+        "transmission_tint": [
+          1,
+          0,
+          1
+        ]
+      },
+      "palette_refs": [
+        "green_lush_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "oak_log_stripped",
+      "file": "oak_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "birch_log_stripped",
+      "file": "birch_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spruce_log_stripped",
+      "file": "spruce_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "jungle_log_stripped",
+      "file": "jungle_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "acacia_log_stripped",
+      "file": "acacia_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_oak_log_stripped",
+      "file": "dark_oak_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mangrove_log_stripped",
+      "file": "mangrove_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cherry_log_stripped",
+      "file": "cherry_log_stripped.png",
+      "category": "wood",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "wood_mid_mid",
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "netherrack",
+      "file": "netherrack.png",
+      "category": "nether",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [
+        "overlay_char"
+      ],
+      "note": ""
+    },
+    {
+      "id": "basalt_side",
+      "file": "basalt_side.png",
+      "category": "nether",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "basalt_top",
+      "file": "basalt_top.png",
+      "category": "nether",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "basalt_polished_side",
+      "file": "basalt_polished_side.png",
+      "category": "nether",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_dark3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "crimson_nylium",
+      "file": "crimson_nylium.png",
+      "category": "nether",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "red_nether_lighter"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "warped_nylium",
+      "file": "warped_nylium.png",
+      "category": "nether",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_teal_mid",
+        "green_teal_lighter"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "nether_bricks",
+      "file": "nether_bricks.png",
+      "category": "nether",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "red_nether_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cracked_nether_bricks",
+      "file": "cracked_nether_bricks.png",
+      "category": "nether",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "ancient_debris_top",
+      "file": "ancient_debris_top.png",
+      "category": "nether",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_mid_mid",
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "ancient_debris_side",
+      "file": "ancient_debris_side.png",
+      "category": "nether",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "nether_gold_ore",
+      "file": "nether_gold_ore.png",
+      "category": "ore",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "ice",
+      "file": "ice.png",
+      "category": "ice",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.08,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": false,
+        "absorbency": 0,
+        "transmission_tint": [
+          3,
+          1,
+          0
+        ]
+      },
+      "palette_refs": [
+        "blue_ice_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "translucent"
+    },
+    {
+      "id": "packed_ice",
+      "file": "packed_ice.png",
+      "category": "ice",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.12,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blue_ice",
+      "file": "blue_ice.png",
+      "category": "ice",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.06,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "snow",
+      "file": "snow.png",
+      "category": "ice",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "frosted_ice",
+      "file": "frosted_ice.png",
+      "category": "ice",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.22,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_white",
+      "file": "concrete_white.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_orange",
+      "file": "concrete_orange.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_magenta",
+      "file": "concrete_magenta.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_light_blue",
+      "file": "concrete_light_blue.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_yellow",
+      "file": "concrete_yellow.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_lime",
+      "file": "concrete_lime.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_pink",
+      "file": "concrete_pink.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_gray",
+      "file": "concrete_gray.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_light_gray",
+      "file": "concrete_light_gray.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_cyan",
+      "file": "concrete_cyan.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_purple",
+      "file": "concrete_purple.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_blue",
+      "file": "concrete_blue.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_brown",
+      "file": "concrete_brown.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_green",
+      "file": "concrete_green.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_red",
+      "file": "concrete_red.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "concrete_black",
+      "file": "concrete_black.png",
+      "category": "concrete",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "concrete_light_mid",
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_aged",
+      "file": "stone_aged.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.91,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 70
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "stone_weathered",
+      "file": "stone_weathered.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.93,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "granite_aged",
+      "file": "granite_aged.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.91,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 70
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "granite_weathered",
+      "file": "granite_weathered.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.93,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sandstone_aged",
+      "file": "sandstone_aged.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.91,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 70
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sandstone_weathered",
+      "file": "sandstone_weathered.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.93,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "clay_aged",
+      "file": "clay_aged.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.91,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 70
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "clay_weathered",
+      "file": "clay_weathered.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.93,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_aged",
+      "file": "deepslate_aged.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.91,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 70
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "deepslate_weathered",
+      "file": "deepslate_weathered.png",
+      "category": "weathered",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.93,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_snow",
+      "file": "overlay_snow.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_moss_light",
+      "file": "overlay_moss_light.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_moss_heavy",
+      "file": "overlay_moss_heavy.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "green_lush_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_frost",
+      "file": "overlay_frost.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "blue_ice_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_crack_light",
+      "file": "overlay_crack_light.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_crack_heavy",
+      "file": "overlay_crack_heavy.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_wet",
+      "file": "overlay_wet.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "blue_ice_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_char",
+      "file": "overlay_char.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_age",
+      "file": "overlay_age.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bread",
+      "file": "bread.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_porkchop",
+      "file": "raw_porkchop.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cooked_porkchop",
+      "file": "cooked_porkchop.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_beef",
+      "file": "raw_beef.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cooked_beef",
+      "file": "cooked_beef.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_chicken",
+      "file": "raw_chicken.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cooked_chicken",
+      "file": "cooked_chicken.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_fish",
+      "file": "raw_fish.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cooked_fish",
+      "file": "cooked_fish.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "apple",
+      "file": "apple.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.75,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "golden_apple",
+      "file": "golden_apple.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.25,
+        "metalness": 0.3,
+        "emission": 0.08,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "carrot",
+      "file": "carrot.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "orange_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "potato",
+      "file": "potato.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "cooked_potato",
+      "file": "cooked_potato.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "beetroot",
+      "file": "beetroot.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mushroom_red",
+      "file": "mushroom_red.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "mushroom_brown",
+      "file": "mushroom_brown.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "kelp_dried",
+      "file": "kelp_dried.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sugar_cane_item",
+      "file": "sugar_cane_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "wheat_item",
+      "file": "wheat_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "flint",
+      "file": "flint.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.7,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bone",
+      "file": "bone.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "feather",
+      "file": "feather.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.6,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "leather_item",
+      "file": "leather_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "string_item",
+      "file": "string_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "slimeball",
+      "file": "slimeball.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "gunpowder",
+      "file": "gunpowder.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "paper_item",
+      "file": "paper_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "charcoal_item",
+      "file": "charcoal_item.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "clay_ball",
+      "file": "clay_ball.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blaze_rod",
+      "file": "blaze_rod.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.25,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "gold_ore_mid",
+        "orange_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "ender_pearl",
+      "file": "ender_pearl.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.22,
+        "metalness": 0.0,
+        "emission": 0.12,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "spider_eye",
+      "file": "spider_eye.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "phantom_membrane",
+      "file": "phantom_membrane.png",
+      "category": "survival",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.4,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_iron_block",
+      "file": "raw_iron_block.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "iron_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_gold_block",
+      "file": "raw_gold_block.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_warm_mid",
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "raw_copper_block",
+      "file": "raw_copper_block.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "copper_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "nether_quartz_ore",
+      "file": "nether_quartz_ore.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "white_snow_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "iron_ingot",
+      "file": "iron_ingot.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.4,
+        "metalness": 0.8,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "iron_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "gold_ingot",
+      "file": "gold_ingot.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.9,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "gold_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "copper_ingot",
+      "file": "copper_ingot.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.38,
+        "metalness": 0.8,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "copper_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "netherite_ingot",
+      "file": "netherite_ingot.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.9,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid",
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "netherite_scrap",
+      "file": "netherite_scrap.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "diamond_gem",
+      "file": "diamond_gem.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.18,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "diamond_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "emerald_gem",
+      "file": "emerald_gem.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.2,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "emerald_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "amethyst_shard",
+      "file": "amethyst_shard.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.22,
+        "metalness": 0.0,
+        "emission": 0.05,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "amethyst_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "nether_quartz_item",
+      "file": "nether_quartz_item.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.28,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_light"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "lapis_lazuli_item",
+      "file": "lapis_lazuli_item.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "lapis_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "prismarine_shard_item",
+      "file": "prismarine_shard_item.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "prismarine_crystal",
+      "file": "prismarine_crystal.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.22,
+        "metalness": 0.0,
+        "emission": 0.12,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "diamond_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "echo_shard",
+      "file": "echo_shard.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.32,
+        "metalness": 0.0,
+        "emission": 0.08,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "disc_fragment",
+      "file": "disc_fragment.png",
+      "category": "mining",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.45,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "prismarine",
+      "file": "prismarine.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "prismarine_bricks",
+      "file": "prismarine_bricks.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dark_prismarine",
+      "file": "dark_prismarine.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 40
+      },
+      "palette_refs": [
+        "green_teal_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sea_lantern",
+      "file": "sea_lantern.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.0,
+        "emission": 0.8,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "diamond_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive \u2014 light level 15"
+    },
+    {
+      "id": "magma_block",
+      "file": "magma_block.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.3,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "orange_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive cracks \u2014 light level 3"
+    },
+    {
+      "id": "honeycomb_block",
+      "file": "honeycomb_block.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "gold_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "hay_block_side",
+      "file": "hay_block_side.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "hay_block_top",
+      "file": "hay_block_top.png",
+      "category": "building",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 180
+      },
+      "palette_refs": [
+        "brown_sandy_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bookshelf",
+      "file": "bookshelf.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "crafting_table_top",
+      "file": "crafting_table_top.png",
+      "category": "building",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "wood_light_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "crafting_table_side",
+      "file": "crafting_table_side.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "wood_mid_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "furnace_front",
+      "file": "furnace_front.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "furnace_front_lit",
+      "file": "furnace_front_lit.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.12,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "orange_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "furnace_top",
+      "file": "furnace_top.png",
+      "category": "building",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "blast_furnace_front",
+      "file": "blast_furnace_front.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.2,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "iron_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sculk",
+      "file": "sculk.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.08,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_grey_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Faint bioluminescent veins"
+    },
+    {
+      "id": "sculk_catalyst",
+      "file": "sculk_catalyst.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.35,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_grey_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive eye \u2014 light level 6"
+    },
+    {
+      "id": "amethyst_block",
+      "file": "amethyst_block.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.25,
+        "metalness": 0.0,
+        "emission": 0.05,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "amethyst_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "budding_amethyst",
+      "file": "budding_amethyst.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.03,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "amethyst_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bamboo_block_side",
+      "file": "bamboo_block_side.png",
+      "category": "building",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "bamboo_planks",
+      "file": "bamboo_planks.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "crimson_planks",
+      "file": "crimson_planks.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "red_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "warped_planks",
+      "file": "warped_planks.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.78,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 160
+      },
+      "palette_refs": [
+        "green_teal_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "froglight_ochre",
+      "file": "froglight_ochre.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.45,
+        "metalness": 0.0,
+        "emission": 0.9,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "gold_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive \u2014 light level 15"
+    },
+    {
+      "id": "froglight_verdant",
+      "file": "froglight_verdant.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.45,
+        "metalness": 0.0,
+        "emission": 0.9,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "green_lush_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive \u2014 light level 15"
+    },
+    {
+      "id": "froglight_pearlescent",
+      "file": "froglight_pearlescent.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.45,
+        "metalness": 0.0,
+        "emission": 0.9,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "amethyst_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Emissive \u2014 light level 15"
+    },
+    {
+      "id": "reinforced_deepslate",
+      "file": "reinforced_deepslate.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_grey_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Blast resistant"
+    },
+    {
+      "id": "chiseled_copper",
+      "file": "chiseled_copper.png",
+      "category": "building",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.45,
+        "metalness": 0.4,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "copper_ore_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "charred_log",
+      "file": "charred_log.png",
+      "category": "weathering",
+      "face_kind": "side",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Post-fire wood \u2014 log side"
+    },
+    {
+      "id": "charred_log_top",
+      "file": "charred_log_top.png",
+      "category": "weathering",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Charred log cross-section"
+    },
+    {
+      "id": "charred_planks",
+      "file": "charred_planks.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "fulgurite",
+      "file": "fulgurite.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_sandy_light3",
+        "white_snow_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Vitrified sand \u2014 lightning strike mark"
+    },
+    {
+      "id": "soot_block",
+      "file": "soot_block.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.98,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Soot-covered surface as a solid block"
+    },
+    {
+      "id": "icicle_block",
+      "file": "icicle_block.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.12,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0,
+        "transmission_tint": [
+          2,
+          1,
+          0
+        ]
+      },
+      "palette_refs": [
+        "blue_ice_light3",
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "frost_block",
+      "file": "frost_block.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.2,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_light3",
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "thin_ice",
+      "file": "thin_ice.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.1,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Fragile \u2014 breaks under weight"
+    },
+    {
+      "id": "earthen_clay",
+      "file": "earthen_clay.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 200
+      },
+      "palette_refs": [
+        "terracotta_base_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "loam",
+      "file": "loam.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 220
+      },
+      "palette_refs": [
+        "brown_dark_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "silt",
+      "file": "silt.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 210
+      },
+      "palette_refs": [
+        "grey_warm_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "permafrost",
+      "file": "permafrost.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "blue_grey_dark4",
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "dune_grass",
+      "file": "dune_grass.png",
+      "category": "weathering",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 100
+      },
+      "palette_refs": [
+        "brown_sandy_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "weeds",
+      "file": "weeds.png",
+      "category": "weathering",
+      "face_kind": "top",
+      "material": {
+        "roughness": 0.95,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 120
+      },
+      "palette_refs": [
+        "brown_mid_mid",
+        "green_dry_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "overlay_soot",
+      "file": "overlay_soot.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "grey_neutral_darkest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Soot deposit on walls/surfaces"
+    },
+    {
+      "id": "overlay_ivy",
+      "file": "overlay_ivy.png",
+      "category": "overlay",
+      "face_kind": "overlay",
+      "material": {},
+      "palette_refs": [
+        "green_lush_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Ivy growth on vertical surfaces"
+    },
+    {
+      "id": "mossy_stone",
+      "file": "mossy_stone.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.92,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 80
+      },
+      "palette_refs": [
+        "green_lush_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "sandy_cobblestone",
+      "file": "sandy_cobblestone.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_shadow",
+        "brown_sandy_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "snowy_stone",
+      "file": "snowy_stone.png",
+      "category": "weathering",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "white_snow_mid",
+        "grey_neutral_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": ""
+    },
+    {
+      "id": "resonance_crystal",
+      "file": "resonance_crystal.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.18,
+        "metalness": 0.0,
+        "emission": 0.15,
+        "is_opaque": true,
+        "absorbency": 0,
+        "transmission_tint": [
+          3,
+          2,
+          1
+        ]
+      },
+      "palette_refs": [
+        "blue_ice_light3",
+        "white_snow_lightest"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Information Bending \u2014 optical focus"
+    },
+    {
+      "id": "resonance_crystal_active",
+      "file": "resonance_crystal_active.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.15,
+        "metalness": 0.0,
+        "emission": 0.55,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_mid",
+        "lapis_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Resonance crystal during active bending"
+    },
+    {
+      "id": "chi_stone",
+      "file": "chi_stone.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.85,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_shadow",
+        "green_lush_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Earth bending amplifier \u2014 S property anchor"
+    },
+    {
+      "id": "chi_stone_active",
+      "file": "chi_stone_active.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.82,
+        "metalness": 0.0,
+        "emission": 0.12,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "green_lush_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Chi stone with active bending flow"
+    },
+    {
+      "id": "conductive_ore",
+      "file": "conductive_ore.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.8,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 60
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "lapis_ore_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Stormstrike ore \u2014 high conductivity host stone"
+    },
+    {
+      "id": "brine_crystal_deposit",
+      "file": "brine_crystal_deposit.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.75,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 30
+      },
+      "palette_refs": [
+        "grey_neutral_mid",
+        "amethyst_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Heavy Brine mineral deposit in stone"
+    },
+    {
+      "id": "thermal_vent_block",
+      "file": "thermal_vent_block.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.9,
+        "metalness": 0.0,
+        "emission": 0.22,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "grey_neutral_darkest",
+        "orange_nether_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Thermal Phase vent \u2014 emissive. R property source"
+    },
+    {
+      "id": "seismic_anchor",
+      "file": "seismic_anchor.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.4,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_grey_mid",
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Seismic anchor \u2014 S property amplifier"
+    },
+    {
+      "id": "bending_shrine_stone",
+      "file": "bending_shrine_stone.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.35,
+        "metalness": 0.0,
+        "emission": 0.05,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid",
+        "grey_neutral_dark4"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Ancient Shrine material \u2014 unlocks elemental access"
+    },
+    {
+      "id": "elemental_core_fire",
+      "file": "elemental_core_fire.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.3,
+        "metalness": 0.0,
+        "emission": 0.45,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "red_nether_mid",
+        "orange_nether_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Fire elemental core \u2014 R property emitter"
+    },
+    {
+      "id": "elemental_core_ice",
+      "file": "elemental_core_ice.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.15,
+        "metalness": 0.0,
+        "emission": 0.25,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_ice_mid",
+        "white_snow_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Ice elemental core \u2014 Water/Ice discipline"
+    },
+    {
+      "id": "elemental_core_earth",
+      "file": "elemental_core_earth.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.88,
+        "metalness": 0.0,
+        "emission": 0.05,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "brown_mid_dark4",
+        "grey_neutral_shadow"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Earth elemental core \u2014 S property anchor"
+    },
+    {
+      "id": "elemental_core_air",
+      "file": "elemental_core_air.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.25,
+        "metalness": 0.0,
+        "emission": 0.2,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "white_snow_light3",
+        "blue_ice_light3"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Air elemental core \u2014 W property generator"
+    },
+    {
+      "id": "elemental_core_storm",
+      "file": "elemental_core_storm.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.22,
+        "metalness": 0.0,
+        "emission": 0.4,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "lapis_ore_mid",
+        "blue_ice_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Storm core \u2014 S+L generator, Stormstrike focus"
+    },
+    {
+      "id": "resonance_node",
+      "file": "resonance_node.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.38,
+        "metalness": 0.0,
+        "emission": 0.18,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "blue_grey_dark4",
+        "grey_cool_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Ryujin Triad infrastructure node \u2014 conducts S through substrate"
+    },
+    {
+      "id": "bending_altar_platform",
+      "file": "bending_altar_platform.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.4,
+        "metalness": 0.0,
+        "emission": 0.0,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid",
+        "grey_neutral_dark5"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Dojo altar platform surface \u2014 stance coinage base"
+    },
+    {
+      "id": "void_mist_core",
+      "file": "void_mist_core.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.28,
+        "metalness": 0.0,
+        "emission": 0.3,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "purple_dark_mid",
+        "amethyst_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Heavy Brine void mist emitter core"
+    },
+    {
+      "id": "echo_stone",
+      "file": "echo_stone.png",
+      "category": "bending",
+      "face_kind": "uniform",
+      "material": {
+        "roughness": 0.55,
+        "metalness": 0.0,
+        "emission": 0.08,
+        "is_opaque": true,
+        "absorbency": 0
+      },
+      "palette_refs": [
+        "amethyst_mid"
+      ],
+      "variants": [],
+      "overlays": [],
+      "note": "Temporal/Information Bending \u2014 echo preservation"
+    }
+  ],
+  "variant_index": {
+    "stone_polished": "stone",
+    "stone_bricks": "stone",
+    "stone_bricks_mossy": "stone",
+    "stone_bricks_cracked": "stone",
+    "stone_chiseled": "stone",
+    "stone_weathered": "stone",
+    "stone_aged": "stone",
+    "cobblestone_mossy": "cobblestone",
+    "cobblestone_weathered": "cobblestone",
+    "granite_polished": "granite",
+    "granite_weathered": "granite",
+    "andesite_polished": "andesite",
+    "diorite_polished": "diorite",
+    "deepslate_polished": "deepslate",
+    "deepslate_cobbled": "deepslate",
+    "deepslate_tiles": "deepslate",
+    "deepslate_bricks": "deepslate",
+    "deepslate_chiseled": "deepslate",
+    "dirt_coarse": "dirt",
+    "dirt_rooted": "dirt",
+    "red_sand": "sand",
+    "gravel_fine": "gravel"
+  },
+  "overlay_index": {
+    "overlay_snow": [
+      "stone",
+      "cobblestone",
+      "dirt",
+      "sand",
+      "gravel",
+      "grass_block_top",
+      "grass_block_top_jungle",
+      "grass_block_top_savanna",
+      "grass_block_top_taiga",
+      "grass_block_top_swamp"
+    ],
+    "overlay_moss_light": [
+      "stone",
+      "cobblestone",
+      "dirt"
+    ],
+    "overlay_frost": [
+      "stone"
+    ],
+    "overlay_crack_light": [
+      "stone"
+    ],
+    "overlay_wet": [
+      "dirt"
+    ],
+    "overlay_char": [
+      "netherrack"
+    ]
+  }
+}

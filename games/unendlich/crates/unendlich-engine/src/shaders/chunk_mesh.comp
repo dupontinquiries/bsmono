@@ -1,0 +1,235 @@
+#version 450
+
+// unendlich GPU mesher (v0.18.1) — naive face-culling, FP32, FP64-free.
+//
+// Reads packed block IDs from a chunk slot in the chunk pool SSBO; for each
+// solid block, emits up to 6 faces (one per neighbor that is air). Each
+// face is two triangles, four vertices, six indices.
+//
+// This is the SIMPLE version: not greedy. One quad per block-face. CPU
+// `mesh_chunk_naive` is the reference oracle. A future increment can layer
+// greedy merging on top once we're confident the data path is correct.
+//
+// Workgroup: 8×8×8 = 512 invocations. Chunk is 32³ = 32,768 blocks.
+// Each invocation handles one block via 4× stride per axis (4×4×4 = 64
+// blocks per invocation, matching the chunk_generation kernel's pattern).
+//
+// Output buffers per chunk:
+//   - vertex SSBO    (binding 1): packed [vec3 pos, vec3 color] per vertex
+//   - index SSBO     (binding 2): u32 indices, 6 per face
+//   - counters SSBO  (binding 3): atomic u32 next-vertex, next-index, per chunk
+//
+// Coordination: an atomicAdd on the per-chunk counter reserves output slots,
+// then the invocation writes to that range. No inter-invocation barrier
+// required — every invocation writes to a non-overlapping range.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
+
+const int CHUNK_SIZE = 32;
+const int CHUNK_VOLUME = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; // 32768
+
+// ---- Inputs --------------------------------------------------------------
+
+// Block storage from the chunk pool. Packed 4 blocks per uint, same layout
+// chunk_generation.comp writes. Each chunk slot is `CHUNK_VOLUME / 4 = 8192`
+// uints starting at offset `slot_index * 8192`.
+layout(std430, binding = 0) readonly buffer BlockPool {
+    uint blocks_packed[];
+};
+
+// ---- Outputs -------------------------------------------------------------
+
+struct Vertex {
+    vec3 position;
+    vec3 color;
+};
+
+// Vertex output. Sized to MAX_VERTICES_PER_CHUNK by the host. Per-chunk
+// region starts at `chunk_index * MAX_VERTICES_PER_CHUNK`.
+layout(std430, binding = 1) writeonly buffer VertexOut {
+    Vertex vertices[];
+};
+
+// Index output. Sized to MAX_INDICES_PER_CHUNK by the host.
+layout(std430, binding = 2) writeonly buffer IndexOut {
+    uint indices[];
+};
+
+// Counters. Two u32 per chunk: next free vertex slot, next free index slot.
+// The host reads these after dispatch to know the actual counts.
+layout(std430, binding = 3) buffer Counters {
+    uint counters[];
+};
+
+// ---- Push constants ------------------------------------------------------
+
+layout(push_constant) uniform PushConstants {
+    ivec3 chunk_coord;     // for world-space vertex positions
+    uint slot_index;       // input slot in BlockPool
+    uint chunk_index;      // output slot in vertex/index/counter buffers
+    uint max_verts;        // capacity per chunk in VertexOut
+    uint max_indices;      // capacity per chunk in IndexOut
+    uint _pad;
+} pc;
+
+// ---- Block ID constants (mirror src/world/blocks.rs) ---------------------
+
+const uint BLOCK_AIR = 0u;
+
+// ---- Color table (mirror render/mesher::block_color, simplified) ---------
+// 32 entries; index by BlockId & 31. Real `block_color` is a match table
+// with 200+ entries, but most BlockIds < 32 are the common cases. Anything
+// out of range gets MISSING_COLOR (bright magenta) as a debug fallback,
+// matching the CPU mesher's behavior for unmapped blocks.
+
+const vec3 MISSING_COLOR = vec3(1.0, 0.0, 1.0);
+
+vec3 block_base_color(uint id) {
+    // Compact lookup. Numbers chosen to match the CPU mesher's defaults.
+    switch (id) {
+        case 0u:  return vec3(0.0);                   // Air (never drawn)
+        case 1u:  return vec3(0.50, 0.50, 0.52);      // Stone
+        case 2u:  return vec3(0.40, 0.70, 0.30);      // Grass
+        case 3u:  return vec3(0.55, 0.40, 0.27);      // Dirt
+        case 7u:  return vec3(0.20, 0.20, 0.22);      // Bedrock
+        case 12u: return vec3(0.92, 0.85, 0.62);      // Sand
+        case 14u: return vec3(0.85, 0.78, 0.20);      // GoldOre
+        case 15u: return vec3(0.72, 0.60, 0.45);      // IronOre
+        case 16u: return vec3(0.20, 0.20, 0.20);      // CoalOre
+        case 23u: return vec3(0.32, 0.50, 0.30);      // Moss
+        case 24u: return vec3(0.78, 0.45, 0.30);      // RedSandstone
+        case 31u: return vec3(0.75, 0.85, 0.95);      // Ice
+        case 80u: return vec3(0.95, 0.97, 0.99);      // SnowBlock
+        default:  return MISSING_COLOR;
+    }
+}
+
+// Per-face brightness, matching mesher::FACE_LIGHT.
+// Index: 0=+Y top, 1=-Y bottom, 2=+X east, 3=-X west, 4=+Z south, 5=-Z north.
+const float FACE_LIGHT[6] = float[6](1.00, 0.55, 0.80, 0.80, 0.70, 0.70);
+
+// ---- Block fetch ---------------------------------------------------------
+
+uint block_at(int x, int y, int z) {
+    // Out of chunk bounds → air. The CPU mesher does the same: chunk
+    // boundaries get faces because we don't peek across into neighbors.
+    if (x < 0 || x >= CHUNK_SIZE) return BLOCK_AIR;
+    if (y < 0 || y >= CHUNK_SIZE) return BLOCK_AIR;
+    if (z < 0 || z >= CHUNK_SIZE) return BLOCK_AIR;
+
+    // Match: idx = x + z*32 + y*32*32 (CPU mesher convention).
+    int local_idx = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
+    int global_idx = int(pc.slot_index) * CHUNK_VOLUME + local_idx;
+    int word_idx = global_idx >> 2;
+    int byte_in_word = global_idx & 3;
+    uint word = blocks_packed[word_idx];
+    return (word >> uint(byte_in_word * 8)) & 0xFFu;
+}
+
+// `is_meshable` per CPU mesher: a block emits faces if it's NOT air. The
+// real CPU mesher has fluid-surface special cases; we don't yet.
+bool is_solid(uint id) { return id != BLOCK_AIR; }
+
+// ---- Face emission -------------------------------------------------------
+//
+// Face direction → 4 corner offsets (in unit-cube space, relative to
+// the block's `(x, y, z)` minimum corner). Order matches CPU mesher:
+// CCW when viewed from outside.
+
+// Vertices for each face direction.  4 vertices per face.
+// Order: +Y, -Y, +X, -X, +Z, -Z (matches FACE_LIGHT).
+const vec3 FACE_VERTS[6 * 4] = vec3[6 * 4](
+    // +Y top  (CCW from above)
+    vec3(0,1,0), vec3(1,1,0), vec3(1,1,1), vec3(0,1,1),
+    // -Y bottom (CCW from below)
+    vec3(0,0,1), vec3(1,0,1), vec3(1,0,0), vec3(0,0,0),
+    // +X east (CCW from +X)
+    vec3(1,0,0), vec3(1,0,1), vec3(1,1,1), vec3(1,1,0),
+    // -X west (CCW from -X)
+    vec3(0,1,0), vec3(0,1,1), vec3(0,0,1), vec3(0,0,0),
+    // +Z south (CCW from +Z)
+    vec3(0,0,1), vec3(1,0,1), vec3(1,1,1), vec3(0,1,1),
+    // -Z north (CCW from -Z)
+    vec3(1,0,0), vec3(0,0,0), vec3(0,1,0), vec3(1,1,0)
+);
+
+// Neighbor offset per face direction, used to test if the face should be drawn.
+const ivec3 FACE_NEIGHBOR[6] = ivec3[6](
+    ivec3( 0,  1,  0),
+    ivec3( 0, -1,  0),
+    ivec3( 1,  0,  0),
+    ivec3(-1,  0,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  0, -1)
+);
+
+void emit_face(int face_id, ivec3 block_pos, vec3 base_color) {
+    // Reserve 4 vertex slots and 6 index slots for this face.
+    uint base_v = atomicAdd(counters[pc.chunk_index * 2u + 0u], 4u);
+    uint base_i = atomicAdd(counters[pc.chunk_index * 2u + 1u], 6u);
+
+    // Capacity check. If we'd overflow, back out: leave the counters at
+    // the new (over-cap) value and don't write. Host detects overflow
+    // by counters[].x > max_verts and reschedules the chunk through
+    // the CPU fallback. This is rare: a 32³ chunk's worst case is
+    // 32³ × 6 = 196,608 faces = 786,432 vertices, but real chunks are
+    // far less. Default cap is well above typical chunk size.
+    if (base_v + 4u > pc.max_verts) return;
+    if (base_i + 6u > pc.max_indices) return;
+
+    uint v_off = pc.chunk_index * pc.max_verts + base_v;
+    uint i_off = pc.chunk_index * pc.max_indices + base_i;
+
+    vec3 face_color = base_color * FACE_LIGHT[face_id];
+
+    // World-space position: chunk origin + block + face corner.
+    vec3 chunk_origin = vec3(pc.chunk_coord) * float(CHUNK_SIZE);
+    vec3 block_origin = chunk_origin + vec3(block_pos);
+
+    for (int k = 0; k < 4; k++) {
+        Vertex v;
+        v.position = block_origin + FACE_VERTS[face_id * 4 + k];
+        v.color = face_color;
+        vertices[v_off + uint(k)] = v;
+    }
+
+    // Two triangles, CCW: (0,1,2) and (0,2,3).
+    indices[i_off + 0u] = v_off + 0u;
+    indices[i_off + 1u] = v_off + 1u;
+    indices[i_off + 2u] = v_off + 2u;
+    indices[i_off + 3u] = v_off + 0u;
+    indices[i_off + 4u] = v_off + 2u;
+    indices[i_off + 5u] = v_off + 3u;
+}
+
+// ---- Main ----------------------------------------------------------------
+
+void main() {
+    uvec3 local = gl_LocalInvocationID;
+
+    // Each invocation processes a 4×4×4 region (64 blocks).
+    for (int dz = 0; dz < 4; dz++) {
+        for (int dy = 0; dy < 4; dy++) {
+            for (int dx = 0; dx < 4; dx++) {
+                int lx = int(local.x) * 4 + dx;
+                int ly = int(local.y) * 4 + dy;
+                int lz = int(local.z) * 4 + dz;
+                ivec3 block_pos = ivec3(lx, ly, lz);
+
+                uint id = block_at(lx, ly, lz);
+                if (!is_solid(id)) continue;
+
+                vec3 color = block_base_color(id);
+
+                // Emit a face for each direction whose neighbor is non-solid.
+                for (int f = 0; f < 6; f++) {
+                    ivec3 n = block_pos + FACE_NEIGHBOR[f];
+                    uint nb = block_at(n.x, n.y, n.z);
+                    if (!is_solid(nb)) {
+                        emit_face(f, block_pos, color);
+                    }
+                }
+            }
+        }
+    }
+}

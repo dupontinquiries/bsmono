@@ -1,0 +1,1 @@
+- [Multiplayer & Netcode](SECTION_multiplayer.md) — local splitscreen, lockstep/rollback, world-join + client streaming.
