@@ -9,9 +9,31 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Turn { User, Assistant }
 
+/// What a node *is*. A text turn matches on its body; an IMAGE node matches on its NAME + generation prompt;
+/// a SHOT node animates a keyframe image (its `refers` points at that image's uuid) and matches on its motion
+/// prompt + the keyframe's own keywords. All three are keyword bags to the matcher — retrieval never branches
+/// on kind. Pixels/clips live in a side-table keyed by [`Node::uuid`], not here.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind { Text, Image, Shot }
+
+/// Stable, session-independent identity — what the chat refers to a node by ("that galaxy image") and what
+/// an image's pixel payload is keyed on. Distinct from `id`, a positional index into this graph. Derived
+/// deterministically from content + index (swap for a random UUIDv4 later without changing the type).
+fn gen_uuid(a: &str, b: &str, salt: u64) -> u128 {
+    use std::hash::{Hash, Hasher};
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    (a, b, salt, 0x9E37_79B9_7F4A_7C15u64).hash(&mut h1);
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    (salt, b, a, 0xD1B5_4A32_D192_ED03u64).hash(&mut h2);
+    ((h1.finish() as u128) << 64) | (h2.finish() as u128)
+}
+
 #[derive(Clone, Debug)]
 pub struct Node {
     pub id: usize,
+    pub uuid: u128,            // stable identity (chat references + image payload key); id is only positional
+    pub kind: Kind,            // Text turn vs Image node vs Shot — retrieval treats all as keyword bags
+    pub refers: Option<u128>,  // a SEMANTIC edge by uuid (a shot → its keyframe, an edit → its source); not the tree parent
     pub parent: Option<usize>,
     pub turn: Turn,
     pub preview: String,
@@ -36,7 +58,7 @@ impl Graph {
         for (turn, text) in turns {
             let id = nodes.len();
             nodes.push(Node {
-                id, parent, turn,
+                id, uuid: gen_uuid(text, "", id as u64), kind: Kind::Text, refers: None, parent, turn,
                 preview: preview(text),
                 tokens: est(text),
                 in_context: false,
@@ -59,7 +81,7 @@ impl Graph {
             let id = nodes.len();
             let parent = parent.filter(|&p| p < id); // parents must precede (guards against bad input/cycles)
             nodes.push(Node {
-                id, parent, turn,
+                id, uuid: gen_uuid(text, "", id as u64), kind: Kind::Text, refers: None, parent, turn,
                 preview: preview(text), tokens: est(text),
                 in_context: false, keywords: keywords(text),
                 looks_back: cue(text).is_some(), pruned: false,
@@ -68,6 +90,99 @@ impl Graph {
         let n = nodes.len();
         let head = head.filter(|&h| h < n).or(if n > 0 { Some(n - 1) } else { None });
         Graph { nodes, head }
+    }
+
+    /// Append a live TEXT turn (parent defaults to the current head) and return its uuid — the incremental
+    /// counterpart to the batch `spine`/`from_tree` builders, so the graph can grow a turn at a time.
+    pub fn push_turn(&mut self, turn: Turn, text: &str, parent: Option<usize>, est: impl Fn(&str) -> usize) -> u128 {
+        let id = self.nodes.len();
+        let parent = parent.or(self.head).filter(|&p| p < id);
+        let uuid = gen_uuid(text, "", id as u64);
+        self.nodes.push(Node {
+            id, uuid, kind: Kind::Text, refers: None, parent, turn,
+            preview: preview(text), tokens: est(text),
+            in_context: false, keywords: keywords(text),
+            looks_back: cue(text).is_some(), pruned: false,
+        });
+        self.head = Some(id);
+        uuid
+    }
+
+    /// Append an IMAGE node to the graph and return its stable [`Node::uuid`]. The image's matchable surface
+    /// is its `name` plus the generation `prompt` — those become its `keywords`, so it's retrieved by the very
+    /// same keyword-overlap machinery ([`back_reference_pins`], [`segments`]) as any text turn; a later turn
+    /// that mentions the image's name pulls it up from the front just like referencing an earlier reply. The
+    /// pixel payload is stored elsewhere, keyed by the returned uuid. `est` charges its (small) token cost —
+    /// an image in context costs only its name/caption tokens, not the pixels.
+    pub fn push_image(&mut self, name: &str, prompt: &str, parent: Option<usize>, est: impl Fn(&str) -> usize) -> u128 {
+        let id = self.nodes.len();
+        let parent = parent.or(self.head).filter(|&p| p < id); // chain off the current head by default
+        let uuid = gen_uuid(name, prompt, id as u64);
+        let mut kw = keywords(name);
+        for w in keywords(prompt) { if !kw.contains(&w) { kw.push(w); } } // name + prompt terms = its surface
+        self.nodes.push(Node {
+            id, uuid, kind: Kind::Image, refers: None, parent, turn: Turn::Assistant,
+            preview: name.to_string(), tokens: est(name).max(1),
+            in_context: false, keywords: kw,
+            looks_back: false, pruned: false,
+        });
+        self.head = Some(id);
+        uuid
+    }
+
+    /// Resolve a stable uuid back to its node (how a named/referenced image is looked up).
+    pub fn node_by_uuid(&self, uuid: u128) -> Option<&Node> { self.nodes.iter().find(|n| n.uuid == uuid) }
+
+    /// Every image node's (uuid, name), newest last — for the payload side-table / a picker.
+    pub fn image_nodes(&self) -> Vec<(u128, &str)> {
+        self.nodes.iter().filter(|n| n.kind == Kind::Image).map(|n| (n.uuid, n.preview.as_str())).collect()
+    }
+
+    /// Append a SHOT node that animates the image `keyframe_uuid` with `motion_prompt`, returning its uuid.
+    /// This is the video layer of the hybrid: an image owns a shot's LOOK, the shot (rendered later by an
+    /// image-to-video model) owns its MOTION. The shot's matchable surface is the motion prompt PLUS the
+    /// keyframe's own keywords, so "the shot where the locket spins" is retrieved by the same overlap
+    /// machinery. `refers` records the keyframe edge; the rendered clip is stored in the side-table by uuid.
+    pub fn push_shot(&mut self, keyframe_uuid: u128, motion_prompt: &str, parent: Option<usize>, est: impl Fn(&str) -> usize) -> u128 {
+        let id = self.nodes.len();
+        let parent = parent.or(self.head).filter(|&p| p < id);
+        let uuid = gen_uuid(motion_prompt, "shot", id as u64);
+        let mut kw = keywords(motion_prompt);
+        if let Some(kf) = self.node_by_uuid(keyframe_uuid) {      // inherit the keyframe's subject terms
+            for w in kf.keywords.clone() { if !kw.contains(&w) { kw.push(w); } }
+        }
+        self.nodes.push(Node {
+            id, uuid, kind: Kind::Shot, refers: Some(keyframe_uuid), parent, turn: Turn::Assistant,
+            preview: motion_prompt.to_string(), tokens: est(motion_prompt).max(1),
+            in_context: false, keywords: kw,
+            looks_back: false, pruned: false,
+        });
+        self.head = Some(id);
+        uuid
+    }
+
+    /// The keyframe an image-edit / shot node derives from, if any (follows the `refers` edge).
+    pub fn keyframe_of(&self, uuid: u128) -> Option<u128> { self.node_by_uuid(uuid).and_then(|n| n.refers) }
+
+    /// The render TIMELINE: shot node ids along the active branch in play order (root→head). Concatenate the
+    /// clips in this order and you have the movie; a cut falls between two shots that sit in different topic
+    /// segments (see [`cuts`]).
+    pub fn timeline(&self) -> Vec<usize> {
+        self.active_path().into_iter().filter(|&id| self.nodes[id].kind == Kind::Shot).collect()
+    }
+
+    /// Hard-CUT boundaries within the [`timeline`]: the index (into the timeline vec) AFTER which the next
+    /// shot begins a new topic segment — a scene change, where a straight cut reads best and no cross-shot
+    /// interpolation should ever be attempted. Reuses the same segmentation as context compaction.
+    pub fn cuts(&self) -> Vec<usize> {
+        let tl = self.timeline();
+        let mut out = Vec::new();
+        for w in 1..tl.len() {
+            if Self::overlap(&self.nodes[tl[w]].keywords, &self.nodes[tl[w - 1]].keywords) == 0 {
+                out.push(w - 1); // a segment break between timeline[w-1] and timeline[w]
+            }
+        }
+        out
     }
 
     /// The lineage root→head of the current leaf.
@@ -384,5 +499,62 @@ mod tests {
         assert!(segs.len() >= 2, "topic shift to haiku starts a new segment: {segs:?}");
         let churn = g.superseded();
         assert!(churn.contains(&0) && !churn.contains(&3), "outcome (end of quicksort run) kept, churn before it collapsible: {churn:?}");
+    }
+
+    #[test]
+    fn image_node_is_pulled_up_by_name_like_text() {
+        // an image enters the chat with a name; many unrelated turns pass; then a later turn references it
+        // by name with a back-cue — and the SAME keyword-overlap retrieval pulls the image node forward.
+        let mut g = Graph::spine(
+            [(Turn::User, "let's talk about database indexing"),
+             (Turn::Assistant, "b-trees keep lookups logarithmic")].into_iter(),
+            |t| t.split_whitespace().count());
+        let img = g.push_image("spiral galaxy over mountains", "a photoreal spiral galaxy above jagged peaks at night", None, |t| t.split_whitespace().count());
+        // unrelated churn so the image falls out of the recency window
+        g.push_turn(Turn::User, "now explain rust lifetimes", None, |t| t.split_whitespace().count());
+        g.push_turn(Turn::Assistant, "a lifetime bounds how long a borrow is valid", None, |t| t.split_whitespace().count());
+        // the referencing turn: a back-cue ("remember") + the image's name keyword ("galaxy")
+        g.push_turn(Turn::User, "remember that galaxy image? bring it back", None, |t| t.split_whitespace().count());
+
+        let img_id = g.node_by_uuid(img).unwrap().id;
+        let pins = g.back_reference_pins(3);
+        assert!(pins.contains(&img_id), "the image node should be pulled up by name overlap, got {pins:?}");
+        // it's registered as an image, discoverable by uuid + in the image list
+        assert_eq!(g.node_by_uuid(img).unwrap().kind, Kind::Image);
+        assert!(g.image_nodes().iter().any(|&(u, name)| u == img && name == "spiral galaxy over mountains"));
+    }
+
+    #[test]
+    fn uuids_are_stable_and_distinct() {
+        let mut g = Graph::spine([(Turn::User, "hello")].into_iter(), |_| 1);
+        let a = g.push_image("cat", "a cat", None, |_| 1);
+        let b = g.push_image("cat", "a cat", None, |_| 1); // same content, different node → different uuid
+        assert_ne!(a, b, "identical content at different indices must not collide");
+        assert_eq!(g.node_by_uuid(a).unwrap().preview, "cat");
+    }
+
+    #[test]
+    fn shots_animate_keyframes_and_assemble_into_a_timeline() {
+        let words = |t: &str| t.split_whitespace().count();
+        let mut g = Graph::spine([(Turn::User, "storyboard the opening")].into_iter(), words);
+        // two scenes, each a keyframe + a shot that animates it
+        let kf1 = g.push_image("harbor at dawn", "a quiet harbor at dawn, boats still", None, words);
+        let s1 = g.push_shot(kf1, "slow push in on the harbor as gulls lift off", None, words);
+        let kf2 = g.push_image("city street chase", "a crowded neon city street at night", None, words);
+        let s2 = g.push_shot(kf2, "handheld chase down the city street", None, words);
+
+        // the shot links back to its keyframe, and inherits the keyframe's subject terms for retrieval
+        assert_eq!(g.keyframe_of(s1), Some(kf1));
+        assert!(g.node_by_uuid(s1).unwrap().keywords.iter().any(|w| w == "harbor"));
+
+        // the timeline is the shots in play order; a cut falls at the scene change (harbor → city)
+        let tl = g.timeline();
+        let (s1_id, s2_id) = (g.node_by_uuid(s1).unwrap().id, g.node_by_uuid(s2).unwrap().id);
+        assert_eq!(tl, vec![s1_id, s2_id]);
+        assert_eq!(g.cuts(), vec![0], "harbor shot and city shot share no keywords → a hard cut between them");
+
+        // and a shot is still retrievable by the same fuzzy matcher: a later 'remember the harbor shot' pulls it
+        g.push_turn(Turn::User, "remember that harbor shot? use it again", None, words);
+        assert!(g.back_reference_pins(3).contains(&s1_id));
     }
 }

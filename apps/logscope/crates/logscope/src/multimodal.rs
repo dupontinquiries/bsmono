@@ -133,6 +133,83 @@ pub fn image_indices(segments: &[Segment]) -> Vec<usize> {
     seen
 }
 
+/// A way a prompt's image markers can disagree with the images actually attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementError {
+    /// A marker (`<image:N>` or the N-th bare `<image>`) points at an image that wasn't attached.
+    MarkerOutOfRange { marker: usize, attached: usize },
+    /// An attached image was never referenced by any marker, so it would be silently dropped.
+    UnplacedImage(usize),
+}
+
+/// Check a parsed prompt places its images sanely against `n_attached` actual attachments: every marker
+/// must point at an attached image (`marker < n_attached`), and every attached image must be referenced
+/// at least once (else the engine would build embeddings for a picture the prompt never mentions).
+///
+/// Out-of-range markers are reported before unplaced images (a dangling marker is the more urgent bug —
+/// it would index a vision embedding that doesn't exist). Returns the first problem, or `Ok(())` when the
+/// placement is complete and in range. Duplicate placement of the same image is allowed (some prompts
+/// legitimately refer back to an image), so it isn't an error here.
+pub fn validate_placement(segments: &[Segment], n_attached: usize) -> Result<(), PlacementError> {
+    let used = image_indices(segments);
+    if let Some(&m) = used.iter().find(|&&i| i >= n_attached) {
+        return Err(PlacementError::MarkerOutOfRange { marker: m, attached: n_attached });
+    }
+    for i in 0..n_attached {
+        if !used.contains(&i) { return Err(PlacementError::UnplacedImage(i)); }
+    }
+    Ok(())
+}
+
+/// The target pixel size an image is resized to before tiling: `(cols*tile, rows*tile)`. The vision
+/// preprocessor resizes/pads the source image to this, then slices it into the `cols×rows` grid of
+/// `cfg.tile`-px tiles that [`tile_grid`] chose. (The optional thumbnail is a separate whole-image tile
+/// downscaled to `cfg.tile`², so it isn't part of these hi-res dims.)
+pub fn preprocess_dims(w: u32, h: u32, cfg: &VisionConfig) -> (u32, u32) {
+    let (c, r) = tile_grid(w, h, cfg);
+    (c * cfg.tile, r * cfg.tile)
+}
+
+/// A single hi-res tile's crop rectangle, in RESIZED-image pixel space (after the source is scaled to
+/// [`ImagePlan::resize_to`]). Each tile is `cfg.tile`² and the grid tiles evenly, so these never overlap
+/// and exactly cover the resized image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileBox { pub x: u32, pub y: u32, pub w: u32, pub h: u32 }
+
+/// The complete plan for turning one source image into vision tokens: resize target, tile grid, the
+/// row-major hi-res tile crop boxes, whether a whole-image thumbnail is also encoded, and the total token
+/// cost. This is the single hand-off to the pixel-resampler (the IO seam): scale the source to `resize_to`,
+/// crop each [`TileBox`], (optionally) also downscale the whole image to one `cfg.tile²` thumbnail, run the
+/// vision encoder on each, and you have `tokens` embeddings to drop into the image slots [`assemble`] made.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImagePlan {
+    pub resize_to: (u32, u32),
+    pub grid: (u32, u32),      // (cols, rows)
+    pub tiles: Vec<TileBox>,   // row-major, len == cols*rows
+    pub thumbnail: bool,
+    pub tokens: u32,
+}
+
+/// Build the [`ImagePlan`] for a `w`×`h` source under `cfg`. Bundles [`tile_grid`], [`preprocess_dims`],
+/// and [`image_tokens`] and adds the concrete per-tile crop boxes so the resampler doesn't recompute them.
+pub fn plan_image(w: u32, h: u32, cfg: &VisionConfig) -> ImagePlan {
+    let (cols, rows) = tile_grid(w, h, cfg);
+    let tile = cfg.tile.max(1);
+    let mut tiles = Vec::with_capacity((cols * rows) as usize);
+    for r in 0..rows {
+        for c in 0..cols {
+            tiles.push(TileBox { x: c * tile, y: r * tile, w: tile, h: tile });
+        }
+    }
+    ImagePlan {
+        resize_to: (cols * tile, rows * tile),
+        grid: (cols, rows),
+        tiles,
+        thumbnail: cfg.thumbnail,
+        tokens: image_tokens(w, h, cfg),
+    }
+}
+
 /// Parse a chat string and tokenize its text spans (via the injected tokenizer — the real tokenizer is the
 /// seam) into the [`Piece`] stream that [`assemble`] consumes. This closes the multimodal input path:
 /// chat string → `Piece`s → (`image_tokens` per image) → `assemble` → `Slot`s.
@@ -141,6 +218,63 @@ pub fn pieces_from_prompt(s: &str, tokenize: impl Fn(&str) -> Vec<u32>) -> Vec<P
         Segment::Text(t) => Piece::Text(tokenize(&t)),
         Segment::Image(i) => Piece::Image(i),
     }).collect()
+}
+
+/// An image payload lifted out of an inline `data:` URL: the declared MIME subtype (`png`, `jpeg`, …)
+/// and the raw base64 body (still encoded — decoding is the IO seam, like pixel resampling).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DataUrlImage { pub mime: String, pub base64: String }
+
+/// Whether a byte is part of a base64 body (standard + URL-safe alphabets, plus `=` padding).
+fn is_b64(c: char) -> bool { c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_' | '=') }
+
+/// Pull inline `data:image/<subtype>;base64,<data>` URLs out of a prompt, replacing each with a numbered
+/// `<image:N>` marker so a pasted image flows through the same segment/assemble path as an attached one —
+/// instead of being tokenized as a giant base64 text blob (thousands of junk tokens that blow the context).
+///
+/// `offset` is how many images are already attached before these; the first extracted image becomes
+/// `<image:offset>`, the next `<image:offset+1>`, and so on, so the markers line up with the caller's
+/// combined attachment list. Only `;base64,` data URLs are handled (the only form that carries pixels);
+/// a `data:` URL that isn't an image, or isn't base64, is left as literal text. Returns the rewritten
+/// prompt and the extracted images in first-seen order.
+pub fn extract_data_urls(prompt: &str, offset: usize) -> (String, Vec<DataUrlImage>) {
+    const MARK: &str = "data:image/";
+    let mut out = String::with_capacity(prompt.len());
+    let mut images = Vec::new();
+    let mut rest = prompt;
+    while let Some(pos) = rest.find(MARK) {
+        let after = &rest[pos + MARK.len()..];
+        // subtype runs up to the `;`; then require the exact `base64,` token.
+        let parsed = after.find(';').and_then(|semi| {
+            let mime = &after[..semi];
+            let tail = &after[semi + 1..];
+            let body = tail.strip_prefix("base64,")?;
+            // MIME subtype must be a simple token (no spaces / weird chars) to count as a real data URL.
+            if mime.is_empty() || !mime.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+                return None;
+            }
+            let b64: String = body.chars().take_while(|&c| is_b64(c)).collect();
+            if b64.is_empty() { return None; }
+            let consumed = MARK.len() + semi + 1 + "base64,".len() + b64.len();
+            Some((mime.to_string(), b64, consumed))
+        });
+        match parsed {
+            Some((mime, b64, consumed)) => {
+                out.push_str(&rest[..pos]);
+                out.push_str(&format!("<image:{}>", offset + images.len()));
+                images.push(DataUrlImage { mime, base64: b64 });
+                rest = &rest[pos + consumed..];
+            }
+            None => {
+                // not a well-formed base64 image data URL — keep the marker text literal, advance past it.
+                let keep = pos + MARK.len();
+                out.push_str(&rest[..keep]);
+                rest = &rest[keep..];
+            }
+        }
+    }
+    out.push_str(rest);
+    (out, images)
 }
 
 #[cfg(test)]
@@ -231,5 +365,113 @@ mod tests {
         let slots = assemble(&pieces, &[3]);
         assert_eq!(counts(&slots), (2, 3));
         assert_eq!(slots[1], Slot::Image { image: 0, idx: 0 });
+    }
+
+    #[test]
+    fn validate_placement_accepts_complete_in_range() {
+        let segs = segment_prompt("a <image> b <image>");        // places 0 and 1
+        assert_eq!(validate_placement(&segs, 2), Ok(()));
+        // duplicate reference to the same image is allowed
+        let segs = segment_prompt("<image:0> and again <image:0>");
+        assert_eq!(validate_placement(&segs, 1), Ok(()));
+    }
+
+    #[test]
+    fn validate_placement_flags_out_of_range_before_unplaced() {
+        // marker points past the single attachment → out-of-range (reported before any unplaced check)
+        let segs = segment_prompt("see <image:5>");
+        assert_eq!(validate_placement(&segs, 1), Err(PlacementError::MarkerOutOfRange { marker: 5, attached: 1 }));
+        // no markers, but two images attached → first unplaced image is flagged
+        let segs = segment_prompt("no markers here");
+        assert_eq!(validate_placement(&segs, 2), Err(PlacementError::UnplacedImage(0)));
+        // image 0 placed, image 1 attached but never referenced → unplaced(1)
+        let segs = segment_prompt("only <image:0>");
+        assert_eq!(validate_placement(&segs, 2), Err(PlacementError::UnplacedImage(1)));
+        // zero attachments + a marker → out of range
+        let segs = segment_prompt("<image>");
+        assert_eq!(validate_placement(&segs, 0), Err(PlacementError::MarkerOutOfRange { marker: 0, attached: 0 }));
+    }
+
+    #[test]
+    fn preprocess_dims_are_the_tile_grid_in_pixels() {
+        let cfg = VisionConfig { tile: 336, patch: 14, max_tiles: 4, thumbnail: true };
+        assert_eq!(preprocess_dims(1600, 400, &cfg), (4 * 336, 1 * 336)); // wide → 4×1 tiles
+        assert_eq!(preprocess_dims(512, 512, &cfg), (2 * 336, 2 * 336));  // square → 2×2 tiles
+    }
+
+    #[test]
+    fn extract_data_urls_replaces_with_markers() {
+        let (clean, imgs) = extract_data_urls("look at data:image/png;base64,iVBORw0KGgo= please", 0);
+        assert_eq!(clean, "look at <image:0> please");
+        assert_eq!(imgs, vec![DataUrlImage { mime: "png".into(), base64: "iVBORw0KGgo=".into() }]);
+        // the rewritten prompt now flows through the normal marker path
+        let segs = segment_prompt(&clean);
+        assert_eq!(image_indices(&segs), vec![0]);
+        assert_eq!(validate_placement(&segs, 1), Ok(()));
+    }
+
+    #[test]
+    fn extract_data_urls_numbers_from_offset_and_handles_multiple() {
+        // two pasted images, with one image already attached before them (offset = 1)
+        let p = "a data:image/jpeg;base64,AAAA b data:image/webp;base64,BBBB";
+        let (clean, imgs) = extract_data_urls(p, 1);
+        assert_eq!(clean, "a <image:1> b <image:2>");
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(imgs[0].mime, "jpeg");
+        assert_eq!(imgs[1].mime, "webp");
+        assert_eq!(imgs[1].base64, "BBBB");
+    }
+
+    #[test]
+    fn extract_data_urls_leaves_non_image_and_malformed_alone() {
+        // non-image data URL is untouched
+        let (clean, imgs) = extract_data_urls("data:text/plain;base64,SGk=", 0);
+        assert_eq!(clean, "data:text/plain;base64,SGk=");
+        assert!(imgs.is_empty());
+        // an image data URL that isn't base64 (URL-encoded) is left literal
+        let (clean, imgs) = extract_data_urls("data:image/svg+xml,<svg/>", 0);
+        assert_eq!(clean, "data:image/svg+xml,<svg/>");
+        assert!(imgs.is_empty());
+        // plain text with no data URL is unchanged
+        assert_eq!(extract_data_urls("no images here", 0).0, "no images here");
+    }
+
+    #[test]
+    fn extract_data_urls_stops_base64_at_delimiter() {
+        // the base64 body ends at the first non-base64 char (a space here), not swallowing the trailing word
+        let (clean, imgs) = extract_data_urls("data:image/png;base64,QUJD then text", 0);
+        assert_eq!(clean, "<image:0> then text");
+        assert_eq!(imgs[0].base64, "QUJD");
+    }
+
+    #[test]
+    fn plan_image_tiles_cover_the_resized_image() {
+        let cfg = VisionConfig { tile: 336, patch: 14, max_tiles: 4, thumbnail: true };
+        let plan = plan_image(512, 512, &cfg); // square → 2×2
+        assert_eq!(plan.grid, (2, 2));
+        assert_eq!(plan.resize_to, (672, 672));
+        assert_eq!(plan.tiles.len(), 4);
+        // row-major order, evenly tiled, no gaps/overlap
+        assert_eq!(plan.tiles[0], TileBox { x: 0, y: 0, w: 336, h: 336 });
+        assert_eq!(plan.tiles[1], TileBox { x: 336, y: 0, w: 336, h: 336 });
+        assert_eq!(plan.tiles[2], TileBox { x: 0, y: 336, w: 336, h: 336 });
+        assert_eq!(plan.tiles[3], TileBox { x: 336, y: 336, w: 336, h: 336 });
+        // union of tile areas == resized area
+        let area: u32 = plan.tiles.iter().map(|t| t.w * t.h).sum();
+        assert_eq!(area, plan.resize_to.0 * plan.resize_to.1);
+        // tokens match image_tokens (4 tiles + thumbnail) × 576
+        assert_eq!(plan.tokens, image_tokens(512, 512, &cfg));
+        assert_eq!(plan.tokens, 5 * 576);
+    }
+
+    #[test]
+    fn plan_image_wide_is_a_single_row() {
+        let cfg = VisionConfig { tile: 336, patch: 14, max_tiles: 4, thumbnail: false };
+        let plan = plan_image(1600, 400, &cfg); // wide → 4×1
+        assert_eq!(plan.grid, (4, 1));
+        assert!(plan.tiles.iter().all(|t| t.y == 0));
+        assert_eq!(plan.tiles.iter().map(|t| t.x).collect::<Vec<_>>(), vec![0, 336, 672, 1008]);
+        assert!(!plan.thumbnail);
+        assert_eq!(plan.tokens, 4 * 576);
     }
 }

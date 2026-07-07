@@ -357,20 +357,49 @@ void main() {
             sh = mix(1.0, acc / 9.0, 0.72); // soften — shadowed areas keep some ambient/bounce, not pure black
         }
     }
-    vec3 col = albedo * (amb + ndl * sh * u_sun_col) * 1.65;
+    // ── PBR MICROSURFACE (photoreal core) ─────────────────────────────────────────────────────────────
+    // Each material gets its own base reflectance F0 + a roughness FLOOR, so its highlight has the correct
+    // CHARACTER before the normal-map roughness adds surface relief: water/glass smooth & mirror-tight,
+    // stone broad & soft, paper matte, wood semi-gloss, moss rough. The texture roughness then modulates
+    // WITHIN that band (relief), rather than every surface sharing one plastic sheen.
+    vec3 view = normalize(u_eye - v_world);
+    float rough_floor = 0.66; float f0s = 0.04;                        // stone / marble (default) — a touch more matte
+    if (is_water)                        { rough_floor = 0.11; f0s = 0.02; } // water / glass / crystal (a touch less mirror-perfect)
+    else if (v_mat < 0.5)                { rough_floor = 0.86; f0s = 0.03; } // paper (matte)
+    else if (v_mat > 3.5)                { rough_floor = 0.74; f0s = 0.03; } // moss / leaf
+    else if (v_mat > 0.5 && v_mat < 1.5) { rough_floor = 0.46; f0s = 0.05; } // wood (semi-gloss)
+    float rgh = clamp(rough_floor * (0.6 + 0.6 * rough), 0.03, 1.0);
+    // SPECULAR ANTIALIASING (geometric normal filtering): where the shading normal changes fast across a
+    // pixel — curved silhouettes, column edges, the pearl rim — a tight GGX highlight would flicker/sparkle
+    // under motion. Widen roughness by the screen-space normal variance so those sub-pixel microfacets
+    // average out, added in quadrature so flat surfaces are untouched. Keeps the new sharp highlights STABLE.
+    vec3 dNx = dFdx(N), dNy = dFdy(N);
+    float nvar = dot(dNx, dNx) + dot(dNy, dNy);
+    rgh = clamp(sqrt(rgh * rgh + min(2.0 * nvar, 0.25)), 0.03, 1.0);
+    float gloss = 1.0 - rgh;
+    float NdV = max(dot(N, view), 1e-3);
+    // Schlick Fresnel with the per-material F0 — drives rim reflection strength + the spec/diffuse energy split.
+    vec3  F0 = vec3(f0s);
+    vec3  Fv = F0 + (1.0 - F0) * pow(1.0 - NdV, 5.0);
+    float fres = Fv.g;
+    // ENERGY CONSERVATION: energy reflected as fresnel isn't available to diffuse (grazing angles → less
+    // diffuse, more mirror) — the subtle cue that separates a real dielectric from flat shading.
+    float kd = 1.0 - clamp(max(Fv.r, max(Fv.g, Fv.b)), 0.0, 1.0);
+
+    vec3 col = albedo * (amb + ndl * sh * u_sun_col * kd) * 1.65;
     // colored secondary fill from the off-sun side — tints shadowed faces with the scene's hue (not shadowed)
     col += albedo * max(dot(N, normalize(u_fill_dir)), 0.0) * u_fill_col;
 
-    vec3 view = normalize(u_eye - v_world);
-    float gloss = 1.0 - rough;
-    // Schlick Fresnel (dielectric F0≈0.04) — drives both the rim reflection strength and spec weight.
-    float fres = 0.04 + 0.96 * pow(1.0 - max(dot(N, view), 0.0), 5.0);
-
-    // Fresnel env reflection: a cheap procedural sky/ground gradient sampled along the reflection vector,
-    // mixed in by fresnel*gloss → smooth surfaces (glass dome, water) mirror the environment; rough stone barely does.
+    // Fresnel env reflection: a cheap procedural sky/ground gradient sampled along the reflection vector.
+    // Uses Fresnel-Schlick-ROUGHNESS (Lagarde) so a ROUGH surface gets a broad, dim grazing reflection
+    // instead of the too-bright sharp rim a plain fresnel gives it — smooth glass/water still mirror sharply,
+    // rough stone/wood barely reflect. A HORIZON fade kills reflection rays that dip below the real surface
+    // (no sky leaking through the underside), the way a real reflectance response occludes at the horizon.
     vec3 R = reflect(-view, N);
+    vec3 Fr = F0 + (max(vec3(1.0 - rgh), F0) - F0) * pow(1.0 - NdV, 5.0);
     vec3 envc = mix(u_ground, u_sky, clamp(R.y * 0.5 + 0.5, 0.0, 1.0));
-    col = mix(col, envc, fres * gloss * 0.6);
+    float horiz = clamp(1.0 + dot(R, n), 0.0, 1.0); horiz *= horiz; // n = geometric normal
+    col = mix(col, envc, clamp(Fr.g, 0.0, 1.0) * gloss * 0.6 * horiz);
 
     // BASIC RAY-BOUNCE / REFLECTIONS: a single analytic bounce toward the bright skylight overhead — glossy
     // surfaces (water, polished floor, glass) catch a sharp reflection of the sky-light disc, and pick up an
@@ -380,10 +409,19 @@ void main() {
     vec3 bounce = u_ground * clamp(-R.y * 0.5 + 0.5, 0.0, 1.0);      // light kicked back up off the floor/ground
     col += albedo * bounce * 0.12 * gloss;
 
-    // PBR-ish specular: tighter highlight as it gets glossier, weighted by fresnel (energy at grazing angles).
+    // COOK-TORRANCE GGX specular (microfacet D·G·F / 4·NdV·NdL) — a physically-based highlight that BROADENS
+    // and DIMS correctly with roughness (replaces the old Blinn-Phong sheen). Water/crystal read as a tight
+    // bright glint, stone as a broad soft sheen, paper almost none: the single biggest photoreal gain here.
     vec3 hv = normalize(L + view);
-    float spec = pow(max(dot(N, hv), 0.0), mix(8.0, 160.0, gloss)) * gloss;
-    col += spec * u_sun_col * ndl * sh * (0.5 + fres);
+    float NdH = max(dot(N, hv), 0.0);
+    float a2 = rgh * rgh * rgh * rgh;                               // alpha^2, with alpha = rgh^2
+    float dnm = NdH * NdH * (a2 - 1.0) + 1.0;
+    float D = a2 / (3.14159265 * dnm * dnm + 1e-6);                 // GGX normal distribution
+    float kg = (rgh * rgh) * 0.5;                                   // Smith geometry k (direct lighting)
+    float G = (NdV / (NdV * (1.0 - kg) + kg)) * (ndl / (ndl * (1.0 - kg) + kg));
+    vec3  Fh = F0 + (1.0 - F0) * pow(1.0 - max(dot(hv, view), 0.0), 5.0);
+    vec3  ggx = min((D * G) * Fh / (4.0 * NdV * max(ndl, 1e-3) + 1e-4) * ndl, vec3(8.0)); // clamp firefly spikes
+    col += ggx * u_sun_col * sh * 2.6;                              // scaled to read under the bloom/exposure chain
 
     // NACRE: thin-film iridescence on glass/water — a view-dependent hue shimmer (the pearl/mother-of-pearl
     // sheen). Strongest at grazing angles (fresnel) and on glossy surfaces, so glass dome, crystal, clear
@@ -413,8 +451,8 @@ void main() {
     // Water depth murk: the water deepens to a murky blue with distance, so the world OUTSIDE the glass reads as
     // water while the AIR interior (handled by the lighter global fog) stays clear — the separation the palace wants.
     if (is_water) {
-        float wd = clamp(length(u_eye - v_world) * 0.018, 0.0, 1.0);
-        col = mix(col, u_fog_col * 1.15 + u_caustic_col * 0.05, wd * 0.55);
+        float wd = clamp(length(u_eye - v_world) * 0.015, 0.0, 1.0);
+        col = mix(col, u_fog_col * 1.08 + u_caustic_col * 0.04, wd * 0.42); // lighter murk → the hall reads clearly
     }
 
     // ── MATERIAL VARIATIONS ────────────────────────────────────────────────────────────────────────
@@ -612,12 +650,12 @@ void main() {
     }
     // DEPTH-OF-FIELD: blur grows for surfaces FARTHER than the focal plane (background defocus / bokeh),
     // leaving the in-focus content + the near UI panel sharp. Reuses the frosted disk-blur. NEAR/FAR match
-    // Camera::from_orbit at the render site (0.1 / 400). Cleared (empty) depth = 1.0 → far → fully blurred.
+    // Camera::from_orbit at the render site (0.3 / 400). Cleared (empty) depth = 1.0 → far → fully blurred.
     float dofc = 0.0;
     if (u_dof > 0.001) {
         float d = texture(u_depth, v_uv).r;            // window depth [0,1] at this pixel
         float ndc = d * 2.0 - 1.0;
-        float lin = (2.0 * 0.1 * 400.0) / (400.0 + 0.1 - ndc * (400.0 - 0.1)); // eye-space distance
+        float lin = (2.0 * 0.3 * 400.0) / (400.0 + 0.3 - ndc * (400.0 - 0.3)); // eye-space distance (znear=0.3)
         float coc = smoothstep(u_focus * 1.3, u_focus * 2.4, lin); // wider sharp field, gentler ramp
         dofc = coc * u_dof * 1.5;                                   // lessened blur strength
     }
@@ -691,14 +729,16 @@ void main() {
     // bright colour's big channel more than its small ones, pulling them together → washing bright areas to
     // grey/white (the "everything's grey" the clamp caused). Here only LUMA rolls off and RGB is scaled to
     // match, preserving hue/saturation. u_shoulder scales it (0 = off/linear → set LOGSCOPE_SHOULDER=0 to A/B).
+    // FILMIC TONEMAP (ACES approximation, Narkowicz) on LUMINANCE only — hue-preserving (RGB scaled to the new
+    // luma, so it never desaturates the way a per-channel curve does). Rolls highlights off smoothly from the
+    // mid-tones so bright materials (marble, water sheen, sky) keep detail instead of clipping to a flat white,
+    // and reads more photographic than the old rational shoulder. Scaled by u_shoulder (0 = off/linear → A/B
+    // via LOGSCOPE_SHOULDER=0); the highlight-heavy scenes are the ones this rescues.
     if (u_shoulder > 0.001) {
-        float kn = 0.85;
         float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
-        if (l > kn) {
-            float ls = kn + (1.0 - kn) * (l - kn) / ((1.0 - kn) + (l - kn));
-            float lt = mix(l, ls, u_shoulder);
-            col *= lt / max(l, 1e-4);
-        }
+        float aces = clamp((l * (2.51 * l + 0.03)) / (l * (2.43 * l + 0.59) + 0.14), 0.0, 1.0);
+        float lt = mix(l, aces, u_shoulder);
+        col *= lt / max(l, 1e-4);
     }
     frag = vec4(clamp(col, 0.0, 1.0), clamp(a, 0.0, 1.0));
 }

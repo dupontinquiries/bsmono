@@ -43,6 +43,22 @@ pub struct Budget {
 impl Default for Budget {
     fn default() -> Self { Self { max_tokens: 8000, whole_file_max_tokens: 1500, min_relevance: 0.15, bytes_per_token: 4 } }
 }
+impl Budget {
+    /// Derive the file-context budget from the model's USABLE context window — `context_tokens` is the
+    /// window after any RoPE extension (`rope::effective_context` of an NTK/YaRN plan), so lengthening the
+    /// context directly widens how much project-space material a turn can pull in. Reserves `reserve_sys`
+    /// for the system prompt + chat history and `reserve_out` for the response; the remainder is the file
+    /// budget, with the whole-file cap a quarter of it (so one big file can't crowd out the rest).
+    pub fn for_context(context_tokens: usize, reserve_sys: usize, reserve_out: usize) -> Self {
+        let avail = context_tokens.saturating_sub(reserve_sys.saturating_add(reserve_out));
+        Self {
+            max_tokens: avail,
+            whole_file_max_tokens: (avail / 4).clamp(256, 16000),
+            min_relevance: 0.15,
+            bytes_per_token: 4,
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Plan { pub inclusions: Vec<Inclusion>, pub used_tokens: usize }
@@ -146,6 +162,25 @@ mod tests {
     // small budget for clear arithmetic: 4 bytes/token
     fn budget(max: usize, whole_max: usize) -> Budget {
         Budget { max_tokens: max, whole_file_max_tokens: whole_max, min_relevance: 0.2, bytes_per_token: 4 }
+    }
+
+    #[test]
+    fn budget_for_context_scales_with_the_window() {
+        // reserve 1k system + 1k response; the rest is the file budget
+        let small = Budget::for_context(8_000, 1_000, 1_000);
+        let big = Budget::for_context(32_768, 1_000, 1_000); // a 4× RoPE-extended window
+        assert_eq!(small.max_tokens, 6_000);
+        assert_eq!(big.max_tokens, 30_768);
+        assert!(big.max_tokens > small.max_tokens, "extending context widens the file budget");
+        assert!(big.whole_file_max_tokens >= small.whole_file_max_tokens);
+
+        // concretely: a 20k-byte (5k-token) relevant file is peeked under the small window but fits whole
+        // under the extended one
+        let f = file("big.rs", 20_000, 0.9, vec![sec("body", 0, 20_000, 0.9)]);
+        let sp = plan(&[f.clone()], &small);
+        assert!(matches!(sp.inclusions[0], Inclusion::Peek { .. }), "peeked when the window is small");
+        let bp = plan(&[f], &big);
+        assert!(matches!(bp.inclusions[0], Inclusion::Whole { .. }), "looped in whole once context is extended");
     }
 
     #[test]
