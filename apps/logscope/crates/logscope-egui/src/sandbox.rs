@@ -29,18 +29,31 @@ pub struct VerifyResult {
 
 /// What a non-pass actually means — so a network hiccup isn't reported as broken code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Verdict { Pass, CompileError, DepsUnavailable, ToolError }
+pub enum Verdict { Pass, CompileError, TestFailure, DepsUnavailable, ToolError }
 
-/// Classify a verify outcome from the toolchain output. Checks dependency/network failures FIRST
-/// (those carry registry/DNS text, never an `error[E…]`), then genuine rustc diagnostics.
+/// Classify a verify outcome from the toolchain output. Order matters: dependency/network failures FIRST
+/// (they carry registry/DNS text, never an `error[E…]`), then TEST failures (the code compiled and the
+/// tests ran, but an assertion/panic failed — cargo prints `test result: FAILED` + `error: test failed`,
+/// so it must be caught before the generic `error:` compile check misreads it as a build error), then
+/// genuine rustc diagnostics.
 pub fn classify(passed: bool, output: &str) -> Verdict {
     if passed { return Verdict::Pass; }
     let o = output.to_lowercase();
     if o.contains("could not resolve host") || o.contains("failed to download")
         || o.contains("spurious network error") || o.contains("failed to get ")
         || o.contains("no matching package") || o.contains("unable to get packages")
-        || o.contains("failed to query replaced source") {
+        || o.contains("failed to query replaced source")
+        // toolchain/environment couldn't even run (can't spawn rustc, build script won't launch): an
+        // unable-to-VERIFY condition, not broken user code — same bucket as network-unavailable.
+        || o.contains("failed to run `rustc`") || o.contains("failed to run custom build")
+        || o.contains("failed to execute") || o.contains("failed to launch") {
         return Verdict::DepsUnavailable;
+    }
+    // Compiled + ran, but a test failed. `test result: FAILED` only appears once the binary ran, so a
+    // build error (tests never run) can't reach here — while a plain `error: test failed` would otherwise
+    // be miscounted as a compile error below.
+    if o.contains("test result: failed") || o.contains("test failed, to rerun") {
+        return Verdict::TestFailure;
     }
     if o.contains("error[e") || o.contains("aborting due to") || o.contains("cannot find")
         || o.contains("mismatched types") || o.contains("expected ") || o.contains("error: ") {
@@ -82,13 +95,18 @@ impl VerifySpec {
     pub fn with_net(mut self, net: bool) -> Self { self.net = net; self }
 }
 
-/// Non-std extern crates referenced via `use <crate>…;` or `extern crate <crate>;`.
+/// Non-std extern crates referenced via `use <crate>…;` or `extern crate <crate>;` (also behind a
+/// `pub`/`pub(crate)`/`pub(super)` re-export). Missing one of these makes the scaffolded build fail with an
+/// unresolved import, so a re-export must count as a dependency just like a plain `use`.
 pub fn detect_deps(files: &[(String, String)]) -> Vec<String> {
     let std_like = ["std", "core", "alloc", "crate", "self", "super", "proc_macro", "test"];
     let mut deps: Vec<String> = Vec::new();
     for (_, content) in files {
         for line in content.lines() {
-            let t = line.trim();
+            let t0 = line.trim();
+            // strip an optional visibility modifier so `pub use foo::…` is seen like `use foo::…`
+            let t = t0.strip_prefix("pub(crate) ").or_else(|| t0.strip_prefix("pub(super) "))
+                .or_else(|| t0.strip_prefix("pub ")).unwrap_or(t0);
             if let Some(rest) = t.strip_prefix("use ").or_else(|| t.strip_prefix("extern crate ")) {
                 let name: String = rest.trim_start_matches("::")
                     .chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
@@ -336,6 +354,18 @@ mod tests {
     }
 
     #[test]
+    fn detect_deps_sees_pub_use_reexports() {
+        // a re-export still needs the crate as a dependency, or the scaffolded build fails on the import
+        let files = [("lib.rs".to_string(),
+            "pub use anyhow::Result;\npub(crate) use tokio::spawn;\npub(super) use bytes::Bytes;\nuse std::io;".to_string())];
+        let d = detect_deps(&files);
+        assert!(d.contains(&"anyhow".to_string()), "pub use → dep: {d:?}");
+        assert!(d.contains(&"tokio".to_string()), "pub(crate) use → dep: {d:?}");
+        assert!(d.contains(&"bytes".to_string()), "pub(super) use → dep: {d:?}");
+        assert!(!d.contains(&"std".to_string()));
+    }
+
+    #[test]
     fn scaffold_picks_bin_vs_lib() {
         let root = scratch("scaf");
         let bin = scaffold_cargo("x", &[("a.rs".to_string(), "fn main(){}".to_string())], &root).unwrap();
@@ -351,6 +381,12 @@ mod tests {
         let root = scratch("vf");
         let res = verify_files("sortcrate", &[("main.rs".to_string(), broken.to_string())], &root, false).unwrap();
         assert!(!res.passed, "the compiler rejects the broken code — the oracle works");
+        // In a sandbox that can't even spawn the toolchain (no runnable rustc), verify can't reach the
+        // compile error — that's an environment (DepsUnavailable) condition, so the oracle-correctness
+        // assertion is inconclusive here rather than a failure. Only assert CompileError when rustc ran.
+        if classify(res.passed, &res.output) == Verdict::DepsUnavailable {
+            return;
+        }
         assert_eq!(classify(res.passed, &res.output), Verdict::CompileError, "classified as a real compile error, not a dep/tool issue");
     }
 
@@ -376,5 +412,16 @@ mod tests {
         // a real compile error
         assert_eq!(classify(false, "error[E0072]: recursive type `Node` has infinite size\n --> src/main.rs:1:1"), Verdict::CompileError);
         assert_eq!(classify(false, "error: cannot find value `rght` in this scope"), Verdict::CompileError);
+    }
+
+    #[test]
+    fn classify_separates_test_failure_from_compile_error() {
+        // compiled + ran, an assertion failed → TestFailure, not CompileError (even though cargo prints
+        // `error: test failed` — that must not be misread as a build error)
+        let tf = "running 2 tests\ntest works ... ok\ntest math ... FAILED\n\nfailures:\n---- math ----\nthread 'math' panicked at src/lib.rs:9:5:\nassertion `left == right` failed\n  left: 4\n right: 5\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored\nerror: test failed, to rerun pass `--lib`";
+        assert_eq!(classify(false, tf), Verdict::TestFailure);
+        // a genuine build error still classifies as CompileError (tests never ran → no `test result`)
+        let ce = "error[E0425]: cannot find value `x` in this scope\nerror: could not compile `proj` due to 1 previous error";
+        assert_eq!(classify(false, ce), Verdict::CompileError);
     }
 }

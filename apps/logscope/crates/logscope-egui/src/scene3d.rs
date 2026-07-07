@@ -36,13 +36,14 @@ fn foliage_tint() -> (Color32, Color32) { FOLIAGE_TINT.with(|cl| cl.get()) }
 
 fn tree_branch(s: &mut Scene, origin: Vec3, dir: Vec3, len: f32, rad: f32, depth: u32, seed: i32, nb: usize, spread: f32) {
     let dir = normv(dir);
+    let rad = rad.max(0.05); // floor: deep recursion was tapering trunks to spindly, pinched cross-sections
     // a bend direction, slightly up-biased, so the limb ARCS instead of standing like a pillar. The horizontal
     // scatter + a scene-preferred lean + an arc boost come from the per-scene TREE BEND POLICY.
     let (lean_x, lean_z, variety, boost) = tree_bend();
     let bax = v(lean_x + (hash(seed, 11) - 0.5) * variety, 0.20 + hash(seed, 12) * 0.45, lean_z + (hash(seed, 13) - 0.5) * variety);
     let bend = 0.14 + hash(seed, 14) * 0.20 + boost;
     let (ftlo, fthi) = foliage_tint(); let fbase = mix_rgb(ftlo, fthi, 0.45); // per-scene canopy colour (e.g. Forest seasons)
-    let r1 = rad * 0.62; // taper toward the tip
+    let r1 = (rad * 0.62).max(0.045); // taper toward the tip, floored so tips don't pinch to a sliver
     let (mut br, end, end_dir) = m3::branch_curved(origin, dir, len, rad, r1, bax, bend, seed as u32, c(0x5b, 0x42, 0x28));
     m3::tint_height(&mut br, origin.y, end.y, c(0x3a, 0x28, 0x16), c(0x70, 0x55, 0x34)); br.mat = M::WOOD;
     s.add(br, Float::STILL);
@@ -58,14 +59,14 @@ fn tree_branch(s: &mut Scene, origin: Vec3, dir: Vec3, len: f32, rad: f32, depth
             let tdir = normv(addv(end_dir, addv(mulv(tu, ta.cos() * 0.85), mulv(tv, ta.sin() * 0.85))));
             let tlen = len * (0.32 + hash(seed + twf, 22) * 0.24);
             let tside = v(hash(seed + twf, 23) - 0.5, 0.35, hash(seed + twf, 24) - 0.5);
-            let (mut twg, tend, _) = m3::branch_curved(end, tdir, tlen, r1 * 0.55, r1 * 0.18, tside, 0.22, (seed + twf * 7) as u32, c(0x6a, 0x52, 0x34));
+            let (mut twg, tend, _) = m3::branch_curved(end, tdir, tlen, (r1 * 0.55).max(0.03), (r1 * 0.18).max(0.022), tside, 0.22, (seed + twf * 7) as u32, c(0x6a, 0x52, 0x34));
             twg.mat = M::WOOD; s.add(twg, Float { amp: 0.05, speed: 0.8, phase: hash(seed + twf, 25) * 6.28, drift: 0.04 });
-            let mut puff = m3::leaf_cluster(tend, tlen * 0.7, (seed as u32).wrapping_mul(131).wrapping_add(tw as u32 + 7), fbase);
+            let mut puff = m3::leaf_cluster_lod(tend, tlen * 0.7, (seed as u32).wrapping_mul(131).wrapping_add(tw as u32 + 7), fbase, 0.8);
             m3::tint_up(&mut puff, fthi, ftlo); puff.mat = M::MOSS;
             s.add(puff, Float { amp: 0.12, speed: 0.7, phase: hash(seed + twf, 26) * 6.28, drift: 0.07 });
         }
         // a cluster right at the fork fills the join where the twigs meet the branch
-        let mut core = m3::leaf_cluster(end, len * 0.34, (seed as u32).wrapping_mul(977).wrapping_add(3), fbase);
+        let mut core = m3::leaf_cluster_lod(end, len * 0.34, (seed as u32).wrapping_mul(977).wrapping_add(3), fbase, 0.8);
         m3::tint_up(&mut core, fthi, ftlo); core.mat = M::MOSS;
         s.add(core, Float { amp: 0.10, speed: 0.7, phase: hash(seed, 7) * 6.28, drift: 0.06 });
         return;
@@ -116,6 +117,17 @@ impl Scene {
         self.meshes.push(m); self.floats.push(f); self.anchors.push(anchor);
     }
     fn add_all(&mut self, ms: Vec<Mesh3>, f: Float) { for m in ms { self.add(m, f); } }
+    /// A brief BUILD-IN when the world is freshly (re)built — which happens on a conversation STATE STEP, since
+    /// EnvParams change with the graph. Everything RISES + settles into place over ~0.65s (smoothstep), additive
+    /// on top of the idle floats (call right after `animate`), so stepping reads as the palace re-forming rather
+    /// than snapping. No-op once settled.
+    fn build_reveal(&mut self, age: f32) {
+        if age >= 0.65 { return; }
+        let r = (age / 0.65).clamp(0.0, 1.0);
+        let ease = r * r * (3.0 - 2.0 * r);
+        let rise = (1.0 - ease) * 3.5;
+        for m in self.meshes.iter_mut() { m.offset.y -= rise; }
+    }
     /// Update every object's float offset for time `t` (seconds). Cheap — no geometry rebuild. Foliage also
     /// gets a WIND sway on top of its idle bob.
     pub fn animate(&mut self, t: f32) {
@@ -308,13 +320,16 @@ fn canopy() -> Scene {
     set_tree_bend(0.0, 0.0, 0.45, 0.04); // enclosed canopy: a calmer, more uniform bow (less varied than Forest)
     tree_branch(&mut s, v(0.0, yf, 0.0), tdir, tlen, 1.3, 2, 7, 3, 0.6);
     let cc = addv(v(0.0, yf, 0.0), addv(mulv(tdir, tlen), v(0.0, 0.6, 0.0))); // canopy rides the lean
-    for k in 0..22 {
-        let a = TAU * k as f32 / 22.0;
+    let q = render_quality();
+    let ncan = ((22.0 * q) as usize).max(12);
+    let cdet = (0.55 + 0.45 * q).min(1.0);                 // fewer leaves per cluster on low settings (2k FPS)
+    for k in 0..ncan {
+        let a = TAU * k as f32 / ncan as f32;
         let tier = (k % 3) as f32 * 0.7;
-        let p = addv(cc, v(a.cos() * 3.4, tier + hash(k, 3) * 0.8 + 0.4, a.sin() * 3.4)); // wider spread + raised above the fork
-        let mut leaf = m3::leaf_cluster(p, 1.4, 50 + k as u32, c(0x6c, 0x90, 0x40));
+        let p = addv(cc, v(a.cos() * 3.4, tier + hash(k as i32, 3) * 0.8 + 0.4, a.sin() * 3.4)); // wider spread + raised above the fork
+        let mut leaf = m3::leaf_cluster_lod(p, 1.4, 50 + k as u32, c(0x6c, 0x90, 0x40), cdet);
         m3::tint_up(&mut leaf, c(0x96, 0xb4, 0x58), c(0x46, 0x66, 0x2c)); leaf.mat = M::MOSS; // natural green foliage, no glow
-        s.add(leaf, Float { amp: 0.06, speed: 0.5, phase: hash(k, 5) * 6.28, drift: 0.05 });
+        s.add(leaf, Float { amp: 0.06, speed: 0.5, phase: hash(k as i32, 5) * 6.28, drift: 0.05 });
     }
     contact_shadow(&mut s, 0.0, 0.0, 3.0, yf, 110);
 
@@ -447,13 +462,14 @@ fn mistfall() -> Scene {
         let a = hash(k, 96) * std::f32::consts::TAU; let rr = hash(k, 97).sqrt() * 18.0 * ms;
         ripple_rings(&mut s, a.cos() * rr, a.sin() * rr, -6.3, (1.5 + hash(k, 98) * 2.5) * ms, 4, c(0x6a, 0x9a, 0xa6));
     }
-    // drifting MIST LAYERS — faint translucent sheets at varied heights for depth + atmosphere (height variation)
+    // drifting MIST LAYERS — faint translucent sheets kept LOW (ground fog) so they add depth without blanketing
+    // the view at eye level (the old eye-height stacks made everything hard to see).
     for k in 0..((6.0 * ms) as i32) {
-        let yy = -3.0 + hash(k, 90) * 9.0;
-        let rad = (8.0 + hash(k, 91) * 16.0) * ms;
-        let off = v((hash(k, 92) - 0.5) * 10.0 * ms, yy, (hash(k, 93) - 0.5) * 10.0 * ms);
-        let mut veil = m3::disc(off, rad, 40, c(0x9c, 0xb0, 0xb8));
-        veil.mat = M::WATER; veil.emissive = 0.05; m3::set_alpha(&mut veil, (22.0 + hash(k, 94) * 26.0) as u8);
+        let yy = -5.5 + hash(k, 90) * 4.0;                       // low, hugging the water/floor
+        let rad = (8.0 + hash(k, 91) * 14.0) * ms;
+        let off = v((hash(k, 92) - 0.5) * 12.0 * ms, yy, (hash(k, 93) - 0.5) * 12.0 * ms);
+        let mut veil = m3::disc(off, rad, 32, c(0x9c, 0xb0, 0xb8));
+        veil.mat = M::WATER; veil.emissive = 0.04; m3::set_alpha(&mut veil, (13.0 + hash(k, 94) * 15.0) as u8); // fainter
         s.add(veil, Float { amp: 0.4, speed: 0.1 + hash(k, 95) * 0.12, phase: hash(k, 96) * 6.28, drift: 0.8 });
     }
 
@@ -548,9 +564,29 @@ fn mistfall() -> Scene {
         stalactite(&mut s, sx, sz, ceil_y - 0.15, len, wdt, tite_lo, tite_hi);
     }
 
+    let pr = env_params();
+    // CEILING NOISE — rocky nodules studding the roof; density + lump size scale with EnvParams (bigger/denser =
+    // "high res" ceiling relief for a busier conversation, sparse/"low res" for a small one). Quality-scaled.
+    let nnod = (((14 + pr.nodes as usize / 8).clamp(14, 60)) as f32 * render_quality()) as usize;
+    for k in 0..nnod {
+        let a = TAU * hash(k as i32, 110); let rad = (hash(k as i32, 111)).sqrt() * 30.0;
+        let (nx, nz) = (a.cos() * rad, a.sin() * rad);
+        let nr = 0.4 + hash(k as i32, 112) * (0.6 + pr.branches as f32 * 0.08);
+        let mut nod = m3::rock(v(nx, ceil_y - nr * 0.5, nz), nr, (7000 + k) as u32, c(0x16, 0x1e, 0x22));
+        m3::tint_up(&mut nod, c(0x24, 0x2e, 0x32), c(0x0c, 0x12, 0x16)); nod.mat = M::STONE; s.add(nod, Float::STILL);
+    }
+    // CALCITE DRIPS — slow luminous water droplets falling from the ceiling (a big, slow vertical drift reads as
+    // the drip falling + reforming), so the cavern feels alive + wet.
+    for k in 0..(10.0 * render_quality()) as i32 {
+        let a = TAU * hash(k, 120); let rad = (hash(k, 121)).sqrt() * 24.0;
+        let (dx, dz) = (a.cos() * rad, a.sin() * rad);
+        let dy = ceil_y - 4.0 - hash(k, 122) * 8.0;
+        let mut drop = m3::uv_sphere(v(dx, dy, dz), 0.12 + hash(k, 123) * 0.08, 6, 5, c(0x9a, 0xc8, 0xd2));
+        drop.mat = M::WATER; drop.emissive = 0.5;
+        s.add(drop, Float { amp: 4.0 + hash(k, 124) * 3.0, speed: 0.12 + hash(k, 125) * 0.1, phase: hash(k, 126) * 6.28, drift: 0.12 });
+    }
     // ANTIGRAVITY LOOPING WATERFALLS — far off in the mist: streams that fall away then loop back on themselves
     // and recondense at the crown. The conversation seed nudges how many + how big (graph-derived weather).
-    let pr = env_params();
     let nfalls = 4 + (pr.seed % 3) as usize;
     for k in 0..nfalls {
         let a = TAU * k as f32 / nfalls as f32 + hash(k as i32, 70) * 0.6;
@@ -1048,11 +1084,22 @@ fn mansion_garden() -> Scene {
     let mut deep = m3::disc(v(0.0, yf - 1.2, 0.0), 30.0 * sc, 90, c(0x06, 0x2e, 0x36));
     deep.mat = M::WATER; deep.emissive = 0.02; s.add(deep, Float::STILL);
 
-    // WATER: scattered pools toward the edges (the central MOAT RING was removed per request — varied pools instead)
+    // STILL POOLS — proper ponds with DEPTH instead of flat z-fighting disc scatter: a bright shallow
+    // turquoise shelf, a deep sapphire centre, a little sandy CORAL ISLAND, and ripples. Set clear of the
+    // marble (yf+0.09) so they stop jittering against it.
     for k in 0..3 {
         let a = hash(k, 21) * TAU; let r = (12.0 + hash(k, 22) * 9.0) * sc;
-        let mut pool = m3::disc(v(a.cos() * r, yf + 0.05, a.sin() * r), (1.6 + hash(k, 23) * 2.2) * sc, 44, water);
-        m3::tint_up(&mut pool, c(0x4c, 0xc4, 0xc8), c(0x16, 0x6c, 0x76)); pool.mat = M::WATER; pool.emissive = 0.14; m3::set_alpha(&mut pool, 198); s.add(pool, Float::STILL);
+        let (px, pz) = (a.cos() * r, a.sin() * r);
+        let pr = (2.4 + hash(k, 23) * 2.6) * sc;              // bigger, better-defined ponds
+        let yw = yf + 0.09;
+        let mut shelf = m3::disc(v(px, yw, pz), pr, 48, c(0x5c, 0xd0, 0xd8)); // shallow bright-blue shelf
+        m3::tint_up(&mut shelf, c(0x86, 0xe6, 0xe0), c(0x2a, 0x9a, 0xa4)); shelf.mat = M::WATER; shelf.emissive = 0.12; m3::set_alpha(&mut shelf, 190); s.add(shelf, Float::STILL);
+        let mut pdeep = m3::disc(v(px, yw + 0.01, pz), pr * 0.55, 40, c(0x14, 0x50, 0x8e)); // deep sapphire centre
+        m3::tint_up(&mut pdeep, c(0x1c, 0x6a, 0xb0), c(0x08, 0x2a, 0x54)); pdeep.mat = M::WATER; pdeep.emissive = 0.05; m3::set_alpha(&mut pdeep, 224); s.add(pdeep, Float::STILL);
+        let (ix, iz) = (px + pr * 0.5, pz);                    // little sandy coral island off-centre
+        let mut isle = m3::disc(v(ix, yw + 0.03, iz), pr * 0.22, 20, c(0xe0, 0xcc, 0x92));
+        m3::tint_up(&mut isle, c(0xf0, 0xdc, 0xa4), c(0xc0, 0xa4, 0x6e)); isle.mat = M::STONE; s.add(isle, Float::STILL);
+        ripple_rings(&mut s, px, pz, yw + 0.015, pr * 0.9, 3, c(0x9a, 0xe6, 0xe0));
     }
 
     // CENTRAL TIERED DAIS (memory marble; low so the graph floats above it)
@@ -1100,7 +1147,7 @@ fn mansion_garden() -> Scene {
 
     // GOLDEN RAIN — thin gold streaks the vertex shader loops downward (emissive 7.0 = raindrop flag). Where they
     // land, the memory-marble shader restains the floor gold, then it fades back to white.
-    for k in 0..150 {
+    for k in 0..(150.0 * render_quality()) as i32 { // light-drops: LOD by quality
         let a = hash(k, 81) * TAU; let r = (hash(k, 82)).sqrt() * 21.0 * sc;
         let (px, pz) = (a.cos() * r, a.sin() * r);
         let topy = yf + (17.0 + hash(k, 83) * 3.0) * sc;
@@ -1108,24 +1155,47 @@ fn mansion_garden() -> Scene {
         drop.mat = M::WATER; drop.emissive = 7.0; s.add(drop, Float::STILL);
     }
 
-    // PALMS — fuller, smaller, more-connected crowns; GENTLE wind (less severe than other scenes)
-    for k in 0..20 {
+    // COCONUT PALMS — light grey-tan RINGED trunks (not the old dark uniform telephone-pole tube), long
+    // ARCHING fronds that radiate out and droop, and a cluster of coconuts at the crown. GENTLE wind.
+    // Count now reflects the CONVERSATION (was a static 20): a lusher grove for a bigger/branchier chat,
+    // scaled by nodes × prop_density and capped so it never runs away on FPS.
+    let pr = env_params();
+    let npalm = ((12.0 + pr.nodes as f32 / 11.0) * pr.prop_density).clamp(10.0, 30.0) as i32;
+    for k in 0..npalm {
         let a = hash(k, 51) * TAU; let r = (13.5 + hash(k, 52) * 8.0) * sc;
         let (px, pz) = (a.cos() * r, a.sin() * r);
-        let lean = normv(v((hash(k, 53) - 0.5) * 0.4, 1.0, (hash(k, 54) - 0.5) * 0.4));
-        let th = (3.0 + hash(k, 55) * 2.5) * sc;
+        let lean = normv(v((hash(k, 53) - 0.5) * 0.5, 1.0, (hash(k, 54) - 0.5) * 0.5)); // a coconut palm curves
+        let th = (5.0 + hash(k, 55) * 3.0) * sc;                 // taller than before
         let top = addv(v(px, yf, pz), mulv(lean, th));
-        let mut trunk = m3::tube(v(px, yf, pz), top, 0.16 * sc, 7, c(0x6e, 0x56, 0x32));
-        m3::tint_up(&mut trunk, c(0x86, 0x6a, 0x3e), c(0x4a, 0x38, 0x20)); trunk.mat = M::WOOD; s.add(trunk, Float::STILL);
-        for f in 0..9 { // two tight tiers of smaller clusters → a fuller, connected crown
-            let fa = TAU * f as f32 / 9.0 + (f % 2) as f32 * 0.35;
-            let rr = (0.45 + (f % 2) as f32 * 0.5) * sc;
-            let fp = addv(top, v(fa.cos() * rr, (0.15 - (f % 2) as f32 * 0.12) * sc, fa.sin() * rr));
-            let mut frond = m3::leaf_cluster(fp, 0.7 * sc, 60 + (k * 9 + f) as u32, c(0x4e, 0x80, 0x36));
-            m3::tint_up(&mut frond, c(0x6e, 0x9c, 0x40), c(0x32, 0x56, 0x22)); frond.mat = M::MOSS;
-            s.add(frond, Float { amp: 0.03, speed: 0.45, phase: hash((k * 9 + f) as i32, 1) * 6.28, drift: 0.04 });
+        let mut trunk = m3::tube(v(px, yf, pz), top, 0.17 * sc, 8, c(0x9a, 0x86, 0x62)); // light grey-tan bark
+        m3::tint_up(&mut trunk, c(0xba, 0xa6, 0x7e), c(0x7c, 0x6a, 0x4c)); trunk.mat = M::WOOD; s.add(trunk, Float::STILL);
+        for rseg in 1..6 {                                       // ringed bark texture up the trunk
+            let f = rseg as f32 / 6.0;
+            let rp = addv(v(px, yf, pz), mulv(lean, th * f));
+            let mut ring = m3::torus(rp, 0.185 * sc, 0.028 * sc, 10, 5, c(0x86, 0x72, 0x50)); ring.mat = M::WOOD; s.add(ring, Float::STILL);
         }
-        contact_shadow(&mut s, px, pz, 1.0 * sc, yf, 90);
+        let up = if lean.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+        let fu = normv(crossv(lean, up)); let fv = crossv(lean, fu);
+        let nf = 9usize;
+        for f in 0..nf {
+            let idx = k as usize * nf + f;
+            let fa = TAU * f as f32 / nf as f32 + hash(k, 56) * 6.28;
+            let outdir = normv(addv(mulv(lean, 0.5), addv(mulv(fu, fa.cos()), mulv(fv, fa.sin())))); // out from the crown
+            let flen = (3.2 + hash(idx as i32, 1) * 1.3) * sc;
+            let droop = v(outdir.x, outdir.y - 0.75, outdir.z);   // arches out then droops
+            // the frond IS one long narrow TAPERED tape straight from the crown top-centre — no twig stem, no
+            // leaf-blob at the tip. Float::STILL so it's TEMPORALLY STABLE (the wobble was the moving-noise the
+            // leaves showed at high res).
+            let (mut frond, _tip, _) = m3::branch_curved(top, outdir, flen, 0.12 * sc, 0.01 * sc, droop, 0.5, idx as u32, c(0x5a, 0x8a, 0x38));
+            m3::tint_up(&mut frond, c(0x74, 0xa4, 0x40), c(0x36, 0x5a, 0x22)); frond.mat = M::MOSS;
+            s.add(frond, Float::STILL);
+        }
+        for cn in 0..3 {                                          // coconuts at the crown base
+            let ca = TAU * cn as f32 / 3.0;
+            let cp = addv(top, v(ca.cos() * 0.25 * sc, -0.15 * sc, ca.sin() * 0.25 * sc));
+            let mut nut = m3::uv_sphere(cp, 0.15 * sc, 7, 6, c(0x5a, 0x44, 0x28)); nut.mat = M::WOOD; s.add(nut, Float::STILL);
+        }
+        contact_shadow(&mut s, px, pz, 1.2 * sc, yf, 90);
     }
     for k in 0..26 { // low ground ferns, gentle wind
         let a = hash(k, 61) * TAU; let r = (10.0 + hash(k, 62) * 12.0) * sc;
@@ -1648,7 +1718,9 @@ fn bee(s: &mut Scene, p: Vec3, seed: u32) {
 fn firefly(s: &mut Scene, p: Vec3, seed: u32) {
     let col = [c(0xc6, 0xf0, 0x6e), c(0xe2, 0xf0, 0x72), c(0x9e, 0xe8, 0x84), c(0xf0, 0xe2, 0x70)][(seed as usize) % 4];
     let mut f = m3::uv_sphere(p, 0.045 + hash(seed as i32, 5) * 0.03, 6, 5, col); f.mat = M::MOSS; f.emissive = 1.9;
-    s.add(f, Float { amp: 0.9, speed: 0.45 + hash(seed as i32, 1) * 0.5, phase: hash(seed as i32, 2) * 6.28, drift: 1.15 });
+    // gentle, slow drift — small amp/drift so the mote bobs softly AND (being MOSS) barely catches the wind
+    // sway (susceptibility is (amp+drift)*3), instead of jittering fast across the air.
+    s.add(f, Float { amp: 0.4, speed: 0.2 + hash(seed as i32, 1) * 0.22, phase: hash(seed as i32, 2) * 6.28, drift: 0.5 });
 }
 
 /// A canopy treehouse platform: a round wooden deck with a railing, four posts and a little hut roof with a
@@ -3019,16 +3091,25 @@ fn atlantis() -> Scene {
     contact_shadow(&mut s, 0.0, 0.0, 3.4, y_floor, 150); // central plinth grounding
     push_collider(Collider::Bound { r: r_hall + 1.9 });
 
-    // MARBLE POSEIDON STATUES — landmarks around the colonnade (on the ellipse), each posed from the seed.
-    let statues = (2 + (pr.seed % 3) as usize + (r_hall as usize) / 12).clamp(2, 5);
-    for k in 0..statues {
-        let a = (k as f32 + 0.5) / statues as f32 * TAU + hh(40) * TAU;
-        let rs = r_col - 2.6;
+    // MARBLE POSEIDON STATUES — TUCKED AGAINST the colonnade columns: aligned to real column angles (skipping
+    // the hallway-mouth gaps + the cleared central lane, where no column stands) and set just inside a pillar,
+    // rather than floating on an independent ring out in the middle of the room.
+    let want = (2 + (pr.seed % 3) as usize + (r_hall as usize) / 12).clamp(2, 5);
+    let lane = 4.0_f32.min(r_col * sz * 0.6);
+    let step = (cols / want.max(1)).max(1);
+    let mut placed = 0usize;
+    for k in (0..cols).step_by(step) {
+        if placed >= want { break; }
+        let a = (k as f32 / cols as f32) * TAU;   // EXACT column angle → the statue stands with a pillar
+        if near_axis(a) { continue; }             // hallway mouth: no column here
+        let rs = r_col - 1.3;                      // just inside the column base, tucked against it
         let (sx, szz) = (a.cos() * rs, ez(a.sin() * rs));
-        let face = (-szz).atan2(-sx); // face the centre from the compressed position
+        if szz.abs() <= lane { continue; }         // central lane cleared of columns → skip (nothing to tuck against)
+        let face = (-szz).atan2(-sx);              // face the centre
         poseidon_statue(&mut s, v(sx, y_floor, szz), face, 1.0, pr.seed ^ (k as u32).wrapping_mul(0x9E37));
         push_collider(Collider::Pillar { x: sx, z: szz, r: 1.1, y0: y_floor, y1: y_floor + 5.0 });
         contact_shadow(&mut s, sx, szz, 1.5, y_floor, 140); // statue cast on the floor
+        placed += 1;
     }
 
     // GARGOYLES — small sea-dragon heads perched on the architrave/cornice rim, facing OUTWARD over the water.
@@ -3298,6 +3379,7 @@ fn forest() -> Scene {
     // (matching terrain_disc's rim dip exactly, so nothing floats or sinks).
     let g_seed = pr.seed ^ 0x5F0E;
     let big = (pr.nodes as f32 / 130.0).clamp(1.0, 2.4);   // larger conversations ⇒ a bigger, denser forest world
+    let q = render_quality();                              // battery-saver / LOGSCOPE_QUALITY thins the understory scatter
     let (g_amp, g_freq, g_r) = (2.4_f32, 0.045_f32, 100.0_f32 * big); // more pronounced ROLLING HILLS (was 1.35)
     let terrain = move |x: f32, z: f32| -> f32 { relief(x, z, g_seed, g_amp, g_freq) };
     let gy = move |x: f32, z: f32| {
@@ -3358,8 +3440,9 @@ fn forest() -> Scene {
         2 => &[c(0x6e, 0x8a, 0x36), c(0x8a, 0x96, 0x34), c(0xb0, 0x86, 0x30), c(0xc0, 0x6a, 0x28), c(0x9a, 0x5a, 0x26), c(0x52, 0x6e, 0x28)],
         _ => &[c(0x7a, 0x6a, 0x4e), c(0x8a, 0x7a, 0x5c), c(0xc4, 0xc4, 0xcc), c(0x6a, 0x5c, 0x44)],
     };
-    for k in 0..480 {
+    for k in 0..(480.0 * q) as i32 {
         let a = hash(k, 70) * TAU; let rad = (hash(k, 71)).sqrt() * 72.0; // sqrt → even areal density
+        if rad > 44.0 + 28.0 * q { continue; }            // cull the far apron scatter (dissolves into fog anyway)
         let (lx, lz) = (a.cos() * rad, a.sin() * rad);
         let r = 0.16 + hash(k, 72) * 0.22;
         let mut leaf = m3::disc(v(lx, yf + terrain(lx, lz) + 0.02 + hash(k, 73) * 0.02, lz), r, 5, leafcols[k as usize % leafcols.len()]);
@@ -3466,12 +3549,12 @@ fn forest() -> Scene {
     }
 
     // GRASS TUFTS — many small upright blades following the terrain
-    for k in 0..220 {
+    for k in 0..(220.0 * q) as i32 {
         let a = hash(k, 200) * TAU; let rad = 3.0 + (hash(k, 201)).sqrt() * 58.0;
         let (gx, gz) = (a.cos() * rad, a.sin() * rad);
         let gy = yf + terrain(gx, gz);
         let base = if season == 3 { c(0x84, 0x86, 0x60) } else { crown_pal[(hash(k, 202) * crown_pal.len() as f32) as usize % crown_pal.len()] };
-        let mut tuft = m3::leaf_cluster(v(gx, gy + 0.28, gz), 0.3 + hash(k, 203) * 0.22, 200 + k as u32, base);
+        let mut tuft = m3::leaf_cluster_lod(v(gx, gy + 0.28, gz), 0.3 + hash(k, 203) * 0.22, 200 + k as u32, base, m3::lod_detail(rad, 16.0, 48.0, 0.2)); // far blades ⇒ few-leaf LOD
         m3::scale3(&mut tuft, 0.42, 1.7, 0.42); // thin + tall → blades
         m3::tint_up(&mut tuft, shade(base, 1.25), shade(base, 0.55)); tuft.mat = M::MOSS;
         s.add(tuft, Float { amp: 0.03, speed: 0.7, phase: hash(k, 204) * 6.28, drift: 0.10 });
@@ -3529,7 +3612,7 @@ fn forest() -> Scene {
         critter(&mut s, if k % 3 == 0 { 1 } else { 0 }, v(cx, yf, cz), face, 1000 + k as u32);
     }
 
-    for k in 0..110 { let a = hash(k, 20) * TAU; let rad = (hash(k, 21)).sqrt() * 66.0; let (gx, gz) = (a.cos() * rad, a.sin() * rad); grass_tuft(&mut s, gx, gz, gy(gx, gz), 300 + k as u32, c(0x5a, 0x7e, 0x30)); }
+    for k in 0..(110.0 * render_quality()) as i32 { let a = hash(k, 20) * TAU; let rad = (hash(k, 21)).sqrt() * 66.0; let (gx, gz) = (a.cos() * rad, a.sin() * rad); grass_tuft(&mut s, gx, gz, gy(gx, gz), 300 + k as u32, c(0x5a, 0x7e, 0x30)); } // grass LOD
     for k in 0..24 {
         let a = hash(k, 30) * TAU; let rad = 1.5 + (hash(k, 31)).sqrt() * 52.0;
         let cols = [c(0xff, 0x6a, 0x8a), c(0xff, 0xd0, 0x40), c(0xa0, 0x86, 0xff), c(0xff, 0xa0, 0x50)];
@@ -3547,6 +3630,7 @@ fn forest() -> Scene {
         0 => (110, &[c(0xe2, 0xb8, 0xd2), c(0x96, 0xc0, 0x5e), c(0xf0, 0xd2, 0xe2)], false),  // spring: blossom + leaf
         _ => (55, &[c(0x5a, 0x82, 0x34), c(0x6e, 0x90, 0x3e)], false),                  // summer: a few leaves
     };
+    let np = (np as f32 * q) as i32; // particle LOD: thin the animated leaf/snow count on low settings
     for k in 0..np {
         let a = hash(k, 300) * TAU; let rad = hash(k, 301).sqrt() * 46.0;
         let (px, pz) = (a.cos() * rad, a.sin() * rad);
@@ -3614,6 +3698,12 @@ fn treehouse() -> Scene {
     // dim forest floor far below — you sense the height of the walk
     let mut floor = m3::disc(v(0.0, -8.0, 0.0), 48.0, 84, c(0x18, 0x1e, 0x12)); // doubled map
     m3::tint_up(&mut floor, c(0x28, 0x30, 0x1a), c(0x10, 0x14, 0x0c)); floor.mat = M::MOSS; floor.emissive = 0.02; s.add(floor, Float::STILL);
+    // BACKDROP DOME — a big inward-facing forest-dusk shell far out, so looking past the canopy shows a graded
+    // green-grey haze (depth) instead of the empty grey cut-off. It's huge (never size-culled) and dissolves
+    // into the fog behind the distant tree band.
+    let mut dome = m3::uv_sphere(v(0.0, 4.0, 0.0), 150.0, 32, 20, c(0x1e, 0x28, 0x22));
+    for nn in dome.norms.iter_mut() { *nn = mulv(*nn, -1.0); }
+    m3::tint_height(&mut dome, -60.0, 90.0, c(0x12, 0x1a, 0x12), c(0x34, 0x42, 0x38)); dome.mat = M::STONE; dome.emissive = 0.06; s.add(dome, Float::STILL);
     // big trees rising from the floor up through the canopy
     let trees = [(-6.0_f32 * tsf, -3.0_f32 * tsf), (5.5 * tsf, -4.0 * tsf), (6.0 * tsf, 4.5 * tsf), (-5.0 * tsf, 5.0 * tsf)]; // central tree removed → room for the graph
     set_tree_bend(0.0, 0.0, 0.25, -0.14); // STRAIGHTER trunks (low bend) so the platforms snap cleanly onto them
@@ -3666,6 +3756,33 @@ fn treehouse() -> Scene {
         let a = plats[i]; let b = plats[(i + 1) % 4];
         rope_bridge(&mut s, v(a.0, a.2, a.1), v(b.0, b.2, b.1), (i * 31) as u32);
     }
+    // WEBBING — each platform is lashed to its host trunk with taut guy-lines and HANGS from a hook up in the
+    // canopy above (a small foliage anchor), so the walk reads as webbed into the trees hammock-style, not
+    // floating. (The scene-level immersion pass; routing the graph EDGES themselves into the canopy is a
+    // graph-render-pipeline change kept for a viewer-in-the-loop follow-up.)
+    {
+        use std::f32::consts::TAU;
+        let rope_col = c(0x6a, 0x54, 0x34);
+        for i in 0..4 {
+            let (sx, sz, py) = plats[i];
+            let (tx, tz) = (trees[i].0, trees[i].1);              // host trunk base xz
+            for gi in 0..4 {                                      // taut guy-lines rim → trunk (lashing it on)
+                let ga = TAU * gi as f32 / 4.0;
+                let rim = v(sx + ga.cos() * 2.4, py, sz + ga.sin() * 2.4);
+                let anchor = v(tx, py - 2.2, tz);
+                let mut guy = m3::tube(rim, anchor, 0.05, 4, rope_col); guy.mat = M::WOOD; s.add(guy, Float::STILL);
+            }
+            let hook = v(sx + (hsh(i as u32 * 13 + 1) - 0.5) * 1.5, py + 8.0, sz + (hsh(i as u32 * 13 + 2) - 0.5) * 1.5);
+            for wi in 0..3 {                                      // hanging web up to the canopy hook (hammock feel)
+                let wa = TAU * wi as f32 / 3.0;
+                let base = v(sx + wa.cos() * 2.0, py + 0.4, sz + wa.sin() * 2.0);
+                let mut web = m3::strand(base, hook, 0.045, 4, 6, 0.0, 0.4, rope_col); web.mat = M::WOOD;
+                s.add(web, Float { amp: 0.08, speed: 0.5, phase: wa, drift: 0.06 });
+            }
+            let mut tuft = m3::leaf_cluster(hook, 1.4, (i * 7 + 900) as u32, c(0x4c, 0x74, 0x30)); tuft.mat = M::MOSS;
+            s.add(tuft, Float { amp: 0.1, speed: 0.6, phase: hsh(i as u32) * 6.28, drift: 0.08 });
+        }
+    }
     set_tree_bend(0.0, 0.0, 1.0, 0.0); // restore varied bow for the surrounding forest
     // MORE TREEHOUSES — extra platforms perched on the surrounding trees (canopy leans toward structures, not orbs)
     for k in 0..24 {
@@ -3686,7 +3803,7 @@ fn treehouse() -> Scene {
         }
     }
     // fireflies drifting through the canopy (denser now — they read as a living dusk swarm)
-    for k in 0..72 { let a = hash(k, 70) * TAU; let rad = hash(k, 71) * 44.0; firefly(&mut s, v(a.cos() * rad, -4.0 + hash(k, 72) * 9.0, a.sin() * rad), 900 + k as u32); }
+    for k in 0..(72.0 * render_quality()) as i32 { let a = hash(k, 70) * TAU; let rad = hash(k, 71) * 44.0; firefly(&mut s, v(a.cos() * rad, -4.0 + hash(k, 72) * 9.0, a.sin() * rad), 900 + k as u32); } // firefly LOD
 
     // DISTANT LOD "blot-out" trees — a far ring of slim trunks + one dim puff, dissolving into the fog so the
     // canopy walk sits inside a deep wood with no hard edge (matches the Forest LOD treatment).
@@ -4242,15 +4359,16 @@ fn alley() -> Scene {
 
     // WET GROUND — damp asphalt grading to cool wet gray; the shared terrain gives gentle relief, walls hide the rim
     terrain_disc(&mut s, (half_len + 20.0).max(54.0), yf, g_seed, 0.5, 0.05,
-                 c(0x40, 0x3e, 0x3a), c(0x70, 0x71, 0x6c), M::STONE);
+                 c(0x30, 0x2f, 0x2c), c(0x54, 0x55, 0x50), M::STONE); // darker → reads as matte asphalt, not wet goo
 
-    // PUDDLES — flat sky-mirroring discs nestled in the dips after the rain
-    for k in 0..(10.0 * af * pd) as u32 {
+    // PUDDLES — flat sky-mirroring discs nestled in the dips after the rain (kept sparse + subtle so the road
+    // reads as matte damp asphalt, not a wet mirror)
+    for k in 0..(6.0 * af * pd) as u32 {
         let x = (rh(k * 7 + 1) - 0.5) * 2.0 * (half_len - 4.0);
         let z = (rh(k * 7 + 2) - 0.5) * 2.0 * (wz - 1.2);
-        let mut pud = m3::disc(v(x, gy(x, z) + 0.03, z), 0.9 + rh(k * 7 + 3) * 2.2, 18, c(0x86, 0xa2, 0xc0));
+        let mut pud = m3::disc(v(x, gy(x, z) + 0.03, z), 0.8 + rh(k * 7 + 3) * 1.7, 18, c(0x74, 0x8c, 0xa4));
         m3::scale_xz(&mut pud, 1.0, 0.6 + rh(k * 7 + 4) * 0.5);
-        m3::set_alpha(&mut pud, 150); pud.mat = M::WATER; pud.emissive = 0.10;
+        m3::set_alpha(&mut pud, 120); pud.mat = M::WATER; pud.emissive = 0.06;
         s.add(pud, Float::STILL);
     }
 
@@ -4276,8 +4394,11 @@ fn alley() -> Scene {
     // YELLOW SPEEDBUMPS — the occasional low painted ridge across the lane (faded traffic yellow)
     for k in 0..(1.0 + 1.2 * pd) as u32 {
         let bx = -half_len * 0.6 + (k as f32 + 0.5) / (1.0 + 2.0 * pd).max(1.0) * half_len * 1.2;
-        let mut bump = m3::tube(v(bx, yf - 0.05, -wz + 0.4), v(bx, yf - 0.05, wz - 0.4), 0.28, 10, c(0xc6, 0xa0, 0x34));
-        m3::scale3(&mut bump, 1.0, 0.5, 1.0); // flatten into a low rounded ridge
+        // a low rounded tube half-set INTO the road surface = the speed-bump ridge. Seated on the terrain at
+        // each end (gy), NOT at a fixed yf then scale3'd — scale3 is origin-pivot, which was lifting the bump
+        // off the ground into mid-air. No scale3 now; the tube radius gives the low rounded profile directly.
+        let (bz0, bz1) = (-wz + 0.4, wz - 0.4);
+        let mut bump = m3::tube(v(bx, gy(bx, bz0) + 0.05, bz0), v(bx, gy(bx, bz1) + 0.05, bz1), 0.26, 12, c(0xc6, 0xa0, 0x34));
         m3::tint_up(&mut bump, c(0xd2, 0xae, 0x40), c(0x86, 0x6a, 0x22)); bump.mat = M::STONE;
         s.add(bump, Float::STILL);
         // worn paint scuffs (dark gaps) so it isn't a solid bar
@@ -4872,7 +4993,9 @@ fn hollow_jungle() -> Scene {
     // RECURSIVE JUNGLE — trees evenly spread over the inner surface (golden-angle spiral), each growing inward
     let (blo, bhi) = (c(0x4a, 0x36, 0x22), c(0x7a, 0x5e, 0x3c));
     let (llo, lhi) = (c(0x2e, 0x52, 0x22), c(0x74, 0xa6, 0x46));
-    let ntree = (44.0 + pr.nodes as f32 / 12.0).min(78.0) as u32;
+    set_foliage_tint(llo, lhi);
+    set_tree_bend(0.0, 0.0, 1.5, 0.55); // CURLY jungle: high scatter + strong arc boost → curvy, curling trunks
+    let ntree = ((26.0 + pr.nodes as f32 / 18.0).min(46.0) * render_quality()) as u32; // fewer trees (each is heavy: leaf clusters up to 110 blades)
     for k in 0..ntree {
         let i = k as f32 + 0.5;
         let phi = (1.0 - 2.0 * i / ntree as f32).clamp(-1.0, 1.0).acos();
@@ -4881,9 +5004,22 @@ fn hollow_jungle() -> Scene {
         let base = mulv(n, rr - 0.4);
         let dir = mulv(n, -1.0);                 // grow inward
         let len = (11.0 + hash(k as i32, 41) * 10.0) * sc;
-        let rad = (0.4 + hash(k as i32, 42) * 0.4) * sc;
-        let depth = 3 + (hash(k as i32, 43) > 0.62) as u32;
-        recurse_tree(&mut s, base, dir, len, rad, depth, 300 + k as i32 * 29, blo, bhi, llo, lhi);
+        let rad = (0.5 + hash(k as i32, 42) * 0.4) * sc;
+        let depth = 2u32;                        // capped at 2 (trunk→3→9) — depth 3 quadrupled the leaf load
+        tree_branch(&mut s, base, dir, len, rad, depth, 300 + k as i32 * 29, 3, 0.6); // curvy jungle tree
+        // VINES — a couple of hanging strands with leaf tufts dangling inward off the tree, swaying (jungle feel)
+        if hash(k as i32, 47) > 0.5 {
+            let hang = addv(base, mulv(dir, len * 0.7));
+            for vv in 0..2 {
+                let voff = v((hash(k as i32 * 3 + vv, 1) - 0.5) * 2.0, 0.0, (hash(k as i32 * 3 + vv, 2) - 0.5) * 2.0);
+                let vtop = addv(hang, mulv(voff, sc));
+                let vbot = addv(vtop, mulv(dir, -(3.0 + hash(k as i32 * 3 + vv, 3) * 4.0) * sc)); // dangles toward the hollow
+                let mut vine = m3::strand(vtop, vbot, 0.04 * sc, 4, 6, 0.0, 0.5, c(0x3a, 0x5a, 0x28)); vine.mat = M::MOSS;
+                s.add(vine, Float { amp: 0.12, speed: 0.5, phase: hash(k as i32 * 3 + vv, 4) * 6.28, drift: 0.12 });
+                let mut tuft = m3::leaf_cluster(vbot, 0.5 * sc, (4400 + k * 3 + vv as u32) as u32, c(0x4c, 0x7a, 0x30)); m3::tint_up(&mut tuft, c(0x6c, 0x9a, 0x40), c(0x30, 0x50, 0x22)); tuft.mat = M::MOSS;
+                s.add(tuft, Float { amp: 0.14, speed: 0.55, phase: hash(k as i32 * 3 + vv, 5) * 6.28, drift: 0.14 });
+            }
+        }
         // grass tuft + a boulder near the base, lying on the shell
         let mut grass = m3::leaf_cluster(mulv(n, rr - 0.6), 1.0 * sc, (600 + k) as u32, c(0x4c, 0x7a, 0x34));
         m3::tint_up(&mut grass, c(0x6e, 0x9c, 0x44), c(0x34, 0x54, 0x24)); grass.mat = M::MOSS; s.add(grass, Float { amp: 0.05, speed: 0.7, phase: hash(k as i32, 44) * 6.28, drift: 0.06 });
@@ -4916,6 +5052,62 @@ fn hollow_jungle() -> Scene {
         let p = addv(cen, v(a.cos() * el.cos() * dr, el.sin() * dr, a.sin() * el.cos() * dr));
         let mut mote = m3::uv_sphere(p, 0.1 + hash(k as i32, 63) * 0.14, 4, 4, c(0xe6, 0xe0, 0x9a)); mote.mat = M::STONE; mote.emissive = 1.2;
         s.add(mote, Float { amp: 0.5 + hash(k as i32, 64), speed: 0.25, phase: hash(k as i32, 65) * 6.28, drift: 0.4 });
+    }
+    // ROCK ARCHES — instead of simple spikes, hollow shoreline-style ARCHES spring off the shell: two feet on
+    // the surface bridged by a thick rock span that bulges inward, some carrying a smaller SECOND-TIER arch on
+    // top (built up + multiple levels), with a little grove of trees clustered around each foot.
+    let qbez = |a: Vec3, b: Vec3, cc: Vec3, t: f32| { let u = 1.0 - t; v(u*u*a.x + 2.0*u*t*b.x + t*t*cc.x, u*u*a.y + 2.0*u*t*b.y + t*t*cc.y, u*u*a.z + 2.0*u*t*b.z + t*t*cc.z) };
+    let narch = ((10.0 + pr.nodes as f32 / 26.0).min(24.0) * render_quality()) as u32;
+    for k in 0..narch {
+        let i = k as f32 + 0.5;
+        let phi = (1.0 - 2.0 * i / narch as f32).clamp(-1.0, 1.0).acos();
+        let theta = PI * (1.0 + 5.0_f32.sqrt()) * i * 1.7 + hash(k as i32, 70);
+        let n = v(phi.sin() * theta.cos(), phi.cos(), phi.sin() * theta.sin());
+        let up = if n.y.abs() < 0.9 { v(0.0, 1.0, 0.0) } else { v(1.0, 0.0, 0.0) };
+        let tang = normv(crossv(n, up));
+        let spread = 0.24 + hash(k as i32, 71) * 0.18;
+        let nb = normv(addv(n, mulv(tang, spread)));
+        let arch = |s: &mut Scene, na: Vec3, nb: Vec3, rise: f32, thick: f32, seed: u32, col: Color32| {
+            let (fa, fb) = (mulv(na, rr - 0.3), mulv(nb, rr - 0.3));
+            let mid = mulv(normv(addv(na, nb)), rr - 0.3 - rise);   // span bulges INWARD toward the hollow centre
+            let segs = 12;
+            let mut prev = fa;
+            for si in 1..=segs {
+                let t = si as f32 / segs as f32;
+                let p = qbez(fa, mid, fb, t);
+                let r = thick * (0.75 + 0.5 * (t * PI).sin());     // thicker across the middle of the span
+                let mut seg = m3::tube(prev, p, r, 8, col);
+                m3::tint_height(&mut seg, prev.y.min(p.y), prev.y.max(p.y), c(0x36, 0x32, 0x28), c(0x64, 0x60, 0x50)); seg.mat = M::STONE; seg.emissive = 0.03; s.add(seg, Float::STILL);
+                let _ = seed; prev = p;
+            }
+        };
+        let rise = (10.0 + hash(k as i32, 72) * 12.0) * sc;
+        let thick = (1.2 + hash(k as i32, 73) * 1.4) * sc;
+        arch(&mut s, n, nb, rise, thick, 5000 + k, c(0x4e, 0x4a, 0x3e));
+        if hash(k as i32, 74) > 0.5 {                              // a smaller SECOND-TIER arch built up on top
+            let na2 = normv(addv(n, mulv(tang, spread * 0.35)));
+            let nb2 = normv(addv(nb, mulv(tang, -spread * 0.15)));
+            arch(&mut s, na2, nb2, rise * 1.55, thick * 0.7, 5500 + k, c(0x56, 0x52, 0x44));
+        }
+        // mossy caps + a little grove of trees clustered around the feet (trees build AROUND the arch)
+        for &foot in &[n, nb] {
+            let fp = mulv(foot, rr - 0.5);
+            let mut moss = m3::leaf_cluster(fp, 1.4 * sc, (5300 + k) as u32, c(0x46, 0x72, 0x30)); m3::tint_up(&mut moss, c(0x6a, 0x98, 0x40), c(0x30, 0x50, 0x22)); moss.mat = M::MOSS; s.add(moss, Float::STILL);
+            if hash(k as i32 + (foot.x * 97.0) as i32, 77) > 0.4 {
+                let tdir = mulv(foot, -1.0);
+                recurse_tree(&mut s, mulv(foot, rr - 0.4), tdir, (8.0 + hash(k as i32, 78) * 6.0) * sc, 0.45 * sc, 3, 3300 + k as i32, blo, bhi, llo, lhi);
+            }
+        }
+    }
+    // VOLUMETRIC FOG — soft translucent haze banks drifting through the hollow (very low alpha, so overlapping
+    // layers read as real atmospheric DEPTH rather than a clear void), keyed to quality.
+    for k in 0..(16.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 80) * TAU; let el = (hash(k as i32, 81) - 0.5) * PI;
+        let dr = rr * (0.35 + hash(k as i32, 82) * 0.55);
+        let p = addv(cen, v(a.cos() * el.cos() * dr, el.sin() * dr, a.sin() * el.cos() * dr));
+        let mut bank = m3::uv_sphere(p, (7.0 + hash(k as i32, 83) * 9.0) * sc, 12, 9, c(0x8a, 0xa0, 0x86));
+        bank.mat = M::WATER; bank.emissive = 0.10; m3::set_alpha(&mut bank, 22);
+        s.add(bank, Float { amp: 1.2, speed: 0.08, phase: hash(k as i32, 84) * 6.28, drift: 0.8 });
     }
     s
 }
@@ -4961,6 +5153,51 @@ fn scarecrow(s: &mut Scene, x: f32, z: f32, yf: f32, seed: i32, sc: f32) {
 /// YELLOW BRICK ROAD — a storybook Oz world. A recursive forking yellow-brick road winds out from the graph across
 /// rolling green fields (poppies, corn, wildflowers) and recursive forests, to a distant glowing EMERALD CITY of
 /// recursive green towers. Rolling-hill organic boundary; recursion stacks the forests, road, and city.
+/// A TIN MAN figure (silver, shiny): cylinder body + limbs, a round head with a funnel hat. Faces `face`.
+fn tin_man(s: &mut Scene, x: f32, z: f32, yf: f32, face: f32, sc: f32) {
+    let sil = c(0xc0, 0xc8, 0xd0); let sil_hi = c(0xe6, 0xec, 0xf2);
+    let bh = 1.6 * sc;
+    for lsd in [-1.0f32, 1.0] {
+        let (lx, lz) = (x + face.sin() * lsd * 0.2 * sc, z - face.cos() * lsd * 0.2 * sc);
+        let mut leg = m3::tube(v(lx, yf, lz), v(lx, yf + bh * 0.5, lz), 0.13 * sc, 8, sil); leg.mat = M::STONE; leg.emissive = 0.12; s.add(leg, Float::STILL);
+    }
+    let mut body = m3::tube(v(x, yf + bh * 0.5, z), v(x, yf + bh * 1.3, z), 0.34 * sc, 12, sil);
+    m3::tint_up(&mut body, sil_hi, sil); body.mat = M::STONE; body.emissive = 0.15; s.add(body, Float::STILL);
+    for asd in [-1.0f32, 1.0] {
+        let (ax, az) = (x + face.sin() * asd * 0.4 * sc, z - face.cos() * asd * 0.4 * sc);
+        let mut arm = m3::tube(v(ax, yf + bh * 1.2, az), v(ax, yf + bh * 0.66, az), 0.1 * sc, 6, sil); arm.mat = M::STONE; arm.emissive = 0.12; s.add(arm, Float::STILL);
+    }
+    let hy = yf + bh * 1.5;
+    let mut head = m3::uv_sphere(v(x, hy, z), 0.25 * sc, 12, 10, sil); m3::tint_up(&mut head, sil_hi, sil); head.mat = M::STONE; head.emissive = 0.17; s.add(head, Float::STILL);
+    let mut hat = m3::tube(v(x, hy + 0.2 * sc, z), v(x, hy + 0.56 * sc, z), 0.13 * sc, 8, sil); hat.mat = M::STONE; hat.emissive = 0.14; s.add(hat, Float::STILL);
+    let mut brim = m3::disc(v(x, hy + 0.22 * sc, z), 0.24 * sc, 12, sil); brim.mat = M::STONE; brim.emissive = 0.14; s.add(brim, Float::STILL);
+    contact_shadow(s, x, z, 0.5 * sc, yf, 100);
+}
+
+/// A COWARDLY LION figure (tan): upright body + a big leafy MANE ruff, a tail with a tuft. Faces `face`.
+fn cowardly_lion(s: &mut Scene, x: f32, z: f32, yf: f32, face: f32, sc: f32) {
+    use std::f32::consts::TAU;
+    let tan = c(0xc2, 0x92, 0x4e); let tan_hi = c(0xda, 0xac, 0x64);
+    let bh = 1.5 * sc;
+    for lsd in [-1.0f32, 1.0] {
+        let (lx, lz) = (x + face.sin() * lsd * 0.2 * sc, z - face.cos() * lsd * 0.2 * sc);
+        let mut leg = m3::tube(v(lx, yf, lz), v(lx, yf + bh * 0.5, lz), 0.16 * sc, 7, tan); leg.mat = M::WOOD; s.add(leg, Float::STILL);
+    }
+    let mut body = m3::uv_sphere(v(x, yf + bh * 0.9, z), 0.42 * sc, 12, 10, tan); m3::tint_up(&mut body, tan_hi, tan); body.mat = M::WOOD; s.add(body, Float::STILL);
+    let hy = yf + bh * 1.4;
+    let mut head = m3::uv_sphere(v(x, hy, z), 0.28 * sc, 12, 10, tan); m3::tint_up(&mut head, tan_hi, tan); head.mat = M::WOOD; s.add(head, Float::STILL);
+    for m in 0..8 { // leafy mane ruff around the head
+        let ma = TAU * m as f32 / 8.0;
+        let mp = addv(v(x, hy, z), v(ma.cos() * 0.34 * sc, ma.sin() * 0.14 * sc, ma.sin() * 0.34 * sc));
+        let mut mane = m3::leaf_cluster(mp, 0.3 * sc, (m + 1) as u32, c(0x9a, 0x6a, 0x2e));
+        m3::tint_up(&mut mane, c(0xc0, 0x8a, 0x3e), c(0x6a, 0x46, 0x1e)); mane.mat = M::MOSS; s.add(mane, Float { amp: 0.03, speed: 0.6, phase: ma, drift: 0.03 });
+    }
+    let (tx, tz) = (x - face.cos() * 0.5 * sc, z - face.sin() * 0.5 * sc); // tail behind
+    let mut tail = m3::tube(v(x, yf + bh * 0.9, z), v(tx, yf + bh * 0.6, tz), 0.06 * sc, 5, tan); tail.mat = M::WOOD; s.add(tail, Float::STILL);
+    let mut tuft = m3::leaf_cluster(v(tx, yf + bh * 0.6, tz), 0.22 * sc, 99, c(0x8a, 0x5e, 0x28)); tuft.mat = M::MOSS; s.add(tuft, Float::STILL);
+    contact_shadow(s, x, z, 0.55 * sc, yf, 100);
+}
+
 fn oz() -> Scene {
     use std::f32::consts::TAU;
     let mut s = Scene::new();
@@ -5025,57 +5262,191 @@ fn oz() -> Scene {
     }
     let mut wall = m3::wall_ring(v(city_x, yf, city_z), 12.0 * sc, 3.0 * sc, 48, emlo); m3::tint_up(&mut wall, emhi, emlo); wall.mat = M::STONE; wall.emissive = 0.14; s.add(wall, Float::STILL);
     let mut glow = m3::disc(v(city_x, yf + 0.1, city_z), 12.0 * sc, 32, emhi); glow.mat = M::WATER; glow.emissive = 0.3; m3::set_alpha(&mut glow, 60); s.add(glow, Float::STILL); // emerald ground-glow
+    // CLOUDS — soft white puffs drifting across the sky (each a few overlapping translucent spheres)
+    for k in 0..(10.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 300) * TAU; let rr = hash(k as i32, 301).sqrt() * world_r * 0.9;
+        let cp = v(a.cos() * rr, yf + (34.0 + hash(k as i32, 302) * 16.0) * sc, a.sin() * rr);
+        for pf in 0..4 {
+            let ki = k as i32 * 7 + pf;
+            let off = v((hash(ki, 1) - 0.5) * 7.0 * sc, (hash(ki, 2) - 0.5) * 2.0 * sc, (hash(ki, 3) - 0.5) * 7.0 * sc);
+            let mut puff = m3::uv_sphere(addv(cp, off), (3.0 + hash(ki, 4) * 3.0) * sc, 10, 8, c(0xf0, 0xf2, 0xf6));
+            puff.mat = M::WATER; puff.emissive = 0.3; m3::set_alpha(&mut puff, 120);
+            s.add(puff, Float { amp: 0.6, speed: 0.05, phase: hash(k as i32, 303) * 6.28, drift: 1.2 });
+        }
+    }
+    // WEATHER — flower petals / pollen drifting through the meadow air (the wind engine gusts them)
+    for k in 0..(30.0 * render_quality()) as u32 {
+        let a = hash(k as i32, 310) * TAU; let rr = hash(k as i32, 311).sqrt() * world_r * 0.7;
+        let p = v(a.cos() * rr, yf + (1.0 + hash(k as i32, 312) * 10.0) * sc, a.sin() * rr);
+        let pc = [c(0xe6, 0xd0, 0x5a), c(0xd2, 0x42, 0x3a), c(0xc8, 0x6a, 0xc0)][(hash(k as i32, 313) * 3.0) as usize % 3];
+        let mut petal = m3::leaf_single(p, 0.2 * sc, k, pc); petal.mat = M::MOSS; petal.emissive = 0.1;
+        s.add(petal, Float { amp: 1.2 + hash(k as i32, 314) * 1.5, speed: 0.4, phase: hash(k as i32, 315) * 6.28, drift: 1.4 });
+    }
+    // THE TRAVELLERS — scarecrow, tin man, cowardly lion walking the road toward the Emerald City (seed-gated,
+    // so they turn up occasionally; spaced + spread along the road, facing the city).
+    if pr.seed % 2 == 0 {
+        let dir = v(cang.cos(), 0.0, cang.sin());
+        let road_len = world_r * 0.55;
+        let start = 0.24 + hash(9, 1) * 0.12;
+        for (ci, along) in [(0usize, 0.0f32), (1, 3.5), (2, 7.0)] {
+            let t = start + along / road_len;
+            let bx = cang.cos() * 11.0 * sc + dir.x * (t * road_len);
+            let bz = cang.sin() * 11.0 * sc + dir.z * (t * road_len);
+            let side = (ci as f32 - 1.0) * 2.0 * sc;                 // spread abreast across the road
+            let (fx, fz) = (bx - dir.z * side, bz + dir.x * side);
+            match ci {
+                0 => scarecrow(&mut s, fx, fz, yf, 111, sc),
+                1 => tin_man(&mut s, fx, fz, yf, cang, sc),
+                _ => cowardly_lion(&mut s, fx, fz, yf, cang, sc),
+            }
+        }
+    }
     // ROLLING-HILL organic boundary (green downs with clinging woods)
     organic_boundary(&mut s, world_r * 0.96, yf, 8000, c(0x46, 0x6a, 0x34), c(0x70, 0x9c, 0x4c), M::MOSS, c(0x3a, 0x60, 0x2c), true, sc);
     s
 }
 
-/// FROZEN BIFROST BUNKER — a POI set-piece: a raised basalt dais (knotwork cornice) ringed by a sunken glacial-ice
-/// trench, centred on a shattered hexagonal glass pane whose upward dagger-shards glow with white energy bleeding
-/// from below, all under a shifting magenta/cyan aurora. Verticality (high ground vs moat) + storytelling light.
+/// ASGARD & THE BIFROST — the realm eternal adrift in the cosmos: a shimmering rainbow bridge arcing across a
+/// star-strewn void toward Heimdall's golden observatory (Himinbjörg, its rainbow cannon the centerpiece) with
+/// the spires of Asgard rising behind. A starfield + nebulae wrap the sky (the graph sits off-world in space).
 fn bifrost() -> Scene {
-    use std::f32::consts::TAU;
+    use std::f32::consts::{TAU, PI};
     let mut s = Scene::new();
     let yf = -3.4_f32;
+    let pr = env_params();
     let sc = (map_radius() / 64.0).clamp(1.0, 2.0);
-    let dais_r = 26.0 * sc;
-    // SUNKEN TRENCH RING — translucent glacial ice moat around the dais, scratched grooves, ash-water floor
-    let mut moat = m3::disc(v(0.0, yf - 3.0, 0.0), dais_r * 1.7, 80, c(0x16, 0x26, 0x34)); moat.mat = M::WATER; moat.emissive = 0.05; s.add(moat, Float::STILL);
-    for k in 0..40 {
-        let a = TAU * k as f32 / 40.0;
-        let mut ice = m3::panel(v(a.cos() * dais_r * 1.45, yf - 1.5, a.sin() * dais_r * 1.45), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), dais_r * 0.24, 3.0 * sc, c(0x6a, 0xa6, 0xc8));
-        m3::tint_up(&mut ice, c(0x9a, 0xd0, 0xe6), c(0x3a, 0x6e, 0x90)); ice.mat = M::WATER; ice.emissive = 0.1; m3::set_alpha(&mut ice, 180); s.add(ice, Float::STILL);
+
+    // ── THE VOID + STARFIELD ─────────────────────────────────────────────────────────────────────────────
+    let mut voiddome = m3::uv_sphere(v(0.0, 0.0, 0.0), 320.0 * sc, 40, 28, c(0x05, 0x06, 0x10));
+    for n in &mut voiddome.norms { *n = mulv(*n, -1.0); } // inward-facing so the interior is the night sky
+    voiddome.mat = M::STONE; voiddome.emissive = 0.02; s.add(voiddome, Float::STILL);
+    let nstar = (360.0 * render_quality()) as u32;
+    for k in 0..nstar {
+        let i = k as f32 + 0.5;
+        let phi = (1.0 - 2.0 * i / nstar as f32).clamp(-1.0, 1.0).acos();
+        let theta = PI * (1.0 + 5.0_f32.sqrt()) * i;
+        let dir = v(phi.sin() * theta.cos(), phi.cos().abs() * 0.9 + 0.08, phi.sin() * theta.sin()); // bias to the sky
+        let scol = [c(0xff, 0xff, 0xff), c(0xcf, 0xe0, 0xff), c(0xff, 0xe6, 0xc0), c(0xd0, 0xc8, 0xff)][(hash(k as i32, 2) * 4.0) as usize % 4];
+        let mut star = m3::uv_sphere(mulv(dir, 280.0 * sc), (0.5 + hash(k as i32, 1) * 1.1) * sc, 4, 4, scol);
+        star.mat = M::WATER; star.emissive = 2.5 + hash(k as i32, 3) * 2.2;
+        s.add(star, Float { amp: 0.0, speed: 0.6, phase: hash(k as i32, 4) * 6.28, drift: 0.0 }); // twinkle via emissive breathing
     }
-    // CENTRAL BASALT DAIS — dark blue-grey, knotwork cornice torus, frost-packed
-    let mut dais = m3::tube(v(0.0, yf - 1.0, 0.0), v(0.0, yf + 0.4, 0.0), dais_r, 64, c(0x24, 0x2e, 0x42));
-    m3::tint_up(&mut dais, c(0x36, 0x44, 0x5e), c(0x18, 0x20, 0x30)); dais.mat = M::STONE; dais.emissive = 0.04; s.add(dais, Float::STILL);
-    let mut top = m3::disc(v(0.0, yf + 0.42, 0.0), dais_r, 64, c(0x2e, 0x3a, 0x52)); m3::tint_up(&mut top, c(0x3e, 0x4e, 0x6c), c(0x22, 0x2c, 0x40)); top.mat = M::STONE; top.emissive = 0.05; s.add(top, Float::STILL);
-    let mut cornice = m3::torus(v(0.0, yf + 0.4, 0.0), dais_r * 1.01, 0.8 * sc, 64, 8, c(0xc6, 0xd6, 0xe6)); cornice.mat = M::STONE; cornice.emissive = 0.06; s.add(cornice, Float::STILL); // frost-packed knotwork rim
-    // SHATTERED IRIDESCENT GLASS — a field of upward dagger-shards over a glowing white core, hue-shifting
-    let mut core = m3::uv_sphere(v(0.0, yf + 0.3, 0.0), dais_r * 0.34, 20, 14, c(0xe8, 0xf2, 0xff)); core.mat = M::WATER; core.emissive = 1.4; m3::set_alpha(&mut core, 150); s.add(core, Float { amp: 0.1, speed: 0.5, phase: 0.0, drift: 0.0 }); // white energy bleeding up
-    let irid = [c(0x7a, 0xe6, 0xf0), c(0xa6, 0x8c, 0xf0), c(0xe0, 0x7c, 0xe0), c(0xc6, 0xf0, 0xe6), c(0x8c, 0xb6, 0xf0)];
-    for k in 0..(60.0 * render_quality()) as u32 {
-        let a = hash(k as i32, 1) * TAU; let rr = hash(k as i32, 2).sqrt() * dais_r * 0.62;
-        let (gx, gz) = (a.cos() * rr, a.sin() * rr);
-        let hgt = (1.4 + hash(k as i32, 3) * 3.4) * sc;
-        let col = irid[(hash(k as i32, 4) * 5.0) as usize % 5];
-        let mut shard = m3::rock(v(gx, yf + 0.4, gz), (0.5 + hash(k as i32, 5) * 0.5) * sc, (k + 7) as u32, col);
-        m3::scale3(&mut shard, 0.32, hgt, 0.32);                          // thin tall dagger
-        m3::tint_up(&mut shard, c(0xf0, 0xfa, 0xff), col); shard.mat = M::WATER; shard.emissive = 0.9 + hash(k as i32, 6) * 0.8; s.add(shard, Float { amp: 0.05, speed: 0.4, phase: hash(k as i32, 7) * 6.28, drift: 0.0 });
+    for k in 0..8 { // nebula wisps
+        let a = TAU * k as f32 / 8.0; let r = (130.0 + hash(k, 10) * 80.0) * sc; let hy = (44.0 + hash(k, 11) * 90.0) * sc;
+        let col = if k % 2 == 0 { c(0x3e, 0x2a, 0x6a) } else { c(0x26, 0x48, 0x7a) };
+        let mut neb = m3::uv_sphere(v(a.cos() * r, hy, a.sin() * r), (26.0 + hash(k, 12) * 22.0) * sc, 12, 9, col);
+        neb.mat = M::WATER; neb.emissive = 0.14; m3::set_alpha(&mut neb, 20); s.add(neb, Float { amp: 2.0, speed: 0.05, phase: hash(k, 13) * 6.28, drift: 1.0 });
     }
-    // AURORA — broad waving emissive ribbons high overhead in magenta/cyan: non-uniform storytelling light
+
+    // ── THE BIFROST BRIDGE — a rainbow ribbon arcing across the void toward Asgard ────────────────────────
+    let bear = 0.6_f32;                                   // bearing toward Asgard
+    let bd = v(bear.cos(), 0.0, bear.sin());
+    let perp = v(-bd.z, 0.0, bd.x);
+    let blen = 190.0 * sc; let bw = 8.0 * sc;
+    let bands = [c(0xe0, 0x3a, 0x3a), c(0xe0, 0x8a, 0x30), c(0xe0, 0xd0, 0x34), c(0x3a, 0xc4, 0x54), c(0x30, 0x84, 0xe0), c(0x52, 0x40, 0xd4), c(0xb0, 0x44, 0xd4)];
+    let arc = |t: f32| { let d = 6.0 * sc + t * blen; v(bd.x * d, yf + (t * PI).sin() * 10.0 * sc, bd.z * d) }; // gentle upward arc
+    let nseg = (blen / 5.0) as usize;
+    for si in 0..nseg {
+        let (t0, t1) = (si as f32 / nseg as f32, (si + 1) as f32 / nseg as f32);
+        let (c0, c1) = (arc(t0), arc(t1));
+        for (bi, bc) in bands.iter().enumerate() {
+            let off = (bi as f32 - 3.0) / 7.0 * bw;
+            let p0 = addv(c0, mulv(perp, off)); let p1 = addv(c1, mulv(perp, off));
+            let mut strip = m3::tube(p0, p1, bw / 15.0, 5, *bc);
+            strip.mat = M::WATER; strip.emissive = 0.7 + 0.3 * ((si as f32 * 0.3 + bi as f32).sin() * 0.5 + 0.5); // shimmer travels the span
+            s.add(strip, Float::STILL);
+        }
+        if si % 4 == 0 { // glowing balustrade posts
+            for &sd in &[-1.0f32, 1.0] {
+                let pp = addv(c0, mulv(perp, sd * bw * 0.55));
+                let mut post = m3::tube(pp, addv(pp, v(0.0, 1.6 * sc, 0.0)), 0.18 * sc, 6, c(0xe8, 0xdc, 0xa0));
+                post.mat = M::STONE; post.emissive = 0.5; s.add(post, Float::STILL);
+            }
+        }
+    }
+
+    // ── ASGARD + HIMINBJÖRG (the rainbow cannon observatory) at the bridge's end ──────────────────────────
+    let far = arc(0.98);
+    let (gold_lo, gold_hi) = (c(0x9a, 0x76, 0x2e), c(0xe6, 0xc4, 0x66));
+    // Heimdall's OBSERVATORY — a golden drum + dome, and the great BIFROST CANNON barrel angled up off it.
+    let obs = v(far.x, yf, far.z);
+    let mut drum = m3::tube(obs, addv(obs, v(0.0, 9.0 * sc, 0.0)), 7.0 * sc, 40, gold_lo);
+    m3::tint_up(&mut drum, gold_hi, gold_lo); drum.mat = M::STONE; drum.emissive = 0.12; s.add(drum, Float::STILL);
+    let mut dome = m3::uv_sphere(addv(obs, v(0.0, 9.0 * sc, 0.0)), 7.2 * sc, 30, 12, gold_hi);
+    for nrm in &mut dome.norms { if nrm.y < 0.0 { *nrm = v(nrm.x, -nrm.y, nrm.z); } } // hemisphere-ish
+    dome.mat = M::STONE; dome.emissive = 0.14; s.add(dome, Float::STILL);
+    let mut cornice = m3::torus(addv(obs, v(0.0, 9.0 * sc, 0.0)), 7.2 * sc, 0.5 * sc, 40, 8, gold_hi); cornice.mat = M::STONE; cornice.emissive = 0.16; s.add(cornice, Float::STILL);
+    // the CANNON — a great glowing ENERGY SPHERE cradled in the observatory, with the barrel emerging from it
+    let cbase = addv(obs, v(0.0, 9.0 * sc, 0.0));
+    let mut sphere = m3::uv_sphere(cbase, 3.2 * sc, 26, 20, c(0x9a, 0xe0, 0xf0));
+    sphere.mat = M::WATER; sphere.emissive = 1.7; m3::set_alpha(&mut sphere, 210);
+    s.add(sphere, Float { amp: 0.12, speed: 0.5, phase: 0.0, drift: 0.0 });
+    let mut cradle = m3::torus(cbase, 3.5 * sc, 0.55 * sc, 28, 8, gold_hi); cradle.mat = M::STONE; cradle.emissive = 0.2; s.add(cradle, Float::STILL);
+    for arm in 0..4 { // cradle arms cupping the sphere
+        let aa = std::f32::consts::TAU * arm as f32 / 4.0;
+        let ap = addv(cbase, v(aa.cos() * 3.4 * sc, -2.4 * sc, aa.sin() * 3.4 * sc));
+        let mut strut = m3::tube(ap, addv(cbase, v(0.0, -1.0 * sc, 0.0)), 0.4 * sc, 6, gold_lo); strut.mat = M::STONE; strut.emissive = 0.1; s.add(strut, Float::STILL);
+    }
+    // barrel projecting up-and-out over the void, glowing rainbow at the muzzle
+    let cdir = normv(addv(mulv(bd, 0.5), v(0.0, 0.85, 0.0)));
+    let cmuz = addv(cbase, mulv(cdir, 16.0 * sc));
+    let mut barrel = m3::tube(cbase, cmuz, 1.5 * sc, 16, gold_hi);
+    m3::tint_up(&mut barrel, gold_hi, gold_lo); barrel.mat = M::STONE; barrel.emissive = 0.16; s.add(barrel, Float::STILL);
+    let mut muzzle = m3::torus(cmuz, 1.7 * sc, 0.5 * sc, 20, 8, c(0x9a, 0xe0, 0xf0)); muzzle.mat = M::WATER; muzzle.emissive = 2.0; s.add(muzzle, Float { amp: 0.1, speed: 0.6, phase: 0.0, drift: 0.0 });
+    for (bi, bc) in bands.iter().enumerate() { // a rainbow beam firing from the muzzle into the sky
+        let off = (bi as f32 - 3.0) / 7.0 * 2.4 * sc;
+        let bp = addv(cmuz, mulv(perp, off));
+        let mut beam = m3::tube(bp, addv(bp, mulv(cdir, 120.0 * sc)), 0.28 * sc, 5, *bc); beam.mat = M::WATER; beam.emissive = 1.2; m3::set_alpha(&mut beam, 150); s.add(beam, Float::STILL);
+    }
+    // ASGARD — a golden LANDMASS with terrain height (a tiered plateau + cliff drop into the void), MANY spires
+    // climbing the terraces, and a floating WATERFALL ISLAND beneath the realm streaming into the abyss.
+    let city = addv(obs, mulv(bd, 24.0 * sc));
+    for tier in 0..3 {                                    // tiered golden plateau → terrace heights
+        let ty = yf + tier as f32 * 3.2 * sc;
+        let trad = (34.0 - tier as f32 * 8.0) * sc;
+        let mut plat = m3::tube(v(city.x, ty - 3.4 * sc, city.z), v(city.x, ty, city.z), trad, 44, gold_lo);
+        m3::tint_up(&mut plat, gold_hi, gold_lo); plat.mat = M::STONE; plat.emissive = 0.06; s.add(plat, Float::STILL);
+        let mut cap = m3::disc(v(city.x, ty, city.z), trad, 44, gold_hi); m3::tint_up(&mut cap, gold_hi, gold_lo); cap.mat = M::STONE; cap.emissive = 0.07; s.add(cap, Float::STILL);
+    }
+    let nspire = (10.0 + pr.nodes as f32 / 8.0).clamp(9.0, 26.0) as i32; // city grows with the conversation
+    for t in 0..nspire {                                  // many spires, varied heights, climbing the terraces
+        let a = hash(t, 40) * TAU; let rr = hash(t, 41).sqrt() * 27.0 * sc;
+        let by = yf + (0.5 + hash(t, 44).powi(2) * 8.0) * sc;
+        let th = (10.0 + hash(t, 42) * 22.0) * sc;
+        recurse_citadel(&mut s, city.x + a.cos() * rr, city.z + a.sin() * rr, by, (1.6 + hash(t, 43) * 1.8) * sc, th * 0.34, 3, 500 + t * 23, gold_lo, gold_hi, c(0xff, 0xe8, 0x9a));
+    }
+    // WATERFALL ISLAND beneath the realm — a rough floating rock, grassy on top, waterfalls off its rim
+    let isle = v(city.x, yf - 26.0 * sc, city.z);
+    let mut rock = m3::rock(isle, 15.0 * sc, 0x1E14, c(0x4a, 0x44, 0x36));
+    m3::tint_height(&mut rock, isle.y - 22.0 * sc, isle.y + 8.0 * sc, c(0x2a, 0x26, 0x1c), c(0x60, 0x5a, 0x48)); rock.mat = M::STONE; s.add(rock, Float::STILL);
+    let mut itop = m3::disc(v(isle.x, isle.y + 6.5 * sc, isle.z), 11.0 * sc, 30, c(0x3a, 0x6a, 0x30));
+    m3::tint_up(&mut itop, c(0x5e, 0x92, 0x3e), c(0x2c, 0x4c, 0x22)); itop.mat = M::MOSS; s.add(itop, Float::STILL);
+    let mut pool = m3::disc(v(isle.x, isle.y + 6.7 * sc, isle.z), 5.0 * sc, 24, c(0x6a, 0xc0, 0xd6)); pool.mat = M::WATER; pool.emissive = 0.2; m3::set_alpha(&mut pool, 180); s.add(pool, Float::STILL);
+    for w in 0..5 {                                       // falls streaming off the rim into the void
+        let wa = TAU * w as f32 / 5.0 + hash(w, 60) * 0.5;
+        let (wx, wz) = (isle.x + wa.cos() * 10.0 * sc, isle.z + wa.sin() * 10.0 * sc);
+        waterfall(&mut s, wx, wz, isle.y + 6.0 * sc, isle.y - 34.0 * sc, 1.5 * sc, c(0x8a, 0xc8, 0xe0), 0);
+    }
+    // ── SHOOTING STARS — a few meteors streaking across the void (bright head + a tapering glowing tail) ──
+    for k in 0..(6.0 * render_quality()) as u32 {
+        let ki = k as i32;
+        let a = hash(ki, 90) * TAU; let el = 0.3 + hash(ki, 91) * 0.5;
+        let dr = 210.0 * sc;
+        let head = v(a.cos() * el.cos() * dr, el.sin() * dr, a.sin() * el.cos() * dr);
+        let tdir = normv(v(-a.sin(), (hash(ki, 92) - 0.5) * 0.4, a.cos()));
+        let (mut tail, _e, _d) = m3::branch_curved(head, tdir, (16.0 + hash(ki, 93) * 12.0) * sc, 0.6 * sc, 0.04 * sc, v(0.0, -0.2, 0.0), 0.05, ki as u32, c(0xff, 0xf0, 0xc8));
+        tail.mat = M::WATER; tail.emissive = 2.6; m3::set_alpha(&mut tail, 200); s.add(tail, Float { amp: 0.0, speed: 0.4, phase: hash(ki, 94) * 6.28, drift: 0.0 });
+        let mut hd = m3::uv_sphere(head, 0.8 * sc, 6, 5, c(0xff, 0xff, 0xf0)); hd.mat = M::WATER; hd.emissive = 4.0; s.add(hd, Float::STILL);
+    }
+    // ── AURORA drift overhead (cosmic light) ─────────────────────────────────────────────────────────────
     for k in 0..7 {
         let a = TAU * k as f32 / 7.0 + hash(k, 8) * 0.5;
-        let rr = (40.0 + hash(k, 9) * 36.0) * sc;
-        let hy = (26.0 + hash(k, 10) * 18.0) * sc;
+        let rr = (50.0 + hash(k, 9) * 40.0) * sc; let hy = (34.0 + hash(k, 10) * 22.0) * sc;
         let col = if k % 2 == 0 { c(0x46, 0xc8, 0xc0) } else { c(0xc0, 0x52, 0xc8) };
-        let mut band = m3::panel(v(a.cos() * rr, hy, a.sin() * rr), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), (30.0 + hash(k, 11) * 24.0) * sc, (10.0 + hash(k, 12) * 12.0) * sc, col);
-        m3::tint_up(&mut band, col, c(0x10, 0x18, 0x2c)); band.mat = M::WATER; band.emissive = 0.7; m3::set_alpha(&mut band, 70); s.add(band, Float { amp: 1.4, speed: 0.18, phase: hash(k, 13) * 6.28, drift: 0.6 });
+        let mut band = m3::panel(v(a.cos() * rr, hy, a.sin() * rr), v(-a.sin(), 0.0, a.cos()), v(0.0, 1.0, 0.0), (34.0 + hash(k, 11) * 24.0) * sc, (10.0 + hash(k, 12) * 12.0) * sc, col);
+        m3::tint_up(&mut band, col, c(0x10, 0x18, 0x2c)); band.mat = M::WATER; band.emissive = 0.6; m3::set_alpha(&mut band, 60); s.add(band, Float { amp: 1.4, speed: 0.18, phase: hash(k, 13) * 6.28, drift: 0.6 });
     }
-    for k in 0..(36.0 * render_quality()) as u32 { // frozen motes glinting in the aurora
-        let a = hash(k as i32, 20) * TAU; let rr = hash(k as i32, 21).sqrt() * dais_r * 1.6; let hy = yf + 1.0 + hash(k as i32, 22) * 22.0 * sc;
-        let mut m = m3::uv_sphere(v(a.cos() * rr, hy, a.sin() * rr), 0.1 + hash(k as i32, 23) * 0.12, 4, 4, irid[(hash(k as i32, 24) * 5.0) as usize % 5]); m.mat = M::WATER; m.emissive = 1.2; s.add(m, Float { amp: 0.6 + hash(k as i32, 25), speed: 0.25, phase: hash(k as i32, 26) * 6.28, drift: 0.4 });
-    }
+    let _ = pr;
     s
 }
 
@@ -5135,8 +5506,150 @@ fn titan_ribcage() -> Scene {
         let mut fog = m3::disc(v((hash(k, 30) - 0.5) * 2.0 * half_w, yf + 1.4 + hash(k, 31) * 1.2, (hash(k, 32) - 0.5) * 2.0 * half_l), (10.0 + hash(k, 33) * 10.0) * sc, 18, c(0xb6, 0xc2, 0x6a));
         fog.mat = M::WATER; fog.emissive = 0.16; m3::set_alpha(&mut fog, 36); s.add(fog, Float { amp: 0.3, speed: 0.12, phase: hash(k, 34) * 6.28, drift: 0.5 });
     }
+    // ── ENVPARAMS-DRIVEN BONE VARIATIONS — a giant SKULL at the head of the lane, scattered LIMB BONES, and a
+    // seed-gated PELVIS, so the ossuary reads as a whole fallen colossus, not just three ribs. Which pieces
+    // appear + how many scale with the seed / branch factor / graph size.
+    {
+        let sk = if pr.seed % 2 == 0 { 1.0 } else { -1.0 };
+        let sctr = v(sk * half_w * 0.12, yf + 3.0 * sc, -half_l * 0.66);
+        let sr = (5.0 + (pr.nodes as f32 / 120.0).min(1.6)) * sc;          // bigger skull for bigger conversations
+        let mut cran = m3::uv_sphere(sctr, sr, 18, 14, bone_lo);
+        m3::tint_up(&mut cran, bone_hi, marrow); cran.mat = M::STONE; cran.emissive = 0.05; s.add(cran, Float::STILL);
+        for eside in [-1.0f32, 1.0] {                                       // recessed eye sockets (face down-lane, +z)
+            let ep = addv(sctr, v(eside * sr * 0.42, sr * 0.12, sr * 0.86));
+            let mut socket = m3::uv_sphere(ep, sr * 0.28, 12, 10, c(0x14, 0x12, 0x0e)); socket.mat = M::STONE; s.add(socket, Float::STILL);
+        }
+        let np = addv(sctr, v(0.0, -sr * 0.18, sr * 0.92));                  // nasal cavity
+        let mut nose = m3::uv_sphere(np, sr * 0.16, 8, 8, c(0x18, 0x14, 0x10)); nose.mat = M::STONE; s.add(nose, Float::STILL);
+        let mut brow = m3::torus(addv(sctr, v(0.0, sr * 0.34, sr * 0.7)), sr * 0.5, sr * 0.08, 16, 6, bone_hi); brow.mat = M::STONE; s.add(brow, Float::STILL);
+        let jc = addv(sctr, v(0.0, -sr * 0.55, sr * 0.7));                   // upper jaw + a row of teeth
+        let mut jaw = m3::torus(jc, sr * 0.44, sr * 0.10, 16, 6, bone_lo); jaw.mat = M::STONE; s.add(jaw, Float::STILL);
+        for ti in 0..8 {
+            let ta = std::f32::consts::PI * (0.15 + 0.7 * ti as f32 / 7.0);
+            let tp = addv(jc, v(ta.cos() * sr * 0.44, -sr * 0.14, ta.sin() * sr * 0.30 + sr * 0.1));
+            let mut tooth = m3::uv_sphere(tp, sr * 0.07, 6, 5, c(0xe8, 0xe0, 0xc4)); tooth.mat = M::STONE; s.add(tooth, Float::STILL);
+        }
+        contact_shadow(&mut s, sctr.x, sctr.z, sr * 1.3, yf, 150);
+
+        let nlegs = (2 + pr.branches as usize).clamp(2, 7);                  // scattered limb bones (femurs/tibiae)
+        for k in 0..nlegs {
+            let ki = k as i32;
+            let a = hash(4000 + ki, 1) * TAU;
+            let (bx, bz) = (a.cos() * half_w * (0.4 + hash(ki, 2) * 0.5), a.sin() * half_l * (0.3 + hash(ki, 3) * 0.5));
+            let dir = normv(v(hash(ki, 4) - 0.5, 0.05, hash(ki, 5) - 0.5));
+            let blen = (10.0 + hash(ki, 6) * 8.0) * sc;
+            let p0 = v(bx, yf + 0.3 * sc, bz); let p1 = addv(p0, mulv(dir, blen));
+            let mut shaft = m3::tube(p0, p1, 0.9 * sc, 8, bone_lo);
+            m3::tint_up(&mut shaft, bone_hi, marrow); shaft.mat = M::STONE; shaft.emissive = 0.04; s.add(shaft, Float::STILL);
+            for &e in &[p0, p1] { let mut ball = m3::uv_sphere(e, 1.5 * sc, 10, 8, bone_hi); ball.mat = M::STONE; s.add(ball, Float::STILL); } // bulbous epiphyses
+        }
+
+        if pr.seed % 3 == 0 {                                               // PELVIS basin — a bone ring, seed-gated
+            let pc = v(-sk * half_w * 0.1, yf + 2.0 * sc, half_l * 0.5);
+            let mut pel = m3::torus(pc, 5.0 * sc, 1.4 * sc, 18, 8, bone_lo);
+            m3::tint_up(&mut pel, bone_hi, marrow); pel.mat = M::STONE; s.add(pel, Float::STILL);
+        }
+    }
     organic_boundary(&mut s, (half_w.max(half_l)) * 1.18, yf, 9000, c(0x3a, 0x42, 0x28), c(0x60, 0x6c, 0x40), M::MOSS, c(0x4a, 0x70, 0x2c), true, sc);
     s
+}
+
+/// A scene-relevant SETTING that the mic pearl sits in, so the voice indicator reads as a placed object in
+/// the world rather than a primitive floating in space: a pearl nestled in a scallop SHELL, a crystal held in
+/// a golden CRADLE, a rune-stone on a PLINTH, a wooden bead in a turned DISH, a dewdrop hung on a curving
+/// STEM. `shape` codes the MicShape (0 Pearl, 1 Gem, 2 Stone, 3 Bead, 4 Leaf); `c`,`r` are the pearl centre +
+/// radius; `right`/`up`/`fwd` its facing basis (fwd toward the viewer); `col` a dim scene tint for stone-ish
+/// mounts. Returns the mount meshes (materials/emissive already set); the caller pushes them behind the orb.
+pub fn mic_setting(scene: &str, shape: u8, center: Vec3, r: f32, right: Vec3, up: Vec3, fwd: Vec3, seed: u32, col: Color32) -> Vec<m3::Mesh3> {
+    let mut out = Vec::new();
+    let off = |a: f32, b: f32, d: f32| Vec3::new(center.x + right.x * a + up.x * b + fwd.x * d, center.y + right.y * a + up.y * b + fwd.y * d, center.z + right.z * a + up.z * b + fwd.z * d);
+    // ── BESPOKE per-scene mounts for the most distinctive worlds (before the material-family fallback) ──
+    match scene {
+        "Old Library" | "Reading Room" | "Archive" => {
+            // an open BOOK lectern: two page-panels meeting at a spine, the bead resting in the gutter.
+            let paper = c(0xe4, 0xdc, 0xc6);
+            for s in [-1.0f32, 1.0] {
+                let pc = off(s * r * 0.7, -r * 1.0, 0.0);
+                let axis = Vec3::new(right.x * s, right.y * s, right.z * s);
+                let mut page = m3::panel(pc, axis, fwd, r * 1.5, r * 1.9, paper);
+                m3::tint_up(&mut page, c(0xf0, 0xe8, 0xd2), c(0xc2, 0xb6, 0x98)); page.mat = M::PAPER; page.emissive = 0.05;
+                out.push(page);
+            }
+            let mut spine = m3::tube(off(0.0, -r * 1.6, r * 0.9), off(0.0, -r * 0.4, -r * 0.9), r * 0.16, 6, c(0x6a, 0x2e, 0x24));
+            spine.mat = M::WOOD; spine.emissive = 0.03; out.push(spine); // leather spine
+            return out;
+        }
+        "Folding@home" => {
+            // nested ORBIT rings + an electron bead (a molecule/orbital cradle) around the pearl.
+            for (k, rad) in [(0usize, 1.3f32), (1, 1.7)] {
+                let mut ring = m3::torus(center, r * rad, r * 0.05, 24, 5, c(0x6a, 0xc8, 0xd0));
+                ring.mat = M::WATER; ring.emissive = 0.55 - k as f32 * 0.15; out.push(ring);
+            }
+            let mut electron = m3::uv_sphere(off(r * 1.7, 0.0, 0.0), r * 0.14, 6, 5, c(0x9a, 0xe6, 0xf0));
+            electron.mat = M::WATER; electron.emissive = 1.2; out.push(electron);
+            return out;
+        }
+        _ => {}
+    }
+    match shape {
+        0 => {
+            // PEARL → open scallop SHELL: two fluted half-fans cupping from below-and-behind, cream nacre.
+            let cream = c(0xe6, 0xde, 0xcc);
+            for s in [-1.0f32, 1.0] {
+                let hc = off(s * r * 0.55, -r * 0.85, -r * 0.35);
+                let axis = Vec3::new(right.x * s, right.y * s, right.z * s);
+                let mut half = m3::panel(hc, axis, fwd, r * 1.5, r * 1.25, cream);
+                m3::tint_up(&mut half, c(0xf2, 0xec, 0xdc), c(0xbc, 0xb2, 0x9c));
+                half.mat = M::STONE; half.emissive = 0.05;
+                out.push(half);
+            }
+            for k in 0..5 { // radial fluting ridges fanning up the shell
+                let a = (k as f32 / 4.0 - 0.5) * 1.4;
+                let base = off(a.sin() * r * 1.1, -r * 0.85, -r * 0.3);
+                let tip = off(a.sin() * r * 1.3, r * 0.2, -r * 0.15);
+                let mut ridge = m3::tube(base, tip, r * 0.05, 4, cream); ridge.mat = M::STONE; ridge.emissive = 0.04;
+                out.push(ridge);
+            }
+        }
+        1 => {
+            // GEM → golden CRADLE: an equatorial band + three claw prongs rising to grip the crystal.
+            let gold = c(0xd8, 0xb0, 0x50);
+            let mut band = m3::torus(off(0.0, -r * 0.15, 0.0), r * 1.08, r * 0.09, 18, 6, gold);
+            band.mat = M::STONE; band.emissive = 0.14; out.push(band);
+            for k in 0..3 {
+                let a = k as f32 / 3.0 * std::f32::consts::TAU + 0.4;
+                let base = off(a.cos() * r * 1.05, -r * 0.15, a.sin() * r * 1.05);
+                let tip = off(a.cos() * r * 0.55, r * 0.75, a.sin() * r * 0.55);
+                let mut prong = m3::tube(base, tip, r * 0.07, 5, gold); prong.mat = M::STONE; prong.emissive = 0.12;
+                out.push(prong);
+            }
+        }
+        2 => {
+            // STONE → carved PLINTH the rune-stone rests on: a short tapered stone drum.
+            let mut plinth = m3::tube(off(0.0, -r * 1.0, 0.0), off(0.0, -r * 2.3, 0.0), r * 0.72, 8, col);
+            m3::tint_up(&mut plinth, c(0x5a, 0x56, 0x4c), c(0x2c, 0x2a, 0x24)); plinth.mat = M::STONE; plinth.emissive = 0.02;
+            out.push(plinth);
+            let mut cap = m3::disc(off(0.0, -r * 1.0, 0.0), r * 0.8, 10, col); cap.mat = M::STONE; out.push(cap);
+        }
+        3 => {
+            // BEAD → turned wooden DISH: a shallow bowl (disc + rim) the bead rests in.
+            let wood = c(0x6a, 0x48, 0x28);
+            let d = off(0.0, -r * 1.05, 0.0);
+            let mut dish = m3::disc(d, r * 1.15, 12, wood);
+            m3::tint_up(&mut dish, c(0x84, 0x5c, 0x34), c(0x4a, 0x30, 0x18)); dish.mat = M::WOOD; out.push(dish);
+            let mut rim = m3::torus(off(0.0, -r * 0.95, 0.0), r * 1.08, r * 0.13, 16, 5, wood); rim.mat = M::WOOD; rim.emissive = 0.03;
+            out.push(rim);
+        }
+        4 => {
+            // LEAF → a curving STEM the dew-leaf hangs from, so it reads as growing, not floating.
+            let start = off(-r * 0.3, -r * 2.4, 0.0);
+            let (mut stem, _e, _d) = m3::branch_curved(start, up, r * 2.6, r * 0.13, r * 0.05, right, 0.35, seed, c(0x5a, 0x6e, 0x30));
+            m3::tint_up(&mut stem, c(0x74, 0x86, 0x40), c(0x3a, 0x4a, 0x22)); stem.mat = M::WOOD; stem.emissive = 0.03;
+            out.push(stem);
+        }
+        _ => {}
+    }
+    out
 }
 
 fn build(palette_name: &str) -> Scene {
@@ -5447,7 +5960,7 @@ fn push_collider(col: Collider) { COLLIDERS.with(|c| c.borrow_mut().push(col)); 
 pub fn env_colliders() -> Vec<Collider> { COLLIDERS.with(|c| c.borrow().clone()) }
 
 // cached baked scene (rebuilt when the palette, detail variant, OR conversation params change); per-frame only floats update.
-thread_local! { static ENV: std::cell::RefCell<Option<(String, u8, EnvParams, Scene)>> = const { std::cell::RefCell::new(None) }; }
+thread_local! { static ENV: std::cell::RefCell<Option<(String, u8, EnvParams, Scene, f32)>> = const { std::cell::RefCell::new(None) }; }
 
 /// Build/cache the themed environment for `palette_name`, float it for `t`, and hand the animated meshes to
 /// `f` (for the GPU path to pack into a vertex buffer). Geometry is cached; only the float offsets update.
@@ -5456,11 +5969,14 @@ pub fn with_env(palette_name: &str, t: f32, f: impl FnOnce(&[Mesh3])) {
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
         let pr = env_params();
-        if b.as_ref().map_or(true, |(n, v, p, _)| n != palette_name || *v != var || *p != pr) {
-            *b = Some((palette_name.to_string(), var, pr, build(palette_name)));
+        if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
+            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t)); // record build time for the build-in
         }
-        let scene = &mut b.as_mut().unwrap().3;
+        let entry = b.as_mut().unwrap();
+        let bt = entry.4;
+        let scene = &mut entry.3;
         scene.animate(t);
+        scene.build_reveal(t - bt);
         f(&scene.meshes);
     });
 }
@@ -5472,11 +5988,14 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
         let pr = env_params();
-        if b.as_ref().map_or(true, |(n, v, p, _)| n != palette_name || *v != var || *p != pr) {
-            *b = Some((palette_name.to_string(), var, pr, build(palette_name)));
+        if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
+            *b = Some((palette_name.to_string(), var, pr, build(palette_name), t));
         }
-        let scene = &mut b.as_mut().unwrap().3;
+        let entry = b.as_mut().unwrap();
+        let bt = entry.4;
+        let scene = &mut entry.3;
         scene.animate(t);
+        scene.build_reveal(t - bt);
         painter.add(m3::render(&scene.meshes, cam, cx, cy, scale, light));
     });
 }
@@ -5484,6 +6003,54 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scenes_respond_to_conversation_size() {
+        // EnvParams expansion: a bigger/branchier conversation → more decorative density (capped). Verify the
+        // scenes that previously ignored EnvParams now grow with it.
+        let small = EnvParams { nodes: 12, prop_density: 1.0, ..Default::default() };
+        let big = EnvParams { nodes: 160, prop_density: 1.0, ..Default::default() };
+        for scene in ["Mansion Garden", "Frozen Bifrost"] {
+            set_env_params(small);
+            let s = build(scene).meshes.len();
+            set_env_params(big);
+            let b = build(scene).meshes.len();
+            assert!(b > s, "{scene}: a bigger conversation should add geometry ({s} → {b})");
+        }
+        set_env_params(EnvParams::default()); // reset the thread-local for other tests
+    }
+
+    #[test]
+    fn mic_setting_mounts_every_shape_near_the_pearl() {
+        let center = v(3.0, 1.0, -2.0);
+        let (right, up, fwd) = (v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), v(0.0, 0.0, 1.0));
+        let r = 0.5;
+        // each of the 5 shape families produces a mount…
+        for shape in 0u8..5 {
+            let ms = mic_setting("Slate", shape, center, r, right, up, fwd, 123, c(0x40, 0x40, 0x40));
+            assert!(!ms.is_empty(), "shape {shape} produces a setting");
+            // …and all its geometry sits close to the pearl (within a few radii), i.e. it's a mount, not stray
+            for m in &ms {
+                for vtx in &m.verts {
+                    let d = ((vtx.x - center.x).powi(2) + (vtx.y - center.y).powi(2) + (vtx.z - center.z).powi(2)).sqrt();
+                    assert!(d < r * 6.0, "shape {shape} vertex {d:.2} should sit near the pearl (r={r})");
+                }
+            }
+        }
+        // an unknown shape code yields nothing (no panic, no stray geometry)
+        assert!(mic_setting("Slate", 9, center, r, right, up, fwd, 0, c(0, 0, 0)).is_empty());
+        // bespoke per-scene mounts override the family fallback and still sit near the pearl
+        for scene in ["Old Library", "Reading Room", "Folding@home"] {
+            let ms = mic_setting(scene, 3, center, r, right, up, fwd, 7, c(0x40, 0x40, 0x40));
+            assert!(!ms.is_empty(), "{scene} has a bespoke mount");
+            for m in &ms {
+                for vtx in &m.verts {
+                    let d = ((vtx.x - center.x).powi(2) + (vtx.y - center.y).powi(2) + (vtx.z - center.z).powi(2)).sqrt();
+                    assert!(d < r * 6.0, "{scene} mount stays near the pearl");
+                }
+            }
+        }
+    }
 
     #[test]
     fn scenes_build_and_float() {

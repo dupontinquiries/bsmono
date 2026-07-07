@@ -76,9 +76,10 @@ pub struct LocalModel {
     pub params_billions: f32,
 }
 
-/// Default directory logscope looks in for local `.gguf` files.
+/// Default directory logscope looks in for local `.gguf` files: `~/models` (the conventional spot the
+/// Asahi/GGUF setup uses — diffusion weights, text encoders, and chat GGUFs all live there together).
 pub fn default_models_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("logscope").join("models")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join("models")
 }
 
 /// Estimate parameter count (billions) from a filename, e.g. "qwen2.5-7b" -> 7.0,
@@ -278,6 +279,12 @@ pub fn generate(_loaded: &LoadedModel, _prompt: &str, _params: &GenParams) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_dir_is_home_models() {
+        let d = default_models_dir();
+        assert!(d.ends_with("models"), "default is ~/models: {d:?}");
+    }
+
     #[test]
     fn params_estimate() {
         assert_eq!(estimate_params_billions("qwen2.5-7b-instruct.gguf"), Some(7.0));

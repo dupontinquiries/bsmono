@@ -92,6 +92,38 @@ fn height(layer: usize, u: f32, v: f32) -> f32 {
 fn bump(layer: usize) -> f32 { match layer { 1 => 3.1, 2 => 2.8, 3 => 1.7, 4 => 2.0, _ => 1.15 } }
 fn roughness(layer: usize) -> f32 { match layer { 3 => 0.12, 2 => 0.45, 1 => 0.8, 4 => 0.9, _ => 0.7 } }
 
+/// Per-TEXEL roughness — the flat `roughness(layer)` broken up by a large-scale weathering field and tied to
+/// the local height, so a surface has POLISHED and MATTE patches instead of one uniform gloss. This is what
+/// gives the GGX highlight a real, non-uniform response: raised stone faces catch a glint while crevices stay
+/// matte, wood sapwood reads smoother than its dark grain, moss stays broadly rough. Wraps (tiles) with fbm.
+fn rough_at(layer: usize, u: f32, v: f32) -> f32 {
+    let base = roughness(layer);
+    let weather = fbm(u, v, 3, 3, 200 + layer as u32) - 0.5; // large-scale polish/matte patches [-0.5,0.5]
+    let h = height(layer, u, v) - 0.5;                        // raised (+) vs recessed (-)
+    let var = match layer {
+        2 => weather * 0.34 - h * 0.26, // stone: proud faces polish smooth, crevices rough
+        1 => weather * 0.24 - h * 0.20, // wood: pale sapwood rings smoother than dark grain
+        3 => weather * 0.10,            // water: near-uniform smooth, faint variation
+        4 => weather * 0.18 + 0.06,     // moss: rough & patchy
+        _ => weather * 0.30,            // paper: matte with a patchy sheen
+    };
+    (base + var).clamp(0.04, 1.0)
+}
+
+/// Per-material fine MICRO-GRAIN: (lattice cells = grain frequency, amplitude = grain strength). A crisp
+/// high-frequency detail normal layered on top of the coarse height-gradient normal so each surface has
+/// tactile sub-relief — paper tooth, stone grain, bark fibre, moss speckle — that the GGX highlight + the
+/// spatially-varying roughness catch. High `cells` keeps it tiling with the lattice.
+fn micro(layer: usize) -> (i32, f32) {
+    match layer {
+        1 => (30, 0.9), // wood: fine fibre
+        2 => (26, 1.0), // stone: gritty grain
+        3 => (14, 0.25),// water: almost none
+        4 => (24, 0.7), // moss: speckle
+        _ => (22, 0.6), // paper: tooth
+    }
+}
+
 /// A multi-stop colour LUT (lookup table) — maps a scalar in [0,1] through N colour stops with linear blend.
 /// Richer, more natural material gradients than a single lo→hi lerp (e.g. bark darkens through a reddish midtone
 /// into pale sapwood). Per-material stop tables live in `lut_stops`.
@@ -141,19 +173,24 @@ fn bake_one(layer: usize, n: usize) -> Vec<u8> {
 fn bake_normal_one(layer: usize, n: usize, bump_scale: f32) -> Vec<u8> {
     let mut out = vec![0u8; n * n * 4];
     let e = 1.0 / n as f32;
-    let (s, r) = (bump(layer) * bump_scale, roughness(layer));
+    let s = bump(layer) * bump_scale;
+    let (mc, ma) = micro(layer);
+    let ms = ma * bump_scale;
     for y in 0..n {
         for x in 0..n {
             let (u, v) = (x as f32 / n as f32, y as f32 / n as f32);
             let i = (y * n + x) * 4;
             let dx = height(layer, u + e, v) - height(layer, u - e, v);
             let dy = height(layer, u, v + e) - height(layer, u, v - e);
-            let (nx, ny, nz) = (-dx * s, -dy * s, 1.0);
+            // fine micro-grain gradient (tiles: fbm with `cells=mc` wraps at u=1) layered on the coarse relief
+            let mdx = fbm(u + e, v, mc, 2, 400 + layer as u32) - fbm(u - e, v, mc, 2, 400 + layer as u32);
+            let mdy = fbm(u, v + e, mc, 2, 400 + layer as u32) - fbm(u, v - e, mc, 2, 400 + layer as u32);
+            let (nx, ny, nz) = (-dx * s - mdx * ms, -dy * s - mdy * ms, 1.0);
             let inv = 1.0 / (nx * nx + ny * ny + nz * nz).sqrt();
             out[i] = ((nx * inv * 0.5 + 0.5) * 255.0) as u8;
             out[i + 1] = ((ny * inv * 0.5 + 0.5) * 255.0) as u8;
             out[i + 2] = ((nz * inv * 0.5 + 0.5) * 255.0) as u8;
-            out[i + 3] = (r.clamp(0.0, 1.0) * 255.0) as u8;
+            out[i + 3] = (rough_at(layer, u, v).clamp(0.0, 1.0) * 255.0) as u8; // spatially-varying roughness
         }
     }
     out

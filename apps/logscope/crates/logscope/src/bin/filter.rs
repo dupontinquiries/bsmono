@@ -46,20 +46,24 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    // arg parsing via cli-kit (shared across the fleet's CLIs)
-    let cli = cli_kit::Cli::from(args.iter().skip(1).cloned().collect::<Vec<String>>());
-    let probe_path:  Option<PathBuf> = cli.opt("probe").map(PathBuf::from);
-    let config_path: Option<PathBuf> = cli.opt("config").map(PathBuf::from);
-    let input_path:  Option<PathBuf> = cli.opt("input").map(PathBuf::from);
-    let mode = if cli.flag("rotate-all") {
-        Mode::RotateAll
-    } else if cli.flag("rotate") {
-        Mode::Rotate
-    } else if probe_path.is_some() {
-        Mode::Probe
-    } else {
-        Mode::Filter
-    };
+    let mut mode         = Mode::Filter;
+    let mut config_path: Option<PathBuf> = None;
+    let mut input_path:  Option<PathBuf> = None;
+    let mut probe_path:  Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--filter"     => mode = Mode::Filter,
+            "--rotate"     => mode = Mode::Rotate,
+            "--rotate-all" => mode = Mode::RotateAll,
+            "--probe"      => { mode = Mode::Probe; i += 1; probe_path = args.get(i).map(PathBuf::from); }
+            "--config"     => { i += 1; config_path = args.get(i).map(PathBuf::from); }
+            "--input"      => { i += 1; input_path  = args.get(i).map(PathBuf::from); }
+            _              => {}
+        }
+        i += 1;
+    }
 
     match mode {
         Mode::Filter => {
