@@ -1,0 +1,85 @@
+{
+  "type": "minecraft:biome",
+  "_id": "relics:crystal_vault",
+  "_comment": "Crystalline vault interior: polished pale marble, gold mineral veins, vast geometric chambers.",
+  "surface_block": "marble",
+  "subsurface_block": "limestone",
+  "has_precipitation": false,
+  "temperature": 0.5,
+  "downfall": 0.0,
+  "effects": {
+    "sky_color": 16316664,
+    "fog_color": 16777160,
+    "water_color": 8889599,
+    "water_fog_color": 5210831,
+    "grass_color": 16777215,
+    "foliage_color": 16777215,
+    "ambient_light": 0.6,
+    "ambient_particle": {
+      "probability": 0.006,
+      "options": {
+        "type": "minecraft:portal"
+      }
+    }
+  },
+  "spawners": {
+    "monster": [
+      {
+        "type": "relics:vex_goblin_radiolite",
+        "weight": 15,
+        "minCount": 2,
+        "maxCount": 4
+      },
+      {
+        "type": "relics:vex_hobgoblin",
+        "weight": 8,
+        "minCount": 1,
+        "maxCount": 2
+      },
+      {
+        "type": "relics:vex_minotaur",
+        "weight": 4,
+        "minCount": 1,
+        "maxCount": 2
+      },
+      {
+        "type": "relics:vex_hydra",
+        "weight": 2,
+        "minCount": 1,
+        "maxCount": 1
+      }
+    ]
+  },
+  "features": [
+    [],
+    [
+      "relics:vog_radiolite_floor",
+      "relics:vog_polished_diorite_path"
+    ],
+    [
+      "relics:vog_gold_vein_inlay"
+    ],
+    [
+      "relics:vog_vex_wall_panel",
+      "relics:vog_glass_panel_time"
+    ],
+    [
+      "relics:vog_geometric_pillar_cluster",
+      "relics:vog_time_gate_inactive"
+    ],
+    [
+      "relics:vog_conflux_nexus",
+      "relics:vog_relic_shrine"
+    ],
+    [],
+    [
+      "relics:vog_vex_milk_pool"
+    ],
+    [
+      "relics:vog_time_gate_active"
+    ],
+    [
+      "relics:vog_oracle_spawn_node"
+    ]
+  ]
+}

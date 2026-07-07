@@ -1,0 +1,10 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:beach",
+  "_comment": "shoreline (r174 registry parity set)",
+  "temperature": 0.95,
+  "downfall": 0.8,
+  "has_precipitation": true,
+  "effects": {},
+  "_legacy_enum": "Beach"
+}

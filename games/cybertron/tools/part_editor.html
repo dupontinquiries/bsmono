@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Cybertron — Part Editor</title>
+<style>
+  :root{ --bg:#0a0d12; --panel:#141922; --line:#243044; --ink:#c9d6e8; --dim:#7f92ab; --accent:#5b7fb0; }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+  #app{display:flex;height:100vh}
+  #view{flex:1;position:relative}
+  #side{width:300px;background:var(--panel);border-left:1px solid var(--line);display:flex;flex-direction:column}
+  h1{font-size:13px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);margin:0;padding:12px 14px;border-bottom:1px solid var(--line)}
+  .sec{padding:10px 14px;border-bottom:1px solid var(--line)}
+  .sec h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:0 0 8px}
+  button{background:#1c2432;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:6px 9px;cursor:pointer;font-size:12px}
+  button:hover{border-color:var(--accent)}
+  button.prim{background:var(--accent);border-color:var(--accent);color:#07101c;font-weight:600}
+  .row{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px}
+  #list{flex:1;overflow:auto;padding:6px 8px}
+  .item{padding:6px 8px;border:1px solid var(--line);border-radius:6px;margin-bottom:4px;cursor:pointer;display:flex;justify-content:space-between;align-items:center}
+  
+  .item.sel{border-color:var(--accent);background:#182130}
+  .item small{color:var(--dim)}
+  label{display:flex;justify-content:space-between;align-items:center;gap:8px;margin:4px 0;color:var(--dim);font-size:11px}
+  input[type=range]{flex:1}
+  input[type=number]{width:56px;background:#0e131b;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:2px 4px}
+  #hint{padding:8px 14px;color:var(--dim);font-size:11px;border-top:1px solid var(--line)}
+  #tag{position:absolute;left:12px;top:10px;color:var(--dim);font-size:11px;letter-spacing:.08em}
+  select{background:#0e131b;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:3px}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view"><div id="tag">CYBERTRON PART EDITOR · primitive assembly → game-ready .iqm</div></div>
+  <div id="side">
+    <h1>Part Editor</h1>
+    <div class="sec">
+      <h2>Add primitive</h2>
+      <div class="row">
+        <button data-add="box">Box</button>
+        <button data-add="bevel">Bevel</button>
+        <button data-add="cyl">Cylinder</button>
+        <button data-add="taper">Taper</button>
+        <button data-add="sphere">Sphere</button>
+        <button data-add="wedge">Wedge</button>
+      </div>
+      <div class="row">
+        <button id="mirror">Mirror X sel</button>
+        <button id="dup">Duplicate</button>
+        <button id="del">Delete</button>
+      </div>
+    </div>
+    <div class="sec" id="props" style="display:none">
+      <h2>Selected</h2>
+      <div id="sliders"></div>
+    </div>
+    <div class="sec"><h2>Parts</h2></div>
+    <div id="list"></div>
+    <div class="sec">
+      <h2>Export</h2>
+      <label>name <input id="pname" type="text" value="mypart" style="width:120px"></label>
+      <label>texture
+        <select id="ptex">
+          <option>plate_blue.png</option><option>wall.png</option><option>obsidian.png</option>
+          <option>stuff.png</option><option>white.png</option><option>rock.png</option>
+        </select>
+      </label>
+      <div class="row" style="margin-top:8px">
+        <button class="prim" id="exportIqm">Export .iqm</button>
+        <button id="exportJson">Save .json</button>
+        <button id="importJson">Load .json</button>
+      </div>
+      <div class="row"><button id="genPy">Copy as gen_props() code</button></div>
+    </div>
+    <div id="hint">Drag = orbit · scroll = zoom · click a part to select · sliders edit size/pos/rot. Export writes the same IQM the engine loads (put it in engine_src/data/ and point a part template at it).</div>
+  </div>
+</div>
+
+<script type="importmap">{ "imports": {
+  "three":"https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js"
+}}</script>
+<script type="module">
+import * as THREE from "three";
+
+// ---------- scene ----------
+const view=document.getElementById("view");
+const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0a0d12);
+const cam=new THREE.PerspectiveCamera(45, view.clientWidth/view.clientHeight, 0.05, 100);
+cam.position.set(3.4,2.4,4.2);
+const rnd=new THREE.WebGLRenderer({antialias:true}); rnd.setSize(view.clientWidth,view.clientHeight);
+rnd.setPixelRatio(devicePixelRatio); view.appendChild(rnd.domElement);
+scene.add(new THREE.HemisphereLight(0x8faace,0x202830,0.9));
+const key=new THREE.DirectionalLight(0xcfe0ff,1.1); key.position.set(4,6,3); scene.add(key);
+const grid=new THREE.GridHelper(6,12,0x243044,0x1a2230); scene.add(grid);
+scene.add(new THREE.AxesHelper(0.8));
+
+// simple orbit (no external controls dep)
+let az=0.7,el=0.5,rad=6,tgt=new THREE.Vector3(0,0.8,0);
+function place(){ cam.position.set(tgt.x+rad*Math.cos(el)*Math.sin(az), tgt.y+rad*Math.sin(el), tgt.z+rad*Math.cos(el)*Math.cos(az)); cam.lookAt(tgt); }
+let drag=false,px,py;
+rnd.domElement.addEventListener("pointerdown",e=>{drag=true;px=e.clientX;py=e.clientY;});
+addEventListener("pointerup",()=>drag=false);
+addEventListener("pointermove",e=>{ if(!drag)return; az-=(e.clientX-px)*0.01; el=Math.max(-1.4,Math.min(1.4,el+(e.clientY-py)*0.01)); px=e.clientX;py=e.clientY; place(); });
+rnd.domElement.addEventListener("wheel",e=>{ rad=Math.max(1.5,Math.min(20,rad+e.deltaY*0.003)); place(); e.preventDefault(); },{passive:false});
+addEventListener("resize",()=>{ cam.aspect=view.clientWidth/view.clientHeight; cam.updateProjectionMatrix(); rnd.setSize(view.clientWidth,view.clientHeight); });
+place();
+
+// ---------- part model ----------
+const mat=new THREE.MeshStandardMaterial({color:0x6b86ab,metalness:0.5,roughness:0.55,flatShading:true});
+const selMat=new THREE.MeshStandardMaterial({color:0x8fb0e0,metalness:0.5,roughness:0.4,emissive:0x223046,flatShading:true});
+let parts=[]; let sel=null;
+
+function makeGeom(p){
+  let g;
+  const s=p.size;
+  if(p.type==="box"||p.type==="bevel") g=new THREE.BoxGeometry(s[0]*2,s[1]*2,s[2]*2, p.type==="bevel"?2:1,p.type==="bevel"?2:1,p.type==="bevel"?2:1);
+  else if(p.type==="cyl") g=new THREE.CylinderGeometry(s[0],s[0],s[1]*2,14);
+  else if(p.type==="taper") g=new THREE.CylinderGeometry(s[0]*0.5,s[0],s[1]*2,14);
+  else if(p.type==="sphere") g=new THREE.SphereGeometry(s[0],16,12);
+  else if(p.type==="wedge"){ g=new THREE.CylinderGeometry(0.0001,s[0],s[1]*2,4); }
+  if(p.type==="bevel"){ // chamfer illusion via slight scale of a box: keep simple
+  }
+  return g;
+}
+function rebuild(p){
+  if(p.mesh){ scene.remove(p.mesh); p.mesh.geometry.dispose(); }
+  const m=new THREE.Mesh(makeGeom(p), p===sel?selMat:mat);
+  m.position.set(...p.pos); m.rotation.set(p.rot[0],p.rot[1],p.rot[2]);
+  m.userData.part=p; p.mesh=m; scene.add(m);
+}
+function addPart(type){
+  const p={type,size:[0.5,0.5,0.5],pos:[0,0.9,0],rot:[0,0,0]};
+  parts.push(p); rebuild(p); select(p); refresh();
+}
+function select(p){ const prev=sel; sel=p; if(prev)rebuild(prev); if(p)rebuild(p); showProps(); refresh(); }
+
+// ---------- UI ----------
+const listEl=document.getElementById("list");
+function refresh(){
+  listEl.innerHTML="";
+  parts.forEach((p,i)=>{
+    const d=document.createElement("div"); d.className="item"+(p===sel?" sel":"");
+    d.innerHTML=`<span>${p.type} <small>#${i}</small></span><small>${p.size.map(x=>x.toFixed(2)).join("·")}</small>`;
+    d.onclick=()=>select(p); listEl.appendChild(d);
+  });
+}
+const slidersEl=document.getElementById("sliders");
+function slider(label,val,min,max,step,cb){
+  const l=document.createElement("label"); l.textContent=label;
+  const r=document.createElement("input"); r.type="range"; r.min=min;r.max=max;r.step=step;r.value=val;
+  const n=document.createElement("input"); n.type="number"; n.value=(+val).toFixed(2); n.step=step;
+  r.oninput=()=>{ n.value=(+r.value).toFixed(2); cb(+r.value); };
+  n.oninput=()=>{ r.value=n.value; cb(+n.value); };
+  l.appendChild(r); l.appendChild(n); slidersEl.appendChild(l);
+}
+function showProps(){
+  const box=document.getElementById("props");
+  if(!sel){ box.style.display="none"; return; }
+  box.style.display="block"; slidersEl.innerHTML="";
+  const names=["size X","size Y","size Z"];
+  sel.size.forEach((v,i)=>slider(names[i],v,0.03,2.5,0.01,x=>{sel.size[i]=x;rebuild(sel);refresh();}));
+  ["pos X","pos Y","pos Z"].forEach((nm,i)=>slider(nm,sel.pos[i],-2.5,2.5,0.01,x=>{sel.pos[i]=x;sel.mesh.position.setComponent(i,x);}));
+  ["rot X","rot Y","rot Z"].forEach((nm,i)=>slider(nm,sel.rot[i],-3.15,3.15,0.02,x=>{sel.rot[i]=x;sel.mesh.rotation.set(...sel.rot);}));
+}
+document.querySelectorAll("[data-add]").forEach(b=>b.onclick=()=>addPart(b.dataset.add));
+document.getElementById("del").onclick=()=>{ if(!sel)return; scene.remove(sel.mesh); parts=parts.filter(x=>x!==sel); select(parts[parts.length-1]||null); };
+document.getElementById("dup").onclick=()=>{ if(!sel)return; const c=JSON.parse(JSON.stringify({type:sel.type,size:sel.size,pos:sel.pos,rot:sel.rot})); parts.push(c); rebuild(c); select(c); };
+document.getElementById("mirror").onclick=()=>{ if(!sel)return; const c=JSON.parse(JSON.stringify({type:sel.type,size:sel.size,pos:[-sel.pos[0],sel.pos[1],sel.pos[2]],rot:[sel.rot[0],-sel.rot[1],-sel.rot[2]]})); parts.push(c); rebuild(c); select(c); };
+
+// click-to-select in viewport
+const ray=new THREE.Raycaster(), mouse=new THREE.Vector2();
+rnd.domElement.addEventListener("click",e=>{
+  const r=rnd.domElement.getBoundingClientRect();
+  mouse.x=((e.clientX-r.left)/r.width)*2-1; mouse.y=-((e.clientY-r.top)/r.height)*2+1;
+  ray.setFromCamera(mouse,cam);
+  const hit=ray.intersectObjects(parts.map(p=>p.mesh));
+  if(hit.length) select(hit[0].object.userData.part);
+});
+
+// ---------- bake combined mesh (verts/normals/uvs/tris) ----------
+function bake(){
+  const V=[],N=[],U=[],T=[];
+  for(const p of parts){
+    const g=p.mesh.geometry.clone(); g.applyMatrix4(p.mesh.matrixWorld);
+    const pos=g.attributes.position, nrm=g.attributes.normal, uv=g.attributes.uv;
+    const base=V.length/3;
+    for(let i=0;i<pos.count;i++){
+      V.push(pos.getX(i),pos.getY(i),pos.getZ(i));
+      N.push(nrm.getX(i),nrm.getY(i),nrm.getZ(i));
+      U.push(uv?uv.getX(i):0, uv?uv.getY(i):0);
+    }
+    const idx=g.index? g.index.array : [...Array(pos.count).keys()];
+    for(let i=0;i<idx.length;i+=3) T.push(base+idx[i],base+idx[i+1],base+idx[i+2]);
+  }
+  return {V,N,U,T};
+}
+
+// ---------- write IQM (matches engine tools/gen_props.py write_iqm) ----------
+function writeIqm(name,tex){
+  const {V,N,U,T}=bake();
+  const nv=V.length/3, nt=T.length/3;
+  const enc=new TextEncoder();
+  const matBytes=enc.encode(tex+"\0");
+  const text=new Uint8Array([0,...matBytes,...enc.encode("prop\0")]);
+  const mat_off=1, name_off=1+matBytes.length;
+  let ofs=16+4+4*26;
+  const ofs_text=ofs; ofs+=text.length; ofs+=(-ofs)%4;
+  const ofs_meshes=ofs; ofs+=6*4; const ofs_va=ofs; ofs+=15*4;
+  const ofs_pos=ofs; ofs+=nv*12; const ofs_uv=ofs; ofs+=nv*8; const ofs_nrm=ofs; ofs+=nv*12; const ofs_tri=ofs; ofs+=nt*12;
+  const filesize=ofs;
+  const buf=new ArrayBuffer(filesize); const dv=new DataView(buf); let o=0;
+  const u32=v=>{dv.setUint32(o,v,true);o+=4;}; const f32=v=>{dv.setFloat32(o,v,true);o+=4;};
+  for(const c of "INTERQUAKEMODEL\0") dv.setUint8(o++,c.charCodeAt(0));
+  u32(2);u32(filesize);u32(0); u32(text.length);u32(ofs_text); u32(1);u32(ofs_meshes);
+  u32(3);u32(nv);u32(ofs_va); u32(nt);u32(ofs_tri);u32(0);
+  u32(0);u32(0); u32(0);u32(0); u32(0);u32(0); u32(0);u32(0);u32(0);u32(0); u32(0);u32(0); u32(0);u32(0);
+  o=ofs_text; for(const b of text) dv.setUint8(o++,b);
+  o=ofs_meshes; u32(name_off);u32(mat_off);u32(0);u32(nv);u32(0);u32(nt);
+  o=ofs_va; u32(0);u32(0);u32(7);u32(3);u32(ofs_pos); u32(1);u32(0);u32(7);u32(2);u32(ofs_uv); u32(2);u32(0);u32(7);u32(3);u32(ofs_nrm);
+  o=ofs_pos; for(const v of V) f32(v);
+  o=ofs_uv;  for(const v of U) f32(v);
+  o=ofs_nrm; for(const v of N) f32(v);
+  o=ofs_tri; for(const t of T) u32(t);
+  return new Blob([buf],{type:"application/octet-stream"});
+}
+function blobToB64(blob){ return new Promise(res=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(",")[1]); r.readAsDataURL(blob); }); }
+function showCopyBox(title,text,note){
+  let ov=document.getElementById("copyOv");
+  if(!ov){ ov=document.createElement("div"); ov.id="copyOv"; document.body.appendChild(ov);
+    ov.style.cssText="position:fixed;inset:0;z-index:100;background:rgba(4,7,12,.92);display:flex;flex-direction:column;padding:16px;gap:10px"; }
+  ov.innerHTML="";
+  const h=document.createElement("div"); h.textContent=title; h.style.cssText="color:#c9d6e8;font:600 14px system-ui"; ov.appendChild(h);
+  const n=document.createElement("div"); n.innerHTML=note; n.style.cssText="color:#7f92ab;font:12px/1.4 system-ui"; ov.appendChild(n);
+  const ta=document.createElement("textarea"); ta.value=text; ta.readOnly=true;
+  ta.style.cssText="flex:1;background:#0e131b;color:#c9d6e8;border:1px solid #243044;border-radius:8px;padding:10px;font:11px/1.3 ui-monospace,monospace;resize:none"; ov.appendChild(ta);
+  const row=document.createElement("div"); row.style.cssText="display:flex;gap:8px";
+  const copy=document.createElement("button"); copy.textContent="Copy to clipboard";
+  copy.style.cssText="flex:1;background:#5b7fb0;border:none;border-radius:8px;padding:12px;color:#07101c;font-weight:700";
+  copy.onclick=async()=>{ ta.select(); try{await navigator.clipboard.writeText(text);}catch(_){document.execCommand("copy");} copy.textContent="Copied ✓"; };
+  const close=document.createElement("button"); close.textContent="Close";
+  close.style.cssText="background:#1c2432;border:1px solid #243044;border-radius:8px;padding:12px;color:#c9d6e8";
+  close.onclick=()=>ov.remove(); row.appendChild(copy); row.appendChild(close); ov.appendChild(row);
+}
+async function download(blob,fname){
+  const isCoarse=matchMedia("(pointer:coarse)").matches;
+  try{ const file=new File([blob],fname,{type:blob.type});
+    if(navigator.canShare&&navigator.canShare({files:[file]})){ await navigator.share({files:[file],title:fname}); return; } }catch(_){}
+  if(!isCoarse){ try{ const a=document.createElement("a"); a.href=URL.createObjectURL(blob); a.download=fname; document.body.appendChild(a); a.click(); a.remove(); return; }catch(_){} }
+  const b64=await blobToB64(blob);
+  const note=fname.endsWith(".iqm")
+    ? `Couldn't auto-save here. Copy this base64 to your desktop, then run tools/paste_to_iqm.py to rebuild <b>${fname}</b>.`
+    : `Copy this and save it as <b>${fname}</b>.`;
+  showCopyBox("Export: "+fname, b64, note);
+}
+
+document.getElementById("exportIqm").onclick=()=>{
+  if(!parts.length){alert("Add some primitives first.");return;}
+  const name=document.getElementById("pname").value||"mypart";
+  download(writeIqm(name,document.getElementById("ptex").value), name+".iqm");
+};
+document.getElementById("exportJson").onclick=()=>{
+  const data=parts.map(p=>({type:p.type,size:p.size,pos:p.pos,rot:p.rot}));
+  download(new Blob([JSON.stringify(data,null,1)],{type:"application/json"}),(document.getElementById("pname").value||"mypart")+".json");
+};
+document.getElementById("importJson").onclick=()=>{
+  const inp=document.createElement("input"); inp.type="file"; inp.accept=".json";
+  inp.onchange=()=>{ const fr=new FileReader(); fr.onload=()=>{ parts.forEach(p=>scene.remove(p.mesh)); parts=[]; JSON.parse(fr.result).forEach(d=>{const p={...d}; parts.push(p); rebuild(p);}); select(parts[0]||null); }; fr.readAsText(inp.files[0]); };
+  inp.click();
+};
+document.getElementById("genPy").onclick=()=>{
+  let s="def mypart():\n    P=[]\n";
+  for(const p of parts){
+    const [sx,sy,sz]=p.size,[x,y,z]=p.pos;
+    if(p.type==="box"||p.type==="bevel") s+=`    P.append(sh(bevel_box(${sx.toFixed(2)},${sy.toFixed(2)},${sz.toFixed(2)},0.1), ${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}))\n`;
+    else if(p.type==="cyl"||p.type==="taper") s+=`    P.append(sh(tapered_cyl(${sx.toFixed(2)},${(sx*(p.type==="taper"?0.5:1)).toFixed(2)},${(sy*2).toFixed(2)}), ${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}))\n`;
+    else if(p.type==="sphere") s+=`    P.append(sh(uv_sphere(${sx.toFixed(2)}), ${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}))\n`;
+  }
+  s+="    return comb(P)\n";
+  navigator.clipboard.writeText(s).then(()=>alert("Copied gen_props() code to clipboard."));
+};
+
+// seed with a starter box
+addPart("bevel");
+(function loop(){ requestAnimationFrame(loop); rnd.render(scene,cam); })();
+</script>
+</body>
+</html>

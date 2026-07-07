@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/unendlich-shared",
+    "crates/unendlich-engine",
+    "crates/vk-harness",
+    "crates/unendlich-launcher",
+    "crates/unendlich-analyze",
+    "crates/unendlich-dash",
+    "crates/unendlich-ui",
+]
+
+# Shared profile config — applied to all member crates.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# r191: sandbox-only test profile — debuginfo off (the 4GB box OOM'd three
+# dev-profile test links). Operator builds untouched; select with
+# `--profile sandboxtest`.
+[profile.sandboxtest]
+inherits = "test"
+debug = false
+incremental = true
