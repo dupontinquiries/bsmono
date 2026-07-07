@@ -3,6 +3,5 @@
 //! who's online and what they're playing. Two backends behind one trait: **OpenDHT** (the global
 //! primary) and a pure **micro-DHT** (a Kademlia-lite fallback for LAN/offline). Same graceful
 //! floor the rest of the fleet uses — the network is a step-up, never a requirement.
-pub mod microdht;
 pub mod profile;
 pub mod store;

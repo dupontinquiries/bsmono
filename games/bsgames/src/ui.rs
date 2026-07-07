@@ -3,11 +3,11 @@
 //! chat/join route out to snapclone + the game's netcode (the I/O seams are marked).
 use crate::centre::{self, GameEntry};
 use netcode::profile::Profile;
-use netcode::store::{MicroDhtStore, ProfileService};
+use netcode::store::{ProfileService, SnapcoreStore};
 
 /// LAN-only service for now; the OpenDHT primary drops into the first slot once its FFI backend is
 /// built (feature `opendht`), no UI change.
-pub type Service = ProfileService<MicroDhtStore, MicroDhtStore>;
+pub type Service = ProfileService<SnapcoreStore, SnapcoreStore>;
 
 pub struct GameCentre {
     pub prefs: settings_kit::Prefs,
