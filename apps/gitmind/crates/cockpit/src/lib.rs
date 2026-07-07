@@ -4,6 +4,7 @@
 //! (extract → detect → build → run / save / merge), reconciling against existing repos,
 //! exploring merge strategies, reclaiming disk, managing access keys, and more.
 
+pub mod matrix;
 pub mod repomap;
 pub mod appcatalog;
 pub mod browse;
