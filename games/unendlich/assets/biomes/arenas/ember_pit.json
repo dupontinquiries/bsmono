@@ -1,0 +1,76 @@
+{
+  "type": "minecraft:biome",
+  "_id": "arenas:ember_pit",
+  "_comment": "Sunken lava bowl ringed by obsidian walls; an ember titan lairs at the center.",
+  "surface_block": "basalt",
+  "subsurface_block": "basalt",
+  "has_precipitation": false,
+  "temperature": 2.0,
+  "downfall": 0.0,
+  "effects": {
+    "sky_color": 4393755,
+    "fog_color": 6513507,
+    "water_color": 4159204,
+    "water_fog_color": 4741958,
+    "grass_color": 8750469,
+    "foliage_color": 9003541,
+    "ambient_light": 0.4,
+    "ambient_mood_sound": {
+      "sound": "minecraft:ambient.nether_wastes.mood",
+      "tick_delay": 6000,
+      "block_search_extent": 8,
+      "offset": 2.0
+    },
+    "ambient_particle": {
+      "probability": 0.04,
+      "options": {
+        "type": "minecraft:lava"
+      }
+    },
+    "ambient_sound": "minecraft:ambient.nether_wastes.loop"
+  },
+  "spawners": {
+    "monster": [
+      {
+        "type": "arenas:ember_titan_boss",
+        "weight": 1,
+        "minCount": 1,
+        "maxCount": 1
+      },
+      {
+        "type": "arenas:fire_salamander",
+        "weight": 6,
+        "minCount": 1,
+        "maxCount": 2
+      }
+    ]
+  },
+  "features": [
+    [],
+    [
+      "arenas:fire_pit_magma_floor",
+      "arenas:fire_pit_lava_vein"
+    ],
+    [],
+    [
+      "arenas:fire_pit_obsidian_wall_ring"
+    ],
+    [
+      "arenas:fire_pit_pillar_cracked",
+      "arenas:fire_pit_chain_overhead"
+    ],
+    [
+      "arenas:fire_pit_boss_spawn_platform"
+    ],
+    [],
+    [
+      "arenas:fire_pit_ember_burst"
+    ],
+    [
+      "arenas:fire_pit_lava_pool_center"
+    ],
+    [
+      "arenas:fire_pit_rune_ring"
+    ]
+  ]
+}

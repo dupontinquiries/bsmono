@@ -1,0 +1,69 @@
+#version 450
+// linear_q8_0.comp — fused int8 (Q8_0) dequant + linear, GPU side.
+//
+// Port of gpu-gemm's LINEAR_Q8_0 WGSL kernel into unendlich's GLSL/ash
+// conventions (std430 storage buffers at set=0, push-constant dims, #version
+// 450). Computes C[m,n] = A[m,k] · dequant(W)ᵀ with int8 weights, where the
+// weight matrix is [n,k] row-major so output column `col` is weight row `col`.
+//
+// CPU reference that DEFINES this kernel's math: bridge/oracle.py
+//   (quantize_q8 + linear_q8_ref). Parity is checked on lavapipe by
+//   bridge/validate_linear_q8.py — the same CPU-ref + lavapipe-readback
+//   pattern field_diffuse.comp documents.
+//
+// Quantization layout (must match quantize_q8 / quantize_q8_resident):
+//   - 32-wide blocks along K; kb = k/32 blocks per row.
+//   - qw: int8 weights, 4 packed per u32, little-endian byte order.
+//   - qs: per-(row,block) f32 scale, layout [n, kb].
+//
+// AGX/Mesa portability note carried over from the WGSL source: use the
+// canonical bitfield op (bitfieldExtract -> NIR bitfield_extract) for the
+// dynamic byte offset rather than a hand-rolled `>>`/`&`, and sign-extend the
+// byte with a guarded branch (no `select` whose dead arm underflows).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly  buffer A  { float a[];  };  // [m,k] activations
+layout(std430, set = 0, binding = 1) readonly  buffer QW { uint  qw[]; };  // [n,k] int8, 4/u32
+layout(std430, set = 0, binding = 2) readonly  buffer QS { float qs[]; };  // [n,kb] scales
+layout(std430, set = 0, binding = 3) writeonly buffer C  { float c[];  };  // [m,n] output
+
+layout(push_constant) uniform PC {
+    uint m;
+    uint n;
+    uint k;
+    uint kb;   // k / 32
+} pc;
+
+void main() {
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+    if (row >= pc.m || col >= pc.n) {
+        return; // padding invocation from the rounded-up dispatch
+    }
+
+    uint wbase = col * (pc.k / 4u);
+    uint sbase = col * pc.kb;
+    uint arow  = row * pc.k;
+
+    // `precise` (as in field_diffuse.comp) so the driver may not fuse the
+    // accumulate into an FMA / reassociate — that is what lets the readback
+    // match the float32 sequential reference rather than drifting by ULPs.
+    precise float acc = 0.0;
+
+    for (uint b = 0u; b < pc.kb; b = b + 1u) {
+        float scale = qs[sbase + b];
+        uint  k0    = b * 32u;
+        for (uint j = 0u; j < 32u; j = j + 1u) {
+            uint kk   = k0 + j;
+            uint word = qw[wbase + (kk / 4u)];
+            uint ub   = bitfieldExtract(word, int((kk % 4u) * 8u), 8); // unsigned byte
+            int  q    = (ub >= 128u) ? (int(ub) - 256) : int(ub);      // sign-extend i8
+            // left-assoc (a*scale)*q, matching the WGSL and the oracle.
+            precise float term = (a[arow + kk] * scale) * float(q);
+            acc = acc + term;
+        }
+    }
+
+    c[row * pc.n + col] = acc;
+}

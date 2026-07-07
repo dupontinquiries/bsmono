@@ -1,0 +1,215 @@
+[package]
+name = "unendlich-engine"
+version = "0.99.81-r686-character-sliders-all"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+rodio = { version = "0.19", optional = true }  # spatial music playback; only built with --features audio
+audiopus = { version = "0.2", optional = true }  # opus decode (libopus); audio feature only
+ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feature only
+linkme = "0.3"
+# Workspace deps
+unendlich-shared = { path = "../unendlich-shared" }
+
+# Math
+nalgebra-glm = "0.18"
+
+# Procedural generation
+noise = "0.8"
+rand = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Concurrency / collections
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+dashmap = "5.5"
+rayon = "1.10" # r191: parallel worldgen columns
+
+# Logging
+log = "0.4"
+env_logger = "0.10"
+
+# Vulkan compute shader pipeline (optional)
+ash = { version = "0.37", optional = true }
+
+# Required by the render feature: glfw 0.45's Vulkan wrappers are typed
+# against vk-sys, so we need the same types we can pass to it. The handles
+# themselves are bit-identical with ash's so we transmute at the boundary.
+vk-sys = { version = "0.4", optional = true }
+
+# Window & input (full game build)
+glfw = { version = "0.45", features = ["vulkan"], optional = true }
+
+# In-game UI overlay (hand-rolled egui renderer; egui 0.34 to match the kit, ash 0.37 to match the engine).
+egui = { version = "0.34", optional = true }
+unendlich-ui = { path = "../unendlich-ui", optional = true }
+
+# v0.24.25-shader-bin-fix: Linux setpriority + sched_setaffinity for
+# the worker-priority fix. Only pulled in on Linux; macOS/Windows
+# builds fall through to a no-op stub in thread_priority.rs.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[features]
+default = ["gpu"]
+gpu = ["ash"]
+# T06-R27 (GLFW_DECOUPLING Approach A): the render module split so it no longer
+# *forces* a window. `render-core` is the whole render module minus the glfw
+# surface/swapchain/input coupling (that coupling is confined to context.rs's
+# windowed constructor + input.rs/keybindings.rs, all `window`-gated). It builds
+# headless (ash dlopen's libvulkan; no cmake/glfw-sys), so render-side changes
+# can compile and run on lavapipe without a display.
+render-core = ["gpu"]
+# `window` is now the opt-in glfw path: the GLFW window + Vulkan surface
+# creation (vk-sys is only used at the glfw->ash surface-handle boundary) plus
+# input/keybindings. Enabling `window` restores the windowed path byte-for-byte.
+window = ["glfw", "vk-sys"]
+# `render` = the render module, WITHOUT pulling glfw. Add `window` for a real
+# window, or `headless` for the offscreen target. (Was: render forced window.)
+render = ["render-core"]
+# Offscreen render: build render-core and render into an offscreen color/depth
+# VkImage instead of a swapchain. No glfw in the dep tree. Present is a no-op
+# (optional readback for screenshots/parity tests).
+headless = ["render-core"]
+# Exposes ONLY the pure-CPU mesher + octree CPU reference (no glfw/ash) via a
+# minimal `render` shim, so GPU-vs-CPU mesh parity can run headless (lavapipe).
+# Mutually exclusive in practice with `render` (which provides the full module).
+mesh-ref = []
+hot-shaders = []
+# Hand-rolled egui overlay over the world (blurred panels, in-game dialogs).
+# The overlay draws into the windowed swapchain present path, so it needs a window.
+ui-overlay = ["render", "window", "egui", "unendlich-ui"]
+# Was referenced by items/debug_ui.rs but never declared -> the module could never
+# compile; now it pulls the overlay so the egui debug UI can build.
+egui_debug = ["ui-overlay"]
+# Spatial music playback (rodio). Optional so the default/headless build needs no
+# audio system libs; the pure mixer (sim::spatial_audio) is always available.
+audio = ["dep:rodio", "dep:audiopus", "dep:ogg"]
+# r238 EXPERIMENTAL (off by default): batch-as-field grass LOD. Instead of
+# culling dense distant grass, treat a patch as a density/phase FIELD: the far
+# "back" of the patch is fast-forwarded with one field-propagation step that
+# compensates for skipped ticks (like leaf_decay's advance_n_ticks but over a
+# field), while only the near "front" edge is high-res per-blade ticked. Pure
+# module (sim::grass_field) is always built + unit-tested; this feature gates
+# the live tick-path integration. See docs/design/grass_field_batch.md.
+grass-field-batch = []
+# r239 EXPERIMENTAL (off by default): batch-as-field fire LOD — the grass
+# treatment applied to spreading fire (far fires fast-forwarded as a fuel/
+# intensity/heat field, near fires high-res per-cell). Pure module
+# (sim::fire_field) always built + tested; this gates the live tick-path
+# integration. See docs/design/batch_field_lod.md.
+fire-field-batch = []
+# r239 EXPERIMENTAL (off by default): vision-driven mesh scheduling. Mesh what
+# player/mob view cones need now/soon and DEFER obscured or behind-the-actor
+# chunks (the dense-cave-interior win) — a meshing-TIME visibility gate, atop
+# the existing draw-time GPU frustum cull. Pure model (sim::mesh_vision) always
+# built + tested; this gates the live mesh-queue integration. See
+# docs/design/mesh_vision_scheduling.md.
+mesh-vision-sched = []
+# r244 EXPERIMENTAL (off by default): per-chunk shader variants. chunk.frag
+# gates fog-steps/water/dynamic-lights/shadows behind compile-time flags; the
+# engine compiles cheaper variants and binds the lightest one a chunk needs
+# (far/flat/dry chunks skip what they can't show). Pure selector
+# (sim::shader_variant) always built + tested; this gates the variant-pipeline
+# compilation + per-chunk binding. See docs/design/shader_variants.md.
+shader-variants = []
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "world-bench"
+path = "src/bin/world_bench.rs"
+
+[[bin]]
+name = "perf-probe"
+path = "src/bin/perf_probe.rs"
+
+[[bin]]
+name = "gpu-headless-probe"
+path = "src/bin/gpu_headless_probe.rs"
+required-features = ["headless"]
+
+[[bin]]
+name = "octree-bench"
+path = "src/bin/octree_bench.rs"
+
+[[bin]]
+name = "mesh-bench"
+path = "src/bin/mesh_bench.rs"
+required-features = ["render"]
+
+[[bin]]
+name = "gpu-mesh-bench"
+path = "src/bin/gpu_mesh_bench.rs"
+required-features = ["render", "gpu", "window"]
+
+[[bin]]
+name = "probe-report"
+path = "src/bin/probe_report.rs"
+
+[[bin]]
+name = "unendlich-demo"
+path = "src/bin/unendlich_demo.rs"
+
+[[bin]]
+name = "unendlich-triangle"
+path = "src/bin/unendlich_triangle.rs"
+required-features = ["render", "window"]
+
+[[bin]]
+name = "unendlich-chunk"
+path = "src/bin/unendlich_chunk.rs"
+required-features = ["render", "window"]
+
+[[bin]]
+name = "unendlich-palette"
+path = "src/bin/unendlich_palette.rs"
+required-features = ["render", "window"]
+
+[[bin]]
+name = "unendlich-world"
+path = "src/bin/unendlich_world.rs"
+required-features = ["render", "window"]
+
+[[bin]]
+name = "unendlich-fullgame"
+path = "src/bin/unendlich_fullgame.rs"
+required-features = ["render", "window", "ui-overlay"]
+
+[[bin]]
+name = "unendlich-server"
+path = "src/bin/unendlich_server.rs"
+# render-core pulls world_renderer which references egui unconditionally, so the lib only builds
+# with egui present; the server never opens a window — egui is just a compile-time dep here.
+required-features = ["headless", "egui"]
+
+[[bin]]
+name = "unendlich-spin"
+path = "src/bin/unendlich_spin.rs"
+required-features = ["render", "window"]
+
+[[bin]]
+name = "winding-check"
+path = "src/bin/winding_check.rs"
+required-features = ["render"]
+
+[dev-dependencies]
+tempfile = "=3.10"
+getrandom = "=0.2.15"
+
+[[example]]
+name = "menu_snapshot"
+required-features = ["egui"]
+
+[[example]]
+name = "flythrough_snapshot"
+required-features = ["egui"]
+
+[[example]]
+name = "heightmap_collage"
+required-features = ["gpu"]

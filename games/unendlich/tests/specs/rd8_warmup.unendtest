@@ -1,0 +1,61 @@
+# Heavy workload at RD=8 with explicit 3-second warmup. Companion to
+# rd8_smoke; differs only in the warmup_ms field. Use this spec when
+# you want assertion-relevant percentiles to reflect steady-state only,
+# not warmup samples.
+#
+# Created at c.13-instrumentation-followup as the anchor spec for c.17
+# baselining: every c.17-a/b/c/d ship should be measured against this
+# spec so the comparison is apples-to-apples (same workload, same
+# warmup, same assertions).
+#
+# The expectation thresholds below were calibrated against the validated
+# rd8 baseline run (r-4b43bbcf5086d02c on c.13-instrumentation-followup,
+# Honeykrisp Asahi M2 Max, Mesa 25.3.6). The validated numbers were:
+#   shadow_p50_ms = 113.9, shadow_mean_ms = 110.2, shadow_p99_ms = 224.8
+#   loaded_max = 522, rendering_max = 103
+# So we set thresholds with ~5-10% headroom to allow run-to-run noise
+# without flagging perf-neutral runs as failures.
+
+spec_version = 1
+name = "rd8_warmup"
+description = """
+Heavy workload at RD=8, 30s total, 3s warmup, 27s steady-state
+measurement. The warmup window resets GPU+CPU timer accumulators at
+t=3s so assertion-relevant percentiles aren't polluted by chunk-load
+warmup samples.
+
+This is the anchor spec for the c.17 multiview-CSM arc. c.17-a/b/c/d
+ships should each PASS this spec without raising the shadow_p50_ms
+threshold — the multiview work is supposed to MAKE shadow faster, not
+just preserve it.
+
+Workload context (from the c.13-instrumentation-followup baseline):
+  loaded_chunks_p50 ≈ 265, max ≈ 520
+  rendering_chunks_p50 ≈ 88, max ≈ 103
+  workload_blocks_delta ≈ +7.8M (world still growing during measurement —
+                                  this is "world-load-in-progress", not
+                                  true steady state)
+"""
+
+[engine]
+binary = "unendlich-world"
+duration_ms = 30000     # 30s total run time
+warmup_ms = 3000        # discard first 3s
+
+[env]
+UNENDLICH_RENDER_DISTANCE = "8"
+UNENDLICH_INDIRECT = "1"
+UNENDLICH_LOD_FACTORS = "4,8,16,32"
+
+[expect]
+# Workload still loaded heavily. These thresholds prove the spec is
+# actually exercising rd=8, not silently degrading to a smaller world.
+duration_completed = true
+rendering_max = { min = 50 }    # validated baseline: 103
+loaded_max = { min = 300 }       # validated baseline: 522
+
+# Performance guard. The validated baseline is shadow_p50_ms = 113.9.
+# We set a generous cap of 150ms (~30% headroom) so noisy runs don't
+# fail, but ANY ship raising p50 above 150ms is a real regression to
+# investigate. c.17 ships should lower this threshold as they land.
+shadow_p50_ms = { max = 150.0 }

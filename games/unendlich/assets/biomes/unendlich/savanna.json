@@ -1,0 +1,9 @@
+{
+  "type": "minecraft:biome",
+  "_id": "unendlich:savanna",
+  "_comment": "dry grass + acacia analog (r174 registry parity set)",
+  "temperature": 1.4,
+  "downfall": 0.25,
+  "has_precipitation": true,
+  "effects": {}
+}

@@ -1,0 +1,102 @@
+{
+  "type": "minecraft:biome",
+  "_id": "relics:rusted_expanse",
+  "_comment": "Rusted industrial expanse: weathered steel, broken concrete, drifting dust.",
+  "surface_block": "gravel",
+  "subsurface_block": "dirt",
+  "has_precipitation": true,
+  "temperature": 0.3,
+  "downfall": 0.6,
+  "effects": {
+    "sky_color": 7907583,
+    "fog_color": 11842740,
+    "water_color": 4159204,
+    "water_fog_color": 329011,
+    "grass_color": 6723891,
+    "foliage_color": 6723891,
+    "ambient_light": 0.05,
+    "ambient_mood_sound": {
+      "sound": "minecraft:ambient.cave",
+      "tick_delay": 6000,
+      "block_search_extent": 8,
+      "offset": 2.0
+    },
+    "ambient_particle": {
+      "probability": 0.003,
+      "options": {
+        "type": "minecraft:rain"
+      }
+    }
+  },
+  "spawners": {
+    "monster": [
+      {
+        "type": "relics:fallen_dreg",
+        "weight": 15,
+        "minCount": 2,
+        "maxCount": 4
+      },
+      {
+        "type": "relics:fallen_vandal",
+        "weight": 8,
+        "minCount": 1,
+        "maxCount": 3
+      },
+      {
+        "type": "relics:fallen_captain",
+        "weight": 3,
+        "minCount": 1,
+        "maxCount": 1
+      },
+      {
+        "type": "relics:hive_thrall",
+        "weight": 10,
+        "minCount": 3,
+        "maxCount": 6
+      },
+      {
+        "type": "relics:hive_acolyte",
+        "weight": 5,
+        "minCount": 1,
+        "maxCount": 3
+      }
+    ],
+    "creature": []
+  },
+  "features": [
+    [],
+    [
+      "relics:rusted_cracked_asphalt",
+      "relics:rusted_gravel_scatter"
+    ],
+    [
+      "relics:rusted_dead_grass_patch",
+      "relics:rusted_weed_cluster"
+    ],
+    [
+      "relics:rusted_collapsed_wall_segment",
+      "relics:rusted_chain_link_fence"
+    ],
+    [
+      "relics:rusted_launch_gantry_ruin",
+      "relics:rusted_fuel_tank_rusted"
+    ],
+    [
+      "relics:rusted_fallen_pike_parked",
+      "relics:rusted_fallen_crate_stack"
+    ],
+    [
+      "relics:rusted_overgrown_oak",
+      "relics:rusted_birch_dead"
+    ],
+    [
+      "relics:rusted_hanging_wire"
+    ],
+    [
+      "relics:rusted_hive_tunnel_entrance"
+    ],
+    [
+      "relics:rusted_loot_cache"
+    ]
+  ]
+}

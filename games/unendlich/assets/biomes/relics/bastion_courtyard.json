@@ -1,0 +1,71 @@
+{
+  "type": "minecraft:biome",
+  "_id": "relics:bastion_courtyard",
+  "_comment": "Fortified bastion courtyard: stone plazas, banners, open sky above.",
+  "surface_block": "marble",
+  "subsurface_block": "tuff",
+  "has_precipitation": false,
+  "temperature": 0.7,
+  "downfall": 0.3,
+  "effects": {
+    "sky_color": 8365247,
+    "fog_color": 12638463,
+    "water_color": 4159204,
+    "water_fog_color": 329011,
+    "grass_color": 5263184,
+    "foliage_color": 5263184,
+    "ambient_light": 0.3,
+    "ambient_mood_sound": {
+      "sound": "minecraft:ambient.cave",
+      "tick_delay": 12000,
+      "block_search_extent": 8,
+      "offset": 2.0
+    }
+  },
+  "spawners": {
+    "creature": [
+      {
+        "type": "relics:guardian_npc_vendor",
+        "weight": 5,
+        "minCount": 1,
+        "maxCount": 1
+      },
+      {
+        "type": "minecraft:villager",
+        "weight": 3,
+        "minCount": 2,
+        "maxCount": 4
+      }
+    ],
+    "monster": []
+  },
+  "features": [
+    [],
+    [
+      "relics:tower_polished_basalt_floor"
+    ],
+    [],
+    [
+      "relics:tower_railing_segment",
+      "relics:tower_glass_panel_wall"
+    ],
+    [
+      "relics:tower_archway_last_city",
+      "relics:tower_guardian_statue"
+    ],
+    [
+      "relics:tower_jumpship_landing_pad",
+      "relics:tower_vendor_kiosk"
+    ],
+    [],
+    [
+      "relics:tower_end_rod_lamp"
+    ],
+    [
+      "relics:tower_traveler_light_beam"
+    ],
+    [
+      "relics:tower_city_wall_backdrop"
+    ]
+  ]
+}

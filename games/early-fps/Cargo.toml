@@ -1,0 +1,64 @@
+[package]
+name = "early-fps"
+version = "0.1.0"
+edition = "2021"
+description = "An early-2000s-style first-person shooter in Rust + egui, software-rendered (painter's algorithm) the way Doom/Quake-era engines were. Built on the logscope Mesh3 renderer technique and the shooter_map architecture."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Pure-Rust immediate-mode GUI. The whole game core renders into egui::epaint::Mesh,
+# so it builds & tests with NO native/windowing deps. This is the reference path.
+egui = "0.34"
+
+# The native window/GL shell. Optional so the core compiles anywhere; enable to play.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+
+# Optional real-time audio backend. The procedural DSP core in `audio.rs` is pure Rust and always builds;
+# only actual playback needs this. On Linux it needs ALSA dev headers, so it's strictly opt-in.
+rodio = { version = "0.19", optional = true, default-features = false }
+
+# ── GPU acceleration (optional) ────────────────────────────────────────────────────────────────────────
+# A wgpu + winit renderer as an alternative to the software painter. Off by default so the core still builds
+# headless with no native deps. Enable + run with: cargo run --release --features gpu --bin gpu
+wgpu = { version = "22", optional = true }
+winit = { version = "0.29", optional = true }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
+# JSON instruction pipeline for the map builder (buildscript.rs) — a stable, documented external format so
+# tooling (including LLMs) can author/edit maps without touching the in-memory editor. Pure Rust, no native
+# deps, safe to keep on unconditionally.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# Default = core only (no native deps): cargo build / cargo test work headless.
+default = []
+# The playable window. Pulls eframe (winit/glow). Run with: cargo run --release --features app
+app = ["dep:eframe"]
+# Procedural sound playback (off by default; pulls rodio/cpal, needs system audio libs).
+sound = ["dep:rodio"]
+# GPU renderer (wgpu + winit). Off by default. Run: cargo run --release --features gpu --bin gpu
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck"]
+
+[lib]
+name = "early_fps"
+path = "src/lib.rs"
+
+[[bin]]
+name = "early-fps"
+path = "src/main.rs"
+required-features = ["app"]
+
+[[bin]]
+name = "gpu"
+path = "src/bin/gpu.rs"
+required-features = ["gpu"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[dev-dependencies]
+# Only used by `examples/preview.rs` to write headless PNG snapshots of the renderer.
+image = { version = "0.25", default-features = false, features = ["png"] }
