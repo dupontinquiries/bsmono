@@ -45,6 +45,10 @@ default = ["gui", "gpu-scene"]
 # the egui/eframe GUI + its modules; off lets logscope-cli build lean (no eframe/vello)
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:async-std", "dep:tree-sitter", "dep:tree-sitter-rust"]
 wgpu-engine = ["dep:gpu-gemm"]
+# Forward the core's local GGML/GGUF inference so the egui app can build with `--features llamacpp`
+# (Vulkan) or `--features llamacpp-cpu`, matching the logscope core's feature names.
+llamacpp = ["logscope/llamacpp"]
+llamacpp-cpu = ["logscope/llamacpp-cpu"]
 # Speech-to-text base: whisper worker pool (whisper_pool) + mic capture (voice.rs) → voice_ingest::Pass.
 voice = ["dep:whisper-rs", "dep:cpal"]
 voice-vulkan = ["voice", "whisper-rs/vulkan"]  # GPU whisper on the Asahi M2 (recommended there)
