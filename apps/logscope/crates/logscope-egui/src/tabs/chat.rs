@@ -783,6 +783,7 @@ pub struct Chat {
     request_smaller_model: bool,   // :why asked to spawn the smallest local model for the diagnosis; ui() applies it
     show_help: bool,               // `?` keybinding overlay is open
     note: String,                  // transient status line (e.g. export path), cleared on next action
+    gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -859,6 +860,7 @@ impl Default for Chat {
             request_smaller_model: false,
             show_help: false,
             note: String::new(),
+            gitmind_session: None,
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -3824,6 +3826,37 @@ impl Chat {
                 // stage the chat's files into the sandbox mirror, then (with a model) ask for per-file summaries
                 self.note = ":summarize-files stages the chat's files into the sandbox; per-file summaries need a loaded model".into();
             }
+            Command::LoadGitmind(path) => {
+                let p = path.trim();
+                if p.is_empty() {
+                    self.note = ":load-gitmind needs a project path (e.g. :lgm ~/work/monorepo)".into();
+                } else {
+                    let expanded = match p.strip_prefix("~/") {
+                        Some(rest) => std::env::var("HOME").map(|h| format!("{h}/{rest}")).unwrap_or_else(|_| p.to_string()),
+                        None => p.to_string(),
+                    };
+                    let proj = std::path::Path::new(&expanded);
+                    let session = proj.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "session".into());
+                    let tmp = std::env::temp_dir().join("logscope-gitmind");
+                    match crate::gitmind_session::load_gitmind(proj, &session, &tmp) {
+                        Ok(s) => {
+                            self.note = format!("loaded '{}' → editing {} · :reapply to land it as a commit", session, s.work_dir().display());
+                            self.gitmind_session = Some(s);
+                        }
+                        Err(e) => self.note = format!(":load-gitmind — {e}"),
+                    }
+                }
+            }
+            Command::Reapply => match self.gitmind_session.take() {
+                None => self.note = ":reapply — no .gitmind session loaded (:load-gitmind <path> first)".into(),
+                Some(s) => match crate::gitmind_session::reapply(&s) {
+                    Ok(hash) => self.note = format!("reapplied '{}' → commit {}", s.name, &hash[..hash.len().min(10)]),
+                    Err(e) => {
+                        self.note = format!(":reapply — {e}");
+                        self.gitmind_session = Some(s); // keep the session so the user can retry
+                    }
+                },
+            },
             Command::Compact(arg) => {
                 // active lineage (tip → root), reversed to chronological
                 let mut chain = Vec::new();
