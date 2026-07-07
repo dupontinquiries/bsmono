@@ -1,7 +1,8 @@
 //! matrix — the first real self-management loop: build + test every crate in the repo and report
 //! which fail. Orchestration is pure (injected command runner, so it's tested without spawning
 //! 150 cargo processes); [`spawn_run`] is the real executor.
-use repo_map::{CrateEntry, CrateKind};
+use crate::{scan_repo, CrateEntry, CrateKind};
+use std::path::Path;
 
 /// The result of running one command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,16 +146,17 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-/// Convenience: index the repo and run the whole matrix for real.
-pub fn run_repo_matrix(repo_root: &str, opts: &RunOpts) -> MatrixReport {
-    let crates = crate::repomap::indexed_crates(repo_root);
+/// Convenience: index the repo (under `tops`, e.g. `["apps","shared","games"]`) and run the whole
+/// matrix for real.
+pub fn run_repo_matrix(repo_root: &str, tops: &[&str], opts: &RunOpts) -> MatrixReport {
+    let crates = scan_repo(Path::new(repo_root), tops);
     run_matrix(crates, |argv| spawn_run(argv, repo_root), opts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use repo_map::CrateKind;
+    use crate::CrateKind;
 
     fn member(name: &str) -> CrateEntry {
         CrateEntry { name: name.into(), path: format!("shared/{name}"), kind: CrateKind::WorkspaceMember { workspace_root: "".into() } }
