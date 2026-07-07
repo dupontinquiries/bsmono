@@ -19,8 +19,281 @@ use egui::RichText;
 use logscope::llm_backend::GenParams;
 use std::time::Instant;
 
+/// The mic pearl's SHAPE — a SECOND per-scene derivative (beyond the colour idiom) so the in-scene voice
+/// indicator matches each world's physical substance, not just its tint. Kept a FREE derivative (no bespoke
+/// per-world table): it falls out of the palette `Material` plus a small crystalline/watery name set —
+///   * `Pearl`  — smooth orb: watery/airy worlds (Atlantis, Cloudscape) and paper worlds (a wafer).
+///   * `Gem`    — faceted iridescent crystal: the crystalline worlds (Fractal Spires, Recursive Citadel,
+///                Frozen Bifrost) — the pass-67 "faceted gem vs smooth pearl" second axis.
+///   * `Stone`  — weathered/carved stone bead: rock & marble & cave/mist worlds (Slate, Titan's Ribcage,
+///                Mistfall, Mansion Garden…).
+///   * `Bead`   — chunky turned wooden bead: the wood-board worlds (Old Library, Archive, Alley…).
+///   * `Leaf`   — a backlit leaf blade: the foliage worlds (Forest, Canopy, Treehouse, Hollow Jungle) — the
+///                signature "leaves instead of the pearl" object.
+/// Rendering maps these onto existing mesh primitives (uv_sphere / cracked_pearl / rock / leaf_single).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MicShape { Pearl, Gem, Stone, Bead, Leaf }
+
+/// Derive the mic pearl shape for a scene from its name + palette material (see `MicShape`). Pure so it can
+/// be unit-tested without a renderer (the GUI verification path is headless render; this is the logic gate).
+pub fn mic_shape(scene: &str, material: theme::Material) -> MicShape {
+    use theme::Material::*;
+    match scene {
+        // foliage worlds → a backlit LEAF blade (the signature "leaves instead of the pearl" object).
+        "Forest" | "Canopy" | "Treehouse" | "Hollow Jungle" => MicShape::Leaf,
+        // crystalline worlds → a faceted gem (the shape derivative the pass-67 note calls for).
+        "Fractal Spires" | "Recursive Citadel" | "Frozen Bifrost" => MicShape::Gem,
+        // cave / carved-rune / mist worlds → weathered stone (the "caves → stones" idiom).
+        "Mistfall" => MicShape::Stone,
+        // watery / airy worlds → a smooth pearl regardless of their (stone) material.
+        "Atlantis" | "Cloudscape" => MicShape::Pearl,
+        // everything else follows its physical material.
+        _ => match material {
+            Wood => MicShape::Bead,          // a turned wooden bead
+            Paper | None => MicShape::Pearl, // a paper wafer reads as a smooth bead
+            Stone | Marble => MicShape::Stone,
+        },
+    }
+}
+
+/// Project a billboarded in-scene UI slab (centre + right/up basis, size w×h in world units) to its
+/// screen-space bounding Rect. This is the basis for making in-scene panels/buttons INTERACTIVE and
+/// ACCESSIBLE: the 3D slab is the visual, and an egui widget placed over this rect is the hit-test +
+/// AccessKit overlay, so pointer clicks and screen-reader focus both target the physical object in the
+/// scene. Returns None if any corner is behind the camera (don't interact with an off-screen slab).
+pub fn project_slab_rect(cam: &crate::spatial::OrbitCam, center: crate::spatial::Vec3,
+                         right: crate::spatial::Vec3, up: crate::spatial::Vec3, w: f32, h: f32,
+                         cx: f32, cy: f32, scale: f32) -> Option<egui::Rect> {
+    let (hw, hh) = (w * 0.5, h * 0.5);
+    let corner = |sx: f32, sy: f32| crate::spatial::Vec3::new(
+        center.x + right.x * (sx * hw) + up.x * (sy * hh),
+        center.y + right.y * (sx * hw) + up.y * (sy * hh),
+        center.z + right.z * (sx * hw) + up.z * (sy * hh));
+    let (mut lo, mut hi) = ((f32::MAX, f32::MAX), (f32::MIN, f32::MIN));
+    for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let (x, y, _d) = cam.project(corner(sx, sy), cx, cy, scale)?;
+        lo.0 = lo.0.min(x); lo.1 = lo.1.min(y); hi.0 = hi.0.max(x); hi.1 = hi.1.max(y);
+    }
+    Some(egui::Rect::from_min_max(egui::pos2(lo.0, lo.1), egui::pos2(hi.0, hi.1)))
+}
+
+// ── PHYSICAL CONTROL DOCK ────────────────────────────────────────────────────────────────────────
+// The camera controls (Overview / Tour / Freecam) rendered as IN-SCENE physical buttons — real 3D
+// objects you press — instead of a 2D toolbar, driven by the tested `physui` FSM. IDs are stable so
+// the panel, the projected hit-rects, and the action mapping all refer to the same control.
+const DOCK_OVERVIEW: usize = 601; // Momentary — recenter + fit the whole graph
+const DOCK_TOUR: usize = 602;     // Toggle    — fly through the palace / stop
+const DOCK_FREECAM: usize = 603;  // Toggle    — free-flight camera on / off
+const DOCK_PRUNE: usize = 604;    // Momentary — prune superseded turns (churn) to free context
+const DOCK_UNPRUNE: usize = 606;  // Momentary — restore every pruned turn to context
+const DOCK_IDS: [usize; 5] = [DOCK_OVERVIEW, DOCK_TOUR, DOCK_FREECAM, DOCK_PRUNE, DOCK_UNPRUNE];
+
+// The Context/params panel, ported to physical DIALS you drag — each bound to a `self.ctx` field. (The time
+// dial was removed: the scene tracks system time.) IDs, ranges, short labels, and stack order in one place.
+const PARAM_TEMP: usize = 610;   // temperature
+const PARAM_NCTX: usize = 611;   // ctx window (context length)
+const PARAM_MAXTOK: usize = 612; // reply budget
+const PARAM_REPEAT: usize = 613; // repeat penalty
+const PARAM_MINP: usize = 614;   // min-p
+/// (dial id, short label, min, max, integer?) — order = top→bottom on the physical settings panel.
+const PARAM_DIALS: [(usize, &str, f32, f32, bool); 5] = [
+    (PARAM_TEMP,   "TEMP",  0.0,   1.5,     false),
+    (PARAM_NCTX,   "CTX",   512.0, 32768.0, true),
+    (PARAM_MAXTOK, "REPLY", 64.0,  4096.0,  true),
+    (PARAM_REPEAT, "REP",   1.0,   1.5,     false),
+    (PARAM_MINP,   "MINP",  0.0,   0.3,     false),
+];
+
+/// Read a `Ctx` field as an f32 by its physical-dial id (for syncing the dial handle to the live value).
+fn ctx_get(ctx: &Ctx, id: usize) -> f32 {
+    match id {
+        PARAM_TEMP => ctx.temperature,
+        PARAM_NCTX => ctx.n_ctx as f32,
+        PARAM_MAXTOK => ctx.max_tokens as f32,
+        PARAM_REPEAT => ctx.repeat_penalty,
+        PARAM_MINP => ctx.min_p,
+        _ => 0.0,
+    }
+}
+/// Write a `Ctx` field from a dragged dial value (rounding the integer params).
+fn ctx_set(ctx: &mut Ctx, id: usize, v: f32) {
+    match id {
+        PARAM_TEMP => ctx.temperature = v,
+        PARAM_NCTX => ctx.n_ctx = v.round() as u32,
+        PARAM_MAXTOK => ctx.max_tokens = v.round() as u32,
+        PARAM_REPEAT => ctx.repeat_penalty = v,
+        PARAM_MINP => ctx.min_p = v,
+        _ => {}
+    }
+}
+
+/// Build the in-scene control dock: every scene control is a physical object — Overview/Prune/Unprune
+/// momentary, Tour/Freecam toggles — plus the Context panel's sampling sliders as physical Dials.
+fn phys_dock() -> crate::physui::Panel {
+    use crate::physui::{ControlKind, Panel};
+    let mut p = Panel::new();
+    p.add(DOCK_OVERVIEW, ControlKind::Momentary, false);
+    p.add(DOCK_TOUR, ControlKind::Toggle, false);
+    p.add(DOCK_FREECAM, ControlKind::Toggle, false);
+    p.add(DOCK_PRUNE, ControlKind::Momentary, false);
+    p.add(DOCK_UNPRUNE, ControlKind::Momentary, false);
+    let cd = Ctx::default();
+    for &(id, _, lo, hi, _) in &PARAM_DIALS { p.add_dial(id, lo, hi, ctx_get(&cd, id)); }
+    p
+}
+
+/// The camera/context change a physical-dock actuation implies. Pure + testable so the button→action
+/// mapping (and the fact that non-dock events are ignored) is locked without a live scene; the field
+/// mutations that apply it mirror the controls the (now-removed) 2D toolbar used to expose.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum DockAction { Overview, Tour(bool), Freecam(bool), Prune, Unprune }
+
+/// Map a [`physui::ControlEvent`] from the dock to its [`DockAction`], or `None` for events that aren't
+/// one of the dock's controls (unknown ids, dial adjusts, etc.).
+fn dock_action(ev: crate::physui::ControlEvent) -> Option<DockAction> {
+    use crate::physui::ControlEvent::*;
+    match ev {
+        Fired(DOCK_OVERVIEW) => Some(DockAction::Overview),
+        Toggled(DOCK_TOUR, on) => Some(DockAction::Tour(on)),
+        Toggled(DOCK_FREECAM, on) => Some(DockAction::Freecam(on)),
+        Fired(DOCK_PRUNE) => Some(DockAction::Prune),
+        Fired(DOCK_UNPRUNE) => Some(DockAction::Unprune),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Role { User, Assistant }
+
+/// A specular GLINT for a camera-facing physical slab: a soft bright highlight that sits where the scene's sun
+/// reflects toward the eye. As the camera orbits (or the slab moves), the glint slides across the surface, so
+/// light genuinely *plays* over the slab instead of it reading as a flat quad. `sun` is the world sun dir;
+/// `hw`/`hu` are the slab half-width/half-height. Intensity rises when the sun faces the slab toward the eye.
+fn slab_glint(graph: &mut Vec<crate::mesh3d::Mesh3>, c: crate::spatial::Vec3, right: crate::spatial::Vec3,
+              up: crate::spatial::Vec3, toward: crate::spatial::Vec3, hw: f32, hu: f32,
+              sun: crate::spatial::Vec3, tglow: f32) {
+    let dot = |a: crate::spatial::Vec3, b: crate::spatial::Vec3| a.x * b.x + a.y * b.y + a.z * b.z;
+    let du = dot(right, sun).clamp(-1.0, 1.0);
+    let dv = dot(up, sun).clamp(-1.0, 1.0);
+    // brightness varies with how the slab faces the sun (either sign — the sign convention is refined with the
+    // viewer), but stays present so it reads as a moving sheen rather than blinking on/off.
+    let inten = 0.9 + 0.7 * dot(toward, sun).abs();
+    let (gu, gv) = (du * hw * 0.72, dv * hu * 0.72);
+    let gc = crate::spatial::Vec3::new(c.x + right.x * gu + up.x * gv - toward.x * 0.03,
+                                       c.y + right.y * gu + up.y * gv - toward.y * 0.03,
+                                       c.z + right.z * gu + up.z * gv - toward.z * 0.03);
+    let r = (hw.min(hu) * 0.5).clamp(0.05, 0.4);
+    let mut glint = crate::mesh3d::uv_sphere(gc, r, 6, 4, egui::Color32::from_rgb(255, 251, 236));
+    glint.emissive = inten * tglow.max(0.6);
+    crate::mesh3d::set_alpha(&mut glint, 135);
+    graph.push(glint);
+}
+
+/// A subtle per-scene emissive undulation (~0.85..1.25) so physical UI slabs catch the scene's light rhythm —
+/// light rippling on Atlantis glass, a slow sway in Forest, an icy glint in Frozen — instead of reading flat.
+fn slab_sheen(anim: crate::mesh3d::TextAnim, t: f32) -> f32 {
+    use crate::mesh3d::TextAnim::*;
+    match anim {
+        Ripple => 1.0 + 0.14 * (t * 1.6).sin(),
+        Sway => 1.0 + 0.08 * (t * 1.1).sin(),
+        Shimmer => 1.0 + 0.22 * ((t * 3.0).sin() * 0.5 + 0.5).powi(4),
+        Drift => 1.0 + 0.10 * (t * 0.8).sin(),
+        Fade => 0.9 + 0.22 * (0.5 + 0.5 * (t * 1.4).sin()),
+        Pulse => 1.0 + 0.16 * (t * 2.2).sin(),
+        Plain => 1.0,
+    }
+}
+
+/// Local screen scale (pixels per world unit) at `cen`'s depth, along right and up — for sizing physical UI
+/// slabs to a target fraction of the canvas so they don't blow up or shrink with window size.
+fn px_per_world(cam: &crate::spatial::OrbitCam, cen: crate::spatial::Vec3, right: crate::spatial::Vec3, up: crate::spatial::Vec3, cx: f32, cy: f32, scale: f32) -> (f32, f32) {
+    let pt = |p: crate::spatial::Vec3| cam.project(p, cx, cy, scale).map(|(x, y, _)| (x, y));
+    let add = |a: crate::spatial::Vec3, b: crate::spatial::Vec3| crate::spatial::Vec3::new(a.x + b.x, a.y + b.y, a.z + b.z);
+    match (pt(cen), pt(add(cen, right)), pt(add(cen, up))) {
+        (Some(p0), Some(pr), Some(pu)) => (((pr.0 - p0.0).powi(2) + (pr.1 - p0.1).powi(2)).sqrt().max(1.0),
+                                           ((pu.0 - p0.0).powi(2) + (pu.1 - p0.1).powi(2)).sqrt().max(1.0)),
+        _ => (scale.max(1.0), scale.max(1.0)),
+    }
+}
+
+/// Unproject a screen point `(ax, ay)` back to a world position on the plane through `cen` spanned by
+/// `right`/`up` (where the billboarded physical UI lives), so UI components can be ANCHORED to screen
+/// positions that adapt to canvas size instead of using fixed world offsets. Falls back to `cen`.
+fn screen_to_world(cam: &crate::spatial::OrbitCam, cen: crate::spatial::Vec3, right: crate::spatial::Vec3, up: crate::spatial::Vec3, cx: f32, cy: f32, scale: f32, ax: f32, ay: f32) -> crate::spatial::Vec3 {
+    let add = |a: crate::spatial::Vec3, b: crate::spatial::Vec3| crate::spatial::Vec3::new(a.x + b.x, a.y + b.y, a.z + b.z);
+    let (p0, pr, pu) = match (cam.project(cen, cx, cy, scale), cam.project(add(cen, right), cx, cy, scale), cam.project(add(cen, up), cx, cy, scale)) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return cen,
+    };
+    let (drx, dry) = (pr.0 - p0.0, pr.1 - p0.1);
+    let (dux, duy) = (pu.0 - p0.0, pu.1 - p0.1);
+    let det = drx * duy - dux * dry;
+    if det.abs() < 1e-4 { return cen; }
+    let (tx, ty) = (ax - p0.0, ay - p0.1);
+    let wr = (tx * duy - dux * ty) / det;
+    let wu = (drx * ty - tx * dry) / det;
+    crate::spatial::Vec3::new(cen.x + right.x * wr + up.x * wu, cen.y + right.y * wr + up.y * wu, cen.z + right.z * wr + up.z * wu)
+}
+
+/// Map a scene/theme name to its text-animation idiom, so each scene animates its UI text in character.
+fn text_anim_for(name: &str) -> crate::mesh3d::TextAnim {
+    use crate::mesh3d::TextAnim::*;
+    match name {
+        "Atlantis" => Ripple,
+        "Forest" | "Treehouse" | "Canopy" => Sway,
+        "Frozen Bifrost" => Shimmer,
+        "Cloudscape" => Drift,
+        "Mistfall" => Fade,
+        "Folding@home" => Pulse,
+        _ => Plain, // Archive / Slate / Alley and any others: the steady twinkle
+    }
+}
+
+/// Word-wrap `text` into at most `max_lines` lines of ≤`cols` chars, for physical `label_cells` panels
+/// (which render one line at a time). Wraps on whitespace; hard-splits words longer than `cols`; collapses
+/// internal newlines/spaces; appends `…` to the last line when the text was truncated. Pure + testable.
+fn wrap_label(text: &str, cols: usize, max_lines: usize) -> Vec<String> {
+    let cols = cols.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut truncated = false;
+    'outer: for word in text.split_whitespace() {
+        let mut word = word;
+        // hard-split words longer than a line
+        while word.chars().count() > cols {
+            if !cur.is_empty() { lines.push(std::mem::take(&mut cur)); if lines.len() >= max_lines { truncated = true; break 'outer; } }
+            let head: String = word.chars().take(cols).collect();
+            lines.push(head);
+            if lines.len() >= max_lines { truncated = true; break 'outer; }
+            let skip = cols; word = &word[word.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(word.len())..];
+        }
+        if cur.is_empty() { cur = word.to_string(); }
+        else if cur.chars().count() + 1 + word.chars().count() <= cols { cur.push(' '); cur.push_str(word); }
+        else { lines.push(std::mem::take(&mut cur)); if lines.len() >= max_lines { truncated = true; break; } cur = word.to_string(); }
+    }
+    if !truncated && !cur.is_empty() && lines.len() < max_lines { lines.push(cur); }
+    else if !cur.is_empty() { truncated = true; }
+    if truncated {
+        if let Some(last) = lines.last_mut() {
+            while last.chars().count() >= cols { last.pop(); }
+            last.push('…');
+        }
+    }
+    lines
+}
+
+/// A translucent "frosted glass" frame for chrome (top control bar, bottom read-out) floating OVER the
+/// full-bleed scene — a dark semi-transparent fill + a faint light rim so it reads as a panel of smoked
+/// glass on top of the 3D view. (egui can't sample a true backdrop blur; this is the "for now" glass.)
+fn glass_frame() -> egui::Frame {
+    egui::Frame {
+        fill: egui::Color32::from_rgba_unmultiplied(10, 13, 20, 190),
+        corner_radius: theme::r(10),
+        inner_margin: egui::Margin::symmetric(10, 6),
+        stroke: egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+        ..Default::default()
+    }
+}
 /// A turn. `variants` lets an assistant turn hold multiple completions (reroll / branch); `cur`
 /// selects which is shown and which streaming appends to. User turns carry a single variant plus
 /// inline-edit state.
@@ -490,6 +763,9 @@ pub struct Chat {
     tour_s: f32,                         // accumulated strand position (variable-speed traversal — lingers on long msgs)
     tour_dwell: Vec<f32>,                // per-node dwell weight (bounded z-score of text length); recomputed on tree change
     cam_drift: Option<crate::voice_intent::MoveDir>, // "move back"/"move forward" continuous travel; cleared by stop/hold
+    walk_phase: f32,                     // footstep cadence accumulator for the walking bob while drifting
+    walk_bob: f32,                       // currently-applied vertical bob offset (eased in/out; delta-applied so no drift)
+    walk_ramp: f32,                      // 0..1 ease-in on the drift speed so walking starts gently, not at full pelt
     fly_push: crate::spatial::Vec3,      // eased collision-avoidance offset for the fly (so evasion glides, not jolts)
     freecam: bool,                       // free-flight camera: WASD/QE move the eye, drag looks (no auto-frame/tour)
     voice: Option<crate::voice_session::VoiceSession>, // live mic session (None = off); pumped each frame in ui()
@@ -531,6 +807,10 @@ pub struct Chat {
     show_history: bool,                     // history/tree panel open
     file_hist: Option<usize>,               // generated-file index whose version history is expanded
     template: TemplateKind,                 // chat-template family of the loaded model (set on load)
+    phys: crate::physui::Panel,             // in-scene physical control dock (Overview/Tour/Freecam as 3D buttons)
+    phys_anim: Vec<crate::physui::ControlAnim>, // per-dock-control eased press/hover/lit feel (indexed by DOCK_IDS)
+    phys_t: Option<std::time::Instant>,     // last dock-anim tick (for dt); None until the first frame
+    slider_drag: Option<(usize, f32)>,      // while dragging a physical settings slider: (dial id, last pointer x)
 }
 impl Default for Chat {
     fn default() -> Self {
@@ -565,6 +845,9 @@ impl Default for Chat {
             tour_s: 0.0,
             tour_dwell: Vec::new(),
             cam_drift: None,
+            walk_phase: 0.0,
+            walk_bob: 0.0,
+            walk_ramp: 0.0,
             fly_push: crate::spatial::Vec3::new(0.0, 0.0, 0.0),
             freecam: false,
             voice: None,
@@ -586,6 +869,10 @@ impl Default for Chat {
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
             head: None, show_history: false, file_hist: None,
             template: TemplateKind::Llama3,
+            phys: phys_dock(),
+            phys_anim: vec![crate::physui::ControlAnim::default(); DOCK_IDS.len()],
+            phys_t: None,
+            slider_drag: None,
         }
     }
 }
@@ -682,6 +969,7 @@ impl Chat {
                 self.hit_cap = capped;
                 self.autosave(); // persist the completed turn for crash recovery
                 self.vault_commit(); // record the turn as a node in the history tree (provenance-linked)
+                if let Some(i) = idx { self.auto_verify_after_reply(i); } // compile-check generated Rust now, not on a click
             }
             Evt::Error(e) => {
                 if let Some(s) = &self.stream {
@@ -1603,72 +1891,12 @@ impl Chat {
         ];
         let max_tok = g.nodes.iter().map(|nd| nd.tokens).max().unwrap_or(1).max(1) as f32;
 
-        // controls: overview framing + human pruning to reclaim context room (hidden when used as a backdrop)
-        if !self.backdrop {
-        ui.horizontal(|ui| {
-            // per-scene button SKIN: the default egui dark button reads as harsh dark contrast on the bright/warm
-            // scenes. Give those a lightened, muted warm fill (reds/browns) with a low-contrast ink. (b_acc tints
-            // the carved Overview button + its hover sheen.) Dark scenes keep the default skin.
-            let nm = theme::active().name;
-            let rgb = egui::Color32::from_rgb;
-            let skin: Option<(egui::Color32, egui::Color32, egui::Color32, egui::Color32)> = match nm {
-                // (accent, base fill, hover fill, ink)
-                "Reading Room" => Some((rgb(0x9a, 0x52, 0x3c), rgb(0xe2, 0xd2, 0xc0), rgb(0xec, 0xdc, 0xc8), rgb(0x5e, 0x38, 0x28))), // muted terracotta on warm paper
-                "Archive"      => Some((rgb(0xb0, 0x6e, 0x34), rgb(0x4a, 0x38, 0x24), rgb(0x5e, 0x48, 0x30), rgb(0xf0, 0xd8, 0xae))), // warm amber-brown
-                "Canopy" | "Old Library" => Some((rgb(0x8a, 0x6e, 0x3a), rgb(0x3c, 0x32, 0x22), rgb(0x4e, 0x42, 0x2e), rgb(0xe6, 0xd8, 0xb6))), // mossy wood
-                _ => None,
-            };
-            if let Some((_, bg, hov, ink)) = skin {
-                let v = ui.visuals_mut();
-                for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
-                    w.bg_fill = bg; w.weak_bg_fill = bg; w.fg_stroke.color = ink;
-                }
-                v.widgets.hovered.bg_fill = hov; v.widgets.hovered.weak_bg_fill = hov;
-                v.widgets.active.bg_fill = hov; v.widgets.active.weak_bg_fill = hov;
-            }
-            let overview = match skin { Some((acc, ..)) => theme::carved_button_tinted(ui, "⊹ Overview", acc), None => theme::carved_button(ui, "⊹ Overview") };
-            if overview.on_hover_text("Recenter and fit the whole graph").clicked() {
-                self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; ui.ctx().request_repaint();
-            }
-            // TOUR: fly the camera along the conversation strand, threading the palace. Eased path + eased collision
-            // avoidance keep it off the columns and within the walls — a smooth flythrough, not a ricochet.
-            let touring = self.fly_auto.is_some();
-            if ui.add(egui::Button::new(RichText::new(if touring { "■ Stop tour" } else { "▶ Tour" }).small()))
-                .on_hover_text("Fly through the palace following the conversation").clicked() {
-                self.fly_auto = if touring { None } else { Some(1.0) };
-                if self.fly_auto.is_none() { self.spatial_auto = true; self.spatial_zoomed = false; } // hand back to overview
-                if self.fly_auto.is_some() { self.freecam = false; } // tour and freecam are mutually exclusive
-                ui.ctx().request_repaint();
-            }
-            if ui.add(egui::Button::new(RichText::new(if self.freecam { "■ Exit freecam" } else { "✜ Freecam" }).small()))
-                .on_hover_text("Free-flight camera — WASD move, Q/E down/up, drag to look, Shift to boost").clicked() {
-                self.freecam = !self.freecam;
-                if self.freecam { self.fly_auto = None; self.spatial_auto = false; self.spatial_zoomed = true; }
-                else { self.spatial_auto = true; self.spatial_zoomed = false; } // hand back to overview
-                ui.ctx().request_repaint();
-            }
-            let sup = g.superseded();
-            let prunable = sup.iter().filter(|id| !self.pruned.contains(id)).count();
-            if ui.add_enabled(prunable > 0, egui::Button::new(RichText::new(format!("✂ Prune churn ({prunable})")).small()))
-                .on_hover_text("Prune superseded turns — earlier iterations the conversation has moved past — to free context").clicked() {
-                for id in sup { self.pruned.insert(id); }
-                ui.ctx().request_repaint();
-            }
-            if ui.add_enabled(!self.pruned.is_empty(), egui::Button::new(RichText::new(format!("↩ Unprune ({})", self.pruned.len())).small()))
-                .on_hover_text("Restore every pruned turn to context").clicked() {
-                self.pruned.clear(); ui.ctx().request_repaint();
-            }
-            if !self.pruned.is_empty() {
-                ui.label(RichText::new(format!("{} pruned · less context used", self.pruned.len())).color(theme::DIM()).small());
-            }
-        });
-        ui.add_space(2.0);
-        }
+        // (The 2D control bar was removed — Overview/Tour/Freecam/Prune/Unprune are physical dock buttons now.)
 
         let total = ui.available_size();
-        // backdrop fills the whole rect; the interactive view reserves a taller strip so the focused-node
-        // message reads as a real box (multiple lines, scrollable) instead of a one-line sliver under the scene.
-        let canvas_h = if self.backdrop { total.y.max(180.0) } else { (total.y - 92.0).max(180.0) };
+        // Full-bleed: the scene fills the whole window; the top control bar and the bottom read-out float over
+        // it as translucent glass overlays (Areas), so nothing reserves vertical space any more.
+        let canvas_h = total.y.max(180.0);
         let (resp, p) = ui.allocate_painter(egui::vec2(total.x, canvas_h), egui::Sense::click_and_drag());
         let rect = resp.rect;
         // Opaque base under the backdrop so empty/sky regions never reveal undefined framebuffer memory (garbage
@@ -1760,7 +1988,8 @@ impl Chat {
                 MoveDir::Down => V3::new(0.0, -1.0, 0.0),
             };
             let dt = ui.input(|i| i.stable_dt).min(0.05);
-            let speed = 14.0 * dt;
+            self.walk_ramp += (1.0 - self.walk_ramp) * (dt * 3.5).min(1.0); // ease the drift up to full over ~0.3s
+            let speed = 14.0 * dt * self.walk_ramp;
             self.orbit.target.x += v.x * speed;
             self.orbit.target.y += v.y * speed;
             self.orbit.target.z += v.z * speed;
@@ -1768,7 +1997,18 @@ impl Chat {
             ui.ctx().request_repaint();
         }
 
-        // SMOOTH GRAPH-PATH PAN: when a node is focused, glide the orbit target along the graph's OWN shortest
+        // WALKING BOB — a gentle footstep cadence on the view while drifting HORIZONTALLY (not up/down), so a
+        // voice "walk"/"start moving" reads as walking rather than a dead-steady glide. The bob is eased in/out
+        // and applied as a per-frame DELTA, so it never accumulates into a permanent vertical drift.
+        {
+            let dt = ui.input(|i| i.stable_dt).min(0.05);
+            let walking = self.cam_drift.map_or(false, |d| !matches!(d, crate::voice_intent::MoveDir::Up | crate::voice_intent::MoveDir::Down));
+            let want = if walking { self.walk_phase += dt * 7.2; self.walk_phase.sin() * 0.05 } else { 0.0 };
+            let eased = self.walk_bob + (want - self.walk_bob) * (dt * 6.0).min(1.0);
+            self.orbit.target.y += eased - self.walk_bob;
+            self.walk_bob = eased;
+            if walking { ui.ctx().request_repaint(); }
+        }
         // path (parent links via LCA) — Catmull-Rom through the node positions — instead of jumping straight there.
         if let Some(t0) = self.cam_pan_t0 {
             let np = self.cam_pan_path.len();
@@ -1835,7 +2075,7 @@ impl Chat {
                 };
                 let pm = pos[i0.saturating_sub(1)]; let p1 = pos[i0]; let p2 = pos[i1]; let p3 = pos[(i1 + 1).min(n - 1)];
                 let here = cr(pm, p1, p2, p3, fr);
-                let look = cr(pm, p1, p2, p3, (fr + 0.16).min(1.0)); // a touch ahead on the same spline
+                let look = cr(pm, p1, p2, p3, (fr + 0.34).min(1.0)); // look well ahead → a SMOOTH tangent that doesn't whip at every node
                 let (tx, ty, tz) = (look.x - here.x, look.y - here.y, look.z - here.z);
                 let tl = (tx * tx + ty * ty + tz * tz).sqrt().max(1e-3);
                 let (txn, tyn, tzn) = (tx / tl, ty / tl, tz / tl);
@@ -1859,18 +2099,27 @@ impl Chat {
                         3 => 0,                                                   // dutch → travel
                         _ => if h < 0.6 { 0 } else { 1 },                         // push → travel / establish
                     };
-                    self.cam_shot_until = now + 7.0 + h * 6.0;                    // 7–13 s dwell: slow film pacing
+                    self.cam_shot_until = now + 11.0 + h * 8.0;                   // 11–19 s dwell: fewer cuts, slower film pacing
                 }
                 self.cam_orbit_phase += 0.0026;                                  // slow continuous drift for orbit/dutch
                 let (mut want_target, mut want_yaw, mut want_pitch, mut want_dist, mut want_roll, mut k) =
-                    (here, base_yaw, base_pitch, base_dist, 0.0f32, 0.035f32);    // default: slow travel along the strand
+                    (here, base_yaw, base_pitch, base_dist, 0.0f32, 0.02f32);     // default: slow travel along the strand
                 match self.cam_shot {
-                    1 => { want_target = cc; want_dist = fitd; want_pitch = 0.42; want_yaw = base_yaw + (self.cam_orbit_phase * 0.4).sin() * 0.5; k = 0.024; } // ESTABLISH
-                    2 => { want_target = here; want_dist = (fitd * 0.55).clamp(7.0, 40.0); want_pitch = 0.3; want_yaw = self.cam_orbit_phase * 0.8; k = 0.03; } // ORBIT arc
-                    3 => { want_roll = (self.cam_orbit_phase * 0.5).sin() * 0.26; k = 0.04; }                                                                   // DUTCH tilt
-                    4 => { want_dist = 3.4; want_pitch = base_pitch * 0.7; k = 0.05; }                                                                          // PUSH-IN passthrough
+                    1 => { want_target = cc; want_dist = fitd; want_pitch = 0.42; want_yaw = base_yaw + (self.cam_orbit_phase * 0.4).sin() * 0.5; k = 0.014; } // ESTABLISH
+                    2 => { want_target = here; want_dist = (fitd * 0.55).clamp(7.0, 40.0); want_pitch = 0.3; want_yaw = self.cam_orbit_phase * 0.8; k = 0.018; } // ORBIT arc
+                    3 => { want_roll = (self.cam_orbit_phase * 0.5).sin() * 0.26; k = 0.022; }                                                                   // DUTCH tilt
+                    4 => { want_dist = 4.4; want_pitch = base_pitch * 0.7; k = 0.026; }                                                                          // PUSH-IN passthrough (less extreme)
                     _ => {}
                 }
+                // GUARD: a collapsed graph (bounding_radius→0) or a gigantic one can make fit_distance return
+                // NaN/inf or an absurd distance; a degenerate spline point can make want_target non-finite. Any
+                // of these propagate into orbit.dist/target → a NaN eye → NaN projection → a BLANK/broken frame
+                // (this is the "starting the tour breaks the render" bug). Clamp them to sane, finite values here.
+                if !want_dist.is_finite() { want_dist = base_dist; }
+                want_dist = want_dist.clamp(2.0, 240.0);
+                if !(want_target.x.is_finite() && want_target.y.is_finite() && want_target.z.is_finite()) { want_target = here; }
+                if !want_yaw.is_finite() { want_yaw = base_yaw; }
+                if !want_pitch.is_finite() { want_pitch = base_pitch; }
                 self.orbit.target.x += (want_target.x - self.orbit.target.x) * k;
                 self.orbit.target.y += (want_target.y - self.orbit.target.y) * k;
                 self.orbit.target.z += (want_target.z - self.orbit.target.z) * k;
@@ -1881,6 +2130,12 @@ impl Chat {
                 self.orbit.pitch += (want_pitch - self.orbit.pitch) * k;
                 self.orbit.dist += (want_dist - self.orbit.dist) * k;
                 self.orbit.roll += (want_roll - self.orbit.roll) * (k * 0.8);    // ease the Dutch tilt in/out
+                // final belt-and-braces: never let the eased orbit carry a non-finite value into projection
+                if !self.orbit.dist.is_finite() { self.orbit.dist = base_dist; }
+                self.orbit.dist = self.orbit.dist.clamp(2.0, 240.0);
+                if !self.orbit.yaw.is_finite() { self.orbit.yaw = base_yaw; }
+                if !self.orbit.pitch.is_finite() { self.orbit.pitch = base_pitch; }
+                if !(self.orbit.target.x.is_finite() && self.orbit.target.y.is_finite() && self.orbit.target.z.is_finite()) { self.orbit.target = here; }
 
                 // CAMERA BOUNDING-SPHERE EVASION: keep the eye OUT of opaque solids (columns / central plinth)
                 // and INSIDE the perimeter wall, using the colliders the env generator emitted from the same
@@ -1954,6 +2209,18 @@ impl Chat {
                     if ey < lo { py += lo - ey; }
                     else if hi > lo && ey > hi { py += hi - ey; }
                 }
+                // COLLIDER-INDEPENDENT HEIGHT CAP: even when a scene emits no floor/ceiling colliders (so the
+                // clamp above is skipped) or the dome is very tall, never let the eye climb more than a bounded
+                // vantage above/below the graph itself. Without this, a big-graph ESTABLISH pull-back sends the
+                // eye straight into the sky — the "start tour flies up very high" bug. Generous (2.5× the
+                // bounding radius) so it still frames the whole palace from above, just not from orbit.
+                {
+                    let br = crate::spatial::bounding_radius(&pos, cc).max(4.0);
+                    let ey = eye.y + py;
+                    let hi = cc.y + br * 2.5 + 6.0;
+                    let lo = cc.y - br * 2.5 - 6.0;
+                    if ey > hi { py += hi - ey; } else if ey < lo { py += lo - ey; }
+                }
                 // HARD OUTER BOUND: clamp the eye into the palace AABB (+margin) so bounded traversal holds even
                 // when the fly slips out a gate down a hall — it stops at the hall's end instead of sailing into
                 // open ocean (pass-63 overshoot). Bound = union of the node extent (so the eye can always reach
@@ -1999,7 +2266,12 @@ impl Chat {
         let mut proj: Vec<(usize, f32, f32, f32)> = Vec::with_capacity(n);
         for nd in &g.nodes {
             if let Some((sx, sy, depth)) = view_cam.project(pos[nd.id], cx, cy, scale) {
-                proj.push((nd.id, sx, sy, depth));
+                // GUARD: a node landing on/behind the camera plane (e.g. the tour's close push-in) can project to
+                // a non-finite depth; if it enters `proj` it poisons near/far/span via the fold, turning every
+                // depth-normalized colour factor into NaN → Color32 multiply panics ("tour breaks the render").
+                if sx.is_finite() && sy.is_finite() && depth.is_finite() {
+                    proj.push((nd.id, sx, sy, depth));
+                }
             }
         }
         proj.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
@@ -2055,13 +2327,29 @@ impl Chat {
                 let h = (theme::variant() as u32).wrapping_mul(0x9E3779B9) >> 25; // 0..127 from the variant
                 egui::Color32::from_rgb(0x3c + (h % 24) as u8, 0x96, 0xd8 + (h % 20) as u8)
             };
-            let cord_col = if beam { egui::Color32::from_rgb(0xb6, 0xee, 0xff) } else if name == "Canopy" { egui::Color32::from_rgb(0xd8, 0xe4, 0xe8) } else { edge_col };
+            let cord_col = if beam { egui::Color32::from_rgb(0xb6, 0xee, 0xff) } else if name == "Canopy" { egui::Color32::from_rgb(0xd8, 0xe4, 0xe8) } else if name == "Frozen Bifrost" { egui::Color32::from_rgb(0x9a, 0xb0, 0xe0) } else { edge_col };
             let mut graph: Vec<m3::Mesh3> = Vec::with_capacity(n * 2);
+            let tanim = text_anim_for(name); // per-scene text-animation idiom for all scene/UI labels
+            let sheen = slab_sheen(tanim, t); // per-scene light-play multiplier for physical UI slabs
+            let sun = m3::sun_dir_3d(); // world sun direction, for specular glints on physical slabs
+            // VOICE LIVE-INTENT HIGHLIGHT: while an utterance is being heard, parse the running PARTIAL — if it
+            // already resolves to an ACTIONABLE command (not plain dictation) we light up the mic (below), and
+            // for "go to N" we glow the target node, so the user sees what will happen before whisper finalizes.
+            // A debug env var lets the headless harness inject a partial for render verification.
+            let voice_partial = self.voice.as_ref().map(|v| v.partial().to_string())
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| std::env::var("LOGSCOPE_VOICE_PARTIAL").ok().filter(|s| !s.trim().is_empty()));
+            let (voice_actionable, voice_target): (bool, Option<usize>) = match voice_partial.as_deref().map(crate::voice_intent::parse) {
+                None | Some(crate::voice_intent::VoiceIntent::Dictate(_)) => (false, None),
+                Some(crate::voice_intent::VoiceIntent::Command(crate::vimmode::Command::Goto(n))) => (true, Some(n.saturating_sub(1))),
+                Some(_) => (true, None),
+            };
             for nd in &g.nodes {
                 if let Some(pid) = nd.parent {
                     let mut st = m3::with_mat(m3::strand(pos[pid], pos[nd.id], cord_r, 6, cord_seg, t, cord_amp, cord_col), strand_mat);
                     st.emissive = cord_glow;
                     if name == "Canopy" { m3::set_alpha(&mut st, 85); } // faint, see-through air
+                    if name == "Frozen Bifrost" { m3::set_alpha(&mut st, 74); st.emissive = 0.6; } // faint glowing constellation lines between stars
                     graph.push(st);
                 }
             }
@@ -2084,6 +2372,10 @@ impl Chat {
                     // smooth nacreous PEARLS (the cracked-gem node read as a foreign asset / wrong texture);
                     // node_mat = WATER → the nacre/thin-film shading gives the pearly sheen.
                     m3::with_mat(m3::uv_sphere(pos[nd.id], 0.27, 22, 14, col), node_mat)
+                } else if name == "Frozen Bifrost" {
+                    // ASGARD: each turn is a STAR in the sky off the world — a small bright emissive point (the
+                    // twinkle is applied to emissive below), rendered in the space void the scene sets up.
+                    m3::with_mat(m3::uv_sphere(pos[nd.id], 0.15, 10, 8, col), node_mat)
                 } else {
                     // Slate reads too uniform → vary the stone SIZE by the turn's weight (on top of the
                     // per-seed shape variation rock() already gives); other scenes keep a steady node size.
@@ -2096,16 +2388,51 @@ impl Chat {
                     let ph = nd.id as f32 * 1.7;
                     nm.offset = crate::spatial::Vec3::new(0.04 * (t * 0.30 + ph).sin(), 0.09 * (t * 0.24 + ph * 1.3).sin(), 0.04 * (t * 0.28 + ph * 0.7).cos());
                 }
-                nm.emissive = if rune { 0.40 + 0.10 * (t * 1.3 + nd.id as f32 * 0.5).sin() } else { pearl_glow }; // runes pulse faintly
+                nm.emissive = if rune { 0.40 + 0.10 * (t * 1.3 + nd.id as f32 * 0.5).sin() }
+                    else if name == "Frozen Bifrost" { 2.2 + 0.9 * (t * 2.0 + nd.id as f32 * 1.3).sin() } // stars twinkle
+                    else { pearl_glow };
                 if active { nm.emissive = 0.9 + 0.35 * (t * 1.6).sin(); }
+                let vhi = voice_target == Some(nd.id);
+                if vhi { nm.emissive = 1.0 + 0.5 * (t * 6.0).sin(); } // the node the user is asking for — pulse hot
                 graph.push(nm);
-                // Treehouse: a rope rising from each wood ball to the canopy overhead — the balls HANG.
+                if vhi {
+                    // a bright accent RING around the spoken-of node, so "go to twelve" visibly marks node 12 live
+                    let a = theme::accent();
+                    let mut ring = m3::with_mat(m3::torus(pos[nd.id], 0.44, 0.03, 20, 6, a), node_mat);
+                    ring.emissive = 1.4 + 0.6 * (t * 6.0).sin(); graph.push(ring);
+                }
+                // ASGARD: cross-shaped GLINT rays off each star, so the nodes read as sparkling points of light.
+                if name == "Frozen Bifrost" {
+                    let p = pos[nd.id];
+                    let gl = 0.34 + 0.12 * (t * 2.0 + nd.id as f32).sin();
+                    for (dx, dz) in [(gl, 0.0), (0.0, gl)] {
+                        let a = crate::spatial::Vec3::new(p.x - dx, p.y, p.z - dz);
+                        let b = crate::spatial::Vec3::new(p.x + dx, p.y, p.z + dz);
+                        let mut ray = m3::with_mat(m3::tube(a, b, 0.012, 3, col), node_mat);
+                        ray.emissive = 1.6; graph.push(ray);
+                    }
+                    // a faint vertical glint too (a 4-point star)
+                    let mut vray = m3::with_mat(m3::tube(crate::spatial::Vec3::new(p.x, p.y - gl, p.z), crate::spatial::Vec3::new(p.x, p.y + gl, p.z), 0.012, 3, col), node_mat);
+                    vray.emissive = 1.6; graph.push(vray);
+                }
+                // Treehouse: each wood ball HANGS from the overhead canopy — a sagging rope rising to a canopy
+                // anchor KNOT (varied height, so ropes reach real branch level), with a couple of splay web
+                // strands hooking the anchor into the surrounding foliage (not a stub ending in mid-air).
                 if treehouse {
                     let p = pos[nd.id];
-                    let top = crate::spatial::Vec3::new(p.x, p.y + 2.1, p.z);
-                    let mut rope = m3::with_mat(m3::tube(top, p, 0.022, 5, egui::Color32::from_rgb(0x46, 0x34, 0x20)), crate::texgen::mat::WOOD);
+                    let canopy_y = p.y + 3.4 + 0.6 * (nd.id as f32 * 1.7).sin();
+                    let anchor = crate::spatial::Vec3::new(p.x + 0.3 * (nd.id as f32).sin(), canopy_y, p.z + 0.3 * (nd.id as f32).cos());
+                    let rope_col = egui::Color32::from_rgb(0x46, 0x34, 0x20);
+                    let mut rope = m3::with_mat(m3::strand(anchor, p, 0.022, 4, 6, t, 0.10, rope_col), crate::texgen::mat::WOOD);
                     if active { rope.emissive = 0.2; }
                     graph.push(rope);
+                    let knot = m3::with_mat(m3::uv_sphere(anchor, 0.09, 6, 5, egui::Color32::from_rgb(0x3a, 0x2a, 0x18)), crate::texgen::mat::WOOD);
+                    graph.push(knot);
+                    for wi in 0..2 { // splay webs hooking the anchor into the canopy branches
+                        let wa = wi as f32 * std::f32::consts::PI + nd.id as f32;
+                        let out = crate::spatial::Vec3::new(anchor.x + wa.cos() * 0.9, anchor.y + 0.45, anchor.z + wa.sin() * 0.9);
+                        graph.push(m3::with_mat(m3::tube(anchor, out, 0.012, 3, rope_col), crate::texgen::mat::WOOD));
+                    }
                 }
             }
 
@@ -2155,7 +2482,7 @@ impl Chat {
                         let label: String = nd.preview.chars().take(16).collect();
                         if label.trim().is_empty() { continue; }
                         for cell in m3::label_cells(pos[q.0], right, up, toward_cam, label.trim(),
-                                                    0.034, t, theme::CYAN(), lit, scroll) {
+                                                    0.034, t, theme::CYAN(), lit, scroll, tanim) {
                             graph.push(cell);
                         }
                     }
@@ -2215,13 +2542,39 @@ impl Chat {
             if !self.backdrop {
                 use crate::spatial::Vec3 as V3;
                 // (panel rgb, material, emissive, alpha, text rgb, text-glow multiplier)
+                // scale a palette colour into an [u8;3] — used by the derived fallback below to tint the
+                // plaque/accent from the active palette rather than a fixed grey.
+                let scl = |c: egui::Color32, k: f32| -> [u8; 3] {
+                    [(c.r() as f32 * k).clamp(0.0, 255.0) as u8,
+                     (c.g() as f32 * k).clamp(0.0, 255.0) as u8,
+                     (c.b() as f32 * k).clamp(0.0, 255.0) as u8]
+                };
                 let (pc, pmat, pemis, palpha, tc, tglow): ([u8; 3], f32, f32, u8, [u8; 3], f32) = match name {
                     "Atlantis"     => ([0xe6, 0xec, 0xf2], crate::texgen::mat::WATER, 0.28, 118, [0x9c, 0xee, 0xff], 1.25),
                     "Canopy"       => ([0x86, 0xb8, 0x52], crate::texgen::mat::MOSS,  0.14, 122, [0xe8, 0xf6, 0x9a], 1.15), // backlit leaf glow
                     "Mistfall"     => ([0x46, 0x60, 0x78], crate::texgen::mat::STONE, 0.08, 158, [0x66, 0xc6, 0xff], 1.0),  // carved blue rune
                     "Archive"      => ([0xe6, 0xd8, 0xbc], crate::texgen::mat::PAPER, 0.04, 188, [0x4a, 0x32, 0x1c], 0.45), // ink on parchment
                     "Reading Room" => ([0xf0, 0xe8, 0xd6], crate::texgen::mat::PAPER, 0.04, 190, [0x2e, 0x24, 0x18], 0.42), // typewriter ink
-                    _               => ([0xc8, 0xd2, 0xe0], crate::texgen::mat::STONE, 0.12, 134, [0x9c, 0xc8, 0xff], 1.0),
+                    "Mansion Garden" => ([0xf0, 0xe6, 0xcc], crate::texgen::mat::STONE, 0.14, 150, [0xd8, 0xb4, 0x5c], 0.9), // cream marble + gold veins
+                    // Every OTHER world derives a coherent idiom from its active palette (material + warm
+                    // light + cool accent) instead of the old flat-grey quad, so the message panel and the
+                    // mic pearl read as belonging to the scene. Dark worlds glow their accent on a dim tinted
+                    // plaque; light worlds ink on a pale surface of their own warm light. This makes the
+                    // panel idiom — and thus the mic pearl derived from it — cover all scenes for free.
+                    _ => {
+                        let pal = theme::active();
+                        let (pmat, pemis, palpha) = match pal.material {
+                            theme::Material::Paper  => (crate::texgen::mat::PAPER, 0.04, 186),
+                            theme::Material::Wood   => (crate::texgen::mat::WOOD,  0.12, 150),
+                            theme::Material::Marble => (crate::texgen::mat::STONE, 0.16, 140),
+                            _                       => (crate::texgen::mat::STONE, 0.10, 138), // Stone / None
+                        };
+                        if pal.dark {
+                            (scl(pal.light, 0.30), pmat, pemis, palpha, [pal.cyan.r(), pal.cyan.g(), pal.cyan.b()], 1.0)
+                        } else {
+                            (scl(pal.light, 0.96), pmat, (pemis * 0.6).min(0.06), palpha.max(180), [pal.ink.r(), pal.ink.g(), pal.ink.b()], 0.5)
+                        }
+                    }
                 };
                 let (cyw, syw) = (view_cam.yaw.cos(), view_cam.yaw.sin());
                 let (cpt, spt) = (view_cam.pitch.cos(), view_cam.pitch.sin());
@@ -2233,6 +2586,28 @@ impl Chat {
                 let eye = V3::new(tg.x + toward.x * view_cam.dist, tg.y + toward.y * view_cam.dist, tg.z + toward.z * view_cam.dist);
                 let (d, drop) = (4.4_f32, -1.45_f32);
                 let cen = V3::new(eye.x + fwd.x * d + up.x * drop, eye.y + fwd.y * d + up.y * drop, eye.z + fwd.z * d + up.z * drop);
+                // WINDOW-SIZE AWARENESS: canvas dims + the local screen scale (px per world unit at `cen`'s
+                // depth), so the physical UI can be ANCHORED to screen regions and SIZED to canvas fractions
+                // (via `screen_to_world` / `ppw`) instead of fixed world offsets that drift off small windows.
+                let (win_w, win_h) = (rect.width(), rect.height());
+                let (ppw_x, ppw_y) = px_per_world(&view_cam, cen, right, up, cx, cy, scale);
+                let ppw = ppw_x.min(ppw_y).max(1.0);
+                let anchor = |ax: f32, ay: f32| screen_to_world(&view_cam, cen, right, up, cx, cy, scale, rect.left() + ax * win_w, rect.top() + ay * win_h);
+                // IN-SCENE PANEL BOX removed by default: the app is moving to a separate message box + text-entry
+                // box, so this third boxy plaque is redundant (and some of its layers weren't rendering cleanly).
+                // LOGSCOPE_PANEL=1 restores it. The MIC pearl (voice state) + node/voice highlights stay — they're
+                // not part of the box.
+                let draw_panel = std::env::var("LOGSCOPE_PANEL").ok().as_deref() == Some("1");
+                if draw_panel {
+                // DROP SHADOW — a larger, dark, soft quad set further back and offset down-right (as if lit
+                // from the upper-left), so the physical UI tablet casts a shadow and reads with real DEPTH
+                // instead of floating flat against the scene.
+                let scen = V3::new(cen.x + fwd.x * 0.16 + right.x * 0.10 - up.x * 0.10,
+                                   cen.y + fwd.y * 0.16 + right.y * 0.10 - up.y * 0.10,
+                                   cen.z + fwd.z * 0.16 + right.z * 0.10 - up.z * 0.10);
+                let mut shadow = m3::panel(scen, right, up, 4.55, 1.26, egui::Color32::from_rgb(0, 0, 0));
+                shadow.mat = crate::texgen::mat::STONE; shadow.emissive = 0.0; m3::set_alpha(&mut shadow, 96);
+                graph.push(shadow);
                 // bezel frame just BEHIND the plaque (darker shade of the panel, a touch more opaque) so the
                 // message entry reads as a physical tablet/plaque rather than a floating quad.
                 let bez = if name == "Atlantis" { egui::Color32::from_rgb(0x1c, 0x5c, 0x6a) } else { egui::Color32::from_rgb((pc[0] as f32 * 0.5) as u8, (pc[1] as f32 * 0.5) as u8, (pc[2] as f32 * 0.5) as u8) };
@@ -2241,21 +2616,46 @@ impl Chat {
                 frame.mat = pmat; frame.emissive = if name == "Atlantis" { 0.34 } else { pemis * 0.4 }; m3::set_alpha(&mut frame, (palpha as u16 + 50).min(255) as u8);
                 graph.push(frame);
                 // a thin glowing accent strip down the left edge, in the scene's text colour — a small UI cue.
+                // It flares to the theme ACCENT and pulses when the live voice partial is already an actionable
+                // command, so the physical panel itself signals "heard — this will do something".
                 let acen = V3::new(cen.x - right.x * 1.92, cen.y - right.y * 1.92, cen.z - right.z * 1.92);
-                let mut accent = m3::panel(acen, right, up, 0.08, 0.66, egui::Color32::from_rgb(tc[0], tc[1], tc[2]));
-                accent.mat = pmat; accent.emissive = 0.45 + pemis; m3::set_alpha(&mut accent, 224);
+                let (astrip_col, astrip_emis, astrip_alpha) = if voice_actionable {
+                    (theme::accent(), 0.9 + 0.5 * (t * 6.0).sin(), 255u8)
+                } else {
+                    (egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.45 + pemis, 224u8)
+                };
+                let mut accent = m3::panel(acen, right, up, 0.08, 0.66, astrip_col);
+                accent.mat = pmat; accent.emissive = astrip_emis; m3::set_alpha(&mut accent, astrip_alpha);
                 graph.push(accent);
                 let mut panel = m3::panel(cen, right, up, 4.0, 0.82, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
                 panel.mat = pmat; panel.emissive = pemis;
                 m3::set_alpha(&mut panel, palpha);
                 graph.push(panel);
+                // ACCESSIBILITY / INTERACTION OVERLAY — the message panel is a real 3D object; lay a transparent
+                // egui widget over its projected screen rect so the pointer (hover cursor) and screen-reader
+                // (AccessKit) both target the physical slab in the scene. Sense::hover so it never steals clicks
+                // from the scene behind it. This is the framework for bringing UI controls into the world as
+                // interactive 3D assets (project the slab → overlay an egui widget on its rect).
+                if let Some(prect) = project_slab_rect(&view_cam, cen, right, up, 4.0, 0.82, cx, cy, scale) {
+                    let ov = ui.interact(prect, egui::Id::new("scene_msg_panel"), egui::Sense::click())
+                        .on_hover_text("Message panel — click to type here, or speak into the pearl");
+                    if ov.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::Text); }
+                    // click the physical slab → focus the composer's text input, so the in-scene panel is a real
+                    // interactive control (the framework for moving the composer fully into the world).
+                    if ov.clicked() {
+                        ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new("logscope_chat_composer")));
+                    }
+                }
                 let typing = !self.input.trim().is_empty();
                 let shown: String = if typing {
                     let nch = self.input.chars().count();
                     self.input.chars().skip(nch.saturating_sub(20)).collect()
                 } else { "speak into the pearl".chars().take(20).collect() };
-                let lit = (if typing { 0.95_f32 } else { 0.34 }) * tglow;
-                let tcol = egui::Color32::from_rgb(tc[0], tc[1], tc[2]);
+                let mut lit = (if typing { 0.95_f32 } else { 0.34 }) * tglow;
+                let mut tcol = egui::Color32::from_rgb(tc[0], tc[1], tc[2]);
+                if name == "Frozen Bifrost" { // ASGARD: the panel text reads as a CONSTELLATION of starlight glyph-points
+                    tcol = egui::Color32::from_rgb(0xdc, 0xe6, 0xff); lit = lit.max(0.55) + 0.35;
+                }
                 // LEFT-ALIGN from a fixed left edge so every glyph sits in a STABLE pixel column as the prompt
                 // grows (label_cells centres on its origin, which would slide the text around as you type). Font
                 // is ~12% smaller than before so longer prompts fit. This is what sells "typing into the panel".
@@ -2265,7 +2665,7 @@ impl Chat {
                 let lx = 1.86_f32; // half the text field width (panel half is 2.0)
                 let bx = V3::new(cen.x - right.x * lx, cen.y - right.y * lx, cen.z - right.z * lx); // fixed left edge
                 let tcen = V3::new(bx.x + right.x * (tw * 0.5) + up.x * 0.06, bx.y + right.y * (tw * 0.5) + up.y * 0.06, bx.z + right.z * (tw * 0.5) + up.z * 0.06);
-                for cell in m3::label_cells(tcen, right, up, toward, shown.trim(), tscale, t, tcol, lit, 0.0) {
+                for cell in m3::label_cells(tcen, right, up, toward, shown.trim(), tscale, t, tcol, lit, 0.0, tanim) {
                     graph.push(cell);
                 }
                 // blinking caret at the end of the entry (the input "cursor"), so the selection point is visible.
@@ -2279,6 +2679,7 @@ impl Chat {
                         cm.emissive = 1.4 * tglow; graph.push(cm);
                     }
                 }
+                } // end draw_panel (in-scene panel box)
                 // MIC PEARL — a small marble-sheen orb beside the message panel, showing live voice state at a
                 // glance. Deliberately a DIFFERENT physical object from the flat resonance-cell text (a glossy
                 // stone/pearl bead rather than glyph cells), but its colour is DERIVED from the same per-scene
@@ -2296,14 +2697,49 @@ impl Chat {
                 let active = self.voice.as_ref().map(|v| !v.partial().is_empty()).unwrap_or(false) || debug.as_deref() == Some("active");
                 let mcen = V3::new(cen.x + right.x * 2.22 + fwd.x * 0.06, cen.y + up.y * 0.02 + fwd.y * 0.06, cen.z + right.z * 2.22 + fwd.z * 0.06);
                 let breathe = if active { (t * 3.4).sin() * 0.5 + 0.5 } else { (t * 1.1).sin() * 0.5 + 0.5 };
-                let r = 0.12 + (if active { 0.045 } else { 0.018 }) * breathe;
-                let shell = if armed {
+                // LOGSCOPE_MIC_PEARL_SCALE (default 1.0) enlarges the pearl for per-scene SHAPE verification —
+                // the ship bead is small (its shape reads as a silhouette/material cue), so this debug hook
+                // (paired with LOGSCOPE_MIC_PEARL_DEBUG) lets the headless harness show the gem/pearl/stone/bead
+                // geometry clearly across scenes without affecting the shipped size.
+                let mscale = std::env::var("LOGSCOPE_MIC_PEARL_SCALE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0).clamp(0.3, 12.0);
+                let r = (0.12 + (if active { 0.045 } else { 0.018 }) * breathe) * mscale;
+                let shell = if voice_actionable {
+                    theme::accent() // an actionable command is already recognized in the live partial → flash accent
+                } else if armed {
                     egui::Color32::from_rgb((pc[0] as u16 + 18).min(255) as u8, (pc[1] as u16 + 14).min(255) as u8, (pc[2] as u16 + 6).min(255) as u8)
                 } else { egui::Color32::from_rgb(0x6a, 0x6a, 0x70) }; // asleep: dim grey mote, no scene tint
-                let mut orb = m3::uv_sphere(mcen, r, 10, 8, shell);
-                orb.mat = if armed { pmat } else { crate::texgen::mat::STONE };
-                orb.emissive = if !armed { 0.06 } else if active { (0.55 + 0.85 * breathe) * tglow } else { (0.18 + 0.22 * breathe) * tglow };
+                // SHAPE is the scene's physical substance (a second derivative beyond colour) — it holds
+                // across all states, so an asleep gem still reads as a gem. A stable per-scene seed varies the
+                // gem facets / stone lumps between worlds. Colour/material/emissive still track the mic state.
+                let mshape = mic_shape(name, theme::active().material);
+                let mseed = name.bytes().fold(0x811C_9DC5u32, |a, b| (a ^ b as u32).wrapping_mul(0x0100_0193));
+                let mut orb = match mshape {
+                    MicShape::Gem   => m3::cracked_pearl(mcen, r, mseed, shell), // faceted iridescent crystal
+                    MicShape::Stone => m3::rock(mcen, r, mseed, shell),          // weathered / carved stone bead
+                    MicShape::Bead  => m3::uv_sphere(mcen, r, 7, 5, shell),      // chunky low-poly turned wood bead
+                    MicShape::Leaf  => m3::leaf_single(mcen, r * 1.35, mseed, shell), // backlit foliage leaf blade
+                    MicShape::Pearl => m3::uv_sphere(mcen, r, 10, 8, shell),     // smooth pearl / paper wafer
+                };
+                orb.mat = if !armed { crate::texgen::mat::STONE }
+                          else if mshape == MicShape::Leaf { crate::texgen::mat::MOSS } // leaf reads as translucent foliage
+                          else { pmat };
+                orb.emissive = if voice_actionable { (0.9 + 0.7 * breathe) * tglow } else if !armed { 0.06 } else if active { (0.55 + 0.85 * breathe) * tglow } else { (0.18 + 0.22 * breathe) * tglow };
                 graph.push(orb);
+                // SCENE-RELEVANT SETTING — the pearl sits IN something that belongs to the world (shell / gem
+                // cradle / rune plinth / wooden dish / dew stem), so the voice indicator reads as a placed
+                // asset, not a primitive floating in space. Dim + matte so the glowing orb still leads.
+                let shape_code = match mshape { MicShape::Pearl => 0, MicShape::Gem => 1, MicShape::Stone => 2, MicShape::Bead => 3, MicShape::Leaf => 4 };
+                for m in crate::scene3d::mic_setting(name, shape_code, mcen, r, right, up, fwd, mseed, egui::Color32::from_rgb(pc[0], pc[1], pc[2])) {
+                    graph.push(m);
+                }
+                // ACCESSIBILITY OVERLAY on the mic object — the second in-scene UI control exposed to pointer +
+                // screen-reader, labelled by voice state. Sense::hover so it never steals scene clicks; a click
+                // handler will toggle voice once that backend is wired.
+                if let Some(mrect) = project_slab_rect(&view_cam, mcen, right, up, r * 2.4, r * 2.4, cx, cy, scale) {
+                    let label = if active { "Voice mic — listening" } else if armed { "Voice mic — armed" } else { "Voice mic — off" };
+                    let mo = ui.interact(mrect, egui::Id::new("scene_mic_object"), egui::Sense::hover()).on_hover_text(label);
+                    if mo.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                }
                 if active {
                     // two tiny orbiting sparkle motes in the scene's accent colour — the pearl actively
                     // "catching" your voice, distinct from the steady breathing glow of just being armed.
@@ -2318,6 +2754,292 @@ impl Chat {
                         graph.push(mote);
                     }
                 }
+
+                // ── PHYSICAL CONTROL DOCK ────────────────────────────────────────────────────────
+                // Overview / Tour / Freecam as in-scene physical BUTTONS (real 3D objects you press),
+                // driven by the tested `physui` FSM. `dock_arc` lays them on a shallow arc below the
+                // pearl; `project_slab_rect` hit-tests each; `ControlAnim` eases the press/hover/lit
+                // feel; and each actuation drives the SAME action as the 2D toolbar (which stays — so
+                // nothing that works today breaks). LOGSCOPE_PHYS_DOCK=0 disables it (A/B + safety valve).
+                if !world_only
+                    && std::env::var("LOGSCOPE_PHYS_DOCK").map(|v| v != "0").unwrap_or(true)
+                {
+                    use crate::physui::Pointer;
+                    // Keep the physical toggles in step with state changed elsewhere (2D button, voice
+                    // command) BEFORE reading input, so a press starts from the true lit state.
+                    self.phys.set_active(DOCK_TOUR, self.fly_auto.is_some());
+                    self.phys.set_active(DOCK_FREECAM, self.freecam);
+
+                    // dt for the eased button feel (clamped so a long stall doesn't jump the ease).
+                    let now = std::time::Instant::now();
+                    let dt = self.phys_t.map(|p| (now - p).as_secs_f32()).unwrap_or(1.0 / 60.0).clamp(0.0, 0.1);
+                    self.phys_t = Some(now);
+
+                    // Lay the dock on a shallow arc just below the message pearl, curving toward the
+                    // viewer; billboarded slabs (right/up basis) so each button faces the camera. The
+                    // small downward offset keeps it a ledge beneath the pearl without dropping off the
+                    // bottom of the canvas (the panel origin already sits low-centre).
+                    let dock_c = anchor(0.5, 0.87); // bottom-centre, adapts to window size
+                    let dock_radius = (0.42 * win_w / ppw / 1.36).clamp(0.55, 1.7); // arc spans ~42% of width
+                    let ds = dock_radius / 0.95; // scale buttons with the arc
+                    let pos = crate::physui::dock_arc(
+                        DOCK_IDS.len(),
+                        [dock_c.x, dock_c.y, dock_c.z],
+                        [right.x, right.y, right.z],
+                        [toward.x, toward.y, toward.z], // arc bulges toward the user
+                        dock_radius, 1.5,
+                    );
+                    let (bw, bh) = (0.29_f32 * ds, 0.26_f32 * ds); // button slab size (world units)
+                    // Prunable churn (matches the 2D "Prune churn (N)" button): superseded turns not yet pruned.
+                    let sup = g.superseded();
+                    let prunable = sup.iter().filter(|id| !self.pruned.contains(id)).count();
+
+                    // Project each button to a screen rect (hit-test target + a11y overlay bounds).
+                    let mut rects: Vec<(usize, egui::Rect)> = Vec::with_capacity(DOCK_IDS.len());
+                    for (i, &id) in DOCK_IDS.iter().enumerate() {
+                        let bc = V3::new(pos[i][0], pos[i][1], pos[i][2]);
+                        if let Some(rct) = project_slab_rect(&view_cam, bc, right, up, bw * 1.2, bh * 1.5, cx, cy, scale) {
+                            rects.push((id, rct));
+                        }
+                    }
+
+                    // Drive the physui FSM from the raw pointer: which control is under the pointer, and
+                    // did the primary button go down / up this frame. Actuation happens on a release over
+                    // the SAME control the press started on (drag-off cancels) — the FSM enforces that;
+                    // here we just feed it. Raw pointer state, so it's independent of egui click routing.
+                    let ptr = ui.input(|i| i.pointer.interact_pos());
+                    let over = ptr.and_then(|pp| rects.iter().find(|(_, r)| r.contains(pp)).map(|(id, _)| *id));
+                    let (down, up_ev) = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_released()));
+                    let ev = if down { self.phys.on_pointer(Pointer::Down, over) }
+                             else if up_ev { self.phys.on_pointer(Pointer::Up, over) }
+                             else { self.phys.on_pointer(Pointer::Move, over) };
+
+                    // Route an actuation to the SAME field mutations as the 2D toolbar buttons.
+                    if let Some(act) = ev.and_then(dock_action) {
+                        // kick the actuation flash on the control that fired (so the press visibly *does* something)
+                        let fired = match ev { Some(crate::physui::ControlEvent::Fired(i)) | Some(crate::physui::ControlEvent::Toggled(i, _)) => Some(i), _ => None };
+                        if let Some(fid) = fired { if let Some(ix) = DOCK_IDS.iter().position(|&d| d == fid) { self.phys_anim[ix].kick_flash(); } }
+                        match act {
+                            DockAction::Overview => { self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; }
+                            DockAction::Tour(on) => {
+                                self.fly_auto = if on { Some(1.0) } else { None };
+                                if on { self.freecam = false; } else { self.spatial_auto = true; self.spatial_zoomed = false; }
+                            }
+                            DockAction::Freecam(on) => {
+                                self.freecam = on;
+                                if on { self.fly_auto = None; self.spatial_auto = false; self.spatial_zoomed = true; }
+                                else { self.spatial_auto = true; self.spatial_zoomed = false; }
+                            }
+                            DockAction::Prune => { for id in &sup { self.pruned.insert(*id); } } // no-op when nothing superseded
+                            DockAction::Unprune => { self.pruned.clear(); } // restore every pruned turn
+                        }
+                        ui.ctx().request_repaint();
+                    }
+                    // Re-sync the toggles so THIS frame's anim reads the just-applied lit state.
+                    self.phys.set_active(DOCK_TOUR, self.fly_auto.is_some());
+                    self.phys.set_active(DOCK_FREECAM, self.freecam);
+
+                    // Draw each button eased by its ControlAnim: hover brightens, press pushes the slab
+                    // IN (toward −toward, away from the eye), active lights it. Each face carries a short
+                    // glowing LABEL in its control colour (cyan Overview · amber Tour · green Freecam ·
+                    // rose Prune), so the dock reads without hovering. Prune dims when there's nothing to
+                    // prune. State-aware labels: TOUR↔STOP, FREE↔EXIT.
+                    let pip = [
+                        egui::Color32::from_rgb(0x7a, 0xe0, 0xff), // Overview — cyan
+                        egui::Color32::from_rgb(0xff, 0xc2, 0x6a), // Tour — amber
+                        egui::Color32::from_rgb(0x8e, 0xe6, 0x9a), // Freecam — green
+                        egui::Color32::from_rgb(0xff, 0x92, 0x9a), // Prune — rose
+                        egui::Color32::from_rgb(0xc9, 0xa8, 0xff), // Unprune — lavender
+                    ];
+                    let face = [
+                        "VIEW",
+                        if self.fly_auto.is_some() { "STOP" } else { "TOUR" },
+                        if self.freecam { "EXIT" } else { "FREE" },
+                        "PRUNE",
+                        "UNDO",
+                    ];
+                    let mut animating = false;
+                    for (i, &id) in DOCK_IDS.iter().enumerate() {
+                        let vis = self.phys.visual(id);
+                        self.phys_anim[i].tick(vis, dt);
+                        // DEBUG (headless verification of the tactile visuals): force control #i into a held
+                        // press + flash so a render shows the depression, flash ring, and label pop.
+                        if std::env::var("LOGSCOPE_PHYS_FORCE").ok().and_then(|s| s.trim().parse::<usize>().ok()) == Some(i) {
+                            self.phys_anim[i].press = 1.0; self.phys_anim[i].hover = 1.0;
+                            self.phys_anim[i].flash = self.phys_anim[i].flash.max(0.7);
+                        }
+                        let a = self.phys_anim[i];
+                        if a.flash > 0.002 || (a.press.abs() > 0.002 && !vis.pressed) || a.hover > 0.002 { animating = true; }
+                        // Prune enabled only when there's churn to drop; Unprune only when something is pruned.
+                        let enabled = match id {
+                            DOCK_PRUNE => prunable > 0,
+                            DOCK_UNPRUNE => !self.pruned.is_empty(),
+                            _ => true,
+                        };
+                        // springy press: pushes IN when pressed, pops slightly PROUD (press<0) on release.
+                        let push = a.press * 0.07;
+                        let bc = V3::new(pos[i][0] - toward.x * push, pos[i][1] - toward.y * push, pos[i][2] - toward.z * push);
+                        let base = egui::Color32::from_rgb(pc[0], pc[1], pc[2]);
+                        let mut btn = m3::panel(bc, right, up, bw, bh, base);
+                        btn.mat = pmat;
+                        let dim = if enabled { 1.0 } else { 0.4 };
+                        // emissive: base + hover + active + a bright ACTUATION FLASH burst
+                        btn.emissive = (0.12 + 0.55 * a.hover + 0.85 * a.active + 1.5 * a.flash) * tglow * dim * sheen;
+                        m3::set_alpha(&mut btn, if enabled { 220 } else { 150 });
+                        graph.push(btn); slab_glint(&mut graph, bc, right, up, toward, bw * 0.5, bh * 0.5, sun, tglow);
+                        // actuation flash RING — a thin frame that flares just outside the slab and fades, so a
+                        // press reads as a real event even at a glance.
+                        if a.flash > 0.02 {
+                            let g = 1.0 + 0.28 * a.flash; // expands as it fires
+                            let mut ring = m3::panel(bc, right, up, bw * g + 0.06, bh * g + 0.06, pip[i]);
+                            ring.mat = pmat;
+                            ring.emissive = 2.2 * a.flash * tglow.max(0.6);
+                            m3::set_alpha(&mut ring, (150.0 * a.flash) as u8);
+                            graph.push(ring);
+                        }
+                        // glowing face label, floated just proud of the slab. A change/press makes it POP
+                        // (scale + brightness) AND slide into place (scroll) via the flash, so text visibly
+                        // reacts — a TOUR→STOP swap reads as motion, not an instant flip.
+                        let lbl = face[i];
+                        let lscale = (bw * 0.86 / (lbl.len() as f32 * 6.0)).min(0.017) * (1.0 + 0.14 * a.flash);
+                        let lcen = V3::new(bc.x - toward.x * 0.30, bc.y - toward.y * 0.30, bc.z - toward.z * 0.30);
+                        let llit = if enabled { (0.55 + 0.5 * a.hover + 0.7 * a.active + 0.8 * a.flash).min(1.6) } else { 0.18 };
+                        for cell in m3::label_cells(lcen, right, up, toward, lbl, lscale, t, pip[i], llit, a.flash * 0.06, tanim) {
+                            graph.push(cell);
+                        }
+                    }
+                    if animating { ui.ctx().request_repaint(); }
+
+                    // Accessibility / interaction overlay: a transparent egui widget over each button's
+                    // projected rect gives the pointer (hand cursor) and screen-reader (AccessKit) a real
+                    // target, and — being added after the scene canvas — keeps a button press from also
+                    // orbiting the camera. Labels track the toggle state.
+                    for &id in DOCK_IDS.iter() {
+                        if let Some((_, rct)) = rects.iter().find(|(rid, _)| *rid == id) {
+                            let label = match id {
+                                DOCK_OVERVIEW => "Overview — recenter and fit the whole graph".to_string(),
+                                DOCK_TOUR => if self.fly_auto.is_some() { "Stop tour".into() } else { "Tour — fly through the palace".into() },
+                                DOCK_FREECAM => if self.freecam { "Exit freecam".into() } else { "Freecam — free-flight camera".into() },
+                                DOCK_PRUNE => if prunable > 0 { format!("Prune churn ({prunable}) — drop superseded turns to free context") } else { "Prune churn — nothing to prune".into() },
+                                DOCK_UNPRUNE => if !self.pruned.is_empty() { format!("Unprune — restore all {} pruned turns to context", self.pruned.len()) } else { "Unprune — nothing pruned".into() },
+                                _ => String::new(),
+                            };
+                            let resp = ui.interact(*rct, egui::Id::new(("scene_phys_ctrl", id)), egui::Sense::click())
+                                .on_hover_text(label);
+                            if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                        }
+                    }
+
+                    // ── PHYSICAL SETTINGS PANEL — the Context panel's sampling sliders as physical DIALS ──
+                    // A plaque on the left of the scene, one draggable dial per self.ctx param (temperature, ctx
+                    // window, reply budget, repeat penalty, min-p). Two-way bound: the handle tracks the live value
+                    // (so 2D edits reflect) and dragging writes back to self.ctx. (The old time dial is gone —
+                    // the scene tracks system time.) LOGSCOPE_PHYS_PARAMS=0 hides it.
+                    if std::env::var("LOGSCOPE_PHYS_PARAMS").map(|v| v != "0").unwrap_or(true) {
+                        let panel_c = anchor(0.15, 0.60); // lower-left corner, adapts to window size
+                        let plaque_w = (0.24 * win_w / ppw).clamp(0.9, 2.6);
+                        let ps = plaque_w / 1.42; // scale the tuned layout by the window-derived plaque width
+                        let back = |o: f32| V3::new(panel_c.x - toward.x * o, panel_c.y - toward.y * o, panel_c.z - toward.z * o);
+                        // backing plaque (set back so the sliders sit proud of it)
+                        let mut plaque = m3::panel(back(-0.06 * ps), right, up, 1.42 * ps, 1.60 * ps, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                        plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150);
+                        graph.push(plaque); slab_glint(&mut graph, back(-0.06 * ps), right, up, toward, 0.71 * ps, 0.80 * ps, sun, tglow);
+                        let title_c = V3::new(panel_c.x - toward.x * 0.30 + up.x * 0.66 * ps, panel_c.y - toward.y * 0.30 + up.y * 0.66 * ps, panel_c.z - toward.z * 0.30 + up.z * 0.66 * ps);
+                        for cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim) { graph.push(cell); }
+
+                        let (p_down, p_pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
+                        let p_pos = ui.input(|i| i.pointer.interact_pos());
+                        if !p_down { self.slider_drag = None; }
+                        let (tw, th) = (0.64_f32 * ps, 0.038_f32 * ps);
+                        for (row, &(id, label, lo, hi, isint)) in PARAM_DIALS.iter().enumerate() {
+                            let off = (0.42 - row as f32 * 0.26) * ps;
+                            let rc = V3::new(panel_c.x + up.x * off, panel_c.y + up.y * off, panel_c.z + up.z * off);
+                            let track_rect = project_slab_rect(&view_cam, rc, right, up, tw, th * 3.2, cx, cy, scale);
+                            if let Some(tr) = track_rect {
+                                if p_pressed && p_pos.map_or(false, |p| tr.contains(p)) { self.slider_drag = p_pos.map(|p| (id, p.x)); }
+                            }
+                            let dragging_this = matches!(self.slider_drag, Some((d, _)) if d == id);
+                            if dragging_this {
+                                if let (Some((_, last_x)), Some(p), Some(tr)) = (self.slider_drag, p_pos, track_rect) {
+                                    let dx = p.x - last_x;
+                                    if dx.abs() > 0.01 {
+                                        let frac = dx / tr.width().max(1.0);
+                                        if let Some(crate::physui::ControlEvent::Adjusted(_, v)) = self.phys.drag(id, frac) { ctx_set(&mut self.ctx, id, v); }
+                                        self.slider_drag = Some((id, p.x));
+                                        ui.ctx().request_repaint();
+                                    }
+                                }
+                            } else {
+                                // handle tracks the live value when not being dragged
+                                self.phys.set_value(id, ctx_get(&self.ctx, id));
+                            }
+                            let val = self.phys.value_of(id);
+                            let frac = ((val - lo) / (hi - lo)).clamp(0.0, 1.0);
+                            let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185);
+                            graph.push(trk);
+                            let hx = (frac - 0.5) * tw;
+                            let hc = V3::new(rc.x + right.x * hx, rc.y + right.y * hx, rc.z + right.z * hx);
+                            let mut handle = m3::uv_sphere(hc, th * 1.7, 8, 6, egui::Color32::from_rgb(0x8a, 0xe0, 0xff));
+                            handle.mat = pmat; handle.emissive = (0.5 + if dragging_this { 0.9 } else { 0.35 }) * tglow.max(0.6);
+                            graph.push(handle);
+                            // label to the left, value to the right (floated proud of the track)
+                            let lx = -(tw * 0.5 + 0.20 * ps);
+                            let lcen = V3::new(rc.x - toward.x * 0.30 + right.x * lx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * lx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * lx + up.z * 0.11 * ps);
+                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim) { graph.push(cell); }
+                            let vtxt = if isint { format!("{}", val.round() as i32) } else { format!("{val:.2}") };
+                            let vx = tw * 0.5 + 0.10 * ps;
+                            let vcen = V3::new(rc.x - toward.x * 0.30 + right.x * vx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * vx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * vx + up.z * 0.11 * ps);
+                            for cell in m3::label_cells(vcen, right, up, toward, &vtxt, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.72, 0.0, tanim) { graph.push(cell); }
+                            if let Some(tr) = track_rect {
+                                let hint = format!("{label}: {vtxt} — drag to change");
+                                let resp = ui.interact(tr, egui::Id::new(("scene_phys_param", id)), egui::Sense::click_and_drag()).on_hover_text(hint);
+                                if resp.hovered() || dragging_this { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+                            }
+                        }
+                    }
+                }
+
+                // ── MESSAGE READING BOX — the focused turn as a physical env-styled plaque ──────────
+                // Clicking a node focuses it; its turn text then reads as a real in-world plaque (bezel + shadow
+                // + slab + wrapped label_cells text) carrying the scene's palette/material/emissive — an object,
+                // not a 2D overlay. (LOGSCOPE_FOCUS=<n> forces a focus for headless checks.)
+                let focus = std::env::var("LOGSCOPE_FOCUS").ok().and_then(|s| s.trim().parse::<usize>().ok()).or(self.walk_focus);
+                if let Some(fid) = focus.filter(|i| *i < self.msgs.len()) {
+                    let (who, raw) = { let m = &self.msgs[fid]; (if m.role == Role::User { "you" } else { "assistant" }, m.text().to_string()) };
+                    let head = format!("{who} · turn {}/{}", fid + 1, n);
+                    let lines = wrap_label(&raw, 24, 4);
+                    let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
+                    let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
+                    let ph = (pw * 0.42).min(0.30 * win_h / ppw); // cap by height so it fits short windows
+                    let bscale = (pw / (24.0 * 6.0) * 0.90).clamp(0.006, 0.03); // body fits ~24 cols
+                    let hscale = bscale * 0.82;
+                    // drop shadow (offset down-right, set back) for real depth
+                    let scen = V3::new(rc.x + fwd.x * 0.16 + right.x * 0.10 - up.x * 0.10, rc.y + fwd.y * 0.16 + right.y * 0.10 - up.y * 0.10, rc.z + fwd.z * 0.16 + right.z * 0.10 - up.z * 0.10);
+                    let mut shadow = m3::panel(scen, right, up, pw + 0.5, ph + 0.4, egui::Color32::from_rgb(0, 0, 0));
+                    shadow.mat = crate::texgen::mat::STONE; shadow.emissive = 0.0; m3::set_alpha(&mut shadow, 96); graph.push(shadow);
+                    // bezel + slab in the scene palette/material
+                    let bez = egui::Color32::from_rgb((pc[0] as f32 * 0.5) as u8, (pc[1] as f32 * 0.5) as u8, (pc[2] as f32 * 0.5) as u8);
+                    let fcen = V3::new(rc.x + fwd.x * 0.05, rc.y + fwd.y * 0.05, rc.z + fwd.z * 0.05);
+                    let mut frame = m3::panel(fcen, right, up, pw + 0.28, ph + 0.24, bez); frame.mat = pmat; frame.emissive = pemis * 0.4; m3::set_alpha(&mut frame, (palpha as u16 + 50).min(255) as u8); graph.push(frame);
+                    let mut slab = m3::panel(rc, right, up, pw, ph, egui::Color32::from_rgb(pc[0], pc[1], pc[2])); slab.mat = pmat; slab.emissive = pemis * sheen; m3::set_alpha(&mut slab, palpha); graph.push(slab); slab_glint(&mut graph, rc, right, up, toward, pw * 0.5, ph * 0.5, sun, tglow);
+                    // left-edge origin: label_cells centres on its origin, so offset each line by +half its width
+                    let left_edge = pw * 0.5 - pw * 0.06;
+                    let mut put_line = |g: &mut Vec<crate::mesh3d::Mesh3>, text: &str, y: f32, scale: f32, col: egui::Color32, lit: f32| {
+                        let w = text.chars().count() as f32 * 6.0 * scale;
+                        let o = V3::new(rc.x - toward.x * 0.30 - right.x * left_edge + right.x * (w * 0.5) + up.x * y,
+                                        rc.y - toward.y * 0.30 - right.y * left_edge + right.y * (w * 0.5) + up.y * y,
+                                        rc.z - toward.z * 0.30 - right.z * left_edge + right.z * (w * 0.5) + up.z * y);
+                        for cell in m3::label_cells(o, right, up, toward, text, scale, t, col, lit, 0.0, tanim) { g.push(cell); }
+                    };
+                    put_line(&mut graph, &head, ph * 0.5 - ph * 0.13, hscale, egui::Color32::from_rgb(0xff, 0xc2, 0x6a), 0.85);
+                    for (li, line) in lines.iter().enumerate() {
+                        put_line(&mut graph, line, ph * 0.5 - ph * 0.38 - li as f32 * ph * 0.17, bscale, egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.85 * tglow.max(0.5));
+                    }
+                    if let Some(pr) = project_slab_rect(&view_cam, rc, right, up, pw, ph, cx, cy, scale) {
+                        ui.interact(pr, egui::Id::new("scene_reader"), egui::Sense::hover()).on_hover_text(format!("{head}: {}", raw.chars().take(160).collect::<String>()));
+                    }
+                }
             }
 
             // CPU path (default): software-shaded triangles into egui's painter.
@@ -2330,7 +3052,7 @@ impl Chat {
             // pixel-aligned with the dots/runes because the camera matrix reproduces OrbitCam::project.
             #[cfg(feature = "gpu-scene")]
             {
-                let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, 0.1, 400.0);
+                let cam = crate::gpuscene::Camera::from_orbit(&view_cam, rect.width(), rect.height(), scale, 0.3, 400.0);
                 let mut verts = Vec::new();
                 // dynamic-LOD screen-size threshold (NDC) for SCENERY: drop meshes too small to read; more
                 // aggressive under battery-saver POWER; tunable via LOGSCOPE_LOD, off via LOGSCOPE_NO_LOD=1.
@@ -2358,7 +3080,7 @@ impl Chat {
                 let (tod_strength, tod_warm, tod_amb) = m3::sun_clock();
                 let tod_target = if tod_warm >= 0.0 { egui::Color32::from_rgb(255, 210, 150) } else { egui::Color32::from_rgb(150, 180, 255) };
                 let sun_tod = theme::lerp_col(sun_graded, tod_target, tod_warm.abs() * 0.8);
-                let caustic = match name { "Atlantis" => 0.5, "Mistfall" => 0.22, _ => 0.0 };
+                let caustic = match name { "Atlantis" => 0.32, "Mistfall" => 0.2, _ => 0.0 };
                 let aquatic = name == "Atlantis";
                 let sun_uv = if aquatic { [0.5, 0.10] } else { sun_uv }; // shafts pour down from the oculus overhead
                 let (gr_amt, gr_w, gr_dec) = if aquatic { (0.9_f32, 0.52_f32, 0.95_f32) } else { (0.6, 0.45, 0.92) };
@@ -2401,11 +3123,12 @@ impl Chat {
                     sky: c3(light.sky), ground: c3(light.ground), ambient: light.ambient * gambm * tod_amb,
                     fog_col: c3(theme::active().bg), fog, sun_uv, time: t,
                     exposure: gexp * lexp * (if aquatic { 1.12 } else { 1.0 }) * (0.55 + 0.48 * tod_strength)
+                        * match name { "Recursive Citadel" => 0.84, "Reading Room" => 0.9, "Folding@home" => 0.86, _ => 1.0 } // trim the over-bright worlds
                         * std::env::var("LOGSCOPE_EXP").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     saturation: std::env::var("LOGSCOPE_SAT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.18),
                     shoulder: std::env::var("LOGSCOPE_SHOULDER").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out)
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.5, "Mansion Garden" => 0.26, _ => 1.0 }, texscale: dtexscale, bump: dbump,
+                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, _ => 1.0 }, texscale: dtexscale, bump: dbump,
                     caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
@@ -2583,15 +3306,21 @@ impl Chat {
             }
         }
 
-        // focused-node preview strip with prune/restore for that turn (skipped when used as a backdrop)
+        // focused-node preview strip with prune/restore for that turn (skipped when used as a backdrop).
+        // Floated as translucent glass anchored to the bottom of the scene — reserves no layout space.
         if !self.backdrop {
-        ui.add_space(4.0);
-        if let Some(id) = self.walk_focus.filter(|i| *i < self.msgs.len()) {
-            let (who, text) = { let m = &self.msgs[id]; (if m.role == Role::User { "you" } else { "assistant" }, m.text().chars().take(280).collect::<String>()) };
-            let prn = self.pruned.contains(&id);
-            egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                stroke: egui::Stroke::new(1.0, theme::AMBER()), ..Default::default() }
-            .show(ui, |ui| {
+        let panel_w = ui.max_rect().width();
+        egui::Area::new(egui::Id::new("scene_bottom_chrome"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, -8.0))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+            ui.set_max_width((panel_w - 16.0).max(160.0));
+            glass_frame().show(ui, |ui| {
+            if let Some(id) = self.walk_focus.filter(|i| *i < self.msgs.len()) {
+                // The turn TEXT now reads on the physical plaque in the scene; this glass strip is just the
+                // per-turn action bar (prune / restore / branch) for the focused node.
+                let who = if self.msgs[id].role == Role::User { "you" } else { "assistant" };
+                let prn = self.pruned.contains(&id);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("{who} · turn {}/{}", id + 1, n)).color(theme::AMBER()).small().strong());
                     if prn {
@@ -2607,14 +3336,10 @@ impl Chat {
                         self.branch_from = Some(id); ui.ctx().request_repaint();
                     }
                 });
-                // the message as a real, scrollable box (was clipped to the first line by the old thin strip)
-                egui::ScrollArea::vertical().id_salt("focus_msg").max_height(64.0).show(ui, |ui| {
-                    ui.label(RichText::new(text).color(if prn { theme::DIM() } else { theme::INK() }).small());
-                });
-            });
-        } else {
-            ui.label(RichText::new("Click a node to read its turn here. ⊹ Overview reframes; ✂ prunes to free context.").color(theme::FAINT()).small());
-        }
+            } else {
+                ui.label(RichText::new("Click a node to read its turn here. ⊹ Overview reframes; ✂ prunes to free context.").color(theme::FAINT()).small());
+            }
+            }); });
         }
     }
 
@@ -3371,6 +4096,29 @@ impl Chat {
         }
     }
 
+    /// AUTO-VERIFY: when a reply finishes producing Rust files, compile-check them automatically (offline
+    /// `cargo check` in an isolated /tmp mirror) instead of waiting for a manual "Verify build" click — so a
+    /// weak model that emits code that won't compile (bad `rand` call, i32-sorted-by-f64) is caught right
+    /// away and the verdict is surfaced up top. No-op for non-Rust replies or while a check is already running.
+    fn auto_verify_after_reply(&mut self, idx: usize) {
+        if self.verify_job.as_ref().map(|j| j.result.is_none()).unwrap_or(false) { return; } // one already running
+        let Some(m) = self.msgs.get(idx) else { return };
+        if m.role != Role::Assistant { return; }
+        let files: Vec<(String, String)> = crate::workspace::parse_artifacts(&m.text())
+            .into_iter().filter(|a| a.path.ends_with(".rs")).map(|a| (a.path, a.content)).collect();
+        if files.is_empty() { return; } // nothing compilable to judge
+        let allow_net = self.verify_net;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = std::env::temp_dir().join("logscope-verify-ui");
+        std::thread::spawn(move || {
+            let r = crate::sandbox::verify_files("generated", &files, &root, allow_net)
+                .map(|r| (r.passed, r.output, r.sandboxed))
+                .unwrap_or_else(|e| (false, format!("verify error: {e}"), false));
+            let _ = tx.send(r);
+        });
+        self.verify_job = Some(VerifyJob { rx, started: Instant::now(), result: None });
+    }
+
     /// Pump the live mic session once per frame: capture → whisper → finalized utterances / barge-in.
     /// Runs in both the linear and spatial views. Utterances route through `on_voice_utterance` (the single
     /// seam future voice features extend); a barge-in reaction while the model streams cancels generation.
@@ -3421,6 +4169,7 @@ impl Chat {
                 self.fly_auto = None; self.freecam = false;
                 self.cam_pan_t0 = None; self.cam_pan_path.clear();
                 self.cam_drift = Some(dir);
+                self.walk_ramp = 0.0;        // ease-in fresh each time a walk starts
                 self.spatial_auto = false; self.spatial_zoomed = true;
             }
             VoiceIntent::Tour(on) => {
@@ -3465,9 +4214,13 @@ impl Chat {
             if let Some(s) = &self.stream {
                 let secs = s.started.elapsed().as_secs_f32().max(0.001);
                 let toks = s.tokens;
-                theme::pulse_dot(ui, theme::AMBER());
+                theme::pulse_dot(ui, if toks == 0 { theme::CYAN() } else { theme::AMBER() });
                 let debug = std::env::var("LOGSCOPE_DEBUG").is_ok();
-                if debug {
+                if toks == 0 {
+                    // prefill: the model is reading the prompt, no tokens yet (this is the slow part on big prompts)
+                    ui.label(RichText::new(format!("thinking… ({:.0}s)", secs)).color(theme::CYAN()).small())
+                        .on_hover_text("prefilling the prompt — the reply starts once this finishes");
+                } else if debug {
                     ui.label(RichText::new(format!("{toks} tok · {:.1} tok/s", toks as f32 / secs)).color(theme::AMBER()).small());
                 } else if let Some(pred) = crate::estimate::predict(&self.gen_samples, self.last_prompt_tokens, 0.35) {
                     let pct = (crate::estimate::progress(toks, &pred) * 100.0).round() as u32;
@@ -3487,6 +4240,20 @@ impl Chat {
                     ui.label(RichText::new(format!("· {t} tok · {:.1} tok/s", t as f32 / secs.max(0.001))).color(theme::FAINT()).small());
                 } else {
                     ui.label(RichText::new(format!("· {t} tokens")).color(theme::FAINT()).small());
+                }
+                // auto-verify verdict of the just-generated Rust, surfaced HERE (not just the buried Files
+                // panel) so it's obvious the model's code was actually build-checked.
+                if let Some(job) = &self.verify_job {
+                    match &job.result {
+                        None => { theme::chip(ui, "⌗ checking build…", theme::AMBER()); }
+                        Some((passed, output, _)) => match crate::sandbox::classify(*passed, output) {
+                            crate::sandbox::Verdict::Pass => theme::chip(ui, "✓ build ok", theme::GREEN()),
+                            crate::sandbox::Verdict::CompileError => theme::chip(ui, "✗ build failed", theme::RED()),
+                            crate::sandbox::Verdict::TestFailure => theme::chip(ui, "✗ tests failed", theme::RED()),
+                            crate::sandbox::Verdict::DepsUnavailable => theme::chip(ui, "⚠ deps not cached", theme::AMBER()),
+                            crate::sandbox::Verdict::ToolError => theme::chip(ui, "⚠ verify error", theme::AMBER()),
+                        },
+                    }
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -3774,6 +4541,7 @@ impl Chat {
                                             let (txt, col, note) = match crate::sandbox::classify(*passed, output) {
                                                 crate::sandbox::Verdict::Pass => ("✓ compiles", theme::GREEN(), ""),
                                                 crate::sandbox::Verdict::CompileError => ("✗ build failed", theme::RED(), ""),
+                                                crate::sandbox::Verdict::TestFailure => ("✗ tests failed", theme::RED(), "it compiled, but a test assertion failed — see the output below"),
                                                 crate::sandbox::Verdict::DepsUnavailable => ("⚠ dependencies not cached", theme::AMBER(), "ran offline; tick 'fetch deps' to resolve from crates.io once (the code itself wasn't judged)"),
                                                 crate::sandbox::Verdict::ToolError => ("⚠ verify error", theme::AMBER(), ""),
                                             };
@@ -4125,8 +4893,16 @@ impl Chat {
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if streaming {
-                            theme::spinner(ui, 16.0, theme::AMBER());
+                            // PHASE on the button: prefill (reading the prompt — the long silent gap before
+                            // any token) reads as "thinking"; once tokens flow it's "drafting" the reply.
+                            let (phase, pcol) = match self.stream.as_ref() {
+                                Some(s) if s.tokens == 0 => ("✦ thinking", theme::CYAN()),
+                                _ => ("✍ drafting", theme::AMBER()),
+                            };
+                            theme::spinner(ui, 16.0, pcol);
                             if theme::action_button(ui, "⏹ Stop", theme::RED(), true).clicked() { infer.cancel(); }
+                            ui.label(RichText::new(phase).color(pcol).small())
+                                .on_hover_text(if pcol == theme::CYAN() { "prefilling the prompt (no tokens yet)" } else { "decoding the reply" });
                             let can = !self.input.trim().is_empty();
                             if theme::action_button(ui, "↪ Queue", theme::CYAN(), can)
                                 .on_hover_text("Fire this as a branch when the current reply finishes — no need to stop the model").clicked() { do_send = true; }
@@ -4320,6 +5096,134 @@ impl Chat {
 mod tests {
     use super::*;
     use crate::analysis::Doc;
+
+    #[test]
+    fn project_slab_rect_maps_a_facing_slab_around_screen_centre() {
+        use crate::spatial::{OrbitCam, Vec3};
+        let cam = OrbitCam::default();
+        let (cx, cy, scale) = (640.0_f32, 400.0_f32, 600.0_f32);
+        // a 2×2 slab AT the camera target, spanned by the world x/y axes → its centre projects to the screen
+        // centre, so the bounding rect must straddle (cx,cy) and have positive area.
+        let r = project_slab_rect(&cam, cam.target, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0),
+                                  2.0, 2.0, cx, cy, scale)
+            .expect("a slab at the target is in front of the camera");
+        assert!(r.width() > 0.0 && r.height() > 0.0, "positive-area rect: {r:?}");
+        assert!(r.contains(egui::pos2(cx, cy)), "rect straddles screen centre: {r:?}");
+        // a wider slab projects to a wider rect (monotonic in world size).
+        let r2 = project_slab_rect(&cam, cam.target, Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0),
+                                   4.0, 2.0, cx, cy, scale).unwrap();
+        assert!(r2.width() > r.width(), "wider slab → wider rect ({} vs {})", r2.width(), r.width());
+    }
+
+    #[test]
+    fn phys_dock_press_release_maps_to_the_camera_action() {
+        use crate::physui::{ControlEvent, Pointer};
+        let mut p = phys_dock();
+        // a full press→release over Overview actuates it → the recenter action.
+        p.on_pointer(Pointer::Down, Some(DOCK_OVERVIEW));
+        let ev = p.on_pointer(Pointer::Up, Some(DOCK_OVERVIEW)).expect("overview fires");
+        assert_eq!(dock_action(ev), Some(DockAction::Overview));
+        // Tour is a toggle: first press → on, second → off, each mapping through.
+        p.on_pointer(Pointer::Down, Some(DOCK_TOUR));
+        let on = p.on_pointer(Pointer::Up, Some(DOCK_TOUR)).unwrap();
+        assert_eq!(dock_action(on), Some(DockAction::Tour(true)));
+        p.on_pointer(Pointer::Down, Some(DOCK_TOUR));
+        let off = p.on_pointer(Pointer::Up, Some(DOCK_TOUR)).unwrap();
+        assert_eq!(dock_action(off), Some(DockAction::Tour(false)));
+        // Freecam toggles the same way.
+        p.on_pointer(Pointer::Down, Some(DOCK_FREECAM));
+        let fc = p.on_pointer(Pointer::Up, Some(DOCK_FREECAM)).unwrap();
+        assert_eq!(dock_action(fc), Some(DockAction::Freecam(true)));
+        // Prune is momentary → fires once per press→release.
+        p.on_pointer(Pointer::Down, Some(DOCK_PRUNE));
+        let pr = p.on_pointer(Pointer::Up, Some(DOCK_PRUNE)).expect("prune fires");
+        assert_eq!(dock_action(pr), Some(DockAction::Prune));
+        // Unprune (ported from the old 2D toolbar) is momentary too.
+        p.on_pointer(Pointer::Down, Some(DOCK_UNPRUNE));
+        let un = p.on_pointer(Pointer::Up, Some(DOCK_UNPRUNE)).expect("unprune fires");
+        assert_eq!(dock_action(un), Some(DockAction::Unprune));
+        // the dock registers exactly the five named controls.
+        assert_eq!(DOCK_IDS.len(), 5);
+        // external sync keeps the physical toggle consistent with app state set elsewhere.
+        p.set_active(DOCK_TOUR, true);
+        assert!(p.is_active(DOCK_TOUR), "set_active lights the physical Tour toggle");
+        // events that aren't a dock control are ignored by the mapping.
+        assert_eq!(dock_action(ControlEvent::Fired(9999)), None);
+        assert_eq!(dock_action(ControlEvent::Adjusted(DOCK_TOUR, 0.5)), None);
+    }
+
+    #[test]
+    fn wrap_label_wraps_splits_and_truncates() {
+        // short text → one line, untouched
+        assert_eq!(wrap_label("hello there", 20, 3), vec!["hello there"]);
+        // wraps on whitespace within the column budget
+        let w = wrap_label("the quick brown fox jumps", 10, 3);
+        assert!(w.iter().all(|l| l.chars().count() <= 10), "each line within cols: {w:?}");
+        assert_eq!(w[0], "the quick");
+        // collapses newlines/extra spaces
+        assert_eq!(wrap_label("a\n\n  b", 20, 2), vec!["a b"]);
+        // hard-splits an over-long word
+        let hw = wrap_label("supercalifragilistic", 6, 5);
+        assert_eq!(hw[0], "superc");
+        // truncation marks the last line with …
+        let t = wrap_label("one two three four five six seven eight", 8, 2);
+        assert_eq!(t.len(), 2);
+        assert!(t[1].ends_with('…'), "truncated last line ends with …: {t:?}");
+    }
+
+    #[test]
+    fn settings_dials_drag_within_range_and_bind_to_ctx() {
+        use crate::physui::ControlEvent;
+        let mut p = phys_dock();
+        // temperature dial: 0..1.5, starts at the Ctx default; drag +0.5 of range → +0.75
+        p.set_value(PARAM_TEMP, 0.0);
+        match p.drag(PARAM_TEMP, 0.5) {
+            Some(ControlEvent::Adjusted(id, v)) => { assert_eq!(id, PARAM_TEMP); assert!((v - 0.75).abs() < 1e-3, "0.0 +0.5·1.5 = 0.75, got {v}"); }
+            other => panic!("expected Adjusted, got {other:?}"),
+        }
+        // clamps at the range ends
+        p.drag(PARAM_TEMP, 5.0);
+        assert!((p.value_of(PARAM_TEMP) - 1.5).abs() < 1e-3, "clamps at max 1.5");
+        // ctx_get / ctx_set round-trip, with integer params rounded
+        let mut c = Ctx::default();
+        ctx_set(&mut c, PARAM_NCTX, 8000.4);
+        assert_eq!(c.n_ctx, 8000, "ctx window written + rounded");
+        assert!((ctx_get(&c, PARAM_NCTX) - 8000.0).abs() < 1e-3);
+        ctx_set(&mut c, PARAM_TEMP, 0.9);
+        assert!((c.temperature - 0.9).abs() < 1e-6, "temperature written");
+        // every registered param dial reads back its range end after a big drag
+        for &(id, _, _lo, hi, _) in &PARAM_DIALS {
+            p.drag(id, 9.0);
+            assert!((p.value_of(id) - hi).abs() < 1e-3, "dial {id} clamps at its max {hi}");
+        }
+    }
+
+    #[test]
+    fn mic_shape_is_a_coherent_per_scene_derivative() {
+        use crate::theme::Material::*;
+        // crystalline worlds → faceted gem (the pass-67 second axis), regardless of their stone material.
+        for s in ["Fractal Spires", "Recursive Citadel", "Frozen Bifrost"] {
+            assert_eq!(mic_shape(s, Stone), MicShape::Gem, "{s} is crystalline");
+        }
+        // foliage worlds → a leaf (signature object), even though their palette material is wood.
+        for s in ["Forest", "Canopy", "Treehouse", "Hollow Jungle"] {
+            assert_eq!(mic_shape(s, Wood), MicShape::Leaf, "{s} is foliage");
+        }
+        // watery / airy worlds → smooth pearl; cave/mist → stone.
+        for s in ["Atlantis", "Cloudscape"] {
+            assert_eq!(mic_shape(s, Stone), MicShape::Pearl, "{s} is watery/airy");
+        }
+        assert_eq!(mic_shape("Mistfall", Stone), MicShape::Stone, "Mistfall is cave/rune stone");
+        // otherwise the shape follows the physical material.
+        assert_eq!(mic_shape("Old Library", Wood), MicShape::Bead, "wood → turned bead");
+        assert_eq!(mic_shape("Slate", Stone), MicShape::Stone, "stone → weathered bead");
+        assert_eq!(mic_shape("Mansion Garden", Marble), MicShape::Stone, "marble → carved bead");
+        assert_eq!(mic_shape("Reading Room", Paper), MicShape::Pearl, "paper → wafer/pearl");
+        // and every registered palette resolves to some shape (no scene falls through to a panic/None).
+        for p in crate::theme::PALETTES {
+            let _ = mic_shape(p.name, p.material); // total over the real scene set
+        }
+    }
 
     #[test]
     fn color_salience_rises_with_use_and_is_zero_without() {

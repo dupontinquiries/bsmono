@@ -12,15 +12,17 @@ pub mod shorten;
 #[cfg(feature = "convo")]
 pub mod conversation_db;
 pub mod model_selector;
-pub mod autonomy;
 pub mod providers;
 pub mod llm_backend;
 #[cfg(feature = "bloc")]
 pub mod bloc_engine;
 #[allow(dead_code)] pub mod specdecode;
 #[allow(dead_code)] pub mod multimodal;
+pub mod markdown_core;
 #[allow(dead_code)] pub mod batching;
 #[allow(dead_code)] pub mod kvcache;
+#[allow(dead_code)] pub mod deploy;
+#[allow(dead_code)] pub mod memplan;
 #[allow(dead_code)] pub mod arch;
 #[allow(dead_code)] pub mod gemmplan;
 #[allow(dead_code)] pub mod dedup;

@@ -90,6 +90,120 @@ pub fn model_combo(ui: &mut egui::Ui, st: &mut ModelState, id: &str, scanning: b
     });
 }
 
+/// What the folder popup reports back so the caller can act (browse / rescan) without this owning that state.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+pub struct FolderPopupResult { pub browse: bool, pub scan: bool }
+
+/// The model-folder configuration, tucked into a popup button (📁) beside the picker instead of eating a
+/// whole header row. Edits `models_dir` in place; returns which button (if any) was pressed. `native` is the
+/// system-file-picker toggle, mutated in place.
+pub fn folder_popup(ui: &mut egui::Ui, models_dir: &mut String, native: &mut bool, native_label: &str) -> FolderPopupResult {
+    let mut out = FolderPopupResult::default();
+    let btn = ui.button("📁").on_hover_text("Models folder settings");
+    let pid = ui.make_persistent_id("folder_popup");
+    if btn.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+    // CloseOnClickOutside so the text field / checkbox / buttons INSIDE work without dismissing the popup
+    // (menu_button closed on every click — that was the "can't interact" bug).
+    egui::popup_below_widget(ui, pid, &btn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+        ui.set_min_width(340.0);
+        ui.label(RichText::new("models folder").color(theme::DIM()).small());
+        ui.add(egui::TextEdit::singleline(models_dir)
+            .font(egui::TextStyle::Monospace).desired_width(320.0)
+            .hint_text("dir to walk for .gguf (recurses, incl. HF cache)"));
+        ui.horizontal(|ui| {
+            if ui.button("📂 Browse…").clicked() { out.browse = true; }
+            if ui.button("Scan").clicked() { out.scan = true; }
+        });
+        ui.separator();
+        ui.checkbox(native, RichText::new("system file picker").small())
+            .on_hover_text(format!("Use the desktop's own file dialog — detected: {native_label}.\nUncheck for the built-in picker on headless sessions."));
+    });
+    out
+}
+
+/// Replaces the single-select dropdown with a multi-model DEPLOYMENT picker: every available model is a TILE
+/// you check to include, then assign a role (Target/Draft/Delegate/Embed) + device, ordered by priority. This
+/// is the backing UI for tree/spec work (a Target verifies a smaller Draft) across devices. Mutates `dep` in
+/// place; returns true if the plan changed this frame. Renders inline (host it in a popup/panel).
+pub fn deployment_tiles(ui: &mut egui::Ui, dep: &mut logscope::deploy::Deployment, available: &[String], est_bytes: &dyn Fn(&str) -> u64) -> bool {
+    use logscope::deploy::{Role, Slot, DeviceId};
+    let mut changed = false;
+    let roles = [Role::Target, Role::Draft, Role::Delegate, Role::Embed, Role::Image, Role::Voice];
+    let role_name = |r: Role| r.label();
+    let devices: Vec<(DeviceId, String)> = dep.devices.iter().map(|d| (d.id, d.name.clone())).collect();
+
+    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+        for name in available.iter() {
+            let slot_idx = dep.slots.iter().position(|s| &s.model == name);
+            let mut enabled = slot_idx.map(|j| dep.slots[j].enabled).unwrap_or(false);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    // the check tile: include this model in the deployment
+                    if ui.checkbox(&mut enabled, "").changed() {
+                        changed = true;
+                        match slot_idx {
+                            Some(j) => dep.slots[j].enabled = enabled,
+                            None if enabled => dep.add(Slot {
+                                model: name.clone(),
+                                role: if dep.slots.iter().all(|s| s.role != Role::Target) { Role::Target } else { Role::Draft },
+                                device: devices.first().map(|d| d.0).unwrap_or(DeviceId(0)),
+                                priority: dep.slots.len() as u32,
+                                enabled: true,
+                                est_bytes: est_bytes(name),
+                            }),
+                            None => {}
+                        }
+                    }
+                    ui.label(RichText::new(name).color(theme::INK()).monospace());
+                    // role + device selectors only matter once the tile is on. Inline selectable CHIPS, not
+                    // ComboBoxes — a nested combo opens its own popup layer, which the parent popup reads as a
+                    // click-outside and closes (the "role dropdown cancels the menu" bug).
+                    if let Some(j) = dep.slots.iter().position(|s| &s.model == name) {
+                        if dep.slots[j].enabled {
+                            let mut role = dep.slots[j].role;
+                            ui.separator();
+                            for r in roles {
+                                if ui.selectable_label(role == r, RichText::new(role_name(r)).small()).clicked() { role = r; changed = true; }
+                            }
+                            dep.slots[j].role = role;
+                            if devices.len() > 1 {
+                                let mut dev = dep.slots[j].device;
+                                ui.separator();
+                                for (id, nm) in &devices {
+                                    if ui.selectable_label(dev == *id, RichText::new(nm).small()).clicked() { dev = *id; changed = true; }
+                                }
+                                dep.slots[j].device = dev;
+                            }
+                        }
+                    }
+                });
+            });
+        }
+    });
+    // validation strip — surfaces the plan's problems inline (what gates the Load button)
+    let issues = dep.validate();
+    if issues.is_empty() {
+        ui.label(RichText::new(if dep.tree_ready() { "✓ ready · speculation on" } else { "✓ ready" }).color(theme::GREEN()).small());
+    } else {
+        for iss in &issues {
+            ui.label(RichText::new(format!("• {}", issue_text(iss))).color(theme::RED()).small());
+        }
+    }
+    changed
+}
+
+fn issue_text(i: &logscope::deploy::Issue) -> String {
+    use logscope::deploy::Issue::*;
+    match i {
+        Empty => "check at least one model".into(),
+        NoTarget => "needs a Target model".into(),
+        MultipleTargets(n) => format!("{n} Targets — pick one"),
+        DraftNotSmallerThanTarget => "the Draft must be smaller than the Target".into(),
+        UnknownDevice(m) => format!("{m}: unknown device"),
+        DeviceOverBudget { used, cap, .. } => format!("device over budget ({:.1} > {:.1} GB)", *used as f64 / 1e9, *cap as f64 / 1e9),
+    }
+}
+
 #[cfg(test)]
 mod walk_tests {
     use logscope::llm_backend::list_local_gguf;

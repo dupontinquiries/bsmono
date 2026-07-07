@@ -43,8 +43,10 @@ mod imp {
     static BASE_STATE: OnceLock<Mutex<Option<whisper_rs::WhisperState>>> = OnceLock::new();
     static HIGH_STATE: OnceLock<Mutex<Option<whisper_rs::WhisperState>>> = OnceLock::new();
     // Results queue: submit() spawns a thread that races the loaded tiers and pushes here; drain_results()
-    // is polled from the UI thread, mirroring whisper_pool's Job/InferenceResult shape.
-    static RESULTS: OnceLock<Mutex<VecDeque<(String, String, u64)>>> = OnceLock::new(); // (speaker, text, t_ms)
+    // is polled from the UI thread, mirroring whisper_pool's Job/InferenceResult shape. The trailing bool is
+    // `is_final`: a fast-tier PREVIEW is pushed with false (shows on the pearl instantly as a volatile partial),
+    // then the resolved best result with true (commits the utterance).
+    static RESULTS: OnceLock<Mutex<VecDeque<(String, String, u64, bool)>>> = OnceLock::new(); // (speaker, text, t_ms, is_final)
 
     fn ctx_cell(t: Tier) -> &'static OnceLock<Mutex<Option<Arc<whisper_rs::WhisperContext>>>> {
         match t { Tier::Tiny => &TINY, Tier::Base => &BASE, Tier::HighAccuracy => &HIGH }
@@ -80,7 +82,14 @@ mod imp {
     fn run_one(ctx: &Arc<whisper_rs::WhisperContext>, sc: &'static OnceLock<Mutex<Option<whisper_rs::WhisperState>>>,
                audio: &[f32], tier: Tier) -> Result<String, String> {
         let cell = sc.get_or_init(|| Mutex::new(None));
-        let mut guard = cell.lock().map_err(|_| "state lock poisoned".to_string())?;
+        // try_lock, NOT lock: each tier's cached WhisperState decodes ONE utterance at a time. If it's still
+        // busy with a previous (slow) decode — the classic backlog when large-v3-turbo can't keep up — skip
+        // this tier for this utterance instead of QUEUEING a thread blocked on the lock (which piles up and
+        // stalls). The race just uses whichever tiers are free (tiny stays responsive).
+        let mut guard = match cell.try_lock() {
+            Ok(g) => g,
+            Err(_) => return Err(format!("{tier:?} busy (previous decode still running) — skipped")),
+        };
         let mut state = match guard.take() {
             Some(s) => s,
             None => ctx.create_state().map_err(|e| format!("create_state: {e:?}"))?,
@@ -114,8 +123,10 @@ mod imp {
     }
 
     /// Race every loaded tier on the SAME audio; return the best-priority result available within the
-    /// adaptive grace window. Single loaded tier = no thread fan-out, just runs it directly.
-    fn transcribe_dual(audio: &[f32]) -> Result<String, String> {
+    /// adaptive grace window. `on_prelim` is called with the FIRST (fastest) tier's text the moment it lands,
+    /// so the UI can show words immediately instead of waiting out the grace / the slow tier. Single loaded
+    /// tier = no thread fan-out, just runs it directly (it is both preview and final — no faster tier exists).
+    fn transcribe_dual(audio: &[f32], mut on_prelim: impl FnMut(String)) -> Result<String, String> {
         let pairs: Vec<(Tier, Arc<whisper_rs::WhisperContext>, &'static OnceLock<Mutex<Option<whisper_rs::WhisperState>>>)> =
             [Tier::HighAccuracy, Tier::Base, Tier::Tiny].into_iter().filter_map(|t| {
                 ctx_cell(t).get().and_then(|m| m.lock().ok().and_then(|g| g.clone())).map(|ctx| (t, ctx, state_cell(t)))
@@ -126,7 +137,12 @@ mod imp {
             return run_one(ctx, sc, audio, *tier);
         }
 
-        let grace = Duration::from_millis(grace_window_ms(audio.len()));
+        // LOGSCOPE_STT_PREFER_SPEED=1 → use whichever tier lands FIRST, skipping the accuracy grace entirely
+        // (best when the high-accuracy model — e.g. large-v3-turbo — is consistently slow). LOGSCOPE_STT_GRACE_MS
+        // overrides the adaptive grace directly.
+        let prefer_speed = std::env::var("LOGSCOPE_STT_PREFER_SPEED").map(|v| !v.is_empty() && v != "0").unwrap_or(false);
+        let grace = std::env::var("LOGSCOPE_STT_GRACE_MS").ok().and_then(|s| s.trim().parse::<u64>().ok())
+            .map(Duration::from_millis).unwrap_or_else(|| Duration::from_millis(grace_window_ms(audio.len())));
         let (tx, rx) = mpsc::channel::<(usize, Tier, Result<String, String>)>();
         let t0 = Instant::now();
         for (idx, (tier, ctx, sc)) in pairs.iter().enumerate() {
@@ -137,54 +153,50 @@ mod imp {
         drop(tx);
 
         let mut best: Option<(usize, String)> = None;
-        let first = rx.recv().map_err(|_| "all tiers failed (channel closed)".to_string())?;
-        crate::clog!("whisper", "{:?} returned at +{:.3}s", first.1, t0.elapsed().as_secs_f32());
-        match first.2 {
-            Ok(text) => best = Some((first.0, text)),
-            Err(e) => crate::clog!("whisper", "{:?} failed: {e}", first.1),
-        }
-        if let Some((0, text)) = &best {
-            crate::clog!("whisper", "using {:?} (best tier, arrived first)", pairs[0].0);
-            return Ok(text.clone());
-        }
-        let deadline = t0 + grace;
+        let mut previewed = false;
+        let mut deadline: Option<Instant> = None; // set to (first successful result + grace)
         loop {
-            let now = Instant::now();
-            if now >= deadline { break; }
-            match rx.recv_timeout(deadline - now) {
-                Ok((idx, tier, r)) => {
+            let msg = match deadline {
+                None => rx.recv().ok(),                                    // nothing yet → block for the first result
+                Some(dl) => match dl.checked_duration_since(Instant::now()) {
+                    Some(d) => rx.recv_timeout(d).ok(),                    // wait out the remaining grace for a better tier
+                    None => None,                                         // grace elapsed
+                },
+            };
+            let Some((idx, tier, r)) = msg else { break };
+            match r {
+                Ok(text) => {
                     crate::clog!("whisper", "{:?} returned at +{:.3}s", tier, t0.elapsed().as_secs_f32());
-                    if let Ok(text) = r {
-                        let cur = best.as_ref().map(|(i, _)| *i).unwrap_or(usize::MAX);
-                        if idx < cur {
-                            best = Some((idx, text));
-                            if idx == 0 {
-                                crate::clog!("whisper", "using {:?} (top tier, within grace)", tier);
-                                return Ok(best.unwrap().1);
-                            }
-                        }
-                    } else if let Err(e) = r { crate::clog!("whisper", "{:?} failed: {e}", tier); }
+                    if idx == 0 { crate::clog!("whisper", "using {:?} (best tier)", tier); return Ok(text); } // top tier always wins
+                    if !previewed { on_prelim(text.clone()); previewed = true; } // instant preview from the fastest tier
+                    if best.as_ref().map(|(i, _)| idx < *i).unwrap_or(true) { best = Some((idx, text)); }
+                    if prefer_speed { crate::clog!("whisper", "prefer-speed: using first result, skipping grace"); return Ok(best.unwrap().1); }
+                    if deadline.is_none() { deadline = Some(Instant::now() + grace); } // start the grace on first success
                 }
-                Err(_) => break, // grace window elapsed or channel closed
+                Err(e) => crate::clog!("whisper", "{:?}: {e}", tier), // busy/failed tier — race on with the others
             }
         }
         best.map(|(_, t)| t).ok_or_else(|| "all tiers failed".into())
     }
 
     /// Submit an utterance to the tier race. Spawns one thread (which itself fans out across tiers);
-    /// utterances are seconds apart so this is cheap. Result lands in `drain_results()`.
+    /// utterances are seconds apart so this is cheap. A fast-tier PREVIEW lands in `drain_results()` with
+    /// is_final=false the moment it's ready, then the resolved result with is_final=true.
     pub fn submit(audio_16k: Vec<f32>, speaker: String) {
         let t_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
         std::thread::spawn(move || {
-            match transcribe_dual(&audio_16k) {
-                Ok(text) => RESULTS.get_or_init(|| Mutex::new(VecDeque::new())).lock().unwrap().push_back((speaker, text, t_ms)),
+            let push = |text: String, is_final: bool| {
+                RESULTS.get_or_init(|| Mutex::new(VecDeque::new())).lock().unwrap().push_back((speaker.clone(), text, t_ms, is_final));
+            };
+            match transcribe_dual(&audio_16k, |prelim| push(prelim, false)) {
+                Ok(text) => push(text, true),
                 Err(e) => crate::clog!("whisper", "fastpath transcribe failed: {e}"),
             }
         });
     }
 
-    /// Drain finished (speaker, text, t_ms) results.
-    pub fn drain_results() -> Vec<(String, String, u64)> {
+    /// Drain finished (speaker, text, t_ms, is_final) results — previews (is_final=false) then finals (true).
+    pub fn drain_results() -> Vec<(String, String, u64, bool)> {
         RESULTS.get_or_init(|| Mutex::new(VecDeque::new())).lock().unwrap().drain(..).collect()
     }
 }
@@ -195,7 +207,7 @@ mod stub {
     pub fn load_tier(_tier: Tier, _path: &std::path::Path) -> Result<(), String> { Err("built without the `voice` feature".into()) }
     pub fn loaded_tiers() -> Vec<Tier> { Vec::new() }
     pub fn submit(_audio_16k: Vec<f32>, _speaker: String) {}
-    pub fn drain_results() -> Vec<(String, String, u64)> { Vec::new() }
+    pub fn drain_results() -> Vec<(String, String, u64, bool)> { Vec::new() }
 }
 
 #[cfg(test)]
