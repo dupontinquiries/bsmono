@@ -5,6 +5,7 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
+repo-map = { path = "../../../../shared/repo-map" }
 png = "0.18"
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
 # Asahi driver's max_color_attachments=5). glow sidesteps it.
