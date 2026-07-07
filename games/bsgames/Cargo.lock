@@ -1606,6 +1606,9 @@ dependencies = [
 [[package]]
 name = "netcode"
 version = "0.1.0"
+dependencies = [
+ "snapcore",
+]
 
 [[package]]
 name = "nohash-hasher"

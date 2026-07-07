@@ -86,8 +86,8 @@ pub fn friend_rows<P: ProfileBackend, F: ProfileBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use netcode::microdht::{MicroDht, NodeId};
-    use netcode::store::{MicroDhtStore, ProfileService};
+    
+    use netcode::store::{ProfileService, SnapcoreStore};
 
     #[test]
     fn registry_has_the_four_games_with_launchers() {
@@ -100,11 +100,8 @@ mod tests {
         assert_eq!(launch_argv(cyber), vec!["games/blackstar/build/blackstar"]);
     }
 
-    fn svc() -> ProfileService<MicroDhtStore, MicroDhtStore> {
-        ProfileService::new(
-            MicroDhtStore::new(MicroDht::new(NodeId::from_key("p"), 20)),
-            MicroDhtStore::new(MicroDht::new(NodeId::from_key("f"), 20)),
-        )
+    fn svc() -> ProfileService<SnapcoreStore, SnapcoreStore> {
+        ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new())
     }
 
     #[test]
