@@ -23,7 +23,13 @@ pub fn inv_freq(head_dim: u32, base: f32) -> Vec<f32> {
 #[derive(Clone, Copy, Debug)]
 pub enum Scaling {
     None,
+    /// Position Interpolation: divide every frequency by `factor` (Chen et al / SuperHOT). Simple, but
+    /// hurts short-context quality because it scales the high frequencies too.
     Linear { factor: f32 },
+    /// NTK-aware ("NTK-by-parts" base scaling): raise the RoPE base so high-freq dims stay ~unscaled and
+    /// low-freq dims scale ~1/factor via a power law — extends context with far less short-context damage
+    /// than linear, and needs no beta params (CodeLlama, many community long-context fine-tunes).
+    Ntk { factor: f32 },
     Yarn { factor: f32, orig_ctx: u32, beta_fast: f32, beta_slow: f32 },
 }
 
@@ -53,6 +59,13 @@ pub fn scaling_factors(head_dim: u32, base: f32, scaling: Scaling) -> Vec<f32> {
     match scaling {
         Scaling::None => vec![1.0; half],
         Scaling::Linear { factor } => vec![1.0 / factor.max(1e-6); half],
+        Scaling::Ntk { factor } => {
+            // base' = base · factor^(head_dim/(head_dim−2)) ⇒ per-pair multiplier factor^(−2i/(head_dim−2)):
+            // i=0 keeps the highest frequency (1.0), the last pair scales ≈ 1/factor. A smooth power law.
+            let denom = (head_dim.saturating_sub(2)).max(1) as f32;
+            let f = factor.max(1e-6);
+            (0..half as u32).map(|i| f.powf(-2.0 * i as f32 / denom)).collect()
+        }
         Scaling::Yarn { factor, orig_ctx, beta_fast, beta_slow } => {
             let inv_scale = 1.0 / factor.max(1e-6);
             let (lo, hi) = corr_range(head_dim, orig_ctx, base, beta_fast, beta_slow);
@@ -75,6 +88,35 @@ pub fn mscale(scaling: Scaling) -> f32 {
 /// Effective scaled inverse frequencies = `inv_freq · scaling_factors`.
 pub fn scaled_inv_freq(head_dim: u32, base: f32, scaling: Scaling) -> Vec<f32> {
     inv_freq(head_dim, base).iter().zip(scaling_factors(head_dim, base, scaling)).map(|(a, b)| a * b).collect()
+}
+
+/// A context-extension method the planner can pick.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method { Linear, Ntk, Yarn }
+
+/// Plan RoPE scaling to run a model with native context `orig_ctx` out to `target_ctx`. The scale factor is
+/// `target/orig` (never < 1 — we don't shrink context). `Yarn` fills in the usual `beta_fast=32, beta_slow=1`
+/// defaults. This is the entry point for "make this model take a longer context": detect the native window
+/// from GGUF, pick a method, get back a [`Scaling`] the apply path already understands.
+pub fn plan_extension(orig_ctx: u32, target_ctx: u32, method: Method) -> Scaling {
+    let factor = (target_ctx as f32 / orig_ctx.max(1) as f32).max(1.0);
+    if factor <= 1.0 + 1e-6 {
+        return Scaling::None; // target fits in the native window — no scaling needed
+    }
+    match method {
+        Method::Linear => Scaling::Linear { factor },
+        Method::Ntk => Scaling::Ntk { factor },
+        Method::Yarn => Scaling::Yarn { factor, orig_ctx, beta_fast: 32.0, beta_slow: 1.0 },
+    }
+}
+
+/// The context length a scaling stretches `orig_ctx` to (⌊orig · factor⌋). `orig_ctx` itself for `None`.
+pub fn effective_context(orig_ctx: u32, scaling: Scaling) -> u32 {
+    let factor = match scaling {
+        Scaling::None => 1.0,
+        Scaling::Linear { factor } | Scaling::Ntk { factor } | Scaling::Yarn { factor, .. } => factor.max(1.0),
+    };
+    (orig_ctx as f32 * factor) as u32
 }
 
 #[cfg(test)]
@@ -121,5 +163,40 @@ mod tests {
                        1.0 + 0.1 * 4.0f32.ln(), 1e-6));
         assert_eq!(mscale(Scaling::Linear { factor: 4.0 }), 1.0);
         assert_eq!(mscale(Scaling::None), 1.0);
+    }
+
+    #[test]
+    fn ntk_keeps_high_freqs_and_scales_low_freqs() {
+        let (hd, base, factor) = (128u32, 10000.0f32, 4.0f32);
+        let f = scaling_factors(hd, base, Scaling::Ntk { factor });
+        assert_eq!(f.len(), 64);
+        // highest-frequency pair unscaled; lowest-frequency pair ≈ 1/factor
+        assert!(approx(f[0], 1.0, 1e-4), "high freq kept: {}", f[0]);
+        assert!(approx(f[63], 1.0 / factor, 2e-2), "low freq ≈ 1/factor: {}", f[63]);
+        // monotonically non-increasing, and everywhere between 1/factor and 1 (a smooth power law)
+        assert!(f.windows(2).all(|w| w[0] >= w[1] - 1e-6));
+        assert!(f.iter().all(|&x| x >= 1.0 / factor - 1e-3 && x <= 1.0 + 1e-4));
+    }
+
+    #[test]
+    fn plan_extension_picks_the_factor_and_method() {
+        // 8k native → 32k target = 4× factor
+        assert!(matches!(plan_extension(8192, 32768, Method::Ntk), Scaling::Ntk { factor } if approx(factor, 4.0, 1e-4)));
+        assert!(matches!(plan_extension(8192, 32768, Method::Linear), Scaling::Linear { factor } if approx(factor, 4.0, 1e-4)));
+        match plan_extension(4096, 131072, Method::Yarn) {
+            Scaling::Yarn { factor, orig_ctx, beta_fast, beta_slow } => {
+                assert!(approx(factor, 32.0, 1e-4) && orig_ctx == 4096 && beta_fast == 32.0 && beta_slow == 1.0);
+            }
+            s => panic!("expected Yarn, got {s:?}"),
+        }
+        // target within the native window → no scaling
+        assert!(matches!(plan_extension(8192, 4096, Method::Yarn), Scaling::None));
+    }
+
+    #[test]
+    fn effective_context_reflects_the_factor() {
+        assert_eq!(effective_context(8192, Scaling::None), 8192);
+        assert_eq!(effective_context(8192, Scaling::Ntk { factor: 4.0 }), 32768);
+        assert_eq!(effective_context(4096, plan_extension(4096, 32768, Method::Linear)), 32768);
     }
 }

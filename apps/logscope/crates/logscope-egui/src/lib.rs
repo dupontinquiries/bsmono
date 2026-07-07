@@ -5,6 +5,11 @@
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
+pub mod spatial_audio;
+pub mod workbench;
+pub mod tab_layout;
+pub mod log_gestures;
+pub mod chat_layout;
 pub mod backend;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;
@@ -28,6 +33,12 @@ pub mod genguard;
 #[allow(dead_code)] pub mod voice;
 pub mod voice_session;
 pub mod voice_intent;
+pub mod imprint;
+pub mod picking;
+pub mod physui;
+pub mod assets;
+pub mod mediagen;
+pub mod decode;
 pub mod voice_dict;
 #[macro_use] pub mod log;
 pub mod fastpath;
@@ -78,12 +89,6 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod convograph;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod spatial;
-pub mod chat_layout;
-pub mod tab_layout;
-pub mod workbench;
-pub mod log_gestures;
-#[cfg(feature = "gui")] pub mod spatial_audio;
-#[cfg(feature = "gui")] pub mod touch_nav;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;

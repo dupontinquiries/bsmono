@@ -21,9 +21,11 @@ use crate::theme;
 /// the in-app Glass toggle remain the escape hatches, and the scene lives in the central panel (it can't cover
 /// these), so translucency no longer risks trapping the view.
 fn glass_chrome_frame() -> egui::Frame {
-    let c = theme::PANEL();
-    let f = |x: u8, t: u8| ((x as u16 * 7 + t as u16 * 3) / 10) as u8;
-    let fill = egui::Color32::from_rgba_unmultiplied(f(c.r(), 18), f(c.g(), 32), f(c.b(), 46), 196);
+    // the header + tab-bar glass carries the live scene light (light bleed) instead of a fixed cool tint.
+    let sl = theme::scene_light();
+    let c = theme::lerp_col(theme::PANEL(), sl.color, 0.14 + 0.18 * sl.intensity);
+    let d = |x: u8| (x as f32 * 0.62) as u8; // darken a touch so overlaid text keeps contrast
+    let fill = egui::Color32::from_rgba_unmultiplied(d(c.r()), d(c.g()), d(c.b()), 196);
     egui::Frame::default().fill(fill).inner_margin(egui::Margin::symmetric(10, 5))
 }
 
@@ -50,6 +52,8 @@ pub struct LogscopeApp {
     toaster: crate::theme::Toaster,
     wizard: crate::wizard::Wizard,
     glass: bool, // LOGSCOPE_GLASS: render the mind-palace behind a translucent UI (in-progress immersive shell)
+    deployment: logscope::deploy::Deployment, // multi-model/multi-device plan behind the tile picker
+    autoloaded: Option<String>,               // name of the model we last auto-kicked a load for (debounce)
 }
 
 impl Default for LogscopeApp {
@@ -76,6 +80,13 @@ impl Default for LogscopeApp {
             toaster: crate::theme::Toaster::default(),
             wizard: crate::wizard::Wizard::default(),
             glass: std::env::var("LOGSCOPE_GLASS").map(|v| v != "0").unwrap_or(false),
+            deployment: logscope::deploy::Deployment::new(vec![logscope::deploy::Device {
+                id: logscope::deploy::DeviceId(0),
+                name: "this device".into(),
+                kind: logscope::deploy::DeviceKind::Gpu,
+                mem_bytes: logscope::model_selector::read_free_bytes().max(1),
+            }]),
+            autoloaded: None,
         };
         app.rescan();
         app.boot_env();
@@ -144,12 +155,52 @@ impl LogscopeApp {
             }
         }
     }
+    /// The model generation should run: the deployment's Target when the plan is valid, else the dropdown
+    /// pick. This is the routing switch — the tile deployment now drives which model loads.
+    fn active_target_name(&self) -> Option<String> {
+        if self.deployment.is_valid() {
+            if let Some(t) = self.deployment.target() { return Some(t.model.clone()); }
+        }
+        Some(self.model.current()).filter(|s| s != "—")
+    }
+
+    /// The deployment's Draft model name, if one is configured (for speculative/tree decoding).
+    fn active_draft_name(&self) -> Option<String> {
+        self.deployment.draft().map(|d| d.model.clone())
+    }
+
+    /// Resolve a model name to a local `.gguf` path, if it names a scanned local model.
+    fn local_path_for(&self, name: &str) -> Option<String> {
+        self.local_models.iter().find(|m| m.name == name).map(|m| m.path.to_string_lossy().into_owned())
+    }
+
+    fn can_load_local(&self) -> bool {
+        self.active_target_name().and_then(|n| self.local_path_for(&n)).is_some() || self.model.selected_is_local()
+    }
+
     fn load_selected_local(&mut self) {
-        if let Some(path) = self.model.selected_local_path() {
+        // Routing: prefer the deployment Target, fall back to the dropdown selection.
+        let path = self.active_target_name().and_then(|n| self.local_path_for(&n))
+            .or_else(|| self.model.selected_local_path());
+        if let Some(path) = path {
             self.local_status = format!("loading {path}…");
             self.model_loaded = false;
             self.infer.load(path); // worker thread owns the model
         }
+    }
+
+    /// AUTOLOAD: whenever the resolved active local target changes, kick a load automatically — no Load
+    /// button. Debounced by name (only re-loads when the target actually changes) and skipped while scanning
+    /// (models aren't settled yet). Ollama/remote targets need no local load, so they're left alone.
+    fn autoload_if_changed(&mut self) {
+        if self.scanning { return; }
+        let Some(name) = self.active_target_name() else { return };
+        if self.autoloaded.as_deref() == Some(name.as_str()) { return; } // already (auto)loaded this one
+        let Some(path) = self.local_path_for(&name) else { return };     // only local files are loaded here
+        self.autoloaded = Some(name.clone());
+        self.local_status = format!("auto-loading {name}…");
+        self.model_loaded = false;
+        self.infer.load(path);
     }
     fn rescan(&mut self) {
         self.host_batches.clear();
@@ -169,6 +220,19 @@ impl LogscopeApp {
         });
         self.scan_local();
     }
+    /// Mirror scanned network hosts (Ollama servers on the LAN) as Remote devices in the deployment, so the
+    /// tile picker can place a model on a network device. Local stays id 0; each new host gets the next id.
+    fn sync_remote_devices(&mut self) {
+        use logscope::deploy::{Device, DeviceId, DeviceKind};
+        for (host, _models) in &self.host_batches {
+            let name = host.trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/').to_string();
+            if name.is_empty() || self.deployment.devices.iter().any(|d| d.name == name) { continue; }
+            let id = self.deployment.devices.iter().map(|d| d.id.0).max().unwrap_or(0) + 1;
+            // remote memory is the remote's problem — set it large so it never trips the local over-budget check
+            self.deployment.devices.push(Device { id: DeviceId(id), name, kind: DeviceKind::Remote, mem_bytes: u64::MAX / 2 });
+        }
+    }
+
     fn drain_scan(&mut self, ctx: &egui::Context) {
         let mut got = false;
         let mut disconnected = false;
@@ -181,7 +245,7 @@ impl LogscopeApp {
                 }
             }
         }
-        if got { self.ollama_entries = build_model_entries(&self.host_batches, &self.recency); self.rebuild_items(); }
+        if got { self.ollama_entries = build_model_entries(&self.host_batches, &self.recency); self.rebuild_items(); self.sync_remote_devices(); }
         if disconnected { self.scan_rx = None; self.scanning = false; self.toaster.push(ctx, format!("Scan complete — {} hosts", self.host_batches.len()), theme::CYAN()); }
         if self.scanning { ctx.request_repaint_after(Duration::from_millis(100)); }
     }
@@ -192,7 +256,21 @@ impl LogscopeApp {
         for e in evts {
             match e {
                 Evt::Loaded(Ok(info)) => { self.model_loaded = true; self.local_status = format!("loaded {}", info.path); self.toaster.push(ctx, "Model loaded", theme::GREEN()); }
-                Evt::Loaded(Err(e)) => { self.model_loaded = false; self.local_status = format!("load failed: {e}"); self.toaster.push(ctx, format!("Load failed: {e}"), theme::RED()); }
+                Evt::Loaded(Err(e)) => {
+                    self.model_loaded = false;
+                    // A backend switch drops the loaded model and reports "…reload the model". Clear the
+                    // autoload debounce so the active target reloads into the NEW backend — this is the
+                    // "models autoload on llamacpp but not the custom backend" bug (after switching, the name
+                    // was unchanged so autoload skipped it). Genuine load failures keep the debounce so a
+                    // broken model can't spin a reload loop.
+                    if e.contains("reload the model") {
+                        self.autoloaded = None;
+                        self.local_status = format!("backend changed — reloading… ({e})");
+                    } else {
+                        self.local_status = format!("load failed: {e}");
+                        self.toaster.push(ctx, format!("Load failed: {e}"), theme::RED());
+                    }
+                }
                 other => { self.tabs.apply_chat_evt(other); repaint = true; }
             }
         }
@@ -213,15 +291,23 @@ impl eframe::App for LogscopeApp {
         let ctx = ui.ctx().clone();
         self.drain_scan(&ctx);
         self.drain_infer(&ctx);
+        self.autoload_if_changed(); // no Load button — the active target loads itself when it changes
 
         // GLASS MODE: the chrome floats over the live 3D mind-palace. The header + tab bar stay SOLID (an always-
         // clickable escape hatch); only the central viewport is immersive. Esc always exits, so you can't get stuck.
         if self.glass && ctx.input(|i| i.key_pressed(egui::Key::Escape)) { self.glass = false; }
         if self.glass {
+            let sl = theme::scene_light();
             let mut v = ctx.style().visuals.clone();
+            // LIGHT BLEED: tint the frosted chrome toward the LIVE scene light so every panel/widget/scrollbar
+            // carries the palace's illumination (warm gold at Mansion dusk, cool cyan under Atlantis water),
+            // instead of a fixed cool frost. Kept dim + translucent so text stays legible over the bleed.
             let frost = |c: egui::Color32, a: u8| {
-                let f = |x: u8, t: u8| ((x as u16 * 7 + t as u16 * 3) / 10) as u8; // pull 30% toward a cool tint
-                egui::Color32::from_rgba_unmultiplied(f(c.r(), 18), f(c.g(), 32), f(c.b(), 46), a)
+                let g = 0.20 + 0.18 * sl.intensity;                 // how strongly the scene light bleeds in
+                let lc = theme::lerp_col(c, sl.color, g);
+                // keep it a touch darker than the raw bleed so foreground text keeps contrast
+                egui::Color32::from_rgba_unmultiplied(
+                    (lc.r() as f32 * 0.9) as u8, (lc.g() as f32 * 0.9) as u8, (lc.b() as f32 * 0.9) as u8, a)
             };
             v.panel_fill = frost(v.panel_fill, 236);
             v.window_fill = frost(v.window_fill, 240);
@@ -233,6 +319,11 @@ impl eframe::App for LogscopeApp {
         }
         self.tabs.chat.set_glass(self.glass);
 
+        // folder popup actions (handled after the header panel closure releases the &mut self borrow)
+        let (mut fp_browse, mut fp_scan) = (false, false);
+        // model list + size lookup for the deployment tiles (cloned so they don't hold a self borrow)
+        let available: Vec<String> = self.model.items.iter().map(|i| i.name().to_string()).collect();
+        let sizes: std::collections::HashMap<String, u64> = self.local_models.iter().map(|m| (m.name.clone(), m.size_bytes)).collect();
         let header_panel = egui::Panel::top("header");
         let header_panel = if self.glass { header_panel.frame(glass_chrome_frame()) } else { header_panel };
         header_panel.show_inside(ui, |ui| {
@@ -252,6 +343,25 @@ impl eframe::App for LogscopeApp {
                     ui.add_space(10.0);
                     let mr = ui.scope(|ui| { model_combo(ui, &mut self.model, "hdr_model", self.scanning); }).response;
                     theme::set_model_light(Some(mr.rect.center())); // the model's "home" — a warm hearth glow
+                    // folder config lives in a popup beside the picker now, not a whole header row
+                    {
+                        let mut native = crate::filepicker::native_enabled();
+                        let label = crate::filepicker::system_picker_label();
+                        let r = crate::model::folder_popup(ui, &mut self.models_dir, &mut native, &label);
+                        crate::filepicker::set_native(native);
+                        fp_browse |= r.browse; fp_scan |= r.scan;
+                    }
+                    // multi-model / multi-device deployment picker (tree work) — a popup that STAYS open on
+                    // click (CloseOnClickOutside) so the tiles/role-combos/device-combos are usable.
+                    let dbtn = ui.button("⚙").on_hover_text("Multi-model / multi-device deployment: pick a Target + a smaller Draft for speculative tree decoding, spread across devices.");
+                    let dpid = ui.make_persistent_id("deploy_popup");
+                    if dbtn.clicked() { ui.memory_mut(|m| m.toggle_popup(dpid)); }
+                    egui::popup_below_widget(ui, dpid, &dbtn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                        ui.set_min_width(420.0);
+                        ui.label(RichText::new("deployment — models · roles · devices").color(theme::DIM()).small());
+                        let sizes = &sizes;
+                        crate::model::deployment_tiles(ui, &mut self.deployment, &available, &|n| sizes.get(n).copied().unwrap_or(4_000_000_000));
+                    });
                     ui.label(RichText::new("model").color(theme::DIM()).small());
                     ui.add_space(10.0);
                     // theme picker — live-switches the palette (Folding@home + the research-journal themes)
@@ -276,33 +386,29 @@ impl eframe::App for LogscopeApp {
                     ui.label(RichText::new("variant").color(theme::DIM()).small());
                 });
             });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("models folder:").color(theme::DIM()).small());
-                ui.add(egui::TextEdit::singleline(&mut self.models_dir)
-                    .font(egui::TextStyle::Monospace).desired_width(300.0)
-                    .hint_text("dir to walk for .gguf (recurses, incl. HF cache)"));
-                if ui.button("📂").on_hover_text("Browse for a models folder").clicked() {
-                    let start = std::path::Path::new(&self.models_dir).to_path_buf();
-                    self.dir_picker.open_dir(&start, "Choose models folder");
-                }
-                // System file dialog (KDE/Dolphin, COSMIC, GNOME via portal/kdialog/zenity) vs the
-                // built-in picker (flip off for headless/SSH sessions).
-                let mut native = crate::filepicker::native_enabled();
-                let label = crate::filepicker::system_picker_label();
-                if ui.checkbox(&mut native, RichText::new("system file picker").small())
-                    .on_hover_text(format!("Use the desktop's own file dialog — detected: {label}.\nUncheck for the built-in picker on headless sessions."))
-                    .changed() { crate::filepicker::set_native(native); }
-                if ui.button("Scan").clicked() { self.scan_local(); }
+            // The folder chrome now lives in the 📁 popup by the picker. This row is just backend status +
+            // the local-model Load button — hidden in glass mode to reclaim scene height.
+            if !self.glass { ui.horizontal(|ui| {
                 let avail = llm_backend::is_available();
                 let (txt, col) = if self.model_loaded { ("backend: ggml loaded", theme::GREEN()) }
                     else if avail { ("backend: llamacpp ✓", theme::CYAN()) }
                     else { ("backend: stub", theme::FAINT()) };
                 ui.label(RichText::new(txt).color(col).small());
-                if self.model.selected_is_local() && theme::action_button(ui, "Load", theme::GREEN(), true).clicked() { self.load_selected_local(); }
+                // routing: show which model actually runs (deployment Target, else dropdown) + a draft note.
+                // No Load button — autoload_if_changed() loads the active target automatically.
+                if let Some(t) = self.active_target_name() {
+                    let loaded = self.model_loaded && self.autoloaded.as_deref() == Some(t.as_str());
+                    let mark = if loaded { "●" } else { "○" };
+                    ui.label(RichText::new(format!("{mark} → {t}")).color(if loaded { theme::GREEN() } else { theme::DIM() }).small())
+                        .on_hover_text("The model generation runs (deployment Target if set, else the picker). Loads automatically when it changes.");
+                    if let Some(d) = self.active_draft_name() {
+                        ui.label(RichText::new(format!("+draft {d}")).color(theme::FAINT()).small());
+                    }
+                }
                 if !self.local_status.is_empty() {
                     ui.label(RichText::new(&self.local_status).color(theme::FAINT()).small());
                 }
-            });
+            }); }
             ui.add_space(3.0);
         });
 
@@ -331,6 +437,13 @@ impl eframe::App for LogscopeApp {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(40)); // inscription sweep animates
             ui.add_space(3.0);
         });
+
+        // Act on the folder popup now that the header closure released &mut self.
+        if fp_browse {
+            let start = std::path::Path::new(&self.models_dir).to_path_buf();
+            self.dir_picker.open_dir(&start, "Choose models folder");
+        }
+        if fp_scan { self.scan_local(); }
 
         // In glass mode the central panel is transparent so the full-window backdrop shows through it.
         let central = if self.glass {
@@ -379,5 +492,23 @@ impl eframe::App for LogscopeApp {
         }
         self.wizard.ui(&ctx);
         self.toaster.ui(&ctx);
+
+        // LIGHT BLEED: after all chrome is drawn, spill the live scene light out of the viewport across the
+        // whole UI (directional sun wash + edge glows onto the header/tab-bar + a faint overall wash), so the
+        // app reads as lit by the mind-palace. Foreground layer, subtle + non-interactive. Repaint so it
+        // breathes and tracks the day cycle.
+        // LIGHT BLEED across the WHOLE app (both modes): the scene light spills over the UI — full strength as
+        // the immersive glass backdrop, gentler as a unifying wash in the default card UI — and FLARES brighter
+        // while the system is generating, so the interface visibly lights up with the palace's activity.
+        if std::env::var("LOGSCOPE_BLEED").map(|v| v != "0").unwrap_or(true) {
+            let t = ctx.input(|i| i.time) as f32;
+            let (_n, gq) = self.tabs.chat.canopy_cues();
+            let flare = 1.0 + 0.35 * (gq as f32).min(3.0);         // in-flight generation → the UI flares up
+            let mut sl = theme::scene_light();
+            sl.intensity = (sl.intensity * flare).min(1.4);
+            let strength = if self.glass { 1.0 } else { 0.42 };    // gentler over the opaque default cards
+            theme::paint_light_bleed(&ctx, ctx.screen_rect(), sl, t, strength);
+            if self.glass || gq > 0 { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
+        }
     }
 }

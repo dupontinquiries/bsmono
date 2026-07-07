@@ -358,26 +358,54 @@ pub fn glyph5x7(ch: char) -> [u8; 5] {
 /// Camera-facing glowing TEXT for a pearl: rasterizes `text` through the 5×7 font into emissive cells laid on
 /// the (right, up) billboard plane, floated slightly toward the camera in front of the node. `lit` (0..1) is
 /// the resonance — the text resolves out of the speckle only as the camera approaches. `scroll` shifts it up.
+/// Per-scene text-animation idiom for physical/scene labels — each scene animates its glyph-cells in its own
+/// character (water ripple, leaf sway, ice shimmer, …). `Plain` is the original uniform twinkle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum TextAnim { #[default] Plain, Ripple, Sway, Shimmer, Drift, Fade, Pulse }
+
+/// Per-cell animation: given the column fraction `cf` (0..1 across the text), char index `ci`, time `t`, and
+/// cell `scale`, returns `(d_up, d_right, emissive_mul)` — a small world-space offset (proportional to scale)
+/// and a brightness multiplier. Pure, so the idioms are unit-testable. Amplitudes stay small: text must read.
+pub fn anim_cell(mode: TextAnim, t: f32, cf: f32, ci: usize, scale: f32) -> (f32, f32, f32) {
+    match mode {
+        TextAnim::Plain => { let tw = 0.55 + 0.45 * (0.5 + 0.5 * (t * 2.6 + ci as f32 * 0.7).sin()); (0.0, 0.0, 0.5 + 1.6 * tw) }
+        // Atlantis: glyphs bob on a traveling water wave, with a caustic brightness ripple.
+        TextAnim::Ripple => (0.16 * scale * (t * 3.0 + cf * 7.0).sin(), 0.0, 1.15 + 0.75 * (0.5 + 0.5 * (t * 4.0 + cf * 10.0).sin())),
+        // Forest/Treehouse/Canopy: whole line sways sideways like leaves in a breeze.
+        TextAnim::Sway => (0.05 * scale * (t * 1.1).sin(), 0.15 * scale * (t * 1.4 + cf * 1.5).sin(), 1.25 + 0.55 * (0.5 + 0.5 * (t * 2.0 + ci as f32).sin())),
+        // Frozen Bifrost: crystalline glints — occasional sharp per-cell sparkle.
+        TextAnim::Shimmer => { let g = ((t * 5.0 + ci as f32 * 2.3).sin() * 0.5 + 0.5).powi(6); (0.0, 0.0, 1.0 + 2.4 * g) }
+        // Cloudscape: gentle upward drift.
+        TextAnim::Drift => (0.10 * scale * (t * 1.0 + cf * 3.0).sin() + 0.04 * scale * (t * 0.5).sin(), 0.0, 1.2 + 0.6 * (0.5 + 0.5 * (t * 1.5 + cf * 4.0).sin())),
+        // Mistfall: glyphs breathe in and out like mist.
+        TextAnim::Fade => (0.0, 0.0, 0.7 + 1.5 * (0.5 + 0.5 * (t * 1.6 + cf * 3.0).sin())),
+        // Folding@home: a bright band of "compute" sweeps across the text.
+        TextAnim::Pulse => { let band = (cf - (t * 0.28).fract()).abs(); (0.0, 0.0, 1.1 + 1.3 * (-band * band * 26.0).exp()) }
+    }
+}
+
 pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: &str,
-                   scale: f32, t: f32, col: Color32, lit: f32, scroll: f32) -> Vec<Mesh3> {
+                   scale: f32, t: f32, col: Color32, lit: f32, scroll: f32, anim: TextAnim) -> Vec<Mesh3> {
     let chars: Vec<char> = text.chars().take(32).collect();
     if chars.is_empty() || lit <= 0.02 { return Vec::new(); }
     let w = chars.len() as f32 * 6.0 * scale;
     let h = 7.0 * scale;
     let base = addv(addv(center, mul(toward_cam, 0.34)), mul(up, scroll)); // float in front, scrolled up
+    let denom = (chars.len().saturating_sub(1)).max(1) as f32;
     let mut out = Vec::new();
     for (ci, ch) in chars.iter().enumerate() {
         let g = glyph5x7(*ch);
+        let cf = ci as f32 / denom;
+        let (d_up, d_right, emis) = anim_cell(anim, t, cf, ci, scale);
         for x in 0..5usize {
             let colb = g[x];
             for y in 0..7usize {
                 if (colb >> y) & 1 == 1 {
-                    let px = (ci as f32 * 6.0 + x as f32) * scale - w * 0.5;
-                    let py = h * 0.5 - y as f32 * scale;
+                    let px = (ci as f32 * 6.0 + x as f32) * scale - w * 0.5 + d_right;
+                    let py = h * 0.5 - y as f32 * scale + d_up;
                     let p = addv(addv(base, mul(right, px)), mul(up, py));
-                    let tw = 0.55 + 0.45 * (0.5 + 0.5 * (t * 2.6 + ci as f32 * 0.7).sin());
                     let mut m = uv_sphere(p, scale * 0.46, 4, 3, col);
-                    m.emissive = (0.5 + 1.6 * tw) * lit;
+                    m.emissive = emis * lit;
                     out.push(m);
                 }
             }
@@ -908,7 +936,11 @@ pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
 /// few blades while near ones stay dense. Blades are kept SMALL (subdivided foliage) rather than big flat cards.
 pub fn leaf_cluster_lod(center: Vec3, r: f32, seed: u32, color: Color32, detail: f32) -> Mesh3 {
     let (mut verts, mut norms, mut tris) = (Vec::new(), Vec::new(), Vec::new());
-    let leaves = tess((((40.0 + r * 16.0).min(110.0)) * detail.clamp(0.15, 1.0)) as usize, 5); // MANY small blades; denser on big crowns to fill the canopy, culled far (LOD)
+    // leaf count: a modest cut everywhere, biggest on small decorations (a 0.3 flower had ~44 blades — absurd)
+    // and a lower ceiling on huge crowns, since the tree-heavy scenes are dominated by big-r canopies. Curve:
+    // r 0.3→~19, 0.55→~27, 1.0→~41, 1.4→~52, 2.5→~86(cap 88). Net FPS win at high graphics; the dense-canopy
+    // look is preserved (big crowns stay near their old density). `detail` still lets callers LOD further.
+    let leaves = tess((((10.0 + r * 24.0).min(84.0)) * detail.clamp(0.15, 1.0)) as usize, 5);
     // a flat leaf-blade silhouette in (along, across) local coords: pointed tip → rounded body → base
     const BLADE: [(f32, f32); 8] = [(1.0, 0.0), (0.6, 0.22), (0.2, 0.32), (-0.35, 0.30), (-0.95, 0.0), (-0.35, -0.30), (0.2, -0.32), (0.6, -0.22)];
     for k in 0..leaves {
@@ -1159,6 +1191,28 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_anim_idioms_are_distinct_and_bounded() {
+        use TextAnim::*;
+        // Plain never displaces the cell (back-compat with the old twinkle)
+        for &tt in &[0.0_f32, 0.5, 1.7, 3.3] {
+            let (du, dr, _) = anim_cell(Plain, tt, 0.5, 3, 0.03);
+            assert!(du == 0.0 && dr == 0.0, "Plain has no displacement");
+        }
+        // Ripple bobs vertically (non-zero d_up somewhere), scaled by `scale`, and stays small
+        let mut max_up = 0.0_f32;
+        for i in 0..40 { let (du, _, e) = anim_cell(Ripple, i as f32 * 0.1, 0.3, 3, 0.03); max_up = max_up.max(du.abs()); assert!(e > 0.0 && e < 4.0); }
+        assert!(max_up > 0.0 && max_up < 0.03, "ripple bob is present but subtle: {max_up}");
+        // Sway pushes sideways (non-zero d_right somewhere)
+        let mut max_r = 0.0_f32;
+        for i in 0..40 { let (_, dr, _) = anim_cell(Sway, i as f32 * 0.1, 0.3, 3, 0.03); max_r = max_r.max(dr.abs()); }
+        assert!(max_r > 0.0, "sway moves sideways");
+        // every idiom keeps emissive positive + bounded (text stays lit + readable)
+        for &m in &[Plain, Ripple, Sway, Shimmer, Drift, Fade, Pulse] {
+            for i in 0..30 { let (_, _, e) = anim_cell(m, i as f32 * 0.13, (i as f32 * 0.03) % 1.0, i, 0.03); assert!(e > 0.0 && e < 5.0, "{m:?} emissive {e} in range"); }
+        }
+    }
 
     #[test]
     fn library_node_forms_are_distinct_and_unroll_extends_scroll() {

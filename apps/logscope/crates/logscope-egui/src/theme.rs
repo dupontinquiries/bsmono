@@ -816,6 +816,64 @@ pub fn paint_light(painter: &egui::Painter, rect: egui::Rect, time: f64) {
     }
 }
 
+// ── SCENE → UI LIGHT BLEED ─────────────────────────────────────────────────────────────────────────────
+// The 3D palace shouldn't feel like a picture behind a separately-skinned UI: its light should spill OUT of
+// the viewport onto the surrounding chrome so the whole app reads as lit by the same world. `scene_light`
+// exposes the live time-of-day sun (the SAME `sun_from_clock` the scene render uses) tinted toward the
+// world's accent, and `paint_light_bleed` washes it across the UI.
+
+/// The live scene light this frame: its dominant `color`, `intensity` in [0,1], and the screen-space `dir`
+/// it comes from. Derived from the active palette + time-of-day sun, tinted toward the world accent so the
+/// bleed carries the world's identity (cyan Atlantis, gold Mansion, green Forest…).
+#[derive(Clone, Copy)]
+pub struct SceneLight { pub color: Color32, pub intensity: f32, pub dir: egui::Vec2 }
+
+pub fn scene_light() -> SceneLight {
+    let p = active();
+    let (dir, sun_col, sun_i) = sun_from_clock(p.light);
+    let color = lerp_col(sun_col, p.cyan, 0.32);            // sun + a third of the world accent → identity
+    let intensity = (0.36 + 0.64 * sun_i).clamp(0.0, 1.0);  // floor so a dim/night world still bleeds its colour
+    SceneLight { color, intensity, dir }
+}
+
+// a vertical gradient quad (colour `ctop` at y0 → `cbot` at y1) — for the edge bleeds onto the chrome bars.
+fn grad_band(mesh: &mut egui::epaint::Mesh, x0: f32, x1: f32, y0: f32, y1: f32, ctop: Color32, cbot: Color32) {
+    let i = mesh.vertices.len() as u32;
+    mesh.colored_vertex(Pos2::new(x0, y0), ctop);
+    mesh.colored_vertex(Pos2::new(x1, y0), ctop);
+    mesh.colored_vertex(Pos2::new(x1, y1), cbot);
+    mesh.colored_vertex(Pos2::new(x0, y1), cbot);
+    mesh.add_triangle(i, i + 1, i + 2);
+    mesh.add_triangle(i, i + 2, i + 3);
+}
+
+/// Spill the live scene light out of the central 3D viewport onto the surrounding UI chrome: a directional
+/// sun WASH from the sun side, soft glows BLEEDING onto the top header + bottom tab bar where they border the
+/// scene, and a faint overall wash so the ENTIRE surface carries the world's light. Subtle, additive,
+/// non-interactive (painted on a foreground layer over the chrome). `t` = seconds (breathes gently);
+/// `strength` scales the whole effect (1.0 immersive glass mode, ~0.4 the gentler default-mode bleed).
+pub fn paint_light_bleed(ctx: &Context, screen: egui::Rect, sl: SceneLight, t: f32, strength: f32) {
+    if sl.intensity <= 0.001 || strength <= 0.001 { return; }
+    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("scene_light_bleed")));
+    let k = sl.intensity * strength * (0.9 + 0.1 * (t * 0.5).sin());
+    let c = sl.color;
+    let (w, h) = (screen.width(), screen.height());
+    let mut mesh = egui::epaint::Mesh::default();
+    // 1) directional SUN WASH — a wide soft radial glow, positioned on the side the sun rises from, up high.
+    let sx = (screen.center().x + sl.dir.x * w * 0.42).clamp(screen.left(), screen.right());
+    let sy = screen.top() + h * (0.05 + 0.16 * (1.0 - sl.dir.y.clamp(0.0, 1.0)));
+    add_glow(&mut mesh, Pos2::new(sx, sy), w * 0.58, c, (42.0 * k) as u8);
+    // 2) TOP edge bleed onto the header glass — a band fading DOWN from the top edge into the scene.
+    grad_band(&mut mesh, screen.left(), screen.right(), screen.top(), screen.top() + h * 0.16,
+              alpha_col(c, (32.0 * k) as u8), clear_col(c));
+    // 3) BOTTOM edge bleed onto the tab bar — a band fading UP from the bottom edge into the scene.
+    grad_band(&mut mesh, screen.left(), screen.right(), screen.bottom() - h * 0.14, screen.bottom(),
+              clear_col(c), alpha_col(c, (28.0 * k) as u8));
+    painter.add(egui::Shape::mesh(mesh));
+    // 4) faint overall wash so the WHOLE ui carries the light (kept low so text stays legible).
+    painter.rect_filled(screen, r(0), alpha_col(c, (7.0 * sl.intensity * strength) as u8));
+}
+
 // Accessor functions named like the old consts, so every `theme::INK()` call reads the live palette.
 macro_rules! pal_colors {
     ($($up:ident => $field:ident),* $(,)?) => {
