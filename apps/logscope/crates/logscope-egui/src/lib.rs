@@ -5,6 +5,12 @@
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
+#[allow(dead_code)] pub mod filescan;
+#[allow(dead_code)] pub mod swarmview;
+#[allow(dead_code)] pub mod vision_cli;
+#[allow(dead_code)] pub mod tts_cli;
+#[allow(dead_code)] pub mod media;
+#[allow(dead_code)] pub mod ws_registry;
 pub mod spatial_audio;
 pub mod workbench;
 pub mod tab_layout;
