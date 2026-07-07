@@ -27,9 +27,9 @@ pub struct GameEntry {
 pub fn registry() -> Vec<GameEntry> {
     vec![
         GameEntry { id: "clawbound".into(), name: "Clawbound".into(), engine: "wgpu".into(), dir: "games/clawbound".into(), kind: LaunchKind::Cargo },
-        GameEntry { id: "early-fps".into(), name: "Early FPS".into(), engine: "wgpu".into(), dir: "games/early-fps".into(), kind: LaunchKind::Cargo },
+        GameEntry { id: "soldier".into(), name: "Soldier".into(), engine: "wgpu".into(), dir: "games/soldier".into(), kind: LaunchKind::Cargo },
         GameEntry { id: "unendlich".into(), name: "Unendlich".into(), engine: "custom".into(), dir: "games/unendlich".into(), kind: LaunchKind::Cargo },
-        GameEntry { id: "cybertron".into(), name: "Cybertron".into(), engine: "vulkan/opengl".into(), dir: "games/cybertron".into(), kind: LaunchKind::CmakeBin("cybertron".into()) },
+        GameEntry { id: "blackstar".into(), name: "Blackstar".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
     ]
 }
 
@@ -96,8 +96,8 @@ mod tests {
         // Rust games → cargo; cybertron → cmake bin
         let claw = r.iter().find(|g| g.id == "clawbound").unwrap();
         assert_eq!(launch_argv(claw), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound/Cargo.toml"]);
-        let cyber = r.iter().find(|g| g.id == "cybertron").unwrap();
-        assert_eq!(launch_argv(cyber), vec!["games/cybertron/build/cybertron"]);
+        let cyber = r.iter().find(|g| g.id == "blackstar").unwrap();
+        assert_eq!(launch_argv(cyber), vec!["games/blackstar/build/blackstar"]);
     }
 
     fn svc() -> ProfileService<MicroDhtStore, MicroDhtStore> {
