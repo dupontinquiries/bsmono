@@ -20,6 +20,7 @@
 
 pub mod mesh;
 pub mod reconcile;
+pub mod relay;
 pub mod hallucination;
 pub mod model;
 pub mod context;
