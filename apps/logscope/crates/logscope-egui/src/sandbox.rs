@@ -235,7 +235,7 @@ pub fn mirror_workspace(src: &Path, root: &Path) -> std::io::Result<PathBuf> {
     Ok(dst)
 }
 
-fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     for e in std::fs::read_dir(src)? {
         let e = e?;
         let name = e.file_name();
