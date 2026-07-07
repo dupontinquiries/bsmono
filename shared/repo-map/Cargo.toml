@@ -1,0 +1,8 @@
+[package]
+name = "repo-map"
+version = "0.1.0"
+edition = "2021"
+description = "A build-aware index of every crate in the monorepo — kind (cargo workspace member / standalone / cmake), path, and the correct build+test command. The substrate gitmind (cockpit) and logscope share to build/test/manage the whole tree themselves."
+
+[lib]
+path = "src/lib.rs"

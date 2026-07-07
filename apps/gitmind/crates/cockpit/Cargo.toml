@@ -12,6 +12,7 @@ name = "cockpit"
 path = "src/lib.rs"
 
 [dependencies]
+repo-map = { path = "../../../../shared/repo-map" }
 serde_json = "1"
 gitmind-core = { path = "../core" }
 peek = { path = "../peek" }
