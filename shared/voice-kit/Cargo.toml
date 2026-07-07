@@ -10,3 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 models-kit = { path = "../models-kit" }
+
+[dev-dependencies]
+crypto-kit = { path = "../crypto-kit" }
