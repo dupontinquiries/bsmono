@@ -53,9 +53,14 @@ bsettings controls the mesh.
   app and shows in bsettings.
 
 ## Phases
-1. **Offload STT (P1).** voiced (or a `voice-relay` companion) accepts sealed audio from a trusted
-   origin, runs whisper, returns the transcript. Origin uses `mesh::stt_host` to choose the host and
-   `mic-kit` fallback to stay live. *Cores done; needs the relay endpoint + wire.*
+1. **Offload STT (P1).** ~~Protocol + decision layer DONE~~ (`voice_kit::relay`, 9 tests):
+   `OffloadRequest`/`OffloadResponse` framing (length-prefixed, versioned, garbage/truncation-safe);
+   `handle(req, host_id, transcribe)` host side; sealed round-trip via `crypto_kit::seal/open`
+   (wrong key can't open); `reference_plan(origin, entry, devices, partners)` →
+   `Skip / Offload(partner) / Local / Unavailable` ties reconcile + mesh. **Remaining (I/O):** the
+   `peermux::Session` transport (send/recv sealed bytes), a voiced endpoint that runs the real
+   whisper transcriber, and the origin capture→fastpath→async-send loop. Origin uses
+   `mesh::stt_host_ranked` + `mic-kit` fallback to stay live.
 2. **Federate the intent Registry (P2).** A transcript captured on A resolves against intents
    registered on any device; `command_target` routes execution. Uses coord-core presence + peermux.
 3. **Multi-mic speaker id (P3).** Speaker embeddings tag transcripts; ContextModel keyed per
