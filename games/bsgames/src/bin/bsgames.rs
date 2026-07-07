@@ -1,0 +1,55 @@
+#[cfg(feature = "app")]
+fn main() -> eframe::Result<()> {
+    use netcode::microdht::{MicroDht, NodeId};
+    use netcode::profile::Profile;
+    use netcode::store::{MicroDhtStore, ProfileService};
+
+    // identity + LAN service (OpenDHT primary swaps in behind the feature later)
+    let me = Profile::new("me@local", whoami_name());
+    let svc = ProfileService::new(
+        MicroDhtStore::new(MicroDht::new(NodeId::from_key("primary"), 20)),
+        MicroDhtStore::new(MicroDht::new(NodeId::from_key(&me.id), 20)),
+    );
+    let mut centre = bsgames::ui::GameCentre::new(me, svc);
+
+    eframe::run_native(
+        "BigSilicon Games",
+        eframe::NativeOptions::default(),
+        Box::new(move |_cc| Ok(Box::new(App { centre: std::mem::replace(&mut centre, dummy()) }))),
+    )
+}
+
+#[cfg(feature = "app")]
+fn whoami_name() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "player".into())
+}
+
+#[cfg(feature = "app")]
+fn dummy() -> bsgames::ui::GameCentre {
+    use netcode::microdht::{MicroDht, NodeId};
+    use netcode::profile::Profile;
+    use netcode::store::{MicroDhtStore, ProfileService};
+    bsgames::ui::GameCentre::new(
+        Profile::new("x", "x"),
+        ProfileService::new(
+            MicroDhtStore::new(MicroDht::new(NodeId::from_key("a"), 20)),
+            MicroDhtStore::new(MicroDht::new(NodeId::from_key("b"), 20)),
+        ),
+    )
+}
+
+#[cfg(feature = "app")]
+struct App {
+    centre: bsgames::ui::GameCentre,
+}
+#[cfg(feature = "app")]
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        self.centre.ui(ctx);
+    }
+}
+
+#[cfg(not(feature = "app"))]
+fn main() {
+    eprintln!("build with --features app for the eframe window (the lib builds headless)");
+}
