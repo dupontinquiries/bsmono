@@ -83,7 +83,7 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 /// Per-system autotune cache: maps (adapter, k×n shape) → the winning decode tile, so the one-time
 /// benchmark on first model load is skipped on every load thereafter. A tiny TSV in the cache dir
 /// (adapter \t k \t n \t tile per line). Best-effort: any IO/parse failure just means "re-benchmark".
-fn autotune_file() -> PathBuf { cache_root().join("autotune.tsv") }
+fn autotune_file() -> PathBuf { cache_root().join("autotune-v3.tsv") } // v2: value is a packed (kernel,tile)
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
