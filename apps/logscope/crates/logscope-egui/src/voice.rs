@@ -146,11 +146,13 @@ mod imp {
             let t_ms = if r.audio_start_ms != 0 { r.audio_start_ms } else { now_ms() };
             Some(Pass { speaker: r.speaker.clone(), name: r.speaker, full_text: text, stable: true, t_ms })
         }).collect();
-        out.extend(crate::fastpath::drain_results().into_iter().filter_map(|(speaker, text, t_ms)| {
+        out.extend(crate::fastpath::drain_results().into_iter().filter_map(|(speaker, text, t_ms, is_final)| {
             let text = text.trim().to_string();
             crate::clog!("voice", "heard {text:?} (fast-path)");
             if !is_speech(&text) { return None; }
-            Some(Pass { speaker: speaker.clone(), name: speaker, full_text: text, stable: true, t_ms })
+            // is_final=false is a volatile fast-tier preview (updates the display, doesn't finalize);
+            // is_final=true commits the utterance. That's exactly Pass.stable's contract.
+            Some(Pass { speaker: speaker.clone(), name: speaker, full_text: text, stable: is_final, t_ms })
         }));
         out
     }
