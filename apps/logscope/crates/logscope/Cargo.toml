@@ -23,6 +23,7 @@ gio = { version = "0.20", optional = true }
 
 # Hashing
 twox-hash = "1.6"
+ash = { version = "0.38", optional = true }  # opt-in vk-upload GPU staging (memplan::exec)
 cli-kit = { path = "../../../../shared/cli-kit" }
 
 # Chart generation → SVG
@@ -91,6 +92,8 @@ bloc  = ["dep:tree-sitter", "dep:tree-sitter-rust", "dep:tree-sitter-python", "d
 llama-ffi = ["dep:llama-cpp-2", "dep:encoding_rs"]
 # GPU (Vulkan) build — needs clang + Vulkan SDK + glslc on the build host
 llamacpp = ["llama-ffi", "llama-cpp-2/vulkan"]
+# opt-in Vulkan upload-staging exec body in memplan (draft; needs the Vulkan SDK on the build host)
+vk-upload = ["dep:ash"]
 # CPU-only build — validates the FFI without a shader compiler (sandbox-friendly)
 llamacpp-cpu = ["llama-ffi"]
 
