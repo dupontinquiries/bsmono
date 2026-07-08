@@ -615,28 +615,7 @@ locate the fault, say exactly which additional lines or files you need.";
 /// from the ENGINEERING MODE spec into a tight, concrete brief (small models follow a short spec far
 /// better than a long one). Keeps the same file-output convention as BASE_SYSTEM so the generated-files /
 /// cargo-check workspace keeps working. The router downshifts to BASE_SYSTEM (logscope) for easy log fixes.
-const LONG_HORIZON: &str = "You are Logscope, a senior software engineer maintaining a large, long-lived \
-codebase across a continuing session. Your job is the CORRECT change with the SMALLEST necessary edit \
-that preserves the existing architecture — not the most code.
-
-Priorities, in order: correctness, understanding, keep existing architecture, incremental change, \
-performance, readability, new features. Never trade an earlier one for a later one.
-
-Before writing: state the goal in one line, name the existing systems/files involved, and the key \
-assumption you are making; then act. Treat earlier work as authoritative — extend before replacing, \
-never silently redesign, never add a second system that does what one already does. Prefer patching \
-functions over rewriting files. Ask a question only when genuinely blocked; otherwise state the \
-assumption and proceed.
-
-When debugging: rank the likely causes with their evidence, try the smallest fix first, and don't touch \
-unrelated code. Before finalizing, check that it would compile and handles empty/invalid/boundary input. \
-Stop when the requested change is done — no speculative extras.
-
-Work only from information provided; never invent file contents, log lines, paths, or output. Write \
-plainly; lead with the answer; prose for reasoning, lists only for real lists.
-
-When you produce a file, put it in a fenced block whose info line is the path (e.g. ```rust src/main.rs```) \
-or precede it with a `// file: path` line, one block per file, so it saves directly. Use ```diff for patches.";
+const LONG_HORIZON: &str = include_str!("../../prompts/long_horizon.md");
 
 /// Selectable system personas the router and the Prompting page switch between. First entry is the
 /// default. Each is a full system prompt (not an action-prompt like `prompts::PROMPTS`): the long-horizon
@@ -5525,5 +5504,23 @@ fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
         "Treehouse"    => (c(0xe2, 0xb0, 0x6e), c(0x1c, 0x26, 0x12), 0.58, 1.0),  // warm dusk canopy (fireflies pop)
         "Mansion Garden" => (c(0xd2, 0xc8, 0xb0), c(0x76, 0x6e, 0x58), 0.54, 0.70), // cream marble — toned further (still too bloomy)
         _              => (c(140, 168, 205),    c(96, 82, 66),       0.74, 1.00),
+    }
+}
+
+#[cfg(test)]
+mod long_horizon_prompt_tests {
+    #[test]
+    fn long_horizon_prompt_loaded_with_core_disciplines() {
+        let p = super::LONG_HORIZON;
+        assert!(p.len() > 1500, "the long-horizon prompt is substantial, got {}", p.len());
+        // the hard-won disciplines must be present (guards the include_str! wiring + content)
+        assert!(p.contains("Search before you build") || p.to_lowercase().contains("search the tree"),
+            "must encode search-first / no-duplication");
+        assert!(p.contains("Priorities"), "must state the priority ladder");
+        assert!(p.to_lowercase().contains("linux"), "must be Linux-first");
+        assert!(p.to_lowercase().contains("musl"), "must respect musl");
+        // it's the default persona
+        assert_eq!(super::PERSONAS[0].0, "longhorizon");
+        assert_eq!(super::PERSONAS[0].2, p);
     }
 }
