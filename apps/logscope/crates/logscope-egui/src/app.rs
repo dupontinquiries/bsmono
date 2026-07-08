@@ -343,6 +343,14 @@ impl eframe::App for LogscopeApp {
                     ui.add_space(10.0);
                     let mr = ui.scope(|ui| { model_combo(ui, &mut self.model, "hdr_model", self.scanning); }).response;
                     theme::set_model_light(Some(mr.rect.center())); // the model's "home" — a warm hearth glow
+                    // Restore the explicit Load control dropped in the ui-branch merge: (re)load the
+                    // selected local .gguf on demand. Autoload still handles deployment-target changes;
+                    // this is for forcing a (re)load of the picked model without touching the deployment.
+                    if self.can_load_local()
+                        && theme::action_button(ui, "Load", theme::GREEN(), true).clicked()
+                    {
+                        self.load_selected_local();
+                    }
                     // folder config lives in a popup beside the picker now, not a whole header row
                     {
                         let mut native = crate::filepicker::native_enabled();
