@@ -213,7 +213,14 @@ pub fn build_locally_logged(
         let _ = std::fs::create_dir_all(&fb);
         fb
     };
-    let argv = crate::buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
+    // Workspace root with no [package] (gitmind: package `gitmind-cli`, binary `gitmind`) → build
+    // `--bin <name>`, since `-p <name>` names a package that doesn't exist. The binary is still
+    // named <name>, so binary resolution is unchanged.
+    let root_toml = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap_or_default();
+    let as_bin = crate::buildflags::declares_workspace(&root_toml)
+        && crate::buildflags::crate_name(&root_toml).is_none()
+        && !has_member_package(app_dir, app); // logscope HAS a member pkg `logscope` → keep -p
+    let argv = crate::buildflags::cargo_build_argv_kind(app, &cargo_target, feats, no_default, as_bin);
     on_line(&format!("$ cargo {}", argv[1..].join(" ")));
     on_line(&format!("  (in {})", app_dir.display()));
     let mut child = std::process::Command::new(&cargo)
@@ -249,6 +256,33 @@ pub fn build_locally_logged(
     }
 }
 
+/// Does a workspace under `dir` contain a MEMBER package literally named `name`? If so, `-p name`
+/// resolves (build that member); if not (gitmind: members are `gitmind-cli` etc., no `gitmind`), we
+/// must build `--bin name` instead. Bounded walk; skips target/.git.
+fn has_member_package(dir: &Path, name: &str) -> bool {
+    fn walk(dir: &Path, name: &str, depth: u32) -> bool {
+        if depth > 3 {
+            return false;
+        }
+        if let Ok(txt) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            if crate::buildflags::crate_name(&txt).as_deref() == Some(name) {
+                return true;
+            }
+        }
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                let n = e.file_name().to_string_lossy().into_owned();
+                if p.is_dir() && n != "target" && !n.starts_with('.') && walk(&p, name, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    walk(dir, name, 0)
+}
+
 pub fn build_locally(app: &str, app_dir: &Path, target: &str, feats: &[String], no_default: bool) -> Result<(PathBuf, u64), String> {
     if !app_dir.join("Cargo.toml").exists() {
         return Err(format!(
@@ -277,7 +311,14 @@ pub fn build_locally(app: &str, app_dir: &Path, target: &str, feats: &[String], 
         let _ = std::fs::create_dir_all(&fb);
         fb
     };
-    let argv = crate::buildflags::cargo_build_argv(app, &cargo_target, feats, no_default);
+    // Workspace root with no [package] (gitmind: package `gitmind-cli`, binary `gitmind`) → build
+    // `--bin <name>`, since `-p <name>` names a package that doesn't exist. The binary is still
+    // named <name>, so binary resolution is unchanged.
+    let root_toml = std::fs::read_to_string(app_dir.join("Cargo.toml")).unwrap_or_default();
+    let as_bin = crate::buildflags::declares_workspace(&root_toml)
+        && crate::buildflags::crate_name(&root_toml).is_none()
+        && !has_member_package(app_dir, app); // logscope HAS a member pkg `logscope` → keep -p
+    let argv = crate::buildflags::cargo_build_argv_kind(app, &cargo_target, feats, no_default, as_bin);
     let mut cmd = std::process::Command::new(&cargo);
     cmd.args(&argv[1..]).current_dir(app_dir).env("PATH", &path_env).env("CARGO_TARGET_DIR", &build_dir);
     match cmd.output() {
@@ -368,6 +409,15 @@ mod root_tests {
         assert!(gm.join("Cargo.toml").exists(), "resolved {} should be a crate", gm.display());
         // absolute paths pass through
         assert_eq!(resolve_app_dir("/tmp/x"), std::path::PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn member_package_check_distinguishes_gitmind_from_logscope() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(4).unwrap().to_path_buf();
+        // gitmind: NO member package named "gitmind" (it's gitmind-cli, bin gitmind) → build --bin
+        assert!(!super::has_member_package(&repo.join("apps/gitmind"), "gitmind"));
+        // logscope: HAS a member package named "logscope" (the core lib) → keep -p logscope
+        assert!(super::has_member_package(&repo.join("apps/logscope"), "logscope"));
     }
 
     #[test]
