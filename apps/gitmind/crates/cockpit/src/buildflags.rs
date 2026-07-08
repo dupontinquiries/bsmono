@@ -186,12 +186,26 @@ pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
 /// no rustup target/linker is needed — the host toolchain builds for itself); a
 /// non-empty triple cross-builds for that target. Pure — unit-tested.
 pub fn cargo_build_argv(app: &str, triple: &str, features: &[String], no_default: bool) -> Vec<String> {
+    cargo_build_argv_kind(app, triple, features, no_default, false)
+}
+
+/// Does this Cargo.toml declare a `[workspace]`? A workspace root with no `[package]` can't be built
+/// with `-p <dir-name>` (that names a package, which doesn't exist) — its app is a **binary** across
+/// members, built with `--bin`.
+pub fn declares_workspace(cargo_toml: &str) -> bool {
+    cargo_toml.lines().any(|l| l.trim_start().starts_with("[workspace]"))
+}
+
+/// Like [`cargo_build_argv`], but `as_bin` selects `--bin <app>` instead of `-p <app>` — used for a
+/// workspace-root app whose runnable binary is named after it (e.g. gitmind: package `gitmind-cli`,
+/// binary `gitmind`), where `-p gitmind` would fail with "did not match any packages".
+pub fn cargo_build_argv_kind(app: &str, triple: &str, features: &[String], no_default: bool, as_bin: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["cargo".into(), "build".into(), "--release".into()];
     if !triple.trim().is_empty() {
         a.push("--target".into());
         a.push(triple.to_string());
     }
-    a.push("-p".into());
+    a.push(if as_bin { "--bin".into() } else { "-p".into() });
     a.push(app.to_string());
     if no_default {
         a.push("--no-default-features".into());
@@ -377,6 +391,21 @@ pub fn install_dir(home: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_root_builds_bin_not_package() {
+        use super::{cargo_build_argv_kind, declares_workspace, crate_name};
+        let ws = "[workspace]\nmembers = [\"crates/cli\"]\n";
+        // gitmind case: workspace root, no [package] → build --bin, not -p
+        assert!(declares_workspace(ws) && crate_name(ws).is_none());
+        let argv = cargo_build_argv_kind("gitmind", "", &[], false, true);
+        assert_eq!(argv, vec!["cargo", "build", "--release", "--bin", "gitmind"]);
+        // normal package case stays -p
+        let pkg = "[package]\nname = \"beatspace\"\n";
+        assert!(crate_name(pkg).is_some());
+        let argv2 = cargo_build_argv_kind("beatspace", "", &[], false, false);
+        assert_eq!(argv2, vec!["cargo", "build", "--release", "-p", "beatspace"]);
+    }
+
     use super::*;
 
     #[test]
