@@ -4,15 +4,15 @@
   "apps": [
     {
       "name": "unendlich",
-      "path": "apps/unendlich",
+      "path": "games/unendlich",
       "features": [],
       "no_default": false,
       "target": "",
       "run_flags": ""
     },
     {
-      "name": "cybertron",
-      "path": "apps/cybertron",
+      "name": "blackstar",
+      "path": "games/blackstar",
       "features": [],
       "no_default": false,
       "target": "",
