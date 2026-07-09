@@ -1,0 +1,8235 @@
+{
+  "schema": 2,
+  "version": "2.0.0",
+  "abilities": {
+    "pounce": {
+      "id": "pounce",
+      "name": "Pounce",
+      "desc": "First hit deals triple.",
+      "color": [
+        150,
+        36,
+        42
+      ],
+      "kind": "onhit"
+    },
+    "armored": {
+      "id": "armored",
+      "name": "Armored",
+      "desc": "Ignores first 3 hits.",
+      "color": [
+        188,
+        146,
+        66
+      ],
+      "kind": "passive"
+    },
+    "feather": {
+      "id": "feather",
+      "name": "Feather",
+      "desc": "Flies over everything.",
+      "color": [
+        110,
+        146,
+        188
+      ],
+      "kind": "passive"
+    },
+    "chill": {
+      "id": "chill",
+      "name": "Chill",
+      "desc": "Nearby foes attack slower.",
+      "color": [
+        110,
+        156,
+        196
+      ],
+      "kind": "passive"
+    },
+    "frenzy": {
+      "id": "frenzy",
+      "name": "Frenzy",
+      "desc": "Attacks faster when hurt.",
+      "color": [
+        150,
+        36,
+        42
+      ],
+      "kind": "special"
+    },
+    "drinker": {
+      "id": "drinker",
+      "name": "Drinker",
+      "desc": "Heals allies on nearby death.",
+      "color": [
+        86,
+        58,
+        106
+      ],
+      "kind": "special"
+    },
+    "slam": {
+      "id": "slam",
+      "name": "Slam",
+      "desc": "Knocks back on heavy hits.",
+      "color": [
+        188,
+        146,
+        66
+      ],
+      "kind": "special"
+    },
+    "taunt": {
+      "id": "taunt",
+      "name": "Taunt",
+      "desc": "Forces foes to strike it.",
+      "color": [
+        104,
+        130,
+        76
+      ],
+      "kind": "passive"
+    },
+    "toxic": {
+      "id": "toxic",
+      "name": "Toxic",
+      "desc": "Poisons on hit.",
+      "color": [
+        72,
+        150,
+        78
+      ],
+      "kind": "onhit"
+    },
+    "sharp": {
+      "id": "sharp",
+      "name": "Sharp",
+      "desc": "Retaliates in melee.",
+      "color": [
+        150,
+        36,
+        42
+      ],
+      "kind": "special"
+    },
+    "relentless": {
+      "id": "relentless",
+      "name": "Relentless",
+      "desc": "Survives one lethal blow.",
+      "color": [
+        188,
+        146,
+        66
+      ],
+      "kind": "special"
+    },
+    "towerbane": {
+      "id": "towerbane",
+      "name": "Towerbane",
+      "desc": "Only targets towers.",
+      "color": [
+        150,
+        36,
+        42
+      ],
+      "kind": "special"
+    },
+    "sap": {
+      "id": "sap",
+      "name": "Sap",
+      "desc": "Heals nearby allies.",
+      "color": [
+        150,
+        36,
+        42
+      ],
+      "kind": "passive"
+    },
+    "manyfold": {
+      "id": "manyfold",
+      "name": "Manyfold",
+      "desc": "Alpha splits on death.",
+      "color": [
+        110,
+        110,
+        120
+      ],
+      "kind": "special"
+    },
+    "doublestrike": {
+      "id": "doublestrike",
+      "name": "Doublestrike",
+      "desc": "Strikes twice per swing.",
+      "color": [
+        120,
+        158,
+        92
+      ],
+      "kind": "onhit"
+    },
+    "rush": {
+      "id": "rush",
+      "name": "Rush",
+      "desc": "Charges faster in the open.",
+      "color": [
+        200,
+        120,
+        60
+      ],
+      "kind": "special"
+    },
+    "dormant": {
+      "id": "dormant",
+      "name": "Dormant",
+      "desc": "Sleeps until struck, then rages.",
+      "color": [
+        140,
+        120,
+        90
+      ],
+      "kind": "special"
+    },
+    "beach": {
+      "id": "beach",
+      "name": "Beach",
+      "desc": "River-drop; dries out over time.",
+      "color": [
+        120,
+        150,
+        170
+      ],
+      "kind": "special"
+    },
+    "grasp": {
+      "id": "grasp",
+      "name": "Grasp",
+      "desc": "Long reach from the water.",
+      "color": [
+        140,
+        70,
+        140
+      ],
+      "kind": "special"
+    },
+    "thorns": {
+      "id": "thorns",
+      "name": "Thorns",
+      "desc": "Allies retaliate nearby.",
+      "color": [
+        80,
+        110,
+        70
+      ],
+      "kind": "passive"
+    },
+    "plague": {
+      "id": "plague",
+      "name": "Plague",
+      "desc": "Damages a wide area.",
+      "color": [
+        150,
+        140,
+        70
+      ],
+      "kind": "special"
+    },
+    "swiftdive": {
+      "id": "swiftdive",
+      "name": "Swiftdive",
+      "desc": "Flocking dive-bombs deal bonus damage.",
+      "color": [
+        60,
+        60,
+        120
+      ],
+      "kind": "onhit"
+    },
+    "inksplash": {
+      "id": "inksplash",
+      "name": "Inksplash",
+      "desc": "Splashes ink puddles on impact.",
+      "color": [
+        80,
+        20,
+        80
+      ],
+      "kind": "onhit"
+    },
+    "knock": {
+      "id": "knock",
+      "name": "Knock",
+      "desc": "Knocks back whole lanes.",
+      "color": [
+        100,
+        180,
+        220
+      ],
+      "kind": "onhit"
+    },
+    "charm": {
+      "id": "charm",
+      "name": "Charm",
+      "desc": "Enemies nearby forget targets.",
+      "color": [
+        200,
+        150,
+        100
+      ],
+      "kind": "special"
+    },
+    "steal": {
+      "id": "steal",
+      "name": "Steal",
+      "desc": "Steals enemy mana on hit.",
+      "color": [
+        100,
+        20,
+        100
+      ],
+      "kind": "onhit"
+    },
+    "freeze": {
+      "id": "freeze",
+      "name": "Freeze",
+      "desc": "Stuns target in place.",
+      "color": [
+        150,
+        200,
+        240
+      ],
+      "kind": "onhit"
+    },
+    "forge": {
+      "id": "forge",
+      "name": "Forge",
+      "desc": "Nearby armor+damage.",
+      "color": [
+        200,
+        160,
+        100
+      ],
+      "kind": "passive"
+    },
+    "stealth": {
+      "id": "stealth",
+      "name": "Stealth",
+      "desc": "Hides until first attack.",
+      "color": [
+        100,
+        100,
+        120
+      ],
+      "kind": "special"
+    },
+    "burrow": {
+      "id": "burrow",
+      "name": "Burrow",
+      "desc": "Digs \u2014 untargetable until it strikes.",
+      "color": [
+        150,
+        122,
+        40
+      ],
+      "kind": "special"
+    },
+    "snipe": {
+      "id": "snipe",
+      "name": "Snipe",
+      "desc": "Very long range; slow, heavy shots.",
+      "color": [
+        200,
+        190,
+        170
+      ],
+      "kind": "special"
+    },
+    "charge": {
+      "id": "charge",
+      "name": "Charge",
+      "desc": "Speeds up the longer it runs.",
+      "color": [
+        200,
+        120,
+        60
+      ],
+      "kind": "special"
+    },
+    "beacon": {
+      "id": "beacon",
+      "name": "Beacon",
+      "desc": "Buildings pull foes toward it.",
+      "color": [
+        120,
+        200,
+        190
+      ],
+      "kind": "passive"
+    },
+    "mirror": {
+      "id": "mirror",
+      "name": "Mirror",
+      "desc": "Spawns a decoy double on deploy.",
+      "color": [
+        170,
+        150,
+        120
+      ],
+      "kind": "special"
+    },
+    "bulwark": {
+      "id": "bulwark",
+      "name": "Bulwark",
+      "desc": "Halves damage from the front.",
+      "color": [
+        110,
+        150,
+        90
+      ],
+      "kind": "passive"
+    },
+    "rebirth": {
+      "id": "rebirth",
+      "name": "Rebirth",
+      "desc": "Revives once at half health.",
+      "color": [
+        240,
+        130,
+        60
+      ],
+      "kind": "special"
+    },
+    "snare": {
+      "id": "snare",
+      "name": "Snare",
+      "desc": "Web slows the units it hits.",
+      "color": [
+        190,
+        160,
+        200
+      ],
+      "kind": "onhit"
+    },
+    "rampage": {
+      "id": "rampage",
+      "name": "Rampage",
+      "desc": "Each kill makes it hit harder.",
+      "color": [
+        200,
+        90,
+        60
+      ],
+      "kind": "onhit"
+    },
+    "blink": {
+      "id": "blink",
+      "name": "Blink",
+      "desc": "Teleports past the front line.",
+      "color": [
+        150,
+        230,
+        190
+      ],
+      "kind": "special"
+    },
+    "artillery": {
+      "id": "artillery",
+      "name": "Artillery",
+      "desc": "Lobs shells across the whole page.",
+      "color": [
+        90,
+        80,
+        120
+      ],
+      "kind": "special"
+    },
+    "copycat": {
+      "id": "copycat",
+      "name": "Copycat",
+      "desc": "Becomes a copy of its first foe.",
+      "color": [
+        170,
+        150,
+        110
+      ],
+      "kind": "special"
+    },
+    "roll": {
+      "id": "roll",
+      "name": "Roll",
+      "desc": "Curls up and bowls through a lane.",
+      "color": [
+        120,
+        110,
+        90
+      ],
+      "kind": "special"
+    },
+    "radiance": {
+      "id": "radiance",
+      "name": "Radiance",
+      "desc": "Heals and shields nearby allies.",
+      "color": [
+        250,
+        210,
+        110
+      ],
+      "kind": "passive"
+    },
+    "leap": {
+      "id": "leap",
+      "name": "Leap",
+      "desc": "Bounds over the river in one hop.",
+      "color": [
+        190,
+        160,
+        120
+      ],
+      "kind": "special"
+    },
+    "tidal": {
+      "id": "tidal",
+      "name": "Tidal",
+      "desc": "Its wake shoves everything aside.",
+      "color": [
+        80,
+        130,
+        180
+      ],
+      "kind": "onhit"
+    },
+    "quill": {
+      "id": "quill",
+      "name": "Quillstorm",
+      "desc": "Fires a volley of quills on death.",
+      "color": [
+        180,
+        150,
+        90
+      ],
+      "kind": "ondeath"
+    },
+    "molten": {
+      "id": "molten",
+      "name": "Molten",
+      "desc": "Leaves a burning trail behind it.",
+      "color": [
+        240,
+        120,
+        50
+      ],
+      "kind": "passive"
+    },
+    "siphon": {
+      "id": "siphon",
+      "name": "Siphon",
+      "desc": "Heals when it damages a tower.",
+      "color": [
+        140,
+        80,
+        190
+      ],
+      "kind": "onhit"
+    },
+    "phalanx": {
+      "id": "phalanx",
+      "name": "Phalanx",
+      "desc": "Takes less damage beside allies.",
+      "color": [
+        90,
+        120,
+        180
+      ],
+      "kind": "passive"
+    },
+    "warp": {
+      "id": "warp",
+      "name": "Warp",
+      "desc": "Teleports to the nearest foe once.",
+      "color": [
+        120,
+        220,
+        200
+      ],
+      "kind": "onspawn"
+    },
+    "echo": {
+      "id": "echo",
+      "name": "Echo",
+      "desc": "Its attacks strike a second time softly.",
+      "color": [
+        160,
+        140,
+        220
+      ],
+      "kind": "onhit"
+    },
+    "gale": {
+      "id": "gale",
+      "name": "Gale",
+      "desc": "Shoves nearby enemies back on spawn.",
+      "color": [
+        150,
+        200,
+        230
+      ],
+      "kind": "onspawn"
+    },
+    "harvest": {
+      "id": "harvest",
+      "name": "Harvest",
+      "desc": "Grants bonus ink when it falls.",
+      "color": [
+        110,
+        180,
+        90
+      ],
+      "kind": "ondeath"
+    },
+    "dazzle": {
+      "id": "dazzle",
+      "name": "Dazzle",
+      "desc": "Blinds nearby foes on arrival.",
+      "color": [
+        240,
+        220,
+        120
+      ],
+      "kind": "onspawn"
+    },
+    "anchor": {
+      "id": "anchor",
+      "name": "Anchor",
+      "desc": "Cannot be pushed or pulled.",
+      "color": [
+        80,
+        100,
+        130
+      ],
+      "kind": "passive"
+    },
+    "kindle": {
+      "id": "kindle",
+      "name": "Kindle",
+      "desc": "Burns hotter as allies fall.",
+      "color": [
+        240,
+        120,
+        50
+      ],
+      "kind": "passive"
+    },
+    "ghostly": {
+      "id": "ghostly",
+      "name": "Ghostly",
+      "desc": "Phases through the first wall.",
+      "color": [
+        170,
+        190,
+        220
+      ],
+      "kind": "passive"
+    },
+    "wildcard": {
+      "color": [
+        230,
+        180,
+        90
+      ],
+      "desc": "Summons a random generated unit; costs more each use."
+    },
+    "builder": {
+      "color": [
+        196,
+        170,
+        120
+      ],
+      "desc": "Wanders to open ground and folds an extra tower troop; killing it tears the build down."
+    }
+  },
+  "cards": {
+    "sabertooth": {
+      "id": "sabertooth",
+      "name": "Sabertooth",
+      "cost": 4,
+      "hp": 520,
+      "dmg": 95,
+      "spd": 62,
+      "rng": 26,
+      "size": 26,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        196,
+        138,
+        76
+      ],
+      "ability": "pounce",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 1.0,
+          "h": 0.55,
+          "tone": 1.0
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.35
+          ],
+          "size": 0.8,
+          "ang": -0.15,
+          "tone": 1.1
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.95,
+            -0.05
+          ],
+          "size": 0.7,
+          "ang": -0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.95,
+            -0.1
+          ],
+          "size": 0.65,
+          "ang": 0.4,
+          "tone": 0.9
+        }
+      ]
+    },
+    "pangolin": {
+      "id": "pangolin",
+      "name": "Pangolin",
+      "cost": 4,
+      "hp": 780,
+      "dmg": 42,
+      "spd": 40,
+      "rng": 24,
+      "size": 24,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        142,
+        106,
+        74
+      ],
+      "ability": "armored",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.95,
+          "h": 0.5,
+          "tone": 0.95
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.2
+          ],
+          "size": 0.7,
+          "count": 5,
+          "tone": 0.7
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.15
+          ],
+          "size": 0.55,
+          "ang": -0.2,
+          "tone": 1.05
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "h": 0.45
+        }
+      ]
+    },
+    "crane": {
+      "id": "crane",
+      "name": "Paper Crane",
+      "cost": 2,
+      "hp": 210,
+      "dmg": 48,
+      "spd": 70,
+      "rng": 26,
+      "size": 20,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        224,
+        218,
+        204
+      ],
+      "ability": "feather",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.85,
+          "h": 0.35,
+          "tone": 1.0
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.25,
+          "ang": 0.6,
+          "tone": 0.9
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.15,
+          "ang": -0.4,
+          "tone": 1.05
+        },
+        {
+          "part": "wedge",
+          "at": [
+            1.0,
+            -0.15
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.1
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.95,
+            0.05
+          ],
+          "size": 0.75,
+          "ang": 0.25,
+          "tone": 0.85
+        }
+      ]
+    },
+    "polarbear": {
+      "id": "polarbear",
+      "name": "Polar Bear",
+      "cost": 7,
+      "hp": 1650,
+      "dmg": 120,
+      "spd": 30,
+      "rng": 28,
+      "size": 34,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        208,
+        214,
+        222
+      ],
+      "ability": "chill",
+      "rarity": "rare",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.65
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.35
+          ],
+          "size": 0.7,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.45
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.05
+          ],
+          "size": 0.4,
+          "ang": 0.3,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "wolverine": {
+      "id": "wolverine",
+      "name": "Wolverine",
+      "cost": 3,
+      "hp": 340,
+      "dmg": 70,
+      "spd": 74,
+      "rng": 22,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        84,
+        62,
+        46
+      ],
+      "ability": "frenzy",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.7,
+          "ang": -0.15,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.9,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.4,
+          "tone": 1.0,
+          "h": 0.5
+        }
+      ]
+    },
+    "batcolony": {
+      "id": "batcolony",
+      "name": "Bat Colony",
+      "cost": 3,
+      "hp": 140,
+      "dmg": 34,
+      "spd": 78,
+      "rng": 22,
+      "size": 15,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 3,
+      "paper": [
+        58,
+        54,
+        68
+      ],
+      "ability": "drinker",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.0,
+          "ang": 0.55,
+          "tone": 0.75,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 0.92,
+          "ang": -0.35,
+          "tone": 0.8624999999999999,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.35,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.4,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "gorilla": {
+      "id": "gorilla",
+      "name": "Silverback",
+      "cost": 6,
+      "hp": 1250,
+      "dmg": 105,
+      "spd": 36,
+      "rng": 26,
+      "size": 31,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        112,
+        112,
+        120
+      ],
+      "ability": "slam",
+      "rarity": "rare",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.7
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.6
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 0.95,
+          "h": 0.45
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "baobab": {
+      "id": "baobab",
+      "name": "Baobab",
+      "cost": 5,
+      "hp": 1100,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 30,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        154,
+        116,
+        78
+      ],
+      "ability": "taunt",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.55,
+          "h": 1.1,
+          "tone": 0.8
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.75
+          ],
+          "size": 1.3,
+          "h": 0.6,
+          "tone": 1.0
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.5
+          ],
+          "size": 0.5,
+          "count": 3,
+          "tone": 0.9
+        }
+      ]
+    },
+    "frog": {
+      "id": "frog",
+      "name": "Dart Frog",
+      "cost": 2,
+      "hp": 180,
+      "dmg": 30,
+      "spd": 64,
+      "rng": 20,
+      "size": 17,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        78,
+        158,
+        84
+      ],
+      "ability": "toxic",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.65,
+            0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.65,
+            0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.55,
+            -0.25
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.4,
+            -0.35
+          ],
+          "size": 0.15,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.7,
+            -0.35
+          ],
+          "size": 0.15,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "cassowary": {
+      "id": "cassowary",
+      "name": "Cassowary",
+      "cost": 4,
+      "hp": 430,
+      "dmg": 88,
+      "spd": 80,
+      "rng": 22,
+      "size": 25,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        40,
+        40,
+        46
+      ],
+      "ability": "sharp",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.35,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.7
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.35,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.7
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.6
+          ],
+          "size": 0.55,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.65,
+            -0.75
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.85,
+            0.0
+          ],
+          "size": 0.5,
+          "ang": 0.2,
+          "tone": 0.8,
+          "h": 0.5
+        }
+      ]
+    },
+    "honeybadger": {
+      "id": "honeybadger",
+      "name": "Honey Badger",
+      "cost": 5,
+      "hp": 560,
+      "dmg": 80,
+      "spd": 58,
+      "rng": 20,
+      "size": 22,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        60,
+        56,
+        52
+      ],
+      "ability": "relentless",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.65,
+          "ang": -0.15,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            -0.25
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.5,
+          "h": 0.5
+        }
+      ]
+    },
+    "mammoth": {
+      "id": "mammoth",
+      "name": "Mammoth",
+      "cost": 8,
+      "hp": 2100,
+      "dmg": 140,
+      "spd": 26,
+      "rng": 30,
+      "size": 38,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        118,
+        84
+      ],
+      "ability": "towerbane",
+      "rarity": "rare",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.65
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.3
+          ],
+          "size": 0.8,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.9,
+            0.0
+          ],
+          "size": 1.3,
+          "ang": 0.5,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            -0.1,
+            -0.45
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 0.95,
+          "h": 0.5
+        }
+      ]
+    },
+    "dragontree": {
+      "id": "dragontree",
+      "name": "Dragon's Blood Tree",
+      "cost": 4,
+      "hp": 820,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 28,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        126,
+        44,
+        42
+      ],
+      "ability": "sap",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 1.0
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.7
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.55
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.85
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5,
+          "count": 3
+        }
+      ]
+    },
+    "mothswarm": {
+      "id": "mothswarm",
+      "name": "Ink Moth Swarm",
+      "cost": 3,
+      "hp": 150,
+      "dmg": 30,
+      "spd": 82,
+      "rng": 20,
+      "size": 14,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 3,
+      "paper": [
+        84,
+        78,
+        96
+      ],
+      "ability": "drinker",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.65,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.1,
+            -0.25
+          ],
+          "size": 0.85,
+          "ang": 0.8,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.3,
+            -0.25
+          ],
+          "size": 0.85,
+          "ang": -0.8,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.8,
+            -0.2
+          ],
+          "size": 0.4,
+          "ang": 0.2,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.2,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5,
+          "count": 2
+        }
+      ]
+    },
+    "wolfpack": {
+      "id": "wolfpack",
+      "name": "Wolf Pack",
+      "cost": 4,
+      "hp": 260,
+      "dmg": 52,
+      "spd": 72,
+      "rng": 20,
+      "size": 18,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 3,
+      "paper": [
+        96,
+        92,
+        100
+      ],
+      "ability": "manyfold",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.42
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.6,
+          "ang": -0.15,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.65,
+          "ang": 0.5,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.8,
+            -0.5
+          ],
+          "size": 0.28,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.28
+        }
+      ]
+    },
+    "mantis": {
+      "id": "mantis",
+      "name": "Paper Mantis",
+      "cost": 3,
+      "hp": 300,
+      "dmg": 54,
+      "spd": 66,
+      "rng": 22,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        158,
+        92
+      ],
+      "ability": "doublestrike",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.75,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.4
+          ],
+          "size": 0.5,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.85,
+            -0.25
+          ],
+          "size": 0.7,
+          "ang": 0.4,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.8,
+          "ang": 0.5,
+          "tone": 0.75,
+          "h": 0.5
+        }
+      ]
+    },
+    "terrorbird": {
+      "id": "terrorbird",
+      "name": "Terror Bird",
+      "cost": 4,
+      "hp": 470,
+      "dmg": 76,
+      "spd": 70,
+      "rng": 22,
+      "size": 26,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        96,
+        70
+      ],
+      "ability": "rush",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.35,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.75
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.35,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.75
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.75,
+            -0.55
+          ],
+          "size": 0.7,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.95,
+            -0.4
+          ],
+          "size": 0.4,
+          "ang": -0.3,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.85,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "sloth": {
+      "id": "sloth",
+      "name": "Ground Sloth",
+      "cost": 5,
+      "hp": 2400,
+      "dmg": 70,
+      "spd": 24,
+      "rng": 24,
+      "size": 33,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        126,
+        110,
+        88
+      ],
+      "ability": "dormant",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 1.0,
+          "ang": 0.0,
+          "tone": 0.95,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.55,
+            -0.4
+          ],
+          "size": 0.6,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            -0.7,
+            0.1
+          ],
+          "size": 0.6,
+          "ang": 0.6,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "shark": {
+      "id": "shark",
+      "name": "Great White",
+      "cost": 6,
+      "hp": 1200,
+      "dmg": 150,
+      "spd": 68,
+      "rng": 24,
+      "size": 30,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        150,
+        158,
+        168
+      ],
+      "ability": "beach",
+      "rarity": "rare",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 1.0,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.9,
+            0.0
+          ],
+          "size": 0.8,
+          "ang": 0.3,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.1,
+            -0.45
+          ],
+          "size": 0.65,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.75,
+            -0.15
+          ],
+          "size": 0.12,
+          "ang": 0.0,
+          "tone": 0.4,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            0.05
+          ],
+          "size": 0.4,
+          "ang": -0.1,
+          "tone": 0.95,
+          "h": 0.5
+        }
+      ]
+    },
+    "squid": {
+      "id": "squid",
+      "name": "Deep Squid",
+      "cost": 5,
+      "hp": 740,
+      "dmg": 64,
+      "spd": 40,
+      "rng": 40,
+      "size": 27,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        120,
+        70,
+        120
+      ],
+      "ability": "grasp",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.55
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            0.35
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.35,
+            -0.1
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.35,
+            -0.1
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        }
+      ]
+    },
+    "monkeypuzzle": {
+      "id": "monkeypuzzle",
+      "name": "Monkey Puzzle",
+      "cost": 3,
+      "hp": 680,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 27,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        74,
+        96,
+        66
+      ],
+      "ability": "thorns",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 0.8,
+          "h": 1.1
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5,
+          "count": 5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.75
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 0.95,
+          "h": 0.4
+        }
+      ]
+    },
+    "locust": {
+      "id": "locust",
+      "name": "Locust Plague",
+      "cost": 5,
+      "hp": 90,
+      "dmg": 22,
+      "spd": 48,
+      "rng": 120,
+      "size": 16,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 4,
+      "paper": [
+        120,
+        108,
+        60
+      ],
+      "ability": "plague",
+      "rarity": "common",
+      "set": "core",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.1,
+            -0.25
+          ],
+          "size": 0.8,
+          "ang": 0.75,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.3,
+            -0.25
+          ],
+          "size": 0.8,
+          "ang": -0.75,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.8,
+            -0.2
+          ],
+          "size": 0.45,
+          "ang": 0.2,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.2,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5,
+          "count": 2
+        }
+      ]
+    },
+    "ravencrows": {
+      "id": "ravencrows",
+      "name": "Raven Crows",
+      "cost": 3,
+      "hp": 120,
+      "dmg": 40,
+      "spd": 86,
+      "rng": 24,
+      "size": 13,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 4,
+      "paper": [
+        30,
+        28,
+        36
+      ],
+      "ability": "swiftdive",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.65,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 0.95,
+          "ang": 0.55,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 0.874,
+          "ang": -0.35,
+          "tone": 0.8049999999999999,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "inkgolem": {
+      "id": "inkgolem",
+      "name": "Ink Golem",
+      "cost": 6,
+      "hp": 1600,
+      "dmg": 85,
+      "spd": 20,
+      "rng": 22,
+      "size": 36,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        24,
+        22,
+        28
+      ],
+      "ability": "inksplash",
+      "rarity": "rare",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 1.05,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.75
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.8925,
+          "ang": 0.0,
+          "tone": 0.65,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": -0.2,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.2,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.3,
+            -0.35
+          ],
+          "size": 0.16,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.3,
+            -0.35
+          ],
+          "size": 0.16,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        }
+      ]
+    },
+    "tidalwave": {
+      "id": "tidalwave",
+      "name": "Tidal Wave",
+      "cost": 7,
+      "hp": 2000,
+      "dmg": 120,
+      "spd": 18,
+      "rng": 200,
+      "size": 40,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        70,
+        130,
+        180
+      ],
+      "ability": "knock",
+      "rarity": "rare",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 0.95,
+          "h": 0.4
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.4
+          ],
+          "size": 1.3,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.6
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.3,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.9,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": 0.2,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "piper": {
+      "id": "piper",
+      "name": "Pipe Piper",
+      "cost": 4,
+      "hp": 380,
+      "dmg": 0,
+      "spd": 60,
+      "rng": 0,
+      "size": 22,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        160,
+        130,
+        90
+      ],
+      "ability": "charm",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 0.9,
+          "h": 0.9
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.6
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.5,
+            -0.3
+          ],
+          "size": 0.7,
+          "ang": 0.4,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        }
+      ]
+    },
+    "voidcritter": {
+      "id": "voidcritter",
+      "name": "Void Critter",
+      "cost": 5,
+      "hp": 500,
+      "dmg": 60,
+      "spd": 65,
+      "rng": 18,
+      "size": 24,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        40,
+        20,
+        60
+      ],
+      "ability": "steal",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 0.2,
+          "ang": 0.0,
+          "tone": 0.35,
+          "h": 0.5
+        }
+      ]
+    },
+    "frostmage": {
+      "id": "frostmage",
+      "name": "Frost Mage",
+      "cost": 4,
+      "hp": 350,
+      "dmg": 50,
+      "spd": 55,
+      "rng": 30,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        180,
+        210,
+        240
+      ],
+      "ability": "freeze",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.55
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.4
+        },
+        {
+          "part": "tusk",
+          "at": [
+            -0.55,
+            -0.2
+          ],
+          "size": 0.7,
+          "ang": 0.5,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.6,
+            -0.55
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5
+        }
+      ]
+    },
+    "ironsmith": {
+      "id": "ironsmith",
+      "name": "Iron Smith",
+      "cost": 5,
+      "hp": 900,
+      "dmg": 70,
+      "spd": 32,
+      "rng": 20,
+      "size": 28,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        140,
+        140,
+        150
+      ],
+      "ability": "forge",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 1.0,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.85
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.5
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.3
+          ],
+          "size": 0.4,
+          "ang": -0.2,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "shadowcat": {
+      "id": "shadowcat",
+      "name": "Shadow Cat",
+      "cost": 3,
+      "hp": 280,
+      "dmg": 65,
+      "spd": 75,
+      "rng": 18,
+      "size": 18,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        50,
+        48,
+        56
+      ],
+      "ability": "stealth",
+      "rarity": "common",
+      "set": "tideswell",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.7,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.75,
+          "ang": 0.5,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "scarab": {
+      "id": "scarab",
+      "name": "Gilt Scarab",
+      "cost": 2,
+      "hp": 240,
+      "dmg": 36,
+      "spd": 70,
+      "rng": 18,
+      "size": 16,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        122,
+        40
+      ],
+      "ability": "burrow",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.55
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.15
+          ],
+          "size": 0.4,
+          "ang": -0.2,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.85,
+            -0.25
+          ],
+          "size": 0.4,
+          "ang": 0.3,
+          "tone": 1.0,
+          "h": 0.5
+        }
+      ]
+    },
+    "heron": {
+      "id": "heron",
+      "name": "Ash Heron",
+      "cost": 4,
+      "hp": 360,
+      "dmg": 92,
+      "spd": 64,
+      "rng": 120,
+      "size": 24,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        180,
+        170,
+        160
+      ],
+      "ability": "snipe",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.8,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.2,
+          "ang": 0.55,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.104,
+          "ang": -0.35,
+          "tone": 1.035,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.7,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            1.0,
+            -0.05
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.0,
+          "h": 0.5
+        }
+      ]
+    },
+    "boar": {
+      "id": "boar",
+      "name": "Bristle Boar",
+      "cost": 4,
+      "hp": 760,
+      "dmg": 74,
+      "spd": 88,
+      "rng": 22,
+      "size": 25,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        84,
+        62
+      ],
+      "ability": "charge",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.3
+          ],
+          "size": 0.65,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.9,
+            0.0
+          ],
+          "size": 0.6,
+          "ang": 0.5,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.2,
+            -0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "lantern": {
+      "id": "lantern",
+      "name": "Lantern Jelly",
+      "cost": 3,
+      "hp": 300,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 24,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        190,
+        180
+      ],
+      "ability": "beacon",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.15
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.6
+        },
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.8,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "coyote": {
+      "id": "coyote",
+      "name": "Trick Coyote",
+      "cost": 3,
+      "hp": 320,
+      "dmg": 58,
+      "spd": 78,
+      "rng": 20,
+      "size": 19,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        120,
+        90
+      ],
+      "ability": "mirror",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.48
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.68,
+          "ang": -0.15,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.7,
+          "ang": 0.45,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.85,
+            -0.5
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.28
+        }
+      ]
+    },
+    "tortoise": {
+      "id": "tortoise",
+      "name": "Siege Tortoise",
+      "cost": 6,
+      "hp": 2200,
+      "dmg": 60,
+      "spd": 22,
+      "rng": 26,
+      "size": 34,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        96,
+        116,
+        80
+      ],
+      "ability": "bulwark",
+      "rarity": "rare",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 1.2,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.95
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            0.05
+          ],
+          "size": 0.45,
+          "ang": -0.1,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "phoenix": {
+      "id": "phoenix",
+      "name": "Ember Phoenix",
+      "cost": 6,
+      "hp": 640,
+      "dmg": 96,
+      "spd": 72,
+      "rng": 24,
+      "size": 27,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        220,
+        120,
+        50
+      ],
+      "ability": "rebirth",
+      "rarity": "epic",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.35,
+          "ang": 0.55,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.2420000000000002,
+          "ang": -0.35,
+          "tone": 1.265,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 1.0,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.2,
+            -0.5
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.4
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.7,
+            0.1
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 3
+        }
+      ]
+    },
+    "weaver": {
+      "id": "weaver",
+      "name": "Silk Weaver",
+      "cost": 4,
+      "hp": 520,
+      "dmg": 30,
+      "spd": 44,
+      "rng": 90,
+      "size": 22,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        180,
+        150,
+        190
+      ],
+      "ability": "snare",
+      "rarity": "uncommon",
+      "set": "clockwork",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.35
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.35
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.3
+          ],
+          "size": 0.4,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "warthog": {
+      "id": "warthog",
+      "name": "War Warthog",
+      "cost": 4,
+      "hp": 880,
+      "dmg": 68,
+      "spd": 80,
+      "rng": 20,
+      "size": 26,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        92,
+        76
+      ],
+      "ability": "rampage",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.3
+          ],
+          "size": 0.66,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.9,
+            0.0
+          ],
+          "size": 0.7,
+          "ang": 0.45,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.5
+          ],
+          "size": 0.35,
+          "ang": 0.2,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "willowisp": {
+      "id": "willowisp",
+      "name": "Will-o-Wisp",
+      "cost": 2,
+      "hp": 120,
+      "dmg": 44,
+      "spd": 96,
+      "rng": 60,
+      "size": 14,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        230,
+        190
+      ],
+      "ability": "blink",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": 0.8,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.2,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": -0.8,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "obelisk": {
+      "id": "obelisk",
+      "name": "Ink Obelisk",
+      "cost": 5,
+      "hp": 1500,
+      "dmg": 80,
+      "spd": 0,
+      "rng": 200,
+      "size": 30,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        60,
+        56,
+        70
+      ],
+      "ability": "artillery",
+      "rarity": "epic",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 1.3
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.85
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.15
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.65,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.4
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "mimic": {
+      "id": "mimic",
+      "name": "Folded Mimic",
+      "cost": 3,
+      "hp": 460,
+      "dmg": 52,
+      "spd": 60,
+      "rng": 18,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        130,
+        96
+      ],
+      "ability": "copycat",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 1.0,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.15
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5,
+          "count": 5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.4,
+            -0.3
+          ],
+          "size": 0.12,
+          "ang": 0.0,
+          "tone": 0.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "beetle": {
+      "id": "beetle",
+      "name": "Dung Beetle",
+      "cost": 3,
+      "hp": 700,
+      "dmg": 40,
+      "spd": 50,
+      "rng": 18,
+      "size": 22,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        70,
+        66,
+        58
+      ],
+      "ability": "roll",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.05,
+            -0.3
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.8,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        }
+      ]
+    },
+    "sunbird": {
+      "id": "sunbird",
+      "name": "Sun Bird",
+      "cost": 5,
+      "hp": 560,
+      "dmg": 70,
+      "spd": 70,
+      "rng": 30,
+      "size": 24,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        240,
+        190,
+        80
+      ],
+      "ability": "radiance",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.75,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.1,
+          "ang": 0.55,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.0120000000000002,
+          "ang": -0.35,
+          "tone": 1.3224999999999998,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.6,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.8,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.9,
+            -0.2
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "jackalope": {
+      "id": "jackalope",
+      "name": "Jackalope",
+      "cost": 2,
+      "hp": 200,
+      "dmg": 48,
+      "spd": 110,
+      "rng": 16,
+      "size": 15,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        180,
+        150,
+        120
+      ],
+      "ability": "leap",
+      "rarity": "uncommon",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.75,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.4,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.4,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.35
+          ],
+          "size": 0.45,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.65,
+            -0.5
+          ],
+          "size": 0.6,
+          "ang": 0.3,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.55,
+            -0.45
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        }
+      ]
+    },
+    "leviathan": {
+      "id": "leviathan",
+      "name": "Ink Leviathan",
+      "cost": 8,
+      "hp": 3000,
+      "dmg": 180,
+      "spd": 30,
+      "rng": 40,
+      "size": 42,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        30,
+        40,
+        66
+      ],
+      "ability": "tidal",
+      "rarity": "epic",
+      "set": "wilds",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.9,
+            -0.3
+          ],
+          "size": 0.7,
+          "ang": -0.2,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.15,
+            0.3
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 6
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.9,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.75,
+            -0.35
+          ],
+          "size": 0.18,
+          "ang": 0.0,
+          "tone": 0.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "stagbeetle": {
+      "id": "stagbeetle",
+      "name": "Stag Beetle",
+      "cost": 4,
+      "hp": 640,
+      "dmg": 70,
+      "spd": 58,
+      "rng": 24,
+      "size": 24,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        90,
+        70,
+        44
+      ],
+      "ability": "quill",
+      "rarity": "uncommon",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.85,
+            -0.25
+          ],
+          "size": 0.8,
+          "ang": 0.5,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.65,
+            -0.15
+          ],
+          "size": 0.4,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "emberfox": {
+      "id": "emberfox",
+      "name": "Ember Fox",
+      "cost": 3,
+      "hp": 300,
+      "dmg": 66,
+      "spd": 96,
+      "rng": 22,
+      "size": 19,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        210,
+        110,
+        50
+      ],
+      "ability": "molten",
+      "rarity": "rare",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.7,
+          "ang": -0.15,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.85,
+          "ang": 0.6,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.8,
+            -0.55
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.3
+        }
+      ]
+    },
+    "leech": {
+      "id": "leech",
+      "name": "Ink Leech",
+      "cost": 3,
+      "hp": 340,
+      "dmg": 40,
+      "spd": 70,
+      "rng": 22,
+      "size": 18,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        120,
+        70,
+        150
+      ],
+      "ability": "siphon",
+      "rarity": "uncommon",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.2,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.8,
+          "h": 0.5,
+          "count": 5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.0
+          ],
+          "size": 0.6,
+          "ang": 0.3,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "legion": {
+      "id": "legion",
+      "name": "Paper Legion",
+      "cost": 5,
+      "hp": 240,
+      "dmg": 44,
+      "spd": 62,
+      "rng": 22,
+      "size": 16,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 4,
+      "paper": [
+        150,
+        150,
+        160
+      ],
+      "ability": "phalanx",
+      "rarity": "rare",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.2,
+            -0.5
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            -0.5,
+            -0.3
+          ],
+          "size": 0.7,
+          "ang": 0.5,
+          "tone": 1.0,
+          "h": 0.5
+        }
+      ]
+    },
+    "mothmage": {
+      "id": "mothmage",
+      "name": "Moth Mage",
+      "cost": 4,
+      "hp": 360,
+      "dmg": 58,
+      "spd": 66,
+      "rng": 150,
+      "size": 20,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        160,
+        150,
+        210
+      ],
+      "ability": "warp",
+      "rarity": "epic",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.72,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.1,
+            -0.25
+          ],
+          "size": 1.0,
+          "ang": 0.65,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.3,
+            -0.25
+          ],
+          "size": 1.0,
+          "ang": -0.65,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.8,
+            -0.2
+          ],
+          "size": 0.55,
+          "ang": 0.2,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.2,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.45
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.35
+        }
+      ]
+    },
+    "bellfrog": {
+      "id": "bellfrog",
+      "name": "Bell Frog",
+      "cost": 2,
+      "hp": 220,
+      "dmg": 34,
+      "spd": 60,
+      "rng": 20,
+      "size": 17,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        110,
+        170,
+        120
+      ],
+      "ability": "echo",
+      "rarity": "common",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.65,
+            0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.65,
+            0.3
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.55,
+            -0.25
+          ],
+          "size": 0.5,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.4,
+            -0.35
+          ],
+          "size": 0.15,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.7,
+            -0.35
+          ],
+          "size": 0.15,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.15
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.3
+        }
+      ]
+    },
+    "condor": {
+      "id": "condor",
+      "name": "Storm Condor",
+      "cost": 5,
+      "hp": 560,
+      "dmg": 88,
+      "spd": 84,
+      "rng": 26,
+      "size": 26,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        190,
+        220
+      ],
+      "ability": "gale",
+      "rarity": "rare",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.35,
+          "ang": 0.55,
+          "tone": 0.92,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.2420000000000002,
+          "ang": -0.35,
+          "tone": 1.058,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.55,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "mushroom": {
+      "id": "mushroom",
+      "name": "Spore Cap",
+      "cost": 3,
+      "hp": 520,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 22,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        150,
+        90
+      ],
+      "ability": "harvest",
+      "rarity": "uncommon",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.7
+        },
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.8,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "rhino": {
+      "id": "rhino",
+      "name": "Ironhide Rhino",
+      "cost": 6,
+      "hp": 1350,
+      "dmg": 150,
+      "spd": 54,
+      "rng": 24,
+      "size": 30,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        130,
+        120,
+        110
+      ],
+      "ability": "charge",
+      "rarity": "epic",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.05,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.3
+          ],
+          "size": 0.75,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.45
+          ],
+          "size": 0.5,
+          "ang": 0.4,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.25
+          ],
+          "size": 0.3,
+          "ang": 0.5,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "wisppack": {
+      "id": "wisppack",
+      "name": "Wisp Pack",
+      "cost": 4,
+      "hp": 180,
+      "dmg": 40,
+      "spd": 92,
+      "rng": 20,
+      "size": 15,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 3,
+      "paper": [
+        200,
+        220,
+        150
+      ],
+      "ability": "blink",
+      "rarity": "rare",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.25,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.4,
+            -0.1
+          ],
+          "size": 0.25,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.4,
+            -0.15
+          ],
+          "size": 0.28,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0,
+            -0.25
+          ],
+          "size": 0.5,
+          "ang": 0.6,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "golemsm": {
+      "id": "golemsm",
+      "name": "Clay Sentry",
+      "cost": 4,
+      "hp": 900,
+      "dmg": 70,
+      "spd": 42,
+      "rng": 22,
+      "size": 26,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        110,
+        80
+      ],
+      "ability": "bulwark",
+      "rarity": "uncommon",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.6
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.765,
+          "ang": 0.0,
+          "tone": 0.65,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": -0.2,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.2,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "serpent": {
+      "id": "serpent",
+      "name": "River Serpent",
+      "cost": 5,
+      "hp": 700,
+      "dmg": 110,
+      "spd": 76,
+      "rng": 24,
+      "size": 27,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        80,
+        150,
+        140
+      ],
+      "ability": "tidal",
+      "rarity": "epic",
+      "set": "expanse",
+      "rotation": true,
+      "blurb": "",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.2
+          ],
+          "size": 0.55,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.95,
+            0.0
+          ],
+          "size": 0.85,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.15
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.9,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "lanternfish": {
+      "id": "lanternfish",
+      "name": "Lantern Fish",
+      "cost": 3,
+      "hp": 360,
+      "dmg": 52,
+      "spd": 72,
+      "rng": 22,
+      "size": 19,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        120,
+        180,
+        190
+      ],
+      "ability": "dazzle",
+      "rarity": "uncommon",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "A cold light drifts up from the river.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.95,
+          "h": 0.4,
+          "tone": 1.0
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.9,
+            0.0
+          ],
+          "size": 0.75,
+          "ang": 0.3,
+          "tone": 0.9
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.9,
+            -0.35
+          ],
+          "size": 0.22,
+          "tone": 1.4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.1,
+            -0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.1
+        }
+      ]
+    },
+    "dunestrider": {
+      "id": "dunestrider",
+      "name": "Dune Strider",
+      "cost": 4,
+      "hp": 620,
+      "dmg": 74,
+      "spd": 66,
+      "rng": 24,
+      "size": 25,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        200,
+        170,
+        110
+      ],
+      "ability": "charge",
+      "rarity": "rare",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "Long legs eat the distance.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.7
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.7
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.72,
+          "ang": -0.15,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.6,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "papercutkite": {
+      "id": "papercutkite",
+      "name": "Papercut Kite",
+      "cost": 2,
+      "hp": 180,
+      "dmg": 44,
+      "spd": 98,
+      "rng": 20,
+      "size": 16,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        220,
+        220,
+        230
+      ],
+      "ability": "swiftdive",
+      "rarity": "common",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "Thin, fast, and unkind at the edges.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.3,
+          "ang": 0.55,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 1.1960000000000002,
+          "ang": -0.35,
+          "tone": 1.2075,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.3,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.9,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "bastioram": {
+      "id": "bastioram",
+      "name": "Bastion Ram",
+      "cost": 6,
+      "hp": 1500,
+      "dmg": 140,
+      "spd": 44,
+      "rng": 24,
+      "size": 31,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        140,
+        120
+      ],
+      "ability": "anchor",
+      "rarity": "epic",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "It does not stop. It does not turn.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.1,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.65
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.3
+          ],
+          "size": 0.7,
+          "ang": -0.2,
+          "tone": 1.08,
+          "h": 0.5
+        },
+        {
+          "part": "shell",
+          "at": [
+            0.75,
+            -0.2
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.35
+          ],
+          "size": 0.5,
+          "ang": 0.3,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.05
+          ],
+          "size": 0.5,
+          "ang": -0.3,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "embermoth": {
+      "id": "embermoth",
+      "name": "Ember Moth",
+      "cost": 3,
+      "hp": 240,
+      "dmg": 50,
+      "spd": 92,
+      "rng": 20,
+      "size": 17,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 2,
+      "paper": [
+        240,
+        140,
+        70
+      ],
+      "ability": "kindle",
+      "rarity": "rare",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "Drawn to the last warm light.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.1,
+            -0.25
+          ],
+          "size": 0.95,
+          "ang": 0.7,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.3,
+            -0.25
+          ],
+          "size": 0.95,
+          "ang": -0.7,
+          "tone": 0.8,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.8,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.2,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.2,
+            -0.1
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.16,
+          "ang": 0.0,
+          "tone": 1.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "glasstortoise": {
+      "id": "glasstortoise",
+      "name": "Glass Tortoise",
+      "cost": 5,
+      "hp": 1300,
+      "dmg": 60,
+      "spd": 34,
+      "rng": 22,
+      "size": 29,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        190,
+        220,
+        225
+      ],
+      "ability": "ghostly",
+      "rarity": "epic",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "You can see straight through its guard.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 1.2,
+          "h": 0.95,
+          "tone": 1.05
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.9,
+          "tone": 0.65
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            0.05
+          ],
+          "size": 0.45,
+          "ang": -0.1,
+          "tone": 0.9
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.35,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.4
+          ],
+          "size": 0.35,
+          "h": 0.35
+        }
+      ]
+    },
+    "saltgolem": {
+      "id": "saltgolem",
+      "name": "Salt Golem",
+      "cost": 4,
+      "hp": 880,
+      "dmg": 72,
+      "spd": 40,
+      "rng": 22,
+      "size": 27,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        220,
+        215,
+        205
+      ],
+      "ability": "bulwark",
+      "rarity": "uncommon",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "Slow, patient, and hard to wash away.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.65
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.25
+          ],
+          "size": 0.8075,
+          "ang": 0.0,
+          "tone": 0.65,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.42
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": -0.2,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.7,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.2,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.45
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "reedcolony": {
+      "id": "reedcolony",
+      "name": "Reed Colony",
+      "cost": 4,
+      "hp": 220,
+      "dmg": 42,
+      "spd": 70,
+      "rng": 22,
+      "size": 16,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 4,
+      "paper": [
+        120,
+        160,
+        110
+      ],
+      "ability": "relentless",
+      "rarity": "rare",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "They rise wherever the water slows.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.9,
+          "h": 0.5,
+          "count": 4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.2
+          ],
+          "size": 0.35,
+          "ang": -0.15,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.4,
+            0.35
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.4,
+            0.35
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        }
+      ]
+    },
+    "inkwren": {
+      "id": "inkwren",
+      "name": "Ink Wren",
+      "cost": 2,
+      "hp": 190,
+      "dmg": 46,
+      "spd": 86,
+      "rng": 22,
+      "size": 17,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        70,
+        60,
+        90
+      ],
+      "ability": "feather",
+      "rarity": "common",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "A small dark note, singing across the page.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.25,
+            -0.2
+          ],
+          "size": 1.0,
+          "ang": 0.55,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.45,
+            -0.15
+          ],
+          "size": 0.92,
+          "ang": -0.35,
+          "tone": 0.8049999999999999,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.95,
+            -0.12
+          ],
+          "size": 0.45,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "cinderhound": {
+      "id": "cinderhound",
+      "name": "Cinder Hound",
+      "cost": 3,
+      "hp": 340,
+      "dmg": 70,
+      "spd": 90,
+      "rng": 22,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        210,
+        90,
+        50
+      ],
+      "ability": "rush",
+      "rarity": "uncommon",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "It runs the coals and does not slow.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.8,
+            -0.35
+          ],
+          "size": 0.72,
+          "ang": -0.15,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.0,
+            -0.4
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.35
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.9,
+            -0.1
+          ],
+          "size": 0.6,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.35
+          ],
+          "size": 0.45,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5,
+          "count": 4
+        }
+      ]
+    },
+    "marbleaegis": {
+      "id": "marbleaegis",
+      "name": "Marble Aegis",
+      "cost": 5,
+      "hp": 1250,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 30,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        220,
+        220,
+        225
+      ],
+      "ability": "beacon",
+      "rarity": "rare",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "A standing shield the enemy must answer.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.1
+          ],
+          "size": 1.15,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 1.0
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.6
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.4
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5,
+          "count": 3
+        }
+      ]
+    },
+    "willothewisp": {
+      "id": "willothewisp",
+      "name": "Will-o-Wisp",
+      "cost": 3,
+      "hp": 150,
+      "dmg": 38,
+      "spd": 96,
+      "rng": 20,
+      "size": 14,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 3,
+      "paper": [
+        190,
+        230,
+        180
+      ],
+      "ability": "blink",
+      "rarity": "rare",
+      "set": "tideturn",
+      "rotation": true,
+      "blurb": "Follow it and lose your footing.",
+      "model": [
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.3
+          ],
+          "size": 0.5,
+          "tone": 1.3
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": 0.8,
+          "tone": 0.7
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.2,
+            -0.2
+          ],
+          "size": 0.6,
+          "ang": -0.8,
+          "tone": 0.7
+        }
+      ]
+    },
+    "inkling": {
+      "id": "inkling",
+      "name": "Inkling",
+      "cost": 1,
+      "hp": 90,
+      "dmg": 26,
+      "spd": 84,
+      "rng": 20,
+      "size": 13,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        60,
+        54,
+        72
+      ],
+      "ability": "sharp",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "A single drop of ink, given legs.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.75,
+            -0.3
+          ],
+          "size": 0.45,
+          "ang": -0.15,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.85,
+            -0.05
+          ],
+          "size": 0.5,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "papermoth": {
+      "id": "papermoth",
+      "name": "Paper Moth",
+      "cost": 1,
+      "hp": 70,
+      "dmg": 20,
+      "spd": 96,
+      "rng": 22,
+      "size": 12,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        200,
+        196,
+        180
+      ],
+      "ability": "feather",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Barely there, and gone in a gust.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.85,
+          "ang": 0.6,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.35,
+            -0.15
+          ],
+          "size": 0.765,
+          "ang": -0.45,
+          "tone": 0.9900000000000001,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.28,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.8,
+            0.05
+          ],
+          "size": 0.45,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "sparkmouse": {
+      "id": "sparkmouse",
+      "name": "Spark Mouse",
+      "cost": 1,
+      "hp": 80,
+      "dmg": 22,
+      "spd": 92,
+      "rng": 20,
+      "size": 12,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        210,
+        150,
+        80
+      ],
+      "ability": "rush",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Quick, twitchy, and faintly warm.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.32
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.4
+          ],
+          "size": 0.28,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.28,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.75,
+            -0.3
+          ],
+          "size": 0.42,
+          "ang": -0.15,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.85,
+            -0.05
+          ],
+          "size": 0.6,
+          "ang": 0.4,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "pebbletoad": {
+      "id": "pebbletoad",
+      "name": "Pebble Toad",
+      "cost": 1,
+      "hp": 150,
+      "dmg": 18,
+      "spd": 54,
+      "rng": 20,
+      "size": 15,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        110,
+        140,
+        110
+      ],
+      "ability": "armored",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Small, stubborn, and river-ready.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.3
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.28
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.28
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.5,
+            -0.2
+          ],
+          "size": 0.4,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.35,
+            -0.28
+          ],
+          "size": 0.13,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.6,
+            -0.28
+          ],
+          "size": 0.13,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5
+        }
+      ]
+    },
+    "cinderling": {
+      "id": "cinderling",
+      "name": "Cinderling",
+      "cost": 1,
+      "hp": 60,
+      "dmg": 34,
+      "spd": 80,
+      "rng": 20,
+      "size": 12,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        220,
+        90,
+        40
+      ],
+      "ability": "kindle",
+      "rarity": "uncommon",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "It burns brightest just before it's gone.",
+      "model": [
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.15
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            0.1
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.15
+          ],
+          "size": 0.3,
+          "ang": -0.1,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "dustsprite": {
+      "id": "dustsprite",
+      "name": "Dust Sprite",
+      "cost": 1,
+      "hp": 55,
+      "dmg": 16,
+      "spd": 100,
+      "rng": 22,
+      "size": 11,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        190,
+        180,
+        150
+      ],
+      "ability": "blink",
+      "rarity": "uncommon",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "A mote that refuses to settle.",
+      "model": [
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.25
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.18,
+            -0.18
+          ],
+          "size": 0.5,
+          "ang": 0.7,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.18,
+            -0.18
+          ],
+          "size": 0.5,
+          "ang": -0.7,
+          "tone": 0.7,
+          "h": 0.5
+        }
+      ]
+    },
+    "reedskiff": {
+      "id": "reedskiff",
+      "name": "Reed Skiff",
+      "cost": 2,
+      "hp": 220,
+      "dmg": 30,
+      "spd": 70,
+      "rng": 22,
+      "size": 17,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        120,
+        150,
+        90
+      ],
+      "ability": "beach",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Rides the river's edge, light as a leaf.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.08
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.45,
+          "ang": -0.1,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.15
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.85,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.3,
+          "tone": 0.9,
+          "h": 0.5
+        }
+      ]
+    },
+    "thistleboar": {
+      "id": "thistleboar",
+      "name": "Thistle Boar",
+      "cost": 2,
+      "hp": 300,
+      "dmg": 44,
+      "spd": 58,
+      "rng": 22,
+      "size": 19,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        130,
+        110,
+        80
+      ],
+      "ability": "thorns",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Bristling and bad-tempered on a budget.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.75,
+            -0.28
+          ],
+          "size": 0.55,
+          "ang": -0.2,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.15,
+            -0.25
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 4
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.85,
+            0.0
+          ],
+          "size": 0.5,
+          "ang": 0.35,
+          "tone": 1.0,
+          "h": 0.5
+        }
+      ]
+    },
+    "gullpair": {
+      "id": "gullpair",
+      "name": "Gull Pair",
+      "cost": 2,
+      "hp": 140,
+      "dmg": 32,
+      "spd": 88,
+      "rng": 22,
+      "size": 14,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 2,
+      "paper": [
+        220,
+        224,
+        230
+      ],
+      "ability": "swiftdive",
+      "rarity": "uncommon",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Two sets of wings, one bad attitude.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.95,
+          "ang": 0.6,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.35,
+            -0.15
+          ],
+          "size": 0.855,
+          "ang": -0.45,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.8,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        }
+      ]
+    },
+    "hedgemage": {
+      "id": "hedgemage",
+      "name": "Hedge Mage",
+      "cost": 2,
+      "hp": 180,
+      "dmg": 28,
+      "spd": 58,
+      "rng": 120,
+      "size": 18,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        150,
+        120,
+        170
+      ],
+      "ability": "chill",
+      "rarity": "uncommon",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "A hedge-witch with a frostbitten wand.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.1
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0,
+            -0.5
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.4
+        },
+        {
+          "part": "tusk",
+          "at": [
+            -0.55,
+            -0.2
+          ],
+          "size": 0.65,
+          "ang": 0.5,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.6,
+            -0.55
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5
+        }
+      ]
+    },
+    "beetlecart": {
+      "id": "beetlecart",
+      "name": "Beetle Cart",
+      "cost": 2,
+      "hp": 360,
+      "dmg": 26,
+      "spd": 44,
+      "rng": 22,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        90,
+        80,
+        60
+      ],
+      "ability": "bulwark",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Slow, low, and hard to shove.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.95,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.55
+        },
+        {
+          "part": "panel",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.75,
+          "ang": 0.0,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.7,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.15,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        }
+      ]
+    },
+    "emberwren": {
+      "id": "emberwren",
+      "name": "Ember Wren",
+      "cost": 2,
+      "hp": 120,
+      "dmg": 38,
+      "spd": 92,
+      "rng": 22,
+      "size": 14,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        230,
+        120,
+        60
+      ],
+      "ability": "kindle",
+      "rarity": "uncommon",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "A small bird with a cinder in its chest.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.35
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.2,
+            -0.2
+          ],
+          "size": 0.9,
+          "ang": 0.6,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.35,
+            -0.15
+          ],
+          "size": 0.81,
+          "ang": -0.45,
+          "tone": 1.2100000000000002,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.42,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tail",
+          "at": [
+            -0.8,
+            0.05
+          ],
+          "size": 0.6,
+          "ang": 0.25,
+          "tone": 0.85,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.28
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "mudcrab": {
+      "id": "mudcrab",
+      "name": "Mud Crab",
+      "cost": 2,
+      "hp": 260,
+      "dmg": 30,
+      "spd": 50,
+      "rng": 22,
+      "size": 17,
+      "flying": false,
+      "building": false,
+      "riverhop": true,
+      "count": 1,
+      "paper": [
+        120,
+        100,
+        80
+      ],
+      "ability": "grasp",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "Sidles out of the shallows to pinch ankles.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            -0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.8,
+            -0.15
+          ],
+          "size": 0.5,
+          "ang": 0.4,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.3,
+            -0.3
+          ],
+          "size": 0.12,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.3,
+            -0.3
+          ],
+          "size": 0.12,
+          "ang": 0.0,
+          "tone": 0.5,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.6,
+            0.35
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.6,
+            0.35
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        }
+      ]
+    },
+    "sproutling": {
+      "id": "sproutling",
+      "name": "Sproutling",
+      "cost": 2,
+      "hp": 200,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 18,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        110,
+        160,
+        90
+      ],
+      "ability": "beacon",
+      "rarity": "common",
+      "set": "pennywise",
+      "rotation": true,
+      "blurb": "A tiny standing sapling that heartens the line.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.2
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.7
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.55
+          ],
+          "size": 0.9,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.4
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "mole": {
+      "id": "mole",
+      "name": "Molewright",
+      "cost": 3,
+      "hp": 340,
+      "dmg": 52,
+      "spd": 64,
+      "rng": 20,
+      "size": 15,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        120,
+        96,
+        72
+      ],
+      "ability": "tunnel",
+      "rarity": "uncommon",
+      "set": "menagerie",
+      "rotation": true,
+      "blurb": "Digs clean under the river and pops up behind the line.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.45
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.85,
+            -0.1
+          ],
+          "size": 0.6,
+          "ang": -0.15,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "tusk",
+          "at": [
+            0.95,
+            0.05
+          ],
+          "size": 0.55,
+          "ang": 0.2,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.5,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.5,
+            0.4
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "orb",
+          "at": [
+            0.7,
+            -0.2
+          ],
+          "size": 0.1,
+          "ang": 0.0,
+          "tone": 0.4,
+          "h": 0.5
+        }
+      ]
+    },
+    "eaglenest": {
+      "id": "eaglenest",
+      "name": "Eagle's Nest",
+      "cost": 6,
+      "hp": 900,
+      "dmg": 120,
+      "spd": 0,
+      "rng": 360,
+      "size": 30,
+      "flying": false,
+      "building": true,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        110,
+        92,
+        64
+      ],
+      "ability": "siege",
+      "rarity": "epic",
+      "set": "menagerie",
+      "rotation": true,
+      "blurb": "A crag fort that rains powder-kegs across the page, then crumbles.",
+      "model": [
+        {
+          "part": "shell",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.15,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 1.0
+        },
+        {
+          "part": "slab",
+          "at": [
+            0,
+            -0.35
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 0.9,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.7
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.4
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            -0.5
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 0.85,
+          "h": 0.5,
+          "count": 4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.4,
+            -0.8
+          ],
+          "size": 0.4,
+          "ang": -0.3,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.45
+          ],
+          "size": 0.14,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "beekeeper": {
+      "id": "beekeeper",
+      "name": "The Beekeeper",
+      "cost": 7,
+      "hp": 1100,
+      "dmg": 40,
+      "spd": 40,
+      "rng": 150,
+      "size": 30,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        180,
+        150,
+        70
+      ],
+      "ability": "carrier",
+      "rarity": "legendary",
+      "set": "menagerie",
+      "rotation": true,
+      "blurb": "A bear in a veil. Its hive looses bees \u2014 but they sip your ink.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.0
+          ],
+          "size": 1.0,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.65
+        },
+        {
+          "part": "leg",
+          "at": [
+            -0.55,
+            0.42
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "leg",
+          "at": [
+            0.55,
+            0.42
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.15,
+            -0.6
+          ],
+          "size": 0.6,
+          "ang": 0.0,
+          "tone": 1.05,
+          "h": 0.5
+        },
+        {
+          "part": "crest",
+          "at": [
+            0.15,
+            -0.75
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.1,
+          "h": 0.35
+        },
+        {
+          "part": "shell",
+          "at": [
+            -0.55,
+            -0.2
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.45
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.55,
+            -0.4
+          ],
+          "size": 0.4,
+          "ang": 0.0,
+          "tone": 0.8,
+          "h": 0.5,
+          "count": 3
+        },
+        {
+          "part": "orb",
+          "at": [
+            -0.55,
+            -0.25
+          ],
+          "size": 0.12,
+          "ang": 0.0,
+          "tone": 1.3,
+          "h": 0.5
+        }
+      ]
+    },
+    "bee": {
+      "id": "bee",
+      "name": "Bee",
+      "cost": 1,
+      "hp": 45,
+      "dmg": 22,
+      "spd": 150,
+      "rng": 16,
+      "size": 9,
+      "flying": true,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        230,
+        200,
+        70
+      ],
+      "ability": "feather",
+      "rarity": "common",
+      "set": "menagerie_token",
+      "rotation": false,
+      "blurb": "A single bee from the keeper's hive.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.3
+        },
+        {
+          "part": "wing",
+          "at": [
+            -0.15,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.7,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "wing",
+          "at": [
+            0.15,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": -0.7,
+          "tone": 0.7,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.1,
+            0.0
+          ],
+          "size": 0.3,
+          "ang": 0.0,
+          "tone": 0.6,
+          "h": 0.5,
+          "count": 2
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.5,
+            -0.05
+          ],
+          "size": 0.25,
+          "ang": -0.1,
+          "tone": 1.1,
+          "h": 0.5
+        }
+      ]
+    },
+    "wildcard": {
+      "id": "wildcard",
+      "name": "Wildcard",
+      "cost": 3,
+      "hp": 1,
+      "dmg": 0,
+      "spd": 0,
+      "rng": 0,
+      "size": 20,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        230,
+        180,
+        90
+      ],
+      "ability": "wildcard",
+      "rarity": "legendary",
+      "set": "core",
+      "rotation": true,
+      "blurb": "Calls in something the binder never drafted. Costs +2 more each time you play it.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.05
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.4
+          ],
+          "size": 0.7,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.45
+        },
+        {
+          "part": "orb",
+          "at": [
+            0,
+            -0.15
+          ],
+          "size": 0.35,
+          "ang": 0.0,
+          "tone": 1.4,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            -0.15,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 4
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.6,
+            -0.25
+          ],
+          "size": 0.4,
+          "ang": -0.2,
+          "tone": 1.2,
+          "h": 0.5
+        }
+      ]
+    },
+    "foldwright": {
+      "id": "foldwright",
+      "name": "The Foldwright",
+      "cost": 9,
+      "hp": 520,
+      "dmg": 0,
+      "spd": 52,
+      "rng": 0,
+      "size": 24,
+      "flying": false,
+      "building": false,
+      "riverhop": false,
+      "count": 1,
+      "paper": [
+        196,
+        170,
+        120
+      ],
+      "ability": "builder",
+      "rarity": "legendary",
+      "set": "core",
+      "rotation": true,
+      "blurb": "Wanders your side seeking open ground, then folds a whole new tower troop from scratch. Slay it and the half-built structure tears apart.",
+      "model": [
+        {
+          "part": "slab",
+          "at": [
+            0,
+            0.08
+          ],
+          "size": 0.85,
+          "ang": 0.0,
+          "tone": 1.0,
+          "h": 0.4
+        },
+        {
+          "part": "crest",
+          "at": [
+            0,
+            -0.42
+          ],
+          "size": 0.55,
+          "ang": 0.0,
+          "tone": 1.15,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            0.5,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": -0.3,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "wedge",
+          "at": [
+            -0.5,
+            -0.1
+          ],
+          "size": 0.4,
+          "ang": 0.3,
+          "tone": 1.1,
+          "h": 0.5
+        },
+        {
+          "part": "spine",
+          "at": [
+            0,
+            -0.2
+          ],
+          "size": 0.5,
+          "ang": 0.0,
+          "tone": 1.2,
+          "h": 0.5,
+          "count": 3
+        }
+      ]
+    }
+  },
+  "variants": {
+    "standard": {
+      "name": "",
+      "rarity_bump": 0,
+      "mods": {}
+    },
+    "inked": {
+      "name": "Inked",
+      "rarity_bump": 1,
+      "suffix": "Inked",
+      "mods": {
+        "hp": 1.12,
+        "dmg": 1.12
+      },
+      "add_ability": null,
+      "tint": [
+        40,
+        40,
+        70
+      ]
+    },
+    "gilded": {
+      "name": "Gilded",
+      "rarity_bump": 2,
+      "suffix": "Gilded",
+      "mods": {
+        "hp": 1.2,
+        "dmg": 1.15,
+        "spd": 1.08
+      },
+      "add_ability": "radiance",
+      "tint": [
+        120,
+        96,
+        30
+      ]
+    },
+    "shadow": {
+      "name": "Shadowbound",
+      "rarity_bump": 2,
+      "suffix": "Shadow",
+      "mods": {
+        "dmg": 1.25,
+        "spd": 1.12,
+        "hp": 0.9
+      },
+      "add_ability": "stealth",
+      "tint": [
+        30,
+        24,
+        40
+      ]
+    },
+    "spiritdiverge": {
+      "name": "Spirit-Divergent",
+      "rarity_bump": 3,
+      "suffix": "Divergent",
+      "mods": {
+        "hp": 1.05
+      },
+      "add_ability": "spiritdiverge",
+      "tint": [
+        110,
+        70,
+        150
+      ]
+    }
+  },
+  "variant_weights": {
+    "standard": 88,
+    "inked": 8,
+    "gilded": 2.5,
+    "shadow": 1.5,
+    "spiritdiverge": 0.6
+  },
+  "rarity_order": [
+    "common",
+    "uncommon",
+    "rare",
+    "epic",
+    "legendary"
+  ],
+  "generation": {
+    "runtime": true,
+    "backends": [
+      "procedural",
+      "openai",
+      "llama",
+      "ollama",
+      "anthropic"
+    ],
+    "bounds": {
+      "cost": [
+        1,
+        9
+      ],
+      "hp": [
+        80,
+        2000
+      ],
+      "dmg": [
+        0,
+        320
+      ],
+      "spd": [
+        0,
+        110
+      ],
+      "rng": [
+        16,
+        240
+      ],
+      "size": [
+        14,
+        34
+      ],
+      "count": [
+        1,
+        6
+      ]
+    },
+    "note": "Cards may be authored at runtime by ai_director.py and validated through sanitize_card() before entering play. The 'living' set marks generated cards; they are not persisted to this file.",
+    "model_recipes": {
+      "note": "Cards may carry an optional 'model' array: an origami recipe of known-good fold parts rendered on the field. Validated via origami.fold_sanitize(); cosmetic only.",
+      "parts": [
+        "slab",
+        "panel",
+        "wedge",
+        "wing",
+        "spine",
+        "leg",
+        "crest",
+        "tusk",
+        "tail",
+        "shell",
+        "orb"
+      ]
+    }
+  }
+}
