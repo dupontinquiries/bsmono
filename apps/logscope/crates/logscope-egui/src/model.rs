@@ -125,6 +125,58 @@ pub fn folder_popup(ui: &mut egui::Ui, models_dir: &mut String, native: &mut boo
 /// you check to include, then assign a role (Target/Draft/Delegate/Embed) + device, ordered by priority. This
 /// is the backing UI for tree/spec work (a Target verifies a smaller Draft) across devices. Mutates `dep` in
 /// place; returns true if the plan changed this frame. Renders inline (host it in a popup/panel).
+/// The **active-pipeline** selectors: one dropdown per primary role — Large (text target), Small
+/// (text draft), Voice (STT/TTS), Image (diffusion). Each is a `ComboBox`, so this MUST be shown in
+/// a Window or a normal panel — never a `popup_below_widget` — because a ComboBox's dropdown is a
+/// separate layer that a click-outside popup treats as an outside click and closes (the
+/// "double-dropdown close each other" bug). Returns true if the plan changed.
+pub fn pipeline_selectors(
+    ui: &mut egui::Ui,
+    dep: &mut logscope::deploy::Deployment,
+    available: &[String],
+    est_bytes: &dyn Fn(&str) -> u64,
+) -> bool {
+    use logscope::deploy::{DeviceId, Role};
+    let mut changed = false;
+    let device = dep.devices.first().map(|d| d.id).unwrap_or(DeviceId(0));
+    let rows = [
+        (Role::Target, "Large model", "the main text model that commits tokens"),
+        (Role::Draft, "Small model", "a smaller model that drafts tokens for the large one to verify (speculative)"),
+        (Role::Voice, "Voice model", "speech — Whisper (STT) or a TTS"),
+        (Role::Image, "Image model", "image diffusion — Z-Image / FLUX / SD"),
+    ];
+    egui::Grid::new("pipeline_roles").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
+        for (role, label, hint) in rows {
+            ui.label(RichText::new(label).color(theme::INK())).on_hover_text(hint);
+            let cur = dep.role_model(role).map(|s| s.to_string());
+            let sel_text = cur.clone().unwrap_or_else(|| "(none)".into());
+            egui::ComboBox::from_id_salt(("pipeline", label))
+                .selected_text(sel_text)
+                .width(250.0)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(cur.is_none(), "(none)").clicked() {
+                        dep.clear_role(role);
+                        changed = true;
+                    }
+                    for name in available {
+                        let is_sel = cur.as_deref() == Some(name.as_str());
+                        let gb = est_bytes(name) as f64 / 1e9;
+                        let txt = format!("{name}  ·  {gb:.1} GB");
+                        if ui.selectable_label(is_sel, RichText::new(txt).monospace().small()).clicked() {
+                            dep.set_role(role, name, device, est_bytes(name));
+                            changed = true;
+                        }
+                    }
+                    if available.is_empty() {
+                        ui.label(RichText::new("(no models — scan a folder)").color(theme::DIM()).small());
+                    }
+                });
+            ui.end_row();
+        }
+    });
+    changed
+}
+
 pub fn deployment_tiles(ui: &mut egui::Ui, dep: &mut logscope::deploy::Deployment, available: &[String], est_bytes: &dyn Fn(&str) -> u64) -> bool {
     use logscope::deploy::{Role, Slot, DeviceId};
     let mut changed = false;
