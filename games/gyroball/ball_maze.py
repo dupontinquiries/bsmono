@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-Rolling Ball Maze - reads monitor-sensor --accel output from stdin
-Run with: monitor-sensor --accel 2>&1 | python3 ball_maze.py
+Rolling Ball Maze — tilt to steer.
+
+Tilt parsing + the tilt→gravity model now live in the shared sensor-kit crate (built as the
+`tilt-source` binary); this reads its "<gx> <gy>" gravity-direction stream from stdin instead of
+parsing monitor-sensor itself.
+
+Run with:  monitor-sensor --accel 2>&1 | tilt-source | python3 ball_maze.py
+      (or just ./run.sh)
 """
 
 import pygame
@@ -17,52 +23,31 @@ FRICTION      = 0.92  # velocity multiplier each frame
 BALL_RADIUS   = 10
 WALL_THICKNESS = 14
 
-# ── Tilt → gravity vector mapping ─────────────────────────────────────────────
-# monitor-sensor tilt values:
-#   normal, face-up, face-down, left-up, right-up,
-#   tilted-down, tilted-up, vertical
-TILT_GRAVITY = {
-    "normal":      ( 0.0,  0.0),
-    "face-up":     ( 0.0,  0.0),
-    "face-down":   ( 0.0,  0.0),
-    "tilted-down": ( 0.0,  1.0),   # ball rolls down (south)
-    "tilted-up":   ( 0.0, -1.0),   # ball rolls up   (north)
-    "vertical":    ( 0.0,  0.8),
-}
-
-# Accelerometer orientation → horizontal tilt
-ORIENT_GRAVITY = {
-    "normal":   ( 0.0,  0.0),
-    "left-up":  (-1.0,  0.0),
-    "right-up": ( 1.0,  0.0),
-    "bottom-up":( 0.0,  1.0),
-    "top-up":   ( 0.0, -1.0),
-}
-
 # ─── Shared sensor state ───────────────────────────────────────────────────────
+# The tilt/orientation parsing and the tilt→gravity mapping now live in the shared sensor-kit crate,
+# piped in through the `tilt-source` binary (see run.sh). This file just consumes its "<gx> <gy>"
+# gravity-direction stream — one line per sensor change, +y = down, unit-scaled.
 sensor_lock = threading.Lock()
-grav_x, grav_y = 0.0, 0.0   # current gravity vector
+grav_x, grav_y = 0.0, 0.0   # current gravity direction; scaled by GRAVITY in the physics step
+
+# sensor-kit emits a unit gravity direction (same convention as the keyboard fallback's ±1.0); this
+# scales how strongly tilt steers the ball. Tune on-device.
+TILT_SENSITIVITY = 1.0
 
 
 def sensor_reader():
-    """Read stdin (piped from monitor-sensor) and update gravity vector."""
+    """Read the shared tilt-source stream ("<gx> <gy>" per change) and update the gravity vector."""
     global grav_x, grav_y
-    tilt_gx, tilt_gy = 0.0, 0.0
-    orient_gx, orient_gy = 0.0, 0.0
-
     for line in sys.stdin:
-        line = line.strip()
-        if "Tilt changed:" in line:
-            tilt = line.split("Tilt changed:")[-1].strip()
-            tilt_gx, tilt_gy = TILT_GRAVITY.get(tilt, (tilt_gx, tilt_gy))
-        elif "Accelerometer orientation changed:" in line:
-            orient = line.split("Accelerometer orientation changed:")[-1].strip()
-            orient_gx, orient_gy = ORIENT_GRAVITY.get(orient, (orient_gx, orient_gy))
-
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            gx, gy = float(parts[0]), float(parts[1])
+        except ValueError:
+            continue
         with sensor_lock:
-            # Combine both signals; orientation dominates horizontal
-            grav_x = orient_gx + tilt_gx * 0.3
-            grav_y = tilt_gy + orient_gy * 0.3
+            grav_x, grav_y = gx * TILT_SENSITIVITY, gy * TILT_SENSITIVITY
 
 
 # ─── Maze generation (recursive backtracker) ──────────────────────────────────
