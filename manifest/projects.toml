@@ -5,15 +5,6 @@
 # runtime: kde | gnome | freedesktop | none | tbd   (Flatpak runtime)
 # targets: subset of manifest/targets.toml ids; "all" = every linux target
 
-[apps.unendlich]
-path = "apps/unendlich"
-kind = "cargo"
-role = "app"
-daemon = false
-flatpak = true
-runtime = "freedesktop"
-targets = ["desktop", "phone", "x86"]
-notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"
 
 [apps.voiceterm]
 path = "apps/voiceterm"
@@ -225,3 +216,14 @@ runtime = "none"
 targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
 notes = "whisper post-proc: hallucination filter + model resolution; zero-dep; consumed by rusty-board (repointed)"
 
+
+# --- games (new tier; consolidated from apps/ duplicates — keeping the larger games/ trees) ---
+[games.unendlich]
+path = "games/unendlich"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = true
+runtime = "freedesktop"
+targets = ["desktop", "phone", "x86"]
+notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"

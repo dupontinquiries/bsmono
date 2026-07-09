@@ -52,7 +52,7 @@
     },
     {
       "name": "cybertron",
-      "path": "apps/cybertron",
+      "path": "games/blackstar",
       "features": [],
       "no_default": false,
       "target": "",
@@ -116,7 +116,7 @@
     },
     {
       "name": "unendlich",
-      "path": "apps/unendlich",
+      "path": "games/unendlich",
       "features": [],
       "no_default": false,
       "target": "",
