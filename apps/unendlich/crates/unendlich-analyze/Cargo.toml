@@ -1,7 +1,0 @@
-[package]
-name = "unendlich-analyze"
-version = "0.24.63-adaptive-uploads"
-edition = "2021"
-
-[dependencies]
-serde_json = "1.0"

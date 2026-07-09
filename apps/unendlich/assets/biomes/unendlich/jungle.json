@@ -1,9 +1,0 @@
-{
-  "type": "minecraft:biome",
-  "_id": "unendlich:jungle",
-  "_comment": "dense hot canopy (r174 registry parity set)",
-  "temperature": 1.7,
-  "downfall": 0.95,
-  "has_precipitation": true,
-  "effects": {}
-}
