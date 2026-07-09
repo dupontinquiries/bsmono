@@ -115,6 +115,29 @@ impl<P: ProfileBackend, F: ProfileBackend> ProfileService<P, F> {
     pub fn friends_of(&self, profile: &Profile) -> Vec<Profile> {
         profile.friends.iter().filter_map(|id| self.lookup(id).0).collect()
     }
+
+    /// Publish raw bytes under a key — for stored values that aren't [`Profile`]s (e.g. the session
+    /// records in [`crate::session`]). Same dual-write discipline as [`Self::publish`]: always the
+    /// snapcore floor for instant LAN/fleet reach, plus OpenDHT when it's up for global reach.
+    pub fn put_raw(&mut self, key: &str, value: Vec<u8>) -> bool {
+        let local = self.fallback.put(key, value.clone());
+        let global = self.primary.available() && self.primary.put(key, value);
+        local || global
+    }
+
+    /// Fetch raw bytes for a key: OpenDHT first (global), snapcore DHT if it's down or misses.
+    /// Surfaces which backend served it, like [`Self::lookup`].
+    pub fn get_raw(&self, key: &str) -> (Option<Vec<u8>>, Reach) {
+        if self.primary.available() {
+            if let Some(bytes) = self.primary.get(key) {
+                return (Some(bytes), Reach::OpenDht);
+            }
+        }
+        if let Some(bytes) = self.fallback.get(key) {
+            return (Some(bytes), Reach::Snapcore);
+        }
+        (None, Reach::Miss)
+    }
 }
 
 #[cfg(test)]

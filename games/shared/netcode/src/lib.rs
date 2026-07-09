@@ -4,4 +4,5 @@
 //! primary) and a pure **micro-DHT** (a Kademlia-lite fallback for LAN/offline). Same graceful
 //! floor the rest of the fleet uses — the network is a step-up, never a requirement.
 pub mod profile;
+pub mod session;
 pub mod store;
