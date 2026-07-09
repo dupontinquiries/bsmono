@@ -1,0 +1,11 @@
+[package]
+name = "sensor-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Device tilt/orientation as game input, shared by every game: parse iio-sensor-proxy's monitor-sensor stream (postmarketOS/Fairphone accelerometer + compass) and turn coarse tilt events into an impulse-based 2D control vector (the gyro-ball model). Reuses touchkit::Vec2. Pure — the platform sensor source is injected."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+touchkit = { path = "../touchkit" }
