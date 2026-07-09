@@ -117,6 +117,46 @@ impl Deployment {
         self.slots.iter().filter(|s| s.enabled && s.role == Role::Voice).min_by_key(|s| s.priority)
     }
 
+    /// The model currently assigned to a primary pipeline `role` (enabled), for the pipeline
+    /// selectors (Large=Target, Small=Draft, Voice, Image).
+    pub fn role_model(&self, role: Role) -> Option<&str> {
+        let slot = match role {
+            Role::Target => self.target(),
+            Role::Draft => self.draft(),
+            Role::Image => self.image(),
+            Role::Voice => self.voice(),
+            _ => self.slots.iter().filter(|s| s.enabled && s.role == role).min_by_key(|s| s.priority),
+        };
+        slot.map(|s| s.model.as_str())
+    }
+
+    /// Assign `model` to a single-slot pipeline `role`: update that role's slot in place, or add one.
+    /// The pipeline selectors are single-select per role, so this keeps one slot per role. Empty
+    /// `model` clears the role.
+    pub fn set_role(&mut self, role: Role, model: &str, device: DeviceId, est_bytes: u64) {
+        if model.is_empty() {
+            self.clear_role(role);
+            return;
+        }
+        match self.slots.iter_mut().find(|s| s.role == role) {
+            Some(s) => {
+                s.model = model.to_string();
+                s.est_bytes = est_bytes;
+                s.device = device;
+                s.enabled = true;
+            }
+            None => {
+                let priority = self.slots.len() as u32;
+                self.add(Slot { model: model.to_string(), role, device, priority, enabled: true, est_bytes });
+            }
+        }
+    }
+
+    /// Remove every slot of `role` (deselect that pipeline stage).
+    pub fn clear_role(&mut self, role: Role) {
+        self.slots.retain(|s| s.role != role);
+    }
+
     /// Devices of a given kind (e.g. list the Remote hosts for the network-device picker).
     pub fn devices_of(&self, kind: DeviceKind) -> Vec<&Device> {
         self.devices.iter().filter(|d| d.kind == kind).collect()
@@ -297,5 +337,32 @@ mod tests {
         assert_eq!(remotes[0].name, "192.168.1.42:11434");
         assert!(d.is_valid(), "a model placed on a remote host validates: {:?}", d.validate());
         assert_eq!(d.target().unwrap().device, DeviceId(1));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_role_tests {
+    use super::*;
+    fn dep() -> Deployment {
+        Deployment::new(vec![Device { id: DeviceId(0), name: "local".into(), kind: DeviceKind::Gpu, mem_bytes: 64_000_000_000 }])
+    }
+    #[test]
+    fn set_and_clear_role_is_single_slot_per_role() {
+        let mut d = dep();
+        d.set_role(Role::Target, "big-70b", DeviceId(0), 40_000_000_000);
+        d.set_role(Role::Draft, "small-1b", DeviceId(0), 1_000_000_000);
+        d.set_role(Role::Voice, "whisper", DeviceId(0), 500_000_000);
+        d.set_role(Role::Image, "z-image", DeviceId(0), 6_000_000_000);
+        assert_eq!(d.role_model(Role::Target), Some("big-70b"));
+        assert_eq!(d.role_model(Role::Draft), Some("small-1b"));
+        assert_eq!(d.role_model(Role::Voice), Some("whisper"));
+        assert_eq!(d.role_model(Role::Image), Some("z-image"));
+        // reassigning a role updates in place — no second Target slot
+        d.set_role(Role::Target, "big-8b", DeviceId(0), 8_000_000_000);
+        assert_eq!(d.slots.iter().filter(|s| s.role == Role::Target).count(), 1);
+        assert_eq!(d.role_model(Role::Target), Some("big-8b"));
+        // clearing removes it
+        d.clear_role(Role::Voice);
+        assert_eq!(d.role_model(Role::Voice), None);
     }
 }

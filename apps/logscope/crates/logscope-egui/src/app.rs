@@ -52,6 +52,7 @@ pub struct LogscopeApp {
     toaster: crate::theme::Toaster,
     wizard: crate::wizard::Wizard,
     glass: bool, // LOGSCOPE_GLASS: render the mind-palace behind a translucent UI (in-progress immersive shell)
+    show_pipeline: bool, // Active-pipeline window (Large/Small/Voice/Image selectors) toggled by the ⚙ button
     deployment: logscope::deploy::Deployment, // multi-model/multi-device plan behind the tile picker
     autoloaded: Option<String>,               // name of the model we last auto-kicked a load for (debounce)
 }
@@ -80,6 +81,7 @@ impl Default for LogscopeApp {
             toaster: crate::theme::Toaster::default(),
             wizard: crate::wizard::Wizard::default(),
             glass: std::env::var("LOGSCOPE_GLASS").map(|v| v != "0").unwrap_or(false),
+            show_pipeline: false,
             deployment: logscope::deploy::Deployment::new(vec![logscope::deploy::Device {
                 id: logscope::deploy::DeviceId(0),
                 name: "this device".into(),
@@ -361,15 +363,29 @@ impl eframe::App for LogscopeApp {
                     }
                     // multi-model / multi-device deployment picker (tree work) — a popup that STAYS open on
                     // click (CloseOnClickOutside) so the tiles/role-combos/device-combos are usable.
-                    let dbtn = ui.button("⚙").on_hover_text("Multi-model / multi-device deployment: pick a Target + a smaller Draft for speculative tree decoding, spread across devices.");
-                    let dpid = ui.make_persistent_id("deploy_popup");
-                    if dbtn.clicked() { ui.memory_mut(|m| m.toggle_popup(dpid)); }
-                    egui::popup_below_widget(ui, dpid, &dbtn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
-                        ui.set_min_width(420.0);
-                        ui.label(RichText::new("deployment — models · roles · devices").color(theme::DIM()).small());
-                        let sizes = &sizes;
-                        crate::model::deployment_tiles(ui, &mut self.deployment, &available, &|n| sizes.get(n).copied().unwrap_or(4_000_000_000));
-                    });
+                    // Active pipeline: Large / Small / Voice / Image model selectors. These are
+                    // ComboBoxes, so they live in a Window — NOT a click-outside popup, which a
+                    // nested combo's dropdown would dismiss (the double-dropdown bug).
+                    let dbtn = ui.button("⚙").on_hover_text("Active pipeline: pick Large / Small / Voice / Image models (+ advanced multi-device placement).");
+                    if dbtn.clicked() { self.show_pipeline = !self.show_pipeline; }
+                    if self.show_pipeline {
+                        let mut open = true;
+                        let sizes_ref = &sizes;
+                        let est = |n: &str| sizes_ref.get(n).copied().unwrap_or(4_000_000_000);
+                        egui::Window::new("Active pipeline")
+                            .open(&mut open)
+                            .default_width(480.0)
+                            .show(ui.ctx(), |ui| {
+                                ui.label(RichText::new("pick the model for each stage").color(theme::DIM()).small());
+                                ui.add_space(4.0);
+                                crate::model::pipeline_selectors(ui, &mut self.deployment, &available, &est);
+                                ui.add_space(6.0);
+                                ui.collapsing(RichText::new("advanced — multi-device placement").small(), |ui| {
+                                    crate::model::deployment_tiles(ui, &mut self.deployment, &available, &est);
+                                });
+                            });
+                        self.show_pipeline = open;
+                    }
                     ui.label(RichText::new("model").color(theme::DIM()).small());
                     ui.add_space(10.0);
                     // theme picker — live-switches the palette (Folding@home + the research-journal themes)
