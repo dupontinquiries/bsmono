@@ -227,3 +227,13 @@ flatpak = true
 runtime = "freedesktop"
 targets = ["desktop", "phone", "x86"]
 notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"
+
+[games.paperbound]
+path = "games/paperbound"
+kind = "python"          # pygame-ce; not a cargo build — needs a python build lane in the orchestrator
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = []
+notes = "origami lane-battler (pygame-ce); 30 cards/9 arenas/LAN lockstep; consolidated from paperbound drop (was a 2-file stub in apps/)"

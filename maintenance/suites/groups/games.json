@@ -20,7 +20,7 @@
     },
     {
       "name": "paperbound",
-      "path": "apps/paperbound",
+      "path": "games/paperbound",
       "features": [],
       "no_default": false,
       "target": "",
