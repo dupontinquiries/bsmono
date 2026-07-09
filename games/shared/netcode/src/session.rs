@@ -108,13 +108,13 @@ pub trait SessionExt {
     /// if the record landed on at least one backend.
     fn announce_session(&mut self, host: &mut Profile, token: &str, rec: &SessionRecord) -> bool;
 
-    /// Host side: tear down. Flips presence back to `Online` and republishes. Note the fleet DHT is
-    /// a **multi-value, eventually-consistent** store, not a latest-wins register: it cannot
-    /// *instantly* invalidate an already-published invite everywhere. The session record and the old
-    /// presence age out by TTL; a joiner may briefly still resolve a just-ended session and get a
-    /// dead `addr` — its own transport dial then fails, which is the correct place to notice. (If the
-    /// fleet wants crisp presence, values need a monotonic stamp so lookups pick the newest — see the
-    /// note on `store::SnapcoreStore`.)
+    /// Host side: tear down. Flips presence back to `Online` and republishes. Because
+    /// [`crate::store::SnapcoreStore`] is now latest-wins, this republish supersedes the `InGame`
+    /// presence even on the micro-DHT floor, so `join_via_friend` stops offering the session
+    /// immediately. The session *record* itself isn't deleted — it's left to expire by TTL — so a
+    /// peer resolving the raw token directly could still get a now-dead `addr` until then; its own
+    /// transport dial failing is the correct place to notice. (Presence, the path friends actually
+    /// use, is crisp.)
     fn end_session(&mut self, host: &mut Profile) -> bool;
 
     /// Joiner side: fetch a session record by its token.
@@ -242,12 +242,10 @@ mod tests {
     }
 
     #[test]
-    fn ending_a_session_flips_host_presence() {
-        // Guaranteed local behavior: the host's own presence returns to Online, so anyone reading a
-        // *fresh* latest-wins view (OpenDHT, or a stamped lookup) stops seeing the invite. On the
-        // multi-value micro-DHT floor the old value lingers until TTL — that's eventual consistency,
-        // asserted separately below, not a bug in end_session.
-        let mut svc = ProfileService::new(Fake::default(), SnapcoreStore::new());
+    fn ending_a_session_stops_the_invite_on_the_snapcore_floor() {
+        // With the latest-wins SnapcoreStore, republishing Online supersedes the InGame presence even
+        // on the LAN/offline floor, so a friend stops seeing the invite — no register primary needed.
+        let mut svc = ProfileService::new(Fake::default(), SnapcoreStore::new()); // OpenDHT down
         let mut host = Profile::new("player-a", "Ada");
         let rec = SessionRecord::new("blackstar", "player-a", "enet", "10.0.0.2:6001");
         svc.announce_session(&mut host, "tok-x", &rec);
@@ -256,6 +254,7 @@ mod tests {
 
         svc.end_session(&mut host);
         assert!(matches!(host.presence, Presence::Online));
+        assert!(svc.join_via_friend("player-a").is_none(), "ended session no longer joinable via presence");
     }
 
     #[test]

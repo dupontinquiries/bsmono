@@ -34,14 +34,21 @@ pub fn key_id(s: &str) -> NodeId {
 
 /// The always-on backend: the fleet's snapcore DHT store. Profiles are durable (long TTL, refreshed
 /// on re-publish). A fixed logical clock keeps them live; the real node advances it from wall time.
+///
+/// snapcore is a **multi-value** store (a republished value coexists with the stale one under the
+/// same key). This wrapper gives it **register (latest-wins)** semantics — what a profile/presence
+/// needs — by stamping every write with `(now, seq)` and returning the newest-stamped value on read.
+/// `now` orders across nodes (wall time, when advanced); `seq` breaks ties between writes made at the
+/// same `now` on this node.
 pub struct SnapcoreStore {
     inner: SnapStore,
     now: u64,
     ttl: u64,
+    seq: u64,
 }
 impl Default for SnapcoreStore {
     fn default() -> Self {
-        SnapcoreStore { inner: SnapStore::new(), now: 1, ttl: 1 << 40 }
+        SnapcoreStore { inner: SnapStore::new(), now: 1, ttl: 1 << 40, seq: 0 }
     }
 }
 impl SnapcoreStore {
@@ -51,7 +58,7 @@ impl SnapcoreStore {
     /// Wrap an existing snapcore store (e.g. the same one chat rides on) so profiles + messages
     /// share one DHT.
     pub fn over(inner: SnapStore) -> Self {
-        SnapcoreStore { inner, now: 1, ttl: 1 << 40 }
+        SnapcoreStore { inner, now: 1, ttl: 1 << 40, seq: 0 }
     }
 }
 impl ProfileBackend for SnapcoreStore {
@@ -59,11 +66,32 @@ impl ProfileBackend for SnapcoreStore {
         true
     }
     fn put(&mut self, key: &str, value: Vec<u8>) -> bool {
-        self.inner.put(key_id(key), value, self.ttl, self.now);
+        // Prefix an (now, seq) stamp so get() can pick the newest of the values snapcore keeps under
+        // this key. 16 bytes: now (8, LE) then seq (8, LE).
+        let mut stamped = Vec::with_capacity(16 + value.len());
+        stamped.extend_from_slice(&self.now.to_le_bytes());
+        stamped.extend_from_slice(&self.seq.to_le_bytes());
+        stamped.extend_from_slice(&value);
+        self.inner.put(key_id(key), stamped, self.ttl, self.now);
+        self.seq = self.seq.wrapping_add(1);
         true
     }
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        self.inner.get(&key_id(key), self.now).into_iter().next()
+        // Of the live values under this key, return the body with the highest (now, seq) stamp — the
+        // most recently written one — so a republished profile supersedes the stale copy.
+        self.inner
+            .get(&key_id(key), self.now)
+            .into_iter()
+            .filter_map(|v| {
+                if v.len() < 16 {
+                    return None; // unstamped/foreign value — ignore
+                }
+                let now = u64::from_le_bytes(v[0..8].try_into().ok()?);
+                let seq = u64::from_le_bytes(v[8..16].try_into().ok()?);
+                Some(((now, seq), v[16..].to_vec()))
+            })
+            .max_by_key(|(stamp, _)| *stamp)
+            .map(|(_, body)| body)
     }
 }
 
@@ -200,5 +228,27 @@ mod tests {
         let mut me = Profile::new("kd@a1", "kesslerd");
         me.friends = vec!["bob@f0".into(), "amy@9c".into(), "ghost@00".into()];
         assert_eq!(svc.friends_of(&me).len(), 2);
+    }
+
+    #[test]
+    fn republished_profile_supersedes_stale_on_snapcore() {
+        // snapcore keeps both the old and new value under a key; the wrapper must return the newer,
+        // or presence never updates on the LAN/offline floor. OpenDHT down → snapcore only.
+        let mut svc = ProfileService::new(Fake { up: false, ..Default::default() }, SnapcoreStore::new());
+        let mut p = Profile::new("ada@01", "Ada");
+        assert!(svc.publish(&p)); // Online
+        p.presence = Presence::InGame { game: "unendlich".into(), session: Some("tok".into()) };
+        assert!(svc.publish(&p)); // republish: now InGame
+        let (got, reach) = svc.lookup("ada@01");
+        assert_eq!(reach, Reach::Snapcore);
+        assert!(
+            matches!(got.unwrap().presence, Presence::InGame { .. }),
+            "the most recently published presence must win"
+        );
+
+        // ...and going back to Online supersedes again (not stuck InGame).
+        p.presence = Presence::Online;
+        assert!(svc.publish(&p));
+        assert!(matches!(svc.lookup("ada@01").0.unwrap().presence, Presence::Online));
     }
 }
