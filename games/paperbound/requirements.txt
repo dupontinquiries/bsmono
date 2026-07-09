@@ -1,0 +1,14 @@
+# Paperbound dependencies.
+#
+# IMPORTANT: use pygame-ce (the community fork), NOT the original `pygame`.
+# pygame-ce ships wheels for newer Pythons (incl. 3.13/3.14) and avoids the
+# SDL_ttf font-module circular-import crash seen on upstream pygame 2.6.1 with
+# Python 3.14. If you already have the old `pygame`, remove it first:
+#     pip uninstall -y pygame
+#
+pygame-ce>=2.5.0
+numpy>=1.24
+
+# Optional — only needed for extra features, the game runs without them:
+#   pyttsx3      # offline text-to-speech (boss/flavor voice), optional
+#   zeroconf     # mDNS LAN discovery (Avahi); UDP/HTTP discovery works without it
