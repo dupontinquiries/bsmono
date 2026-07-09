@@ -26,6 +26,7 @@
 
 pub mod gen;
 pub mod goertzel;
+pub mod fingerprint;
 pub mod level;
 pub mod pitch;
 pub mod window;
