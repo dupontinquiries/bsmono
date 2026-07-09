@@ -66,6 +66,14 @@ pub fn parse_monitor_sensor(line: &str) -> Option<SensorEvent> {
 pub struct TiltControl {
     impulse: Vec2,
     active: bool,
+    /// Sustained unit gravity from the last *tilt* change (vertical axis) and last *orientation*
+    /// change (horizontal axis), tracked separately so they combine into a diagonal — the gyro-ball
+    /// model, where tilt drives north/south and orientation drives east/west at the same time. The
+    /// *hold* model, for coarse change-only sources like `monitor-sensor`; zero on each axis when
+    /// that axis goes neutral. Separate from `impulse` so one controller serves both a continuous
+    /// source (drive `tick`) and a change-event source (read [`TiltControl::hold_gravity`]).
+    held_tilt: Vec2,
+    held_orient: Vec2,
     /// Impulse magnitude per tilt event (tune to taste).
     pub impulse_mag: f32,
     /// Friction multiplier applied to velocity each frame when no tilt is held.
@@ -81,6 +89,8 @@ impl Default for TiltControl {
         TiltControl {
             impulse: Vec2::ZERO,
             active: false,
+            held_tilt: Vec2::ZERO,
+            held_orient: Vec2::ZERO,
             impulse_mag: 5.6,
             friction_neutral: 0.80,
             friction_active: 0.92,
@@ -115,6 +125,29 @@ impl TiltControl {
         self.impulse.x += dx;
         self.impulse.y += dy;
         self.active = active;
+        // Sustained-hold model (for coarse change-event sources): update the axis this event changed,
+        // in screen coordinates (+y = down). Tilt owns the vertical axis, orientation the horizontal;
+        // they persist independently and combine in `hold_gravity`, so tilt + turn = diagonal roll.
+        // Matches the gyro-ball tilt/orientation tables; independent of `flip_vert`.
+        match ev {
+            SensorEvent::Tilt(TiltState::Down) => self.held_tilt = Vec2 { x: 0.0, y: 1.0 },
+            SensorEvent::Tilt(TiltState::Up) => self.held_tilt = Vec2 { x: 0.0, y: -1.0 },
+            SensorEvent::Tilt(TiltState::Normal) => self.held_tilt = Vec2::ZERO,
+            SensorEvent::Orient(Orientation::LeftUp) => self.held_orient = Vec2 { x: -1.0, y: 0.0 },
+            SensorEvent::Orient(Orientation::RightUp) => self.held_orient = Vec2 { x: 1.0, y: 0.0 },
+            SensorEvent::Orient(Orientation::Normal) | SensorEvent::Orient(Orientation::BottomUp) => {
+                self.held_orient = Vec2::ZERO
+            }
+        };
+    }
+
+    /// The sustained tilt **gravity direction** (screen coords: +y down): the last tilt axis combined
+    /// with the last orientation axis, each held until its next change, zeroed when that axis goes
+    /// neutral. This is the model that fits a coarse change-only source like `monitor-sensor` — read
+    /// it each frame and scale by your own gravity constant; no `tick` needed. (For a continuous
+    /// sample source, use the impulse model via [`TiltControl::tick`] instead.)
+    pub fn hold_gravity(&self) -> Vec2 {
+        Vec2 { x: self.held_tilt.x + self.held_orient.x, y: self.held_tilt.y + self.held_orient.y }
     }
 
     /// Convenience: parse a `monitor-sensor` line and apply it if it's an event. Returns true if the
@@ -194,5 +227,31 @@ mod tests {
         c.apply(SensorEvent::Tilt(TiltState::Down));
         c.tick(&mut vel);
         assert!((vel.y - 2.0 * c.impulse_mag * c.friction_active).abs() < 0.01, "two kicks accumulate: {}", vel.y);
+    }
+
+    #[test]
+    fn hold_gravity_sustains_direction_for_change_event_sources() {
+        // The model that fits monitor-sensor: tilt and orientation each set a sustained axis that
+        // persists until its next change and combine into a diagonal. Matches the gyro-ball tables.
+        let mut c = TiltControl::new();
+        assert_eq!(c.hold_gravity(), Vec2::ZERO); // starts neutral
+
+        c.feed_line("Tilt changed: tilted-down");
+        assert_eq!(c.hold_gravity(), Vec2 { x: 0.0, y: 1.0 }); // rolls down, held
+
+        // no further events → still held (unlike the impulse model, which would have decayed)
+        assert_eq!(c.hold_gravity(), Vec2 { x: 0.0, y: 1.0 });
+
+        // orientation changes the horizontal axis WITHOUT clearing the held vertical tilt → diagonal
+        c.feed_line("Accelerometer orientation changed: left-up");
+        assert_eq!(c.hold_gravity(), Vec2 { x: -1.0, y: 1.0 });
+
+        // tilt back to normal clears only the vertical axis; horizontal orientation persists
+        c.feed_line("Tilt changed: normal");
+        assert_eq!(c.hold_gravity(), Vec2 { x: -1.0, y: 0.0 });
+
+        // orientation normal clears the horizontal axis → fully neutral
+        c.feed_line("Accelerometer orientation changed: normal");
+        assert_eq!(c.hold_gravity(), Vec2::ZERO);
     }
 }
