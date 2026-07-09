@@ -188,7 +188,7 @@
     },
     {
       "name": "unendlich-analyze",
-      "path": "apps/unendlich/crates/unendlich-analyze",
+      "path": "games/unendlich/crates/unendlich-analyze",
       "features": [],
       "no_default": false,
       "target": "",
@@ -196,7 +196,7 @@
     },
     {
       "name": "unendlich-dash",
-      "path": "apps/unendlich/crates/unendlich-dash",
+      "path": "games/unendlich/crates/unendlich-dash",
       "features": [],
       "no_default": false,
       "target": "",
@@ -204,7 +204,7 @@
     },
     {
       "name": "unendlich-engine",
-      "path": "apps/unendlich/crates/unendlich-engine",
+      "path": "games/unendlich/crates/unendlich-engine",
       "features": [],
       "no_default": false,
       "target": "",
@@ -212,7 +212,7 @@
     },
     {
       "name": "unendlich-launcher",
-      "path": "apps/unendlich/crates/unendlich-launcher",
+      "path": "games/unendlich/crates/unendlich-launcher",
       "features": [],
       "no_default": false,
       "target": "",
