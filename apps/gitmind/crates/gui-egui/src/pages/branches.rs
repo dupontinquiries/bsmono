@@ -45,7 +45,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if app.branches.branches.is_empty() && app.branches.err.is_empty() {
         ui.label(egui::RichText::new("no branches in the native store yet").weak());
     }
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("branches").show(ui, |ui| {
         for (name, oid, head) in &app.branches.branches {
             ui.horizontal(|ui| {
                 ui.label(if *head { "●" } else { " " });

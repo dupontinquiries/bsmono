@@ -175,6 +175,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     let log = app.task.log();
     if !log.is_empty() {
         egui::ScrollArea::vertical()
+            .id_salt("pushlog")
             .max_height(200.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
