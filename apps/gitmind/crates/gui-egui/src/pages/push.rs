@@ -141,6 +141,20 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(&app.push.strategy).color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)).small());
     }
 
+    // Bootstrap rustup on the device over SSH — for RemoteNative builds, the device needs rustup to add
+    // its target's std ("rustup isn't installed" on a fresh device is fixed here, no manual ssh).
+    ui.horizontal(|ui| {
+        let can_boot = !app.task.is_running() && !app.push.host.trim().is_empty();
+        if ui.add_enabled(can_boot, egui::Button::new("bootstrap rustup on device")).clicked() {
+            let (u, h, t) = (app.push.user.clone(), app.push.host.clone(), app.push.target.clone());
+            app.task.run(move || match cockpit::deploy::bootstrap_rustup_remote(&u, &h, &t) {
+                Ok(o) => format!("✓ rustup ready on {h}\n{o}"),
+                Err(e) => format!("error: {e}"),
+            });
+        }
+        ui.label(egui::RichText::new("installs rustup + the target's std on the device (idempotent)").weak().small());
+    });
+
     // Populate the flag grid from the SELECTED app's real cargo features (rescanned on change).
     if let Some(sel) = &app.push.selected {
         if app.push.flags_for != sel.name {
