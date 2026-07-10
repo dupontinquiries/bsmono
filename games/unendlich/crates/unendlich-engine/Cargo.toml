@@ -11,6 +11,7 @@ ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feat
 linkme = "0.3"
 # Workspace deps
 unendlich-shared = { path = "../unendlich-shared" }
+gpu-kit = { path = "../../../../shared/gpu-kit" }  # shared, version-agnostic present-mode/format policy core
 
 # Math
 nalgebra-glm = "0.18"
