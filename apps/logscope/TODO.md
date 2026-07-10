@@ -52,8 +52,19 @@ only in the fan state and the persona badge appears in both. No scene geometry t
 
 NEXT (same GPU-only scene frontier as pass 68): Atlantis rings/ceiling (needs user pinpoint), Mistfall
 anti-gravity waterfall polish, Cloudscape night tuning, Forest stateful leaf decay + critter wander, Treehouse
-wood-grain shader. On the chat side, a natural follow-on is wiring the persona badge to be *clickable* (switch
-persona inline, using the parked `persona_by_key` router seam) rather than edit-only via the Context page.
+wood-grain shader.
+
+### pass 69b — status-bar affordances made interactive (fan launcher + clickable persona)
+Follow-on landed the same day: the read-only badge became a **click-to-switch persona popup** (wires the
+formerly-parked `persona_by_key` seam; same effect as the Context page, now inline), and a **⑃ fan launcher**
+popup appears when idle so the fan commands (`:ca` · `:3ca` · `:fuzz 8` · `:fa 4`) are reachable from the GUI
+without dropping to the `:` cmdline — each item calls the same `run_command` path the cmdline uses. Both use
+the shipped `popup_below_widget` + `selectable_label` pattern (from `model::folder_popup`). +1 round-trip test
+(persona_by_key ↔ badge label); suite 470/470. Note: the popup *contents* are covered by unit tests + the reused
+pattern + a clean compile of the nested closures; the live popup open is best eyeballed on-GPU (a hover/click
+popup over the animated scene resists headless screenshotting). Buttons + badge render (OCR-confirmed on the
+status row).
+
 
 
 
