@@ -21,6 +21,8 @@ pub struct State {
     pub flag_grid: uikit_egui::toggle_grid::ToggleGrid,
     /// The app name `flags` were loaded for, so we only rescan on a selection change.
     pub flags_for: String,
+    /// Detected build system for the selected app ("Rust (cargo)", "Python", "CMake", …).
+    pub build_system: String,
 }
 
 impl Default for State {
@@ -39,6 +41,7 @@ impl Default for State {
             flags: Vec::new(),
             flag_grid: uikit_egui::toggle_grid::ToggleGrid::new("push-build-flags").columns(3),
             flags_for: String::new(),
+            build_system: String::new(),
         }
     }
 }
@@ -154,8 +157,18 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     uikit_egui::toggle_grid::ToggleOption::new(f.clone(), f.clone(), on)
                 })
                 .collect();
+            // detect the build system (Rust cargo / Python / Node / Go / CMake / Make)
+            app.push.build_system = cockpit::buildsystem::detect(std::path::Path::new(&sel.path))
+                .map(|d| d.kind.label().to_string())
+                .unwrap_or_default();
             app.push.flags_for = sel.name.clone();
         }
+    }
+    if !app.push.build_system.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("build system");
+            ui.label(egui::RichText::new(&app.push.build_system).strong().color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)));
+        });
     }
 
     // Build features — hold the button and swipe across the grid to flip features, release to confirm.
@@ -194,6 +207,28 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 Err(e) => format!("error: {e}"),
             }
         });
+    }
+
+    // Build ALL apps in the selected app's group, and install them on the device (cockpit build-all).
+    if let Some(sel) = &app.push.selected {
+        if let Some(group) =
+            cockpit::flow::store_groups().into_iter().find(|g| g.apps.iter().any(|a| a.name == sel.name))
+        {
+            let n = group.apps.len();
+            let can_all = !app.task.is_running() && !app.push.host.trim().is_empty() && n > 1;
+            if ui
+                .add_enabled(can_all, egui::Button::new(format!("Build & push all · {} ({n})", group.name)))
+                .clicked()
+            {
+                let (t, u, h) = (app.push.target.clone(), app.push.user.clone(), app.push.host.clone());
+                app.task.run_logged(move |sink| {
+                    let mut on_line = |l: &str| sink.push(l);
+                    let results = cockpit::flow::install_group_remote_logged(&group, &t, &u, &h, &mut on_line);
+                    let ok = results.iter().filter(|r| r.ok).count();
+                    format!("✓ {ok}/{} apps installed", results.len())
+                });
+            }
+        }
     }
 
     if let Some(r) = app.task.take_result() {
