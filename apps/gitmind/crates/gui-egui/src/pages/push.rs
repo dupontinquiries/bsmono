@@ -174,15 +174,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     let log = app.task.log();
     if !log.is_empty() {
-        egui::ScrollArea::vertical()
-            .id_salt("pushlog")
-            .max_height(200.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for l in &log {
-                    ui.label(egui::RichText::new(l).monospace().small());
-                }
-            });
+        uikit_egui::scroll::log(ui, &log, 200.0);
     }
     if !app.push.note.is_empty() {
         ui.add_space(6.0);
