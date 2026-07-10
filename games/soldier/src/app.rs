@@ -174,6 +174,28 @@ impl Bindings {
             ..Self::nav_forge_defaults()
         }
     }
+    /// Build movement bindings from the shared cross-app [`settings_kit::MovementLayout`] — the one
+    /// setting the bsettings app exposes (WASD / .oeu Dvorak / ESDF / arrows). Maps the abstract key
+    /// labels to egui `Key`, keeping this game's action + nav/forge keys from the closest preset.
+    fn from_layout(layout: settings_kit::MovementLayout) -> Self {
+        fn key(label: &str) -> Key {
+            match label {
+                "w" => Key::W, "a" => Key::A, "s" => Key::S, "d" => Key::D,
+                "e" => Key::E, "f" => Key::F, "o" => Key::O, "u" => Key::U,
+                "." => Key::Period,
+                "up" => Key::ArrowUp, "left" => Key::ArrowLeft, "down" => Key::ArrowDown, "right" => Key::ArrowRight,
+                _ => Key::W,
+            }
+        }
+        // action/nav keys come from the matching preset; the 4 movement keys from the shared layout
+        let base = match layout {
+            settings_kit::MovementLayout::Dvorak => Self::dvorak(),
+            _ => Self::qwerty(),
+        };
+        let [f, l, b, r] = layout.keys();
+        Self { forward: key(f), left: key(l), back: key(b), right: key(r), ..base }
+    }
+
     /// Shared defaults for menu/forge navigation, independent of the movement layout: arrow keys plus a
     /// vim-style `h j k l` for up/down/left/right, Enter to select, Backspace to go back, and the forge
     /// editor keys. These are the same regardless of Dvorak/QWERTY so navigation is always available.
@@ -292,7 +314,7 @@ impl Default for Settings {
             fov_deg: 74.0,
             third_person: false,
             show_minimap: true,
-            bindings: Bindings::dvorak(),
+            bindings: Bindings::from_layout(settings_kit::MovementLayout::Dvorak),
             render_detail: 1.4,
             texture_detail: 3.0,
             graphics_preset: crate::graphics::GraphicsPreset::default(),
