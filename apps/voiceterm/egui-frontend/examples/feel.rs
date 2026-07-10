@@ -22,9 +22,10 @@ struct Feel {
 }
 
 impl eframe::App for Feel {
-    // this eframe\'s App trait requires ui(); the app is driven from update() below.
+    // this eframe's App trait requires ui(); the app is driven from update() below.
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::Panel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
