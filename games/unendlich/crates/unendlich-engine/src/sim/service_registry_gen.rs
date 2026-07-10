@@ -353,9 +353,7 @@ static GS_0014: ServiceEntry = ServiceEntry {
 // GEN-END
 
 // GEN-ENTRY: render_adaptive_upload__AdaptiveUploadController src=render::adaptive_upload
-#[cfg(feature = "render-core")]
 struct S0015(crate::render::adaptive_upload::AdaptiveUploadController, u64);
-#[cfg(feature = "render-core")]
 impl Service for S0015 {
     fn name(&self) -> &'static str { "render_adaptive_upload__AdaptiveUploadController" }
     fn tick(&mut self, ctx: &ServiceCtx) {
@@ -366,7 +364,6 @@ impl Service for S0015 {
         let _ = self.0.observe(c.phase as f64);
     }
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(SERVICES)]
 static GS_0015: ServiceEntry = ServiceEntry {
     name: "render_adaptive_upload__AdaptiveUploadController",
@@ -379,9 +376,7 @@ static GS_0015: ServiceEntry = ServiceEntry {
 // GEN-END
 
 // GEN-ENTRY: render_mesh_buffer_alloc__SpanAllocator src=render::mesh_buffer_alloc
-#[cfg(feature = "render-core")]
 struct S0016(crate::render::mesh_buffer_alloc::SpanAllocator, u64);
-#[cfg(feature = "render-core")]
 impl Service for S0016 {
     fn name(&self) -> &'static str { "render_mesh_buffer_alloc__SpanAllocator" }
     fn tick(&mut self, ctx: &ServiceCtx) {
@@ -392,7 +387,6 @@ impl Service for S0016 {
         let _ = self.0.alloc(((c.tick % 7) + 1) as u64);
     }
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(SERVICES)]
 static GS_0016: ServiceEntry = ServiceEntry {
     name: "render_mesh_buffer_alloc__SpanAllocator",

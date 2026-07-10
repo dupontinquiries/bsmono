@@ -319,6 +319,48 @@ impl InventoryGrid {
             count: taken,
         })
     }
+
+    /// Merge scattered partial stacks of the same item into fuller stacks (up to
+    /// [`max_stack`]), packing counts toward earlier slots and freeing later ones.
+    /// Returns the number of slots freed. Conserves the total count of every item
+    /// kind and is order-stable (earlier slots fill first). This is the "tidy" /
+    /// auto-stack operation a UI button or a pickup path wants after many small
+    /// additions have fragmented the grid.
+    pub fn consolidate(&mut self) -> u32 {
+        let n = self.slots.len();
+        let mut freed = 0u32;
+        for i in 0..n {
+            let (id, mut count) = match self.slots[i] {
+                Some(s) => (s.id, s.count),
+                None => continue,
+            };
+            let cap = max_stack(id);
+            if count >= cap {
+                continue; // already full — nothing to pull in
+            }
+            for j in (i + 1)..n {
+                if count >= cap {
+                    break;
+                }
+                if let Some(s) = self.slots[j] {
+                    if s.id != id {
+                        continue;
+                    }
+                    let moved = (cap - count).min(s.count);
+                    count += moved;
+                    let left = s.count - moved;
+                    if left == 0 {
+                        self.slots[j] = None;
+                        freed += 1;
+                    } else {
+                        self.slots[j] = Some(ItemStack { id, count: left });
+                    }
+                }
+            }
+            self.slots[i] = Some(ItemStack { id, count });
+        }
+        freed
+    }
 }
 
 #[cfg(test)]
@@ -496,6 +538,61 @@ mod tests {
             // determinism: identical inputs -> identical grids and leftovers
             assert_eq!(g1, g2);
             assert_eq!(leftovers1, leftovers2);
+        }
+    }
+
+    #[test]
+    fn consolidate_merges_partials_and_conserves() {
+        let mut g = InventoryGrid::new(1, 4);
+        // Three partial stacks of id 1 (max 64): 40 + 30 + 20 = 90 → one 64 + one 26.
+        g.set(0, Some(ItemStack::new(id(1), 40)));
+        g.set(1, Some(ItemStack::new(id(1), 30)));
+        g.set(2, Some(ItemStack::new(id(1), 20)));
+        let before = g.total();
+        let freed = g.consolidate();
+        assert_eq!(g.total(), before, "count conserved");
+        assert_eq!(freed, 1, "three partials → two stacks, one slot freed");
+        assert_eq!(g.get(0), Some(ItemStack::new(id(1), 64)));
+        assert_eq!(g.get(1), Some(ItemStack::new(id(1), 26)));
+        assert_eq!(g.get(2), None);
+        assert!(invariants_hold(&g));
+    }
+
+    #[test]
+    fn consolidate_leaves_distinct_ids_alone() {
+        let mut g = InventoryGrid::new(1, 3);
+        g.set(0, Some(ItemStack::new(id(1), 10)));
+        g.set(1, Some(ItemStack::new(id(2), 10)));
+        g.set(2, Some(ItemStack::new(id(1), 10)));
+        let freed = g.consolidate();
+        assert_eq!(freed, 1); // the two id(1) stacks merge; id(2) untouched
+        assert_eq!(g.get(0), Some(ItemStack::new(id(1), 20)));
+        assert_eq!(g.get(1), Some(ItemStack::new(id(2), 10)));
+        assert_eq!(g.count_of(id(1)), 20);
+    }
+
+    #[test]
+    fn consolidate_never_stacks_unstackables() {
+        // ids >= 200 stack to 1 — two of them must stay in separate slots.
+        let mut g = InventoryGrid::new(1, 2);
+        g.set(0, Some(ItemStack::new(id(210), 1)));
+        g.set(1, Some(ItemStack::new(id(210), 1)));
+        let freed = g.consolidate();
+        assert_eq!(freed, 0);
+        assert_eq!(g.count_of(id(210)), 2);
+    }
+
+    #[test]
+    fn consolidate_conserves_on_random_grids() {
+        let mut s = 0xC0FFEEu32;
+        for _ in 0..200 {
+            let mut g = random_grid(&mut s, 3, 4);
+            let before = g.total();
+            g.consolidate();
+            assert_eq!(g.total(), before);
+            assert!(invariants_hold(&g));
+            // Idempotent: a second pass frees nothing.
+            assert_eq!(g.consolidate(), 0);
         }
     }
 }

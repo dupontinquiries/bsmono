@@ -2536,6 +2536,29 @@ impl WorldRenderer {
         self.upload_fail_count
     }
 
+    /// r736: apply a CPU chunk-occlusion set to the indirect draw metadata. The
+    /// caller (which owns the world) computes the set of *visible* chunk coords —
+    /// e.g. `world::occlusion_flood::flood_visible` over the loaded chunks'
+    /// `cached_all_opaque` around the camera — and passes it in each frame *before*
+    /// `render()`. Resident chunks not in the set are marked occluded and skipped by
+    /// the cull shader. Returns how many resident slots are currently occluded.
+    ///
+    /// Only sets flags on changed slots; the per-frame `flush_frame` inside
+    /// `render()` propagates them. When occlusion is disabled call
+    /// [`clear_chunk_occlusion`] once so nothing stays hidden.
+    pub fn apply_chunk_occlusion(
+        &mut self,
+        chunk_size: i32,
+        visible: &std::collections::HashSet<[i32; 3]>,
+    ) -> u32 {
+        self.indirect.apply_occlusion(chunk_size, visible)
+    }
+
+    /// r736: clear all occlusion flags (turn the pre-cull off).
+    pub fn clear_chunk_occlusion(&mut self) {
+        self.indirect.clear_occlusion();
+    }
+
     /// v0.24.63-adaptive-uploads: most-recent `wait_for_fences`
     /// measurement in milliseconds. Captured at the top of every
     /// `draw_frame` call. The bin's adaptive upload controller polls
@@ -2655,6 +2678,23 @@ impl WorldRenderer {
             return Some(m.version);
         }
         self.empty_mesh_versions.get(&key).copied()
+    }
+
+    /// r703: record a chunk as "meshed empty at this version" WITHOUT running the
+    /// mesher — used by the fully-buried-chunk cull so a totally-occluded chunk is
+    /// marked done (via `mesh_or_empty_version_for_lod`) and stops being re-picked
+    /// as a mesh candidate every frame. Identical bookkeeping to what the empty-
+    /// mesh branch of the upload path does; no GPU work. When the chunk (or a
+    /// neighbour) is edited, `chunk.version` bumps past this recorded version, so
+    /// it is re-picked and meshed normally — exposing the newly-uncovered faces.
+    pub fn mark_meshed_empty(
+        &mut self,
+        coord: ChunkCoord,
+        lod: crate::world::lod::LodLevel,
+        version: u64,
+    ) {
+        let key = crate::world::lod::MeshSlotKey::at(coord, lod);
+        self.empty_mesh_versions.insert(key, version);
     }
 
     /// v0.24.72: like `mesh_version_for`, but ALSO checks the

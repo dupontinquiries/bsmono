@@ -32,60 +32,6 @@ impl std::error::Error for SwapchainError {}
 
 pub type Result<T> = std::result::Result<T, SwapchainError>;
 
-/// Map a Vulkan present mode to gpu-kit's version-neutral name (None for modes gpu-kit's policy core
-/// doesn't model — e.g. the shared-demand variants — which we simply don't offer to the policy).
-fn vk_present_to_gpukit(m: vk::PresentModeKHR) -> Option<gpu_kit::PresentMode> {
-    match m {
-        vk::PresentModeKHR::FIFO => Some(gpu_kit::PresentMode::Fifo),
-        vk::PresentModeKHR::FIFO_RELAXED => Some(gpu_kit::PresentMode::FifoRelaxed),
-        vk::PresentModeKHR::MAILBOX => Some(gpu_kit::PresentMode::Mailbox),
-        vk::PresentModeKHR::IMMEDIATE => Some(gpu_kit::PresentMode::Immediate),
-        _ => None,
-    }
-}
-
-/// Map gpu-kit's chosen present mode back to Vulkan. Total: every gpu-kit variant has a vk peer.
-fn gpukit_present_to_vk(m: gpu_kit::PresentMode) -> vk::PresentModeKHR {
-    match m {
-        gpu_kit::PresentMode::Fifo => vk::PresentModeKHR::FIFO,
-        gpu_kit::PresentMode::FifoRelaxed => vk::PresentModeKHR::FIFO_RELAXED,
-        gpu_kit::PresentMode::Mailbox => vk::PresentModeKHR::MAILBOX,
-        gpu_kit::PresentMode::Immediate => vk::PresentModeKHR::IMMEDIATE,
-    }
-}
-
-#[cfg(test)]
-mod present_mode_tests {
-    use super::*;
-
-    #[test]
-    fn vk_gpukit_present_roundtrips() {
-        for m in [
-            vk::PresentModeKHR::FIFO,
-            vk::PresentModeKHR::FIFO_RELAXED,
-            vk::PresentModeKHR::MAILBOX,
-            vk::PresentModeKHR::IMMEDIATE,
-        ] {
-            assert_eq!(gpukit_present_to_vk(vk_present_to_gpukit(m).unwrap()), m);
-        }
-    }
-
-    #[test]
-    fn default_intent_picks_fifo_even_when_mailbox_is_offered() {
-        // The stutter fix: with MAILBOX available, the default (Vsync) still chooses FIFO.
-        let modes = [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX, vk::PresentModeKHR::FIFO];
-        let supported: Vec<_> = modes.iter().copied().filter_map(vk_present_to_gpukit).collect();
-        let picked = gpu_kit::Policy { present: gpu_kit::Present::Vsync, ..Default::default() }
-            .pick_present_mode(&supported);
-        assert_eq!(gpukit_present_to_vk(picked), vk::PresentModeKHR::FIFO);
-
-        // And low-latency intent still prefers MAILBOX when it's there.
-        let picked_ll = gpu_kit::Policy { present: gpu_kit::Present::LowLatency, ..Default::default() }
-            .pick_present_mode(&supported);
-        assert_eq!(gpukit_present_to_vk(picked_ll), vk::PresentModeKHR::MAILBOX);
-    }
-}
-
 pub struct Swapchain {
     pub handle: vk::SwapchainKHR,
     pub format: vk::Format,
@@ -120,28 +66,59 @@ impl Swapchain {
                 && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
         }).copied().unwrap_or(formats[0]);
 
-        // Present mode via the shared gpu-kit policy core (version-agnostic: it selects over the
-        // surface's own capability list and always falls back to FIFO). UNENDLICH_VSYNC picks the
-        // *intent*; gpu-kit picks a supported mode for it.
+        // v0.24.2c.10: present mode selection — three-way knob now.
         //
-        //   UNENDLICH_VSYNC=1|on|fifo    → Vsync      (FIFO — no tearing, smoothest; the default)
-        //   UNENDLICH_VSYNC=mailbox      → LowLatency (MAILBOX→IMMEDIATE→…→FIFO)
-        //   UNENDLICH_VSYNC=immediate|tearing|0 → Fast (IMMEDIATE→MAILBOX→…→FIFO)
-        //   default (unset)              → Vsync (FIFO)
+        //   UNENDLICH_VSYNC=1            → FIFO (capped to refresh, no tearing,
+        //                                  CPU/GPU block on present queue —
+        //                                  CHOOSE for quiet fans, accept latency).
+        //   UNENDLICH_VSYNC=immediate    → IMMEDIATE (zero latency, may tear,
+        //   UNENDLICH_VSYNC=tearing             CHOOSE for input-critical workflows
+        //   UNENDLICH_VSYNC=0                   like first-person where tearing is
+        //                                       less perceptible than latency).
+        //   default (unset or =mailbox)  → MAILBOX (newest-wins, no tearing,
+        //                                  CPU never waits on present —
+        //                                  the no-latency baseline).
         //
-        // NOTE: the default is now FIFO, not MAILBOX. MAILBOX on Wayland/Asahi is the stutter source
-        // (the compositor re-paces newest-wins presentation), so FIFO is the correct smooth baseline;
-        // the low-latency modes remain one env var away for displays/compositors that handle them well.
-        let present = match std::env::var("UNENDLICH_VSYNC").ok().as_deref() {
-            Some("1") | Some("on") | Some("fifo") => gpu_kit::Present::Vsync,
-            Some("mailbox") => gpu_kit::Present::LowLatency,
-            Some("immediate") | Some("tearing") | Some("0") => gpu_kit::Present::Fast,
-            _ => gpu_kit::Present::Vsync,
+        // MAILBOX is the c.10 default because the no-latency ship cares
+        // about presented-frame freshness above all else. If MAILBOX
+        // isn't supported (some Asahi/Wayland configurations), we fall
+        // back to FIFO and log a warning so the user knows latency
+        // mitigation is degraded.
+        let vsync_request = std::env::var("UNENDLICH_VSYNC").ok();
+        let present_mode = match vsync_request.as_deref() {
+            Some("1") | Some("on") | Some("fifo") => vk::PresentModeKHR::FIFO,
+            Some("immediate") | Some("tearing") => {
+                if modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+                    vk::PresentModeKHR::IMMEDIATE
+                } else {
+                    log::warn!(
+                        "UNENDLICH_VSYNC=immediate requested but IMMEDIATE present mode \
+                         isn't supported by this surface — falling back to MAILBOX"
+                    );
+                    if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                        vk::PresentModeKHR::MAILBOX
+                    } else {
+                        log::warn!("MAILBOX not supported either — falling back to FIFO (latency degraded)");
+                        vk::PresentModeKHR::FIFO
+                    }
+                }
+            }
+            // Default + explicit mailbox/0 — try MAILBOX, fall back to FIFO.
+            _ => {
+                if modes.contains(&vk::PresentModeKHR::MAILBOX) {
+                    vk::PresentModeKHR::MAILBOX
+                } else {
+                    log::warn!(
+                        "MAILBOX present mode not supported by this surface \
+                         (driver/compositor limitation) — falling back to FIFO. \
+                         Latency mitigation degraded. Try UNENDLICH_VSYNC=immediate \
+                         if your display can tolerate tearing."
+                    );
+                    vk::PresentModeKHR::FIFO
+                }
+            }
         };
-        let supported: Vec<gpu_kit::PresentMode> = modes.iter().copied().filter_map(vk_present_to_gpukit).collect();
-        let picked = gpu_kit::Policy { present, ..gpu_kit::Policy::default() }.pick_present_mode(&supported);
-        let present_mode = gpukit_present_to_vk(picked);
-        log::info!("Swapchain present mode: {:?} (intent {:?}), format: {:?}", present_mode, present, format.format);
+        log::info!("Swapchain present mode: {:?}, format: {:?}", present_mode, format.format);
 
         // Resolve extent — driver may impose CURRENT_EXTENT, otherwise we use
         // what we asked for, clamped.

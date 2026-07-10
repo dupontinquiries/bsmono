@@ -37,6 +37,32 @@ pub enum GameMode {
     Spectator,
 }
 
+impl GameMode {
+    /// r711: bridge to the atomic trait system (`sim::gamemode_traits`). The doc's
+    /// four base modes are Survival/Adventure/Creative/CrashDummy; the engine's
+    /// fourth mode is Spectator, which the doc frames as pure overlays — so we
+    /// compose it from a Creative base plus noclip/vision/invisibility and no
+    /// build. Systems can then gate behaviour on `game_mode.traits().can_build()`,
+    /// `.takes_damage()`, `.mobs_target()`, `.no_collision()`, etc. instead of
+    /// matching the mode name.
+    pub fn traits(self) -> crate::sim::gamemode_traits::TraitSet {
+        use crate::sim::gamemode_traits::{Mode, Trait};
+        match self {
+            GameMode::Survival => Mode::Survival.traits(),
+            GameMode::Creative => Mode::Creative.traits(),
+            GameMode::Adventure => Mode::Adventure.traits(),
+            // Ghost observer: fly + noclip + immune + ignored + full vision +
+            // hidden, with no build and outside the survival system.
+            GameMode::Spectator => Mode::Creative
+                .traits()
+                .without(Trait::Build)
+                .with(Trait::PassThrough)
+                .with(Trait::Vision)
+                .with(Trait::InvisToPlayers),
+        }
+    }
+}
+
 /// A parsed chat command. `Unknown` is the catch-all for unrecognised verbs,
 /// bad arity, or unparseable arguments — parsing is total and never panics.
 #[derive(Clone, PartialEq, Eq, Debug)]

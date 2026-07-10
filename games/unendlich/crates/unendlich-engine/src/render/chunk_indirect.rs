@@ -105,6 +105,9 @@ pub const CULL_WORKGROUP_SIZE: u32 = 64;
 
 /// Flag bits in `ChunkDraw::flags`.
 pub const FLAG_DEBUG_OVERLAY: u32 = 1;
+/// r736: set by the CPU occlusion pre-cull; the cull shader skips emitting a draw
+/// for a chunk with this bit (unless it's also a debug-overlay chunk).
+pub const FLAG_OCCLUDED: u32 = 2;
 
 /// Mirrors `chunk_cull.comp`'s `ChunkDraw`. std430 layout.
 #[repr(C)]
@@ -413,6 +416,65 @@ impl IndirectDrawSet {
         self.cpu_shadow[i] = draw;
         for d in &mut self.frame_dirty {
             d.push(slot.0);
+        }
+    }
+
+    /// r736: apply a CPU occlusion set. For every active slot, set or clear
+    /// [`FLAG_OCCLUDED`] according to whether the slot's chunk is in `visible`,
+    /// deriving the chunk coord from the slot's world AABB min and `chunk_size`.
+    /// Only changed slots are marked dirty (mirroring [`set`]), so `flush_frame`
+    /// propagates the minimal delta. Returns the number of slots currently occluded.
+    ///
+    /// Safe by construction: when `visible` contains every resident chunk (or the
+    /// caller never invokes this), no `FLAG_OCCLUDED` bit is ever set and the cull
+    /// shader behaves exactly as before.
+    pub fn apply_occlusion(
+        &mut self,
+        chunk_size: i32,
+        visible: &std::collections::HashSet<[i32; 3]>,
+    ) -> u32 {
+        let cs = chunk_size.max(1) as f32;
+        let mut occluded_total = 0u32;
+        for i in 0..self.cpu_shadow.len() {
+            let c = self.cpu_shadow[i];
+            if c.index_count == 0 {
+                continue; // inactive slot
+            }
+            let coord = [
+                (c.aabb_min[0] / cs).floor() as i32,
+                (c.aabb_min[1] / cs).floor() as i32,
+                (c.aabb_min[2] / cs).floor() as i32,
+            ];
+            let want_occluded = !visible.contains(&coord);
+            let is_occluded = (c.flags & FLAG_OCCLUDED) != 0;
+            if want_occluded {
+                occluded_total += 1;
+            }
+            if want_occluded == is_occluded {
+                continue; // no change → no dirty
+            }
+            if want_occluded {
+                self.cpu_shadow[i].flags |= FLAG_OCCLUDED;
+            } else {
+                self.cpu_shadow[i].flags &= !FLAG_OCCLUDED;
+            }
+            for d in &mut self.frame_dirty {
+                d.push(i as u32);
+            }
+        }
+        occluded_total
+    }
+
+    /// r736: clear all occlusion flags (call when the pre-cull is turned off so no
+    /// chunk stays hidden). Only touches slots that were occluded.
+    pub fn clear_occlusion(&mut self) {
+        for i in 0..self.cpu_shadow.len() {
+            if self.cpu_shadow[i].flags & FLAG_OCCLUDED != 0 {
+                self.cpu_shadow[i].flags &= !FLAG_OCCLUDED;
+                for d in &mut self.frame_dirty {
+                    d.push(i as u32);
+                }
+            }
         }
     }
 

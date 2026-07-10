@@ -227,6 +227,64 @@ impl ResolutionController {
     }
 }
 
+/// Adaptive **render distance** from frame-time pressure — the coarse companion to
+/// [`ResolutionController`] (which scales effect resolution). Render distance is the
+/// single biggest cost knob, so this shrinks it *eagerly* to claw back FPS when the
+/// frame runs long, and grows it back only *cautiously* (twice as patiently, and
+/// only with real headroom below target) so it doesn't oscillate at the boundary.
+/// Integer chunks, clamped to `[min_rd, max_rd]`.
+pub struct RenderDistanceController {
+    pub rd: u32,
+    pub min_rd: u32,
+    pub max_rd: u32,
+    /// Consecutive over-budget frames before shrinking (grow uses `2×` this).
+    pub patience: u8,
+    over: u8,
+    under: u8,
+}
+
+impl RenderDistanceController {
+    pub fn new(initial_rd: u32, min_rd: u32, max_rd: u32, patience: u8) -> RenderDistanceController {
+        let lo = min_rd.min(max_rd);
+        let hi = min_rd.max(max_rd);
+        RenderDistanceController {
+            rd: initial_rd.clamp(lo, hi),
+            min_rd: lo,
+            max_rd: hi,
+            patience: patience.max(1),
+            over: 0,
+            under: 0,
+        }
+    }
+
+    /// Feed the smoothed frame time + target; returns the new render distance.
+    /// Over target ⇒ shrink after `patience` frames. Comfortably under target
+    /// (below ~83%, a headroom band that stops flapping at the boundary) ⇒ grow
+    /// after `2×patience` frames. In the deadband between, hold and reset.
+    pub fn update(&mut self, smoothed_us: u32, target_us: u32) -> u32 {
+        let grow_ceiling = target_us.saturating_sub(target_us / 6); // ~83% of target
+        if smoothed_us > target_us {
+            self.over = self.over.saturating_add(1);
+            self.under = 0;
+        } else if smoothed_us < grow_ceiling {
+            self.under = self.under.saturating_add(1);
+            self.over = 0;
+        } else {
+            self.over = 0;
+            self.under = 0;
+        }
+
+        if self.over >= self.patience {
+            self.rd = self.rd.saturating_sub(1).max(self.min_rd);
+            self.over = 0;
+        } else if self.under >= self.patience.saturating_mul(2) && self.rd < self.max_rd {
+            self.rd += 1;
+            self.under = 0;
+        }
+        self.rd
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,5 +400,70 @@ mod tests {
             r.update(100_000, 2000);
         }
         assert_eq!(r.scale, 0.5, "clamped at the minimum scale");
+    }
+
+    #[test]
+    fn rd_shrinks_under_sustained_overbudget() {
+        let target = 8333; // ~120Hz
+        let mut c = RenderDistanceController::new(16, 4, 24, 3);
+        // Three over-budget frames → shrink by exactly one.
+        for _ in 0..3 {
+            c.update(target + 2000, target);
+        }
+        assert_eq!(c.rd, 15, "one shrink after `patience` over-budget frames");
+        // Keep the pressure on: it keeps stepping down, flooring at min_rd.
+        for _ in 0..200 {
+            c.update(target + 2000, target);
+        }
+        assert_eq!(c.rd, 4, "floors at min_rd");
+    }
+
+    #[test]
+    fn rd_grows_only_with_sustained_headroom() {
+        let target = 8333;
+        let mut c = RenderDistanceController::new(8, 4, 24, 3);
+        // Comfortably under target (well below the ~83% band) for 2×patience → +1.
+        for _ in 0..6 {
+            c.update(target / 2, target);
+        }
+        assert_eq!(c.rd, 9, "grows one step after 2×patience of headroom");
+    }
+
+    #[test]
+    fn rd_grows_more_reluctantly_than_it_shrinks() {
+        let target = 8333;
+        let mut shrink = RenderDistanceController::new(16, 4, 24, 3);
+        let mut grow = RenderDistanceController::new(16, 4, 24, 3);
+        for _ in 0..3 {
+            shrink.update(target + 5000, target);
+        }
+        for _ in 0..3 {
+            grow.update(target / 2, target);
+        }
+        // Same 3 frames: shrink already stepped; grow has not (needs 6).
+        assert_eq!(shrink.rd, 15);
+        assert_eq!(grow.rd, 16, "grow waits for 2×patience");
+    }
+
+    #[test]
+    fn rd_ignores_a_lone_spike() {
+        let target = 8333;
+        let mut c = RenderDistanceController::new(12, 4, 24, 4);
+        c.update(50_000, target); // one bad frame
+        for _ in 0..3 {
+            c.update(target / 2, target); // then fine
+        }
+        assert_eq!(c.rd, 12, "a single spike never moves render distance");
+    }
+
+    #[test]
+    fn rd_holds_in_the_deadband() {
+        let target = 8333;
+        let mut c = RenderDistanceController::new(12, 4, 24, 3);
+        // Just under target but inside the ~83%..100% band → neither grow nor shrink.
+        for _ in 0..50 {
+            c.update(target - 100, target);
+        }
+        assert_eq!(c.rd, 12, "stable near-but-under target");
     }
 }

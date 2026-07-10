@@ -21,6 +21,7 @@ pub mod hot_shaders;
 pub mod light;
 pub mod mesher;
 pub mod mesh_buffer_alloc;
+pub mod copy_coalesce;
 pub mod mesh_buffer_pool;
 pub mod chunk_indirect;
 pub mod gpu_timer;

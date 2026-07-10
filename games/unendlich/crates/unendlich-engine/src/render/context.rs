@@ -847,32 +847,48 @@ fn create_device(
 
     let features = vk::PhysicalDeviceFeatures::default();
 
-    // Enable Vulkan 1.2 features used by v0.20+ rendering. Specifically:
-    //   - drawIndirectCount: needed for `vkCmdDrawIndexedIndirectCount`,
-    //     the core of GPU-driven culling. Promoted from KHR to core in 1.2.
-    //
-    // We require Vulkan 1.2 at the instance level (see api_version above);
-    // any conformant 1.2+ implementation supports drawIndirectCount in the
-    // core feature struct, so opting in is just a flag flip.
+    // r687: NEGOTIATE Vulkan 1.1/1.2 feature support instead of blindly
+    // enabling. Blindly requesting a feature the device lacks makes
+    // `create_device` FAIL — the common macOS/MoltenVK failure, since MoltenVK
+    // (Vulkan-over-Metal) doesn't advertise every feature a desktop GPU does.
+    // We query what THIS device supports and only flip on the intersection with
+    // what we need; anything missing is logged so the operator knows the GPU
+    // path may be degraded rather than getting a cryptic device-create error.
+    // On Linux/desktop GPUs every feature below is supported, so this is a
+    // no-op there.
+    let mut sup12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut sup11 = vk::PhysicalDeviceVulkan11Features::default();
+    let mut sup2 = vk::PhysicalDeviceFeatures2::builder()
+        .push_next(&mut sup12)
+        .push_next(&mut sup11)
+        .build();
+    unsafe { instance.get_physical_device_features2(pdev, &mut sup2) };
+
+    // drawIndirectCount: the core of GPU-driven culling (vkCmdDrawIndexedIndirectCount,
+    // promoted KHR→core in 1.2). Recent MoltenVK supports it; older builds don't.
+    let want_draw_indirect_count = sup12.draw_indirect_count == vk::TRUE;
+    // shaderDrawParameters (1.1): reliable per-draw gl_InstanceIndex in the chunk
+    // vertex shader.
+    let want_shader_draw_parameters = sup11.shader_draw_parameters == vk::TRUE;
+    if !want_draw_indirect_count {
+        log::warn!(
+            "[gpu] device lacks drawIndirectCount (older MoltenVK / non-1.2 driver?) — \
+             GPU-driven indirect culling will be unavailable; update MoltenVK if on macOS"
+        );
+    }
+    if !want_shader_draw_parameters {
+        log::warn!(
+            "[gpu] device lacks shaderDrawParameters — per-draw instance index may be \
+             unreliable on this driver"
+        );
+    }
+
     let mut vulkan12 = vk::PhysicalDeviceVulkan12Features::builder()
-        .draw_indirect_count(true)
+        .draw_indirect_count(want_draw_indirect_count)
         .build();
 
-    // Enable Vulkan 1.1 features used by v0.24.20-vertex-pack:
-    //   - shaderDrawParameters: enables the SPIR-V `DrawParameters`
-    //     capability so the vertex shader's `gl_InstanceIndex` (and
-    //     `gl_BaseInstance` / `gl_DrawID` if needed later) reliably
-    //     includes the per-draw firstInstance value across drivers.
-    //     The chunk vertex shader uses gl_InstanceIndex to look up
-    //     each chunk's world origin in the chunks-metadata SSBO (the
-    //     cull shader writes the chunk's slot index into the indirect
-    //     command's firstInstance field).
-    //
-    // shaderDrawParameters is a core Vulkan 1.1 feature; any 1.2-
-    // conformant implementation supports it. Honeykrisp on M2 has it
-    // (confirmed via vkconfig).
     let mut vulkan11 = vk::PhysicalDeviceVulkan11Features::builder()
-        .shader_draw_parameters(true)
+        .shader_draw_parameters(want_shader_draw_parameters)
         .build();
 
     let info = vk::DeviceCreateInfo::builder()

@@ -31,6 +31,15 @@ pub enum Bond {
     Tamed,
 }
 
+impl Bond {
+    /// r718: a creature becomes eligible for the companion roster
+    /// (`sim::companion_roster`) once its bond quest is complete. The roster then
+    /// decides which slot (Dragon / Fauna / Auxiliary) it occupies.
+    pub const fn eligible_as_companion(self) -> bool {
+        matches!(self, Bond::Tamed)
+    }
+}
+
 /// Something the player (or world) did to the creature this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
