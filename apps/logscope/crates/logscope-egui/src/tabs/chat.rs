@@ -5262,8 +5262,12 @@ mod tests {
         assert!(fs.contains("Logscope"), "base system present");
         assert!(fs.contains("CURRENT LOG: app.log (1000 lines)"), "log header present");
         assert!(fs.contains("Most-repeated line patterns"), "patterns present");
-        // a summary, not a 1000-line dump
-        assert!(fs.len() < 4000, "log block must stay bounded, got {} chars", fs.len());
+        // a summary, not a 1000-line dump: measure the LOG BLOCK itself (the delta the
+        // attachment adds over the base persona), so this bound is independent of how big
+        // the selected system persona happens to be. 1000 raw lines would be ~20 KB.
+        let base = c.full_system(&Doc::from_text("app.log", ""));
+        let block = fs.len() - base.len();
+        assert!(block < 1500, "log block must stay bounded, got {block} chars");
     }
 
     #[test]
