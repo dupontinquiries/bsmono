@@ -1,17 +1,18 @@
 //! action_compass — a compass action menu for the voiceterm toolbar, built on the shared
-//! `uikit_egui::slide_menu::show_cardinal`, wired to real [`crate::Terminal`] actions.
+//! `uikit_egui::slide_menu::show_cardinal` and wired to real terminal [`crate::App`] actions.
 //!
-//! A single "⋯" host button that, on press, floats a ring of quick terminal actions around it; the
-//! live swipe highlights one and release runs it against the terminal. Same gesture as rusty-board's
-//! cardinal keyboard — the QML toolbar's GestureHost/SlidePopup pattern, egui-native.
+//! A single "⋯" host button that, on press, floats a ring of quick actions around it; the live swipe
+//! highlights one and release runs it. Same gesture as rusty-board's cardinal keyboard — the QML
+//! toolbar's GestureHost/SlidePopup pattern, egui-native. Actions operate on the whole `App` so the
+//! compass can both mutate the terminal (clear/copy/interrupt/stage) and open the find bar (search).
 //!
-//! The direction→action map and id round-trip are pure and unit-tested; [`apply`] performs the action
-//! on a `Terminal` (whose `clear`/`screen_text`/`interrupt`/`stage` are themselves tested in uikit-term).
+//! The direction→action map and id round-trip are pure and unit-tested; [`apply`] is exercised against
+//! a headless `egui::Context`.
 
-use crate::Terminal;
+use crate::App;
 use uikit_egui::slide_menu::{Dir8, SlideMenu, SlideOption, SlideOutcome};
 
-/// A quick terminal action reachable from the compass.
+/// A quick action reachable from the compass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TermAction {
     /// Clear the visible screen.
@@ -20,10 +21,10 @@ pub enum TermAction {
     Copy,
     /// Clear the input line (^C).
     Interrupt,
-    /// Stage `ls` on the input line (not run).
-    StageLs,
     /// Stage `clear` on the input line (not run).
     StageClear,
+    /// Open the in-screen find bar.
+    Search,
 }
 
 impl TermAction {
@@ -32,8 +33,8 @@ impl TermAction {
             TermAction::Clear => "clear",
             TermAction::Copy => "copy",
             TermAction::Interrupt => "interrupt",
-            TermAction::StageLs => "stage-ls",
             TermAction::StageClear => "stage-clear",
+            TermAction::Search => "search",
         }
     }
     pub fn from_id(id: &str) -> Option<TermAction> {
@@ -41,8 +42,8 @@ impl TermAction {
             "clear" => TermAction::Clear,
             "copy" => TermAction::Copy,
             "interrupt" => TermAction::Interrupt,
-            "stage-ls" => TermAction::StageLs,
             "stage-clear" => TermAction::StageClear,
+            "search" => TermAction::Search,
             _ => return None,
         })
     }
@@ -52,8 +53,8 @@ impl TermAction {
             TermAction::Clear => "clr",
             TermAction::Copy => "copy",
             TermAction::Interrupt => "^C",
-            TermAction::StageLs => "ls",
             TermAction::StageClear => "clear",
+            TermAction::Search => "find",
         }
     }
 }
@@ -62,25 +63,25 @@ impl TermAction {
 pub fn compass_layout() -> [(Dir8, TermAction); 4] {
     [
         (Dir8::N, TermAction::Copy),
-        (Dir8::E, TermAction::StageLs),
+        (Dir8::E, TermAction::Search),
         (Dir8::S, TermAction::Interrupt),
         (Dir8::W, TermAction::StageClear),
     ]
 }
 
-/// Perform `action` against `term` (copying to the clipboard through `ctx` when needed).
-pub fn apply(action: TermAction, term: &mut Terminal, ctx: &egui::Context) {
+/// Perform `action` against `app` (copying through `ctx` when needed).
+pub fn apply(action: TermAction, app: &mut App, ctx: &egui::Context) {
     match action {
-        TermAction::Clear => term.clear(),
-        TermAction::Copy => ctx.copy_text(term.screen_text()),
-        TermAction::Interrupt => term.interrupt(),
-        TermAction::StageLs => term.stage("ls"),
-        TermAction::StageClear => term.stage("clear"),
+        TermAction::Clear => app.terminal.clear(),
+        TermAction::Copy => ctx.copy_text(app.terminal.screen_text()),
+        TermAction::Interrupt => app.terminal.interrupt(),
+        TermAction::StageClear => app.terminal.stage("clear"),
+        TermAction::Search => app.open_search(),
     }
 }
 
-/// A toolbar compass control. Hold one; call [`ActionCompass::ui`] where the toolbar button belongs;
-/// on a chosen action it runs [`apply`] against `term`.
+/// A toolbar compass control. Hold one; call [`ActionCompass::ui`] where the toolbar button belongs; on
+/// a chosen action it runs [`apply`] against `app`.
 pub struct ActionCompass {
     menu: SlideMenu,
     /// The center-tap action (a plain press/release with no swipe).
@@ -94,9 +95,9 @@ impl Default for ActionCompass {
 }
 
 impl ActionCompass {
-    /// Render the "⋯" host button and its compass; on release, run the chosen action against `term`
-    /// and return it (so the caller can also react, e.g. flash a toast).
-    pub fn ui(&mut self, ui: &mut egui::Ui, term: &mut Terminal) -> Option<TermAction> {
+    /// Render the "⋯" host button and its compass; on release, run the chosen action against `app` and
+    /// return it (so the caller can also react, e.g. flash a toast).
+    pub fn ui(&mut self, ui: &mut egui::Ui, app: &mut App) -> Option<TermAction> {
         let resp = ui.add(egui::Button::new("⋯").min_size(egui::vec2(34.0, 28.0)));
         let id = resp.id;
         let tap = SlideOption::new(self.tap.id(), self.tap.label());
@@ -106,7 +107,7 @@ impl ActionCompass {
             .collect();
         if let SlideOutcome::Selected(chosen) = self.menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
             if let Some(action) = TermAction::from_id(&chosen) {
-                apply(action, term, ui.ctx());
+                apply(action, app, ui.ctx());
                 return Some(action);
             }
         }
@@ -120,7 +121,7 @@ mod tests {
 
     #[test]
     fn action_ids_round_trip() {
-        for a in [TermAction::Clear, TermAction::Copy, TermAction::Interrupt, TermAction::StageLs, TermAction::StageClear] {
+        for a in [TermAction::Clear, TermAction::Copy, TermAction::Interrupt, TermAction::StageClear, TermAction::Search] {
             assert_eq!(TermAction::from_id(a.id()), Some(a));
         }
         assert_eq!(TermAction::from_id("nope"), None);
@@ -136,19 +137,22 @@ mod tests {
     }
 
     #[test]
-    fn clear_and_interrupt_and_stage_mutate_the_terminal() {
-        // the clipboard (Copy) path needs an egui Context, but the terminal-mutating actions don't.
-        let mut t = Terminal::new(20, 4);
-        t.feed("output here");
-        assert_eq!(t.screen_text(), "output here");
+    fn apply_runs_each_action_on_the_app() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(20, 4);
+        app.terminal.feed("output here");
+        app.terminal.stage("half typed");
 
-        // Clear is applied by calling the terminal method the dispatcher uses.
-        t.clear();
-        assert_eq!(t.screen_text(), "");
+        apply(TermAction::Search, &mut app, &ctx);
+        assert!(app.search_open, "search opens the find bar");
 
-        t.stage("git status");
-        assert_eq!(t.input, "git status");
-        t.interrupt();
-        assert_eq!(t.input, "");
+        apply(TermAction::Interrupt, &mut app, &ctx);
+        assert_eq!(app.terminal.input, "", "^C clears the input line");
+
+        apply(TermAction::StageClear, &mut app, &ctx);
+        assert_eq!(app.terminal.input, "clear");
+
+        apply(TermAction::Clear, &mut app, &ctx);
+        assert_eq!(app.terminal.screen_text(), "", "clear wipes the screen");
     }
 }
