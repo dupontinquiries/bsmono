@@ -51,7 +51,7 @@ fn main() -> eframe::Result<()> {
         "EARLY-FPS",
         options,
         Box::new(move |cc| {
-            early_fps::hud::theme::apply_visuals(&cc.egui_ctx);
+            early_fps::hud::theme::install_prefs(&cc.egui_ctx, &settings_kit::Prefs::default());
             Ok(Box::new(FpsApp::new(seed)))
         }),
     )
