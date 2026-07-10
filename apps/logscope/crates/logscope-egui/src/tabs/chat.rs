@@ -868,6 +868,35 @@ impl Chat {
         (self.msgs.len(), active)
     }
 
+    /// A compact live summary of in-flight generation work for the status bar: whatever combination of a
+    /// streaming reply, a queue of pending (branch/fan) turns, and a running depth fan is active right now.
+    /// `None` when idle. Pure so the wording is unit-testable; the status bar renders it with a ⏹ stop
+    /// control. Unlike `self.note` (which any later message overwrites), this reflects live state every frame,
+    /// so a multi-round `:Nca`/`:Nfa` fan stays visible until it drains.
+    fn activity_status(&self) -> Option<String> {
+        // headless render hook (like LOGSCOPE_MIC_PEARL_DEBUG): force the HUD text so the status-bar
+        // harness can screenshot the fan/queue indicator + stop control without a live model.
+        if let Ok(s) = std::env::var("LOGSCOPE_FAN_DEBUG") { if !s.is_empty() { return Some(s); } }
+        let mut parts: Vec<String> = Vec::new();
+        if self.stream.is_some() { parts.push("generating".into()); }
+        let q = self.queue.len();
+        if q > 0 { parts.push(format!("{q} queued")); }
+        if let Some(f) = &self.fan {
+            if f.rounds_left > 0 {
+                parts.push(format!("{} {} left", f.rounds_left, if f.rounds_left == 1 { "round" } else { "rounds" }));
+            }
+        }
+        if parts.is_empty() { None } else { Some(parts.join(" · ")) }
+    }
+
+    /// The active system persona's short label, for the status badge. Matches the current system prompt
+    /// against the `PERSONAS` table (long-horizon engineer by default, or the logscope quick-fix persona);
+    /// a user-edited context that matches neither reads as "custom". Pure + testable.
+    fn active_persona_label(&self) -> &'static str {
+        let sys = self.sys();
+        PERSONAS.iter().find(|p| p.2.trim() == sys).map(|p| p.1).unwrap_or("custom · system")
+    }
+
     /// Record the current conversation + its derived files as a node in the history tree. Files are
     /// linked to the assistant turn (and thus the reasoning) that produced them. Cheap: messages are
     /// content-addressed and shared with the parent, so only the new turn's blobs are written.
@@ -4033,6 +4062,18 @@ impl Chat {
                         if let Some(f) = self.walk_focus {
                             ui.label(RichText::new(format!("turn {}/{}", f + 1, self.msgs.len())).color(theme::DIM()).small());
                         }
+                        // long-horizon: which system persona is steering replies (invisible until now)
+                        ui.label(RichText::new(self.active_persona_label()).color(theme::FAINT()).small())
+                            .on_hover_text("active system persona — edit it on the Context page");
+                        // live activity HUD: a running fan/queue/stream stays visible (with a stop control)
+                        // instead of flashing once through self.note and getting overwritten mid-fan.
+                        if let Some(act) = self.activity_status() {
+                            if ui.small_button("⏹").on_hover_text("stop — clear the queue and cancel the fan (:stop)").clicked() {
+                                let n = self.queue.len(); self.queue.clear(); self.fan = None;
+                                self.note = format!("stopped — cleared {n} queued, fan cancelled");
+                            }
+                            ui.label(RichText::new(act).color(theme::CYAN()).small().strong());
+                        }
                     });
                 }
             }
@@ -5328,6 +5369,38 @@ mod tests {
         let fs = c.full_system(&doc);
         assert!(fs.contains("Logscope"), "base system still present");
         assert!(fs.contains("FIX MODE is on"), "on → fix block appended");
+    }
+
+    #[test]
+    fn activity_status_summarizes_inflight_work() {
+        let mut c = Chat::default();
+        assert_eq!(c.activity_status(), None, "idle → nothing to show");
+        c.queue.push_back(("x".into(), None));
+        c.queue.push_back(("y".into(), None));
+        assert_eq!(c.activity_status().as_deref(), Some("2 queued"));
+        // a running depth fan reads alongside the queued count
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 3 });
+        let s = c.activity_status().unwrap();
+        assert!(s.contains("2 queued") && s.contains("3 rounds left"), "combines queue + fan: {s}");
+        // singular grammar for the last round
+        c.queue.clear();
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 1 });
+        assert_eq!(c.activity_status().as_deref(), Some("1 round left"));
+        // an exhausted fan (0 rounds) contributes nothing → idle
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 0 });
+        assert_eq!(c.activity_status(), None);
+    }
+
+    #[test]
+    fn active_persona_label_names_the_system_persona() {
+        // Chat::default() seeds the context with the long-horizon persona
+        assert_eq!(Chat::default().active_persona_label(), "Long-horizon engineer");
+        let mut c = Chat::default();
+        c.context = BASE_SYSTEM.to_string();
+        assert_eq!(c.active_persona_label(), "Logscope · quick log fix");
+        let mut c2 = Chat::default();
+        c2.context = "You are a haiku bot.".into();
+        assert_eq!(c2.active_persona_label(), "custom · system");
     }
 
     #[test]
