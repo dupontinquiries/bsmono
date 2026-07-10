@@ -36,6 +36,7 @@ struct Vert {
     uv: [f32; 2],
     slot: f32, // atlas slot (0 = white tile → untextured)
     emis: f32, // emissive strength (glow: lava, crystals, tracers, markers)
+    reflect: f32, // environment reflectivity (water, ice, metal, car paint)
 }
 
 #[repr(C)]
@@ -47,23 +48,34 @@ struct U {
     amb: [f32; 4],    // ambient colour
     fog: [f32; 4],    // rgb fog colour, w unused
     params: [f32; 4], // x = atlas cols, y = fog near, z = fog far, w = point-light count
+    cam: [f32; 4],    // xyz camera position (for view-dependent reflection/fresnel)
+    sky: [f32; 4],    // sky environment colour
+    ground: [f32; 4], // ground environment colour
+    cr: [f32; 4],     // camera right (xyz), w = tan(fovy/2)
+    cu: [f32; 4],     // camera up (xyz)
+    cf: [f32; 4],     // camera forward (xyz)
+    hud: [f32; 4],    // x = health frac, y = ammo frac, z = low-health flag
     // Dynamic point lights, packed as pairs: [pos.xyz, radius], [col.rgb, intensity]. Up to MAX_PLIGHTS.
     plights: [[f32; 4]; MAX_PLIGHTS * 2],
 }
 
 const MAX_PLIGHTS: usize = 16;
 
-/// Flatten meshes into two vertex lists: `solid` (single-sided, safe to backface-cull — walls, most geometry)
-/// and `double` (double-sided — water, foliage, particles, billboards). Culling the solid set halves its
-/// fill and removes the far side of every wall.
-fn flatten(meshes: &[Mesh3]) -> (Vec<Vert>, Vec<Vert>) {
+/// Flatten meshes into three vertex lists for correct draw order:
+///   `solid`   — single-sided opaque, backface-culled, writes depth (walls, most geometry)
+///   `opaque`  — double-sided opaque (foliage, particles), no cull, writes depth
+///   `trans`   — translucent (water, glass), no cull, NO depth write, sorted back-to-front so they blend
+///               in the right order over everything already drawn.
+fn flatten(meshes: &[Mesh3], cam: Vec3) -> (Vec<Vert>, Vec<Vert>, Vec<Vert>) {
     let mut solid = Vec::new();
-    let mut double = Vec::new();
-    for m in meshes {
+    let mut opaque = Vec::new();
+    // translucent meshes are gathered with a camera distance, then sorted far→near before flattening
+    let mut trans_meshes: Vec<(f32, &Mesh3)> = Vec::new();
+    let push_mesh = |m: &Mesh3, dst: &mut Vec<Vert>| {
         let slot = m.material.map(atlas_slot).unwrap_or(0) as f32;
         let emis = m.emissive;
+        let reflect = m.reflect;
         let base = m.color;
-        let dst = if m.single_sided { &mut solid } else { &mut double };
         for tri in &m.tris {
             for &idx in tri {
                 let i = idx as usize;
@@ -79,11 +91,36 @@ fn flatten(meshes: &[Mesh3]) -> (Vec<Vert>, Vec<Vert>) {
                     uv: [uv.x, uv.y],
                     slot,
                     emis,
+                    reflect,
                 });
             }
         }
+    };
+    for m in meshes {
+        let translucent = m.color.a() < 250 && !m.single_sided;
+        if translucent {
+            // centroid distance from the camera for back-to-front sorting
+            let mut c = Vec3::new(0.0, 0.0, 0.0);
+            if !m.verts.is_empty() {
+                for v in &m.verts {
+                    c = c + *v;
+                }
+                c = c * (1.0 / m.verts.len() as f32);
+            }
+            let d = (c.x - cam.x).powi(2) + (c.y - cam.y).powi(2) + (c.z - cam.z).powi(2);
+            trans_meshes.push((d, m));
+        } else if m.single_sided {
+            push_mesh(m, &mut solid);
+        } else {
+            push_mesh(m, &mut opaque);
+        }
     }
-    (solid, double)
+    trans_meshes.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // far → near
+    let mut trans = Vec::new();
+    for (_, m) in trans_meshes {
+        push_mesh(m, &mut trans);
+    }
+    (solid, opaque, trans)
 }
 
 // ── column-major 4x4 matrix helpers (wgpu NDC: z in 0..1) ───────────────────────────────────────────────
@@ -132,6 +169,9 @@ struct State {
     config: wgpu::SurfaceConfiguration,
     pipe_solid: wgpu::RenderPipeline,
     pipe_double: wgpu::RenderPipeline,
+    pipe_trans: wgpu::RenderPipeline,
+    pipe_cross: wgpu::RenderPipeline,
+    pipe_sky: wgpu::RenderPipeline,
     ubuf: wgpu::Buffer,
     bind: wgpu::BindGroup,
     vbuf_solid: wgpu::Buffer,
@@ -140,8 +180,21 @@ struct State {
     vbuf_double: wgpu::Buffer,
     vcap_double: u64,
     vcount_double: u32,
+    vbuf_trans: wgpu::Buffer,
+    vcap_trans: u64,
+    vcount_trans: u32,
     depth: wgpu::TextureView,
+    msaa: wgpu::TextureView,
+    scene_view: wgpu::TextureView,
+    post_bgl: wgpu::BindGroupLayout,
+    post_samp: wgpu::Sampler,
+    post_bind: wgpu::BindGroup,
+    post_ubuf: wgpu::Buffer,
+    pipe_post: wgpu::RenderPipeline,
+    format: wgpu::TextureFormat,
 }
+
+const SAMPLES: u32 = 4; // MSAA sample count
 
 fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
     device
@@ -149,10 +202,74 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
             label: Some("depth"),
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
-            sample_count: 1,
+            sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+/// The multisampled colour target the scene renders into; it's resolved down to the (single-sample) surface.
+fn make_msaa(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("msaa"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: SAMPLES,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
+}
+
+/// Box-downsample an RGBA image into a concatenated mip chain (level 0 = full res, each level half-size).
+/// Used to give the atlas mipmaps so distant textures don't shimmer.
+fn build_mips(base: &[u8], size: usize, levels: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(base.len() * 2);
+    out.extend_from_slice(base);
+    let mut prev = base.to_vec();
+    let mut psize = size;
+    for _ in 1..levels {
+        let nsize = (psize / 2).max(1);
+        let mut next = vec![0u8; nsize * nsize * 4];
+        for y in 0..nsize {
+            for x in 0..nsize {
+                let x0 = x * 2;
+                let y0 = y * 2;
+                let x1 = (x0 + 1).min(psize - 1);
+                let y1 = (y0 + 1).min(psize - 1);
+                for c in 0..4 {
+                    let s = prev[(y0 * psize + x0) * 4 + c] as u32
+                        + prev[(y0 * psize + x1) * 4 + c] as u32
+                        + prev[(y1 * psize + x0) * 4 + c] as u32
+                        + prev[(y1 * psize + x1) * 4 + c] as u32;
+                    next[(y * nsize + x) * 4 + c] = (s / 4) as u8;
+                }
+            }
+        }
+        out.extend_from_slice(&next);
+        prev = next;
+        psize = nsize;
+    }
+    out
+}
+
+/// The single-sample offscreen texture the MSAA scene resolves into; the post pass samples it to the surface.
+fn make_scene(device: &wgpu::Device, format: wgpu::TextureFormat, w: u32, h: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("scene"),
+            size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&Default::default())
@@ -223,26 +340,39 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        // ── material atlas → GPU texture ──
+        // ── material atlas → GPU texture (with mipmaps for distance stability) ──
         let tile = 512usize;
         let (atlas_bytes, asz, _) = build_material_atlas(tile, ATLAS_COLS);
+        // Cap mip levels so the coarsest still has enough pixels per cell to limit cross-cell bleeding.
+        let mut levels = 1u32;
+        while (asz >> levels) >= 32 && levels < 6 {
+            levels += 1;
+        }
+        let mip_data = build_mips(&atlas_bytes, asz, levels as usize);
         let atlas_tex = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
                 label: Some("atlas"),
                 size: wgpu::Extent3d { width: asz as u32, height: asz as u32, depth_or_array_layers: 1 },
-                mip_level_count: 1,
+                mip_level_count: levels,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &atlas_bytes,
+            wgpu::util::TextureDataOrder::MipMajor,
+            &mip_data,
         );
         let atlas_view = atlas_tex.create_view(&Default::default());
-        let samp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        // trilinear + anisotropic filtering (needs the mip chain above)
+        let samp = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
+            anisotropy_clamp: 8,
+            ..Default::default()
+        });
 
         let ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("u"), size: std::mem::size_of::<U>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
 
@@ -273,10 +403,11 @@ impl State {
             wgpu::VertexAttribute { offset: 40, shader_location: 3, format: wgpu::VertexFormat::Float32x2 },
             wgpu::VertexAttribute { offset: 48, shader_location: 4, format: wgpu::VertexFormat::Float32 },
             wgpu::VertexAttribute { offset: 52, shader_location: 5, format: wgpu::VertexFormat::Float32 },
+            wgpu::VertexAttribute { offset: 56, shader_location: 6, format: wgpu::VertexFormat::Float32 },
         ];
         // NOTE: front_face defaults to Ccw here. If single-sided surfaces (walls) render see-through or
         // inside-out on a real GPU, the winding is the other way — flip this to `Cw` for the solid pipeline.
-        let mk_pipe = |cull: Option<wgpu::Face>| {
+        let mk_pipe = |cull: Option<wgpu::Face>, depth_write: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: None,
                 layout: Some(&layout),
@@ -288,20 +419,86 @@ impl State {
                 },
                 fragment: Some(wgpu::FragmentState { module: &sh, entry_point: "fs", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
                 primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, front_face: wgpu::FrontFace::Ccw, cull_mode: cull, ..Default::default() },
-                depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
-                multisample: Default::default(),
+                depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: depth_write, depth_compare: wgpu::CompareFunction::Less, stencil: Default::default(), bias: Default::default() }),
+                multisample: wgpu::MultisampleState { count: SAMPLES, mask: !0, alpha_to_coverage_enabled: false },
                 multiview: None,
                 cache: None,
             })
         };
-        let pipe_solid = mk_pipe(Some(wgpu::Face::Back));
-        let pipe_double = mk_pipe(None);
+        let pipe_solid = mk_pipe(Some(wgpu::Face::Back), true);
+        let pipe_double = mk_pipe(None, true);
+        let pipe_trans = mk_pipe(None, false); // translucent: test depth but don't write it
+
+        // Sky gradient: a fullscreen triangle drawn first inside the scene pass. It sits at the far plane
+        // (depth test Always, no depth write) so scene geometry always draws over it.
+        let pipe_sky = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &sh, entry_point: "vs_sky", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &sh, entry_point: "fs_sky", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: false, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+            multisample: wgpu::MultisampleState { count: SAMPLES, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        // Crosshair overlay: a tiny screen-space pipeline drawn after the scene resolves, straight onto the
+        // single-sample surface (so no MSAA, no depth, alpha-blended). Generates its own verts from the index.
+        let pipe_cross = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("crosshair"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState { module: &sh, entry_point: "vs_overlay", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &sh, entry_point: "fs_overlay", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
 
         let vcap = 64 * 1024 * std::mem::size_of::<Vert>() as u64;
         let mk_vbuf = || device.create_buffer(&wgpu::BufferDescriptor { label: Some("v"), size: vcap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let vbuf_solid = mk_vbuf();
         let vbuf_double = mk_vbuf();
+        let vbuf_trans = mk_vbuf();
         let depth = make_depth(&device, config.width, config.height);
+        let msaa = make_msaa(&device, format, config.width, config.height);
+        let scene_view = make_scene(&device, format, config.width, config.height);
+
+        // Post-processing pass: samples the resolved scene and applies tonemap + vignette + a cheap bloom.
+        let post_samp = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: wgpu::AddressMode::ClampToEdge, address_mode_v: wgpu::AddressMode::ClampToEdge, ..Default::default() });
+        let post_ubuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("postu"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("post"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let post_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post"),
+            layout: &post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&scene_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&post_samp) },
+                wgpu::BindGroupEntry { binding: 2, resource: post_ubuf.as_entire_binding() },
+            ],
+        });
+        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("post"), bind_group_layouts: &[&post_bgl], push_constant_ranges: &[] });
+        let post_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("post"), source: wgpu::ShaderSource::Wgsl(POST_WGSL.into()) });
+        let pipe_post = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("post"),
+            layout: Some(&post_layout),
+            vertex: wgpu::VertexState { module: &post_sh, entry_point: "vs_post", compilation_options: Default::default(), buffers: &[] },
+            fragment: Some(wgpu::FragmentState { module: &post_sh, entry_point: "fs_post", compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })] }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
 
         State {
             surface,
@@ -310,6 +507,9 @@ impl State {
             config,
             pipe_solid,
             pipe_double,
+            pipe_trans,
+            pipe_cross,
+            pipe_sky,
             ubuf,
             bind,
             vbuf_solid,
@@ -318,7 +518,18 @@ impl State {
             vbuf_double,
             vcap_double: vcap,
             vcount_double: 0,
+            vbuf_trans,
+            vcap_trans: vcap,
+            vcount_trans: 0,
             depth,
+            msaa,
+            scene_view,
+            post_bgl,
+            post_samp,
+            post_bind,
+            post_ubuf,
+            pipe_post,
+            format,
         }
     }
 
@@ -330,28 +541,34 @@ impl State {
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
         self.depth = make_depth(&self.device, w, h);
+        self.msaa = make_msaa(&self.device, self.format, w, h);
+        self.scene_view = make_scene(&self.device, self.format, w, h);
+        self.post_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("post"),
+            layout: &self.post_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&self.scene_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.post_samp) },
+                wgpu::BindGroupEntry { binding: 2, resource: self.post_ubuf.as_entire_binding() },
+            ],
+        });
     }
 
-    fn upload(&mut self, solid: &[Vert], double: &[Vert]) {
-        let sb = bytemuck::cast_slice(solid);
-        if sb.len() as u64 > self.vcap_solid {
-            self.vcap_solid = (sb.len() as u64).next_power_of_two();
-            self.vbuf_solid = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("vs"), size: self.vcap_solid, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+    fn upload(&mut self, solid: &[Vert], opaque: &[Vert], trans: &[Vert]) {
+        fn up(device: &wgpu::Device, queue: &wgpu::Queue, buf: &mut wgpu::Buffer, cap: &mut u64, cnt: &mut u32, verts: &[Vert], label: &'static str) {
+            let bytes: &[u8] = bytemuck::cast_slice(verts);
+            if bytes.len() as u64 > *cap {
+                *cap = (bytes.len() as u64).next_power_of_two();
+                *buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: *cap, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            }
+            if !bytes.is_empty() {
+                queue.write_buffer(buf, 0, bytes);
+            }
+            *cnt = verts.len() as u32;
         }
-        if !sb.is_empty() {
-            self.queue.write_buffer(&self.vbuf_solid, 0, sb);
-        }
-        self.vcount_solid = solid.len() as u32;
-
-        let db = bytemuck::cast_slice(double);
-        if db.len() as u64 > self.vcap_double {
-            self.vcap_double = (db.len() as u64).next_power_of_two();
-            self.vbuf_double = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("vd"), size: self.vcap_double, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        }
-        if !db.is_empty() {
-            self.queue.write_buffer(&self.vbuf_double, 0, db);
-        }
-        self.vcount_double = double.len() as u32;
+        up(&self.device, &self.queue, &mut self.vbuf_solid, &mut self.vcap_solid, &mut self.vcount_solid, solid, "vs");
+        up(&self.device, &self.queue, &mut self.vbuf_double, &mut self.vcap_double, &mut self.vcount_double, opaque, "vd");
+        up(&self.device, &self.queue, &mut self.vbuf_trans, &mut self.vcap_trans, &mut self.vcount_trans, trans, "vt");
     }
 
     fn render(&mut self, u: &U) {
@@ -369,24 +586,61 @@ impl State {
             let fog = u.fog;
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: fog[0] as f64, g: fog[1] as f64, b: fog[2] as f64, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.msaa, resolve_target: Some(&self.scene_view), ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: fog[0] as f64, g: fog[1] as f64, b: fog[2] as f64, a: 1.0 }), store: wgpu::StoreOp::Store } })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
             rp.set_bind_group(0, &self.bind, &[]);
-            // solid geometry: backface-culled
+            // 0) sky gradient (fills the background at the far plane)
+            rp.set_pipeline(&self.pipe_sky);
+            rp.draw(0..3, 0..1);
+            // 1) solid geometry, backface-culled, writes depth
             if self.vcount_solid > 0 {
                 rp.set_pipeline(&self.pipe_solid);
                 rp.set_vertex_buffer(0, self.vbuf_solid.slice(..));
                 rp.draw(0..self.vcount_solid, 0..1);
             }
-            // double-sided geometry (water, foliage, particles): both faces
+            // 2) opaque double-sided (foliage/particles), writes depth
             if self.vcount_double > 0 {
                 rp.set_pipeline(&self.pipe_double);
                 rp.set_vertex_buffer(0, self.vbuf_double.slice(..));
                 rp.draw(0..self.vcount_double, 0..1);
             }
+            // 3) translucent (water/glass), sorted back-to-front, tests depth but doesn't write it
+            if self.vcount_trans > 0 {
+                rp.set_pipeline(&self.pipe_trans);
+                rp.set_vertex_buffer(0, self.vbuf_trans.slice(..));
+                rp.draw(0..self.vcount_trans, 0..1);
+            }
+        }
+        // post-processing pass: tonemap + vignette + cheap bloom, offscreen scene → surface
+        {
+            // feed the damage-vignette params: [low-health flag, time, health frac, 0]
+            self.queue.write_buffer(&self.post_ubuf, 0, bytemuck::cast_slice(&[u.hud[2], u.fog[3], u.hud[0], 0.0f32]));
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("post"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rp.set_pipeline(&self.pipe_post);
+            rp.set_bind_group(0, &self.post_bind, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        // crosshair + HUD overlay pass: draw onto the post-processed surface (load, keep it)
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rp.set_pipeline(&self.pipe_cross);
+            rp.set_bind_group(0, &self.bind, &[]);
+            rp.draw(0..36, 0..1); // crosshair (2) + health bg/fill + ammo bg/fill
         }
         self.queue.submit([enc.finish()]);
         frame.present();
@@ -481,14 +735,25 @@ pub fn run() {
                     let cam = game.player.view_cam();
                     let fwd = cam_forward(&cam);
                     let aspect = state.config.width as f32 / state.config.height.max(1) as f32;
-                    let vp = mul(&perspective(75f32.to_radians(), aspect, 0.05, 400.0), &look_at(cam.pos, fwd));
+                    let fovy = 75f32.to_radians();
+                    let vp = mul(&perspective(fovy, aspect, 0.05, 400.0), &look_at(cam.pos, fwd));
+                    let wup = Vec3::new(0.0, 1.0, 0.0);
+                    let right = fwd.cross(wup).normalized();
+                    let camup = right.cross(fwd);
+                    let tanh = (fovy * 0.5).tan();
 
                     let meshes = game.frame_meshes(&cam, false);
-                    let (solid, double) = flatten(&meshes);
-                    state.upload(&solid, &double);
+                    let (solid, opaque, trans) = flatten(&meshes, cam.pos);
+                    state.upload(&solid, &opaque, &trans);
 
                     let sky = game.light.sky;
+                    let grd = game.light.ground;
                     let fog = game.fog.color;
+                    // HUD readouts
+                    let hf = (game.player.health / game.player.max_health.max(1.0)).clamp(0.0, 1.0);
+                    let w = game.player.weapon();
+                    let af = (w.mag as f32 / w.kind.def().mag_size.max(1) as f32).clamp(0.0, 1.0);
+                    let low = if hf < 0.3 { 1.0 } else { 0.0 };
                     // pack the game's dynamic point lights (muzzle, jetpack, rockets, explosions, lava, markers)
                     let dl = game.dynamic_lights();
                     let mut plights = [[0.0f32; 4]; MAX_PLIGHTS * 2];
@@ -502,8 +767,15 @@ pub fn run() {
                         light: { let d = game.light.dir; [d.x, d.y, d.z, 0.0] },
                         key: [1.05, 0.99, 0.9, 0.0],
                         amb: [sky.r() as f32 / 255.0 * 0.6 + 0.25, sky.g() as f32 / 255.0 * 0.6 + 0.25, sky.b() as f32 / 255.0 * 0.6 + 0.25, 0.0],
-                        fog: [fog.r() as f32 / 255.0, fog.g() as f32 / 255.0, fog.b() as f32 / 255.0, 0.0],
+                        fog: [fog.r() as f32 / 255.0, fog.g() as f32 / 255.0, fog.b() as f32 / 255.0, game.time],
                         params: [ATLAS_COLS as f32, game.fog.start, game.fog.end, n as f32],
+                        cam: [cam.pos.x, cam.pos.y, cam.pos.z, aspect],
+                        sky: [sky.r() as f32 / 255.0, sky.g() as f32 / 255.0, sky.b() as f32 / 255.0, 0.0],
+                        ground: [grd.r() as f32 / 255.0, grd.g() as f32 / 255.0, grd.b() as f32 / 255.0, 0.0],
+                        cr: [right.x, right.y, right.z, tanh],
+                        cu: [camup.x, camup.y, camup.z, 0.0],
+                        cf: [fwd.x, fwd.y, fwd.z, 0.0],
+                        hud: [hf, af, low, 0.0],
                         plights,
                     };
                     state.render(&u);
@@ -524,6 +796,13 @@ struct U {
   amb: vec4<f32>,
   fog: vec4<f32>,
   params: vec4<f32>,   // x=cols, y=fog_near, z=fog_far, w=point-light count
+  cam: vec4<f32>,      // xyz camera position, w = aspect
+  sky: vec4<f32>,      // sky env colour
+  ground: vec4<f32>,   // ground env colour
+  cr: vec4<f32>,       // camera right (xyz), w = tan(fovy/2)
+  cu: vec4<f32>,       // camera up
+  cf: vec4<f32>,       // camera forward
+  hud: vec4<f32>,      // x=health frac, y=ammo frac, z=low-health flag
   plights: array<vec4<f32>, 32>,   // pairs: [pos.xyz, radius], [col.rgb, intensity] × 16
 };
 @group(0) @binding(0) var<uniform> u: U;
@@ -539,9 +818,10 @@ struct VO {
   @location(4) wz: f32,
   @location(5) emis: f32,
   @location(6) wpos: vec3<f32>,
+  @location(7) reflect: f32,
 };
 
-@vertex fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>, @location(3) uv: vec2<f32>, @location(4) slot: f32, @location(5) emis: f32) -> VO {
+@vertex fn vs(@location(0) p: vec3<f32>, @location(1) n: vec3<f32>, @location(2) c: vec4<f32>, @location(3) uv: vec2<f32>, @location(4) slot: f32, @location(5) emis: f32, @location(6) reflect: f32) -> VO {
   var o: VO;
   o.pos = u.viewproj * vec4<f32>(p, 1.0);
   o.nrm = n;
@@ -551,7 +831,31 @@ struct VO {
   o.wz = o.pos.w;   // view-space depth proxy for fog
   o.emis = emis;
   o.wpos = p;
+  o.reflect = reflect;
   return o;
+}
+
+fn aces(x: f32) -> f32 {
+  return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+// Matches the software renderer's grade(): ACES tonemap + saturation lift + split-tone (warm highlights,
+// cool shadows) keyed to the sun term, so the GPU path reads the same graded, filmic look.
+fn grade(c: vec3<f32>, ndl: f32) -> vec3<f32> {
+  let e = 1.05;
+  var r = aces(c.r * e);
+  var g = aces(c.g * e);
+  var b = aces(c.b * e);
+  let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+  let sat = 1.14;
+  r = clamp(lum + (r - lum) * sat, 0.0, 1.0);
+  g = clamp(lum + (g - lum) * sat, 0.0, 1.0);
+  b = clamp(lum + (b - lum) * sat, 0.0, 1.0);
+  let shadow = clamp(1.0 - ndl, 0.0, 1.0);
+  let hi = clamp(ndl, 0.0, 1.0);
+  r = clamp(r + hi * 0.035 - shadow * 0.012, 0.0, 1.0);
+  g = clamp(g + hi * 0.01, 0.0, 1.0);
+  b = clamp(b - hi * 0.03 + shadow * 0.045, 0.0, 1.0);
+  return vec3<f32>(r, g, b);
 }
 
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
@@ -562,7 +866,10 @@ struct VO {
   let ty = floor(s / cols);
   let au = (tx + fract(i.uv.x)) / cols;
   let av = (ty + fract(i.uv.y)) / cols;
-  let texel = textureSample(atlas, samp, vec2<f32>(au, av));
+  // gradients from the CONTINUOUS uv (not the fract'd one) so mip selection is correct across tile seams
+  let ddx = dpdx(i.uv) / cols;
+  let ddy = dpdy(i.uv) / cols;
+  let texel = textureSampleGrad(atlas, samp, vec2<f32>(au, av), ddx, ddy);
   var albedo = i.col.rgb * texel.rgb;
 
   // alpha cutout (foliage/particles); water/glass blend via the pipeline's alpha blending
@@ -586,6 +893,30 @@ struct VO {
   }
   var lit = albedo * shade;
 
+  // view-dependent fresnel sheen (all surfaces) + environment reflection (water/ice/metal), matching the
+  // software renderer: a Schlick-fresnel blend toward a sky↔ground gradient, plus a sharp sun glint.
+  let V = normalize(u.cam.xyz - i.wpos);
+  let nv = max(dot(nrm, V), 0.0);
+  let rim = pow(1.0 - nv, 3.0) * 0.12 * (0.4 + 0.6 * (0.5 + 0.5 * nrm.y));
+  lit = lit + u.sky.xyz * rim;
+  if (i.reflect > 0.001) {
+    let fr = 1.0 - nv;
+    let fres = fr * fr * fr * fr * fr;
+    let amt = min(i.reflect * (0.18 + 0.82 * fres), 0.78);
+    let horizon = mix(u.ground.xyz, u.sky.xyz, 0.72);
+    var envc = horizon;
+    if (nrm.y >= 0.0) { envc = mix(horizon, u.sky.xyz, nrm.y); }
+    else { envc = mix(horizon, u.ground.xyz, -nrm.y); }
+    let env = mix(envc, albedo, 0.16);
+    lit = mix(lit, env, amt);
+    let H = normalize(L + V);
+    let glint = pow(max(dot(nrm, H), 0.0), 80.0) * i.reflect * 1.5 * (0.3 + 0.7 * ndl);
+    lit = lit + u.key.xyz * glint;
+  }
+
+  // filmic grade + split-tone (matches the software renderer), keyed to the sun term
+  lit = grade(lit, ndl);
+
   // distance fog toward the sky/fog colour
   let fnear = u.params.y;
   let ffar = max(u.params.z, fnear + 1.0);
@@ -596,6 +927,135 @@ struct VO {
   lit = lit + albedo * clamp(i.emis, 0.0, 3.0);
 
   return vec4<f32>(lit, i.col.a);
+}
+
+// ── overlay: crosshair + health/ammo bars. Six quads (36 verts), each coloured in the vertex shader. ──
+struct OV { @builtin(position) pos: vec4<f32>, @location(0) col: vec4<f32> };
+
+fn quad_corner(local: u32, x0: f32, y0: f32, x1: f32, y1: f32) -> vec2<f32> {
+  var uu = 0.0;
+  var vv = 0.0;
+  if (local == 1u) { uu = 1.0; vv = 0.0; }
+  else if (local == 2u) { uu = 1.0; vv = 1.0; }
+  else if (local == 3u) { uu = 0.0; vv = 0.0; }
+  else if (local == 4u) { uu = 1.0; vv = 1.0; }
+  else if (local == 5u) { uu = 0.0; vv = 1.0; }
+  return vec2<f32>(mix(x0, x1, uu), mix(y0, y1, vv));
+}
+
+@vertex fn vs_overlay(@builtin(vertex_index) vi: u32) -> OV {
+  var o: OV;
+  let q = vi / 6u;
+  let l = vi % 6u;
+  let aspect = max(u.cam.w, 0.001);
+  var p = vec2<f32>(0.0, 0.0);
+  var col = vec4<f32>(1.0, 1.0, 1.0, 1.0);
+  if (q == 0u) {
+    let tx = 0.020 / aspect; let th = 0.0022;
+    p = quad_corner(l, -tx, -th, tx, th);
+    col = vec4<f32>(0.95, 0.97, 1.0, 0.85);
+  } else if (q == 1u) {
+    let ty = 0.020; let thx = 0.0022 / aspect;
+    p = quad_corner(l, -thx, -ty, thx, ty);
+    col = vec4<f32>(0.95, 0.97, 1.0, 0.85);
+  } else if (q == 2u) {
+    p = quad_corner(l, -0.92, -0.94, -0.52, -0.90);
+    col = vec4<f32>(0.05, 0.06, 0.08, 0.72);
+  } else if (q == 3u) {
+    let hf = u.hud.x;
+    p = quad_corner(l, -0.912, -0.933, -0.912 + 0.384 * hf, -0.907);
+    let g = vec3<f32>(0.3, 0.85, 0.35);
+    let r = vec3<f32>(0.9, 0.25, 0.2);
+    col = vec4<f32>(mix(r, g, hf), 0.95);
+  } else if (q == 4u) {
+    p = quad_corner(l, 0.52, -0.94, 0.92, -0.90);
+    col = vec4<f32>(0.05, 0.06, 0.08, 0.72);
+  } else {
+    let af = u.hud.y;
+    p = quad_corner(l, 0.528, -0.933, 0.528 + 0.384 * af, -0.907);
+    col = vec4<f32>(0.95, 0.75, 0.25, 0.95);
+  }
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.col = col;
+  return o;
+}
+@fragment fn fs_overlay(i: OV) -> @location(0) vec4<f32> {
+  return i.col;
+}
+
+// ── sky gradient: a fullscreen triangle, sky colour up top fading to the fog/horizon colour lower down ──
+struct SO { @builtin(position) pos: vec4<f32>, @location(0) v: f32, @location(1) ndc: vec2<f32> };
+@vertex fn vs_sky(@builtin(vertex_index) vi: u32) -> SO {
+  // oversized triangle covering the screen: clip positions (-1,-1),(3,-1),(-1,3)
+  var xy = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o: SO;
+  let p = xy[vi];
+  o.pos = vec4<f32>(p, 1.0, 1.0); // z=1 → far plane
+  o.v = 1.0 - (p.y * 0.5 + 0.5);  // 0 at top of screen, 1 at bottom
+  o.ndc = p;
+  return o;
+}
+@fragment fn fs_sky(i: SO) -> @location(0) vec4<f32> {
+  // top: sky; toward the horizon: fog colour. A soft curve keeps the zenith rich.
+  let t = clamp(i.v, 0.0, 1.0);
+  let horizon = mix(u.sky.xyz, u.fog.xyz, 0.85);
+  var c = mix(u.sky.xyz, horizon, pow(t, 0.8));
+  // reconstruct the world-space view ray from the camera basis and add a sun disk + glow toward the light
+  let ray = normalize(u.cf.xyz + u.cr.xyz * (i.ndc.x * u.cr.w * u.cam.w) + u.cu.xyz * (i.ndc.y * u.cr.w));
+  let sun = normalize(u.light.xyz);
+  let sd = max(dot(ray, sun), 0.0);
+  let disk = smoothstep(0.9986, 0.9995, sd);
+  let glow = pow(sd, 260.0) * 0.55;
+  c = c + vec3<f32>(1.0, 0.96, 0.86) * (disk + glow);
+  return vec4<f32>(c, 1.0);
+}
+"#;
+
+const POST_WGSL: &str = r#"
+@group(0) @binding(0) var scene_tex: texture_2d<f32>;
+@group(0) @binding(1) var scene_samp: sampler;
+struct PU { v: vec4<f32> }; // x=low-health flag, y=time, z=health frac
+@group(0) @binding(2) var<uniform> pu: PU;
+
+struct PO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
+
+@vertex fn vs_post(@builtin(vertex_index) vi: u32) -> PO {
+  var xy = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+  var o: PO;
+  let p = xy[vi];
+  o.pos = vec4<f32>(p, 0.0, 1.0);
+  o.uv = vec2<f32>(p.x * 0.5 + 0.5, 1.0 - (p.y * 0.5 + 0.5)); // flip Y for texture space
+  return o;
+}
+
+fn bright(c: vec3<f32>) -> vec3<f32> {
+  let l = dot(c, vec3<f32>(0.299, 0.587, 0.114));
+  return c * (max(l - 0.75, 0.0) / max(l, 0.001));
+}
+
+@fragment fn fs_post(i: PO) -> @location(0) vec4<f32> {
+  let base = textureSample(scene_tex, scene_samp, i.uv).rgb;
+  // cheap bloom: gather bright neighbours around the pixel
+  let o = 0.0032;
+  var b = bright(base);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(o, 0.0)).rgb);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(-o, 0.0)).rgb);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(0.0, o)).rgb);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(0.0, -o)).rgb);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(o, o)).rgb);
+  b = b + bright(textureSample(scene_tex, scene_samp, i.uv + vec2<f32>(-o, -o)).rgb);
+  b = b * (1.0 / 7.0) * 0.6;
+  var col = base + b;
+  // (tonemap + grade now happen in the scene shader) — post keeps bloom, vignette, damage flash
+  // subtle vignette
+  let d = i.uv - vec2<f32>(0.5, 0.5);
+  let r2 = dot(d, d);
+  col = col * clamp(1.0 - r2 * 0.6, 0.0, 1.0);
+  // low-health damage vignette: pulsing red bloom in from the edges
+  let pulse = 0.55 + 0.45 * sin(pu.v.y * 6.0);
+  let dmg = clamp(pu.v.x * pulse * smoothstep(0.15, 0.5, r2), 0.0, 1.0);
+  col = mix(col, vec3<f32>(0.75, 0.05, 0.05), dmg * 0.6);
+  return vec4<f32>(col, 1.0);
 }
 "#;
 
