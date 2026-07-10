@@ -25,6 +25,7 @@ pub mod touch;
 pub mod skin;
 pub mod livebg;
 pub mod nav;
+pub mod scroll;
 pub mod theme_bridge;
 pub mod tokens;
 
