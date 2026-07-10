@@ -228,9 +228,7 @@ pub fn curated_models_json() -> String {
 /// backslashes). The curated strings are ASCII and contain none of
 /// these in practice, but escape defensively so the JSON is always
 /// valid.
-fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
-}
+fn json_escape(s: &str) -> String { crate::util::json_esc(s) }
 
 /// Build the search URL. `query` is the user's text; `limit`
 /// caps results. We always filter to GGUF and sort by
