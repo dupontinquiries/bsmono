@@ -15,6 +15,8 @@
 //! Apps reach the daemon through ipc-kit and, per the socket-first rule, fall back to
 //! their own in-process voice code if `voiced` isn't running.
 
+pub mod gate;
+
 use ipc_kit::Scope;
 use std::collections::HashMap;
 

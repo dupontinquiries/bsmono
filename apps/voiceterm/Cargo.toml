@@ -4,6 +4,7 @@ version = "0.1.900"
 edition = "2021"
 
 [dependencies]
+voiced-core = { path = "../../shared/voiced-core" }
 nifty-core = { path = "../../shared/nifty-core" }
 qmetaobject = "0.2"
 scraper = "0.14"

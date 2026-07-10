@@ -1111,13 +1111,28 @@ fn ensure_preview_thread() {
             // anything yet.
             let hint = crate::audio_profile::pitch_hint();
             let matches = crate::phonetic::top_matches_with_hint(&audio_16k, 1, hint);
-            if let Some((label, score)) = matches.first() {
-                if *score >= 0.55 && !label.is_empty() {
+            // DB-FIRST gate (voiced_core::gate): a confident match is authoritative and RETIRES the
+            // whisper call for this utterance (dedup — Tier 2 is skipped below); a weak match stays a
+            // provisional "≈" preview while whisper confirms; a miss falls through to whisper, whose
+            // confident result trains the DB (enrich, below).
+            let db_decision = voiced_core::gate::decide(
+                matches.first().map(|(l, s)| (l.as_str(), *s)),
+                &voiced_core::gate::Thresholds::default(),
+            );
+            let db_dedup = db_decision.skips_whisper();
+            match &db_decision {
+                voiced_core::gate::Decision::Dedup(label) => {
+                    // Authoritative DB hit: emit the FINAL transcript (no "≈"). Whisper is retired.
                     if let Ok(mut g) = PARTIAL_PREVIEW.lock() {
-                        // Only overwrite if currently empty OR what's
-                        // there is itself a phonetic match (prefix "≈ ").
-                        // This way a whisper transcript "stays" once
-                        // it lands, even if phonetic keeps cycling.
+                        if g.as_str() != label.as_str() {
+                            *g = label.clone();
+                        }
+                    }
+                }
+                voiced_core::gate::Decision::Preview(label) => {
+                    if let Ok(mut g) = PARTIAL_PREVIEW.lock() {
+                        // Only overwrite if currently empty OR what's there is itself a phonetic
+                        // preview (prefix "≈ ") — so a whisper transcript "stays" once it lands.
                         let starts_with_approx = g.starts_with("≈ ");
                         if g.is_empty() || starts_with_approx {
                             let new_val = format!("≈ {}", label);
@@ -1127,6 +1142,7 @@ fn ensure_preview_thread() {
                         }
                     }
                 }
+                voiced_core::gate::Decision::Whisper => {}
             }
 
             // ── Tier 2: real whisper streaming (1500ms cadence) ──
@@ -1142,8 +1158,10 @@ fn ensure_preview_thread() {
             // (whisper beats phonetic when both available).
             let now = std::time::Instant::now();
             let buf_grew = audio_16k.len() >= last_whisper_len + 8000;
-            if buf_grew && now.duration_since(last_whisper).as_millis() as u64
-                >= whisper_interval_ms()
+            if !db_dedup
+                && buf_grew
+                && now.duration_since(last_whisper).as_millis() as u64
+                    >= whisper_interval_ms()
             {
                 // Capture audio length up-front so we can record it
                 // even if the whisper call fails or skips.
@@ -1199,6 +1217,13 @@ fn ensure_preview_thread() {
                                     .join("");
                                 let text = text.trim();
                                 if !text.is_empty() {
+                                    // TRAIN: a confident whisper result for an utterance the DB did
+                                    // NOT already own becomes a new fingerprint (self-supervised
+                                    // "magic profile" building), so the next identical utterance
+                                    // dedups instead of paying for whisper again.
+                                    if voiced_core::gate::should_enrich(text, true, &db_decision) {
+                                        crate::phonetic::add_fingerprint(text, &audio_16k);
+                                    }
                                     if let Ok(mut g) = PARTIAL_PREVIEW.lock() {
                                         let new_val = text.to_string();
                                         if g.as_str() != new_val.as_str() {
