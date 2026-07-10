@@ -50,6 +50,37 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // arg parsing via cli-kit (shared across the fleet's CLIs)
     let cli = cli_kit::Cli::from(args.iter().skip(1).cloned().collect::<Vec<String>>());
+
+    // ── headless fabric (LAN workspace) commands — short-circuit before the script path is required ──
+    // Join a workspace and list a peer's shared models, or stand up a fabric node other boxes can join.
+    if let Some(addr) = cli.opt("fabric-join") {
+        use logscope_egui::fabric::Worker;
+        match logscope_egui::fabric_net::join(addr) {
+            Ok(w) => {
+                eprintln!("# joined {} — shared models:", w.id().tag());
+                for m in w.models() {
+                    println!("  {:<22} {:>5.1}B{}", m.name, m.params_b, if m.public { "" } else { "  [private]" });
+                }
+            }
+            Err(e) => { eprintln!("# join {addr} failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if let Some(addr) = cli.opt("fabric-serve") {
+        use std::sync::Arc;
+        let device = cli.opt("device").unwrap_or("local").to_string();
+        // Real-model serving (a LocalWorker over the loaded GGUF) is behind `wgpu-engine`; the lean CLI
+        // serves a mock so the mesh — join/discovery/routing — can be stood up and exercised headlessly.
+        let worker: Arc<dyn logscope_egui::fabric::Worker + Send + Sync> =
+            Arc::new(logscope_egui::fabric::MockWorker::new(&device, "cli", &[("mock", true, 0.0)]));
+        eprintln!("# fabric node on {addr} (device={device}) — Ctrl-C to stop");
+        if let Err(e) = logscope_egui::fabric_net::serve(addr, worker) {
+            eprintln!("# serve on {addr} failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let mut model_args: Vec<String> = cli.opt_all("model").iter().map(|s| s.to_string()).collect();
     let mock = cli.flag("mock");
     let system = cli
