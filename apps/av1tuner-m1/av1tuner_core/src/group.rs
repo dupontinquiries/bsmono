@@ -270,10 +270,7 @@ pub const DEFAULT_TEMPLATE: &str = "{localdir}/av1tuner/{groupname}.{codec}.mkv"
 /// only std — no chrono dependency. Derives from SystemTime via a 
 /// minimal civil-date conversion.
 fn current_datetime_parts() -> (String, String) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let now = core_kit::time::now_secs();
     let (y, mo, d, h, mi, s) = civil_from_unix(now as i64);
     (
         format!("{:04}-{:02}-{:02}", y, mo, d),
