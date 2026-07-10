@@ -12,6 +12,7 @@ path = "src/lib.rs"
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-term = { path = "../../../shared/uikit/crates/uikit-term" }
+uikit-web = { path = "../../../shared/uikit/crates/uikit-web" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
