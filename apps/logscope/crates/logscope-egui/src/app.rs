@@ -531,7 +531,7 @@ impl eframe::App for LogscopeApp {
             let mut sl = theme::scene_light();
             sl.intensity = (sl.intensity * flare).min(1.4);
             let strength = if self.glass { 1.0 } else { 0.42 };    // gentler over the opaque default cards
-            theme::paint_light_bleed(&ctx, ctx.screen_rect(), sl, t, strength);
+            theme::paint_light_bleed(&ctx, ctx.viewport_rect(), sl, t, strength);
             if self.glass || gq > 0 { ctx.request_repaint_after(std::time::Duration::from_millis(50)); }
         }
     }
