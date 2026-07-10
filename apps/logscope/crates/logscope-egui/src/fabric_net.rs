@@ -425,6 +425,33 @@ pub fn serve_on(listener: TcpListener, worker: Arc<dyn Worker + Send + Sync>) {
     }
 }
 
+/// Like [`serve`] but stops cleanly when `shutdown` flips true (a daemon flips it from a SIGTERM
+/// handler), so in-flight requests drain and the process exits gracefully. Non-blocking accept + a
+/// short poll keeps the shutdown check responsive without a busy-spin.
+pub fn serve_until(
+    addr: &str,
+    worker: Arc<dyn Worker + Send + Sync>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    let listener = TcpListener::bind(addr)?;
+    listener.set_nonblocking(true)?;
+    while !shutdown.load(Ordering::Relaxed) {
+        match listener.accept() {
+            Ok((s, _)) => {
+                let _ = s.set_nonblocking(false); // connection back to blocking for handle_conn
+                let w = Arc::clone(&worker);
+                std::thread::spawn(move || { let _ = handle_conn(s, &*w); });
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Join a workspace at `addr`: handshake for its public models, return it as a `Worker` the rest of
 /// the fabric (and the model-select menu) treats like any other. `registry.add(Box::new(join(addr)?))`.
 pub fn join(addr: &str) -> std::io::Result<RemoteWorker<HttpTransport<TcpConnect>>> {

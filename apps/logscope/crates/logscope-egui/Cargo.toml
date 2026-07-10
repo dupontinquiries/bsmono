@@ -5,6 +5,7 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
+libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
 png = "0.18"
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
@@ -86,3 +87,7 @@ required-features = ["gui"]
 name = "mic-pearl-view"
 path = "src/bin/mic-pearl-view.rs"
 required-features = ["gui"]
+
+[[bin]]
+name = "logscope-fabricd"
+path = "src/bin/logscope-fabricd.rs"
