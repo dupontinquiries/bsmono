@@ -1,0 +1,15 @@
+[package]
+name = "uikit-web"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A shared HTML → egui renderer. Parses HTML once into a flat, render-ready display list (RichDoc: blocks of styled inline runs) and walks it each frame — immediate-mode friendly, unlike retained scene graphs. Lifted out of voiceterm so any egui app can show rich text / lightweight web content."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../uikit-egui" }
+
+[workspace]
