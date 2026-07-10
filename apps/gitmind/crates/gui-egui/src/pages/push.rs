@@ -15,10 +15,14 @@ pub struct State {
     pub discovered: Vec<(String, String)>, // (ip, hostname)
     pub discovering: bool,
     pub trusted: Option<bool>, // SSH trust status of the selected host (None = unknown/unchecked)
+    /// Cargo build flags, flipped via a hold-to-open swipe-toggle grid.
+    pub flags: Vec<uikit_egui::toggle_grid::ToggleOption>,
+    pub flag_grid: uikit_egui::toggle_grid::ToggleGrid,
 }
 
 impl Default for State {
     fn default() -> Self {
+        use uikit_egui::toggle_grid::ToggleOption as T;
         Self {
             selected: None,
             user: "user".to_string(),
@@ -30,6 +34,13 @@ impl Default for State {
             discovered: Vec::new(),
             discovering: false,
             trusted: None,
+            flags: vec![
+                T::new("release", "release", true),
+                T::new("locked", "locked", true),
+                T::new("offline", "offline", false),
+                T::new("verbose", "verbose", false),
+            ],
+            flag_grid: uikit_egui::toggle_grid::ToggleGrid::new("push-build-flags").columns(2),
         }
     }
 }
@@ -128,6 +139,24 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if !app.push.strategy.is_empty() {
         ui.label(egui::RichText::new(&app.push.strategy).color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)).small());
     }
+
+    // Build flags — hold the button and swipe across the grid to flip flags, release to confirm.
+    ui.horizontal(|ui| {
+        ui.label("flags");
+        let host = ui.add(egui::Button::new("⚑ hold + swipe"));
+        if let uikit_egui::toggle_grid::ToggleOutcome::Committed(new) =
+            app.push.flag_grid.show(ui, &host, &app.push.flags)
+        {
+            for (id, on) in new {
+                if let Some(f) = app.push.flags.iter_mut().find(|f| f.id == id) {
+                    f.on = on;
+                }
+            }
+        }
+        let on: Vec<&str> = app.push.flags.iter().filter(|f| f.on).map(|f| f.label.as_str()).collect();
+        let summary = if on.is_empty() { "(none)".to_string() } else { on.join(" · ") };
+        ui.label(egui::RichText::new(summary).weak().small());
+    });
 
     let can = !app.task.is_running() && app.push.selected.is_some() && !app.push.host.trim().is_empty();
     if ui.add_enabled(can, egui::Button::new("Build & push")).clicked() {
