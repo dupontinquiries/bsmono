@@ -21,7 +21,15 @@ struct GitmindApp {
 
 #[cfg(feature = "app")]
 impl eframe::App for GitmindApp {
+    // This eframe (0.34) makes `ui(&mut Ui, ..)` the required method and defaults/deprecates
+    // `update(&Context, ..)`. gitmind's UI owns the egui Context — `app.ui(ctx)` builds its own
+    // SidePanel + CentralPanel — so it must be driven at the Context level, not from inside eframe's
+    // pre-wrapped Ui (which would nest panels). The runner still calls `update` every frame, so we
+    // keep driving from there and leave the required `ui` hook empty.
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.ui(ctx);
     }
+
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 }
