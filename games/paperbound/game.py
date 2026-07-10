@@ -98,7 +98,7 @@ DT = 1.0 / TPS
 # the whole battle 15% slower (more reaction time, less spammy) WITHOUT touching
 # any per-tick math — the tick sequence is identical on every peer, so net
 # lockstep determinism is unaffected. Applied only to the sim accumulator.
-GAME_SPEED = 0.85
+GAME_SPEED = 0.82875            # 0.85 slowed 2.5% for a slightly calmer pace
 
 DESK      = (32, 22, 18)
 DESK_GRAIN= (24, 16, 13)
@@ -129,15 +129,21 @@ S_FAR, S_NEAR = 0.60, 1.12
 UNIT_SCALE = 0.70      # visual only; sim sizes unchanged
 TOWER_SCALE = 0.85
 
-# accessibility: a global visual punch-up for units + towers (+15%) so pieces
-# read better on small screens. Purely cosmetic — sim hitboxes are unchanged, so
-# it never affects gameplay or net determinism.
-BIG_UNITS = False
+# accessibility: a global visual punch-up for units + towers so pieces read
+# better on small screens. Purely cosmetic — sim hitboxes are unchanged, so it
+# never affects gameplay or net determinism. Cycles through several steps for
+# mobile, where the default can look too small.
+PIECE_SCALE_STEPS = [1.0, 1.15, 1.3, 1.5, 1.75]
+PIECE_SCALE_LABELS = ["100%", "115%", "130%", "150%", "175%"]
+PIECE_SCALE_I = 0                # index into the steps (0 = standard)
+BIG_UNITS = False               # kept for backward-compat with saved prefs
 BIG_UNITS_SCALE = 1.15
+def _piece_scale():
+    return PIECE_SCALE_STEPS[PIECE_SCALE_I % len(PIECE_SCALE_STEPS)]
 def unit_vis_scale():
-    return UNIT_SCALE * (BIG_UNITS_SCALE if BIG_UNITS else 1.0)
+    return UNIT_SCALE * _piece_scale()
 def tower_vis_scale():
-    return TOWER_SCALE * (BIG_UNITS_SCALE if BIG_UNITS else 1.0)
+    return TOWER_SCALE * _piece_scale()
 
 CANDLE_R = (1092, 210)
 CANDLE_L = (150, 596)
@@ -354,10 +360,12 @@ MODES = {
                       ink_rate=1.1, tower_hp=1.0, fog=False, start_ink=8, ink_max=20),
     "lastword":  dict(name="Last Word",     blurb="No flank towers — only the king stands.",
                       ink_rate=1.0, tower_hp=1.0, fog=False, start_ink=6, king_only=True),
+    "risen":     dict(name="The Risen",      blurb="The fallen rise again — a hostile horde turns on you both.",
+                      ink_rate=1.2, tower_hp=1.0, fog=False, start_ink=6, risen=True),
 }
 MODE_ORDER = ["classic", "blitz", "sudden", "fog", "doubleink",
               "drought", "fortress", "tempest", "veil", "living",
-              "deluge", "lastword"]
+              "deluge", "lastword", "risen"]
 MODE = "classic"                # active mode; toggled from menu / arena select
 def mode_cfg():
     return MODES[MODE]
@@ -672,7 +680,7 @@ CARDS = {
     "inkgolem":   dict(name="Ink Golem", cost=6, hp=1600, dmg=85, spd=20, rng=22,
                        size=36, flying=False, paper=(24, 22, 28), sigil="inksplash"),
     "tidalwave":  dict(name="Tidal Wave", cost=7, hp=2000, dmg=120, spd=18, rng=200,
-                       size=40, flying=False, paper=(70, 130, 180), sigil="knock"),
+                       size=40, flying=False, paper=(70, 130, 180), sigil="tidal"),
     "piper":      dict(name="Pipe Piper", cost=4, hp=380, dmg=0, spd=60, rng=0,
                        size=22, flying=False, paper=(160, 130, 90), sigil="charm", building=True),
     "voidcritter": dict(name="Void Critter", cost=5, hp=500, dmg=60, spd=65, rng=18,
@@ -795,6 +803,60 @@ try:
     COLLECTION_OK = True
 except Exception:
     COLLECTION_OK = False
+
+# seasonal / holiday events — a date-driven cosmetic layer. Because the active
+# event is a pure function of the calendar date, every device agrees on it with
+# no networking, so a LAN full of players themes itself automatically.
+try:
+    import events as EVENTS_MOD
+    ACTIVE_EVENT = EVENTS_MOD.active_event()
+    EVENTS_OK = True
+except Exception:
+    EVENTS_MOD = None
+    ACTIVE_EVENT = None
+    EVENTS_OK = False
+EVENT_PARTICLES = []          # display-only ambient overlay (never touches sim)
+
+# sigil bank — a registry of ability glyphs. Floating badges above units (an
+# accessibility aid: read a creature's ability at a glance) can be toggled.
+try:
+    import sigils as SIGILS_MOD
+    SIGILS_OK = True
+except Exception:
+    SIGILS_MOD = None
+    SIGILS_OK = False
+SIGIL_BADGES = False          # off by default; toggle in Options (accessibility)
+
+# Foldworks — the RTS mode ("game inside the game"), a self-contained skirmish.
+try:
+    import rts as rtsmod
+    RTS_OK = True
+except Exception:
+    rtsmod = None
+    RTS_OK = False
+RTS_GAME = None               # active RTS match while in the "rts" scene
+
+def _register_seasonal_variant():
+    """If a holiday is active and it offers a card skin, register its variant spec
+    with carddata so make_variant() can print any card in that seasonal style.
+    Returns the variant id, or None."""
+    if not (EVENTS_OK and CARDDATA_OK):
+        return None
+    spec = EVENTS_MOD.seasonal_variant()
+    if not spec:
+        return None
+    vid = spec["id"]
+    try:
+        carddata.VARIANTS.setdefault(vid, {
+            "name": spec["name"], "suffix": spec["suffix"], "rarity_bump": 0,
+            "mods": spec.get("mods", {}), "tint": spec["tint"],
+            "add_ability": spec.get("add_ability"),
+        })
+    except Exception:
+        return None
+    return vid
+
+SEASONAL_VARIANT_ID = None    # set at startup if an event skin is live
 
 _SHADE_CACHE = {}
 def shade(c, f):
@@ -1199,6 +1261,8 @@ class Game:
         if seed is not None:
             random.seed(seed)
         self.units, self.parts, self.texts, self.projs = [], [], [], []
+        self.dying = []            # DISPLAY-ONLY crumpling corpses (sim never reads)
+        self.waves = []            # Tidal Wave: traveling line-attacks (sim-real)
         self.fallen = {0: 0, 1: 0}           # kindle: friendly units lost, per team
         self.mode = MODE                     # snapshot the active mode for this match
         cfg = MODES[self.mode]
@@ -1423,6 +1487,15 @@ class Game:
             for _ in range(14):
                 self.parts.append(Particle(x, y, (230, 180, 90), 90, 0.5, 3))
             key = gen                     # deploy the generated card instead
+        # ── Tidal Wave is a SPELL, not a unit: it looses three cresting waves that
+        #    roll straight up the lane, each a wide band that damages and shoves
+        #    everything it washes over (buildings take reduced damage and barely
+        #    budge). Keyed off the CARD, not the shared "tidal" sigil — the Ink
+        #    Leviathan and River Serpent also carry that sigil (a swim-shove) and
+        #    must stay ordinary units. Fully deterministic — fixed sim clock. ──
+        if key == "tidalwave":
+            self._cast_tidal(x, y, team, CARDS[key])
+            return []
         d = CARDS[key]
         n = d.get("count", 1)
         made = []
@@ -1674,12 +1747,50 @@ class Game:
                 self.parts.append(Particle(tgt.x, tgt.y, (240, 150, 60), 150, 0.7, 3))
             self.texts.append(FloatText(tgt.x, tgt.y - 24, "reborn!", (240, 130, 60)))
             return
+        # ── paper-crumple death: the folded creature bursts into scraps of its
+        #    own colour and a soft collapse ring, rather than just vanishing. All
+        #    deterministic in sim order, so net peers stay in lockstep. ──
+        pcol = getattr(tgt, "paper", PAGE)
+        if isinstance(pcol, list): pcol = tuple(pcol)
+        sz = getattr(tgt, "size", 20)
         for _ in range(14):
-            self.parts.append(Particle(tgt.x, tgt.y,
-                shade(getattr(tgt, "paper", PAGE), 0.9), 120, 0.6, 3))
+            self.parts.append(Particle(tgt.x, tgt.y, shade(pcol, 0.9), 120, 0.6, 3))
+        # bigger tumbling scraps (torn folds of the model)
+        for _ in range(max(4, int(sz / 6))):
+            self.parts.append(Particle(tgt.x, tgt.y, shade(pcol, 1.15),
+                                       90, 0.75, max(3, int(sz * 0.18))))
+        # a dark collapse puff at the feet
+        for _ in range(5):
+            self.parts.append(Particle(tgt.x, tgt.y + sz * 0.3, shade(pcol, 0.5), 45, 0.5, 4))
+        self.add_shockwave(tgt.x, tgt.y, mag=6, dur=0.3)
+        # capture a DISPLAY-ONLY dying copy so the model crumples & topples over the
+        # next ~0.5s instead of vanishing. This list is never read by the sim, so
+        # it can't affect determinism — the unit is already gone from self.units.
+        if isinstance(tgt, Unit) and not getattr(tgt, "is_echo", False) and not getattr(tgt, "is_eagle", False):
+            self.dying.append({
+                "key": tgt.key, "x": tgt.x, "y": tgt.y, "team": tgt.team,
+                "fam": _card_family(tgt.key), "size": sz, "paper": pcol,
+                "face": getattr(tgt, "face", 1), "fly": bool(getattr(tgt, "flying", False)),
+                "t": 0.0, "dur": 0.55,
+                # a deterministic-looking topple direction from the last hit isn't
+                # needed (display only), so a cheap per-unit value is fine
+                "tip": 1 if (int(tgt.x) % 2 == 0) else -1,
+            })
         # tally fallen (kindle scales off this) — count real units, not echoes/eagles
         if isinstance(tgt, Unit) and not getattr(tgt, "is_echo", False) and not getattr(tgt, "is_eagle", False):
             self.fallen[tgt.team] = self.fallen.get(tgt.team, 0) + 1
+        # ── THE RISEN: in zombie mode, a fallen real unit reincarnates on the
+        #    hostile horde (team 2), which enemies_of() makes an enemy of BOTH
+        #    players. Deterministic: no local RNG, no re-raising zombies (guarded),
+        #    so net peers stay in perfect lockstep. ──
+        if (MODES.get(self.mode, {}).get("risen")
+                and isinstance(tgt, Unit)
+                and not getattr(tgt, "is_echo", False)
+                and not getattr(tgt, "is_eagle", False)
+                and not getattr(tgt, "is_zombie", False)
+                and tgt.team in (0, 1)
+                and not getattr(tgt, "building", False)):
+            self._raise_zombie(tgt)
         # quill (Stag Beetle): looses a radial volley of quills on death
         if isinstance(tgt, Unit) and tgt.sigil == "quill" and not getattr(tgt, "quill_done", False):
             tgt.quill_done = True
@@ -1763,6 +1874,120 @@ class Game:
             for _ in range(18):
                 self.parts.append(Particle(tgt.x, tgt.y, (150, 90, 190), 150, 0.7, 3))
             self.texts.append(FloatText(tgt.x, tgt.y - 24, "diverges!", (170, 110, 210)))
+
+    def _cast_tidal(self, x, y, team, card):
+        """Tidal Wave spell: loose THREE cresting waves that roll straight toward
+        the enemy side in a wide band. Each wave sweeps the lane once, damaging &
+        shoving whatever it washes over. Buildings take reduced damage and barely
+        move. Deterministic: the waves advance on the fixed sim clock, spaced by a
+        launch delay so they arrive as a three-beat set. Never uses local RNG."""
+        dirn = -1 if team == 0 else 1          # team 0 pushes up-page, team 1 down
+        dmg = card.get("dmg", 120)
+        width = 150                            # half-width of the band (px each side)
+        speed = 260                            # px/sec the wave front travels
+        reach = 520                            # how far it rolls before dissipating
+        for i in range(3):                     # a three-shot set
+            self.waves.append({
+                "x": x, "y0": y, "y": y, "team": team, "dir": dirn,
+                "dmg": dmg, "width": width, "speed": speed,
+                "traveled": 0.0, "reach": reach,
+                "delay": i * 0.35,             # staggered launch — three beats
+                "hit": set(),                  # unit ids already struck by THIS wave
+                "gaps": [],                    # (gx, half) shadows carved by obstacles
+                "t": 0.0,
+            })
+        self.texts.append(FloatText(x, y - 30, "TIDAL WAVE!", (120, 190, 235)))
+        for a in range(16):
+            ang = a / 16 * 6.2832
+            self.parts.append(Particle(x + math.cos(ang) * 20, y + math.sin(ang) * 12,
+                                       (150, 200, 235), 90, 0.5, 3))
+        sfx("deploy", 0.8)
+
+    def _tick_waves(self):
+        """Advance every live Tidal Wave, applying damage + knockback to units and
+        towers the front sweeps past this tick. Obstacles SPLIT the wave: a troop
+        carves a small shadow, a building a wide one, so anything in a building's
+        lee is shielded — you can wall off a tidal wave. Buildings also take
+        reduced damage and barely move. Deterministic; stable iteration order."""
+        if not self.waves:
+            return
+        for w in self.waves:
+            w["t"] += DT
+            if w["t"] < w["delay"]:
+                continue                       # still winding up
+            step = w["speed"] * DT
+            w["y"] += w["dir"] * step
+            w["traveled"] += step
+            fy = w["y"]
+            lo_x, hi_x = w["x"] - w["width"], w["x"] + w["width"]
+            band = 46                          # vertical thickness of the crest
+            # process obstacles in the order the wave REACHES them (front-to-back
+            # along travel), so a building carves its shadow before things behind
+            # it are tested. dir<0 → smaller y first; dir>0 → larger y first.
+            foes = sorted(self.enemies_of(w["team"]),
+                          key=lambda f: (w["dir"] * f.y, getattr(f, "uid", 0)))
+            for f in foes:
+                fid = getattr(f, "uid", id(f))
+                if fid in w["hit"]:
+                    continue
+                if not (lo_x <= f.x <= hi_x):
+                    continue
+                if abs(f.y - fy) > band:
+                    continue
+                # blocked? if this x sits inside a shadow carved upstream, the wave
+                # never reached here — spare the target entirely.
+                if any(abs(f.x - gx) < gh for gx, gh in w["gaps"]):
+                    continue
+                is_bldg = isinstance(f, Tower) or getattr(f, "building", False)
+                dmg = w["dmg"] * (0.35 if is_bldg else 1.0)
+                f.hp -= dmg
+                w["hit"].add(fid)
+                # carve a shadow behind the obstacle: buildings block a lot, troops
+                # only split the flow a little. Scales with the obstacle's size.
+                osz = getattr(f, "size", 24)
+                gh = (osz * 2.2) if is_bldg else (osz * 0.7)
+                w["gaps"].append((f.x, gh))
+                # knockback: greatly reduced on buildings, none if anchored
+                if isinstance(f, Unit) and not getattr(f, "anchored", False):
+                    push = 14 if is_bldg else 70
+                    f.y += w["dir"] * push
+                    f.x += (f.x - w["x"]) * 0.04
+                    if not is_bldg:
+                        f.knock_timer = 0.35
+                self.texts.append(FloatText(f.x, f.y - 20, str(int(dmg)), (150, 200, 235)))
+            # spray along the crest (skipping the shadowed gaps)
+            if random.random() < 0.6:
+                px = w["x"] + random.uniform(-w["width"], w["width"])
+                if not any(abs(px - gx) < gh for gx, gh in w["gaps"]):
+                    self.parts.append(Particle(px, fy, (170, 210, 240), 60, 0.4, 3))
+        # retire waves that have rolled their full reach
+        self.waves = [w for w in self.waves if w["traveled"] < w["reach"]]
+
+    def _raise_zombie(self, tgt):
+        """Reincarnate a fallen unit as a shambling member of the hostile horde
+        (team 2). The zombie is a weakened copy that hunts the nearest of EITHER
+        player's units/towers. Fully deterministic — derives everything from the
+        sim state, never local RNG — so both net peers raise identical zombies."""
+        try:
+            z = Unit(tgt.key, tgt.x, tgt.y, 2)          # team 2 = the horde
+        except Exception:
+            return
+        z.is_zombie = True
+        z.spawn_t = 0.3
+        # decayed: a fraction of its former self, slower but relentless
+        z.maxhp = max(1, int(z.maxhp * 0.6))
+        z.hp = z.maxhp
+        z.dmg = max(1, int(getattr(z, "dmg", 1) * 0.7))
+        z.spd = getattr(z, "spd", 1.0) * 0.7
+        z.paper = (96, 120, 84)                          # sickly green-grey
+        z.sigil = "none"                                 # strip special abilities
+        for attr in ("split_done", "quill_done", "reborn", "is_echo", "is_eagle"):
+            try: setattr(z, attr, True if attr in ("split_done", "quill_done", "reborn") else False)
+            except Exception: pass
+        self.units.append(z)
+        for _ in range(12):
+            self.parts.append(Particle(tgt.x, tgt.y, (120, 160, 90), 90, 0.8, 3))
+        self.texts.append(FloatText(tgt.x, tgt.y - 24, "risen!", (140, 200, 110)))
 
     def _trickster_tick(self):
         """The Candlethief's darkness duel. Periodically he snuffs the light and
@@ -2057,7 +2282,7 @@ class Game:
         self.tick += 1
 
         self.time += DT
-        _ir = MODES[self.mode]["ink_rate"] / 2.8
+        _ir = MODES[self.mode]["ink_rate"] / 2.8 * 1.025   # +2.5% ink gain globally
         _cap = ink_cap(self.mode)
         # ── carrier (Beekeeper): each live one on your side slows your ink gain,
         #    the price of the swarm. Per-team so it hits the right pool. ──
@@ -2085,7 +2310,11 @@ class Game:
 
         if self.hand_reach:
             self.hand_t += DT
-            if 0.55 < self.hand_t < 0.6 and self.hand_reach[3] is not None:
+            # fire the deploy as the reach animation passes its midpoint. Use a
+            # crossing test (>=) with the key-cleared-to-None guard, NOT an open
+            # interval — an interval one DT-step wide can land exactly on both
+            # bounds and never trigger (which silently disabled the AI).
+            if self.hand_t >= 0.55 and self.hand_reach[3] is not None:
                 self.deploy(self.hand_reach[3], self.hand_reach[0], self.hand_reach[1], 1)
                 self.hand_reach = (self.hand_reach[0], self.hand_reach[1],
                                    self.hand_reach[2], None)
@@ -2752,11 +2981,16 @@ class Game:
                 if len(p) > 5: p[5] = prev
                 elif len(p) == 5: p.append(prev)
 
+        self._tick_waves()          # Tidal Wave line-attacks sweep the lane
         self.units = [u for u in self.units if u.alive]
         for lst in (self.parts, self.texts):
             for e in lst: e.update()
         self.parts = [p for p in self.parts if p.life > 0]
         self.texts = [t for t in self.texts if t.life > 0]
+        # advance & retire display-only dying corpses (never affects the sim)
+        for dcorpse in self.dying:
+            dcorpse["t"] += DT
+        self.dying = [d for d in self.dying if d["t"] < d["dur"]]
         for fx in self.boss_fx: fx["t"] += DT
         self.boss_fx = [fx for fx in self.boss_fx if fx["t"] < 1.0]
         for sw in self.shockwaves: sw["t"] += DT
@@ -2823,13 +3057,19 @@ class Game:
                 self.frenzy_fx.append(dict(kind="fireball", x=bx, y=BOOK.top + 40,
                                            vy=260, t=0.0))
         elif ar == "storm":
-            # relentless lightning that zaps a random unit
-            if random.random() < 0.05 * sev:
+            # relentless lightning that zaps a unit — but tuned so it HARASSES
+            # rather than clears the field. A rare strike doing a flat, capped
+            # chunk (never a near-one-shot), skewed toward sturdier units so it
+            # doesn't instantly vaporise fresh troops and stall the match.
+            if random.random() < 0.018 * sev:
                 self.flash = 1.0
-                alive = [u for u in self.units if u.alive]
+                alive = [u for u in self.units if u.alive and u.spawn_t <= 0]
                 if alive:
-                    tgt = random.choice(alive)
-                    tgt.hp -= tgt.maxhp * 0.3
+                    # prefer the healthiest target in absolute HP (a big beast is a
+                    # lightning rod; small fresh units are mostly spared)
+                    tgt = max(alive, key=lambda u: u.hp)
+                    dmg = min(tgt.maxhp * 0.18, 140)      # capped: never a one-shot
+                    tgt.hp -= dmg
                     self.frenzy_fx.append(dict(kind="bolt", x=tgt.x, y=tgt.y, t=0.0))
                     self.add_shockwave(tgt.x, tgt.y, mag=12, dur=0.4)
         elif ar in ("sandbar", "sunken"):
@@ -3558,6 +3798,105 @@ def _hi_model_detail(screen, u, x, y, s, f, c, hgt):
         pygame.draw.line(screen, crl, (cxa, cya - 1), (cxb, cyb - 1), 1)
 
 
+def _crumple_part(part, p, seed, tip):
+    """Return a display-only crumpled copy of one recipe part at death-progress p
+    (0→1). Each fold bursts outward briefly, rotates, shrinks, and its height
+    collapses to the page — a sheet of paper being crushed. Deterministic per part
+    (seeded from its index) so the crush looks consistent frame to frame."""
+    ax, ay = part["at"]
+    # a cheap per-part pseudo-random direction (no RNG object needed)
+    h = (seed * 2654435761) & 0xffffffff
+    dirx = ((h & 0xff) / 255.0 - 0.5) * 2.0
+    diry = (((h >> 8) & 0xff) / 255.0 - 0.5) * 2.0
+    spin = (((h >> 16) & 0xff) / 255.0 - 0.5) * 2.0
+    # burst outward then settle inward: sin(pi*p) peaks mid-death
+    burst = math.sin(p * math.pi) * 0.5
+    inward = 1.0 - 0.35 * p                      # overall pull toward centre late
+    nax = ax * inward + dirx * burst
+    nay = ay * inward + diry * burst - burst * 0.3   # slight upward pop
+    q = dict(part)
+    q["at"] = [nax, nay]
+    q["size"] = max(0.05, part["size"] * (1.0 - 0.45 * p))       # shrink
+    q["ang"] = part.get("ang", 0.0) + (spin + tip * 0.6) * p * 1.8  # tumble/fold
+    q["h"] = part.get("h", 0.0) * (1.0 - p)                       # flatten to page
+    q["tone"] = part.get("tone", 1.0) * (1.0 - 0.25 * p)          # dim as it dies
+    return q
+
+
+def _draw_waves(screen, g):
+    """Draw the Tidal Wave crests as translucent cresting bands rolling up the
+    lane, with notches punched out where obstacles have split the flow — so you
+    can see a building casting a dry shadow behind it. Display-only."""
+    for w in getattr(g, "waves", []):
+        if w["t"] < w["delay"]:
+            continue
+        fade = max(0.25, 1.0 - w["traveled"] / w["reach"])
+        gaps = w.get("gaps", [])
+        cx, cy, sc = proj(w["x"], w["y"])
+        half = int(w["width"] * sc)
+        bw, bh = half * 2 + 20, 26
+        band = pygame.Surface((bw, bh), pygame.SRCALPHA)
+        # draw the band in world-x slices onto the temp surface, skipping shadows
+        x0 = w["x"] - w["width"]
+        seg = 12
+        wx = x0
+        while wx < w["x"] + w["width"]:
+            midx = wx + seg / 2
+            if not any(abs(midx - gx) < gh for gx, gh in gaps):
+                # local x on the band surface
+                lx = int((midx - x0) * sc)
+                sw = max(2, int(seg * sc) + 1)
+                pygame.draw.ellipse(band, (70, 140, 190, int(150 * fade)), (lx, 8, sw, 16))
+                pygame.draw.ellipse(band, (170, 210, 240, int(210 * fade)), (lx, 0, sw, 10))
+            wx += seg
+        screen.blit(band, (int(cx - bw / 2), int(cy - bh / 2)))
+
+
+def _draw_dying(screen, shadow_layer, d):
+    """Render a DISPLAY-ONLY dying corpse as a per-fold PAPER CRUSH: each fold of
+    the model scatters, tumbles and collapses flat to the page over the corpse's
+    short lifetime, then the whole thing fades to scraps. Never touches the sim."""
+    p = min(1.0, d["t"] / d["dur"])          # 0→1 over the death
+    if p >= 1.0:
+        return
+    sx, sy, sc = proj(d["x"], d["y"])
+    s = max(6, d["size"] * sc * unit_vis_scale())
+    pad = int(s * 3.4)
+    tmp = pygame.Surface((pad, pad), pygame.SRCALPHA)
+    cx, cy = pad // 2, int(pad * 0.60)
+    hgt = s * 0.5
+    try:
+        recipe = origami.recipe_for(d["key"], d["fam"], CARDS.get(d["key"]))
+        anim = {"t": 0.0, "move": 0.0, "phase": 0.0, "attack": 0.0, "breathe": 0.0}
+        # draw folds back-to-front, each crumpled per its own scatter
+        for i, part in enumerate(recipe):
+            cp = _crumple_part(part, p, i + 1, d["tip"])
+            origami.draw_part(tmp, cp, cx, cy, s, d["face"], d["paper"], hgt, 0.0, 0.0, anim)
+    except Exception:
+        pygame.draw.circle(tmp, shade(d["paper"], 1.0), (cx, cy), max(2, int(s * 0.7 * (1 - p))))
+    # a gentle global squash + a slight whole-body lean as it goes down
+    squash = 1.0 - 0.35 * p
+    lean = d["tip"] * 14 * (p ** 0.7)
+    rot = pygame.transform.rotozoom(tmp, lean, 1.0)
+    rw, rh = rot.get_size()
+    rot = pygame.transform.smoothscale(rot, (rw, max(1, int(rh * squash))))
+    # fade over the back half of the death
+    alpha = int(255 * (1.0 - max(0.0, (p - 0.45) / 0.55)))
+    rot.set_alpha(max(0, alpha))
+    # a flattening ground shadow that spreads as the folds collapse
+    shcol = (8, 5, 4, int(120 * (1 - p)))
+    pygame.draw.ellipse(shadow_layer, shcol,
+                        (sx - s * (1.1 + p), sy + s * 0.35, s * (2.2 + p * 2), s * (0.7 + p * 0.3)))
+    screen.blit(rot, (sx - rot.get_width() / 2, sy + s * 0.4 - rot.get_height()))
+
+
+class _DyingProxy:
+    """(retained for compatibility; the crush path no longer needs a unit proxy)"""
+    def __init__(self, d):
+        self.key = d["key"]; self.face = d["face"]; self.team = d["team"]
+        self.size = d["size"]; self.paper = d["paper"]; self.uid = 0
+
+
 def origami_animal(screen, shadow_layer, u):
     sx, sy, sc = proj(u.x, u.y)
     # cartoon "boil": hand-inked frames never sit perfectly still — add a tiny
@@ -3567,7 +3906,17 @@ def origami_animal(screen, shadow_layer, u):
         jr = random.Random(hash((id(u) & 0xffff, beat)))
         sx += jr.uniform(-1.4, 1.4); sy += jr.uniform(-1.4, 1.4)
     s = u.size * sc * unit_vis_scale()
-    grow = 1.0 - u.spawn_t * 1.6
+    # unfold pop: fresh units spring open with a slight ease-out overshoot, so a
+    # deploy reads as a sheet of paper snapping into shape rather than fading in.
+    if u.spawn_t > 0:
+        p = max(0.0, 1.0 - u.spawn_t / 0.35)      # 0→1 over the spawn window
+        p = min(1.0, p)
+        # ease-out-back: overshoots ~8% then settles to 1.0
+        c1, c3 = 1.9, 2.9
+        grow = 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2
+        grow = max(0.2, grow)
+    else:
+        grow = 1.0
     s = max(6, s * grow)
     f = u.face
     # firing animation: a quick lunge toward the enemy + a muzzle flash, easing back
@@ -3642,6 +3991,7 @@ def origami_animal(screen, shadow_layer, u):
                 "phase": (id(u) & 0xff) * 0.1,       # de-sync the crowd
                 "attack": (math.sin((ff / 0.25) * math.pi) if ff > 0 else 0.0),
                 "breathe": math.sin(tms * 0.0025 + (id(u) & 0xff)),
+                "style": _ANIM_STYLE.get(fam, ""),   # family motion flavour
             }
             for part in recipe:
                 origami.draw_part(screen, part, x, y, s, f, c, hgt, tms * 0.001, flap, anim)
@@ -3969,6 +4319,18 @@ def _card_family(key):
         return "bird"
     return "feline"
 
+
+# per-family motion flavour, read by the origami animator. Each is a light tweak
+# on top of the shared walk/breathe cycle so a family MOVES like what it is —
+# cephalopods & serpents undulate, jellies pulse, wisps flicker, insects skitter.
+_ANIM_STYLE = {
+    "cephalopod": "undulate", "wave": "undulate",
+    "jelly": "pulse", "amphibian": "hop",
+    "wisp": "flicker", "blob": "wobble",
+    "insect": "skitter", "bird": "flap",
+    "fish": "swim", "wisppack": "flicker",
+}
+
 _SKETCH_CACHE = {}
 
 # ── diffusion-generated VFX sprites (tiny, portable, cached) ────────────────
@@ -4280,12 +4642,19 @@ def draw_card(surf, key, rect, font, sfont, affordable, cost_override=None):
     # ── footer band with sigil (bottom-left) + cost (bottom-right) ──
     pygame.draw.rect(surf, band, (body.x + 2, body.bottom - foot_h, body.w - 4, foot_h - 2),
                      border_bottom_left_radius=7, border_bottom_right_radius=7)
-    # sigil seal — bottom-left
-    sc2 = SIGIL_COLORS.get(d["sigil"], GOLD)
+    # sigil seal — bottom-left, now bearing the ability's glyph (from the bank)
+    sig = d["sigil"]
+    sc2 = SIGIL_COLORS.get(sig, GOLD)
     sgx, sgy = body.x + 15, body.bottom - 13
-    pygame.draw.circle(surf, sc2, (sgx, sgy), 9)
-    pygame.draw.circle(surf, shade(sc2, 0.6), (sgx, sgy), 9, 2)
-    pygame.draw.circle(surf, shade(sc2, 1.35), (sgx - 3, sgy - 3), 3)
+    if sig and sig != "none" and SIGILS_OK:
+        pygame.draw.circle(surf, (30, 24, 20), (sgx, sgy), 10)
+        pygame.draw.circle(surf, sc2, (sgx, sgy), 9)
+        pygame.draw.circle(surf, shade(sc2, 0.55), (sgx, sgy), 9, 2)
+        SIGILS_MOD.draw_glyph(surf, SIGILS_MOD.glyph_for(sig), sgx, sgy, 6, shade(sc2, 0.35))
+    else:
+        pygame.draw.circle(surf, sc2, (sgx, sgy), 9)
+        pygame.draw.circle(surf, shade(sc2, 0.6), (sgx, sgy), 9, 2)
+        pygame.draw.circle(surf, shade(sc2, 1.35), (sgx - 3, sgy - 3), 3)
     # cost seal — bottom-right corner (ringed by cost-tier colour: cheap→green,
     # mid→amber, pricey→red — a fast at-a-glance read of what a card costs)
     cval = cost_override if cost_override is not None else d["cost"]
@@ -4737,6 +5106,159 @@ def apply_shockwaves(screen, g):
         # a faint bright rim to sell the energy
         pygame.draw.circle(screen, (255, 240, 210), (int(cx), int(cy)), radius, 2)
 
+def _update_event_particles(dt):
+    """Spawn & advance the display-only seasonal ambient overlay (snow, leaves,
+    bats…). Purely cosmetic — never read by the simulation, so it's safe in net
+    play. Density adapts to the battery-saver setting."""
+    if not ACTIVE_EVENT or not EVENTS_OK:
+        if EVENT_PARTICLES: EVENT_PARTICLES.clear()
+        return
+    spec = EVENTS_MOD.ambient_spec(ACTIVE_EVENT)
+    if not spec:
+        return
+    target = spec.get("count", 0)
+    if BATTERY_SAVER:
+        target = target * 2 // 3
+    while len(EVENT_PARTICLES) < target:
+        _spawn_event_particle(spec)
+    for p in EVENT_PARTICLES:
+        p["t"] += dt
+        p["y"] += p["vy"] * dt
+        p["x"] += p["vx"] * dt + (math.sin(p["t"] * 1.6 + p["seed"]) * p["sway"] * dt if p.get("sway") else 0)
+        if p.get("spin_v"):
+            p["ang"] += p["spin_v"] * dt
+        if p["vy"] >= 0 and p["y"] > H + 20:
+            _respawn_event_particle(p, spec)
+        elif p["vy"] < 0 and p["y"] < -20:
+            _respawn_event_particle(p, spec)
+        if p["x"] < -30: p["x"] = W + 20
+        elif p["x"] > W + 30: p["x"] = -20
+    if len(EVENT_PARTICLES) > target and not ACTIVE_EVENT.get("particles") == "fireworks":
+        del EVENT_PARTICLES[target:]
+
+
+def _spawn_event_particle(spec):
+    import random as _r
+    lo, hi = spec.get("fall", (18, 40))
+    rise = spec.get("rise")
+    EVENT_PARTICLES.append(dict(
+        x=_r.uniform(0, W),
+        y=_r.uniform(-40, H) if not rise else _r.uniform(0, H + 40),
+        vy=(-_r.uniform(abs(lo), abs(hi)) if rise else _r.uniform(max(1, lo), max(2, hi))),
+        vx=_r.uniform(-1, 1) * spec.get("drift", 12),
+        sz=_r.uniform(*spec.get("size", (2, 4))),
+        ang=_r.uniform(0, 6.28), spin_v=(_r.uniform(-2, 2) if spec.get("spin") else 0),
+        sway=spec.get("drift", 12) if spec.get("sway") else 0,
+        seed=_r.uniform(0, 6.28), t=0.0,
+        col=spec.get("color") or _rainbow_col(),
+        shape=spec.get("shape", "dot"), glow=spec.get("glow", False)))
+
+
+def _respawn_event_particle(p, spec):
+    import random as _r
+    p["y"] = -20 if not spec.get("rise") else H + 20
+    p["x"] = _r.uniform(0, W); p["t"] = 0.0
+    if spec.get("rainbow"): p["col"] = _rainbow_col()
+
+
+def _rainbow_col():
+    import random as _r
+    return _r.choice([(230, 90, 90), (230, 190, 80), (110, 200, 110),
+                      (90, 160, 230), (190, 120, 210)])
+
+
+def draw_event_overlay(screen):
+    """Draw the seasonal ambient particles over the scene. Cheap shapes only."""
+    if not ACTIVE_EVENT or not EVENT_PARTICLES:
+        return
+    for p in EVENT_PARTICLES:
+        x, y, s, col = int(p["x"]), int(p["y"]), max(1, int(p["sz"])), p["col"]
+        sh = p["shape"]
+        if sh in ("dot", "mote"):
+            if p.get("glow"):
+                gs = pygame.Surface((s * 6, s * 6), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (*col, 60), (s * 3, s * 3), s * 3)
+                screen.blit(gs, (x - s * 3, y - s * 3))
+            pygame.draw.circle(screen, col, (x, y), s)
+        elif sh == "rect":
+            r = pygame.Surface((s * 2, s), pygame.SRCALPHA)
+            r.fill((*col, 220)); r = pygame.transform.rotate(r, math.degrees(p["ang"]))
+            screen.blit(r, (x, y))
+        elif sh == "leaf":
+            lf = pygame.Surface((s * 2, s * 3), pygame.SRCALPHA)
+            pygame.draw.ellipse(lf, (*col, 230), (0, 0, s * 2, s * 3))
+            lf = pygame.transform.rotate(lf, math.degrees(p["ang"]))
+            screen.blit(lf, (x - lf.get_width() // 2, y - lf.get_height() // 2))
+        elif sh == "heart":
+            _draw_mini_heart(screen, x, y, s, col)
+        elif sh == "bat":
+            _draw_mini_bat(screen, x, y, s, col, p["t"])
+        elif sh == "clover":
+            for dx, dy in ((-s, 0), (s, 0), (0, -s), (0, s)):
+                pygame.draw.circle(screen, col, (x + dx, y + dy), max(1, s // 2 + 1))
+        elif sh == "lantern":
+            if p.get("glow"):
+                gs = pygame.Surface((s * 5, s * 5), pygame.SRCALPHA)
+                pygame.draw.circle(gs, (*col, 70), (int(s * 2.5), int(s * 2.5)), s * 2)
+                screen.blit(gs, (x - int(s * 2.5), y - int(s * 2.5)))
+            pygame.draw.ellipse(screen, col, (x - s, y - s, s * 2, int(s * 2.4)))
+        else:
+            pygame.draw.circle(screen, col, (x, y), s)
+    if ACTIVE_EVENT.get("particles") == "fireworks" and random.random() < 0.04:
+        _spawn_firework()
+
+
+def _draw_mini_heart(screen, x, y, s, col):
+    pygame.draw.circle(screen, col, (x - s // 2, y), max(1, s // 2))
+    pygame.draw.circle(screen, col, (x + s // 2, y), max(1, s // 2))
+    pygame.draw.polygon(screen, col, [(x - s, y), (x + s, y), (x, y + s)])
+
+
+def _draw_mini_bat(screen, x, y, s, col, t):
+    flap = math.sin(t * 8) * s * 0.4
+    pygame.draw.circle(screen, col, (x, y), max(1, int(s * 0.4)))
+    pygame.draw.polygon(screen, col, [(x, y), (x - s, int(y - flap)), (x - s, int(y + s * 0.3))])
+    pygame.draw.polygon(screen, col, [(x, y), (x + s, int(y - flap)), (x + s, int(y + s * 0.3))])
+
+
+def _spawn_firework():
+    import random as _r
+    cx, cy = _r.uniform(W * 0.2, W * 0.8), _r.uniform(H * 0.1, H * 0.4)
+    col = _rainbow_col()
+    for _ in range(14):
+        a = _r.uniform(0, 6.28); v = _r.uniform(40, 110)
+        EVENT_PARTICLES.append(dict(
+            x=cx, y=cy, vx=math.cos(a) * v, vy=math.sin(a) * v,
+            sz=_r.uniform(2, 3), ang=0, spin_v=0, sway=0, seed=0, t=0.0,
+            col=col, shape="dot", glow=True))
+
+
+def _draw_sigil_badge(screen, u):
+    """Float a small rounded badge with the unit's ability glyph above it. An
+    accessibility aid — see what a creature does without opening its card. Purely
+    cosmetic; skips units with no special ability."""
+    sig = getattr(u, "sigil", None)
+    if not sig or sig == "none":
+        return
+    sx, sy, sc = proj(u.x, u.y)
+    s = max(6, u.size * sc * unit_vis_scale())
+    r = max(7, int(s * 0.42))                     # badge radius scales with unit
+    bx = int(sx)
+    by = int(sy - s * 1.7 - r)                    # sit above the head
+    col = SIGIL_COLORS.get(sig, (200, 170, 90))
+    # rounded ink-paper badge
+    pad = r + 4
+    badge = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
+    pygame.draw.circle(badge, (30, 24, 20, 210), (pad, pad), r + 2)
+    pygame.draw.circle(badge, (*shade(col, 0.55), 235), (pad, pad), r + 2, 2)
+    pygame.draw.circle(badge, (238, 230, 214, 235), (pad, pad), r)
+    SIGILS_MOD.draw_glyph(badge, SIGILS_MOD.glyph_for(sig), pad, pad, r * 0.72,
+                          shade(col, 0.9))
+    screen.blit(badge, (bx - pad, by - pad))
+    # a tiny stem connecting badge to the creature
+    pygame.draw.line(screen, (30, 24, 20, 180), (bx, by + r), (bx, int(sy - s * 1.5)), 1)
+
+
 def render(screen, g, font, bfont, sfont):
     global BOARD_STATIC
     if BOARD_STATIC is None:
@@ -4782,6 +5304,10 @@ def render(screen, g, font, bfont, sfont):
     screen.blit(shadow_layer, (0, 0))
     shadow_layer = pygame.Surface((W, H), pygame.SRCALPHA)
     cart = cartoon_on()
+    # draw crumpling corpses first (beneath the living), then living entities
+    for d in getattr(g, "dying", []):
+        _draw_dying(screen, shadow_layer, d)
+    _draw_waves(screen, g)          # Tidal Wave crests roll over the lane
     for e in sorted(ents, key=lambda e: e.y):
         if isinstance(e, Tower):
             draw_tower(screen, shadow_layer, e)
@@ -4791,6 +5317,11 @@ def render(screen, g, font, bfont, sfont):
             origami_animal(screen, shadow_layer, e)
             if cart:
                 e._crx, e._cry = e.x, e.y          # remember this held pose
+    # accessibility: float a sigil badge above each ability-bearing unit
+    if SIGIL_BADGES and SIGILS_OK:
+        for e in ents:
+            if not isinstance(e, Tower):
+                _draw_sigil_badge(screen, e)
     # unit shadows composite beneath subsequent light pass
     screen.blit(shadow_layer, (0, 0), special_flags=pygame.BLEND_RGBA_MULT) if False else screen.blit(shadow_layer, (0, 0))
 
@@ -5477,25 +6008,36 @@ def draw_menu(screen, fonts, t, mouse):
     origami_animal(screen, sh, emblem)
     fl = sfont.render("Fold your beasts. Hold the page.", True, shade(INK, 2.4))
     screen.blit(fl, (b.left + 200 - fl.get_width() / 2, b.centery + 150))
+    # seasonal event greeting (date-driven; the same for everyone on the day)
+    if ACTIVE_EVENT:
+        ev = ACTIVE_EVENT
+        acc = ev.get("accent", GOLD)
+        title = f"{ev.get('emoji','')}  {ev['name']}  {ev.get('emoji','')}"
+        et = sfont.render(title, True, acc)
+        screen.blit(et, (b.left + 200 - et.get_width() / 2, b.centery + 178))
+        bn = _font(15).render(ev.get("banner", ""), True, shade(INK, 2.2))
+        screen.blit(bn, (b.left + 200 - bn.get_width() / 2, b.centery + 200))
     # right page: menu buttons
     bx = b.centerx + 70
-    ys = b.top + 64
-    gap = 42
-    bh = 36
+    ys = b.top + 52
+    gap = 39
+    bh = 34
     button(screen, pygame.Rect(bx, ys + 0*gap, 300, bh), "Play", bfont, mouse, key="play")
     button(screen, pygame.Rect(bx, ys + 1*gap, 300, bh), "Arch-Scribe Duel", bfont, mouse,
            enabled=AIBOSS_OK, key="aiboss")
     button(screen, pygame.Rect(bx, ys + 2*gap, 300, bh), "Local 1v1", bfont, mouse, key="local1v1")
-    button(screen, pygame.Rect(bx, ys + 3*gap, 300, bh), "Multiplayer (LAN)", bfont, mouse, key="mp")
-    button(screen, pygame.Rect(bx, ys + 4*gap, 300, bh), "Deck Builder", bfont, mouse, key="deck")
-    button(screen, pygame.Rect(bx, ys + 5*gap, 300, bh), "Defenses", bfont, mouse, key="towers")
-    button(screen, pygame.Rect(bx, ys + 6*gap, 300, bh), "Collection", bfont, mouse, key="collection")
-    button(screen, pygame.Rect(bx, ys + 7*gap, 300, bh), "Profile / Replays", bfont, mouse,
+    button(screen, pygame.Rect(bx, ys + 3*gap, 300, bh), "Foldworks (RTS)", bfont, mouse,
+           enabled=RTS_OK, key="rts")
+    button(screen, pygame.Rect(bx, ys + 4*gap, 300, bh), "Multiplayer (LAN)", bfont, mouse, key="mp")
+    button(screen, pygame.Rect(bx, ys + 5*gap, 300, bh), "Deck Builder", bfont, mouse, key="deck")
+    button(screen, pygame.Rect(bx, ys + 6*gap, 300, bh), "Defenses", bfont, mouse, key="towers")
+    button(screen, pygame.Rect(bx, ys + 7*gap, 300, bh), "Collection", bfont, mouse, key="collection")
+    button(screen, pygame.Rect(bx, ys + 8*gap, 300, bh), "Profile / Replays", bfont, mouse,
            enabled=REPLAY_OK, key="replays")
-    button(screen, pygame.Rect(bx, ys + 8*gap, 300, bh), "Choose Arena", bfont, mouse, key="arena")
-    button(screen, pygame.Rect(bx, ys + 9*gap, 300, bh), "Options", bfont, mouse, key="options")
-    button(screen, pygame.Rect(bx, ys + 10*gap, 300, bh), "Codex / Debug", bfont, mouse, key="debug")
-    button(screen, pygame.Rect(bx, ys + 11*gap, 300, bh), "Quit", bfont, mouse, key="quit")
+    button(screen, pygame.Rect(bx, ys + 9*gap, 300, bh), "Choose Arena", bfont, mouse, key="arena")
+    button(screen, pygame.Rect(bx, ys + 10*gap, 300, bh), "Options", bfont, mouse, key="options")
+    button(screen, pygame.Rect(bx, ys + 11*gap, 300, bh), "Codex / Debug", bfont, mouse, key="debug")
+    button(screen, pygame.Rect(bx, ys + 12*gap, 300, bh), "Quit", bfont, mouse, key="quit")
     menu_vignette(screen)
 
 def make_rock_event(rng=None):
@@ -5758,11 +6300,11 @@ def draw_options(screen, fonts, t, mouse):
                                   60: "60 fps · smooth"}.get(FPS_CAP, f"{FPS_CAP} fps · high-refresh")),
         ("ssample","Supersampling", ("On · crisp (photoreal)" if SUPERSAMPLE else "Off")
                     + ("" if gfx_hi() else " — needs photoreal")),
-        ("bigunits","Bigger pieces", f"On · +{int((BIG_UNITS_SCALE-1)*100)}% units & towers"
-                    if BIG_UNITS else "Off · standard size"),
+        ("piecescale","Piece size", f"{PIECE_SCALE_LABELS[PIECE_SCALE_I % len(PIECE_SCALE_STEPS)]} · tap to enlarge units & towers"),
         ("orient","Layout", "Reflows to your screen — portrait & landscape"),
         ("pausebg","Pause in background", "On — saves battery" if PAUSE_BG else "Off"),
         ("battsave","Battery saver", "On — throttles menus to save power" if BATTERY_SAVER else "Off · full framerate everywhere"),
+        ("sigilbadges","Ability badges", "On — show sigil icons above units" if SIGIL_BADGES else "Off · cleaner board"),
     ]
     for i, (key, name, val) in enumerate(rows):
         r = pygame.Rect(b.centerx + 30, b.top + 150 + i * 52, b.right - (b.centerx + 30) - 44, 46)
@@ -5771,10 +6313,20 @@ def draw_options(screen, fonts, t, mouse):
         pygame.draw.rect(screen, shade(INK, 3.2), r, 2, border_radius=10)
         screen.blit(font.render(name, True, INK), (r.left + 16, r.top + 4))
         screen.blit(sfont.render(val, True, shade(INK, 2.0)), (r.left + 16, r.top + 26))
-        # a little pill toggle on the right
+        # a little pill toggle on the right (piecescale shows its % instead)
         on = (key == "fps" and FPS_CAP != 60) or (key == "orient" and ORIENT_LOCK == "landscape") \
              or (key == "pausebg" and PAUSE_BG) or (key == "ssample" and SUPERSAMPLE) \
-             or (key == "bigunits" and BIG_UNITS) or (key == "battsave" and BATTERY_SAVER)
+             or (key == "battsave" and BATTERY_SAVER) \
+             or (key == "sigilbadges" and SIGIL_BADGES)
+        if key == "piecescale":
+            pill = pygame.Rect(r.right - 78, r.centery - 13, 62, 26)
+            active = PIECE_SCALE_I != 0
+            pygame.draw.rect(screen, GOLD if active else shade(INK, 2.6), pill, border_radius=13)
+            lbl = sfont.render(PIECE_SCALE_LABELS[PIECE_SCALE_I % len(PIECE_SCALE_STEPS)],
+                               True, shade(PAGE, 0.3) if active else PAGE)
+            screen.blit(lbl, (pill.centerx - lbl.get_width() / 2, pill.centery - lbl.get_height() / 2))
+            HOT["toggles"].append((r, key))
+            continue
         pill = pygame.Rect(r.right - 66, r.centery - 13, 50, 26)
         pygame.draw.rect(screen, GOLD if on else shade(INK, 2.6), pill, border_radius=13)
         knob = (pill.right - 13) if on else (pill.left + 13)
@@ -6157,7 +6709,11 @@ _DECK_DRAG = None        # {key,x0,base} while dragging a stack to cycle it
 def _owned_variants(base_key):
     """All owned printings of a base card (standard + any rare variants), as a
     stack ordered standard-first. Falls back to just the base if collection is
-    unavailable. This is what the deck grid cycles through."""
+    unavailable. This is what the deck grid cycles through.
+
+    While a holiday event is active it also offers that event's seasonal skin for
+    EVERY card (built on demand), so players can swipe a card into its themed form
+    and back — available to everyone on the day, no unlock needed."""
     variants = [base_key]
     if COLLECTION_OK:
         try:
@@ -6165,6 +6721,14 @@ def _owned_variants(base_key):
                 if "#" in k and carddata.base_of(k) == base_key:
                     if k not in variants:
                         variants.append(k)
+        except Exception:
+            pass
+    # seasonal skin (event-gated, free for the duration)
+    if SEASONAL_VARIANT_ID and CARDDATA_OK:
+        try:
+            sk = carddata.make_variant(base_key, SEASONAL_VARIANT_ID)
+            if sk not in variants:
+                variants.append(sk)
         except Exception:
             pass
     return variants
@@ -6649,9 +7213,52 @@ def render_trophy(spec, size=180):
 
 # ── Profile / Replays ──────────────────────────────────────────────────────
 REPLAY_LIST = None                 # cached list of saved replays
+REPLAY_CASTER = None               # live auto-caster for the current replay
+REPLAY_CASTER_FOR = None           # which player the caster is bound to
+SHOW_CAST_STORY = True             # show the narration overlay during replays
+try:
+    import caster as castermod
+    CASTER_OK = True
+except Exception:
+    castermod = None
+    CASTER_OK = False
+
+
+def _draw_story_panel(screen, sfont, entries):
+    """Draw the last few auto-caster lines as a story ticker, bottom-left."""
+    lines = entries[-5:]
+    if not lines:
+        return
+    pad = 10
+    wrapped = []
+    for e in lines:
+        txt = e["text"]
+        # simple wrap at ~54 chars
+        while len(txt) > 58:
+            cut = txt.rfind(" ", 0, 58)
+            if cut <= 0: cut = 58
+            wrapped.append((txt[:cut], e["kind"]))
+            txt = txt[cut + 1:]
+        wrapped.append((txt, e["kind"]))
+    wrapped = wrapped[-7:]
+    lh = 18
+    panel_h = lh * len(wrapped) + pad * 2
+    panel_w = 430
+    surf = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+    surf.fill((18, 14, 12, 180))
+    pygame.draw.rect(surf, (200, 168, 96, 160), surf.get_rect(), 1)
+    kindcol = {"summon": (150, 200, 235), "engage": (235, 200, 150),
+               "fall": (230, 150, 140), "open": (200, 200, 200),
+               "close": (200, 180, 120)}
+    for i, (line, kind) in enumerate(wrapped):
+        col = kindcol.get(kind, (222, 214, 198))
+        surf.blit(sfont.render(line, True, col), (pad, pad + i * lh))
+    screen.blit(surf, (24, H - panel_h - 70))
 REPLAY_PLAYER = None               # active ReplayPlayer while viewing
 REPLAY_PLAYING = False             # auto-advance toggle
-REPLAY_SPEED = 1                   # ticks per frame when playing
+REPLAY_SPEED = 1                   # wall-clock playback multiplier (1x/2x/4x/8x)
+REPLAY_ACC = 0.0                   # real-time accumulator (fixed-timestep sim)
+REPLAY_LAST_T = None               # last wall-clock t seen, for frame delta
 
 def _fmt_time(ts):
     try:
@@ -6713,19 +7320,56 @@ def draw_replays(screen, fonts, t, mouse):
 def draw_replay_view(screen, fonts, t, mouse, g_container):
     """Scrub viewer: renders the replayed battle with a timeline scrubber and
     play/pause + speed controls so a player can study any moment."""
-    global REPLAY_PLAYER, REPLAY_PLAYING, REPLAY_SPEED
+    global REPLAY_PLAYER, REPLAY_PLAYING, REPLAY_SPEED, REPLAY_ACC, REPLAY_LAST_T
     font, bfont, sfont = fonts
     HOT.clear()
     player = REPLAY_PLAYER
     if player is None:
+        REPLAY_LAST_T = None
         return
-    # advance if playing
+    # advance on a real-time accumulator so playback speed is independent of how
+    # heavy the current frame is to render. Without this, busy moments (many
+    # units/particles) render slowly and the replay drags, while quiet moments
+    # race ahead — the sim would be paced by frame rate, not wall-clock time.
+    if REPLAY_LAST_T is None:
+        REPLAY_LAST_T = t
+    frame_dt = t - REPLAY_LAST_T
+    REPLAY_LAST_T = t
+    # ignore absurd gaps (first frame after load, tab switch, breakpoints)
+    if frame_dt < 0 or frame_dt > 0.5:
+        frame_dt = 0.0
     if REPLAY_PLAYING and player.cur < player.total:
-        player.step(REPLAY_SPEED)
+        # REPLAY_SPEED is a wall-clock multiplier (1x/2x/4x/8x). Ticks advance at
+        # the same TPS the match was recorded at, paced by GAME_SPEED, so 1x here
+        # equals the original match speed exactly.
+        REPLAY_ACC = min(REPLAY_ACC + frame_dt * GAME_SPEED * REPLAY_SPEED, 0.5)
+        steps = 0
+        while REPLAY_ACC >= DT and player.cur < player.total and steps < 240:
+            player.step(1); REPLAY_ACC -= DT; steps += 1
         if player.cur >= player.total:
             REPLAY_PLAYING = False
+    else:
+        REPLAY_ACC = 0.0
+    # auto-caster: narrate the match as it plays. The caster only READS the game,
+    # so it never disturbs playback. Rebuilt when a new player is attached.
+    global REPLAY_CASTER, REPLAY_CASTER_FOR
+    if CASTER_OK and getattr(player, "g", None) is not None:
+        if REPLAY_CASTER_FOR is not player:
+            try:
+                REPLAY_CASTER = castermod.Caster(
+                    seed=getattr(player.g, "match_seed", 1),
+                    name_of=lambda k: CARDS.get(k, {}).get("name", str(k).title()))
+            except Exception:
+                REPLAY_CASTER = None
+            REPLAY_CASTER_FOR = player
+        if REPLAY_CASTER is not None:
+            try: REPLAY_CASTER.observe(player.g)
+            except Exception: pass
     # render the battle frame from the replayed game
     render(screen, player.g, font, bfont, sfont)
+    # story panel: the last few narration lines, bottom-left, if enabled
+    if SHOW_CAST_STORY and REPLAY_CASTER is not None and REPLAY_CASTER.entries:
+        _draw_story_panel(screen, sfont, REPLAY_CASTER.entries)
     # version banner: if this replay was recorded on a different patch set, warn
     # (an incompatible replay may not reproduce faithfully on this build)
     compat = getattr(player, "compat", "exact")
@@ -7289,6 +7933,24 @@ def main():
     fonts = (font, bfont, sfont)
     set_arena("study")
 
+    # seasonal nudge: if a holiday event is active, offer its themed mode as the
+    # default (the player can still switch to anything). Purely a menu default.
+    if ACTIVE_EVENT and ACTIVE_EVENT.get("default_mode") in MODES:
+        globals()["MODE"] = ACTIVE_EVENT["default_mode"]
+        try:
+            print(f"[event] {ACTIVE_EVENT['name']} {ACTIVE_EVENT.get('emoji','')} — "
+                  f"themed mode: {MODES[MODE]['name']}")
+        except Exception:
+            pass
+    # register the active event's card skin (if any) so the deck builder can offer
+    # swapping cards to/from their seasonal variant
+    globals()["SEASONAL_VARIANT_ID"] = _register_seasonal_variant()
+    if SEASONAL_VARIANT_ID:
+        try:
+            print(f"[event] seasonal card skin available: {SEASONAL_VARIANT_ID}")
+        except Exception:
+            pass
+
     if HEADLESS:
         # headless screenshot mode needs a display surface but no interactivity
         screen = pygame.display.set_mode((W, H))
@@ -7308,6 +7970,19 @@ def main():
         sound.init()
         sound.set_master(VOLUME)
         sound.set_muted(MUTED)
+    # restore accessibility / display preferences
+    if COLLECTION_OK:
+        try:
+            sb = PBCOLLECTION.get_pref("sigil_badges")
+            if isinstance(sb, bool): globals()["SIGIL_BADGES"] = sb
+            bs = PBCOLLECTION.get_pref("battery_saver")
+            if isinstance(bs, bool): globals()["BATTERY_SAVER"] = bs
+            ps = PBCOLLECTION.get_pref("piece_scale_i")
+            if isinstance(ps, int) and 0 <= ps < len(PIECE_SCALE_STEPS):
+                globals()["PIECE_SCALE_I"] = ps
+                globals()["BIG_UNITS"] = ps != 0
+        except Exception:
+            pass
     set_ambient("study")            # menu ambience (the binder's study)
 
     clock = pygame.time.Clock()
@@ -7443,6 +8118,28 @@ def main():
             globals()["_last_input_t"] = t
         for e in raw_events:
             if e.type == pygame.QUIT: running = False
+            elif scene == "rts" and RTS_GAME is not None and flip is None:
+                # Foldworks RTS owns its own input. Translate pointer coords from
+                # the window into canvas space so clicks land where they're drawn.
+                if e.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+                    ce = pygame.event.Event(e.type, {**e.dict, "pos": win_to_canvas(e.pos)})
+                    RTS_GAME.handle_event(ce)
+                elif e.type == pygame.MOUSEWHEEL:
+                    RTS_GAME.handle_event(e)
+                elif e.type in (pygame.FINGERDOWN, pygame.FINGERUP, pygame.FINGERMOTION):
+                    # convert normalized finger coords → window px → canvas space
+                    ww, wh = screen.get_size()
+                    cpos = win_to_canvas((e.x * ww, e.y * wh))
+                    fid = getattr(e, "finger_id", getattr(e, "fingerId", 0))
+                    ce = pygame.event.Event(e.type, {**e.dict, "pos": cpos, "finger_id": fid})
+                    RTS_GAME.handle_event(ce)
+                elif e.type == pygame.KEYDOWN:
+                    if e.key == pygame.K_ESCAPE and RTS_GAME.done:
+                        globals()["RTS_GAME"] = None; scene = "menu"; start_flip("menu")
+                    else:
+                        RTS_GAME.handle_event(e)
+                elif e.type == pygame.QUIT:
+                    running = False
             elif e.type == pygame.VIDEORESIZE:
                 # DO NOT call set_mode() here — doing so re-emits VIDEORESIZE on
                 # several compositors and spins an infinite resize loop (the bug
@@ -7526,6 +8223,12 @@ def main():
                         set_arena(sel_arena); g = Game(deck=DECK[:], local_1v1=True); scene = "battle"; start_flip("battle")
                     elif HOT.get("mp") and HOT["mp"].collidepoint(m):
                         mp_state.update(status="", role=None); scene = "mp"; start_flip("mp")
+                    elif HOT.get("rts") and HOT["rts"].collidepoint(m) and RTS_OK:
+                        globals()["RTS_GAME"] = rtsmod.RTS(dict(
+                            W=W, H=H, font=font, sfont=sfont, bfont=bfont,
+                            draw_unit=None, cards=CARDS, origami=origami,
+                            sfx=sfx))  # opens picker
+                        scene = "rts"; start_flip("rts")
                     elif HOT.get("deck") and HOT["deck"].collidepoint(m): scene = "deck"; start_flip("deck")
                     elif HOT.get("collection") and HOT["collection"].collidepoint(m): scene = "collection"; start_flip("collection")
                     elif HOT.get("towers") and HOT["towers"].collidepoint(m): scene = "towers"; start_flip("towers")
@@ -7630,6 +8333,17 @@ def main():
                                 globals()["BATTERY_SAVER"] = not BATTERY_SAVER
                                 if COLLECTION_OK:
                                     try: PBCOLLECTION.set_pref("battery_saver", BATTERY_SAVER)
+                                    except Exception: pass
+                            elif key == "sigilbadges":
+                                globals()["SIGIL_BADGES"] = not SIGIL_BADGES
+                                if COLLECTION_OK:
+                                    try: PBCOLLECTION.set_pref("sigil_badges", SIGIL_BADGES)
+                                    except Exception: pass
+                            elif key == "piecescale":
+                                globals()["PIECE_SCALE_I"] = (PIECE_SCALE_I + 1) % len(PIECE_SCALE_STEPS)
+                                globals()["BIG_UNITS"] = PIECE_SCALE_I != 0   # keep compat flag
+                                if COLLECTION_OK:
+                                    try: PBCOLLECTION.set_pref("piece_scale_i", PIECE_SCALE_I)
                                     except Exception: pass
                     if HOT.get("mute") and HOT["mute"].collidepoint(m):
                         globals()["MUTED"] = not MUTED
@@ -7811,11 +8525,15 @@ def main():
                                     globals()["REPLAY_PLAYER"] = player
                                     globals()["REPLAY_PLAYING"] = True
                                     globals()["REPLAY_SPEED"] = 1
+                                    globals()["REPLAY_ACC"] = 0.0
+                                    globals()["REPLAY_LAST_T"] = None
                                     scene = "replayview"; start_flip("replayview")
                                 break
                 elif scene == "replayview":
                     if HOT.get("rexit") and HOT["rexit"].collidepoint(m):
                         globals()["REPLAY_PLAYER"] = None
+                        globals()["REPLAY_CASTER"] = None
+                        globals()["REPLAY_CASTER_FOR"] = None
                         scene = "replays"; start_flip("replays")
                     elif HOT.get("playpause") and HOT["playpause"].collidepoint(m):
                         globals()["REPLAY_PLAYING"] = not globals().get("REPLAY_PLAYING", False)
@@ -7825,6 +8543,7 @@ def main():
                         frac = (m[0] - HOT["scrub"].x) / max(1, HOT["scrub"].w)
                         REPLAY_PLAYER.seek(int(frac * REPLAY_PLAYER.total))
                         globals()["REPLAY_PLAYING"] = False
+                        globals()["REPLAY_ACC"] = 0.0
                 elif scene == "collection":
                     if HOT.get("back") and HOT["back"].collidepoint(m): scene = "menu"; start_flip("menu")
                 elif scene == "towers":
@@ -8283,6 +9002,9 @@ def main():
         elif scene == "debug": draw_debug(canvas, fonts, t, mouse)
         elif scene == "replays": draw_replays(canvas, fonts, t, mouse)
         elif scene == "replayview": draw_replay_view(canvas, fonts, t, mouse, None)
+        elif scene == "rts" and RTS_GAME is not None:
+            RTS_GAME.update(dt)
+            RTS_GAME.draw(canvas)
         elif scene == "forest" and forest_ev:
             if forest_ev.get("rock"): draw_rock(canvas, fonts, t, mouse, forest_ev)
             else: draw_forest(canvas, fonts, t, mouse, forest_ev)
@@ -8347,6 +9069,11 @@ def main():
             shsurf.fill((0, 0, 0, 120))
             canvas.blit(shsurf, (wpx, 0))
             if p >= 1.0: flip = None
+
+        # seasonal ambient overlay (snow/leaves/bats…) drawn atop every scene —
+        # display-only, updated on the real-time clock, never touches the sim
+        _update_event_particles(dt)
+        draw_event_overlay(canvas)
 
         # present the reflowed canvas — a plain fit-and-centre; the canvas aspect
         # already matches the window so this fills the screen with no real bars.
