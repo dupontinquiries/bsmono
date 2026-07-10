@@ -89,7 +89,7 @@ impl ChatPanel {
                     Role::Assistant => (Align::Min, ui.visuals().extreme_bg_color, ui.visuals().text_color()),
                 };
                 ui.with_layout(Layout::top_down(align), |ui| {
-                    egui::Frame::none()
+                    egui::Frame::new()
                         .fill(fill)
                         .inner_margin(egui::Margin::symmetric(10, 6))
                         .corner_radius(10)

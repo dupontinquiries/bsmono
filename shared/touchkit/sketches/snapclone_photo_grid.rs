@@ -107,7 +107,7 @@ impl eframe::App for SnapcloneApp {
 
         // ── toolbar ──────────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar")
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("snapclone").color(ACCENT).strong());
@@ -134,7 +134,7 @@ impl eframe::App for SnapcloneApp {
 
         // ── content ──────────────────────────────────────────────────────────
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(PANEL))
+            .frame(egui::Frame::new().fill(PANEL))
             .show(ctx, |ui| {
                 self.draw_grid(ui);
             });
@@ -295,7 +295,7 @@ impl SnapcloneApp {
 // ---- small UI bits ----
 
 fn peer_pill(ui: &mut egui::Ui, dot: egui::Color32, txt: &str) {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(CARD)
         .stroke(egui::Stroke::new(1.0, STROKE))
         .rounding(10.0)

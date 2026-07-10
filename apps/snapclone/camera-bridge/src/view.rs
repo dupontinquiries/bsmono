@@ -598,7 +598,7 @@ impl eframe::App for CameraApp {
 
         // ── render ────────────────────────────────────────────────────────────
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::BLACK))
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let panel_rect = ui.max_rect();
                 if let Some(tex) = &self.texture {
