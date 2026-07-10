@@ -15,14 +15,16 @@ pub struct State {
     pub discovered: Vec<(String, String)>, // (ip, hostname)
     pub discovering: bool,
     pub trusted: Option<bool>, // SSH trust status of the selected host (None = unknown/unchecked)
-    /// Cargo build flags, flipped via a hold-to-open swipe-toggle grid.
+    /// The selected app's cargo features, flipped via a hold-to-open swipe-toggle grid. Populated from
+    /// the app's Cargo.toml when the selection changes; committing writes them back to `selected.features`.
     pub flags: Vec<uikit_egui::toggle_grid::ToggleOption>,
     pub flag_grid: uikit_egui::toggle_grid::ToggleGrid,
+    /// The app name `flags` were loaded for, so we only rescan on a selection change.
+    pub flags_for: String,
 }
 
 impl Default for State {
     fn default() -> Self {
-        use uikit_egui::toggle_grid::ToggleOption as T;
         Self {
             selected: None,
             user: "user".to_string(),
@@ -34,13 +36,9 @@ impl Default for State {
             discovered: Vec::new(),
             discovering: false,
             trusted: None,
-            flags: vec![
-                T::new("release", "release", true),
-                T::new("locked", "locked", true),
-                T::new("offline", "offline", false),
-                T::new("verbose", "verbose", false),
-            ],
-            flag_grid: uikit_egui::toggle_grid::ToggleGrid::new("push-build-flags").columns(2),
+            flags: Vec::new(),
+            flag_grid: uikit_egui::toggle_grid::ToggleGrid::new("push-build-flags").columns(3),
+            flags_for: String::new(),
         }
     }
 }
@@ -140,23 +138,50 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new(&app.push.strategy).color(egui::Color32::from_rgb(0x7a, 0xa2, 0xf7)).small());
     }
 
-    // Build flags — hold the button and swipe across the grid to flip flags, release to confirm.
-    ui.horizontal(|ui| {
-        ui.label("flags");
-        let host = ui.add(egui::Button::new("⚑ hold + swipe"));
-        if let uikit_egui::toggle_grid::ToggleOutcome::Committed(new) =
-            app.push.flag_grid.show(ui, &host, &app.push.flags)
-        {
-            for (id, on) in new {
-                if let Some(f) = app.push.flags.iter_mut().find(|f| f.id == id) {
-                    f.on = on;
+    // Populate the flag grid from the SELECTED app's real cargo features (rescanned on change).
+    if let Some(sel) = &app.push.selected {
+        if app.push.flags_for != sel.name {
+            let toml = std::fs::read_to_string(format!("{}/Cargo.toml", sel.path)).unwrap_or_default();
+            let feats = cockpit::buildflags::scan_cargo_features(&toml);
+            let defaults = cockpit::buildflags::arch_default_features(&toml, &app.push.target);
+            let on_set: std::collections::HashSet<&String> = sel.features.iter().collect();
+            app.push.flags = feats
+                .all
+                .iter()
+                .map(|f| {
+                    // on if the app already enables it, or (no explicit set) it's an arch default
+                    let on = on_set.contains(f) || (sel.features.is_empty() && defaults.contains(f));
+                    uikit_egui::toggle_grid::ToggleOption::new(f.clone(), f.clone(), on)
+                })
+                .collect();
+            app.push.flags_for = sel.name.clone();
+        }
+    }
+
+    // Build features — hold the button and swipe across the grid to flip features, release to confirm.
+    if !app.push.flags.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("features");
+            let host = ui.add(egui::Button::new("⚑ hold + swipe"));
+            if let uikit_egui::toggle_grid::ToggleOutcome::Committed(new) =
+                app.push.flag_grid.show(ui, &host, &app.push.flags)
+            {
+                for (id, on) in &new {
+                    if let Some(f) = app.push.flags.iter_mut().find(|f| &f.id == id) {
+                        f.on = *on;
+                    }
+                }
+                // thread the choice into the build: SuiteApp.features is what the build consumes
+                if let Some(sel) = &mut app.push.selected {
+                    sel.features = new.iter().filter(|(_, on)| *on).map(|(id, _)| id.clone()).collect();
+                    sel.no_default = true; // explicit feature set → don't also pull defaults
                 }
             }
-        }
-        let on: Vec<&str> = app.push.flags.iter().filter(|f| f.on).map(|f| f.label.as_str()).collect();
-        let summary = if on.is_empty() { "(none)".to_string() } else { on.join(" · ") };
-        ui.label(egui::RichText::new(summary).weak().small());
-    });
+            let on: Vec<&str> = app.push.flags.iter().filter(|f| f.on).map(|f| f.label.as_str()).collect();
+            let summary = if on.is_empty() { "(no features)".to_string() } else { on.join(" · ") };
+            ui.label(egui::RichText::new(summary).weak().small());
+        });
+    }
 
     let can = !app.task.is_running() && app.push.selected.is_some() && !app.push.host.trim().is_empty();
     if ui.add_enabled(can, egui::Button::new("Build & push")).clicked() {
