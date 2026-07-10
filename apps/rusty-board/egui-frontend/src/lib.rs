@@ -163,6 +163,37 @@ impl Layout {
         }
     }
 
+    /// An **8-way** cardinal keyboard: like [`Layout::cardinal`] but each key also uses the four
+    /// diagonals (NE/SE/SW/NW), packing digits and punctuation onto the corners MessagEase-style — so
+    /// the whole alphabet plus numbers fit in a 3×3. Exercises the widget's full `Dir8`.
+    pub fn cardinal8() -> Layout {
+        use uikit_egui::slide_menu::Dir8::{E, N, NE, NW, S, SE, SW, W};
+        fn k(center: &str, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
+            Key::new(center).with_cardinal(dirs)
+        }
+        let row = |keys: Vec<Key>| Row { keys, weight: 1.0 };
+        Layout {
+            name: "cardinal8".into(),
+            rows: vec![
+                row(vec![
+                    k("a", &[(N, "A"), (E, "b"), (S, "c"), (W, "d"), (NE, "1"), (SE, "2"), (SW, "3"), (NW, "!")]),
+                    k("n", &[(N, "N"), (E, "f"), (S, "g"), (W, "j"), (NE, "4"), (SE, "5"), (SW, "6"), (NW, "?")]),
+                    k("i", &[(N, "I"), (E, "k"), (S, "l"), (W, "m"), (NE, "7"), (SE, "8"), (SW, "9"), (NW, "@")]),
+                ]),
+                row(vec![
+                    k("h", &[(N, "H"), (E, "p"), (S, "q"), (W, "u"), (NE, "0"), (SE, "#"), (SW, "%"), (NW, "&")]),
+                    k("o", &[(N, "O"), (E, "v"), (S, "w"), (W, "x"), (NE, "("), (SE, ")"), (SW, "-"), (NW, "+")]),
+                    k("r", &[(N, "R"), (E, "y"), (S, "z"), (W, "'"), (NE, "\""), (SE, ":"), (SW, ";"), (NW, "/")]),
+                ]),
+                row(vec![
+                    k("t", &[(N, "T"), (E, ","), (S, "."), (W, "e"), (NE, "s"), (SE, "*"), (SW, "="), (NW, "_")]),
+                    Key::emitting("space", " ", 2.0),
+                    Key::emitting("⌫", "\u{8}", 1.0).with_variants(&["\n"]),
+                ]),
+            ],
+        }
+    }
+
     /// A symbols/numbers layout, reached by swiping the keyboard sideways.
     pub fn symbols() -> Layout {
         fn row(keys: &[&str]) -> Row {
@@ -207,7 +238,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
@@ -438,17 +469,29 @@ mod tests {
     }
 
     #[test]
+    fn cardinal8_uses_all_eight_directions() {
+        use uikit_egui::slide_menu::Dir8::*;
+        let l = Layout::cardinal8();
+        let a = l.rows.iter().flat_map(|r| &r.keys).find(|k| k.emit == "a").unwrap();
+        for d in [N, NE, E, SE, S, SW, W, NW] {
+            assert!(a.cardinal.iter().any(|(dd, _)| *dd == d), "key 'a' should map {d:?}");
+        }
+    }
+
+    #[test]
     fn swipe_switches_layout() {
         let mut b = Board::new();
         assert_eq!(b.current().name, "qwerty");
         b.swipe(1);
         assert_eq!(b.current().name, "symbols");
         b.swipe(1);
-        assert_eq!(b.current().name, "cardinal"); // experimental cardinal keyboard is in the rotation
+        assert_eq!(b.current().name, "cardinal"); // experimental cardinal keyboards are in the rotation
+        b.swipe(1);
+        assert_eq!(b.current().name, "cardinal8");
         b.swipe(1); // wraps back
         assert_eq!(b.current().name, "qwerty");
         b.swipe(-1); // wraps backward to the last layout
-        assert_eq!(b.current().name, "cardinal");
+        assert_eq!(b.current().name, "cardinal8");
     }
 
     #[test]
