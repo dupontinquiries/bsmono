@@ -89,7 +89,22 @@ impl SettingsEditor {
                 }
             }
         });
-        ui.add(Slider::new(&mut self.prefs.touch.text_scale, 0.8..=1.8).text("text size"));
+        // Text size re-scales the whole window, so applying it live makes the slider jump under the
+        // cursor. Draft it during the drag and commit to prefs only on release. Reduced range with
+        // quarter-step detents.
+        {
+            let id = egui::Id::new("bsettings_text_scale_draft");
+            let mut draft: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(self.prefs.touch.text_scale);
+            let resp = ui.add(Slider::new(&mut draft, 0.75..=1.5).step_by(0.25).text("text size"));
+            if resp.dragged() {
+                ui.data_mut(|d| d.insert_temp(id, draft)); // hold in-progress; don't apply yet
+            } else {
+                if resp.drag_stopped() || resp.changed() {
+                    self.prefs.touch.text_scale = draft; // commit on release / click / keyboard
+                }
+                ui.data_mut(|d| d.insert_temp(id, self.prefs.touch.text_scale));
+            }
+        }
         ui.add(Slider::new(&mut self.prefs.touch.button_scale, 0.8..=1.8).text("button size"));
         ui.horizontal_wrapped(|ui| {
             ui.label("handedness:");
