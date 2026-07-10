@@ -11,6 +11,7 @@ netview = { path = "../../shared/netview" }
 # so it builds & tests with NO native/windowing deps. This is the reference path.
 egui = "0.34"
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../shared/settings-kit" }
 
 # The native window/GL shell. Optional so the core compiles anywhere; enable to play.
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
