@@ -91,12 +91,63 @@ pub fn ensure_build_essentials(extra: &[String]) -> Result<String, String> {
 
 /// Detect a CMake project needing a cross toolchain file (informational — the file itself is
 /// project-specific and must exist on-device).
+/// System packages a non-cargo build needs, by build system + package manager (naming differs across
+/// apk/dnf/apt). CMake → cmake; Python → python3 + pip + venv; Node → nodejs + npm; Go → go; Make/Cargo
+/// → none extra (the base essentials cover make + gcc). Pure — unit-tested.
+pub fn build_system_packages(kind: crate::buildsystem::Kind, mgr: crate::pydeps::PkgManager) -> Vec<String> {
+    use crate::buildsystem::Kind;
+    use crate::pydeps::PkgManager as P;
+    let names: &[&str] = match kind {
+        Kind::CMake => &["cmake"],
+        Kind::Python => match mgr {
+            P::Apk => &["python3", "py3-pip", "py3-virtualenv"],
+            P::Dnf => &["python3", "python3-pip", "python3-virtualenv"],
+            P::Apt => &["python3", "python3-pip", "python3-venv"],
+            _ => &["python3"],
+        },
+        Kind::Node => match mgr {
+            P::Apk => &["nodejs", "npm"],
+            _ => &["nodejs", "npm"],
+        },
+        Kind::Go => &["go"],
+        Kind::Make | Kind::Cargo => &[],
+    };
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+/// Ensure the system packages a non-cargo build needs are present, via the host package manager — apk
+/// on Alpine, dnf on Fedora (best-effort apt/pacman/zypper). Non-fatal: logs what it does and continues
+/// so the build still surfaces the real error if a tool is somehow still missing.
+pub fn ensure_build_system_deps(kind: &crate::buildsystem::Kind, path_env: &str, on_line: &mut dyn FnMut(&str)) {
+    if matches!(kind, crate::buildsystem::Kind::Cargo) {
+        return;
+    }
+    let mgr = crate::pydeps::detect_pkg_manager(path_env);
+    let extra = build_system_packages(*kind, mgr);
+    on_line(&format!("ensuring {} build deps via {}", kind.label(), mgr.name()));
+    match ensure_build_essentials(&extra) {
+        Ok(o) if !o.trim().is_empty() => on_line(o.trim()),
+        Ok(_) => {}
+        Err(e) => on_line(&format!("note: couldn't auto-install deps ({e}) — install them manually")),
+    }
+}
+
 pub fn cmake_needs_toolchain_file(app_dir: &Path, target: &str, native: &str) -> bool {
     !target.trim().is_empty() && target != native && app_dir.join("CMakeLists.txt").exists()
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn build_system_packages_map_per_manager() {
+        use crate::buildsystem::Kind;
+        use crate::pydeps::PkgManager as P;
+        assert_eq!(build_system_packages(Kind::CMake, P::Dnf), vec!["cmake"]);
+        assert!(build_system_packages(Kind::Python, P::Apk).contains(&"py3-pip".to_string()));
+        assert!(build_system_packages(Kind::Python, P::Dnf).contains(&"python3-pip".to_string()));
+        assert!(build_system_packages(Kind::Cargo, P::Dnf).is_empty()); // cargo needs no extra pkgs
+    }
+
     use super::*;
 
     #[test]
