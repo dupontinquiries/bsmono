@@ -149,3 +149,22 @@ mod tests {
         }
     }
 }
+
+/// Escape a string for embedding in JSON: quotes, backslashes, newlines and tabs; other control chars
+/// are dropped. One implementation for the whole crate — several had drifted (hf_hub's escaped only
+/// quotes and backslashes and would emit invalid JSON on a newline).
+pub(crate) fn json_esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => {}
+            '\t' => o.push_str("\\t"),
+            c if c.is_control() => {}
+            _ => o.push(c),
+        }
+    }
+    o
+}

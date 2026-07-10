@@ -410,13 +410,7 @@ impl ChatClient {
     }
 }
 
-fn json_esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c { '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"), '\n' => o.push_str("\\n"), '\r' => {}, '\t' => o.push_str("\\t"), c if c.is_control() => {}, _ => o.push(c) }
-    }
-    o
-}
+fn json_esc(s: &str) -> String { crate::util::json_esc(s) }
 
 fn json_get(json: &str, key: &str) -> Option<String> {
     let pat = format!("\"{}\":\"", key);
