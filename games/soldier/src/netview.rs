@@ -13,9 +13,6 @@
 
 use crate::game::Game;
 use serde::Serialize;
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, ToSocketAddrs};
-use std::sync::Arc;
 
 /// A player/enemy as the browser needs it: floor position + hp.
 #[derive(Serialize, Clone, Debug)]
@@ -61,54 +58,6 @@ pub fn snapshot(g: &Game) -> SnapshotView {
             .map(|e| Actor { x: e.pos.x, y: e.pos.y, z: e.pos.z, hp: e.health })
             .collect(),
     }
-}
-
-/// Serve snapshots over TCP. `get` is called per request to read the current state — the app hands a
-/// closure that locks its `Game` (e.g. `move || netview::snapshot(&game.lock())`). Blocks; run it on
-/// a thread. Spectate-only for now: an "action" is acked but not applied (soldier's own input stays
-/// authoritative); wire it through `get`'s owner when input-over-web lands.
-pub fn serve<A, F>(addr: A, get: F) -> std::io::Result<()>
-where
-    A: ToSocketAddrs,
-    F: Fn() -> SnapshotView + Send + Sync + 'static,
-{
-    let get = Arc::new(get);
-    let listener = TcpListener::bind(addr)?;
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let get = Arc::clone(&get);
-        std::thread::spawn(move || {
-            let mut w = match stream.try_clone() {
-                Ok(w) => w,
-                Err(_) => return,
-            };
-            let mut r = BufReader::new(stream);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match r.read_line(&mut line) {
-                    Ok(0) | Err(_) => return, // peer closed
-                    Ok(_) => {}
-                }
-                let cmd = serde_json::from_str::<serde_json::Value>(&line)
-                    .ok()
-                    .and_then(|v| v.get("cmd").and_then(|c| c.as_str()).map(str::to_owned))
-                    .unwrap_or_default();
-                let resp = match cmd.as_str() {
-                    "snapshot" => serde_json::to_string(&get()).unwrap_or_else(|_| "{\"ok\":false}".into()),
-                    "action" => "{\"ok\":true}".into(), // spectate-only for now
-                    _ => "{\"ok\":false,\"err\":\"unknown cmd\"}".into(),
-                };
-                if writeln!(w, "{resp}").is_err() || w.flush().is_err() {
-                    return;
-                }
-            }
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
