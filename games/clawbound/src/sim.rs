@@ -19,6 +19,17 @@ const SCENT_DROP: u32 = 5;      // ticks between scent deposits per moving cat
 const SCENT_DRIFT: f32 = 3.5;   // how fast scent slides downwind (u/s)
 const SCENT_DECAY: f32 = 0.22;  // strength lost per second
 const CLIMB_R: f32 = 3.0;       // reach a trunk to scramble up
+const CLIMB_HEIGHT: f32 = 5.5;  // how high up the trunk a cat gets
+const CLIMB_RATE: f32 = 2.2;    // ascent per second (climb_t 0→1)
+const CLIMB_BASE: f32 = 0.28;   // instant scramble onto the low branches
+const CLIMB_SAFE: f32 = 0.2;    // above this you're out of a ground hunter's reach
+const CLIMB_DRAIN: f32 = 0.22;  // stamina/s spent clinging (net drain vs recovery)
+const DESCEND_RATE: f32 = 3.0;  // how fast climb_t falls when you let go
+const TWIG_SNAP_R: f32 = 0.7;   // step this close to an intact twig and it cracks
+const TWIG_HEAR_R: f32 = 30.0;  // how far a snap carries to the hunter
+const TWIG_SUSPICION: f32 = 0.6; // suspicion a heard snap adds (scaled by nearness)
+const STAGGER_DUR: f32 = 0.9;   // seconds the hunter is dazed by a connecting hit
+const MOVE_REACH: f32 = 3.4;    // how close an attack move connects with the hunter
 const DODGE_DUR: f32 = 0.34;    // i-frame + burst window
 const DODGE_CD: f32 = 1.5;      // cooldown between rolls
 const DODGE_SPEED: f32 = CAT_SPEED * 2.3;
@@ -51,6 +62,17 @@ pub enum Mode { Rendezvous, Survive }
 #[derive(Clone, Copy)]
 pub struct Scent { pub x: f32, pub z: f32, pub strength: f32 }
 
+/// What the player's nose catches on the wind this instant.
+pub struct WindScent {
+    /// The strongest prey scent: (unit dir toward it, distance, strength 0..1), if any.
+    pub prey: Option<(f32, f32, f32, f32)>,
+    pub prey_name: &'static str,
+    /// How strongly the hunter's reek is on the wind (0 = none, 1 = right upwind, close).
+    pub predator_reek: f32,
+    /// Unit wind direction (the way scent drifts).
+    pub wind: (f32, f32),
+}
+
 pub struct Cat {
     pub id: u8,
     pub x: f32, pub z: f32, pub heading: f32,
@@ -61,11 +83,16 @@ pub struct Cat {
     pub leap_t: f32, pub leap_cd: f32, pub leap_dx: f32, pub leap_dz: f32,
     pub carried_t: f32,   // > 0 while the hawk is hoisting this cat aloft
     pub crippled_t: f32,  // > 0 = limping (just broke free of the hawk)
+    pub climb_t: f32,     // 0 = on the ground … 1 = high up the trunk
+    pub speed: f32,       // world units/sec actually travelled this step (for gait)
+    pub snag_t: f32,      // > 0 briefly when a bramble has snagged you in the undergrowth
 }
 
 impl Cat {
     pub fn is_leaping(&self) -> bool { self.leap_t > 0.0 }
     pub fn is_carried(&self) -> bool { self.carried_t > 0.0 }
+    /// Height up the trunk right now, for rendering.
+    pub fn climb_height(&self) -> f32 { self.climb_t * CLIMB_HEIGHT }
     /// Height offset for the leap arc (0 on the ground … peak mid-bound), for rendering.
     pub fn leap_arc(&self) -> f32 {
         if self.leap_t <= 0.0 { return 0.0; }
@@ -95,12 +122,24 @@ pub struct Game {
     pub outcome: Option<Outcome>,
     pub scent: Vec<Scent>,
     pub wind: (f32, f32),
+    pub weather: crate::weather::Weather,
     pub snake_home: Option<(f32, f32)>,
     pub mode: Mode,
     pub shifted: bool,      // Shadow: the afterlife is overlaid on the world (cover stripped)
     pub critters: Vec<crate::ecology::Critter>,
     pub prey_caught: u32,   // ambient critters pounced by the cats
     pub difficulty: f32,    // hunter aggression multiplier (0.8 easy .. 1.25 hard)
+    pub clan: u8,           // the pack's clan — sets climb/sprint/swim/stealth traits
+    pub roster: Vec<(String, crate::lore::Rank)>,  // each cat's name + rank (index-aligned with cats)
+    pub danger: f32,        // 0..1 tension: how close/aware the hunter is to the player
+    pub player_move: Option<(crate::combat::Move, f32)>,  // the player's move in progress + elapsed
+    pub combo_last: Option<(crate::combat::Move, f32)>,   // last finished move + seconds since, for combos
+    pub combo_flash: f32,   // > 0 briefly after a combo lands
+    pub combo_name: &'static str,   // the last combo's name, for the HUD
+    pub hunter_stagger: f32,        // > 0 while the hunter is dazed by a hit
+    pub twigs: Vec<(f32, f32)>,   // intact twigs on the forest floor; snapping one is loud
+    pub logs: Vec<(f32, f32)>,    // fallen logs a running cat bounds over
+    pub noise_flash: f32,   // brief > 0 right after a twig snaps, for feedback
     shift_t: f32,
     teleport_cd: f32,
     input: Option<(u8, f32, f32, bool, bool, bool)>,
@@ -112,27 +151,80 @@ fn dist(ax: f32, az: f32, bx: f32, bz: f32) -> f32 { ((ax - bx).powi(2) + (az - 
 impl Game {
     pub fn new_6v1(kind: Kind) -> Game { Self::new_match(kind, Mode::Rendezvous) }
 
-    pub fn new_match(kind: Kind, mode: Mode) -> Game {
+    pub fn new_match(kind: Kind, mode: Mode) -> Game { Self::new_match_seeded(kind, mode, 0) }
+
+    /// Like `new_match`, but `seed` perturbs the objective choice and the cats' spawn
+    /// scatter so repeat matches aren't identical. `seed == 0` reproduces the legacy
+    /// fixed layout exactly (so determinism and existing tests are unchanged).
+    pub fn new_match_seeded(kind: Kind, mode: Mode, seed: u32) -> Game {
         world::init_world();
         let bushes = world::bush_positions(200);
         let trees = world::tree_positions(120);
         let obj = crate::objectives::place();
-        let objective = (obj[0].x, obj[0].z);
+        let oi = (seed as usize) % obj.len().max(1);
+        let objective = (obj[oi].x, obj[oi].z);
         let mut cats = Vec::new();
         for i in 0..N_CATS {
-            let a = i as f32 / N_CATS as f32 * std::f32::consts::TAU;
-            let (x, z) = (a.cos() * 40.0, a.sin() * 40.0);
-            cats.push(Cat { id: i as u8, x, z, heading: 0.0, alive: true, crouched: false, hidden: false, moving: false, safe: false, climbing: false, stamina: 1.0, dodge_t: 0.0, dodge_cd: 0.0, dodge_dx: 0.0, dodge_dz: 0.0, goal: objective, player: i == 0, leap_t: 0.0, leap_cd: 0.0, leap_dx: 0.0, leap_dz: 0.0, carried_t: 0.0, crippled_t: 0.0 });
+            let mut a = i as f32 / N_CATS as f32 * std::f32::consts::TAU;
+            let mut r = 40.0;
+            if seed != 0 {
+                a += (hashf(seed ^ (i as u32).wrapping_mul(2_654_435_761)) - 0.5) * 0.7;
+                r += (hashf(seed.wrapping_mul(40_503) ^ i as u32) - 0.5) * 18.0;
+            }
+            let (x, z) = (a.cos() * r, a.sin() * r);
+            cats.push(Cat { id: i as u8, x, z, heading: 0.0, alive: true, crouched: false, hidden: false, moving: false, safe: false, climbing: false, stamina: 1.0, dodge_t: 0.0, dodge_cd: 0.0, dodge_dx: 0.0, dodge_dz: 0.0, goal: objective, player: i == 0, leap_t: 0.0, leap_cd: 0.0, leap_dx: 0.0, leap_dz: 0.0, carried_t: 0.0, crippled_t: 0.0, climb_t: 0.0, speed: 0.0, snag_t: 0.0 });
         }
         let snake_home = if matches!(kind, Kind::Snake) && mode == Mode::Rendezvous { world::nearest_water(objective, 130.0) } else { None };
         let (hx, hz) = if mode == Mode::Survive { (34.0, 34.0) } else { snake_home.unwrap_or((objective.0 + 40.0, objective.1 + 40.0)) };
         let hunter = HunterUnit { kind, x: hx, z: hz, heading: 0.0, state: HState::Patrol, suspicion: 0.0, target: None, last_seen: None, carrying: false };
-        let wind = norm(1.0, 0.4);   // a steady prevailing wind
-        let critters = crate::ecology::populate(520, false);
-        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, shift_t: 0.0, teleport_cd: 5.0, input: None }
+        // pick a season from the match layout so a match has a consistent time of year
+        let season = match (objective.0.abs() as u32 + objective.1.abs() as u32 + kind as u32) % 4 {
+            0 => crate::weather::Season::Newleaf, 1 => crate::weather::Season::Greenleaf,
+            2 => crate::weather::Season::LeafFall, _ => crate::weather::Season::LeafBare,
+        };
+        let weather = crate::weather::Weather::new(season);
+        let wind = weather.wind_dir_vec();
+        let prey_n = (520.0 * weather.prey_abundance()) as usize;   // leaner in leaf-bare, plenty in greenleaf
+        let critters = crate::ecology::populate(prey_n.max(120), false);
+        let twigs = world::twig_positions(1400);   // the forest floor a running cat can betray itself on
+        let logs = world::log_positions(110);       // fallen logs to bound over
+        let name_seed = (objective.0.abs() as u32).wrapping_mul(2_654_435_761)
+            ^ (objective.1.abs() as u32).wrapping_mul(40_503) ^ (kind as u32).wrapping_mul(2_246_822_519);
+        let roster = crate::lore::roster(name_seed, crate::lore::Rank::Warrior, N_CATS);
+        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, weather, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, clan: 0, roster, danger: 0.0, player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0, twigs, logs, noise_flash: 0.0, shift_t: 0.0, teleport_cd: 5.0, input: None }
     }
 
     pub fn set_input(&mut self, id: u8, mx: f32, mz: f32, crouch: bool, dodge: bool, leap: bool) { self.input = Some((id, mx, mz, crouch, dodge, leap)); }
+
+    /// Perform a flick move. `dir_local` is the flick in the cat's frame (`.1` forward,
+    /// `.0` right), `mag` its speed, `low` the underbelly modifier. Resolves to a move,
+    /// chains a combo off the last one if it lands in the window, and kicks off the
+    /// movement (pounce/roll/jump reuse the leap/dodge mechanics). No-op if already busy.
+    pub fn player_flick(&mut self, dir_local: (f32, f32), mag: f32, low: bool) {
+        use crate::combat::{combo, resolve_flick, Move, COMBO_WINDOW};
+        if self.player_move.is_some() { return; }
+        let mut mv = match resolve_flick(dir_local, mag, low) { Some(m) => m, None => return };
+        if let Some((prev, since)) = self.combo_last {
+            if since < COMBO_WINDOW {
+                if let Some((name, finisher)) = combo(prev, mv) {
+                    mv = finisher; self.combo_name = name; self.combo_flash = 1.0;
+                }
+            }
+        }
+        let heading = self.cats.iter().find(|c| c.player).map(|c| c.heading).unwrap_or(0.0);
+        let (sh, ch) = (heading.sin(), heading.cos());
+        let (wx, wz) = (dir_local.1 * sh + dir_local.0 * ch, dir_local.1 * ch - dir_local.0 * sh);
+        let (wx, wz) = norm(wx, wz);
+        if let Some(cat) = self.cats.iter_mut().find(|c| c.player && c.alive) {
+            match mv {
+                Move::Pounce => { cat.leap_t = LEAP_DUR; cat.leap_cd = 0.5; cat.leap_dx = wx; cat.leap_dz = wz; }
+                Move::Jump   => { cat.leap_t = LEAP_DUR * 0.6; cat.leap_cd = 0.4; cat.leap_dx = wx * 0.35; cat.leap_dz = wz * 0.35; }
+                Move::Roll | Move::Dodge => { cat.dodge_t = 0.28; cat.dodge_cd = 0.5; cat.dodge_dx = wx; cat.dodge_dz = wz; }
+                _ => {}
+            }
+        }
+        self.player_move = Some((mv, 0.0));
+    }
 
     pub fn step(&mut self, dt: f32) {
         if self.outcome.is_some() { return; }
@@ -151,7 +243,7 @@ impl Game {
                 cat.carried_t -= dt;
                 cat.x += (hx - cat.x) * (dt * 4.0).min(1.0);
                 cat.z += (hz - cat.z) * (dt * 4.0).min(1.0);
-                cat.moving = false; cat.hidden = false; cat.crouched = false; cat.climbing = false;
+                cat.moving = false; cat.hidden = false; cat.crouched = false; cat.climbing = false; cat.climb_t = 0.0;
                 if cat.carried_t <= 0.0 {
                     if hashf(tick ^ (cat.id as u32).wrapping_mul(2_654_435_761)) < BREAK_FREE {
                         cat.crippled_t = CRIPPLE_DUR;    // wrenches free, drops, limps off
@@ -167,7 +259,9 @@ impl Game {
         }
 
         // ── cats ──
+        let ct = crate::clan::trait_of(self.clan);   // the pack's clan-adapted traits
         let bushes = self.bushes.clone();
+        let logs = self.logs.clone();
         let trees = self.trees.clone();
         let hunter_aerial = self.hunter.kind.params().aerial;
         let nearest_bush = |x: f32, z: f32| -> Option<(f32, f32, f32)> {
@@ -202,8 +296,13 @@ impl Game {
                                 _ => want_crouch = true,
                             }
                         }
-                        sprinting = dir.0.abs() + dir.1.abs() > 1e-4 && !cr;
-                        if sprinting { speed = CAT_SPEED * sprint; }
+                        // pace with the danger: amble across safe ground, break into a
+                        // sprint as the hunter closes — a journey of gaits, not one speed.
+                        if dir.0.abs() + dir.1.abs() > 1e-4 && !cr {
+                            let urgency = (1.0 - dh / 26.0).clamp(0.0, 1.0);
+                            speed = CAT_SPEED * (0.45 + 0.67 * urgency) * if can_sprint { 1.0 } else { 0.78 };
+                            sprinting = urgency > 0.45;   // only a real bolt tires you out
+                        }
                     }
                 }
             } else if dh < FLEE_RADIUS {
@@ -270,21 +369,96 @@ impl Game {
             cat.crippled_t = (cat.crippled_t - dt).max(0.0);
             if cat.crippled_t > 0.0 && cat.leap_t <= 0.0 && cat.dodge_t <= 0.0 { speed *= 0.5; }
 
+            // ── clan terrain adaptation: wading is slow (river clans cope far better);
+            //    on open ground the moor runners stretch out. Airborne moves are exempt. ──
+            if cat.leap_t <= 0.0 && cat.dodge_t <= 0.0 {
+                if world::height_at(cat.x, cat.z) < world::WATER_Y { speed *= 0.5 * ct.swim; }
+                else { speed *= 0.85 + 0.15 * ct.sprint; }
+            }
+
+            // ── undergrowth: pushing through thick cover drags at you a little, and now
+            //    and then a trailing bramble snags — a brief tug you have to pull free of.
+            //    Creeping (crouched) slips through clean. ──
+            cat.snag_t = (cat.snag_t - dt).max(0.0);
+            if cat.leap_t <= 0.0 && cat.dodge_t <= 0.0 {
+                let cover = world::cover_at(cat.x, cat.z);
+                if cover > 0.35 && !cat.crouched { speed *= 1.0 - cover * 0.18; }   // brush drags
+                // a snag: rare, only when running through a real thicket
+                if cover > 0.6 && !cat.crouched && cat.snag_t <= 0.0 && sprinting
+                    && hashf(self.tick.wrapping_mul(2_654_435_761) ^ (cat.id as u32).wrapping_mul(0x9e37)) < 0.010 {
+                    cat.snag_t = 0.35;
+                }
+                if cat.snag_t > 0.0 { speed *= 0.45; }   // dragging free of the bramble
+            }
+
             // stamina: sprinting drains, everything else recovers
             cat.stamina = (cat.stamina + if sprinting { -0.32 } else { 0.16 } * dt).clamp(0.0, 1.0);
 
             cat.crouched = want_crouch;
-            cat.climbing = want_climb;
-            let mv = dir.0.abs() + dir.1.abs() > 1e-4 && !want_crouch && !want_climb;
+            // ── climb: scramble up the nearest trunk. You ascend over ~half a second,
+            //    hug the tree, and it costs stamina to cling — run dry and you slip back
+            //    down into a ground hunter's reach, so you can't roost forever. ──
+            // once you've slipped below safe height you need real stamina to commit
+            // again, so an exhausted cat genuinely drops out of the tree for a spell.
+            let can_grab = if cat.climb_t > CLIMB_SAFE { cat.stamina > 0.03 } else { cat.stamina > 0.30 };
+            if want_climb && can_grab {
+                if cat.climb_t < CLIMB_BASE { cat.climb_t = CLIMB_BASE; }   // grab the low branches
+                if let Some((tx, tz)) = nearest_tree(cat.x, cat.z) {         // hug the trunk
+                    let k = (dt * 6.0).min(1.0);
+                    cat.x += (tx - cat.x) * k; cat.z += (tz - cat.z) * k;
+                }
+                cat.climb_t = (cat.climb_t + CLIMB_RATE * ct.climb * dt).min(1.0);
+                cat.stamina = (cat.stamina - CLIMB_DRAIN / ct.climb.max(0.4) * dt).max(0.0);
+                cat.climbing = true;
+            } else {
+                cat.climb_t = (cat.climb_t - DESCEND_RATE * dt).max(0.0);    // let go → slide down
+                cat.climbing = false;
+            }
+            let mv = dir.0.abs() + dir.1.abs() > 1e-4 && !cat.crouched && !cat.climbing;
             if mv {
-                cat.x = (cat.x + dir.0 * speed * dt).clamp(-MAP, MAP);
-                cat.z = (cat.z + dir.1 * speed * dt).clamp(-MAP, MAP);
+                let nx = (cat.x + dir.0 * speed * dt).clamp(-MAP, MAP);
+                let nz = (cat.z + dir.1 * speed * dt).clamp(-MAP, MAP);
+                cat.speed = dist(cat.x, cat.z, nx, nz) / dt.max(1e-4);
+                cat.x = nx; cat.z = nz;
                 cat.heading = dir.0.atan2(dir.1);
+                // bound over a fallen log in the path — a natural little leap when running
+                if cat.leap_t <= 0.0 && cat.leap_cd <= 0.0 && cat.speed > 2.0
+                    && logs.iter().any(|&(lx, lz)| dist(cat.x, cat.z, lx, lz) < 1.5) {
+                    cat.leap_t = LEAP_DUR * 0.7;
+                    cat.leap_cd = 0.7;
+                    cat.leap_dx = dir.0; cat.leap_dz = dir.1;
+                }
+            } else {
+                cat.speed = 0.0;
             }
             cat.moving = mv;
             cat.hidden = cat.crouched && in_bush(cat.x, cat.z);
             // reached the rendezvous → escaped for good (Rendezvous mode only)
-            if mode == Mode::Rendezvous && dist(cat.x, cat.z, objective.0, objective.1) < OBJECTIVE_R { cat.safe = true; cat.moving = false; cat.hidden = false; cat.climbing = false; }
+            if mode == Mode::Rendezvous && dist(cat.x, cat.z, objective.0, objective.1) < OBJECTIVE_R { cat.safe = true; cat.moving = false; cat.hidden = false; cat.climbing = false; cat.climb_t = 0.0; }
+        }
+
+        // ── twig-snap: a cat running (not creeping) through the leaf-litter can crack a
+        //    twig underfoot. It's consumed, and if a hunter is within earshot the sharp
+        //    sound spikes its suspicion and turns it toward the noise. Crouched cats,
+        //    airborne leapers and climbers make none. ──
+        self.noise_flash = (self.noise_flash - dt * 2.0).max(0.0);
+        let movers: Vec<(f32, f32, bool)> = self.cats.iter()
+            .filter(|c| c.alive && !c.safe && c.moving && !c.crouched && c.leap_t <= 0.0 && c.climb_t <= 0.05)
+            .map(|c| (c.x, c.z, c.player)).collect();
+        let mut snapped: Option<(f32, f32)> = None;
+        for (cx, cz, player) in movers {
+            if let Some(idx) = self.twigs.iter().position(|&(tx, tz)| dist(cx, cz, tx, tz) < TWIG_SNAP_R) {
+                self.twigs.swap_remove(idx);
+                if player || snapped.is_none() { snapped = Some((cx, cz)); }
+            }
+        }
+        if let Some((sx, sz)) = snapped {
+            self.noise_flash = 1.0;
+            let hd = dist(self.hunter.x, self.hunter.z, sx, sz);
+            if hd < TWIG_HEAR_R && !self.hunter.carrying {
+                self.hunter.suspicion = (self.hunter.suspicion + TWIG_SUSPICION * (1.0 - hd / TWIG_HEAR_R)).min(1.5);
+                self.hunter.last_seen = Some((sx, sz));   // it snaps its head toward the crack
+            }
         }
 
         // ── scent: moving cats leave a trail that drifts downwind and fades ──
@@ -293,17 +467,50 @@ impl Game {
                 self.scent.push(Scent { x: c.x, z: c.z, strength: 1.0 });
             }
         }
+        // ── weather: evolve wind/sky, then let it shape the scent trails ──
+        self.weather.step(dt);
+        self.wind = self.weather.wind_dir_vec();
+        let drift = SCENT_DRIFT * self.weather.scent_drift_mult();
+        let decay = SCENT_DECAY * self.weather.scent_decay_mult();
         for s in self.scent.iter_mut() {
-            s.x += self.wind.0 * SCENT_DRIFT * dt;
-            s.z += self.wind.1 * SCENT_DRIFT * dt;
-            s.strength -= SCENT_DECAY * dt;
+            s.x += self.wind.0 * drift * dt;
+            s.z += self.wind.1 * drift * dt;
+            s.strength -= decay * dt;
         }
         self.scent.retain(|s| s.strength > 0.05);
+
+        // ── combat moves: advance the player's move, land attacks that stagger the
+        //    hunter (and can wrench you free of a grab), and tick the combo window. ──
+        self.combo_flash = (self.combo_flash - dt * 1.5).max(0.0);
+        self.hunter_stagger = (self.hunter_stagger - dt).max(0.0);
+        if let Some((m, s)) = self.combo_last { let ns = s + dt; self.combo_last = if ns > 1.0 { None } else { Some((m, ns)) }; }
+        if let Some((mv, t)) = self.player_move {
+            let sp = crate::combat::spec(mv);
+            let nt = t + dt;
+            // the hit lands on the frame the move turns active
+            if mv.is_attack() && t < sp.windup && nt >= sp.windup {
+                let pc = self.cats.iter().find(|c| c.player && c.alive).map(|c| (c.x, c.z, c.carried_t > 0.0));
+                if let Some((px, pz, carried)) = pc {
+                    let hd = dist(px, pz, self.hunter.x, self.hunter.z);
+                    if hd < MOVE_REACH && (!self.hunter.carrying || carried) {
+                        let power = if self.combo_flash > 0.0 { sp.power * crate::combat::COMBO_POWER_BONUS } else { sp.power };
+                        self.hunter_stagger = self.hunter_stagger.max(STAGGER_DUR * (0.5 + power * 0.35));
+                        self.hunter.suspicion = (self.hunter.suspicion - 0.35).max(0.0);   // rattled, loses the thread a beat
+                        // a hind-kick or swipe can wrench the player free of the hawk
+                        if carried && matches!(mv, crate::combat::Move::HindKick | crate::combat::Move::UnderbellySwipe) {
+                            self.hunter.carrying = false;
+                            if let Some(c) = self.cats.iter_mut().find(|c| c.player) { c.carried_t = 0.0; c.crippled_t = 1.2; }
+                        }
+                    }
+                }
+            }
+            self.player_move = if nt >= mv.total() { self.combo_last = Some((mv, 0.0)); None } else { Some((mv, nt)) };
+        }
 
         // ── hunter: sight → smell → FSM → pursue → catch ──
         // While the hawk is carrying prey it hovers and hunts no one else, so the
         // entire sensing/pursuit/catch step is skipped until the struggle resolves.
-        if !self.hunter.carrying {
+        if !self.hunter.carrying && self.hunter_stagger <= 0.0 {
         let p = self.hunter.kind.params();
         // Shadow only: the otherworld phases in and out. While shifted, the afterlife
         // is overlaid on the world and cover no longer conceals the living.
@@ -353,7 +560,8 @@ impl Game {
         let has_scent = smelled.is_some();
 
         if let Some((id, cx, cz, _)) = seen_cat {
-            self.hunter.suspicion = (self.hunter.suspicion + dt * 2.4 * self.difficulty).min(1.5);
+            let concealment = 1.0 - world::cover_at(cx, cz) * 0.5;   // half-seen in thick cover
+            self.hunter.suspicion = (self.hunter.suspicion + dt * 2.4 * self.difficulty * self.weather.sight_mult() * concealment).min(1.5);
             self.hunter.last_seen = Some((cx, cz));
             self.hunter.target = Some(id);
         } else if has_scent {
@@ -382,6 +590,12 @@ impl Game {
                 }
             }
         };
+        // stalk: when it's nosing around right where it last had the scent, the hunter
+        // slows to a deliberate creep and casts about — a menacing, patient hunt rather
+        // than a flat sprint. This is where the dread lives.
+        if matches!(self.hunter.state, HState::Search | HState::Track | HState::Alert) && !seen {
+            if dist(hx, hz, goal.0, goal.1) < 12.0 { speed *= 0.4; }
+        }
         // snake: an ambusher. It lurks in its water rather than orbiting, then
         // erupts with a strike-burst when prey strays near the pool.
         if let Some(home) = self.snake_home {
@@ -417,14 +631,14 @@ impl Game {
         // rooted out by proximity scaled by the nose. During the Shadow's shift,
         // cover is stripped so hiders are as catchable as cats in the open.
         let aggressive = self.hunter.state == HState::Chase || self.hunter.suspicion > 0.55;
-        let flush_r = 1.2 + p.smell * 0.035;
+        let flush_r = (1.2 + p.smell * 0.035) * self.difficulty / ct.stealth;   // harder settings root hiders out from further; lurking clans hide tighter
         let is_hawk = matches!(self.hunter.kind, Kind::Hawk);
         let mut grabbed_any = false;
         {
             let (hx, hz) = (self.hunter.x, self.hunter.z);
             for cat in self.cats.iter_mut().filter(|c| c.alive && !c.safe && c.carried_t <= 0.0) {
                 if cat.dodge_t > 0.0 || cat.leap_t > 0.0 { continue; } // rolling or airborne → invulnerable
-                if cat.climbing && !hunter_aerial && !strip { continue; } // up the trunk — safe unless a hawk or the shift reaches it
+                if cat.climb_t > CLIMB_SAFE && !hunter_aerial && !strip { continue; } // high up the trunk — safe unless a hawk or the shift reaches it
                 let d = dist(hx, hz, cat.x, cat.z);
                 let hidden = cat.hidden && !strip;
                 let taken = if hidden { d < flush_r } else { aggressive && d < CATCH_DIST };
@@ -477,10 +691,72 @@ impl Game {
         if resolved >= N_CATS || self.time >= ROUND_LEN {
             self.outcome = Some(if self.caught >= 3 { Outcome::HunterWins } else { Outcome::CatsWin });
         }
+
+        // ── suspense: how much dread the player should feel this instant. Rises with
+        //    the hunter's nearness, weighted by how switched-on it is (a point-blank
+        //    chase pins it near 1; a distant patrol leaves it near 0), and eases so it
+        //    swells and ebbs rather than snapping. Drives the heartbeat/vignette. ──
+        let target = if let Some(pc) = self.cats.iter().find(|c| c.player && c.alive && !c.safe) {
+            let d = dist(pc.x, pc.z, self.hunter.x, self.hunter.z);
+            // freeze and taste the air: a still cat reads the wind farther than a moving one
+            let sense = if pc.moving { 1.0 } else { 1.35 };
+            let prox = (1.0 - d / (40.0 * ct.scent * sense)).clamp(0.0, 1.0);   // keen noses (and stillness) feel the predator sooner
+            let state_w = match self.hunter.state {
+                HState::Chase => 1.0, HState::Alert => 0.7, HState::Track => 0.6, HState::Search => 0.45, HState::Patrol => 0.12,
+            };
+            (prox * (0.4 + 0.6 * state_w) + self.hunter.suspicion.min(1.5) * 0.22).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let ease = (dt * if target > self.danger { 4.0 } else { 1.6 }).min(1.0);   // spikes fast, fades slow
+        self.danger += (target - self.danger) * ease;
     }
 
     pub fn alive_cats(&self) -> usize { self.cats.iter().filter(|c| c.alive).count() }
     pub fn active_cats(&self) -> usize { self.cats.iter().filter(|c| c.alive && !c.safe).count() }
+
+    /// The name of cat `i` (index-aligned with `cats`); empty if out of range.
+    pub fn cat_name(&self, i: usize) -> &str { self.roster.get(i).map(|(n, _)| n.as_str()).unwrap_or("") }
+    /// The biome the rendezvous sits in — the "region" of this match.
+    pub fn region(&self) -> &'static str { world::biome_at(self.objective.0, self.objective.1).name }
+    /// A line of lore for the current region.
+    pub fn region_lore(&self) -> &'static str { crate::lore::region_lore(self.region()) }
+
+    /// Read the wind: what the player's nose catches on the breeze right now. Scent drifts
+    /// *downwind*, so you smell prey and the predator that lie **upwind** of you — approach
+    /// prey from downwind and you'll scent it before it bolts; drop downwind of the hunter
+    /// and its reek warns you early. Keen-nosed clans and a strong wind carry scent farther.
+    pub fn read_wind(&self) -> WindScent {
+        let ct = crate::clan::trait_of(self.clan);
+        let (wx, wz) = self.weather.wind_vec();
+        let wstr = (wx * wx + wz * wz).sqrt().max(0.05);
+        let (wux, wuz) = (wx / wstr, wz / wstr);
+        let mut out = WindScent { prey: None, prey_name: "", predator_reek: 0.0, wind: (wux, wuz) };
+        let pc = match self.cats.iter().find(|c| c.player && c.alive && !c.safe) { Some(c) => c, None => return out };
+
+        // prey: the strongest-smelled critter that lies upwind (its scent blows to you)
+        let mut best = 0.0f32;
+        for cr in &self.critters {
+            let (dx, dz) = (pc.x - cr.x, pc.z - cr.z);   // from prey → you
+            let d = (dx * dx + dz * dz).sqrt();
+            if d < 0.2 { continue; }
+            let align = (dx * wux + dz * wuz) / d;        // 1 = you're straight downwind of it
+            let range = 22.0 * ct.scent * (0.55 + wstr);
+            if align > 0.25 && d < range {
+                let s = (1.0 - d / range) * align;
+                if s > best { best = s; out.prey = Some((-dx / d, -dz / d, d, s)); out.prey_name = cr.species.name(); }
+            }
+        }
+        // the predator's reek, when you're downwind of the hunter
+        let (dx, dz) = (pc.x - self.hunter.x, pc.z - self.hunter.z);
+        let d = (dx * dx + dz * dz).sqrt();
+        if d > 0.2 {
+            let align = (dx * wux + dz * wuz) / d;
+            let range = 55.0 * ct.scent * (0.55 + wstr);
+            if align > 0.0 && d < range { out.predator_reek = ((1.0 - d / range) * align).clamp(0.0, 1.0); }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -596,6 +872,333 @@ mod tests {
         let easy = caught_at(0.82);
         let hard = caught_at(1.22);
         assert!(hard >= easy, "a harder hunter shouldn't catch fewer cats (easy {easy}, hard {hard})");
+    }
+
+    #[test]
+    fn difficulty_widens_the_flush_radius() {
+        // a hidden cat sitting at roughly the normal flush distance: easy leaves it a
+        // margin, hard's wider radius roots it out. Tiny dt so the hunter barely closes.
+        let base = 1.2 + Kind::Badger.params().smell * 0.035;   // flush radius at normal difficulty
+        let flushed = |diff: f32| -> bool {
+            let mut g = Game::new_match(Kind::Badger, Mode::Survive);
+            g.difficulty = diff;
+            g.clan = 2;   // Mossclan (stealth 1.0) so this measures difficulty alone
+            for i in 1..N_CATS { g.cats[i].alive = false; }
+            g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+            g.bushes.clear(); g.bushes.push((0.0, 0.0, 4.0));
+            g.hunter.x = 0.0; g.hunter.z = base;
+            g.hunter.state = HState::Chase; g.hunter.suspicion = 1.4;
+            g.set_input(0, 0.0, 0.0, true, false, false);       // crouch in the bush, hold still
+            g.step(0.001);
+            !g.cats[0].alive
+        };
+        assert!(!flushed(0.82), "easy: a hider just outside normal range stays safe");
+        assert!(flushed(1.22), "hard: the widened flush radius roots the hider out");
+    }
+
+    #[test]
+    fn match_seed_varies_setup_but_zero_is_legacy() {
+        let a = Game::new_match_seeded(Kind::Fox, Mode::Rendezvous, 1);
+        let b = Game::new_match_seeded(Kind::Fox, Mode::Rendezvous, 2);
+        let cats_differ = a.cats[0].x != b.cats[0].x || a.cats[0].z != b.cats[0].z;
+        assert!(cats_differ || a.objective != b.objective, "different seeds should vary the match");
+        // seed 0 must reproduce the legacy fixed layout exactly
+        let z = Game::new_match_seeded(Kind::Fox, Mode::Rendezvous, 0);
+        let legacy = Game::new_match(Kind::Fox, Mode::Rendezvous);
+        assert_eq!(z.cats[0].x, legacy.cats[0].x);
+        assert_eq!(z.cats[3].z, legacy.cats[3].z);
+        assert_eq!(z.objective, legacy.objective);
+    }
+
+    #[test]
+    fn weather_evolves_during_a_match() {
+        let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+        let dir0 = g.weather.wind_dir;
+        let mut gusted = false;
+        for _ in 0..(120 * 30) {
+            g.step(1.0 / 30.0);
+            if g.weather.gust > 0.1 { gusted = true; }
+            assert!(g.weather.total_wind() <= 1.5 && g.weather.wetness <= 1.0, "weather stayed bounded");
+        }
+        assert!((g.weather.wind_dir - dir0).abs() > 1e-3, "the wind should veer over the match");
+        assert!(gusted, "gusts should come and go");
+        let (wx, wz) = g.wind;
+        assert!((wx * wx + wz * wz).sqrt() > 0.5, "the wind is a live unit direction");
+    }
+
+    #[test]
+    fn a_storm_does_not_help_the_hunter() {
+        // a storm both blinds the hunter and scatters scent on the wind, so it should
+        // never catch more than on a clear day (pin the sky each tick to isolate it).
+        let caught = |sky| {
+            let mut g = Game::new_match(Kind::Dog, Mode::Survive);
+            for _ in 0..(90 * 30) {
+                g.weather.sky = sky;
+                if g.outcome.is_some() { break; }
+                g.step(1.0 / 30.0);
+            }
+            g.caught
+        };
+        let clear = caught(crate::weather::Sky::Clear);
+        let storm = caught(crate::weather::Sky::Storm);
+        assert!(storm <= clear, "a storm shouldn't help the hunter (clear {clear}, storm {storm})");
+    }
+
+    #[test]
+    fn climb_is_gradual_hugs_the_trunk_and_costs_stamina() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.trees = vec![(0.0, 0.0)];
+        g.hunter.x = 300.0; g.hunter.z = 300.0;   // keep the hunter out of it
+        g.cats[0].x = 1.6; g.cats[0].z = 0.0; g.cats[0].stamina = 1.0;
+        g.set_input(0, 0.0, 0.0, true, false, false);
+        g.step(1.0 / 30.0);
+        let t1 = g.cats[0].climb_t;
+        for _ in 0..15 { g.set_input(0, 0.0, 0.0, true, false, false); g.step(1.0 / 30.0); }
+        let t2 = g.cats[0].climb_t;
+        assert!(t2 > t1 && t2 <= 1.0, "the cat should climb the trunk over time ({t1:.2} → {t2:.2})");
+        assert!(g.cats[0].x.abs() < 1.4, "climbing should pull the cat onto the trunk");
+        assert!(g.cats[0].stamina < 1.0, "clinging should cost stamina");
+    }
+
+    #[test]
+    fn an_exhausted_cat_slips_out_of_the_tree() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.trees = vec![(0.0, 0.0)];
+        g.hunter.x = 300.0; g.hunter.z = 300.0;
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0; g.cats[0].stamina = 0.06;   // nearly spent
+        let mut slipped = false;
+        for _ in 0..(20 * 30) {
+            g.set_input(0, 0.0, 0.0, true, false, false);   // keep holding on
+            g.step(1.0 / 30.0);
+            if g.cats[0].climb_t <= CLIMB_SAFE { slipped = true; break; }
+        }
+        assert!(slipped, "with no stamina to cling, the cat should drop below safe height");
+    }
+
+    #[test]
+    fn clans_move_to_their_element() {
+        use crate::world;
+        // measure how far a clan's cat travels in one step over a given terrain type
+        let travel = |clan: u8, want_water: bool| -> f32 {
+            let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+            g.clan = clan;
+            g.hunter.x = 400.0; g.hunter.z = 400.0;
+            // find a tile of the wanted terrain
+            let mut spot = None;
+            for i in -80..80 { let (x, z) = (i as f32 * 3.0, 0.0);
+                let wet = world::height_at(x, z) < world::WATER_Y;
+                if wet == want_water { spot = Some((x, z)); break; } }
+            let (sx, sz) = spot.expect("terrain sample");
+            g.cats[0].x = sx; g.cats[0].z = sz;
+            g.set_input(0, 1.0, 0.0, false, false, false);   // run east
+            g.step(1.0 / 30.0);
+            (g.cats[0].x - sx).abs()
+        };
+        // Tideclan (1) outswims Mossclan (2) in the water
+        assert!(travel(1, true) > travel(2, true), "Tideclan should swim faster than Mossclan");
+        // Amberclan (3) outruns Tideclan (1) on open ground
+        assert!(travel(3, false) > travel(1, false), "Amberclan should run faster than Tideclan on land");
+    }
+
+    #[test]
+    fn mossclan_climbs_faster_than_amberclan() {
+        let climb_after = |clan: u8| -> f32 {
+            let mut g = Game::new_6v1(Kind::Fox);
+            g.clan = clan;
+            g.trees = vec![(0.0, 0.0)];
+            g.hunter.x = 400.0; g.hunter.z = 400.0;
+            g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+            for _ in 0..4 { g.set_input(0, 0.0, 0.0, true, false, false); g.step(1.0 / 30.0); }
+            g.cats[0].climb_t
+        };
+        assert!(climb_after(2) > climb_after(3), "Mossclan should scramble up faster than Amberclan");
+    }
+
+    #[test]
+    fn emberclan_hides_tighter_than_amberclan() {
+        // a hidden cat with the hunter creeping in: the stealthy clan gets flushed from
+        // closer, so at a mid distance it survives where a poor-stealth clan is caught.
+        let survives = |clan: u8| -> bool {
+            let mut g = Game::new_match(Kind::Badger, Mode::Survive);
+            g.clan = clan;
+            for i in 1..N_CATS { g.cats[i].alive = false; }
+            g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+            g.bushes.clear(); g.bushes.push((0.0, 0.0, 4.0));
+            let base = 1.2 + Kind::Badger.params().smell * 0.035;
+            g.hunter.x = 0.0; g.hunter.z = base * 0.95;   // just inside the neutral flush range
+            g.hunter.state = HState::Chase; g.hunter.suspicion = 1.4;
+            g.set_input(0, 0.0, 0.0, true, false, false);
+            g.step(0.001);
+            g.cats[0].alive
+        };
+        assert!(survives(0) && !survives(3), "Emberclan should hide tighter than Amberclan");
+    }
+
+    #[test]
+    fn danger_spikes_when_the_hunter_closes_in() {
+        let mut g = Game::new_match(Kind::Dog, Mode::Survive);
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+        // far, idle patrol → little dread
+        for _ in 0..40 {
+            g.hunter.x = 120.0; g.hunter.z = 120.0; g.hunter.state = HState::Patrol; g.hunter.suspicion = 0.0;
+            g.set_input(0, 0.0, 0.0, false, false, false); g.step(1.0 / 30.0);
+        }
+        let far = g.danger;
+        // right on top, chasing (held just out of catch range) → dread pins near 1
+        for _ in 0..40 {
+            g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+            g.hunter.x = 5.0; g.hunter.z = 0.0; g.hunter.state = HState::Chase; g.hunter.suspicion = 1.4;
+            g.set_input(0, 0.0, 0.0, false, false, false); g.step(1.0 / 30.0);
+        }
+        let near = g.danger;
+        assert!(far < 0.25, "a distant patrol should feel calm (danger {far:.2})");
+        assert!(near > far + 0.4 && near > 0.6, "closing in should spike the dread (far {far:.2} → near {near:.2})");
+    }
+
+    #[test]
+    fn the_hunter_creeps_when_it_searches_the_trail() {
+        // the same searching hunter covers far less ground when it's right on the trail's
+        // end (creeping and casting about) than when the trail is far off (running to it).
+        let ground = |near_trail: bool| -> f32 {
+            let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+            for c in g.cats.iter_mut() { c.x = 300.0; c.z = 300.0; }   // nothing in sight
+            g.scent.clear();
+            g.hunter.x = 0.0; g.hunter.z = 0.0;
+            let mut moved = 0.0;
+            for _ in 0..6 {
+                g.hunter.suspicion = 0.5;                              // keep it in the search band
+                g.hunter.state = HState::Search;                       // and actively searching
+                g.hunter.last_seen = Some(if near_trail { (2.0, 0.0) } else { (250.0, 0.0) });
+                let (px, pz) = (g.hunter.x, g.hunter.z);
+                g.step(1.0 / 30.0);
+                moved += dist(px, pz, g.hunter.x, g.hunter.z);
+            }
+            moved
+        };
+        assert!(ground(true) < ground(false) * 0.75, "the hunter should creep near the trail's end ({:.2} vs {:.2})", ground(true), ground(false));
+    }
+
+    #[test]
+    fn keen_nosed_clans_sense_danger_from_further() {
+        // a predator 55 units off is beyond a normal nose but within Fenclan's keen one,
+        // so Fenclan feels the dread where Amberclan (poor nose) stays oblivious.
+        let danger_at = |clan: u8| -> f32 {
+            let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+            g.clan = clan;
+            for _ in 0..40 {
+                g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+                g.hunter.x = 55.0; g.hunter.z = 0.0; g.hunter.state = HState::Track; g.hunter.suspicion = 0.6;
+                g.set_input(0, 0.0, 0.0, false, false, false); g.step(1.0 / 30.0);
+            }
+            g.danger
+        };
+        assert!(danger_at(4) > danger_at(3) + 0.05, "Fenclan should smell the far predator where Amberclan can't ({:.2} vs {:.2})", danger_at(4), danger_at(3));
+    }
+
+    #[test]
+    fn a_running_cat_snaps_a_twig_and_is_heard() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.twigs = vec![(0.6, 0.0)];                    // a twig right in the player's path
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+        g.hunter.x = 10.0; g.hunter.z = 0.0;           // within earshot
+        let s0 = g.hunter.suspicion;
+        g.set_input(0, 1.0, 0.0, false, false, false); // run east, not crouched
+        g.step(1.0 / 30.0);
+        assert!(g.twigs.is_empty(), "the twig should crack underfoot");
+        assert!(g.noise_flash > 0.0, "the snap should register as noise");
+        assert!(g.hunter.suspicion > s0, "a hunter within earshot should hear it");
+    }
+
+    #[test]
+    fn a_crouched_cat_leaves_twigs_intact() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.twigs = vec![(0.4, 0.0)];
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+        g.hunter.x = 300.0; g.hunter.z = 300.0;        // far off, so only the snap could matter
+        g.set_input(0, 1.0, 0.0, true, false, false);  // creep (crouched) east
+        g.step(1.0 / 30.0);
+        assert_eq!(g.twigs.len(), 1, "a careful, crouched cat snaps nothing");
+        assert_eq!(g.noise_flash, 0.0, "and makes no noise");
+    }
+
+    #[test]
+    fn a_running_cat_bounds_over_a_log() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.logs = vec![(2.5, 0.0)];                     // a fallen log just ahead
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0; g.cats[0].leap_cd = 0.0;
+        g.hunter.x = 300.0; g.hunter.z = 300.0;
+        let mut bounded = false;
+        for _ in 0..40 {
+            g.set_input(0, 1.0, 0.0, false, false, false);   // run east across the log
+            g.step(1.0 / 30.0);
+            if g.cats[0].leap_t > 0.0 { bounded = true; break; }
+        }
+        assert!(bounded, "a cat running across a log should bound over it");
+    }
+
+    #[test]
+    fn a_flick_performs_a_move() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.cats[0].heading = 0.0;
+        g.player_flick((0.0, 1.0), 1.0, false);        // forward flick → pounce
+        assert_eq!(g.player_move.map(|(m, _)| m), Some(crate::combat::Move::Pounce));
+        assert!(g.cats[0].leap_t > 0.0, "a pounce should lunge");
+    }
+
+    #[test]
+    fn a_landed_attack_staggers_the_hunter() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.cats[0].x = 0.0; g.cats[0].z = 0.0; g.cats[0].heading = 0.0;
+        g.hunter.x = 2.0; g.hunter.z = 0.0; g.hunter.state = HState::Chase; g.hunter.suspicion = 1.4;
+        g.player_flick((0.1, 0.1), 1.0, false);        // a swat (attack) at point-blank
+        for _ in 0..10 { g.set_input(0, 0.0, 0.0, false, false, false); g.step(1.0 / 30.0); if g.hunter_stagger > 0.0 { break; } }
+        assert!(g.hunter_stagger > 0.0, "a connecting swat should stagger the hunter");
+        assert!(g.cats[0].alive, "and the dazed hunter can't complete the catch");
+    }
+
+    #[test]
+    fn two_moves_chain_into_a_named_combo() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.hunter.x = 300.0; g.hunter.z = 300.0;
+        g.player_flick((1.0, 0.0), 1.0, false);        // a roll
+        for _ in 0..30 { g.set_input(0, 0.0, 0.0, false, false, false); g.step(1.0 / 30.0); if g.player_move.is_none() { break; } }
+        assert!(g.combo_last.is_some(), "the finished roll is available to chain");
+        g.player_flick((0.0, 1.0), 1.0, false);        // pounce within the window
+        assert_eq!(g.combo_name, "Ambush Pounce");
+        assert!(g.combo_flash > 0.0);
+    }
+
+    #[test]
+    fn a_frozen_cat_reads_the_predator_farther() {
+        // stopping to taste the air extends how far off the danger registers, so a still
+        // cat feels a distant predator that a moving one wouldn't.
+        let danger_at = |moving: bool| -> f32 {
+            let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+            for _ in 0..40 {
+                g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+                g.hunter.x = 45.0; g.hunter.z = 0.0; g.hunter.state = HState::Track; g.hunter.suspicion = 0.4;
+                g.set_input(0, if moving { 1.0 } else { 0.0 }, 0.0, false, false, false);
+                g.step(1.0 / 30.0);
+            }
+            g.danger
+        };
+        assert!(danger_at(false) > danger_at(true), "a frozen cat should read the danger more keenly ({:.2} vs {:.2})", danger_at(false), danger_at(true));
+    }
+
+    #[test]
+    fn you_smell_the_predator_that_lies_upwind() {
+        // wind blows toward +x, so a hunter to your west (upwind) drifts its reek to you,
+        // while one to your east (downwind) you can't smell at all.
+        let reek = |hunter_x: f32| -> f32 {
+            let mut g = Game::new_match(Kind::Fox, Mode::Survive);
+            g.weather.wind_dir = std::f32::consts::FRAC_PI_2;   // toward +x
+            g.weather.wind_strength = 0.8; g.weather.gust = 0.0;
+            g.cats[0].x = 0.0; g.cats[0].z = 0.0;
+            g.hunter.x = hunter_x; g.hunter.z = 0.0;
+            g.read_wind().predator_reek
+        };
+        assert!(reek(-30.0) > 0.2, "the hunter's reek should carry downwind to you");
+        assert_eq!(reek(30.0), 0.0, "you can't smell a hunter that sits downwind of you");
     }
 
     #[test]

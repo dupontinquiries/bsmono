@@ -5,8 +5,13 @@ use clawbound_rs::math::{look_at, perspective, v3, Vec3};
 use clawbound_rs::mesh::{rgb, shade, Mesh};
 use wgpu::util::DeviceExt;
 
-const W: u32 = 1100;
-const H: u32 = 680;
+const BASE_W: u32 = 1100;
+const BASE_H: u32 = 680;
+
+/// AAA / high-res mode toggle (env CLAW_HIRES): 2x supersampling + denser geometry.
+fn hires() -> bool { std::env::var("CLAW_HIRES").is_ok() }
+/// Scale a geometry/particle count by the quality setting.
+fn q(n: usize) -> usize { if hires() { (n as f32 * 1.8) as usize } else { n } }
 
 // ── papercraft actors ──────────────────────────────────────────────────────
 fn build_shadow(m: &mut Mesh, at: Vec3) {
@@ -351,6 +356,37 @@ fn build_wildlife() -> (Mesh, Vec3) {
 }
 
 /// Play out a 6-vs-1 match for a few seconds and render the moment.
+/// A row of floating attribute bars above a point, one per clan trait, coloured by
+/// trait (climb=green, sprint=gold, swim=blue, stealth=violet), length ∝ value.
+fn trait_bars(m: &mut Mesh, x: f32, base_y: f32, z: f32, t: &clawbound_rs::clan::ClanTrait) {
+    let rows = [(t.climb, 0x5aa054u32), (t.sprint, 0xd8a53c), (t.swim, 0x3d7fd8), (t.stealth, 0x9a6cff), (t.scent, 0xe08040)];
+    for (i, (v, col)) in rows.iter().enumerate() {
+        let by = base_y - i as f32 * 0.62;
+        m.set_op(0.6); m.boxx(v3(x, by, z), v3(1.25, 0.24, 0.05), rgb(0x1a1a1a)); m.set_op(1.0); // track
+        let f = ((v - 0.6) / 1.05).clamp(0.06, 1.0);          // map ~0.6..1.65 → 0..1
+        m.boxx(v3(x - 1.25 + 1.25 * f, by, z - 0.03), v3(1.25 * f, 0.2, 0.07), rgb(*col));
+    }
+}
+
+/// Showcase: the four clans lined up, each under a floating profile of trait bars.
+fn build_clans() -> (Mesh, Vec3) {
+    use clawbound_rs::clan;
+    let mut m = world::build_terrain(120);
+    m.extend(&world::build_grass(1600));
+    m.extend(&world::build_trees(40));
+    for c in 0..clan::CLAN_COUNT as u8 {
+        let x = (c as f32 - 2.5) * 5.6;
+        let z = 0.0;
+        let gy = world::height_at(x, z);
+        let t = clan::trait_of(c);
+        cat::build(&mut m, v3(x, gy, z), 0.0, &cat::idle(0.2 + c as f32 * 0.3));
+        m.boxx(v3(x, gy + 2.15, z), v3(0.55, 0.2, 0.55), rgb(t.color));   // clan banner
+        trait_bars(&mut m, x, gy + 6.4, z, &t);
+        eprintln!("{} ({}) — {}", t.name, clan::specialty(c), t.home);
+    }
+    (m, v3(0.0, 3.2, 0.0))
+}
+
 fn build_game() -> (Mesh, Vec3) {
     use clawbound_rs::sim::{Game, Mode, Outcome};
     let kind = match std::env::args().nth(4).as_deref() {
@@ -361,21 +397,25 @@ fn build_game() -> (Mesh, Vec3) {
     let mode = match std::env::args().nth(5).as_deref() { Some("survive") => Mode::Survive, _ => Mode::Rendezvous };
     let mut g = Game::new_match(kind, mode);
     for _ in 0..300 { if g.outcome.is_some() { break; } g.step(1.0 / 30.0); }
+    if let Some(sky) = sky_override() { g.weather.sky = sky; }   // CLAW_SKY=rain|snow|storm|fog for headless previews
+    eprintln!("weather: {} ({}), wind {:.2}", g.weather.sky.name(), g.weather.season.name(), g.weather.total_wind());
     let status = match g.outcome { Some(Outcome::CatsWin) => "CATS WIN", Some(Outcome::HunterWins) => "HUNTER WINS", None => "in progress" };
     eprintln!("GAME 6v1 [{}]: active {}  escaped {}  caught {}  susp {:.2}", status, g.active_cats(), g.escaped, g.caught, g.hunter.suspicion);
 
-    let mut m = world::build_trees(150);
-    m.extend(&world::build_bushes(200));
-    m.extend(&world::build_grass(2500));
-    m.extend(&world::build_terrain(150));
-    m.extend(&world::build_reeds(500));
+    let mut m = world::build_trees(q(150));
+    m.extend(&world::build_bushes(q(200)));
+    m.extend(&world::build_logs(q(90)));
+    m.extend(&world::build_grass(q(9000)));
+    m.extend(&world::build_litter(q(4000)));
+    m.extend(&world::build_terrain(if hires() { 240 } else { 150 }));
+    m.extend(&world::build_reeds(q(500)));
     m.extend(&build_critters(&g.critters));      // wildlife scattering from the chase
 
     let mut cx_sum = 0.0; let mut cz_sum = 0.0; let mut n = 0.0;
     for c in g.cats.iter().filter(|c| c.alive) {
         let gy = world::height_at(c.x, c.z);
-        let (yoff, pose) = if c.climbing { (4.2, cat::climb()) } else if c.crouched { (0.0, cat::coil()) } else if c.moving { (0.0, cat::walk((g.tick as f32 * 0.1) % 1.0)) } else { (0.0, cat::stand()) };
-        cat::build(&mut m, v3(c.x, gy + yoff, c.z), 1.0, &pose);
+        let (yoff, pose) = if c.climb_t > 0.01 { (c.climb_height(), cat::climb()) } else if c.crouched { (0.0, cat::coil()) } else if c.moving { (0.0, cat::gait(c.speed, g.tick as f32 * 0.05, c.id as f32 * 0.37)) } else { (0.0, cat::idle(g.tick as f32 * 0.03 + c.id as f32 * 0.3)) };
+        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose);
         cx_sum += c.x; cz_sum += c.z; n += 1.0;
     }
     let hp = g.hunter.kind.params();
@@ -391,7 +431,64 @@ fn build_game() -> (Mesh, Vec3) {
     m.segment(v3(ox, ogy, oz), v3(ox, ogy + 14.0, oz), 0.7, 0.2, 6, rgb(0xffd24a));
     m.set_op(1.0);
 
+    // weather particles around the pack's centre
+    let focus = v3(cx_sum / n, world::height_at(cx_sum / n, cz_sum / n), cz_sum / n);
+    m.extend(&build_weather(&g.weather, 0.4, focus));
+
+    // paw prints pressed into the ground where the pack has trodden (the scent trail)
+    for s in &g.scent {
+        let gy = world::height_at(s.x, s.z);
+        let a = (s.strength * 0.45).clamp(0.0, 0.4);
+        m.set_op(a);
+        m.boxx(v3(s.x, gy + 0.03, s.z), v3(0.1, 0.008, 0.16), rgb(0x37291d));
+        m.set_op(1.0);
+    }
+    m.extend(&build_scent_wisps(&g, 0.4));   // scent made visible on the wind
+
     (m, v3(cx_sum / n, 2.0, cz_sum / n))
+}
+
+/// Worn dirt paths (lanes) drawn as a ribbon of flat discs hugging the terrain.
+fn build_lanes(m: &mut Mesh, lanes: &[(f32, f32, f32, f32)]) {
+    let dirt = rgb(0x8a7550);
+    for &(ax, az, bx, bz) in lanes {
+        let len = ((bx - ax).powi(2) + (bz - az).powi(2)).sqrt();
+        let steps = (len / 3.5).max(1.0) as i32;
+        for s in 0..=steps {
+            let t = s as f32 / steps as f32;
+            let (x, z) = (ax + (bx - ax) * t, az + (bz - az) * t);
+            let gy = world::height_at(x, z);
+            m.cone(v3(x, gy + 0.12, z), 5.2, 0.22, 8, dirt);
+        }
+    }
+}
+
+/// A grand, swaying ancestor tree: tiered canopy on a heavy trunk with flared roots and
+/// an aura ring — gold when claimable, green once it's a claimed staging ground, dim while
+/// its buff is resting on cooldown. `sway` animates the canopy lean.
+fn build_ancestor(m: &mut Mesh, x: f32, z: f32, gy: f32, sway: f32, ready: bool, owner: Option<u8>) {
+    let bark = rgb(0x5b4636);
+    let leaf = if owner.is_some() { rgb(0x93c46f) } else { rgb(0x6f9a54) };
+    m.segment(v3(x, gy, z), v3(x, gy + 13.0, z), 1.7, 1.1, 8, bark);          // trunk
+    for k in 0..6 {                                                           // flared roots
+        let a = k as f32 / 6.0 * std::f32::consts::TAU;
+        m.segment(v3(x, gy + 0.6, z), v3(x + a.cos() * 3.2, gy - 0.4, z + a.sin() * 3.2), 0.8, 0.3, 4, bark);
+    }
+    let (sx, sz) = (sway.sin() * 0.9, (sway * 0.8).cos() * 0.6);              // canopy sway
+    for (i, (h, r)) in [(11.0f32, 8.5f32), (14.5, 6.6), (17.6, 4.3)].iter().enumerate() {
+        let lean = (i as f32 + 1.0) * 0.5;
+        m.cone(v3(x + sx * lean, gy + *h, z + sz * lean), *r, 5.2, 9, leaf);
+    }
+    // aura: the owning clan's colour, gold if it's wild but ready to claim, else dim
+    let (ac, op) = if let Some(c) = owner { (rgb(clawbound_rs::prowl::clan_color(c)), 0.36) }
+        else if ready { (rgb(0xffcf5a), 0.42) } else { (rgb(0x555560), 0.16) };
+    m.set_op(op);
+    for k in 0..40 {                                                          // aura ring
+        let a = k as f32 / 40.0 * std::f32::consts::TAU;
+        let (rx, rz) = (x + a.cos() * 11.0, z + a.sin() * 11.0);
+        m.segment(v3(rx, gy - 0.5, rz), v3(rx, gy + 1.3, rz), 0.32, 0.32, 3, ac);
+    }
+    m.set_op(1.0);
 }
 
 fn build_prowl() -> (Mesh, Vec3) {
@@ -415,6 +512,11 @@ fn build_prowl() -> (Mesh, Vec3) {
         g.step(1.0 / 30.0);
     }
     eprintln!("PROWL [{}]: {}  | prey {}  caught {}  escapes {}", g.class.name(), g.objective_text(), g.prey_caught, g.times_caught, g.escapes);
+    // showcase: stand the prowler at the first ancestor tree (claimed) so the shot frames it
+    if let Some(a) = g.ancestors.first().copied() {
+        g.ancestors[0].claimed_by = Some(0);
+        g.x = a.x + 7.0; g.z = a.z + 3.0; g.heading = 3.6;
+    }
 
     let mut m = world::build_terrain(150);
     m.extend(&world::build_water());
@@ -422,6 +524,7 @@ fn build_prowl() -> (Mesh, Vec3) {
     m.extend(&world::build_grass(2400));
     m.extend(&world::build_reeds(450));
     m.extend(&build_critters(&g.critters));
+    build_lanes(&mut m, &g.lanes);   // worn paths between the staging grounds
 
     // point-of-interest pillars, and a bright beacon on the live objective
     for &(px, pz, _n) in &g.pois {
@@ -451,10 +554,37 @@ fn build_prowl() -> (Mesh, Vec3) {
         m.set_op(1.0);
     }
 
+    // ancestor trees — grand swaying staging grounds
+    for a in &g.ancestors {
+        let gy = world::height_at(a.x, a.z);
+        build_ancestor(&mut m, a.x, a.z, gy, g.time * 1.1 + a.x * 0.05, a.ready(), a.claimed_by);
+    }
+
+    // power-up pickups
+    for (px, pz, kind) in &g.pickups {
+        let gy = world::height_at(*px, *pz) + 1.4;
+        m.boxx(v3(*px, gy, *pz), v3(0.5, 0.5, 0.5), rgb(kind.color()));
+    }
+
+    // clan minions — small cats on border patrol, tinted by clan
+    for mm in &g.minions {
+        let gy = world::height_at(mm.x, mm.z);
+        let pose = cat::walk((g.time * 5.0 + mm.x) % 1.0);
+        cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose);
+        m.boxx(v3(mm.x, gy + 1.3, mm.z), v3(0.28, 0.12, 0.28), rgb(clawbound_rs::prowl::clan_color(mm.clan)));
+    }
+    // rival clan prowlers — full-size clan-tinted cats
+    for rv in &g.rivals {
+        let gy = world::height_at(rv.x, rv.z);
+        let pose = cat::walk((g.time * 5.0 + rv.x) % 1.0);
+        cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose);
+        m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
+    }
+
     // the prowler (player) + a class-tint marker; then the stalking hunter
     let pgy = world::height_at(g.x, g.z);
     let pose = if g.leap_t > 0.0 { cat::leap() } else if g.crouched { cat::coil() } else if g.moving { cat::walk((g.time * 6.0) % 1.0) } else { cat::stand() };
-    cat::build(&mut m, v3(g.x, pgy + g.leap_t.max(0.0) * 2.0, g.z), 1.0, &pose);
+    cat::build(&mut m, v3(g.x, pgy + g.leap_t.max(0.0) * 2.0, g.z), g.heading, &pose);
     m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
 
     let hgy = world::height_at(g.hx, g.hz);
@@ -516,7 +646,7 @@ fn build_capture() -> (Mesh, Vec3) {
     for mob in &g.mobs {
         let gy = world::height_at(mob.x, mob.z);
         let pose = if mob.stunned() { cat::startle() } else { cat::stand() };
-        cat::build(&mut m, v3(mob.x, gy, mob.z), 1.0, &pose);
+        cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose);
         let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
         m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);          // team collar/flag
         m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color)); // class tint
@@ -529,27 +659,140 @@ fn build_capture() -> (Mesh, Vec3) {
 #[cfg(feature = "app")]
 fn build_world_env() -> Mesh {
     world::init_world();
-    let mut m = world::build_terrain(150);
+    let hi = hires();
+    let mut m = world::build_terrain(if hi { 240 } else { 150 });
     m.extend(&world::build_water());
-    m.extend(&world::build_trees(320));
-    m.extend(&world::build_bushes(200));
-    m.extend(&world::build_grass(3500));
-    m.extend(&world::build_rocks(220));
-    m.extend(&world::build_reeds(700));
+    m.extend(&world::build_trees(if hi { 460 } else { 320 }));
+    m.extend(&world::build_bushes(q(200)));
+    m.extend(&world::build_logs(q(110)));
+    m.extend(&world::build_grass(q(11000)));
+    m.extend(&world::build_litter(q(5000)));
+    m.extend(&world::build_rocks(q(220)));
+    m.extend(&world::build_reeds(q(700)));
+    m
+}
+
+/// Deterministic hash → [0,1) for scattering weather particles.
+fn whash(mut h: u32) -> f32 {
+    h ^= h >> 16; h = h.wrapping_mul(0x7feb352d);
+    h ^= h >> 15; h = h.wrapping_mul(0x846ca68b);
+    h ^= h >> 16; (h as f32) / (u32::MAX as f32)
+}
+
+/// Optional weather override for headless renders via the CLAW_SKY env var.
+fn sky_override() -> Option<clawbound_rs::weather::Sky> {
+    use clawbound_rs::weather::Sky;
+    match std::env::var("CLAW_SKY").ok().as_deref() {
+        Some("rain") => Some(Sky::Rain), Some("storm") => Some(Sky::Storm),
+        Some("snow") => Some(Sky::Snow), Some("fog") => Some(Sky::Fog),
+        Some("overcast") => Some(Sky::Overcast), Some("clear") => Some(Sky::Clear),
+        _ => None,
+    }
+}
+
+/// Scent made visible — faint motes drifting downwind. Your own trail fading behind you,
+/// a warm thread from the nearest prey you can smell (follow it upwind to the catch), and
+/// the predator's reek when you're downwind of it (a warning drifting to your nose).
+fn build_scent_wisps(g: &clawbound_rs::sim::Game, t: f32) -> Mesh {
+    use clawbound_rs::mesh::{rgb, Mesh};
+    let mut m = Mesh::new();
+    let (wx, wz) = g.weather.wind_vec();
+    let wstr = (wx * wx + wz * wz).sqrt().max(0.05);
+    let (wux, wuz) = (wx / wstr, wz / wstr);
+    // your own scent trail: pale motes lifting and drifting downwind, fading as it thins
+    for (i, s) in g.scent.iter().enumerate() {
+        let drift = (t * 0.5 + i as f32 * 0.31).rem_euclid(1.0);
+        let a = (s.strength * 0.2 * (1.0 - drift)).clamp(0.0, 0.16);
+        if a < 0.02 { continue; }
+        let (px, pz) = (s.x + wux * drift * 1.6, s.z + wuz * drift * 1.6);
+        let gy = world::height_at(px, pz) + 0.4 + drift * 0.9;
+        m.set_op(a); m.boxx(v3(px, gy, pz), v3(0.09, 0.09, 0.09), rgb(0xbfc8d6)); m.set_op(1.0);
+    }
+    let ws = g.read_wind();
+    // the nearest prey you can smell: a warm thread of scent riding the wind to your nose
+    if let (Some((dx, dz, dist, _)), Some(pc)) = (ws.prey, g.cats.iter().find(|c| c.player && c.alive)) {
+        let (prx, prz) = (pc.x + dx * dist, pc.z + dz * dist);   // prey sits upwind
+        for k in 0..9 {
+            let f = (t * 0.6 + k as f32 * 0.12).rem_euclid(1.0);
+            let (mx, mz) = (prx + wux * f * dist, prz + wuz * f * dist);
+            let gy = world::height_at(mx, mz) + 0.5 + (f * 6.28).sin() * 0.2;
+            m.set_op(0.13 * (1.0 - f)); m.boxx(v3(mx, gy, mz), v3(0.1, 0.1, 0.1), rgb(0xd8b060)); m.set_op(1.0);
+        }
+    }
+    // the predator's reek, drifting to you when you're downwind
+    if ws.predator_reek > 0.05 {
+        for k in 0..7 {
+            let f = (t * 0.72 + k as f32 * 0.16).rem_euclid(1.0);
+            let (mx, mz) = (g.hunter.x + wux * f * 32.0, g.hunter.z + wuz * f * 32.0);
+            let gy = world::height_at(mx, mz) + 0.5 + (f * 6.28 + 1.0).sin() * 0.25;
+            m.set_op(0.13 * ws.predator_reek * (1.0 - f)); m.boxx(v3(mx, gy, mz), v3(0.11, 0.11, 0.11), rgb(0xc05040)); m.set_op(1.0);
+        }
+    }
+    m
+}
+
+/// Rain streaks / snow / storm particles in a column around `focus`, slanted by wind.
+fn build_weather(w: &clawbound_rs::weather::Weather, t: f32, focus: Vec3) -> Mesh {
+    use clawbound_rs::weather::Sky;
+    let mut m = Mesh::new();
+    let (wx, wz) = w.wind_vec();
+    let span = 48.0;
+    match w.sky {
+        Sky::Rain | Sky::Storm => {
+            let n = if w.sky == Sky::Storm { 460 } else { 240 };
+            let col = if w.sky == Sky::Storm { rgb(0x8aa0bc) } else { rgb(0xa6bdd6) };
+            for i in 0..n {
+                let (h, h2) = (whash(i as u32), whash(i as u32 ^ 0x9e37));
+                let x = focus.x + (h - 0.5) * span;
+                let z = focus.z + (h2 - 0.5) * span;
+                let fall = (t * 26.0 + h * 40.0).rem_euclid(24.0);
+                let y = focus.y + 24.0 - fall;
+                let top = v3(x, y + 1.7, z);
+                let bot = v3(x + wx * 0.7, y, z + wz * 0.7);
+                m.segment(top, bot, 0.03, 0.02, 3, col);
+            }
+        }
+        Sky::Snow => {
+            for i in 0..300 {
+                let (h, h2) = (whash(i as u32), whash(i as u32 ^ 0x33a1));
+                let sway = (t * 0.8 + h * 6.28).sin() * 1.3;
+                let x = focus.x + (h - 0.5) * span + sway;
+                let z = focus.z + (h2 - 0.5) * span;
+                let fall = (t * 3.2 + h * 14.0).rem_euclid(14.0);
+                let y = focus.y + 20.0 - fall;
+                m.boxx(v3(x, y, z), v3(0.12, 0.12, 0.12), rgb(0xf2f6ff));
+            }
+        }
+        _ => {}
+    }
     m
 }
 
 #[cfg(feature = "app")]
-fn build_entities(g: &clawbound_rs::sim::Game, phase: f32, show_cone: bool) -> Mesh {
+fn build_entities(g: &clawbound_rs::sim::Game, anim_t: f32, show_cone: bool) -> Mesh {
     let mut m = Mesh::new();
     m.extend(&build_critters(&g.critters));      // ambient wildlife, fleeing the chase
     for c in g.cats.iter().filter(|c| c.alive) {
         let gy = world::height_at(c.x, c.z);
-        let (yoff, pose) = if c.is_carried() { (2.6 + (phase * 6.28).sin() * 0.15, cat::startle()) } // dangling in the talons
+        let off = c.id as f32 * 0.37;                       // per-cat gait offset so they don't march in lockstep
+        let (yoff, pose) = if let Some((mv, t)) = g.player_move.filter(|_| c.player) {
+            let ph = (t / mv.total()).clamp(0.0, 1.0);
+            let air = if matches!(mv, clawbound_rs::combat::Move::Pounce | clawbound_rs::combat::Move::Jump) { c.leap_arc() } else { 0.0 };
+            (air, cat::move_pose(mv, ph))
+        }
+            else if c.is_carried() { (2.6 + (anim_t * 6.28).sin() * 0.15, cat::startle()) } // dangling in the talons
             else if c.is_leaping() { (c.leap_arc(), cat::leap()) }   // airborne bound, arcing over the ground
-            else if c.climbing { (4.2, cat::climb()) }
-            else if c.crouched { (0.0, cat::coil()) } else if c.moving { (0.0, cat::walk(phase)) } else { (0.0, cat::stand()) };
-        cat::build(&mut m, v3(c.x, gy + yoff, c.z), 1.0, &pose);
+            else if c.climb_t > 0.01 { (c.climb_height(), cat::climb()) }
+            else if c.crouched { (0.0, cat::coil()) }
+            else if c.moving {
+                let cover = world::cover_at(c.x, c.z);
+                if cover > 0.42 { (0.0, cat::wade(c.speed, anim_t, off, cover)) }   // pushing through the brush
+                else { (0.0, cat::gait(c.speed, anim_t, off)) }                     // walk → trot → bound by speed
+            }
+            else if c.player && g.danger > 0.35 { (0.0, cat::taste_air(anim_t * 0.9)) }   // frozen, reading the wind
+            else { (0.0, cat::idle(anim_t * 0.6 + off)) };   // breathing idle when standing still
+        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose);
+        m.boxx(v3(c.x, gy + yoff + 1.55, c.z), v3(0.22, 0.1, 0.22), rgb(clawbound_rs::clan::color(g.clan))); // clan collar
     }
     let hp = g.hunter.kind.params();
     let hgy = world::height_at(g.hunter.x, g.hunter.z);
@@ -558,7 +801,7 @@ fn build_entities(g: &clawbound_rs::sim::Game, phase: f32, show_cone: bool) -> M
 
     // floating stamina bar + marker over the player's cat (id 0)
     if let Some(pc) = g.cats.iter().find(|c| c.player && c.alive && !c.safe) {
-        let gy = world::height_at(pc.x, pc.z) + if pc.climbing { 4.2 } else { 0.0 };
+        let gy = world::height_at(pc.x, pc.z) + pc.climb_height();
         let by = gy + 2.7;
         m.boxx(v3(pc.x, by, pc.z), v3(0.36, 0.05, 0.12), rgb(0x232323));       // bar backing
         let s = pc.stamina.clamp(0.0, 1.0);
@@ -569,6 +812,21 @@ fn build_entities(g: &clawbound_rs::sim::Game, phase: f32, show_cone: bool) -> M
     }
     let (ox, oz) = g.objective; let ogy = world::height_at(ox, oz);
     m.set_op(0.9); m.segment(v3(ox, ogy, oz), v3(ox, ogy + 12.0, oz), 0.6, 0.18, 6, rgb(0xffd24a)); m.set_op(1.0);
+
+    // weather: rain / snow / storm particles falling around the player
+    if let Some(pc) = g.cats.iter().find(|c| c.player) {
+        let f = v3(pc.x, world::height_at(pc.x, pc.z), pc.z);
+        m.extend(&build_weather(&g.weather, anim_t, f));
+    }
+    // paw prints in the dirt where the pack has trodden (the scent trail)
+    for s in &g.scent {
+        let gy = world::height_at(s.x, s.z);
+        let a = (s.strength * 0.45).clamp(0.0, 0.4);
+        m.set_op(a);
+        m.boxx(v3(s.x, gy + 0.03, s.z), v3(0.1, 0.008, 0.16), rgb(0x37291d));
+        m.set_op(1.0);
+    }
+    m.extend(&build_scent_wisps(g, anim_t));   // scent made visible, drifting on the wind
     m
 }
 
@@ -620,9 +878,13 @@ fn main() {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn run() {
+    let scale: f32 = if hires() { 1.85 } else { 1.0 };   // supersample for AAA mode (fits a 2048 texture cap)
+    #[allow(non_snake_case)]
+    let (W, H) = ((BASE_W as f32 * scale) as u32, (BASE_H as f32 * scale) as u32);
     let mode = std::env::args().nth(2).unwrap_or_default();
     let (mut scene, focus) = match mode.as_str() {
         "poses" => build_poses(),
+        "clans" => build_clans(),
         "seq" => build_sequence(),
         "senses" => build_senses(),
         "map" => build_scene(),
@@ -660,6 +922,7 @@ async fn run() {
 
     // camera — pose sheet gets a side-on sweep; world gets the hero-tree framing
     let (eye, target) = match mode.as_str() {
+        "clans" => (focus.add(v3(0.0, 8.5, -17.0)), focus.add(v3(0.0, 4.2, 1.0))),
         "poses" => (focus.add(v3(10.0, 4.2, -9.5)), focus.add(v3(-3.0, -0.3, 2.0))),
         "seq" => (focus.add(v3(15.0, 5.5, 1.0)), focus.add(v3(-4.0, 0.0, 6.0))),
         "senses" => (v3(0.0, 78.0, 26.0), v3(0.0, 0.0, 26.0)),
@@ -873,6 +1136,13 @@ fn h21(p: vec2<f32>) -> f32 {
   p3 = p3 + dot(p3, vec3<f32>(p3.y, p3.z, p3.x) + 33.33);
   return fract((p3.x + p3.y) * p3.z);
 }
+// ordered 4x4 Bayer threshold (0..1) at a pixel, for dithering
+fn bayer4(c: vec2<f32>) -> f32 {
+  var m = array<f32,16>(0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0);
+  let x = u32(c.x) & 3u;
+  let y = u32(c.y) & 3u;
+  return (m[y * 4u + x] + 0.5) / 16.0;
+}
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
   let uv = i.uv;
   let nightmare = fx.x; let night = fx.y; let t = fx.z;
@@ -908,11 +1178,24 @@ fn h21(p: vec2<f32>) -> f32 {
     col = col + vec3<f32>(0.06, 0.03, 0.09) * nightmare;                        // faint violet underglow so shapes read
   }
 
+  // ── suspense: a heartbeat that pounds faster and harder as danger (fx.w) rises,
+  //    closing the vignette in on each beat and bleeding the edges red near a catch ──
+  let danger = fx.w;
+  let hr = 3.0 + danger * 6.5;
+  let beat = pow(max(sin(t * hr), 0.0), 6.0);
+  let pulse = danger * (0.35 + 0.65 * beat);
   let d = distance(uv, vec2<f32>(0.5, 0.5));
-  let vig = 0.55 + nightmare * 0.35;                                           // heavier, closing-in vignette in the nightmare
-  col = col * (1.0 - smoothstep(0.5, 0.98, d) * vig);
+  let vig = 0.55 + nightmare * 0.35 + pulse * 0.55;
+  col = col * (1.0 - smoothstep(0.42 - pulse * 0.12, 0.98, d) * vig);
+  let edgeglow = smoothstep(0.44, 0.95, d) * pulse;
+  col = mix(col, vec3<f32>(0.52, 0.06, 0.05), edgeglow * 0.55);
   let ink = vec3<f32>(0.15, 0.11, 0.09);
   col = mix(col, ink, edge * 0.8);
-  return vec4<f32>(col, 1.0);
+  // ordered (Bayer) dithering: quantise the colour along a 4x4 threshold pattern,
+  // which breaks up smooth-gradient banding and lays down a printed-paper texture.
+  let bay = bayer4(px);
+  let levels = 26.0;
+  col = floor(col * levels + (bay - 0.5)) / levels;
+  return vec4<f32>(clamp(col, vec3<f32>(0.0), vec3<f32>(1.0)), 1.0);
 }
 "#;
