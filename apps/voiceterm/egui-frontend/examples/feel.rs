@@ -70,7 +70,7 @@ impl eframe::App for Feel {
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
     app.terminal.feed("$ echo hello\r\nhello\r\n$ ls\r\nfeel.rs  main.rs  Cargo.toml\r\n$ ");
-    let colors = PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
+    let colors = uikit_egui::default_palette();
     eframe::run_native(
         "voiceterm · feel",
         eframe::NativeOptions::default(),

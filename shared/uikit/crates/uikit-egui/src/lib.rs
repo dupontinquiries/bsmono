@@ -42,6 +42,24 @@ pub use skin::Skin;
 pub use livebg::{BgStyle, LiveBackground};
 pub use nav::Nav;
 pub use theme_bridge::{apply_palette, filter_color, PaletteColors};
+
+/// The default palette's egui colours (the first palette in the theme set). Replaces the verbose
+/// `PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]))`
+/// incantation that was copy-pasted into every front-end.
+pub fn default_palette() -> PaletteColors {
+    PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]))
+}
+
+/// The `PaletteColors` for a named palette id, falling back to the default on an unknown name — so a
+/// front-end can honour a `prefs.palette` string without re-implementing the lookup.
+pub fn palette_colors(id: &str) -> PaletteColors {
+    let pid = snapclone_theme::PaletteId::all()
+        .iter()
+        .copied()
+        .find(|p| p.as_str() == id)
+        .unwrap_or_else(|| snapclone_theme::PaletteId::all()[0]);
+    PaletteColors::from_palette(snapclone_theme::palette_for(pid))
+}
 pub use uikit_gesture::{Direction, GestureConfig, Outcome, ReleaseOutcome, TwoTierGesture};
 
 /// Apply the theme + touch parts of cross-app [`settings_kit::Prefs`] to an egui context:
