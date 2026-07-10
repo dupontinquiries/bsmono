@@ -150,6 +150,15 @@ impl Grid {
         }
     }
 
+    /// Clear the visible cells and home the cursor (scrollback is preserved).
+    pub fn clear(&mut self) {
+        for c in &mut self.cells {
+            *c = Cell::default();
+        }
+        self.cur_row = 0;
+        self.cur_col = 0;
+    }
+
     /// Absolute cursor move, 0-based, clamped to the grid.
     pub fn move_to(&mut self, r: usize, c: usize) {
         self.cur_row = r.min(self.rows - 1);
@@ -381,6 +390,26 @@ impl Terminal {
         self.input = command.to_string();
     }
 
+    /// Clear the visible screen (cells + cursor home); scrollback is kept.
+    pub fn clear(&mut self) {
+        self.grid.clear();
+    }
+
+    /// The visible screen as text — one line per row, trailing blank lines trimmed. Used to put the
+    /// screen on the clipboard (the compass "copy" action).
+    pub fn screen_text(&self) -> String {
+        let mut lines: Vec<String> = (0..self.grid.rows).map(|r| self.grid.row_text(r)).collect();
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
+    /// Clear the input line — the ^C / interrupt gesture.
+    pub fn interrupt(&mut self) {
+        self.input.clear();
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.grid.resize(cols, rows);
     }
@@ -544,6 +573,19 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_clear_copy_interrupt() {
+        let mut t = Terminal::new(20, 4);
+        t.feed("hello");
+        t.stage("git status");
+        assert_eq!(t.screen_text(), "hello");
+        assert_eq!(t.input, "git status");
+        t.interrupt();
+        assert_eq!(t.input, ""); // interrupt clears the input line
+        t.clear();
+        assert_eq!(t.screen_text(), ""); // screen cleared
+    }
 
     #[test]
     fn pinch_zooms_font_within_bounds() {
