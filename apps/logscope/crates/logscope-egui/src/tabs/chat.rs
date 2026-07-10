@@ -1692,9 +1692,6 @@ impl Chat {
                 let mut fp = pos.clone();
                 let mut obs: Vec<([f32; 2], [f32; 2], [f32; 2])> = Vec::new(); // (x[lo,hi], z[lo,hi], y[lo,hi])
                 crate::scene3d::with_env(theme::active().name, 0.0, |meshes| {
-                    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-                    for m in meshes { for v in &m.verts { lo[0] = lo[0].min(v.x); lo[2] = lo[2].min(v.z); hi[0] = hi[0].max(v.x); hi[2] = hi[2].max(v.z); } }
-                    let rext = (hi[0] - lo[0]).max(hi[2] - lo[2]).max(1.0);
                     for m in meshes {
                         if m.verts.is_empty() { continue; }
                         let (mut blo, mut bhi) = (m.verts[0], m.verts[0]);
