@@ -85,13 +85,15 @@ pub struct SlideMenu {
     /// menu, the original GestureHost feel); ~`0.3` = long-press (so a quick tap still does the host's
     /// normal action, e.g. typing the key).
     pub hold_secs: f32,
+    /// Minimum swipe distance (px) that counts as a cardinal swipe rather than a tap.
+    pub deadzone: f32,
     state: SlideState,
     id: Id,
 }
 
 impl SlideMenu {
     pub fn new(id_source: impl std::hash::Hash) -> Self {
-        Self { max_cols: 3, item_size: 52.0, spacing: 8.0, hold_secs: 0.0, state: SlideState::default(), id: Id::new(id_source) }
+        Self { max_cols: 3, item_size: 52.0, spacing: 8.0, hold_secs: 0.0, deadzone: 18.0, state: SlideState::default(), id: Id::new(id_source) }
     }
     pub fn columns(mut self, cols: usize) -> Self {
         self.max_cols = cols.max(1);
@@ -194,6 +196,122 @@ fn run(
     SlideOutcome::Idle
 }
 
+/// Eight compass directions for cardinal-swipe (MessagEase-style) keys.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dir8 {
+    N,
+    NE,
+    E,
+    SE,
+    S,
+    SW,
+    W,
+    NW,
+}
+
+impl Dir8 {
+    /// Unit offset for placing this direction's cell around a center (screen space: +y is down).
+    pub fn offset(self) -> Vec2 {
+        const D: f32 = std::f32::consts::FRAC_1_SQRT_2; // 0.707, the diagonal component
+        let (x, y) = match self {
+            Dir8::N => (0.0, -1.0),
+            Dir8::NE => (D, -D),
+            Dir8::E => (1.0, 0.0),
+            Dir8::SE => (D, D),
+            Dir8::S => (0.0, 1.0),
+            Dir8::SW => (-D, D),
+            Dir8::W => (-1.0, 0.0),
+            Dir8::NW => (-D, -D),
+        };
+        Vec2::new(x, y)
+    }
+}
+
+/// Snap a swipe `delta` (screen space, +y down) to a compass direction, or `None` if it's shorter than
+/// `deadzone` — i.e. a tap, not a swipe. Pure — the tested core of cardinal dispatch.
+pub fn swipe_dir8(delta: Vec2, deadzone: f32) -> Option<Dir8> {
+    if delta.length() < deadzone {
+        return None;
+    }
+    // Flip y so "up" is positive; 0deg = E, 90deg = N. Snap to 45deg sectors.
+    let ang = (-delta.y).atan2(delta.x).to_degrees();
+    let a = (ang + 360.0) % 360.0;
+    let sector = (((a + 22.5) / 45.0) as i32) % 8;
+    Some(match sector {
+        0 => Dir8::E,
+        1 => Dir8::NE,
+        2 => Dir8::N,
+        3 => Dir8::NW,
+        4 => Dir8::W,
+        5 => Dir8::SW,
+        6 => Dir8::S,
+        _ => Dir8::SE,
+    })
+}
+
+impl SlideMenu {
+    /// A cardinal-swipe key popup: press shows `tap` at the center with each `dirs` variant floated in
+    /// its compass direction; the live swipe from center highlights a direction; release commits the
+    /// swiped direction's variant, or `tap` when the swipe stayed inside the deadzone (a plain tap).
+    /// State is memory-backed by `id`, so a keyboard can call this per-key without holding a menu.
+    /// Always resolves to a `Selected` (a key press never cancels).
+    pub fn show_cardinal(
+        &self,
+        ui: &mut Ui,
+        id: Id,
+        host: &Response,
+        tap: &SlideOption,
+        dirs: &[(Dir8, SlideOption)],
+    ) -> SlideOutcome {
+        let mut st = ui.ctx().data_mut(|d| d.get_temp::<SlideState>(id).unwrap_or_default());
+        if !st.open && host.is_pointer_button_down_on() {
+            st.open = true;
+            st.origin = host.rect.center();
+        }
+        if !st.open {
+            ui.ctx().data_mut(|d| d.insert_temp(id, st));
+            return SlideOutcome::Idle;
+        }
+        let center = st.origin;
+        let pointer = ui.ctx().pointer_latest_pos().unwrap_or(center);
+        let hot = swipe_dir8(pointer - center, self.deadzone);
+        let radius = self.item_size + 6.0;
+
+        egui::Area::new(id).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ui.ctx(), |ui| {
+            let vis = ui.visuals().clone();
+            let painter = ui.painter();
+            let cr = CornerRadius::same(8);
+            let cell = |painter: &egui::Painter, c: Pos2, label: &str, on: bool| {
+                let rect = Rect::from_center_size(c, Vec2::splat(self.item_size));
+                let fill = if on { vis.selection.bg_fill } else { vis.extreme_bg_color };
+                painter.rect_filled(rect, cr, fill);
+                painter.rect_stroke(rect, cr, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
+                let tc = if on { Color32::WHITE } else { vis.text_color() };
+                painter.text(c, Align2::CENTER_CENTER, label, FontId::proportional(18.0), tc);
+            };
+            // center (tap) is highlighted only when there's no active swipe
+            cell(painter, center, &tap.label, hot.is_none());
+            for (d, opt) in dirs {
+                let c = center + d.offset() * radius;
+                cell(painter, c, &opt.label, hot == Some(*d));
+            }
+        });
+        ui.ctx().request_repaint();
+
+        if ui.input(|i| i.pointer.any_released()) {
+            st.open = false;
+            ui.ctx().data_mut(|d| d.insert_temp(id, st));
+            let chosen = hot
+                .and_then(|d| dirs.iter().find(|(dd, _)| *dd == d))
+                .map(|(_, o)| o.id.clone())
+                .unwrap_or_else(|| tap.id.clone());
+            return SlideOutcome::Selected(chosen);
+        }
+        ui.ctx().data_mut(|d| d.insert_temp(id, st));
+        SlideOutcome::Idle
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +344,23 @@ mod tests {
         assert_eq!(hit(egui::pos2(85.0, 85.0), &cells), Some(3));
         assert_eq!(hit(egui::pos2(55.0, 5.0), &cells), None); // in the gutter between columns
         assert_eq!(hit(egui::pos2(500.0, 500.0), &cells), None);
+    }
+
+    #[test]
+    fn swipe_dir8_snaps_cardinals_and_ignores_taps() {
+        assert_eq!(swipe_dir8(Vec2::new(0.0, -30.0), 18.0), Some(Dir8::N)); // up
+        assert_eq!(swipe_dir8(Vec2::new(30.0, 0.0), 18.0), Some(Dir8::E));
+        assert_eq!(swipe_dir8(Vec2::new(0.0, 30.0), 18.0), Some(Dir8::S)); // down
+        assert_eq!(swipe_dir8(Vec2::new(-30.0, 0.0), 18.0), Some(Dir8::W));
+        assert_eq!(swipe_dir8(Vec2::new(25.0, -25.0), 18.0), Some(Dir8::NE));
+        assert_eq!(swipe_dir8(Vec2::new(5.0, 5.0), 18.0), None); // inside deadzone → a tap
+    }
+
+    #[test]
+    fn dir_offsets_point_the_right_way() {
+        assert!(Dir8::N.offset().y < 0.0); // up
+        assert!(Dir8::S.offset().y > 0.0); // down
+        assert!(Dir8::E.offset().x > 0.0);
+        assert!(Dir8::W.offset().x < 0.0);
     }
 }

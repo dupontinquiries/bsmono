@@ -20,21 +20,29 @@ pub struct Key {
     /// Long-press alternates (accents, symbols); empty = no popup. Surfaced via the shared
     /// `uikit_egui::slide_menu` gesture grid on a hold.
     pub variants: Vec<String>,
+    /// Cardinal-swipe variants (MessagEase-style): tap emits `emit`, a swipe in a compass direction
+    /// emits that direction's string. Empty = a plain key. Surfaced via `slide_menu::show_cardinal`.
+    pub cardinal: Vec<(uikit_egui::slide_menu::Dir8, String)>,
 }
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new() }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new() }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new() }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new(), cardinal: Vec::new() }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new() }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new(), cardinal: Vec::new() }
     }
     /// Attach long-press variant characters (each emits itself).
     pub fn with_variants(mut self, vs: &[&str]) -> Key {
         self.variants = vs.iter().map(|s| s.to_string()).collect();
+        self
+    }
+    /// Attach cardinal-swipe variants: `(direction, emitted string)` pairs. Tap still emits `emit`.
+    pub fn with_cardinal(mut self, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
+        self.cardinal = dirs.iter().map(|(d, s)| (*d, s.to_string())).collect();
         self
     }
 }
@@ -115,6 +123,46 @@ impl Layout {
         }
     }
 
+    /// An experimental MessagEase-style **cardinal** keyboard: a 3×3 of high-frequency letters where a
+    /// tap types the center and a swipe in a compass direction types that direction's variant. This is
+    /// the flagship user of the shared `slide_menu::show_cardinal` gesture. Reached like any other
+    /// layout (swipe the board sideways to cycle to it).
+    pub fn cardinal() -> Layout {
+        use uikit_egui::slide_menu::Dir8::{E, N, S, W};
+        fn k(center: &str, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
+            Key::new(center).with_cardinal(dirs)
+        }
+        let row = |keys: Vec<Key>| Row { keys, weight: 1.0 };
+        Layout {
+            name: "cardinal".into(),
+            rows: vec![
+                row(vec![
+                    k("e", &[(N, "E"), (W, "b"), (S, "v"), (E, "g")]),
+                    k("t", &[(N, "T"), (W, "c"), (S, "x"), (E, "k")]),
+                    k("a", &[(N, "A"), (W, "d"), (S, "z"), (E, "q")]),
+                ]),
+                row(vec![
+                    k("o", &[(N, "O"), (W, "f"), (S, "j")]),
+                    k("i", &[(N, "I"), (W, "p"), (S, "y")]),
+                    k("n", &[(N, "N"), (W, "m"), (S, "w")]),
+                ]),
+                row(vec![
+                    k("s", &[(N, "S"), (W, "l"), (E, "u")]),
+                    k("h", &[(N, "H"), (S, ".")]),
+                    k("r", &[(N, "R"), (E, ",")]),
+                ]),
+                Row {
+                    keys: vec![
+                        Key::emitting("⌫", "\u{8}", 1.5),
+                        Key::emitting("space", " ", 4.0),
+                        Key::emitting("⏎", "\n", 1.5),
+                    ],
+                    weight: 1.0,
+                },
+            ],
+        }
+    }
+
     /// A symbols/numbers layout, reached by swiping the keyboard sideways.
     pub fn symbols() -> Layout {
         fn row(keys: &[&str]) -> Row {
@@ -159,7 +207,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
@@ -249,6 +297,22 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors)
         text_color,
     );
     let _ = gutter;
+    // Cardinal-swipe key (MessagEase-style): tap emits `emit`, a swipe in a compass direction emits
+    // that direction's variant. `show_cardinal` resolves tap-vs-swipe, so no separate click handling.
+    if !key.cardinal.is_empty() {
+        let id = ui.id().with(("keycard", &key.label, rect.min.x as i32, rect.min.y as i32));
+        let tap = uikit_egui::slide_menu::SlideOption::new(key.emit.clone(), key.label.clone());
+        let dirs: Vec<(uikit_egui::slide_menu::Dir8, uikit_egui::slide_menu::SlideOption)> = key
+            .cardinal
+            .iter()
+            .map(|(d, s)| (*d, uikit_egui::slide_menu::SlideOption::new(s.clone(), s.clone())))
+            .collect();
+        let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
+        if let uikit_egui::slide_menu::SlideOutcome::Selected(v) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
+            return Some(v);
+        }
+        return None;
+    }
     // Long-press → variant grid via the shared gesture widget; a quick tap still types the key.
     if !key.variants.is_empty() {
         let id = ui.id().with(("keyvar", &key.label, rect.min.x as i32, rect.min.y as i32));
@@ -364,15 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn cardinal_layout_exposes_swipe_variants() {
+        let l = Layout::cardinal();
+        let with_card = l.rows.iter().flat_map(|r| &r.keys).filter(|k| !k.cardinal.is_empty()).count();
+        assert!(with_card >= 9, "the 3x3 letters should carry cardinal variants, got {with_card}");
+        // 'e' taps to "e" and swipes north to "E"
+        let e = l.rows.iter().flat_map(|r| &r.keys).find(|k| k.emit == "e").unwrap();
+        assert!(e.cardinal.iter().any(|(d, s)| matches!(d, uikit_egui::slide_menu::Dir8::N) && s == "E"));
+    }
+
+    #[test]
     fn swipe_switches_layout() {
         let mut b = Board::new();
         assert_eq!(b.current().name, "qwerty");
         b.swipe(1);
         assert_eq!(b.current().name, "symbols");
+        b.swipe(1);
+        assert_eq!(b.current().name, "cardinal"); // experimental cardinal keyboard is in the rotation
         b.swipe(1); // wraps back
         assert_eq!(b.current().name, "qwerty");
-        b.swipe(-1);
-        assert_eq!(b.current().name, "symbols");
+        b.swipe(-1); // wraps backward to the last layout
+        assert_eq!(b.current().name, "cardinal");
     }
 
     #[test]
