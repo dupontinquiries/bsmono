@@ -624,7 +624,7 @@ const PERSONAS: &[(&str, &str, &str)] = &[
     ("longhorizon", "Long-horizon engineer", LONG_HORIZON),
     ("logscope", "Logscope · quick log fix", BASE_SYSTEM),
 ];
-#[allow(dead_code)] // router seam (next): pick a persona by key
+/// Look up a persona's full system prompt by key (the status-bar persona popup switches with this).
 fn persona_by_key(key: &str) -> Option<&'static str> { PERSONAS.iter().find(|p| p.0 == key).map(|p| p.2) }
 
 /// Which subpage the right sidebar shows. The sidebar consolidates the per-conversation panels
@@ -4062,17 +4062,46 @@ impl Chat {
                         if let Some(f) = self.walk_focus {
                             ui.label(RichText::new(format!("turn {}/{}", f + 1, self.msgs.len())).color(theme::DIM()).small());
                         }
-                        // long-horizon: which system persona is steering replies (invisible until now)
-                        ui.label(RichText::new(self.active_persona_label()).color(theme::FAINT()).small())
-                            .on_hover_text("active system persona — edit it on the Context page");
-                        // live activity HUD: a running fan/queue/stream stays visible (with a stop control)
-                        // instead of flashing once through self.note and getting overwritten mid-fan.
+                        // long-horizon: the active system persona — now click-to-switch inline (was edit-only
+                        // on the Context page). Switching sets self.context via the persona_by_key seam.
+                        let pbtn = ui.small_button(RichText::new(self.active_persona_label()).color(theme::FAINT()).small())
+                            .on_hover_text("system persona steering replies — click to switch");
+                        let ppid = ui.make_persistent_id("persona_popup");
+                        if pbtn.clicked() { ui.memory_mut(|m| m.toggle_popup(ppid)); }
+                        egui::popup_below_widget(ui, ppid, &pbtn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                            ui.set_min_width(210.0);
+                            ui.label(RichText::new("system persona").color(theme::DIM()).small());
+                            for (key, title, _) in PERSONAS {
+                                let active = self.active_persona_label() == *title;
+                                if ui.selectable_label(active, RichText::new(*title).small()).on_hover_text(*key).clicked() {
+                                    if let Some(body) = persona_by_key(key) { self.context = body.to_string(); }
+                                }
+                            }
+                        });
+                        // fan commands, surfaced in the GUI: a live HUD + stop while work is in flight, else a
+                        // launcher so the frontier can be fanned without dropping to the `:` cmdline.
                         if let Some(act) = self.activity_status() {
                             if ui.small_button("⏹").on_hover_text("stop — clear the queue and cancel the fan (:stop)").clicked() {
                                 let n = self.queue.len(); self.queue.clear(); self.fan = None;
                                 self.note = format!("stopped — cleared {n} queued, fan cancelled");
                             }
                             ui.label(RichText::new(act).color(theme::CYAN()).small().strong());
+                        } else if !self.msgs.is_empty() {
+                            use crate::vimmode::Command;
+                            let fbtn = ui.small_button(RichText::new("⑃ fan").color(theme::DIM()).small())
+                                .on_hover_text("fan the frontier — continue or fuzz every leaf (:ca · :fa · :fuzz)");
+                            let fpid = ui.make_persistent_id("fan_popup");
+                            if fbtn.clicked() { ui.memory_mut(|m| m.toggle_popup(fpid)); }
+                            let mut launch: Option<Command> = None;
+                            egui::popup_below_widget(ui, fpid, &fbtn, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                ui.set_min_width(220.0);
+                                ui.label(RichText::new("fan the frontier").color(theme::DIM()).small());
+                                if ui.selectable_label(false, RichText::new("continue every leaf").small()).on_hover_text(":ca").clicked() { launch = Some(Command::ContinueAll(1)); }
+                                if ui.selectable_label(false, RichText::new("continue · depth 3").small()).on_hover_text(":3ca").clicked() { launch = Some(Command::ContinueAll(3)); }
+                                if ui.selectable_label(false, RichText::new("fuzz ×8 (this turn)").small()).on_hover_text(":fuzz 8 — needs composer text").clicked() { launch = Some(Command::Fuzz(8)); }
+                                if ui.selectable_label(false, RichText::new("fuzzy-all ×4").small()).on_hover_text(":fa 4").clicked() { launch = Some(Command::FuzzyAll { depth: 1, width: 4, template: String::new() }); }
+                            });
+                            if let Some(cmd) = launch { self.run_command(cmd, ui); }
                         }
                     });
                 }
@@ -5401,6 +5430,17 @@ mod tests {
         let mut c2 = Chat::default();
         c2.context = "You are a haiku bot.".into();
         assert_eq!(c2.active_persona_label(), "custom · system");
+    }
+
+    #[test]
+    fn persona_switch_round_trips_through_the_badge() {
+        // the status-bar popup switches persona with persona_by_key(key); the badge then reflects it
+        let mut c = Chat::default();
+        for (key, title, _) in PERSONAS {
+            c.context = persona_by_key(key).expect("known key resolves").to_string();
+            assert_eq!(c.active_persona_label(), *title, "badge follows the picked persona: {key}");
+        }
+        assert!(persona_by_key("nope").is_none(), "unknown key → None");
     }
 
     #[test]
