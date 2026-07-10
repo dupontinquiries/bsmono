@@ -71,7 +71,7 @@ impl Dashboard {
     /// Render the dashboard. Swipe left/right pages between views; on desktop a tab row is
     /// also shown (adaptive — the phone relies on the swipe).
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
-        let colors = PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
+        let colors = uikit_egui::default_palette();
 
         // swipe paging via the shared gesture layer
         let surface = ui.available_rect_before_wrap();

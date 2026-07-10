@@ -61,7 +61,7 @@ impl SettingsEditor {
     /// changed). The caller publishes them via `bigsilicon_client::Settings::set` and calls
     /// `mark_published`.
     pub fn ui(&mut self, ui: &mut Ui, _adaptive: &Adaptive) -> Vec<(String, String)> {
-        let colors = PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
+        let colors = uikit_egui::default_palette();
         self.a11y.begin_frame();
 
         if self.page == Page::Voice {
