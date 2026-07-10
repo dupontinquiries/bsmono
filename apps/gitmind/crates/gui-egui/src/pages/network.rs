@@ -138,6 +138,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if !lines.is_empty() || !app.net.streaming_name.is_empty() {
         ui.add_space(6.0);
         egui::ScrollArea::vertical()
+            .id_salt("netlog")
             .max_height(180.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
