@@ -18,24 +18,36 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 pub mod theme {
     use egui::Color32;
     use snapclone_theme::{Palette, MODERN};
+    use std::sync::RwLock;
 
-    pub const PALETTE: &Palette = &MODERN;
+    // The active palette. Set from the user's cross-app `settings_kit::Prefs` (via `install_prefs`) so
+    // the HUD painters, egui Visuals, and any widgets all share ONE palette — the user's choice, not a
+    // hardcode. Defaults to MODERN until prefs are applied.
+    static ACTIVE: RwLock<&'static Palette> = RwLock::new(&MODERN);
+
+    pub fn set_palette(p: &'static Palette) {
+        if let Ok(mut g) = ACTIVE.write() {
+            *g = p;
+        }
+    }
+    /// The palette the HUD paints from (see `dim()` etc.).
+    pub fn palette() -> &'static Palette {
+        ACTIVE.read().map(|g| *g).unwrap_or(&MODERN)
+    }
 
     pub fn c(hex: &str) -> Color32 {
         let [r, g, b] = snapclone_theme::rgb(hex);
         Color32::from_rgb(r, g, b)
     }
 
-    /// Apply the palette to egui's global Visuals (used by both the eframe app path and the wgpu
-    /// gpu_egui overlay), so any egui-widget chrome matches the HUD.
-    pub fn apply_visuals(ctx: &egui::Context) {
-        let mut v = egui::Visuals::dark();
-        v.override_text_color = Some(c(PALETTE.text_primary));
-        v.panel_fill = c(PALETTE.bg_base);
-        v.window_fill = c(PALETTE.bg_raised);
-        v.extreme_bg_color = c(PALETTE.bg_deep);
-        v.hyperlink_color = c(PALETTE.accent);
-        ctx.set_visuals(v);
+    /// Adopt the shared uikit-egui prefs on an egui context: the user's palette + text / touch-target /
+    /// animation scaling, applied once to the eframe app path and the wgpu gpu_egui overlay alike. Also
+    /// points the HUD's `palette()` at the same palette so the game and its chrome never diverge.
+    #[cfg(any(feature = "app", feature = "gpu"))]
+    pub fn install_prefs(ctx: &egui::Context, prefs: &settings_kit::Prefs) {
+        set_palette(snapclone_theme::palette_by_id(&prefs.palette));
+        // uikit_egui::apply_prefs sets Visuals from the palette AND scales text/button/animation.
+        uikit_egui::apply_prefs(ctx, prefs);
     }
 }
 
@@ -578,15 +590,17 @@ pub fn draw_center_banner(p: &egui::Painter, rect: Rect, text: &str, col: Color3
 // ── small colour helpers ────────────────────────────────────────────────────────
 
 pub fn dim() -> Color32 {
-    theme::c(theme::PALETTE.text_secondary)
+    theme::c(theme::palette().text_secondary)
 }
 pub fn health_color(h: f32) -> Color32 {
+    // Health feedback = the palette's semantic colors, so it tracks the user's theme.
+    let p = theme::palette();
     if h > 60.0 {
-        Color32::from_rgb(120, 230, 130)
+        theme::c(p.success)
     } else if h > 30.0 {
-        Color32::from_rgb(235, 200, 90)
+        theme::c(p.warning)
     } else {
-        Color32::from_rgb(230, 70, 60)
+        theme::c(p.danger)
     }
 }
 pub fn weapon_color(k: WeaponKind) -> Color32 {

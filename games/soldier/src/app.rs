@@ -1096,7 +1096,7 @@ impl FpsApp {
                             );
                         }
                         ui.add_space(6.0);
-                        egui::ScrollArea::vertical().id_salt("soldier-list").max_height(280.0).show(ui, |ui| {
+                        uikit_egui::scroll::bounded(ui, 280.0, |ui| {
                             egui::Grid::new("maps").spacing([8.0, 8.0]).show(ui, |ui| {
                                 for (i, pr) in crate::level::PRESETS.iter().enumerate() {
                                     let sel = self.sel_preset == Some(i);

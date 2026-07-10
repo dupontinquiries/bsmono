@@ -11,6 +11,7 @@ netview = { path = "../../shared/netview" }
 # so it builds & tests with NO native/windowing deps. This is the reference path.
 egui = "0.34"
 snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
 settings-kit = { path = "../../shared/settings-kit" }
 
 # The native window/GL shell. Optional so the core compiles anywhere; enable to play.
@@ -39,11 +40,11 @@ serde_json = "1"
 # Default = core only (no native deps): cargo build / cargo test work headless.
 default = []
 # The playable window. Pulls eframe (winit/glow). Run with: cargo run --release --features app
-app = ["dep:eframe"]
+app = ["dep:eframe", "dep:uikit-egui"]
 # Procedural sound playback (off by default; pulls rodio/cpal, needs system audio libs).
 sound = ["dep:rodio"]
 # GPU renderer (wgpu + winit). Off by default. Run: cargo run --release --features gpu --bin gpu
-gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:gpu-kit"]
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:gpu-kit", "dep:uikit-egui"]
 
 [lib]
 name = "early_fps"

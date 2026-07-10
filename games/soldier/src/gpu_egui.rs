@@ -170,7 +170,7 @@ impl EguiOverlay {
         });
 
         let ctx = Context::default();
-        crate::hud::theme::apply_visuals(&ctx);
+        crate::hud::theme::install_prefs(&ctx, &settings_kit::Prefs::default());
         EguiOverlay {
             ctx,
             pipeline,
