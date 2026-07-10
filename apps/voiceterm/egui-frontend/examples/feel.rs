@@ -22,8 +22,11 @@ struct Feel {
 }
 
 impl eframe::App for Feel {
+    // this eframe\'s App trait requires ui(); the app is driven from update() below.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("bar").show(ctx, |ui| {
+        egui::Panel::top("bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if let Some(a) = self.compass.ui(ui, &mut self.app) {
                     self.last_action = format!("{a:?}");
