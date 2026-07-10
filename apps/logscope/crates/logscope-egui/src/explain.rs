@@ -104,7 +104,11 @@ fn prompt_for(question: &str, cref: &CodeRef, facet: Facet, budget: usize) -> St
         Facet::Followups => format!("After understanding {label}, what are the 3 questions someone is most likely to ask next? One per line, no preamble."),
     };
     let snippet = trim_chars(cref.snippet.trim(), budget);
-    if snippet.is_empty() { ask } else { format!("{ask}\n\n```\n{snippet}\n```") }
+    // ground the facet in what the user actually asked (the doc contract), so the explanation is relevant
+    // to their question rather than a generic description of the symbol.
+    let q = question.trim();
+    let ctx = if q.is_empty() { String::new() } else { format!("Context — the user asked: {q}\n\n") };
+    if snippet.is_empty() { format!("{ctx}{ask}") } else { format!("{ctx}{ask}\n\n```\n{snippet}\n```") }
 }
 
 fn trim_chars(s: &str, budget: usize) -> String {
@@ -198,6 +202,8 @@ mod tests {
         // grounded: prompt names the symbol/file and inlines the snippet
         assert!(lanes[0].prompt.contains("parse_csv") && lanes[0].prompt.contains("src/parse.rs"));
         assert!(lanes[0].prompt.contains("```") && lanes[0].prompt.contains("fn parse_csv"));
+        // and grounded in the USER'S QUESTION (the prompt_for contract), not just a generic ask
+        assert!(lanes[0].prompt.contains("how does csv parsing work?"), "prompt carries the question for context");
     }
 
     #[test]
