@@ -15,16 +15,45 @@ pub struct Daemon {
     pub socket: &'static str,
     /// One-line description.
     pub description: &'static str,
+    /// The core-kit this first-party daemon integrates. This is the developer marker: it's embedded in
+    /// the generated unit (see [`FLEET_MARKER`]) so a system scan can auto-discover fleet daemons and
+    /// tell them apart from third-party services that carry no integration.
+    pub integration: &'static str,
+}
+
+/// The unit key that marks a service as a first-party fleet daemon. Every generated unit carries it;
+/// a scan greps for it to separate developer daemons (with integrations) from other services.
+pub const FLEET_MARKER: &str = "X-Fleet-Integration";
+
+/// Extract the fleet integration (core-kit) from a unit body, if it carries [`FLEET_MARKER`]. Handles
+/// both the systemd form `X-Fleet-Integration=voiced-core` and the OpenRC comment form
+/// `# X-Fleet-Integration: voiced-core`. Pure — the basis of on-system auto-detection.
+pub fn fleet_integration(unit_body: &str) -> Option<String> {
+    for line in unit_body.lines() {
+        let t = line.trim_start_matches(['#', ' ', '\t']);
+        if let Some(rest) = t.strip_prefix(FLEET_MARKER) {
+            let v = rest.trim_start_matches([' ', '=', ':']).trim();
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Whether a unit body is a first-party fleet daemon (carries the developer marker).
+pub fn is_fleet_daemon(unit_body: &str) -> bool {
+    fleet_integration(unit_body).is_some()
 }
 
 /// Every daemon gitmind manages. Adding one here is all that's needed for install/start to pick
 /// it up.
 pub fn all() -> &'static [Daemon] {
     &[
-        Daemon { name: "voiced", socket: "voice", description: "voice intent routing (voiced-core: registry + matcher)" },
-        Daemon { name: "sharemd", socket: "share", description: "shared-data hub (datashare-core)" },
-        Daemon { name: "coordd", socket: "coord", description: "coordination arbiter (coord-core)" },
-        Daemon { name: "settingsd", socket: "settings", description: "cross-app settings, persisted to ~/.config/gitmind (settings-kit)" },
+        Daemon { name: "voiced", socket: "voice", description: "voice intent routing (voiced-core: registry + matcher)", integration: "voiced-core" },
+        Daemon { name: "sharemd", socket: "share", description: "shared-data hub (datashare-core)", integration: "datashare-core" },
+        Daemon { name: "coordd", socket: "coord", description: "coordination arbiter (coord-core)", integration: "coord-core" },
+        Daemon { name: "settingsd", socket: "settings", description: "cross-app settings, persisted to ~/.config/gitmind (settings-kit)", integration: "settings-kit" },
     ]
 }
 
@@ -65,6 +94,7 @@ pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
     format!(
         "[Unit]\n\
          Description={desc}\n\
+         X-Fleet-Integration={integration}\n\
          After=default.target\n\
          \n\
          [Service]\n\
@@ -75,6 +105,7 @@ pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         desc = d.description,
+        integration = d.integration,
         exec = exec_path,
     )
 }
@@ -83,6 +114,7 @@ pub fn systemd_user_unit(d: &Daemon, exec_path: &str) -> String {
 pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
     format!(
         "#!/sbin/openrc-run\n\
+         # X-Fleet-Integration: {integration}\n\
          name=\"{name}\"\n\
          description=\"{desc}\"\n\
          command=\"{exec}\"\n\
@@ -96,6 +128,7 @@ pub fn openrc_service(d: &Daemon, exec_path: &str) -> String {
          }}\n",
         name = d.name,
         desc = d.description,
+        integration = d.integration,
         exec = exec_path,
     )
 }
@@ -244,6 +277,28 @@ mod tests {
         assert_eq!(InitSystem::detect_from_os_release("ID=alpine"), InitSystem::OpenRc);
         assert_eq!(InitSystem::detect_from_os_release("ID=postmarketos\nID_LIKE=alpine"), InitSystem::OpenRc);
         assert_eq!(InitSystem::detect_from_os_release("ID=fedora"), InitSystem::Systemd);
+    }
+
+    #[test]
+    fn fleet_marker_round_trips_and_detects_third_party() {
+        // generated units carry the developer marker → auto-detectable as fleet daemons
+        let d = find("voiced").unwrap();
+        let sysd = systemd_user_unit(d, "/usr/bin/voiced");
+        assert_eq!(fleet_integration(&sysd).as_deref(), Some("voiced-core"));
+        assert!(is_fleet_daemon(&sysd));
+        let rc = openrc_service(d, "/usr/bin/voiced");
+        assert_eq!(fleet_integration(&rc).as_deref(), Some("voiced-core")); // OpenRC comment form
+        // a plain third-party unit carries no marker
+        let other = "[Unit]\nDescription=some other service\n[Service]\nExecStart=/usr/bin/other\n";
+        assert_eq!(fleet_integration(other), None);
+        assert!(!is_fleet_daemon(other));
+    }
+
+    #[test]
+    fn every_fleet_daemon_declares_an_integration() {
+        for d in all() {
+            assert!(!d.integration.is_empty(), "{} needs an integration", d.name);
+        }
     }
 
     #[test]
