@@ -68,7 +68,7 @@ impl Controller {
 
     /// Render the controller.
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
-        let colors = PaletteColors::from_palette(snapclone_theme::palette_for(snapclone_theme::PaletteId::all()[0]));
+        let colors = uikit_egui::default_palette();
         self.a11y.begin_frame();
 
         let surface = ui.available_rect_before_wrap();
