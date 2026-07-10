@@ -72,6 +72,7 @@ pub mod net;
 pub mod personality;
 pub mod physics;
 pub mod rollback;
+pub mod netview; // webhost-kit snapshot (spectate the rollback sim in a browser)
 /// EXPERIMENTAL (r238): batch-as-field grass LOD — front high-res per-blade,
 /// back fast-forwarded as a density/growth/sway field. Pure model always
 /// built + tested; live tick-path hookup is behind `grass-field-batch`.
