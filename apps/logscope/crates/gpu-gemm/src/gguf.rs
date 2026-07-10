@@ -94,8 +94,19 @@ pub fn parse(bytes: &[u8]) -> Result<Gguf, String> {
 
 impl Gguf {
     pub fn tensor(&self, name: &str) -> Option<&TensorInfo> { self.tensors.iter().find(|t| t.name == name) }
+    /// Read an integer metadata value as u32. GGUF integer metadata comes in several widths and
+    /// signednesses; the parser normalizes them to `U32` / `I32` / `U64`. A converter may store a
+    /// dimension (`embedding_length`, `block_count`, `head_count`, …) as any of these — matching only
+    /// `U32` was the cause of a spurious "missing embedding_length" on models whose hyperparameters
+    /// were written as int32 or uint64 (e.g. some Qwen3.5 GGUFs like Ornith). Read them all; a negative
+    /// or too-large value isn't a valid dimension, so those still fail (caller reports it).
     pub fn get_u32(&self, key: &str) -> Option<u32> {
-        match self.metadata.get(key) { Some(Value::U32(v)) => Some(*v), _ => None }
+        match self.metadata.get(key)? {
+            Value::U32(v) => Some(*v),
+            Value::I32(v) if *v >= 0 => Some(*v as u32),
+            Value::U64(v) if *v <= u32::MAX as u64 => Some(*v as u32),
+            _ => None,
+        }
     }
     pub fn get_str(&self, key: &str) -> Option<&str> {
         match self.metadata.get(key) { Some(Value::Str(s)) => Some(s.as_str()), _ => None }
@@ -471,6 +482,28 @@ mod arch_tests {
         Gguf { version: 3, metadata: m, tensors: vec![], data_offset: 0 }
     }
     fn emb(prefix: &str) -> (&'static str, Value) { (Box::leak(format!("{prefix}.embedding_length").into_boxed_str()), Value::U32(4096)) }
+
+    #[test]
+    fn get_u32_reads_any_integer_width() {
+        // GGUF may store a dimension as int32 or uint64, not only uint32. Reading only U32 was the cause
+        // of the Ornith/Qwen3.5 "missing embedding_length" (the key was present, as int32/uint64).
+        let m = g(vec![
+            ("qwen3_5.embedding_length", Value::I32(3584)), // int32-encoded dim
+            ("qwen3_5.block_count", Value::U64(36)),        // uint64-encoded count
+            ("qwen3_5.attention.head_count", Value::U32(28)),
+        ]);
+        assert_eq!(m.get_u32("qwen3_5.embedding_length"), Some(3584));
+        assert_eq!(m.get_u32("qwen3_5.block_count"), Some(36));
+        assert_eq!(m.get_u32("qwen3_5.attention.head_count"), Some(28));
+        // arch() resolves qwen3_5 once the int32-encoded key is readable
+        let m2 = g(vec![
+            ("general.architecture", Value::Str("qwen3_5".into())),
+            ("qwen3_5.embedding_length", Value::I32(3584)),
+        ]);
+        assert_eq!(m2.arch(), "qwen3_5");
+        // a negative value is not a valid dimension → still None (caller reports)
+        assert_eq!(g(vec![("x.embedding_length", Value::I32(-1))]).get_u32("x.embedding_length"), None);
+    }
 
     #[test]
     fn arch_trusts_general_architecture_when_consistent() {
