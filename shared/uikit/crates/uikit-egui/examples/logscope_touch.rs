@@ -57,6 +57,9 @@ impl Default for Demo {
 }
 
 impl eframe::App for Demo {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         // logscope uses its own cool palette; we borrow Modern here for contrast
         let pal = palette_by_id("modern");
