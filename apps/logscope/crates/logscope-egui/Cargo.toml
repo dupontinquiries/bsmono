@@ -81,3 +81,8 @@ required-features = ["gpu-scene"]
 name = "pearl-input-view"
 path = "src/bin/pearl-input-view.rs"
 required-features = ["gui"]
+
+[[bin]]
+name = "mic-pearl-view"
+path = "src/bin/mic-pearl-view.rs"
+required-features = ["gui"]
