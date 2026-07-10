@@ -412,13 +412,7 @@ pub fn chrono_now() -> String {
 }
 
 // Minimal JSON helpers — no serde
-fn json_esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c { '"' => o.push_str("\\\""), '\\' => o.push_str("\\\\"), '\n' => o.push_str("\\n"), '\r' => {}, '\t' => o.push_str("\\t"), c if c.is_control() => {}, _ => o.push(c) }
-    }
-    o
-}
+fn json_esc(s: &str) -> String { crate::util::json_esc(s) }
 
 fn json_str(out: &mut String, key: &str, val: &str) {
     out.push('"'); out.push_str(key); out.push_str("\":\""); out.push_str(&json_esc(val)); out.push('"');

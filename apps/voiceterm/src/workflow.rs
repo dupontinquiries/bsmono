@@ -314,21 +314,7 @@ pub fn match_workflow_replay(text: &str, slugs: &[String]) -> Option<String> {
 
 // ── hand-rolled JSON helpers (mirrors archive.rs; no serde) ──
 
-fn json_esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => {}
-            '\t' => o.push_str("\\t"),
-            c if c.is_control() => {}
-            _ => o.push(c),
-        }
-    }
-    o
-}
+fn json_esc(s: &str) -> String { crate::util::json_esc(s) }
 
 fn json_unesc(s: &str) -> String {
     s.replace("\\\"", "\"").replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
