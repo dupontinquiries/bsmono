@@ -163,11 +163,13 @@ impl Layout {
         }
     }
 
-    /// An **8-way** cardinal keyboard: like [`Layout::cardinal`] but each key also uses the four
-    /// diagonals (NE/SE/SW/NW), packing digits and punctuation onto the corners MessagEase-style — so
-    /// the whole alphabet plus numbers fit in a 3×3. Exercises the widget's full `Dir8`.
+    /// An **8-way** cardinal keyboard, MessagEase-style and frequency-optimized: the nine most common
+    /// English letters sit on the key *centers* (tap), so the vast majority of keystrokes are plain
+    /// taps; the remaining letters ride the cardinal swipes and the digits ride the diagonals, so the
+    /// whole alphabet plus numbers fit in nine keys. Swiping north is always the uppercase. Exercises
+    /// the widget's full `Dir8`.
     pub fn cardinal8() -> Layout {
-        use uikit_egui::slide_menu::Dir8::{E, N, NE, NW, S, SE, SW, W};
+        use uikit_egui::slide_menu::Dir8::{E, N, NE, S, SE, SW, W};
         fn k(center: &str, dirs: &[(uikit_egui::slide_menu::Dir8, &str)]) -> Key {
             Key::new(center).with_cardinal(dirs)
         }
@@ -175,21 +177,30 @@ impl Layout {
         Layout {
             name: "cardinal8".into(),
             rows: vec![
+                // centers e t a o i n s h r — the nine highest-frequency letters (tap = no swipe)
                 row(vec![
-                    k("a", &[(N, "A"), (E, "b"), (S, "c"), (W, "d"), (NE, "1"), (SE, "2"), (SW, "3"), (NW, "!")]),
-                    k("n", &[(N, "N"), (E, "f"), (S, "g"), (W, "j"), (NE, "4"), (SE, "5"), (SW, "6"), (NW, "?")]),
-                    k("i", &[(N, "I"), (E, "k"), (S, "l"), (W, "m"), (NE, "7"), (SE, "8"), (SW, "9"), (NW, "@")]),
+                    k("e", &[(N, "E"), (E, "b"), (S, "v"), (NE, "1"), (SE, "2"), (SW, "3")]),
+                    k("t", &[(N, "T"), (E, "c"), (S, "w"), (NE, "4"), (SE, "5"), (SW, "6")]),
+                    k("a", &[(N, "A"), (E, "d"), (S, "x"), (NE, "7"), (SE, "8"), (SW, "9")]),
                 ]),
                 row(vec![
-                    k("h", &[(N, "H"), (E, "p"), (S, "q"), (W, "u"), (NE, "0"), (SE, "#"), (SW, "%"), (NW, "&")]),
-                    k("o", &[(N, "O"), (E, "v"), (S, "w"), (W, "x"), (NE, "("), (SE, ")"), (SW, "-"), (NW, "+")]),
-                    k("r", &[(N, "R"), (E, "y"), (S, "z"), (W, "'"), (NE, "\""), (SE, ":"), (SW, ";"), (NW, "/")]),
+                    k("o", &[(N, "O"), (E, "f"), (S, "y"), (W, "k"), (SE, "0")]),
+                    k("i", &[(N, "I"), (E, "g"), (S, "z"), (W, "p")]),
+                    k("n", &[(N, "N"), (E, "l"), (S, "m"), (W, "u")]),
                 ]),
                 row(vec![
-                    k("t", &[(N, "T"), (E, ","), (S, "."), (W, "e"), (NE, "s"), (SE, "*"), (SW, "="), (NW, "_")]),
-                    Key::emitting("space", " ", 2.0),
-                    Key::emitting("⌫", "\u{8}", 1.0).with_variants(&["\n"]),
+                    k("s", &[(N, "S"), (E, "j"), (S, "q"), (W, "."), (SE, ",")]),
+                    k("h", &[(N, "H"), (E, "'"), (S, "!"), (W, "?")]),
+                    k("r", &[(N, "R"), (E, ":"), (S, "@"), (W, "/")]),
                 ]),
+                Row {
+                    keys: vec![
+                        Key::emitting("space", " ", 2.0),
+                        Key::emitting("⌫", "\u{8}", 1.0),
+                        Key::emitting("⏎", "\n", 1.0),
+                    ],
+                    weight: 1.0,
+                },
             ],
         }
     }
@@ -469,12 +480,23 @@ mod tests {
     }
 
     #[test]
-    fn cardinal8_uses_all_eight_directions() {
-        use uikit_egui::slide_menu::Dir8::*;
+    fn cardinal8_covers_the_alphabet_with_frequent_letters_on_taps() {
         let l = Layout::cardinal8();
-        let a = l.rows.iter().flat_map(|r| &r.keys).find(|k| k.emit == "a").unwrap();
-        for d in [N, NE, E, SE, S, SW, W, NW] {
-            assert!(a.cardinal.iter().any(|(dd, _)| *dd == d), "key 'a' should map {d:?}");
+        let letter_keys: Vec<&Key> = l.rows.iter().flat_map(|r| &r.keys).filter(|k| !k.cardinal.is_empty()).collect();
+        // the nine centers are the high-frequency letters, typed on a plain tap
+        let centers: std::collections::HashSet<&str> = letter_keys.iter().map(|k| k.emit.as_str()).collect();
+        for c in ["e", "t", "a", "o", "i", "n", "s", "h", "r"] {
+            assert!(centers.contains(c), "high-frequency '{c}' should be a tap center");
+        }
+        // every letter a–z is reachable, as a center or a swipe variant
+        let mut reachable: std::collections::HashSet<char> = centers.iter().flat_map(|s| s.chars()).collect();
+        for k in &letter_keys {
+            for (_, s) in &k.cardinal {
+                reachable.extend(s.to_lowercase().chars());
+            }
+        }
+        for ch in 'a'..='z' {
+            assert!(reachable.contains(&ch), "letter '{ch}' should be reachable on cardinal8");
         }
     }
 
