@@ -34,12 +34,22 @@ pub const SPECS: &[CmdSpec] = &[
         help: "switch the active model in the pool", example: ":use smollm2-360m" },
     CmdSpec { name: "fuzz", aliases: &["f"], usage: ":fuzz [n]", arg: ArgKind::Count,
         help: "fan n varied retries of the last prompt off the same parent", example: ":fuzz 8" },
+    CmdSpec { name: "fuzzd", aliases: &["fd"], usage: ":fuzzd [n]", arg: ArgKind::Count,
+        help: "fan n branches off the focus, each carrying a different behavioral directive", example: ":fd 6" },
     CmdSpec { name: "fuzzy-all", aliases: &["fa"], usage: ":fuzzy-all [n]", arg: ArgKind::Count,
         help: "fan n varied continuations off every current leaf", example: ":fa 4" },
     CmdSpec { name: "continue-all", aliases: &["ca"], usage: ":continue-all", arg: ArgKind::None,
         help: "continue every current leaf one step (1 prefill, N decodes)", example: ":ca" },
     CmdSpec { name: "branch", aliases: &["b"], usage: ":branch", arg: ArgKind::None,
         help: "branch a new line from the focused node", example: ":b" },
+    CmdSpec { name: "prune", aliases: &["p"], usage: ":prune", arg: ArgKind::None,
+        help: "prune the focused turn from the tree", example: ":p" },
+    CmdSpec { name: "unprune", aliases: &["up"], usage: ":unprune", arg: ArgKind::None,
+        help: "restore the last pruned turn", example: ":up" },
+    CmdSpec { name: "overview", aliases: &["fit"], usage: ":overview", arg: ArgKind::None,
+        help: "refit the camera to the whole tree", example: ":fit" },
+    CmdSpec { name: "goto", aliases: &[], usage: ":goto <id|-K|N>", arg: ArgKind::Refs,
+        help: "focus a node by id prefix, -K from the end, or 1-based position", example: ":goto -1" },
     CmdSpec { name: "best", aliases: &[], usage: ":best", arg: ArgKind::None,
         help: "rank the sibling candidates and mark the strongest", example: ":best" },
     CmdSpec { name: "strategy", aliases: &["bird", "birdseye", "strat"], usage: ":strategy [refs] ['focus']", arg: ArgKind::Refs,
@@ -54,16 +64,24 @@ pub const SPECS: &[CmdSpec] = &[
         help: "save this chat as a logscope/chats dump in a workspace", example: ":dump ~/proj" },
     CmdSpec { name: "loadchat", aliases: &["lc"], usage: ":loadchat <dir>", arg: ArgKind::Path,
         help: "reload a saved chat dump directory", example: ":lc ~/proj/logscope/chats/chat-..." },
+    CmdSpec { name: "open", aliases: &["o"], usage: ":open <path>", arg: ArgKind::Path,
+        help: "import a chat (## You / ## Assistant markdown) from a file", example: ":open notes.md" },
+    CmdSpec { name: "attach", aliases: &["a", "add"], usage: ":attach <path>", arg: ArgKind::Path,
+        help: "attach a file's text to the next message", example: ":a src/main.rs" },
     CmdSpec { name: "import-workspace", aliases: &["importws", "iw"], usage: ":import-workspace <dir>", arg: ArgKind::Path,
         help: "discover chat dumps under a directory of one or many workspaces", example: ":iw ~/code" },
     CmdSpec { name: "summarize-files", aliases: &["sf"], usage: ":summarize-files [glob]", arg: ArgKind::Free,
         help: "stage the chat's files for per-file summaries", example: ":sf" },
     CmdSpec { name: "quest", aliases: &["questions"], usage: ":quest [n]", arg: ArgKind::Count,
         help: "have the model pose the questions that would unblock it", example: ":quest 3" },
+    CmdSpec { name: "ans", aliases: &["answer"], usage: ":ans [path]", arg: ArgKind::Path,
+        help: "fold filled Q/A answers back into a focused, targeted generation", example: ":ans" },
     CmdSpec { name: "check", aliases: &["chk"], usage: ":check", arg: ArgKind::None,
         help: "verify the assembled result in the sandbox", example: ":check" },
     CmdSpec { name: "assemble", aliases: &["asm"], usage: ":assemble", arg: ArgKind::None,
         help: "assemble the selected branches into one artifact", example: ":asm" },
+    CmdSpec { name: "fill", aliases: &[], usage: ":fill [path]", arg: ArgKind::Path,
+        help: "decompose a todo!()-skeleton into KV-shared sub-tasks and fan them out", example: ":fill" },
     CmdSpec { name: "export", aliases: &["e"], usage: ":export <md|ascii|git>", arg: ArgKind::Free,
         help: "export the conversation tree", example: ":export md" },
     CmdSpec { name: "linear", aliases: &[], usage: ":linear", arg: ArgKind::None,
@@ -164,5 +182,46 @@ mod tests {
         assert_eq!(suggest_args(spec("why").unwrap(), "", &ctx).len(), 2);
         // none-arg commands suggest nothing
         assert!(suggest_args(spec("best").unwrap(), "", &ctx).is_empty());
+    }
+
+    // A dummy argument that the PARSER accepts for each arg kind (a bare positive int is valid for both
+    // counts and ref-lists — including :goto N — so those share one).
+    fn sample_arg(k: ArgKind) -> &'static str {
+        match k {
+            ArgKind::Ratio => "0.3",
+            ArgKind::Model => "m",
+            ArgKind::Path => "x",
+            ArgKind::Free => "x",
+            ArgKind::None => "",
+            ArgKind::Count | ArgKind::Refs => "1",
+        }
+    }
+
+    #[test]
+    fn fan_and_longhorizon_commands_are_discoverable() {
+        // The fan commands and the long-horizon quest→ans / fill→assemble loops must be reachable from
+        // :help and offered to :suggest — not just parseable if you happen to know them.
+        for n in ["fuzzd", "fd", "fill", "ans", "answer", "prune", "unprune", "overview", "fit", "open", "goto", "attach"] {
+            assert!(spec(n).is_some(), ":help / :suggest cannot see '{n}'");
+        }
+    }
+
+    #[test]
+    fn palette_stays_in_parity_with_the_parser() {
+        use crate::vimmode::{parse_command, Command};
+        // Every command this palette advertises (in :help + :suggest) must map to a real parser arm —
+        // otherwise :help would list a command the user can't actually run.
+        for s in SPECS {
+            let line = format!(":{} {}", s.name, sample_arg(s.arg));
+            assert!(!matches!(parse_command(line.trim()), Command::Unknown(_)),
+                    "palette lists ':{}' but the parser rejects it (tables drifted)", s.name);
+        }
+        // …and conversely every command in the LIVE completion catalog (the `:` grid) must be in this
+        // palette, so :help/:suggest never fall behind what the grid already offers. This is exactly the
+        // drift that hid the fan commands (:fuzzd, :fill, :ans) from help while the grid showed them.
+        for c in crate::vimmode::command_catalog() {
+            assert!(spec(c.name).is_some(),
+                    "'{}' is in the live command grid but missing from :help/:suggest", c.name);
+        }
     }
 }
