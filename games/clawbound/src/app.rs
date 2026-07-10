@@ -471,7 +471,7 @@ impl State {
             use egui::{Align2, Color32, RichText};
             if open { draw_menu(ctx, &items, cursor, screen); return; }
             egui::Area::new("phud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
-                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                     .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.label(RichText::new(format!("PROWL · {cls_name}   ·   your score {}", clans[0])).size(15.0).strong().color(Color32::from_rgb(200, 180, 235)));
@@ -600,7 +600,7 @@ impl State {
             use egui::{Align2, Color32, RichText};
             if open { draw_menu(ctx, &items, cursor, screen); return; }
             egui::Area::new("cscore".into()).anchor(Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
-                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("TAWNY {s0}")).size(20.0).strong().color(Color32::from_rgb(255, 138, 90)));
                         ui.label(RichText::new(format!("   {}:{:02}   ", (ptime as u32) / 60, (ptime as u32) % 60)).size(18.0).color(Color32::WHITE));
@@ -610,7 +610,7 @@ impl State {
                 });
             });
             egui::Area::new("cinfo".into()).anchor(Align2::LEFT_BOTTOM, [16.0, -16.0]).show(ctx, |ui| {
-                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
+                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.label(RichText::new(format!("{cls} - TEAM TAWNY")).size(14.0).strong().color(Color32::from_rgb(255, 160, 110)));
                     ui.label(RichText::new(format!("captures {caps}  -  stuns {stuns}")).size(13.0).color(Color32::from_rgb(210, 215, 225)));
@@ -898,7 +898,7 @@ impl State {
             } else {
                 // ── in-game HUD ──
                 egui::Area::new("hud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
-                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                         .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
                         ui.label(RichText::new(format!("Hunter: {hunter_name}   ·   {mode_name}"))
@@ -926,7 +926,7 @@ impl State {
                 // world panel (top-right): the region, a line about it, the hour, and the
                 // named pack with each cat's rank and fate — the clan you're fighting for.
                 egui::Area::new("world".into()).anchor(Align2::RIGHT_TOP, [-14.0, 14.0]).show(ctx, |ui| {
-                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 13, 20, 155)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(7.0).show(ui, |ui| {
+                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 13, 20, 155)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(7.0).show(ui, |ui| {
                         ui.set_max_width(230.0);
                         ui.label(RichText::new(format!("{region} · {day_phase}")).size(13.0).strong().color(Color32::from_rgb(210, 205, 180)));
                         ui.label(RichText::new(region_lore).size(11.0).italics().color(Color32::from_rgb(160, 160, 172)));
@@ -977,7 +977,7 @@ impl State {
                     let r = 235.0;
                     let off = [threat_bearing.sin() * r, -threat_bearing.cos() * r];
                     egui::Area::new("threat".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, off).show(ctx, |ui| {
-                        egui::Frame::none().fill(Color32::from_rgba_unmultiplied(210, 48, 40, (110.0 + 120.0 * a) as u8))
+                        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(210, 48, 40, (110.0 + 120.0 * a) as u8))
                             .rounding(10.0).inner_margin(egui::Margin::symmetric(9.0, 4.0)).show(ui, |ui| {
                             ui.label(RichText::new("THREAT").size(11.0 + a * 5.0).strong().color(Color32::WHITE));
                         });

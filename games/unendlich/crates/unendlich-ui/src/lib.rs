@@ -683,7 +683,7 @@ pub fn dest_button(ui: &mut egui::Ui, label: &str) -> bool {
 
 /// Glass frame at open-interpolation t in [0,1] (margin + alpha ease).
 pub fn glass_at(t01: f32) -> egui::Frame {
-    egui::Frame::none()
+    egui::Frame::new()
         .fill(egui::Color32::from_rgba_unmultiplied(14, 18, 24, (120.0 + 88.0 * t01) as u8))
         .stroke(egui::Stroke::new(1.0,
             egui::Color32::from_rgba_unmultiplied(120, 160, 190, (40.0 + 50.0 * t01) as u8)))

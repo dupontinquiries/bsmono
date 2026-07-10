@@ -163,7 +163,7 @@ impl eframe::App for LogscopeApp {
 
         self.toolbar(ctx);
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(PANEL))
+            .frame(egui::Frame::new().fill(PANEL))
             .show(ctx, |ui| {
                 self.draw_timeline(ui);
                 self.draw_legend(ui);
@@ -232,7 +232,7 @@ impl LogscopeApp {
     // ── toolbar: the toggle + the baseline buttons ───────────────────────────
     fn toolbar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("ls_toolbar")
-            .frame(egui::Frame::none().fill(PANEL).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(PANEL).inner_margin(8.0))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new("logscope").color(ACCENT).strong());

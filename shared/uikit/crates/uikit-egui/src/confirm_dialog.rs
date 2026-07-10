@@ -95,7 +95,7 @@ impl ConfirmDialog {
         let mut outcome = Outcome::Pending;
 
         // Dimmed backdrop; a click anywhere on it cancels (QML "click outside cancels").
-        let screen = ctx.screen_rect();
+        let screen = ctx.viewport_rect();
         egui::Area::new(Id::new("confirm_backdrop"))
             .order(Order::Middle)
             .fixed_pos(screen.min)
