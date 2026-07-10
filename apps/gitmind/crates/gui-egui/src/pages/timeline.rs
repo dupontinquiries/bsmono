@@ -38,7 +38,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.colored_label(egui::Color32::from_rgb(0xf7, 0x76, 0x8e), &app.timeline.err);
     }
 
-    egui::ScrollArea::vertical().id_salt("timeline").show(ui, |ui| {
+    uikit_egui::scroll::area(ui, |ui| {
         for (oid, _when, label) in &app.timeline.checkpoints {
             ui.horizontal(|ui| {
                 let short = &oid[..oid.len().min(8)];

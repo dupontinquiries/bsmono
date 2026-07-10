@@ -14,7 +14,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.label(egui::RichText::new("build + install BigSilicon apps from the catalog").weak().small());
     ui.separator();
 
-    egui::ScrollArea::vertical().max_height(280.0).id_salt("catalog").show(ui, |ui| {
+    uikit_egui::scroll::bounded(ui, 280.0, |ui| {
         for suite in cockpit::flow::store_groups() {
             egui::CollapsingHeader::new(format!("{}  ·  {}", suite.name, suite.description))
                 .default_open(suite.name == "coding")
@@ -62,15 +62,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     let log = app.task.log();
     if !log.is_empty() {
-        egui::ScrollArea::vertical()
-            .id_salt("buildlog")
-            .max_height(200.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for l in &log {
-                    ui.label(egui::RichText::new(l).monospace().small());
-                }
-            });
+        uikit_egui::scroll::log(ui, &log, 200.0);
     }
     if !app.fleet.note.is_empty() {
         ui.add_space(6.0);
