@@ -825,15 +825,28 @@ pub fn create_default_suite(root: &Path) -> Result<crate::suite::Suite, String> 
 /// in one go". Paths are repo-relative `apps/<name>` (resolved against the gitmind root at
 /// build time by the same machinery suites use).
 pub fn store_groups() -> Vec<crate::suite::Suite> {
+    /// Repo-relative path for an app or game by name. Games live under `games/`, everything else
+    /// under `apps/` — so a game like unendlich or paperbound resolves to its real crate/dir instead
+    /// of a non-existent `apps/<name>`.
+    fn app_path(name: &str) -> String {
+        const GAMES: &[&str] = &[
+            "blackstar", "bsgames", "clawbound", "gyroball", "paperbound", "soldier", "unendlich",
+        ];
+        if GAMES.contains(&name) {
+            format!("games/{name}")
+        } else {
+            format!("apps/{name}")
+        }
+    }
     fn group(name: &str, desc: &str, apps: &[&str]) -> crate::suite::Suite {
         crate::suite::Suite {
             name: name.to_string(),
             description: desc.to_string(),
-            apps: apps.iter().map(|a| crate::suite::SuiteApp::simple(a, &format!("apps/{a}"))).collect(),
+            apps: apps.iter().map(|a| crate::suite::SuiteApp::simple(a, &app_path(a))).collect(),
         }
     }
     let coding = ["gitmind", "logscope", "bot-arena"];
-    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "cybertron", "unendlich"];
+    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "unendlich"];
     let music = ["beatspace", "krapper", "bo-suite", "fao-codec"];
     let work = ["voiceterm", "ambient-learner", "rusty-board"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
@@ -871,8 +884,11 @@ mod store_group_tests {
     fn bigsilicons_is_the_union_and_paths_are_app_relative() {
         let groups = super::store_groups();
         let all = super::group_by_name("bigsilicons-apps").expect("all group");
-        assert_eq!(all.apps.len(), 17, "every app is in the all group (incl. bsettings)");
-        assert!(all.apps.iter().all(|a| a.path.starts_with("apps/")));
+        assert_eq!(all.apps.len(), 16, "every app is in the all group (incl. bsettings)");
+        assert!(all.apps.iter().all(|a| a.path.starts_with("apps/") || a.path.starts_with("games/")));
+        // games resolve under games/, not a non-existent apps/<name>
+        assert!(all.apps.iter().any(|a| a.name == "unendlich" && a.path == "games/unendlich"), "unendlich resolves under games/");
+        assert!(all.apps.iter().all(|a| a.name != "cybertron"), "cybertron (nonexistent) is not in the store");
         assert!(all.apps.iter().any(|a| a.name == "bsettings" && a.path == "apps/settings-app" && a.features == vec!["gui".to_string()]), "bsettings registered with its real path + gui feature");
         // the four categories partition into the union
         let cat_total: usize = groups.iter().filter(|g| g.name != "bigsilicons-apps").map(|g| g.apps.len()).sum();
