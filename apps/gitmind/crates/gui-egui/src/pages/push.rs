@@ -203,7 +203,28 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     let log = app.task.log();
     if !log.is_empty() {
-        uikit_egui::scroll::log(ui, &log, 200.0);
+        use uikit_egui::log_view::{log_row, LogEntry, LogLevel};
+        let level_of = |line: &str| {
+            let l = line.to_ascii_lowercase();
+            if l.contains("error") || l.contains('✗') || l.contains("failed") {
+                LogLevel::Error
+            } else if l.contains("warn") {
+                LogLevel::Warn
+            } else if line.trim_start().starts_with('✓') || l.contains("finished") || l.contains("success") {
+                LogLevel::Info
+            } else {
+                LogLevel::Debug
+            }
+        };
+        egui::ScrollArea::vertical()
+            .max_height(200.0)
+            .stick_to_bottom(true)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (i, line) in log.iter().enumerate() {
+                    log_row(ui, &LogEntry::new(level_of(line), line.clone(), i as u64));
+                }
+            });
     }
     if !app.push.note.is_empty() {
         ui.add_space(6.0);
