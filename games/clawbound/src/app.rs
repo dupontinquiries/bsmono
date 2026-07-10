@@ -15,7 +15,7 @@ use clawbound_rs::math::{look_at, perspective, v3};
 use clawbound_rs::sim::Game;
 
 #[derive(Default)]
-struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool }
+struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, mleft: bool, mmiddle: bool, mright: bool }
 impl Keys {
     fn set(&mut self, code: KeyCode, down: bool) {
         match code {
@@ -52,6 +52,28 @@ fn move_world(yaw: f32, ix: f32, iz: f32) -> (f32, f32) {
     (ix * r.0 + iz * f.0, ix * r.1 + iz * f.1)
 }
 
+/// Draw the pause/title menu overlay (shared by the sim and prowl render paths).
+fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen) {
+    use clawbound_rs::menu::Screen;
+    use egui::{Align2, Color32, RichText};
+    egui::Area::new("clawbound_menu".into()).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
+        egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
+            ui.set_min_width(320.0);
+            ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
+            let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
+            if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
+            ui.add_space(10.0);
+            for (i, it) in items.iter().enumerate() {
+                let sel = i == cursor;
+                ui.label(RichText::new(format!("{} {}", if sel { "▶" } else { "  " }, it)).size(20.0)
+                    .color(if sel { Color32::from_rgb(255, 220, 120) } else { Color32::from_rgb(205, 205, 210) }));
+            }
+            ui.add_space(10.0);
+            ui.label(RichText::new("↑↓ move   ←→ change   Enter select   Esc back").size(12.0).weak());
+        });
+    });
+}
+
 struct State {
     _window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -68,6 +90,8 @@ struct State {
     ent_vcount: u32,
     ent_cap: u64,
     game: Game,
+    prowl: Option<clawbound_rs::prowl::Prowl>,
+    capture: Option<clawbound_rs::capture::Capture>,
     kind: clawbound_rs::hunter::Kind,
     mode: clawbound_rs::sim::Mode,
     over_timer: f32,
@@ -85,6 +109,7 @@ struct State {
     pbg: wgpu::BindGroup,
     focus: clawbound_rs::math::Vec3,
     frame: f32,
+    last: std::time::Instant,
     yaw: f32,
     pitch: f32,
     captured: bool,
@@ -216,7 +241,7 @@ impl State {
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
         let menu = clawbound_rs::menu::Menu::new();
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, pbg, focus, frame: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, pbg, focus, frame: 0.0, last: std::time::Instant::now(), yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -255,10 +280,308 @@ impl State {
         self.pitch = (self.pitch + dy * 0.0022).clamp(0.12, 1.32);
     }
 
+    /// Grow (if needed) and upload the moving-entity vertex buffer.
+    fn upload_entities(&mut self, ents: &clawbound_rs::mesh::Mesh) {
+        self.ent_vcount = ents.count();
+        let bytes: &[u8] = bytemuck::cast_slice(&ents.verts);
+        if (bytes.len() as u64) > self.ent_cap {
+            self.ent_cap = (bytes.len() as u64).next_power_of_two();
+            self.ent_vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("entities"), size: self.ent_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
+            });
+        }
+        if !bytes.is_empty() { self.queue.write_buffer(&self.ent_vbuf, 0, bytes); }
+    }
+
+    /// Write the third-person orbit camera uniform from the current focus/yaw/pitch.
+    fn write_camera(&mut self, dist: f32) {
+        let (sy, cy) = (self.yaw.sin(), self.yaw.cos());
+        let horiz = self.pitch.cos() * dist;
+        let height = self.pitch.sin() * dist;
+        let eye = self.focus.add(v3(-sy * horiz, height, -cy * horiz));
+        let target = self.focus.add(v3(0.0, 1.1, 0.0));
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let mvp = perspective(56f32.to_radians(), aspect, 0.1, 900.0).mul(&look_at(eye, target, v3(0.0, 1.0, 0.0)));
+        let u = U { mvp: mvp.0, light: [0.4, 1.0, 0.35, 0.0], key: [1.05, 0.97, 0.85, 0.0], amb: [0.52, 0.53, 0.50, 0.0] };
+        self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(&u));
+    }
+
+    /// The two render passes (scene → post) + the egui overlay, then present.
+    fn present(&mut self, bg: wgpu::Color, full: egui::FullOutput, ppp: f32) {
+        let frame = match self.surface.get_current_texture() { Ok(f) => f, Err(_) => { self.surface.configure(&self.device, &self.config); return; } };
+        let view = frame.texture.create_view(&Default::default());
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("scene"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &self.scene_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &self.depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
+                timestamp_writes: None, occlusion_query_set: None,
+            });
+            rp.set_pipeline(&self.scene_pipe);
+            rp.set_bind_group(0, &self.ubg, &[]);
+            rp.set_vertex_buffer(0, self.world_vbuf.slice(..));
+            rp.draw(0..self.world_vcount, 0..1);
+            if self.ent_vcount > 0 { rp.set_vertex_buffer(0, self.ent_vbuf.slice(..)); rp.draw(0..self.ent_vcount, 0..1); }
+        }
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("post"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+                depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
+            });
+            rp.set_pipeline(&self.post_pipe); rp.set_bind_group(0, &self.pbg, &[]); rp.draw(0..3, 0..1);
+        }
+        self.egui_state.handle_platform_output(&self._window, full.platform_output);
+        let prims = self.egui_ctx.tessellate(full.shapes, ppp);
+        self.egui_render.render(&self.device, &self.queue, &mut enc, &view, [self.config.width, self.config.height], ppp, &prims, &full.textures_delta);
+        self.queue.submit(Some(enc.finish()));
+        frame.present();
+    }
+
+    /// Dynamic entities for the Prowl mode (the static world is already in world_vbuf).
+    fn build_prowl_entities(&self) -> clawbound_rs::mesh::Mesh {
+        use clawbound_rs::mesh::{rgb, Mesh};
+        use clawbound_rs::prowl::ProwlObj;
+        use clawbound_rs::{cat, world};
+        let g = self.prowl.as_ref().unwrap();
+        let mut m: Mesh = crate::build_critters(&g.critters);
+        for &(px, pz, _n) in &g.pois {
+            let gy = world::height_at(px, pz);
+            m.set_op(0.5); m.segment(v3(px, gy, pz), v3(px, gy + 10.0, pz), 0.4, 0.1, 5, rgb(0x8fd0ff)); m.set_op(1.0);
+        }
+        if matches!(g.obj.kind, ProwlObj::Reach | ProwlObj::Rendezvous) {
+            let (ox, oz) = (g.obj.tx, g.obj.tz); let gy = world::height_at(ox, oz);
+            m.set_op(0.85); m.segment(v3(ox, gy, oz), v3(ox, gy + 22.0, oz), 0.9, 0.25, 8, rgb(0x8fd0ff)); m.set_op(1.0);
+        }
+        // the shrinking hunt-ring wall
+        let rr = g.ring.radius();
+        m.set_op(0.3);
+        for k in 0..72 {
+            let a = k as f32 / 72.0 * std::f32::consts::TAU;
+            let (rx, rz) = (g.ring.cx + a.cos() * rr, g.ring.cz + a.sin() * rr);
+            let gy = world::height_at(rx, rz);
+            m.segment(v3(rx, gy - 1.0, rz), v3(rx, gy + 7.0, rz), 0.35, 0.35, 4, rgb(0x9a6cff));
+        }
+        m.set_op(1.0);
+        // the prowler + a class-tint marker
+        let pgy = world::height_at(g.x, g.z);
+        let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
+        let pose = if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.frame * 0.06) % 1.0) } else { cat::stand() };
+        cat::build(&mut m, v3(g.x, pgy + arc, g.z), 1.0, &pose);
+        m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
+        // the stalking hunter
+        let hgy = world::height_at(g.hx, g.hz);
+        if g.hunter_kind.is_shadow() { crate::build_shadow(&mut m, v3(g.hx, hgy, g.hz)); } else { crate::build_fox(&mut m, v3(g.hx, hgy, g.hz)); }
+        m
+    }
+
+    /// The full per-frame path for the Prowl mode (parallel to the sim `render`).
+    fn render_prowl(&mut self, dt: f32) {
+        self.set_capture(!self.menu.open);   // prowl is endless — capture while playing
+
+        if !self.menu.open {
+            let (ix, iz) = self.keys.move_vec();
+            let (mx, mz) = move_world(self.yaw, ix, iz);
+            {
+                let p = self.prowl.as_mut().unwrap();
+                p.set_input(mx, mz, self.keys.leap || self.keys.mleft, self.keys.dodge || self.keys.mmiddle, self.keys.crouch);
+                p.step(dt);
+            }
+            if self.keys.restart {
+                let (c, k, diff) = { let p = self.prowl.as_ref().unwrap(); (p.class, p.hunter_kind, p.difficulty) };
+                let mut p = clawbound_rs::prowl::Prowl::new(c, k);
+                p.difficulty = diff;
+                self.prowl = Some(p);
+                self.keys.restart = false;
+            }
+        }
+
+        let (px, pz) = { let p = self.prowl.as_ref().unwrap(); (p.x, p.z) };
+        let gy = clawbound_rs::world::height_at(px, pz);
+        self.focus = v3(px, gy, pz);
+
+        let ents = self.build_prowl_entities();
+        self.upload_entities(&ents);
+
+        let (flash, exposed) = { let p = self.prowl.as_ref().unwrap(); (p.respawn_flash, p.exposed) };
+        let grim = ((flash / 1.2).clamp(0.0, 1.0) * 0.8 + if exposed { 0.25 } else { 0.0 }).min(1.0);
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32]));
+        self.write_camera(20.0);
+
+        let items = self.menu.items();
+        let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
+        let (obj_text, prey, caught, escapes, stamina, cls_name) = {
+            let p = self.prowl.as_ref().unwrap();
+            (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class.name())
+        };
+        let ppp = self.egui_ctx.pixels_per_point();
+        let raw = self.egui_state.take_egui_input(&self._window);
+        let full = self.egui_ctx.run(raw, |ctx| {
+            use egui::{Align2, Color32, RichText};
+            if open { draw_menu(ctx, &items, cursor, screen); return; }
+            egui::Area::new("phud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
+                    .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(RichText::new(format!("PROWL · {cls_name}")).size(15.0).strong().color(Color32::from_rgb(200, 180, 235)));
+                    ui.label(RichText::new(obj_text).size(14.0).color(Color32::from_rgb(200, 220, 205)));
+                    ui.label(RichText::new(format!("prey {prey}   ·   caught {caught}   ·   escapes {escapes}")).size(13.0).color(Color32::from_rgb(200, 210, 225)));
+                    ui.add(egui::ProgressBar::new(stamina).desired_width(168.0)
+                        .fill(if stamina > 0.25 { Color32::from_rgb(120, 200, 150) } else { Color32::from_rgb(215, 120, 90) })
+                        .text(RichText::new("stamina").size(11.0).color(Color32::WHITE)));
+                    if exposed { ui.label(RichText::new("⚠ EXPOSED — get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
+                });
+            });
+            egui::Area::new("phint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
+                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · R restart · Esc menu")
+                    .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
+            });
+            if exposed {
+                egui::Area::new("pexp".into()).order(egui::Order::Background).show(ctx, |ui| {
+                    ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_rgba_unmultiplied(70, 24, 80, 46));
+                });
+            }
+        });
+        let bg = wgpu::Color { r: 0.80, g: 0.82, b: 0.86, a: 1.0 };
+        self.present(bg, full, ppp);
+    }
+
+    /// Dynamic entities for Pop Island (bases, yarn, power-ups, firecrackers, creatures).
+    fn build_capture_entities(&self) -> clawbound_rs::mesh::Mesh {
+        use clawbound_rs::capture::{BASE_R, TAWNY};
+        use clawbound_rs::mesh::{rgb, Mesh};
+        use clawbound_rs::{cat, world};
+        let g = self.capture.as_ref().unwrap();
+        let mut m = Mesh::new();
+        for team in [0u8, 1u8] {
+            let (bx, bz) = g.base(team);
+            let col = if team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
+            let gy = world::height_at(bx, bz);
+            m.set_op(0.5); m.cone(v3(bx, gy + 0.15, bz), BASE_R, 0.3, 22, col); m.set_op(1.0);
+            m.segment(v3(bx, gy, bz), v3(bx, gy + 16.0, bz), 0.6, 0.15, 6, col);
+        }
+        for &(yx, yz) in &g.yarn_free { let gy = world::height_at(yx, yz); m.cone(v3(yx, gy + 0.8, yz), 0.8, 1.4, 6, rgb(0xff6acf)); }
+        for p in &g.powerups { let gy = world::height_at(p.x, p.z); m.boxx(v3(p.x, gy + 1.6, p.z), v3(0.5, 0.5, 0.5), rgb(p.kind.color())); }
+        for c in &g.crackers { let gy = world::height_at(c.x, c.z); m.boxx(v3(c.x, gy + 0.9, c.z), v3(0.28, 0.28, 0.28), rgb(0xff8030)); }
+        for mob in &g.mobs {
+            let gy = world::height_at(mob.x, mob.z);
+            let pose = if mob.stunned() { cat::startle() } else { cat::walk((self.frame * 0.06 + mob.x * 0.1) % 1.0) };
+            cat::build(&mut m, v3(mob.x, gy, mob.z), 1.0, &pose);
+            let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
+            m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);
+            m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color));
+            if mob.carrying { m.cone(v3(mob.x, gy + 1.9, mob.z), 0.45, 0.7, 6, rgb(0xff6acf)); }
+        }
+        m
+    }
+
+    /// The full per-frame path for Pop Island (parallel to the sim/prowl renders).
+    fn render_capture(&mut self, dt: f32) {
+        self.set_capture(!self.menu.open);
+        if !self.menu.open {
+            let (ix, iz) = self.keys.move_vec();
+            let (mx, mz) = move_world(self.yaw, ix, iz);
+            {
+                let g = self.capture.as_mut().unwrap();
+                g.set_input(mx, mz, self.keys.dodge || self.keys.mleft, self.keys.crouch || self.keys.mright);   // Space/L-click throw, Shift/R-click jump
+                g.step(dt);
+            }
+            if self.keys.restart {
+                let c = self.capture.as_ref().unwrap().mobs[0].class;
+                self.capture = Some(clawbound_rs::capture::Capture::new(c));
+                self.keys.restart = false;
+            }
+        }
+        let (px, pz) = { let g = self.capture.as_ref().unwrap(); (g.mobs[0].x, g.mobs[0].z) };
+        let gy = clawbound_rs::world::height_at(px, pz);
+        self.focus = v3(px, gy, pz);
+
+        let ents = self.build_capture_entities();
+        self.upload_entities(&ents);
+
+        let stunned = { self.capture.as_ref().unwrap().mobs[0].stunned() };
+        let grim = if stunned { 0.4 } else { 0.0 };
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32]));
+        self.write_camera(34.0);
+
+        let items = self.menu.items();
+        let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
+        let (s0, s1, period, ptime, outcome, carrying, caps, stuns, cls, b_speed, b_shield, b_triple, cd, overtime) = {
+            let g = self.capture.as_ref().unwrap();
+            let p = &g.mobs[0];
+            (g.score[0], g.score[1], g.period, g.period_t.max(0.0), g.outcome, p.carrying, p.captures, p.stuns, p.class.name(),
+             p.buffs.speed_boosted(), p.buffs.shield, p.buffs.triple_active(), p.cd, g.overtime)
+        };
+        let ppp = self.egui_ctx.pixels_per_point();
+        let raw = self.egui_state.take_egui_input(&self._window);
+        let full = self.egui_ctx.run(raw, |ctx| {
+            use egui::{Align2, Color32, RichText};
+            if open { draw_menu(ctx, &items, cursor, screen); return; }
+            egui::Area::new("cscore".into()).anchor(Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("TAWNY {s0}")).size(20.0).strong().color(Color32::from_rgb(255, 138, 90)));
+                        ui.label(RichText::new(format!("   {}:{:02}   ", (ptime as u32) / 60, (ptime as u32) % 60)).size(18.0).color(Color32::WHITE));
+                        ui.label(RichText::new(format!("{s1} SILVER")).size(20.0).strong().color(Color32::from_rgb(90, 154, 255)));
+                    });
+                    ui.vertical_centered(|ui| ui.label(RichText::new(if overtime { "SUDDEN DEATH".to_string() } else { format!("PERIOD {period}") }).size(12.0).strong().color(if overtime { Color32::from_rgb(255, 180, 90) } else { Color32::from_gray(180) })));
+                });
+            });
+            egui::Area::new("cinfo".into()).anchor(Align2::LEFT_BOTTOM, [16.0, -16.0]).show(ctx, |ui| {
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 3.0;
+                    ui.label(RichText::new(format!("{cls} - TEAM TAWNY")).size(14.0).strong().color(Color32::from_rgb(255, 160, 110)));
+                    ui.label(RichText::new(format!("captures {caps}  -  stuns {stuns}")).size(13.0).color(Color32::from_rgb(210, 215, 225)));
+                    let mut pu = String::new();
+                    if b_speed { pu.push_str("SPD "); }
+                    if b_shield { pu.push_str("SHLD "); }
+                    if b_triple { pu.push_str("3X "); }
+                    if !pu.is_empty() { ui.label(RichText::new(pu).size(13.0).strong().color(Color32::from_rgb(255, 224, 120))); }
+                    if cd > 0.0 { ui.label(RichText::new(format!("firecracker {:.1}s", cd)).size(12.0).color(Color32::from_rgb(230, 150, 120))); }
+                    else { ui.label(RichText::new("firecracker READY").size(12.0).color(Color32::from_rgb(150, 220, 150))); }
+                });
+            });
+            if carrying {
+                egui::Area::new("ccarry".into()).anchor(Align2::CENTER_TOP, [0.0, 86.0]).show(ctx, |ui| {
+                    ui.label(RichText::new("* CARRYING YARN - GET TO YOUR BASE! *").size(16.0).strong().color(Color32::from_rgb(255, 106, 207)));
+                });
+            }
+            egui::Area::new("chint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
+                ui.label(RichText::new("WASD move · mouse look · Space/L-click throw · Shift/R-click jump · R restart · Esc menu")
+                    .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
+            });
+            if let Some(w) = outcome {
+                egui::Area::new("cdim".into()).order(egui::Order::Background).show(ctx, |ui| { ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_black_alpha(150)); });
+                let (txt, col) = match w {
+                    0 => ("TAWNY WINS", Color32::from_rgb(255, 138, 90)),
+                    1 => ("SILVER WINS", Color32::from_rgb(90, 154, 255)),
+                    _ => ("DRAW", Color32::from_rgb(220, 214, 205)),
+                };
+                egui::Area::new("cresult".into()).anchor(Align2::CENTER_CENTER, [0.0, -10.0]).show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(txt).size(46.0).strong().color(col));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("press  R  for another match").size(16.0).color(Color32::from_rgb(255, 220, 120)));
+                    });
+                });
+            }
+        });
+        let bg = wgpu::Color { r: 0.62, g: 0.80, b: 0.92, a: 1.0 };
+        self.present(bg, full, ppp);
+    }
+
     fn render(&mut self) {
         self.frame += 1.0;
-        let dt = 1.0 / 60.0;
+        let now = std::time::Instant::now();
+        // real elapsed time, clamped so a stall can't fling everything across the map;
+        // this keeps the game running at the same pace on 60Hz and 120Hz displays alike.
+        let dt = now.duration_since(self.last).as_secs_f32().clamp(0.0, 0.1);
+        self.last = now;
         self.debug_cone = self.menu.settings.show_cone;
+        if self.capture.is_some() { self.render_capture(dt); return; }
+        if self.prowl.is_some() { self.render_prowl(dt); return; }
 
         // cursor capture follows play: locked+hidden while playing, freed in menus / after a round
         let want_capture = !self.menu.open && self.game.outcome.is_none();
@@ -270,7 +593,7 @@ impl State {
             // which felt like the controls were rotated ~30° off).
             let (ix, iz) = self.keys.move_vec();
             let (mx, mz) = move_world(self.yaw, ix, iz);
-            self.game.set_input(0, mx, mz, self.keys.crouch, self.keys.dodge, self.keys.leap);
+            self.game.set_input(0, mx, mz, self.keys.crouch, self.keys.dodge || self.keys.mmiddle, self.keys.leap || self.keys.mleft);
 
             // when the player's own cat is caught: a short slow-motion beat + a fade flash
             let alive = self.game.cats[0].alive;
@@ -283,7 +606,9 @@ impl State {
             // round flow: hold the result a beat, then restart (or on 'R')
             if self.game.outcome.is_some() { self.over_timer += dt; } else { self.over_timer = 0.0; }
             if self.keys.restart || self.over_timer > 6.0 {
+                let diff = self.game.difficulty;
                 self.game = Game::new_match(self.kind, self.mode);
+                self.game.difficulty = diff;
                 self.over_timer = 0.0; self.keys.restart = false;
                 self.death_t = 0.0; self.prev_player_alive = true;
             }
@@ -445,7 +770,7 @@ impl State {
                     });
                 });
                 egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                    ui.label(RichText::new("WASD move   ·   mouse look   ·   Shift hide/climb   ·   Space roll   ·   F leap   ·   Esc menu")
+                    ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · Esc menu")
                         .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
                 });
                 // caught: a red flash while the slow-motion death beat plays out
@@ -492,7 +817,17 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.kind = k; state.mode = m; state.game = Game::new_match(k, m); state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; state.game = Game::new_match(k, m); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.over_timer = 0.0; }
+                                            MenuCmd::StartMode(g, k, c) => {
+                                                use clawbound_rs::menu::GameMode;
+                                                state.prowl = None; state.capture = None;
+                                                let diff = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty);
+                                                match g {
+                                                    GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; state.prowl = Some(p); }
+                                                    GameMode::Capture => { state.capture = Some(clawbound_rs::capture::Capture::new(c)); }
+                                                    _ => { state.menu.open = true; }
+                                                }
+                                            }
                                             MenuCmd::Quit => elwt.exit(),
                                             MenuCmd::Close => state.menu.open = false,
                                             MenuCmd::Multiplayer | MenuCmd::None => {}
@@ -522,6 +857,15 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                             }
                             state.keys.set(code, down);
                         }
+                    }
+                }
+                WindowEvent::MouseInput { state: btn_state, button, .. } => {
+                    let down = btn_state == ElementState::Pressed;
+                    match button {
+                        MouseButton::Left => state.keys.mleft = down,
+                        MouseButton::Middle => state.keys.mmiddle = down,
+                        MouseButton::Right => state.keys.mright = down,
+                        _ => {}
                     }
                 }
                 WindowEvent::RedrawRequested => { state.render(); }

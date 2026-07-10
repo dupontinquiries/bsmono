@@ -3,6 +3,7 @@
 //! its `menu.rs` logic from the `egui_overlay` renderer. The app drives this with
 //! key/pointer input and an egui (or any) front-end reads it to draw.
 
+use crate::class::{Class, CLASSES};
 use crate::hunter::Kind;
 use crate::sim::Mode;
 
@@ -61,9 +62,25 @@ impl Default for Settings {
     fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, keybinds: Keybinds::default() } }
 }
 
+/// Map the difficulty setting (0 easy .. 2 hard) to a hunter-aggression multiplier.
+pub fn difficulty_mult(d: u8) -> f32 { match d { 0 => 0.82, 2 => 1.22, _ => 1.0 } }
+
+/// The game modes the player can launch from the menu.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GameMode { Rendezvous, Survive, Prowl, Capture }
+pub const GAME_MODES: [GameMode; 4] = [GameMode::Rendezvous, GameMode::Survive, GameMode::Prowl, GameMode::Capture];
+impl GameMode {
+    pub fn name(self) -> &'static str {
+        match self { GameMode::Rendezvous => "Rendezvous (6v1)", GameMode::Survive => "Survive (6v1)", GameMode::Prowl => "Prowl", GameMode::Capture => "Pop Island" }
+    }
+    /// The two 6v1 modes map onto the existing sim; Prowl/Capture are their own sims.
+    pub fn is_sim(self) -> bool { matches!(self, GameMode::Rendezvous | GameMode::Survive) }
+    pub fn sim_mode(self) -> Mode { if self == GameMode::Survive { Mode::Survive } else { Mode::Rendezvous } }
+}
+
 /// What the app should do when the player commits a menu choice.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum MenuCmd { None, StartSingle(Kind, Mode), Multiplayer, Quit, Close }
+pub enum MenuCmd { None, StartSingle(Kind, Mode), StartMode(GameMode, Kind, Class), Multiplayer, Quit, Close }
 
 pub struct Menu {
     pub open: bool,
@@ -72,6 +89,8 @@ pub struct Menu {
     pub settings: Settings,
     pub sel_hunter: Kind,
     pub sel_mode: Mode,
+    pub sel_game: GameMode,
+    pub sel_class: Class,
     pub rebinding: Option<Action>,   // Some(action) while waiting for a key press
 }
 
@@ -80,7 +99,7 @@ impl Default for Menu { fn default() -> Self { Self::new() } }
 impl Menu {
     pub fn new() -> Self {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
-               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, rebinding: None }
+               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, rebinding: None }
     }
 
     /// Menu item labels for the current screen (top-to-bottom).
@@ -88,8 +107,9 @@ impl Menu {
         match self.screen {
             Screen::Title => vec!["Single Player".into(), "Multiplayer".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
             Screen::Play => vec![
+                format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
-                format!("Mode: {}", if self.sel_mode == Mode::Rendezvous { "Rendezvous" } else { "Survive" }),
+                format!("Class: {}", self.sel_class.name()),
                 "Start".into(), "Back".into(),
             ],
             Screen::Settings => vec![
@@ -119,11 +139,25 @@ impl Menu {
         self.sel_hunter = all[(((cur as i32 + dir) % n + n) % n) as usize];
     }
 
-    /// Left/right adjust the value on the current row (hunter, mode, volume, etc.).
+    fn next_game(&mut self, dir: i32) {
+        let cur = GAME_MODES.iter().position(|&g| g == self.sel_game).unwrap_or(0);
+        let n = GAME_MODES.len() as i32;
+        self.sel_game = GAME_MODES[(((cur as i32 + dir) % n + n) % n) as usize];
+        if self.sel_game.is_sim() { self.sel_mode = self.sel_game.sim_mode(); }
+    }
+
+    fn next_class(&mut self, dir: i32) {
+        let cur = CLASSES.iter().position(|&c| c == self.sel_class).unwrap_or(0);
+        let n = CLASSES.len() as i32;
+        self.sel_class = CLASSES[(((cur as i32 + dir) % n + n) % n) as usize];
+    }
+
+    /// Left/right adjust the value on the current row (game, hunter, class, volume, etc.).
     pub fn adjust(&mut self, dir: i32) {
         match (self.screen, self.cursor) {
-            (Screen::Play, 0) => self.next_hunter(dir),
-            (Screen::Play, 1) => self.sel_mode = if self.sel_mode == Mode::Rendezvous { Mode::Survive } else { Mode::Rendezvous },
+            (Screen::Play, 0) => self.next_game(dir),
+            (Screen::Play, 1) => self.next_hunter(dir),
+            (Screen::Play, 2) => self.next_class(dir),
             (Screen::Settings, 0) => self.settings.show_cone = !self.settings.show_cone,
             (Screen::Settings, 1) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
             (Screen::Settings, 2) => {
@@ -145,9 +179,13 @@ impl Menu {
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
-                2 => { self.open = false; MenuCmd::StartSingle(self.sel_hunter, self.sel_mode) }
-                3 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
-                _ => MenuCmd::None,   // rows 0/1 are adjusted with left/right
+                3 => {
+                    self.open = false;
+                    if self.sel_game.is_sim() { MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode()) }
+                    else { MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class) }
+                }
+                4 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
+                _ => MenuCmd::None,   // rows 0/1/2 are adjusted with left/right
             },
             Screen::Settings => { if self.cursor == 3 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
             Screen::Keybinds => {
@@ -189,10 +227,25 @@ mod tests {
         let mut m = Menu::new();
         assert_eq!(m.activate(), MenuCmd::None);      // Title → Play screen
         assert_eq!(m.screen, Screen::Play);
-        m.adjust(1);                                   // change hunter
-        m.cursor = 2;                                  // Start
+        m.cursor = 1; m.adjust(1);                     // change hunter
+        m.cursor = 3;                                  // Start (a sim game is selected by default)
         match m.activate() { MenuCmd::StartSingle(_, _) => {}, c => panic!("expected StartSingle, got {c:?}") }
         assert!(!m.open);
+    }
+
+    #[test]
+    fn play_screen_selects_game_and_class() {
+        let mut m = Menu::new();
+        m.activate();                                  // Title → Play
+        assert_eq!(m.sel_game, GameMode::Rendezvous);
+        m.cursor = 0; m.adjust(1); assert_eq!(m.sel_game, GameMode::Survive);
+        m.adjust(1); assert_eq!(m.sel_game, GameMode::Prowl);
+        m.cursor = 2; let c0 = m.sel_class; m.adjust(1); assert_ne!(m.sel_class, c0, "class should cycle");
+        m.cursor = 3;
+        match m.activate() {
+            MenuCmd::StartMode(GameMode::Prowl, _, cls) => assert_eq!(cls, m.sel_class),
+            c => panic!("expected StartMode(Prowl,..), got {c:?}"),
+        }
     }
 
     #[test]

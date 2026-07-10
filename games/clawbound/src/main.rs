@@ -327,7 +327,7 @@ fn build_wildlife() -> (Mesh, Vec3) {
     let mut m = world::build_terrain(150);
     m.extend(&world::build_water());
     m.extend(&world::build_trees(220));
-    m.extend(&world::build_bushes(160));
+    m.extend(&world::build_bushes(200));
     m.extend(&world::build_grass(3200));
     m.extend(&world::build_reeds(650));
     m.extend(&world::build_rocks(200));
@@ -392,6 +392,138 @@ fn build_game() -> (Mesh, Vec3) {
     m.set_op(1.0);
 
     (m, v3(cx_sum / n, 2.0, cz_sum / n))
+}
+
+fn build_prowl() -> (Mesh, Vec3) {
+    use clawbound_rs::prowl::{Prowl, ProwlObj};
+    use clawbound_rs::class::Class;
+    let hk = match std::env::args().nth(4).as_deref() {
+        Some("dog") => hunter::Kind::Dog, Some("badger") => hunter::Kind::Badger, Some("hawk") => hunter::Kind::Hawk,
+        Some("snake") => hunter::Kind::Snake, Some("shadow") => hunter::Kind::Shadow, _ => hunter::Kind::Fox,
+    };
+    let cl = match std::env::args().nth(5).as_deref() {
+        Some("squirrel") => Class::Squirrel, Some("frog") => Class::Frog, Some("goat") => Class::Goat,
+        Some("hawk") => Class::Hawk, Some("cat") => Class::Cat, _ => Class::Otter,
+    };
+    let mut g = Prowl::new(cl, hk);
+    for _ in 0..(6 * 30) {
+        let (mut tx, mut tz) = (g.obj.tx - g.x, g.obj.tz - g.z);
+        let hd = ((g.hx - g.x).powi(2) + (g.hz - g.z).powi(2)).sqrt();
+        let dodge = hd < 6.0;
+        if dodge { tx = g.x - g.hx; tz = g.z - g.hz; }
+        g.set_input(tx, tz, false, dodge, false);
+        g.step(1.0 / 30.0);
+    }
+    eprintln!("PROWL [{}]: {}  | prey {}  caught {}  escapes {}", g.class.name(), g.objective_text(), g.prey_caught, g.times_caught, g.escapes);
+
+    let mut m = world::build_terrain(150);
+    m.extend(&world::build_water());
+    m.extend(&world::build_trees(140));
+    m.extend(&world::build_grass(2400));
+    m.extend(&world::build_reeds(450));
+    m.extend(&build_critters(&g.critters));
+
+    // point-of-interest pillars, and a bright beacon on the live objective
+    for &(px, pz, _n) in &g.pois {
+        let gy = world::height_at(px, pz);
+        m.set_op(0.5);
+        m.segment(v3(px, gy, pz), v3(px, gy + 10.0, pz), 0.4, 0.1, 5, rgb(0x8fd0ff));
+        m.set_op(1.0);
+    }
+    if matches!(g.obj.kind, ProwlObj::Reach | ProwlObj::Rendezvous) {
+        let (ox, oz) = (g.obj.tx, g.obj.tz);
+        let gy = world::height_at(ox, oz);
+        m.set_op(0.85);
+        m.segment(v3(ox, gy, oz), v3(ox, gy + 22.0, oz), 0.9, 0.25, 8, rgb(0x8fd0ff));
+        m.set_op(1.0);
+    }
+    // the shrinking hunt-ring — a translucent violet storm wall at the current radius
+    {
+        let rr = g.ring.radius();
+        m.set_op(0.3);
+        let rc = rgb(0x9a6cff);
+        for k in 0..72 {
+            let a = k as f32 / 72.0 * std::f32::consts::TAU;
+            let (rx, rz) = (g.ring.cx + a.cos() * rr, g.ring.cz + a.sin() * rr);
+            let gy = world::height_at(rx, rz);
+            m.segment(v3(rx, gy - 1.0, rz), v3(rx, gy + 7.0, rz), 0.35, 0.35, 4, rc);
+        }
+        m.set_op(1.0);
+    }
+
+    // the prowler (player) + a class-tint marker; then the stalking hunter
+    let pgy = world::height_at(g.x, g.z);
+    let pose = if g.leap_t > 0.0 { cat::leap() } else if g.crouched { cat::coil() } else if g.moving { cat::walk((g.time * 6.0) % 1.0) } else { cat::stand() };
+    cat::build(&mut m, v3(g.x, pgy + g.leap_t.max(0.0) * 2.0, g.z), 1.0, &pose);
+    m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
+
+    let hgy = world::height_at(g.hx, g.hz);
+    if g.hunter_kind.is_shadow() { build_shadow(&mut m, v3(g.hx, hgy, g.hz)); } else { build_fox(&mut m, v3(g.hx, hgy, g.hz)); }
+
+    (m, v3(g.x, 2.0, g.z))
+}
+
+fn build_capture() -> (Mesh, Vec3) {
+    use clawbound_rs::capture::{Capture, BASE_R, TAWNY, SILVER};
+    use clawbound_rs::class::Class;
+    let pc = match std::env::args().nth(4).as_deref() {
+        Some("squirrel") => Class::Squirrel, Some("otter") => Class::Otter, Some("frog") => Class::Frog,
+        Some("goat") => Class::Goat, Some("hawk") => Class::Hawk, _ => Class::Cat,
+    };
+    let mut g = Capture::new(pc);
+    // play a few seconds so mobs spread out, yarn is in motion, power-ups appear
+    let mut t = 0;
+    while g.outcome.is_none() && t < 12 * 30 {
+        // nudge the player toward the nearest loose yarn so the shot shows a carry
+        let m = &g.mobs[0];
+        let (mut tx, mut tz) = (0.0f32, 0.0f32);
+        if m.carrying { let b = g.base(TAWNY); tx = b.0 - m.x; tz = b.1 - m.z; }
+        else { let mut best = (f32::MAX, 0.0f32, 0.0f32);
+            for &(yx, yz) in &g.yarn_free { let d = ((yx - m.x).powi(2) + (yz - m.z).powi(2)).sqrt(); if d < best.0 { best = (d, yx, yz); } }
+            if best.0 < f32::MAX { tx = best.1 - m.x; tz = best.2 - m.z; } }
+        g.set_input(tx, tz, t % 50 == 0, false);
+        g.step(1.0 / 30.0); t += 1;
+    }
+    eprintln!("CAPTURE [period {}]: Tawny {} — Silver {}  loose-yarn {}  powerups {}", g.period, g.score[0], g.score[1], g.yarn_free.len(), g.powerups.len());
+
+    let mut m = world::build_terrain(150);
+    m.extend(&world::build_water());
+    m.extend(&world::build_trees(90));
+    m.extend(&world::build_grass(2200));
+    m.extend(&world::build_reeds(400));
+
+    // team bases: a broad low disc + a beacon in team colour
+    for team in [TAWNY, SILVER] {
+        let (bx, bz) = g.base(team);
+        let col = if team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
+        let gy = world::height_at(bx, bz);
+        m.set_op(0.5);
+        m.cone(v3(bx, gy + 0.15, bz), BASE_R, 0.3, 22, col);   // flat pad
+        m.set_op(1.0);
+        m.segment(v3(bx, gy, bz), v3(bx, gy + 16.0, bz), 0.6, 0.15, 6, col);
+    }
+    // yarn balls — pink papercraft puffs
+    for &(yx, yz) in &g.yarn_free {
+        let gy = world::height_at(yx, yz);
+        m.cone(v3(yx, gy + 0.8, yz), 0.8, 1.4, 6, rgb(0xff6acf));
+    }
+    // power-ups — floating coloured markers
+    for p in &g.powerups {
+        let gy = world::height_at(p.x, p.z);
+        m.boxx(v3(p.x, gy + 1.6, p.z), v3(0.5, 0.5, 0.5), rgb(p.kind.color()));
+    }
+    // creatures — cat rig tinted per team, a class-coloured back marker, yarn if carried
+    for mob in &g.mobs {
+        let gy = world::height_at(mob.x, mob.z);
+        let pose = if mob.stunned() { cat::startle() } else { cat::stand() };
+        cat::build(&mut m, v3(mob.x, gy, mob.z), 1.0, &pose);
+        let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
+        m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);          // team collar/flag
+        m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color)); // class tint
+        if mob.carrying { m.cone(v3(mob.x, gy + 1.9, mob.z), 0.45, 0.7, 6, rgb(0xff6acf)); }
+    }
+
+    (m, v3(0.0, 0.0, 0.0))
 }
 
 #[cfg(feature = "app")]
@@ -496,6 +628,8 @@ async fn run() {
         "map" => build_scene(),
         "goals" => build_goals(),
         "game" => build_game(),
+        "prowl" => build_prowl(),
+        "capture" => build_capture(),
         "wildlife" => build_wildlife(),
         _ => build_scene(),
     };
@@ -532,6 +666,8 @@ async fn run() {
         "map" => (v3(70.0, 82.0, -14.0), v3(4.0, -3.0, 42.0)),
         "goals" => (v3(48.0, 66.0, -24.0), v3(0.0, -2.0, 16.0)),
         "game" => (focus.add(v3(22.0, 40.0, -22.0)), focus.add(v3(0.0, -3.0, 9.0))),
+        "prowl" => (focus.add(v3(20.0, 34.0, -20.0)), focus.add(v3(0.0, -3.0, 8.0))),
+        "capture" => (v3(92.0, 104.0, -30.0), v3(-6.0, -10.0, 6.0)),
         "wildlife" => (focus.add(v3(0.5, 2.3, -7.5)), focus.add(v3(0.0, 0.9, 3.2))),
         _ => (focus.add(v3(-13.0, 8.0, -15.0)), focus.add(v3(3.0, -3.5, 7.0))),
     };

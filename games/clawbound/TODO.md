@@ -39,6 +39,111 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] Nightmare/otherworld atmospherics (Shadow shift): near-black violet sky, stars snuffed out (robust hash), long shadows crawling up from the trees, spectral cats drifting in the underworld, sickly desaturation + closing vignette. `tod=nightmare` render + driven live by the shift in --play (post fx uniform)
 
 ## Roadmap (multi-turn)
+-17. [x] Three fixes from the playtest:
+   (a) **Game speed** — the loop stepped a hardcoded dt=1/60 every frame, so on the M2's
+   120Hz ProMotion display everything ran at 2× speed. Now it uses real elapsed time
+   (clamped to 0.1s so a stall can't fling things), so it plays at the same pace on 60Hz
+   and 120Hz alike.
+   (b) **Mouse binds** — added left/middle/right mouse buttons to the input. Middle-click
+   rolls and left-click leaps (sim/prowl); left-click throws a firecracker and right-click
+   jumps (Pop Island). Control hints updated.
+   (c) **Feature (mode separation)** — Pop Island **sudden-death overtime**: a tie after
+   two periods now goes to a 30s golden-goal window (the HUD shows "SUDDEN DEATH"); the
+   next capture wins outright, or it's a draw if no one scores. Test covers the golden
+   goal; the invariants soak was widened to cover the overtime window. 68 tests.
+-16. [x] Bug hunt on the newer modes (capture/prowl) — no bugs found, but added the
+   property coverage they lacked: a **yarn-conservation + invariants soak** over full
+   Pop Island matches for all six classes (loose + carried yarn always == the six balls,
+   scores only climb, mobs finite and inside the arena, timers never negative, always
+   resolves), and a **Prowl invariants soak** over 16 class×hunter combos (stamina in
+   [0,1], prowler + hunter finite and on-map, tallies monotonic, no panic). Swept all 18
+   capture/prowl render configs — panic-free. Removed a dead `.chain(..take(0))` no-op in
+   `respawn_yarn`. 67 tests total. (Also re-hit the recurring test-clobber footgun and
+   caught/fixed it before it shipped.)
+-15. [x] Smarter Pop Island AI (capture.rs) — replaced the fetch-and-throw-randomly bots
+   with role-based play: one **defender** per team orbits its base and runs down enemy
+   yarn carriers, while the rest fetch yarn. Firecracker targeting now prefers carriers
+   (weighted 0.4× distance, wider 20u lob) and fires whenever loaded and in range instead
+   of a 3% coin-flip, and every bot detours for a power-up that's on the way. Result:
+   firecrackers actually land (≈4 stuns/match vs near-zero), carriers get contested, both
+   teams score. 3 unit tests (throws at a nearby carrier, detours to a close power-up,
+   defender chases a distant carrier). 65 tests total.
+-14. [x] Wired the **Settings difficulty** into gameplay (it was previously unused). A
+   hunter-aggression multiplier (easy 0.82 / normal 1.0 / hard 1.22 via
+   `menu::difficulty_mult`) scales both the suspicion build-up rate and the hunter's
+   pace, in the 6v1 sim (`Game.difficulty`) and Prowl (`Prowl.difficulty`). The app sets
+   it from Settings when a match starts and preserves it across restarts. Verified it
+   moves outcomes: over a fixed Survive match a Fox catches 2 on easy → 3 on hard, a Dog
+   2 → 3 (the Hawk already sweeps 6/6). Test asserts a harder hunter never catches fewer.
+-13. [x] Pop Island polish from the playtest concerns: (a) **bases now land on dry
+   ground** — instead of fixed anchors at (0,±70) that could sit underwater on this
+   hilly/watery map, each base is nudged to the nearest dry, reasonably flat spot near
+   its anchor (`land_near`), so yarn is always deliverable. Bases are instance fields
+   with a `base(team)` method (replaced the fixed `base_of`); test asserts both bases are
+   above the waterline. (b) **Per-mode camera** — `write_camera(dist)` is parameterized
+   so Pop Island pulls back to 34 (from 20) for its wide, 140-unit-long arena while
+   Prowl stays tight at 20.
+-12. [x] **Pop Island is now playable in the window too** (app.rs) — all four menu modes
+   are live. Selecting Game: Pop Island launches a capture session dispatched to a
+   self-contained `render_capture` reusing the shared helpers (upload_entities /
+   write_camera / present / draw_menu). WASD move, Space throws a firecracker, Shift
+   jumps, R restarts. HUD: a Tawny–Silver scoreboard with the period timer, your
+   creature + captures/stuns, active power-ups (SPD/SHLD/3X) and the firecracker
+   cooldown, a "carrying yarn" banner, and a win/draw screen. Renders both team bases,
+   loose yarn, power-ups, in-flight firecrackers, and team-collared creatures. The menu
+   now fully drives mode selection → the sim (Rendezvous/Survive), Prowl, and Pop Island
+   are each playable; picking one clears the others. (App wiring compile-verified only —
+   no display in the sandbox.)
+-11. [x] **Prowl is now playable in the window** (app.rs). Selecting Game: Prowl in the
+   menu launches a live prowl session: the loop dispatches to a self-contained
+   `render_prowl` (input → step → follow-cam → entities → HUD) while the 6v1 sim path is
+   left untouched. Camera-relative WASD, mouse-look, Shift hide, Space roll, F leap, R
+   restart; the HUD shows the rotating objective, prey/caught/escapes, stamina, and an
+   EXPOSED warning (with a violet screen tint) when you're outside the ring. Renders the
+   prowler, stalker, critters, POI pillars, objective beacon and the storm-ring wall.
+   Factored shared helpers (upload_entities / write_camera / present / draw_menu) so the
+   two modes share GPU + menu code without touching the working sim path. Also aligned
+   the visible world to 200 bushes so every hiding spot the sim/prowl use is drawn.
+   Pop Island in-window is the remaining mode. (App wiring is compile-verified only —
+   no display in the sandbox.)
+-10. [x] Wired the shared `ring` into **Prowl** as real pressure (it was an unused
+   primitive): a shrinking hunt-ring where, once you're *outside*, cover no longer
+   conceals you from the hunter and stamina bleeds — forcing the prowl inward. Rendered
+   as a translucent violet storm wall at the live radius (starts wide, so it's off the
+   close follow-cam early). Test: cover hides you inside the ring, fails outside it.
+   Also extended **menu.rs** (tested UI logic) with a game-mode selector — the Play
+   screen now cycles Game (Rendezvous / Survive / Prowl / Pop Island) · Hunter · Class,
+   and commits either `StartSingle` (the 6v1 sim) or a new `StartMode(game, hunter,
+   class)` for Prowl/Capture. App handles the new command (live in-window Prowl/Pop
+   Island is the next milestone; sim modes play as before). 2 new tests → 60 total.
+-9. [x] Ported the second prototype — **Prowl** (the SMITE-2-inspired mode) as a shared
+   lib (prowl.rs), reusing class/hunter/ecology/objectives. You prowl as a chosen class
+   while a hunter stalks you, clearing **rotating objectives** (Reach a biome landmark,
+   hold a Rendezvous, Survive the hunt, Forage N prey), hunting prey by pouncing
+   mid-leap for score, with respawn-on-catch (not permadeath) and escape/catch tallies.
+   Movement is terrain-scaled through the class, so the map shapes the chase (an otter
+   thrives on this water-heavy map where a squirrel drowns — verified integrated: Otter
+   vs Badger cleared+rotated objectives, caught once; Squirrel vs Fox drowned). Objective
+   landmarks are named by biome ("Reach the Moor Plains"). Headless `prowl` render mode
+   (POI pillars, objective beacon, prowler + stalker). 5 unit tests (reach clears+rotates,
+   survive counts down, leap-pounce feeds forage, catch respawns, airborne is uncatchable).
+-8. [x] Ported the two new browser prototypes toward the native engine as **shared
+   libs**, starting with Pop Island 2 ("Tails of the Wild — Yarn Ball Capture"):
+   * **class.rs** (shared) — six terrain-specialised creature classes (Cat/Squirrel/
+     Otter/Frog/Goat/Hawk) with land/water/mtn speeds, jump, stun-resist, fly; `speed_at`
+     reads the world heightfield so who's fastest depends on land vs water vs mountain.
+   * **powerup.rs** (shared) — Speed / Shield (one-hit) / Triple-Toss buffs with a
+     `Buffs` struct (grant/tick/absorb_hit/throw_count).
+   * **ring.rs** (shared) — a shrinking safe-zone/dome (radius easing r0→r1, damage
+     outside, flee-to-safety vector) for the Prowl storm, next.
+   * **capture.rs** — the full Pop Island mode as deterministic renderer-free logic:
+     two teams (Tawny/Silver), yarn-ball carry-to-base scoring, firecracker throws that
+     stun and make carriers drop yarn (shield soaks it), power-up pickups, terrain- and
+     buff-scaled movement, simple fetch/throw AI, two timed periods → winner. Headless
+     `capture` render mode (team bases, yarn, power-ups, team-collared creatures).
+   15 new unit tests (class 4, powerup 3, ring 2, capture 6). Prowl (SMITE-2 mode:
+   objectives, jungle camps, blink ability, the ring) is the next pass and will reuse
+   class/powerup/ring.
 -7. [x] Ported the three three.js-only mechanics into the native sim (sim.rs), unit-
    tested, wired into --play (app.rs) and the renderer (main.rs):
    (1) **Leap** — a committed forward bound on `F`/`E`: longer and airborne, so it's
