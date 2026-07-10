@@ -1,0 +1,15 @@
+[package]
+name = "beatspace-gpu"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+flate2 = "1"
+bytemuck = "1"
+fastrand = "2"
+serde_json = "1.0.150"
+
+[profile.release]
+opt-level = 3
