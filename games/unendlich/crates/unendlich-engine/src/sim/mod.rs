@@ -72,7 +72,6 @@ pub mod net;
 pub mod personality;
 pub mod physics;
 pub mod rollback;
-pub mod netview; // webhost-kit snapshot (spectate the rollback sim in a browser)
 /// EXPERIMENTAL (r238): batch-as-field grass LOD — front high-res per-blade,
 /// back fast-forwarded as a density/growth/sway field. Pure model always
 /// built + tested; live tick-path hookup is behind `grass-field-batch`.
@@ -150,6 +149,7 @@ pub mod leap;
 pub mod water_sight;
 pub mod concealment;
 pub mod lauscher;
+pub mod phrase_learning;
 pub mod sentinel;
 pub mod elemental;
 pub mod stature;
@@ -209,7 +209,16 @@ pub mod dragon_energy; // r605: dragon energy pool (6 states + capability gates 
 pub mod wing_loading;
 pub mod flight_modes; // r675: 7-mode flight FSM (flap/bound/undulate/soar/stoop) from flying_animal_behaviour §2.1
 pub mod provocation; // r607: context-sensitive fauna threat response (passive/neutral/hostile + sticky provocation)
-pub mod dragon_territory; // r609: age-scaled core/influence dragon territory + deference/conflict
+pub mod dragon_territory;
+pub mod dragon_voice;
+pub mod deeptime_convergence;
+pub mod hybrid_step;
+pub mod gamemode_traits;
+pub mod legendary_tier;
+pub mod lore_attribution;
+pub mod dragon_roost;
+pub mod builder_genome; // r690: builder dragons (BLD alleles → Shaper/Neatener/Builder/Architect) from builder_genome_revised // r689: dragon roost formation (SPEC-011 whisper_roosts) — element signature + territory // r609: age-scaled core/influence dragon territory + deference/conflict
+pub mod cave_dragon; // r691: cave dragons (biome→element habitat) derived from cave_biomes.docx
 pub mod resonance; // r613: character-panel Resonance Rating (POWER) + Resilience mitigation
 pub mod skill_constellation; // r614: bending-discipline skill tree (nodes/prereqs/env-gate/unlock)
 pub mod ability_bar; // r615: five-slot technique binding row (composes with skill_constellation)
@@ -249,6 +258,9 @@ pub mod strafe_face;
 // they are reached by path (e.g. `sim::inventory_grid::ItemId`) rather than
 // re-exported here; unifying on a shared item type is a follow-up.
 pub mod command_parse;
+pub mod craft_sway;
+pub mod collections;
+pub mod companion_roster;
 pub mod game_mode; // r335-gamemode: gamemode switch model + caps
 pub mod world_management; // r335-worldmgmt: world-mgmt settings + Open-to-DHT
 pub mod crafting;
@@ -463,6 +475,7 @@ pub mod limb_detail_flag;
 pub mod damage_shard;
 pub mod dismember_check;
 pub mod stance_bias;
+pub mod stance_culture;
 pub mod batch_scent_decay;
 pub mod pack_flank;
 pub mod cover_seek;
@@ -691,6 +704,7 @@ pub mod tree_pollination;
 pub mod combustion_spread;
 pub mod river_flow;
 pub mod bending_stormstrike;
+pub mod bending_fx; // r688: bending visual-effect params (lightning arc etc.) from bending_shaders.docx
 pub mod net_candidates;
 pub mod net_channels; // r330: multiplayer QoS channel table + per-tick byte budgeter (§6)
 // r330 returns (coordinator-reconciled mod lines for the merged worker modules):

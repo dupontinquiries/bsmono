@@ -308,12 +308,21 @@ pub fn format_workload_summary(loaded: &[u64], rendering: &[u64]) -> String {
     }
     let (n_l, min_l, p50_l, p90_l, max_l) = stats(loaded);
     let (n_r, min_r, p50_r, p90_r, max_r) = stats(rendering);
+    // Derived analysis — the numbers to watch when tuning occlusion cull (r726) and
+    // adaptive render distance (r727): render fraction (complement = cull rate) and
+    // burstiness p90/p50 (≈1.0 flat; large = occasional floods stressing the frame).
+    let render_pct = if p50_l > 0 { (p50_r.saturating_mul(100) / p50_l).min(100) } else { 0 };
+    let cull_pct = 100u64.saturating_sub(render_pct);
+    let load_burst = if p50_l > 0 { p90_l as f32 / p50_l as f32 } else { 1.0 };
+    let render_burst = if p50_r > 0 { p90_r as f32 / p50_r as f32 } else { 1.0 };
     format!(
         "Workload-shape summary (samples taken once per FPS-log window):\n  \
          loaded     n={:>4}  min={:>5}  p50={:>5}  p90={:>5}  max={:>5}\n  \
-         rendering  n={:>4}  min={:>5}  p50={:>5}  p90={:>5}  max={:>5}",
+         rendering  n={:>4}  min={:>5}  p50={:>5}  p90={:>5}  max={:>5}\n  \
+         analysis   render~{:>3}% of loaded (cull~{:>3}%)  burst p90/p50: load={:.2}x render={:.2}x",
         n_l, min_l, p50_l, p90_l, max_l,
         n_r, min_r, p50_r, p90_r, max_r,
+        render_pct, cull_pct, load_burst, render_burst,
     )
 }
 
@@ -366,8 +375,7 @@ mod tests {
     /// loaded vs rendering can have different shapes — they're tracked
     /// independently and reported on separate lines.
     #[test]
-    fn workload_summary_independent_tracks() {
-        let loaded = vec![1000u64, 1000, 1000, 1000];
+    fn workload_summary_independent_tracks() {        let loaded = vec![1000u64, 1000, 1000, 1000];
         let rendering = vec![50u64, 100, 150, 200];
         let s = format_workload_summary(&loaded, &rendering);
         let loaded_line = s.lines().find(|l| l.contains("loaded")).unwrap();
@@ -376,5 +384,29 @@ mod tests {
         let rendering_line = s.lines().find(|l| l.contains("rendering")).unwrap();
         assert!(rendering_line.contains("min=   50"));
         assert!(rendering_line.contains("max=  200"));
+    }
+
+    /// The derived analysis line reports render fraction, cull rate, and burstiness.
+    #[test]
+    fn workload_summary_analysis_line() {
+        // p50 loaded = 1000, p50 rendering = 250 → render≈25%, cull≈75%.
+        let loaded = vec![1000u64; 5];
+        let rendering = vec![250u64; 5];
+        let s = format_workload_summary(&loaded, &rendering);
+        let a = s.lines().find(|l| l.contains("analysis")).expect("analysis line present");
+        assert!(a.contains("render~ 25%"), "render fraction; got: {a}");
+        assert!(a.contains("cull~ 75%"), "cull rate; got: {a}");
+        // Flat samples → burst ≈ 1.00x on both tracks.
+        assert!(a.contains("load=1.00x"), "flat load burst; got: {a}");
+        assert!(a.contains("render=1.00x"), "flat render burst; got: {a}");
+    }
+
+    /// Empty input must not divide by zero in the analysis line.
+    #[test]
+    fn workload_summary_analysis_empty_is_safe() {
+        let s = format_workload_summary(&[], &[]);
+        let a = s.lines().find(|l| l.contains("analysis")).unwrap();
+        assert!(a.contains("render~  0%"));
+        assert!(a.contains("cull~100%"));
     }
 }

@@ -978,6 +978,27 @@ fn octree_gpu_dispatcher_loop(
     // global (settable from the Performance page); seed it from the env var once.
     let yield_seed = env_u64("UNENDLICH_GPU_MESH_YIELD_PCT", 0);
     crate::constants::set_gpu_mesh_yield_pct(yield_seed);
+    // r708: per-FRAME GPU-mesh budget. `yield_pct` is a proportional per-dispatch
+    // sleep (a constant duty ratio), so under a deep queue meshing still eats a lot
+    // of wall time. This instead HARD-CAPS GPU-mesh wall time to `budget_us` per
+    // `window_us` (≈ one render frame): once the dispatcher has spent its budget for
+    // the window it sleeps out the remainder, guaranteeing the render
+    // (window − budget) of GPU time every frame no matter how many chunks are
+    // queued — so a 190-chunk burst spreads across frames instead of monopolising
+    // one and producing the 1071ms spike. Default 0 → disabled (yield_pct still
+    // applies). Set UNENDLICH_GPU_MESH_BUDGET_US=4000 for ~4ms/frame of meshing,
+    // leaving ~12ms/frame for the render at the default 16.67ms window.
+    let mesh_budget_us = env_u64("UNENDLICH_GPU_MESH_BUDGET_US", 4000); // r709: default ON (~4ms/frame)
+    let mesh_window_us = env_u64("UNENDLICH_GPU_MESH_WINDOW_US", 16_670).max(1);
+    if mesh_budget_us > 0 {
+        log::info!(
+            "octree-gpu-mesh-dispatcher: per-frame GPU-mesh budget = {}us / {}us window \
+             (UNENDLICH_GPU_MESH_BUDGET_US) — dispatcher yields the GPU to the render once spent",
+            mesh_budget_us, mesh_window_us
+        );
+    }
+    let mut mesh_window_start = Instant::now();
+    let mut mesh_window_used_us: u64 = 0;
     log::info!("octree-gpu-mesh-dispatcher: batch cap = {}, timeout = {:?}, adaptive = {}, \
                 shrink_us = {}, grow_us = {}, yield_pct = {}",
         batch_cap, batch_timeout, adaptive, adapt_shrink_us, adapt_grow_us, yield_seed);
@@ -1146,6 +1167,22 @@ fn octree_gpu_dispatcher_loop(
             let nap_us = dispatch_us.saturating_mul(yield_pct) / 100;
             if nap_us > 0 {
                 thread::sleep(Duration::from_micros(nap_us));
+            }
+        }
+        // r708: per-frame GPU-mesh budget — once this window's meshing budget is
+        // spent, sleep out the rest of the window so the render owns the GPU for
+        // the remainder of the frame. The window resets either when it elapses
+        // naturally or right after a budget-triggered yield.
+        if mesh_budget_us > 0 {
+            mesh_window_used_us = mesh_window_used_us.saturating_add(dispatch_us);
+            let win_elapsed = mesh_window_start.elapsed().as_micros() as u64;
+            if win_elapsed >= mesh_window_us {
+                mesh_window_start = Instant::now();
+                mesh_window_used_us = 0;
+            } else if mesh_window_used_us >= mesh_budget_us {
+                thread::sleep(Duration::from_micros(mesh_window_us - win_elapsed));
+                mesh_window_start = Instant::now();
+                mesh_window_used_us = 0;
             }
         }
         for _ in &batch {

@@ -268,7 +268,21 @@ pub fn spawn(kind: CreatureKind, position: [f32; 3]) -> Creature {
             // r684: also carry a spawn-time growth size, so a wild population
             // shows a real age range (mostly adults, some juveniles/hatchlings).
             let seed = dragon_seed(position);
-            let g = Genome::from_seed(seed);
+            // r692: CAVE DRAGONS — a dragon spawned underground takes the genome
+            // element of the cave biome it inhabits (sim::cave_dragon), so deep
+            // dragons match their habitat: a Fire dragon in the volcanic Steam
+            // Caverns, an Earth/Dust dragon in the limestone cathedrals. The biome
+            // is picked deterministically from the seed; surface dragons keep the
+            // free genome. CAVE_CEIL_Y is a coarse underground threshold (the
+            // procedural surface sits around y≈64).
+            const CAVE_CEIL_Y: f32 = 48.0;
+            let g = if position[1] < CAVE_CEIL_Y {
+                let all = crate::sim::cave_dragon::CaveBiome::ALL;
+                let biome = all[((seed >> 33) as usize) % all.len()];
+                Genome::from_seed_element(seed, crate::sim::cave_dragon::genome_element(biome))
+            } else {
+                Genome::from_seed(seed)
+            };
             spawn_dragon_with_genome_grown(position, &g, DRAGON_FORGE_RES, spawn_growth_size_mul(seed))
         }
         CreatureKind::Lauscher => {
