@@ -658,8 +658,22 @@ const CONTINUE_ALL_TOK: &str = "\u{1}__continue_all__";
 #[derive(Clone)]
 enum FanKind { Continue, Fuzzy { width: usize, template: String } }
 #[derive(Clone)]
-struct Fan { kind: FanKind, rounds_left: usize }
+struct Fan { kind: FanKind, rounds_left: usize, only: Option<usize> }
 const MAX_FAN_QUEUE: usize = 96;
+
+/// What a submitted composer line resolves to. Pure + module-level so the routing is unit-testable
+/// without a live model or egui context.
+enum Composed { Empty, Command(crate::vimmode::Command), Message(String) }
+
+/// Classify a submitted composer line: a leading single ':' is a command (executed, not sent to the
+/// model); '::' escapes a literal message that begins with a colon; anything else is a chat turn.
+fn compose_input(raw: &str) -> Composed {
+    let t = raw.trim();
+    if t.is_empty() { return Composed::Empty; }
+    if let Some(rest) = t.strip_prefix("::") { return Composed::Message(rest.to_string()); } // escaped literal ':'
+    if t.starts_with(':') { return Composed::Command(crate::vimmode::parse_command(t)); }
+    Composed::Message(t.to_string())
+}
 
 /// State for a `:fill` decomposition: the skeleton and its holes, so `:assemble` can splice the filled
 /// bodies back. The sub-task replies come back as branches; assembly maps them positionally (the last N
@@ -1018,6 +1032,22 @@ impl Chat {
         (0..n).filter(|&i| !is_parent[i]).collect()
     }
 
+    /// The live leaf that descends from `anc` (following recorded/linear parentage) — the current tip of
+    /// the line rooted at `anc`. For a single continued line there's exactly one; `:continue` uses this to
+    /// keep deepening the SAME line across rounds. Falls back to `anc` if it is itself a leaf.
+    fn leaf_under(&self, anc: usize) -> Option<usize> {
+        if anc >= self.msgs.len() { return None; }
+        self.leaf_ids().into_iter().find(|&l| {
+            let mut cur = Some(l);
+            while let Some(i) = cur {
+                if i == anc { return true; }
+                cur = self.msgs.get(i).and_then(|m| m.parent).or(if i > 0 { Some(i - 1) } else { None });
+                if cur == Some(i) { break; }
+            }
+            false
+        })
+    }
+
     /// Each message's effective parent (recorded, else previous turn) — the tree the convo-graph and the
     /// best-region selector both read.
     fn effective_parents(&self) -> Vec<Option<usize>> {
@@ -1041,7 +1071,13 @@ impl Chat {
     fn fan_step(&mut self) {
         let Some(mut fan) = self.fan.take() else { return; };
         if fan.rounds_left == 0 { return; }
-        let leaves = self.leaf_ids();
+        // `only` anchors the fan to ONE line (`:continue`): each round descends to the current live tip
+        // under the anchor, so it deepens that line linearly even when other branches exist. `None` fans
+        // the whole frontier (`:ca`/`:fa`).
+        let leaves: Vec<usize> = match fan.only {
+            Some(anc) => self.leaf_under(anc).into_iter().collect(),
+            None => self.leaf_ids(),
+        };
         let mut added = 0usize;
         'outer: for &l in &leaves {
             match &fan.kind {
@@ -1498,16 +1534,40 @@ impl Chat {
         s
     }
 
-    fn send(&mut self, infer: &Inference, doc: &crate::analysis::Doc) {
-        let qt = self.input.trim().to_string();
-        if qt.is_empty() { return; }
-        self.input.clear();
-        // Branch point: a human interjection forks off the selected node (or the previous tip).
-        let parent = self.branch_from.take().or(self.active_leaf).or(self.msgs.len().checked_sub(1));
-        // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
-        // soon as the current reply finishes. This is what makes branching non-blocking.
-        if self.stream.is_some() { self.queue.push_back((qt, parent)); return; }
-        self.start_generation(qt, parent, infer, doc);
+    fn send(&mut self, infer: &Inference, doc: &crate::analysis::Doc, ui: &egui::Ui) {
+        // Composer command routing: a line the user submits that begins with ':' is executed as a
+        // command HERE, not sent to the model. '::text' escapes a literal message that starts with a
+        // colon. Everything else is a normal chat turn.
+        match compose_input(&self.input) {
+            Composed::Empty => {}
+            Composed::Command(cmd) => {
+                self.input.clear();
+                match cmd {
+                    crate::vimmode::Command::Noop => {}
+                    crate::vimmode::Command::Unknown(l) =>
+                        self.note = format!("unknown command '{}' — :help to list commands", l.trim().trim_start_matches(':')),
+                    other => self.run_command(other, ui),
+                }
+            }
+            Composed::Message(qt) => {
+                self.input.clear();
+                // Branch point: a human interjection forks off the selected node (or the previous tip).
+                let parent = self.branch_from.take().or(self.active_leaf).or(self.msgs.len().checked_sub(1));
+                // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
+                // soon as the current reply finishes. This is what makes branching non-blocking.
+                if self.stream.is_some() { self.queue.push_back((qt, parent)); return; }
+                self.start_generation(qt, parent, infer, doc);
+            }
+        }
+    }
+
+    /// The base text a composer-invoked fan command (`:fuzz`/`:fuzzd`) works from: the composer if it holds
+    /// a prompt (the two-box cmdline workflow), else the last user turn — so `:fuzz N` typed straight into
+    /// the message box means "fan N retries of my last prompt", matching the command's documented intent.
+    fn base_for_fan(&self) -> String {
+        let c = self.input.trim();
+        if !c.is_empty() { return c.to_string(); }
+        self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_default()
     }
 
     /// Actually begin a generation: checkpoint, append the user turn (forked at `parent`) + an empty
@@ -3576,23 +3636,25 @@ impl Chat {
             // :fuzz N — fan N framing-perturbed variants of the composer text as branches off the focus,
             // queued to generate one after another (uses the fuzz + queue + branching pieces together).
             Command::Fuzz(n) => {
-                let base = self.input.trim().to_string();
+                let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
                     for v in crate::consensus::fuzz(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
                     self.input.clear();
-                }
+                    self.note = format!("fuzz: fanned {n} retries (:stop to cancel)");
+                } else { self.note = ":fuzz — nothing to fan (type a prompt, or send one first)".into(); }
             }
             // :fuzzd N — like :fuzz, but each branch carries a different BEHAVIORAL directive (strategy/
             // persona/constraint…) instead of a lexical reword, so the fan explores different approaches
             // to the same task. The directive name could later label each branch in the spatial view.
             Command::FuzzDirective(n) => {
-                let base = self.input.trim().to_string();
+                let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
                     for (v, _name) in crate::directives::fanout_user(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
                     self.input.clear();
-                }
+                    self.note = format!("fuzzd: fanned {n} directive-varied branches (:stop to cancel)");
+                } else { self.note = ":fuzzd — nothing to fan (type a prompt, or send one first)".into(); }
             }
             // :o / :open <path> — import a chat (markdown ## You / ## Assistant) and load it as the convo.
             Command::Open(p) => {
@@ -3614,7 +3676,7 @@ impl Chat {
             Command::ContinueAll(depth) => {
                 if self.leaf_ids().is_empty() { self.note = "continue-all — no leaves yet".into(); }
                 else {
-                    self.fan = Some(Fan { kind: FanKind::Continue, rounds_left: depth });
+                    self.fan = Some(Fan { kind: FanKind::Continue, rounds_left: depth, only: None });
                     self.fan_step();
                     if depth > 1 { self.note = format!("continue-all depth {depth} — fanning the frontier (:stop to cancel)"); }
                 }
@@ -3628,12 +3690,67 @@ impl Chat {
                 else if self.leaf_ids().is_empty() { self.note = ":fa — no leaves yet (send a turn or :open a chat first)".into(); }
                 else {
                     self.input.clear();
-                    self.fan = Some(Fan { kind: FanKind::Fuzzy { width, template: task }, rounds_left: depth });
+                    self.fan = Some(Fan { kind: FanKind::Fuzzy { width, template: task }, rounds_left: depth, only: None });
                     self.fan_step();
                     self.note = format!("fuzzy-all depth {depth} × width {width} — fanning (:stop to cancel)");
                 }
             }
             Command::Stop => { let n = self.queue.len(); self.queue.clear(); self.fan = None; self.note = format!("stopped — cleared {n} queued, fan cancelled"); }
+            // :continue [N] / :cont — deepen the FOCUSED line N times. Unlike :ca (every leaf), this pins the
+            // fan to the current line via `only`, and fan_step descends to that line's live tip each round.
+            Command::Continue(n) => {
+                match self.walk_focus.or(self.active_leaf).or(self.msgs.len().checked_sub(1)) {
+                    Some(anchor) => {
+                        self.fan = Some(Fan { kind: FanKind::Continue, rounds_left: n, only: Some(anchor) });
+                        self.fan_step();
+                        self.note = format!("continue ×{n} — deepening this line (:stop to cancel)");
+                    }
+                    None => self.note = ":continue — nothing to continue yet (send a turn first)".into(),
+                }
+            }
+            // :ws / :workspace — status of the loaded /tmp .gitmind session and how much has changed in it.
+            Command::WorkspaceStatus => {
+                self.note = match &self.gitmind_session {
+                    None => ":ws — no workspace loaded (:load-gitmind <path> to mirror one into /tmp)".into(),
+                    Some(s) => {
+                        let changed = crate::gitmind_session::changed_files(s.work_dir(), &s.project);
+                        let head: String = changed.iter().take(6).cloned().collect::<Vec<_>>().join(", ");
+                        format!("workspace '{}' → {} · {} changed file(s){}", s.name, s.work_dir().display(),
+                                changed.len(), if head.is_empty() { String::new() } else { format!(": {head}") })
+                    }
+                };
+            }
+            // :sync — rescan the /tmp workspace (pick up edits made since load); reports the new change count.
+            Command::SyncWorkspace => {
+                self.note = match &self.gitmind_session {
+                    None => ":sync — no workspace loaded (:load-gitmind <path> first)".into(),
+                    Some(s) => {
+                        let n = crate::gitmind_session::changed_files(s.work_dir(), &s.project).len();
+                        format!("workspace rescanned — {n} changed file(s) (:map to fan work per file, :reapply to land)")
+                    }
+                };
+            }
+            // :map <glob> ['tmpl'] — fan one worker task per changed file in the /tmp workspace, filtered by an
+            // optional glob, with {file} filled into the template. The per-file fan-out for a software project.
+            Command::MapFiles { glob, template } => {
+                match &self.gitmind_session {
+                    None => self.note = ":map — no workspace loaded (:load-gitmind <path> first)".into(),
+                    Some(s) => {
+                        let mut files = crate::gitmind_session::changed_files(s.work_dir(), &s.project);
+                        if !glob.trim().is_empty() { files.retain(|f| crate::vimmode::glob_match(&glob, f)); }
+                        if files.is_empty() {
+                            self.note = format!(":map — no {}changed files in the workspace",
+                                                if glob.trim().is_empty() { String::new() } else { format!("'{glob}' ") });
+                        } else {
+                            let parent = self.walk_focus.or(self.active_leaf);
+                            let tasks = crate::vimmode::map_tasks(&files, &template);
+                            let n = tasks.len();
+                            for t in tasks { self.queue.push_back((t, parent)); }
+                            self.note = format!(":map — fanned {n} worker task(s), one per changed file (:stop to cancel)");
+                        }
+                    }
+                }
+            }
             // :fill [path] — structured decomposition. Take a skeleton (path, else the composer if it holds
             // a todo!(), else the latest reply), find its todo!()/unimplemented!() holes, and fan one
             // sub-task per hole. Every sub-task embeds the SAME skeleton → the KV prefix tree prefills it
@@ -4263,7 +4380,7 @@ impl Chat {
             }
             VoiceIntent::CodeMode(on) => { self.code_voice = on; }
             VoiceIntent::Send => {
-                if !streaming && !self.input.trim().is_empty() { self.send(infer, doc); }
+                if !streaming && !self.input.trim().is_empty() { self.send(infer, doc, ui); }
             }
             VoiceIntent::Dictate(text) => {
                 // coder dictation: spoken symbols → punctuation ("open paren" → "("), unless prose mode
@@ -4921,6 +5038,32 @@ impl Chat {
                     self.mode = crate::vimmode::Mode::Insert;
                     if !resp.has_focus() { resp.request_focus(); }
                 }
+                // Composer command hint: when the line is a ':' command (and not a '::' escaped message),
+                // show its usage + argument suggestions inline — the same palette the vim cmdline uses — so
+                // commands typed straight into the message box are discoverable and self-documenting, and it's
+                // visually obvious the line will RUN a command instead of being sent to the model.
+                let ci = self.input.trim();
+                if ci.starts_with(':') && !ci.starts_with("::") {
+                    let raw = ci.trim_start_matches(':');
+                    let mut parts = raw.splitn(2, char::is_whitespace);
+                    let head = parts.next().unwrap_or("");
+                    let arg_partial = parts.next().unwrap_or("");
+                    if let Some(s) = crate::cmdpalette::spec(head) {
+                        ui.label(RichText::new(format!("⌘ {}  ·  {}", s.usage, s.help)).color(theme::CYAN()).small());
+                        let ctx = crate::cmdpalette::ArgCtx { models: Vec::new(), refs: vec!["-1".into(), "-2".into(), "-3".into()] };
+                        let sugg = crate::cmdpalette::suggest_args(s, arg_partial, &ctx);
+                        if !sugg.is_empty() {
+                            let line = sugg.iter().take(4).map(|a| format!("{} — {}", a.value, a.hint)).collect::<Vec<_>>().join("    ");
+                            ui.label(RichText::new(line).color(theme::FAINT()).small());
+                        }
+                    } else if !head.is_empty() {
+                        let names: Vec<&str> = crate::cmdpalette::matches(head).iter().take(8).map(|s| s.name).collect();
+                        ui.label(RichText::new(if names.is_empty() { "no match · :help to list commands".to_string() } else { format!("↹ {}", names.join("  ")) })
+                            .color(theme::DIM()).small());
+                    } else {
+                        ui.label(RichText::new("command mode · :help to list · Enter runs it (not sent to the model)").color(theme::DIM()).small());
+                    }
+                }
                 ui.add_space(theme::PAD_XS as f32);
                 ui.horizontal(|ui| {
                     if theme::carved_button(ui, "📎 Attach").on_hover_text("Attach a text file into your message (bounded)").clicked() {
@@ -5140,7 +5283,7 @@ impl Chat {
             let ctx = ui.ctx().clone();
             self.apply_msg_action(&ctx, act, infer, doc);
         }
-        if do_send { self.send(infer, doc); }
+        if do_send { self.send(infer, doc, ui); }
         // Drain one queued (branch) turn as soon as the model is free — serial, but non-blocking from
         // the user's side: they fired it mid-generation and it runs the moment the current reply ends.
         if self.stream.is_none() {
@@ -5388,6 +5531,42 @@ mod tests {
     }
 
     #[test]
+    fn continue_fan_pins_to_one_line() {
+        // same branched tree: leaves are 1 (linear line) and 3 (the fork off 0)
+        let mut c = Chat::default();
+        c.msgs.push(Msg::user("q1".into()));           // 0
+        c.msgs.push(Msg::assistant());                 // 1  (line A tip)
+        let mut u = Msg::user("q1-alt".into()); u.parent = Some(0); c.msgs.push(u); // 2
+        let mut a = Msg::assistant(); a.parent = Some(2); c.msgs.push(a);           // 3 (line B tip)
+        // leaf_under descends the fork to its live tip
+        assert_eq!(c.leaf_under(2), Some(3), "the tip under anchor 2 is leaf 3");
+        assert_eq!(c.leaf_under(0), Some(1), "anchor 0's linear-fallback tip is 1");
+        // :continue anchored to line B (node 2) queues a continuation for leaf 3 ONLY — not line A's leaf 1
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 2, only: Some(2) });
+        c.fan_step();
+        assert_eq!(c.queue.len(), 1, "single-line continue expands exactly one leaf per round");
+        assert_eq!(c.queue[0].1, Some(3), "…and it's the tip of the anchored line, not the other branch");
+    }
+
+    #[test]
+    fn compose_input_routes_commands_vs_messages() {
+        use crate::vimmode::Command;
+        // a leading ':' is a command, not a chat turn — this is the whole point of composer routing
+        assert!(matches!(compose_input(":fuzz 8"), Composed::Command(Command::Fuzz(8))));
+        assert!(matches!(compose_input("  :ca 3  "), Composed::Command(Command::ContinueAll(3))));
+        assert!(matches!(compose_input(":stop"), Composed::Command(Command::Stop)));
+        // bare number = goto (vim-style)
+        assert!(matches!(compose_input(":5"), Composed::Command(Command::Goto(5))));
+        // an unknown command still routes as a command (send() surfaces it, never ships it to the model)
+        assert!(matches!(compose_input(":definitelynotacommand"), Composed::Command(Command::Unknown(_))));
+        // '::' escapes a literal message that begins with a colon
+        match compose_input("::look at line :50") { Composed::Message(m) => assert_eq!(m, "look at line :50"), _ => panic!(":: should be a literal message") }
+        // ordinary text is a chat turn, untouched
+        match compose_input("how does the parser work?") { Composed::Message(m) => assert_eq!(m, "how does the parser work?"), _ => panic!("plain text is a message") }
+        assert!(matches!(compose_input("   "), Composed::Empty));
+    }
+
+    #[test]
     fn fix_mode_appends_only_when_on() {
         let doc = Doc::from_text("x.log", "boom\n");
         let mut c = Chat::default();
@@ -5408,15 +5587,15 @@ mod tests {
         c.queue.push_back(("y".into(), None));
         assert_eq!(c.activity_status().as_deref(), Some("2 queued"));
         // a running depth fan reads alongside the queued count
-        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 3 });
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 3, only: None });
         let s = c.activity_status().unwrap();
         assert!(s.contains("2 queued") && s.contains("3 rounds left"), "combines queue + fan: {s}");
         // singular grammar for the last round
         c.queue.clear();
-        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 1 });
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 1, only: None });
         assert_eq!(c.activity_status().as_deref(), Some("1 round left"));
         // an exhausted fan (0 rounds) contributes nothing → idle
-        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 0 });
+        c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 0, only: None });
         assert_eq!(c.activity_status(), None);
     }
 
