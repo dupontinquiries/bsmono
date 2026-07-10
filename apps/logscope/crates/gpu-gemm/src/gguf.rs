@@ -103,6 +103,31 @@ impl Gguf {
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.metadata.get(key) { Some(Value::F32(v)) => Some(*v), _ => None }
     }
+
+    /// The model architecture, resolved robustly for the metadata-key prefix used by the hyperparameters.
+    /// GGUF stores those under `<arch>.embedding_length` etc., and `<arch>` should equal
+    /// `general.architecture` — but some converters omit or misset that field, which then surfaces as a
+    /// spurious "missing embedding_length" when the loader trusts it blindly. Resolution order:
+    ///   1. `general.architecture`, but ONLY when its own `<arch>.embedding_length` key is actually present
+    ///      (the consistent, common case — declared arch is authoritative when the keys back it up);
+    ///   2. otherwise the prefix of whatever `*.embedding_length` key the file DOES carry (recovering the
+    ///      real arch a converter mislabeled), skipping vision/adapter towers so a VLM resolves to its
+    ///      language model; the pick is deterministic (`min`) rather than hash-order;
+    ///   3. else the declared arch as-is, else "llama".
+    /// The caller still gates on the result, so a recovered unsupported arch (e.g. gemma2) is refused
+    /// clearly and safely instead of loading with the wrong forward path.
+    pub fn arch(&self) -> String {
+        if let Some(a) = self.get_str("general.architecture") {
+            if self.metadata.contains_key(&format!("{a}.embedding_length")) { return a.to_string(); }
+        }
+        let recovered = self.metadata.keys()
+            .filter_map(|k| k.strip_suffix(".embedding_length"))
+            .filter(|p| !p.is_empty() && !matches!(*p, "general" | "clip" | "vision" | "mmproj"))
+            .min();
+        recovered.map(str::to_string)
+            .or_else(|| self.get_str("general.architecture").map(str::to_string))
+            .unwrap_or_else(|| "llama".to_string())
+    }
 }
 
 /// IEEE half → f32.
@@ -432,5 +457,56 @@ mod kquant_subnormal_tests {
         let want = 15.0 * 2f32.powi(-15);
         assert!((out[0] - want).abs() <= want * 1e-4,
             "q4_k subnormal: got {} want {want} (4x-small means the f16 subnormal bug is back)", out[0]);
+    }
+}
+
+#[cfg(test)]
+mod arch_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn g(pairs: Vec<(&str, Value)>) -> Gguf {
+        let mut m = HashMap::new();
+        for (k, v) in pairs { m.insert(k.to_string(), v); }
+        Gguf { version: 3, metadata: m, tensors: vec![], data_offset: 0 }
+    }
+    fn emb(prefix: &str) -> (&'static str, Value) { (Box::leak(format!("{prefix}.embedding_length").into_boxed_str()), Value::U32(4096)) }
+
+    #[test]
+    fn arch_trusts_general_architecture_when_consistent() {
+        let m = g(vec![("general.architecture", Value::Str("qwen2".into())), emb("qwen2")]);
+        assert_eq!(m.arch(), "qwen2");
+    }
+
+    #[test]
+    fn arch_recovers_prefix_when_general_architecture_is_missing() {
+        // the reported failure: no general.architecture, but the hyperparameters are under "qwen2.*".
+        // Old code defaulted to "llama" → "missing embedding_length"; now we recover "qwen2" and load.
+        let m = g(vec![emb("qwen2"), ("qwen2.block_count", Value::U32(28))]);
+        assert_eq!(m.arch(), "qwen2", "recover the real arch from the metadata key prefix");
+    }
+
+    #[test]
+    fn arch_recovers_prefix_when_general_architecture_lies() {
+        // general.architecture says llama but the keys are gemma2 → resolve to gemma2 so the caller's
+        // guard refuses it CORRECTLY (safe: never runs gemma2 weights through the llama path) instead of
+        // emitting a confusing "missing embedding_length".
+        let m = g(vec![("general.architecture", Value::Str("llama".into())), emb("gemma2")]);
+        assert_eq!(m.arch(), "gemma2");
+    }
+
+    #[test]
+    fn arch_skips_vision_tower_for_a_vlm() {
+        // a VLM carries clip.embedding_length beside the language tower's; resolve to the language arch
+        let m = g(vec![emb("clip"), emb("llama")]);
+        assert_eq!(m.arch(), "llama");
+        // and if general.architecture is present + consistent, it wins outright
+        let m2 = g(vec![("general.architecture", Value::Str("llama".into())), emb("clip"), emb("llama")]);
+        assert_eq!(m2.arch(), "llama");
+    }
+
+    #[test]
+    fn arch_defaults_to_llama_when_nothing_is_declared() {
+        assert_eq!(g(vec![]).arch(), "llama");
     }
 }
