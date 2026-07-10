@@ -104,6 +104,8 @@ pub const SPECS: &[CmdSpec] = &[
         help: "reapply the loaded session's changes over the project as one new commit", example: ":reapply" },
     CmdSpec { name: "longterm", aliases: &["lt"], usage: ":longterm [--deep|--quick] <objective>", arg: ArgKind::Free,
         help: "plan + orchestrate a long-horizon objective: decompose into sibling lanes, fan out by directive, prune/expand under budget", example: ":longterm unify the code duplications across the repo" },
+    CmdSpec { name: "interject", aliases: &["ij"], usage: ":interject <change>", arg: ArgKind::Free,
+        help: "queue a targeted edit for the tapped file/line span (the workspace-explorer interjection pipe) instead of a chat turn", example: ":interject rename this to run()" },
 ];
 
 /// Look up a command by its name or any alias (a leading `:` is tolerated).
