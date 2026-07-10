@@ -100,6 +100,7 @@ pub struct Game {
     pub shifted: bool,      // Shadow: the afterlife is overlaid on the world (cover stripped)
     pub critters: Vec<crate::ecology::Critter>,
     pub prey_caught: u32,   // ambient critters pounced by the cats
+    pub difficulty: f32,    // hunter aggression multiplier (0.8 easy .. 1.25 hard)
     shift_t: f32,
     teleport_cd: f32,
     input: Option<(u8, f32, f32, bool, bool, bool)>,
@@ -128,7 +129,7 @@ impl Game {
         let hunter = HunterUnit { kind, x: hx, z: hz, heading: 0.0, state: HState::Patrol, suspicion: 0.0, target: None, last_seen: None, carrying: false };
         let wind = norm(1.0, 0.4);   // a steady prevailing wind
         let critters = crate::ecology::populate(520, false);
-        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, snake_home, mode, shifted: false, critters, prey_caught: 0, shift_t: 0.0, teleport_cd: 5.0, input: None }
+        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, shift_t: 0.0, teleport_cd: 5.0, input: None }
     }
 
     pub fn set_input(&mut self, id: u8, mx: f32, mz: f32, crouch: bool, dodge: bool, leap: bool) { self.input = Some((id, mx, mz, crouch, dodge, leap)); }
@@ -352,7 +353,7 @@ impl Game {
         let has_scent = smelled.is_some();
 
         if let Some((id, cx, cz, _)) = seen_cat {
-            self.hunter.suspicion = (self.hunter.suspicion + dt * 2.4).min(1.5);
+            self.hunter.suspicion = (self.hunter.suspicion + dt * 2.4 * self.difficulty).min(1.5);
             self.hunter.last_seen = Some((cx, cz));
             self.hunter.target = Some(id);
         } else if has_scent {
@@ -404,6 +405,7 @@ impl Game {
             }
         }
         if self.hunter.kind.is_shadow() && self.shifted { speed *= 1.35; } // empowered by the otherworld
+        speed *= self.difficulty;   // Settings difficulty scales the hunter's pace
         let d = norm(goal.0 - hx, goal.1 - hz);
         if d.0.abs() + d.1.abs() > 1e-4 {
             self.hunter.x = (hx + d.0 * speed * dt).clamp(-MAP, MAP);
@@ -579,6 +581,21 @@ mod tests {
                 assert_eq!((g.outcome, g.hunter.x, g.hunter.z, g.caught), snap, "a finished round kept simulating");
             }
         }
+    }
+
+    #[test]
+    fn difficulty_scales_hunter_danger() {
+        // identical deterministic Survive matches; a harder setting should catch at
+        // least as many cats as an easier one (faster pursuit + quicker suspicion).
+        let caught_at = |diff: f32| -> u32 {
+            let mut g = Game::new_match(Kind::Dog, Mode::Survive);
+            g.difficulty = diff;
+            for _ in 0..(90 * 30) { if g.outcome.is_some() { break; } g.step(1.0 / 30.0); }
+            g.caught
+        };
+        let easy = caught_at(0.82);
+        let hard = caught_at(1.22);
+        assert!(hard >= easy, "a harder hunter shouldn't catch fewer cats (easy {easy}, hard {hard})");
     }
 
     #[test]
