@@ -15,10 +15,10 @@
 
 pub mod protocol;
 pub mod peer_auth;
-pub mod audio_features;
-pub mod backup_beeper;
+pub use bo_core::audio_features;
+pub use bo_core::backup_beeper;
 pub mod drone_canceller;
-pub mod music_masker;
+pub use bo_core::music_masker;
 pub mod passby_canceller;
 pub mod sync;
 pub mod upmix;
@@ -29,7 +29,7 @@ pub mod mux;
 pub mod chan_server;
 pub mod masker;
 pub mod cancel_tones;
-pub mod pattern_learner;
+pub use bo_core::pattern_learner;
 pub mod mic_capture;
 pub mod predictor;
 pub mod pattern_runner;

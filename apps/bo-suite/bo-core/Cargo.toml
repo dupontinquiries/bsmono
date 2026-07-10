@@ -1,0 +1,5 @@
+[package]
+name = "bo-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared bo-suite modules used by both bo-controller and bo-mux (audio features, music masker, backup beeper, pattern learner) — std-only, so the two binaries stop carrying byte-identical copies."
