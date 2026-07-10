@@ -158,6 +158,39 @@ fn make_depth(device: &wgpu::Device, w: u32, h: u32) -> wgpu::TextureView {
         .create_view(&Default::default())
 }
 
+/// Choose the swapchain present mode via the shared gpu-kit policy instead of blindly taking
+/// `caps.present_modes[0]` (whose order isn't guaranteed — it can hand back Mailbox/Immediate and
+/// stutter on Wayland). Default intent is Vsync (Fifo, smoothest); `SOLDIER_VSYNC` overrides it,
+/// matching unendlich's knob so the fleet's games behave the same:
+///   1|on|fifo → Vsync · mailbox → LowLatency · immediate|tearing|0 → Fast
+fn choose_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    fn to_gk(m: wgpu::PresentMode) -> Option<gpu_kit::PresentMode> {
+        match m {
+            wgpu::PresentMode::Fifo => Some(gpu_kit::PresentMode::Fifo),
+            wgpu::PresentMode::FifoRelaxed => Some(gpu_kit::PresentMode::FifoRelaxed),
+            wgpu::PresentMode::Mailbox => Some(gpu_kit::PresentMode::Mailbox),
+            wgpu::PresentMode::Immediate => Some(gpu_kit::PresentMode::Immediate),
+            _ => None, // AutoVsync/AutoNoVsync are request hints, not surface caps
+        }
+    }
+    fn from_gk(m: gpu_kit::PresentMode) -> wgpu::PresentMode {
+        match m {
+            gpu_kit::PresentMode::Fifo => wgpu::PresentMode::Fifo,
+            gpu_kit::PresentMode::FifoRelaxed => wgpu::PresentMode::FifoRelaxed,
+            gpu_kit::PresentMode::Mailbox => wgpu::PresentMode::Mailbox,
+            gpu_kit::PresentMode::Immediate => wgpu::PresentMode::Immediate,
+        }
+    }
+    let present = match std::env::var("SOLDIER_VSYNC").ok().as_deref() {
+        Some("1") | Some("on") | Some("fifo") => gpu_kit::Present::Vsync,
+        Some("mailbox") => gpu_kit::Present::LowLatency,
+        Some("immediate") | Some("tearing") | Some("0") => gpu_kit::Present::Fast,
+        _ => gpu_kit::Present::Vsync,
+    };
+    let gk: Vec<gpu_kit::PresentMode> = supported.iter().copied().filter_map(to_gk).collect();
+    from_gk(gpu_kit::Policy { present, ..gpu_kit::Policy::default() }.pick_present_mode(&gk))
+}
+
 impl State {
     async fn new(window: Arc<Window>) -> State {
         let size = window.inner_size();
@@ -183,7 +216,7 @@ impl State {
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: caps.present_modes[0],
+            present_mode: choose_present_mode(&caps.present_modes),
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -565,3 +598,26 @@ struct VO {
   return vec4<f32>(lit, i.col.a);
 }
 "#;
+
+#[cfg(test)]
+mod present_tests {
+    use super::choose_present_mode;
+    use wgpu::PresentMode;
+
+    #[test]
+    fn defaults_to_fifo_even_when_mailbox_offered() {
+        // The stutter fix: surfaces often list Mailbox/Immediate first; the default must be Fifo.
+        let supported = [PresentMode::Mailbox, PresentMode::Immediate, PresentMode::Fifo];
+        std::env::remove_var("SOLDIER_VSYNC");
+        assert_eq!(choose_present_mode(&supported), PresentMode::Fifo);
+    }
+
+    #[test]
+    fn env_override_reaches_low_latency_and_falls_back() {
+        std::env::set_var("SOLDIER_VSYNC", "mailbox");
+        assert_eq!(choose_present_mode(&[PresentMode::Mailbox, PresentMode::Fifo]), PresentMode::Mailbox);
+        // only Fifo offered → low-latency intent still yields Fifo, never panics on an empty pick
+        assert_eq!(choose_present_mode(&[PresentMode::Fifo]), PresentMode::Fifo);
+        std::env::remove_var("SOLDIER_VSYNC");
+    }
+}
