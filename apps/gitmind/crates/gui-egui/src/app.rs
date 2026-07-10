@@ -4,7 +4,7 @@
 use crate::pages;
 use crate::task::Task;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tab {
     Fleet,
     Push,
@@ -32,6 +32,21 @@ impl Tab {
             Tab::Settings => "Settings",
         }
     }
+
+    /// A glyph for the nav (icon-only on the phone's bottom bar, icon + label on the desktop sidebar).
+    pub fn icon(self) -> &'static str {
+        match self {
+            Tab::Fleet => "🛰",
+            Tab::Push => "⬆",
+            Tab::Network => "🌐",
+            Tab::Apps => "📦",
+            Tab::Import => "📥",
+            Tab::Branches => "🌿",
+            Tab::Files => "📁",
+            Tab::Timeline => "🕘",
+            Tab::Settings => "⚙",
+        }
+    }
 }
 
 pub struct App {
@@ -46,6 +61,8 @@ pub struct App {
     pub import: pages::import::State,
     pub branches: pages::branches::State,
     pub files: pages::files::State,
+    /// Horizontal swipe-between-tabs gesture (with detent), used on the phone's bottom-bar layout.
+    pub nav_gesture: uikit_egui::GestureLayer,
 }
 
 impl Default for App {
@@ -62,6 +79,7 @@ impl Default for App {
             import: pages::import::State::default(),
             branches: pages::branches::State::default(),
             files: pages::files::State::default(),
+            nav_gesture: uikit_egui::GestureLayer::horizontal_page(320.0),
         }
     }
 }
@@ -77,39 +95,127 @@ impl App {
     #[allow(deprecated)]
     pub fn ui(&mut self, ctx: &egui::Context) {
         uikit_egui::apply_prefs(ctx, &self.prefs);
+        // Adopt the user's gesture feel (incl. the detent animation) for swipe-between-tabs nav.
+        *self.nav_gesture.config_mut() = self.prefs.gesture_config(320.0);
         let adaptive = uikit_egui::adaptive::Adaptive::detect(ctx);
+        let compact = adaptive.is_compact();
 
-        if adaptive.is_compact() {
+        if compact {
             egui::Panel::bottom("nav").show(ctx, |ui| {
-                ui.horizontal_wrapped(|ui| self.nav_buttons(ui));
+                ui.horizontal_wrapped(|ui| self.nav_buttons(ui, true));
             });
         } else {
             egui::Panel::left("nav").resizable(false).show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.heading("gitmind");
                 ui.add_space(6.0);
-                ui.vertical(|ui| self.nav_buttons(ui));
+                ui.vertical(|ui| self.nav_buttons(ui, false));
             });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Network => pages::network::ui(self, ui),
-            Tab::Apps => pages::apps::ui(self, ui),
-            Tab::Import => pages::import::ui(self, ui),
-            Tab::Branches => pages::branches::ui(self, ui),
-            Tab::Files => pages::files::ui(self, ui),
-            Tab::Timeline => pages::timeline::ui(self, ui),
-            Tab::Fleet => pages::fleet::ui(self, ui),
-            Tab::Push => pages::push::ui(self, ui),
-            Tab::Settings => pages::settings::ui(self, ui),
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let surface = ui.max_rect();
+            match self.tab {
+                Tab::Network => pages::network::ui(self, ui),
+                Tab::Apps => pages::apps::ui(self, ui),
+                Tab::Import => pages::import::ui(self, ui),
+                Tab::Branches => pages::branches::ui(self, ui),
+                Tab::Files => pages::files::ui(self, ui),
+                Tab::Timeline => pages::timeline::ui(self, ui),
+                Tab::Fleet => pages::fleet::ui(self, ui),
+                Tab::Push => pages::push::ui(self, ui),
+                Tab::Settings => pages::settings::ui(self, ui),
+            }
+            // Swipe left/right between tabs on the phone, with the shared detent feel. Enabled only in
+            // the compact (bottom-bar) layout; on desktop the sidebar is the nav.
+            let frame = self.nav_gesture.update(ui, surface, compact);
+            if let Some(dir) = frame.page_jump {
+                self.switch_tab(dir.sign());
+            }
         });
     }
 
-    fn nav_buttons(&mut self, ui: &mut egui::Ui) {
+    /// Move to the previous/next tab (wrapping), used by the swipe gesture.
+    fn switch_tab(&mut self, sign: i32) {
+        let n = Tab::ALL.len() as i32;
+        let cur = Tab::ALL.iter().position(|&t| t == self.tab).unwrap_or(0) as i32;
+        self.tab = Tab::ALL[(((cur + sign) % n + n) % n) as usize];
+    }
+
+    fn nav_buttons(&mut self, ui: &mut egui::Ui, compact: bool) {
         for t in Tab::ALL {
-            if ui.selectable_label(self.tab == t, t.label()).clicked() {
+            // Icon-only on the phone's bottom bar; icon + label on the desktop sidebar.
+            let text = if compact {
+                t.icon().to_string()
+            } else {
+                format!("{}  {}", t.icon(), t.label())
+            };
+            if ui.selectable_label(self.tab == t, text).clicked() {
                 self.tab = t;
             }
         }
+    }
+}
+
+
+/// A glyph for a BigSilicon app, by name — used in the Fleet/Apps store lists so each app is
+/// recognizable at a glance (the QML store rows carried per-app affordances the first port dropped).
+pub fn app_icon(name: &str) -> &'static str {
+    let n = name.to_ascii_lowercase();
+    if n.contains("voiceterm") || n.contains("voiced") || n.contains("voice") {
+        "🎤"
+    } else if n.contains("rusty-board") || n.contains("keyboard") || n.contains("board") {
+        "⌨"
+    } else if n.contains("gitmind") {
+        "🧠"
+    } else if n.contains("av1") || n.contains("tuner") {
+        "🎬"
+    } else if n.contains("snapclone") || n.contains("camera") {
+        "📸"
+    } else if n.contains("logscope") {
+        "🔭"
+    } else if n.contains("beatspace") || n.contains("beat") {
+        "🎵"
+    } else if n.contains("bo-suite") || n.contains("bo-") {
+        "🎛"
+    } else if n.contains("clawbound") || n.contains("soldier") || n.contains("paperbound") || n.contains("unendlich") {
+        "🎮"
+    } else if n.contains("settings") {
+        "⚙"
+    } else if n.contains("ambient") {
+        "🌿"
+    } else {
+        "📦"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tab_has_an_icon_and_label() {
+        for t in Tab::ALL {
+            assert!(!t.icon().trim().is_empty(), "{:?} needs an icon", t);
+            assert!(!t.label().is_empty());
+        }
+    }
+
+    #[test]
+    fn swipe_cycles_tabs_with_wraparound() {
+        let mut app = App::default();
+        let start = app.tab;
+        app.switch_tab(1);
+        assert_ne!(app.tab, start, "a swipe advances to a different tab");
+        // a full forward cycle returns to the start
+        app.tab = start;
+        for _ in 0..Tab::ALL.len() {
+            app.switch_tab(1);
+        }
+        assert_eq!(app.tab, start, "a full cycle wraps back");
+        // backward from the first tab wraps to the last
+        app.tab = Tab::ALL[0];
+        app.switch_tab(-1);
+        assert_eq!(app.tab, Tab::ALL[Tab::ALL.len() - 1]);
     }
 }
