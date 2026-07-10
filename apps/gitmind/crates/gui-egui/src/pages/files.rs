@@ -11,6 +11,8 @@ pub struct State {
     pub err: String,
     pub peek_name: String,
     pub peek_content: String,
+    /// Fuzzy filter over the current directory (voiceterm's nav-palette pattern).
+    pub filter: String,
 }
 
 fn load(state: &mut State) {
@@ -52,19 +54,55 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.colored_label(egui::Color32::from_rgb(0xf7, 0x76, 0x8e), &app.files.err);
     }
 
+    // Fuzzy filter over this directory — type a few letters, subsequence-matched (voiceterm palette).
+    ui.horizontal(|ui| {
+        ui.label("🔍");
+        ui.add(
+            egui::TextEdit::singleline(&mut app.files.filter)
+                .hint_text("filter — type a few letters")
+                .desired_width(240.0),
+        );
+        if !app.files.filter.is_empty() && ui.button("✕").clicked() {
+            app.files.filter.clear();
+        }
+    });
+
+    let filter = app.files.filter.clone();
+    // dirs: keep matches in listing order
+    let dirs: Vec<String> = app
+        .files
+        .dirs
+        .iter()
+        .filter(|d| uikit_egui::fuzzy::subsequence_match(&filter, d))
+        .cloned()
+        .collect();
+    // files: matches, ranked best-first while filtering
+    let mut files: Vec<String> = app
+        .files
+        .files
+        .iter()
+        .filter(|f| uikit_egui::fuzzy::subsequence_match(&filter, f))
+        .cloned()
+        .collect();
+    if !filter.is_empty() {
+        files.sort_by_key(|f| -uikit_egui::fuzzy::score(&filter, f).unwrap_or(0));
+    }
+    let hidden = (app.files.dirs.len() + app.files.files.len()) - (dirs.len() + files.len());
+
     uikit_egui::scroll::bounded(ui, 240.0, |ui| {
-        for d in app.files.dirs.clone() {
-            if ui.button(format!("[dir] {d}")).clicked() {
+        for d in dirs {
+            if ui.button(format!("📁 {d}")).clicked() {
                 app.files.subpath = if app.files.subpath.is_empty() {
                     d.clone()
                 } else {
                     format!("{}/{}", app.files.subpath, d)
                 };
+                app.files.filter.clear();
                 load(&mut app.files);
             }
         }
-        for f in app.files.files.clone() {
-            if ui.selectable_label(app.files.peek_name == f, format!("     {f}")).clicked() {
+        for f in files {
+            if ui.selectable_label(app.files.peek_name == f, format!("📄 {f}")).clicked() {
                 let root = cockpit::ops::repo_root();
                 let path = if app.files.subpath.is_empty() {
                     root.join(&f)
@@ -76,6 +114,9 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                     .map(|s| s.chars().take(20000).collect())
                     .unwrap_or_else(|e| format!("(cannot read: {e})"));
             }
+        }
+        if hidden > 0 {
+            ui.label(egui::RichText::new(format!("… {hidden} hidden by filter")).weak().small());
         }
     });
 
