@@ -7,6 +7,12 @@ use settings_kit::AnimationStyle;
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.heading("Settings");
     ui.separator();
+    ui.label(
+        egui::RichText::new("this window's local prefs — the fleet's central settings app is bsettings (bigsilicon-settings), which publishes changes to every app live via settingsd")
+            .weak()
+            .small(),
+    );
+    ui.add_space(6.0);
 
     ui.label(egui::RichText::new("animation").strong());
     ui.horizontal_wrapped(|ui| {
@@ -32,7 +38,24 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     });
     ui.add_space(8.0);
 
-    ui.add(egui::Slider::new(&mut app.prefs.touch.text_scale, 0.7..=1.6).text("text size"));
+    // Text size re-scales the whole window, so applying it live makes the slider jump under the
+    // cursor. Draft it in memory during the drag and only commit to prefs on release. Reduced range
+    // with quarter-step detents.
+    {
+        let id = egui::Id::new("gm_text_scale_draft");
+        let mut draft: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(app.prefs.touch.text_scale);
+        let resp = ui.add(egui::Slider::new(&mut draft, 0.75..=1.5).step_by(0.25).text("text size"));
+        if resp.dragged() {
+            // hold the in-progress value; do NOT apply yet (that's what bugs out)
+            ui.data_mut(|d| d.insert_temp(id, draft));
+        } else {
+            if resp.drag_stopped() || resp.changed() {
+                app.prefs.touch.text_scale = draft; // commit on release / click / keyboard
+            }
+            // keep the draft synced to the live pref while idle
+            ui.data_mut(|d| d.insert_temp(id, app.prefs.touch.text_scale));
+        }
+    }
     ui.add(egui::Slider::new(&mut app.prefs.display.opacity, 0.4..=1.0).text("surface opacity"));
 
     ui.add_space(10.0);
