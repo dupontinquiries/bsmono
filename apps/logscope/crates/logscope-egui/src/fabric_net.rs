@@ -388,8 +388,177 @@ fn read_http_request(s: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
 
 /// Serve one connection: hello → this box's public models; gen → run it on the local worker (only if
 /// the model is shared publicly — the private/public toggle is enforced at the network edge).
-fn handle_conn(mut s: TcpStream, worker: &dyn Worker) -> std::io::Result<()> {
+// ───────────────────────── shared model-storage pool ─────────────────────────
+// A box shares a directory of model files (*.gguf); peers `pool_list` to see what's there and
+// `pool_fetch` to stream a file's weights over the LAN and load it locally — so a model resident on
+// one device becomes loadable on another without copying it around by hand. Fetch streams straight to
+// disk (models are GBs), never buffered. The config directory is a shared `settings_kit` pref.
+use std::path::{Path, PathBuf};
+
+/// One model file offered to the pool.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolEntry {
+    pub name: String,
+    pub size: u64,
+}
+
+/// A directory of shareable model files.
+pub struct ModelPool {
+    pub dir: PathBuf,
+}
+impl ModelPool {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { dir: dir.into() }
+    }
+    /// The `*.gguf` files in the pool directory, name-sorted.
+    pub fn list(&self) -> Vec<PoolEntry> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                    if let (Ok(md), Some(name)) = (e.metadata(), p.file_name().and_then(|s| s.to_str())) {
+                        out.push(PoolEntry { name: name.to_string(), size: md.len() });
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+    /// Resolve a request to a file inside the pool, guarding against path traversal (basename only).
+    pub fn path(&self, name: &str) -> Option<PathBuf> {
+        let base = Path::new(name).file_name()?.to_str()?;
+        let p = self.dir.join(base);
+        p.is_file().then_some(p)
+    }
+}
+
+fn encode_pool_list(entries: &[PoolEntry]) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_u32(&mut b, entries.len() as u32);
+    for e in entries {
+        put_str(&mut b, &e.name);
+        put_u64(&mut b, e.size);
+    }
+    b
+}
+fn decode_pool_list(b: &[u8]) -> Vec<PoolEntry> {
+    let mut r = Rd { b, i: 0 };
+    let n = r.u32() as usize;
+    (0..n).map(|_| PoolEntry { name: r.str(), size: r.u64() }).collect()
+}
+
+/// What a served box exposes to the fabric: a `Worker` (inference) and, optionally, a `ModelPool`
+/// (weights other boxes can pull). The serve loop hands this to each connection.
+pub struct Node {
+    pub worker: Arc<dyn Worker + Send + Sync>,
+    pub pool: Option<Arc<ModelPool>>,
+}
+impl Node {
+    pub fn new(worker: Arc<dyn Worker + Send + Sync>) -> Self {
+        Self { worker, pool: None }
+    }
+    /// Also share a directory of model files to the pool.
+    pub fn with_pool(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.pool = Some(Arc::new(ModelPool::new(dir)));
+        self
+    }
+}
+
+/// List the model files a peer offers to the pool.
+pub fn pool_list(addr: &str) -> std::io::Result<Vec<PoolEntry>> {
+    let mut s = TcpStream::connect(addr)?;
+    let resp = http_post(&mut s, addr, "/pool/list", &[])?;
+    Ok(decode_pool_list(&resp))
+}
+
+/// Stream a model file from a peer's pool to `dest`. Chunked to disk — never buffers the whole file.
+/// Returns bytes written. The peer's returned size (from `pool_list`) can be checked against it.
+pub fn pool_fetch(addr: &str, name: &str, dest: impl AsRef<Path>) -> std::io::Result<u64> {
+    let mut s = TcpStream::connect(addr)?;
+    let head = format!(
+        "POST /pool/fetch HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        name.len()
+    );
+    s.write_all(head.as_bytes())?;
+    s.write_all(name.as_bytes())?;
+    s.flush()?;
+
+    let (status, clen, leftover) = read_http_response_head(&mut s)?;
+    if status != 200 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("pool fetch '{name}' from {addr}: HTTP {status}"),
+        ));
+    }
+    let mut f = std::fs::File::create(dest)?;
+    let mut written = 0u64;
+    f.write_all(&leftover)?;
+    written += leftover.len() as u64;
+    let mut buf = [0u8; 64 * 1024];
+    while written < clen {
+        let n = s.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n])?;
+        written += n as u64;
+    }
+    Ok(written)
+}
+
+/// Read an HTTP response's status line + headers → (status, content_length, body_bytes_already_read).
+fn read_http_response_head(s: &mut TcpStream) -> std::io::Result<(u16, u64, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let hdr_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p + 4;
+        }
+        let n = s.read(&mut tmp)?;
+        if n == 0 {
+            break buf.len();
+        }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..hdr_end.min(buf.len())]).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let clen = head
+        .lines()
+        .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<u64>().unwrap_or(0)))
+        .unwrap_or(0);
+    Ok((status, clen, buf[hdr_end.min(buf.len())..].to_vec()))
+}
+
+fn handle_conn(mut s: TcpStream, node: &Node) -> std::io::Result<()> {
     let (path, body) = read_http_request(&mut s)?;
+
+    // /pool/fetch streams a (potentially multi-GB) model file straight off disk — never buffered.
+    if path == "/pool/fetch" {
+        let name = String::from_utf8_lossy(&body).trim().to_string();
+        match node.pool.as_ref().and_then(|p| p.path(&name)) {
+            Some(fp) => {
+                let mut f = std::fs::File::open(&fp)?;
+                let size = f.metadata()?.len();
+                s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n").as_bytes(),
+                )?;
+                std::io::copy(&mut f, &mut s)?;
+            }
+            None => {
+                s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            }
+        }
+        return s.flush();
+    }
+
+    let worker = &*node.worker;
     let resp_body = match path.as_str() {
         "/fabric/hello" => {
             let public: Vec<ModelInfo> = worker.models().iter().filter(|m| m.public).cloned().collect();
@@ -403,6 +572,7 @@ fn handle_conn(mut s: TcpStream, worker: &dyn Worker) -> std::io::Result<()> {
                 Vec::new()
             }
         }
+        "/pool/list" => node.pool.as_ref().map(|p| encode_pool_list(&p.list())).unwrap_or_default(),
         _ => Vec::new(),
     };
     let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", resp_body.len());
@@ -413,24 +583,29 @@ fn handle_conn(mut s: TcpStream, worker: &dyn Worker) -> std::io::Result<()> {
 
 /// Host a workspace: accept connections and serve `worker` to peers. Blocks; run on a thread.
 pub fn serve(addr: &str, worker: Arc<dyn Worker + Send + Sync>) -> std::io::Result<()> {
-    serve_on(TcpListener::bind(addr)?, worker);
+    serve_node(TcpListener::bind(addr)?, Arc::new(Node::new(worker)));
     Ok(())
 }
 pub fn serve_on(listener: TcpListener, worker: Arc<dyn Worker + Send + Sync>) {
+    serve_node(listener, Arc::new(Node::new(worker)));
+}
+/// Serve a full [`Node`] (worker + optional model pool) — the pool-aware entry point.
+pub fn serve_node(listener: TcpListener, node: Arc<Node>) {
     for stream in listener.incoming() {
         if let Ok(s) = stream {
-            let w = Arc::clone(&worker);
-            std::thread::spawn(move || { let _ = handle_conn(s, &*w); });
+            let n = Arc::clone(&node);
+            std::thread::spawn(move || { let _ = handle_conn(s, &n); });
         }
     }
 }
 
 /// Like [`serve`] but stops cleanly when `shutdown` flips true (a daemon flips it from a SIGTERM
 /// handler), so in-flight requests drain and the process exits gracefully. Non-blocking accept + a
-/// short poll keeps the shutdown check responsive without a busy-spin.
+/// short poll keeps the shutdown check responsive without a busy-spin. Takes a full [`Node`] so the
+/// daemon serves inference *and* the model pool.
 pub fn serve_until(
     addr: &str,
-    worker: Arc<dyn Worker + Send + Sync>,
+    node: Arc<Node>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     use std::sync::atomic::Ordering;
@@ -440,8 +615,8 @@ pub fn serve_until(
         match listener.accept() {
             Ok((s, _)) => {
                 let _ = s.set_nonblocking(false); // connection back to blocking for handle_conn
-                let w = Arc::clone(&worker);
-                std::thread::spawn(move || { let _ = handle_conn(s, &*w); });
+                let n = Arc::clone(&node);
+                std::thread::spawn(move || { let _ = handle_conn(s, &n); });
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -548,8 +723,47 @@ mod tcp_tests {
         reg.add(Box::new(join(&addr).unwrap()));
         assert!(reg.available_models().iter().any(|(n, _)| n == "llama-1b"));
 
-        // private model refused over the wire even if asked directly
+        // a private model is refused over the wire even if asked directly
         let priv_req = GenRequest { prefix: vec![1], model: "deepseek-8b".into(), max_new: 4, temperature: 0.8, seed: 1 };
         assert!(remote.generate(&priv_req).is_none());
+    }
+
+    #[test]
+    fn model_pool_list_fetch_and_traversal_guard_over_tcp() {
+        use std::io::Write;
+        // a "source" box with a model file in its shared pool
+        let src_dir = std::env::temp_dir().join(format!("fabricpool-src-{}", std::process::id()));
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let contents: Vec<u8> = b"GGUF\x00fake-weights-".repeat(5000); // ~85KB stand-in for a model file
+        std::fs::File::create(src_dir.join("llama-1b.gguf")).unwrap().write_all(&contents).unwrap();
+        std::fs::write(src_dir.join("notes.txt"), b"ignored").unwrap(); // only *.gguf is pooled
+
+        let w: Arc<dyn Worker + Send + Sync> = Arc::new(MockWorker::new("studio-m2", "dustin", &[("llama-1b", true, 1.0)]));
+        let node = Arc::new(Node::new(w).with_pool(&src_dir));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let n = Arc::clone(&node);
+            std::thread::spawn(move || serve_node(listener, n));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // a "dest" box lists the peer's pool — only the .gguf, with its true size
+        let entries = pool_list(&addr).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "llama-1b.gguf");
+        assert_eq!(entries[0].size, contents.len() as u64);
+
+        // and pulls the weights over the network (streamed) to load locally, byte-for-byte
+        let dest = std::env::temp_dir().join(format!("fabricpool-dst-{}.gguf", std::process::id()));
+        let n = pool_fetch(&addr, "llama-1b.gguf", &dest).unwrap();
+        assert_eq!(n, contents.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), contents);
+
+        // path traversal is refused (basename only → 404 → Err)
+        assert!(pool_fetch(&addr, "../../etc/hostname", &dest).is_err());
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_file(&dest);
     }
 }
