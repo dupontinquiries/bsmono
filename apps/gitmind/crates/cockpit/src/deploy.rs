@@ -190,6 +190,33 @@ pub fn remote_capture(user: &str, host: &str, cmd: &str) -> Result<String, Strin
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// The shell script that bootstraps rustup on a device: no-op if already present, else install via
+/// curl (or wget) with the minimal profile, source the env, and add `target` if given. Pure so the
+/// exact commands are unit-tested (nothing here runs locally).
+pub fn rustup_bootstrap_script(target: &str) -> String {
+    let add = if target.trim().is_empty() {
+        String::new()
+    } else {
+        format!("rustup target add {} 2>&1 || true; ", target.trim())
+    };
+    format!(
+        "set -e; \
+         if command -v rustup >/dev/null 2>&1; then echo 'rustup already installed'; \
+         elif command -v curl >/dev/null 2>&1; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path; \
+         elif command -v wget >/dev/null 2>&1; then wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path; \
+         else echo 'need curl or wget on the device to install rustup' >&2; exit 1; fi; \
+         . \"$HOME/.cargo/env\" 2>/dev/null || export PATH=\"$HOME/.cargo/bin:$PATH\"; \
+         {add}rustup --version"
+    )
+}
+
+/// Bootstrap rustup on the remote device over SSH (non-interactive, minimal profile), then add
+/// `target` if given. Idempotent — a no-op when rustup is already installed. This is what lets a
+/// RemoteNative build add the target's std on a fresh device. Returns the combined output.
+pub fn bootstrap_rustup_remote(user: &str, host: &str, target: &str) -> Result<String, String> {
+    remote_capture(user, host, &rustup_bootstrap_script(target))
+}
+
 /// `scp <hardened opts> user@host:<remote> <local>` argv — pull a file (the built
 /// binary) from the server to this device. Reuses SSH_OPTS so the same defence-in-
 /// depth (no agent/tunnel) applies. Pure — unit-tested.
@@ -1152,6 +1179,18 @@ impl Job {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rustup_bootstrap_is_idempotent_has_fallback_and_adds_target() {
+        let s = super::rustup_bootstrap_script("aarch64-unknown-linux-musl");
+        assert!(s.contains("command -v rustup")); // no-op when already installed
+        assert!(s.contains("sh.rustup.rs"));
+        assert!(s.contains("command -v curl") && s.contains("command -v wget")); // fallback
+        assert!(s.contains("--profile minimal") && s.contains("-y")); // non-interactive
+        assert!(s.contains("rustup target add aarch64-unknown-linux-musl"));
+        // no target → no `target add`
+        assert!(!super::rustup_bootstrap_script("").contains("target add"));
+    }
+
     use super::*;
 
     #[test]
