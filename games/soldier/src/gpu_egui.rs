@@ -169,8 +169,10 @@ impl EguiOverlay {
             mapped_at_creation: false,
         });
 
+        let ctx = Context::default();
+        crate::hud::theme::apply_visuals(&ctx);
         EguiOverlay {
-            ctx: Context::default(),
+            ctx,
             pipeline,
             uniform_buf,
             uniform_bind,

@@ -8,6 +8,7 @@ wgpu = "22"
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 egui = { version = "0.28", optional = true }
+snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme", optional = true }
 egui-winit = { version = "0.28", optional = true, default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 log = "0.4"
@@ -21,7 +22,7 @@ web-sys = { version = "0.3", optional = true, features = ["Document", "Window", 
 
 [features]
 # Native playable window (winit + wgpu surface). Run: cargo run --features app -- --play
-app = ["dep:winit", "dep:env_logger", "dep:egui", "dep:egui-winit"]
+app = ["dep:winit", "dep:env_logger", "dep:egui", "dep:egui-winit", "dep:snapclone-theme"]
 # Web build (wasm32 + WebGPU/WebGL canvas). Build on a machine with the wasm target.
 web = ["app", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:console_error_panic_hook", "dep:console_log", "dep:web-sys"]
 
