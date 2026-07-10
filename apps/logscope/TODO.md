@@ -29,7 +29,34 @@ EXPLICIT PER-SCENE OVERRIDES the user asked for (do NOT propagate to other scene
 - ATLANTIS: self-enclosing (excluded from generic shell); banners; perimeter soffit.
 
 
-## 2026-07-09 (pass 68) — GREEN THE SUITE + mic-pearl cross-scene spot-check (pass-67 NEXT, verified)
+## 2026-07-09 (pass 69) — CHAT STATUS BAR: live fan/queue HUD + long-horizon persona badge
+
+GUI pass on the chat tab's status line (`modal_banner`), two small always-on indicators in the right-aligned
+cluster (beside the `?` button):
+
+- **Live activity HUD (fan commands).** A running `:Nca`/`:Nfa`/`:fuzz` fan queues dozens of generations over
+  minutes, but its progress only flashed once through `self.note` and got overwritten by the next message. Added
+  `Chat::activity_status() -> Option<String>` (pure) summarizing in-flight work every frame — "generating ·
+  N queued · M rounds left" (singular/plural grammar) — rendered in cyan with a **⏹ stop** button that clears the
+  queue + cancels the fan (same effect as `:stop`). None when idle. Headless render hook `LOGSCOPE_FAN_DEBUG=<text>`
+  forces the HUD (mirrors `LOGSCOPE_MIC_PEARL_DEBUG`).
+- **Persona badge (long-horizon).** The active system persona was invisible in the GUI. Added
+  `Chat::active_persona_label()` (pure) — matches the live system prompt against the `PERSONAS` table
+  ("Long-horizon engineer" by default, "Logscope · quick log fix" for the downshift persona, else "custom ·
+  system") — shown faint next to the HUD, hover points to the Context page.
+
+Verification: 2 new unit tests (activity_status grammar/combination + persona matching); suite 467/467 (was 465).
+New headless harness `src/bin/status-view.rs` drives the REAL `Chat::ui`, so the screenshots are the production
+widgets. Rendered idle vs. forced-fan under Xvfb+llvmpipe; OCR of the status band confirms the HUD text appears
+only in the fan state and the persona badge appears in both. No scene geometry touched.
+
+NEXT (same GPU-only scene frontier as pass 68): Atlantis rings/ceiling (needs user pinpoint), Mistfall
+anti-gravity waterfall polish, Cloudscape night tuning, Forest stateful leaf decay + critter wander, Treehouse
+wood-grain shader. On the chat side, a natural follow-on is wiring the persona badge to be *clickable* (switch
+persona inline, using the parked `persona_by_key` router seam) rather than edit-only via the Context page.
+
+
+
 
 Housekeeping/verification pass; no scene geometry changed. Rust 1.96 toolchain re-provisioned from the
 offline bundle; software-GL render loop (Xvfb + llvmpipe, GL 4.5 / GLSL 330) confirmed working.
