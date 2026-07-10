@@ -244,12 +244,13 @@ pub struct Board {
     layouts: Vec<Layout>,
     idx: usize,
     gesture: uikit_egui::GestureLayer,
+    palette: String,
 }
 
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0) }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), palette: String::new() }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
@@ -273,7 +274,11 @@ impl Board {
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
+        self.palette = prefs.palette.clone();
     }
+
+    /// The user's selected palette id (empty ⇒ default), for the render fn to colour keys with.
+    pub fn palette(&self) -> &str { &self.palette }
 }
 
 impl Default for Board {
@@ -292,8 +297,8 @@ pub fn apply_theme(ctx: &egui::Context) {
 /// tapped key (if any). The whole surface adapts: key height is the adaptive touch target
 /// (comfortably large on a phone), spacing is the adaptive gutter, and the board fills the
 /// available width with per-key widths proportional to their weight.
-pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive) -> Option<String> {
-    let colors = uikit_egui::default_palette();
+pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &str) -> Option<String> {
+    let colors = uikit_egui::palette_colors(palette);
     let gutter = adaptive.gutter;
     let key_h = adaptive.min_touch_target; // 44pt touch / 28pt pointer, from the adaptive layer
     let total_w = ui.available_width();
