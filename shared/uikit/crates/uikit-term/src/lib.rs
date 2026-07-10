@@ -103,6 +103,20 @@ impl Grid {
         s.trim_end().to_string()
     }
 
+    /// Every line as text — scrollback (oldest first) then the visible rows. The unit of search and
+    /// copy; line 0 is the oldest scrollback row.
+    pub fn all_lines(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .scrollback
+            .iter()
+            .map(|row| row.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+            .collect();
+        for r in 0..self.rows {
+            v.push(self.row_text(r));
+        }
+        v
+    }
+
     /// Write a printable char at the cursor and advance (wrapping + scrolling as needed).
     pub fn put(&mut self, ch: char) {
         if self.cur_col >= self.cols {
@@ -410,6 +424,16 @@ impl Terminal {
         self.input.clear();
     }
 
+    /// Append pasted text to the input line (Ctrl+V / paste). Control characters are dropped so a
+    /// multi-line paste doesn't smuggle newlines onto a single input line.
+    pub fn paste(&mut self, text: &str) {
+        for ch in text.chars() {
+            if !ch.is_control() {
+                self.input.push(ch);
+            }
+        }
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.grid.resize(cols, rows);
     }
@@ -520,6 +544,9 @@ pub struct App {
     /// Multitouch input (pinch-to-zoom the terminal, swipe, fling) via the shared kit bridge.
     pub touch: uikit_egui::touch::TouchSource,
     pub recognizer: uikit_egui::touch::GestureRecognizer,
+    /// In-screen find state; `search_open` toggles the search bar.
+    pub search: SearchState,
+    pub search_open: bool,
 }
 
 impl App {
@@ -531,7 +558,71 @@ impl App {
             font_size: 13.0,
             touch: uikit_egui::touch::TouchSource::new(),
             recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
+            search: SearchState::default(),
+            search_open: false,
         }
+    }
+
+    /// Consume this frame's keyboard/paste events into the input line. Returns `Some(command)` on Enter
+    /// (the submitted line, already taken out of the input); typing appends, Backspace deletes, and a
+    /// paste inserts its text (control chars stripped). The host runs the returned command on its PTY.
+    pub fn handle_input(&mut self, ui: &egui::Ui) -> Option<String> {
+        let mut submitted = None;
+        ui.input(|i| {
+            for ev in &i.events {
+                match ev {
+                    egui::Event::Text(t) => self.terminal.input.push_str(t),
+                    egui::Event::Paste(t) => self.terminal.paste(t),
+                    egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
+                        self.terminal.input.pop();
+                    }
+                    egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
+                        submitted = Some(std::mem::take(&mut self.terminal.input));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        submitted
+    }
+
+    /// Open the find bar (the compass "search" action / Ctrl+F).
+    pub fn open_search(&mut self) {
+        self.search_open = true;
+    }
+
+    /// Render the search bar when open: a query field, an `n/N` match counter, prev/next, and close.
+    /// Re-runs the search when the query changes; Esc or ✕ closes. Returns whether it's still open.
+    pub fn search_ui(&mut self, ui: &mut egui::Ui) -> bool {
+        if !self.search_open {
+            return false;
+        }
+        ui.horizontal(|ui| {
+            ui.label("🔍");
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.search.query)
+                    .hint_text("find in screen…")
+                    .desired_width(180.0),
+            );
+            if resp.changed() {
+                self.search.run(&self.terminal.grid);
+            }
+            let n = self.search.count();
+            let cur = if n == 0 { 0 } else { self.search.active + 1 };
+            ui.label(format!("{cur}/{n}"));
+            if ui.button("▲").clicked() {
+                self.search.prev();
+            }
+            if ui.button("▼").clicked() {
+                self.search.next();
+            }
+            if ui.button("✕").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.search_open = false;
+                self.search.query.clear();
+                self.search.matches.clear();
+            }
+        });
+        self.search_open
     }
 
     /// Adopt cross-app settings (theme/text/button + gesture feel handled by the kit).
@@ -567,12 +658,149 @@ impl App {
     pub fn render(&self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         let origin = ui.min_rect().min;
         render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size);
+
+        // Highlight search hits that fall in the visible region (matches in scrollback still count in
+        // the n/N tally, they just aren't on screen to box). The active hit gets a solid box.
+        if self.search_open && !self.search.matches.is_empty() {
+            let scroll = self.terminal.grid.scrollback.len();
+            for (i, m) in self.search.matches.iter().enumerate() {
+                if m.line < scroll {
+                    continue; // in scrollback, off screen
+                }
+                let row = m.line - scroll;
+                if row >= self.terminal.grid.rows {
+                    continue;
+                }
+                let x = origin.x + m.col as f32 * self.cell.0;
+                let y = origin.y + row as f32 * self.cell.1;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(x, y),
+                    egui::vec2(m.len as f32 * self.cell.0, self.cell.1),
+                );
+                let active = i == self.search.active;
+                let accent = egui::Color32::from_rgb(230, 180, 60);
+                let col = if active { accent } else { accent.gamma_multiply(0.5) };
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(2),
+                    egui::Stroke::new(if active { 2.0 } else { 1.0 }, col),
+                    egui::StrokeKind::Inside,
+                );
+            }
+        }
+    }
+}
+
+/// One search hit: `col` and `len` are in characters within line `line` (indexing [`Grid::all_lines`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SearchMatch {
+    pub line: usize,
+    pub col: usize,
+    pub len: usize,
+}
+
+/// Case-insensitive search of `lines` for `query`, returning every non-overlapping hit in reading
+/// order. Character-indexed (safe for multibyte). Empty query → no matches. Pure.
+pub fn search_lines(lines: &[String], query: &str) -> Vec<SearchMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let mut out = Vec::new();
+    for (li, line) in lines.iter().enumerate() {
+        let hay: Vec<char> = line.to_lowercase().chars().collect();
+        if hay.len() < q.len() {
+            continue;
+        }
+        let mut i = 0;
+        while i + q.len() <= hay.len() {
+            if hay[i..i + q.len()] == q[..] {
+                out.push(SearchMatch { line: li, col: i, len: q.len() });
+                i += q.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// In-terminal search state: the query, its matches over the grid, and the active match. Drives the
+/// search bar (next/prev cycle through hits).
+#[derive(Default)]
+pub struct SearchState {
+    pub query: String,
+    pub matches: Vec<SearchMatch>,
+    pub active: usize,
+}
+
+impl SearchState {
+    /// Re-run the search against `grid` (call when the query changes or the screen scrolls).
+    pub fn run(&mut self, grid: &Grid) {
+        self.matches = search_lines(&grid.all_lines(), &self.query);
+        if self.active >= self.matches.len() {
+            self.active = 0;
+        }
+    }
+    pub fn next(&mut self) {
+        if !self.matches.is_empty() {
+            self.active = (self.active + 1) % self.matches.len();
+        }
+    }
+    pub fn prev(&mut self) {
+        if !self.matches.is_empty() {
+            self.active = (self.active + self.matches.len() - 1) % self.matches.len();
+        }
+    }
+    pub fn current(&self) -> Option<SearchMatch> {
+        self.matches.get(self.active).copied()
+    }
+    pub fn count(&self) -> usize {
+        self.matches.len()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_finds_case_insensitive_char_indexed_matches() {
+        let lines = vec!["Error: file not found".to_string(), "another error here".to_string(), "clean".to_string()];
+        let m = search_lines(&lines, "error");
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0], SearchMatch { line: 0, col: 0, len: 5 }); // "Error" case-insensitive
+        assert_eq!(m[1], SearchMatch { line: 1, col: 8, len: 5 });
+        assert!(search_lines(&lines, "").is_empty()); // empty query
+        assert!(search_lines(&lines, "zzz").is_empty());
+    }
+
+    #[test]
+    fn search_state_cycles_matches() {
+        let mut g = Grid::new(40, 3);
+        for ch in "foo bar foo".chars() {
+            g.put(ch);
+        }
+        let mut st = SearchState { query: "foo".to_string(), ..Default::default() };
+        st.run(&g);
+        assert_eq!(st.count(), 2);
+        assert_eq!(st.current().unwrap().col, 0);
+        st.next();
+        assert_eq!(st.current().unwrap().col, 8);
+        st.next(); // wraps
+        assert_eq!(st.current().unwrap().col, 0);
+        st.prev(); // wraps back
+        assert_eq!(st.current().unwrap().col, 8);
+    }
+
+    #[test]
+    fn paste_appends_and_strips_controls() {
+        let mut t = Terminal::new(20, 3);
+        t.stage("cd ");
+        t.paste("src/main.rs
+");
+        assert_eq!(t.input, "cd src/main.rs"); // newline dropped, text appended
+    }
 
     #[test]
     fn terminal_clear_copy_interrupt() {
