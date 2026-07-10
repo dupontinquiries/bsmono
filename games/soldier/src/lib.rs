@@ -43,6 +43,7 @@ pub mod graphics;
 pub mod particles;
 pub mod pickups;
 pub mod game;
+pub mod netview;
 
 #[cfg(feature = "app")]
 pub mod app;
