@@ -24,5 +24,5 @@ settings-kit = { path = "../../shared/settings-kit", optional = true }
 
 [features]
 default = []
-app = ["dep:eframe", "dep:egui", "dep:uikit-egui", "dep:settings-kit"]
+app = ["gui", "dep:eframe"]
 gui = ["dep:egui", "dep:uikit-egui", "dep:settings-kit"]

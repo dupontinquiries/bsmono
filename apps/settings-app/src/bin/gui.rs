@@ -29,6 +29,9 @@ impl BSettings {
 }
 
 impl eframe::App for BSettings {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // absorb changes made elsewhere (another app or the CLI) so we don't show stale values
         if let Some(s) = self.settings.as_mut() {
