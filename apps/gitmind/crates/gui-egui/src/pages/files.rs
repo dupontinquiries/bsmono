@@ -52,7 +52,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.colored_label(egui::Color32::from_rgb(0xf7, 0x76, 0x8e), &app.files.err);
     }
 
-    egui::ScrollArea::vertical().max_height(240.0).id_salt("tree").show(ui, |ui| {
+    uikit_egui::scroll::bounded(ui, 240.0, |ui| {
         for d in app.files.dirs.clone() {
             if ui.button(format!("[dir] {d}")).clicked() {
                 app.files.subpath = if app.files.subpath.is_empty() {
@@ -82,7 +82,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     if !app.files.peek_name.is_empty() {
         ui.separator();
         ui.label(egui::RichText::new(&app.files.peek_name).strong());
-        egui::ScrollArea::vertical().max_height(260.0).id_salt("peek").show(ui, |ui| {
+        uikit_egui::scroll::bounded(ui, 260.0, |ui| {
             ui.label(egui::RichText::new(&app.files.peek_content).monospace().small());
         });
     }
