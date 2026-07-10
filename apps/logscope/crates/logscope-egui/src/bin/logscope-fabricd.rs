@@ -113,6 +113,7 @@ fn main() {
     let models: Vec<String> = cli.opt_all("model").iter().map(|s| s.to_string()).collect();
     let pid_file = cli.opt("pid-file").map(String::from);
     let log_file = cli.opt("log-file").map(String::from);
+    let pool_dir = cli.opt("pool-dir").map(String::from);
     let detach = cli.flag("daemon");
 
     if detach {
@@ -134,6 +135,14 @@ fn main() {
     for m in worker.models() {
         eprintln!("#   {:<20} {:>5.1}B{}", m.name, m.params_b, if m.public { "" } else { "  [private]" });
     }
+    // model-storage pool: share a directory of *.gguf so peers can pull weights over the LAN
+    let mut node = fabric_net::Node::new(worker);
+    if let Some(dir) = &pool_dir {
+        node = node.with_pool(dir);
+        let n = fabric_net::ModelPool::new(dir).list().len();
+        eprintln!("# pool: sharing {n} model file(s) from {dir}");
+    }
+    let node = Arc::new(node);
 
     // bridge the async-signal flag → the serve loop's shutdown handle
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -147,7 +156,7 @@ fn main() {
         });
     }
 
-    let code = match fabric_net::serve_until(&addr, worker, shutdown) {
+    let code = match fabric_net::serve_until(&addr, node, shutdown) {
         Ok(()) => {
             eprintln!("# logscope-fabricd: shut down cleanly");
             0
