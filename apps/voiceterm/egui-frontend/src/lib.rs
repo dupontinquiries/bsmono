@@ -13,6 +13,7 @@
 //! rather than mis-rendered.
 
 pub mod viz;
+pub mod confirm_dialog;
 // `web` (HTML → egui RichDoc renderer) now lives in the shared uikit-web kit; re-export as `web`.
 pub use uikit_web as web;
 
