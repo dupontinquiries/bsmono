@@ -8,14 +8,15 @@
 //!     python3 shared/webhost-kit/webserve.py     # (with a SocketAdapter("soldier") game)
 //! or hit it directly:  printf '{"cmd":"snapshot"}\n' | nc 127.0.0.1 7788
 
-use early_fps::netview::{self, Actor, SnapshotView};
+use early_fps::netview::{Actor, SnapshotView};
+use netview::serve;
 use std::time::Instant;
 
 fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:7788".to_string());
     println!("soldier netview demo serving on {addr} (Ctrl-C to stop)");
     let start = Instant::now();
-    let res = netview::serve(addr, move || {
+    let res = serve(addr, move || {
         // A player orbiting the origin + one enemy — enough to see motion in a browser.
         let t = start.elapsed().as_secs_f32();
         SnapshotView {
