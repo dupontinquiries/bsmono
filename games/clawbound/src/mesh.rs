@@ -33,6 +33,25 @@ impl Mesh {
     }
 
     /// Axis-aligned box centred at `c` with half-extents `h`, flat-shaded.
+    /// A box rotated `yaw` radians about the vertical axis through its centre.
+    pub fn boxx_yaw(&mut self, c: Vec3, h: Vec3, yaw: f32, col: [f32; 3]) {
+        let (s, co) = (yaw.sin(), yaw.cos());
+        let corner = |sx: f32, sy: f32, sz: f32| {
+            let (lx, ly, lz) = (sx * h.x, sy * h.y, sz * h.z);
+            v3(c.x + lx * co + lz * s, c.y + ly, c.z - lx * s + lz * co)
+        };
+        let (p000, p001) = (corner(-1., -1., -1.), corner(-1., -1., 1.));
+        let (p010, p011) = (corner(-1., 1., -1.), corner(-1., 1., 1.));
+        let (p100, p101) = (corner(1., -1., -1.), corner(1., -1., 1.));
+        let (p110, p111) = (corner(1., 1., -1.), corner(1., 1., 1.));
+        self.quad(p010, p110, p111, p011, col);                 // top
+        self.quad(p001, p101, p100, p000, shade(col, 0.7));     // bottom
+        self.quad(p001, p011, p111, p101, shade(col, 0.92));    // +z
+        self.quad(p100, p110, p010, p000, shade(col, 0.86));    // -z
+        self.quad(p101, p111, p110, p100, shade(col, 0.96));    // +x
+        self.quad(p000, p010, p011, p001, shade(col, 0.82));    // -x
+    }
+
     pub fn boxx(&mut self, c: Vec3, h: Vec3, col: [f32; 3]) {
         let (x0, x1) = (c.x - h.x, c.x + h.x);
         let (y0, y1) = (c.y - h.y, c.y + h.y);
