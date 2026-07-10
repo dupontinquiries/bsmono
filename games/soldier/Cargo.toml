@@ -6,6 +6,7 @@ description = "An early-2000s-style first-person shooter in Rust + egui, softwar
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+netview = { path = "../../shared/netview" }
 # Pure-Rust immediate-mode GUI. The whole game core renders into egui::epaint::Mesh,
 # so it builds & tests with NO native/windowing deps. This is the reference path.
 egui = "0.34"
