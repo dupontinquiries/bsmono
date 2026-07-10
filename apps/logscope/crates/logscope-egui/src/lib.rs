@@ -79,7 +79,7 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] pub mod vault;
 #[cfg(feature = "gui")] pub mod ast;
 #[cfg(feature = "gui")] pub mod vertices;
-#[cfg(feature = "gui")] pub mod fabric_net;
+#[allow(dead_code)] pub mod fabric_net; // pure std (TCP fabric) — available to the lean CLI too, not gui-gated
 #[cfg(feature = "gui")] pub mod context_graph;
 #[cfg(feature = "gui")] pub mod retrieval;
 #[cfg(feature = "gui")] pub mod pipeline;
@@ -94,9 +94,9 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod merge;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod coordinator;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod sandbox;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod convograph;
+#[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod spatial;
+#[allow(dead_code)] pub mod spatial; // pure math (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod mesh3d;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod pearl_input;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scene3d;
@@ -106,5 +106,5 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod estimate;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod multiparty;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod directives;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod mount;
+#[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] pub mod tabs;
