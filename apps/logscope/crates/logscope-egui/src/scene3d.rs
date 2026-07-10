@@ -3744,7 +3744,10 @@ fn treehouse() -> Scene {
         // platform height is a fraction UP the trunk (so it clearly sits on the tree), then snapped to where the
         // LEANING trunk actually is at that height — the trunks lean, so the base xz drifts as you go up.
         let th = 13.5 + (hsh(i as u32 * 5 + 10) - 0.5) * 4.0 + canopy_lift; // matches the tree loop
-        let py = -8.0 + th * (0.42 + hsh(i as u32 * 7 + 3) * 0.18);
+        // base fraction up the trunk, plus a per-platform stagger whose MAGNITUDE is the graph-derived
+        // `canopy_spread` (world units) — so low-spread conversations get a level walk and high-spread ones a
+        // steeply-pitched one, giving each conversation a differently-pitched canopy walk (was: fixed jitter).
+        let py = -8.0 + th * 0.42 + hsh(i as u32 * 7 + 3) * canopy_spread;
         let dir = normv(v(0.04 * (i as f32 - 2.0), 1.0, 0.03)); // same lean as the tree
         let sx = px + dir.x / dir.y * (py + 8.0);
         let sz = pz + dir.z / dir.y * (py + 8.0);
