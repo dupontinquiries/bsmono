@@ -717,16 +717,36 @@ pub fn install_suite_app(app: &crate::suite::SuiteApp) -> Result<Installed, Stri
 /// Like [`install_suite_app`] but streams the build log to `on_line`.
 pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn FnMut(&str)) -> Result<Installed, String> {
     let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
-    let (bin, _) = crate::ops::build_locally_logged(
-        &app.name,
-        &crate::ops::resolve_app_dir(&app.path),
-        &target,
-        &app.features,
-        app.no_default,
-        on_line,
-    )
-    .map_err(|e| format!("build: {e}"))?;
-    add_to_apps(&bin, &app.name, "suite", &app.run_flags)
+    let app_dir = crate::ops::resolve_app_dir(&app.path);
+
+    // Detect the build system. Cargo keeps the rich cross-target/rustup path; CMake / Python / Make /
+    // Go / Node build through the general buildsystem (so a CMake app like snapclone or a Python game
+    // installs locally instead of failing with "no Cargo.toml"). System deps (cmake, python3+venv) are
+    // ensured for the host's package manager — apk on Alpine, dnf on Fedora — before the build.
+    let detected = crate::buildsystem::detect(&app_dir);
+    let is_cargo = matches!(detected.as_ref().map(|d| &d.kind), Some(crate::buildsystem::Kind::Cargo) | None);
+
+    if is_cargo {
+        let (bin, _) = crate::ops::build_locally_logged(
+            &app.name,
+            &app_dir,
+            &target,
+            &app.features,
+            app.no_default,
+            on_line,
+        )
+        .map_err(|e| format!("build: {e}"))?;
+        add_to_apps(&bin, &app.name, "suite", &app.run_flags)
+    } else {
+        let d = detected.expect("non-cargo kind implies a Detected");
+        on_line(&format!("build system: {}", d.kind.label()));
+        let path_env = crate::ops::tool_path_env();
+        crate::sysdeps::ensure_build_system_deps(&d.kind, &path_env, on_line);
+        let built = crate::buildsystem::build(&d, &target, &app.features, &path_env)
+            .map_err(|e| format!("build: {e}"))?;
+        on_line(&format!("built {} ({} bytes)", built.install.display(), built.bytes));
+        add_to_apps(&built.install, &app.name, "suite", &app.run_flags)
+    }
 }
 
 /// Install every app in a suite, collecting a per-app result (never aborts on one failure).
