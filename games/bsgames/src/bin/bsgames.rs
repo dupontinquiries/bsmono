@@ -36,6 +36,9 @@ struct App {
 }
 #[cfg(feature = "app")]
 impl eframe::App for App {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.centre.ui(ctx);
     }

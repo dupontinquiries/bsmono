@@ -126,7 +126,7 @@ impl GameCentre {
         let mb = crate::wiring::dm_mailbox(&self.me.id, &to);
         let key = crate::wiring::dm_key(&self.me.id, &to);
         let log = crate::wiring::recv_chat(&self.store, &mb, &key, 0, self.now);
-        egui::ScrollArea::vertical().max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt("chat").max_height(160.0).stick_to_bottom(true).show(ui, |ui| {
             for (from, text) in &log {
                 ui.label(egui::RichText::new(format!("{from}: {text}")).small());
             }

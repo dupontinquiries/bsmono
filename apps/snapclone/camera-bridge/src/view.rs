@@ -535,6 +535,9 @@ impl CameraApp {
 }
 
 impl eframe::App for CameraApp {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.no_cursor {
             ctx.set_cursor_icon(egui::CursorIcon::None);

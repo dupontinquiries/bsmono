@@ -77,7 +77,7 @@ pub fn panel(ui: &mut egui::Ui, tel: &Telemetry) {
     }
     ui.separator();
     ui.label(egui::RichText::new("findings").weak());
-    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("swarm").max_height(220.0).show(ui, |ui| {
         for n in tel.nodes.iter().rev() {
             let [r, g, b] = n.kind.rgb();
             let col = egui::Color32::from_rgb(r, g, b);
