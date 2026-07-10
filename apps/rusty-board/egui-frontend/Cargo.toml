@@ -15,3 +15,6 @@ snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 mic-kit = { path = "../../../shared/mic-kit" }
 voice-kit = { path = "../../../shared/voice-kit" }
+
+[dev-dependencies]
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
