@@ -88,6 +88,32 @@ fn main() {
         }
         return;
     }
+    // Model-storage pool: list a peer's shared model files, or pull one over the LAN to load locally.
+    if let Some(addr) = cli.opt("pool-list") {
+        match logscope_egui::fabric_net::pool_list(addr) {
+            Ok(entries) => {
+                eprintln!("# {addr} pool — {} model file(s):", entries.len());
+                for e in entries {
+                    println!("  {:<32} {:>8.2} GB", e.name, e.size as f64 / 1e9);
+                }
+            }
+            Err(e) => { eprintln!("# pool-list {addr} failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if let Some(addr) = cli.opt("pool-fetch") {
+        let name = match cli.opt("name") {
+            Some(n) => n,
+            None => { eprintln!("# --pool-fetch <addr> needs --name <model.gguf> (and optional --out <path>)"); std::process::exit(2); }
+        };
+        let dest = cli.opt("out").map(String::from).unwrap_or_else(|| name.to_string());
+        eprintln!("# fetching '{name}' from {addr} → {dest} …");
+        match logscope_egui::fabric_net::pool_fetch(addr, name, &dest) {
+            Ok(bytes) => println!("# pulled {name}: {:.2} GB → {dest}", bytes as f64 / 1e9),
+            Err(e) => { eprintln!("# pool-fetch failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
     if let Some(addr) = cli.opt("fabric-serve") {
         use std::sync::Arc;
         let device = cli.opt("device").unwrap_or("local").to_string();
