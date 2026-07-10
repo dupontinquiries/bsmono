@@ -9,6 +9,7 @@
 use egui::epaint::Primitive;
 use egui::{Color32, Context, ImageData, RawInput, Rect, TextureId};
 use unendlich_engine::sim::menu_controller::MenuController;
+use unendlich_engine::pngutil::write_png;
 use unendlich_engine::sim::title_flow::MenuId;
 
 const W: usize = 720;
@@ -193,64 +194,4 @@ fn sample(apx: &[f32], aw: usize, ah: usize, u: f32, v: f32) -> f32 {
 }
 
 // ── minimal, dependency-free PNG encoder (8-bit RGBA, uncompressed zlib) ──
-fn write_png(path: &str, w: usize, h: usize, rgba: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut out = Vec::new();
-    out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
-
-    // IHDR
-    let mut ihdr = Vec::new();
-    ihdr.extend_from_slice(&(w as u32).to_be_bytes());
-    ihdr.extend_from_slice(&(h as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, no filter, no interlace
-    chunk(&mut out, b"IHDR", &ihdr);
-
-    // raw filtered scanlines: each row prefixed with filter byte 0
-    let mut raw = Vec::with_capacity(h * (1 + w * 4));
-    for y in 0..h {
-        raw.push(0);
-        raw.extend_from_slice(&rgba[y * w * 4..(y + 1) * w * 4]);
-    }
-    chunk(&mut out, b"IDAT", &zlib_store(&raw));
-    chunk(&mut out, b"IEND", &[]);
-
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(&out)
-}
-
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(data);
-    let mut crc = 0xffff_ffffu32;
-    for b in kind.iter().chain(data.iter()) {
-        crc ^= *b as u32;
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
-        }
-    }
-    out.extend_from_slice(&(crc ^ 0xffff_ffff).to_be_bytes());
-}
-
 /// zlib stream with stored (uncompressed) deflate blocks.
-fn zlib_store(data: &[u8]) -> Vec<u8> {
-    let mut z = vec![0x78, 0x01]; // zlib header (CM=8, no preset dict)
-    let mut i = 0;
-    while i < data.len() {
-        let n = (data.len() - i).min(0xffff);
-        let final_block = i + n >= data.len();
-        z.push(if final_block { 1 } else { 0 }); // BFINAL, BTYPE=00 (stored)
-        z.extend_from_slice(&(n as u16).to_le_bytes());
-        z.extend_from_slice(&(!(n as u16)).to_le_bytes());
-        z.extend_from_slice(&data[i..i + n]);
-        i += n;
-    }
-    // adler32 of the uncompressed data
-    let (mut a, mut b) = (1u32, 0u32);
-    for &byte in data {
-        a = (a + byte as u32) % 65521;
-        b = (b + a) % 65521;
-    }
-    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
-    z
-}
