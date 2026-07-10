@@ -109,9 +109,7 @@ fn run_group_inner(
     let run_dir = config.work_root.join(format!(
         "group_{}_{}",
         sanitize(&group.name),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0)
+        core_kit::time::now_secs()
     ));
     if let Err(e) = std::fs::create_dir_all(&run_dir) {
         let _ = tx.send(GroupEvent::Failed(format!("create work dir: {}", e)));
