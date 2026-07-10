@@ -26,6 +26,7 @@ pub mod skin;
 pub mod livebg;
 pub mod nav;
 pub mod scroll;
+pub mod fuzzy;
 pub mod motion;
 pub mod log_view;
 pub mod mono_tile;
