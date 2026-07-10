@@ -164,11 +164,69 @@ pub struct InputPrefs {
     pub handedness: Handedness,
     /// Whether a double physical tilt of the device flips handedness (on-device gesture).
     pub double_tilt: bool,
+    /// Movement keybind layout — one shared setting every game reads (see [`MovementLayout`]).
+    pub movement: MovementLayout,
 }
 
 impl Default for InputPrefs {
     fn default() -> Self {
-        InputPrefs { handedness: Handedness::Right, double_tilt: false }
+        InputPrefs { handedness: Handedness::Right, double_tilt: false, movement: MovementLayout::default() }
+    }
+}
+
+/// Movement keybind layout — the WASD cluster and its counterparts on other keyboard layouts. Shared
+/// so every game reads *one* setting and the settings app offers *one* picker; each game maps the
+/// abstract key labels to its own key type (egui `Key`, winit `KeyCode`, …) via [`MovementLayout::keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MovementLayout {
+    /// QWERTY: W A S D.
+    #[default]
+    Wasd,
+    /// Dvorak: `.` O E U — the WASD inverted-T reproduced by physical key position.
+    Dvorak,
+    /// QWERTY ESDF — one column right of WASD (frees a column of keys under the left hand).
+    Esdf,
+    /// Arrow keys.
+    Arrows,
+}
+
+impl MovementLayout {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MovementLayout::Wasd => "wasd",
+            MovementLayout::Dvorak => "dvorak",
+            MovementLayout::Esdf => "esdf",
+            MovementLayout::Arrows => "arrows",
+        }
+    }
+    pub fn parse(s: &str) -> MovementLayout {
+        match s {
+            "dvorak" => MovementLayout::Dvorak,
+            "esdf" => MovementLayout::Esdf,
+            "arrows" => MovementLayout::Arrows,
+            _ => MovementLayout::Wasd,
+        }
+    }
+    pub fn all() -> [MovementLayout; 4] {
+        [MovementLayout::Wasd, MovementLayout::Dvorak, MovementLayout::Esdf, MovementLayout::Arrows]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            MovementLayout::Wasd => "WASD (QWERTY)",
+            MovementLayout::Dvorak => ".oeu (Dvorak)",
+            MovementLayout::Esdf => "ESDF (QWERTY)",
+            MovementLayout::Arrows => "Arrow keys",
+        }
+    }
+    /// `[forward, left, back, right]` as lowercase key labels a game maps to its own key enum — the
+    /// inverted-T movement cluster on the chosen layout ("up"/"left"/"down"/"right" for `Arrows`).
+    pub fn keys(self) -> [&'static str; 4] {
+        match self {
+            MovementLayout::Wasd => ["w", "a", "s", "d"],
+            MovementLayout::Dvorak => [".", "o", "e", "u"],
+            MovementLayout::Esdf => ["e", "s", "d", "f"],
+            MovementLayout::Arrows => ["up", "left", "down", "right"],
+        }
     }
 }
 
@@ -437,6 +495,7 @@ impl Prefs {
             ("display.opacity".into(), self.display.opacity.to_string()),
             ("input.handedness".into(), self.input.handedness.as_str().to_string()),
             ("input.double_tilt".into(), self.input.double_tilt.to_string()),
+            ("input.movement".into(), self.input.movement.as_str().to_string()),
             ("theme.palette".into(), self.palette.clone()),
             ("voice.mic_enabled".into(), self.voice.mic_enabled.to_string()),
             ("voice.offload_enabled".into(), self.voice.offload_enabled.to_string()),
@@ -479,6 +538,7 @@ impl Prefs {
                 "display.opacity" => if let Ok(x) = v.parse::<f32>() { self.display.opacity = x.clamp(0.3, 1.0) },
                 "input.handedness" => self.input.handedness = Handedness::parse(v),
                 "input.double_tilt" => if let Ok(x) = v.parse() { self.input.double_tilt = x },
+                "input.movement" => self.input.movement = MovementLayout::parse(v),
                 "theme.palette" => self.palette = v.clone(),
                 _ => {}
             }
@@ -606,8 +666,23 @@ mod tests {
     }
 
     #[test]
+    fn movement_layout_presets_and_persist() {
+        // the .oeu Dvorak preset the request asked for, plus WASD
+        assert_eq!(MovementLayout::Wasd.keys(), ["w", "a", "s", "d"]);
+        assert_eq!(MovementLayout::Dvorak.keys(), [".", "o", "e", "u"]);
+        assert_eq!(MovementLayout::parse("dvorak"), MovementLayout::Dvorak);
+        assert_eq!(MovementLayout::parse("nonsense"), MovementLayout::Wasd); // forward-compatible default
+        assert_eq!(MovementLayout::default(), MovementLayout::Wasd);
+        // survives the shared KV round-trip (so every app + the settings app agree)
+        let mut p = Prefs::default();
+        p.input.movement = MovementLayout::Dvorak;
+        let back = Prefs::from_kv(&p.to_kv());
+        assert_eq!(back.input.movement, MovementLayout::Dvorak);
+    }
+
+    #[test]
     fn double_tilt_flips_handedness_only_when_enabled() {
-        let mut input = InputPrefs { handedness: Handedness::Right, double_tilt: false };
+        let mut input = InputPrefs { handedness: Handedness::Right, double_tilt: false, movement: MovementLayout::default() };
         assert_eq!(double_tilt_action(&input), None, "disabled → no effect");
         input.double_tilt = true;
         assert_eq!(double_tilt_action(&input), Some(Handedness::Left), "flips when enabled");

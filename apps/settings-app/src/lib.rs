@@ -101,6 +101,20 @@ impl SettingsEditor {
             }
         });
         semantic_toggle(ui, &mut self.a11y, 3, "double-tilt device to flip handedness", &mut self.prefs.input.double_tilt);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("movement keys:");
+            for m in settings_kit::MovementLayout::all() {
+                let selected = self.prefs.input.movement == m;
+                if ui.selectable_label(selected, m.label()).clicked() {
+                    self.prefs.input.movement = m;
+                }
+            }
+        });
+        {
+            // show the live cluster so ".oeu" (Dvorak) etc. is legible at a glance
+            let [f, l, b, r] = self.prefs.input.movement.keys();
+            ui.colored_label(colors.text_weak, format!("forward {f} · left {l} · back {b} · right {r}"));
+        }
         ui.add_space(6.0);
 
         ui.label("Touch");
