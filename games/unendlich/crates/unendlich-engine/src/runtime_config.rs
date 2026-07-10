@@ -27,6 +27,11 @@ pub struct RuntimeConfig {
     pub frame_target_ms: f32,
     pub mesh_cache_size: usize,
     pub gpu_gen_batch: u32,
+    /// r708: per-frame GPU-mesh time budget (µs). When the octree GPU mesher is
+    /// active (gpu_mesher=2), the dispatcher yields the GPU back to the render
+    /// once it's spent this much meshing per frame — bounding the load-burst
+    /// contention. 0 = unthrottled. No effect under the default CPU mesher.
+    pub gpu_mesh_budget_us: u32,
     /// Render resolution scale for the neural upscaler (0.5..1.0; <1 renders
     /// internally smaller and upscales).
     pub render_scale: f32,
@@ -95,6 +100,7 @@ impl RuntimeConfig {
             frame_target_ms: f32v("UNENDLICH_FRAME_TARGET_MS", 16.67),
             mesh_cache_size: u32v("UNENDLICH_MESH_CACHE_SIZE", 0) as usize,
             gpu_gen_batch: u32v("UNENDLICH_GPU_GEN_BATCH", 16),
+            gpu_mesh_budget_us: u32v("UNENDLICH_GPU_MESH_BUDGET_US", 4000),
             render_scale: f32v("UNENDLICH_RENDER_SCALE", 1.0),
             shadow_map_size: u32v("UNENDLICH_SHADOW_MAP_SIZE", 2048),
             vsync: u32v("UNENDLICH_VSYNC", 1),
@@ -116,6 +122,7 @@ impl RuntimeConfig {
             frame_target_ms: 16.67,
             mesh_cache_size: 0,
             gpu_gen_batch: 16,
+            gpu_mesh_budget_us: 4000,
             render_scale: 1.0,
             shadow_map_size: 2048,
             vsync: 1,
@@ -130,6 +137,7 @@ impl RuntimeConfig {
                 frame_target_ms: 33.3, // 30 fps cap to save power
                 mesh_cache_size: 0,
                 gpu_gen_batch: 4,
+                gpu_mesh_budget_us: 2000,
                 render_scale: 0.6,
                 shadow_map_size: 1024,
                 ..base
@@ -140,6 +148,7 @@ impl RuntimeConfig {
                 max_uploads_per_frame: 8,
                 upload_budget_ms: 3.0,
                 gpu_gen_batch: 8,
+                gpu_mesh_budget_us: 3000,
                 render_scale: 0.8,
                 shadow_map_size: 1024,
                 ..base
@@ -152,6 +161,7 @@ impl RuntimeConfig {
                 upload_budget_ms: 6.0,
                 mesh_cache_size: 256,
                 gpu_gen_batch: 24,
+                gpu_mesh_budget_us: 6000,
                 shadow_map_size: 4096,
                 ..base
             },
@@ -162,6 +172,7 @@ impl RuntimeConfig {
                 upload_budget_ms: 8.0,
                 mesh_cache_size: 512,
                 gpu_gen_batch: 32,
+                gpu_mesh_budget_us: 8000,
                 shadow_map_size: 8192,
                 ..base
             },
@@ -205,6 +216,7 @@ mod tests {
         assert_eq!(m.lod_bands, [8, 16, 32]);
         assert_eq!(m.gpu_mesher, 0); // r477: CPU mesher is the default
         assert_eq!(m.mesh_cache_size, 0);
+        assert_eq!(m.gpu_mesh_budget_us, 4000); // r708: budget on by default
     }
 
     #[test]
@@ -215,6 +227,7 @@ mod tests {
         assert!(bs.max_uploads_per_frame < ul.max_uploads_per_frame);
         assert!(bs.shadow_map_size <= ul.shadow_map_size);
         assert!(bs.mesh_cache_size <= ul.mesh_cache_size);
+        assert!(bs.gpu_mesh_budget_us <= ul.gpu_mesh_budget_us);
     }
 
     #[test]

@@ -710,12 +710,10 @@ static GK_0077: KernelEntry = KernelEntry { name: "damping_force__force", run: g
 // GEN-END
 
 // GEN-ENTRY: debug_overlay__build_debug_mesh src=debug_overlay
-#[cfg(feature = "render-core")]
 fn gk_0078(c: &KernelCtx) {
     let _ = c;
     black_box(crate::debug_overlay::build_debug_mesh(black_box(&crate::debug_overlay::DebugScene::default())));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0078: KernelEntry = KernelEntry { name: "debug_overlay__build_debug_mesh", run: gk_0078 };
 // GEN-END
@@ -1684,78 +1682,64 @@ static GK_0185: KernelEntry = KernelEntry { name: "refraction_offset__refract_uv
 // GEN-END
 
 // GEN-ENTRY: render_dynamic_lights__dynamic_lights_frag_glsl src=render::dynamic_lights
-#[cfg(feature = "render-core")]
 fn gk_0186(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::dynamic_lights::dynamic_lights_frag_glsl(black_box(((c.tick % 7) + 1) as usize)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0186: KernelEntry = KernelEntry { name: "render_dynamic_lights__dynamic_lights_frag_glsl", run: gk_0186 };
 // GEN-END
 
 // GEN-ENTRY: render_gpu_meshing_octree_cpu_ref__is_solid_opaque src=render::gpu_meshing_octree_cpu_ref
-#[cfg(feature = "render-core")]
 fn gk_0187(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::gpu_meshing_octree_cpu_ref::is_solid_opaque(black_box(crate::world::blocks::BlockId::Air)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0187: KernelEntry = KernelEntry { name: "render_gpu_meshing_octree_cpu_ref__is_solid_opaque", run: gk_0187 };
 // GEN-END
 
 // GEN-ENTRY: render_gpu_meshing_octree_cpu_ref__is_weatherable src=render::gpu_meshing_octree_cpu_ref
-#[cfg(feature = "render-core")]
 fn gk_0188(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::gpu_meshing_octree_cpu_ref::is_weatherable(black_box(crate::world::blocks::BlockId::Air)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0188: KernelEntry = KernelEntry { name: "render_gpu_meshing_octree_cpu_ref__is_weatherable", run: gk_0188 };
 // GEN-END
 
 // GEN-ENTRY: render_gpu_meshing_octree_cpu_ref__bumpy_height src=render::gpu_meshing_octree_cpu_ref
-#[cfg(feature = "render-core")]
 fn gk_0189(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::gpu_meshing_octree_cpu_ref::bumpy_height(black_box(c.phase), black_box(c.phase)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0189: KernelEntry = KernelEntry { name: "render_gpu_meshing_octree_cpu_ref__bumpy_height", run: gk_0189 };
 // GEN-END
 
 // GEN-ENTRY: render_gpu_meshing_octree_cpu_ref__color_for_block src=render::gpu_meshing_octree_cpu_ref
-#[cfg(feature = "render-core")]
 fn gk_0190(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::gpu_meshing_octree_cpu_ref::color_for_block(black_box(crate::world::blocks::BlockId::Air)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0190: KernelEntry = KernelEntry { name: "render_gpu_meshing_octree_cpu_ref__color_for_block", run: gk_0190 };
 // GEN-END
 
 // GEN-ENTRY: render_gpu_timer__zones src=render::gpu_timer
-#[cfg(feature = "render-core")]
 fn gk_0191(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::gpu_timer::zones());
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0191: KernelEntry = KernelEntry { name: "render_gpu_timer__zones", run: gk_0191 };
 // GEN-END
 
 // GEN-ENTRY: render_mesh_buffer_alloc__align_up src=render::mesh_buffer_alloc
-#[cfg(feature = "render-core")]
 fn gk_0192(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::mesh_buffer_alloc::align_up(black_box(((c.tick % 7) + 1) as u64)));
 }
-#[cfg(feature = "render-core")]
 #[distributed_slice(KERNELS)]
 static GK_0192: KernelEntry = KernelEntry { name: "render_mesh_buffer_alloc__align_up", run: gk_0192 };
 // GEN-END
@@ -7584,12 +7568,10 @@ static GK_0839: KernelEntry = KernelEntry { name: "world_subvoxel__procedural_su
 // GEN-END
 
 // GEN-ENTRY: world_subvoxel_templates__template_for src=world::subvoxel_templates
-#[cfg(any(feature = "render-core", feature = "mesh-ref"))]
 fn gk_0840(c: &KernelCtx) {
     let _ = c;
     black_box(crate::world::subvoxel_templates::template_for(black_box(crate::world::blocks::BlockId::Air), black_box(((c.tick % 7) + 1) as u32)));
 }
-#[cfg(any(feature = "render-core", feature = "mesh-ref"))]
 #[distributed_slice(KERNELS)]
 static GK_0840: KernelEntry = KernelEntry { name: "world_subvoxel_templates__template_for", run: gk_0840 };
 // GEN-END

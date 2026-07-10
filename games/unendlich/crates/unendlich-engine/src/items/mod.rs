@@ -25,6 +25,8 @@ pub mod inventory;
 
 /// Shapeless crafting over the inventory.
 pub mod crafting;
+pub mod recipe_gen;
+pub mod inventory_filter;
 
 /// Item drops — fallen item entities with pickup-by-proximity.
 pub mod drops;

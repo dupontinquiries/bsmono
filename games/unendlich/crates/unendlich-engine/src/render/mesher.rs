@@ -308,6 +308,75 @@ fn corner_y_offset(
         + surface_bumps(corner_x, corner_z, corner_softness) * weathering_factor
 }
 
+// r695: corner-offset MEMO — a big meshing win. `corner_y_offset` is a PURE
+// function of (chunk, corner_x, slice, corner_z) — its `softness` arg is unused —
+// yet the greedy mesher calls it 4× per top face (o00/o10/o01/o11), and each
+// call does ~28 neighbour samples + trig via `max_softness_at_corner`,
+// `avg_weathering_at_corner` and `corner_sag`. Adjacent faces share corners, so
+// the same corner is recomputed up to 4×. We memoise per mesh PASS: both greedy
+// meshers call `corner_cache_reset()` at entry, so the cache only ever holds the
+// current pass's chunk (correct even when an edited chunk is re-meshed — a fresh
+// pass starts empty), and `corner_y_offset_cached` returns byte-identical values
+// to `corner_y_offset`, so greedy-merge parity is preserved exactly. Keyed by
+// (corner_x, slice, corner_z) WORLD coords, which are unique within a pass.
+/// Local corner span per axis: `origin + [0 ..= CHUNK_SIZE+1]` → CHUNK_SIZE+2.
+const CORNER_CACHE_W: usize = CHUNK_SIZE as usize + 2;
+/// Slice span: chunk-local `y` in `0 .. CHUNK_SIZE`.
+const CORNER_CACHE_H: usize = CHUNK_SIZE as usize;
+
+thread_local! {
+    // r697: FLAT-ARRAY corner memo (was a HashMap in r695). The cache is hit 4×
+    // per corner, so lookup cost matters: a flat `Vec<f32>` indexed by local
+    // (x, z, slice) is ~10× cheaper per access than hashing a 3-i32 key, and the
+    // per-pass reset is a plain fill instead of a HashMap clear + rehash. NaN is
+    // the "not computed" sentinel (corner_y_offset only ever returns finite sums).
+    static CORNER_CACHE: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(vec![
+        f32::NAN;
+        CORNER_CACHE_W * CORNER_CACHE_W * CORNER_CACHE_H
+    ]);
+}
+
+/// Clear the corner memo at the start of a mesh pass (keeps the allocation).
+#[inline]
+fn corner_cache_reset() {
+    CORNER_CACHE.with(|c| c.borrow_mut().iter_mut().for_each(|v| *v = f32::NAN));
+}
+
+/// Memoised [`corner_y_offset`]: identical result, computed once per corner per
+/// mesh pass instead of once per adjacent face. In-range corners hit the flat
+/// cache; the rare out-of-range corner (a below-block edge sample) falls back to
+/// direct computation, so the result is always byte-identical to `corner_y_offset`.
+#[inline]
+fn corner_y_offset_cached(
+    chunk: &Chunk,
+    corner_x: i32,
+    slice: i32,
+    corner_z: i32,
+    softness: f32,
+) -> f32 {
+    let (ox, _oy, oz) = chunk.coord.block_origin();
+    let lx = corner_x - ox;
+    let lz = corner_z - oz;
+    if lx >= 0
+        && (lx as usize) < CORNER_CACHE_W
+        && lz >= 0
+        && (lz as usize) < CORNER_CACHE_W
+        && slice >= 0
+        && (slice as usize) < CORNER_CACHE_H
+    {
+        let idx = (slice as usize * CORNER_CACHE_W + lz as usize) * CORNER_CACHE_W + lx as usize;
+        let cached = CORNER_CACHE.with(|c| c.borrow()[idx]);
+        if !cached.is_nan() {
+            return cached;
+        }
+        let v = corner_y_offset(chunk, corner_x, slice, corner_z, softness);
+        CORNER_CACHE.with(|c| c.borrow_mut()[idx] = v);
+        v
+    } else {
+        corner_y_offset(chunk, corner_x, slice, corner_z, softness)
+    }
+}
+
 /// Per-block color tint based on world position. Returns a multiplier
 /// in roughly [0.85, 1.15] that varies smoothly across world space.
 ///
@@ -451,6 +520,47 @@ fn sample_env_at(
     }
 }
 
+// r696: ENV-SAMPLE memo — the second meshing win (after r695's corner memo).
+// `sample_env_at` is called per exposed cell for BOTH the top-face colour and
+// each side-face colour of the same block, each call doing a world_model
+// temperature+humidity noise sample + a vertical `sky_exposure_at` probe + a
+// 4-neighbour `slope_at`. A block's top + up-to-4 sides re-sample the identical
+// (block, wx, wy, wz). We memoise per mesh PASS (reset at both greedy entries),
+// keyed by (block, wx, wy, wz) — within a pass a position holds one block, so
+// this is byte-identical to `sample_env_at` and colour output is unchanged.
+thread_local! {
+    static ENV_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(BlockId, i32, i32, i32), crate::world::material_response::EnvironmentSample>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[inline]
+fn env_cache_reset() {
+    ENV_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// Memoised [`sample_env_at`]: identical result, computed once per (block,pos)
+/// per mesh pass instead of once per exposed face of that block.
+#[inline]
+fn sample_env_at_cached(
+    block: BlockId,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+    chunk: &Chunk,
+    world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
+) -> crate::world::material_response::EnvironmentSample {
+    let key = (block, wx, wy, wz);
+    if let Some(v) = ENV_CACHE.with(|c| c.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = sample_env_at(block, wx, wy, wz, chunk, world_model);
+    ENV_CACHE.with(|c| {
+        c.borrow_mut().insert(key, v);
+    });
+    v
+}
+
 /// Compute the per-block top-face color via the response matrix.
 /// When the response matrix doesn't apply (`base_rgb` is the default
 /// neutral grey), falls back to the legacy block_color() palette
@@ -483,7 +593,7 @@ fn compute_tinted_color_for_top(
             (palette[2] * tint[2]).clamp(0.0, 1.0),
         ];
     }
-    let env = sample_env_at(block, wx, wy, wz, chunk, world_model);
+    let env = sample_env_at_cached(block, wx, wy, wz, chunk, world_model);
     // response.tint() returns the climate-shifted color (already
     // including base_rgb). Add a position-noise wobble for per-block
     // variation; matrix's `position_variance` controls amplitude.
@@ -535,7 +645,7 @@ fn compute_tinted_color_for_face(
     // which we don't currently consult through the matrix path. Future:
     // matrix could carry per-face shifts. For now: top face tint applies
     // to all faces of matrix-aware blocks.
-    let env = sample_env_at(block, wx, wy, wz, chunk, world_model);
+    let env = sample_env_at_cached(block, wx, wy, wz, chunk, world_model);
     let mut c = response.tint(env);
     let pn = tint_for_position(block, wx, wy, wz);
     let variance = response.position_variance;
@@ -993,18 +1103,23 @@ fn block_color_per_face(b: BlockId) -> Option<[[f32; 3]; 6]> {
 
 /// Whether this block should be meshed at all (i.e. has visible faces).
 fn is_meshable(b: BlockId) -> bool {
-    // r523: subvoxel-only blocks (leaves, crops) must NOT emit a solid cube — they render
-    // entirely as subvoxel decoration, and a cube on top hides that detail (the "solid block
-    // over the leaves" bug). This now matches world::surface::is_meshable, which already
-    // excluded them; the two paths are meant to agree.
-    !b.is_air() && b.is_solid() && !b.is_subvoxel_only()
+    // r699: single array load via the compile-time LUT instead of three `matches!`
+    // chains (`!is_air() && is_solid() && !is_subvoxel_only()`). The LUT is built
+    // from `is_meshable_cube` — the exact same predicate — so this is identical to
+    // the old body (verified by a parity test over BlockId::ALL) and still agrees
+    // with world::surface::is_meshable. Called ~6M×/chunk in the greedy mask build.
+    crate::world::blocks::BlockId::MESHABLE_LUT[b as usize]
 }
 
 /// Whether a face between `inner` (the meshed block) and `neighbor` should
 /// be emitted. Delegates to the narrow `produces_face_against` predicate
 /// on BlockId so the rule is owned by the block type, not duplicated here.
 fn should_emit_face(inner: BlockId, neighbor: BlockId) -> bool {
-    inner.produces_face_against(neighbor)
+    // r700: single flat 2D-array load via the compile-time LUT instead of four
+    // predicate evaluations + a compare in `produces_face_against`. The LUT is
+    // built from that exact predicate (parity-tested over BlockId::ALL²), so this
+    // is byte-identical. Called ~6M×/chunk in the greedy mask build.
+    crate::world::blocks::BlockId::FACE_EMIT_LUT[(inner as usize) * 256 + (neighbor as usize)]
 }
 
 /// Get the block at chunk-local coordinates. Out-of-bounds returns Air.
@@ -1017,7 +1132,12 @@ fn get_local(chunk: &Chunk, x: i32, y: i32, z: i32) -> BlockId {
     {
         return BlockId::Air;
     }
-    chunk.get(x, y, z)
+    // r698: index the flat block array directly. We've just proven (x,y,z) is in
+    // bounds, so `chunk.get` — which repeats the same 3-axis `in_bounds` check —
+    // would double-check every read. get_local is the mesher's hottest call
+    // (~12M reads/chunk in the greedy mask build across 6 axis configs), so
+    // dropping the redundant check is a real inner-loop win. Identical result.
+    chunk.blocks[Chunk::block_index(x, y, z)]
 }
 
 // =============================================================================
@@ -1667,6 +1787,8 @@ pub fn mesh_chunk_greedy(
     current_tick: Option<u64>,
 ) -> ChunkMesh {
     let mut mesh = ChunkMesh::empty();
+    corner_cache_reset(); // r695: fresh corner memo for this pass
+    env_cache_reset();    // r696: fresh env-sample memo for this pass
     let (origin_x, origin_y, origin_z) = chunk.coord.block_origin();
     let origin = [origin_x, origin_y, origin_z];
 
@@ -2087,6 +2209,8 @@ fn emit_cloud_cube_culled(
 #[cfg(test)]
 fn mesh_chunk_greedy_undecorated(chunk: &Chunk, sky: Option<&crate::sky::Sky>) -> ChunkMesh {
     let mut mesh = ChunkMesh::empty();
+    corner_cache_reset(); // r695: fresh corner memo for this pass
+    env_cache_reset();    // r696: fresh env-sample memo for this pass
     let (origin_x, origin_y, origin_z) = chunk.coord.block_origin();
     let origin = [origin_x, origin_y, origin_z];
     let _ = origin;
@@ -2310,10 +2434,10 @@ pub(crate) fn decorate_chunk(
         // perfectly with the visible block top corner — no gap, no z-fighting.
         let softness = block.softness();
         let corner_avg_offset = if softness > 0.0 {
-            let o00 = corner_y_offset(chunk, origin[0] + lx,     ly, origin[2] + lz,     softness);
-            let o10 = corner_y_offset(chunk, origin[0] + lx + 1, ly, origin[2] + lz,     softness);
-            let o01 = corner_y_offset(chunk, origin[0] + lx,     ly, origin[2] + lz + 1, softness);
-            let o11 = corner_y_offset(chunk, origin[0] + lx + 1, ly, origin[2] + lz + 1, softness);
+            let o00 = corner_y_offset_cached(chunk, origin[0] + lx,     ly, origin[2] + lz,     softness);
+            let o10 = corner_y_offset_cached(chunk, origin[0] + lx + 1, ly, origin[2] + lz,     softness);
+            let o01 = corner_y_offset_cached(chunk, origin[0] + lx,     ly, origin[2] + lz + 1, softness);
+            let o11 = corner_y_offset_cached(chunk, origin[0] + lx + 1, ly, origin[2] + lz + 1, softness);
             (o00 + o10 + o01 + o11) * 0.25
         } else {
             0.0
@@ -2748,10 +2872,10 @@ fn emit_subdivided_top(
     // isolated blocks). The 4 corner sags are then bilinearly
     // interpolated across the subdivision grid so the entire top
     // tilts smoothly toward isolated edges.
-    let o00 = corner_y_offset(chunk, block_wx,     slice, block_wz,     softness);
-    let o10 = corner_y_offset(chunk, block_wx + 1, slice, block_wz,     softness);
-    let o11 = corner_y_offset(chunk, block_wx + 1, slice, block_wz + 1, softness);
-    let o01 = corner_y_offset(chunk, block_wx,     slice, block_wz + 1, softness);
+    let o00 = corner_y_offset_cached(chunk, block_wx,     slice, block_wz,     softness);
+    let o10 = corner_y_offset_cached(chunk, block_wx + 1, slice, block_wz,     softness);
+    let o11 = corner_y_offset_cached(chunk, block_wx + 1, slice, block_wz + 1, softness);
+    let o01 = corner_y_offset_cached(chunk, block_wx,     slice, block_wz + 1, softness);
 
     // 9×9 vertex grid at the default 8 subdivisions; runtime-overridable
     // via UNENDLICH_TOP_SUBDIVISION (1..=8). Index: i × (nsub+1) + j.
@@ -2859,10 +2983,10 @@ fn emit_jittered_top(
     // exposed). All four corners query the same world coords + slice that
     // adjacent blocks would, so corners stay welded.
     let softness = block.softness();
-    let o00 = corner_y_offset(chunk, origin[0] + u,     slice, origin[2] + v,     softness);
-    let o10 = corner_y_offset(chunk, origin[0] + u + 1, slice, origin[2] + v,     softness);
-    let o11 = corner_y_offset(chunk, origin[0] + u + 1, slice, origin[2] + v + 1, softness);
-    let o01 = corner_y_offset(chunk, origin[0] + u,     slice, origin[2] + v + 1, softness);
+    let o00 = corner_y_offset_cached(chunk, origin[0] + u,     slice, origin[2] + v,     softness);
+    let o10 = corner_y_offset_cached(chunk, origin[0] + u + 1, slice, origin[2] + v,     softness);
+    let o11 = corner_y_offset_cached(chunk, origin[0] + u + 1, slice, origin[2] + v + 1, softness);
+    let o01 = corner_y_offset_cached(chunk, origin[0] + u,     slice, origin[2] + v + 1, softness);
 
     let positions = [
         [wx,       wy + o00, wz      ],
@@ -3119,7 +3243,7 @@ fn emit_soft_side_face(
             // agree without coordination.
             let cx = p[0] as i32;
             let cz = p[2] as i32;
-            let off = corner_y_offset(chunk, cx, slice, cz, softness);
+            let off = corner_y_offset_cached(chunk, cx, slice, cz, softness);
             p[1] += off;
         } else if (p[1] - block_bot_y).abs() < 1e-4 {
             // Bottom corner: this corner is at the boundary between
@@ -3146,7 +3270,7 @@ fn emit_soft_side_face(
             let below_y = slice - 1;
             let below_block = block_at(chunk, [below_x, below_y, below_z]);
             if is_meshable(below_block) && below_block.softness() > 0.0 {
-                let below_off = corner_y_offset(
+                let below_off = corner_y_offset_cached(
                     chunk, cx, below_y, cz, below_block.softness());
                 // Only drop downward, never lift.
                 if below_off < 0.0 {

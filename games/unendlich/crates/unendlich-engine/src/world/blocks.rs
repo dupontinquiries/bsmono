@@ -135,8 +135,8 @@ impl BlockId {
         BlockId::Magma, BlockId::GlowCrystal,
     ];
 
-    pub fn is_air(self) -> bool {
-        self == BlockId::Air
+    pub const fn is_air(self) -> bool {
+        matches!(self, BlockId::Air)
     }
 
     /// Coarse "solid-like" hint. NOT load-bearing — consumers should
@@ -157,7 +157,7 @@ impl BlockId {
     /// (TODO), etc. Old call sites still using `is_solid` are technical
     /// debt — flag with `// TODO migrate to narrower predicate` when
     /// touching them.
-    pub fn is_solid(self) -> bool {
+    pub const fn is_solid(self) -> bool {
         !matches!(self, BlockId::Air | BlockId::Water | BlockId::Lava
             | BlockId::Flower | BlockId::TallGrass | BlockId::Fern
             | BlockId::DeadBush | BlockId::Vine | BlockId::Cobweb
@@ -191,7 +191,7 @@ impl BlockId {
     /// This is the predicate the mesher should use, NOT `is_solid()`.
     /// Differs from `blocks_collision()` for things like glass (blocks
     /// collision, but produces transparent face — needs a separate path).
-    pub fn produces_face_against(self, neighbor: BlockId) -> bool {
+    pub const fn produces_face_against(self, neighbor: BlockId) -> bool {
         if !self.is_solid() { return false; }   // air/fluid/plants emit nothing
         // Sub-voxel-only blocks (leaves) draw their visual entirely
         // through the decoration pass — no cube faces. Otherwise the
@@ -199,9 +199,31 @@ impl BlockId {
         // inside.
         if self.is_subvoxel_only() { return false; }
         if neighbor.is_air() { return true; }
-        if neighbor.is_transparent() && neighbor != self { return true; }
+        if neighbor.is_transparent() && (neighbor as u8) != (self as u8) { return true; }
         false
     }
+
+    /// r700: compile-time 2D lookup table for [`produces_face_against`], indexed
+    /// by `(self as u8) * 256 + (neighbor as u8)`. `should_emit_face` calls the
+    /// predicate ~6M×/chunk in the greedy mask build (once per meshable cell); a
+    /// single flat array load replaces four predicate evaluations + a compare.
+    /// Built at const-eval time from `BlockId::ALL × BlockId::ALL`; pairs outside
+    /// `ALL` stay `false` (chunk storage only holds valid `BlockId`s). 64 KiB.
+    pub const FACE_EMIT_LUT: [bool; 256 * 256] = {
+        let mut t = [false; 256 * 256];
+        let mut i = 0;
+        while i < BlockId::ALL.len() {
+            let a = BlockId::ALL[i];
+            let mut j = 0;
+            while j < BlockId::ALL.len() {
+                let b = BlockId::ALL[j];
+                t[(a as usize) * 256 + (b as usize)] = a.produces_face_against(b);
+                j += 1;
+            }
+            i += 1;
+        }
+        t
+    };
 
     /// Is this block valid anchorage for a tree's root marker?
     ///
@@ -232,7 +254,7 @@ impl BlockId {
             | BlockId::DiamondOre | BlockId::Dripstone)
     }
 
-    pub fn is_transparent(self) -> bool {
+    pub const fn is_transparent(self) -> bool {
         matches!(self, BlockId::Air | BlockId::Water | BlockId::Ice
             | BlockId::OakLeaves | BlockId::BirchLeaves | BlockId::Flower
             | BlockId::TallGrass | BlockId::Fern | BlockId::DeadBush
@@ -420,10 +442,30 @@ impl BlockId {
     /// work could query the same height function for "raise the player by
     /// X when standing on this corner".
     pub fn wants_top_jitter(self) -> bool {
+        // r701: LUT-backed (one bool load).
+        Self::WANTS_TOP_JITTER_LUT[self as usize]
+    }
+
+    /// The match `wants_top_jitter` tables, as a `const fn`.
+    const fn wants_top_jitter_raw(self) -> bool {
         matches!(self,
             BlockId::Grass | BlockId::Dirt | BlockId::Sand | BlockId::Gravel
             | BlockId::Moss | BlockId::Snow | BlockId::SnowBlock | BlockId::Clay)
     }
+
+    /// r701: compile-time table for `wants_top_jitter` (built from
+    /// `wants_top_jitter_raw` over `BlockId::ALL`; non-`ALL` = `false`, matching
+    /// the `matches!` catch-all).
+    pub const WANTS_TOP_JITTER_LUT: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut i = 0;
+        while i < BlockId::ALL.len() {
+            let b = BlockId::ALL[i];
+            t[b as usize] = b.wants_top_jitter_raw();
+            i += 1;
+        }
+        t
+    };
 
     /// Should grass tufts / sub-block decoration be emitted in the air space
     /// above this block? Used by the mesher's decoration pass.
@@ -470,7 +512,7 @@ impl BlockId {
     ///
     /// Today: leaves. As we add more pure-decoration blocks (cobweb,
     /// fancy vines, wisp), they go here too.
-    pub fn is_subvoxel_only(self) -> bool {
+    pub const fn is_subvoxel_only(self) -> bool {
         matches!(self,
             BlockId::OakLeaves
             | BlockId::BirchLeaves
@@ -478,6 +520,40 @@ impl BlockId {
             // still raycast-harvestable; blocks_collision is false so you walk through them.
             | BlockId::Carrot | BlockId::Potato | BlockId::Cabbage | BlockId::Sprout)
     }
+
+    /// r699: the greedy mesher's "emit a solid cube?" predicate as a `const fn` —
+    /// a block meshes iff it's not air, is solid, and isn't subvoxel-only. Kept
+    /// here (next to the predicates it composes) so the mesher's `is_meshable`
+    /// and the `MESHABLE_LUT` below can't drift from each other.
+    pub const fn is_meshable_cube(self) -> bool {
+        !self.is_air() && self.is_solid() && !self.is_subvoxel_only()
+    }
+
+    /// r702: does this block, as a neighbour, FULLY occlude the adjacent face —
+    /// i.e. cull it regardless of the inner block? True only for a full opaque
+    /// cube: it must emit a solid cube (`is_meshable_cube`) AND be opaque
+    /// (`!is_transparent`, which also excludes air/fluids/plants). Glass and ice
+    /// are meshable cubes but transparent → they do NOT occlude. Used to detect
+    /// fully-buried chunks that can skip meshing entirely.
+    pub const fn is_opaque_occluder(self) -> bool {
+        self.is_meshable_cube() && !self.is_transparent()
+    }
+
+    /// r699: compile-time lookup table for [`is_meshable_cube`], indexed by
+    /// `BlockId as u8`. The greedy mesher evaluates the predicate ~6M×/chunk in
+    /// the mask build; a single array load replaces three `matches!` chains.
+    /// Built at const-eval time from [`BlockId::ALL`]; discriminants not in `ALL`
+    /// stay `false` (chunk storage only ever holds valid `BlockId`s).
+    pub const MESHABLE_LUT: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut i = 0;
+        while i < BlockId::ALL.len() {
+            let b = BlockId::ALL[i];
+            t[b as usize] = b.is_meshable_cube();
+            i += 1;
+        }
+        t
+    };
 
     /// "Softness" of a block's edges — how much its top corners sag at
     /// terrain cliffs / steps. 0 = sharp 90° corners (stone, marble).
@@ -496,6 +572,13 @@ impl BlockId {
     /// shared corner agree on the sag because they query the same world
     /// neighbors — no T-junctions, no visual cracks.
     pub fn softness(self) -> f32 {
+        // r701: LUT-backed — one f32 load instead of the match below, for the
+        // several-thousand per-chunk calls in the mesher's side-face path + emit.
+        Self::SOFTNESS_LUT[self as usize]
+    }
+
+    /// The match `softness` tables, as a `const fn` (used to build `SOFTNESS_LUT`).
+    const fn softness_raw(self) -> f32 {
         match self {
             // Loose/granular: strong sag.
             BlockId::Sand        => 0.85,
@@ -513,6 +596,20 @@ impl BlockId {
             _ => 0.0,
         }
     }
+
+    /// r701: compile-time table for `softness`, indexed by `BlockId as u8`. Built
+    /// from `softness_raw` over `BlockId::ALL`; entries not in `ALL` stay `0.0` —
+    /// which equals `softness_raw`'s `_ => 0.0` arm, so it's exact for every u8.
+    pub const SOFTNESS_LUT: [f32; 256] = {
+        let mut t = [0.0f32; 256];
+        let mut i = 0;
+        while i < BlockId::ALL.len() {
+            let b = BlockId::ALL[i];
+            t[b as usize] = b.softness_raw();
+            i += 1;
+        }
+        t
+    };
 
     pub fn hardness(self) -> f32 {
         match self {

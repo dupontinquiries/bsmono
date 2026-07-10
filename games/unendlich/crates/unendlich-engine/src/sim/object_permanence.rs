@@ -117,6 +117,46 @@ impl Tracker {
             _ => false,
         }
     }
+
+    /// Fold in a *partial* observation — a fleeting glimpse, a heard sound, a
+    /// fresh footprint — rather than a clean line-of-sight sighting. Blends the
+    /// ghost's last-known position toward `pos` with weight `confidence`, capped
+    /// at 0.85 because partial information can't fully resolve the target, and
+    /// rewinds the trail age toward `now` by that same weight (a glimpse cools the
+    /// trail less than a full sighting resets it). Does nothing without an active
+    /// ghost: partial info alone can't *acquire* a target — that needs `observe`.
+    pub fn observe_partial(&mut self, pos: [f32; 3], confidence: f32, now: f32) {
+        if let Some(g) = self.ghost.as_mut() {
+            let w = confidence.clamp(0.0, 0.85);
+            for i in 0..3 {
+                g.last_pos[i] += (pos[i] - g.last_pos[i]) * w;
+            }
+            g.last_seen += (now - g.last_seen) * w;
+        }
+    }
+
+    /// A deterministic *systematic* search position for the movement system:
+    /// sample `i` of a phyllotaxis (sunflower) spiral over the current uncertainty
+    /// disc in the XZ plane, centred on the dead-reckoned position. Successive `i`
+    /// spread evenly from the most-likely centre outward, so the searcher sweeps
+    /// the volume in confidence order instead of wandering blindly. `total` is how
+    /// many samples the sweep will use (sets the outer radius reach). `None` when
+    /// the trail is cold / no ghost.
+    pub fn search_point(&self, now: f32, i: u32, total: u32) -> Option<[f32; 3]> {
+        if self.should_give_up(now) {
+            return None;
+        }
+        let centre = self.predicted_position(now)?;
+        let r_max = self.uncertainty_radius(now)?;
+        let total = total.max(1);
+        // sqrt() radius mapping = equal-area rings → even coverage.
+        let frac = (i.min(total - 1) as f32 + 0.5) / total as f32;
+        let r = r_max * frac.sqrt();
+        // golden angle (~137.5°) — the phyllotaxis spacing that avoids spokes.
+        const GOLDEN_ANGLE: f32 = 2.399_963_2;
+        let a = i as f32 * GOLDEN_ANGLE;
+        Some([centre[0] + r * a.cos(), centre[1], centre[2] + r * a.sin()])
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +257,48 @@ mod tests {
         t.observe([1.0, 2.0, 3.0], [0.5, 0.0, -0.5], 2.0);
         assert_eq!(t.predicted_position(5.0), t.predicted_position(5.0));
         assert_eq!(t.uncertainty_radius(5.0), t.uncertainty_radius(5.0));
+    }
+
+    #[test]
+    fn partial_observation_blends_not_resets() {
+        let mut t = tracker();
+        t.observe([0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0);
+        // A glimpse of the target at x=10 with 50% confidence pulls the belief
+        // partway (0.5 of the way), not all the way.
+        t.observe_partial([10.0, 0.0, 0.0], 0.5, 2.0);
+        let g = t.ghost().unwrap();
+        assert!((g.last_pos[0] - 5.0).abs() < 1e-4, "blended halfway, got {}", g.last_pos[0]);
+        // Confidence is capped at 0.85 — even a "certain" partial can't fully resolve.
+        let mut t2 = tracker();
+        t2.observe([0.0, 0.0, 0.0], [0.0; 3], 0.0);
+        t2.observe_partial([10.0, 0.0, 0.0], 1.0, 2.0);
+        assert!(t2.ghost().unwrap().last_pos[0] <= 8.5 + 1e-3);
+        // Partial info without a prior sighting acquires nothing.
+        let mut t3 = tracker();
+        t3.observe_partial([1.0, 2.0, 3.0], 0.8, 1.0);
+        assert!(!t3.is_tracking());
+    }
+
+    #[test]
+    fn search_points_cover_the_uncertainty_disc() {
+        let mut t = tracker();
+        t.observe([0.0, 0.0, 0.0], [0.0; 3], 0.0);
+        let now = 3.0;
+        let r = t.uncertainty_radius(now).unwrap();
+        let c = t.predicted_position(now).unwrap();
+        // Every sample lies within the disc, and the first is nearer the centre
+        // than the last (centre-out ordering).
+        let p0 = t.search_point(now, 0, 16).unwrap();
+        let plast = t.search_point(now, 15, 16).unwrap();
+        for i in 0..16 {
+            let p = t.search_point(now, i, 16).unwrap();
+            let d = ((p[0] - c[0]).powi(2) + (p[2] - c[2]).powi(2)).sqrt();
+            assert!(d <= r + 1e-3, "sample {i} outside disc");
+        }
+        let d0 = ((p0[0] - c[0]).powi(2) + (p0[2] - c[2]).powi(2)).sqrt();
+        let dl = ((plast[0] - c[0]).powi(2) + (plast[2] - c[2]).powi(2)).sqrt();
+        assert!(d0 < dl, "search should sweep centre-outward");
+        // Cold trail → no search point.
+        assert_eq!(t.search_point(100.0, 0, 16), None);
     }
 }
