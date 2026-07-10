@@ -42,7 +42,7 @@ impl eframe::App for Feel {
             let surface = ui.max_rect();
             // swipe the board sideways to cycle qwerty → symbols → cardinal → cardinal8
             self.board.poll_swipe(ui, surface);
-            if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive) {
+            if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
                 if e == "\u{8}" {
                     self.typed.pop();
                 } else {
