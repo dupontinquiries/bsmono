@@ -30,6 +30,7 @@ pub mod motion;
 pub mod log_view;
 pub mod mono_tile;
 pub mod slide_menu;
+pub mod toggle_grid;
 pub mod theme_bridge;
 pub mod tokens;
 
