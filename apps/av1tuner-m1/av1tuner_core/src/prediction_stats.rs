@@ -191,9 +191,7 @@ pub fn run_analysis(
     let temp_dir = std::env::temp_dir().join(format!(
         "av1tuner_pred_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0),
+        core_kit::time::now_secs(),
     ));
     std::fs::create_dir_all(&temp_dir)?;
     let output_path = temp_dir.join("sample.ivf");
