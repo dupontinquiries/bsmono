@@ -180,6 +180,16 @@ class Host(NetPeer):
         self.host_name = host_name or "Paperbound Table"
         self.port = port
         self.transport_kind = transport      # "udp" | "http"
+        # ── fleet integration (shared netcode SessionRecord; see fleet.py) ──
+        # A paperbound host can announce itself to the shared fleet DHT so friends see it in the
+        # games centre and can be handed our dial string. The DHT publisher is injected by a
+        # fleet-aware launcher (a running snapcore/OpenDHT node); with none this stays inert and
+        # paperbound's own mDNS/UDP discovery is unaffected. Guarded so it never breaks hosting.
+        try:
+            from fleet import FleetPresence
+            self.fleet = FleetPresence(self.host_name)
+        except Exception:
+            self.fleet = None
         self.seed = random.randint(1, 10_000_000)
         self.arena = "study"
         self.match_mode = mode          # "1v1" | "2v2"
@@ -344,6 +354,22 @@ class Host(NetPeer):
         for addr in self._all_peers():
             if addr != exclude:
                 self.send_to(addr, msg)
+
+    def announce_to_fleet(self, publish=None, ip=None):
+        """Announce this host to the shared fleet so friends discover it via the games centre.
+        `publish(key, value_bytes)` writes to the fleet DHT (injected by a fleet node); `ip` is our
+        advertised LAN address. Best-effort: never raises into the game loop, and a no-op without a
+        fleet layer/publisher, so paperbound stays fully playable standalone. Returns the session
+        token (which a friend's "join" resolves) or None."""
+        if not getattr(self, "fleet", None):
+            return None
+        try:
+            if publish is not None:
+                self.fleet._publish = publish
+            addr = f"{ip or '0.0.0.0'}:{self.port}"
+            return self.fleet.announce_host(self.transport_kind, addr)
+        except Exception:
+            return None
 
     def start_match_for(self, addr, role, seats=None):
         """Send the start packet (seed+arena+role+seats+mode+ruleset stamp) to one
