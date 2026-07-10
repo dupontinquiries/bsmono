@@ -1,0 +1,11 @@
+[package]
+name = "weather-share"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "iOS-like, per-contact exposed sharing of weather data with snapclone contacts. Composes datashare-core (the live namespaced pub/sub DB), share-kit (durable DHT mailbox delivery), and snapcore (the mesh store). Granular and revocable: each (record, contact) grant is explicit, the recipient sees exactly what's shared with them, and a revoke removes it like iOS 'Stop Sharing'. Pure, std-only."
+
+[dependencies]
+datashare-core = { path = "../datashare-core" }
+share-kit = { path = "../share-kit" }
+snapcore = { path = "../snapcore" }
