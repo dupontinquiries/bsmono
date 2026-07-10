@@ -21,7 +21,7 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 .show(ui, |ui| {
                     for a in &suite.apps {
                         let sel = app.fleet.selected.as_ref().is_some_and(|s| s.name == a.name);
-                        if ui.selectable_label(sel, &a.name).clicked() {
+                        if ui.selectable_label(sel, format!("{}  {}", crate::app::app_icon(&a.name), a.name)).clicked() {
                             app.fleet.selected = Some(a.clone());
                         }
                     }
