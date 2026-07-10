@@ -15,10 +15,13 @@ struct Feel {
 }
 
 impl eframe::App for Feel {
+    // this eframe\'s App trait requires ui(); the app is driven from update() below.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx);
 
-        egui::TopBottomPanel::top("out").show(ctx, |ui| {
+        egui::Panel::top("out").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("layout: {}", self.board.current().name)).strong());
                 ui.separator();
