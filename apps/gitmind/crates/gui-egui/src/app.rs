@@ -69,7 +69,12 @@ impl Default for App {
     fn default() -> Self {
         Self {
             tab: Tab::Network,
-            prefs: settings_kit::Prefs::default(),
+            prefs: {
+                // Default to the Night palette so the egui shell matches gitmind's Qt/QML colours.
+                let mut p = settings_kit::Prefs::default();
+                p.palette = "night".to_string();
+                p
+            },
             task: Task::default(),
             net: pages::network::State::default(),
             fleet: pages::fleet::State::default(),
