@@ -1,0 +1,17 @@
+[package]
+name = "uikit-term"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A shared egui terminal widget: a portable screen-grid model + VT/ANSI parser (pure, unit-tested) and a themed run-length cell renderer that routes colours through the uikit-egui palette + display-accessibility filters. Lifted out of voiceterm so any egui app can embed a terminal."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../uikit-egui" }
+settings-kit = { path = "../../../settings-kit" }
+snapclone-theme = { path = "../snapclone-theme" }
+
+[workspace]
