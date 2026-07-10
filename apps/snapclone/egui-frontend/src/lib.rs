@@ -25,6 +25,7 @@ pub struct Snapclone {
     pub bg: LiveBackground,
     pub peers: Vec<Peer>,
     gesture: GestureLayer,
+    palette: String,
 }
 
 impl Snapclone {
@@ -34,6 +35,7 @@ impl Snapclone {
             bg: LiveBackground::new(BgStyle::Aurora),
             peers,
             gesture: GestureLayer::horizontal_page(320.0),
+            palette: String::new(),
         }
     }
 
@@ -61,11 +63,12 @@ impl Snapclone {
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
+        self.palette = prefs.palette.clone();
     }
 
     /// Render: live background, then the current page/subpage.
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
-        let colors = uikit_egui::default_palette();
+        let colors = uikit_egui::palette_colors(&self.palette);
         let surface = ui.available_rect_before_wrap();
 
         // live background painted behind everything

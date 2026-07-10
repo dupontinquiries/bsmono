@@ -45,11 +45,13 @@ pub struct Controller {
     pub active_scene: usize,
     gesture: GestureLayer,
     a11y: A11yScene,
+    /// The user's selected palette id (empty ⇒ default); set from prefs in apply_settings.
+    palette: String,
 }
 
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
-        Controller { view_idx: 0, devices, scenes, active_scene: 0, gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new() }
+        Controller { view_idx: 0, devices, scenes, active_scene: 0, gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
     }
 
     pub fn current(&self) -> &'static str {
@@ -64,11 +66,12 @@ impl Controller {
     pub fn apply_settings(&mut self, ctx: &egui::Context, prefs: &settings_kit::Prefs) {
         uikit_egui::apply_prefs(ctx, prefs);
         *self.gesture.config_mut() = prefs.gesture_config(320.0);
+        self.palette = prefs.palette.clone();
     }
 
     /// Render the controller.
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
-        let colors = uikit_egui::default_palette();
+        let colors = uikit_egui::palette_colors(&self.palette);
         self.a11y.begin_frame();
 
         let surface = ui.available_rect_before_wrap();
