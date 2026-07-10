@@ -30,6 +30,47 @@ pub struct ClassDef {
     pub trait_: &'static str,
 }
 
+/// Each class's signature active ability.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Ability { SecondWind, Scamper, Dive, Bound, Charge, Stoop }
+
+impl Ability {
+    pub fn name(self) -> &'static str {
+        match self {
+            Ability::SecondWind => "Second Wind", Ability::Scamper => "Scamper", Ability::Dive => "Dive",
+            Ability::Bound => "Bound", Ability::Charge => "Charge", Ability::Stoop => "Stoop",
+        }
+    }
+    /// One-line description for a HUD/tooltip.
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Ability::SecondWind => "catch your breath — refill stamina, briefly untouchable",
+            Ability::Scamper => "a blazing sprint",
+            Ability::Dive => "slip away fast and untouchable",
+            Ability::Bound => "a huge airborne leap",
+            Ability::Charge => "an unstoppable charge",
+            Ability::Stoop => "a screaming dive",
+        }
+    }
+    pub fn cooldown(self) -> f32 {
+        match self { Ability::Bound => 8.0, Ability::Scamper | Ability::Charge | Ability::Stoop => 10.0, _ => 12.0 }
+    }
+    /// How long the ability's effect lasts once triggered.
+    pub fn duration(self) -> f32 {
+        match self { Ability::SecondWind | Ability::Bound => 0.6, Ability::Charge | Ability::Stoop => 1.5, Ability::Scamper => 2.0, Ability::Dive => 3.0 }
+    }
+    /// Movement multiplier while active.
+    pub fn speed_mult(self) -> f32 {
+        match self { Ability::SecondWind => 1.0, Ability::Dive => 1.5, Ability::Scamper => 1.9, Ability::Charge => 2.2, Ability::Stoop => 2.6, Ability::Bound => 3.0 }
+    }
+    /// Whether you're uncatchable while it's active.
+    pub fn invuln(self) -> bool {
+        matches!(self, Ability::SecondWind | Ability::Dive | Ability::Bound | Ability::Stoop)
+    }
+    /// Whether triggering it refills stamina.
+    pub fn refills(self) -> bool { matches!(self, Ability::SecondWind) }
+}
+
 impl Class {
     pub fn def(self) -> ClassDef {
         match self {
@@ -44,6 +85,18 @@ impl Class {
     }
 
     pub fn name(self) -> &'static str { self.def().name }
+
+    /// The class's signature active ability.
+    pub fn ability(self) -> Ability {
+        match self {
+            Class::Cat => Ability::SecondWind,
+            Class::Squirrel => Ability::Scamper,
+            Class::Otter => Ability::Dive,
+            Class::Frog => Ability::Bound,
+            Class::Goat => Ability::Charge,
+            Class::Hawk => Ability::Stoop,
+        }
+    }
 
     /// Terrain kind under a point: 0 = water, 1 = land, 2 = mountain.
     pub fn terrain_at(x: f32, z: f32) -> u8 {
@@ -114,5 +167,20 @@ mod tests {
             if world::height_at(x, z) < world::WATER_Y { saw_water = true; assert_eq!(Class::terrain_at(x, z), 0); }
         }
         assert!(saw_water, "the scan should cross some water");
+    }
+
+    #[test]
+    fn every_class_has_a_distinct_ability() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for c in CLASSES {
+            let a = c.ability();
+            assert!(seen.insert(a), "abilities should be unique per class");
+            assert!(a.cooldown() > 0.0 && a.duration() > 0.0 && a.speed_mult() >= 1.0);
+            assert!(!a.name().is_empty());
+        }
+        assert_eq!(seen.len(), 6);
+        assert!(Class::Frog.ability().speed_mult() >= 3.0, "the frog's Bound is the big leap");
+        assert!(Class::Cat.ability().refills(), "the cat's Second Wind refills stamina");
     }
 }

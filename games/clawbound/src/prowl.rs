@@ -12,6 +12,7 @@ use crate::class::Class;
 use crate::ecology::Critter;
 use crate::hunter::{self, HState, Kind};
 use crate::objectives;
+use crate::powerup::{Buffs, Power};
 use crate::ring::Ring;
 use crate::world;
 
@@ -26,12 +27,33 @@ const DODGE_CD: f32 = 1.5;
 const DODGE_SPEED: f32 = 30.0;
 const POUNCE_R: f32 = 2.4;
 const MAP: f32 = world::SIZE * 0.92;
+// ── ancestor trees: defensible staging grounds that store a buff for the pack ──
+const N_ANCESTORS: usize = 4;
+const CLAIM_R: f32 = 11.0;      // dwell this close to claim a tree
+const CLAIM_TIME: f32 = 2.5;    // seconds of dwelling to claim
+const ANCESTOR_CD: f32 = 26.0;  // after granting its buff, the tree rests this long
+const STAGE_R: f32 = 15.0;      // within this of a claimed tree = safe staging ground
 const REACH_R: f32 = 8.0;
 const RENDEZVOUS_R: f32 = 9.0;
 const RENDEZVOUS_NEED: f32 = 4.0;
 const SURVIVE_LEN: f32 = 45.0;
 const FORAGE_NEED: u32 = 4;
 const NEXT_DELAY: f32 = 1.8;
+const LANE_HALF_W: f32 = 6.5;   // how wide the beaten paths between the trees are
+const LANE_BONUS: f32 = 1.25;   // travel is faster along a lane
+// ── four clans, each defending an ancestor home with border-patrolling cat minions ──
+const PLAYER_CLAN: u8 = 0;
+const MINIONS_PER_CLAN: usize = 3;
+const BORDER_R: f32 = 20.0;     // radius of a clan's border-patrol loop around its home
+const MINION_SPEED: f32 = 6.5;
+const MINION_AGGRO_R: f32 = 12.0;
+const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
+const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
+
+/// The four clan colours (Ember / Tide / Moss / Amber).
+pub fn clan_color(clan: u8) -> u32 {
+    match clan & 3 { 0 => 0xd8623c, 1 => 0x3d7fd8, 2 => 0x5aa054, _ => 0xd8a53c }
+}
 
 fn hashf(mut h: u32) -> f32 {
     h ^= h >> 16; h = h.wrapping_mul(0x7feb352d);
@@ -41,8 +63,58 @@ fn hashf(mut h: u32) -> f32 {
 fn norm(x: f32, z: f32) -> (f32, f32) { let l = (x * x + z * z).sqrt(); if l > 1e-5 { (x / l, z / l) } else { (0.0, 0.0) } }
 fn dist(ax: f32, az: f32, bx: f32, bz: f32) -> f32 { ((ax - bx).powi(2) + (az - bz).powi(2)).sqrt() }
 
+/// Shortest distance from a point to a segment (ax,az)-(bx,bz).
+fn dist_to_seg(px: f32, pz: f32, ax: f32, az: f32, bx: f32, bz: f32) -> f32 {
+    let (dx, dz) = (bx - ax, bz - az);
+    let len2 = dx * dx + dz * dz;
+    let t = if len2 > 1e-6 { (((px - ax) * dx + (pz - az) * dz) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    dist(px, pz, ax + dx * t, az + dz * t)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ProwlObj { Reach, Rendezvous, Survive, Forage }
+
+/// An ancestor tree — a big landmark where the ancestors stored a buff. Dwell close to
+/// claim it (which grants its stored buff and puts it on cooldown); a claimed tree is a
+/// safe **staging ground** that mends stamina, cools the hunt, and anchors respawns.
+#[derive(Clone, Copy)]
+pub struct AncestorTree {
+    pub x: f32, pub z: f32,
+    pub stored: Power,
+    pub claim: f32,       // 0..CLAIM_TIME the player's dwell progress
+    pub cooldown: f32,    // >0 = spent, recharging
+    pub claimed_by: Option<u8>,   // which clan currently owns this tree (None = wild)
+}
+impl AncestorTree {
+    pub fn ready(&self) -> bool { self.cooldown <= 0.0 }
+    pub fn claim_frac(&self) -> f32 { (self.claim / CLAIM_TIME).clamp(0.0, 1.0) }
+    pub fn claimed(&self) -> bool { self.claimed_by.is_some() }
+    pub fn owned_by(&self, clan: u8) -> bool { self.claimed_by == Some(clan) }
+}
+
+/// A small cat minion belonging to a clan. It walks a border-patrol loop around its clan's
+/// home and breaks off to shoo away intruders from rival clans.
+#[derive(Clone, Copy)]
+pub struct Minion {
+    pub clan: u8,
+    pub x: f32, pub z: f32, pub heading: f32,
+    pub home: (f32, f32),
+    pub phase: f32,      // position along the patrol loop
+    pub aggro: bool,     // currently defending against an intruder
+}
+
+/// A rival clan's AI prowler. It roams to the nearest ancestor tree it doesn't own, dwells to
+/// claim it (flipping ownership and scoring for its clan), and flees the stalker when caught.
+#[derive(Clone, Copy)]
+pub struct Rival {
+    pub clan: u8,
+    pub class: Class,
+    pub x: f32, pub z: f32, pub heading: f32,
+    pub buffs: Buffs,
+    pub dwell: f32,       // claim progress at its current tree
+    pub target: usize,    // ancestor index it's heading for
+    pub respawn_flash: f32,
+}
 
 pub struct Objective {
     pub kind: ProwlObj,
@@ -74,7 +146,21 @@ pub struct Prowl {
     pub prey_caught: u32,
     pub escapes: u32,
     pub times_caught: u32,
+    pub buffs: Buffs,                       // Speed / Shield picked up in the field
+    pub ability_cd: f32,                     // signature ability cooldown remaining
+    pub ability_t: f32,                      // signature ability active time remaining
+    ability_want: bool,                      // ability key pressed this frame
+    pub pickups: Vec<(f32, f32, Power)>,    // power-up markers scattered on land
+    pub ancestors: Vec<AncestorTree>,       // buff-storing staging grounds (clan homes)
+    pub lanes: Vec<(f32, f32, f32, f32)>,   // beaten paths between the staging grounds
+    pub minions: Vec<Minion>,               // clan cats on border patrol
+    pub rivals: Vec<Rival>,                 // rival clans' AI prowlers
+    pub on_staging: bool,                    // currently within a claimed tree's grounds
+    pub on_lane: bool,                       // currently travelling a lane (faster)
+    pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
+    pub outcome: Option<u8>,                // Some(clan) winner, Some(255) draw, None = ongoing
     pub respawn_flash: f32,
+    pub shielded_flash: f32,                // brief flash when a Shield soaks a catch
     pub time: f32,
     pub difficulty: f32,
     tick: u32,
@@ -88,6 +174,10 @@ impl Prowl {
             .map(|o| (o.x, o.z, world::biome_at(o.x, o.z).name)).collect();
         let critters = crate::ecology::populate(400, false);
         let bushes = world::bush_positions(200);
+        let ancestors = Self::place_ancestors();
+        let lanes = Self::place_lanes(&ancestors);
+        let minions = Self::spawn_minions(&ancestors);
+        let rivals = Self::spawn_rivals(&ancestors);
         let mut g = Prowl {
             class, x: 0.0, z: 0.0, heading: 0.0, stamina: 1.0,
             moving: false, crouched: false, hidden: false,
@@ -98,15 +188,198 @@ impl Prowl {
             ring: Ring::new(0.0, 0.0, world::SIZE * 0.34, world::SIZE * 0.12, 120.0, 0.0),
             exposed: false,
             obj: Objective { kind: ProwlObj::Reach, tx: 0.0, tz: 0.0, name: "", progress: 0.0, time_left: 0.0, start_caught: 0, done: false, next_t: 0.0 },
-            cleared: 0, prey_caught: 0, escapes: 0, times_caught: 0, respawn_flash: 0.0, time: 0.0, difficulty: 1.0, tick: 0, input: None,
+            cleared: 0, prey_caught: 0, escapes: 0, times_caught: 0,
+            buffs: Buffs::new(), ability_cd: 0.0, ability_t: 0.0, ability_want: false,
+            pickups: Self::scatter_pickups(), clan_scores: [0; 4], outcome: None,
+            ancestors, lanes, on_staging: false, on_lane: false,
+            minions,
+            rivals,
+            respawn_flash: 0.0, shielded_flash: 0.0, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
         g
     }
 
+    /// Lane network: a spoke from the middle out to each ancestor tree, plus a ring linking
+    /// neighbouring trees — the beaten paths you rotate along between staging grounds.
+    fn place_lanes(ancestors: &[AncestorTree]) -> Vec<(f32, f32, f32, f32)> {
+        let mut v = Vec::new();
+        let n = ancestors.len();
+        for (i, a) in ancestors.iter().enumerate() {
+            v.push((0.0, 0.0, a.x, a.z));                       // spoke from centre
+            let b = &ancestors[(i + 1) % n.max(1)];             // ring to the next tree
+            v.push((a.x, a.z, b.x, b.z));
+        }
+        v
+    }
+
+    /// Is the point on a beaten lane? (used for the travel bonus and for rendering)
+    pub fn on_lane_at(&self, x: f32, z: f32) -> bool {
+        self.lanes.iter().any(|&(ax, az, bx, bz)| dist_to_seg(x, z, ax, az, bx, bz) < LANE_HALF_W)
+    }
+
+    /// Spawn each clan's border-patrol minions evenly around its home's patrol loop.
+    fn spawn_minions(ancestors: &[AncestorTree]) -> Vec<Minion> {
+        let mut v = Vec::new();
+        for (ci, a) in ancestors.iter().enumerate() {
+            for j in 0..MINIONS_PER_CLAN {
+                let phase = j as f32 / MINIONS_PER_CLAN as f32 * std::f32::consts::TAU;
+                v.push(Minion {
+                    clan: ci as u8,
+                    x: a.x + phase.cos() * BORDER_R, z: a.z + phase.sin() * BORDER_R,
+                    heading: 0.0, home: (a.x, a.z), phase, aggro: false,
+                });
+            }
+        }
+        v
+    }
+
+    /// Advance the clan minions: patrol the border loop, or break off to shoo an intruder
+    /// (rival clan). A rival minion that spots you raises the hunt alarm.
+    fn step_minions(&mut self, dt: f32) {
+        let (px, pz) = (self.x, self.z);
+        for m in self.minions.iter_mut() {
+            let to_p = dist(m.x, m.z, px, pz);
+            m.aggro = m.clan != PLAYER_CLAN && to_p < MINION_AGGRO_R;
+            let (tx, tz) = if m.aggro {
+                (px, pz)                                     // charge the intruder
+            } else {
+                m.phase += (MINION_SPEED / BORDER_R) * dt;   // walk the border loop
+                (m.home.0 + m.phase.cos() * BORDER_R, m.home.1 + m.phase.sin() * BORDER_R)
+            };
+            let (dx, dz) = norm(tx - m.x, tz - m.z);
+            m.x = (m.x + dx * MINION_SPEED * dt).clamp(-MAP, MAP);
+            m.z = (m.z + dz * MINION_SPEED * dt).clamp(-MAP, MAP);
+            if dx.abs() + dz.abs() > 1e-4 { m.heading = dx.atan2(dz); }
+        }
+        if self.minions.iter().any(|m| m.aggro) {            // spotted trespassing → alarm
+            self.suspicion = (self.suspicion + dt * 0.8).min(1.5);
+            self.last_seen = Some((px, pz));
+        }
+    }
+
+    /// One rival AI prowler per rival clan, starting at its own home.
+    fn spawn_rivals(ancestors: &[AncestorTree]) -> Vec<Rival> {
+        let classes = [Class::Cat, Class::Squirrel, Class::Goat, Class::Frog, Class::Hawk, Class::Otter];
+        let mut v = Vec::new();
+        for clan in 1..ancestors.len().min(N_ANCESTORS) {
+            let home = ancestors[clan];
+            v.push(Rival {
+                clan: clan as u8, class: classes[clan % classes.len()],
+                x: home.x, z: home.z, heading: 0.0,
+                buffs: Buffs::new(), dwell: 0.0, target: clan, respawn_flash: 0.0,
+            });
+        }
+        v
+    }
+
+    /// Advance the rival prowlers: each heads for the nearest tree it doesn't own, dwells to
+    /// claim it (flipping ownership + scoring for its clan), and rallies home if the stalker
+    /// catches it. This is what makes the map a live four-way contest over the ancestors.
+    fn step_rivals(&mut self, dt: f32) {
+        let aggressive = self.hstate == HState::Chase || self.suspicion > 0.55;
+        for i in 0..self.rivals.len() {
+            self.rivals[i].buffs.tick(dt);
+            self.rivals[i].respawn_flash = (self.rivals[i].respawn_flash - dt).max(0.0);
+            let (rx, rz, rclan) = { let r = &self.rivals[i]; (r.x, r.z, r.clan) };
+
+            // flee the stalker if it's close and hunting
+            if aggressive && dist(rx, rz, self.hx, self.hz) < RIVAL_FLEE_R {
+                let (dx, dz) = norm(rx - self.hx, rz - self.hz);
+                let speed = self.rivals[i].class.speed_at(rx, rz) * PROWL_SCALE * self.rivals[i].buffs.move_mult();
+                let r = &mut self.rivals[i];
+                r.x = (r.x + dx * speed * dt).clamp(-MAP, MAP);
+                r.z = (r.z + dz * speed * dt).clamp(-MAP, MAP);
+                if dx.abs() + dz.abs() > 1e-4 { r.heading = dx.atan2(dz); }
+                r.dwell = 0.0;
+                continue;   // no claiming while running for its life
+            }
+
+            // pick the nearest ancestor this clan doesn't already own (ready trees preferred)
+            let mut best = (f32::MAX, rclan as usize);
+            for (ai, a) in self.ancestors.iter().enumerate() {
+                if a.owned_by(rclan) { continue; }
+                let w = dist(rx, rz, a.x, a.z) + if a.ready() { 0.0 } else { 250.0 };
+                if w < best.0 { best = (w, ai); }
+            }
+            let target = best.1;
+            self.rivals[i].target = target;
+            let (tx, tz, tready) = { let a = &self.ancestors[target]; (a.x, a.z, a.ready()) };
+
+            if dist(rx, rz, tx, tz) > CLAIM_R * 0.75 {
+                let speed = self.rivals[i].class.speed_at(rx, rz) * PROWL_SCALE * self.rivals[i].buffs.move_mult() * 0.95;
+                let (dx, dz) = norm(tx - rx, tz - rz);
+                let r = &mut self.rivals[i];
+                r.x = (r.x + dx * speed * dt).clamp(-MAP, MAP);
+                r.z = (r.z + dz * speed * dt).clamp(-MAP, MAP);
+                if dx.abs() + dz.abs() > 1e-4 { r.heading = dx.atan2(dz); }
+                r.dwell = 0.0;
+            } else if tready {
+                self.rivals[i].dwell += dt;
+                if self.rivals[i].dwell >= CLAIM_TIME {
+                    self.rivals[i].dwell = 0.0;
+                    let stored = self.ancestors[target].stored;
+                    self.ancestors[target].claimed_by = Some(rclan);
+                    self.ancestors[target].cooldown = ANCESTOR_CD;
+                    self.rivals[i].buffs.grant(stored);
+                    self.clan_scores[rclan as usize] += 40;
+                }
+            }
+
+            // the stalker can catch a rival too → it rallies at its clan home, losing points
+            if aggressive && dist(self.hx, self.hz, self.rivals[i].x, self.rivals[i].z) < CATCH_DIST {
+                let home = self.ancestors[rclan as usize];
+                let r = &mut self.rivals[i];
+                r.x = home.x; r.z = home.z; r.respawn_flash = 1.0;
+                self.clan_scores[rclan as usize] = (self.clan_scores[rclan as usize] - 20).max(0);
+            }
+        }
+    }
+
+    /// Place the ancestor trees well out across the map (so the arena plays big), each on
+    /// dry land near a cardinal bearing, storing an alternating Speed / Shield buff.
+    fn place_ancestors() -> Vec<AncestorTree> {
+        let stored = [Power::Speed, Power::Shield, Power::Shield, Power::Speed];
+        let mut v = Vec::new();
+        for k in 0..N_ANCESTORS {
+            let a = k as f32 / N_ANCESTORS as f32 * std::f32::consts::TAU + 0.4;
+            let (mut x, mut z) = (a.cos() * 95.0, a.sin() * 95.0);
+            for r in 0..14 {
+                let rad = 95.0 - r as f32 * 5.0;
+                let (tx, tz) = (a.cos() * rad, a.sin() * rad);
+                if world::height_at(tx, tz) >= world::WATER_Y + 0.3 { x = tx; z = tz; break; }
+            }
+            v.push(AncestorTree { x, z, stored: stored[k], claim: 0.0, cooldown: 0.0, claimed_by: None });
+        }
+        v
+    }
+
+    /// Scatter Speed/Shield power-ups on dry land in a ring around the middle.
+    fn scatter_pickups() -> Vec<(f32, f32, Power)> {
+        let powers = [Power::Speed, Power::Shield, Power::Speed, Power::Shield, Power::Speed, Power::Shield];
+        let mut v = Vec::new();
+        for k in 0..6 {
+            let a = k as f32 / 6.0 * std::f32::consts::TAU;
+            let (mut x, mut z) = (a.cos() * 36.0, a.sin() * 36.0);
+            for r in 0..10 {
+                let rad = 36.0 - r as f32 * 3.0;
+                let (tx, tz) = (a.cos() * rad, a.sin() * rad);
+                if world::height_at(tx, tz) >= world::WATER_Y + 0.2 { x = tx; z = tz; break; }
+            }
+            v.push((x, z, powers[k]));
+        }
+        v
+    }
+
     pub fn set_input(&mut self, mx: f32, mz: f32, leap: bool, dodge: bool, crouch: bool) {
         self.input = Some((mx, mz, leap, dodge, crouch));
     }
+
+    /// Press the class's signature ability (consumed on the next `step`).
+    pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
+
+    /// The class's ability and whether it can be fired right now (for a HUD).
+    pub fn ability_ready(&self) -> bool { self.ability_cd <= 0.0 && self.ability_t <= 0.0 }
 
     fn a_poi(&self) -> (f32, f32, &'static str) {
         if self.pois.is_empty() { return (0.0, 0.0, "Landmark"); }
@@ -134,22 +407,42 @@ impl Prowl {
         self.obj.done = true;
         self.cleared += 1;
         self.obj.next_t = NEXT_DELAY;
+        self.clan_scores[0] += 100;                                  // clearing an objective banks points
+        self.difficulty = (self.difficulty + 0.05).min(1.6); // the hunt escalates, wave by wave
     }
 
     fn respawn(&mut self) {
-        self.x = 0.0; self.z = 0.0; self.heading = 0.0;
-        self.leap_t = 0.0; self.dodge_t = 0.0;
-        self.hx = -self.hx.signum().max(1.0) * 60.0; self.hz = -60.0;   // reset far away
-        self.hstate = HState::Patrol; self.suspicion = 0.0; self.last_seen = None;
+        // a Shield soaks the catch instead — you're spared (brief flash), no respawn
+        if !self.buffs.absorb_hit() {
+            self.shielded_flash = 0.8;
+            self.suspicion = 0.4; self.hstate = HState::Search;
+            return;
+        }
         self.times_caught += 1; self.respawn_flash = 1.2;
+        self.clan_scores[0] = (self.clan_scores[0] - 50).max(0);              // getting caught costs you
+        self.buffs = Buffs::new();                          // and clears any buffs
+        // rally at the nearest claimed ancestor tree if you have one, else the origin
+        let mut best: Option<(f32, f32, f32)> = None;
+        for a in self.ancestors.iter().filter(|a| a.owned_by(PLAYER_CLAN)) {
+            let d = dist(0.0, 0.0, a.x, a.z);
+            if best.map_or(true, |(bd, _, _)| d < bd) { best = Some((d, a.x, a.z)); }
+        }
+        if let Some((_, ax, az)) = best { self.x = ax; self.z = az; } else { self.x = 0.0; self.z = 0.0; }
+        self.heading = 0.0;
+        self.leap_t = 0.0; self.dodge_t = 0.0;
+        self.hx = -self.hx.signum().max(1.0) * 60.0; self.hz = -60.0;   // reset the hunter far away
+        self.hstate = HState::Patrol; self.suspicion = 0.0; self.last_seen = None;
         if self.obj.kind == ProwlObj::Rendezvous { self.obj.progress = 0.0; }
     }
 
     pub fn step(&mut self, dt: f32) {
+        if self.outcome.is_some() { return; }   // match decided — freeze
         self.time += dt;
         self.ring.tick(dt);
         self.exposed = !self.ring.contains(self.x, self.z);
         self.respawn_flash = (self.respawn_flash - dt).max(0.0);
+        self.shielded_flash = (self.shielded_flash - dt).max(0.0);
+        self.buffs.tick(dt);
         let input = self.input.take();
 
         // ── player movement ──
@@ -157,7 +450,8 @@ impl Prowl {
         let (mut dx, mut dz) = norm(ix, iz);
         let sprinting = (dx.abs() + dz.abs() > 1e-4) && !want_crouch;
         let can_sprint = self.stamina > 0.12;
-        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 };
+        self.on_lane = self.on_lane_at(self.x, self.z);
+        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 } * self.buffs.move_mult() * if self.on_lane { LANE_BONUS } else { 1.0 };
 
         // dodge (i-frames) and leap (airborne) bursts
         self.dodge_cd = (self.dodge_cd - dt).max(0.0);
@@ -180,6 +474,24 @@ impl Prowl {
         if self.dodge_t > 0.0 { dx = self.bx; dz = self.bz; speed = DODGE_SPEED; airborne = true; }
         if self.leap_t > 0.0 { dx = self.bx; dz = self.bz; speed = LEAP_SPEED; airborne = true; }
 
+        // ── signature ability ──
+        self.ability_cd = (self.ability_cd - dt).max(0.0);
+        self.ability_t = (self.ability_t - dt).max(0.0);
+        if self.ability_want && self.ability_cd <= 0.0 && self.ability_t <= 0.0 && self.stamina > 0.1 {
+            let ab = self.class.ability();
+            self.ability_t = ab.duration();
+            self.ability_cd = ab.cooldown();
+            if ab.refills() { self.stamina = 1.0; }
+            let d = if dx.abs() + dz.abs() > 1e-4 { (dx, dz) } else { (self.heading.sin(), self.heading.cos()) };
+            self.bx = d.0; self.bz = d.1;
+        }
+        self.ability_want = false;
+        if self.ability_t > 0.0 && self.dodge_t <= 0.0 && self.leap_t <= 0.0 {
+            let ab = self.class.ability();
+            speed *= ab.speed_mult();
+            if ab.speed_mult() >= 1.4 { dx = self.bx; dz = self.bz; airborne = true; } // committed burst
+        }
+
         self.crouched = want_crouch && !airborne;
         let mv = (dx.abs() + dz.abs() > 1e-4) && !self.crouched;
         if mv {
@@ -191,6 +503,39 @@ impl Prowl {
         self.hidden = self.crouched && self.bushes.iter().any(|(bx, bz, r)| dist(self.x, self.z, *bx, *bz) < *r);
         self.stamina = (self.stamina + if sprinting { -0.30 } else { 0.18 } * dt).clamp(0.0, 1.0);
         if self.exposed { self.stamina = (self.stamina - 0.12 * dt).max(0.0); }   // the ring wears you down
+
+        // ── power-ups: grab a nearby one, then replace it on land elsewhere ──
+        if let Some(j) = self.pickups.iter().position(|(px, pz, _)| dist(self.x, self.z, *px, *pz) < 2.2) {
+            let p = self.pickups.swap_remove(j).2;
+            self.buffs.grant(p);
+            // drop a fresh one at a scatter point that isn't already occupied
+            for cand in Self::scatter_pickups() {
+                let (cx, cz, _) = cand;
+                if !self.pickups.iter().any(|(px, pz, _)| dist(cx, cz, *px, *pz) < 4.0) {
+                    self.pickups.push(cand); break;
+                }
+            }
+        }
+
+        // ── ancestor trees: dwell to claim (grants the stored buff); a claimed tree is a
+        //    safe staging ground that mends stamina and cools the hunt ──
+        self.on_staging = false;
+        for anc in self.ancestors.iter_mut() {
+            anc.cooldown = (anc.cooldown - dt).max(0.0);
+            let d = dist(self.x, self.z, anc.x, anc.z);
+            if d < CLAIM_R && anc.ready() {
+                anc.claim += dt;
+                if anc.claim >= CLAIM_TIME {
+                    anc.claim = 0.0; anc.cooldown = ANCESTOR_CD; anc.claimed_by = Some(PLAYER_CLAN);
+                    self.buffs.grant(anc.stored);       // the ancestors bestow their stored buff
+                    self.clan_scores[0] += 40;
+                }
+            } else if d >= CLAIM_R {
+                anc.claim = (anc.claim - dt * 0.5).max(0.0);
+            }
+            if anc.owned_by(PLAYER_CLAN) && d < STAGE_R { self.on_staging = true; }
+        }
+        if self.on_staging { self.stamina = (self.stamina + 0.35 * dt).min(1.0); } // mend at the grounds
 
         // ── prey: flee, and get pounced when we're mid-burst on top of one ──
         {
@@ -205,14 +550,30 @@ impl Prowl {
             if eaten > 0 {
                 self.prey_caught += eaten;
                 self.stamina = (self.stamina + 0.25 * eaten as f32).min(1.0);
+                self.clan_scores[0] += 25 * eaten as i32;
             }
         }
+
+        // ── clan minions: border patrol + intruder defense ──
+        self.step_minions(dt);
 
         // ── the stalker: sense → chase → catch (respawn) ──
         self.step_hunter(dt);
 
+        // ── rival clans' prowlers contest the ancestor trees ──
+        self.step_rivals(dt);
+
         // ── objectives ──
         self.update_objective(dt);
+
+        // ── win condition: first clan to WIN_SCORE, else the leader when the ring finishes ──
+        if let Some(c) = (0..4).find(|&c| self.clan_scores[c] >= WIN_SCORE) {
+            self.outcome = Some(c as u8);
+        } else if self.ring.t >= self.ring.shrink {
+            let max = *self.clan_scores.iter().max().unwrap_or(&0);
+            let leaders: Vec<usize> = (0..4).filter(|&c| self.clan_scores[c] == max).collect();
+            self.outcome = Some(if leaders.len() == 1 { leaders[0] as u8 } else { 255 });
+        }
         self.tick += 1;
     }
 
@@ -225,7 +586,8 @@ impl Prowl {
             self.suspicion = (self.suspicion + dt * 2.4 * self.difficulty).min(1.5);
             self.last_seen = Some((self.x, self.z));
         } else {
-            self.suspicion = (self.suspicion - dt * (if eff_hidden { 1.6 } else { 0.5 })).max(0.0);
+            let stage_bonus = if self.on_staging { 1.2 } else { 0.0 };   // a claimed tree cools the hunt
+            self.suspicion = (self.suspicion - dt * (if eff_hidden { 1.6 } else { 0.5 } + stage_bonus)).max(0.0);
         }
         let prev = self.hstate;
         self.hstate = if sees && self.suspicion > 0.9 { HState::Chase }
@@ -249,7 +611,8 @@ impl Prowl {
 
         // catch: aggressive + in reach + not airborne/hidden → respawn the prowler
         let aggressive = self.hstate == HState::Chase || self.suspicion > 0.55;
-        if aggressive && self.leap_t <= 0.0 && self.dodge_t <= 0.0 && !(self.hidden && !self.exposed)
+        let ability_invuln = self.ability_t > 0.0 && self.class.ability().invuln();
+        if aggressive && self.leap_t <= 0.0 && self.dodge_t <= 0.0 && !ability_invuln && !(self.hidden && !self.exposed)
             && dist(self.hx, self.hz, self.x, self.z) < CATCH_DIST {
             self.respawn();
         }
@@ -358,6 +721,203 @@ mod tests {
         assert_eq!(g.times_caught, caught0 + 1, "a point-blank aggressive hunter catches you");
         assert!(g.x.abs() < 1e-3 && g.z.abs() < 1e-3, "you respawn at the origin");
         assert!(g.respawn_flash > 0.0);
+    }
+
+    #[test]
+    fn a_shield_soaks_a_catch_instead_of_respawning() {
+        let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.buffs.grant(Power::Shield);
+        g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        let caught0 = g.times_caught;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.times_caught, caught0, "the shield should spare you the catch");
+        assert!(!g.buffs.shield, "and the shield is spent");
+        assert!(g.shielded_flash > 0.0);
+    }
+
+    #[test]
+    fn grabbing_a_powerup_grants_a_buff() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 300.0; g.hz = 300.0;                 // keep the hunter away
+        g.pickups.clear();
+        g.pickups.push((0.0, 1.0, Power::Speed));   // a Speed pickup underfoot
+        g.x = 0.0; g.z = 0.0;
+        assert!(!g.buffs.speed_boosted());
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.buffs.speed_boosted(), "walking onto a Speed power-up should boost you");
+        assert!(!g.pickups.is_empty(), "and a fresh power-up is scattered to replace it");
+    }
+
+    #[test]
+    fn clearing_an_objective_banks_score_and_escalates() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 300.0; g.hz = 300.0;
+        g.new_objective(Some(ProwlObj::Reach));
+        let (d0, s0) = (g.difficulty, g.clan_scores[0]);
+        g.x = g.obj.tx; g.z = g.obj.tz;             // stand on the target
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.obj.done);
+        assert_eq!(g.clan_scores[0], s0 + 100, "clearing banks points");
+        assert!(g.difficulty > d0, "and the hunt escalates");
+    }
+
+    #[test]
+    fn dwelling_at_an_ancestor_tree_claims_its_buff() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 300.0; g.hz = 300.0;                 // hunter away
+        let (ax, az, stored) = { let a = &g.ancestors[0]; (a.x, a.z, a.stored) };
+        g.buffs = crate::powerup::Buffs::new();
+        for _ in 0..((CLAIM_TIME + 0.3) * 30.0) as i32 {
+            g.x = ax; g.z = az;                     // keep dwelling at the tree
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert!(g.ancestors[0].claimed(), "dwelling should claim the tree");
+        assert!(g.ancestors[0].cooldown > 0.0, "a claimed tree goes on cooldown");
+        match stored {
+            Power::Speed => assert!(g.buffs.speed_boosted(), "a Speed tree grants haste"),
+            Power::Shield => assert!(g.buffs.shield, "a Shield tree grants a ward"),
+            _ => {}
+        }
+        assert!(g.on_staging, "standing at a claimed tree is a staging ground");
+    }
+
+    #[test]
+    fn respawn_rallies_at_a_claimed_ancestor() {
+        let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.ancestors[0].claimed_by = Some(0);
+        let (ax, az) = (g.ancestors[0].x, g.ancestors[0].z);
+        g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;   // caught out in the open
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!((g.x - ax).abs() < 1.0 && (g.z - az).abs() < 1.0, "should rally at the claimed ancestor, not the origin");
+    }
+
+    #[test]
+    fn lanes_speed_up_travel() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 300.0; g.hz = 300.0;
+        let a0 = g.ancestors[0];
+        let (mx, mz) = (a0.x * 0.5, a0.z * 0.5);           // midpoint of the centre→tree spoke
+        assert!(g.on_lane_at(mx, mz), "a spoke midpoint sits on a lane");
+        let dir = norm(a0.x, a0.z);
+        let step_from = |g: &mut Prowl| -> f32 {
+            g.x = mx; g.z = mz; g.stamina = 1.0;
+            g.set_input(dir.0, dir.1, false, false, false);
+            let (x0, z0) = (g.x, g.z);
+            g.step(1.0 / 30.0);
+            dist(x0, z0, g.x, g.z)
+        };
+        let on = step_from(&mut g);
+        g.lanes.clear();                                   // same spot, but now off any lane
+        let off = step_from(&mut g);
+        assert!(on > off + 1e-3, "travel should be faster along a lane ({on} vs {off})");
+    }
+
+    #[test]
+    fn clan_minions_border_patrol_their_home() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 800.0; g.hz = 800.0; g.x = 800.0; g.z = 800.0;   // player far → no aggro
+        assert_eq!(g.minions.len(), N_ANCESTORS * MINIONS_PER_CLAN);
+        let p0 = (g.minions[0].x, g.minions[0].z);
+        for _ in 0..30 { g.x = 800.0; g.z = 800.0; g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); }
+        let p1 = (g.minions[0].x, g.minions[0].z);
+        assert!(dist(p0.0, p0.1, p1.0, p1.1) > 0.5, "a minion should walk its patrol");
+        let home = g.minions[0].home;
+        assert!(dist(p1.0, p1.1, home.0, home.1) < BORDER_R + 8.0, "and stay near its clan's border");
+        assert!(!g.minions[0].aggro);
+    }
+
+    #[test]
+    fn rival_minions_defend_the_border_and_raise_the_alarm() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 800.0; g.hz = 800.0;
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN).unwrap();
+        let (mx, mz) = (g.minions[idx].x, g.minions[idx].z);
+        g.x = mx + 3.0; g.z = mz;                               // intrude on a rival's border
+        g.suspicion = 0.0;
+        let d0 = dist(g.minions[idx].x, g.minions[idx].z, g.x, g.z);
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.minions[idx].aggro, "a rival minion should defend against an intruder");
+        assert!(dist(g.minions[idx].x, g.minions[idx].z, g.x, g.z) <= d0, "it advances on you");
+        assert!(g.suspicion > 0.0, "being spotted trespassing raises the alarm");
+    }
+
+    #[test]
+    fn rival_prowlers_contest_the_ancestor_trees() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;   // keep the player + hunter clear
+        assert_eq!(g.rivals.len(), N_ANCESTORS - 1, "one AI prowler per rival clan");
+        let rclan = g.rivals[0].clan;
+        let (ax, az) = (g.ancestors[0].x, g.ancestors[0].z);     // a wild tree
+        let s0 = g.clan_scores[rclan as usize];
+        for _ in 0..((CLAIM_TIME + 0.6) * 30.0) as i32 {
+            g.rivals[0].x = ax; g.rivals[0].z = az;              // hold the rival on the tree
+            g.x = 900.0; g.z = 900.0;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert_eq!(g.ancestors[0].claimed_by, Some(rclan), "a rival should claim the tree for its clan");
+        assert!(g.clan_scores[rclan as usize] > s0, "and bank score for its clan");
+    }
+
+    #[test]
+    fn reaching_the_score_threshold_wins_and_freezes() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        g.clan_scores[2] = WIN_SCORE;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.outcome, Some(2), "first clan to the threshold wins");
+        let t = g.time;
+        g.step(1.0 / 30.0);
+        assert_eq!(g.time, t, "a decided match freezes");
+    }
+
+    #[test]
+    fn ring_close_awards_the_leader() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        g.clan_scores = [30, 90, 10, 50];        // clan 1 leads, none at the threshold
+        g.ring.t = g.ring.shrink;                // the ring has finished closing
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.outcome, Some(1), "the leader takes it when the ring closes");
+    }
+
+    #[test]
+    fn cat_second_wind_refills_and_shields() {
+        let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        g.stamina = 0.25;
+        let caught0 = g.times_caught;
+        g.set_ability(true);
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.ability_t > 0.0 && g.ability_cd > 0.0, "the ability engages and goes on cooldown");
+        assert!(g.stamina > 0.9, "Second Wind refills stamina");
+        assert_eq!(g.times_caught, caught0, "and briefly makes you untouchable");
+    }
+
+    #[test]
+    fn squirrel_scamper_bursts_speed() {
+        let travel = |ability: bool| -> f32 {
+            let mut g = Prowl::new(Class::Squirrel, Kind::Fox);
+            g.hx = 400.0; g.hz = 400.0; g.x = 0.0; g.z = 0.0;
+            if ability { g.set_ability(true); }
+            g.set_input(0.0, 1.0, false, false, false);
+            let z0 = g.z;
+            g.step(1.0 / 30.0);
+            g.z - z0
+        };
+        assert!(travel(true) > travel(false) + 1e-3, "Scamper should cover more ground");
     }
 
     #[test]

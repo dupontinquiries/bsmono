@@ -39,6 +39,281 @@ Rendered/verified headless via lavapipe (software Vulkan) → PNG.
 - [x] Nightmare/otherworld atmospherics (Shadow shift): near-black violet sky, stars snuffed out (robust hash), long shadows crawling up from the trees, spectral cats drifting in the underworld, sickly desaturation + closing vignette. `tod=nightmare` render + driven live by the shift in --play (post fx uniform)
 
 ## Roadmap (multi-turn)
+-29. [x] **Scent on the wind — reading the air like a cat does.** Scent is no longer just an
+   invisible trail the hunter tracks; it's something you sense and *see*.
+   * **`Game::read_wind`** — what your nose catches this instant. Scent drifts downwind, so
+     you smell prey and the predator that lie **upwind**: approach prey from downwind and
+     you scent it before it bolts; drop downwind of the hunter and its reek warns you early.
+     Returns the strongest prey's direction/distance/strength + its name, the predator's
+     reek (0..1), and the wind vector. Keen-nosed clans and a strong wind carry scent
+     farther. Tested (a hunter upwind reeks; one downwind you can't smell at all).
+   * **Visible scent** — `build_scent_wisps` renders faint motes drifting downwind: your own
+     pale trail lifting and thinning behind you, a warm thread from the nearest prey you can
+     smell (follow it upwind to the catch), and the predator's red reek drifting to you when
+     you're downwind. In the headless game view and the app.
+   * **HUD readout** — the world panel now whispers what the wind carries: "rabbit-scent on
+     the breeze — upwind", or "the reek of the fox is on the wind".
+   1 new test → 125 total. Together with -28 (cover, snag, freeze-and-taste-air) a crossing
+   of the territory is now read through the nose as much as the eyes. (All original.)
+-28. [x] **Tactile traversal — making crossing the world feel like the writing.** The world
+   now pushes back the way a cat's does: undergrowth to slip through half-seen, brush that
+   drags, a bramble that snags, and stillness that sharpens the senses.
+   * **Cover field** — `world::cover_at(x,z)` gives a patchy undergrowth density (thick in
+     the oak floor / reeds / pines, thin on the moor and scree, near-zero on open water).
+     Tested that the woods hold more cover than the open.
+   * **Slip through half-seen** — a cat in cover is harder to spot: the hunter's suspicion
+     builds up to 50% slower on a cat standing in thick growth. Crossing open ground is
+     fast but exposed; threading the brush is slow but hidden.
+   * **Brush drag + bramble snag** — pushing through cover shaves a little speed, and now
+     and then (only when running a real thicket) a trailing bramble **snags** you for a
+     brief tug you pull free of (`Cat.snag_t`). Creeping crouched slips clean.
+   * **Freeze and taste the air** — a *still* cat reads the wind ~35% farther than a moving
+     one, so stopping to scent genuinely extends your danger-sense (tested).
+   * **Animation** — a `wade` gait (hunched, shouldering into the brush, head dipped) when
+     moving through thick cover, and a `taste_air` pose (muzzle lifted, casting side to
+     side, quick scenting breaths) when the player freezes with danger about.
+   4 new tests → 124 total. (All original systems; the book was reference only, for the
+   *feel* of how cats move through undergrowth — no text or names taken from it.)
+-27. [x] **Flick controls + a combo move-set (`combat.rs`).** A stylish, chainable fighting
+   layer, continuing the "rich journey" thread into confrontation:
+   * **Moves** — seven: Pounce, Jump, Roll, Dodge, Underbelly Swipe, Hind Kick, Swat, each
+     with windup/active/recovery timings, i-frames, power and lunge (`combat::spec`).
+   * **Flick controls** — `resolve_flick(dir_local, mag, low)` maps a fast aim-flick to a
+     move by direction: forward→Pounce, back→Hind Kick, sideways→Roll, sharp/directionless
+     →Swat, low-modifier→Underbelly Swipe. In-app a fast mouse-flick + left-click performs
+     it (right-click = low modifier); a bare click swats.
+   * **Combos** — `combo(prev, next)` chains two moves inside a 0.55s window into named
+     finishers (Ambush Pounce, Counter Gut, Rake-Off, Pin & Bat, Rising Pounce, Flurry,
+     Kick Away) that hit 1.5× harder. HUD flashes the combo name.
+   * **Sim integration** — `Game::player_flick` performs a move (pounce/roll reuse the
+     leap/dodge mechanics); an attack that connects within reach **staggers the hunter**
+     (it's dazed, skips its chase/catch), and a Hind Kick or Underbelly Swipe **wrenches
+     you free of the hawk's grab**. New poses (underbelly swipe, hind kick, jump) + a
+     `move_pose` bridge, rendered for the player's active move.
+   9 new tests (4 combat-module + 2 cat-pose + 3 sim-integration) → 117 total.
+   (System + integration verified in sandbox; the flick feel/combo HUD are compile-only.)
+-26. [x] **Traversal variety — "every trip A→B is a rich journey."** Movement was one flat
+   sprint; now it's a continuum of gaits and events:
+   * **Gaits by speed** — `cat::gait`/`gait_name` pick a walk that quickens to a trot and
+     breaks into a bounding gallop, keyed to each cat's *actual* travelled speed
+     (`Cat.speed`, measured per step), with a per-cat phase offset. Rendered in the
+     headless game view and the app.
+   * **Paced by danger** — the player no longer moves at one speed: it ambles across safe
+     ground and accelerates toward a sprint as the hunter closes (pace = f(distance to
+     hunter)); only a real bolt drains stamina, and a winded cat can't gallop. Verified a
+     lone journey shifts walk↔trot as the hunter nears/recedes.
+   * **Bounding over logs** — the fallen logs are now in the sim (`Game.logs` via
+     `world::log_positions`); a running cat that crosses one auto-leaps over it (a short
+     bound), so obstacles punctuate a run. Tested.
+   3 new tests (gait shifts with speed, bounds over a log, + the pace threading) → 109
+   total. Together with -25 (grass/litter/twig-snap/paw-prints), a crossing of the
+   territory now reads as amble → trot → bound over a log → snap a twig → bolt.
+-25. [x] **Ground-level immersion pass ("think like a cat").**
+   * **Grass, everywhere** — grass was gated to only grow under trees, so the whole open
+     moor was bare. Rewrote `build_grass`: it now covers open/temperate ground (moor, oak,
+     reeds, mangrove, shore), 3–5 taller blades per tuft, green-tinted and leaning with a
+     prevailing wind, ~4× denser. Coverage went from sparse to ~29% of the frame.
+   * **Forest-floor litter + logs (art)** — new `build_litter` (fallen twigs + scattered
+     autumn leaves, thickest under the trees) and `build_logs` (thick bark cylinders to
+     bound over / hide behind), density following each biome's tree cover. Wired into the
+     headless game view and the app world.
+   * **Twig-snap stealth (system)** — a cat *running* (not crouched) through the leaf-litter
+     can crack a twig underfoot (`world::twig_positions` → `Game.twigs`); the twig is
+     consumed and, if a hunter is within earshot (30u), the sharp sound spikes its suspicion
+     and turns its head toward the noise. Crouched/creeping cats, airborne leapers and
+     climbers stay silent. An on-screen "*SNAP!*" cue fires (`noise_flash`). Tested both
+     ways (running snaps + is heard; crouched leaves twigs intact and silent).
+   * **Paw prints (art)** — soft dark paw marks pressed into the ground along the pack's
+     scent trail, fading with it, in both the headless and app renders.
+   2 new tests → 107 total. Still on the wishlist for later passes: scent-marking borders,
+   grass that swishes as you brush past, mud that soils your paws, ambient sound.
+-24. [x] **Two new clans, a mangrove biome, and an AAA graphics mode.**
+   * **Scent trait + clans** — `ClanTrait` gained a fifth attribute, **scent** (a keen
+     nose). Added **Fenclan** (the misted fen — best nose, "trackers") and **Mangroveclan**
+     (the tangled mangroves — fish-eating ocelots that swim and scent). `CLAN_COUNT` is now
+     6; keen-nosed clans feel the predator's danger from further off (danger sense range
+     ×scent) — tested (Fenclan senses at 55u where Amberclan can't). Overlays extended to
+     5 bars (showcase + HUD, scent = orange); the clan showcase now lines up all six.
+   * **Mangrove biome** — added `MANGROVE` ("Mangrove Shallows") to `BIOMES` (now 7);
+     `biome_at` slots it into the wettest shoreline band (moisture > 0.72). Verified
+     reachable on the map; the seam-blend test still passes.
+   * **AAA hi-res mode** — `CLAW_HIRES=1` (headless) supersamples 1.85x (capped to the
+     2048 texture limit) and scales geometry ×1.8: verified 1100x680/398k verts →
+     2035x1258/788k verts. In-app it's a **Settings → Graphics: Standard/High (AAA)**
+     toggle that rebuilds the scene target at 1.85x supersampling on the fly (surface stays
+     at window size). 3 new tests → 105 total.
+-23. [x] **Suspense system for the hunted (6v1) mode.** Added a `danger` level (0..1) on
+   the Game that swells with the hunter's nearness weighted by how switched-on it is
+   (point-blank chase ≈ 1, distant patrol ≈ 0) and eases — spiking fast, fading slow.
+   Verified it reaches 0.99 at close encounters in a real hunt. It drives three things:
+   (a) a **heartbeat vignette** in the post shader — the edges pulse and close in on a
+   beat that pounds faster/harder as danger rises, bleeding red near a catch (fx.w);
+   (b) a **directional THREAT marker** at the screen edge pointing to where the hunter is
+   closing from (camera-relative bearing); and (c) a **stalking creep** — when the hunter
+   is nosing around right where it last had you (searching/tracking near its last-seen
+   point) it slows to 0.4× and casts about, a patient menace instead of a flat sprint.
+   4 new tests (danger spikes on approach, hunter creeps on the trail, + module) → 104
+   total. (danger + creep verified in sandbox; heartbeat/marker compile-only.)
+-22. [x] **Clan traits + overlays** (Warriors-inspired). The four clans (Ember/Tide/Moss/
+   Amber) were identical teams; now each is adapted to its home terrain via `clan.rs`
+   (shared) with four diverging attributes — **climb** (Mossclan, the oak canopy),
+   **sprint** (Amberclan, the open moor), **swim** (Tideclan, the reed river), **stealth**
+   (Emberclan, the shadowed pines) — as balanced trade-off multipliers. Wired into the
+   6v1 sim: the pack's clan scales climb ascent/stamina, water speed, open-ground running,
+   and how tightly it hides (flush radius). Overlays to read the values: a headless
+   **`clans` showcase** with floating per-trait bars (climb=green/sprint=gold/swim=blue/
+   stealth=violet — verified all four render), an in-game **HUD clan panel** with the four
+   trait bars + specialty tag, and a **clan-colour collar** on every cat. Menu gains a
+   **Clan** selector row. 8 new tests (3 clan-module + 4 sim-trait + menu) → 102 total.
+   (Sim traits + showcase verified in sandbox; HUD panel/menu compile-only.)
+-21. [x] **Refined tree climbing.** It used to be instant and binary — press crouch at a
+   trunk and the cat teleported up (+4.2) with full safety, no cost. Now it's a real
+   climb: the cat **scrambles up gradually** (`climb_t` 0→1 over ~½s, rendered at that
+   height), **hugs the actual trunk** (x/z snap onto the tree), and **clinging costs
+   stamina** (net drain), so you can't roost forever. Safety is keyed to *height*
+   (`climb_t > CLIMB_SAFE`) rather than the on/off flag, and a **hysteresis** means once
+   you slip below safe height you need real stamina to re-commit — so an **exhausted cat
+   slips out of the tree** and is briefly catchable by the ground hunter. The hawk still
+   plucks a climber (aerial), and reaching the beacon / being grabbed resets the height.
+   3 tests (gradual+trunk-hug+stamina, exhaustion-slips-you, and the original
+   escapes-ground-but-not-hawk still green). 96 tests total.
+-20. [x] **Dithering + biome blending.** (a) Added ordered **Bayer 4x4 dithering** as the
+   final post-process step: the colour is quantised along a 4x4 threshold pattern, which
+   breaks up smooth-gradient banding (sky, fog, shadow) and lays down a printed-paper
+   texture that suits the papercraft look. Verified active — a smooth sky band shows
+   ~747/1099 adjacent pixels alternating (the dither signature; a flat gradient would be
+   near-uniform). (b) Widened the **biome-colour blend** kernel from a single 9-tap ring
+   (band ≈ 2r, r=3.6) to a two-ring 13-tap kernel (centre + inner 8 + outer 4, r=4.2,
+   reach 2r) with distance-falloff weights, so biomes crossfade over a wider, softer band.
+   The seam-smoothing test still passes. 94 tests.
+-19. [x] **Wind + weather system** (`weather.rs`, shared) — Warriors + SMITE-2 flavoured.
+   Four **seasons** (Newleaf … Leaf-bare) set prey abundance and which skies roll in;
+   the **sky shifts during a match** (clear → rain → fog → storm → snow) on a timer, and
+   a gusty, veering **wind** carries scent. Modifiers: rain/storm wash scent away and
+   scatter it downwind while fog/snow let it linger (tracks in snow); fog and storm blind
+   the hunter; season + weather set how much prey is about. Integrated into the sim —
+   dynamic wind now drives the scent drift, weather scales scent decay and the hunter's
+   suspicion build-up, and the season sizes the wildlife population. Rendered as rain /
+   snow / storm **particles** (slanted by wind) in the headless game view and the app sim
+   path (verified: 0 rain-px clear, 589 storm, 1159 snow); a HUD line shows
+   "Greenleaf · rain · brisk wind", and `CLAW_SKY=rain|snow|storm|fog` forces the sky for
+   headless previews. 7 new tests (5 weather unit + 2 sim integration) → 94 total.
+   (Weather logic + particles verified in sandbox; live feel on the M2 still to confirm.
+   Prowl/Pop Island don't share the weather yet — a clean follow-up since it's one field.)
+-18. [x] Animation overhaul from playtest feedback:
+   * **Model rotation (bug)** — the cat rig's `build` only *flipped* along z (every caller
+     passed 1.0), so cats never faced their heading. Added `mesh::boxx_yaw` (an oriented
+     box) and rewrote `cat::build(at, yaw, pose)` to rotate the whole rig — body, head,
+     ears, tail, legs — about the vertical axis. Every gameplay caller now passes the
+     entity's `heading` (sim cats, prowler, minions, rivals, capture mobs). Unit test
+     proves it (facing +z the cat is longer along z; a quarter-turn makes it longer along
+     x). This also gives "shoulders turning when turning" for free.
+   * **Walk too fast** — the phase was `frame*0.06`, i.e. ~7 strides/sec at 120Hz. Added a
+     real-time `anim_t` accumulator; walk now runs a framerate-independent ~1.35 strides/sec
+     with a per-cat gait offset so they don't march in lockstep.
+   * **Naturalization** — new `cat::idle(t)` breathing pose (chest expansion, body rise,
+     slow head glances, lazy tail sway) used whenever a creature is standing; `Pose` gained
+     `head_yaw` + `breath`.
+   * **Combat groundwork** — added `stance(t)` (low ready-crouch, tail lashing) and
+     `strike(t)` (a swipe that peaks mid-swing) poses, with tests. NOTE: these are the
+     animation vocabulary; full combat *gameplay* (attack action, damage, hit reactions,
+     stances wired into the loop) is still to do. 87 tests. (Rig math + poses verified in
+     sandbox; the live look on the M2 is still to confirm.)
+-27. [x] **Signature class abilities** (abilities + character design + a new control). Each of
+   the six classes now has a distinct active ability in the shared `class` module, on its own
+   cooldown: Cat **Second Wind** (refill stamina + briefly untouchable), Squirrel **Scamper**
+   (blazing sprint), Otter **Dive** (fast + untouchable getaway), Frog **Bound** (huge airborne
+   leap), Goat **Charge** (unstoppable rush), Hawk **Stoop** (screaming dive). Each has tuned
+   cooldown/duration/speed-multiplier/invuln/refill params. Wired into Prowl: press **Q** (or
+   right-click) to fire it — activation, cooldown, speed burst, i-frames, and stamina refill all
+   handled in `step`. The HUD shows the ability name, READY/cooldown, and a blurb; controls hint
+   updated. 3 tests (every class has a unique ability; Second Wind refills + shields a catch;
+   Scamper covers more ground). 84 tests. So classes finally play distinctly, not just move at
+   different terrain speeds. (World interactions + more map design are the continuing direction.)
+-26. [x] **Win condition + rivals flee the stalker** — the four-way match now has a proper
+   end. A clan wins outright at **600 points**, otherwise the **leader when the ring finishes
+   closing (~120s)** takes it (ties → stalemate). `outcome: Option<u8>` freezes the sim once
+   decided. Rivals now **break off to flee** the stalker when it's hunting them nearby (rather
+   than only reacting once caught). The app shows a result banner ("YOUR CLAN WINS" / "TIDE
+   CLAN WINS" / "STALEMATE") with R to restart. Verified integrated: a full match ran to the
+   120s ring-close and awarded Amber the win on a [0,120,160,240] score. 2 tests (score
+   threshold wins + freezes; ring-close awards the leader). 81 tests.
+-25. [x] **Rival AI prowlers → a live 1v1v1v1 match.** Refactored ancestor ownership from a
+   single bool to `claimed_by: Option<u8>` (which clan owns each tree) and the score from one
+   int to `clan_scores: [i32; 4]`. Added one **AI prowler per rival clan**: each roams to the
+   nearest tree it doesn't own, dwells to claim it (flipping ownership + banking +40 for its
+   clan), and rallies home (losing points) if the stalker catches it — so the four clans
+   genuinely fight over the ancestors. Trees glow in their **owning clan's colour**; rivals
+   render as full-size clan-tinted cats; the HUD shows a four-clan scoreboard (Ember/Tide/
+   Moss/Amber). Verified integrated: over 120s the rivals claimed and flipped trees to a
+   [0,120,160,240] score spread with two rivals contesting the same tree. 2 tests (a rival
+   claims a wild tree for its clan + scores; one prowler per rival clan). 79 tests.
+-24. [x] **Four clans + border-patrol minions** in Prowl — a 1v1v1v1 territorial map. The
+   four ancestor trees are now four **clan homes** (Ember / Tide / Moss / Amber), each
+   defended by a ring of small **cat minions** that walk a border-patrol loop around their
+   territory. The player prowls as clan 0. Trespass near a **rival** clan's minions and they
+   break off to shoo you — and a rival spotting you **raises the hunt alarm** (bumps the
+   stalker's suspicion), so raiding enemy ground is risky. Minions render as small clan-tinted
+   cats (patrol animation) in both the live and headless renders. 2 tests (patrol stays near
+   the clan border + moves; rival minions aggro on an intruder, advance, and raise the alarm).
+   78 tests. (Rival AI prowlers per clan would be the next step toward a full 4-way match.)
+-23. [x] **Lanes** in Prowl — a MOBA-style path network tying the map together. A spoke runs
+   from the middle out to each ancestor tree plus a ring linking neighbours, so the staging
+   grounds are connected by deliberate routes. **Travel is faster on a lane** (×1.25), giving
+   a fast-but-open rotation option vs slower-but-hideable off-lane movement. `on_lane_at`
+   (point-to-segment test) drives the bonus and the render. Drawn as worn dirt-path ribbons
+   hugging the terrain in both the live and headless renders (~8% of the showcase frame).
+   Test: a spoke midpoint is on a lane, and travel there beats the same move off-lane. 76 tests.
+-22. [x] **Ancestor trees** in Prowl — SMITE-style buff camps themed as defensible staging
+   grounds, spread far out across the map (radius ~95, on dry land) so the arena plays big:
+   * **Claim by dwelling** — hold near a tree for a few seconds to claim it; it bestows its
+     stored buff (Speed or Shield) and rests on cooldown. Banks +40 score.
+   * **Staging ground** — a claimed tree shelters you: standing in its grounds mends stamina
+     and cools the hunt (suspicion decays faster), and getting caught **rallies you at the
+     nearest claimed ancestor** instead of the origin (a forward respawn).
+   * **Render + animation + texture** — a grand tiered papercraft tree on a heavy flared-root
+     trunk with a **swaying canopy** and an aura ring (gold = claimable, green = claimed
+     staging, dim = resting). Drawn in both the live window and headless renders; HUD shows a
+     "STAGING GROUND" indicator.
+   2 new tests (dwelling claims + grants the buff + is a staging ground; a catch rallies you
+   at a claimed tree). 75 tests, both builds clean.
+-21. [x] Built out the **Prowl (SMITE-2) mode** with MOBA-flavored depth, reusing the
+   shared `powerup` module:
+   * **Power-up buffs in the field** — Speed and Shield pickups scatter on dry land; grab
+     one for a boost. A **Shield soaks a catch** (you're spared instead of respawning, the
+     shield pops) — a defensive-item mechanic. Buffs clear when you're actually caught.
+   * **Hunt score + escalation** — clearing an objective banks +100 and ramps difficulty
+     (+0.05, capped) like waves; pouncing prey is +25; getting caught costs −50 (floored
+     at 0). So the hunt gets harder the better you do.
+   * **Wiring** — the app HUD shows score + active buffs (SPD/SHLD), a shield-soak shows no
+     damage tint, and both the live and headless renders draw the bobbing pickups.
+   4 new tests (shield soaks a catch, pickup grants a buff, clear banks score + escalates,
+   plus the existing respawn path). Verified integrated (buffs grabbed, clears escalate,
+   score arithmetic correct). 73 tests.
+-20. [x] **Match seeding for replayability.** `new_match` was fully deterministic — every
+   Rendezvous-vs-Fox match spawned cats at the same angles, picked obj[0], and placed the
+   hunter identically, so every match played out the same. Added `new_match_seeded(kind,
+   mode, seed)`: the seed rotates the objective choice and scatters the cats' spawn
+   positions, so repeat matches differ (verified: seeds 0–5 give caught/escaped spreads of
+   0–3 / 1–4). `seed == 0` reproduces the legacy fixed layout exactly, so determinism and
+   all existing tests are untouched. The live window seeds each new match/restart from the
+   frame counter. Test covers both the variation and the seed-0 legacy guarantee. 70 tests.
+-19. [x] Consolidation pass. (a) **Fixed a web-build regression before it shipped**: last
+   turn's real-dt fix used `std::time::Instant`, which panics at runtime on wasm32 (no
+   clock without a shim). Swapped in the `web-time` crate — a drop-in `Instant` that's
+   plain std on native (so native behavior is identical and verified) and uses
+   `performance.now()` on wasm. (b) **Rewrote the README** to match reality: it still
+   described a single 6v1 game with three controls; it now documents all four modes, the
+   full headless-render arg matrix, the live-window menu + per-mode controls (incl. the
+   new mouse binds), difficulty, the shared-lib architecture (all 17 modules), and the
+   test suite. Verified the arg/mode claims against main.rs. 69 tests, both builds clean.
+-18. [x] Completed the difficulty system — it scaled hunter speed + suspicion but a hider
+   was equally safe at every setting, which was inconsistent. Now the **flush radius**
+   (how close a hidden cat must be for the hunter to sniff it out) also scales with
+   difficulty, so hard mode makes cover genuinely riskier while normal play is unchanged
+   (×1.0 leaves it as-is). Test: a hider just outside the normal flush distance stays safe
+   on easy but is rooted out on hard. Fixed the now-stale "affects aggression later"
+   comment. 69 tests.
 -17. [x] Three fixes from the playtest:
    (a) **Game speed** — the loop stepped a hardcoded dt=1/60 every frame, so on the M2's
    120Hz ProMotion display everything ran at 2× speed. Now it uses real elapsed time
