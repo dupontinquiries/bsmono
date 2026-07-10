@@ -2739,8 +2739,22 @@ impl Gpu {
         let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
         let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
         let d = g.get_u32(&format!("{pfx}.embedding_length"))
-            .ok_or_else(|| format!("missing embedding_length: the GGUF has no '<arch>.embedding_length' \
-                key (resolved arch '{pfx}') — the file may be truncated, non-standard, or not a supported LLM"))? as usize;
+            .ok_or_else(|| {
+                let key = format!("{pfx}.embedding_length");
+                if g.metadata.contains_key(&key) {
+                    // key IS present but get_u32 couldn't read it — a non-integer or out-of-range type
+                    format!("'{key}' is present but not a readable u32 dimension (unexpected metadata value \
+                        type or out-of-range) — the GGUF's hyperparameter encoding is non-standard")
+                } else {
+                    let mut present: Vec<&str> = g.metadata.keys()
+                        .filter(|k| k.starts_with(&format!("{pfx}.")))
+                        .map(|s| s.as_str()).collect();
+                    present.sort_unstable();
+                    let listed = if present.is_empty() { "(none)".to_string() } else { present.join(", ") };
+                    format!("missing embedding_length: the GGUF has no '{key}' key (resolved arch '{pfx}'); \
+                        keys under '{pfx}.' present: {listed} — the file may be truncated, non-standard, or not a supported LLM")
+                }
+            })? as usize;
         let h = g.get_u32(&format!("{pfx}.feed_forward_length")).ok_or("missing feed_forward_length")? as usize;
         let n = g.get_u32(&format!("{pfx}.block_count")).ok_or("missing block_count")? as usize;
         // vocab_size is often absent in real GGUFs; derive it from the embedding below.
