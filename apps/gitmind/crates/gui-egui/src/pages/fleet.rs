@@ -21,9 +21,14 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 .show(ui, |ui| {
                     for a in &suite.apps {
                         let sel = app.fleet.selected.as_ref().is_some_and(|s| s.name == a.name);
-                        if ui.selectable_label(sel, format!("{}  {}", crate::app::app_icon(&a.name), a.name)).clicked() {
-                            app.fleet.selected = Some(a.clone());
-                        }
+                        ui.horizontal(|ui| {
+                            // deterministic identicon tile (ported from the Qt MonoTile), not an emoji
+                            uikit_egui::mono_tile::mono_tile(ui, &a.name, 22.0);
+                            ui.add_space(6.0);
+                            if ui.selectable_label(sel, &a.name).clicked() {
+                                app.fleet.selected = Some(a.clone());
+                            }
+                        });
                     }
                 });
         }
