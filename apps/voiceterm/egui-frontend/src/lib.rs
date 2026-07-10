@@ -12,8 +12,9 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
-pub mod web;
 pub mod viz;
+// `web` (HTML → egui RichDoc renderer) now lives in the shared uikit-web kit; re-export as `web`.
+pub use uikit_web as web;
 
 // The terminal (grid model + VT/ANSI parser + themed egui renderer + App) now lives in the
 // shared `uikit-term` kit so other egui apps can embed it. Re-exported here so voiceterm's own
