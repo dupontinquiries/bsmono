@@ -192,6 +192,8 @@ struct State {
     post_ubuf: wgpu::Buffer,
     pipe_post: wgpu::RenderPipeline,
     format: wgpu::TextureFormat,
+    egui: crate::gpu_egui::EguiOverlay,
+    scale: f32,
 }
 
 const SAMPLES: u32 = 4; // MSAA sample count
@@ -500,6 +502,8 @@ impl State {
             cache: None,
         });
 
+        let egui = crate::gpu_egui::EguiOverlay::new(&device, format);
+        let scale = window.scale_factor() as f32;
         State {
             surface,
             device,
@@ -530,6 +534,8 @@ impl State {
             post_ubuf,
             pipe_post,
             format,
+            egui,
+            scale,
         }
     }
 
@@ -571,7 +577,7 @@ impl State {
         up(&self.device, &self.queue, &mut self.vbuf_trans, &mut self.vcap_trans, &mut self.vcount_trans, trans, "vt");
     }
 
-    fn render(&mut self, u: &U) {
+    fn render(&mut self, u: &U, game: &crate::game::Game) {
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(u));
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
@@ -641,6 +647,41 @@ impl State {
             rp.set_pipeline(&self.pipe_cross);
             rp.set_bind_group(0, &self.bind, &[]);
             rp.draw(0..36, 0..1); // crosshair (2) + health bg/fill + ammo bg/fill
+        }
+        // egui HUD overlay: run the shared `crate::hud` painters through a headless egui Context and
+        // paint the tessellated meshes on top of the finished frame. No winit 0.30 rewrite and no
+        // egui-winit/egui-wgpu — just egui 0.34 (already a dep) + a small 2-D wgpu pass (gpu_egui).
+        {
+            let w = self.config.width;
+            let h = self.config.height;
+            let scale = self.scale;
+            self.egui.prepare(&self.device, &self.queue, w, h, scale, |ctx| {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("gpu_hud"),
+                ));
+                let rect = ctx.content_rect();
+                // the game-only subset of the shared HUD (GPU path carries no app Settings/build state)
+                crate::hud::draw_damage_vignette(&painter, rect, game);
+                crate::hud::draw_hit_flash(&painter, rect, game);
+                crate::hud::draw_underwater_tint(&painter, rect, game);
+                crate::hud::draw_reticle(&painter, rect, game, 0.0);
+                crate::hud::draw_hitmarker(&painter, rect, game);
+                crate::hud::draw_damage_arrows(&painter, rect, game);
+                crate::hud::draw_hud(&painter, rect, game);
+                crate::hud::draw_scorestreaks(&painter, rect, game);
+                crate::hud::draw_compass(&painter, rect, game);
+                crate::hud::draw_killfeed(&painter, rect, game);
+                if !game.player.alive {
+                    crate::hud::draw_center_banner(
+                        &painter,
+                        rect,
+                        "YOU WERE KILLED",
+                        egui::Color32::from_rgb(220, 50, 50),
+                    );
+                }
+            });
+            self.egui.paint(&mut enc, &view, w, h);
         }
         self.queue.submit([enc.finish()]);
         frame.present();
@@ -778,7 +819,7 @@ pub fn run() {
                         hud: [hf, af, low, 0.0],
                         plights,
                     };
-                    state.render(&u);
+                    state.render(&u, &game);
                     window.request_redraw();
                 }
                 _ => {}
