@@ -1,0 +1,14 @@
+#!/sbin/openrc-run
+# OpenRC init script for the logscope fabric daemon (Alpine / postmarketOS on the M2).
+# Install: cp to /etc/init.d/logscope-fabricd; chmod +x; rc-update add logscope-fabricd; rc-service logscope-fabricd start
+name="logscope-fabricd"
+description="logscope fabric daemon (LAN model workspace)"
+command="/usr/local/bin/logscope-fabricd"
+# --daemon backgrounds it (OpenRC's default supervisor expects a backgrounded process here);
+# adjust --model to the GGUF this box serves.
+command_args="--daemon --pid-file /run/logscope-fabricd.pid --log-file /var/log/logscope-fabricd.log --addr 0.0.0.0:7777 --model llama-1b=/var/lib/logscope/models/llama-1b.gguf:1.0"
+pidfile="/run/logscope-fabricd.pid"
+
+depend() {
+    need net
+}
