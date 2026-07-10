@@ -17,17 +17,25 @@ pub struct Key {
     pub weight: f32,
     /// The string emitted on tap (defaults to the label).
     pub emit: String,
+    /// Long-press alternates (accents, symbols); empty = no popup. Surfaced via the shared
+    /// `uikit_egui::slide_menu` gesture grid on a hold.
+    pub variants: Vec<String>,
 }
 
 impl Key {
     pub fn new(label: &str) -> Key {
-        Key { label: label.to_string(), weight: 1.0, emit: label.to_string() }
+        Key { label: label.to_string(), weight: 1.0, emit: label.to_string(), variants: Vec::new() }
     }
     pub fn wide(label: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: label.to_string() }
+        Key { label: label.to_string(), weight, emit: label.to_string(), variants: Vec::new() }
     }
     pub fn emitting(label: &str, emit: &str, weight: f32) -> Key {
-        Key { label: label.to_string(), weight, emit: emit.to_string() }
+        Key { label: label.to_string(), weight, emit: emit.to_string(), variants: Vec::new() }
+    }
+    /// Attach long-press variant characters (each emits itself).
+    pub fn with_variants(mut self, vs: &[&str]) -> Key {
+        self.variants = vs.iter().map(|s| s.to_string()).collect();
+        self
     }
 }
 
@@ -48,8 +56,34 @@ pub struct Layout {
 impl Layout {
     /// A compact QWERTY, mirroring rusty-board's `default_qwerty` shape.
     pub fn qwerty() -> Layout {
+        fn variants_for(k: &str) -> Option<&'static [&'static str]> {
+            Some(match k {
+                "a" => &["à", "á", "â", "ä", "æ"],
+                "e" => &["é", "è", "ê", "ë"],
+                "i" => &["í", "ì", "î", "ï"],
+                "o" => &["ó", "ò", "ô", "ö", "œ"],
+                "u" => &["ú", "ù", "û", "ü"],
+                "n" => &["ñ"],
+                "c" => &["ç"],
+                "y" => &["ÿ"],
+                "s" => &["ß"],
+                _ => return None,
+            })
+        }
         fn row(keys: &[&str]) -> Row {
-            Row { keys: keys.iter().map(|k| Key::new(k)).collect(), weight: 1.0 }
+            Row {
+                keys: keys
+                    .iter()
+                    .map(|k| {
+                        let key = Key::new(k);
+                        match variants_for(k) {
+                            Some(vs) => key.with_variants(vs),
+                            None => key,
+                        }
+                    })
+                    .collect(),
+                weight: 1.0,
+            }
         }
         Layout {
             name: "qwerty".into(),
@@ -182,8 +216,8 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive) -> Option<
             ui.add_space(gutter);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
-                if paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors) {
-                    emitted = Some(key.emit.clone());
+                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors) {
+                    emitted = Some(e);
                 }
             }
         });
@@ -193,7 +227,7 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive) -> Option<
 }
 
 /// Paint one key as a carved rounded tile with a centered label; returns true on tap.
-fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors) -> bool {
+fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors) -> Option<String> {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     let fill = if resp.is_pointer_button_down_on() {
@@ -215,7 +249,26 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors)
         text_color,
     );
     let _ = gutter;
-    resp.clicked()
+    // Long-press → variant grid via the shared gesture widget; a quick tap still types the key.
+    if !key.variants.is_empty() {
+        let id = ui.id().with(("keyvar", &key.label, rect.min.x as i32, rect.min.y as i32));
+        let opts: Vec<uikit_egui::slide_menu::SlideOption> = key
+            .variants
+            .iter()
+            .map(|v| uikit_egui::slide_menu::SlideOption::new(v.clone(), v.clone()))
+            .collect();
+        let menu = uikit_egui::slide_menu::SlideMenu::new(id).columns(key.variants.len().min(5)).hold(0.3);
+        match menu.show_stored(ui, id, &resp, &opts) {
+            uikit_egui::slide_menu::SlideOutcome::Selected(v) => return Some(v),
+            uikit_egui::slide_menu::SlideOutcome::Cancelled => return None, // opened then released without a pick
+            uikit_egui::slide_menu::SlideOutcome::Idle => {}
+        }
+    }
+    if resp.clicked() {
+        Some(key.emit.clone())
+    } else {
+        None
+    }
 }
 
 /// Convenience for tests / headless: which key (emit) a tap at `pos` would hit, given a

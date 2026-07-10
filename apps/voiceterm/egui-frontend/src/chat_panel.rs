@@ -9,6 +9,7 @@
 //! The wire-format parsing is pure and unit-tested; only the rendering needs egui.
 
 use egui::{Align, Color32, Layout, RichText, ScrollArea};
+use uikit_egui::slide_menu::{SlideMenu, SlideOption, SlideOutcome};
 
 /// Who authored a turn.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,11 +54,19 @@ pub struct ChatPanel {
     pub busy: bool,
     /// Provider string sent alongside the message ("llama" routes to the local model when active).
     pub provider: String,
+    /// Press-drag picker (shared gesture widget) for choosing the provider.
+    provider_menu: SlideMenu,
 }
 
 impl Default for ChatPanel {
     fn default() -> Self {
-        Self { messages: Vec::new(), input: String::new(), busy: false, provider: "llama".into() }
+        Self {
+            messages: Vec::new(),
+            input: String::new(),
+            busy: false,
+            provider: "llama".into(),
+            provider_menu: SlideMenu::new("chat_provider").columns(3).item_size(64.0),
+        }
     }
 }
 
@@ -101,6 +110,16 @@ impl ChatPanel {
         // input row — Enter or the button sends (disabled while busy).
         ui.separator();
         ui.horizontal(|ui| {
+            // provider picker — press-drag the badge to open a grid of providers.
+            let badge = ui.button(RichText::new(format!("◆ {}", self.provider)).small());
+            let providers = [
+                SlideOption::new("llama", "llama"),
+                SlideOption::new("gpt", "gpt"),
+                SlideOption::new("claude", "claude"),
+            ];
+            if let SlideOutcome::Selected(id) = self.provider_menu.show(ui, &badge, &providers) {
+                self.provider = id;
+            }
             let enter =
                 ui.add(egui::TextEdit::singleline(&mut self.input).desired_width(f32::INFINITY).hint_text("Message…"))
                     .lost_focus()
