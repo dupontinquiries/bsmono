@@ -28,6 +28,7 @@ pub mod nav;
 pub mod scroll;
 pub mod fuzzy;
 pub mod motion;
+pub mod confirm_dialog;
 pub mod log_view;
 pub mod mono_tile;
 pub mod slide_menu;
