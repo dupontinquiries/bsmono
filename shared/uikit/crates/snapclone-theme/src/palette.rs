@@ -20,6 +20,7 @@ pub enum PaletteId {
     Earth,
     Pastels,
     Metallic,
+    Night,
 }
 
 impl PaletteId {
@@ -34,6 +35,7 @@ impl PaletteId {
             Self::Earth      => "earth",
             Self::Pastels    => "pastels",
             Self::Metallic   => "metallic",
+            Self::Night      => "night",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -47,6 +49,7 @@ impl PaletteId {
             Self::Earth      => "Earth",
             Self::Pastels    => "Pastels",
             Self::Metallic   => "Metallic",
+            Self::Night      => "Night",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -59,12 +62,13 @@ impl PaletteId {
             "earth"       => Self::Earth,
             "pastels"     => Self::Pastels,
             "metallic"    => Self::Metallic,
+            "night"       => Self::Night,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night]
     }
 }
 
@@ -141,6 +145,33 @@ pub const DARK: Palette = Palette {
     gradient_bar:  ["#1A1917", "#111110"],
     glow_online:   "#5E9470",
 };
+
+/// Tokyo-Night cool-blue dark — matches gitmind's Qt/QML surface (the egui apps' colour north-star).
+pub const NIGHT: Palette = Palette {
+    id: PaletteId::Night, name: "Night",
+    bg_deep:   "#0c0f1a",
+    bg_base:   "#0f1320",
+    bg_card:   "#171c2b",
+    bg_raised: "#2a3350",
+    bg_hover:  "#3a4566",
+    bg_scrim:  "rgba(12,15,26,0.72)",
+    text_primary:   "#cdd6f4",
+    text_secondary: "#8a93a6",
+    text_disabled:  "#5b6477",
+    text_inverse:   "#0c0f1a",
+    accent:      "#7aa2f7",
+    accent_soft: "#c9a3ff",
+    accent_dim:  "#3a4566",
+    danger:  "#f7768e",
+    success: "#56d364",
+    warning: "#f9e2af",
+    border:       "#2a3350",
+    border_focus: "#7aa2f7",
+    gradient_hero: ["#171c2b", "#0c0f1a"],
+    gradient_bar:  ["#171c2b", "#0f1320"],
+    glow_online:   "#56d364",
+};
+
 
 /// OLED pitch-black — maximum contrast, minimum eye strain in dark rooms.
 /// Pure #000000 base for OLED displays where black = zero power.
