@@ -24,6 +24,7 @@ wgpu = { version = "22", optional = true }
 winit = { version = "0.29", optional = true }
 pollster = { version = "0.3", optional = true }
 bytemuck = { version = "1", optional = true, features = ["derive"] }
+gpu-kit = { path = "../../shared/gpu-kit", optional = true }  # shared present-mode policy (gpu feature only)
 
 # JSON instruction pipeline for the map builder (buildscript.rs) — a stable, documented external format so
 # tooling (including LLMs) can author/edit maps without touching the in-memory editor. Pure Rust, no native
@@ -39,7 +40,7 @@ app = ["dep:eframe"]
 # Procedural sound playback (off by default; pulls rodio/cpal, needs system audio libs).
 sound = ["dep:rodio"]
 # GPU renderer (wgpu + winit). Off by default. Run: cargo run --release --features gpu --bin gpu
-gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck"]
+gpu = ["dep:wgpu", "dep:winit", "dep:pollster", "dep:bytemuck", "dep:gpu-kit"]
 
 [lib]
 name = "early_fps"
