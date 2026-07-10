@@ -63,6 +63,11 @@ pub enum Command {
     Open(String),      // :o / :open <path>    — import a chat (markdown ## You / ## Assistant) from a file
     ContinueAll(usize),// :ca [N] / :Nca       — continuation on every leaf, fanned N rounds deep (depth-N)
     FuzzyAll { depth: usize, width: usize, template: String }, // :fa [W] ['tmpl'] / :Nfa W 'tmpl' — depth×width templated fan
+    Continue(usize),   // :continue [N] / :cont — deepen the FOCUSED line N times (a single-leaf continue-all)
+    MapFiles { glob: String, template: String }, // :map <glob> ['tmpl'] — fan one worker task per changed file in
+                       // the /tmp workspace ({file} → the path); the worker-thread-per-file fan-out for a project
+    WorkspaceStatus,   // :ws / :workspace — show the loaded /tmp .gitmind session + its changed files
+    SyncWorkspace,     // :sync — rescan the /tmp workspace's changed files (refresh after edits)
     Stop,              // :stop / :st          — cancel a running fan + clear the queue
     Fill(String),      // :fill [path]         — decompose a todo!()-skeleton into KV-shared sub-tasks + fan them
     Assemble,          // :assemble / :asm     — splice the filled bodies back into the skeleton
@@ -245,6 +250,10 @@ pub struct CmdSpec { pub name: &'static str, pub aliases: &'static [&'static str
 
 static CATALOG: &[CmdSpec] = &[
     CmdSpec { name: "ca",        aliases: &["continue-all"],        args: "[N]",           help: "continue every leaf, fanned N rounds deep" },
+    CmdSpec { name: "continue",  aliases: &["cont"],                args: "[N]",           help: "deepen the FOCUSED line N times (single-line continue)" },
+    CmdSpec { name: "map",       aliases: &[],                      args: "<glob> ['tmpl']", help: "fan one worker task per changed file ({file}) in the /tmp workspace" },
+    CmdSpec { name: "ws",        aliases: &["workspace"],           args: "",              help: "show the loaded /tmp .gitmind workspace + its changed files" },
+    CmdSpec { name: "sync",      aliases: &[],                      args: "",              help: "rescan the /tmp workspace's changed files after edits" },
     CmdSpec { name: "fa",        aliases: &["fuzzy-all"],           args: "[W] ['tmpl']",  help: "depth×width templated fan-out over the leaves" },
     CmdSpec { name: "fuzz",      aliases: &["f"],                   args: "[N]",           help: "fan N fuzzed variants of the prompt (default 10)" },
     CmdSpec { name: "fuzzd",     aliases: &["fd"],                  args: "[N]",           help: "fan N variants, each a different behavioral directive" },
@@ -346,6 +355,48 @@ pub fn fill_template(tmpl: &str, lastmsg: &str, msgid: usize) -> String {
     tmpl.replace("{lastmsg}", lastmsg).replace("{msgid}", &msgid.to_string())
 }
 
+/// Split `:map` args into the file glob and an optional (quoted) task template:
+/// "*.rs" → ("*.rs", ""); "*.rs 'add tests to {file}'" → ("*.rs", "add tests to {file}").
+fn parse_map_args(arg: &str) -> (String, String) {
+    let arg = arg.trim();
+    let mut it = arg.splitn(2, char::is_whitespace);
+    let glob = it.next().unwrap_or("").trim().to_string();
+    let tmpl = it.next().unwrap_or("").trim().trim_matches(|c| c == '\'' || c == '"').to_string();
+    (glob, tmpl)
+}
+
+/// A deliberately tiny glob for `:map`: `*` matches any run, so `*.rs`, `src/*`, `*bench*`, and an exact
+/// name all work; an empty pattern matches everything. Enough to pick a file set in a worker fan without a
+/// dependency. Matches on the full relative path.
+pub fn glob_match(pat: &str, name: &str) -> bool {
+    let pat = pat.trim();
+    if pat.is_empty() || pat == "*" { return true; }
+    let parts: Vec<&str> = pat.split('*').collect();
+    let mut pos = 0usize;
+    for (i, part) in parts.iter().enumerate() {
+        if part.is_empty() { continue; }
+        match name[pos..].find(part) {
+            Some(off) => {
+                if i == 0 && off != 0 { return false; }             // no leading '*' → must anchor at start
+                pos += off + part.len();
+            }
+            None => return false,
+        }
+    }
+    // no trailing '*' → the pattern must consume to the end
+    if !pat.ends_with('*') { if let Some(last) = parts.last() { return name.ends_with(last); } }
+    true
+}
+
+/// One worker task per file, with `{file}` filled in the template (or a sensible default when the template
+/// is blank). This is the per-file fan-out a `:map` over a project's changed files produces.
+pub fn map_tasks(files: &[String], template: &str) -> Vec<String> {
+    files.iter().map(|f| {
+        if template.trim().is_empty() { format!("Work on the file `{f}` in this project.") }
+        else { template.replace("{file}", f) }
+    }).collect()
+}
+
 /// Parse a command line (with or without the leading ':').
 pub fn parse_command(line: &str) -> Command {
     let s = line.trim().trim_start_matches(':').trim();
@@ -376,6 +427,13 @@ pub fn parse_command(line: &str) -> Command {
             let (width, template) = parse_fa_args(arg);
             Command::FuzzyAll { depth: count.unwrap_or(1).clamp(1, 200), width: width.unwrap_or(10).clamp(2, 40), template }
         }
+        "continue" | "cont" => {
+            let n = count.or_else(|| arg.split_whitespace().next().and_then(|w| w.parse().ok())).unwrap_or(1).clamp(1, 200);
+            Command::Continue(n)
+        }
+        "map" => { let (glob, template) = parse_map_args(arg); Command::MapFiles { glob, template } }
+        "ws" | "workspace" => Command::WorkspaceStatus,
+        "sync" => Command::SyncWorkspace,
         "stop" | "st" | "qa" => Command::Stop,  // :qa reads as vim "quit all" → cancel the run
         "quest" | "questions" => {
             let n = count.or_else(|| arg.split_whitespace().next().and_then(|w| w.parse().ok())).unwrap_or(5).clamp(1, 40);
@@ -686,6 +744,34 @@ mod tests {
         let (ok, bad) = resolve_refs(10, &["-1".into(), "nope!".into(), "2".into()]);
         assert_eq!(ok, vec![9, 1]);
         assert_eq!(bad, vec!["nope!".to_string()]);
+    }
+
+    #[test]
+    fn parses_new_worker_commands() {
+        assert_eq!(parse_command(":continue 4"), Command::Continue(4));
+        assert_eq!(parse_command(":cont"), Command::Continue(1), "default 1");
+        assert_eq!(parse_command(":3continue"), Command::Continue(3), "count prefix");
+        assert_eq!(parse_command(":ws"), Command::WorkspaceStatus);
+        assert_eq!(parse_command(":workspace"), Command::WorkspaceStatus);
+        assert_eq!(parse_command(":sync"), Command::SyncWorkspace);
+        assert_eq!(parse_command(":map *.rs 'add tests to {file}'"),
+                   Command::MapFiles { glob: "*.rs".into(), template: "add tests to {file}".into() });
+        assert_eq!(parse_command(":map"), Command::MapFiles { glob: String::new(), template: String::new() });
+    }
+
+    #[test]
+    fn glob_and_map_tasks_fan_per_file() {
+        // tiny glob: suffix, prefix, substring, exact, and '*'/empty = all
+        assert!(glob_match("*.rs", "src/main.rs") && !glob_match("*.rs", "readme.md"));
+        assert!(glob_match("src/*", "src/main.rs") && !glob_match("src/*", "tests/x.rs"));
+        assert!(glob_match("*bench*", "crates/kv-bench.rs"));
+        assert!(glob_match("Cargo.toml", "Cargo.toml") && !glob_match("Cargo.toml", "Cargo.lock"));
+        assert!(glob_match("", "anything") && glob_match("*", "anything"));
+        // one task per file, {file} filled; blank template → a sensible default
+        let files = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let t = map_tasks(&files, "add doctests to {file}");
+        assert_eq!(t, vec!["add doctests to src/a.rs", "add doctests to src/b.rs"]);
+        assert!(map_tasks(&files, "").iter().all(|t| t.contains("src/") && t.contains("file")));
     }
 
     #[test]
