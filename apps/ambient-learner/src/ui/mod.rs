@@ -9,6 +9,9 @@ pub mod gtk4;
 #[cfg(feature = "iced")]
 pub mod iced;
 
+#[cfg(feature = "egui")]
+pub mod egui;
+
 /// UI framework selection
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UIFramework {
