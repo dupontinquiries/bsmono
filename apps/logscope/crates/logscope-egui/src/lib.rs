@@ -107,5 +107,6 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod multiparty;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod directives;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod longterm;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod interject;
 #[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] pub mod tabs;

@@ -22,6 +22,27 @@ pub fn slug(prompt: &str, max_words: usize) -> String {
     words.into_iter().take(max_words.max(1)).collect::<Vec<_>>().join(" ")
 }
 
+/// Make `base` unique against `existing` by appending " 2", " 3", … — so two similar prompts don't
+/// collapse to the same node name (the bug: `slug` alone repeats for like prompts). Pure.
+pub fn unique_name(base: &str, existing: &[&str]) -> String {
+    if !existing.iter().any(|e| *e == base) {
+        return base.to_string();
+    }
+    for n in 2.. {
+        let cand = format!("{base} {n}");
+        if !existing.iter().any(|e| *e == cand) {
+            return cand;
+        }
+    }
+    unreachable!()
+}
+
+/// A [`slug`] for `prompt` guaranteed distinct from the `existing` node names — the naming call site
+/// passes `convograph::image_nodes()`'s names so every new node gets a unique, referenceable name.
+pub fn slug_unique(prompt: &str, max_words: usize, existing: &[&str]) -> String {
+    unique_name(&slug(prompt, max_words), existing)
+}
+
 /// Generation lifecycle, so the UI can show progress and gate what's drawable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Status {
@@ -152,6 +173,15 @@ impl AssetStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_name_dedups_like_prompts() {
+        // slug alone collides for similar prompts; slug_unique appends a counter
+        let existing = ["harbor dawn", "harbor dawn 2"];
+        assert_eq!(unique_name("harbor dawn", &existing), "harbor dawn 3");
+        assert_eq!(unique_name("fresh name", &existing), "fresh name"); // free name unchanged
+        assert_eq!(slug_unique("the harbor at dawn", 4, &existing), "harbor dawn 3");
+    }
 
     #[test]
     fn slug_names_from_content_words() {
