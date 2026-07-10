@@ -67,7 +67,10 @@ mod tests {
         let s = Skin::carved();
         // opacity rises rest -> hover, and the pressed/disabled states are within range
         assert!(s.fill_rest < s.fill_hover);
-        assert!(s.fill_off <= s.fill_rest && s.fill_down <= 255);
+        // off is the faintest; the pressed state sits within the [off, hover] opacity envelope
+        // (a press reads more solid than off, never more than the hover peak).
+        assert!(s.fill_off <= s.fill_rest);
+        assert!(s.fill_off <= s.fill_down && s.fill_down <= s.fill_hover);
         // relief, grain, sheen and engraving are all live (non-zero) for the carved look
         assert!(s.radius > 0 && s.grain_alpha > 0 && s.bevel_lit > 0 && s.bevel_shadow > 0);
         assert!(s.sheen > 0.0 && s.sheen_speed > 0.0 && s.vein > 0.0);

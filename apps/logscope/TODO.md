@@ -29,6 +29,39 @@ EXPLICIT PER-SCENE OVERRIDES the user asked for (do NOT propagate to other scene
 - ATLANTIS: self-enclosing (excluded from generic shell); banners; perimeter soffit.
 
 
+## 2026-07-09 (pass 68) — GREEN THE SUITE + mic-pearl cross-scene spot-check (pass-67 NEXT, verified)
+
+Housekeeping/verification pass; no scene geometry changed. Rust 1.96 toolchain re-provisioned from the
+offline bundle; software-GL render loop (Xvfb + llvmpipe, GL 4.5 / GLSL 330) confirmed working.
+
+Fixes (all headless, root-caused):
+- **egui lib suite was 2 red → now 465/465** (core `logscope` 166/166). Both failures dated to the default
+  chat persona switching from the short inline BASE_SYSTEM to the file-based LONG_HORIZON:
+  * `prompts/long_horizon.md`: `LogScope` → `Logscope` (lone camelCase outlier: 47 `Logscope` vs 1 in the
+    suite; it was also the sentinel `fix_mode_appends_only_when_on` + `log_block_injected_and_bounded` use to
+    assert the base persona is present in `full_system()`).
+  * `log_block_injected_and_bounded`: bound the LOG BLOCK *delta* over the base persona, not the whole prompt.
+    The old `fs.len() < 4000` measured base+block and the 7.7 KB long-horizon persona blew it, even though the
+    block itself summarizes 1000 lines to ~0.3 KB. New bound (<1500) still catches a raw dump (~20 KB) but is
+    independent of persona size.
+- `ui.rs::carved_skin_tokens_are_sane`: replaced a dead `s.fill_down <= 255` (always true for a u8 — a
+  "comparison is useless due to type limits" warning) with the real pressed-state invariant
+  `fill_off <= fill_down <= fill_hover` (the press sits inside the [off,hover] opacity envelope; carved()'s
+  70/165/174 satisfy it, a broken skin wouldn't).
+
+Mic-pearl SHAPE derivative (pass-67 NEXT) spot-checked via `mic-pearl-view` (DEBUG=active, SCALE=6) across
+one scene per shape + both bespoke mounts — Atlantis (Pearl→scallop shell), Fractal Spires (Gem→gold claw
+cradle), Mistfall (Stone→rune plinth), Old Library (bespoke book-lectern), Forest (Leaf→dew stem),
+Folding@home (bespoke orbital cradle). All read as distinct, scene-appropriate placed objects; the logic side
+is already total over PALETTES (`mic_shape_is_a_coherent_per_scene_derivative`). No change needed — the
+feature is complete. Montage archived alongside this bundle.
+
+NEXT (unchanged real frontier, from the §8 backlog): per-SHAPE second axis is done; remaining scene work is
+GPU-only (Atlantis ceiling gaps / mid-area rings — needs the user to pinpoint which rings; Mistfall
+anti-gravity waterfalls; Cloudscape storms + moonlit night; Forest persistent-leaf stateful system + darting
+critters; Treehouse wood-grain shader). Each is its own turn, built one at a time as a reviewable patch.
+
+
 ## 2026-07-02 (pass 67) — MIC PEARL: marble-sheen voice indicator, derived from the panel idiom table
 
 A small in-scene orb beside the message panel (billboarded, camera-facing) showing live voice state:
