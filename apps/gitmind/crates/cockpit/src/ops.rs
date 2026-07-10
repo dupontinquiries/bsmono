@@ -173,10 +173,27 @@ pub fn repo_root() -> PathBuf {
 pub fn resolve_app_dir(path: &str) -> PathBuf {
     let p = Path::new(path);
     if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        repo_root().join(p)
+        return p.to_path_buf();
     }
+    let root = repo_root();
+    // An explicit repo-relative path (contains a separator) that exists is honored as-is.
+    if path.contains('/') {
+        let direct = root.join(p);
+        if direct.exists() {
+            return direct;
+        }
+    }
+    // Otherwise treat `path` as a bare app/game NAME and DISCOVER where it lives, so we never hard-code
+    // "apps/<name>" vs "games/<name>" — the filesystem is the source of truth. Games and apps can move
+    // trees without touching the store.
+    for base in ["apps", "games"] {
+        let cand = root.join(base).join(path);
+        if cand.exists() {
+            return cand;
+        }
+    }
+    // Fall back to the literal join so the caller still surfaces a clear "not found" error.
+    root.join(p)
 }
 
 /// Like [`build_locally`] but streams cargo's output line-by-line to `on_line` as it runs, so a
@@ -409,6 +426,22 @@ mod root_tests {
         assert!(gm.join("Cargo.toml").exists(), "resolved {} should be a crate", gm.display());
         // absolute paths pass through
         assert_eq!(resolve_app_dir("/tmp/x"), std::path::PathBuf::from("/tmp/x"));
+    }
+
+    #[test]
+    fn discovers_apps_vs_games_by_name() {
+        // a temp repo with an app under apps/ and a game under games/
+        let root = std::env::temp_dir().join(format!("gm-disc-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(root.join("apps").join("gitmind"));
+        let _ = std::fs::create_dir_all(root.join("games").join("unendlich"));
+        std::env::set_var("GITMIND_ROOT", &root);
+        // bare names resolve to the tree that actually contains them
+        assert_eq!(resolve_app_dir("gitmind"), root.join("apps").join("gitmind"));
+        assert_eq!(resolve_app_dir("unendlich"), root.join("games").join("unendlich"));
+        // an explicit existing path is honored as-is
+        assert_eq!(resolve_app_dir("apps/gitmind"), root.join("apps").join("gitmind"));
+        std::env::remove_var("GITMIND_ROOT");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
