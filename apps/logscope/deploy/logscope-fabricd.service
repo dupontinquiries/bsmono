@@ -1,0 +1,28 @@
+# systemd unit for the logscope fabric daemon — exposes this box's models to the LAN.
+# Install: cp to /etc/systemd/system/, edit ExecStart's --model, then:
+#   systemctl daemon-reload && systemctl enable --now logscope-fabricd
+[Unit]
+Description=logscope fabric daemon (LAN model workspace)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Foreground (Type=simple) — do NOT pass --daemon; systemd backgrounds it and journald captures stdout.
+ExecStart=/usr/local/bin/logscope-fabricd --addr 0.0.0.0:7777 --device %H --model llama-1b=/var/lib/logscope/models/llama-1b.gguf:1.0
+Restart=on-failure
+RestartSec=2
+# graceful: SIGTERM flips the daemon's shutdown flag; give in-flight requests time to drain
+KillSignal=SIGTERM
+TimeoutStopSec=15
+# hardening
+DynamicUser=yes
+StateDirectory=logscope
+RuntimeDirectory=logscope-fabricd
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
