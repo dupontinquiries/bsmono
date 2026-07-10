@@ -115,6 +115,11 @@ impl SettingsEditor {
             let [f, l, b, r] = self.prefs.input.movement.keys();
             ui.colored_label(colors.text_weak, format!("forward {f} · left {l} · back {b} · right {r}"));
         }
+        ui.horizontal(|ui| {
+            ui.label("model pool dir:");
+            ui.text_edit_singleline(&mut self.prefs.pool_dir);
+        });
+        ui.colored_label(colors.text_weak, "directory of *.gguf the fabric daemon shares to the LAN pool");
         ui.add_space(6.0);
 
         ui.label("Touch");

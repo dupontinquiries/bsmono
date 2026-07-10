@@ -53,6 +53,28 @@ fn main() {
 
     // ── headless fabric (LAN workspace) commands — short-circuit before the script path is required ──
     // Join a workspace and list a peer's shared models, or stand up a fabric node other boxes can join.
+    if let Some(addr) = cli.opt("pool-list") {
+        match logscope_egui::fabric_net::pool_list(addr) {
+            Ok(entries) => {
+                eprintln!("# {addr} pool — {} model file(s):", entries.len());
+                for e in &entries {
+                    println!("  {:<28} {:>8.2} GB", e.name, e.size as f64 / 1e9);
+                }
+            }
+            Err(e) => { eprintln!("# pool-list {addr} failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
+    if let Some(addr) = cli.opt("pool-fetch") {
+        let name = cli.opt("name").unwrap_or_else(|| { eprintln!("# --pool-fetch needs --name <model.gguf>"); std::process::exit(2); });
+        let out = cli.opt("out").map(String::from).unwrap_or_else(|| name.to_string());
+        eprintln!("# pulling '{name}' from {addr} → {out} …");
+        match logscope_egui::fabric_net::pool_fetch(addr, name, &out) {
+            Ok(bytes) => eprintln!("# fetched {:.2} GB → {out}", bytes as f64 / 1e9),
+            Err(e) => { eprintln!("# pool-fetch failed: {e}"); std::process::exit(1); }
+        }
+        return;
+    }
     if let Some(addr) = cli.opt("fabric-join") {
         use logscope_egui::fabric::Worker;
         match logscope_egui::fabric_net::join(addr) {

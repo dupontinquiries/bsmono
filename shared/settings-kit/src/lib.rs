@@ -459,6 +459,9 @@ pub struct Prefs {
     pub palette: String,
     /// Fleet voice-mesh preferences.
     pub voice: VoicePrefs,
+    /// Directory of shareable model files for the fabric model-storage pool (empty = none). The
+    /// logscope fabric daemon serves this dir; peers pull weights from it over the LAN.
+    pub pool_dir: String,
 }
 
 impl Default for Prefs {
@@ -471,6 +474,7 @@ impl Default for Prefs {
             input: InputPrefs::default(),
             palette: "Dark".to_string(),
             voice: VoicePrefs::default(),
+            pool_dir: String::new(),
         }
     }
 }
@@ -502,6 +506,7 @@ impl Prefs {
             ("voice.compute_host".into(), self.voice.compute_host.clone()),
             ("voice.speaker_id".into(), self.voice.speaker_id.to_string()),
             ("voice.partners".into(), self.voice.partners.join(",")),
+            ("model.pool_dir".into(), self.pool_dir.clone()),
         ]
     }
 
@@ -533,6 +538,7 @@ impl Prefs {
                 "voice.compute_host" => self.voice.compute_host = v.to_string(),
                 "voice.speaker_id" => if let Ok(x) = v.parse() { self.voice.speaker_id = x },
                 "voice.partners" => self.voice.partners = v.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+                "model.pool_dir" => self.pool_dir = v.clone(),
                 "display.white_point" => if let Ok(x) = v.parse() { self.display.white_point = x },
                 "display.color_filter" => self.display.color_filter = ColorFilter::parse(v),
                 "display.opacity" => if let Ok(x) = v.parse::<f32>() { self.display.opacity = x.clamp(0.3, 1.0) },
