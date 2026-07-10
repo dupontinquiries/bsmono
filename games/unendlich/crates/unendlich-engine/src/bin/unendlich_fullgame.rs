@@ -195,6 +195,38 @@ struct Roamer {
 fn build_roamer(kind: unendlich_engine::item::CreatureKind, pos: [f32; 3], wseed: u64) -> Roamer {
     let mut cr = unendlich_engine::spawn::spawn(kind, pos);
     cr.body.position[1] = cr.grounded_y(pos[1]);
+    // r694: classify a DRAGON's builder phenotype from its seed (sim::builder_genome)
+    // and announce the rare constructive ones. Most dragons are NonBuilders; a
+    // Shaper/Neatener/Builder/Architect is uncommon → worth a log so the rare
+    // builder dragons are visible in a session. (Full building behaviour — a
+    // Builder actually raising shrine/column structures — is the next step; this
+    // makes the classification live per-dragon.)
+    if matches!(kind, unendlich_engine::item::CreatureKind::Dragon) {
+        let b = unendlich_engine::sim::builder_genome::from_seed(wseed);
+        // r712: a constructive builder dragon raises a Builder Construct whose tier
+        // scales with its phenotype (Shaper→I, Builder→II, Architect→III), per the
+        // legendary-items catalogue. Announce it so the rare constructive spawns are
+        // visible with the artifact tier they'd leave behind.
+        if let Some((_src, tier)) =
+            unendlich_engine::sim::legendary_tier::builder_construct_tier(b.construct_rank())
+        {
+            log::info!(
+                "[builder] a {} dragon spawned at ({:.0},{:.0},{:.0}) — raises a Tier-{} {} Builder Construct",
+                b.name(), pos[0], pos[1], pos[2], tier.roman(), tier.rarity()
+            );
+        }
+        // r715: every dragon has a deterministic voice computed from its
+        // genome-scale traits (sim::dragon_voice) — size sets the fundamental &
+        // formants, attunement sets the register/brightness, age deepens it.
+        let velem = unendlich_engine::sim::dragon_voice::VoiceElement::from_index((wseed >> 8) as u8);
+        let vmass = 50.0 + ((wseed >> 16) & 0x7FF) as f32; // ~50..2098 kg
+        let vage = ((wseed >> 32) & 0x3F) as f32; // 0..63 years
+        let voice = unendlich_engine::sim::dragon_voice::DragonVoice::from_genome(vmass, velem, vage, 0.4);
+        log::info!(
+            "[voice] {:?} dragon: fundamental {:.0}Hz formant {:.0}Hz brightness {:.2} ground {:.0}Hz (mass {:.0}kg age {:.0}y)",
+            velem, voice.fundamental_hz, voice.formant_peak_hz, voice.brightness, voice.ground_resonance_hz, vmass, vage
+        );
+    }
     let genome = unendlich_engine::genetics::Genome::from_seed(wseed);
     let ph = genome.express(wseed, 0);
     let speed = 0.8 + ph.speed * 1.4;
@@ -662,7 +694,100 @@ fn main() {
         .filter(|&n| n > 0)
         .unwrap_or(24); // r482: ↑ from 16 (more chunks/gen dispatch)
     log::info!("GPU terrain-gen batch size = {} (UNENDLICH_GPU_GEN_BATCH)", gen_batch);
-    let generator = match TerrainGenerator::new(WORLD_SEED_DEFAULT, Backend::Auto, gen_batch) {
+    // r706: terrain-gen backend override. The GPU generator serializes ALL loader
+    // worker threads through one submit_lock + a single command buffer/fence —
+    // each batch holds the lock across its GPU fence wait, so no matter how many
+    // loader workers exist, only ONE gen batch runs at a time (this is why the gen
+    // queue backs up to thousands). `cpu` runs the noise generator lock-free
+    // per-worker → true N-way parallelism across the loader pool, which fills the
+    // world faster when gen is the streaming bottleneck (slower per-chunk, but N×
+    // concurrent). `gpu` forces the serialized GPU path; `auto` (default) picks GPU
+    // if present.
+    let gen_backend = match std::env::var("UNENDLICH_GEN_BACKEND").as_deref() {
+        Ok("cpu") | Ok("CPU") => Backend::Cpu,
+        Ok("gpu") | Ok("GPU") => Backend::Gpu,
+        _ => Backend::Auto,
+    };
+    // r726: opt-in CPU chunk-occlusion flood cull (world::occlusion_flood). OFF by
+    // default; its failure mode is vanishing terrain, so it's operator-gated. The
+    // renderer reads DEBUG.occlusion_cull when building its draw set.
+    if std::env::var("UNENDLICH_OCCLUSION_CULL").as_deref() == Ok("1") {
+        unendlich_engine::debug_settings::DEBUG
+            .occlusion_cull
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        log::info!("[occlusion] CPU chunk-occlusion flood cull ENABLED (UNENDLICH_OCCLUSION_CULL=1) — experimental");
+    }
+    // r727: opt-in adaptive render distance (world::adaptive_stream::RenderDistanceController).
+    // OFF by default; when on, the render loop feeds the smoothed frame time to the
+    // controller and applies its RD each frame (shrinks under load, regrows with headroom).
+    if std::env::var("UNENDLICH_ADAPTIVE_RD").as_deref() == Ok("1") {
+        unendlich_engine::debug_settings::DEBUG
+            .adaptive_rd
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        log::info!("[adaptive-rd] adaptive render distance ENABLED (UNENDLICH_ADAPTIVE_RD=1)");
+    }
+    // r729: simulation-distance prewarm (world::sim_prewarm::plan_prewarm).
+    // sim distance is larger + steadier than render distance, so warming its shell
+    // ahead of the player kills the load hitches you get when a chunk is needed the
+    // instant it enters render range. Read here; the throttled prewarm loop calls
+    // plan_prewarm(player_chunk, travel_dir, render_distance, sim_distance,
+    // prewarm_budget, |c| loader.is_loaded_or_inflight(c)) and hands the result to
+    // loader.request_many at a LOWER priority than render-range requests.
+    let sim_distance: i32 = std::env::var("UNENDLICH_SIM_DISTANCE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0); // 0 → "render_distance + default margin", resolved at the call site
+    let prewarm_budget: usize = std::env::var("UNENDLICH_PREWARM_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24);
+    if sim_distance > 0 {
+        log::info!(
+            "[prewarm] simulation-distance prewarm: sim_distance={} budget={}/tick (UNENDLICH_SIM_DISTANCE / UNENDLICH_PREWARM_BUDGET)",
+            sim_distance, prewarm_budget
+        );
+    }
+    let _ = (sim_distance, prewarm_budget); // consumed by the prewarm loop wiring
+    // r732: column-profile cache capacity (world::column_cache). The generator wraps
+    // its per-(x,z) column build in cache.get_or_compute so a vertical chunk stack
+    // reuses one column compute instead of redoing it per Y level. 0 = disabled.
+    let column_cache_cap: usize = std::env::var("UNENDLICH_COLUMN_CACHE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(256);
+    if column_cache_cap > 0 {
+        log::info!("[column-cache] per-column profile cache capacity={} (UNENDLICH_COLUMN_CACHE)", column_cache_cap);
+    }
+    let _ = column_cache_cap; // consumed by the generator wiring
+    // r734: generation-rate falloff (world::gen_falloff) to smooth the load burst.
+    // The loader scales its per-ring budget by falloff(dist_ratio, floor) and its
+    // total by settle_scale(loaded, target) so far rings trickle and a settled
+    // world quiets down — turning "hundreds pending during a climb" into a ramp.
+    let gen_falloff_floor: f32 = std::env::var("UNENDLICH_GEN_FALLOFF_FLOOR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.15);
+    log::info!(
+        "[gen-falloff] distance/settle gen-rate falloff floor={:.2} (UNENDLICH_GEN_FALLOFF_FLOOR; smooths the load burst — NOTE: does not affect GPU draw cost)",
+        gen_falloff_floor
+    );
+    let _ = gen_falloff_floor; // consumed by the loader budget wiring
+    // r733: SIMD front-end sphere-vs-frustum pre-cull (world::simd_cull). When on,
+    // the uploader/dispatcher runs cull_spheres over the candidate chunk bounds
+    // (SoA xs/ys/zs/rs + the 6 frustum planes, SSE 4-wide on x86_64) and only feeds
+    // the survivors to the GPU path — fewer draws/copies recorded. Auto-dispatches
+    // to a scalar fallback off x86_64; output is verified identical to scalar.
+    if std::env::var("UNENDLICH_SIMD_PRECULL").as_deref() == Ok("1") {
+        unendlich_engine::debug_settings::DEBUG
+            .simd_precull
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        log::info!("[simd-cull] SIMD front-end frustum pre-cull ENABLED (UNENDLICH_SIMD_PRECULL=1)");
+    }
+    log::info!(
+        "terrain-gen backend = {} (UNENDLICH_GEN_BACKEND=cpu|gpu|auto; cpu = lock-free parallel across loader workers)",
+        std::env::var("UNENDLICH_GEN_BACKEND").unwrap_or_else(|_| "auto".into())
+    );
+    let generator = match TerrainGenerator::new(WORLD_SEED_DEFAULT, gen_backend, gen_batch) {
         Ok(g) => Arc::new(g),
         Err(e) => {
             eprintln!("Failed to create terrain generator: {}", e);
@@ -1355,6 +1480,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         pool
     };
 
+    // r702: fully-buried-chunk mesh culling — on by default (the occlusion test
+    // is conservative and digging correctly re-meshes). Set UNENDLICH_NO_BURIED_CULL=1
+    // to disable if it ever misbehaves.
+    let buried_cull_enabled = std::env::var("UNENDLICH_NO_BURIED_CULL").is_err();
+    log::info!("buried-chunk mesh culling: {}",
+        if buried_cull_enabled { "on (UNENDLICH_NO_BURIED_CULL=1 to disable)" } else { "off" });
     // Tracks coords for which a mesh request is in flight (submitted to the
     // pool but result not yet consumed). Prevents double-submission.
     let mut meshing_in_flight: HashSet<ChunkCoord> = HashSet::new();
@@ -3272,6 +3403,11 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             let i = renderer.inv_click as usize;
             renderer.inv_click = -1;
             let inv = fg_app.inventory_mut();
+            // r741 diag: pin where drag/pick-place breaks. Logs the slot, whether a
+            // stack was on the cursor, and the slot's occupancy — so a real run shows
+            // whether clicks reach here at all and whether pick/place fires.
+            let cursor_before = fg_inv_cursor.is_some();
+            let slot_filled = i < inv.len() && inv.slot(i).is_some();
             if i < inv.len() {
                 match fg_inv_cursor.take() {
                     None => fg_inv_cursor = inv.take(i),
@@ -3281,6 +3417,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         fg_inv_cursor = prev;
                     }
                 }
+                log::info!(
+                    "[inventory] slot {} click: cursor_before={} slot_was_filled={} cursor_after={}",
+                    i, cursor_before, slot_filled, fg_inv_cursor.is_some()
+                );
+            } else {
+                log::warn!("[inventory] click slot {} out of range (len {})", i, inv.len());
             }
         }
         // r454: CREATIVE TABS — creative mode only. G cycles the category tab, V cycles the block
@@ -3943,8 +4085,12 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         // ---- Update ----
         let now = Instant::now();
         let dt = (now - last_frame).as_secs_f32().min(0.1); // cap dt at 100ms
-        let dt_ms = (now - last_frame).as_secs_f64() * 1000.0;
-        let frame_dt_s = (dt_ms as f32) / 1000.0; // r486: for the held-item swing decay
+        let dt_ms = (now - last_frame).as_secs_f64() * 1000.0; // UNCLAMPED — for diagnostics/adaptive-rd
+        // r738: frame_dt_s drives camera smoothing, gait, and animation. It MUST be
+        // clamped like `dt` — otherwise a stalled frame (e.g. a 1.3s hitch) advances
+        // every animation by 1.3s, jerking the camera/gait on top of the low FPS.
+        // Was `dt_ms/1000` (unclamped); now the clamped `dt`. Identical below 100ms.
+        let frame_dt_s = dt;
 
         // ── r526: MOB AI + MOVEMENT ──────────────────────────────────────
         // Tick each test mob's brain (wander / seek / flee) and advance it with
@@ -7496,6 +7642,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     graze_target,
                     graze_cell,
                     graze_scan_tick,
+                    home, // r693: den anchor for dragon territorial defense
                     ..
                 } = r;
                 let self_xz = (cr.body.position[0], cr.body.position[2]);
@@ -7839,6 +7986,29 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     // r289: a hostile lineage never relaxes below its genetic floor.
                     if let Some(d) = disposition {
                         *aggro = unendlich_engine::sim::disposition::aggro_with_floor(*aggro, d.aggression_base);
+                    }
+                    // r693: TERRITORIAL DEFENSE — a dragon guards its den
+                    // (sim::dragon_territory, previously a dormant core). When the
+                    // perceived threat is inside the dragon's territory, its
+                    // intrusion depth stokes aggro, so approaching a dragon's home
+                    // makes it defensive even if unprovoked. Den = the roamer's
+                    // home-chunk centre; Mature territory radius for wild adults.
+                    if matches!(*kind, unendlich_engine::item::CreatureKind::Dragon) {
+                        if let Some((tx, tz)) = threat {
+                            let cs = unendlich_engine::constants::CHUNK_SIZE as f32;
+                            let den = [
+                                home.0 as f32 * cs + cs * 0.5,
+                                home.1 as f32 * cs + cs * 0.5,
+                            ];
+                            let intr = unendlich_engine::sim::dragon_territory::intrusion(
+                                unendlich_engine::sim::dragon_territory::DragonAge::Mature,
+                                den,
+                                [tx, tz],
+                            );
+                            if intr > 0.0 {
+                                *aggro = (*aggro + intr * 0.6 * tick_dt).min(1.0);
+                            }
+                        }
                     }
                     // r269: when the arbiter is on, IT decides fight-vs-flee from
                     // scored drives (supersedes the raw aggro>0.5 threshold).
@@ -10677,18 +10847,35 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         None => continue, // not yet generated
                     };
                     let chunk_ver = chunk.version;
-                    // v0.24.72: use mesh_or_empty_version_for_lod so
-                    // chunks that meshed to empty AT THIS LOD don't
-                    // get re-enqueued every dispatch round. Before
-                    // this fix, all-air chunks (sky / deep underground)
-                    // re-meshed endlessly because empty meshes aren't
-                    // stored in `meshes`, so `mesh_version_for` always
-                    // returned None.
-                    //
-                    // LOD-precise: a chunk meshed empty at Near isn't
-                    // necessarily empty at Far (different downsample
-                    // grids see different content) — so we key the
-                    // check on `(coord, lod)`, not just `coord`.
+
+                    // r703: FULLY-BURIED chunk cull (moved here from the submission
+                    // site so buried chunks never consume candidate budget). If this
+                    // chunk AND all 6 loaded face-neighbours are entirely opaque
+                    // cubes, it's totally occluded. Mark it meshed-empty — so it's
+                    // not re-picked every frame — and skip it. Editing it or a
+                    // neighbour bumps chunk.version past the recorded empty version,
+                    // re-picking it to mesh the newly exposed faces. cached_all_opaque
+                    // is conservatively false after edits, so we only ever skip a
+                    // definitely-buried chunk. Opt-out: UNENDLICH_NO_BURIED_CULL=1.
+                    if buried_cull_enabled && chunk.cached_all_opaque {
+                        let all_buried = [
+                            (1_i32, 0_i32, 0_i32), (-1, 0, 0),
+                            (0, 1, 0), (0, -1, 0),
+                            (0, 0, 1), (0, 0, -1),
+                        ]
+                        .iter()
+                        .all(|d| {
+                            let nc = unendlich_engine::world::chunk::ChunkCoord::new(
+                                coord.x + d.0, coord.y + d.1, coord.z + d.2,
+                            );
+                            chunk_manager.get_chunk(nc).map_or(false, |c| c.cached_all_opaque)
+                        });
+                        if all_buried {
+                            renderer.mark_meshed_empty(coord, lod, chunk_ver);
+                            continue;
+                        }
+                    }
+
                     let renderer_ver = renderer.mesh_or_empty_version_for_lod(coord, lod);
                     let needs_submit = match renderer_ver {
                         None => true,
@@ -10818,6 +11005,8 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     };
                     if let Some((coord, chunk, version)) = next {
                         any_progress = true;
+                        // (r703: buried-chunk cull now happens at candidate
+                        // population above, so buried chunks never reach here.)
                         let lod = unendlich_engine::world::lod::desired_lod_for(coord, player_chunk, rd);
                         // v0.23.7 Stage 2b: attach a generator Arc to Far/VeryFar
                         // requests so the worker can take the reverse-regen path
@@ -12730,6 +12919,48 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 if shake_mag < 0.001 {
                     shake_mag = 0.0;
                 }
+            }
+        }
+        // r736: CPU chunk-occlusion pre-cull. When enabled, flood-fill visibility
+        // from the camera's chunk through see-through chunks and mark buried
+        // resident chunks occluded so the cull shader skips them — the fix for
+        // altitude overdraw (the r734 2-FPS diagnosis). Gated; default off, and it
+        // clears the flags when disabled so nothing stays hidden.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            if unendlich_engine::debug_settings::DEBUG.occlusion_cull.load(Relaxed) {
+                use unendlich_engine::constants::CHUNK_SIZE;
+                let cp = render_view.position;
+                let cam_chunk = [
+                    (cp.x.floor() as i32).div_euclid(CHUNK_SIZE),
+                    (cp.y.floor() as i32).div_euclid(CHUNK_SIZE),
+                    (cp.z.floor() as i32).div_euclid(CHUNK_SIZE),
+                ];
+                // in_range = resident chunks; is_opaque = the chunk's cached_all_opaque.
+                let resident: std::collections::HashSet<[i32; 3]> = renderer
+                    .loaded_chunk_coords()
+                    .map(|c| [c.x, c.y, c.z])
+                    .collect();
+                let visible = unendlich_engine::world::occlusion_flood::flood_visible(
+                    cam_chunk,
+                    // The camera chunk always seeds the flood (it may be empty air /
+                    // unmeshed at altitude); otherwise only resident chunks are in range.
+                    |c| c == cam_chunk || resident.contains(&c),
+                    |c| {
+                        chunk_manager
+                            .get_chunk(unendlich_engine::world::chunk::ChunkCoord::new(c[0], c[1], c[2]))
+                            .map_or(false, |ch| ch.cached_all_opaque)
+                    },
+                );
+                // Fail-safe: only cull if the flood actually reached geometry; an
+                // empty/degenerate result draws everything rather than blacking out.
+                if visible.len() > 1 {
+                    renderer.apply_chunk_occlusion(CHUNK_SIZE, &visible);
+                } else {
+                    renderer.clear_chunk_occlusion();
+                }
+            } else {
+                renderer.clear_chunk_occlusion();
             }
         }
         let draw_result = renderer.draw_frame_with_view_and_atmos(

@@ -411,9 +411,14 @@ impl WorldGenerator {
         // (generator is Sync, no interior mutability); map to per-column
         // solid index lists in parallel, scatter serially (distinct
         // indices; order-free). Deterministic: identical per-column math.
-        {
+        // r737/r739: per-column solidity as a u32 BITMASK (bit ly = solid), not a
+        // heap Vec<usize> per column — drops 1024 inner Vec allocations per chunk to
+        // zero (CHUNK_SIZE==32 fits a u32 exactly). Bit-identical scatter (see
+        // bitmask_scatter_matches_index_list). r739: the mask now OUTLIVES phase 1 so
+        // the phase-2 surface walk reads solidity straight from it.
+        let col_masks: Vec<u32> = {
             use rayon::prelude::*;
-            let solids: Vec<Vec<usize>> = (0..(CHUNK_SIZE * CHUNK_SIZE))
+            (0..(CHUNK_SIZE * CHUNK_SIZE))
                 .into_par_iter()
                 .map(|ci| {
                     let lz = ci / CHUNK_SIZE;
@@ -422,7 +427,7 @@ impl WorldGenerator {
                     let wx = origin_x + lx;
                     let surface_target =
                         self.model.surface_target(wx as f64, wz as f64, 0.0);
-                    let mut v = Vec::new();
+                    let mut mask = 0u32;
                     for ly in 0..CHUNK_SIZE {
                         let wy = origin_y + ly;
                         let solid = self.model.density_from_surface(
@@ -430,16 +435,21 @@ impl WorldGenerator {
                                     ) > anchors::DENSITY_THRESHOLD
                                     && !self.is_cave(wx, wy, wz);
                         if solid {
-                            v.push(Chunk::block_index(lx, ly, lz));
+                            mask |= 1u32 << ly;
                         }
                     }
-                    v
+                    mask
                 })
-                .collect();
-            for col in solids {
-                for idx in col {
-                    blocks[idx] = BlockId::Stone;
-                }
+                .collect()
+        };
+        for ci in 0..(CHUNK_SIZE * CHUNK_SIZE) {
+            let lz = ci / CHUNK_SIZE;
+            let lx = ci % CHUNK_SIZE;
+            let mut mask = col_masks[ci as usize];
+            while mask != 0 {
+                let ly = mask.trailing_zeros() as i32;
+                blocks[Chunk::block_index(lx, ly, lz)] = BlockId::Stone;
+                mask &= mask - 1; // clear lowest set bit
             }
         }
 
@@ -452,14 +462,22 @@ impl WorldGenerator {
             for lx in 0..CHUNK_SIZE {
                 let wx = origin_x + lx;
                 let sample = self.biome_at_3d(wx, origin_y, wz);
+                // r739: solidity from the phase-1 bitmask instead of re-reading
+                // `blocks`. Valid because phase 1 is the only writer before here and
+                // phase 2 only RECOLOURS already-solid cells (solidity unchanged), so
+                // `(col_mask >> ly) & 1` == `blocks[idx].is_solid()` for every in-chunk
+                // cell. The top-of-chunk `above` sample still re-evaluates density
+                // since it looks outside the chunk (not covered by the mask).
+                let col_mask = col_masks[(lz * CHUNK_SIZE + lx) as usize];
+                let col_solid = |ly: i32| (col_mask >> ly) & 1 != 0;
 
                 for ly in (0..CHUNK_SIZE).rev() {
                     let wy = origin_y + ly;
                     let here_idx = Chunk::block_index(lx, ly, lz);
-                    if !blocks[here_idx].is_solid() { continue; }
+                    if !col_solid(ly) { continue; }
 
                     let above_solid = if ly + 1 < CHUNK_SIZE {
-                        blocks[Chunk::block_index(lx, ly + 1, lz)].is_solid()
+                        col_solid(ly + 1)
                     } else {
                         let wy_above = origin_y + ly + 1;
                         self.density(wx, wy_above, wz) > anchors::DENSITY_THRESHOLD
@@ -472,7 +490,7 @@ impl WorldGenerator {
                             if ly < d { break; }
                             let sub_ly = ly - d;
                             let sub_idx = Chunk::block_index(lx, sub_ly, lz);
-                            if blocks[sub_idx].is_solid() {
+                            if col_solid(sub_ly) {
                                 let sub_wy = origin_y + sub_ly;
                                 blocks[sub_idx] = self.pick_subsurface_block(sample.biome, wx, sub_wy, wz);
                             } else {

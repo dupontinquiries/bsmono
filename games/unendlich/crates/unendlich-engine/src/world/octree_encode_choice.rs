@@ -108,6 +108,92 @@ impl PaletteRle {
 }
 
 // ---------------------------------------------------------------------------
+// Bit-packed palette (fallback for noisy chunks where RLE runs explode)
+// ---------------------------------------------------------------------------
+
+/// A dense chunk encoded as a palette plus fixed-width bit-packed indices (no run
+/// overhead). For noisy chunks — many distinct blocks, short runs — this beats
+/// palette+RLE, which pays 6 bytes per run. Cost is `ceil(log2(palette))` bits per
+/// voxel, so it is never larger than the raw `u8` slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PalettePacked {
+    /// Distinct block ids, first-seen order (≤256, so index fits a byte).
+    pub palette: Vec<u8>,
+    /// Bits per voxel index (1..=8).
+    pub bits: u8,
+    /// Bit-packed indices, LSB-first, `volume` entries of `bits` bits each.
+    pub packed: Vec<u8>,
+    pub volume: u32,
+}
+
+fn bits_for(palette_len: usize) -> u8 {
+    if palette_len <= 1 {
+        return 1;
+    }
+    let mut b = 0u8;
+    let mut cap = 1usize;
+    while cap < palette_len {
+        cap <<= 1;
+        b += 1;
+    }
+    b.max(1)
+}
+
+impl PalettePacked {
+    /// Encode a linear block-id slice (len == volume). Pure, deterministic.
+    pub fn encode(blocks: &[u8]) -> Self {
+        let mut palette: Vec<u8> = Vec::new();
+        let mut indices: Vec<u8> = Vec::with_capacity(blocks.len());
+        for &b in blocks {
+            let idx = match palette.iter().position(|&p| p == b) {
+                Some(i) => i,
+                None => {
+                    palette.push(b);
+                    palette.len() - 1
+                }
+            };
+            indices.push(idx as u8);
+        }
+        let bits = bits_for(palette.len());
+        let total_bits = indices.len() * bits as usize;
+        let mut packed = vec![0u8; total_bits.div_ceil(8)];
+        let mut bit = 0usize;
+        for &idx in &indices {
+            for k in 0..bits {
+                if (idx >> k) & 1 != 0 {
+                    packed[bit >> 3] |= 1 << (bit & 7);
+                }
+                bit += 1;
+            }
+        }
+        PalettePacked { palette, bits, packed, volume: blocks.len() as u32 }
+    }
+
+    /// Decode back to a linear block-id Vec of length `volume`.
+    pub fn decode(&self) -> Vec<u8> {
+        let vol = self.volume as usize;
+        let mut out = Vec::with_capacity(vol);
+        let bits = self.bits as usize;
+        for i in 0..vol {
+            let mut idx = 0u16;
+            for k in 0..bits {
+                let bit = i * bits + k;
+                if (self.packed[bit >> 3] >> (bit & 7)) & 1 != 0 {
+                    idx |= 1 << k;
+                }
+            }
+            out.push(self.palette.get(idx as usize).copied().unwrap_or(0));
+        }
+        out
+    }
+
+    /// Estimated serialized byte size: 8 header + palette + packed bytes.
+    pub fn byte_size(&self) -> usize {
+        8 + self.palette.len() + self.packed.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Chooser
 // ---------------------------------------------------------------------------
 
@@ -120,6 +206,8 @@ pub enum ChunkRepr {
     Sparse { node_count: usize, blocks: Vec<u8> },
     /// Dense palette+RLE won (heterogeneous).
     Dense(PaletteRle),
+    /// Bit-packed palette won (noisy: many short runs).
+    Packed(PalettePacked),
 }
 
 /// Decision result + both candidate sizes, so callers can log the perf ratio.
@@ -140,6 +228,7 @@ impl ChooseResult {
         match &self.repr {
             ChunkRepr::Sparse { node_count, .. } => node_count * OCTREE_NODE_BYTES,
             ChunkRepr::Dense(p) => p.byte_size(),
+            ChunkRepr::Packed(p) => p.byte_size(),
         }
     }
 }
@@ -153,10 +242,17 @@ pub fn choose(blocks: &[u8], sparse_node_count: usize) -> ChooseResult {
     let sparse_bytes = sparse_node_count * OCTREE_NODE_BYTES;
     let dense = PaletteRle::encode(blocks);
     let dense_bytes = dense.byte_size();
-    let repr = if dense_bytes < sparse_bytes {
+    let packed = PalettePacked::encode(blocks);
+    let packed_bytes = packed.byte_size();
+    // Pick the smallest of the three encodings. Ties prefer sparse, then dense,
+    // then packed (cheapest to decode first), matching the prior 2-way behaviour
+    // when packed doesn't win.
+    let repr = if sparse_bytes <= dense_bytes && sparse_bytes <= packed_bytes {
+        ChunkRepr::Sparse { node_count: sparse_node_count, blocks: blocks.to_vec() }
+    } else if dense_bytes <= packed_bytes {
         ChunkRepr::Dense(dense)
     } else {
-        ChunkRepr::Sparse { node_count: sparse_node_count, blocks: blocks.to_vec() }
+        ChunkRepr::Packed(packed)
     };
     ChooseResult { repr, sparse_bytes, dense_bytes }
 }
@@ -171,6 +267,7 @@ impl ChunkRepr {
                 b
             }
             ChunkRepr::Dense(p) => p.decode(volume),
+            ChunkRepr::Packed(p) => p.decode(),
         }
     }
 }
@@ -270,5 +367,46 @@ mod tests {
     fn empty_palette_decode_safe() {
         let p = PaletteRle { palette: vec![], runs: vec![] };
         assert_eq!(p.decode(VOL).len(), VOL);
+    }
+
+    #[test]
+    fn packed_round_trips_exactly() {
+        // A few distinct blocks in an arbitrary noisy pattern.
+        let blocks: Vec<u8> = (0..VOL).map(|i| ((i * 7 + 3) % 11) as u8).collect();
+        let p = PalettePacked::encode(&blocks);
+        assert_eq!(p.decode(), blocks, "bit-packed decode must reproduce the input");
+        // 11 distinct → 4 bits each.
+        assert_eq!(p.bits, 4);
+        assert_eq!(p.palette.len(), 11);
+    }
+
+    #[test]
+    fn packed_wins_on_noisy_chunks() {
+        // Noisy: alternating among 8 blocks → RLE runs are all length 1 (huge),
+        // but packed is a flat 3 bits/voxel.
+        let blocks: Vec<u8> = (0..VOL).map(|i| (i % 8) as u8).collect();
+        let rle = PaletteRle::encode(&blocks).byte_size();
+        let packed = PalettePacked::encode(&blocks).byte_size();
+        assert!(packed < rle, "packed {packed} should beat RLE {rle} on noise");
+        // And the chooser actually picks it (with a large sparse count so it loses).
+        let res = choose(&blocks, 100_000);
+        assert!(matches!(res.repr, ChunkRepr::Packed(_)), "chooser should pick Packed");
+        assert_eq!(res.repr.to_blocks(VOL), blocks, "chosen repr round-trips");
+    }
+
+    #[test]
+    fn packed_never_worse_than_raw() {
+        // Even worst case (every voxel distinct up to 256) stays ≤ raw + header.
+        let blocks: Vec<u8> = (0..VOL).map(|i| (i % 256) as u8).collect();
+        let p = PalettePacked::encode(&blocks);
+        assert!(p.byte_size() <= VOL + 8 + p.palette.len());
+    }
+
+    #[test]
+    fn uniform_still_prefers_a_compact_repr_over_packed() {
+        // A single-block chunk: RLE is 1 run (tiny) and must win over packed.
+        let blocks = vec![5u8; VOL];
+        let res = choose(&blocks, 100_000);
+        assert!(!matches!(res.repr, ChunkRepr::Packed(_)), "packed shouldn't win uniform");
     }
 }

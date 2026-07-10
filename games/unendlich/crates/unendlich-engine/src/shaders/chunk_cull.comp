@@ -33,6 +33,7 @@
 layout(local_size_x = 64) in;
 
 const uint FLAG_DEBUG_OVERLAY = 1u; // bit 0 = skip cull, always emit
+const uint FLAG_OCCLUDED      = 2u; // bit 1 = CPU occlusion pre-cull hid this chunk (r736)
 
 // ---- Chunk metadata (input) ----------------------------------------------
 
@@ -170,7 +171,11 @@ void main() {
         bool stride_ok = (pc.stride <= 1u) || ((i % pc.stride) == pc.stride_phase);
         if (stride_ok) {
             bool always_emit = (c.flags & FLAG_DEBUG_OVERLAY) != 0u;
-            emit = always_emit || aabb_visible(c.aabb_min.xyz, c.aabb_max.xyz);
+            // r736: a chunk the CPU occlusion pre-cull marked as buried does not
+            // emit (unless it's a debug-overlay chunk). When occlusion culling is
+            // off the flag is never set, so this is identical to the prior behaviour.
+            bool occluded = (c.flags & FLAG_OCCLUDED) != 0u;
+            emit = always_emit || (aabb_visible(c.aabb_min.xyz, c.aabb_max.xyz) && !occluded);
         }
     }
 

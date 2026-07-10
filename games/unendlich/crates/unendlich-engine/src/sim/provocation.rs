@@ -66,11 +66,14 @@ pub struct Provocable {
     pub temperament: Temperament,
     /// Time until which the animal stays committed after provocation (0 = calm).
     provoked_until: f32,
+    /// r716: time until which a prior *warning* still counts — a repeat defensive
+    /// offense inside this window escalates a bluff to a real attack.
+    warned_until: f32,
 }
 
 impl Provocable {
     pub fn new(temperament: Temperament) -> Provocable {
-        Provocable { temperament, provoked_until: 0.0 }
+        Provocable { temperament, provoked_until: 0.0, warned_until: 0.0 }
     }
 
     /// Is the animal still in its post-provocation aggressive window?
@@ -101,6 +104,67 @@ impl Provocable {
                     Response::Attack
                 } else if t.too_close {
                     // proximity alone is a warning, not an attack
+                    Response::Warn
+                } else {
+                    Response::Ignore
+                }
+            }
+            Temperament::Hostile => {
+                if t.detected || t.too_close || t.attacked {
+                    self.provoked_until = now + hold.max(0.0);
+                    Response::Attack
+                } else {
+                    Response::Ignore
+                }
+            }
+        }
+    }
+
+    /// r716: two-strike defensive escalation — the doc's "bluff charge, then full
+    /// charge." A NEUTRAL animal provoked by a *defensive* trigger (young in
+    /// danger, resource contested, or cornered) issues ONE warning (a roar / bluff
+    /// charge that stops short); a repeat offense within `warn_grace` seconds
+    /// escalates to a committed attack. Direct damage (`attacked`) always skips the
+    /// bluff. Passive and Hostile animals behave exactly as in [`update`].
+    pub fn update_escalating(
+        &mut self,
+        t: &Triggers,
+        now: f32,
+        hold: f32,
+        warn_grace: f32,
+    ) -> Response {
+        if self.temperament != Temperament::Passive && self.is_provoked(now) {
+            return Response::Attack;
+        }
+        match self.temperament {
+            Temperament::Passive => {
+                if t.attacked || t.too_close {
+                    Response::Flee
+                } else {
+                    Response::Ignore
+                }
+            }
+            Temperament::Neutral => {
+                // Direct damage: commit immediately, no bluff.
+                if t.attacked {
+                    self.provoked_until = now + hold.max(0.0);
+                    return Response::Attack;
+                }
+                let defensive = t.between_and_young || t.cornered || t.resource_contested;
+                if defensive {
+                    if now < self.warned_until {
+                        // Second offense while the warning still stands → full attack.
+                        self.provoked_until = now + hold.max(0.0);
+                        self.warned_until = 0.0;
+                        Response::Attack
+                    } else {
+                        // First offense → a single warning (bluff charge), and open
+                        // the grace window during which a repeat escalates.
+                        self.warned_until = now + warn_grace.max(0.0);
+                        Response::Warn
+                    }
+                } else if t.too_close {
+                    // Plain proximity is a warning but never escalates on its own.
                     Response::Warn
                 } else {
                     Response::Ignore
@@ -197,5 +261,41 @@ mod tests {
         let t = Triggers { between_and_young: true, ..trig() };
         assert_eq!(a.update(&t, 0.0, 5.0), b.update(&t, 0.0, 5.0));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn escalation_warns_then_attacks_on_repeat() {
+        let mut bear = Provocable::new(Temperament::Neutral);
+        let cub = Triggers { between_and_young: true, ..trig() };
+        // First offense near cubs → a warning (bluff charge), not an attack.
+        assert_eq!(bear.update_escalating(&cub, 0.0, 5.0, 3.0), Response::Warn);
+        // Repeat offense inside the 3s grace → full attack.
+        assert_eq!(bear.update_escalating(&cub, 1.0, 5.0, 3.0), Response::Attack);
+    }
+
+    #[test]
+    fn escalation_resets_after_grace_expires() {
+        let mut moose = Provocable::new(Temperament::Neutral);
+        let res = Triggers { resource_contested: true, ..trig() };
+        assert_eq!(moose.update_escalating(&res, 0.0, 2.0, 3.0), Response::Warn);
+        // Let the whole provoked+grace window pass, then a fresh approach → warn again.
+        assert_eq!(moose.update_escalating(&res, 10.0, 2.0, 3.0), Response::Warn);
+    }
+
+    #[test]
+    fn escalation_direct_attack_skips_the_bluff() {
+        let mut boar = Provocable::new(Temperament::Neutral);
+        let hit = Triggers { attacked: true, ..trig() };
+        // Being struck is immediate commitment — no courtesy warning.
+        assert_eq!(boar.update_escalating(&hit, 0.0, 5.0, 3.0), Response::Attack);
+    }
+
+    #[test]
+    fn escalation_plain_proximity_only_warns() {
+        let mut deer = Provocable::new(Temperament::Neutral);
+        let near = Triggers { too_close: true, ..trig() };
+        // Proximity without a defensive trigger warns but never escalates.
+        assert_eq!(deer.update_escalating(&near, 0.0, 5.0, 3.0), Response::Warn);
+        assert_eq!(deer.update_escalating(&near, 1.0, 5.0, 3.0), Response::Warn);
     }
 }

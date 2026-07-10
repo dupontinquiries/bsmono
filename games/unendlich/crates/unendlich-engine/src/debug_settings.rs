@@ -35,6 +35,16 @@ pub struct DebugSettings {
     // ── Render toggles ─────────────────────────────────────────────────────
     pub disable_fog: AtomicBool,
     pub no_cull: AtomicBool,
+    /// r726: CPU chunk-occlusion flood cull (world::occlusion_flood). OFF by
+    /// default — an experimental cull whose failure mode is vanishing terrain, so
+    /// the operator opts in via UNENDLICH_OCCLUSION_CULL=1 or the F3 toggle.
+    pub occlusion_cull: AtomicBool,
+    /// r727: adaptive render distance (world::adaptive_stream::RenderDistanceController).
+    /// OFF by default; when on, RD auto-shrinks under frame-time pressure and
+    /// regrows with headroom. UNENDLICH_ADAPTIVE_RD=1 or F3 toggle.
+    pub adaptive_rd: AtomicBool,
+    /// r733: SIMD front-end sphere-vs-frustum pre-cull (world::simd_cull). Opt-in.
+    pub simd_precull: AtomicBool,
     pub disable_ssr: AtomicBool,
     pub disable_bloom: AtomicBool,
     pub disable_shadows: AtomicBool,
@@ -78,6 +88,9 @@ impl DebugSettings {
             request_quit: AtomicBool::new(false),
             disable_fog: AtomicBool::new(false),
             no_cull: AtomicBool::new(false),
+            occlusion_cull: AtomicBool::new(false), // r726: opt-in
+            adaptive_rd: AtomicBool::new(false), // r727: opt-in
+            simd_precull: AtomicBool::new(false), // r733: opt-in
             disable_ssr: AtomicBool::new(false),
             disable_bloom: AtomicBool::new(false),
             disable_shadows: AtomicBool::new(false),

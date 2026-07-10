@@ -235,6 +235,12 @@ pub struct Chunk {
     ///
     /// Not persisted: recomputed in from_blocks() at chunk load.
     pub cached_all_air: bool,
+    /// r702: true iff EVERY block is a full opaque cube (`is_opaque_occluder`).
+    /// A fully-opaque chunk whose 6 face-neighbours are also fully opaque is
+    /// completely occluded and can skip meshing. Conservatively false after edits
+    /// (never recovered to true without a rescan), so it can only ever cause a
+    /// missed skip — never a wrongly-skipped visible chunk. Recomputed at load.
+    pub cached_all_opaque: bool,
 }
 
 /// Per-block-instance mutable state. Compact (currently 2 bytes) and
@@ -431,6 +437,8 @@ impl Chunk {
             structural_dirty: true,
             // v0.24.72: empty chunk = all air by definition.
             cached_all_air: true,
+            // r702: all-air is the opposite of all-opaque.
+            cached_all_opaque: false,
         }
     }
 
@@ -450,6 +458,7 @@ impl Chunk {
         // v0.24.72: compute cached_all_air in the same single pass —
         // free since we're already walking blocks.
         let mut all_air = true;
+        let mut all_opaque = true; // r702
         for (i, b) in blocks.iter().enumerate() {
             if b.has_subvoxels() {
                 plant_indices.insert(i as u16);
@@ -459,6 +468,9 @@ impl Chunk {
             }
             if !b.is_air() {
                 all_air = false;
+            }
+            if !b.is_opaque_occluder() {
+                all_opaque = false;
             }
         }
         Self {
@@ -482,6 +494,8 @@ impl Chunk {
             // v0.24.72: computed in the scan above. Air-only chunks
             // (sky, deep underground) get the mesher fast-path.
             cached_all_air: all_air,
+            // r702: computed in the same scan — feeds the fully-buried skip.
+            cached_all_opaque: all_opaque,
         }
     }
 
@@ -512,7 +526,19 @@ impl Chunk {
     /// direct mutation, OR migrate to `set()` which handles the cache
     /// automatically.
     pub fn recompute_cached_all_air(&mut self) {
-        self.cached_all_air = self.blocks.iter().all(|b| b.is_air());
+        // r702: refresh both cached flags in one pass (both are O(CHUNK_VOLUME)).
+        let mut all_air = true;
+        let mut all_opaque = true;
+        for b in self.blocks.iter() {
+            if !b.is_air() {
+                all_air = false;
+            }
+            if !b.is_opaque_occluder() {
+                all_opaque = false;
+            }
+        }
+        self.cached_all_air = all_air;
+        self.cached_all_opaque = all_opaque;
     }
 
     /// Was this block explicitly set (player edit, simulation, etc.) or is
@@ -547,6 +573,14 @@ impl Chunk {
             // strictly invalidate here.
             if !block.is_air() {
                 self.cached_all_air = false;
+            }
+            // r702: invalidate the all-opaque cache when a non-opaque block
+            // (air, glass, plant, fluid) is placed. Conservatively left false
+            // otherwise (no recover-to-true rescan) — the buried skip then just
+            // meshes the chunk normally. A false NEGATIVE here is safe (missed
+            // skip); a false positive would punch a hole, so we only clear.
+            if !block.is_opaque_occluder() {
+                self.cached_all_opaque = false;
             }
 
             // Maintain the plant inverted index: if the block-type

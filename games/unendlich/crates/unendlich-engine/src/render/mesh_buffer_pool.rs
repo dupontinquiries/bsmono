@@ -267,6 +267,34 @@ fn mesh_defer_budget_bytes() -> u64 {
         .unwrap_or(1 << 20)
 }
 
+/// r730: opt-in coalescing of contiguous buffer-copy regions in the mesh upload
+/// flush (UNENDLICH_COPY_COALESCE=1). Off by default so the recorded copies are
+/// bit-for-bit identical to prior builds.
+fn copy_coalesce_enabled() -> bool {
+    std::env::var("UNENDLICH_COPY_COALESCE").as_deref() == Ok("1")
+}
+
+/// Coalesce a vector of `vk::BufferCopy` in place via the pure
+/// [`crate::render::copy_coalesce`] core. Byte-identical: only merges runs that
+/// are contiguous in both src and dst.
+fn coalesce_vk_copies(copies: &mut Vec<vk::BufferCopy>) {
+    use crate::render::copy_coalesce::{coalesced, CopyRegion};
+    if copies.len() <= 1 {
+        return;
+    }
+    let regions: Vec<CopyRegion> = copies
+        .iter()
+        .map(|c| CopyRegion { src: c.src_offset, dst: c.dst_offset, size: c.size })
+        .collect();
+    let merged = coalesced(&regions);
+    if merged.len() < copies.len() {
+        *copies = merged
+            .into_iter()
+            .map(|r| vk::BufferCopy { src_offset: r.src, dst_offset: r.dst, size: r.size })
+            .collect();
+    }
+}
+
 /// Pure budget-split for the deferrable copy lane: given copy `sizes` (in
 /// order) and a `budget`, with `already_spent` bytes consumed earlier this
 /// frame, return how many leading copies to drain now. The remainder carries
@@ -406,8 +434,25 @@ impl VulkanMeshPool {
         // write vs GPU read. On discrete-VRAM GPUs the win is larger
         // (separate VRAM transfer). Either way the protocol is the
         // architecturally correct one.
-        let device_local_enabled = std::env::var("UNENDLICH_DEVICE_LOCAL_MESH")
+        // r707: ReBAR strictly dominates the DEVICE_LOCAL-staging path — it gives
+        // device-local read speed AND a persistent host map AND zero copies. So when
+        // ReBAR memory is available (and not opted out via UNENDLICH_NO_REBAR), use
+        // the direct `create_persistent_buffer` (ReBAR) path for the vertex/index
+        // buffers REGARDLESS of UNENDLICH_DEVICE_LOCAL_MESH. This removes the footgun
+        // where the staging copy-stall was silently re-enabled (the flag defaults ON,
+        // so only an explicit `=0` used to reach ReBAR). Staging remains the fallback
+        // only when ReBAR is unavailable.
+        let device_local_requested = std::env::var("UNENDLICH_DEVICE_LOCAL_MESH")
             .ok().as_deref() != Some("0"); // R27: default ON
+        let rebar_ok = std::env::var("UNENDLICH_NO_REBAR").is_err()
+            && rebar_available(instance, physical_device);
+        if rebar_ok && device_local_requested {
+            log::info!(
+                "mesh_pool: ReBAR available — using zero-copy direct mesh buffers, \
+                 ignoring UNENDLICH_DEVICE_LOCAL_MESH (ReBAR supersedes staging)"
+            );
+        }
+        let device_local_enabled = device_local_requested && !rebar_ok;
 
         if device_local_enabled {
             log::info!(
@@ -686,6 +731,16 @@ impl VulkanMeshPool {
             return;
         }
 
+        // r730: coalesce contiguous copy regions before recording. Merges only runs
+        // that are contiguous in BOTH staging (src) and device (dst) space, so the
+        // bytes transferred and the written dst range (hence the barrier scope
+        // below) are identical — just fewer regions for the driver to set up. Gated
+        // (UNENDLICH_COPY_COALESCE=1) so the default path is bit-for-bit unchanged.
+        if copy_coalesce_enabled() {
+            coalesce_vk_copies(&mut s.pending_vert_copies);
+            coalesce_vk_copies(&mut s.pending_idx_copies);
+        }
+
         // Record copies. vkCmdCopyBuffer takes a slice of regions; we
         // can pass all pending copies in one call per buffer.
         if !s.pending_vert_copies.is_empty() {
@@ -847,6 +902,21 @@ impl VulkanMeshPool {
     }
 }
 
+/// r707: is there a memory type exposing DEVICE_LOCAL | HOST_VISIBLE |
+/// HOST_COHERENT (ReBAR / Resizable BAR, or unified-memory iGPUs)? If so the mesh
+/// vertex/index buffers can be zero-copy device-local and the staging path is
+/// pure overhead. Coarse probe over the physical device's memory types; if it says
+/// yes, `create_persistent_buffer`'s per-buffer selection will use it (and still
+/// falls back safely if a specific buffer's `memory_type_bits` excludes it).
+fn rebar_available(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let want = vk::MemoryPropertyFlags::DEVICE_LOCAL
+        | vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT;
+    (0..props.memory_type_count)
+        .any(|i| props.memory_types[i as usize].property_flags.contains(want))
+}
+
 unsafe fn create_persistent_buffer(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -864,26 +934,58 @@ unsafe fn create_persistent_buffer(
     let req = device.get_buffer_memory_requirements(buffer);
     let props = instance.get_physical_device_memory_properties(physical_device);
 
-    let mut chosen = None;
-    for i in 0..props.memory_type_count {
-        let mt = props.memory_types[i as usize];
-        if req.memory_type_bits & (1 << i) != 0
-            && mt.property_flags.contains(
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            )
-        {
-            chosen = Some(i);
-            break;
+    // r704: ReBAR / zero-copy memory preference. Prefer
+    // DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT: on Resizable-BAR systems and
+    // unified-memory iGPUs this is memory the CPU memcpys into directly AND the
+    // GPU reads at full device-local speed — no staging buffer, no vkCmdCopyBuffer,
+    // no barrier, no PCIe read penalty. That is the true zero-copy mesh upload:
+    // `write_at` lands the packed vertices straight in the buffer the shader
+    // fetches from. Falls back to plain HOST_VISIBLE | HOST_COHERENT when the ReBAR
+    // type is absent OR its allocation fails (e.g. the small BAR window on an older
+    // discrete GPU can't fit the buffer) — byte-for-byte the previous behaviour.
+    // Opt out with UNENDLICH_NO_REBAR=1.
+    let allow_rebar = std::env::var("UNENDLICH_NO_REBAR").is_err();
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let rebar = host | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let find_type = |required: vk::MemoryPropertyFlags| -> Option<u32> {
+        (0..props.memory_type_count).find(|&i| {
+            (req.memory_type_bits & (1u32 << i)) != 0
+                && props.memory_types[i as usize].property_flags.contains(required)
+        })
+    };
+    // Preference order: ReBAR (device-local + host-visible) first when allowed,
+    // then plain host-visible. Bound to a local (not a borrowed temporary) so the
+    // slice iterator below is valid.
+    let candidates = [(rebar, true, allow_rebar), (host, false, true)];
+    let mut memory = None;
+    let mut used_rebar = false;
+    for &(required, is_rebar, enabled) in candidates.iter() {
+        if !enabled {
+            continue;
+        }
+        if let Some(mt) = find_type(required) {
+            let alloc = vk::MemoryAllocateInfo::builder()
+                .allocation_size(req.size)
+                .memory_type_index(mt);
+            if let Ok(m) = device.allocate_memory(&alloc, None) {
+                memory = Some(m);
+                used_rebar = is_rebar;
+                break;
+            }
         }
     }
-    let mt = chosen.ok_or_else(||
-        MeshPoolError::Backend("No HOST_VISIBLE | HOST_COHERENT memory type".into()))?;
-
-    let alloc = vk::MemoryAllocateInfo::builder()
-        .allocation_size(req.size)
-        .memory_type_index(mt);
-    let memory = device.allocate_memory(&alloc, None)
-        .map_err(|e| MeshPoolError::Backend(format!("vkAllocateMemory: {:?}", e)))?;
+    let memory = memory.ok_or_else(||
+        MeshPoolError::Backend("No usable HOST_VISIBLE | HOST_COHERENT memory type".into()))?;
+    if used_rebar {
+        static ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::info!(
+                "mesh_pool: ReBAR zero-copy mesh memory ACTIVE (DEVICE_LOCAL | HOST_VISIBLE | \
+                 HOST_COHERENT) — write_at memcpys straight into device-local memory, no staging/copy \
+                 (UNENDLICH_NO_REBAR=1 to disable)"
+            );
+        }
+    }
     device.bind_buffer_memory(buffer, memory, 0)
         .map_err(|e| MeshPoolError::Backend(format!("vkBindBufferMemory: {:?}", e)))?;
 
