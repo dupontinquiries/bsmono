@@ -308,3 +308,221 @@ pub fn gate_http() {
     }
     println!("gate-http: {}", if framed && roundtrip { "transport framing checks \u{2713} (TLS connect = your boxes)" } else { "FAIL \u{2717}" });
 }
+
+// ───────────────────────── real TCP transport + server + workspace join ─────────────────────────
+// This is the "network later" the module was built toward: a plain-TCP `Connect` (the `HttpTransport`
+// rides the already-tested framing over it), a listener that serves a local `Worker` to peers, and a
+// `join` handshake so a box learns a peer's public models and drops it into the `Registry` — whose
+// `available_models()` is exactly what the pipeline model-select menu lists. TLS is one wrapper away
+// (swap `TcpStream` for a rustls stream behind the same `Connect`); a trusted LAN needs only this.
+use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+
+/// Plain-TCP `Connect` — the fabric's connection seam over a real socket.
+pub struct TcpConnect { pub addr: String }
+impl Connect for TcpConnect {
+    fn open(&self) -> std::io::Result<Box<dyn ReadWrite>> {
+        Ok(Box::new(TcpStream::connect(&self.addr)?))
+    }
+}
+
+/// A real network `Transport` to a peer's `/fabric/gen` endpoint.
+pub fn tcp_transport(addr: &str) -> HttpTransport<TcpConnect> {
+    HttpTransport { host: addr.to_string(), path: "/fabric/gen".into(), connect: TcpConnect { addr: addr.to_string() } }
+}
+
+/// Join handshake: `WorkerId` + the box's PUBLIC models, so a joiner can build a `RemoteWorker`.
+pub fn encode_hello(id: &WorkerId, models: &[ModelInfo]) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_str(&mut b, &id.device);
+    put_str(&mut b, &id.author);
+    put_u32(&mut b, models.len() as u32);
+    for m in models {
+        put_str(&mut b, &m.name);
+        put_u32(&mut b, m.public as u32);
+        put_f32(&mut b, m.params_b);
+    }
+    b
+}
+pub fn decode_hello(b: &[u8]) -> (WorkerId, Vec<ModelInfo>) {
+    let mut r = Rd { b, i: 0 };
+    let device = r.str();
+    let author = r.str();
+    let n = r.u32() as usize;
+    let mut models = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str();
+        let public = r.u32() != 0;
+        let params_b = r.f32();
+        models.push(ModelInfo { name, public, params_b });
+    }
+    (WorkerId { device, author }, models)
+}
+
+/// Read one HTTP/1.1 request off the socket → (path, body). Bounds the body by Content-Length (the
+/// client keeps its write side open, so we can't read-to-EOF for the request).
+fn read_http_request(s: &mut TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 2048];
+    let hdr_end = loop {
+        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") { break p + 4; }
+        let n = s.read(&mut tmp)?;
+        if n == 0 { return Ok((String::new(), Vec::new())); }
+        buf.extend_from_slice(&tmp[..n]);
+    };
+    let head = String::from_utf8_lossy(&buf[..hdr_end]).to_string();
+    let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("/").to_string();
+    let clen = head.lines().find_map(|l| {
+        let ll = l.to_ascii_lowercase();
+        ll.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+    }).unwrap_or(0);
+    let mut body = buf[hdr_end..].to_vec();
+    while body.len() < clen {
+        let n = s.read(&mut tmp)?;
+        if n == 0 { break; }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    body.truncate(clen);
+    Ok((path, body))
+}
+
+/// Serve one connection: hello → this box's public models; gen → run it on the local worker (only if
+/// the model is shared publicly — the private/public toggle is enforced at the network edge).
+fn handle_conn(mut s: TcpStream, worker: &dyn Worker) -> std::io::Result<()> {
+    let (path, body) = read_http_request(&mut s)?;
+    let resp_body = match path.as_str() {
+        "/fabric/hello" => {
+            let public: Vec<ModelInfo> = worker.models().iter().filter(|m| m.public).cloned().collect();
+            encode_hello(worker.id(), &public)
+        }
+        "/fabric/gen" => {
+            let (req, _files) = decode_request(&body);
+            if worker.serves_public(&req.model) {
+                match worker.generate(&req) { Some(r) => encode_result(&r), None => Vec::new() }
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", resp_body.len());
+    s.write_all(head.as_bytes())?;
+    s.write_all(&resp_body)?;
+    s.flush()
+}
+
+/// Host a workspace: accept connections and serve `worker` to peers. Blocks; run on a thread.
+pub fn serve(addr: &str, worker: Arc<dyn Worker + Send + Sync>) -> std::io::Result<()> {
+    serve_on(TcpListener::bind(addr)?, worker);
+    Ok(())
+}
+pub fn serve_on(listener: TcpListener, worker: Arc<dyn Worker + Send + Sync>) {
+    for stream in listener.incoming() {
+        if let Ok(s) = stream {
+            let w = Arc::clone(&worker);
+            std::thread::spawn(move || { let _ = handle_conn(s, &*w); });
+        }
+    }
+}
+
+/// Join a workspace at `addr`: handshake for its public models, return it as a `Worker` the rest of
+/// the fabric (and the model-select menu) treats like any other. `registry.add(Box::new(join(addr)?))`.
+pub fn join(addr: &str) -> std::io::Result<RemoteWorker<HttpTransport<TcpConnect>>> {
+    let mut s = TcpStream::connect(addr)?;
+    let resp = http_post(&mut s, addr, "/fabric/hello", &[])?;
+    let (id, models) = decode_hello(&resp);
+    Ok(RemoteWorker { id, models, transport: tcp_transport(addr) })
+}
+
+/// Self-test over real TCP loopback (no mock): host a workspace, join it, generate across the wire,
+/// confirm the joined box feeds the Registry/menu, and that a private model is refused over the wire.
+pub fn gate_tcp() {
+    use crate::fabric::{MockWorker, Registry};
+    let backend = Arc::new(MockWorker::new(
+        "studio-m2", "dustin",
+        &[("llama-1b", true, 1.0), ("smollm2", true, 0.4), ("deepseek-8b", false, 8.0)],
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    {
+        let w: Arc<dyn Worker + Send + Sync> = backend.clone();
+        std::thread::spawn(move || serve_on(listener, w));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    // join over real TCP — hello advertises public models, hides private
+    let remote = join(&addr).unwrap();
+    let names: Vec<&str> = remote.models().iter().map(|m| m.name.as_str()).collect();
+    let join_ok = names.contains(&"llama-1b") && names.contains(&"smollm2") && !names.contains(&"deepseek-8b");
+
+    // generate across the wire == the same local worker's output
+    let req = GenRequest { prefix: vec![1, 2, 3], model: "llama-1b".into(), max_new: 6, temperature: 0.8, seed: 9 };
+    let local = MockWorker::new("studio-m2", "dustin", &[("llama-1b", true, 1.0)]).generate(&req).unwrap();
+    let rgen = remote.generate(&req).unwrap();
+    let gen_ok = rgen.tokens == local.tokens && rgen.model == local.model && rgen.worker == local.worker;
+
+    // the joined box drops into the Registry → its public models feed the pipeline menu's `available`
+    let mut reg = Registry::new();
+    reg.add(Box::new(join(&addr).unwrap()));
+    let in_menu = reg.available_models().iter().any(|(n, _)| n == "llama-1b");
+
+    // a private model is refused over the wire even if asked directly
+    let priv_req = GenRequest { prefix: vec![1], model: "deepseek-8b".into(), max_new: 4, temperature: 0.8, seed: 1 };
+    let private_blocked = remote.generate(&priv_req).is_none();
+
+    for (label, ok) in [
+        ("join handshake advertises public (hides private)", join_ok),
+        ("generate over real TCP == local", gen_ok),
+        ("joined box feeds the Registry/model menu", in_menu),
+        ("private model refused over the wire", private_blocked),
+    ] {
+        println!("  [{}] {}", if ok { "\u{2713}" } else { "\u{2717} FAIL" }, label);
+    }
+    let all = join_ok && gen_ok && in_menu && private_blocked;
+    println!("gate-tcp: workspace join + serve over real TCP {}", if all { "\u{2713}" } else { "FAIL \u{2717}" });
+}
+
+#[cfg(test)]
+mod tcp_tests {
+    use super::*;
+    use crate::fabric::{MockWorker, Registry, Worker};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    #[test]
+    fn workspace_join_and_generate_over_real_tcp() {
+        let backend = Arc::new(MockWorker::new(
+            "studio-m2", "dustin",
+            &[("llama-1b", true, 1.0), ("smollm2", true, 0.4), ("deepseek-8b", false, 8.0)],
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        {
+            let w: Arc<dyn Worker + Send + Sync> = backend.clone();
+            std::thread::spawn(move || serve_on(listener, w));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // hello advertises public models only
+        let remote = join(&addr).unwrap();
+        let names: Vec<&str> = remote.models().iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"llama-1b") && names.contains(&"smollm2"));
+        assert!(!names.contains(&"deepseek-8b"), "private model leaked in the join handshake");
+
+        // generate across the wire == local
+        let req = GenRequest { prefix: vec![1, 2, 3], model: "llama-1b".into(), max_new: 6, temperature: 0.8, seed: 9 };
+        let local = MockWorker::new("studio-m2", "dustin", &[("llama-1b", true, 1.0)]).generate(&req).unwrap();
+        let rgen = remote.generate(&req).unwrap();
+        assert_eq!(rgen.tokens, local.tokens);
+        assert_eq!(rgen.worker, local.worker);
+
+        // joined box feeds the Registry (→ the model-select menu's `available`)
+        let mut reg = Registry::new();
+        reg.add(Box::new(join(&addr).unwrap()));
+        assert!(reg.available_models().iter().any(|(n, _)| n == "llama-1b"));
+
+        // private model refused over the wire even if asked directly
+        let priv_req = GenRequest { prefix: vec![1], model: "deepseek-8b".into(), max_new: 4, temperature: 0.8, seed: 1 };
+        assert!(remote.generate(&priv_req).is_none());
+    }
+}
