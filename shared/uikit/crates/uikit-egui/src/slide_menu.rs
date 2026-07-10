@@ -170,15 +170,23 @@ fn run(
     let pointer = ui.ctx().pointer_latest_pos();
     let hot = pointer.and_then(|p| hit(p, &cells));
 
+    // Spring pop-in (OutBack) — ticked every frame so it resets when closed and springs on each open.
+    let appear = crate::motion::animate_eased(ui.ctx(), id.with("appear"), st.open, 0.14, crate::motion::ease::out_back);
+
     egui::Area::new(id).order(Order::Foreground).fixed_pos(st.origin).show(ui.ctx(), |ui| {
         let vis = ui.visuals().clone();
+        let ctx = ui.ctx().clone();
         let painter = ui.painter();
         let radius = CornerRadius::same(8);
         for (i, (opt, rect)) in options.iter().zip(&cells).enumerate() {
             let hot_i = hot == Some(i);
-            let fill = if hot_i { vis.selection.bg_fill } else { vis.extreme_bg_color };
-            painter.rect_filled(*rect, radius, fill);
-            painter.rect_stroke(*rect, radius, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
+            // scale each cell around its center by the spring value
+            let rect = Rect::from_center_size(rect.center(), rect.size() * appear.max(0.01));
+            // highlight glides between rest/selected instead of snapping (QML highlightColor feel)
+            let target = if hot_i { vis.selection.bg_fill } else { vis.extreme_bg_color };
+            let fill = crate::motion::animate_color(&ctx, id.with(("cell", i)), target, 0.12);
+            painter.rect_filled(rect, radius, fill);
+            painter.rect_stroke(rect, radius, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
             let text_col = if hot_i { Color32::WHITE } else { vis.text_color() };
             painter.text(rect.center(), Align2::CENTER_CENTER, &opt.label, FontId::proportional(18.0), text_col);
         }
@@ -277,23 +285,29 @@ impl SlideMenu {
         let hot = swipe_dir8(pointer - center, self.deadzone);
         let radius = self.item_size + 6.0;
 
+        // Spring pop-in for the whole compass, and a smoothly-eased per-cell highlight.
+        let appear = crate::motion::animate_eased(ui.ctx(), id.with("appear"), st.open, 0.14, crate::motion::ease::out_back);
+        let item = self.item_size;
+
         egui::Area::new(id).order(Order::Foreground).fixed_pos(Pos2::ZERO).show(ui.ctx(), |ui| {
             let vis = ui.visuals().clone();
+            let ctx = ui.ctx().clone();
             let painter = ui.painter();
             let cr = CornerRadius::same(8);
-            let cell = |painter: &egui::Painter, c: Pos2, label: &str, on: bool| {
-                let rect = Rect::from_center_size(c, Vec2::splat(self.item_size));
-                let fill = if on { vis.selection.bg_fill } else { vis.extreme_bg_color };
+            let cell = |c: Pos2, label: &str, on: bool, key: usize| {
+                let rect = Rect::from_center_size(c, Vec2::splat(item * appear.max(0.01)));
+                let target = if on { vis.selection.bg_fill } else { vis.extreme_bg_color };
+                let fill = crate::motion::animate_color(&ctx, id.with(("card", key)), target, 0.12);
                 painter.rect_filled(rect, cr, fill);
                 painter.rect_stroke(rect, cr, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
                 let tc = if on { Color32::WHITE } else { vis.text_color() };
                 painter.text(c, Align2::CENTER_CENTER, label, FontId::proportional(18.0), tc);
             };
             // center (tap) is highlighted only when there's no active swipe
-            cell(painter, center, &tap.label, hot.is_none());
-            for (d, opt) in dirs {
+            cell(center, &tap.label, hot.is_none(), 0);
+            for (idx, (d, opt)) in dirs.iter().enumerate() {
                 let c = center + d.offset() * radius;
-                cell(painter, c, &opt.label, hot == Some(*d));
+                cell(c, &opt.label, hot == Some(*d), idx + 1);
             }
         });
         ui.ctx().request_repaint();

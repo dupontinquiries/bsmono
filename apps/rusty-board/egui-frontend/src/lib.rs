@@ -320,13 +320,8 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive) -> Option<
 fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors) -> Option<String> {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
-    let fill = if resp.is_pointer_button_down_on() {
-        c.accent
-    } else if resp.hovered() {
-        c.bg_hover
-    } else {
-        c.bg_raised
-    };
+    // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
+    let fill = uikit_egui::motion::interactive_fill(ui.ctx(), &resp, c.bg_raised, c.bg_hover, c.accent);
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
     painter.rect_filled(rect, rounding, fill);
     painter.rect_stroke(rect, rounding, Stroke::new(1.0, c.bg_base), egui::StrokeKind::Inside);
