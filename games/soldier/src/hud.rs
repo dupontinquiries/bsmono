@@ -11,6 +11,34 @@ use crate::level::Cell;
 use crate::weapons::WeaponKind;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Stroke, Vec2};
 
+/// Shared-palette theming. Soldier's HUD/menu colors are sourced from `snapclone-theme` (the
+/// portfolio's single source of truth) so the game matches the rest of the suite; swap `PALETTE` to
+/// restyle. Only the palette-tied colors route through here — the deliberately-bespoke HUD accents
+/// (health red/green, weapon tints) stay literal. egui-version-agnostic (palette is plain hex data).
+pub mod theme {
+    use egui::Color32;
+    use snapclone_theme::{Palette, MODERN};
+
+    pub const PALETTE: &Palette = &MODERN;
+
+    pub fn c(hex: &str) -> Color32 {
+        let [r, g, b] = snapclone_theme::rgb(hex);
+        Color32::from_rgb(r, g, b)
+    }
+
+    /// Apply the palette to egui's global Visuals (used by both the eframe app path and the wgpu
+    /// gpu_egui overlay), so any egui-widget chrome matches the HUD.
+    pub fn apply_visuals(ctx: &egui::Context) {
+        let mut v = egui::Visuals::dark();
+        v.override_text_color = Some(c(PALETTE.text_primary));
+        v.panel_fill = c(PALETTE.bg_base);
+        v.window_fill = c(PALETTE.bg_raised);
+        v.extreme_bg_color = c(PALETTE.bg_deep);
+        v.hyperlink_color = c(PALETTE.accent);
+        ctx.set_visuals(v);
+    }
+}
+
 /// A modern dynamic reticle: four ticks that bloom apart as your spread grows (moving, hip-fire), shrink
 /// when you aim down sights, with a small centre dot. Turns faintly red over an enemy.
 pub fn draw_reticle(p: &egui::Painter, rect: Rect, g: &Game, ads: f32) {
@@ -550,7 +578,7 @@ pub fn draw_center_banner(p: &egui::Painter, rect: Rect, text: &str, col: Color3
 // ── small colour helpers ────────────────────────────────────────────────────────
 
 pub fn dim() -> Color32 {
-    Color32::from_rgb(150, 156, 162)
+    theme::c(theme::PALETTE.text_secondary)
 }
 pub fn health_color(h: f32) -> Color32 {
     if h > 60.0 {
