@@ -83,9 +83,9 @@ impl Default for ShutdownSignal {
 /// etc.) and we want the rest of the app to keep working when it
 /// does. The other systems are pure in-process and don't fail.
 pub struct SystemHandles {
-    pub sensor: JoinHandle<()>,
-    pub model: JoinHandle<()>,
-    pub environment: JoinHandle<()>,
+    pub sensor: Option<JoinHandle<()>>,
+    pub model: Option<JoinHandle<()>>,
+    pub environment: Option<JoinHandle<()>>,
     pub screen_temp: Option<JoinHandle<()>>,
     /// The shutdown signal. Public so external code can request a
     /// shutdown without dropping the whole handle struct (useful
@@ -100,13 +100,13 @@ impl SystemHandles {
     /// Use this when you want to wait for the workers to finish
     /// (graceful-exit handler, test teardown). Use plain `drop()`
     /// when you don't care to wait (typical process exit).
-    pub fn shutdown_and_join(self) {
+    pub fn shutdown_and_join(mut self) {
         self.shutdown.request();
-        let _ = self.sensor.join();
-        let _ = self.model.join();
-        let _ = self.environment.join();
-        if let Some(st) = self.screen_temp {
-            let _ = st.join();
+        // take() the handles out of their Options — can't move fields out of a Drop type directly.
+        for h in [self.sensor.take(), self.model.take(), self.environment.take(), self.screen_temp.take()] {
+            if let Some(h) = h {
+                let _ = h.join();
+            }
         }
     }
 }
@@ -162,7 +162,7 @@ pub fn spawn_all(
     println!("✅ All systems spawned");
 
     (
-        SystemHandles { sensor, model, environment, screen_temp, shutdown },
+        SystemHandles { sensor: Some(sensor), model: Some(model), environment: Some(environment), screen_temp, shutdown },
         calibration_queue,
     )
 }
