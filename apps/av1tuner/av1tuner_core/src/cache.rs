@@ -208,9 +208,7 @@ impl CacheManifest {
         let meta = std::fs::metadata(&output_path)?;
         let output_size = meta.len();
         let output_hash = cheap_content_hash(&output_path, output_size, &meta)?;
-        let recorded_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs()).unwrap_or(0);
+        let recorded_at = core_kit::time::now_secs();
         let key = sig.key();
         self.entries.insert(key, CacheEntry {
             signature: sig, output_path, output_size, output_hash, recorded_at,
@@ -251,8 +249,7 @@ mod tests {
     fn temp_file(content: &[u8]) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "cache_test_{}_{}", std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            core_kit::time::now_nanos()
         ));
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(content).unwrap();
