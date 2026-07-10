@@ -107,7 +107,7 @@ targets = ["desktop"]
 notes = "canonical peek, now lib+bins v0.2.0 (lib `view` consumed by gitmind GUI); wiring-audit.sh suspender"
 
 [tools.drift]
-path = "tools/drift"
+path = "tools/drift/playground"
 kind = "cargo"
 role = "tool"            # SUSPENDER: boundary-drift reconciliation
 daemon = false
