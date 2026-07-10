@@ -50,7 +50,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "EARLY-FPS",
         options,
-        Box::new(move |_cc| Ok(Box::new(FpsApp::new(seed)))),
+        Box::new(move |cc| {
+            early_fps::hud::theme::apply_visuals(&cc.egui_ctx);
+            Ok(Box::new(FpsApp::new(seed)))
+        }),
     )
 }
 

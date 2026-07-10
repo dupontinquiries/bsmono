@@ -36,6 +36,33 @@ pub use tokens::Spacing;
 
 pub use palette::{DARK, PITCH_BLACK, PAPER, NEON, MINIMAL, MODERN, EARTH, PASTELS, METALLIC};
 
+/// Parse one of this crate's `#RRGGBB` (or `#RRGGBBAA`) color strings to raw bytes.
+///
+/// Palettes store colors as CSS-style hex so every backend — egui, Qt, Slint, web, pygame — reads a
+/// single source of truth; this is the shared parser so none of them reimplement it and drift. Each
+/// backend maps the returned bytes into its own color type (`Color32`, `QColor`, an RGB tuple, …).
+/// Malformed input yields magenta, the classic "unset color" marker, rather than panicking.
+pub fn rgb(hex: &str) -> [u8; 3] {
+    let h = hex.trim_start_matches('#');
+    if h.len() < 6 {
+        return [0xFF, 0x00, 0xFF];
+    }
+    let b = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).unwrap_or(0xFF);
+    [b(0), b(2), b(4)]
+}
+
+/// Like [`rgb`] but with alpha: `#RRGGBBAA` → `[r,g,b,a]` (opaque `#RRGGBB` → alpha 255).
+pub fn rgba(hex: &str) -> [u8; 4] {
+    let [r, g, b] = rgb(hex);
+    let h = hex.trim_start_matches('#');
+    let a = if h.len() >= 8 {
+        u8::from_str_radix(&h[6..8], 16).unwrap_or(0xFF)
+    } else {
+        0xFF
+    };
+    [r, g, b, a]
+}
+
 /// Look up a palette by its id string (matches the settings page selector).
 ///
 /// V32.34+ FIX: this match was missing `earth`, `pastels`, and `metallic`
@@ -71,6 +98,15 @@ pub fn palette_for(id: PaletteId) -> &'static Palette {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgb_parses_palette_hex() {
+        assert_eq!(rgb("#1A1917"), [0x1A, 0x19, 0x17]);
+        assert_eq!(rgb(DARK.accent), [0xC9, 0xB9, 0x9A]);
+        assert_eq!(rgba("#11111088"), [0x11, 0x11, 0x10, 0x88]);
+        assert_eq!(rgba(DARK.bg_base), [0x1A, 0x19, 0x17, 0xFF]);
+        assert_eq!(rgb("bad"), [0xFF, 0x00, 0xFF]);
+    }
 
     // V32.34+: these guard the palette-lookup bug where palette_by_id was
     // missing earth/pastels/metallic and silently returned Dark for them.

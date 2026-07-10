@@ -53,20 +53,57 @@ fn move_world(yaw: f32, ix: f32, iz: f32) -> (f32, f32) {
 }
 
 /// Draw the pause/title menu overlay (shared by the sim and prowl render paths).
+/// Palette-driven UI colors, sourced from the shared `snapclone-theme` (the portfolio's single source
+/// of truth for design) instead of hardcoded, so clawbound's UI matches the rest of the suite. Swap
+/// `PALETTE` to restyle everything at once; egui-version-agnostic because the palette is plain hex data.
+mod theme {
+    use egui::Color32;
+    use snapclone_theme::{Palette, MODERN};
+
+    pub const PALETTE: &Palette = &MODERN;
+
+    fn c(hex: &str) -> Color32 {
+        let [r, g, b] = snapclone_theme::rgb(hex);
+        Color32::from_rgb(r, g, b)
+    }
+    fn ca(hex: &str, a: u8) -> Color32 {
+        let [r, g, b] = snapclone_theme::rgb(hex);
+        Color32::from_rgba_unmultiplied(r, g, b, a)
+    }
+
+    pub fn menu_fill() -> Color32 { ca(PALETTE.bg_raised, 235) }
+    pub fn title() -> Color32 { c(PALETTE.accent) }
+    pub fn subtitle() -> Color32 { c(PALETTE.text_secondary) }
+    pub fn selected() -> Color32 { c(PALETTE.accent_soft) }
+    pub fn item() -> Color32 { c(PALETTE.text_primary) }
+
+    /// Apply the palette to egui's global Visuals so widget chrome matches the menu.
+    pub fn apply(ctx: &egui::Context) {
+        let mut v = egui::Visuals::dark();
+        v.override_text_color = Some(item());
+        v.panel_fill = c(PALETTE.bg_base);
+        v.window_fill = c(PALETTE.bg_raised);
+        v.extreme_bg_color = c(PALETTE.bg_deep);
+        v.hyperlink_color = title();
+        v.selection.bg_fill = ca(PALETTE.accent, 60);
+        ctx.set_visuals(v);
+    }
+}
+
 fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen) {
     use clawbound_rs::menu::Screen;
-    use egui::{Align2, Color32, RichText};
+    use egui::{Align2, RichText};
     egui::Area::new("clawbound_menu".into()).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
+        egui::Frame::popup(ui.style()).fill(theme::menu_fill()).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
             ui.set_min_width(320.0);
-            ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
+            ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(theme::title()));
             let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
-            if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
+            if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(theme::subtitle())); }
             ui.add_space(10.0);
             for (i, it) in items.iter().enumerate() {
                 let sel = i == cursor;
                 ui.label(RichText::new(format!("{} {}", if sel { "▶" } else { "  " }, it)).size(20.0)
-                    .color(if sel { Color32::from_rgb(255, 220, 120) } else { Color32::from_rgb(205, 205, 210) }));
+                    .color(if sel { theme::selected() } else { theme::item() }));
             }
             ui.add_space(10.0);
             ui.label(RichText::new("↑↓ move   ←→ change   Enter select   Esc back").size(12.0).weak());
@@ -237,6 +274,7 @@ impl State {
         ] });
 
         let egui_ctx = egui::Context::default();
+        theme::apply(&egui_ctx);
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None);
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
         let menu = clawbound_rs::menu::Menu::new();
