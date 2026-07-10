@@ -27,6 +27,8 @@ pub mod livebg;
 pub mod nav;
 pub mod scroll;
 pub mod motion;
+pub mod log_view;
+pub mod mono_tile;
 pub mod slide_menu;
 pub mod theme_bridge;
 pub mod tokens;
