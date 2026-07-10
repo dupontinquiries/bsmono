@@ -601,6 +601,9 @@ pub struct BlockWeights {
     /// wqkv exclusively; at that point the separates (and their cache entries) can be dropped.
     pub wqkv: Lin,
     pub wgate_up: Lin, pub wdown: Lin, pub g1: Tensor, pub g2: Tensor,
+    /// Qwen3/3.5 per-head QK-Norm weights ([head_dim] each), applied as an RMSNorm to Q and K before RoPE.
+    /// None for llama/qwen2 (→ pass-through). Loaded from blk.N.attn_{q,k}_norm.weight.
+    pub q_norm: Option<Tensor>, pub k_norm: Option<Tensor>,
 }
 /// One ViT/CLIP encoder layer (pre-norm): LN → multi-head bidirectional attention → residual →
 /// LN → MLP (fc1 → GELU → fc2) → residual. Separate Q/K/V (no fusion: t = num_patches > 1 here, and
@@ -1550,8 +1553,8 @@ impl Gpu {
     pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, t), ff, t, d, base, 0, hd);
-        let k = self.rope_mh_t(&w.wk.apply(self, &n1, t), ff, t, kv, base, 0, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, d, hd, eps), ff, t, d, base, 0, hd);
+        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
         let v = w.wv.apply(self, &n1, t);
         let attn = self.attention_mh_t(&q, &k, &v, t, d, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, t);
@@ -1570,8 +1573,8 @@ impl Gpu {
     fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, t), ff, t, d, base, 0, hd);
-        let k = self.rope_mh_t(&w.wk.apply(self, &n1, t), ff, t, kv, base, 0, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, d, hd, eps), ff, t, d, base, 0, hd);
+        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
         let v = w.wv.apply(self, &n1, t);
         self.write_rows(kc, &k, 0, t, kv);
         self.write_rows(vc, &v, 0, t, kv);
@@ -1592,8 +1595,8 @@ impl Gpu {
     fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, s), ff, s, d, base_freq, base, hd);
-        let k = self.rope_mh_t(&w.wk.apply(self, &n1, s), ff, s, kv, base_freq, base, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, d, hd, eps), ff, s, d, base_freq, base, hd);
+        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, s), &w.k_norm, s, kv, hd, eps), ff, s, kv, base_freq, base, hd);
         let v = w.wv.apply(self, &n1, s);
         self.write_rows(kc, &k, base, s, kv);
         self.write_rows(vc, &v, base, s, kv);
@@ -2721,17 +2724,23 @@ impl Gpu {
         if !kind.is_llm() {
             return Err(format!("not a language model: {}", kind.guidance()));
         }
-        // llama-family + Qwen2. Qwen2's only delta is a bias add on Q/K/V (loaded below, applied in
-        // Lin::apply) and reading qwen2.* metadata (incl. its RoPE θ); everything else is shared. Other
-        // arches (gemma2 geglu/soft-cap, phi3) would produce WRONG outputs, so refuse with guidance.
-        // Some converters omit general.architecture → fall through to llama.
-        let arch = g.get_str("general.architecture").unwrap_or("llama").to_string();
-        if !matches!(arch.as_str(), "llama" | "qwen2") {
-            return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet \
-                (llama-family + Qwen2). Use the llama.cpp backend for this model."));
+        // Architecture support is decided by the arch registry (archcfg): llama, Qwen2 (QKV bias), and
+        // Qwen3/Qwen3.5 (QK-Norm before RoPE) are wired; gemma2/phi3/unknown are refused with guidance.
+        // arch() resolves the metadata-key prefix robustly: general.architecture when its own keys back
+        // it up, else the prefix of whatever *.embedding_length key the file DOES carry (recovering a
+        // converter's mislabel, e.g. an Ornith GGUF missing general.architecture), else "llama". So a
+        // mislabeled-but-supported model loads, and a genuinely unsupported one is named correctly below.
+        let arch = g.arch();
+        let acfg = crate::archcfg::for_arch(&arch);
+        if !acfg.supported {
+            return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet — {}. \
+                Use the llama.cpp backend for this model.", acfg.note));
         }
-        let pfx = arch.as_str(); // metadata key prefix: "llama" or "qwen2"
-        let d = g.get_u32(&format!("{pfx}.embedding_length")).ok_or("missing embedding_length")? as usize;
+        let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
+        let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
+        let d = g.get_u32(&format!("{pfx}.embedding_length"))
+            .ok_or_else(|| format!("missing embedding_length: the GGUF has no '<arch>.embedding_length' \
+                key (resolved arch '{pfx}') — the file may be truncated, non-standard, or not a supported LLM"))? as usize;
         let h = g.get_u32(&format!("{pfx}.feed_forward_length")).ok_or("missing feed_forward_length")? as usize;
         let n = g.get_u32(&format!("{pfx}.block_count")).ok_or("missing block_count")? as usize;
         // vocab_size is often absent in real GGUFs; derive it from the embedding below.
@@ -2864,6 +2873,9 @@ impl Gpu {
                     self.make_lin(&gu, 2 * h, d, q, q4_mode)
                 },
                 wdown: lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)?,
+                // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
+                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, d / n_heads)) } else { None },
+                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, d / n_heads)) } else { None },
             });
         }
         let out_norm = self.upload(&fetch("output_norm.weight")?, 1, d);
@@ -2911,10 +2923,10 @@ impl Gpu {
     /// Write the resident model to `path`, tagged with the source GGUF's (size, mtime) so a changed
     /// model invalidates the cache.
     pub fn save_int8_cache(&self, m: &Model, path: &std::path::Path, fp: (u64, u64)) -> std::io::Result<()> {
-        // Biased (Qwen2) and 4-bit-resident projections aren't in the int8 cache layout, so skip the
-        // cache for them — they reload from the GGUF. Keeps the cache (and gate-store/mmap) identical.
+        // Biased (Qwen2), QK-Norm (Qwen3/3.5), and 4-bit-resident projections aren't in the int8 cache
+        // layout, so skip the cache for them — they reload from the GGUF. Keeps the cache layout identical.
         let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
-        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias()) { return Ok(()); }
+        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some()) { return Ok(()); }
         let mut o = Vec::new();
         o.extend_from_slice(b"LSI8C\x02");
         o.extend_from_slice(&fp.0.to_le_bytes()); o.extend_from_slice(&fp.1.to_le_bytes());
@@ -2955,7 +2967,7 @@ impl Gpu {
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2 });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None });
         }
         Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, base, eps })
     }
@@ -3021,8 +3033,8 @@ impl Gpu {
         for (li, w) in m.layers.iter().enumerate() {
             // inline of block_forward, measuring each contribution's last-token RMS
             let n1 = self.rmsnorm_t(&x, &w.g1, t, m.d, m.eps);
-            let q = self.rope_mh_t(&w.wq.apply(self, &n1, t), ff, t, m.d, m.base, 0, hd);
-            let k = self.rope_mh_t(&w.wk.apply(self, &n1, t), ff, t, kv, m.base, 0, hd);
+            let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, m.d, hd, m.eps), ff, t, m.d, m.base, 0, hd);
+            let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, m.eps), ff, t, kv, m.base, 0, hd);
             let v = w.wv.apply(self, &n1, t);
             let attn = self.attention_mh_t(&q, &k, &v, t, m.d, m.n_heads, m.n_kv_heads);
             let o = w.wo.apply(self, &attn, t);
@@ -3579,6 +3591,22 @@ impl Gpu {
         let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, 0, 0, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
+
+    /// Qwen3/3.5 QK-Norm: per-head RMSNorm over `head_dim`, applied to a projected `[t, width]` tensor
+    /// (width = heads·head_dim) BEFORE RoPE. `norm` is the [head_dim] weight; `None` → pass-through (llama/
+    /// qwen2). Since head_dim is contiguous per head, the [t, width] buffer viewed as [t·heads, head_dim]
+    /// rows makes this a plain rmsnorm_t — no new kernel — then we restore the [t, width] shape for RoPE.
+    fn qk_norm(&self, x: Tensor, norm: &Option<Tensor>, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
+        match norm {
+            Some(w) => {
+                let heads = width / head_dim;
+                let mut n = self.rmsnorm_t(&x, w, t * heads, head_dim, eps);
+                n.rows = t; n.cols = width; // restore logical shape; buffer order is identical
+                n
+            }
+            None => x,
+        }
+    }
     /// Causal multi-head attention (prefill). `q` is [t, n_heads*hd]; `k`/`v` are
     /// [t, n_kv_heads*hd]. With n_kv_heads < n_heads this is grouped-query attention.
     pub fn attention_mh_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
@@ -3661,8 +3689,8 @@ impl Gpu {
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, 1), ff, 1, d, base, pos, hd);
-        let kr = self.rope_mh_t(&w.wk.apply(self, &n1, 1), ff, 1, kv, base, pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, pos, hd);
+        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
@@ -3737,8 +3765,8 @@ impl Gpu {
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, 1), ff, 1, d, base, pos, hd);
-        let kr = self.rope_mh_t(&w.wk.apply(self, &n1, 1), ff, 1, kv, base, pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, pos, hd);
+        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
@@ -3793,8 +3821,8 @@ impl Gpu {
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&w.wq.apply(self, &n1, 1), ff, 1, d, base, rope_pos, hd);
-        let kr = self.rope_mh_t(&w.wk.apply(self, &n1, 1), ff, 1, kv, base, rope_pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, rope_pos, hd);
+        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, rope_pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, slot, kv);
         self.write_row(vc, &vr, slot, kv);
@@ -5015,5 +5043,36 @@ mod decode_cfg_tests {
         // This proves it COMPILES even though llvmpipe here can't RUN subgroups — the M2 validates results.
         let (ok, msg) = crate::wgsl_validate::check_wgsl(MATVEC_Q8_0_TILED_V2_WG128_SG);
         assert!(ok, "subgroup kernel failed naga validation:\n{msg}");
+    }
+
+    // Qwen3/3.5 QK-Norm: the GPU qk_norm (rmsnorm_t over [t*heads, head_dim] + shape restore) must match an
+    // independent per-head RMSNorm reference. Validates the buffer-layout reshape on llvmpipe; the M2 runs
+    // the same kernel. None → pass-through.
+    #[test]
+    fn qk_norm_matches_per_head_reference() {
+        let gpu = Gpu::new();
+        let (t, heads, hd) = (3usize, 4usize, 8usize);
+        let d = heads * hd;
+        let eps = 1e-6f32;
+        // distinct values per position/head/dim, and a non-trivial per-dim norm weight
+        let q: Vec<f32> = (0..t * d).map(|i| ((i % 13) as f32 - 6.0) * 0.5).collect();
+        let w: Vec<f32> = (0..hd).map(|j| 1.0 + 0.1 * j as f32).collect();
+        // reference: independent per-head RMSNorm over head_dim
+        let mut want = vec![0.0f32; t * d];
+        for row in 0..t * heads {
+            let b = row * hd;
+            let ms = (0..hd).map(|j| q[b + j] * q[b + j]).sum::<f32>() / hd as f32;
+            let inv = 1.0 / (ms + eps).sqrt();
+            for j in 0..hd { want[b + j] = q[b + j] * inv * w[j]; }
+        }
+        let qt = gpu.upload(&q, t, d);
+        let wt = gpu.upload(&w, 1, hd);
+        let got = gpu.download(&gpu.qk_norm(qt, &Some(wt), t, d, hd, eps));
+        assert_eq!(got.len(), want.len());
+        for (a, b) in got.iter().zip(&want) { assert!((a - b).abs() < 1e-4, "qk_norm mismatch: {a} vs {b}"); }
+        // None → identity pass-through
+        let qt2 = gpu.upload(&q, t, d);
+        let pass = gpu.download(&gpu.qk_norm(qt2, &None, t, d, hd, eps));
+        assert_eq!(pass, q, "no norm weight ⇒ unchanged");
     }
 }
