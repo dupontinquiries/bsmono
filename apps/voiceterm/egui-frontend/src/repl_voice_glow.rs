@@ -39,19 +39,30 @@ impl ReplVoiceGlow {
     /// slow sine. Esc or a click on the card dismisses it. Returns true on the frame it's dismissed.
     pub fn show(&mut self, ctx: &egui::Context) -> bool {
         let visible = self.active && !self.dismissed;
-        let fade = ctx.animate_bool(Id::new("repl_glow_fade"), visible);
+        // 320ms OutCubic fade — matches the QML `Behavior on opacity` instead of a linear snap.
+        let fade = uikit_egui::motion::animate_eased(
+            ctx,
+            Id::new("repl_glow_fade"),
+            visible,
+            0.32,
+            uikit_egui::motion::ease::out_cubic,
+        );
         if fade <= 0.01 {
             return false;
         }
         ctx.request_repaint(); // keep the halo breathing
 
         let t = ctx.input(|i| i.time) as f32;
-        let halo = 0.2 + 0.15 * (t * 1.6).sin().abs(); // breathing alpha
+        // Gentle eased breathing (SequentialAnimation feel), not a bare abs-sine.
+        let breath = 0.5 + 0.5 * (t * 1.4).sin(); // 0..1
+        let halo = 0.16 + 0.16 * uikit_egui::motion::ease::out_sine(breath);
+        // Rise softly into the corner as it fades in (QML "glows into the corner").
+        let rise = (1.0 - fade) * 12.0;
         let mut just_dismissed = false;
 
         egui::Area::new(Id::new("repl_voice_glow"))
             .order(Order::Foreground)
-            .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0])
+            .anchor(Align2::RIGHT_BOTTOM, [-16.0, -16.0 + rise])
             .show(ctx, |ui| {
                 ui.set_opacity(fade);
                 let accent = ui.visuals().selection.bg_fill;

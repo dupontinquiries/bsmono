@@ -9,7 +9,7 @@
 //! The timeout arithmetic is factored into pure helpers so the resolution logic is unit-tested without
 //! a running egui context.
 
-use egui::{Align2, Color32, Context, Id, Key, Order, Stroke};
+use egui::{Align2, Color32, Context, Id, Key, Order};
 
 /// What a timeout should do if the user doesn't choose.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -87,6 +87,11 @@ impl ConfirmDialog {
         let remaining = (self.timeout_secs - elapsed).max(0.0);
         ctx.request_repaint(); // keep the countdown animating
 
+        // Eased modal appear (fade + a soft rise), re-triggered each open because `elapsed` resets.
+        let appear_t = (elapsed / 0.20).clamp(0.0, 1.0);
+        let fade = uikit_egui::motion::ease::out_cubic(appear_t);
+        let rise = (1.0 - fade) * 10.0;
+
         let mut outcome = Outcome::Pending;
 
         // Dimmed backdrop; a click anywhere on it cancels (QML "click outside cancels").
@@ -96,7 +101,7 @@ impl ConfirmDialog {
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
                 let resp = ui.allocate_response(screen.size(), egui::Sense::click());
-                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha(140));
+                ui.painter().rect_filled(screen, 0.0, Color32::from_black_alpha((140.0 * fade) as u8));
                 if resp.clicked() {
                     outcome = Outcome::Cancelled;
                 }
@@ -105,8 +110,9 @@ impl ConfirmDialog {
         // The dialog itself.
         egui::Area::new(Id::new("confirm_dialog"))
             .order(Order::Foreground)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .anchor(Align2::CENTER_CENTER, [0.0, rise])
             .show(ctx, |ui| {
+                ui.set_opacity(fade);
                 egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(18)).show(ui, |ui| {
                     ui.set_max_width(380.0);
                     ui.heading(&self.title);
@@ -127,15 +133,20 @@ impl ConfirmDialog {
                     ui.add_space(6.0);
                     ui.label(format!("{}s", remaining.ceil() as i32));
 
-                    // Animated border: a top edge line that shrinks from full width to zero.
+                    // Countdown bar along the bottom edge: shrinks with the remaining fraction, and its
+                    // colour glides from calm blue toward warning amber below a third left (QML: color
+                    // switch at 0.33 with a 200ms ColorAnimation).
                     let r = ui.min_rect().expand(8.0);
+                    let bar_h = 3.0;
                     let w = r.width() * frac;
-                    let x0 = r.center().x - w / 2.0;
-                    let accent = ui.visuals().selection.bg_fill;
-                    ui.painter().line_segment(
-                        [egui::pos2(x0, r.top()), egui::pos2(x0 + w, r.top())],
-                        Stroke::new(2.0, accent),
-                    );
+                    let bar = egui::Rect::from_min_size(egui::pos2(r.left(), r.bottom() - bar_h), egui::vec2(w, bar_h));
+                    let target = if frac > 0.33 {
+                        Color32::from_rgb(59, 130, 246) // #3b82f6
+                    } else {
+                        Color32::from_rgb(230, 140, 60) // warning amber
+                    };
+                    let col = uikit_egui::motion::animate_color(ui.ctx(), Id::new("confirm_bar_col"), target, 0.2);
+                    ui.painter().rect_filled(bar, egui::CornerRadius::same(2), col);
                 });
             });
 

@@ -26,6 +26,7 @@ pub mod skin;
 pub mod livebg;
 pub mod nav;
 pub mod scroll;
+pub mod motion;
 pub mod slide_menu;
 pub mod theme_bridge;
 pub mod tokens;
