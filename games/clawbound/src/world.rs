@@ -231,14 +231,34 @@ pub const RIVER_REEDS: Biome = Biome { name: "River Reeds",     ground: 0x5e7146
 pub const SHADOWY:     Biome = Biome { name: "Shadowy Forest",  ground: 0x2e3a30, tree: 0.88, leaf: 0x22301f, kind: 0, reeds: 0.0,  rocks: 0.10, dark: 0.65 };
 pub const OAK_FOREST:  Biome = Biome { name: "Oak Tree Forest", ground: 0x517d38, tree: 0.60, leaf: 0x50702c, kind: 1, reeds: 0.0,  rocks: 0.05, dark: 0.0 };
 pub const MOOR:        Biome = Biome { name: "Moor Plains",     ground: 0x6f5f48, tree: 0.05, leaf: 0x8a5f78, kind: 0, reeds: 0.0,  rocks: 0.20, dark: 0.0 };
-pub const BIOMES: [Biome; 6] = [MOUNTAINS, LAKE_SHORE, RIVER_REEDS, SHADOWY, OAK_FOREST, MOOR];
+pub const MANGROVE:    Biome = Biome { name: "Mangrove Shallows", ground: 0x4a5f42, tree: 0.5, leaf: 0x3e5a38, kind: 1, reeds: 0.6, rocks: 0.0, dark: 0.24 };
+pub const BIOMES: [Biome; 7] = [MOUNTAINS, LAKE_SHORE, RIVER_REEDS, SHADOWY, OAK_FOREST, MOOR, MANGROVE];
 
 /// Pick the biome at a point from its elevation, nearness to water and moisture.
+/// Undergrowth density at a point (0 = open, 1 = deep thicket). Grass, brush, reeds and
+/// gloom all thicken it; it's patchy (clearings and thickets), sparse on scree and open
+/// water. Cats slip through cover half-seen but risk a rustle or a snagging bramble.
+pub fn cover_at(x: f32, z: f32) -> f32 {
+    let h = height_at(x, z);
+    if h < WATER_Y { return 0.08; }              // open water — nothing to hide in
+    let b = biome_at(x, z);
+    let grass = match b.name {
+        "Moor Plains" => 0.5, "Oak Tree Forest" => 0.68, "River Reeds" => 0.85,
+        "Mangrove Shallows" => 0.7, "Lake Shore" => 0.32, "Shadowy Forest" => 0.78,
+        "Mountains" => 0.08, _ => 0.4,
+    };
+    let brush = b.tree * 0.5 + b.reeds * 0.5 + b.dark * 0.35;
+    // patchy: a low-frequency noise carves clearings and thickens thickets
+    let patch = 0.55 + 0.45 * vnoise(x * 0.12 + 11.0, z * 0.12 - 7.0, 0x0C);
+    ((grass + brush) * patch).clamp(0.0, 1.0)
+}
+
 pub fn biome_at(x: f32, z: f32) -> Biome {
     let y = height_at(x, z);
     let (m, s) = climate(x, z);
     if y > 1.9 { return MOUNTAINS; }                       // the rare high ground (top ~2%)
     if y < WATER_Y + 0.7 {                                 // a tight shoreline band
+        if m > 0.72 { return MANGROVE; }                   // the wettest, warmest shallows grow mangroves
         return if m > 0.5 { RIVER_REEDS } else { LAKE_SHORE };
     }
     if m > 0.5 && s > 0.5 { SHADOWY }                      // dark, wet, dense
@@ -256,13 +276,16 @@ pub fn biome_color(x: f32, z: f32) -> ([f32; 3], f32) {
     // organically rather than following a clean disc.
     let jx = (vnoise(x * 0.15 + 2.0, z * 0.15 - 6.0, 0x51) - 0.5) * 3.0;
     let jz = (vnoise(x * 0.15 - 8.0, z * 0.15 + 4.0, 0x52) - 0.5) * 3.0;
-    let r = 3.6;
+    let r = 4.2;
     let d = r * 0.7;
-    // centre weighted heaviest, then a ring of eight — blend band ≈ 2·r wide
+    let o = r * 2.0;
+    // centre + an inner ring of eight + an outer ring of four, weights falling off
+    // with distance (an approximate Gaussian) so biomes crossfade over a wide, soft band.
     let samples = [
-        (0.0, 0.0, 2.0f32),
-        (r, 0.0, 1.0), (-r, 0.0, 1.0), (0.0, r, 1.0), (0.0, -r, 1.0),
-        (d, d, 0.7), (-d, d, 0.7), (d, -d, 0.7), (-d, -d, 0.7),
+        (0.0, 0.0, 3.0f32),
+        (r, 0.0, 1.4), (-r, 0.0, 1.4), (0.0, r, 1.4), (0.0, -r, 1.4),
+        (d, d, 1.0), (-d, d, 1.0), (d, -d, 1.0), (-d, -d, 1.0),
+        (o, 0.0, 0.5), (-o, 0.0, 0.5), (0.0, o, 0.5), (0.0, -o, 0.5),
     ];
     let (mut acc, mut dark, mut wsum) = ([0.0f32; 3], 0.0f32, 0.0f32);
     for (dx, dz, w) in samples {
@@ -487,30 +510,127 @@ pub fn build_bushes(count: usize) -> Mesh {
 pub fn build_grass(count: usize) -> Mesh {
     let mut m = Mesh::new();
     let tau = std::f32::consts::TAU;
+    let wind = (0.35f32, 0.12);   // a prevailing lean so the sward looks combed by the breeze
     for i in 0..count {
-        let x = (hash2(i as i32, 61, 0xF1) - 0.5) * SIZE * 1.2;
-        let z = (hash2(i as i32, 67, 0xF2) - 0.5) * SIZE * 1.2;
+        let x = (hash2(i as i32, 61, 0xF1) - 0.5) * SIZE * 1.9;
+        let z = (hash2(i as i32, 67, 0xF2) - 0.5) * SIZE * 1.9;
         let y = height_at(x, z);
-        if y > 4.2 { continue; }
+        if y < WATER_Y + 0.12 || y > 5.0 { continue; }      // not underwater, not bare scree
         let biome = biome_at(x, z);
-        if biome.tree < 0.1 { continue; }
-        let base_g = shade(rgb(biome.ground), 1.35);
-        for b in 0..4 {
-            let a = hash2(i as i32, b, 0x33) * tau;
-            let h = 0.45 + hash2(i as i32 + b, z as i32, 0x44) * 0.65;
-            let bx = x + a.cos() * 0.12; let bz = z + a.sin() * 0.12;
+        // grass thrives on open and temperate ground; it thins in scree and deep shadow
+        let lush = match biome.name {
+            "Moor Plains" => 0.96, "Oak Tree Forest" => 0.9, "River Reeds" => 0.85,
+            "Mangrove Shallows" => 0.72, "Lake Shore" => 0.66, "Shadowy Forest" => 0.5, _ => 0.1,
+        };
+        if hash2(i as i32, 5, 0xA1) > lush { continue; }
+        let g = [0.30 + hash2(i as i32, 1, 0x11) * 0.12, 0.50 + hash2(i as i32, 2, 0x12) * 0.18, 0.16 + hash2(i as i32, 3, 0x13) * 0.10];
+        let gr = rgb(biome.ground);
+        let base_g = [g[0] * 0.7 + gr[0] * 0.3, g[1] * 0.7 + gr[1] * 0.3, g[2] * 0.7 + gr[2] * 0.3];
+        let blades = 3 + (hash2(i as i32, 7, 0xB2) * 3.0) as usize;
+        for b in 0..blades {
+            let a = hash2(i as i32, b as i32, 0x33) * tau;
+            let h = 0.5 + hash2(i as i32 + b as i32, z as i32, 0x44) * 0.9;
+            let bx = x + a.cos() * 0.18; let bz = z + a.sin() * 0.18;
             let by = height_at(bx, bz);
-            let side = v3(-a.sin(), 0.0, a.cos()).scale(0.05);
+            let side = v3(-a.sin(), 0.0, a.cos()).scale(0.055);
             let p0 = v3(bx, by, bz).add(side);
             let p1 = v3(bx, by, bz).sub(side);
-            let tip = v3(bx + a.cos() * 0.15, by + h, bz + a.sin() * 0.15);
-            let mut c = base_g; let d = (hash2(b, i as i32, 0x55) - 0.5) * 0.14;
+            let tip = v3(bx + wind.0 * h * 0.5, by + h, bz + wind.1 * h * 0.5);   // lean with the wind
+            let mut c = base_g; let d = (hash2(b as i32, i as i32, 0x55) - 0.5) * 0.14;
             for k in 0..3 { c[k] = (c[k] + d).clamp(0.0, 1.0); }
             m.tri(p0, p1, tip, c);   // front
             m.tri(p0, tip, p1, c);   // back (double-sided)
         }
     }
     m
+}
+
+/// Forest-floor litter: fallen twigs (short bark segments) and scattered leaves,
+/// gathering thickest under the trees. Pure ambience — but the twigs are also what a
+/// running cat snaps underfoot (see `sim`), so their placement is shared with the twig map.
+pub fn build_litter(count: usize) -> Mesh {
+    let mut m = Mesh::new();
+    let tau = std::f32::consts::TAU;
+    for i in 0..count {
+        let x = (hash2(i as i32, 131, 0xC1) - 0.5) * SIZE * 1.8;
+        let z = (hash2(i as i32, 137, 0xC2) - 0.5) * SIZE * 1.8;
+        let y = height_at(x, z);
+        if y < WATER_Y + 0.1 || y > 5.0 { continue; }
+        let biome = biome_at(x, z);
+        let litter = biome.tree * 0.9 + biome.dark * 0.4 + 0.04;   // thickest on the forest floor
+        if hash2(i as i32, 9, 0xC3) > litter { continue; }
+        let a = hash2(i as i32, 2, 0xC4) * tau;
+        if hash2(i as i32, 4, 0xC5) < 0.5 {
+            let len = 0.35 + hash2(i as i32, 6, 0xC6) * 0.5;         // a twig lying on the ground
+            let (dx, dz) = (a.cos() * len, a.sin() * len);
+            let p0 = v3(x, height_at(x, z) + 0.04, z);
+            let p1 = v3(x + dx, height_at(x + dx, z + dz) + 0.04, z + dz);
+            let bark = shade(rgb(0x6b4f33), 0.85 + hash2(i as i32, 1, 0xC7) * 0.3);
+            m.segment(p0, p1, 0.035, 0.02, 3, bark);
+        } else {
+            let s = 0.12 + hash2(i as i32, 8, 0xC8) * 0.12;          // a fallen leaf, autumn-tinted
+            let leaf = [0.5 + hash2(i as i32, 3, 0xC9) * 0.3, 0.32 + hash2(i as i32, 5, 0xCA) * 0.2, 0.1 + hash2(i as i32, 7, 0xCB) * 0.08];
+            let yy = height_at(x, z) + 0.03;
+            let (c1, s1) = (a.cos(), a.sin());
+            m.quad(v3(x - c1 * s, yy, z - s1 * s), v3(x + s1 * s, yy, z - c1 * s), v3(x + c1 * s, yy, z + s1 * s), v3(x - s1 * s, yy, z + s1 * s), leaf);
+        }
+    }
+    m
+}
+
+/// Fallen logs — thick bark cylinders lying in the woods. Low cover and something to
+/// bound over. Density follows the tree cover of the biome.
+pub fn build_logs(count: usize) -> Mesh {
+    let mut m = Mesh::new();
+    let tau = std::f32::consts::TAU;
+    for i in 0..count {
+        let x = (hash2(i as i32, 211, 0xD1) - 0.5) * SIZE * 1.6;
+        let z = (hash2(i as i32, 223, 0xD2) - 0.5) * SIZE * 1.6;
+        let y = height_at(x, z);
+        if y < WATER_Y + 0.3 || y > 4.5 { continue; }
+        let biome = biome_at(x, z);
+        if hash2(i as i32, 3, 0xD3) > biome.tree * 0.5 { continue; }   // fallen from the woods
+        let a = hash2(i as i32, 5, 0xD4) * tau;
+        let len = 2.5 + hash2(i as i32, 7, 0xD5) * 3.5;
+        let r = 0.28 + hash2(i as i32, 9, 0xD6) * 0.18;
+        let (dx, dz) = (a.cos() * len * 0.5, a.sin() * len * 0.5);
+        let p0 = v3(x - dx, height_at(x - dx, z - dz) + r * 0.7, z - dz);
+        let p1 = v3(x + dx, height_at(x + dx, z + dz) + r * 0.7, z + dz);
+        let bark = shade(rgb(0x5a4530), 0.9 + hash2(i as i32, 1, 0xD7) * 0.25);
+        m.segment(p0, p1, r, r * 0.9, 7, bark);
+    }
+    m
+}
+
+/// Twig positions a running cat can snap (drawn from the same field as `build_litter`
+/// twigs). Returns points on walkable ground, thickest under the trees.
+pub fn twig_positions(count: usize) -> Vec<(f32, f32)> {
+    let mut v = Vec::new();
+    for i in 0..count {
+        let x = (hash2(i as i32, 131, 0xC1) - 0.5) * SIZE * 1.8;
+        let z = (hash2(i as i32, 137, 0xC2) - 0.5) * SIZE * 1.8;
+        let y = height_at(x, z);
+        if y < WATER_Y + 0.1 || y > 5.0 { continue; }
+        let biome = biome_at(x, z);
+        let litter = biome.tree * 0.9 + biome.dark * 0.4 + 0.04;
+        if hash2(i as i32, 9, 0xC3) > litter { continue; }
+        if hash2(i as i32, 4, 0xC5) < 0.5 { v.push((x, z)); }   // the twig half of the litter
+    }
+    v
+}
+
+/// Fallen-log centres (mirrors `build_logs`), so the sim can let cats bound over them.
+pub fn log_positions(count: usize) -> Vec<(f32, f32)> {
+    let mut v = Vec::new();
+    for i in 0..count {
+        let x = (hash2(i as i32, 211, 0xD1) - 0.5) * SIZE * 1.6;
+        let z = (hash2(i as i32, 223, 0xD2) - 0.5) * SIZE * 1.6;
+        let y = height_at(x, z);
+        if y < WATER_Y + 0.3 || y > 4.5 { continue; }
+        if hash2(i as i32, 3, 0xD3) > biome_at(x, z).tree * 0.5 { continue; }
+        v.push((x, z));
+    }
+    v
 }
 
 /// Faceted paper boulders, clustered and half-sunk into the ground.
@@ -571,6 +691,27 @@ pub fn build_reeds(count: usize) -> Mesh {
 #[cfg(test)]
 mod biome_blend_tests {
     use super::*;
+
+    #[test]
+    fn cover_is_thick_in_the_woods_thin_in_the_open() {
+        init_world();
+        // sample many points; forest/reed biomes should average far more cover than the
+        // bare moor/mountains, and open water should be near-zero.
+        let (mut forest, mut fc, mut open, mut oc) = (0.0f32, 0, 0.0f32, 0);
+        for i in -60..60 { for j in -60..60 {
+            let (x, z) = (i as f32 * 3.0, j as f32 * 3.0);
+            let c = cover_at(x, z);
+            match biome_at(x, z).name {
+                "Oak Tree Forest" | "Shadowy Forest" | "River Reeds" => { forest += c; fc += 1; }
+                "Mountains" | "Lake Shore" => { open += c; oc += 1; }
+                _ => {}
+            }
+        }}
+        if fc > 0 && oc > 0 {
+            assert!(forest / fc as f32 > open / oc as f32, "woods should hold more cover than open ground");
+        }
+        assert!(cover_at(0.0, 0.0) >= 0.0 && cover_at(0.0, 0.0) <= 1.0);
+    }
 
     // The blend must crossfade the ground palette across biome seams: scanning the map,
     // the worst colour jump between adjacent samples should be far smaller than with the

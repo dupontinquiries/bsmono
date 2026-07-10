@@ -15,7 +15,7 @@ use clawbound_rs::math::{look_at, perspective, v3};
 use clawbound_rs::sim::Game;
 
 #[derive(Default)]
-struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, mleft: bool, mmiddle: bool, mright: bool }
+struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, ability: bool, mleft: bool, mmiddle: bool, mright: bool }
 impl Keys {
     fn set(&mut self, code: KeyCode, down: bool) {
         match code {
@@ -26,6 +26,7 @@ impl Keys {
             KeyCode::ShiftLeft | KeyCode::ControlLeft | KeyCode::KeyC => self.crouch = down,
             KeyCode::Space => self.dodge = down,
             KeyCode::KeyF | KeyCode::KeyE => self.leap = down,
+            KeyCode::KeyQ => self.ability = down,
             KeyCode::KeyR => self.restart = down,
             _ => {}
         }
@@ -53,57 +54,20 @@ fn move_world(yaw: f32, ix: f32, iz: f32) -> (f32, f32) {
 }
 
 /// Draw the pause/title menu overlay (shared by the sim and prowl render paths).
-/// Palette-driven UI colors, sourced from the shared `snapclone-theme` (the portfolio's single source
-/// of truth for design) instead of hardcoded, so clawbound's UI matches the rest of the suite. Swap
-/// `PALETTE` to restyle everything at once; egui-version-agnostic because the palette is plain hex data.
-mod theme {
-    use egui::Color32;
-    use snapclone_theme::{Palette, MODERN};
-
-    pub const PALETTE: &Palette = &MODERN;
-
-    fn c(hex: &str) -> Color32 {
-        let [r, g, b] = snapclone_theme::rgb(hex);
-        Color32::from_rgb(r, g, b)
-    }
-    fn ca(hex: &str, a: u8) -> Color32 {
-        let [r, g, b] = snapclone_theme::rgb(hex);
-        Color32::from_rgba_unmultiplied(r, g, b, a)
-    }
-
-    pub fn menu_fill() -> Color32 { ca(PALETTE.bg_raised, 235) }
-    pub fn title() -> Color32 { c(PALETTE.accent) }
-    pub fn subtitle() -> Color32 { c(PALETTE.text_secondary) }
-    pub fn selected() -> Color32 { c(PALETTE.accent_soft) }
-    pub fn item() -> Color32 { c(PALETTE.text_primary) }
-
-    /// Apply the palette to egui's global Visuals so widget chrome matches the menu.
-    pub fn apply(ctx: &egui::Context) {
-        let mut v = egui::Visuals::dark();
-        v.override_text_color = Some(item());
-        v.panel_fill = c(PALETTE.bg_base);
-        v.window_fill = c(PALETTE.bg_raised);
-        v.extreme_bg_color = c(PALETTE.bg_deep);
-        v.hyperlink_color = title();
-        v.selection.bg_fill = ca(PALETTE.accent, 60);
-        ctx.set_visuals(v);
-    }
-}
-
 fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen) {
     use clawbound_rs::menu::Screen;
-    use egui::{Align2, RichText};
+    use egui::{Align2, Color32, RichText};
     egui::Area::new("clawbound_menu".into()).anchor(Align2::CENTER_CENTER, [0.0, 0.0]).show(ctx, |ui| {
-        egui::Frame::popup(ui.style()).fill(theme::menu_fill()).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
+        egui::Frame::popup(ui.style()).fill(Color32::from_rgba_unmultiplied(18, 14, 26, 235)).inner_margin(egui::Margin::same(24.0)).show(ui, |ui| {
             ui.set_min_width(320.0);
-            ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(theme::title()));
+            ui.label(RichText::new("C L A W B O U N D").size(30.0).strong().color(Color32::from_rgb(230, 210, 170)));
             let sub = match screen { Screen::Title => "", Screen::Play => "Single Player", Screen::Settings => "Settings", Screen::Keybinds => "Keybinds" };
-            if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(theme::subtitle())); }
+            if !sub.is_empty() { ui.label(RichText::new(sub).size(14.0).color(Color32::from_rgb(150, 130, 180))); }
             ui.add_space(10.0);
             for (i, it) in items.iter().enumerate() {
                 let sel = i == cursor;
                 ui.label(RichText::new(format!("{} {}", if sel { "▶" } else { "  " }, it)).size(20.0)
-                    .color(if sel { theme::selected() } else { theme::item() }));
+                    .color(if sel { Color32::from_rgb(255, 220, 120) } else { Color32::from_rgb(205, 205, 210) }));
             }
             ui.add_space(10.0);
             ui.label(RichText::new("↑↓ move   ←→ change   Enter select   Esc back").size(12.0).weak());
@@ -143,10 +107,14 @@ struct State {
     fxbuf: wgpu::Buffer,
     scene_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    ss_on: bool,
+    flick: (f32, f32),
+    mleft_prev: bool,
     pbg: wgpu::BindGroup,
     focus: clawbound_rs::math::Vec3,
     frame: f32,
-    last: std::time::Instant,
+    last: web_time::Instant,
+    anim_t: f32,
     yaw: f32,
     pitch: f32,
     captured: bool,
@@ -274,12 +242,11 @@ impl State {
         ] });
 
         let egui_ctx = egui::Context::default();
-        theme::apply(&egui_ctx);
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None);
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
         let menu = clawbound_rs::menu::Menu::new();
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, pbg, focus, frame: 0.0, last: std::time::Instant::now(), yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -288,8 +255,20 @@ impl State {
         let (w, h) = (size.width.min(max), size.height.min(max));
         self.config.width = w; self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        let (sv, dv) = make_targets(&self.device, w, h);
+        self.apply_targets();
+    }
+
+    /// (Re)create the offscreen scene/depth targets and post bind group. In High/AAA
+    /// graphics the scene renders to a 1.85x-supersampled target that the post pass
+    /// samples down, for crisper edges — the surface itself stays at window size.
+    fn apply_targets(&mut self) {
+        let max = self.device.limits().max_texture_dimension_2d;
+        let s = if self.menu.settings.hires { 1.85 } else { 1.0 };
+        let tw = ((self.config.width as f32 * s) as u32).min(max).max(1);
+        let th = ((self.config.height as f32 * s) as u32).min(max).max(1);
+        let (sv, dv) = make_targets(&self.device, tw, th);
         self.scene_view = sv; self.depth_view = dv;
+        self.ss_on = self.menu.settings.hires;
         self.pbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.pbgl, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&self.samp) },
             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&self.scene_view) },
@@ -316,6 +295,7 @@ impl State {
     fn on_mouse(&mut self, dx: f32, dy: f32) {
         self.yaw += dx * 0.0026;
         self.pitch = (self.pitch + dy * 0.0022).clamp(0.12, 1.32);
+        self.flick.0 += dx; self.flick.1 += dy;   // accumulate for flick-move detection
     }
 
     /// Grow (if needed) and upload the moving-entity vertex buffer.
@@ -385,6 +365,7 @@ impl State {
         use clawbound_rs::{cat, world};
         let g = self.prowl.as_ref().unwrap();
         let mut m: Mesh = crate::build_critters(&g.critters);
+        crate::build_lanes(&mut m, &g.lanes);   // worn paths between the staging grounds
         for &(px, pz, _n) in &g.pois {
             let gy = world::height_at(px, pz);
             m.set_op(0.5); m.segment(v3(px, gy, pz), v3(px, gy + 10.0, pz), 0.4, 0.1, 5, rgb(0x8fd0ff)); m.set_op(1.0);
@@ -403,11 +384,35 @@ impl State {
             m.segment(v3(rx, gy - 1.0, rz), v3(rx, gy + 7.0, rz), 0.35, 0.35, 4, rgb(0x9a6cff));
         }
         m.set_op(1.0);
+        // ancestor trees — grand swaying staging grounds
+        for a in &g.ancestors {
+            let gy = world::height_at(a.x, a.z);
+            crate::build_ancestor(&mut m, a.x, a.z, gy, self.frame * 0.03 + a.x * 0.05, a.ready(), a.claimed_by);
+        }
+        // power-up pickups — floating coloured markers that bob
+        for (px, pz, kind) in &g.pickups {
+            let gy = world::height_at(*px, *pz) + 1.4 + (self.frame * 0.06 + *px).sin() * 0.2;
+            m.boxx(v3(*px, gy, *pz), v3(0.5, 0.5, 0.5), rgb(kind.color()));
+        }
+        // clan minions — small cats on border patrol, tinted by clan
+        for mm in &g.minions {
+            let gy = world::height_at(mm.x, mm.z);
+            let pose = cat::walk((self.anim_t * 1.3 + mm.x * 0.2).rem_euclid(1.0));
+            cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose);
+            m.boxx(v3(mm.x, gy + 1.3, mm.z), v3(0.28, 0.12, 0.28), rgb(clawbound_rs::prowl::clan_color(mm.clan)));
+        }
+        // rival clan prowlers — full-size clan-tinted cats
+        for rv in &g.rivals {
+            let gy = world::height_at(rv.x, rv.z);
+            let pose = cat::walk((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0));
+            cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose);
+            m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
+        }
         // the prowler + a class-tint marker
         let pgy = world::height_at(g.x, g.z);
         let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
-        let pose = if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.frame * 0.06) % 1.0) } else { cat::stand() };
-        cat::build(&mut m, v3(g.x, pgy + arc, g.z), 1.0, &pose);
+        let pose = if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
+        cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose);
         m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
         // the stalking hunter
         let hgy = world::height_at(g.hx, g.hz);
@@ -425,6 +430,7 @@ impl State {
             {
                 let p = self.prowl.as_mut().unwrap();
                 p.set_input(mx, mz, self.keys.leap || self.keys.mleft, self.keys.dodge || self.keys.mmiddle, self.keys.crouch);
+                p.set_ability(self.keys.ability || self.keys.mright);
                 p.step(dt);
             }
             if self.keys.restart {
@@ -443,16 +449,21 @@ impl State {
         let ents = self.build_prowl_entities();
         self.upload_entities(&ents);
 
-        let (flash, exposed) = { let p = self.prowl.as_ref().unwrap(); (p.respawn_flash, p.exposed) };
+        let (flash, exposed, shield_flash) = { let p = self.prowl.as_ref().unwrap(); (p.respawn_flash, p.exposed, p.shielded_flash) };
         let grim = ((flash / 1.2).clamp(0.0, 1.0) * 0.8 + if exposed { 0.25 } else { 0.0 }).min(1.0);
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32]));
+        // a shield-soak spares you, so it shows no damage tint
+        let fx0 = if shield_flash > 0.0 { 0.0 } else { grim };
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32]));
         self.write_camera(20.0);
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
-        let (obj_text, prey, caught, escapes, stamina, cls_name) = {
+        let (obj_text, prey, caught, escapes, stamina, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb) = {
             let p = self.prowl.as_ref().unwrap();
-            (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class.name())
+            let ab = p.class.ability();
+            (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class.name(),
+             p.clan_scores, p.buffs.speed_boosted(), p.buffs.shield, p.on_staging, p.outcome,
+             ab.name(), p.ability_ready(), p.ability_cd, ab.blurb())
         };
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
@@ -463,22 +474,50 @@ impl State {
                 egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                     .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.label(RichText::new(format!("PROWL · {cls_name}")).size(15.0).strong().color(Color32::from_rgb(200, 180, 235)));
+                    ui.label(RichText::new(format!("PROWL · {cls_name}   ·   your score {}", clans[0])).size(15.0).strong().color(Color32::from_rgb(200, 180, 235)));
+                    ui.horizontal(|ui| {
+                        let names = ["Ember", "Tide", "Moss", "Amber"];
+                        let cols = [Color32::from_rgb(216, 98, 60), Color32::from_rgb(61, 127, 216), Color32::from_rgb(90, 160, 84), Color32::from_rgb(216, 165, 60)];
+                        for c in 0..4 { ui.label(RichText::new(format!("{} {}", names[c], clans[c])).size(12.0).color(cols[c])); }
+                    });
                     ui.label(RichText::new(obj_text).size(14.0).color(Color32::from_rgb(200, 220, 205)));
                     ui.label(RichText::new(format!("prey {prey}   ·   caught {caught}   ·   escapes {escapes}")).size(13.0).color(Color32::from_rgb(200, 210, 225)));
                     ui.add(egui::ProgressBar::new(stamina).desired_width(168.0)
                         .fill(if stamina > 0.25 { Color32::from_rgb(120, 200, 150) } else { Color32::from_rgb(215, 120, 90) })
                         .text(RichText::new("stamina").size(11.0).color(Color32::WHITE)));
-                    if exposed { ui.label(RichText::new("⚠ EXPOSED — get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
+                    let mut buffs = String::new();
+                    if b_speed { buffs.push_str("SPD "); }
+                    if b_shield { buffs.push_str("SHLD "); }
+                    if !buffs.is_empty() { ui.label(RichText::new(buffs).size(13.0).strong().color(Color32::from_rgb(120, 200, 255))); }
+                    let (astate, acol) = if ab_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ab_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
+                    ui.label(RichText::new(format!("Q · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
+                    ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
+                    if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
+                    if exposed { ui.label(RichText::new("! EXPOSED - get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
                 });
             });
             egui::Area::new("phint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · R restart · Esc menu")
+                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · Q/R-click ability · R restart · Esc menu")
                     .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
             });
             if exposed {
                 egui::Area::new("pexp".into()).order(egui::Order::Background).show(ctx, |ui| {
                     ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_rgba_unmultiplied(70, 24, 80, 46));
+                });
+            }
+            if let Some(w) = outcome {
+                egui::Area::new("pdim".into()).order(egui::Order::Background).show(ctx, |ui| { ui.painter().rect_filled(ctx.screen_rect(), 0.0, Color32::from_black_alpha(150)); });
+                let names = ["EMBER", "TIDE", "MOSS", "AMBER"];
+                let cols = [Color32::from_rgb(216, 98, 60), Color32::from_rgb(61, 127, 216), Color32::from_rgb(90, 160, 84), Color32::from_rgb(216, 165, 60)];
+                let (txt, col) = if (w as usize) < 4 {
+                    (if w == 0 { "YOUR CLAN WINS".to_string() } else { format!("{} CLAN WINS", names[w as usize]) }, cols[w as usize])
+                } else { ("STALEMATE".to_string(), Color32::from_rgb(210, 205, 200)) };
+                egui::Area::new("pres".into()).anchor(Align2::CENTER_CENTER, [0.0, -10.0]).show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new(txt).size(44.0).strong().color(col));
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("press  R  for a new hunt").size(16.0).color(Color32::from_rgb(255, 220, 120)));
+                    });
                 });
             }
         });
@@ -505,8 +544,11 @@ impl State {
         for c in &g.crackers { let gy = world::height_at(c.x, c.z); m.boxx(v3(c.x, gy + 0.9, c.z), v3(0.28, 0.28, 0.28), rgb(0xff8030)); }
         for mob in &g.mobs {
             let gy = world::height_at(mob.x, mob.z);
-            let pose = if mob.stunned() { cat::startle() } else { cat::walk((self.frame * 0.06 + mob.x * 0.1) % 1.0) };
-            cat::build(&mut m, v3(mob.x, gy, mob.z), 1.0, &pose);
+            let moving = mob.stun_t <= 0.0;
+            let pose = if mob.stunned() { cat::startle() }
+                else if moving { cat::walk((self.anim_t * 1.5 + mob.x * 0.1).rem_euclid(1.0)) }
+                else { cat::idle(self.anim_t * 0.6 + mob.x * 0.05) };
+            cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose);
             let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
             m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);
             m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color));
@@ -612,12 +654,14 @@ impl State {
 
     fn render(&mut self) {
         self.frame += 1.0;
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         // real elapsed time, clamped so a stall can't fling everything across the map;
         // this keeps the game running at the same pace on 60Hz and 120Hz displays alike.
         let dt = now.duration_since(self.last).as_secs_f32().clamp(0.0, 0.1);
         self.last = now;
+        self.anim_t += dt;
         self.debug_cone = self.menu.settings.show_cone;
+        if self.ss_on != self.menu.settings.hires { self.apply_targets(); }   // Graphics toggle → (de)supersample
         if self.capture.is_some() { self.render_capture(dt); return; }
         if self.prowl.is_some() { self.render_prowl(dt); return; }
 
@@ -631,7 +675,21 @@ impl State {
             // which felt like the controls were rotated ~30° off).
             let (ix, iz) = self.keys.move_vec();
             let (mx, mz) = move_world(self.yaw, ix, iz);
-            self.game.set_input(0, mx, mz, self.keys.crouch, self.keys.dodge || self.keys.mmiddle, self.keys.leap || self.keys.mleft);
+            self.game.set_input(0, mx, mz, self.keys.crouch, self.keys.dodge || self.keys.mmiddle, self.keys.leap);
+
+            // flick controls: a fast mouse-flick + left-click performs the matching move
+            // (up = pounce, down = hind-kick, sideways = roll); a bare click is a swat.
+            // Right-click held is the low modifier (underbelly swipe). Screen-up maps to
+            // the cat's forward since the follow-cam sits behind it.
+            self.flick.0 *= 0.7; self.flick.1 *= 0.7;
+            let fmag = (self.flick.0 * self.flick.0 + self.flick.1 * self.flick.1).sqrt();
+            if self.keys.mleft && !self.mleft_prev {
+                let fast = fmag > 14.0;
+                let local = if fast { (self.flick.0 / fmag, -self.flick.1 / fmag) } else { (0.0, 0.0) };
+                let mag = if fast { 1.0 } else { clawbound_rs::combat::FLICK_MIN + 0.1 };
+                self.game.player_flick(local, mag, self.keys.mright);
+            }
+            self.mleft_prev = self.keys.mleft;
 
             // when the player's own cat is caught: a short slow-motion beat + a fade flash
             let alive = self.game.cats[0].alive;
@@ -645,8 +703,11 @@ impl State {
             if self.game.outcome.is_some() { self.over_timer += dt; } else { self.over_timer = 0.0; }
             if self.keys.restart || self.over_timer > 6.0 {
                 let diff = self.game.difficulty;
-                self.game = Game::new_match(self.kind, self.mode);
+                let clan = self.game.clan;
+                let seed = (self.frame as u32).wrapping_mul(2_654_435_761) | 1;
+                self.game = Game::new_match_seeded(self.kind, self.mode, seed);
                 self.game.difficulty = diff;
+                self.game.clan = clan;
                 self.over_timer = 0.0; self.keys.restart = false;
                 self.death_t = 0.0; self.prev_player_alive = true;
             }
@@ -664,7 +725,7 @@ impl State {
 
         // rebuild + upload the moving entities (+ otherworld dressing during a shift)
         let nightmare = if self.game.hunter.kind.is_shadow() && self.game.shifted { 1.0f32 } else { 0.0 };
-        let mut ents = crate::build_entities(&self.game, (self.frame * 0.06) % 1.0, self.debug_cone);
+        let mut ents = crate::build_entities(&self.game, self.anim_t, self.debug_cone);
         if nightmare > 0.5 { ents.extend(&crate::build_nightmare_extras(self.focus)); }
         self.ent_vcount = ents.count();
         let bytes: &[u8] = bytemuck::cast_slice(&ents.verts);
@@ -680,7 +741,7 @@ impl State {
         // death fade reuses the nightmare desaturate/vignette in the post shader
         let death = (self.death_t / 1.6).clamp(0.0, 1.0);
         let grim = nightmare.max(death * 0.9);
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, self.game.danger]));
 
         // third-person orbit positioned from mouse-driven yaw/pitch
         let (sy, cy) = (self.yaw.sin(), self.yaw.cos());
@@ -735,6 +796,50 @@ impl State {
         // HUD snapshot (copied out so the egui closure doesn't borrow self)
         let hunter_name = self.kind.params().name;
         let mode_name = match self.mode { clawbound_rs::sim::Mode::Survive => "Survive", _ => "Rendezvous" };
+        let weather_line = {
+            let w = &self.game.weather;
+            let wind = w.total_wind();
+            let windword = if wind > 0.85 { "gale" } else if wind > 0.5 { "brisk wind" } else if wind > 0.25 { "light wind" } else { "still air" };
+            format!("{} · {} · {}", w.season.name(), w.sky.name(), windword)
+        };
+        let ct = clawbound_rs::clan::trait_of(self.game.clan);
+        let clan_line = format!("{} — {}", ct.name, clawbound_rs::clan::specialty(self.game.clan));
+        let clan_traits = [("climb", ct.climb, egui::Color32::from_rgb(90, 160, 84)), ("sprint", ct.sprint, egui::Color32::from_rgb(216, 165, 60)),
+                           ("swim", ct.swim, egui::Color32::from_rgb(61, 127, 216)), ("stealth", ct.stealth, egui::Color32::from_rgb(154, 108, 255)),
+                           ("scent", ct.scent, egui::Color32::from_rgb(224, 128, 64))];
+        let clan_color = ct.color;
+        // directional threat: bearing to the hunter relative to the camera, for an
+        // edge marker that tells you which way the danger is closing from.
+        let (thx, thz) = (self.game.hunter.x, self.game.hunter.z);
+        let (tpx, tpz) = (self.game.cats[0].x, self.game.cats[0].z);
+        let (dxh, dzh) = (thx - tpx, thz - tpz);
+        let (fwx, fwz) = (self.yaw.sin(), self.yaw.cos());
+        let sxh = dxh * fwz - dzh * fwx;                 // screen-right component
+        let syh = dxh * fwx + dzh * fwz;                 // depth (ahead) component
+        let threat_bearing = sxh.atan2(syh);
+        let threat = self.game.danger;
+        let noise = self.game.noise_flash;
+        let combo_flash = self.game.combo_flash;
+        let combo_name = self.game.combo_name;
+        let move_name = self.game.player_move.map(|(m, _)| m.name());
+        // world lore for the HUD: the pack roster (name · rank · fate), the region and a
+        // line about it, the time of day, and a tenet of the code.
+        let region = self.game.region();
+        let region_lore = self.game.region_lore();
+        let scent_line = {
+            let ws = self.game.read_wind();
+            if ws.predator_reek > 0.22 { format!("the reek of the {} is on the wind", hunter_name.to_lowercase()) }
+            else if let Some((_, _, _, s)) = ws.prey { if s > 0.15 { format!("{}-scent on the breeze — upwind", ws.prey_name) } else { String::new() } }
+            else { String::new() }
+        };
+        let day_phase = clawbound_rs::lore::day_phase(0.25 + self.game.time / 480.0);
+        let code_line = clawbound_rs::lore::code_line((self.game.tick / 600).wrapping_add(self.game.clan as u32));
+        let roster: Vec<(String, &'static str, bool, bool)> = self.game.cats.iter().enumerate()
+            .map(|(i, c)| (self.game.cat_name(i).to_string(), self.game.roster.get(i).map(|(_, r)| r.title()).unwrap_or("warrior"), c.alive, c.safe))
+            .collect();
+        let player_name = self.game.cat_name(0).to_string();
+        let death_show = self.death_t;
+        let blessing = if death_show > 0.0 { clawbound_rs::lore::death_blessing(&player_name) } else { String::new() };
         let p = &self.game.cats[0];
         let stamina = p.stamina;
         let player_alive = p.alive;
@@ -804,13 +909,80 @@ impl State {
                             .fill(if stamina > 0.25 { Color32::from_rgb(120, 200, 150) } else { Color32::from_rgb(215, 120, 90) })
                             .text(RichText::new("stamina").size(11.0).color(Color32::WHITE)));
                         let sc = if player_alive { Color32::from_rgb(180, 200, 235) } else { Color32::from_rgb(235, 130, 120) };
-                        ui.label(RichText::new(format!("you: {pstate}")).size(13.0).color(sc));
+                        ui.label(RichText::new(format!("{player_name} — {pstate}")).size(13.0).color(sc));
+                        ui.label(RichText::new(&weather_line).size(12.0).color(Color32::from_rgb(160, 178, 196)));
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(&clan_line).size(13.0).strong().color(Color32::from_rgb(((clan_color >> 16) & 255) as u8, ((clan_color >> 8) & 255) as u8, (clan_color & 255) as u8)));
+                        for (label, v, col) in clan_traits {
+                            ui.add(egui::ProgressBar::new(((v - 0.6) / 1.05).clamp(0.05, 1.0)).desired_width(150.0).fill(col)
+                                .text(RichText::new(label).size(10.0).color(Color32::WHITE)));
+                        }
                     });
                 });
                 egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                    ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · Esc menu")
+                    ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Esc menu")
                         .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
                 });
+                // world panel (top-right): the region, a line about it, the hour, and the
+                // named pack with each cat's rank and fate — the clan you're fighting for.
+                egui::Area::new("world".into()).anchor(Align2::RIGHT_TOP, [-14.0, 14.0]).show(ctx, |ui| {
+                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 13, 20, 155)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(7.0).show(ui, |ui| {
+                        ui.set_max_width(230.0);
+                        ui.label(RichText::new(format!("{region} · {day_phase}")).size(13.0).strong().color(Color32::from_rgb(210, 205, 180)));
+                        ui.label(RichText::new(region_lore).size(11.0).italics().color(Color32::from_rgb(160, 160, 172)));
+                        if !scent_line.is_empty() {
+                            ui.label(RichText::new(format!("\u{2022} {scent_line}")).size(11.0).color(Color32::from_rgb(200, 180, 130)));
+                        }
+                        ui.add_space(4.0);
+                        for (nm, rank, alive, safe) in &roster {
+                            let (col, tag) = if !*alive { (Color32::from_rgb(150, 90, 86), "lost") }
+                                else if *safe { (Color32::from_rgb(120, 200, 130), "safe") }
+                                else { (Color32::from_rgb(205, 210, 220), *rank) };
+                            ui.label(RichText::new(format!("{nm} — {tag}")).size(12.0).color(col));
+                        }
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(format!("\u{201c}{code_line}\u{201d}")).size(10.0).italics().color(Color32::from_rgb(140, 140, 155)));
+                    });
+                });
+                // a farewell over the fallen — the clan's blessing as you go down
+                if death_show > 0.0 && !blessing.is_empty() {
+                    egui::Area::new("blessing".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, 40.0]).show(ctx, |ui| {
+                        ui.set_max_width(420.0);
+                        ui.label(RichText::new(&blessing).size(15.0).italics().color(Color32::from_rgba_unmultiplied(230, 224, 210, (200.0 * (death_show / 1.6).min(1.0)) as u8)));
+                    });
+                }
+                // combat: the current move, and a combo banner when a chain lands
+                if let Some(mn) = move_name {
+                    egui::Area::new("move".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_TOP, [0.0, 46.0]).show(ctx, |ui| {
+                        ui.label(RichText::new(mn).size(15.0).strong().color(Color32::from_rgb(255, 240, 200)));
+                    });
+                }
+                if combo_flash > 0.05 {
+                    egui::Area::new("combo".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+                        ui.label(RichText::new(combo_name).size(20.0 + combo_flash * 12.0).strong()
+                            .color(Color32::from_rgba_unmultiplied(255, 210, 90, (255.0 * combo_flash.min(1.0)) as u8)));
+                    });
+                }
+                // twig-snap cue: a sharp flash when you crack a twig underfoot
+                if noise > 0.05 && player_alive {
+                    egui::Area::new("snap".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_TOP, [0.0, 70.0]).show(ctx, |ui| {
+                        ui.label(RichText::new("*SNAP!*").size(15.0 + noise * 7.0).strong()
+                            .color(Color32::from_rgba_unmultiplied(255, 220, 120, (255.0 * noise) as u8)));
+                    });
+                }
+                // directional threat: a red marker at the screen edge in the hunter's
+                // direction, brighter and larger the closer the danger.
+                if threat > 0.28 && player_alive {
+                    let a = ((threat - 0.28) / 0.72).clamp(0.0, 1.0);
+                    let r = 235.0;
+                    let off = [threat_bearing.sin() * r, -threat_bearing.cos() * r];
+                    egui::Area::new("threat".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, off).show(ctx, |ui| {
+                        egui::Frame::none().fill(Color32::from_rgba_unmultiplied(210, 48, 40, (110.0 + 120.0 * a) as u8))
+                            .rounding(10.0).inner_margin(egui::Margin::symmetric(9.0, 4.0)).show(ui, |ui| {
+                            ui.label(RichText::new("THREAT").size(11.0 + a * 5.0).strong().color(Color32::WHITE));
+                        });
+                    });
+                }
                 // caught: a red flash while the slow-motion death beat plays out
                 if !player_alive && death_t > 0.0 {
                     let a = (death_t / 1.6).clamp(0.0, 1.0);
@@ -855,7 +1027,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; state.game = Game::new_match(k, m); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.over_timer = 0.0; }
                                             MenuCmd::StartMode(g, k, c) => {
                                                 use clawbound_rs::menu::GameMode;
                                                 state.prowl = None; state.capture = None;

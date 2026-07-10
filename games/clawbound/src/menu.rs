@@ -55,11 +55,12 @@ impl Keybinds {
 pub struct Settings {
     pub show_cone: bool,   // debug: draw the AI vision cone
     pub master_volume: f32,
-    pub difficulty: u8,    // 0 easy .. 2 hard (affects hunter aggression later)
+    pub difficulty: u8,    // 0 easy .. 2 hard — scales hunter speed, suspicion, and flush radius
+    pub hires: bool,       // AAA graphics: supersample + denser geometry
     pub keybinds: Keybinds,
 }
 impl Default for Settings {
-    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, keybinds: Keybinds::default() } }
+    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, hires: false, keybinds: Keybinds::default() } }
 }
 
 /// Map the difficulty setting (0 easy .. 2 hard) to a hunter-aggression multiplier.
@@ -91,6 +92,7 @@ pub struct Menu {
     pub sel_mode: Mode,
     pub sel_game: GameMode,
     pub sel_class: Class,
+    pub sel_clan: u8,
     pub rebinding: Option<Action>,   // Some(action) while waiting for a key press
 }
 
@@ -99,7 +101,7 @@ impl Default for Menu { fn default() -> Self { Self::new() } }
 impl Menu {
     pub fn new() -> Self {
         Menu { open: true, screen: Screen::Title, cursor: 0, settings: Settings::default(),
-               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, rebinding: None }
+               sel_hunter: Kind::Fox, sel_mode: Mode::Rendezvous, sel_game: GameMode::Rendezvous, sel_class: Class::Cat, sel_clan: 0, rebinding: None }
     }
 
     /// Menu item labels for the current screen (top-to-bottom).
@@ -110,12 +112,14 @@ impl Menu {
                 format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
                 format!("Class: {}", self.sel_class.name()),
+                format!("Clan: {} ({})", crate::clan::name(self.sel_clan), crate::clan::specialty(self.sel_clan)),
                 "Start".into(), "Back".into(),
             ],
             Screen::Settings => vec![
                 format!("Show vision cone: {}", if self.settings.show_cone { "On" } else { "Off" }),
                 format!("Master volume: {:.0}%", self.settings.master_volume * 100.0),
                 format!("Difficulty: {}", ["Easy", "Normal", "Hard"][self.settings.difficulty as usize]),
+                format!("Graphics: {}", if self.settings.hires { "High (AAA)" } else { "Standard" }),
                 "Back".into(),
             ],
             Screen::Keybinds => {
@@ -158,12 +162,14 @@ impl Menu {
             (Screen::Play, 0) => self.next_game(dir),
             (Screen::Play, 1) => self.next_hunter(dir),
             (Screen::Play, 2) => self.next_class(dir),
+            (Screen::Play, 3) => self.sel_clan = (self.sel_clan as i32 + dir).rem_euclid(crate::clan::CLAN_COUNT as i32) as u8,
             (Screen::Settings, 0) => self.settings.show_cone = !self.settings.show_cone,
             (Screen::Settings, 1) => self.settings.master_volume = (self.settings.master_volume + dir as f32 * 0.1).clamp(0.0, 1.0),
             (Screen::Settings, 2) => {
                 let d = self.settings.difficulty as i32 + dir;
                 self.settings.difficulty = d.clamp(0, 2) as u8;
             }
+            (Screen::Settings, 3) => self.settings.hires = !self.settings.hires,
             _ => {}
         }
     }
@@ -179,15 +185,15 @@ impl Menu {
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
-                3 => {
+                4 => {
                     self.open = false;
                     if self.sel_game.is_sim() { MenuCmd::StartSingle(self.sel_hunter, self.sel_game.sim_mode()) }
                     else { MenuCmd::StartMode(self.sel_game, self.sel_hunter, self.sel_class) }
                 }
-                4 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
-                _ => MenuCmd::None,   // rows 0/1/2 are adjusted with left/right
+                5 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
+                _ => MenuCmd::None,   // rows 0..3 are adjusted with left/right
             },
-            Screen::Settings => { if self.cursor == 3 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
+            Screen::Settings => { if self.cursor == 4 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
             Screen::Keybinds => {
                 let n = self.settings.keybinds.keys.len();
                 if self.cursor == n { self.screen = Screen::Title; self.cursor = 0; }
@@ -228,7 +234,7 @@ mod tests {
         assert_eq!(m.activate(), MenuCmd::None);      // Title → Play screen
         assert_eq!(m.screen, Screen::Play);
         m.cursor = 1; m.adjust(1);                     // change hunter
-        m.cursor = 3;                                  // Start (a sim game is selected by default)
+        m.cursor = 4;                                  // Start (a sim game is selected by default)
         match m.activate() { MenuCmd::StartSingle(_, _) => {}, c => panic!("expected StartSingle, got {c:?}") }
         assert!(!m.open);
     }
@@ -241,7 +247,8 @@ mod tests {
         m.cursor = 0; m.adjust(1); assert_eq!(m.sel_game, GameMode::Survive);
         m.adjust(1); assert_eq!(m.sel_game, GameMode::Prowl);
         m.cursor = 2; let c0 = m.sel_class; m.adjust(1); assert_ne!(m.sel_class, c0, "class should cycle");
-        m.cursor = 3;
+        m.cursor = 3; let k0 = m.sel_clan; m.adjust(1); assert_ne!(m.sel_clan, k0, "clan should cycle");
+        m.cursor = 4;
         match m.activate() {
             MenuCmd::StartMode(GameMode::Prowl, _, cls) => assert_eq!(cls, m.sel_class),
             c => panic!("expected StartMode(Prowl,..), got {c:?}"),
@@ -256,6 +263,8 @@ mod tests {
         assert_ne!(before, m.settings.show_cone);
         m.cursor = 1; m.adjust(-1); m.adjust(-1);
         assert!(m.settings.master_volume < 0.71);
+        m.cursor = 3; let g0 = m.settings.hires; m.adjust(1);
+        assert_ne!(g0, m.settings.hires, "the Graphics setting should toggle");
     }
 
     #[test]

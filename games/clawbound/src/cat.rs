@@ -18,11 +18,47 @@ pub struct Pose {
     pub crouch: f32,     // 0..1 lowers the body, folds the legs
     pub tail: f32,       // tail sway/lift
     pub head: f32,       // head pitch
+    pub head_yaw: f32,   // head turn left(−)/right(+)
+    pub breath: f32,     // 0..1 breathing expansion of the chest
 }
 
-fn base() -> Pose { Pose { swing: [0.0; 4], knee: [0.35; 4], bob: 0.0, pitch: 0.0, crouch: 0.0, tail: 0.2, head: 0.0 } }
+fn base() -> Pose { Pose { swing: [0.0; 4], knee: [0.35; 4], bob: 0.0, pitch: 0.0, crouch: 0.0, tail: 0.2, head: 0.0, head_yaw: 0.0, breath: 0.0 } }
 
 pub fn stand() -> Pose { base() }
+
+/// Idle — a living, breathing stand: slow chest rise, tail sway, the odd glance.
+pub fn idle(t: f32) -> Pose {
+    let mut p = base();
+    let b = (t * TAU).sin();
+    p.breath = 0.5 + 0.5 * b;                       // chest expands and settles
+    p.bob = 0.018 * b;                              // whole body rises a touch with the breath
+    p.head = 0.045 * (t * 0.7 * TAU + 1.0).sin();   // small head bob, offset from the breath
+    p.head_yaw = 0.14 * (t * 0.33 * TAU).sin();     // slow glances left and right
+    p.tail = 0.2 + 0.18 * (t * 0.5 * TAU).sin();    // lazy tail sway
+    p
+}
+
+/// Frozen, reading the wind — muzzle lifted, casting the head, quick scenting breaths.
+/// The pose a cat holds when it stops to taste the air for a predator.
+pub fn taste_air(t: f32) -> Pose {
+    let mut p = base();
+    p.head = 0.34 + 0.08 * (t * TAU).sin();         // muzzle raised to the breeze
+    p.pitch = -0.12;
+    p.head_yaw = 0.2 * (t * 0.6 * TAU).sin();        // casting side to side
+    p.breath = 0.5 + 0.5 * (t * 1.8 * TAU).sin();    // fast scenting breaths
+    p.tail = 0.35;
+    p
+}
+
+/// Wading/pushing through thick cover — the gait, but lowered and shouldering into the
+/// brush, head dipped. `cover` (0..1) is how deep the undergrowth is.
+pub fn wade(speed: f32, t: f32, off: f32, cover: f32) -> Pose {
+    let mut p = gait(speed, t, off);
+    p.crouch = (p.crouch + cover * 0.4).min(0.6);   // hunched low, pushing through
+    p.head = -0.15 * cover;                          // head down, breasting the growth
+    p.pitch = 0.05 * cover;
+    p
+}
 
 /// Four-beat walk (lateral sequence).
 pub fn walk(t: f32) -> Pose {
@@ -54,6 +90,24 @@ pub fn bound(t: f32) -> Pose {
 }
 
 /// Mid-leap — body stretched, legs extended.
+/// Name the gait a ground speed calls for — a walk quickens to a trot, then breaks
+/// into a bound. Used for both animation and (in tests) to reason about traversal.
+pub fn gait_name(speed: f32) -> &'static str {
+    if speed > 11.0 { "bound" } else if speed > 6.0 { "trot" } else { "walk" }
+}
+
+/// The moving pose for a ground speed: a slow walk, quickening to a trot, breaking
+/// into a bounding gallop when running flat out. `t` is the animation clock, `off`
+/// a per-cat phase offset so a pack doesn't move in lockstep.
+pub fn gait(speed: f32, t: f32, off: f32) -> Pose {
+    if speed > 11.0 {
+        bound((t * 2.4 + off).rem_euclid(1.0))          // galloping bound
+    } else {
+        let rate = 1.0 + (speed * 0.12).min(1.8);        // walk cadence quickens toward a trot
+        walk((t * rate + off).rem_euclid(1.0))
+    }
+}
+
 pub fn leap() -> Pose {
     let mut p = base();
     p.swing = [0.9, 0.9, -0.8, -0.8];
@@ -86,41 +140,210 @@ pub fn climb() -> Pose {
     p
 }
 
-pub fn build(m: &mut Mesh, at: Vec3, face: f32, p: &Pose) {
+/// Combat ready-stance — low and coiled on the haunches, tail lashing, eyes on the foe.
+pub fn stance(t: f32) -> Pose {
+    let mut p = base();
+    p.crouch = 0.55;
+    p.knee = [0.8; 4];
+    p.pitch = -0.05;
+    p.head = -0.1;
+    p.tail = 0.6 + 0.45 * (t * 2.0 * TAU).sin();   // tail whips side to side
+    p.head_yaw = 0.06 * (t * TAU).sin();
+    p.breath = 0.5 + 0.5 * (t * 1.5 * TAU).sin();
+    p
+}
+
+/// A swipe/pounce strike. `t` runs 0→1 over the attack; the fore paws lash forward
+/// and the body lunges, peaking mid-swing.
+pub fn strike(t: f32) -> Pose {
+    let mut p = base();
+    let k = (t.clamp(0.0, 1.0) * PI).sin();          // ease in and out of the swing
+    p.swing = [0.6 * k, 0.95 * k, -0.3 * k, -0.3 * k]; // fore paws reach, hind braces
+    p.knee = [0.15, 0.1, 0.5, 0.5];
+    p.pitch = 0.15 * k;
+    p.bob = 0.1 * k;
+    p.head = 0.22 * k;
+    p.tail = 0.4;
+    p
+}
+
+/// Underbelly swipe — dropped low and half-rolled, fore paws raking up under a high
+/// or pouncing attacker.
+pub fn underbelly_swipe(t: f32) -> Pose {
+    let mut p = base();
+    let k = (t.clamp(0.0, 1.0) * PI).sin();
+    p.crouch = 0.75;
+    p.pitch = -0.35 - 0.2 * k;             // belly turned toward the foe
+    p.swing = [0.7 * k, 0.95 * k, -0.2, -0.2];  // fore paws rake upward
+    p.knee = [0.1, 0.1, 0.7, 0.7];
+    p.head = -0.2;
+    p.tail = 0.5;
+    p
+}
+
+/// Hind kick — front dipped, both hind legs lashing backward to rake and shove off.
+pub fn hind_kick(t: f32) -> Pose {
+    let mut p = base();
+    let k = (t.clamp(0.0, 1.0) * PI).sin();
+    p.pitch = 0.3 + 0.2 * k;               // nose down, haunches up
+    p.swing = [0.3, 0.3, -0.9 * k, -1.05 * k];  // hind legs drive back
+    p.knee = [0.5, 0.5, 0.1, 0.05];
+    p.bob = 0.15 * k;
+    p.tail = -0.4;
+    p.head = -0.3;
+    p
+}
+
+/// A vertical hop — legs tuck, body rises and settles.
+pub fn jump(t: f32) -> Pose {
+    let mut p = base();
+    let k = (t.clamp(0.0, 1.0) * PI).sin();
+    p.bob = 0.4 * k;
+    p.crouch = (0.5 * (1.0 - k)).max(0.0); // coiled at take-off and landing
+    p.swing = [0.5 * k, 0.5 * k, 0.5 * k, 0.5 * k];  // legs tuck under
+    p.knee = [0.8, 0.8, 0.8, 0.8];
+    p.pitch = 0.1;
+    p.tail = 0.3 + 0.3 * k;
+    p
+}
+
+/// The pose for a combat move at progress `t` (0→1). Bridges `combat::Move` to the rig.
+pub fn move_pose(m: crate::combat::Move, t: f32) -> Pose {
+    use crate::combat::Move::*;
+    match m {
+        Pounce => leap(),
+        Jump => jump(t),
+        Roll | Dodge => coil(),
+        UnderbellySwipe => underbelly_swipe(t),
+        HindKick => hind_kick(t),
+        Swat => strike(t),
+    }
+}
+
+/// Build the cat facing `yaw` radians (0 = +z, matching `heading = dx.atan2(dz)`).
+pub fn build(m: &mut Mesh, at: Vec3, yaw: f32, p: &Pose) {
     let pelt = rgb(0x9a7b53);
     let dark = rgb(0x6f5638);
-    let fz = face;
+    let (s, co) = (yaw.sin(), yaw.cos());
+    // rotate a body-local point (forward = +z) into world, pivoting about `at`
+    let place = |lx: f32, wy: f32, lz: f32| v3(at.x + lx * co + lz * s, wy, at.z - lx * s + lz * co);
+
     let stand_h = 0.52;
+    let breath = 1.0 + p.breath * 0.05;
     let body_y = at.y + stand_h * (1.0 - p.crouch * 0.35) + p.bob;
+    let fore_y = body_y + p.pitch * 0.25 + 0.03;
+    let hind_y = body_y - p.pitch * 0.25;
 
-    let fore = v3(at.x, body_y + p.pitch * 0.25 + 0.03, at.z + 0.30 * fz);
-    let hind = v3(at.x, body_y - p.pitch * 0.25, at.z - 0.35 * fz);
-    m.boxx(hind, v3(0.34, 0.30, 0.45), pelt);
-    m.boxx(fore, v3(0.32, 0.30, 0.42), pelt);
+    m.boxx_yaw(place(0.0, hind_y, -0.35), v3(0.34, 0.30 * breath, 0.45), yaw, pelt);
+    m.boxx_yaw(place(0.0, fore_y, 0.30), v3(0.32, 0.30 * breath, 0.42), yaw, pelt);
 
-    let head = v3(at.x, fore.y + 0.22 + p.head * 0.12, at.z + 0.78 * fz);
-    m.boxx(head, v3(0.27, 0.24, 0.25), pelt);
-    m.cone(v3(head.x - 0.15, head.y + 0.24, head.z), 0.1, 0.22, 4, dark);
-    m.cone(v3(head.x + 0.15, head.y + 0.24, head.z), 0.1, 0.22, 4, dark);
+    // head turns with head_yaw; ears ride on top, rotated with it
+    let head_c = place(0.0, fore_y + 0.22 + p.head * 0.12, 0.78);
+    m.boxx_yaw(head_c, v3(0.27, 0.24, 0.25), yaw + p.head_yaw, pelt);
+    let (hs, hc) = (p.head_yaw.sin(), p.head_yaw.cos());
+    for ex in [-0.15f32, 0.15] {
+        let ear = place(ex * hc, head_c.y + 0.24, 0.78 - ex * hs);
+        m.cone(ear, 0.1, 0.22, 4, dark);
+    }
 
-    let tb = v3(at.x, hind.y + 0.05, at.z - 0.78 * fz);
-    let ttip = v3(tb.x + p.tail * 0.3, tb.y + 0.2 + p.tail.abs() * 0.25, tb.z - 0.5 * fz);
+    // tail sweeps out behind (−z)
+    let tb = place(0.0, hind_y + 0.05, -0.78);
+    let ttip = place(p.tail * 0.3, tb.y + 0.2 + p.tail.abs() * 0.25, -0.78 - 0.5);
     m.segment(tb, ttip, 0.08, 0.04, 5, pelt);
 
-    let hips = [
-        v3(at.x - 0.22, body_y, at.z + 0.32 * fz),
-        v3(at.x + 0.22, body_y, at.z + 0.32 * fz),
-        v3(at.x - 0.22, body_y, at.z - 0.32 * fz),
-        v3(at.x + 0.22, body_y, at.z - 0.32 * fz),
-    ];
+    // four two-bone legs; swing rotates each leg in its own fore/aft (z–y) plane
     let (lt, ls) = (0.28, 0.28);
+    let hip_lx = [-0.22, 0.22, -0.22, 0.22];
+    let hip_lz = [0.32, 0.32, -0.32, -0.32];
     for i in 0..4 {
         let sw = p.swing[i];
         let kn = p.knee[i] + p.crouch * 0.4;
-        let hip = hips[i];
-        let knee = v3(hip.x, hip.y - lt * sw.cos(), hip.z + lt * sw.sin() * fz);
-        let foot = v3(knee.x, knee.y - ls * (sw + kn).cos(), knee.z + ls * (sw + kn).sin() * fz);
+        let hip = place(hip_lx[i], body_y, hip_lz[i]);
+        let knee_lz = hip_lz[i] + lt * sw.sin();
+        let knee_y = body_y - lt * sw.cos();
+        let knee = place(hip_lx[i], knee_y, knee_lz);
+        let foot_lz = knee_lz + ls * (sw + kn).sin();
+        let foot_y = knee_y - ls * (sw + kn).cos();
+        let foot = place(hip_lx[i], foot_y, foot_lz);
         m.segment(hip, knee, 0.09, 0.075, 5, dark);
         m.segment(knee, foot, 0.075, 0.05, 5, dark);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans(yaw: f32) -> (f32, f32) {
+        let mut m = Mesh::new();
+        build(&mut m, v3(0.0, 0.0, 0.0), yaw, &stand());
+        let (mut xmin, mut xmax, mut zmin, mut zmax) = (1e9f32, -1e9f32, 1e9f32, -1e9f32);
+        for v in &m.verts {
+            xmin = xmin.min(v.pos[0]); xmax = xmax.max(v.pos[0]);
+            zmin = zmin.min(v.pos[2]); zmax = zmax.max(v.pos[2]);
+        }
+        (xmax - xmin, zmax - zmin)
+    }
+
+    #[test]
+    fn build_rotates_to_face_yaw() {
+        // facing +z (yaw 0) the cat is longer front-to-back (z); rotated a quarter turn
+        // it's longer side-to-side (x). This proves the whole rig actually turns.
+        let (x0, z0) = spans(0.0);
+        assert!(z0 > x0 + 0.3, "facing +z, longer along z (z {z0:.2} vs x {x0:.2})");
+        let (x9, z9) = spans(std::f32::consts::FRAC_PI_2);
+        assert!(x9 > z9 + 0.3, "facing +x, longer along x (x {x9:.2} vs z {z9:.2})");
+    }
+
+    #[test]
+    fn idle_breathes_and_stand_is_still() {
+        // the idle pose animates (breath varies over time); stand is a fixed base
+        let a = idle(0.1).breath;
+        let b = idle(0.6).breath;
+        assert!((a - b).abs() > 0.1, "idle breathing should vary over time");
+        assert_eq!(stand().breath, 0.0);
+    }
+
+    #[test]
+    fn strike_peaks_mid_swing() {
+        // the swipe reaches farthest at the middle of the animation, not the ends
+        let start = strike(0.0).swing[1].abs();
+        let mid = strike(0.5).swing[1].abs();
+        let end = strike(1.0).swing[1].abs();
+        assert!(mid > start && mid > end, "the strike should peak mid-swing ({start:.2}/{mid:.2}/{end:.2})");
+        // the ready-stance is a low crouch, distinct from an upright stand
+        assert!(stance(0.0).crouch > 0.3 && stand().crouch == 0.0);
+    }
+
+    #[test]
+    fn gait_shifts_up_with_speed() {
+        assert_eq!(gait_name(3.0), "walk");
+        assert_eq!(gait_name(8.0), "trot");
+        assert_eq!(gait_name(13.0), "bound");
+        assert!(gait(13.0, 0.25, 0.0).bob.abs() >= gait(3.0, 0.25, 0.0).bob.abs());
+    }
+
+    #[test]
+    fn traversal_poses_read_right() {
+        // tasting the air raises the muzzle; wading through cover hunches lower than the
+        // same open gait
+        assert!(taste_air(0.25).head > 0.2, "tasting the air lifts the muzzle");
+        let open = gait(6.0, 0.3, 0.0).crouch;
+        let thick = wade(6.0, 0.3, 0.0, 1.0).crouch;
+        assert!(thick > open, "wading through cover hunches the cat lower");
+    }
+
+    #[test]
+    fn combat_poses_are_distinct_and_read_right() {
+        use crate::combat::Move;
+        // the hind-kick drives the hind legs backward; the underbelly swipe rakes the fore
+        // paws up from a low crouch; each move maps to its own pose
+        assert!(hind_kick(0.5).swing[3] < -0.3, "hind kick lashes the hind legs back");
+        assert!(underbelly_swipe(0.5).crouch > 0.5 && underbelly_swipe(0.5).swing[1] > 0.3, "swipe rakes up from low");
+        assert!(jump(0.5).bob > 0.2, "the jump gets air");
+        // move_pose bridges combat → rig for every move
+        for m in [Move::Pounce, Move::Jump, Move::Roll, Move::Dodge, Move::UnderbellySwipe, Move::HindKick, Move::Swat] {
+            let _ = move_pose(m, 0.5);
+        }
     }
 }
