@@ -13,6 +13,8 @@ pub struct State {
     pub streaming_name: String,
     /// A session roster of devices (name, user, host) to roll daemon health up across.
     pub health_targets: Vec<(String, String, String)>,
+    /// Third-party services discovered on a device (no fleet marker): (name, description).
+    pub other_services: Vec<(String, String)>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -29,10 +31,23 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     let can = idle && !app.net.host.trim().is_empty();
 
     ui.add_space(6.0);
-    ui.label(egui::RichText::new("daemons — the fleet's background services").strong());
+    ui.label(egui::RichText::new("fleet daemons · by the developer").strong());
+    ui.label(
+        egui::RichText::new("first-party services with core-kit integrations — auto-discovered via the X-Fleet-Integration unit marker")
+            .weak()
+            .small(),
+    );
     for d in cockpit::daemons::all() {
         ui.horizontal(|ui| {
             ui.label(format!("● {}", d.name));
+            // the developer/integration marker — a coloured chip so first-party daemons read at a glance
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgb(0x2a, 0x3a, 0x5a))
+                .inner_margin(egui::Margin::symmetric(5, 0))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(d.integration).small().color(egui::Color32::from_rgb(0x9a, 0xc2, 0xff)));
+                });
             ui.label(egui::RichText::new(d.description).weak().small());
         });
         ui.horizontal(|ui| {
@@ -94,6 +109,29 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             });
         }
     });
+
+    // Third-party services: anything on the system WITHOUT the X-Fleet-Integration marker. These
+    // aren't by the developer and carry no core-kit integration, so they're listed apart from the
+    // fleet daemons above. Populated by a scan on the device (units whose body fails
+    // cockpit::daemons::is_fleet_daemon); gitmind manages the fleet set, not these.
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("other services · third-party").strong());
+    if app.net.other_services.is_empty() {
+        ui.label(
+            egui::RichText::new("none discovered — run a scan on a device; services without the fleet marker appear here")
+                .weak()
+                .small(),
+        );
+    } else {
+        for (name, desc) in &app.net.other_services {
+            ui.horizontal(|ui| {
+                ui.label(format!("○ {name}"));
+                if !desc.is_empty() {
+                    ui.label(egui::RichText::new(desc).weak().small());
+                }
+            });
+        }
+    }
 
     // fleet health: roll daemon status up across a roster of devices
     ui.add_space(6.0);
