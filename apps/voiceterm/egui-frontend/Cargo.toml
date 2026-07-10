@@ -18,3 +18,6 @@ settings-kit = { path = "../../../shared/settings-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
 
 [workspace]
+
+[dev-dependencies]
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
