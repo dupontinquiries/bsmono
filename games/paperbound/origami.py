@@ -135,26 +135,122 @@ def _recipe_for_family(fam, rng):
             {"part": "slab", "at": [0, 0.2], "size": 0.5, "h": 1.0, "tone": 0.85},   # trunk
             {"part": "crest", "at": [0, -0.7], "size": 1.2, "h": 0.55, "tone": 1.0}, # crown
         ]
-    if fam in ("monolith", "golem", "shelled", "armored"):
+    if fam in ("monolith", "golem", "shelled"):
         return [
             {"part": "shell", "at": [0, -0.1], "size": 1.1, "h": 0.9, "tone": 1.0},
             {"part": "panel", "at": [0, 0.2], "size": 0.9, "tone": 0.7},
             {"part": "spine", "at": [-0.1, -0.5], "size": 0.5, "count": 4, "tone": 1.1},
         ]
-    if fam in ("tusker",):
+    if fam in ("armored",):
+        # pangolin: a low hunched body sheathed in overlapping scale-plates, small
+        # pointed head, no big legs — reads as living armour, not a stone block
         return [
-            {"part": "slab", "at": [0, 0.0], "size": 1.05, "h": 0.6, "tone": 1.0},
-            {"part": "leg", "at": [-0.6, 0.4], "size": 0.5, "h": 0.5}, {"part": "leg", "at": [0.6, 0.4], "size": 0.5, "h": 0.5},
-            {"part": "wedge", "at": [0.8, -0.3], "size": 0.7, "ang": -0.2, "tone": 1.08},  # head
-            {"part": "tusk", "at": [0.9, 0.0], "size": 0.9, "ang": 0.35},
+            {"part": "shell", "at": [-0.1, -0.05], "size": 1.0, "h": 0.7, "tone": 1.0},   # plated back
+            {"part": "panel", "at": [-0.35, 0.05], "size": 0.75, "tone": 0.82},           # under-plate
+            {"part": "spine", "at": [-0.15, -0.35], "size": 0.4, "count": 5, "tone": 1.12}, # scale ridge
+            {"part": "wedge", "at": [0.85, 0.05], "size": 0.5, "ang": 0.15, "tone": 1.08}, # low pointed head
+            {"part": "leg", "at": [0.3, 0.42], "size": 0.28, "h": 0.3},                    # stubby foreleg
+            {"part": "tail", "at": [-0.95, 0.15], "size": 0.65, "ang": 0.15, "tone": 0.9}, # thick scaled tail
         ]
-    if fam in ("bird_big", "rabbit"):
+    if fam in ("tusker",):
+        # heavy build: bulky body with a shoulder hump, four thick legs, a raised
+        # head carrying big curved tusks and a short trunk
+        return [
+            {"part": "slab", "at": [-0.05, 0.0], "size": 1.2, "h": 0.72, "tone": 1.0},    # big body
+            {"part": "crest", "at": [-0.3, -0.45], "size": 0.6, "h": 0.4, "tone": 1.05},  # shoulder hump
+            {"part": "leg", "at": [-0.7, 0.42], "size": 0.5, "h": 0.55}, {"part": "leg", "at": [-0.35, 0.45], "size": 0.48, "h": 0.55},
+            {"part": "leg", "at": [0.4, 0.45], "size": 0.48, "h": 0.55}, {"part": "leg", "at": [0.7, 0.42], "size": 0.5, "h": 0.55},
+            {"part": "wedge", "at": [0.85, -0.32], "size": 0.72, "ang": -0.15, "tone": 1.08},  # head raised
+            {"part": "tusk", "at": [1.0, -0.05], "size": 0.95, "ang": 0.4},               # tusk lower
+            {"part": "tusk", "at": [0.95, 0.1], "size": 0.8, "ang": 0.15, "tone": 0.95},  # trunk/second tusk
+        ]
+    if fam in ("rabbit",):
+        # jackalope: a crouched hopping body, tall upright ears, and antler forks —
+        # springy and alert, not a generic quadruped
+        return [
+            {"part": "slab", "at": [0, 0.05], "size": 0.9, "h": 0.5, "tone": 1.0},        # crouched body
+            {"part": "wedge", "at": [0.6, -0.35], "size": 0.5, "ang": -0.2, "tone": 1.08}, # head up
+            {"part": "tusk", "at": [0.55, -0.75], "size": 0.55, "ang": 0.45, "tone": 1.05}, # ear L (tall)
+            {"part": "tusk", "at": [0.72, -0.72], "size": 0.55, "ang": 0.15, "tone": 1.05}, # ear R
+            {"part": "spine", "at": [0.6, -0.85], "size": 0.3, "count": 3, "tone": 1.15},  # antler forks
+            {"part": "leg", "at": [-0.35, 0.42], "size": 0.5, "h": 0.55},                  # big hind leg (hop)
+            {"part": "leg", "at": [0.45, 0.45], "size": 0.32, "h": 0.35},                  # small foreleg
+            {"part": "orb", "at": [-0.85, 0.15], "size": 0.16, "tone": 1.1},               # cotton tail
+        ]
+    if fam in ("bird_big",):
         return [
             {"part": "slab", "at": [0, 0.0], "size": 0.95, "h": 0.55, "tone": 1.0},
-            {"part": "crest", "at": [0.2, -0.5], "size": 0.7, "h": 0.4, "tone": 1.1},  # ears/plume
+            {"part": "crest", "at": [0.2, -0.5], "size": 0.7, "h": 0.4, "tone": 1.1},
             {"part": "leg", "at": [-0.5, 0.4], "size": 0.4, "h": 0.4}, {"part": "leg", "at": [0.5, 0.4], "size": 0.4, "h": 0.4},
         ]
-    # default quadruped: feline / canine / mustelid / ape / figure / blob / wisp
+    if fam in ("ape",):
+        # upright, heavy-shouldered: a broad torso, low-slung arms, small head
+        return [
+            {"part": "slab", "at": [0, -0.1], "size": 1.05, "h": 0.85, "tone": 1.0},   # torso
+            {"part": "leg", "at": [-0.7, -0.15], "size": 0.55, "h": 0.7, "tone": 0.9},  # long arm L
+            {"part": "leg", "at": [0.7, -0.15], "size": 0.55, "h": 0.7, "tone": 0.9},   # long arm R
+            {"part": "leg", "at": [-0.35, 0.45], "size": 0.4, "h": 0.4},                # foot L
+            {"part": "leg", "at": [0.35, 0.45], "size": 0.4, "h": 0.4},                 # foot R
+            {"part": "wedge", "at": [0, -0.75], "size": 0.55, "ang": 0.0, "tone": 1.1}, # head
+        ]
+    if fam in ("figure",):
+        # a robed humanoid: tall tapering body, hood/crest, two arm folds
+        return [
+            {"part": "slab", "at": [0, 0.1], "size": 0.7, "h": 1.1, "tone": 1.0},       # robe
+            {"part": "crest", "at": [0, -0.75], "size": 0.55, "h": 0.45, "tone": 1.1},  # hood
+            {"part": "wing", "at": [-0.35, -0.1], "size": 0.6, "ang": 0.8, "tone": 0.85},  # sleeve L
+            {"part": "wing", "at": [0.35, -0.1], "size": 0.6, "ang": -0.8, "tone": 0.85},  # sleeve R
+            {"part": "orb", "at": [0, -0.55], "size": 0.1, "tone": 0.4},                # face shadow
+        ]
+    if fam in ("blob",):
+        # amorphous: a low wide lump with a couple of pseudopod bulges, no legs
+        return [
+            {"part": "shell", "at": [0, 0.1], "size": 1.15, "h": 0.5, "tone": 1.0},
+            {"part": "crest", "at": [-0.4, -0.05], "size": 0.5, "h": 0.35, "tone": 0.9},
+            {"part": "crest", "at": [0.45, 0.0], "size": 0.45, "h": 0.3, "tone": 1.05},
+            {"part": "orb", "at": [0.15, -0.2], "size": 0.12, "tone": 0.35},            # eye
+        ]
+    if fam in ("wisp",):
+        # ethereal: a floating flame-body with trailing wisps, no ground contact
+        return [
+            {"part": "crest", "at": [0, -0.15], "size": 0.85, "h": 0.7, "tone": 1.0},   # flame body
+            {"part": "spine", "at": [0, -0.55], "size": 0.5, "count": 3, "tone": 1.15}, # licks
+            {"part": "tail", "at": [-0.3, 0.3], "size": 0.5, "ang": 0.5, "tone": 0.8},  # trail
+            {"part": "orb", "at": [0, -0.25], "size": 0.13, "tone": 1.3},               # core glow
+        ]
+    if fam in ("feline",):
+        # sleek cat: low body, upright triangular ears, long curved tail
+        return [
+            {"part": "slab", "at": [0, 0.0], "size": 1.0, "h": 0.5, "tone": 1.0},
+            {"part": "leg", "at": [-0.6, 0.42], "size": 0.42, "h": 0.5},
+            {"part": "leg", "at": [0.55, 0.42], "size": 0.42, "h": 0.5},
+            {"part": "wedge", "at": [0.82, -0.3], "size": 0.62, "ang": -0.1, "tone": 1.08},   # head
+            {"part": "tusk", "at": [0.78, -0.62], "size": 0.32, "ang": 0.5, "tone": 1.05},    # ear L
+            {"part": "tusk", "at": [0.95, -0.6], "size": 0.32, "ang": -0.2, "tone": 1.05},    # ear R
+            {"part": "tail", "at": [-0.95, -0.25], "size": 0.8, "ang": 0.7, "tone": 0.92},    # long curl tail
+        ]
+    if fam in ("canine",):
+        # dog/wolf: bushy tail up, pointed snout, alert ears
+        return [
+            {"part": "slab", "at": [0, 0.0], "size": 1.0, "h": 0.55, "tone": 1.0},
+            {"part": "leg", "at": [-0.6, 0.42], "size": 0.45, "h": 0.55},
+            {"part": "leg", "at": [0.58, 0.42], "size": 0.45, "h": 0.55},
+            {"part": "wedge", "at": [0.9, -0.28], "size": 0.72, "ang": -0.2, "tone": 1.08},   # snout
+            {"part": "tusk", "at": [0.7, -0.55], "size": 0.3, "ang": 0.3, "tone": 1.05},      # ear
+            {"part": "crest", "at": [-0.85, -0.35], "size": 0.7, "h": 0.5, "tone": 0.95},     # bushy tail (up)
+        ]
+    if fam in ("mustelid",):
+        # weasel/badger: long low tube body, short legs, small round ears, stub tail
+        return [
+            {"part": "slab", "at": [0, 0.05], "size": 1.15, "h": 0.4, "tone": 1.0},           # long low body
+            {"part": "leg", "at": [-0.7, 0.35], "size": 0.32, "h": 0.35},
+            {"part": "leg", "at": [0.6, 0.35], "size": 0.32, "h": 0.35},
+            {"part": "wedge", "at": [0.95, -0.18], "size": 0.55, "ang": -0.1, "tone": 1.1},   # head low
+            {"part": "orb", "at": [0.82, -0.42], "size": 0.12, "tone": 0.85},                 # round ear
+            {"part": "tail", "at": [-1.0, 0.0], "size": 0.5, "ang": 0.25, "tone": 0.9},       # stub tail
+        ]
+    # default quadruped: figure / blob / wisp fall through to here only if their
+    # specific recipes above didn't catch (kept as a safe generic base)
     return [
         {"part": "slab", "at": [0, 0.0], "size": 1.0, "h": 0.55, "tone": 1.0},
         {"part": "leg", "at": [-0.6, 0.4], "size": 0.45, "h": 0.5},
@@ -197,6 +293,33 @@ def _pp(x, y, s, f, ax, ay):
     return (x + ax * s * f, y + ay * s)
 
 
+def _crease(screen, center, ps, f, col, vertical=True, cross=False):
+    """Draw a subtle fold-crease line across a body part so it reads as folded
+    paper rather than a solid block. A lighter highlight beside a darker valley,
+    the way a mountain-fold catches light. `cross` adds a fainter perpendicular
+    fold for a richer, hand-creased look (used on larger parts). Cheap; cosmetic."""
+    import pygame
+    shade = _DRAW["shade"]
+    cx, cy = center
+    hi = shade(col, 1.14); lo = shade(col, 0.82)
+    if vertical:
+        x = int(cx)
+        pygame.draw.line(screen, lo, (x, int(cy - ps * 0.42)), (x, int(cy + ps * 0.42)), 1)
+        pygame.draw.line(screen, hi, (x + 1, int(cy - ps * 0.40)), (x + 1, int(cy + ps * 0.40)), 1)
+        if cross:                     # a fainter perpendicular valley-fold
+            faint = shade(col, 0.90)
+            y = int(cy)
+            pygame.draw.line(screen, faint, (int(cx - ps * 0.5 * f), y), (int(cx + ps * 0.5 * f), y), 1)
+    else:
+        y = int(cy)
+        pygame.draw.line(screen, lo, (int(cx - ps * 0.7 * f), y), (int(cx + ps * 0.7 * f), y), 1)
+        pygame.draw.line(screen, hi, (int(cx - ps * 0.7 * f), y + 1), (int(cx + ps * 0.7 * f), y + 1), 1)
+        if cross:
+            faint = shade(col, 0.90)
+            x = int(cx)
+            pygame.draw.line(screen, faint, (x, int(cy - ps * 0.34)), (x, int(cy + ps * 0.34)), 1)
+
+
 def draw_part(screen, part, x, y, s, f, base, hgt, tnow, flap, anim=None):
     """Render ONE known-good part. Unknown types are ignored (defensive).
 
@@ -223,6 +346,25 @@ def draw_part(screen, part, x, y, s, f, base, hgt, tnow, flap, anim=None):
         move = anim.get("move", 0.0)
         phase = anim.get("phase", 0.0)
         breathe = anim.get("breathe", 0.0)
+        style = anim.get("style", "")
+        # ── family motion flavour (applies to the whole body, cheap) ──
+        if style == "undulate":       # cephalopods / waves: a travelling S-wave
+            dy += math.sin(t * 3.5 + ax * 2.0 + phase) * s * 0.09
+            dx += math.cos(t * 3.0 + ay * 2.0 + phase) * s * 0.05 * f
+        elif style == "pulse":        # jellies: rhythmic squash/stretch
+            dy += (math.sin(t * 3.0 + phase) ** 2 - 0.5) * s * 0.10
+        elif style == "flicker":      # wisps: a nervous flame waver
+            dx += math.sin(t * 9.0 + ay * 4 + phase) * s * 0.05 * f
+            dy += math.sin(t * 7.0 + phase) * s * 0.05
+        elif style == "wobble":       # blobs: a slow gelatinous sway
+            dx += math.sin(t * 2.2 + phase) * s * 0.06 * f
+        elif style == "skitter":      # insects: a fast tiny jitter
+            dy += math.sin(t * 16.0 + phase) * s * 0.02
+            dx += math.cos(t * 14.0 + phase) * s * 0.015 * f
+        elif style == "hop" and move > 0.02:   # amphibians: bob on the move
+            dy += -abs(math.sin(t * 5.0 + phase)) * s * 0.10 * move
+        elif style == "swim":         # fish: a lateral tail-led glide
+            dx += math.sin(t * 4.0 + phase) * s * 0.04 * f
         # body & shell "breathe" — a subtle vertical bob
         if pt in ("slab", "shell", "panel"):
             dy += breathe * s * 0.05
@@ -233,11 +375,18 @@ def draw_part(screen, part, x, y, s, f, base, hgt, tnow, flap, anim=None):
         # crest/mane/plume flutter
         if pt == "crest":
             dy += math.sin(t * 4.0 + phase) * s * 0.04
-        # tail sway — faster when moving
+        # tail sway — faster when moving; family style adds character
         if pt == "tail":
-            sway = math.sin(t * (3.0 + move * 4.0) + phase)
+            rate = 3.0 + move * 4.0
+            if style == "undulate": rate += 2.0        # cephalopod: livelier whip
+            elif style == "swim": rate += 1.0
+            sway = math.sin(t * rate + phase)
             dx += sway * s * 0.10 * (0.5 + move)
             dy += abs(sway) * s * 0.03
+        # spine/scale rows ripple for undulating/pulsing bodies (out of phase by
+        # their anchor, so a row of scales looks like it's waving down the back)
+        if pt == "spine" and style in ("undulate", "pulse", "flicker"):
+            dy += math.sin(t * 4.0 + ax * 3.0 + phase) * s * 0.05
         # legs: a walk cycle — alternate legs lift while the unit moves
         if pt == "leg" and move > 0.02:
             side = -1 if ax < 0 else 1        # left legs vs right legs
@@ -249,15 +398,20 @@ def draw_part(screen, part, x, y, s, f, base, hgt, tnow, flap, anim=None):
     if pt == "slab":
         body = [(cx - ps * f, cy - ps * 0.28), (cx + ps * 0.9 * f, cy - ps * 0.32),
                 (cx + ps * f, cy + ps * 0.34), (cx - ps * 1.05 * f, cy + ps * 0.36)]
-        return prism(screen, body, ph, col)
+        r = prism(screen, body, ph, col)
+        _crease(screen, (cx, cy - ph), ps, f, col, vertical=True, cross=(ps > 22))
+        return r
     if pt == "panel":
         quad = [(cx - ps * f, cy - ps * 0.3), (cx + ps * f, cy - ps * 0.32),
                 (cx + ps * f, cy + ps * 0.3), (cx - ps * f, cy + ps * 0.3)]
         poly(screen, quad, col, thick=1)
+        _crease(screen, (cx, cy), ps * 0.85, f, col, vertical=False)
     elif pt == "shell":
         dome = [(cx - ps * f, cy + ps * 0.3), (cx - ps * 0.55 * f, cy - ps * 0.5),
                 (cx + ps * 0.55 * f, cy - ps * 0.5), (cx + ps * f, cy + ps * 0.3)]
-        return prism(screen, dome, ph, col)
+        r = prism(screen, dome, ph, col)
+        _crease(screen, (cx, cy - ph), ps, f, col, vertical=True, cross=(ps > 22))
+        return r
     elif pt == "wedge":
         ca, sa = math.cos(ang), math.sin(ang)
         tip = (cx + (ps * 0.9 * ca) * f, cy - ph - ps * 0.5 + ps * 0.9 * sa)
