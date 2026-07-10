@@ -53,6 +53,32 @@ pub mod ease {
     pub fn out_sine(t: f32) -> f32 {
         (t * std::f32::consts::FRAC_PI_2).sin()
     }
+
+    /// QML `Easing.InSine`.
+    pub fn in_sine(t: f32) -> f32 {
+        1.0 - (t * std::f32::consts::FRAC_PI_2).cos()
+    }
+    /// QML `Easing.InOutSine` — the smooth breathing/ambient curve the Qt apps lean on (bo-controller
+    /// uses it 16×). Symmetric ease-in-out.
+    pub fn in_out_sine(t: f32) -> f32 {
+        -((std::f32::consts::PI * t).cos() - 1.0) / 2.0
+    }
+    /// A cubic-Bézier easing evaluator matching QML `Easing.Bezier` (and CSS `cubic-bezier`): the two
+    /// control points `(x1,y1),(x2,y2)` with endpoints fixed at (0,0)/(1,1). Solves x(u)=t for the curve
+    /// parameter by bisection (x is monotonic for well-formed control points), then returns y(u). Lets a
+    /// port reproduce a hand-tuned QML Bezier curve exactly instead of approximating with a named easing.
+    pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32, t: f32) -> f32 {
+        let comp = |a: f32, b: f32, u: f32| {
+            let v = 1.0 - u;
+            3.0 * v * v * u * a + 3.0 * v * u * u * b + u * u * u
+        };
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        for _ in 0..24 {
+            let mid = 0.5 * (lo + hi);
+            if comp(x1, x2, mid) < t { lo = mid; } else { hi = mid; }
+        }
+        comp(y1, y2, 0.5 * (lo + hi))
+    }
 }
 
 /// `animate_bool` with an easing curve: drives a 0→1 value for `id` toward `target` over `duration`
@@ -122,7 +148,7 @@ mod tests {
 
     #[test]
     fn curves_hit_their_endpoints() {
-        for f in [linear, out_quad, in_quad, in_out_quad, out_cubic, in_cubic, out_back, out_sine] {
+        for f in [linear, out_quad, in_quad, in_out_quad, out_cubic, in_cubic, out_back, out_sine, in_sine, in_out_sine] {
             endpoints(f);
         }
     }
@@ -141,5 +167,16 @@ mod tests {
         // the spring goes beyond 1.0 somewhere before settling
         let peak = (70..=95).map(|i| out_back(i as f32 / 100.0)).fold(0.0f32, f32::max);
         assert!(peak > 1.0, "out_back should overshoot, peak={peak}");
+    }
+
+    #[test]
+    fn in_out_sine_is_symmetric_and_bezier_matches_endpoints() {
+        assert!((in_out_sine(0.0)).abs() < 1e-4 && (in_out_sine(1.0) - 1.0).abs() < 1e-4);
+        assert!((in_out_sine(0.5) - 0.5).abs() < 1e-3, "InOutSine passes through the midpoint");
+        // a standard ease (0.25,0.1,0.25,1.0) hits the endpoints and stays in-range
+        assert!(cubic_bezier(0.25, 0.1, 0.25, 1.0, 0.0).abs() < 1e-3);
+        assert!((cubic_bezier(0.25, 0.1, 0.25, 1.0, 1.0) - 1.0).abs() < 1e-3);
+        let mid = cubic_bezier(0.25, 0.1, 0.25, 1.0, 0.5);
+        assert!(mid > 0.0 && mid < 1.0);
     }
 }
