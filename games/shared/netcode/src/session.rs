@@ -191,6 +191,16 @@ mod tests {
     }
 
     #[test]
+    fn decodes_bytes_from_the_python_fleet_module() {
+        // Byte-for-byte interop with games/paperbound/fleet.py: the exact bytes its
+        // SessionRecord("paperbound","kesslerd","http","10.0.0.5:7777").encode() produces.
+        let py: &[u8] = &[1, 10, 0, 0, 0, 112, 97, 112, 101, 114, 98, 111, 117, 110, 100, 8, 0, 0, 0, 107, 101, 115, 115, 108, 101, 114, 100, 4, 0, 0, 0, 104, 116, 116, 112, 13, 0, 0, 0, 49, 48, 46, 48, 46, 48, 46, 53, 58, 55, 55, 55, 55];
+        let rec = SessionRecord::decode(py).expect("python bytes must decode");
+        assert_eq!(rec, SessionRecord::new("paperbound", "kesslerd", "http", "10.0.0.5:7777"));
+        assert_eq!(rec.encode(), py, "our encode must match Python byte-for-byte");
+    }
+
+    #[test]
     fn session_record_roundtrips() {
         let rec = SessionRecord::new("unendlich", "player-a", "udp", "192.168.1.5:4123");
         let back = SessionRecord::decode(&rec.encode()).unwrap();
