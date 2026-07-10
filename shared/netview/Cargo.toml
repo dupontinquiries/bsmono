@@ -1,0 +1,9 @@
+[package]
+name = "netview"
+version = "0.1.0"
+edition = "2021"
+description = "Rust server side of webhost-kit: expose a game's live snapshot over a local socket for the shared Python browser/LAN host. Generic over any serde::Serialize snapshot."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
