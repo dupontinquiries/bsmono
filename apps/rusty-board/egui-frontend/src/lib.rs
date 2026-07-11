@@ -250,7 +250,7 @@ pub struct Board {
 impl Board {
     /// Default board: qwerty + symbols.
     pub fn new() -> Board {
-        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), palette: String::new() }
+        Board { layouts: vec![Layout::qwerty(), Layout::symbols(), Layout::cardinal(), Layout::cardinal8()], idx: 0, gesture: uikit_egui::GestureLayer::horizontal_page(320.0), palette: "system".to_string() }
     }
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
