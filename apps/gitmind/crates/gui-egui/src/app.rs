@@ -70,9 +70,10 @@ impl Default for App {
         Self {
             tab: Tab::Network,
             prefs: {
-                // Default to the Night palette so the egui shell matches gitmind's Qt/QML colours.
+                // System palette: the minimal neutral-dark "system utilities" theme, shared with
+                // rusty-board. (Not the blue Night — that matched the Qt shell but read too strong.)
                 let mut p = settings_kit::Prefs::default();
-                p.palette = "night".to_string();
+                p.palette = "system".to_string();
                 p
             },
             task: Task::default(),

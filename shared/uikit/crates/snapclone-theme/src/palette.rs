@@ -21,6 +21,7 @@ pub enum PaletteId {
     Pastels,
     Metallic,
     Night,
+    System,
 }
 
 impl PaletteId {
@@ -36,6 +37,7 @@ impl PaletteId {
             Self::Pastels    => "pastels",
             Self::Metallic   => "metallic",
             Self::Night      => "night",
+            Self::System     => "system",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -50,6 +52,7 @@ impl PaletteId {
             Self::Pastels    => "Pastels",
             Self::Metallic   => "Metallic",
             Self::Night      => "Night",
+            Self::System     => "System",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -63,12 +66,13 @@ impl PaletteId {
             "pastels"     => Self::Pastels,
             "metallic"    => Self::Metallic,
             "night"       => Self::Night,
+            "system"      => Self::System,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic, Self::Night]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System]
     }
 }
 
@@ -171,6 +175,35 @@ pub const NIGHT: Palette = Palette {
     gradient_bar:  ["#171c2b", "#0f1320"],
     glow_online:   "#56d364",
 };
+
+/// Neutral minimal dark — the canonical "system utilities" theme (gitmind, rusty-board). Low chrome, a
+/// restrained steel accent (no strong hue), text-forward. This is the "fully dark minimal" look, refined
+/// off DARK but de-warmed so it reads as a functional tool rather than a styled app.
+pub const SYSTEM: Palette = Palette {
+    id: PaletteId::System, name: "System",
+    bg_deep:   "#0f0f11",
+    bg_base:   "#161619",
+    bg_card:   "#161619",
+    bg_raised: "#1e1e22",
+    bg_hover:  "#26262b",
+    bg_scrim:  "rgba(15,15,17,0.72)",
+    text_primary:   "#e6e6e9",
+    text_secondary: "#8e8e97",
+    text_disabled:  "#4e4e57",
+    text_inverse:   "#0f0f11",
+    accent:      "#aab0bb",
+    accent_soft: "#cdd2da",
+    accent_dim:  "#5a5f68",
+    danger:  "#c26356",
+    success: "#6a9c7a",
+    warning: "#c2a04e",
+    border:       "#26262b",
+    border_focus: "#aab0bb",
+    gradient_hero: ["#161619", "#0f0f11"],
+    gradient_bar:  ["#161619", "#0f0f11"],
+    glow_online:   "#6a9c7a",
+};
+
 
 
 /// OLED pitch-black — maximum contrast, minimum eye strain in dark rooms.
