@@ -8,6 +8,17 @@ description = "voiceterm ported to egui — starting with the portable terminal 
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "voiceterm-egui"
+path = "src/bin/voiceterm_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+# Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
+# manifest/projects.toml) produces the deploy binary directly, same convention as rusty-board-egui.
+app = ["dep:eframe"]
+
 [dependencies]
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
@@ -16,6 +27,7 @@ uikit-web = { path = "../../../shared/uikit/crates/uikit-web" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 [workspace]
 
