@@ -115,6 +115,7 @@ set(CYBERTRON_MODULE_SRC
   ${EDIR}/material.c
   ${EDIR}/lore.c
   ${EDIR}/waves.c
+  ${EDIR}/gates.c
   ${EDIR}/pickup.c
   ${EDIR}/vfx.c
 )
@@ -237,7 +238,7 @@ add_library(cybertron_modules STATIC ${CYBERTRON_MODULE_SRC}
 target_include_directories(cybertron_modules PUBLIC ${ENGINE_INCLUDES})
 target_compile_options(cybertron_modules PRIVATE -Wno-unused)
 
-foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally)
+foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves test_gates harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally)
   add_executable(${t} ${CMAKE_SOURCE_DIR}/tests/${t}.c)
   target_link_libraries(${t} PRIVATE cybertron_modules m)
   add_test(NAME ${t} COMMAND ${t})

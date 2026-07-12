@@ -28,7 +28,11 @@ static const struct { int w, h; } RES[EX_RES_PRESETS] = {
 };
 
 const char* ex_map_name(int i){ return (i>=0 && i<MAP_TABLE_COUNT) ? MAP_NAMES[i] : "?"; }
-const char* ex_mode_name(ex_mode_t m){ return m==EX_MODE_SURVIVAL ? "survival" : "arena fight"; }
+const char* ex_mode_name(ex_mode_t m){
+  if (m==EX_MODE_SURVIVAL) return "survival";
+  if (m==EX_MODE_ESCALATION) return "escalation";
+  return "arena fight";
+}
 void ex_res_preset(int i, int *w, int *h){ if(i<0)i=0; if(i>=EX_RES_PRESETS)i=EX_RES_PRESETS-1; *w=RES[i].w; *h=RES[i].h; }
 
 const char* ex_size_class_name(int sc){
