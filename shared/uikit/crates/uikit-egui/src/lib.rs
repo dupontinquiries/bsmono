@@ -20,6 +20,7 @@
 pub mod a11y;
 pub mod adaptive;
 pub mod carved;
+pub mod glass;
 pub mod gesture_layer;
 pub mod touch;
 pub mod skin;
@@ -42,6 +43,7 @@ pub mod tokens;
 
 pub use a11y::{Action as A11yAction, A11yScene, Outcome as A11yOutcome, Role, Semantics};
 pub use adaptive::{Adaptive, DeviceClass, SafeArea};
+pub use glass::{glass_key, surface_fill, key_fill, key_fill_hover, key_fill_modifier, key_fill_modifier_hover, key_fill_pressed, key_border, key_border_soft, opaque_strip_fill, paint_top_hairline, tint as glass_tint, GlassAlphas};
 pub use gesture_layer::{Axis, GestureFrame, GestureLayer};
 pub use skin::Skin;
 pub use livebg::{BgStyle, LiveBackground};
