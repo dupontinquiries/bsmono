@@ -22,6 +22,7 @@ pub enum PaletteId {
     Metallic,
     Night,
     System,
+    Voice,
 }
 
 impl PaletteId {
@@ -38,6 +39,7 @@ impl PaletteId {
             Self::Metallic   => "metallic",
             Self::Night      => "night",
             Self::System     => "system",
+            Self::Voice      => "voice",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -53,6 +55,7 @@ impl PaletteId {
             Self::Metallic   => "Metallic",
             Self::Night      => "Night",
             Self::System     => "System",
+            Self::Voice      => "Voice",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -67,12 +70,13 @@ impl PaletteId {
             "metallic"    => Self::Metallic,
             "night"       => Self::Night,
             "system"      => Self::System,
+            "voice"       => Self::Voice,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice]
     }
 }
 
@@ -203,6 +207,34 @@ pub const SYSTEM: Palette = Palette {
     gradient_bar:  ["#161619", "#0f0f11"],
     glow_online:   "#6a9c7a",
 };
+
+/// Terminal orange/green — matches voiceterm's Qt/QML surface (the egui apps' colour north-star).
+/// Distinct from Night/System: voiceterm's own identity (a terminal), not a shared utility theme.
+pub const VOICE: Palette = Palette {
+    id: PaletteId::Voice, name: "Voice",
+    bg_deep:   "#1c1c22",
+    bg_base:   "#23232a",
+    bg_card:   "#26262e",
+    bg_raised: "#33333d",
+    bg_hover:  "#3a3a44",
+    bg_scrim:  "rgba(28,28,34,0.72)",
+    text_primary:   "#e8e8ee",
+    text_secondary: "#9a9aa6",
+    text_disabled:  "#55555f",
+    text_inverse:   "#1c1c22",
+    accent:      "#e0552e",
+    accent_soft: "#bfe3cf",
+    accent_dim:  "#3a3a44",
+    danger:  "#dc2626",
+    success: "#7ddc7d",
+    warning: "#e0a050",
+    border:       "#3a3a44",
+    border_focus: "#e0552e",
+    gradient_hero: ["#26262e", "#1c1c22"],
+    gradient_bar:  ["#26262e", "#23232a"],
+    glow_online:   "#7ddc7d",
+};
+
 
 
 
