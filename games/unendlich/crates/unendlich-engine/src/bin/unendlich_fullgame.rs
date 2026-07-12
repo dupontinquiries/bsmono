@@ -2837,6 +2837,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
     );
     let mut fg_create_spree: u8 = 0; // r186: Create World presses-through
     let mut fg_rebuild_call_count: u32 = 0; // DIAGNOSTIC (temporary) — see the log at rebuild_for_seed's call site
+    let mut ocean_diag_logged: u32 = 0; // DIAGNOSTIC (temporary) — caps the [diag-surface] formula-term dump
     // r661: (removed fg_host_pending — Host World now opens the wizard normally)
     let mut fg_pending_load: Option<(String, u64, bool)> = None; // r197 load-world
     // r661: Bending Tutorial — when set, the tutorial world was just launched and
@@ -4740,6 +4741,28 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                     let blk = chunk_manager.block_at(bx, ay, bz);
                     let below = chunk_manager.block_at(bx, ay - 1, bz);
                     if is_flora(blk) && no_support(below) {
+                        // DIAGNOSTIC (temporary): the FP32/FP64-drift theory only explains a block or
+                        // two of error, not a whole chunk — so at an ACTUAL detected floating column,
+                        // log the real surface_target formula terms (sea/continental/biome/hills) and
+                        // the ground-truth surface, so a genuine "floats a whole CHUNK above the
+                        // ocean" case shows us which term is actually off, instead of guessing at
+                        // coefficients from reading the formula alone.
+                        if ocean_diag_logged < 20 {
+                            let model = chunk_manager.generator().cpu().model();
+                            let (xf, zf) = (bx as f64, bz as f64);
+                            let sea = model.sea_level(xf, zf, 0.0);
+                            let cont = model.continental(xf, zf);
+                            let hills = model.hills(xf, zf);
+                            let biome = model.biome_at_2d(xf, zf);
+                            let st = model.surface_target(xf, zf, 0.0);
+                            let real_ground = chunk_manager.generator().cpu().surface_y_at(bx, bz, -64, (sea as i32) + 64);
+                            log::warn!(
+                                "[diag-surface] FLORA-ON-AIR at ({bx},{ay},{bz}) sea={sea:.1} continental={cont:.3}(*30={:.1}) hills={hills:.3}(*15={:.1}) biome={biome:?} biome_height_mod={:.1} surface_target={st:.1} real_ground_y={real_ground:?} delta_from_ay={:?} CHUNK_SIZE=32",
+                                cont * 30.0, hills * 15.0, biome.height_modifier(),
+                                real_ground.map(|g| ay - g)
+                            );
+                            ocean_diag_logged += 1;
+                        }
                         if chunk_manager.set_block(bx, ay, bz, B::Air) {
                             cut += 1;
                         }
@@ -4768,6 +4791,25 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                         let in_water = base_below == B::Water || water_beside;
                         let floating = base_below == B::Air;
                         if floating {
+                            // DIAGNOSTIC (temporary): same capture as the flora-on-air site above,
+                            // but for a floating TREE TRUNK specifically — this is very likely the
+                            // exact case reported ("trees spawning a whole chunk above oceans").
+                            if ocean_diag_logged < 20 {
+                                let model = chunk_manager.generator().cpu().model();
+                                let (xf, zf) = (bx as f64, bz as f64);
+                                let sea = model.sea_level(xf, zf, 0.0);
+                                let cont = model.continental(xf, zf);
+                                let hills = model.hills(xf, zf);
+                                let biome = model.biome_at_2d(xf, zf);
+                                let st = model.surface_target(xf, zf, 0.0);
+                                let real_ground = chunk_manager.generator().cpu().surface_y_at(bx, bz, -64, (sea as i32) + 64);
+                                log::warn!(
+                                    "[diag-surface] FLOATING-TRUNK at ({bx},{base_y},{bz}) sea={sea:.1} continental={cont:.3}(*30={:.1}) hills={hills:.3}(*15={:.1}) biome={biome:?} biome_height_mod={:.1} surface_target={st:.1} real_ground_y={real_ground:?} delta_from_base={:?} CHUNK_SIZE=32",
+                                    cont * 30.0, hills * 15.0, biome.height_modifier(),
+                                    real_ground.map(|g| base_y - g)
+                                );
+                                ocean_diag_logged += 1;
+                            }
                             // placement artifact — remove the whole floating trunk + leaves
                             let mut yy = base_y;
                             let mut guard = 0;
