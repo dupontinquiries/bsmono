@@ -44,6 +44,7 @@ pub mod voice_intent;
 pub mod imprint;
 pub mod picking;
 pub mod physui;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
 pub mod assets;
 pub mod mediagen;
 pub mod decode;

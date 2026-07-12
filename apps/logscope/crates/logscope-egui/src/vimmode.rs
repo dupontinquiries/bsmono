@@ -510,6 +510,8 @@ pub enum Action {
     ZoomIn, ZoomOut,               // i / I
     Yaw(f32), Pitch(f32),          // z then h/l (yaw), z then k/j (pitch)
     BeginZoomPrefix,               // z   — next h/j/k/l rotates
+    BeginReadPrefix,               // r   — next j/k scrolls the focused message's text (impakt-cam glide)
+    ScrollPreviewDown, ScrollPreviewUp, // r then j/k
     BeginLeader,                   // space — next / or \ searches the tree
     Search,                        // /
     TreeSearch, FuzzyTreeSearch,   // <leader>/  ,  <leader>\
@@ -523,7 +525,7 @@ pub enum Action {
 /// Map a Normal-mode character (already lowercased; `shift` says if it was uppercase) to an Action,
 /// honoring a pending `z` rotation prefix and a pending `space` leader. Pure: the caller tracks the
 /// pending flags (set by BeginZoomPrefix / BeginLeader) and clears them after the next key.
-pub fn normal_action(c: char, shift: bool, z_pending: bool, leader: bool) -> Action {
+pub fn normal_action(c: char, shift: bool, z_pending: bool, r_pending: bool, leader: bool) -> Action {
     if leader {
         return match c { '/' => Action::TreeSearch, '\\' => Action::FuzzyTreeSearch, _ => Action::None };
     }
@@ -531,6 +533,12 @@ pub fn normal_action(c: char, shift: bool, z_pending: bool, leader: bool) -> Act
         return match c {
             'h' => Action::Yaw(-0.25), 'l' => Action::Yaw(0.25),
             'k' => Action::Pitch(0.20), 'j' => Action::Pitch(-0.20),
+            _ => Action::None,
+        };
+    }
+    if r_pending {
+        return match c {
+            'j' => Action::ScrollPreviewDown, 'k' => Action::ScrollPreviewUp,
             _ => Action::None,
         };
     }
@@ -542,6 +550,7 @@ pub fn normal_action(c: char, shift: bool, z_pending: bool, leader: bool) -> Act
         'g' => if shift { Action::Last } else { Action::First },
         'i' => if shift { Action::ZoomOut } else { Action::ZoomIn },
         'z' => Action::BeginZoomPrefix,
+        'r' => Action::BeginReadPrefix,
         ' ' => Action::BeginLeader,
         '/' => Action::Search,
         ':' => Action::EnterCommand,
@@ -652,43 +661,43 @@ mod tests {
 
     #[test]
     fn navigation_keys_map() {
-        assert_eq!(normal_action('j', false, false, false), Action::FocusNext);
-        assert_eq!(normal_action('k', false, false, false), Action::FocusPrev);
-        assert_eq!(normal_action('h', false, false, false), Action::SiblingPrev);
-        assert_eq!(normal_action('l', false, false, false), Action::SiblingNext);
-        assert_eq!(normal_action('g', false, false, false), Action::First);
-        assert_eq!(normal_action('g', true, false, false), Action::Last);
+        assert_eq!(normal_action('j', false, false, false, false), Action::FocusNext);
+        assert_eq!(normal_action('k', false, false, false, false), Action::FocusPrev);
+        assert_eq!(normal_action('h', false, false, false, false), Action::SiblingPrev);
+        assert_eq!(normal_action('l', false, false, false, false), Action::SiblingNext);
+        assert_eq!(normal_action('g', false, false, false, false), Action::First);
+        assert_eq!(normal_action('g', true, false, false, false), Action::Last);
     }
 
     #[test]
     fn camera_keys_and_prefixes() {
-        assert_eq!(normal_action('i', false, false, false), Action::ZoomIn);
-        assert_eq!(normal_action('i', true, false, false), Action::ZoomOut);
-        assert_eq!(normal_action('z', false, false, false), Action::BeginZoomPrefix);
+        assert_eq!(normal_action('i', false, false, false, false), Action::ZoomIn);
+        assert_eq!(normal_action('i', true, false, false, false), Action::ZoomOut);
+        assert_eq!(normal_action('z', false, false, false, false), Action::BeginZoomPrefix);
         // with z pending, hjkl rotate instead of navigating
-        assert_eq!(normal_action('h', false, true, false), Action::Yaw(-0.25));
-        assert_eq!(normal_action('l', false, true, false), Action::Yaw(0.25));
-        assert_eq!(normal_action('k', false, true, false), Action::Pitch(0.20));
-        assert_eq!(normal_action('j', false, true, false), Action::Pitch(-0.20));
+        assert_eq!(normal_action('h', false, true, false, false), Action::Yaw(-0.25));
+        assert_eq!(normal_action('l', false, true, false, false), Action::Yaw(0.25));
+        assert_eq!(normal_action('k', false, true, false, false), Action::Pitch(0.20));
+        assert_eq!(normal_action('j', false, true, false, false), Action::Pitch(-0.20));
     }
 
     #[test]
     fn leader_and_search_keys() {
-        assert_eq!(normal_action(' ', false, false, false), Action::BeginLeader);
-        assert_eq!(normal_action('/', false, false, false), Action::Search);
+        assert_eq!(normal_action(' ', false, false, false, false), Action::BeginLeader);
+        assert_eq!(normal_action('/', false, false, false, false), Action::Search);
         // leader then / or \ → tree searches
-        assert_eq!(normal_action('/', false, false, true), Action::TreeSearch);
-        assert_eq!(normal_action('\\', false, false, true), Action::FuzzyTreeSearch);
-        assert_eq!(normal_action(':', false, false, false), Action::EnterCommand);
-        assert_eq!(normal_action('a', false, false, false), Action::EnterInsert);
+        assert_eq!(normal_action('/', false, false, false, true), Action::TreeSearch);
+        assert_eq!(normal_action('\\', false, false, false, true), Action::FuzzyTreeSearch);
+        assert_eq!(normal_action(':', false, false, false, false), Action::EnterCommand);
+        assert_eq!(normal_action('a', false, false, false, false), Action::EnterInsert);
     }
 
     #[test]
     fn help_key_and_mode_metadata() {
-        assert_eq!(normal_action('?', true, false, false), Action::Help);
-        assert_eq!(normal_action('?', false, false, false), Action::Help);
+        assert_eq!(normal_action('?', true, false, false, false), Action::Help);
+        assert_eq!(normal_action('?', false, false, false, false), Action::Help);
         // a z/leader prefix swallows the next key, so ? only helps from a clean Normal state
-        assert_eq!(normal_action('?', false, true, false), Action::None);
+        assert_eq!(normal_action('?', false, true, false, false), Action::None);
         // every mode has a distinct indicator colour + the right typing classification
         let modes = [Mode::Normal, Mode::Insert, Mode::Command, Mode::Search];
         for (i, &a) in modes.iter().enumerate() {
