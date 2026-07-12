@@ -255,12 +255,30 @@ impl Board {
     pub fn current(&self) -> &Layout {
         &self.layouts[self.idx]
     }
-    /// Switch layout by a swipe sign (wraps, since there are only a couple).
+    /// Switch layout by a swipe sign (wraps, since there are only a couple). Pure index arithmetic —
+    /// used by tests and by whatever drives layout switching (the sidebar's tap, or a future prev/next).
     pub fn swipe(&mut self, sign: i32) {
         let n = self.layouts.len() as i32;
         self.idx = (((self.idx as i32 + sign) % n + n) % n) as usize;
     }
+    /// Jump directly to a layout by index (clamped) — what the vertical-tabs sidebar calls on a tap.
+    pub fn set_layout(&mut self, idx: usize) {
+        self.idx = idx.min(self.layouts.len().saturating_sub(1));
+    }
+    /// Layout names, in order, for the sidebar's tab labels.
+    pub fn layout_names(&self) -> Vec<&str> {
+        self.layouts.iter().map(|l| l.name.as_str()).collect()
+    }
+    pub fn layout_index(&self) -> usize { self.idx }
     /// Read a committed swipe from the gesture layer (call each frame with the board rect).
+    ///
+    /// NOT used by the live app any more (see `vertical_tabs` in feel.rs): a whole-board swipe surface
+    /// reads the same raw pointer trajectory that per-key cardinal swipes read, with nothing arbitrating
+    /// between them — a swipe on a key's compass could also register as a page change, and since a
+    /// cardinal key's gesture state is keyed by its on-screen rect, a layout change MID-swipe orphans
+    /// that state (the id no longer matches anything drawn next frame). That's the intermittent
+    /// "swipe doesn't register" failure. Kept (not deleted) in case a narrow dedicated bezel strip
+    /// wants swipe-to-page later — just don't feed it the same surface a key renders in.
     pub fn poll_swipe(&mut self, ui: &egui::Ui, surface: Rect) {
         let frame = self.gesture.update(ui, surface, true);
         if let Some(dir) = frame.page_jump {
