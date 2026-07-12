@@ -299,9 +299,18 @@ pub fn apply_theme(ctx: &egui::Context) {
 /// available width with per-key widths proportional to their weight.
 pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &str) -> Option<String> {
     let colors = uikit_egui::palette_colors(palette);
+    let glass = palette == "system"; // the shared system-utilities look (gitmind/rusty-board): glass keys
     let gutter = adaptive.gutter;
     let key_h = adaptive.min_touch_target; // 44pt touch / 28pt pointer, from the adaptive layer
     let total_w = ui.available_width();
+
+    if glass {
+        // Glass root surface: high-alpha tinted fill + a single top hairline highlight, matching the
+        // ported rusty-board-GTK `.glass-keyboard` recipe (no gradient/blur — see uikit_egui::glass).
+        let board_rect = ui.max_rect();
+        ui.painter().rect_filled(board_rect, 0, uikit_egui::surface_fill(colors.bg_base));
+        uikit_egui::paint_top_hairline(ui, board_rect);
+    }
 
     let mut emitted = None;
     for row in &layout.rows {
@@ -311,7 +320,7 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
             ui.add_space(gutter);
             for key in &row.keys {
                 let w = (usable * (key.weight / total_weight)).max(8.0);
-                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors) {
+                if let Some(e) = paint_key(ui, key, Vec2::new(w, key_h), gutter, &colors, glass) {
                     emitted = Some(e);
                 }
             }
@@ -322,9 +331,33 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
 }
 
 /// Paint one key as a carved rounded tile with a centered label; returns true on tap.
-fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors) -> Option<String> {
+///
+/// When `glass` is set (the System palette — gitmind/rusty-board's shared "system utilities" look), keys
+/// use the ported rusty-board-GTK glass recipe (`uikit_egui::glass`): high-alpha tinted fill, hairline
+/// border, instant colour-flip on press — no gradient/sheen, no blur. Otherwise keys use the standard
+/// carved-tile motion glide.
+fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
+    if glass {
+        let modifier = key.label.chars().count() > 1; // "shift"/"space"/"enter" etc. — sit subtly less present
+        let pressed = resp.is_pointer_button_down_on();
+        let (fill, stroke) = if pressed {
+            (uikit_egui::glass_tint(c.accent, uikit_egui::GlassAlphas::PRESSED_ACCENT), uikit_egui::key_border(c.border))
+        } else if modifier {
+            (if resp.hovered() { uikit_egui::key_fill_modifier_hover(c.bg_card) } else { uikit_egui::key_fill_modifier(c.bg_card) }, uikit_egui::key_border_soft(c.border))
+        } else {
+            (if resp.hovered() { uikit_egui::key_fill_hover(c.bg_card) } else { uikit_egui::key_fill(c.bg_card) }, uikit_egui::key_border(c.border))
+        };
+        let rounding = CornerRadius::same((size.y * 0.18) as u8);
+        painter.rect(rect, rounding, fill, stroke, egui::StrokeKind::Inside);
+        if rect.top() <= gutter + 1.0 {
+            uikit_egui::paint_top_hairline(ui, rect);
+        }
+        let text_color = if pressed { egui::Color32::WHITE } else { c.text };
+        painter.text(rect.center(), Align2::CENTER_CENTER, &key.label, FontId::proportional((size.y * 0.42).clamp(11.0, 26.0)), text_color);
+        return resp.clicked().then(|| key.emit.clone());
+    }
     // Rest→hover→press glides (120ms) instead of snapping — the QML key ColorAnimation feel.
     let fill = uikit_egui::motion::interactive_fill(ui.ctx(), &resp, c.bg_raised, c.bg_hover, c.accent);
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
