@@ -2836,6 +2836,7 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
         whitelist.len()
     );
     let mut fg_create_spree: u8 = 0; // r186: Create World presses-through
+    let mut fg_rebuild_call_count: u32 = 0; // DIAGNOSTIC (temporary) — see the log at rebuild_for_seed's call site
     // r661: (removed fg_host_pending — Host World now opens the wizard normally)
     let mut fg_pending_load: Option<(String, u64, bool)> = None; // r197 load-world
     // r661: Bending Tutorial — when set, the tutorial world was just launched and
@@ -13871,6 +13872,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                             whitelist =
                                 unendlich_engine::sim::whitelist::Whitelist::load(&flora_root);
                         }
+                        // DIAGNOSTIC (temporary — remove once the double-launch question is settled):
+                        // logs every rebuild_for_seed call with a running counter + the spree/frame
+                        // state that was live at the moment of the call. If "Create World" ever fires
+                        // rebuild_for_seed twice for one click, this makes it undeniable in the log —
+                        // two DIFFERENT frame numbers, back to back, both with the SAME seed — and the
+                        // fg_create_spree value at each call tells us whether the spree counter (armed
+                        // by the one-click Create path, r186) is the one re-firing it.
+                        fg_rebuild_call_count += 1;
+                        log::warn!(
+                            "[diag] rebuild_for_seed CALL #{} — seed={seed} frame={frame_count} fg_create_spree={fg_create_spree} wizard_open={} wizard_at_confirm={}",
+                            fg_rebuild_call_count, renderer.wizard_open, renderer.wizard_at_confirm
+                        );
                         match chunk_manager.rebuild_for_seed(seed, Backend::Auto, gen_batch) {
                             Ok(()) => {
                                 // r346 SEED FIX: adopt the launched seed as the single
