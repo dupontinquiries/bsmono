@@ -27,11 +27,25 @@ int main(void){
   assert(w.score == s0+2350 && w.kills==3);
   printf("  score after 3 kills: %ld\n", w.score);
 
-  // clear the wave (alive drops to 0) -> breather -> next wave spawns
+  printf("=== escalation energon economy ===\n");
+  assert(ex_waves_energon_value(0)==20 && ex_waves_energon_value(1)==40 &&
+         ex_waves_energon_value(2)==30 && ex_waves_energon_value(3)==120);
+  assert(w.energon == 20+40+120);                 // banked from the 3 kills above
+  long banked = w.energon;
+  printf("  banked energon: %ld\n", banked);
+
+  // clear the wave (alive drops to 0) -> breather -> next wave spawns, and
+  // Escalation's forge converts the banked energon into a permanent bonus
   long before = w.score;
-  ex_waves_update(&w, 0, 0.016f);                 // triggers clear bonus + intermission
+  ex_waves_update(&w, 0, 0.016f);                 // triggers clear bonus + intermission + forge
   assert(w.score > before);                        // wave-clear bonus
   assert(w.intermission > 0.0f && !w.pending_spawn);
+  assert(w.forge_event && w.forge_hp_amount == (float)banked*0.4f);
+  assert(w.energon == 0 && w.forged_total == banked);  // spent into the forge
+  printf("  forged +%.1f integrity, forged_total %ld\n", w.forge_hp_amount, w.forged_total);
+  // forge_event clears next tick with nothing new banked
+  ex_waves_update(&w, 0, 0.016f);
+  assert(!w.forge_event);
   // wait out the breather
   for(int i=0;i<60*4 && !w.pending_spawn;i++) ex_waves_update(&w, 0, 1.0f/60.0f);
   assert(w.pending_spawn);
@@ -57,6 +71,25 @@ int main(void){
     if(e.pending_spawn) ex_waves_begin_next(&e,&mk); }
   assert(!e.finished && e.wave>5);
   printf("  endless reached wave %d\n", e.wave);
+
+  printf("=== titan waves ===\n");
+  for (int wv=1; wv<=10; wv++){
+    ex_wave_makeup_t mk = ex_waves_makeup(wv);
+    int expect_titan = (wv % 5 == 0);
+    assert(mk.titan == expect_titan);
+    if (mk.titan) {
+      // thinned + boss must fit the encounter budget (<=12) with headroom
+      assert(mk.grunts + mk.corrupted + mk.hijacks + 1 <= 12);
+      printf("  wave %d TITAN: g%d c%d h%d + boss\n", wv, mk.grunts, mk.corrupted, mk.hijacks);
+    }
+  }
+
+  printf("=== ex_waves_spend ===\n");
+  ex_waves_t s; ex_waves_init(&s, 0);
+  s.energon = 200;
+  assert(!ex_waves_spend(&s, 250) && s.energon==200);   // can't afford
+  assert(ex_waves_spend(&s, 150) && s.energon==50);      // affords, deducts
+  assert(ex_waves_spend(&s, 50)  && s.energon==0);       // exact remainder
 
   printf("\nALL ASSERTIONS PASSED\n");
   return 0;
