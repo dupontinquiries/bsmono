@@ -1,7 +1,7 @@
 //! feel.rs — a runnable eframe harness for feel-testing the rusty-board keyboard: the motion key
 //! feedback (press glides colour), long-press accent variants (the slide_menu grid popup), and the
-//! cardinal-swipe layouts (swipe a key on the `cardinal`/`cardinal8` layouts). Swipe the whole board
-//! left/right to cycle layouts.
+//! cardinal-swipe layouts (swipe a key on the `cardinal`/`cardinal8` layouts). Layouts are switched via
+//! the sidebar tabs on the left (not a whole-board swipe — see Board::poll_swipe's doc comment for why).
 //!
 //! Run:  cargo run --example feel        (from apps/rusty-board/egui-frontend)
 
@@ -26,7 +26,7 @@ impl eframe::App for Feel {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("layout: {}", self.board.current().name)).strong());
                 ui.separator();
-                ui.label("hold a key for accents · swipe a key on the cardinal layouts · swipe the board to switch");
+                ui.label("hold a key for accents · swipe a key on the cardinal layouts · tap a sidebar tab to switch layout");
                 if ui.button("clear").clicked() {
                     self.typed.clear();
                 }
@@ -39,16 +39,31 @@ impl eframe::App for Feel {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let adaptive = Adaptive::detect(ctx);
-            let surface = ui.max_rect();
-            // swipe the board sideways to cycle qwerty → symbols → cardinal → cardinal8
-            self.board.poll_swipe(ui, surface);
-            if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
-                if e == "\u{8}" {
-                    self.typed.pop();
-                } else {
-                    self.typed.push_str(&e);
-                }
-            }
+            // Layout switching lives in its OWN strip (the sidebar), never contested with a key's
+            // gesture space — a whole-board swipe used to race per-key cardinal swipes (see
+            // Board::poll_swipe's doc comment) and intermittently "eat" a key's swipe on real touch
+            // hardware. A sidebar tap has no such race.
+            ui.horizontal(|ui| {
+                let sidebar_w = 64.0_f32.max(adaptive.min_touch_target * 1.3);
+                ui.allocate_ui(egui::vec2(sidebar_w, ui.available_height()), |ui| {
+                    let names = self.board.layout_names();
+                    let tabs: Vec<uikit_egui::vertical_tabs::Tab> = names.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
+                    let colors = uikit_egui::palette_colors(self.board.palette());
+                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, self.board.layout_index(), adaptive.min_touch_target, &colors) {
+                        self.board.set_layout(i);
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
+                        if e == "\u{8}" {
+                            self.typed.pop();
+                        } else {
+                            self.typed.push_str(&e);
+                        }
+                    }
+                });
+            });
         });
     }
 }

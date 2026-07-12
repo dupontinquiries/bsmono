@@ -8,6 +8,18 @@ description = "rusty-board's on-screen keyboard, ported from GTK4 to egui on the
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "rusty-board-egui"
+path = "src/bin/rusty_board_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+# The runnable eframe app is default-on so `cargo build --release` (what the build orchestrator runs,
+# with no extra flags — see manifest/projects.toml) produces the deploy binary directly. A lib-only
+# consumer can still opt out with `default-features = false`.
+app = ["dep:eframe"]
+
 [dependencies]
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
@@ -15,6 +27,7 @@ snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 mic-kit = { path = "../../../shared/mic-kit" }
 voice-kit = { path = "../../../shared/voice-kit" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
 
 [dev-dependencies]
 eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
