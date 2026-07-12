@@ -31,7 +31,7 @@ typedef enum {
   EX_NAV_UP, EX_NAV_DOWN, EX_NAV_LEFT, EX_NAV_RIGHT, EX_NAV_CONFIRM, EX_NAV_BACK
 } ex_nav_t;
 
-typedef enum { EX_MODE_ARENA_FIGHT, EX_MODE_SURVIVAL, EX_MODE_COUNT } ex_mode_t;
+typedef enum { EX_MODE_ARENA_FIGHT, EX_MODE_SURVIVAL, EX_MODE_ESCALATION, EX_MODE_COUNT } ex_mode_t;
 
 typedef struct {
   int          size_class;    // 0..3

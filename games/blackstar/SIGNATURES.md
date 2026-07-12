@@ -573,3 +573,59 @@ the cannon now indexes the real mode (was clamped to 0..4). Combined with the
 addon-driven reshaping already in place (barrel length / girth / heat glow), your
 gun now reads its form AND its addons. All meshes structurally validated
 (test_spine_iqm); data archive repacks them. All 41 tests pass; game.c clean.
+
+## Update 35 -- ESCALATION mode (WFC's signature horde loop) + energon economy
+Adds Escalation as a third skirmish mode, built on the existing wave-loop
+framework (waves.h/.c), the same one Survival already used:
+- NEW MODE `EX_MODE_ESCALATION` (menu.h/menu.c): endless waves, selectable by
+  cycling the skirmish mode picker like Survival/Arena Fight.
+- ENERGON ECONOMY (waves.h/.c): kills bank energon credits (grunt 20 /
+  hijack 30 / corrupted 40 / apex 120, `ex_waves_energon_value`). When a wave
+  clears, the whole bank is FORGED into a permanent +max-integrity increase
+  (0.4x the banked total) plus a full repair and a 30-armor floor -- so
+  surviving compounds your strength, and playing greedy (banking more before
+  the wave clears) pays off. `forge_event`/`forge_hp_amount` fire for one tick
+  on the wave-clear frame; `forged_total` tracks the lifetime forge for the HUD.
+- game.c wiring: Escalation dispatches like Survival (endless waves, 60s
+  survive floor) but additionally applies the forge to g_player_max_hp/hp/armor
+  on `forge_event`, with a "FORGED +N integrity" toast. HUD gains an
+  `ENERGON n  forged n  integrity n` line, shown only in Escalation.
+test_waves.c extended: energon values, banking across kill kinds, forge math
+(banked*0.4), forged_total accumulation, and the event flag clearing next tick.
+All 41 tests pass; game.c compiles clean (link needs a system SDL2 runtime,
+unrelated to this change -- not present in this sandbox).
+
+## Update 36 -- Escalation triple: titan-boss waves, buy-a-door gates, energon perks
+The three follow-ups queued after Escalation's energon economy landed:
+
+1. TITAN-CLASS BOSS WAVES: every 5th wave is now a titan wave (`ex_wave_makeup_t.
+   titan`, waves.h/.c). The regular grunt/corrupted/hijack makeup is thinned so a
+   titan-class apex boss (hp = 900 + 120*wave, scaling with progress) always gets
+   a guaranteed spawn slot inside the 12-enemy encounter budget. Reuses the
+   existing apex boss kit wholesale -- phase/slam/summon AI, the boss health bar,
+   the render styling -- all of which was already generic, not campaign-only, so
+   this needed no new combat code, just a `ex_encounter_boss()` call in
+   spawn_wave_makeup + a "TITAN AWAKENS" toast.
+
+2. BUY-A-DOOR MAP EXPANSION: new pure-logic module `gates.c/.h` -- a 3-gate chain
+   (causeway 300 energon -> foundry wing 750 -> outer rim causeway 1500), each
+   permanently expanding the arena's spawn half-extent (60 -> 100 -> 150 -> 220)
+   once opened. Keys 1/2/3 attempt to open gate 0/1/2 straight from the banked
+   energon wallet (spends before it would otherwise auto-forge). HUD shows the
+   next affordable gate + its cost; spawn_wave_makeup now spawns into
+   `ex_gates_extent(g_gates)` instead of a fixed 60 in Escalation.
+
+3. ENERGON PERK SHOP: `ex_waves_spend()` (waves.h/.c) is the shared spend gate
+   used by both gates and perks. Keys 4-7 buy: repair (+50 hp, 150), shield
+   (+40 armor, 200), overcharge surge (12s, 250, reuses the existing overcharge
+   pickup's buff), and +80 repair energy for the part-repair system (100). All
+   mid-run, competing with the gates for the same wallet that forges on wave
+   clear -- so spending vs. banking-for-the-forge is now a real tradeoff.
+
+HUD: ENERGON/forged/integrity line moved to row 9 (was colliding with the
+corruption-stage line at row 8); added a "[n] open <gate> -- cost" hint row.
+test_waves.c extended (titan escalation + budget-fit assertions, ex_waves_spend);
+new test_gates.c (afford/deny, no double-spend, extent tracks the largest open
+gate, next-locked index). gates.c wired into CMakeLists' module sources + test
+list. All 42 tests pass; game.c compiles clean (SDL2 runtime link unavailable
+in this sandbox, as before -- unrelated to these changes).
