@@ -252,6 +252,10 @@ fn text_anim_for(name: &str) -> crate::mesh3d::TextAnim {
 /// Word-wrap `text` into at most `max_lines` lines of ≤`cols` chars, for physical `label_cells` panels
 /// (which render one line at a time). Wraps on whitespace; hard-splits words longer than `cols`; collapses
 /// internal newlines/spaces; appends `…` to the last line when the text was truncated. Pure + testable.
+/// How many wrapped lines the physical-UI reading plaque shows at once — the rest is reached by
+/// scrolling (jk / impakt-cam glide) rather than being truncated with a trailing "…".
+const PLAQUE_WINDOW: usize = 4;
+
 fn wrap_label(text: &str, cols: usize, max_lines: usize) -> Vec<String> {
     let cols = cols.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -772,7 +776,10 @@ pub struct Chat {
     search_q: String,              // the `/` search buffer
     search_kind: crate::vimmode::SearchKind,
     z_pending: bool,               // a `z` rotation prefix is armed
+    r_pending: bool,               // a `r` (read/scroll) prefix is armed — next j/k scrolls the plaque text
     leader_pending: bool,          // a `space` leader is armed
+    plaque_scroll: crate::plaque_scroll::PlaqueScroll, // impakt-cam-style smooth scroll for the reading plaque
+    plaque_last_focus: Option<usize>, // which message the plaque scroll belongs to (reset on change)
     request_smaller_model: bool,   // :why asked to spawn the smallest local model for the diagnosis; ui() applies it
     show_help: bool,               // `?` keybinding overlay is open
     note: String,                  // transient status line (e.g. export path), cleared on next action
@@ -849,7 +856,9 @@ impl Default for Chat {
             code_voice: true,
             cam_shot: 0, cam_shot_until: 0.0, cam_orbit_phase: 0.0,
             mode: crate::vimmode::Mode::Insert, cmdline: String::new(), search_q: String::new(),
-            search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, leader_pending: false,
+            search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, r_pending: false, leader_pending: false,
+            plaque_scroll: crate::plaque_scroll::PlaqueScroll::default(),
+            plaque_last_focus: None,
             request_smaller_model: false,
             show_help: false,
             note: String::new(),
@@ -3075,7 +3084,24 @@ impl Chat {
                 if let Some(fid) = focus.filter(|i| *i < self.msgs.len()) {
                     let (who, raw) = { let m = &self.msgs[fid]; (if m.role == Role::User { "you" } else { "assistant" }, m.text().to_string()) };
                     let head = format!("{who} · turn {}/{}", fid + 1, n);
-                    let lines = wrap_label(&raw, 24, 4);
+                    // Reset the glide (don't inherit scroll position/animation) when focus moves to a
+                    // DIFFERENT message this frame.
+                    if self.plaque_last_focus != Some(fid) { self.plaque_scroll.reset(); self.plaque_last_focus = Some(fid); }
+                    let all_lines = wrap_label(&raw, 24, usize::MAX);
+                    let max_line = all_lines.len().saturating_sub(PLAQUE_WINDOW) as f32;
+                    let dt = ui.input(|i| i.stable_dt).min(0.1); // clamp a stalled first frame's huge dt
+                    let pos = self.plaque_scroll.tick(dt).clamp(0.0, max_line);
+                    if !self.plaque_scroll.at_rest() { ui.ctx().request_repaint(); } // keep animating the glide
+                    let start = pos.round() as usize;
+                    let lines: Vec<String> = all_lines.iter().skip(start).take(PLAQUE_WINDOW).cloned().collect();
+                    // scroll affordance: show "▲ n above" / "▼ n below" so scrolled state is legible in-scene.
+                    let head = if all_lines.len() > PLAQUE_WINDOW {
+                        let above = start; let below = all_lines.len().saturating_sub(start + lines.len());
+                        let marks = match (above > 0, below > 0) {
+                            (true, true) => " ▲▼", (true, false) => " ▲", (false, true) => " ▼", (false, false) => "",
+                        };
+                        format!("{head}{marks}  ⟨r j/k to scroll⟩")
+                    } else { head };
                     let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
                     let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
                     let ph = (pw * 0.42).min(0.30 * win_h / ppw); // cap by height so it fits short windows
@@ -3462,12 +3488,15 @@ impl Chat {
                 }
                 continue;
             }
-            let act = crate::vimmode::normal_action(c, shift, self.z_pending, self.leader_pending);
+            let act = crate::vimmode::normal_action(c, shift, self.z_pending, self.r_pending, self.leader_pending);
             match act {
-                Action::BeginZoomPrefix => { self.z_pending = true; self.leader_pending = false; }
-                Action::BeginLeader => { self.leader_pending = true; self.z_pending = false; }
-                Action::Help => { self.show_help = !self.show_help; self.z_pending = false; self.leader_pending = false; self.count_pending = None; }
-                Action::None => { self.z_pending = false; self.leader_pending = false; self.count_pending = None; }
+                Action::BeginZoomPrefix => { self.z_pending = true; self.r_pending = false; self.leader_pending = false; }
+                Action::BeginReadPrefix => { self.r_pending = true; self.z_pending = false; self.leader_pending = false; }
+                Action::BeginLeader => { self.leader_pending = true; self.z_pending = false; self.r_pending = false; }
+                Action::Help => { self.show_help = !self.show_help; self.z_pending = false; self.r_pending = false; self.leader_pending = false; self.count_pending = None; }
+                Action::ScrollPreviewDown => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(1.0, max); self.r_pending = false; }
+                Action::ScrollPreviewUp => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(-1.0, max); self.r_pending = false; }
+                Action::None => { self.z_pending = false; self.r_pending = false; self.leader_pending = false; self.count_pending = None; }
                 _ => {
                     self.z_pending = false; self.leader_pending = false;
                     // repeatable motions honour the count; everything else runs once
@@ -3503,7 +3532,9 @@ impl Chat {
             Action::EnterInsert => self.enter_insert(ui),
             Action::Branch => { if let Some(f) = self.walk_focus { self.branch_from = Some(f); } }
             Action::Overview => { self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; }
-            Action::BeginZoomPrefix | Action::BeginLeader | Action::Help | Action::None => {}
+            Action::ScrollPreviewDown => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(1.0, max); }
+            Action::ScrollPreviewUp => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(-1.0, max); }
+            Action::BeginZoomPrefix | Action::BeginReadPrefix | Action::BeginLeader | Action::Help | Action::None => {}
         }
         self.spatial_zoomed = self.spatial_zoomed || matches!(act, Action::ZoomIn | Action::ZoomOut);
         ui.ctx().request_repaint();
@@ -3534,6 +3565,22 @@ impl Chat {
             None => if dir < 0 { path.len() - 1 } else { 0 },
         };
         self.set_focus(Some(path[next]));
+    }
+
+    /// The highest scrollable start-line for the physical-UI reading plaque of whichever message is
+    /// currently focused — the top of the visible window can go no further than `total lines - PLAQUE_WINDOW`.
+    /// Used both by the jk scroll handlers (before the plaque renders this frame) and by the renderer
+    /// itself, so the two always agree on the same wrap.
+    fn plaque_max_line(&self) -> f32 {
+        let focus = std::env::var("LOGSCOPE_FOCUS").ok().and_then(|s| s.trim().parse::<usize>().ok()).or(self.walk_focus);
+        match focus.filter(|i| *i < self.msgs.len()) {
+            Some(fid) => {
+                let raw = self.msgs[fid].text().to_string();
+                let all_lines = wrap_label(&raw, 24, usize::MAX);
+                all_lines.len().saturating_sub(PLAQUE_WINDOW) as f32
+            }
+            None => 0.0,
+        }
     }
 
     /// Switch focus to a sibling branch (h/l) and make that branch live (its lineage becomes the prompt).
@@ -3590,6 +3637,7 @@ impl Chat {
 
     fn modal_hint(&self) -> String {
         if self.z_pending { return "z →  h/l yaw · k/j pitch · Esc cancel".into(); }
+        if self.r_pending { return "r →  j/k scroll the reading plaque · Esc cancel".into(); }
         if self.leader_pending { return "leader →  / tree-search · \\ fuzzy-tree · Esc cancel".into(); }
         if self.spatial_view {
             "j/k move · h/l branch · g/G ends · i/I zoom · z+hjkl rotate · o fit · / find · : cmd · b branch · a write · ? help".into()
