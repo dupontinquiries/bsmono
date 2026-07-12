@@ -52,6 +52,11 @@ pub fn region_of(block_x: i32, block_z: i32) -> (i32, i32) {
     (block_x.div_euclid(REGION_SIZE), block_z.div_euclid(REGION_SIZE))
 }
 
+/// DIAGNOSTIC (temporary) — caps the [diag-surface] MOB-SPAWN dump below. `spawn_region` is pure and
+/// runs on the generation thread pool, so this needs to be a plain atomic rather than a threaded-in
+/// parameter (no caller here holds long-lived diagnostic state).
+static SPAWN_DIAG_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Deterministically spawn the mobs for one region. `(rx, rz)` is the region
 /// coordinate (see [`region_of`]). Pure given `(seed, rx, rz, generator)`.
 pub fn spawn_region(gen: &WorldGenerator, world_seed: u64, rx: i32, rz: i32) -> Vec<Mob> {
@@ -74,6 +79,23 @@ pub fn spawn_region(gen: &WorldGenerator, world_seed: u64, rx: i32, rz: i32) -> 
         let sea = gen.sea_level_at(wx, wz);
         if (surface as f64) < sea - 1.0 {
             continue;
+        }
+        // DIAGNOSTIC (temporary): "animals floating a whole chunk above the ocean" — this is the ONLY
+        // gate standing between a legit spawn and a bad one for a near-ocean column. If `surface` is
+        // implausibly far above `sea` (near or beyond one CHUNK_SIZE=32), this dumps the same
+        // formula-term breakdown used at the flora-cleanup site, so we can correlate the two symptoms
+        // against the exact same root cause instead of treating them as separate bugs.
+        if surface as f64 - sea > 24.0 && SPAWN_DIAG_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            let model = gen.model();
+            let (xf, zf) = (wx as f64, wz as f64);
+            let cont = model.continental(xf, zf);
+            let hills = model.hills(xf, zf);
+            let biome = model.biome_at_2d(xf, zf);
+            let st = model.surface_target(xf, zf, 0.0);
+            log::warn!(
+                "[diag-surface] MOB-SPAWN-HIGH at ({wx},{wz}) surface={surface} sea={sea:.1} gap={:.1} continental={cont:.3}(*30={:.1}) hills={hills:.3}(*15={:.1}) biome={biome:?} biome_height_mod={:.1} surface_target={st:.1} CHUNK_SIZE=32",
+                surface as f64 - sea, cont * 30.0, hills * 15.0, biome.height_modifier()
+            );
         }
         let pos = Vec3 {
             x: Fixed::from_int(wx as i64),
