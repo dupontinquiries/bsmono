@@ -53,6 +53,7 @@
 #include "exengine/absorb.h"
 #include "exengine/ally.h"
 #include "exengine/waves.h"
+#include "exengine/gates.h"
 
 ex_fps_camera_t *camera;
 ex_scene_t *scene;
@@ -284,6 +285,7 @@ static ex_ability_loadout_t g_abilities;
 static ex_weapon_mods_t g_wmods;
 static float g_dash_t = 0.0f;
 static ex_waves_t g_waves;
+static ex_gate_t  g_gates[EX_GATE_COUNT];   // Escalation's buy-a-door chain
 static int g_wave_mode = 0;      // skirmish/survival use waves
 static int g_prev_alive = 0;    // to detect kills for scoring
 static int g_was_alive[EX_MAX_ENEMIES];
@@ -1033,10 +1035,13 @@ static void start_match(void)
     if (ms->objective == EX_OBJ_CONTROL) g_control_target = 60.0f;   // hold pads to score 60
     if (ms->objective == EX_OBJ_PROTECT) g_protect_mission = 1;
   } else if (g_menu.mode == EX_MODE_SURVIVAL) { wmode = EX_WIN_SURVIVE; survive_s = 60.0f; n_grunt=3; n_corr=2; n_hijack=4; }
-  g_wave_mode = !g_menu.in_campaign;   // skirmish + survival = wave game loop
+  else if (g_menu.mode == EX_MODE_ESCALATION) { wmode = EX_WIN_SURVIVE; survive_s = 60.0f; n_grunt=3; n_corr=2; n_hijack=4; }
+  g_wave_mode = !g_menu.in_campaign;   // skirmish + survival + escalation = wave game loop
+  if (g_menu.mode == EX_MODE_ESCALATION) ex_gates_init(g_gates);
+  else memset(g_gates, 0, sizeof(g_gates));
   if (g_wave_mode) {
-    // endless in survival, 8 waves in skirmish
-    ex_waves_init(&g_waves, (g_menu.mode==EX_MODE_SURVIVAL)?0:8);
+    // endless in survival + escalation, 8 waves in skirmish
+    ex_waves_init(&g_waves, (g_menu.mode==EX_MODE_SURVIVAL || g_menu.mode==EX_MODE_ESCALATION)?0:8);
     wmode = EX_WIN_ELIMINATE; survive_s = 0.0f;
     ex_encounter_init(&g_enc, wmode, survive_s);   // waves fill it
     g_prev_alive = 0;
@@ -1706,8 +1711,19 @@ static void spawn_wave_makeup(ex_wave_makeup_t mk)
 {
   // reset the encounter and spawn the wave's enemies + their bodies
   ex_encounter_init(&g_enc, EX_WIN_ELIMINATE, 0.0f);
-  ex_encounter_spawn_makeup(&g_enc, mk.grunts, mk.corrupted, mk.hijacks, -60,-60,60,60,
+  // Escalation's buy-a-door gates push the arena perimeter outward as
+  // they're opened; every other mode stays at the base 60 extent.
+  float ext = (g_menu.mode == EX_MODE_ESCALATION) ? ex_gates_extent(g_gates) : 60.0f;
+  ex_encounter_spawn_makeup(&g_enc, mk.grunts, mk.corrupted, mk.hijacks, -ext,-ext,ext,ext,
                             0x5A7E1u ^ (unsigned)(g_waves.wave*2654435761u));
+  if (mk.titan) {
+    // TITAN WAVE: a titan-class apex boss, scaled up with wave number
+    // (WFC's Omega-Supreme-style set-piece), reusing the existing apex
+    // phase/slam/summon boss kit + HUD boss bar.
+    float hp = 900.0f + 120.0f * (float)g_waves.wave;
+    ex_encounter_boss(&g_enc, 0.0f, 0.0f, hp);
+    snprintf(g_shot_msg,sizeof(g_shot_msg), "TITAN AWAKENS"); g_shot_timer = 3.0f;
+  }
   for (int i = 0; i < g_enc.count && i < EX_MAX_ENEMIES; i++) {
     spawn_body(g_enemy_bodies[i]); g_enemy_phase[i]=0.0f;
   }
@@ -2481,6 +2497,39 @@ void game_update(double dt, double ft)
   if (g_menu.state == EX_GS_PLAYING && ex_keys_down[SDL_SCANCODE_ESCAPE]) {
     ex_menu_pause_toggle(&g_menu);
     ex_keys_down[SDL_SCANCODE_ESCAPE] = 0;
+  }
+
+  // Escalation's mid-run buys: gates (buy-a-door expansion) on 1/2/3, and
+  // energon perks (repair / shield / overcharge surge / part-repair energy)
+  // on 4/5/6/7. All spend straight from the banked energon that would
+  // otherwise wait for the next wave-clear forge.
+  if (g_menu.state == EX_GS_PLAYING && g_menu.mode == EX_MODE_ESCALATION) {
+    static const int gate_sc[EX_GATE_COUNT] = { SDL_SCANCODE_1, SDL_SCANCODE_2, SDL_SCANCODE_3 };
+    for (int gi=0; gi<EX_GATE_COUNT; gi++){
+      if (ex_keys_down[gate_sc[gi]]) {
+        ex_keys_down[gate_sc[gi]] = 0;
+        if (g_gates[gi].opened) { snprintf(g_shot_msg,sizeof(g_shot_msg),"already open"); g_shot_timer=1.2f; }
+        else if (ex_gate_try_open(&g_gates[gi], &g_waves.energon)) {
+          snprintf(g_shot_msg,sizeof(g_shot_msg),"GATE OPEN: %s", g_gates[gi].name); g_shot_timer=2.5f;
+        } else { snprintf(g_shot_msg,sizeof(g_shot_msg),"not enough energon (%ld)", g_gates[gi].cost); g_shot_timer=1.5f; }
+      }
+    }
+    if (ex_keys_down[SDL_SCANCODE_4]) { ex_keys_down[SDL_SCANCODE_4]=0;
+      if (ex_waves_spend(&g_waves, 150)) { g_player_hp = fminf(g_player_max_hp, g_player_hp+50.0f);
+        snprintf(g_shot_msg,sizeof(g_shot_msg),"REPAIR +50 hp (-150 energon)"); g_shot_timer=1.5f; }
+      else { snprintf(g_shot_msg,sizeof(g_shot_msg),"need 150 energon"); g_shot_timer=1.2f; } }
+    if (ex_keys_down[SDL_SCANCODE_5]) { ex_keys_down[SDL_SCANCODE_5]=0;
+      if (ex_waves_spend(&g_waves, 200)) { g_player_armor = fminf(60.0f, g_player_armor+40.0f);
+        snprintf(g_shot_msg,sizeof(g_shot_msg),"SHIELD +40 (-200 energon)"); g_shot_timer=1.5f; }
+      else { snprintf(g_shot_msg,sizeof(g_shot_msg),"need 200 energon"); g_shot_timer=1.2f; } }
+    if (ex_keys_down[SDL_SCANCODE_6]) { ex_keys_down[SDL_SCANCODE_6]=0;
+      if (ex_waves_spend(&g_waves, 250)) { g_overcharge_t = fmaxf(g_overcharge_t, 12.0f);
+        snprintf(g_shot_msg,sizeof(g_shot_msg),"OVERCHARGE SURGE (-250 energon)"); g_shot_timer=1.5f; }
+      else { snprintf(g_shot_msg,sizeof(g_shot_msg),"need 250 energon"); g_shot_timer=1.2f; } }
+    if (ex_keys_down[SDL_SCANCODE_7]) { ex_keys_down[SDL_SCANCODE_7]=0;
+      if (ex_waves_spend(&g_waves, 100)) { g_repair_energy = fminf(200.0f, g_repair_energy+80.0f);
+        snprintf(g_shot_msg,sizeof(g_shot_msg),"+80 repair energy (-100 energon)"); g_shot_timer=1.5f; }
+      else { snprintf(g_shot_msg,sizeof(g_shot_msg),"need 100 energon"); g_shot_timer=1.2f; } }
   }
 
   if (g_menu.state != EX_GS_PLAYING) {
@@ -3752,6 +3801,15 @@ void game_update(double dt, double ft)
     int alive_now = ex_encounter_alive(&g_enc);
     g_prev_alive = alive_now;
     ex_waves_update(&g_waves, alive_now, dt);
+    if (g_menu.mode == EX_MODE_ESCALATION && g_waves.forge_event) {
+      // FORGE: banked energon becomes a permanent integrity increase, plus a
+      // full repair + armor floor -- surviving compounds your strength.
+      g_player_max_hp += g_waves.forge_hp_amount;
+      g_player_hp = g_player_max_hp;
+      g_player_armor = fmaxf(g_player_armor, 30.0f);
+      snprintf(g_shot_msg,sizeof(g_shot_msg),"FORGED +%.0f integrity", g_waves.forge_hp_amount);
+      g_shot_timer = 2.5f;
+    }
     if (g_waves.pending_spawn) {
       ex_wave_makeup_t mk;
       if (ex_waves_begin_next(&g_waves, &mk)) spawn_wave_makeup(mk);
@@ -4919,6 +4977,18 @@ void game_update(double dt, double ft)
   else
     sprintf(buf, "enemies left  %d / %d", ex_encounter_alive(&g_enc), g_enc.count);
   ex_vga_print(2, 7, buf);
+  if (g_wave_mode && g_menu.mode == EX_MODE_ESCALATION) {
+    ex_vga_setfg(255,214,90,255);
+    sprintf(buf, "ENERGON %ld   forged %ld   integrity %.0f",
+            g_waves.energon, g_waves.forged_total, g_player_max_hp);
+    ex_vga_print(2, 9, buf);
+    int nl = ex_gates_next_locked(g_gates);
+    if (nl >= 0) {
+      ex_vga_setfg(150,220,255,255);
+      sprintf(buf, "[%d] open %s -- %ld energon", nl+1, g_gates[nl].name, g_gates[nl].cost);
+      ex_vga_print(2, 12, buf);
+    }
+  }
   // note deepest corrupted stage present, for the horror read
   { int deepest=0; for(int i=0;i<g_enc.count;i++){ ex_enemy_t*en=&g_enc.enemies[i];
       if(en->kind==EX_ENEMY_CORRUPTED && en->state!=EX_ENEMY_DEAD && en->stage>deepest) deepest=en->stage; }
