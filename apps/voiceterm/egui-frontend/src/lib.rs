@@ -19,6 +19,7 @@ pub mod model_picker;
 pub mod repl_voice_glow;
 pub mod setup_wizard;
 pub mod action_compass;
+pub mod shell;
 // `web` (HTML → egui RichDoc renderer) now lives in the shared uikit-web kit; re-export as `web`.
 pub use uikit_web as web;
 
