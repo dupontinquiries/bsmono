@@ -776,7 +776,6 @@ pub struct Chat {
     search_q: String,              // the `/` search buffer
     search_kind: crate::vimmode::SearchKind,
     z_pending: bool,               // a `z` rotation prefix is armed
-    r_pending: bool,               // a `r` (read/scroll) prefix is armed — next j/k scrolls the plaque text
     leader_pending: bool,          // a `space` leader is armed
     plaque_scroll: crate::plaque_scroll::PlaqueScroll, // impakt-cam-style smooth scroll for the reading plaque
     plaque_last_focus: Option<usize>, // which message the plaque scroll belongs to (reset on change)
@@ -856,7 +855,7 @@ impl Default for Chat {
             code_voice: true,
             cam_shot: 0, cam_shot_until: 0.0, cam_orbit_phase: 0.0,
             mode: crate::vimmode::Mode::Insert, cmdline: String::new(), search_q: String::new(),
-            search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, r_pending: false, leader_pending: false,
+            search_kind: crate::vimmode::SearchKind::Tree, z_pending: false, leader_pending: false,
             plaque_scroll: crate::plaque_scroll::PlaqueScroll::default(),
             plaque_last_focus: None,
             request_smaller_model: false,
@@ -3100,7 +3099,7 @@ impl Chat {
                         let marks = match (above > 0, below > 0) {
                             (true, true) => " ▲▼", (true, false) => " ▲", (false, true) => " ▼", (false, false) => "",
                         };
-                        format!("{head}{marks}  ⟨r j/k to scroll⟩")
+                        format!("{head}{marks}  ⟨j/k to scroll⟩")
                     } else { head };
                     let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
                     let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
@@ -3488,15 +3487,16 @@ impl Chat {
                 }
                 continue;
             }
-            let act = crate::vimmode::normal_action(c, shift, self.z_pending, self.r_pending, self.leader_pending);
+            let act = crate::vimmode::normal_action(c, shift, self.z_pending, self.leader_pending);
             match act {
-                Action::BeginZoomPrefix => { self.z_pending = true; self.r_pending = false; self.leader_pending = false; }
-                Action::BeginReadPrefix => { self.r_pending = true; self.z_pending = false; self.leader_pending = false; }
-                Action::BeginLeader => { self.leader_pending = true; self.z_pending = false; self.r_pending = false; }
-                Action::Help => { self.show_help = !self.show_help; self.z_pending = false; self.r_pending = false; self.leader_pending = false; self.count_pending = None; }
-                Action::ScrollPreviewDown => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(1.0, max); self.r_pending = false; }
-                Action::ScrollPreviewUp => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(-1.0, max); self.r_pending = false; }
-                Action::None => { self.z_pending = false; self.r_pending = false; self.leader_pending = false; self.count_pending = None; }
+                Action::BeginZoomPrefix => { self.z_pending = true; self.leader_pending = false; }
+                Action::BeginLeader => { self.leader_pending = true; self.z_pending = false; }
+                Action::Help => { self.show_help = !self.show_help; self.z_pending = false; self.leader_pending = false; self.count_pending = None; }
+                // jk scroll the reading plaque directly now (no prefix needed — hl took over the graph-
+                // focus movement jk used to do; see vimmode::normal_action).
+                Action::ScrollPreviewDown => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(1.0, max); }
+                Action::ScrollPreviewUp => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(-1.0, max); }
+                Action::None => { self.z_pending = false; self.leader_pending = false; self.count_pending = None; }
                 _ => {
                     self.z_pending = false; self.leader_pending = false;
                     // repeatable motions honour the count; everything else runs once
@@ -3534,7 +3534,7 @@ impl Chat {
             Action::Overview => { self.spatial_auto = true; self.spatial_zoomed = false; self.walk_focus = None; }
             Action::ScrollPreviewDown => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(1.0, max); }
             Action::ScrollPreviewUp => { let max = self.plaque_max_line(); self.plaque_scroll.nudge(-1.0, max); }
-            Action::BeginZoomPrefix | Action::BeginReadPrefix | Action::BeginLeader | Action::Help | Action::None => {}
+            Action::BeginZoomPrefix | Action::BeginLeader | Action::Help | Action::None => {}
         }
         self.spatial_zoomed = self.spatial_zoomed || matches!(act, Action::ZoomIn | Action::ZoomOut);
         ui.ctx().request_repaint();
@@ -3637,12 +3637,11 @@ impl Chat {
 
     fn modal_hint(&self) -> String {
         if self.z_pending { return "z →  h/l yaw · k/j pitch · Esc cancel".into(); }
-        if self.r_pending { return "r →  j/k scroll the reading plaque · Esc cancel".into(); }
         if self.leader_pending { return "leader →  / tree-search · \\ fuzzy-tree · Esc cancel".into(); }
         if self.spatial_view {
-            "j/k move · h/l branch · g/G ends · i/I zoom · z+hjkl rotate · o fit · / find · : cmd · b branch · a write · ? help".into()
+            "j/k scroll message · h/l move · H/L branch · g/G ends · i/I zoom · z+hjkl rotate · o fit · / find · : cmd · b branch · a write · ? help".into()
         } else {
-            "j/k move · h/l branch · g/G ends · / find · : cmd · b branch · a write · ? help".into()
+            "j/k scroll message · h/l move · H/L branch · g/G ends · / find · : cmd · b branch · a write · ? help".into()
         }
     }
 
