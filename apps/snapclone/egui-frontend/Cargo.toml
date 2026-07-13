@@ -8,11 +8,24 @@ description = "snapclone's UI ported to egui on uikit-egui. The founder app now 
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "snapclone-egui"
+path = "src/bin/snapclone_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe"]
+
 [dependencies]
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[dev-dependencies]
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
 
 [workspace]
