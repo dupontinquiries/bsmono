@@ -95,11 +95,25 @@ impl Deployment {
         v
     }
 
-    /// The single enabled Target (the model that commits tokens), if the config is well-formed.
+    /// The primary enabled Target slot. Several enabled Target slots are fine as long as they're all
+    /// the SAME model on different devices (replicated for fanout speed, not competing targets) —
+    /// returns the highest-priority one of those. Genuinely different models both marked Target is
+    /// the actual ambiguous case, and returns `None` (surfaced by `validate` as `MultipleTargets`).
     pub fn target(&self) -> Option<&Slot> {
-        let mut it = self.slots.iter().filter(|s| s.enabled && s.role == Role::Target);
-        let first = it.next();
-        if it.next().is_some() { None } else { first } // ambiguous if >1
+        let mut targets: Vec<&Slot> = self.slots.iter().filter(|s| s.enabled && s.role == Role::Target).collect();
+        targets.sort_by_key(|s| s.priority);
+        let first = *targets.first()?;
+        if targets.iter().all(|s| s.model == first.model) { Some(first) } else { None }
+    }
+
+    /// Every enabled device currently running the Target model — what fanout dispatch (fuzz,
+    /// summarize, …) round-robins or splits work across. A single-device deployment returns one slot,
+    /// same as before; a model replicated on `this device` + a remote host returns both.
+    pub fn target_slots(&self) -> Vec<&Slot> {
+        let Some(t) = self.target() else { return Vec::new() };
+        let mut v: Vec<&Slot> = self.slots.iter().filter(|s| s.enabled && s.role == Role::Target && s.model == t.model).collect();
+        v.sort_by_key(|s| s.priority);
+        v
     }
 
     /// The enabled Draft, if any (highest priority wins when several are checked).
@@ -180,9 +194,11 @@ impl Deployment {
             issues.push(Issue::Empty);
             return issues;
         }
-        let targets = enabled.iter().filter(|s| s.role == Role::Target).count();
+        // Distinct Target MODELS, not raw slot count — the same model enabled as Target on two
+        // devices (replicated for fanout speed) is one target, not two competing ones.
+        let target_models: std::collections::HashSet<&str> = enabled.iter().filter(|s| s.role == Role::Target).map(|s| s.model.as_str()).collect();
         let has_text = enabled.iter().any(|s| s.role.is_text());
-        match targets {
+        match target_models.len() {
             0 if has_text => issues.push(Issue::NoTarget), // a text stack needs a Target; an image/voice-only plan doesn't
             0 => {}
             1 => {}
@@ -236,6 +252,42 @@ mod tests {
         assert_eq!(d.target().unwrap().model, "big-target");
         assert_eq!(d.draft().unwrap().model, "small-draft");
         assert!(d.tree_ready(), "target + smaller draft → speculation available");
+    }
+
+    #[test]
+    fn same_target_model_replicated_across_devices_is_not_ambiguous() {
+        // the exact bug report: the same model deployed on BOTH "this device" and a remote host, to
+        // fan work out for speed — this is one target, not two competing ones.
+        let mut d = Deployment::new(vec![dev(0, 100), dev(1, 100)]);
+        d.add(slot("deepseek-r1", Role::Target, 0, 0, 40)); // this device
+        d.add(slot("deepseek-r1", Role::Target, 1, 1, 40)); // remote host
+        assert!(d.is_valid(), "replicating one target across devices must validate cleanly: {:?}", d.validate());
+        assert_eq!(d.target().unwrap().model, "deepseek-r1");
+        assert_eq!(d.target().unwrap().device, DeviceId(0), "the lowest-priority (first-added) slot wins as primary");
+        let slots = d.target_slots();
+        assert_eq!(slots.len(), 2, "fanout needs to see BOTH devices running the target");
+        assert_eq!(slots.iter().map(|s| s.device).collect::<Vec<_>>(), vec![DeviceId(0), DeviceId(1)]);
+    }
+
+    #[test]
+    fn genuinely_different_target_models_are_still_ambiguous() {
+        let mut d = Deployment::new(vec![dev(0, 100), dev(1, 100)]);
+        d.add(slot("model-a", Role::Target, 0, 0, 40));
+        d.add(slot("model-b", Role::Target, 1, 1, 40)); // a DIFFERENT model, also marked Target
+        assert!(!d.is_valid());
+        assert!(d.validate().contains(&Issue::MultipleTargets(2)));
+        assert!(d.target().is_none(), "two different models both claiming Target IS ambiguous");
+    }
+
+    #[test]
+    fn disabling_one_replica_leaves_the_other_as_sole_target() {
+        let mut d = Deployment::new(vec![dev(0, 100), dev(1, 100)]);
+        d.add(slot("deepseek-r1", Role::Target, 0, 0, 40));
+        d.add(slot("deepseek-r1", Role::Target, 1, 1, 40));
+        d.slots[1].enabled = false; // toggle off the remote replica
+        assert!(d.is_valid());
+        assert_eq!(d.target_slots().len(), 1);
+        assert_eq!(d.target_slots()[0].device, DeviceId(0));
     }
 
     #[test]

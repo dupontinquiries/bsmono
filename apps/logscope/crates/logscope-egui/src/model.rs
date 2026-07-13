@@ -186,45 +186,76 @@ pub fn deployment_tiles(ui: &mut egui::Ui, dep: &mut logscope::deploy::Deploymen
 
     egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
         for name in available.iter() {
-            let slot_idx = dep.slots.iter().position(|s| &s.model == name);
-            let mut enabled = slot_idx.map(|j| dep.slots[j].enabled).unwrap_or(false);
+            // ALL slots for this model, across every device — not just the first match. A model can
+            // now be enabled on MULTIPLE devices at once (e.g. "this device" + a remote host), so the
+            // same model fans out across both for speed instead of being pinned to a single machine.
+            let slot_idxs: Vec<usize> = dep.slots.iter().enumerate().filter(|(_, s)| &s.model == name).map(|(i, _)| i).collect();
+            let any_enabled = slot_idxs.iter().any(|&j| dep.slots[j].enabled);
+            // Role is shared across a model's device-slots — you don't want DeepSeek as Target on one
+            // box and Draft on another; toggling role updates every enabled slot for this model at once.
+            let mut role = slot_idxs.iter().find(|&&j| dep.slots[j].enabled).map(|&j| dep.slots[j].role)
+                .or_else(|| slot_idxs.first().map(|&j| dep.slots[j].role))
+                .unwrap_or(if dep.slots.iter().all(|s| s.role != Role::Target) { Role::Target } else { Role::Draft });
+
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    // the check tile: include this model in the deployment
+                    let mut enabled = any_enabled;
                     if ui.checkbox(&mut enabled, "").changed() {
                         changed = true;
-                        match slot_idx {
-                            Some(j) => dep.slots[j].enabled = enabled,
-                            None if enabled => dep.add(Slot {
-                                model: name.clone(),
-                                role: if dep.slots.iter().all(|s| s.role != Role::Target) { Role::Target } else { Role::Draft },
-                                device: devices.first().map(|d| d.0).unwrap_or(DeviceId(0)),
-                                priority: dep.slots.len() as u32,
-                                enabled: true,
-                                est_bytes: est_bytes(name),
-                            }),
-                            None => {}
+                        if enabled {
+                            if slot_idxs.is_empty() {
+                                dep.add(Slot {
+                                    model: name.clone(), role,
+                                    device: devices.first().map(|d| d.0).unwrap_or(DeviceId(0)),
+                                    priority: dep.slots.len() as u32, enabled: true, est_bytes: est_bytes(name),
+                                });
+                            } else {
+                                for &j in &slot_idxs { dep.slots[j].enabled = true; }
+                            }
+                        } else {
+                            for &j in &slot_idxs { dep.slots[j].enabled = false; }
                         }
                     }
                     ui.label(RichText::new(name).color(theme::INK()).monospace());
-                    // role + device selectors only matter once the tile is on. Inline selectable CHIPS, not
-                    // ComboBoxes — a nested combo opens its own popup layer, which the parent popup reads as a
-                    // click-outside and closes (the "role dropdown cancels the menu" bug).
-                    if let Some(j) = dep.slots.iter().position(|s| &s.model == name) {
-                        if dep.slots[j].enabled {
-                            let mut role = dep.slots[j].role;
-                            ui.separator();
-                            for r in roles {
-                                if ui.selectable_label(role == r, RichText::new(role_name(r)).small()).clicked() { role = r; changed = true; }
+                    // role + device selectors only matter once at least one device-slot is on. Inline
+                    // selectable CHIPS, not ComboBoxes — a nested combo opens its own popup layer, which
+                    // the parent popup reads as a click-outside and closes (the "role dropdown cancels
+                    // the menu" bug).
+                    if enabled || any_enabled {
+                        ui.separator();
+                        for r in roles {
+                            if ui.selectable_label(role == r, RichText::new(role_name(r)).small()).clicked() {
+                                role = r; changed = true;
+                                for &j in &slot_idxs { if dep.slots[j].enabled { dep.slots[j].role = role; } }
                             }
-                            dep.slots[j].role = role;
-                            if devices.len() > 1 {
-                                let mut dev = dep.slots[j].device;
-                                ui.separator();
-                                for (id, nm) in &devices {
-                                    if ui.selectable_label(dev == *id, RichText::new(nm).small()).clicked() { dev = *id; changed = true; }
+                        }
+                        if devices.len() > 1 {
+                            ui.separator();
+                            // Independent toggle chips, one per device — NOT an exclusive picker. This
+                            // is the actual fix: previously a model's device was a single selectable
+                            // choice (like the role chips above), so checking a second device silently
+                            // moved the model rather than replicating it. Each chip here toggles its
+                            // OWN slot, so any subset of devices can be on at once for this model.
+                            for (id, nm) in &devices {
+                                let on = slot_idxs.iter().any(|&j| dep.slots[j].device == *id && dep.slots[j].enabled);
+                                if ui.selectable_label(on, RichText::new(nm).small()).clicked() {
+                                    changed = true;
+                                    if on {
+                                        // turn OFF this device's slot (but don't delete it — keep its
+                                        // est_bytes/priority around in case the user re-checks it)
+                                        if let Some(&j) = slot_idxs.iter().find(|&&j| dep.slots[j].device == *id) {
+                                            dep.slots[j].enabled = false;
+                                        }
+                                    } else if let Some(&j) = slot_idxs.iter().find(|&&j| dep.slots[j].device == *id) {
+                                        dep.slots[j].enabled = true;
+                                        dep.slots[j].role = role;
+                                    } else {
+                                        dep.add(Slot {
+                                            model: name.clone(), role, device: *id,
+                                            priority: dep.slots.len() as u32, enabled: true, est_bytes: est_bytes(name),
+                                        });
+                                    }
                                 }
-                                dep.slots[j].device = dev;
                             }
                         }
                     }
