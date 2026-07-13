@@ -16,6 +16,16 @@ runtime = "kde"
 targets = ["desktop", "phone"]
 notes = "QML voice app; pulseaudio; android via build-android.sh; QtState pattern"
 
+[apps.bot-arena-egui]
+path = "apps/bot-arena/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11) — no GTK runtime, same convention as rusty-board-egui
+targets = ["desktop"]
+notes = "the egui-primary port of bot-arena (GTK4/libadwaita dashboard) — see UI_STRATEGY.md. Defaults to the Arena palette, matching main.rs's real .bot-* CSS status colours (idle/running/pass/fail/spawn), not fsm.rs's separate SVG-diagram colour scheme. `cargo build --release` produces the deployable `bot-arena-egui` bin directly (the `app` feature is default-on); the GTK4 original stays the parity reference."
+
 [apps.bo-suite-egui]
 path = "apps/bo-suite/egui-frontend"
 kind = "cargo"
