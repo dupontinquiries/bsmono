@@ -2557,7 +2557,7 @@ impl Chat {
                         let label: String = nd.preview.chars().take(16).collect();
                         if label.trim().is_empty() { continue; }
                         for cell in m3::label_cells(pos[q.0], right, up, toward_cam, label.trim(),
-                                                    0.034, t, theme::CYAN(), lit, scroll, tanim) {
+                                                    0.034, t, theme::CYAN(), lit, scroll, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
                     }
@@ -2740,7 +2740,7 @@ impl Chat {
                 let lx = 1.86_f32; // half the text field width (panel half is 2.0)
                 let bx = V3::new(cen.x - right.x * lx, cen.y - right.y * lx, cen.z - right.z * lx); // fixed left edge
                 let tcen = V3::new(bx.x + right.x * (tw * 0.5) + up.x * 0.06, bx.y + right.y * (tw * 0.5) + up.y * 0.06, bx.z + right.z * (tw * 0.5) + up.z * 0.06);
-                for cell in m3::label_cells(tcen, right, up, toward, shown.trim(), tscale, t, tcol, lit, 0.0, tanim) {
+                for cell in m3::label_cells(tcen, right, up, toward, shown.trim(), tscale, t, tcol, lit, 0.0, tanim, m3::SceneLight::Uniform, 0) {
                     graph.push(cell);
                 }
                 // blinking caret at the end of the entry (the input "cursor"), so the selection point is visible.
@@ -2979,7 +2979,7 @@ impl Chat {
                         let lscale = (bw * 0.86 / (lbl.len() as f32 * 6.0)).min(0.017) * (1.0 + 0.14 * a.flash);
                         let lcen = V3::new(bc.x - toward.x * 0.30, bc.y - toward.y * 0.30, bc.z - toward.z * 0.30);
                         let llit = if enabled { (0.55 + 0.5 * a.hover + 0.7 * a.active + 0.8 * a.flash).min(1.6) } else { 0.18 };
-                        for cell in m3::label_cells(lcen, right, up, toward, lbl, lscale, t, pip[i], llit, a.flash * 0.06, tanim) {
+                        for cell in m3::label_cells(lcen, right, up, toward, lbl, lscale, t, pip[i], llit, a.flash * 0.06, tanim, m3::SceneLight::Uniform, 0) {
                             graph.push(cell);
                         }
                     }
@@ -3020,7 +3020,7 @@ impl Chat {
                         plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150);
                         graph.push(plaque); slab_glint(&mut graph, back(-0.06 * ps), right, up, toward, 0.71 * ps, 0.80 * ps, sun, tglow);
                         let title_c = V3::new(panel_c.x - toward.x * 0.30 + up.x * 0.66 * ps, panel_c.y - toward.y * 0.30 + up.y * 0.66 * ps, panel_c.z - toward.z * 0.30 + up.z * 0.66 * ps);
-                        for cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim) { graph.push(cell); }
+                        for cell in m3::label_cells(title_c, right, up, toward, "PARAMS", 0.010 * ps, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
 
                         let (p_down, p_pressed) = ui.input(|i| (i.pointer.primary_down(), i.pointer.primary_pressed()));
                         let p_pos = ui.input(|i| i.pointer.interact_pos());
@@ -3061,11 +3061,11 @@ impl Chat {
                             // label to the left, value to the right (floated proud of the track)
                             let lx = -(tw * 0.5 + 0.20 * ps);
                             let lcen = V3::new(rc.x - toward.x * 0.30 + right.x * lx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * lx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * lx + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim) { graph.push(cell); }
+                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
                             let vtxt = if isint { format!("{}", val.round() as i32) } else { format!("{val:.2}") };
                             let vx = tw * 0.5 + 0.10 * ps;
                             let vcen = V3::new(rc.x - toward.x * 0.30 + right.x * vx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * vx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * vx + up.z * 0.11 * ps);
-                            for cell in m3::label_cells(vcen, right, up, toward, &vtxt, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.72, 0.0, tanim) { graph.push(cell); }
+                            for cell in m3::label_cells(vcen, right, up, toward, &vtxt, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.72, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
                             if let Some(tr) = track_rect {
                                 let hint = format!("{label}: {vtxt} — drag to change");
                                 let resp = ui.interact(tr, egui::Id::new(("scene_phys_param", id)), egui::Sense::click_and_drag()).on_hover_text(hint);
@@ -3117,12 +3117,18 @@ impl Chat {
                     let mut slab = m3::panel(rc, right, up, pw, ph, egui::Color32::from_rgb(pc[0], pc[1], pc[2])); slab.mat = pmat; slab.emissive = pemis * sheen; m3::set_alpha(&mut slab, palpha); graph.push(slab); slab_glint(&mut graph, rc, right, up, toward, pw * 0.5, ph * 0.5, sun, tglow);
                     // left-edge origin: label_cells centres on its origin, so offset each line by +half its width
                     let left_edge = pw * 0.5 - pw * 0.06;
+                    // the plaque's text is lit by the CURRENT SCENE's physical light source (dappled
+                    // canopy leaves, a rotating pearl's facets, …) rather than a flat dot-matrix glow —
+                    // see mesh3d::SceneLight's doc comment for the full per-scene ledger. Seeded by the
+                    // focused message id so different messages' motes/glints don't move in lockstep.
+                    let scene_light = crate::mesh3d::scene_light_for(theme::active().name);
+                    let plaque_seed = fid as u32;
                     let mut put_line = |g: &mut Vec<crate::mesh3d::Mesh3>, text: &str, y: f32, scale: f32, col: egui::Color32, lit: f32| {
                         let w = text.chars().count() as f32 * 6.0 * scale;
                         let o = V3::new(rc.x - toward.x * 0.30 - right.x * left_edge + right.x * (w * 0.5) + up.x * y,
                                         rc.y - toward.y * 0.30 - right.y * left_edge + right.y * (w * 0.5) + up.y * y,
                                         rc.z - toward.z * 0.30 - right.z * left_edge + right.z * (w * 0.5) + up.z * y);
-                        for cell in m3::label_cells(o, right, up, toward, text, scale, t, col, lit, 0.0, tanim) { g.push(cell); }
+                        for cell in m3::label_cells(o, right, up, toward, text, scale, t, col, lit, 0.0, tanim, scene_light, plaque_seed) { g.push(cell); }
                     };
                     put_line(&mut graph, &head, ph * 0.5 - ph * 0.13, hscale, egui::Color32::from_rgb(0xff, 0xc2, 0x6a), 0.85);
                     for (li, line) in lines.iter().enumerate() {

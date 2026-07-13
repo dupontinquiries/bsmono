@@ -392,8 +392,176 @@ pub fn anim_cell(mode: TextAnim, t: f32, cf: f32, ci: usize, scale: f32) -> (f32
 const DOT_SEGMENTS: usize = 6;
 const DOT_RINGS: usize = 4;
 
+/// A scene's PHYSICAL light source that "writes" the reading plaque's text via a real in-scene
+/// process — dappled leaf-light, refraction through a rotating pearl's facets, bioluminescent motes
+/// — instead of the dot-matrix floating independent of the scene it's standing in. Each dot's
+/// brightness (and, for RainbowRefraction, its hue) comes from `modulate_dot`, keyed by the dot's
+/// position in the label (character-column × 6 for `gx`, row 0..7 for `gy`), a per-label `seed` (so
+/// two messages' motes/glints don't move in lockstep), and time `t`.
+///
+/// LEDGER — one entry per named scene in `scene3d::build`'s dispatch. IMPLEMENTED scenes have a
+/// real mechanism below; PROPOSED scenes default to `Uniform` (today's flat behaviour) with a design
+/// note for whoever picks them up next — see `scene_light_for`.
+///
+/// | Scene              | Variant             | Physical process                                          |
+/// |---------------------|--------------------|------------------------------------------------------------|
+/// | Canopy              | DappledCanopy       | IMPLEMENTED — sunlight dappling through swaying leaves     |
+/// | Atlantis             | FacetedPearl        | IMPLEMENTED — a rotating pearl's facets sweep the beam     |
+/// | Mistfall             | RisingMotes         | IMPLEMENTED — bioluminescent motes drifting up through mist|
+/// | Folding@home         | MembraneRipple      | IMPLEMENTED — a slow fold-wave through the lipid membrane  |
+/// | Fractal Spires       | CrystalGlint        | IMPLEMENTED — unpredictable facet-glints, per-dot timed     |
+/// | Frozen Bifrost       | RainbowRefraction   | IMPLEMENTED — a shifting spectrum sweeping across the text |
+/// | Forest / Treehouse   | proposed: DappledCanopy shared (same leaf-light story, wider/higher canopy) |
+/// | Cloudscape           | proposed: light breaking through moving cloud gaps (like DappledCanopy but softer, slower, cooler-toned) |
+/// | Mansion Garden       | proposed: sunlight through a conservatory's glass panes — a grid-aligned "window-pane" shadow sweep |
+/// | Old Library/Archive/Reading Room | proposed: candle/lamp flicker — per-dot warm flicker keyed to a shared "flame" noise |
+/// | Slate                | proposed: chalk-dust catching a single raking light — a directional sweep, not radial |
+/// | Alley                | proposed: neon sign flicker/buzz — sharp on/off per-dot with occasional stutter |
+/// | Recursive Citadel     | proposed: sun on sandstone — slow warm pulse, like heat-shimmer |
+/// | Hollow Jungle         | proposed: canopy-hole shafts — like DappledCanopy but sparser, harder-edged beams |
+/// | Yellow Brick Road     | proposed: literal brick-road glints — sequential left-to-right chase lights |
+/// | Titan's Ribcage       | proposed: bioluminescent pulse along the ribs — a slow heartbeat-timed wave |
+/// | Islands (default)     | Uniform — no bespoke scene to key off |
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SceneLight {
+    DappledCanopy,
+    FacetedPearl,
+    RisingMotes,
+    MembraneRipple,
+    CrystalGlint,
+    RainbowRefraction,
+    Uniform,
+}
+
+/// Map a scene's display name (the same strings `scene3d::build`'s `palette_name` dispatches on) to
+/// its `SceneLight`. Scenes without a bespoke mechanism yet fall back to `Uniform` — see the ledger
+/// on `SceneLight` for what's proposed for them.
+pub fn scene_light_for(scene_name: &str) -> SceneLight {
+    match scene_name {
+        "Canopy" => SceneLight::DappledCanopy,
+        "Atlantis" => SceneLight::FacetedPearl,
+        "Mistfall" => SceneLight::RisingMotes,
+        "Folding@home" => SceneLight::MembraneRipple,
+        "Fractal Spires" => SceneLight::CrystalGlint,
+        "Frozen Bifrost" => SceneLight::RainbowRefraction,
+        _ => SceneLight::Uniform,
+    }
+}
+
+/// Per-dot (brightness multiplier, hue-shift-degrees) from the scene's physical process. Brightness
+/// always has a legibility floor (never fully dark) — these are meant to make the text feel alive
+/// and IN the scene, not to obscure it.
+pub fn modulate_dot(light: SceneLight, gx: f32, gy: f32, seed: u32, t: f32) -> (f32, f32) {
+    match light {
+        SceneLight::DappledCanopy => (dappled_canopy(gx, gy, seed, t), 0.0),
+        SceneLight::FacetedPearl => (faceted_pearl(gx, gy, seed, t), 0.0),
+        SceneLight::RisingMotes => (rising_motes(gx, gy, seed, t), 0.0),
+        SceneLight::MembraneRipple => (membrane_ripple(gx, gy, seed, t), 0.0),
+        SceneLight::CrystalGlint => (crystal_glint(gx, gy, seed, t), 0.0),
+        SceneLight::RainbowRefraction => rainbow_refraction(gx, gy, t),
+        SceneLight::Uniform => (1.0, 0.0),
+    }
+}
+
+/// CANOPY: sunlight dappling through swaying leaves — a slow-drifting mottled brightness field.
+/// Legible floor 0.55 so the glyph always reads; the mottling is a shimmer ON TOP of it, not a
+/// replacement for it (real dappled light doesn't fully black out what it's shining on).
+fn dappled_canopy(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let sway = t * 0.35; // leaves sway slowly
+    let n1 = hash3((gx * 1.3 + sway * 4.0).floor() as i32, (gy * 1.1).floor() as i32, seed as i32);
+    let n2 = hash3((gx * 0.6 - sway * 2.6).floor() as i32, (gy * 0.5 + sway * 1.1).floor() as i32, seed.wrapping_add(97) as i32);
+    let dapple = (n1 * 0.6 + n2 * 0.4).clamp(0.0, 1.0);
+    0.55 + 0.45 * dapple
+}
+
+/// ATLANTIS: a rotating faceted pearl refracts a beam; a bright facet-band sweeps across the text as
+/// the pearl turns. The sweep's phase advances monotonically with `t` — this IS the "text scrolling
+/// as the pearl rotates" effect, not a separate scroll mechanism layered on top.
+fn faceted_pearl(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let _ = gy; // the facet band sweeps horizontally; every row in a column shares its brightness
+    let facet_period = 5.0; // roughly one letter-width per facet
+    let rotation = t * 0.6 + hash3(seed as i32, 0, 0) * 3.0; // per-label phase offset so labels don't sync
+    let phase = ((gx / facet_period) - rotation).rem_euclid(1.0);
+    let dist = (phase - 0.5).abs() * 2.0; // 0 at the band's centre, 1 at its edges
+    let band = (1.0 - dist).clamp(0.0, 1.0).powf(2.0);
+    0.6 + 0.4 * band
+}
+
+/// MISTFALL: bioluminescent motes drifting upward through mist/water; a dot lights when a mote
+/// passes near its row. Sparse and twinkling rather than a smooth field — motes are individual.
+fn rising_motes(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let lane = (gx / 3.0).floor() as i32; // a handful of independent rising columns
+    let speed = 0.4 + 0.3 * hash3(lane, seed as i32, 11);
+    let phase = (t * speed + hash3(lane, seed as i32, 29)).rem_euclid(1.0);
+    let mote_row = phase * 7.0; // motes cycle through the glyph's 7 rows as they rise
+    let dist = (gy - mote_row).abs();
+    let near = (1.0 - dist * 0.9).clamp(0.0, 1.0).powf(2.0);
+    0.35 + 0.65 * near
+}
+
+/// FOLDING@HOME: a slow undulating fold-wave rippling through the translucent lipid membrane —
+/// smooth and continuous (unlike the mote/glint mechanisms), radiating outward from the label centre.
+fn membrane_ripple(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let phase_offset = hash3(seed as i32, 0, 0) * std::f32::consts::TAU;
+    let ripple = ((gx * 0.25 + gy * 0.4 - t * 0.9 + phase_offset).sin() * 0.5 + 0.5).clamp(0.0, 1.0);
+    0.6 + 0.4 * ripple
+}
+
+/// FRACTAL SPIRES: crystal facets catching the light unpredictably — sharp, per-dot-timed glints
+/// rather than a smooth sweep (unlike FacetedPearl's continuous rotation).
+fn crystal_glint(gx: f32, gy: f32, seed: u32, t: f32) -> f32 {
+    let cell = ((gx.floor() as i32) << 8) ^ (gy.floor() as i32) ^ seed as i32;
+    let glint_period = 1.4 + hash3(cell, 1, 0) * 2.0; // each dot glints on its own cycle
+    let phase = (t / glint_period + hash3(cell, 2, 0)).fract();
+    // a brief, sharp flash rather than a smooth oscillation — glints are quick
+    let flash = (1.0 - (phase * 2.0 - 1.0).abs() * 8.0).clamp(0.0, 1.0);
+    0.5 + 0.5 * flash
+}
+
+/// FROZEN BIFROST: a slowly shifting rainbow spectrum sweeping across the text — the one mechanism
+/// that tints HUE rather than just brightness, matching the bridge's literal refracted-light identity.
+fn rainbow_refraction(gx: f32, gy: f32, t: f32) -> (f32, f32) {
+    let _ = gy;
+    let hue_deg = (gx * 6.0 + t * 40.0).rem_euclid(360.0);
+    (0.85, hue_deg) // brightness stays high and steady; the colour itself is the effect
+}
+
+
+/// Rotate `col`'s hue by `deg` degrees, keeping its saturation/value — a small manual RGB↔HSV
+/// round-trip rather than pulling in `ecolor::Hsva` as a new dependency for one hue shift.
+fn hue_rotate(col: Color32, deg: f32) -> Color32 {
+    let (r, g, b) = (col.r() as f32 / 255.0, col.g() as f32 / 255.0, col.b() as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    let v = max;
+    let s = if max > 0.0 { delta / max } else { 0.0 };
+    if delta <= 1e-6 {
+        // achromatic (grey/white/black) — hue is undefined, so give it a hue to rotate FROM rather
+        // than staying grey forever (a scene's rainbow light should tint even a plain white dot).
+        return hsv_to_rgb(deg.rem_euclid(360.0), 0.35_f32.max(s), v);
+    }
+    let mut h = if max == r { 60.0 * ((g - b) / delta).rem_euclid(6.0) }
+        else if max == g { 60.0 * ((b - r) / delta + 2.0) }
+        else { 60.0 * ((r - g) / delta + 4.0) };
+    h = (h + deg).rem_euclid(360.0);
+    hsv_to_rgb(h, s, v)
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> Color32 {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0).rem_euclid(2.0) - 1.0).abs());
+    let m = v - c;
+    let (r1, g1, b1) = match (h / 60.0) as i32 {
+        0 => (c, x, 0.0), 1 => (x, c, 0.0), 2 => (0.0, c, x),
+        3 => (0.0, x, c), 4 => (x, 0.0, c), _ => (c, 0.0, x),
+    };
+    Color32::from_rgb(((r1 + m) * 255.0) as u8, ((g1 + m) * 255.0) as u8, ((b1 + m) * 255.0) as u8)
+}
+
 pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: &str,
-                   scale: f32, t: f32, col: Color32, lit: f32, scroll: f32, anim: TextAnim) -> Vec<Mesh3> {
+                   scale: f32, t: f32, col: Color32, lit: f32, scroll: f32, anim: TextAnim,
+                   scene_light: SceneLight, seed: u32) -> Vec<Mesh3> {
     let chars: Vec<char> = text.chars().take(32).collect();
     if chars.is_empty() || lit <= 0.02 { return Vec::new(); }
     let w = chars.len() as f32 * 6.0 * scale;
@@ -412,8 +580,12 @@ pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: 
                     let px = (ci as f32 * 6.0 + x as f32) * scale - w * 0.5 + d_right;
                     let py = h * 0.5 - y as f32 * scale + d_up;
                     let p = addv(addv(base, mul(right, px)), mul(up, py));
-                    let mut m = uv_sphere(p, scale * 0.46, DOT_SEGMENTS, DOT_RINGS, col);
-                    m.emissive = emis * lit;
+                    // the scene's physical light source modulates this dot's brightness (and, for
+                    // RainbowRefraction, its hue) — see SceneLight's doc comment for the full ledger.
+                    let (bright, hue_shift_deg) = modulate_dot(scene_light, ci as f32 * 6.0 + x as f32, y as f32, seed, t);
+                    let dot_col = if hue_shift_deg != 0.0 { hue_rotate(col, hue_shift_deg) } else { col };
+                    let mut m = uv_sphere(p, scale * 0.46, DOT_SEGMENTS, DOT_RINGS, dot_col);
+                    m.emissive = emis * lit * bright;
                     out.push(m);
                 }
             }
@@ -1201,6 +1373,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scene_light_maps_the_named_scenes_and_falls_back_to_uniform() {
+        assert_eq!(scene_light_for("Canopy"), SceneLight::DappledCanopy);
+        assert_eq!(scene_light_for("Atlantis"), SceneLight::FacetedPearl);
+        assert_eq!(scene_light_for("Mistfall"), SceneLight::RisingMotes);
+        assert_eq!(scene_light_for("Folding@home"), SceneLight::MembraneRipple);
+        assert_eq!(scene_light_for("Fractal Spires"), SceneLight::CrystalGlint);
+        assert_eq!(scene_light_for("Frozen Bifrost"), SceneLight::RainbowRefraction);
+        // scenes without a bespoke mechanism yet — honest Uniform fallback, not a guess
+        for unimplemented in ["Forest", "Treehouse", "Cloudscape", "Old Library", "Islands", "made up name"] {
+            assert_eq!(scene_light_for(unimplemented), SceneLight::Uniform);
+        }
+    }
+
+    #[test]
+    fn every_mechanism_stays_within_a_legible_brightness_floor() {
+        // real dappled/glinting/rippling light never fully blacks out the text it's illuminating —
+        // sweep a spread of positions/times and check brightness never bottoms out at 0.
+        let lights = [
+            SceneLight::DappledCanopy, SceneLight::FacetedPearl, SceneLight::RisingMotes,
+            SceneLight::MembraneRipple, SceneLight::CrystalGlint, SceneLight::RainbowRefraction, SceneLight::Uniform,
+        ];
+        for light in lights {
+            for i in 0..40 {
+                let (gx, gy, t) = (i as f32 * 1.7, (i % 7) as f32, i as f32 * 0.31);
+                let (bright, _) = modulate_dot(light, gx, gy, 42, t);
+                assert!(bright > 0.1, "{light:?} at ({gx},{gy},{t}) went too dark: {bright}");
+                assert!(bright <= 1.05, "{light:?} brightness should stay roughly normalized, got {bright}");
+            }
+        }
+    }
+
+    #[test]
+    fn faceted_pearl_sweep_advances_with_time_like_a_rotating_pearl() {
+        // "as the pearl rotates, the text is effectively scrolling" — the bright band's position
+        // should move as t increases, not sit static.
+        let (b_early, _) = modulate_dot(SceneLight::FacetedPearl, 10.0, 3.0, 7, 0.0);
+        let (b_late, _) = modulate_dot(SceneLight::FacetedPearl, 10.0, 3.0, 7, 4.0);
+        assert_ne!(b_early, b_late, "the facet band must have moved past this column as time passed");
+    }
+
+    #[test]
+    fn different_seeds_decorrelate_so_messages_dont_glint_in_lockstep() {
+        // sweep several (gy, t) points — two seeds landing on the SAME brightness floor at one
+        // particular point is a coincidence (both motes just happen to be far from that row), not
+        // evidence the seeds are correlated; require at least one point where they clearly differ.
+        let mut any_differ = false;
+        for i in 0..12 {
+            let (gy, t) = ((i % 7) as f32, i as f32 * 0.4);
+            let (b1, _) = modulate_dot(SceneLight::RisingMotes, 5.0, gy, 1, t);
+            let (b2, _) = modulate_dot(SceneLight::RisingMotes, 5.0, gy, 2, t);
+            if (b1 - b2).abs() > 1e-6 { any_differ = true; }
+        }
+        assert!(any_differ, "different seeds should produce different mote timing somewhere across the sweep");
+    }
+
+    #[test]
+    fn rainbow_refraction_shifts_hue_and_stays_high_brightness() {
+        let (bright, hue) = modulate_dot(SceneLight::RainbowRefraction, 12.0, 2.0, 0, 3.0);
+        assert!(bright > 0.7, "the spectrum effect should stay bright, not dim");
+        assert!((0.0..360.0).contains(&hue));
+        // a different gx at the same t should generally land at a different hue (spectrum SWEEPS
+        // across columns, it isn't a single flat tint)
+        let (_, hue2) = modulate_dot(SceneLight::RainbowRefraction, 40.0, 2.0, 0, 3.0);
+        assert_ne!(hue, hue2);
+    }
+
+    #[test]
+    fn hue_rotate_preserves_grey_handling_and_full_rotation_is_identity() {
+        let red = Color32::from_rgb(220, 40, 40);
+        let full_turn = hue_rotate(red, 360.0);
+        assert!((full_turn.r() as i16 - red.r() as i16).abs() <= 2, "360° rotation should return ~the same colour");
+        // white/grey (no hue) shouldn't panic and should still produce a valid colour
+        let _ = hue_rotate(Color32::from_rgb(200, 200, 200), 90.0);
+    }
+
+    #[test]
+    fn label_cells_with_a_scene_light_still_produces_dots() {
+        // wiring smoke test: a non-Uniform light shouldn't accidentally suppress all dots.
+        let dots = label_cells(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 0.0 }, Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            Vec3 { x: 0.0, y: 0.0, z: 1.0 }, "Hi", 0.2, 1.5, Color32::WHITE, 1.0, 0.0, TextAnim::Plain,
+            SceneLight::FacetedPearl, 3);
+        assert!(!dots.is_empty());
+    }
+
+    #[test]
     fn label_dots_are_rounder_than_the_old_low_res_blob() {
         // the literal "dots too low-res" complaint: each lit pixel used to be a 4×3 sphere (~12 tris,
         // reads as a faceted diamond up close). Confirms the fix actually raised the segment counts,
@@ -1208,7 +1465,7 @@ mod tests {
         // silently drift back down.
         assert!(DOT_SEGMENTS > 4 && DOT_RINGS > 3, "must be a real improvement over the old 4×3");
         let dots = label_cells(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 0.0 }, Vec3 { x: 0.0, y: 1.0, z: 0.0 },
-            Vec3 { x: 0.0, y: 0.0, z: 1.0 }, "Hi", 0.2, 0.0, Color32::WHITE, 1.0, 0.0, TextAnim::Plain);
+            Vec3 { x: 0.0, y: 0.0, z: 1.0 }, "Hi", 0.2, 0.0, Color32::WHITE, 1.0, 0.0, TextAnim::Plain, SceneLight::Uniform, 0);
         assert!(!dots.is_empty());
         // a uv_sphere(segs, rings) mesh has 2 + segs*(rings-1) vertices and 2*segs + segs*(rings-2)*2
         // triangles (poles + rings of quads) — just check it's meaningfully more detailed than the old
