@@ -54,6 +54,7 @@ pub fn all() -> &'static [Daemon] {
         Daemon { name: "sharemd", socket: "share", description: "shared-data hub (datashare-core)", integration: "datashare-core" },
         Daemon { name: "coordd", socket: "coord", description: "coordination arbiter (coord-core)", integration: "coord-core" },
         Daemon { name: "settingsd", socket: "settings", description: "cross-app settings, persisted to ~/.config/gitmind (settings-kit)", integration: "settings-kit" },
+        Daemon { name: "logscope-fabricd", socket: "fabric", description: "logscope distributed fanout — broadcaster discovery + remote worker dispatch (fuzz/summarize across devices)", integration: "logscope-fabric" },
     ]
 }
 
@@ -265,10 +266,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_includes_all_four_daemons() {
+    fn registry_includes_all_fleet_daemons() {
         let names: Vec<&str> = all().iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["voiced", "sharemd", "coordd", "settingsd"]);
+        assert_eq!(names, vec!["voiced", "sharemd", "coordd", "settingsd", "logscope-fabricd"]);
         assert_eq!(find("settingsd").unwrap().socket, "settings");
+        assert_eq!(find("logscope-fabricd").unwrap().socket, "fabric");
         assert!(find("nope").is_none());
     }
 
