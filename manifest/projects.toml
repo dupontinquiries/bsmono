@@ -16,6 +16,16 @@ runtime = "kde"
 targets = ["desktop", "phone"]
 notes = "QML voice app; pulseaudio; android via build-android.sh; QtState pattern"
 
+[apps.snapclone-egui]
+path = "apps/snapclone/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop"]
+notes = "the founding egui app for the uikit-egui patterns (live backgrounds, page/subpage nav originated here) — not a Qt/GTK port, so it uses the shared default palette rather than a bespoke one. `cargo build --release` produces the deployable `snapclone-egui` bin directly (the `app` feature is default-on). The C++ camera/peer engine (src/, cmake/) is the separate on-device native app; this is the egui reference/demo surface."
+
 [apps.bot-arena-egui]
 path = "apps/bot-arena/egui-frontend"
 kind = "cargo"
