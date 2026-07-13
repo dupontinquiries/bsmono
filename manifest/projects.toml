@@ -16,6 +16,16 @@ runtime = "kde"
 targets = ["desktop", "phone"]
 notes = "QML voice app; pulseaudio; android via build-android.sh; QtState pattern"
 
+[apps.bo-suite-egui]
+path = "apps/bo-suite/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11) — no Qt runtime, same convention as rusty-board-egui
+targets = ["desktop"]
+notes = "the egui-primary port of bo-controller (Qt/QML B&O ambient audio panel) — see UI_STRATEGY.md. Defaults to the Amber palette (warm gold) matching the Qt surface. `cargo build --release` produces the deployable `bo-suite-egui` bin directly (the `app` feature is default-on); the Qt/QML original stays the parity reference. Compact-width layout uses the vertical-tabs sidebar (not a whole-surface swipe) since the Devices view's volume sliders would otherwise race a page-swipe gesture for the same drag."
+
 [apps.voiceterm-egui]
 path = "apps/voiceterm/egui-frontend"
 kind = "cargo"

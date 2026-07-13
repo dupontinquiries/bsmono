@@ -8,11 +8,27 @@ description = "bo-controller's Qt/QML control panel ported to egui on uikit-egui
 [lib]
 path = "src/lib.rs"
 
+[[bin]]
+name = "bo-suite-egui"
+path = "src/bin/bo_suite_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+# Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
+# manifest/projects.toml) produces the deploy binary directly, same convention as rusty-board-egui /
+# voiceterm-egui.
+app = ["dep:eframe"]
+
 [dependencies]
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[dev-dependencies]
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
 
 [workspace]

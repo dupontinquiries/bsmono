@@ -23,6 +23,7 @@ pub enum PaletteId {
     Night,
     System,
     Voice,
+    Amber,
 }
 
 impl PaletteId {
@@ -40,6 +41,7 @@ impl PaletteId {
             Self::Night      => "night",
             Self::System     => "system",
             Self::Voice      => "voice",
+            Self::Amber      => "amber",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -56,6 +58,7 @@ impl PaletteId {
             Self::Night      => "Night",
             Self::System     => "System",
             Self::Voice      => "Voice",
+            Self::Amber      => "Amber",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -71,12 +74,13 @@ impl PaletteId {
             "night"       => Self::Night,
             "system"      => Self::System,
             "voice"       => Self::Voice,
+            "amber"       => Self::Amber,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber]
     }
 }
 
@@ -234,6 +238,34 @@ pub const VOICE: Palette = Palette {
     gradient_bar:  ["#26262e", "#23232a"],
     glow_online:   "#7ddc7d",
 };
+
+/// Warm gold/amber — matches bo-controller's Qt/QML surface (the egui apps' colour north-star).
+/// bo-suite's own identity (a B&O-style ambient audio control panel), distinct from System/Night/Voice.
+pub const AMBER: Palette = Palette {
+    id: PaletteId::Amber, name: "Amber",
+    bg_deep:   "#000000",
+    bg_base:   "#1a1a1a",
+    bg_card:   "#33291a",
+    bg_raised: "#3a3a3a",
+    bg_hover:  "#4a3f28",
+    bg_scrim:  "rgba(0,0,0,0.72)",
+    text_primary:   "#e8dcc0",
+    text_secondary: "#b8a888",
+    text_disabled:  "#6a6155",
+    text_inverse:   "#1a1a1a",
+    accent:      "#c8a04b",
+    accent_soft: "#d4c89a",
+    accent_dim:  "#4a3f28",
+    danger:  "#8e4a3d",
+    success: "#4a7c59",
+    warning: "#c0a060",
+    border:       "#3a3a3a",
+    border_focus: "#c8a04b",
+    gradient_hero: ["#33291a", "#1a1a1a"],
+    gradient_bar:  ["#33291a", "#000000"],
+    glow_online:   "#4a7c59",
+};
+
 
 
 
