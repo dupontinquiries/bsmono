@@ -24,6 +24,7 @@ pub enum PaletteId {
     System,
     Voice,
     Amber,
+    Arena,
 }
 
 impl PaletteId {
@@ -42,6 +43,7 @@ impl PaletteId {
             Self::System     => "system",
             Self::Voice      => "voice",
             Self::Amber      => "amber",
+            Self::Arena      => "arena",
         }
     }
     pub fn display_name(self) -> &'static str {
@@ -59,6 +61,7 @@ impl PaletteId {
             Self::System     => "System",
             Self::Voice      => "Voice",
             Self::Amber      => "Amber",
+            Self::Arena      => "Arena",
         }
     }
     pub fn from_str(s: &str) -> Self {
@@ -75,12 +78,13 @@ impl PaletteId {
             "system"      => Self::System,
             "voice"       => Self::Voice,
             "amber"       => Self::Amber,
+            "arena"       => Self::Arena,
             _             => Self::Dark,
         }
     }
     pub fn all() -> &'static [Self] {
         &[Self::Dark, Self::PitchBlack, Self::Paper, Self::Neon, Self::Minimal, Self::Modern,
-          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber]
+          Self::Earth, Self::Pastels, Self::Metallic, Self::Night, Self::System, Self::Voice, Self::Amber, Self::Arena]
     }
 }
 
@@ -265,6 +269,36 @@ pub const AMBER: Palette = Palette {
     gradient_bar:  ["#33291a", "#000000"],
     glow_online:   "#4a7c59",
 };
+
+/// Matches bot-arena's real GTK CSS (main.rs's .bot-* status classes: idle/provisioning/running/pass/
+/// fail/culled/spawn cell colours) — the egui apps' colour north star. Distinct identity: a status-grid
+/// tool, not a themed "brand" app, so the palette centres on the RUNNING blue as the active/interactive
+/// colour with pass/fail/spawn mapped onto success/danger/warning.
+pub const ARENA: Palette = Palette {
+    id: PaletteId::Arena, name: "Arena",
+    bg_deep:   "#1a1a1a",
+    bg_base:   "#222222",
+    bg_card:   "#2a2a2a",
+    bg_raised: "#333333",
+    bg_hover:  "#3a3a3a",
+    bg_scrim:  "rgba(26,26,26,0.72)",
+    text_primary:   "#e8e8e8",
+    text_secondary: "#cfcfcf",
+    text_disabled:  "#6a6a6a",
+    text_inverse:   "#1a1a1a",
+    accent:      "#1c5fa8",
+    accent_soft: "#4d9de0",
+    accent_dim:  "#3a3a3a",
+    danger:  "#7a2f2f",
+    success: "#1f7a3d",
+    warning: "#8a7a1f",
+    border:       "#3a3a3a",
+    border_focus: "#1c5fa8",
+    gradient_hero: ["#2a2a2a", "#1a1a1a"],
+    gradient_bar:  ["#2a2a2a", "#222222"],
+    glow_online:   "#1f7a3d",
+};
+
 
 
 
