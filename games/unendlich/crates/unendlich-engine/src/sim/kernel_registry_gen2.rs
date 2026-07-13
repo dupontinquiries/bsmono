@@ -314,29 +314,35 @@ static G2K_0033: KernelEntry = KernelEntry { name: "region_cull__child_mask", ru
 // GEN-END
 
 // GEN-ENTRY: render_dynamic_lights__gather_nearest src=render::dynamic_lights
+#[cfg(feature = "render-core")]
 fn g2k_0034(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::dynamic_lights::gather_nearest(black_box([c.phase; 3]), black_box(&[]), black_box(((c.tick % 7) + 1) as usize)));
 }
 #[distributed_slice(KERNELS)]
+#[cfg(feature = "render-core")]
 static G2K_0034: KernelEntry = KernelEntry { name: "render_dynamic_lights__gather_nearest", run: g2k_0034 };
 // GEN-END
 
 // GEN-ENTRY: render_dynamic_lights__apply_lights src=render::dynamic_lights
+#[cfg(feature = "render-core")]
 fn g2k_0035(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::dynamic_lights::apply_lights(black_box([c.phase; 3]), black_box(&[])));
 }
 #[distributed_slice(KERNELS)]
+#[cfg(feature = "render-core")]
 static G2K_0035: KernelEntry = KernelEntry { name: "render_dynamic_lights__apply_lights", run: g2k_0035 };
 // GEN-END
 
 // GEN-ENTRY: render_view_params__derive_planes_cpu_reference src=render::view_params
+#[cfg(feature = "render-core")]
 fn g2k_0036(c: &KernelCtx) {
     let _ = c;
     black_box(crate::render::view_params::derive_planes_cpu_reference(black_box(&[[0.0f32; 4]; 4])));
 }
 #[distributed_slice(KERNELS)]
+#[cfg(feature = "render-core")]
 static G2K_0036: KernelEntry = KernelEntry { name: "render_view_params__derive_planes_cpu_reference", run: g2k_0036 };
 // GEN-END
 
