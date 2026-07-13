@@ -58,6 +58,11 @@ impl Controller {
         VIEWS[self.view_idx]
     }
 
+    /// Switch view by a swipe sign (wraps at the ends — clamped, see `page()`). Pure index arithmetic;
+    /// used by tests. NOT gesture-driven in the live UI any more — compact mode uses the vertical-tabs
+    /// sidebar instead of a whole-surface swipe (see `ui()`'s doc comment for why: the Devices view's
+    /// volume Sliders claim horizontal drag themselves, and a whole-surface gesture reads the same raw
+    /// pointer trajectory with nothing arbitrating between the two).
     pub fn swipe(&mut self, sign: i32) {
         self.view_idx = page(self.view_idx, sign, VIEWS.len());
     }
@@ -74,12 +79,6 @@ impl Controller {
         let colors = uikit_egui::palette_colors(&self.palette);
         self.a11y.begin_frame();
 
-        let surface = ui.available_rect_before_wrap();
-        let frame = self.gesture.update(ui, surface, true);
-        if let Some(dir) = frame.page_jump {
-            self.swipe(dir.sign());
-        }
-
         if !adaptive.is_compact() {
             ui.horizontal(|ui| {
                 for (i, name) in VIEWS.iter().enumerate() {
@@ -89,18 +88,33 @@ impl Controller {
                 }
             });
             ui.separator();
+            match self.view_idx {
+                0 => self.devices_view(ui, &colors),
+                1 => self.scenes_view(ui, &colors),
+                _ => self.library_view(ui, &colors),
+            }
         } else {
-            ui.colored_label(colors.text_weak, format!("‹ swipe ›   {}", self.current()));
-        }
-
-        match self.view_idx {
-            0 => self.devices_view(ui, &colors),
-            1 => self.scenes_view(ui, &colors),
-            _ => self.library_view(ui, &colors),
-        }
-
-        if let Some(edge) = frame.barrier_edge {
-            uikit_egui::paint_barrier(ui, surface, frame.barrier_fraction, edge, colors.accent);
+            // Compact width: a vertical-tabs sidebar instead of a whole-surface swipe gesture. The
+            // devices view has volume Sliders, which claim horizontal drag themselves — a whole-surface
+            // GestureLayer reads the same raw pointer trajectory with nothing arbitrating between the
+            // two (the exact rusty-board keyboard bug: see uikit_egui::vertical_tabs's doc comment), so
+            // dragging a slider could also register as a page swipe. A sidebar tap has no such race.
+            ui.horizontal(|ui| {
+                ui.allocate_ui(egui::vec2(64.0_f32.max(adaptive.min_touch_target * 1.3), ui.available_height()), |ui| {
+                    let tabs: Vec<uikit_egui::vertical_tabs::Tab> = VIEWS.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
+                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, self.view_idx, adaptive.min_touch_target, &colors) {
+                        self.view_idx = i;
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    match self.view_idx {
+                        0 => self.devices_view(ui, &colors),
+                        1 => self.scenes_view(ui, &colors),
+                        _ => self.library_view(ui, &colors),
+                    }
+                });
+            });
         }
     }
 
