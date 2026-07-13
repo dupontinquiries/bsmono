@@ -728,6 +728,9 @@ pub struct Chat {
     verify_job: Option<VerifyJob>, // running sandbox build-check of the generated files
     verify_net: bool,              // allow the verify to fetch missing deps from crates.io (opt-in)
     show_files: bool,              // expand the generated-files drawer (toggled from the composer)
+    hide_bottom_bar: bool,         // hide the whole composer/files/suggestions strip — reclaims the
+                                    // full window height for the physical UI (spatial_view), which was
+                                    // otherwise cramped/cut off behind it with no way to get it back.
     walk: crate::walkcam::WalkCam, // prezi-style walkthrough camera over the graph
     walk_focus: Option<usize>,     // node the walkthrough is centered on
     cam_pan_path: Vec<usize>,      // node-id path (graph shortest path) the camera is gliding along
@@ -822,6 +825,7 @@ impl Default for Chat {
             verify_job: None,
             verify_net: false,
             show_files: false,
+            hide_bottom_bar: false,
             walk: crate::walkcam::WalkCam::new(13.0), walk_focus: None, scroll_chat_to: None,
             cam_pan_path: Vec::new(), cam_pan_t0: None,
             orbit: crate::spatial::OrbitCam::default(), spatial_view: false,
@@ -4544,6 +4548,20 @@ impl Chat {
                     let next = !self.spatial_view;
                     self.set_view(next, ui);
                 }
+                // Only meaningful in Spatial mode: the composer/files/suggestions strip otherwise
+                // cramps or cuts off the physical UI's scene against the bottom of the window, with
+                // no way to reclaim that space — this hides the WHOLE bottom panel, not just parts
+                // of it, and moves nothing (no repositioning to "fit better") since a toggle is a
+                // much more predictable fix than trying to auto-shrink composer sub-elements.
+                if self.spatial_view {
+                    ui.add_space(6.0);
+                    let label = if self.hide_bottom_bar { "▲ Show bar" } else { "▼ Hide bar" };
+                    if ui.selectable_label(self.hide_bottom_bar, RichText::new(label).color(theme::DIM()))
+                        .on_hover_text("Hide the composer/files/suggestions strip entirely, so the physical UI gets the full window height instead of being cramped behind it.")
+                        .clicked() {
+                        self.hide_bottom_bar = !self.hide_bottom_bar;
+                    }
+                }
             });
         });
 
@@ -4827,6 +4845,9 @@ impl Chat {
 
         // ── bottom: generated files + composer, PINNED so they never scroll off-screen even
         //    when the Context panel is open or a reply produces a tall file list ──
+        // Gated behind hide_bottom_bar: when hidden, this whole panel doesn't exist, so the spatial
+        // view's CentralPanel gets the full remaining height instead of being cramped behind it.
+        if !self.hide_bottom_bar {
         egui::Panel::bottom("chat_bottom").resizable(false).show_inside(ui, |ui| {
             ui.add_space(theme::PAD_XS as f32);
             if !arts.is_empty() && self.show_files {
@@ -5208,6 +5229,7 @@ impl Chat {
             });
             theme::carved_trough(ui.painter(), composer_frame.response.rect, ui.input(|i| i.time) as f32);
         });
+        }
 
         // ── center: the message log fills whatever height remains above the pinned bottom ──
         egui::CentralPanel::default().show_inside(ui, |ui| {
