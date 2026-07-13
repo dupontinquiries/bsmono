@@ -485,6 +485,108 @@ pub fn resolve_colors(style: Style, colors: &uikit_egui::PaletteColors) -> (egui
 /// Render the terminal grid into `ui` as a monospace cell grid. Efficient: per row, cells are
 /// grouped into runs of identical style and drawn as one text galley (not one per cell).
 /// Colours route through `filter_color` so the display-accessibility settings apply live.
+/// The terminal cursor's interaction mode — ported 1:1 from voiceterm's QML `termCursor`
+/// (main.qml): mode 0 hides the cursor entirely (an inner TUI like vim draws its own, so ours
+/// on top would double-image); mode 1 holds a flat 0.7 opacity; mode 2 pulses; mode 3 sits at a
+/// static 0.85 opacity but slides smoothly between cells. The QML defaults to 3 (slide) as the
+/// primary experience — 1/2 exist for accessibility/reduced-motion preference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CursorMode {
+    Off,
+    Static,
+    Pulse,
+    #[default]
+    Slide,
+}
+
+/// Cursor animation state: the QML's `Behavior on x/y { NumberAnimation { duration: 80;
+/// easing.type: Easing.OutCubic } }` (mode 3, slide) plus the mode-2 pulse (`SequentialAnimation`,
+/// 0.3↔0.7 opacity, 600ms each leg, `Easing.InOutQuad`). Kept as a small tick-driven struct
+/// (matching the `PlaqueScroll` shape used for logscope's smooth scroll) rather than reaching for
+/// egui's built-in `animate_value` so the exact QML durations/curves carry over precisely.
+#[derive(Clone, Copy, Debug)]
+pub struct CursorAnim {
+    x: f32, y: f32,           // current rendered position (cells)
+    from_x: f32, from_y: f32, // where this glide started
+    target_x: f32, target_y: f32,
+    elapsed: f32,             // seconds into the current slide
+    pulse_t: f32,             // seconds into the current pulse leg
+    pulse_rising: bool,
+}
+
+impl Default for CursorAnim {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0, from_x: 0.0, from_y: 0.0, target_x: 0.0, target_y: 0.0, elapsed: 0.0, pulse_t: 0.0, pulse_rising: false }
+    }
+}
+
+impl CursorAnim {
+    const SLIDE_DURATION: f32 = 0.08; // 80ms, matching the QML exactly
+    const PULSE_LEG: f32 = 0.6; // 600ms per leg, matching the QML exactly
+
+    /// Set a new target cell (call every frame with the grid's current cursor position).
+    pub fn set_target(&mut self, col: usize, row: usize) {
+        let (tx, ty) = (col as f32, row as f32);
+        if (tx - self.target_x).abs() < 1e-4 && (ty - self.target_y).abs() < 1e-4 {
+            return; // already headed there (or already there) — don't restart the glide
+        }
+        self.from_x = self.x;
+        self.from_y = self.y;
+        self.target_x = tx;
+        self.target_y = ty;
+        self.elapsed = 0.0;
+    }
+
+    /// Advance both the slide and the pulse by `dt` seconds. Returns (x, y, opacity) in cell
+    /// units / [0,1] for the caller to convert to pixels and paint.
+    pub fn tick(&mut self, dt: f32, mode: CursorMode) -> (f32, f32, f32) {
+        // slide (mode 3): eased position; other modes snap instantly (matches the QML's
+        // `Behavior { enabled: cursorMode === 3 }` — the Behavior simply doesn't apply otherwise).
+        if mode == CursorMode::Slide {
+            if (self.target_x - self.x).abs() > 1e-4 || (self.target_y - self.y).abs() > 1e-4 {
+                self.elapsed = (self.elapsed + dt.max(0.0)).min(Self::SLIDE_DURATION);
+                let t = uikit_egui::motion::ease::out_cubic(self.elapsed / Self::SLIDE_DURATION);
+                self.x = self.from_x + (self.target_x - self.from_x) * t;
+                self.y = self.from_y + (self.target_y - self.from_y) * t;
+                if self.elapsed >= Self::SLIDE_DURATION { self.x = self.target_x; self.y = self.target_y; }
+            }
+        } else {
+            self.x = self.target_x;
+            self.y = self.target_y;
+        }
+        // pulse (mode 2): a continuous 0.3↔0.7 oscillation, InOutQuad each leg.
+        let opacity = match mode {
+            CursorMode::Off => 0.0,
+            CursorMode::Static => 0.7,
+            CursorMode::Slide => 0.85,
+            CursorMode::Pulse => {
+                self.pulse_t += dt.max(0.0);
+                if self.pulse_t >= Self::PULSE_LEG {
+                    self.pulse_t -= Self::PULSE_LEG;
+                    self.pulse_rising = !self.pulse_rising;
+                }
+                let t = uikit_egui::motion::ease::in_out_quad(self.pulse_t / Self::PULSE_LEG);
+                if self.pulse_rising { 0.3 + (0.7 - 0.3) * t } else { 0.7 + (0.3 - 0.7) * t }
+            }
+        };
+        (self.x, self.y, opacity)
+    }
+
+    pub fn is_animating(&self, mode: CursorMode) -> bool {
+        mode == CursorMode::Pulse
+            || (mode == CursorMode::Slide && ((self.target_x - self.x).abs() > 1e-4 || (self.target_y - self.y).abs() > 1e-4))
+    }
+}
+
+/// Lighten a colour toward white by `factor` (0 = unchanged, 1 = white) — matches Qt's
+/// `Qt.lighter(colour, 1.2)` used for the QML cursor's fill (a lightened terminal-fg, not the
+/// theme accent — the cursor should read as "brighter text", not as a UI-chrome highlight).
+fn lighten(c: egui::Color32, factor: f32) -> egui::Color32 {
+    let f = factor.clamp(0.0, 1.0);
+    let lerp = |a: u8| (a as f32 + (255.0 - a as f32) * f).round() as u8;
+    egui::Color32::from_rgb(lerp(c.r()), lerp(c.g()), lerp(c.b()))
+}
+
 pub fn render_grid(
     ui: &egui::Ui,
     grid: &Grid,
@@ -494,8 +596,21 @@ pub fn render_grid(
     cell_w: f32,
     cell_h: f32,
     font_size: f32,
+    cursor_mode: CursorMode,
+    cursor_anim: &mut CursorAnim,
+    dt: f32,
 ) {
     let painter = ui.painter();
+    // The terminal viewport's own base is a hardcoded near-black in the QML (Canvas's default
+    // cell colour, `#0d0d0d` — a sentinel literal, not theme-derived), distinct from the lighter
+    // chrome bg_base around it. Paint it explicitly rather than relying on whatever panel fill
+    // happens to be behind this region.
+    const TERM_BASE: egui::Color32 = egui::Color32::from_rgb(0x0d, 0x0d, 0x0d);
+    painter.rect_filled(
+        egui::Rect::from_min_size(origin, egui::vec2(grid.cols as f32 * cell_w, grid.rows as f32 * cell_h)),
+        0.0,
+        TERM_BASE,
+    );
     let filt = |c: egui::Color32| uikit_egui::filter_color(c, display);
     let font = egui::FontId::monospace(font_size);
 
@@ -523,14 +638,23 @@ pub fn render_grid(
             c = end;
         }
     }
-    // cursor block
-    let cx = origin.x + grid.cur_col as f32 * cell_w;
-    let cy = origin.y + grid.cur_row as f32 * cell_h;
-    painter.rect_filled(
-        egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cell_w, cell_h)),
-        0.0,
-        filt(colors.accent).gamma_multiply(0.6),
-    );
+    // cursor — ported from voiceterm's QML `termCursor` (see CursorAnim's doc comment for the
+    // exact mode semantics/timings this matches).
+    if cursor_mode != CursorMode::Off {
+        cursor_anim.set_target(grid.cur_col, grid.cur_row);
+        let (cx_cells, cy_cells, opacity) = cursor_anim.tick(dt, cursor_mode);
+        let cx = origin.x + cx_cells * cell_w;
+        let cy = origin.y + cy_cells * cell_h;
+        let cursor_color = lighten(filt(colors.text), 0.2); // Qt.lighter(th.tfg, 1.2)
+        painter.rect_filled(
+            egui::Rect::from_min_size(egui::pos2(cx, cy), egui::vec2(cell_w, cell_h)),
+            1.0, // QML: radius: 1
+            cursor_color.gamma_multiply(opacity),
+        );
+        if cursor_anim.is_animating(cursor_mode) {
+            ui.ctx().request_repaint(); // keep the pulse/slide going
+        }
+    }
 }
 
 /// A minimal voiceterm view: the terminal, current prefs, and settings adoption. The egui
@@ -547,6 +671,9 @@ pub struct App {
     /// In-screen find state; `search_open` toggles the search bar.
     pub search: SearchState,
     pub search_open: bool,
+    /// Cursor interaction mode + its glide/pulse state — see `CursorMode`/`CursorAnim`.
+    pub cursor_mode: CursorMode,
+    cursor_anim: CursorAnim,
 }
 
 impl App {
@@ -560,6 +687,8 @@ impl App {
             recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
             search: SearchState::default(),
             search_open: false,
+            cursor_mode: CursorMode::default(), // Slide, matching the QML's default
+            cursor_anim: CursorAnim::default(),
         }
     }
 
@@ -655,9 +784,10 @@ impl App {
     }
 
     /// Draw the terminal into the current UI region.
-    pub fn render(&self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
+    pub fn render(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         let origin = ui.min_rect().min;
-        render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size);
+        let dt = ui.input(|i| i.stable_dt).min(0.1); // clamp a stalled first frame's huge dt
+        render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size, self.cursor_mode, &mut self.cursor_anim, dt);
 
         // Highlight search hits that fall in the visible region (matches in scrollback still count in
         // the n/N tally, they just aren't on screen to box). The active hit gets a solid box.
@@ -763,6 +893,55 @@ impl SearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_slide_glides_to_target_and_stops() {
+        let mut a = CursorAnim::default();
+        a.set_target(5, 2);
+        let mut last = (0.0, 0.0, 0.0);
+        for _ in 0..20 { last = a.tick(1.0 / 60.0, CursorMode::Slide); }
+        assert!((last.0 - 5.0).abs() < 1e-3 && (last.1 - 2.0).abs() < 1e-3, "should settle on target, got {last:?}");
+        assert!((last.2 - 0.85).abs() < 1e-6, "slide mode holds a static 0.85 opacity");
+        assert!(!a.is_animating(CursorMode::Slide));
+    }
+
+    #[test]
+    fn cursor_static_and_off_snap_instantly_ignoring_target() {
+        let mut a = CursorAnim::default();
+        a.set_target(9, 4);
+        let (x, y, op) = a.tick(1.0 / 60.0, CursorMode::Static);
+        assert_eq!((x, y), (9.0, 4.0), "non-slide modes snap immediately, no glide");
+        assert!((op - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cursor_pulse_oscillates_between_0_3_and_0_7() {
+        let mut a = CursorAnim::default();
+        let mut seen_low = false;
+        let mut seen_high = false;
+        for _ in 0..200 {
+            let (_, _, op) = a.tick(1.0 / 60.0, CursorMode::Pulse);
+            assert!((0.3..=0.7).contains(&op), "pulse must stay within [0.3, 0.7], got {op}");
+            if op < 0.35 { seen_low = true; }
+            if op > 0.65 { seen_high = true; }
+        }
+        assert!(seen_low && seen_high, "should oscillate through both ends over ~3+ legs of 600ms at 60fps/200 frames");
+    }
+
+    #[test]
+    fn cursor_off_is_zero_opacity() {
+        let mut a = CursorAnim::default();
+        let (_, _, op) = a.tick(1.0 / 60.0, CursorMode::Off);
+        assert_eq!(op, 0.0);
+    }
+
+    #[test]
+    fn lighten_moves_toward_white_and_zero_factor_is_identity() {
+        let c = egui::Color32::from_rgb(0x20, 0x40, 0x60);
+        assert_eq!(lighten(c, 0.0), c);
+        let l = lighten(c, 0.2);
+        assert!(l.r() > c.r() && l.g() > c.g() && l.b() > c.b());
+    }
 
     #[test]
     fn search_finds_case_insensitive_char_indexed_matches() {
