@@ -173,6 +173,14 @@ fn run(
     // Spring pop-in (OutBack) — ticked every frame so it resets when closed and springs on each open.
     let appear = crate::motion::animate_eased(ui.ctx(), id.with("appear"), st.open, 0.14, crate::motion::ease::out_back);
 
+    /// The compass/cardinal-picker "hot cell" highlight — a fixed blue, deliberately NOT the
+    /// theme accent. Confirmed against a real screenshot of voiceterm's Qt action-compass: the
+    /// highlighted cell reads as a clear sky-blue even when the rest of the app is a warm amber
+    /// theme, so this is a consistent gesture-system colour, not a per-palette one. (Before this,
+    /// the highlight used `vis.selection.bg_fill`, which `apply_palette` recolours to the theme
+    /// accent — correct-looking by accident for accent-blue palettes, wrong for anything warm.)
+    const HOT_CELL_BLUE: Color32 = Color32::from_rgb(0x4d, 0x9e, 0xff);
+
     egui::Area::new(id).order(Order::Foreground).fixed_pos(st.origin).show(ui.ctx(), |ui| {
         let vis = ui.visuals().clone();
         let ctx = ui.ctx().clone();
@@ -183,7 +191,7 @@ fn run(
             // scale each cell around its center by the spring value
             let rect = Rect::from_center_size(rect.center(), rect.size() * appear.max(0.01));
             // highlight glides between rest/selected instead of snapping (QML highlightColor feel)
-            let target = if hot_i { vis.selection.bg_fill } else { vis.extreme_bg_color };
+            let target = if hot_i { HOT_CELL_BLUE } else { vis.extreme_bg_color };
             let fill = crate::motion::animate_color(&ctx, id.with(("cell", i)), target, 0.12);
             painter.rect_filled(rect, radius, fill);
             painter.rect_stroke(rect, radius, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);

@@ -100,12 +100,24 @@ impl ActionCompass {
     pub fn ui(&mut self, ui: &mut egui::Ui, app: &mut App) -> Option<TermAction> {
         let resp = ui.add(egui::Button::new("⋯").min_size(egui::vec2(34.0, 28.0)));
         let id = resp.id;
+        self.show_from_host(ui, id, &resp, app)
+    }
+
+    /// Same compass, anchored to a HOST RESPONSE THE CALLER ALREADY DREW (e.g. voiceterm's mic FAB —
+    /// see shell.rs's `mic_fab_ui`) instead of drawing our own generic button. This is what the real
+    /// app does: the compass opens from the mic button itself, not a separate "⋯".
+    pub fn ui_from_host(&mut self, ui: &mut egui::Ui, host_resp: &egui::Response, app: &mut App) -> Option<TermAction> {
+        let id = host_resp.id;
+        self.show_from_host(ui, id, host_resp, app)
+    }
+
+    fn show_from_host(&mut self, ui: &mut egui::Ui, id: egui::Id, resp: &egui::Response, app: &mut App) -> Option<TermAction> {
         let tap = SlideOption::new(self.tap.id(), self.tap.label());
         let dirs: Vec<(Dir8, SlideOption)> = compass_layout()
             .into_iter()
             .map(|(d, a)| (d, SlideOption::new(a.id(), a.label())))
             .collect();
-        if let SlideOutcome::Selected(chosen) = self.menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
+        if let SlideOutcome::Selected(chosen) = self.menu.show_cardinal(ui, id, resp, &tap, &dirs) {
             if let Some(action) = TermAction::from_id(&chosen) {
                 apply(action, app, ui.ctx());
                 return Some(action);
