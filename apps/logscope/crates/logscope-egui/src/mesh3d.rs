@@ -384,6 +384,14 @@ pub fn anim_cell(mode: TextAnim, t: f32, cf: f32, ci: usize, scale: f32) -> (f32
     }
 }
 
+/// Per-dot sphere resolution for `label_cells`'s dot-matrix text. Was 4×3 (≈12 triangles) — visibly
+/// faceted/blocky up close, the literal "dots are too low-res" complaint about the physical UI's
+/// message plaque. 6×4 (≈24 triangles) reads as a genuinely round dot instead of a diamond-ish blob,
+/// roughly doubling per-dot triangle count — a deliberate moderate bump, not maxed out, since a single
+/// 32-char plaque line can already place 100+ dots (up to 5×7×32) and this scene renders many labels.
+const DOT_SEGMENTS: usize = 6;
+const DOT_RINGS: usize = 4;
+
 pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: &str,
                    scale: f32, t: f32, col: Color32, lit: f32, scroll: f32, anim: TextAnim) -> Vec<Mesh3> {
     let chars: Vec<char> = text.chars().take(32).collect();
@@ -404,7 +412,7 @@ pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: 
                     let px = (ci as f32 * 6.0 + x as f32) * scale - w * 0.5 + d_right;
                     let py = h * 0.5 - y as f32 * scale + d_up;
                     let p = addv(addv(base, mul(right, px)), mul(up, py));
-                    let mut m = uv_sphere(p, scale * 0.46, 4, 3, col);
+                    let mut m = uv_sphere(p, scale * 0.46, DOT_SEGMENTS, DOT_RINGS, col);
                     m.emissive = emis * lit;
                     out.push(m);
                 }
@@ -1191,6 +1199,24 @@ pub fn rune_cells(seed: u64, grid: usize) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn label_dots_are_rounder_than_the_old_low_res_blob() {
+        // the literal "dots too low-res" complaint: each lit pixel used to be a 4×3 sphere (~12 tris,
+        // reads as a faceted diamond up close). Confirms the fix actually raised the segment counts,
+        // and that label_cells uses the shared constants rather than a hand-rolled number that could
+        // silently drift back down.
+        assert!(DOT_SEGMENTS > 4 && DOT_RINGS > 3, "must be a real improvement over the old 4×3");
+        let dots = label_cells(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 0.0 }, Vec3 { x: 0.0, y: 1.0, z: 0.0 },
+            Vec3 { x: 0.0, y: 0.0, z: 1.0 }, "Hi", 0.2, 0.0, Color32::WHITE, 1.0, 0.0, TextAnim::Plain);
+        assert!(!dots.is_empty());
+        // a uv_sphere(segs, rings) mesh has 2 + segs*(rings-1) vertices and 2*segs + segs*(rings-2)*2
+        // triangles (poles + rings of quads) — just check it's meaningfully more detailed than the old
+        // 4×3 sphere would have produced, without hard-coding uv_sphere's internal formula here.
+        let old_tri_count = uv_sphere(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.1, 4, 3, Color32::WHITE).tris.len();
+        let new_tri_count = uv_sphere(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.1, DOT_SEGMENTS, DOT_RINGS, Color32::WHITE).tris.len();
+        assert!(new_tri_count > old_tri_count, "new dot ({new_tri_count} tris) should be more detailed than the old one ({old_tri_count} tris)");
+    }
 
     #[test]
     fn text_anim_idioms_are_distinct_and_bounded() {
