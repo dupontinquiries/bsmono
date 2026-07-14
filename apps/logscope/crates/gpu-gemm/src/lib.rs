@@ -605,6 +605,30 @@ pub struct BlockWeights {
     /// None for llama/qwen2 (→ pass-through). Loaded from blk.N.attn_{q,k}_norm.weight.
     pub q_norm: Option<Tensor>, pub k_norm: Option<Tensor>,
 }
+/// One Z-Image/DiT transformer block (Peebles & Xie AdaLN-Zero design): non-affine LayerNorm →
+/// AdaLN modulate → bidirectional MHA → AdaLN gated residual → non-affine LayerNorm → AdaLN modulate →
+/// MLP (fc1 → GELU → fc2) → AdaLN gated residual. `w_mod` maps `SiLU(cond)` (the timestep+text
+/// conditioning embedding) to the 6 per-block modulation vectors (shift/scale/gate × {attn, mlp}),
+/// concatenated as one `[1, 6*d]` row that the caller slices — mirroring `wgate_up`'s fusion elsewhere.
+pub struct DitBlock {
+    pub wq: Lin, pub wk: Lin, pub wv: Lin, pub wo: Lin,
+    pub fc1: Lin, pub fc2: Lin,
+    pub w_mod: Lin,
+}
+
+/// One VAE decoder residual block (the SD/SDXL-family design): GroupNorm → SiLU → conv3x3 → GroupNorm →
+/// SiLU → conv3x3, added back to the input — with a 1x1 "skip" conv when `cin != cout` (channel count
+/// changes at several points in a real VAE decoder's upsample stack) or a plain passthrough when they
+/// match. `gn1_gamma`/`gn1_beta` are `[1,cin]`, `gn2_gamma`/`gn2_beta` are `[1,cout]`, `conv1_w` is
+/// `[cout,cin,3,3]`, `conv2_w`/`skip_w` as their shapes imply.
+pub struct VaeResBlock {
+    pub gn1_gamma: Tensor, pub gn1_beta: Tensor,
+    pub conv1_w: Tensor, pub conv1_b: Tensor,
+    pub gn2_gamma: Tensor, pub gn2_beta: Tensor,
+    pub conv2_w: Tensor, pub conv2_b: Tensor,
+    pub skip: Option<(Tensor, Tensor)>,
+}
+
 /// One ViT/CLIP encoder layer (pre-norm): LN → multi-head bidirectional attention → residual →
 /// LN → MLP (fc1 → GELU → fc2) → residual. Separate Q/K/V (no fusion: t = num_patches > 1 here, and
 /// the tower runs once per image). Each Lin may carry its bias via `with_bias`. The GGUF→struct
@@ -1473,6 +1497,32 @@ impl Gpu {
         let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
         self.dispatch(ADD, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
     }
+    /// AdaLN-Zero modulation: `x*(1+scale)+shift`, `scale`/`shift` a [1,cols] row broadcast over every
+    /// row of `x`. `scale`/`shift` come from a small MLP over the timestep+conditioning embedding.
+    pub fn dit_modulate(&self, x: &Tensor, scale: &Tensor, shift: &Tensor) -> Tensor {
+        let out = self.alloc(x.rows, x.cols);
+        let dims = [x.rows as u32, x.cols as u32, 0u32, 0u32];
+        self.dispatch(DIT_MODULATE, &[x, scale, shift], &out, bytemuck::cast_slice(&dims), wg1((x.rows * x.cols) as u32)); out
+    }
+    /// AdaLN-Zero gated residual: `x + gate*y`, `gate` a [1,cols] row broadcast over every row of `y`.
+    pub fn dit_gated_add(&self, x: &Tensor, y: &Tensor, gate: &Tensor) -> Tensor {
+        let out = self.alloc(x.rows, x.cols);
+        let dims = [x.rows as u32, x.cols as u32, 0u32, 0u32];
+        self.dispatch(DIT_GATED_ADD, &[x, y, gate], &out, bytemuck::cast_slice(&dims), wg1((x.rows * x.cols) as u32)); out
+    }
+    /// [h,w,c] image → [(h/patch)*(w/patch), patch*patch*c] patch tokens.
+    pub fn patchify(&self, img: &Tensor, h: usize, w: usize, c: usize, patch: usize) -> Tensor {
+        let n = (h / patch) * (w / patch); let plen = patch * patch * c;
+        let out = self.alloc(n, plen);
+        let dims = [h as u32, w as u32, c as u32, patch as u32];
+        self.dispatch(PATCHIFY, &[img], &out, bytemuck::cast_slice(&dims), wg1((h * w * c) as u32)); out
+    }
+    /// Inverse of `patchify`: [(h/patch)*(w/patch), patch*patch*c] tokens → [h,w,c] image.
+    pub fn unpatchify(&self, tok: &Tensor, h: usize, w: usize, c: usize, patch: usize) -> Tensor {
+        let out = self.alloc(h, w * c);
+        let dims = [h as u32, w as u32, c as u32, patch as u32];
+        self.dispatch(UNPATCHIFY, &[tok], &out, bytemuck::cast_slice(&dims), wg1((h * w * c) as u32)); out
+    }
     /// Add a per-column bias vector (length = `a.cols`) broadcast across every row of `a` [rows, cols].
     /// This is the only delta Qwen2 needs over llama on the Q/K/V projections.
     pub fn add_bias_t(&self, a: &Tensor, bias: &Tensor) -> Tensor {
@@ -1487,6 +1537,51 @@ impl Gpu {
     pub fn silu_t(&self, x: &Tensor) -> Tensor {
         let out = self.alloc(x.rows, x.cols); let dims = [x.len() as u32, 0, 0, 0];
         self.dispatch(SILU, &[x], &out, bytemuck::cast_slice(&dims), wg1(x.len() as u32)); out
+    }
+    /// 2D convolution, channel-last, batched. `x` is `[n_batch*h*w, cin]` (rows = flattened n,h,w),
+    /// `weight` is the flat `[cout,cin,k,k]` tensor, `bias` is `[1,cout]`. Returns
+    /// `[n_batch*hout*wout, cout]` with `hout=(h+2*pad-k)/stride+1` (same formula for `wout`).
+    pub fn conv2d(&self, x: &Tensor, weight: &Tensor, bias: &Tensor, n_batch: usize, h: usize, w: usize, cin: usize, cout: usize, k: usize, stride: usize, pad: usize) -> (Tensor, usize, usize) {
+        let hout = (h + 2 * pad - k) / stride + 1;
+        let wout = (w + 2 * pad - k) / stride + 1;
+        let out = self.alloc(n_batch * hout * wout, cout);
+        let dims = [n_batch as u32, h as u32, w as u32, cin as u32, cout as u32, k as u32, stride as u32, pad as u32, hout as u32, wout as u32, 0u32, 0u32];
+        self.dispatch(CONV2D, &[x, weight, bias], &out, bytemuck::cast_slice(&dims), wg1((n_batch * hout * wout * cout) as u32));
+        (out, hout, wout)
+    }
+    /// GroupNorm, channel-last, batched. `x` is `[n_batch*hw, c]`; `gamma`/`beta` are `[1,c]`. Splits
+    /// `c` into `groups` equal chunks and normalizes each `(batch, group)` over its channels × every
+    /// spatial position, then applies the per-channel affine. Returns the same shape as `x`.
+    pub fn group_norm(&self, x: &Tensor, gamma: &Tensor, beta: &Tensor, n_batch: usize, hw: usize, c: usize, groups: usize, eps: f32) -> Tensor {
+        let out = self.alloc(n_batch * hw, c);
+        let dims = [n_batch as u32, hw as u32, c as u32, groups as u32, eps.to_bits(), 0u32, 0u32, 0u32];
+        self.dispatch(GROUP_NORM, &[x, gamma, beta], &out, bytemuck::cast_slice(&dims), wg1((n_batch * groups) as u32)); out
+    }
+    /// Nearest-neighbor 2x spatial upsample, channel-last, batched: `[n_batch*h*w, c]` → `[n_batch*2h*2w, c]`.
+    pub fn upsample2x(&self, x: &Tensor, n_batch: usize, h: usize, w: usize, c: usize) -> Tensor {
+        let out = self.alloc(n_batch * h * 2 * w * 2, c);
+        let dims = [n_batch as u32, h as u32, w as u32, c as u32, 0u32, 0u32, 0u32, 0u32];
+        self.dispatch(UPSAMPLE2X, &[x], &out, bytemuck::cast_slice(&dims), wg1((n_batch * h * 2 * w * 2 * c) as u32)); out
+    }
+    /// One VAE decoder residual block: `GN→SiLU→conv3x3→GN→SiLU→conv3x3`, added back to `x` (through a
+    /// 1x1 conv first if `cin != cout`, otherwise directly). `groups` is the GroupNorm group count
+    /// (applied against `cin` for the first norm, `cout` for the second — real VAE decoders keep the
+    /// same group count throughout, so the caller just needs one that divides both).
+    pub fn vae_resblock(&self, b: &VaeResBlock, x: &Tensor, n_batch: usize, h: usize, w: usize, cin: usize, cout: usize, groups: usize, eps: f32) -> Tensor {
+        let h1 = self.silu_t(&self.group_norm(x, &b.gn1_gamma, &b.gn1_beta, n_batch, h * w, cin, groups, eps));
+        let (h1c, _, _) = self.conv2d(&h1, &b.conv1_w, &b.conv1_b, n_batch, h, w, cin, cout, 3, 1, 1);
+        let h2 = self.silu_t(&self.group_norm(&h1c, &b.gn2_gamma, &b.gn2_beta, n_batch, h * w, cout, groups, eps));
+        let (h2c, _, _) = self.conv2d(&h2, &b.conv2_w, &b.conv2_b, n_batch, h, w, cout, cout, 3, 1, 1);
+        match &b.skip {
+            Some((sw, sb)) => { let (s, _, _) = self.conv2d(x, sw, sb, n_batch, h, w, cin, cout, 1, 1, 0); self.add_t(&h2c, &s) }
+            None => self.add_t(&h2c, x),
+        }
+    }
+    /// One VAE decoder upsample stage: nearest 2x upsample, then a conv3x3 (same channel count in/out)
+    /// to smooth/mix — the SD/SDXL-family convention. Returns the new (h, w) alongside the tensor.
+    pub fn vae_upsample_stage(&self, x: &Tensor, conv_w: &Tensor, conv_b: &Tensor, n_batch: usize, h: usize, w: usize, c: usize) -> (Tensor, usize, usize) {
+        let up = self.upsample2x(x, n_batch, h, w, c);
+        self.conv2d(&up, conv_w, conv_b, n_batch, h * 2, w * 2, c, c, 3, 1, 1)
     }
     /// Fused SwiGLU activation: silu(gate)*up in one dispatch (saves a SILU+MUL pair).
     pub fn swiglu_t(&self, gate: &Tensor, up: &Tensor) -> Tensor {
@@ -1528,6 +1623,38 @@ impl Gpu {
         let out = self.alloc(t, dm); let hd = dm / n_heads;
         let dims = [t as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
         self.dispatch(ATTENTION_MH_FULL, &[q, k, v], &out, bytemuck::cast_slice(&dims), (((t * n_heads) as u32).div_ceil(64), 1, 1)); out
+    }
+    /// One Z-Image/DiT AdaLN-Zero block over `t` patch tokens of width `d`. `cond` is the `[1,d]`
+    /// timestep+text conditioning vector (already-summed, pre-SiLU); `ln_one`/`ln_zero` are shared
+    /// `[1,d]` all-ones/all-zeros tensors standing in for LayerNorm's (absent) affine — real DiT norms
+    /// here are non-affine, AdaLN supplies the scale/shift instead. Attention is bidirectional (no
+    /// causal mask — every patch token can see every other patch token). --gate-dit-block validates the
+    /// assembly (modulation split, gated-residual placement, non-affine norm) vs a CPU reference.
+    pub fn dit_block(&self, b: &DitBlock, x: &Tensor, cond: &Tensor, ln_one: &Tensor, ln_zero: &Tensor, t: usize, d: usize, n_heads: usize, eps: f32) -> Tensor {
+        let cact = self.silu_t(cond);
+        let modv = b.w_mod.apply(self, &cact, 1); // [1, 6d]: shift1|scale1|gate1|shift2|scale2|gate2
+        let shift1 = self.slice_cols(&modv, 0, d);
+        let scale1 = self.slice_cols(&modv, d, d);
+        let gate1 = self.slice_cols(&modv, 2 * d, d);
+        let shift2 = self.slice_cols(&modv, 3 * d, d);
+        let scale2 = self.slice_cols(&modv, 4 * d, d);
+        let gate2 = self.slice_cols(&modv, 5 * d, d);
+
+        let h1 = self.layernorm_t(x, ln_one, ln_zero, t, d, eps);
+        let h1m = self.dit_modulate(&h1, &scale1, &shift1);
+        let q = b.wq.apply(self, &h1m, t);
+        let k = b.wk.apply(self, &h1m, t);
+        let v = b.wv.apply(self, &h1m, t);
+        let attn = self.attention_mh_full_t(&q, &k, &v, t, d, n_heads, n_heads);
+        let o = b.wo.apply(self, &attn, t);
+        let x2 = self.dit_gated_add(x, &o, &gate1);
+
+        let h2 = self.layernorm_t(&x2, ln_one, ln_zero, t, d, eps);
+        let h2m = self.dit_modulate(&h2, &scale2, &shift2);
+        let f1 = b.fc1.apply(self, &h2m, t);
+        let act = self.gelu_tanh_t(&f1);
+        let f2 = b.fc2.apply(self, &act, t);
+        self.dit_gated_add(&x2, &f2, &gate2)
     }
     /// One pre-norm ViT/CLIP encoder layer over `t` tokens of width `d` with `n_heads` heads.
     /// `quick_gelu` selects OpenAI-CLIP's QuickGELU vs the tanh GELU. Returns [t, d]. All ops are
@@ -2494,6 +2621,76 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*b[i]; }"#;
 
+// --- DiT (Z-Image-style diffusion transformer) primitives -------------------------------------------
+
+/// AdaLN-Zero modulation: `o[r,c] = x[r,c] * (1 + scale[c]) + shift[c]`. `scale`/`shift` are a single
+/// [1,cols] row derived from the timestep+conditioning embedding and broadcast over every token row —
+/// this is what replaces the usual learned-affine LayerNorm/RMSNorm gain in a DiT block.
+const DIT_MODULATE: &str = r#"
+struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> scale: array<f32>;
+@group(0)@binding(2) var<storage,read> shift: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.rows*d.cols){return;}
+  let c=i%d.cols; o[i]=x[i]*(1.0+scale[c])+shift[c];
+}"#;
+
+/// AdaLN-Zero gated residual: `o[r,c] = x[r,c] + gate[c] * y[r,c]`. `gate` starts at ~0 at
+/// initialization (the "-Zero" in AdaLN-Zero) so a freshly-added DiT block starts as a no-op.
+const DIT_GATED_ADD: &str = r#"
+struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> y: array<f32>;
+@group(0)@binding(2) var<storage,read> gate: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.rows*d.cols){return;}
+  let c=i%d.cols; o[i]=x[i]+gate[c]*y[i];
+}"#;
+
+/// Patchify: an [H,W,C] image (row-major, channel-last) → [num_patches, patch*patch*C] tokens, one
+/// row per non-overlapping `patch x patch` block, patches scanned left-to-right/top-to-bottom and each
+/// patch's contents flattened row-major-within-patch then channel-last (matches the ViT/DiT convention
+/// so a plain linear projection turns a patch row directly into a token embedding).
+const PATCHIFY: &str = r#"
+struct D { h:u32,w:u32,c:u32,psz:u32 };
+@group(0)@binding(0) var<storage,read> img: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let pw=d.w/d.psz; let ph=d.h/d.psz; let n=ph*pw; let plen=d.psz*d.psz*d.c;
+  let i=g.y*nwg.x*64u+g.x; if(i>=n*plen){return;}
+  let p=i/plen; let within=i%plen;
+  let py=p/pw; let px=p%pw;
+  let pc=within%d.c; let pp=within/d.c; let pyy=pp/d.psz; let pxx=pp%d.psz;
+  let sy=py*d.psz+pyy; let sx=px*d.psz+pxx;
+  o[i]=img[(sy*d.w+sx)*d.c+pc];
+}"#;
+
+/// Unpatchify: the exact inverse of `PATCHIFY` — [num_patches, patch*patch*C] tokens → [H,W,C] image.
+const UNPATCHIFY: &str = r#"
+struct D { h:u32,w:u32,c:u32,psz:u32 };
+@group(0)@binding(0) var<storage,read> tok: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let pw=d.w/d.psz; let ph=d.h/d.psz; let n=ph*pw; let plen=d.psz*d.psz*d.c;
+  let i=g.y*nwg.x*64u+g.x; if(i>=n*plen){return;}
+  let p=i/plen; let within=i%plen;
+  let py=p/pw; let px=p%pw;
+  let pc=within%d.c; let pp=within/d.c; let pyy=pp/d.psz; let pxx=pp%d.psz;
+  let sy=py*d.psz+pyy; let sx=px*d.psz+pxx;
+  o[(sy*d.w+sx)*d.c+pc]=tok[i];
+}"#;
+
 const SILU: &str = r#"
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
@@ -2501,6 +2698,91 @@ struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(2) var<uniform> d: D;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let v=x[i]; o[i]=v/(1.0+exp(-v)); }"#;
+
+// --- VAE decoder primitives (batched: every tensor carries an explicit N dimension) ------------------
+
+/// 2D convolution, channel-last, batched: `x[N,H,W,Cin] * w[Cout,Cin,K,K] + bias[Cout] -> o[N,Hout,Wout,Cout]`.
+/// Direct (untiled) accumulation — correctness first, matching how `block_decode`/`block_decode_at`
+/// (the non-fused paths) came before their fused/tiled speed-ups elsewhere in this file. `Hout =
+/// (H+2*pad-K)/stride+1` (same for W); the caller computes and passes these so the shader stays a flat
+/// index walk. One invocation per output element (n,ho,wo,co).
+const CONV2D: &str = r#"
+struct D { n_batch:u32,h:u32,w:u32,cin:u32,cout:u32,k:u32,stride:u32,pad:u32,hout:u32,wout:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> wt: array<f32>;
+@group(0)@binding(2) var<storage,read> bias: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; let total=d.n_batch*d.hout*d.wout*d.cout; if(i>=total){return;}
+  let co=i%d.cout; let rest1=i/d.cout;
+  let wo=rest1%d.wout; let rest2=rest1/d.wout;
+  let ho=rest2%d.hout; let n=rest2/d.hout;
+  var acc=bias[co];
+  for(var ci=0u;ci<d.cin;ci=ci+1u){
+    for(var kh=0u;kh<d.k;kh=kh+1u){
+      let hi_s=i32(ho*d.stride+kh)-i32(d.pad); if(hi_s<0||hi_s>=i32(d.h)){continue;}
+      let hi=u32(hi_s);
+      for(var kw=0u;kw<d.k;kw=kw+1u){
+        let wi_s=i32(wo*d.stride+kw)-i32(d.pad); if(wi_s<0||wi_s>=i32(d.w)){continue;}
+        let wi=u32(wi_s);
+        let xv=x[((n*d.h+hi)*d.w+wi)*d.cin+ci];
+        let wv=wt[((co*d.cin+ci)*d.k+kh)*d.k+kw];
+        acc=acc+xv*wv;
+      }
+    }
+  }
+  o[i]=acc;
+}"#;
+
+/// GroupNorm, channel-last, batched: split `C` channels into `groups` equal chunks, normalize each
+/// (n, group) over {its channels} × {every spatial position}, then apply the per-channel affine
+/// `gamma`/`beta`. One invocation per (n, group) — each walks the whole group's spatial×channel extent
+/// twice (stats, then write), same two-pass shape as `RMSNORM`'s per-row walk.
+const GROUP_NORM: &str = r#"
+struct D { n_batch:u32,hw:u32,c:u32,groups:u32,eps:f32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> gamma: array<f32>;
+@group(0)@binding(2) var<storage,read> beta: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n_batch*d.groups){return;}
+  let gi=i%d.groups; let n=i/d.groups;
+  let cpg=d.c/d.groups; let c0=gi*cpg;
+  var mean=0.0; var cnt=0.0;
+  for(var p=0u;p<d.hw;p=p+1u){ for(var cc=0u;cc<cpg;cc=cc+1u){ mean=mean+x[(n*d.hw+p)*d.c+c0+cc]; cnt=cnt+1.0; } }
+  mean=mean/cnt;
+  var v=0.0;
+  for(var p=0u;p<d.hw;p=p+1u){ for(var cc=0u;cc<cpg;cc=cc+1u){ let dd=x[(n*d.hw+p)*d.c+c0+cc]-mean; v=v+dd*dd; } }
+  v=v/cnt; let inv=1.0/sqrt(v+d.eps);
+  for(var p=0u;p<d.hw;p=p+1u){
+    for(var cc=0u;cc<cpg;cc=cc+1u){
+      let idx=(n*d.hw+p)*d.c+c0+cc;
+      o[idx]=(x[idx]-mean)*inv*gamma[c0+cc]+beta[c0+cc];
+    }
+  }
+}"#;
+
+/// Nearest-neighbor 2x spatial upsample, channel-last, batched: `x[N,H,W,C] -> o[N,2H,2W,C]`. The VAE
+/// decoder's upsample stages use this (not a learned transposed-conv) — a plain repeat, followed by an
+/// ordinary `conv2d` (stride 1, pad 1) to smooth/mix, matching the SD/SDXL-family VAE decoder design.
+const UPSAMPLE2X: &str = r#"
+struct D { n_batch:u32,h:u32,w:u32,c:u32,_a:u32,_b:u32,_c:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; let h2=d.h*2u; let w2=d.w*2u; let total=d.n_batch*h2*w2*d.c; if(i>=total){return;}
+  let cc=i%d.c; let rest1=i/d.c;
+  let wo=rest1%w2; let rest2=rest1/w2;
+  let ho=rest2%h2; let n=rest2/h2;
+  let hi=ho/2u; let wi=wo/2u;
+  o[i]=x[((n*d.h+hi)*d.w+wi)*d.c+cc];
+}"#;
 
 // True LayerNorm (mean-subtract + population variance + eps), then per-channel scale `gt` and bias
 // `bt`. One row per invocation, mirroring RMSNORM's launch. Vision towers (CLIP/SigLIP/Qwen2-VL).
@@ -3030,6 +3312,43 @@ impl Gpu {
         self.download(&logits)
     }
 
+    /// Text-encoder forward for DiT conditioning (e.g. Z-Image-Turbo's Qwen3 text encoder): identical to
+    /// `model_forward` through the final norm, but returns the `[t, d]` hidden states directly instead of
+    /// projecting through the LM head — there's no next-token prediction here, just an embedding of the
+    /// prompt for `dit_conditioning`/cross-attention to consume. Every real Qwen3 weight (including
+    /// QK-Norm) is exercised identically to normal text generation; only the last step differs.
+    pub fn text_forward_hidden(&self, m: &Model, ids: &[u32]) -> Tensor {
+        let t = ids.len();
+        let mut xh = Vec::with_capacity(t * m.d);
+        for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        let mut x = self.upload(&xh, t, m.d);
+        for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps); }
+        self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps)
+    }
+
+    /// Extract row `row` of a `[rows, cols]` tensor as a fresh `[1, cols]` tensor (a buffer copy, not a
+    /// dispatch). Used to pool a text encoder's hidden states down to the single vector `dit_conditioning`
+    /// needs — by convention the LAST token's hidden state (the `t-1` row), matching how embedding /
+    /// conditioning models typically read a causal encoder's summary of the whole sequence.
+    pub fn row_at(&self, x: &Tensor, row: usize, cols: usize) -> Tensor {
+        let out = self.alloc(1, cols);
+        self.copy_buf(x, (row * cols * 4) as u64, &out, 0, (cols * 4) as u64);
+        out
+    }
+
+    /// Build the `[1, d_dit]` conditioning vector `dit_block` expects: a timestep embedding pushed
+    /// through its own 2-layer SiLU MLP, plus the text encoder's pooled (last-token) hidden state pushed
+    /// through a projection `Lin` (needed since the text encoder's width and the DiT's width generally
+    /// differ), summed elementwise. `text_hidden` is `text_forward_hidden`'s `[t, d_text]` output.
+    pub fn dit_conditioning(&self, text_hidden: &Tensor, d_text: usize, timestep: f32, ts_dim: usize, ts_fc1: &Lin, ts_fc2: &Lin, text_proj: &Lin) -> Tensor {
+        let t_emb = timestep_embedding(timestep, ts_dim, 10000.0);
+        let t_emb_t = self.upload(&t_emb, 1, ts_dim);
+        let t_h = ts_fc2.apply(self, &self.silu_t(&ts_fc1.apply(self, &t_emb_t, 1)), 1);
+        let pooled = self.row_at(text_hidden, text_hidden.rows - 1, d_text);
+        let txt_h = text_proj.apply(self, &pooled, 1);
+        self.add_t(&t_h, &txt_h)
+    }
+
     /// Like `model_forward` but prints the RMS and max-abs of the LAST token's hidden state
     /// after the embedding and after every block. A healthy stack grows/holds a stable norm
     /// and stays input-sensitive; a collapse or explosion at layer k localizes the fault.
@@ -3516,6 +3835,23 @@ impl PrefixStore {
     }
 }
 
+/// Sinusoidal timestep embedding (the DiT/DDPM convention): for a scalar timestep `t` and embedding
+/// width `dim`, returns `concat(cos(t*freq_i), sin(t*freq_i))` for `freq_i = max_period^(-i/half)`,
+/// `i in 0..half`, `half = dim/2` (a trailing zero pad if `dim` is odd). This feeds a small
+/// Linear→SiLU→Linear MLP (ordinary GEMM, already covered by existing kernels) whose output is the
+/// conditioning vector that `dit_modulate`/`dit_gated_add` broadcast into every DiT block.
+pub fn timestep_embedding(t: f32, dim: usize, max_period: f32) -> Vec<f32> {
+    let half = dim / 2;
+    let mut emb = vec![0.0f32; dim];
+    for i in 0..half {
+        let freq = max_period.powf(-(i as f32) / half as f32);
+        let arg = t * freq;
+        emb[i] = arg.cos();
+        emb[half + i] = arg.sin();
+    }
+    emb
+}
+
 /// Workgroup grid for a 1-D dispatch of `n_elems` (workgroup_size 64), splitting the
 /// count across the y dimension when the x count would exceed the 65535 per-dim limit.
 /// Shaders using this compute their flat index as `g.y * nwg.x * 64 + g.x`.
@@ -3808,10 +4144,27 @@ impl Gpu {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, d+2kv] — one matmul (was three)
-        // RoPE q and k in one pass: [0,d)=q heads, [d,d+kv)=k heads are contiguous and head-aligned.
-        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
-        let q = self.slice_cols(&qk, 0, d);
-        self.copy_buf(&qk, (d * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
+            // Qwen3/3.5: QK-Norm is a per-head RMSNorm with its OWN weight for Q vs K, so it can't ride
+            // the single combined RoPE dispatch below — Q and K must be split, normalized separately,
+            // then roped separately. (This branch was missing entirely — the fused decode path applied
+            // RoPE straight to the raw fused-QKV projection, silently skipping QK-Norm for every Qwen3
+            // decode step since fused-QKV is the default. Non-fused `block_decode_at` already did this
+            // correctly; this now matches it.)
+            let qn = self.qk_norm(self.slice_cols(&qkv, 0, d), &w.q_norm, 1, d, hd, eps);
+            let kn = self.qk_norm(self.slice_cols(&qkv, d, kv), &w.k_norm, 1, kv, hd, eps);
+            let qr = self.rope_mh_t(&qn, ff, 1, d, base, pos, hd);
+            let kr = self.rope_mh_t(&kn, ff, 1, kv, base, pos, hd);
+            self.write_row(kc, &kr, pos, kv);
+            (qr, kr)
+        } else {
+            // RoPE q and k in one pass: [0,d)=q heads, [d,d+kv)=k heads are contiguous and head-aligned.
+            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
+            let q = self.slice_cols(&qk, 0, d);
+            self.copy_buf(&qk, (d * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+            (q, self.slice_cols(&qk, d, kv))
+        };
+        let _ = &kr; // k already written to cache above in both branches
         self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, d, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
@@ -3854,10 +4207,22 @@ impl Gpu {
         let hd = d / n_heads; let kv = n_kv_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
-        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, rope_pos, hd);
-        let q  = self.slice_cols(&qk, 0, d);
-        self.copy_buf(&qk, (d * 4) as u64, kc, (slot * kv * 4) as u64, (kv * 4) as u64);   // roped k → slot
+        let q = if w.q_norm.is_some() || w.k_norm.is_some() {
+            // Qwen3/3.5: see block_decode_fused — QK-Norm needs Q and K split and normalized with their
+            // own weight before RoPE, so it can't ride the single combined dispatch below.
+            let qn = self.qk_norm(self.slice_cols(&qkv, 0, d), &w.q_norm, 1, d, hd, eps);
+            let kn = self.qk_norm(self.slice_cols(&qkv, d, kv), &w.k_norm, 1, kv, hd, eps);
+            let qr = self.rope_mh_t(&qn, ff, 1, d, base, rope_pos, hd);
+            let kr = self.rope_mh_t(&kn, ff, 1, kv, base, rope_pos, hd);
+            self.write_row(kc, &kr, slot, kv);
+            qr
+        } else {
+            // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
+            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, rope_pos, hd);
+            let q  = self.slice_cols(&qk, 0, d);
+            self.copy_buf(&qk, (d * 4) as u64, kc, (slot * kv * 4) as u64, (kv * 4) as u64);   // roped k → slot
+            q
+        };
         self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (slot * kv * 4) as u64, (kv * 4) as u64);
         let attn = self.decode_attention_mh(&q, kc, vc, attend_len, d, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
