@@ -49,6 +49,22 @@ pub fn chat_layout_for_width(avail_width: f32, touch: bool) -> ChatLayout {
     chat_layout(DeviceClass::from_width(avail_width), avail_width, touch)
 }
 
+/// How the top header bar arranges itself. The header has MANY controls (title, ?, Rescan, a
+/// spinner, the Glass toggle, the model picker, Load, the folder popup, the pipeline ⚙, theme,
+/// variant) — on a portrait/narrow screen they don't fit on one line. `primary_visible` (title +
+/// model picker + Load) always shows; when `controls_overflow` is true the rest collapse behind a
+/// single "⋯" button instead of wrapping raggedly across the topbar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeaderLayout {
+    pub controls_overflow: bool,
+}
+
+/// Same breakpoint as `chat_layout`'s `split` (720px) — one "is this screen wide enough" threshold
+/// used consistently across the app rather than each panel inventing its own number.
+pub fn header_layout(avail_width: f32) -> HeaderLayout {
+    HeaderLayout { controls_overflow: DeviceClass::from_width(avail_width).is_compact() || avail_width < 720.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,5 +101,12 @@ mod tests {
     fn from_width_picks_the_class() {
         assert!(chat_layout_for_width(400.0, true).scene_as_backdrop, "narrow -> phone");
         assert!(chat_layout_for_width(1400.0, false).split, "wide -> desktop split");
+    }
+
+    #[test]
+    fn header_collapses_below_the_same_720_breakpoint_split_uses() {
+        assert!(header_layout(400.0).controls_overflow, "phone-width header collapses");
+        assert!(header_layout(680.0).controls_overflow, "narrow desktop window still collapses");
+        assert!(!header_layout(1200.0).controls_overflow, "wide desktop keeps controls inline");
     }
 }
