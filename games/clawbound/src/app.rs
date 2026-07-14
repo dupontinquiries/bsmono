@@ -429,10 +429,22 @@ impl State {
             let (mx, mz) = move_world(self.yaw, ix, iz);
             {
                 let p = self.prowl.as_mut().unwrap();
-                p.set_input(mx, mz, self.keys.leap || self.keys.mleft, self.keys.dodge || self.keys.mmiddle, self.keys.crouch);
-                p.set_ability(self.keys.ability || self.keys.mright);
-                p.step(dt);
+                p.set_input(mx, mz, self.keys.leap, self.keys.dodge || self.keys.mmiddle, self.keys.crouch);
+                p.set_ability(self.keys.ability);   // Q / bound key — the ultimate
             }
+            // flick controls: a fast mouse-flick + left-click performs the matching
+            // autoattack move (forward=pounce, back=hind-kick, sideways=roll, sharp=swat);
+            // right-click held is the low/underbelly modifier. Same feel as the 6v1 mode.
+            self.flick.0 *= 0.7; self.flick.1 *= 0.7;
+            let fmag = (self.flick.0 * self.flick.0 + self.flick.1 * self.flick.1).sqrt();
+            if self.keys.mleft && !self.mleft_prev {
+                let fast = fmag > 14.0;
+                let local = if fast { (self.flick.0 / fmag, -self.flick.1 / fmag) } else { (0.0, 0.0) };
+                let mag = if fast { 1.0 } else { clawbound_rs::combat::FLICK_MIN + 0.1 };
+                self.prowl.as_mut().unwrap().player_flick(local, mag, self.keys.mright);
+            }
+            self.mleft_prev = self.keys.mleft;
+            self.prowl.as_mut().unwrap().step(dt);
             if self.keys.restart {
                 let (c, k, diff) = { let p = self.prowl.as_ref().unwrap(); (p.class, p.hunter_kind, p.difficulty) };
                 let mut p = clawbound_rs::prowl::Prowl::new(c, k);
@@ -458,12 +470,18 @@ impl State {
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
-        let (obj_text, prey, caught, escapes, stamina, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb) = {
+        let (obj_text, prey, caught, escapes, stamina, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb, pv_name, pv_blurb, pv_used) = {
             let p = self.prowl.as_ref().unwrap();
             let ab = p.class.ability();
+            let pv = p.class.passive();
             (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class.name(),
              p.clan_scores, p.buffs.speed_boosted(), p.buffs.shield, p.on_staging, p.outcome,
-             ab.name(), p.ability_ready(), p.ability_cd, ab.blurb())
+             ab.name(), p.ability_ready(), p.ability_cd, ab.blurb(),
+             pv.name(), pv.blurb(), p.nine_lives_used)
+        };
+        let (prowl_move_name, prowl_combo_flash, prowl_combo_name) = {
+            let p = self.prowl.as_ref().unwrap();
+            (p.player_move.map(|(m, _)| m.name()), p.combo_flash, p.combo_name)
         };
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
@@ -471,7 +489,7 @@ impl State {
             use egui::{Align2, Color32, RichText};
             if open { draw_menu(ctx, &items, cursor, screen); return; }
             egui::Area::new("phud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
-                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                     .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 4.0;
                     ui.label(RichText::new(format!("PROWL · {cls_name}   ·   your score {}", clans[0])).size(15.0).strong().color(Color32::from_rgb(200, 180, 235)));
@@ -489,15 +507,30 @@ impl State {
                     if b_speed { buffs.push_str("SPD "); }
                     if b_shield { buffs.push_str("SHLD "); }
                     if !buffs.is_empty() { ui.label(RichText::new(buffs).size(13.0).strong().color(Color32::from_rgb(120, 200, 255))); }
+                    let pv_state = if pv_name == "Nine Lives" { if pv_used { " (spent)" } else { " (ready)" } } else { "" };
+                    ui.label(RichText::new(format!("Passive · {pv_name}{pv_state}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
+                    ui.label(RichText::new(pv_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     let (astate, acol) = if ab_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ab_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
-                    ui.label(RichText::new(format!("Q · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
+                    ui.label(RichText::new(format!("ULT (Q) · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
                     ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
                     if exposed { ui.label(RichText::new("! EXPOSED - get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
                 });
             });
+            // autoattack: the current move, and a combo banner when a chain lands
+            if let Some(mn) = prowl_move_name {
+                egui::Area::new("pmove".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_TOP, [0.0, 46.0]).show(ctx, |ui| {
+                    ui.label(RichText::new(mn).size(15.0).strong().color(Color32::from_rgb(255, 240, 200)));
+                });
+            }
+            if prowl_combo_flash > 0.05 {
+                egui::Area::new("pcombo".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+                    ui.label(RichText::new(prowl_combo_name).size(20.0 + prowl_combo_flash * 12.0).strong()
+                        .color(Color32::from_rgba_unmultiplied(255, 210, 90, (255.0 * prowl_combo_flash.min(1.0)) as u8)));
+                });
+            }
             egui::Area::new("phint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F/L-click leap · Q/R-click ability · R restart · Esc menu")
+                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click autoattack (R-click low) · Q ultimate · R restart · Esc menu")
                     .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
             });
             if exposed {
@@ -566,8 +599,21 @@ impl State {
             {
                 let g = self.capture.as_mut().unwrap();
                 g.set_input(mx, mz, self.keys.dodge || self.keys.mleft, self.keys.crouch || self.keys.mright);   // Space/L-click throw, Shift/R-click jump
-                g.step(dt);
+                g.set_ability(self.keys.ability);   // Q — the ultimate
             }
+            // flick controls: a fast mouse-flick + middle-click performs the matching
+            // melee autoattack (forward=pounce, back=hind-kick, sideways=roll) — a
+            // close-range option alongside the firecracker throw. Same feel as Prowl/6v1.
+            self.flick.0 *= 0.7; self.flick.1 *= 0.7;
+            let fmag = (self.flick.0 * self.flick.0 + self.flick.1 * self.flick.1).sqrt();
+            if self.keys.mmiddle && !self.mleft_prev {
+                let fast = fmag > 14.0;
+                let local = if fast { (self.flick.0 / fmag, -self.flick.1 / fmag) } else { (0.0, 0.0) };
+                let mag = if fast { 1.0 } else { clawbound_rs::combat::FLICK_MIN + 0.1 };
+                self.capture.as_mut().unwrap().player_flick(local, mag, false);
+            }
+            self.mleft_prev = self.keys.mmiddle;
+            self.capture.as_mut().unwrap().step(dt);
             if self.keys.restart {
                 let c = self.capture.as_ref().unwrap().mobs[0].class;
                 self.capture = Some(clawbound_rs::capture::Capture::new(c));
@@ -594,13 +640,18 @@ impl State {
             (g.score[0], g.score[1], g.period, g.period_t.max(0.0), g.outcome, p.carrying, p.captures, p.stuns, p.class.name(),
              p.buffs.speed_boosted(), p.buffs.shield, p.buffs.triple_active(), p.cd, g.overtime)
         };
+        let (cap_move_name, cap_combo_flash, cap_combo_name, ult_name, ult_ready, ult_cd, ult_blurb) = {
+            let g = self.capture.as_ref().unwrap();
+            let ab = g.mobs[0].class.ability();
+            (g.player_move.map(|(m, _)| m.name()), g.combo_flash, g.combo_name, ab.name(), g.ability_ready(), g.ability_cd, ab.blurb())
+        };
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
             use egui::{Align2, Color32, RichText};
             if open { draw_menu(ctx, &items, cursor, screen); return; }
             egui::Area::new("cscore".into()).anchor(Align2::CENTER_TOP, [0.0, 12.0]).show(ctx, |ui| {
-                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 160)).inner_margin(egui::Margin::symmetric(16.0, 8.0)).rounding(8.0).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("TAWNY {s0}")).size(20.0).strong().color(Color32::from_rgb(255, 138, 90)));
                         ui.label(RichText::new(format!("   {}:{:02}   ", (ptime as u32) / 60, (ptime as u32) % 60)).size(18.0).color(Color32::WHITE));
@@ -610,7 +661,7 @@ impl State {
                 });
             });
             egui::Area::new("cinfo".into()).anchor(Align2::LEFT_BOTTOM, [16.0, -16.0]).show(ctx, |ui| {
-                egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
+                egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 3.0;
                     ui.label(RichText::new(format!("{cls} - TEAM TAWNY")).size(14.0).strong().color(Color32::from_rgb(255, 160, 110)));
                     ui.label(RichText::new(format!("captures {caps}  -  stuns {stuns}")).size(13.0).color(Color32::from_rgb(210, 215, 225)));
@@ -621,6 +672,9 @@ impl State {
                     if !pu.is_empty() { ui.label(RichText::new(pu).size(13.0).strong().color(Color32::from_rgb(255, 224, 120))); }
                     if cd > 0.0 { ui.label(RichText::new(format!("firecracker {:.1}s", cd)).size(12.0).color(Color32::from_rgb(230, 150, 120))); }
                     else { ui.label(RichText::new("firecracker READY").size(12.0).color(Color32::from_rgb(150, 220, 150))); }
+                    let (ustate, ucol) = if ult_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ult_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
+                    ui.label(RichText::new(format!("ULT (Q) · {ult_name}  [{ustate}]")).size(12.0).strong().color(if ult_ready { Color32::from_rgb(255, 214, 120) } else { ucol }));
+                    ui.label(RichText::new(ult_blurb).size(10.0).italics().color(Color32::from_rgb(150, 150, 165)));
                 });
             });
             if carrying {
@@ -628,8 +682,19 @@ impl State {
                     ui.label(RichText::new("* CARRYING YARN - GET TO YOUR BASE! *").size(16.0).strong().color(Color32::from_rgb(255, 106, 207)));
                 });
             }
+            if let Some(mn) = cap_move_name {
+                egui::Area::new("cmove".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_TOP, [0.0, 46.0]).show(ctx, |ui| {
+                    ui.label(RichText::new(mn).size(15.0).strong().color(Color32::from_rgb(255, 240, 200)));
+                });
+            }
+            if cap_combo_flash > 0.05 {
+                egui::Area::new("ccombo".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
+                    ui.label(RichText::new(cap_combo_name).size(20.0 + cap_combo_flash * 12.0).strong()
+                        .color(Color32::from_rgba_unmultiplied(255, 210, 90, (255.0 * cap_combo_flash.min(1.0)) as u8)));
+                });
+            }
             egui::Area::new("chint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                ui.label(RichText::new("WASD move · mouse look · Space/L-click throw · Shift/R-click jump · R restart · Esc menu")
+                ui.label(RichText::new("WASD move · mouse look · Space/L-click throw · Shift/R-click jump · flick+M-click melee · Q ultimate · R restart · Esc menu")
                     .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
             });
             if let Some(w) = outcome {
@@ -676,6 +741,7 @@ impl State {
             let (ix, iz) = self.keys.move_vec();
             let (mx, mz) = move_world(self.yaw, ix, iz);
             self.game.set_input(0, mx, mz, self.keys.crouch, self.keys.dodge || self.keys.mmiddle, self.keys.leap);
+            self.game.set_ultimate(self.keys.ability);   // Q — the clan ultimate (only fires if the settings toggle is on)
 
             // flick controls: a fast mouse-flick + left-click performs the matching move
             // (up = pounce, down = hind-kick, sideways = roll); a bare click is a swat.
@@ -708,6 +774,7 @@ impl State {
                 self.game = Game::new_match_seeded(self.kind, self.mode, seed);
                 self.game.difficulty = diff;
                 self.game.clan = clan;
+                self.game.set_abilities_on(self.menu.settings.clan_abilities);
                 self.over_timer = 0.0; self.keys.restart = false;
                 self.death_t = 0.0; self.prev_player_alive = true;
             }
@@ -822,6 +889,10 @@ impl State {
         let combo_flash = self.game.combo_flash;
         let combo_name = self.game.combo_name;
         let move_name = self.game.player_move.map(|(m, _)| m.name());
+        let abilities_on = self.game.abilities_on;
+        let (ult_name, ult_blurb, _ult_cd_max, _ult_dur) = self.game.clan_ultimate();
+        let (pv_name, pv_blurb) = self.game.clan_passive();
+        let (ult_ready, ult_cd_left) = (self.game.ultimate_ready(), self.game.ult_cd);
         // world lore for the HUD: the pack roster (name · rank · fate), the region and a
         // line about it, the time of day, and a tenet of the code.
         let region = self.game.region();
@@ -898,7 +969,7 @@ impl State {
             } else {
                 // ── in-game HUD ──
                 egui::Area::new("hud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
-                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
+                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                         .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 4.0;
                         ui.label(RichText::new(format!("Hunter: {hunter_name}   ·   {mode_name}"))
@@ -917,16 +988,28 @@ impl State {
                             ui.add(egui::ProgressBar::new(((v - 0.6) / 1.05).clamp(0.05, 1.0)).desired_width(150.0).fill(col)
                                 .text(RichText::new(label).size(10.0).color(Color32::WHITE)));
                         }
+                        if abilities_on {
+                            ui.add_space(3.0);
+                            ui.label(RichText::new(format!("Passive · {pv_name}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
+                            ui.label(RichText::new(pv_blurb).size(10.0).italics().color(Color32::from_rgb(150, 150, 165)));
+                            let (ustate, ucol) = if ult_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ult_cd_left.ceil()), Color32::from_rgb(180, 180, 190)) };
+                            ui.label(RichText::new(format!("ULT (Q) · {ult_name}  [{ustate}]")).size(12.0).strong().color(if ult_ready { Color32::from_rgb(255, 214, 120) } else { ucol }));
+                            ui.label(RichText::new(ult_blurb).size(10.0).italics().color(Color32::from_rgb(150, 150, 165)));
+                        }
                     });
                 });
                 egui::Area::new("hint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                    ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Esc menu")
-                        .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
+                    let hint = if abilities_on {
+                        "WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Q ultimate · Esc menu"
+                    } else {
+                        "WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click move (R-click low) · Esc menu"
+                    };
+                    ui.label(RichText::new(hint).size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
                 });
                 // world panel (top-right): the region, a line about it, the hour, and the
                 // named pack with each cat's rank and fate — the clan you're fighting for.
                 egui::Area::new("world".into()).anchor(Align2::RIGHT_TOP, [-14.0, 14.0]).show(ctx, |ui| {
-                    egui::Frame::new().fill(Color32::from_rgba_unmultiplied(14, 13, 20, 155)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(7.0).show(ui, |ui| {
+                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 13, 20, 155)).inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(7.0).show(ui, |ui| {
                         ui.set_max_width(230.0);
                         ui.label(RichText::new(format!("{region} · {day_phase}")).size(13.0).strong().color(Color32::from_rgb(210, 205, 180)));
                         ui.label(RichText::new(region_lore).size(11.0).italics().color(Color32::from_rgb(160, 160, 172)));
@@ -977,7 +1060,7 @@ impl State {
                     let r = 235.0;
                     let off = [threat_bearing.sin() * r, -threat_bearing.cos() * r];
                     egui::Area::new("threat".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, off).show(ctx, |ui| {
-                        egui::Frame::new().fill(Color32::from_rgba_unmultiplied(210, 48, 40, (110.0 + 120.0 * a) as u8))
+                        egui::Frame::none().fill(Color32::from_rgba_unmultiplied(210, 48, 40, (110.0 + 120.0 * a) as u8))
                             .rounding(10.0).inner_margin(egui::Margin::symmetric(9.0, 4.0)).show(ui, |ui| {
                             ui.label(RichText::new("THREAT").size(11.0 + a * 5.0).strong().color(Color32::WHITE));
                         });
@@ -1027,7 +1110,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
                                             MenuCmd::StartMode(g, k, c) => {
                                                 use clawbound_rs::menu::GameMode;
                                                 state.prowl = None; state.capture = None;
