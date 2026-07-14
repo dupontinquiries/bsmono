@@ -57,10 +57,11 @@ pub struct Settings {
     pub master_volume: f32,
     pub difficulty: u8,    // 0 easy .. 2 hard — scales hunter speed, suspicion, and flush radius
     pub hires: bool,       // AAA graphics: supersample + denser geometry
+    pub clan_abilities: bool,  // survival mode: give each clan a small passive + ultimate (off = hardcore, hunter feels dominant)
     pub keybinds: Keybinds,
 }
 impl Default for Settings {
-    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, hires: false, keybinds: Keybinds::default() } }
+    fn default() -> Self { Settings { show_cone: false, master_volume: 0.7, difficulty: 1, hires: false, clan_abilities: false, keybinds: Keybinds::default() } }
 }
 
 /// Map the difficulty setting (0 easy .. 2 hard) to a hunter-aggression multiplier.
@@ -120,6 +121,7 @@ impl Menu {
                 format!("Master volume: {:.0}%", self.settings.master_volume * 100.0),
                 format!("Difficulty: {}", ["Easy", "Normal", "Hard"][self.settings.difficulty as usize]),
                 format!("Graphics: {}", if self.settings.hires { "High (AAA)" } else { "Standard" }),
+                format!("Survival clan abilities: {}", if self.settings.clan_abilities { "On" } else { "Off (hardcore)" }),
                 "Back".into(),
             ],
             Screen::Keybinds => {
@@ -170,6 +172,7 @@ impl Menu {
                 self.settings.difficulty = d.clamp(0, 2) as u8;
             }
             (Screen::Settings, 3) => self.settings.hires = !self.settings.hires,
+            (Screen::Settings, 4) => self.settings.clan_abilities = !self.settings.clan_abilities,
             _ => {}
         }
     }
@@ -193,7 +196,7 @@ impl Menu {
                 5 => { self.screen = Screen::Title; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::None,   // rows 0..3 are adjusted with left/right
             },
-            Screen::Settings => { if self.cursor == 4 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
+            Screen::Settings => { if self.cursor == 5 { self.screen = Screen::Title; self.cursor = 0; } MenuCmd::None }
             Screen::Keybinds => {
                 let n = self.settings.keybinds.keys.len();
                 if self.cursor == n { self.screen = Screen::Title; self.cursor = 0; }
