@@ -17,7 +17,7 @@ GPUs under Asahi Linux — where PyTorch has no GPU backend at all.
 
 | Path         | What it is | Language |
 |--------------|------------|----------|
-| `pipeline/`  | The music GAN: sharded-SQLite mel cache, DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, and a cache diagnostic. | Python / PyTorch |
+| `pipeline/`  | The music GAN: sharded-SQLite mel cache (stable hash-based sharding), DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, and a cache diagnostic. | Python / PyTorch |
 | `vocoder/`   | HiFi-GAN-style neural vocoder that inverts the pipeline's exact mel representation (mel → waveform), replacing Griffin-Lim. | Python / PyTorch |
 | `gpu/`       | Rust port of both trainers (GAN + vocoder) on the Burn framework's **Vulkan** backend, so training runs on the Apple GPU with no CUDA. Reads the same SQLite cache. | Rust / Burn |
 | `explorer/`  | Web-based latent-space explorer — live mel spectrogram, 2D navigator, latent sliders, A/B morph, presets. Runs standalone (demo synth) or against a model server. | HTML/JS + FastAPI |
@@ -29,9 +29,13 @@ Each directory has its own README with details and exact commands.
 **Train the GAN (CPU or GPU).**
 ```bash
 cd pipeline
-python gan-zai-v5.2.py train --data ./music --batch 32 --workers 4
-python gan-zai-v5.2.py plot  --log checkpoints/train_log.csv --out progress.png
+python gan-zai-v5.3.py train --data ./music --batch 32 --workers 4
+python gan-zai-v5.3.py plot  --log checkpoints/train_log.csv --out progress.png
 ```
+> v5.3 fixed a real cache-sharding bug (files could silently get orphaned from
+> their shard whenever the library size changed, e.g. 5535 mels built but only
+> 740 "valid"). If you have a cache built with v5.2 or earlier, delete `cache/`
+> and rebuild once — `diagnose_cache.py` (below) confirms whether you need to.
 
 **Explore what it learned.** Open `explorer/index.html` for the standalone demo,
 or serve a checkpoint for real output:
@@ -92,7 +96,7 @@ loader to feed it real waveforms (the pattern is in `gpu/src/data.rs`).
 
 ```
 kbm3/
-├── pipeline/   gan-zai-v5{,.1,.2}.py   (v5.2 is current)   + docs/training-curves.png
+├── pipeline/   gan-zai-v5{,.1,.2,.3}.py   (v5.3 is current)   + docs/training-curves.png
 ├── vocoder/    vocoder.py, README.md
 ├── gpu/        Cargo.toml, src/{main,model,data}.rs, src/bin/vocoder.rs, tools/mel2audio.py
 └── explorer/   index.html, server.py, README.md, docs/spectrogram-preview.png
