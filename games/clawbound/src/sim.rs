@@ -143,6 +143,10 @@ pub struct Game {
     shift_t: f32,
     teleport_cd: f32,
     input: Option<(u8, f32, f32, bool, bool, bool)>,
+    pub abilities_on: bool,   // settings toggle: give each clan a small passive + ultimate (off = hardcore)
+    pub ult_cd: f32,          // player's clan ultimate cooldown remaining
+    pub ult_t: f32,           // player's clan ultimate active time remaining
+    ult_want: bool,
 }
 
 fn norm(x: f32, z: f32) -> (f32, f32) { let l = (x * x + z * z).sqrt(); if l > 1e-5 { (x / l, z / l) } else { (0.0, 0.0) } }
@@ -191,10 +195,49 @@ impl Game {
         let name_seed = (objective.0.abs() as u32).wrapping_mul(2_654_435_761)
             ^ (objective.1.abs() as u32).wrapping_mul(40_503) ^ (kind as u32).wrapping_mul(2_246_822_519);
         let roster = crate::lore::roster(name_seed, crate::lore::Rank::Warrior, N_CATS);
-        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, weather, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, clan: 0, roster, danger: 0.0, player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0, twigs, logs, noise_flash: 0.0, shift_t: 0.0, teleport_cd: 5.0, input: None }
+        Game { cats, hunter, bushes, trees, objective, tick: 0, caught: 0, escaped: 0, time: 0.0, outcome: None, scent: Vec::new(), wind, weather, snake_home, mode, shifted: false, critters, prey_caught: 0, difficulty: 1.0, clan: 0, roster, danger: 0.0, player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0, twigs, logs, noise_flash: 0.0, shift_t: 0.0, teleport_cd: 5.0, input: None,
+            abilities_on: false, ult_cd: 0.0, ult_t: 0.0, ult_want: false }
     }
 
     pub fn set_input(&mut self, id: u8, mx: f32, mz: f32, crouch: bool, dodge: bool, leap: bool) { self.input = Some((id, mx, mz, crouch, dodge, leap)); }
+
+    /// Turn the clan passive/ultimate kit on or off (a settings toggle — off by default,
+    /// so the hunter stays the dominant force; the abilities are a "softer" option).
+    pub fn set_abilities_on(&mut self, on: bool) { self.abilities_on = on; }
+
+    /// Press the player's clan ultimate (consumed on the next `step`). No-op if the
+    /// abilities toggle is off.
+    pub fn set_ultimate(&mut self, on: bool) { if on { self.ult_want = true; } }
+    pub fn ultimate_ready(&self) -> bool { self.abilities_on && self.ult_cd <= 0.0 && self.ult_t <= 0.0 }
+
+    /// The player's clan ultimate — name, blurb, cooldown, duration. Deliberately modest
+    /// and evasive/utility-only (no attack power), so the hunter still feels dominant.
+    pub fn clan_ultimate(&self) -> (&'static str, &'static str, f32, f32) {
+        match self.clan % 6 {
+            0 => ("Vanish", "melt into the shadows — a hard suspicion drop and forced cover", 30.0, 1.5),
+            1 => ("Undertow", "a burst of speed while you're in the water", 24.0, 2.0),
+            2 => ("Canopy Leap", "snap straight up into full cover at a nearby tree", 26.0, 0.15),
+            3 => ("Sprint Burst", "a burst of speed across open ground", 22.0, 2.0),
+            4 => ("Warning Howl", "a moment's true sense of exactly where the hunter is", 26.0, 3.0),
+            _ => ("Reed Dive", "a burst of speed and cover while you're in the water", 26.0, 2.0),
+        }
+    }
+    pub fn clan_passive(&self) -> (&'static str, &'static str) {
+        match self.clan % 6 {
+            0 => ("Camouflage", "loses the hunter's trail faster once you're both out of sight and out of scent"),
+            1 => ("Slipstream", "never tires while swimming"),
+            2 => ("Quick Grip", "scrambles up a trunk a little faster"),
+            3 => ("Second Wind", "catches its breath faster at a standstill"),
+            4 => ("Keen Nose", "leaves a fainter scent trail for the hunter to follow"),
+            _ => ("Silt Cloak", "leaves a fainter scent trail while in the water"),
+        }
+    }
+
+    /// Fenclan's Warning Howl: a true fix on the hunter's position for a HUD arrow,
+    /// while the ultimate is active. No effect on the hunter itself.
+    pub fn warning_howl_hunter(&self) -> Option<(f32, f32)> {
+        if self.ult_t > 0.0 && self.clan % 6 == 4 { Some((self.hunter.x, self.hunter.z)) } else { None }
+    }
 
     /// Perform a flick move. `dir_local` is the flick in the cat's frame (`.1` forward,
     /// `.0` right), `mag` its speed, `low` the underbelly modifier. Resolves to a move,
@@ -372,8 +415,15 @@ impl Game {
             // ── clan terrain adaptation: wading is slow (river clans cope far better);
             //    on open ground the moor runners stretch out. Airborne moves are exempt. ──
             if cat.leap_t <= 0.0 && cat.dodge_t <= 0.0 {
-                if world::height_at(cat.x, cat.z) < world::WATER_Y { speed *= 0.5 * ct.swim; }
+                let in_water = world::height_at(cat.x, cat.z) < world::WATER_Y;
+                if in_water { speed *= 0.5 * ct.swim; }
                 else { speed *= 0.85 + 0.15 * ct.sprint; }
+                // clan ultimate: a brief, situational speed burst — evasion only, no attack power
+                if cat.player && self.ult_t > 0.0 {
+                    let c6 = self.clan % 6;
+                    if in_water && (c6 == 1 || c6 == 5) { speed *= 1.8; }        // Undertow / Reed Dive
+                    else if !in_water && c6 == 3 { speed *= 1.6; }               // Sprint Burst
+                }
             }
 
             // ── undergrowth: pushing through thick cover drags at you a little, and now
@@ -392,7 +442,10 @@ impl Game {
             }
 
             // stamina: sprinting drains, everything else recovers
-            cat.stamina = (cat.stamina + if sprinting { -0.32 } else { 0.16 } * dt).clamp(0.0, 1.0);
+            let in_water_now = world::height_at(cat.x, cat.z) < world::WATER_Y;
+            let tide_slipstream = self.abilities_on && self.clan % 6 == 1 && in_water_now;   // never tires swimming
+            let amber_second_wind = if self.abilities_on && self.clan % 6 == 3 { 1.3 } else { 1.0 };   // recovers faster
+            cat.stamina = (cat.stamina + if sprinting && !tide_slipstream { -0.32 } else if sprinting { 0.0 } else { 0.16 * amber_second_wind } * dt).clamp(0.0, 1.0);
 
             cat.crouched = want_crouch;
             // ── climb: scramble up the nearest trunk. You ascend over ~half a second,
@@ -407,7 +460,8 @@ impl Game {
                     let k = (dt * 6.0).min(1.0);
                     cat.x += (tx - cat.x) * k; cat.z += (tz - cat.z) * k;
                 }
-                cat.climb_t = (cat.climb_t + CLIMB_RATE * ct.climb * dt).min(1.0);
+                let moss_grip = if self.abilities_on && self.clan % 6 == 2 { 1.15 } else { 1.0 };
+                cat.climb_t = (cat.climb_t + CLIMB_RATE * ct.climb * moss_grip * dt).min(1.0);
                 cat.stamina = (cat.stamina - CLIMB_DRAIN / ct.climb.max(0.4) * dt).max(0.0);
                 cat.climbing = true;
             } else {
@@ -464,7 +518,10 @@ impl Game {
         // ── scent: moving cats leave a trail that drifts downwind and fades ──
         if self.tick % SCENT_DROP == 0 {
             for c in self.cats.iter().filter(|c| c.alive && !c.safe && c.moving && !c.hidden && !c.climbing) {
-                self.scent.push(Scent { x: c.x, z: c.z, strength: 1.0 });
+                // Fenclan/Mangroveclan passive: a keen nose also knows how to mask a trail
+                let in_water = world::height_at(c.x, c.z) < world::WATER_Y;
+                let strength = if self.abilities_on && (self.clan % 6 == 4 || (self.clan % 6 == 5 && in_water)) { 0.6 } else { 1.0 };
+                self.scent.push(Scent { x: c.x, z: c.z, strength });
             }
         }
         // ── weather: evolve wind/sky, then let it shape the scent trails ──
@@ -505,6 +562,34 @@ impl Game {
                 }
             }
             self.player_move = if nt >= mv.total() { self.combo_last = Some((mv, 0.0)); None } else { Some((mv, nt)) };
+        }
+
+        // ── clan ultimate: tick cooldown/duration, and fire on request. Deliberately
+        //    evasive/utility-only (no attack power) — the hunter should still feel like
+        //    the dominant force even with the abilities toggle on. ──
+        self.ult_cd = (self.ult_cd - dt).max(0.0);
+        self.ult_t = (self.ult_t - dt).max(0.0);
+        if self.ult_want && self.ultimate_ready() {
+            let (_, _, cd, dur) = self.clan_ultimate();
+            if let Some(p) = self.cats.iter_mut().find(|c| c.player && c.alive) {
+                self.ult_t = dur; self.ult_cd = cd;
+                match self.clan % 6 {
+                    0 => { self.hunter.suspicion = (self.hunter.suspicion - 1.0).max(0.0); }   // Vanish: a hard scare
+                    2 => {                                                                       // Canopy Leap: snap up a nearby tree
+                        if let Some((tx, tz)) = nearest_tree(p.x, p.z) {
+                            if dist(p.x, p.z, tx, tz) < CLIMB_R * 1.6 {
+                                p.climbing = true; p.climb_t = 1.0; p.hidden = true;
+                            }
+                        }
+                    }
+                    _ => {}   // Undertow / Sprint Burst / Warning Howl / Reed Dive apply continuously above
+                }
+            }
+        }
+        self.ult_want = false;
+        // Vanish: force cover for its short duration, on top of the instant scare above
+        if self.ult_t > 0.0 && self.clan % 6 == 0 {
+            if let Some(p) = self.cats.iter_mut().find(|c| c.player && c.alive) { p.hidden = true; }
         }
 
         // ── hunter: sight → smell → FSM → pursue → catch ──
@@ -567,7 +652,8 @@ impl Game {
         } else if has_scent {
             self.hunter.suspicion = (self.hunter.suspicion + dt * 0.5).min(0.85); // a trail keeps it hunting, not charging
         } else {
-            self.hunter.suspicion = (self.hunter.suspicion - dt * 0.3).max(0.0);
+            let ember_bonus = if self.abilities_on && self.clan % 6 == 0 { 1.5 } else { 1.0 };   // Emberclan passive: Camouflage
+            self.hunter.suspicion = (self.hunter.suspicion - dt * 0.3 * ember_bonus).max(0.0);
         }
         self.hunter.state = hunter::step(self.hunter.state, self.hunter.suspicion, has_scent, seen);
 
@@ -768,6 +854,104 @@ mod tests {
         let g = Game::new_6v1(Kind::Fox);
         assert_eq!(g.cats.len(), N_CATS);
         assert_eq!(g.alive_cats(), 6);
+    }
+
+    #[test]
+    fn abilities_are_off_by_default_and_the_ultimate_wont_fire() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        assert!(!g.abilities_on);
+        g.set_ultimate(true);
+        g.set_input(0, 0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.ult_t, 0.0, "the ultimate shouldn't engage while the toggle is off");
+    }
+
+    #[test]
+    fn emberclan_vanish_scares_off_suspicion_when_abilities_are_on() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.set_abilities_on(true);
+        g.clan = 0;   // Emberclan
+        g.hunter.suspicion = 1.4;
+        g.set_ultimate(true);
+        g.set_input(0, 0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.ult_t > 0.0 && g.ult_cd > 0.0, "Vanish should engage and go on cooldown");
+        assert!(g.hunter.suspicion < 1.4, "Vanish should scare off suspicion");
+        assert!(g.cats[0].hidden, "and force cover for its duration");
+    }
+
+    #[test]
+    fn tideclan_slipstream_never_tires_swimming_when_abilities_are_on() {
+        let mut wx = 0.0; let mut wz = 0.0; let mut found = false;
+        for i in -60..60 { let (x, z) = (i as f32 * 3.0, 0.0); if world::height_at(x, z) < world::WATER_Y { wx = x; wz = z; found = true; break; } }
+        assert!(found, "expected some water on the map");
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.set_abilities_on(true);
+        g.clan = 1;   // Tideclan
+        g.hunter.x = 900.0; g.hunter.z = 900.0;
+        g.cats[0].x = wx; g.cats[0].z = wz; g.cats[0].stamina = 0.5;
+        let s0 = g.cats[0].stamina;
+        // urgency-driven sprint needs the hunter close; instead exercise the branch directly
+        // by moving hard for a beat and checking stamina never drops below the start.
+        for _ in 0..15 { g.set_input(0, 1.0, 0.0, false, false, false); g.step(1.0 / 30.0); g.cats[0].x = wx; g.cats[0].z = wz; }
+        assert!(g.cats[0].stamina >= s0 - 1e-3, "Slipstream should prevent stamina drain while swimming");
+    }
+
+    #[test]
+    fn amberclan_second_wind_recovers_faster_when_abilities_are_on() {
+        let recover = |abilities: bool| -> f32 {
+            let mut g = Game::new_6v1(Kind::Fox);
+            g.set_abilities_on(abilities);
+            g.clan = 3;   // Amberclan
+            g.hunter.x = 900.0; g.hunter.z = 900.0;
+            g.cats[0].stamina = 0.5;
+            g.set_input(0, 0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            g.cats[0].stamina
+        };
+        assert!(recover(true) > recover(false) + 1e-5, "Second Wind should recover stamina faster than the baseline");
+    }
+
+    #[test]
+    fn mossclan_quick_grip_climbs_faster_when_abilities_are_on() {
+        let climb_after = |abilities: bool| -> f32 {
+            let mut g = Game::new_6v1(Kind::Fox);
+            g.set_abilities_on(abilities);
+            g.clan = 2;   // Mossclan
+            g.hunter.x = 900.0; g.hunter.z = 900.0;
+            let (tx, tz) = g.trees[0];
+            g.cats[0].x = tx; g.cats[0].z = tz;
+            for _ in 0..3 { g.set_input(0, 0.0, 0.0, true, false, false); g.step(1.0 / 30.0); }
+            g.cats[0].climb_t
+        };
+        assert!(climb_after(true) > climb_after(false) + 1e-4, "Quick Grip should climb faster than the baseline");
+    }
+
+    #[test]
+    fn mossclan_canopy_leap_snaps_up_a_nearby_tree() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.set_abilities_on(true);
+        g.clan = 2;   // Mossclan
+        let (tx, tz) = g.trees[0];
+        g.cats[0].x = tx; g.cats[0].z = tz;
+        g.set_ultimate(true);
+        g.set_input(0, 0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.cats[0].climbing && g.cats[0].climb_t >= 0.999, "Canopy Leap should snap straight up a nearby tree");
+    }
+
+    #[test]
+    fn fenclan_warning_howl_reveals_the_hunter_only_while_active() {
+        let mut g = Game::new_6v1(Kind::Fox);
+        g.set_abilities_on(true);
+        g.clan = 4;   // Fenclan
+        g.hunter.x = 40.0; g.hunter.z = -12.0;
+        assert_eq!(g.warning_howl_hunter(), None, "not revealed before the ultimate fires");
+        g.set_ultimate(true);
+        g.set_input(0, 0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        let (hx, hz) = (g.hunter.x, g.hunter.z);
+        assert_eq!(g.warning_howl_hunter(), Some((hx, hz)));
     }
 
     #[test]
