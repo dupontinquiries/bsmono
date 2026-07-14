@@ -30,7 +30,7 @@ impl eframe::App for VoicetermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Voice));
 
-        egui::SidePanel::left("sidebar").resizable(false).exact_width(160.0).show(ctx, |ui| {
+        egui::SidePanel::left("sidebar").resizable(true).default_width(160.0).width_range(120.0..=320.0).show(ctx, |ui| {
             if let Some(action) = self.sidebar.ui(ui, &self.colors) {
                 match action {
                     SidebarAction::SelectSession(_) => {} // on-device: switch the active PTY/session
