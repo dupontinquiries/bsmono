@@ -17,7 +17,7 @@ GPUs under Asahi Linux — where PyTorch has no GPU backend at all.
 
 | Path         | What it is | Language |
 |--------------|------------|----------|
-| `pipeline/`  | The music GAN: sharded-SQLite mel cache, DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots. | Python / PyTorch |
+| `pipeline/`  | The music GAN: sharded-SQLite mel cache, DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, and a cache diagnostic. | Python / PyTorch |
 | `vocoder/`   | HiFi-GAN-style neural vocoder that inverts the pipeline's exact mel representation (mel → waveform), replacing Griffin-Lim. | Python / PyTorch |
 | `gpu/`       | Rust port of both trainers (GAN + vocoder) on the Burn framework's **Vulkan** backend, so training runs on the Apple GPU with no CUDA. Reads the same SQLite cache. | Rust / Burn |
 | `explorer/`  | Web-based latent-space explorer — live mel spectrogram, 2D navigator, latent sliders, A/B morph, presets. Runs standalone (demo synth) or against a model server. | HTML/JS + FastAPI |
@@ -43,7 +43,22 @@ python server.py --weights ../pipeline/checkpoints/gen_8000.pt \
 # open http://localhost:8000
 ```
 
-**Train the vocoder** (better + faster than Griffin-Lim):
+**Diagnose a cache/valid-tracks mismatch** (read-only, no rebuild needed):
+```bash
+cd pipeline
+python diagnose_cache.py --cache cache
+```
+
+**Multiply the effective dataset** by blending tracks with matching tempo/key
+(only blends musically-compatible pairs, not random tracks):
+```bash
+cd pipeline
+python augment.py features --cache cache   # one-time BPM/key pass, resumable
+python augment.py groups   --cache cache   # see how many tracks got a blend partner
+```
+Then wrap your dataset in training: `AugmentedDataset(OpusMelDataset(cfg), cache_dir=cfg.cache_dir, blend_prob=0.35)`.
+
+
 ```bash
 cd vocoder
 python vocoder.py train --data ./music --iters 200000 --batch 16
