@@ -4698,6 +4698,81 @@ fn alley() -> Scene {
         s.add(tuft, Float { amp: 0.05, speed: 0.8, phase: rh(k) * 6.28, drift: 0.05 });
     }
 
+    // YELLOW SHOULDER BANDS — continuous painted edge-stripes running the full length of the lane, distinct
+    // from the broken centre-line dashes (ref: ref-photo-1-green-alley-sunny.png). Slightly worn/patchy alpha
+    // so it reads as old paint, not a fresh line.
+    for &sgn in &[-1.0f32, 1.0] {
+        let bz = sgn * (wz - 0.35);
+        let nseg = (half_len / 3.0) as u32;
+        for k in 0..nseg {
+            let bx = -half_len + (k as f32 + 0.5) / nseg as f32 * 2.0 * half_len;
+            if rh(k * 131 + (sgn > 0.0) as u32 * 900) < 0.08 { continue; } // rare worn-away gap
+            let mut band = m3::panel(v(bx, gy(bx, bz) + 0.016, bz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), 2.0 * half_len / nseg as f32 * 1.02, 0.22, c(0xc2, 0x9c, 0x36));
+            m3::tint_up(&mut band, c(0xd0, 0xac, 0x40), c(0x8c, 0x70, 0x24)); band.mat = M::STONE; band.emissive = 0.03;
+            s.add(band, Float::STILL);
+        }
+    }
+
+    // CONCRETE PLANTER BOXES lining the edges, packed with shrubs/greenery (ref: photo-1, mockup). Sparse
+    // rather than a solid wall, alternating with the yellow band.
+    let n_planter = (half_len / 6.0) as u32;
+    for &sgn in &[-1.0f32, 1.0] {
+        let bz = sgn * (wz - 0.9);
+        for k in 0..n_planter {
+            if rh(k * 151 + (sgn > 0.0) as u32 * 700) < 0.4 { continue; }
+            let bx = -half_len + (k as f32 + 0.5) / n_planter as f32 * 2.0 * half_len;
+            let by = gy(bx, bz);
+            let (pw, ph, pdd) = (1.1, 0.55, 0.55);
+            for (rt, up, ww, hh, offx, offy, offz) in [
+                (v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), pw, ph, 0.0, ph * 0.5, pdd * 0.5),
+                (v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), pw, ph, 0.0, ph * 0.5, -pdd * 0.5),
+                (v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0), pdd, ph, pw * 0.5, ph * 0.5, 0.0),
+                (v(0.0, 0.0, 1.0), v(0.0, 1.0, 0.0), pdd, ph, -pw * 0.5, ph * 0.5, 0.0),
+            ] {
+                let mut face = m3::panel(v(bx + offx, by + offy, bz + offz), rt, up, ww, hh, c(0x6c, 0x68, 0x60));
+                m3::tint_up(&mut face, c(0x7c, 0x78, 0x70), c(0x4a, 0x46, 0x40)); face.mat = M::STONE;
+                s.add(face, Float::STILL);
+            }
+            let mut shrub = m3::leaf_cluster(v(bx, by + ph + 0.35, bz), 0.55 + rh(k * 3) * 0.3, 2200 + k, c(0x3c, 0x66, 0x2e));
+            m3::tint_up(&mut shrub, c(0x58, 0x8c, 0x40), c(0x28, 0x46, 0x1e)); shrub.mat = M::MOSS;
+            s.add(shrub, Float { amp: 0.06, speed: 0.6, phase: rh(k * 5) * 6.28, drift: 0.06 });
+        }
+    }
+
+    // GRAFFITI MURALS on brick end-walls (ref: "graffiti murals on brick end-walls"). Layered colour-block
+    // panels standing just proud of a wall face, reading as a painted composition without texture assets.
+    for k in 0..(2.0 + 2.0 * pd) as u32 {
+        let sgn = if rh(k * 171) > 0.5 { 1.0 } else { -1.0 };
+        let bx = -half_len + (k as f32 + 0.5) / ((2.0 + 2.0 * pd) as u32).max(1) as f32 * 2.0 * half_len;
+        let bz = sgn * (wz + 0.02);
+        let mural_cols = [c(0xc0, 0x4a, 0x5c), c(0x3a, 0x7a, 0x9c), c(0xd8, 0xa8, 0x3a), c(0x5a, 0x9c, 0x5a), c(0x9a, 0x5a, 0xc0)];
+        let (mw, mh) = (2.6 + rh(k * 5) * 1.8, 2.2 + rh(k * 7) * 1.6);
+        let mut base = m3::panel(v(bx, gy(bx, bz) + mh * 0.5 + 0.3, bz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), mw, mh, mural_cols[(rh(k * 9) * 5.0) as usize % 5]);
+        base.mat = M::PAPER; base.emissive = 0.05; s.add(base, Float::STILL);
+        for b in 0..3u32 {
+            let bw = mw * (0.3 + rh(k * 13 + b) * 0.3);
+            let bh = mh * (0.25 + rh(k * 17 + b) * 0.3);
+            let ox = (rh(k * 19 + b) - 0.5) * (mw - bw);
+            let oy = (rh(k * 23 + b) - 0.5) * (mh - bh);
+            let mut blk = m3::panel(v(bx + ox, gy(bx, bz) + mh * 0.5 + 0.31 + oy, bz), v(1.0, 0.0, 0.0), v(0.0, 1.0, 0.0), bw, bh, mural_cols[(rh(k * 29 + b) * 5.0) as usize % 5]);
+            blk.mat = M::PAPER; blk.emissive = 0.06; s.add(blk, Float::STILL);
+        }
+    }
+
+    // CHALK GROUND DECAL — a flat compass/sun rune drawn in chalky white on the asphalt (ref: "chalk ground
+    // drawings — a compass/sun, a crowned figure").
+    {
+        let (dx, dz) = (-half_len * 0.35, 0.0);
+        let dy = gy(dx, dz) + 0.018;
+        let mut ring = m3::annulus(v(dx, dy, dz), 0.9, 1.05, 24, c(0xd8, 0xd4, 0xc4));
+        ring.mat = M::STONE; ring.emissive = 0.05; s.add(ring, Float::STILL);
+        for r in 0..8u32 {
+            let ang = TAU * r as f32 / 8.0;
+            let mut ray = m3::panel(v(dx + ang.cos() * 0.65, dy, dz + ang.sin() * 0.65), v(ang.cos(), 0.0, ang.sin()), v(-ang.sin(), 0.0, ang.cos()), 1.3, 0.09, c(0xd8, 0xd4, 0xc4));
+            ray.mat = M::STONE; ray.emissive = 0.05; s.add(ray, Float::STILL);
+        }
+    }
+
     s
 }
 
