@@ -1,8 +1,17 @@
-//! shell.rs — the app chrome around the terminal: the session sidebar, the bottom keycap bar, and
-//! the mic FAB's docked position. Ported from real screenshots of voiceterm's Qt app (not just QML
+//! shell.rs — voiceterm's app chrome: the session sidebar, the bottom keycap bar, and the mic
+//! FAB's docked position. Ported from real screenshots of voiceterm's Qt app (not just QML
 //! reading) — this is the part of the port that was entirely missing before: the existing harness
 //! (examples/feel.rs, src/bin/voiceterm_egui.rs) only assembled the terminal + popups, with no
 //! surrounding shell at all.
+//!
+//! This is now a thin, voiceterm-specific layer over `uikit_egui::dock`'s shared primitives (list
+//! row, action stack, chip row, FAB docking) — extracted there once this module's shapes proved
+//! out, since none of the four pieces were actually voiceterm-specific: a session list is "rows in
+//! a fixed-width column, some selected, with actions pinned below," the same shape gitmind's Qt nav
+//! rail or a device list needs; the keycap row is "a wrapping row of small pill buttons," the same
+//! shape a filter-tag or quick-action bar needs; and any app with a floating action button needs
+//! the same corner-overlap docking math. What stays HERE is voiceterm's own data (Session, the two
+//! keycap sets) and the mic glyph/glow specifics.
 //!
 //! Colours: the reference screenshots were taken with the "Mocha" theme active (a *selectable*
 //! theme, per the Settings panel's own theme picker) — a different, warmer palette than the
@@ -12,7 +21,8 @@
 //! multi-theme picker (Dark/Light/Nord/Solar/Mono/Rose/Gruv/Ocean/Mocha, "long-press to show all
 //! vibes") is a real, separate feature visible in the settings screenshot — not ported here.
 
-use egui::{Align2, Color32, CornerRadius, FontId, Rect, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Rect, Response, Ui};
+use uikit_egui::dock::{self, Chip, Corner};
 use uikit_egui::PaletteColors;
 
 /// One entry in the session list (the left sidebar).
@@ -40,19 +50,8 @@ impl Sidebar {
         let mut action = None;
         ui.add_space(4.0);
         for (i, s) in self.sessions.iter().enumerate() {
-            let selected = i == self.active;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::click());
-            let fill = if selected { c.accent_soft } else if resp.hovered() { c.bg_hover } else { c.bg_base };
-            ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
-            let text_color = if selected { c.bg_base } else { c.text };
-            ui.painter().text(
-                rect.left_center() + egui::vec2(10.0, 0.0),
-                Align2::LEFT_CENTER,
-                format!("{}  ({})", s.name, s.count),
-                FontId::proportional(13.0),
-                text_color,
-            );
-            if resp.clicked() {
+            let label = format!("{}  ({})", s.name, s.count);
+            if dock::list_row(ui, &label, i == self.active, 32.0, c).clicked() {
                 self.active = i;
                 action = Some(SidebarAction::SelectSession(i));
             }
@@ -60,13 +59,8 @@ impl Sidebar {
         // spacer pushes the action buttons to the bottom of the sidebar
         ui.add_space(ui.available_height() - 3.0 * 34.0 - 8.0);
         ui.separator();
-        for (label, act) in [("+ New", SidebarAction::New), ("○ Graph", SidebarAction::Graph), ("⚙ Settings", SidebarAction::Settings)] {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.0), Sense::click());
-            let fill = if resp.hovered() { c.bg_hover } else { c.bg_raised };
-            ui.painter().rect(rect, CornerRadius::same(4), fill, Stroke::new(1.0, c.border), StrokeKind::Inside);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, label, FontId::proportional(13.0), c.text);
-            if resp.clicked() { action = Some(act); }
-            ui.add_space(4.0);
+        if let Some(i) = dock::action_stack(ui, &["+ New", "○ Graph", "⚙ Settings"], 30.0, c) {
+            action = Some([SidebarAction::New, SidebarAction::Graph, SidebarAction::Settings][i]);
         }
         action
     }
@@ -120,44 +114,31 @@ pub const EXTENDED_KEYCAPS: &[Keycap] = &[
 /// Render the bottom keycap bar plus the "Sel · Copy · Paste" hint row beneath it. Returns the
 /// `send` string of a tapped keycap, if any.
 pub fn keycap_bar_ui(ui: &mut Ui, keys: &[Keycap], c: &PaletteColors) -> Option<&'static str> {
-    let mut sent = None;
-    ui.horizontal_wrapped(|ui| {
-        for k in keys {
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(k.label.len() as f32 * 8.0 + 22.0, 30.0), Sense::click());
-            let fill = if resp.is_pointer_button_down_on() { c.accent_soft } else if resp.hovered() { c.bg_hover } else { c.bg_raised };
-            ui.painter().rect(rect, CornerRadius::same(6), fill, Stroke::new(1.0, c.border), StrokeKind::Inside);
-            ui.painter().text(rect.center(), Align2::CENTER_CENTER, k.label, FontId::proportional(13.0), c.text);
-            if resp.clicked() { sent = Some(k.send); }
-        }
-    });
+    let chips: Vec<Chip> = keys.iter().map(|k| Chip::new(k.label)).collect();
+    let clicked = dock::chip_row(ui, &chips, 30.0, c);
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Sel · Copy · Paste").color(c.text_weak).size(11.0));
     });
-    sent
+    clicked.map(|i| keys[i].send)
 }
 
 /// Where the mic FAB docks — the bottom-right corner of `terminal_rect`, overlapping its border
 /// slightly (matches the reference: the button sits ON the corner, not fully inside or outside).
 pub fn fab_rect(terminal_rect: Rect, diameter: f32) -> Rect {
-    let center = terminal_rect.right_bottom() + egui::vec2(-diameter * 0.35, -diameter * 0.35);
-    Rect::from_center_size(center, Vec2::splat(diameter))
+    dock::fab_dock(terminal_rect, diameter, Corner::BottomRight)
 }
 
 /// Paint the terminal's bordered frame (the amber/accent outline visible around the whole
 /// terminal region in the reference screenshots).
 pub fn paint_terminal_border(ui: &Ui, rect: Rect, c: &PaletteColors) {
-    ui.painter().rect_stroke(rect, CornerRadius::same(6), Stroke::new(1.5, c.accent), StrokeKind::Outside);
+    dock::accent_border(ui, rect, c);
 }
 
 /// Paint the mic FAB itself (the circular button — the compass opens from here on press-hold).
 /// Returns the interaction response so the caller can wire press/hold/tap.
-pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> egui::Response {
-    let resp = ui.interact(rect, ui.id().with("mic_fab"), Sense::click());
-    let fill = if resp.is_pointer_button_down_on() { c.accent } else { c.accent.gamma_multiply(0.9) };
-    ui.painter().circle_filled(rect.center(), rect.width() * 0.5, fill);
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, "\u{1F3A4}", FontId::proportional(rect.width() * 0.4), Color32::WHITE);
-    resp
+pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
+    dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
 #[cfg(test)]
@@ -166,12 +147,10 @@ mod tests {
 
     #[test]
     fn fab_docks_at_the_corner_overlapping_slightly() {
-        let term = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(400.0, 300.0));
+        let term = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
         let fab = fab_rect(term, 60.0);
-        // centre should be near the bottom-right corner, pulled inward by less than half the FAB
         assert!(fab.center().x < term.right() && fab.center().x > term.right() - 60.0);
         assert!(fab.center().y < term.bottom() && fab.center().y > term.bottom() - 60.0);
-        // and it should actually overlap the corner (extend past both edges a bit)
         assert!(fab.right() > term.right());
         assert!(fab.bottom() > term.bottom());
     }
@@ -202,8 +181,6 @@ mod tests {
         ];
         let sb = Sidebar::new(sessions);
         assert_eq!(sb.active, 0);
-        // (UI interaction itself needs a live egui::Ui — covered by the render smoke test in the
-        // bin/example; this test locks down the pure construction/default-state contract.)
         assert_eq!(sb.sessions.len(), 2);
     }
 }

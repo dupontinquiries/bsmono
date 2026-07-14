@@ -20,6 +20,7 @@
 pub mod a11y;
 pub mod adaptive;
 pub mod carved;
+pub mod dock;
 pub mod vertical_tabs;
 pub mod glass;
 pub mod gesture_layer;
