@@ -71,7 +71,45 @@ impl Ability {
     pub fn refills(self) -> bool { matches!(self, Ability::SecondWind) }
 }
 
+/// Each class's passive trait — an always-on edge that plays into its terrain
+/// specialisation, distinct from its active ability. Gives every class a second
+/// point of differentiation (SMITE-style kit depth: passive + active).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Passive { NineLives, Cache, Slipstream, Camouflage, SureFooted, KeenEyes }
+
+impl Passive {
+    pub fn name(self) -> &'static str {
+        match self {
+            Passive::NineLives => "Nine Lives", Passive::Cache => "Cache",
+            Passive::Slipstream => "Slipstream", Passive::Camouflage => "Camouflage",
+            Passive::SureFooted => "Sure-Footed", Passive::KeenEyes => "Keen Eyes",
+        }
+    }
+    pub fn blurb(self) -> &'static str {
+        match self {
+            Passive::NineLives => "cheats death the first time it would be caught each match",
+            Passive::Cache => "claims ancestor trees 30% faster — quick paws",
+            Passive::Slipstream => "never tires while sprinting in water",
+            Passive::Camouflage => "suspicion melts away faster while hidden",
+            Passive::SureFooted => "harder to spot while up on the mountains",
+            Passive::KeenEyes => "always senses the hunter's position from the air",
+        }
+    }
+}
+
 impl Class {
+    /// The class's passive trait — always on, complementing its active ability.
+    pub fn passive(self) -> Passive {
+        match self {
+            Class::Cat => Passive::NineLives,
+            Class::Squirrel => Passive::Cache,
+            Class::Otter => Passive::Slipstream,
+            Class::Frog => Passive::Camouflage,
+            Class::Goat => Passive::SureFooted,
+            Class::Hawk => Passive::KeenEyes,
+        }
+    }
+
     pub fn def(self) -> ClassDef {
         match self {
             // land, water, mtn, jump, stun, fly, color, trait  — ported values
@@ -182,5 +220,19 @@ mod tests {
         assert_eq!(seen.len(), 6);
         assert!(Class::Frog.ability().speed_mult() >= 3.0, "the frog's Bound is the big leap");
         assert!(Class::Cat.ability().refills(), "the cat's Second Wind refills stamina");
+    }
+
+    #[test]
+    fn every_class_has_a_distinct_passive() {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        for c in CLASSES {
+            let p = c.passive();
+            assert!(seen.insert(p), "passives should be unique per class");
+            assert!(!p.name().is_empty() && !p.blurb().is_empty());
+        }
+        assert_eq!(seen.len(), 6);
+        assert_eq!(Class::Otter.passive(), Passive::Slipstream, "the river king never tires in water");
+        assert_eq!(Class::Hawk.passive(), Passive::KeenEyes, "the flyer always senses the hunter");
     }
 }

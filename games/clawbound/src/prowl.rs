@@ -49,6 +49,9 @@ const MINION_SPEED: f32 = 6.5;
 const MINION_AGGRO_R: f32 = 12.0;
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
+const MOVE_REACH: f32 = 3.6;    // how close an autoattack move connects with a target
+const STAGGER_DUR: f32 = 0.9;   // seconds a landed hit dazes the hunter/a rival
+const ULT_CD_MULT: f32 = 1.8;   // stretches the shared Ability's cooldown to feel like an ultimate
 
 /// The four clan colours (Ember / Tide / Moss / Amber).
 pub fn clan_color(clan: u8) -> u32 {
@@ -114,6 +117,7 @@ pub struct Rival {
     pub dwell: f32,       // claim progress at its current tree
     pub target: usize,    // ancestor index it's heading for
     pub respawn_flash: f32,
+    pub stagger: f32,     // > 0 while dazed by a landed hit — freezes it, interrupts its claim
 }
 
 pub struct Objective {
@@ -147,9 +151,14 @@ pub struct Prowl {
     pub escapes: u32,
     pub times_caught: u32,
     pub buffs: Buffs,                       // Speed / Shield picked up in the field
-    pub ability_cd: f32,                     // signature ability cooldown remaining
-    pub ability_t: f32,                      // signature ability active time remaining
-    ability_want: bool,                      // ability key pressed this frame
+    pub ability_cd: f32,                     // ultimate ability cooldown remaining
+    pub ability_t: f32,                      // ultimate ability active time remaining
+    ability_want: bool,                      // ultimate key pressed this frame
+    pub player_move: Option<(crate::combat::Move, f32)>,  // in-progress autoattack move + elapsed
+    pub combo_last: Option<(crate::combat::Move, f32)>,   // last finished move + seconds since, for combos
+    pub combo_flash: f32,                    // > 0 briefly after a combo lands
+    pub combo_name: &'static str,
+    pub hunter_stagger: f32,                 // > 0 while the hunter is dazed by a landed hit
     pub pickups: Vec<(f32, f32, Power)>,    // power-up markers scattered on land
     pub ancestors: Vec<AncestorTree>,       // buff-storing staging grounds (clan homes)
     pub lanes: Vec<(f32, f32, f32, f32)>,   // beaten paths between the staging grounds
@@ -161,6 +170,7 @@ pub struct Prowl {
     pub outcome: Option<u8>,                // Some(clan) winner, Some(255) draw, None = ongoing
     pub respawn_flash: f32,
     pub shielded_flash: f32,                // brief flash when a Shield soaks a catch
+    pub nine_lives_used: bool,              // the Cat's passive: spent on its first catch
     pub time: f32,
     pub difficulty: f32,
     tick: u32,
@@ -190,11 +200,12 @@ impl Prowl {
             obj: Objective { kind: ProwlObj::Reach, tx: 0.0, tz: 0.0, name: "", progress: 0.0, time_left: 0.0, start_caught: 0, done: false, next_t: 0.0 },
             cleared: 0, prey_caught: 0, escapes: 0, times_caught: 0,
             buffs: Buffs::new(), ability_cd: 0.0, ability_t: 0.0, ability_want: false,
+            player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", hunter_stagger: 0.0,
             pickups: Self::scatter_pickups(), clan_scores: [0; 4], outcome: None,
             ancestors, lanes, on_staging: false, on_lane: false,
             minions,
             rivals,
-            respawn_flash: 0.0, shielded_flash: 0.0, time: 0.0, difficulty: 1.0, tick: 0, input: None,
+            respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
         g
@@ -267,7 +278,7 @@ impl Prowl {
             v.push(Rival {
                 clan: clan as u8, class: classes[clan % classes.len()],
                 x: home.x, z: home.z, heading: 0.0,
-                buffs: Buffs::new(), dwell: 0.0, target: clan, respawn_flash: 0.0,
+                buffs: Buffs::new(), dwell: 0.0, target: clan, respawn_flash: 0.0, stagger: 0.0,
             });
         }
         v
@@ -281,6 +292,8 @@ impl Prowl {
         for i in 0..self.rivals.len() {
             self.rivals[i].buffs.tick(dt);
             self.rivals[i].respawn_flash = (self.rivals[i].respawn_flash - dt).max(0.0);
+            self.rivals[i].stagger = (self.rivals[i].stagger - dt).max(0.0);
+            if self.rivals[i].stagger > 0.0 { self.rivals[i].dwell = 0.0; continue; }   // dazed — frozen, claim interrupted
             let (rx, rz, rclan) = { let r = &self.rivals[i]; (r.x, r.z, r.clan) };
 
             // flee the stalker if it's close and hunting
@@ -375,11 +388,71 @@ impl Prowl {
         self.input = Some((mx, mz, leap, dodge, crouch));
     }
 
-    /// Press the class's signature ability (consumed on the next `step`).
+    /// Press the class's ultimate ability (consumed on the next `step`).
     pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
+
+    /// Perform a flick — the gesture-driven autoattack. `dir_local` is the flick in the
+    /// prowler's local frame (`.1` forward, `.0` right), `mag` its speed, `low` the
+    /// underbelly modifier. Resolves to a move (ported from `combat.rs`, the same
+    /// move-set every class shares), chains a combo off the last one if it lands in the
+    /// window, and kicks off the movement (pounce/roll reuse leap/dodge). No-op if busy.
+    pub fn player_flick(&mut self, dir_local: (f32, f32), mag: f32, low: bool) {
+        use crate::combat::{combo, resolve_flick, Move, COMBO_WINDOW};
+        if self.player_move.is_some() { return; }
+        let mut mv = match resolve_flick(dir_local, mag, low) { Some(m) => m, None => return };
+        if let Some((prev, since)) = self.combo_last {
+            if since < COMBO_WINDOW {
+                if let Some((name, finisher)) = combo(prev, mv) {
+                    mv = finisher; self.combo_name = name; self.combo_flash = 1.0;
+                }
+            }
+        }
+        let (sh, ch) = (self.heading.sin(), self.heading.cos());
+        let (wx, wz) = norm(dir_local.1 * sh + dir_local.0 * ch, dir_local.1 * ch - dir_local.0 * sh);
+        match mv {
+            Move::Pounce => { self.leap_t = LEAP_DUR; self.leap_cd = 0.5; self.bx = wx; self.bz = wz; }
+            Move::Jump   => { self.leap_t = LEAP_DUR * 0.6; self.leap_cd = 0.4; self.bx = wx * 0.35; self.bz = wz * 0.35; }
+            Move::Roll | Move::Dodge => { self.dodge_t = 0.28; self.dodge_cd = 0.5; self.bx = wx; self.bz = wz; }
+            _ => {}
+        }
+        self.player_move = Some((mv, 0.0));
+    }
+
+    /// Advance the in-progress autoattack move, land a hit on the hunter or a nearby
+    /// rival on the frame it turns active, and tick the combo window.
+    fn step_combat(&mut self, dt: f32) {
+        self.combo_flash = (self.combo_flash - dt * 1.5).max(0.0);
+        self.hunter_stagger = (self.hunter_stagger - dt).max(0.0);
+        if let Some((m, s)) = self.combo_last { let ns = s + dt; self.combo_last = if ns > 1.0 { None } else { Some((m, ns)) }; }
+        if let Some((mv, t)) = self.player_move {
+            let sp = crate::combat::spec(mv);
+            let nt = t + dt;
+            if mv.is_attack() && t < sp.windup && nt >= sp.windup {
+                let power = if self.combo_flash > 0.0 { sp.power * crate::combat::COMBO_POWER_BONUS } else { sp.power };
+                // the hunter: a landed hit dazes it and rattles its suspicion
+                if dist(self.x, self.z, self.hx, self.hz) < MOVE_REACH {
+                    self.hunter_stagger = self.hunter_stagger.max(STAGGER_DUR * (0.5 + power * 0.35));
+                    self.suspicion = (self.suspicion - 0.35).max(0.0);
+                }
+                // a rival clan's prowler: a landed hit dazes it too, interrupting its claim
+                for r in self.rivals.iter_mut() {
+                    if dist(self.x, self.z, r.x, r.z) < MOVE_REACH {
+                        r.stagger = r.stagger.max(STAGGER_DUR * (0.5 + power * 0.35));
+                    }
+                }
+            }
+            self.player_move = if nt >= mv.total() { self.combo_last = Some((mv, 0.0)); None } else { Some((mv, nt)) };
+        }
+    }
 
     /// The class's ability and whether it can be fired right now (for a HUD).
     pub fn ability_ready(&self) -> bool { self.ability_cd <= 0.0 && self.ability_t <= 0.0 }
+
+    /// The Hawk's Keen Eyes passive: always senses the hunter's position from the air,
+    /// regardless of stealth or suspicion. Returns `None` for every other class (for a HUD arrow).
+    pub fn keen_eyes_hunter(&self) -> Option<(f32, f32)> {
+        if self.class == Class::Hawk { Some((self.hx, self.hz)) } else { None }
+    }
 
     fn a_poi(&self) -> (f32, f32, &'static str) {
         if self.pois.is_empty() { return (0.0, 0.0, "Landmark"); }
@@ -412,6 +485,13 @@ impl Prowl {
     }
 
     fn respawn(&mut self) {
+        // Cat passive: Nine Lives cheats the first catch each match — a scare, not a rally
+        if self.class == Class::Cat && !self.nine_lives_used {
+            self.nine_lives_used = true;
+            self.shielded_flash = 0.8;
+            self.suspicion = 0.2; self.hstate = HState::Search;
+            return;
+        }
         // a Shield soaks the catch instead — you're spared (brief flash), no respawn
         if !self.buffs.absorb_hit() {
             self.shielded_flash = 0.8;
@@ -480,7 +560,7 @@ impl Prowl {
         if self.ability_want && self.ability_cd <= 0.0 && self.ability_t <= 0.0 && self.stamina > 0.1 {
             let ab = self.class.ability();
             self.ability_t = ab.duration();
-            self.ability_cd = ab.cooldown();
+            self.ability_cd = ab.cooldown() * ULT_CD_MULT;
             if ab.refills() { self.stamina = 1.0; }
             let d = if dx.abs() + dz.abs() > 1e-4 { (dx, dz) } else { (self.heading.sin(), self.heading.cos()) };
             self.bx = d.0; self.bz = d.1;
@@ -501,7 +581,8 @@ impl Prowl {
         }
         self.moving = mv;
         self.hidden = self.crouched && self.bushes.iter().any(|(bx, bz, r)| dist(self.x, self.z, *bx, *bz) < *r);
-        self.stamina = (self.stamina + if sprinting { -0.30 } else { 0.18 } * dt).clamp(0.0, 1.0);
+        let slipstream = self.class == Class::Otter && Class::terrain_at(self.x, self.z) == 0;
+        self.stamina = (self.stamina + if sprinting && !slipstream { -0.30 } else if sprinting { 0.0 } else { 0.18 } * dt).clamp(0.0, 1.0);
         if self.exposed { self.stamina = (self.stamina - 0.12 * dt).max(0.0); }   // the ring wears you down
 
         // ── power-ups: grab a nearby one, then replace it on land elsewhere ──
@@ -524,7 +605,8 @@ impl Prowl {
             anc.cooldown = (anc.cooldown - dt).max(0.0);
             let d = dist(self.x, self.z, anc.x, anc.z);
             if d < CLAIM_R && anc.ready() {
-                anc.claim += dt;
+                let cache_mult = if self.class == Class::Squirrel { 1.3 } else { 1.0 };
+                anc.claim += dt * cache_mult;
                 if anc.claim >= CLAIM_TIME {
                     anc.claim = 0.0; anc.cooldown = ANCESTOR_CD; anc.claimed_by = Some(PLAYER_CLAN);
                     self.buffs.grant(anc.stored);       // the ancestors bestow their stored buff
@@ -554,6 +636,9 @@ impl Prowl {
             }
         }
 
+        // ── autoattack: advance the in-progress move, land hits on the hunter/rivals ──
+        self.step_combat(dt);
+
         // ── clan minions: border patrol + intruder defense ──
         self.step_minions(dt);
 
@@ -578,16 +663,21 @@ impl Prowl {
     }
 
     fn step_hunter(&mut self, dt: f32) {
+        if self.hunter_stagger > 0.0 { return; }   // dazed by a landed hit — frozen this frame
         let p = self.hunter_kind.params();
         // outside the ring, cover no longer conceals you
         let eff_hidden = self.hidden && !self.exposed;
         let sees = hunter::detects(self.hunter_kind, self.hx, self.hz, self.hheading, self.x, self.z, self.moving, eff_hidden);
+        // Goat's Sure-Footed passive: harder to spot while up in the mountains
+        let sure_footed = self.class == Class::Goat && Class::terrain_at(self.x, self.z) == 2;
         if sees {
-            self.suspicion = (self.suspicion + dt * 2.4 * self.difficulty).min(1.5);
+            self.suspicion = (self.suspicion + dt * 2.4 * self.difficulty * if sure_footed { 0.7 } else { 1.0 }).min(1.5);
             self.last_seen = Some((self.x, self.z));
         } else {
             let stage_bonus = if self.on_staging { 1.2 } else { 0.0 };   // a claimed tree cools the hunt
-            self.suspicion = (self.suspicion - dt * (if eff_hidden { 1.6 } else { 0.5 } + stage_bonus)).max(0.0);
+            // Frog's Camouflage passive: suspicion melts away faster while hidden
+            let camo_bonus = if eff_hidden && self.class == Class::Frog { 1.0 } else { 0.0 };
+            self.suspicion = (self.suspicion - dt * (if eff_hidden { 1.6 } else { 0.5 } + stage_bonus + camo_bonus)).max(0.0);
         }
         let prev = self.hstate;
         self.hstate = if sees && self.suspicion > 0.9 { HState::Chase }
@@ -712,6 +802,7 @@ mod tests {
     #[test]
     fn getting_caught_respawns_the_prowler() {
         let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.nine_lives_used = true;   // test generic catch behaviour, not Nine Lives
         // put the hunter on top, locked on
         g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
         g.hstate = HState::Chase; g.suspicion = 1.4;
@@ -726,6 +817,7 @@ mod tests {
     #[test]
     fn a_shield_soaks_a_catch_instead_of_respawning() {
         let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.nine_lives_used = true;   // test the shield, not Nine Lives
         g.buffs.grant(Power::Shield);
         g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
         g.hstate = HState::Chase; g.suspicion = 1.4;
@@ -789,6 +881,7 @@ mod tests {
     #[test]
     fn respawn_rallies_at_a_claimed_ancestor() {
         let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.nine_lives_used = true;   // test the rally point, not Nine Lives
         g.ancestors[0].claimed_by = Some(0);
         let (ax, az) = (g.ancestors[0].x, g.ancestors[0].z);
         g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;   // caught out in the open
@@ -942,16 +1035,162 @@ mod tests {
                 let (mut pc, mut cc) = (0u32, 0u32);
                 for t in 0..(60 * 30) {
                     g.set_input((t as f32 * 0.10).sin(), (t as f32 * 0.08).cos(), t % 40 == 0, t % 25 == 0, t % 12 < 3);
+                    if t % 17 == 0 { g.player_flick(((t as f32 * 0.37).sin(), (t as f32 * 0.29).cos()), 1.0, t % 34 == 0); }
                     g.step(1.0 / 30.0);
                     assert!(g.stamina >= 0.0 && g.stamina <= 1.0, "stamina out of range {} ({cls:?}/{hk:?})", g.stamina);
                     assert!(g.x.is_finite() && g.z.is_finite() && g.hx.is_finite() && g.hz.is_finite(), "position not finite");
                     assert!(g.x.abs() <= MAP + 1.0 && g.z.abs() <= MAP + 1.0, "prowler left the map");
                     assert!(g.hx.abs() <= MAP + 1.0 && g.hz.abs() <= MAP + 1.0, "hunter left the map");
                     assert!(g.prey_caught >= pc && g.times_caught >= cc, "a tally went backwards");
+                    assert!(g.hunter_stagger >= 0.0 && g.combo_flash >= 0.0, "combat timers went negative");
+                    for r in &g.rivals { assert!(r.stagger >= 0.0 && r.x.is_finite() && r.z.is_finite(), "rival state broke"); }
                     pc = g.prey_caught; cc = g.times_caught;
                 }
             }
         }
+    }
+
+    #[test]
+    fn cat_nine_lives_cheats_the_first_catch_only() {
+        let mut g = Prowl::new(Class::Cat, Kind::Dog);
+        g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.times_caught, 0, "the first catch is cheated by Nine Lives");
+        assert!(g.nine_lives_used);
+        // a second catch is not cheated
+        g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.times_caught, 1, "only the first life is free");
+    }
+
+    #[test]
+    fn squirrel_cache_claims_ancestor_trees_faster() {
+        let claim_progress = |cls: Class| -> f32 {
+            let mut g = Prowl::new(cls, Kind::Fox);
+            g.hx = 900.0; g.hz = 900.0;
+            let (ax, az) = (g.ancestors[0].x, g.ancestors[0].z);
+            g.x = ax; g.z = az;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            g.ancestors[0].claim
+        };
+        assert!(claim_progress(Class::Squirrel) > claim_progress(Class::Cat) + 1e-6,
+            "Cache should claim ancestor trees faster than a class without it");
+    }
+
+    #[test]
+    fn otter_slipstream_never_tires_sprinting_in_water() {
+        let mut g = Prowl::new(Class::Otter, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        // find a water point to stand in
+        let mut wx = 0.0; let mut wz = 0.0; let mut found = false;
+        for i in -60..60 {
+            let (x, z) = (i as f32 * 3.0, 0.0);
+            if world::height_at(x, z) < world::WATER_Y { wx = x; wz = z; found = true; break; }
+        }
+        assert!(found, "expected some water on the map");
+        g.x = wx; g.z = wz; g.stamina = 0.5;
+        g.ring = Ring::new(wx, wz, 1e6, 1e6, 1.0, 0.0);   // isolate: no ring-exposure drain
+        g.set_input(1.0, 0.0, false, false, false);   // sprint
+        let s0 = g.stamina;
+        g.step(1.0 / 30.0);
+        assert!(g.stamina >= s0 - 1e-4, "Slipstream should prevent stamina drain while sprinting in water");
+    }
+
+    #[test]
+    fn frog_camouflage_decays_suspicion_faster_when_hidden() {
+        let decay = |cls: Class| -> f32 {
+            let mut g = Prowl::new(cls, Kind::Fox);
+            g.x = 0.0; g.z = 0.0; g.bushes.push((0.0, 0.0, 4.0));
+            g.hx = 900.0; g.hz = 900.0;   // hunter far away, doesn't see us
+            g.suspicion = 1.0;
+            g.set_input(0.0, 0.0, false, false, true);   // crouch/hide
+            g.step(1.0 / 30.0);
+            1.0 - g.suspicion
+        };
+        assert!(decay(Class::Frog) > decay(Class::Cat) + 1e-6, "Camouflage should decay suspicion faster while hidden");
+    }
+
+    #[test]
+    fn goat_sure_footed_builds_less_suspicion_on_mountains() {
+        let build = |cls: Class| -> f32 {
+            let mut g = Prowl::new(cls, Kind::Fox);
+            // find a mountain point and stand there in plain view of a point-blank hunter
+            let mut mx = 0.0; let mut mz = 0.0; let mut found = false;
+            for i in -60..60 {
+                let (x, z) = (i as f32 * 3.0, 0.0);
+                if world::height_at(x, z) > 1.9 { mx = x; mz = z; found = true; break; }
+            }
+            assert!(found, "expected some mountain on the map");
+            g.x = mx; g.z = mz; g.hx = mx; g.hz = mz;
+            g.hheading = 0.0; g.suspicion = 0.0;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            g.suspicion
+        };
+        assert!(build(Class::Goat) < build(Class::Cat) - 1e-6, "Sure-Footed should build less suspicion on mountains");
+    }
+
+    #[test]
+    fn hawk_keen_eyes_always_senses_the_hunter() {
+        let mut g = Prowl::new(Class::Hawk, Kind::Fox);
+        g.hx = 123.0; g.hz = 456.0;
+        assert_eq!(g.keen_eyes_hunter(), Some((123.0, 456.0)));
+        let mut c = Prowl::new(Class::Cat, Kind::Fox);
+        c.hx = 123.0; c.hz = 456.0;
+        assert_eq!(c.keen_eyes_hunter(), None, "only the Hawk has Keen Eyes");
+    }
+
+    #[test]
+    fn a_flick_attack_staggers_the_hunter_and_rattles_suspicion() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.x = 0.0; g.z = 0.0; g.hx = 1.0; g.hz = 0.0;   // point-blank
+        g.suspicion = 1.0;
+        g.player_flick((0.0, 1.0), 1.0, false);   // forward flick → Pounce
+        assert_eq!(g.player_move.map(|(m, _)| m), Some(crate::combat::Move::Pounce));
+        for _ in 0..10 { g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); if g.hunter_stagger > 0.0 { break; } }
+        assert!(g.hunter_stagger > 0.0, "a connecting pounce should stagger the hunter");
+        assert!(g.suspicion < 1.0, "and rattle its suspicion");
+    }
+
+    #[test]
+    fn a_staggered_hunter_is_frozen() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hunter_stagger = 0.5;
+        let (hx0, hz0) = (g.hx, g.hz);
+        g.hstate = HState::Chase;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!((g.hx, g.hz), (hx0, hz0), "a dazed hunter shouldn't move");
+    }
+
+    #[test]
+    fn a_flick_attack_interrupts_a_rivals_claim() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let (rx, rz) = (g.rivals[0].x, g.rivals[0].z);
+        g.x = rx + 1.0; g.z = rz; g.heading = 0.0;
+        g.rivals[0].dwell = 1.0;   // mid-claim
+        // forward flick with the low modifier → underbelly swipe (a real attack)
+        g.player_flick((0.0, 1.0), 1.0, true);
+        for _ in 0..10 { g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); if g.rivals[0].stagger > 0.0 { break; } }
+        assert!(g.rivals[0].stagger > 0.0, "a connecting hit should daze the rival");
+        assert_eq!(g.rivals[0].dwell, 0.0, "and interrupt its claim");
+    }
+
+    #[test]
+    fn flicks_chain_into_a_named_combo_in_prowl() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.player_flick((1.0, 0.0), 1.0, false);   // Roll
+        while g.player_move.is_some() { g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); }
+        g.player_flick((0.0, 1.0), 1.0, false);   // Pounce within the combo window
+        assert_eq!(g.player_move.map(|(m, _)| m), Some(crate::combat::Move::Pounce));
+        assert!(g.combo_flash > 0.0, "Roll into Pounce should flash the Ambush Pounce combo");
     }
 
     #[test]

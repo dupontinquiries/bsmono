@@ -30,6 +30,8 @@ const FC_CD: f32 = 1.6;
 const PICKUP_R: f32 = 1.6;
 const PU_INTERVAL: f32 = 8.0;
 const LEAP_DUR: f32 = 0.32;
+const MOVE_REACH: f32 = 3.2;    // melee autoattack range
+const ULT_CD_MULT: f32 = 1.8;   // stretch the shared Ability's cooldown to feel like an ultimate
 
 const YARN_SPAWNS: [(f32, f32); 6] = [(-20.0, -18.0), (20.0, -18.0), (-20.0, 18.0), (20.0, 18.0), (0.0, -22.0), (0.0, 22.0)];
 const PU_SPAWNS: [(f32, f32); 6] = [(-30.0, 0.0), (30.0, 0.0), (0.0, 0.0), (-14.0, -40.0), (14.0, 40.0), (0.0, -8.0)];
@@ -98,6 +100,13 @@ pub struct Capture {
     pu_spawn_t: f32,
     tick: u32,
     input: Option<(f32, f32, bool, bool)>,   // mx, mz, throw, jump
+    pub player_move: Option<(crate::combat::Move, f32)>,   // player's in-progress autoattack
+    pub combo_last: Option<(crate::combat::Move, f32)>,
+    pub combo_flash: f32,
+    pub combo_name: &'static str,
+    pub ability_cd: f32,      // the player's ultimate (class.ability())
+    pub ability_t: f32,
+    ability_want: bool,
 }
 
 impl Capture {
@@ -121,10 +130,60 @@ impl Capture {
             }
         }
         let yarn_free = YARN_SPAWNS.to_vec();
-        Capture { mobs, yarn_free, crackers: Vec::new(), powerups: Vec::new(), score: [0, 0], period: 1, period_t: PERIOD_LEN, time: 0.0, outcome: None, overtime: false, bases, pu_spawn_t: PU_INTERVAL, tick: 0, input: None }
+        Capture { mobs, yarn_free, crackers: Vec::new(), powerups: Vec::new(), score: [0, 0], period: 1, period_t: PERIOD_LEN, time: 0.0, outcome: None, overtime: false, bases, pu_spawn_t: PU_INTERVAL, tick: 0, input: None,
+            player_move: None, combo_last: None, combo_flash: 0.0, combo_name: "", ability_cd: 0.0, ability_t: 0.0, ability_want: false }
     }
 
     pub fn set_input(&mut self, mx: f32, mz: f32, throw: bool, jump: bool) { self.input = Some((mx, mz, throw, jump)); }
+
+    /// Perform a flick — the same gesture-driven autoattack as Prowl/the 6v1 mode
+    /// (ported from `combat.rs`). `dir_local` is the flick in the player's local frame
+    /// (`.1` forward, `.0` right). Chains combos, and a landed hit stuns the nearest
+    /// enemy in range and makes it drop any yarn it's carrying — a melee option
+    /// alongside the firecracker throw.
+    pub fn player_flick(&mut self, dir_local: (f32, f32), mag: f32, low: bool) {
+        use crate::combat::{combo, resolve_flick, COMBO_WINDOW};
+        if self.player_move.is_some() { return; }
+        let mut mv = match resolve_flick(dir_local, mag, low) { Some(m) => m, None => return };
+        if let Some((prev, since)) = self.combo_last {
+            if since < COMBO_WINDOW {
+                if let Some((name, finisher)) = combo(prev, mv) {
+                    mv = finisher; self.combo_name = name; self.combo_flash = 1.0;
+                }
+            }
+        }
+        self.player_move = Some((mv, 0.0));
+    }
+
+    /// Press the player's ultimate (class.ability()), consumed on the next `step`.
+    pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
+    pub fn ability_ready(&self) -> bool { self.ability_cd <= 0.0 && self.ability_t <= 0.0 }
+
+    /// Advance the player's in-progress autoattack, land a hit on the nearest stunnable
+    /// enemy on the frame it turns active, and tick the combo window.
+    fn step_combat(&mut self, dt: f32) {
+        self.combo_flash = (self.combo_flash - dt * 1.5).max(0.0);
+        if let Some((m, s)) = self.combo_last { let ns = s + dt; self.combo_last = if ns > 1.0 { None } else { Some((m, ns)) }; }
+        if let Some((mv, t)) = self.player_move {
+            let sp = crate::combat::spec(mv);
+            let nt = t + dt;
+            if mv.is_attack() && t < sp.windup && nt >= sp.windup {
+                let power = if self.combo_flash > 0.0 { sp.power * crate::combat::COMBO_POWER_BONUS } else { sp.power };
+                let (px, pz, pteam) = { let p = &self.mobs[0]; (p.x, p.z, p.team) };
+                if let Some(m) = self.mobs.iter_mut().skip(1)
+                    .filter(|m| m.team != pteam && !m.stunned())
+                    .find(|m| dist(px, pz, m.x, m.z) < MOVE_REACH)
+                {
+                    if m.buffs.absorb_hit() {
+                        m.stun_t = m.class.def().stun * (0.5 + power * 0.35);
+                        if m.carrying { m.carrying = false; let (mx, mz) = (m.x, m.z); self.yarn_free.push((mx, mz)); }
+                        self.mobs[0].stuns += 1;
+                    }
+                }
+            }
+            self.player_move = if nt >= mv.total() { self.combo_last = Some((mv, 0.0)); None } else { Some((mv, nt)) };
+        }
+    }
 
     fn spawn_powerup(&mut self) {
         let i = (self.tick.wrapping_mul(2_654_435_761) >> 8) as usize % PU_SPAWNS.len();
@@ -149,10 +208,11 @@ impl Capture {
 
     fn explode(&mut self, cx: f32, cz: f32, owner: usize) {
         let owner_team = self.mobs[owner].team;
+        let player_invuln = self.ability_t > 0.0 && self.mobs[0].class.ability().invuln();
         let mut drops: Vec<(f32, f32)> = Vec::new();
         let mut credited = 0u32;
-        for m in self.mobs.iter_mut() {
-            if m.stunned() { continue; }
+        for (i, m) in self.mobs.iter_mut().enumerate() {
+            if m.stunned() || (i == 0 && player_invuln) { continue; }
             if dist(m.x, m.z, cx, cz) < FC_RADIUS {
                 if !m.buffs.absorb_hit() { continue; }       // shield soaks the blast
                 m.stun_t = m.class.def().stun;
@@ -194,6 +254,17 @@ impl Capture {
         self.pu_spawn_t -= dt;
         if self.pu_spawn_t <= 0.0 { self.spawn_powerup(); self.pu_spawn_t = PU_INTERVAL; }
 
+        // ── the player's ultimate (class.ability()) ──
+        self.ability_cd = (self.ability_cd - dt).max(0.0);
+        self.ability_t = (self.ability_t - dt).max(0.0);
+        if self.ability_want && self.ability_cd <= 0.0 && self.ability_t <= 0.0 && !self.mobs[0].stunned() {
+            let ab = self.mobs[0].class.ability();
+            self.ability_t = ab.duration();
+            self.ability_cd = ab.cooldown() * ULT_CD_MULT;
+        }
+        self.ability_want = false;
+        if self.ability_t > 0.0 && self.mobs[0].class.ability().invuln() { self.mobs[0].stun_t = 0.0; }   // untouchable — shrug off any stun this frame
+
         // ── decide each mob's move, then integrate ──
         let n = self.mobs.len();
         let mut throws: Vec<(usize, u32)> = Vec::new();
@@ -225,12 +296,16 @@ impl Capture {
             // integrate movement at the terrain-and-buff-scaled speed
             let base = self.mobs[i].class.speed_at(self.mobs[i].x, self.mobs[i].z);
             let leap_mult = if self.mobs[i].leap_t > 0.0 { 1.0 + self.mobs[i].class.def().jump * 0.06 } else { 1.0 };
-            let speed = base * self.mobs[i].buffs.move_mult() * leap_mult;
+            let ult_mult = if i == 0 && self.ability_t > 0.0 { self.mobs[0].class.ability().speed_mult() } else { 1.0 };
+            let speed = base * self.mobs[i].buffs.move_mult() * leap_mult * ult_mult;
             let m = &mut self.mobs[i];
             m.x = (m.x + dx * speed * dt).clamp(-ARENA, ARENA);
             m.z = (m.z + dz * speed * dt).clamp(-ARENA, ARENA);
         }
         for (i, cnt) in throws { self.throw_from(i, cnt); }
+
+        // ── the player's flick autoattack: advance the move, land a stun on a nearby enemy ──
+        self.step_combat(dt);
 
         // ── yarn pickup + capture at base ──
         for i in 0..n {
@@ -340,6 +415,62 @@ mod tests {
     use super::*;
 
     fn settle(g: &mut Capture, secs: f32) { for _ in 0..(secs * 30.0) as i32 { g.step(1.0 / 30.0); } }
+
+    #[test]
+    fn a_flick_attack_stuns_a_nearby_enemy_and_drops_their_yarn() {
+        let mut g = Capture::new(Class::Cat);
+        let enemy = g.mobs.iter().position(|m| m.team == SILVER).unwrap();
+        g.mobs[enemy].x = g.mobs[0].x + 1.0; g.mobs[enemy].z = g.mobs[0].z;
+        g.mobs[enemy].carrying = true;
+        let stuns0 = g.mobs[0].stuns;
+        g.player_flick((0.0, 1.0), 1.0, false);   // forward flick → Pounce
+        assert_eq!(g.player_move.map(|(m, _)| m), Some(crate::combat::Move::Pounce));
+        for _ in 0..10 { g.set_input(0.0, 0.0, false, false); g.step(1.0 / 30.0); if g.mobs[0].stuns > stuns0 { break; } }
+        assert!(g.mobs[0].stuns > stuns0, "a connecting flick should stun the nearby enemy");
+        assert!(g.mobs[enemy].stunned());
+        assert!(!g.mobs[enemy].carrying, "and make it drop its yarn");
+        assert!(!g.yarn_free.is_empty());
+    }
+
+    #[test]
+    fn flicks_chain_into_a_named_combo_in_capture() {
+        let mut g = Capture::new(Class::Cat);
+        g.player_flick((1.0, 0.0), 1.0, false);   // Roll
+        while g.player_move.is_some() { g.set_input(0.0, 0.0, false, false); g.step(1.0 / 30.0); }
+        g.player_flick((0.0, 1.0), 1.0, false);   // Pounce within the combo window
+        assert_eq!(g.player_move.map(|(m, _)| m), Some(crate::combat::Move::Pounce));
+        assert!(g.combo_flash > 0.0, "Roll into Pounce should flash the Ambush Pounce combo");
+    }
+
+    #[test]
+    fn the_ultimate_engages_and_speeds_the_player() {
+        let mut g = Capture::new(Class::Squirrel);   // Scamper — a speed burst
+        g.set_ability(true);
+        g.set_input(0.0, 1.0, false, false);
+        let z0 = g.mobs[0].z;
+        g.step(1.0 / 30.0);
+        assert!(g.ability_t > 0.0 && g.ability_cd > 0.0, "the ultimate engages and goes on cooldown");
+        let with = g.mobs[0].z - z0;
+        let mut h = Capture::new(Class::Squirrel);
+        h.set_input(0.0, 1.0, false, false);
+        let z1 = h.mobs[0].z;
+        h.step(1.0 / 30.0);
+        let without = h.mobs[0].z - z1;
+        assert!(with > without + 1e-3, "Scamper should cover more ground than normal movement");
+    }
+
+    #[test]
+    fn an_invulnerable_ultimate_shrugs_off_a_stun() {
+        let mut g = Capture::new(Class::Otter);   // Dive — invuln
+        g.set_ability(true);
+        g.set_input(0.0, 0.0, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.ability_t > 0.0);
+        g.mobs[0].stun_t = 1.0;   // try to stun the player while the ultimate is active
+        g.set_input(0.0, 0.0, false, false);
+        g.step(1.0 / 30.0);
+        assert!(!g.mobs[0].stunned(), "Dive's invulnerability should shrug off a stun");
+    }
 
     #[test]
     fn bases_are_placed_on_dry_land() {
