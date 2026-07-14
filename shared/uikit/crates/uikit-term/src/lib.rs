@@ -657,6 +657,27 @@ pub fn render_grid(
     }
 }
 
+/// Cell/font-size bounds for pinch-to-zoom — clamped so the terminal never becomes illegibly
+/// tiny or so huge it can't fit any real content. The cell dimensions scale proportionally with
+/// font_size, keeping the same aspect ratio as the default (8.5/13.0 wide, 17.0/13.0 tall).
+/// Cell/font-size bounds and ratio — named constants for what was three duplicated magic-number
+/// sets (`apply_settings`, `apply_pinch`, and this module) before this pass. `set_font_size` is now
+/// the single place that computes cell-from-font; `apply_settings`/`apply_pinch` both delegate to it.
+pub const MIN_FONT_SIZE: f32 = 7.0;
+pub const MAX_FONT_SIZE: f32 = 48.0;
+const DEFAULT_FONT_SIZE: f32 = 13.0;
+const CELL_W_RATIO: f32 = 0.62;
+const CELL_H_RATIO: f32 = 1.3;
+
+/// A tap or long-press's resolved terminal position + (for long-press) what it selected.
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    /// The row this selection is on, if any.
+    pub row: Option<usize>,
+    /// The selected text (a word for a tap-and-hold on it, a whole line for a long-press).
+    pub text: String,
+}
+
 /// A minimal voiceterm view: the terminal, current prefs, and settings adoption. The egui
 /// `main` connects a PTY to `terminal.feed_bytes` and calls `render` each frame; the voice and
 /// mail panes attach here later.
@@ -665,7 +686,8 @@ pub struct App {
     pub prefs: settings_kit::Prefs,
     pub cell: (f32, f32),
     pub font_size: f32,
-    /// Multitouch input (pinch-to-zoom the terminal, swipe, fling) via the shared kit bridge.
+    /// Multitouch input (pinch-to-zoom the terminal, tap-to-select-word, long-press-to-select-line)
+    /// via the shared kit bridge.
     pub touch: uikit_egui::touch::TouchSource,
     pub recognizer: uikit_egui::touch::GestureRecognizer,
     /// In-screen find state; `search_open` toggles the search bar.
@@ -674,6 +696,11 @@ pub struct App {
     /// Cursor interaction mode + its glide/pulse state — see `CursorMode`/`CursorAnim`.
     pub cursor_mode: CursorMode,
     cursor_anim: CursorAnim,
+    /// The most recent tap/long-press selection (word or line) — cleared by the caller once read.
+    pub selection: Option<Selection>,
+    /// The grid size `fit_to` last resized to, so it's a no-op when the available area hasn't
+    /// actually changed (resizing the grid drops any columns/rows that no longer fit).
+    fitted_size: Option<(usize, usize)>,
 }
 
 impl App {
@@ -681,15 +708,47 @@ impl App {
         App {
             terminal: Terminal::new(cols, rows),
             prefs: settings_kit::Prefs::default(),
-            cell: (8.5, 17.0),
-            font_size: 13.0,
+            cell: (DEFAULT_FONT_SIZE * CELL_W_RATIO, DEFAULT_FONT_SIZE * CELL_H_RATIO),
+            font_size: DEFAULT_FONT_SIZE,
             touch: uikit_egui::touch::TouchSource::new(),
             recognizer: uikit_egui::touch::GestureRecognizer::new(uikit_egui::touch::Config::default()),
             search: SearchState::default(),
             search_open: false,
             cursor_mode: CursorMode::default(), // Slide, matching the QML's default
             cursor_anim: CursorAnim::default(),
+            selection: None,
+            fitted_size: None,
         }
+    }
+
+    /// Resize the terminal grid to fill `avail` at the current cell size — the fix for the
+    /// terminal not tracking its actual pane/window size (it used to stay at whatever cols/rows
+    /// `new()` was given forever, so resizing the window either left dead space or clipped the
+    /// grid). Call once per frame with `ui.available_size()` before `render`; a no-op if the
+    /// computed cols/rows haven't changed since the last call.
+    pub fn fit_to(&mut self, avail: egui::Vec2) {
+        let cols = ((avail.x / self.cell.0).floor() as usize).max(1);
+        let rows = ((avail.y / self.cell.1).floor() as usize).max(1);
+        if self.fitted_size != Some((cols, rows)) {
+            self.terminal.grid.resize(cols, rows);
+            self.fitted_size = Some((cols, rows));
+        }
+    }
+
+    /// Set the font size directly (clamped to [`MIN_FONT_SIZE`], [`MAX_FONT_SIZE`]), recomputing
+    /// the cell size to match — the two must move together or text stops fitting its own cells.
+    pub fn set_font_size(&mut self, size: f32) {
+        self.font_size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
+        self.cell = (self.font_size * CELL_W_RATIO, self.font_size * CELL_H_RATIO);
+    }
+
+    /// Convert a screen position to a (col, row) in the grid, given the terminal's on-screen
+    /// origin. `None` if the position falls outside the grid.
+    fn cell_at(&self, origin: egui::Pos2, pos: egui::Pos2) -> Option<(usize, usize)> {
+        let rel = pos - origin;
+        if rel.x < 0.0 || rel.y < 0.0 { return None; }
+        let (col, row) = ((rel.x / self.cell.0) as usize, (rel.y / self.cell.1) as usize);
+        if col < self.terminal.grid.cols && row < self.terminal.grid.rows { Some((col, row)) } else { None }
     }
 
     /// Consume this frame's keyboard/paste events into the input line. Returns `Some(command)` on Enter
@@ -759,25 +818,37 @@ impl App {
         self.prefs = prefs.clone();
         uikit_egui::apply_prefs(ctx, prefs);
         // scale the monospace cell to the text-size preference
-        self.font_size = 13.0 * prefs.touch.text_scale.max(0.5);
-        self.cell = (self.font_size * 0.62, self.font_size * 1.3);
+        self.set_font_size(DEFAULT_FONT_SIZE * prefs.touch.text_scale.max(0.5));
     }
 
     /// Apply a pinch scale factor to the terminal font (pure; clamped to a readable range).
     pub fn apply_pinch(&mut self, rel: f32) {
-        let f = (self.font_size * rel).clamp(7.0, 48.0);
-        self.font_size = f;
-        self.cell = (f * 0.62, f * 1.3);
+        self.set_font_size(self.font_size * rel);
     }
 
-    /// Poll multitouch for this frame and apply it: pinch zooms the terminal font. Returns whether
-    /// fling momentum is still gliding, so the caller can `ctx.request_repaint()`. Graceful — no
-    /// touch input means no gestures and a no-op.
-    pub fn handle_gestures(&mut self, ctx: &egui::Context) -> bool {
+    /// Poll multitouch for this frame and fold it into terminal actions: a tap selects the word
+    /// under it, a long-press selects the whole line, and a pinch live-scales the font. Returns
+    /// whether fling momentum is still gliding, so the caller can `ctx.request_repaint()`.
+    /// Graceful — no touch input means no gestures and a no-op. `origin` is the terminal's
+    /// on-screen top-left (`ui.min_rect().min`, the same value `render` uses) — needed to resolve
+    /// a tap/long-press's screen position to a grid cell.
+    pub fn handle_gestures(&mut self, ctx: &egui::Context, origin: egui::Pos2) -> bool {
         let (gestures, gliding) = self.touch.poll(ctx, &mut self.recognizer);
         for g in gestures {
-            if let uikit_egui::touch::Gesture::Pinch { rel, .. } = g {
-                self.apply_pinch(rel);
+            match g {
+                uikit_egui::touch::Gesture::Pinch { rel, .. } => self.apply_pinch(rel),
+                uikit_egui::touch::Gesture::Tap(p) => {
+                    if let Some((col, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
+                        let word = word_at(&self.terminal.grid.row_text(row), col);
+                        self.selection = Some(Selection { row: Some(row), text: word });
+                    }
+                }
+                uikit_egui::touch::Gesture::LongPress(p) => {
+                    if let Some((_, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
+                        self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.row_text(row) });
+                    }
+                }
+                _ => {}
             }
         }
         gliding
@@ -827,6 +898,19 @@ pub struct SearchMatch {
     pub line: usize,
     pub col: usize,
     pub len: usize,
+}
+
+/// The word at character-column `col` in `line` (whitespace-delimited), for tap-to-select.
+/// Character-indexed (safe for multibyte); an empty string if `col` lands on whitespace or past
+/// the end of the line.
+pub fn word_at(line: &str, col: usize) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    if col >= chars.len() || chars[col].is_whitespace() {
+        return String::new();
+    }
+    let start = chars[..col].iter().rposition(|c| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
+    let end = chars[col..].iter().position(|c| c.is_whitespace()).map(|i| col + i).unwrap_or(chars.len());
+    chars[start..end].iter().collect()
 }
 
 /// Case-insensitive search of `lines` for `query`, returning every non-overlapping hit in reading
@@ -893,6 +977,105 @@ impl SearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_at_finds_the_whitespace_delimited_word() {
+        assert_eq!(word_at("hello world", 0), "hello");
+        assert_eq!(word_at("hello world", 4), "hello");
+        assert_eq!(word_at("hello world", 6), "world");
+        assert_eq!(word_at("hello world", 10), "world");
+        assert_eq!(word_at("hello world", 5), "", "landing on the space itself is empty");
+        assert_eq!(word_at("hello world", 999), "", "past the end of the line is empty");
+        assert_eq!(word_at("", 0), "");
+    }
+
+    #[test]
+    fn word_at_handles_multibyte_characters_by_char_index_not_byte_index() {
+        // "café bar" — é is multibyte; a naive byte-index would panic or mis-slice
+        let line = "café bar";
+        assert_eq!(word_at(line, 2), "café");
+        assert_eq!(word_at(line, 5), "bar");
+    }
+
+    #[test]
+    fn fit_to_resizes_the_grid_to_the_available_space() {
+        let mut app = App::new(80, 24);
+        app.set_font_size(10.0); // a known cell size to compute against
+        let (cw, ch) = app.cell;
+        app.fit_to(egui::vec2(cw * 40.0, ch * 10.0));
+        assert_eq!(app.terminal.grid.cols, 40);
+        assert_eq!(app.terminal.grid.rows, 10);
+    }
+
+    #[test]
+    fn fit_to_is_a_no_op_when_the_computed_size_hasnt_changed() {
+        let mut app = App::new(80, 24);
+        app.set_font_size(10.0);
+        let (cw, ch) = app.cell;
+        app.fit_to(egui::vec2(cw * 40.0, ch * 10.0));
+        // feed some content, then fit again at the SAME size — the grid (and its content) must
+        // not have been reset by a redundant resize
+        app.terminal.feed("hello");
+        app.fit_to(egui::vec2(cw * 40.0, ch * 10.0));
+        assert_eq!(app.terminal.grid.row_text(0), "hello", "a same-size fit_to must not clear the grid");
+    }
+
+    #[test]
+    fn fit_to_never_produces_a_zero_sized_grid() {
+        let mut app = App::new(80, 24);
+        app.fit_to(egui::vec2(0.0, 0.0));
+        assert!(app.terminal.grid.cols >= 1 && app.terminal.grid.rows >= 1, "a collapsed pane shouldn't zero out the grid");
+    }
+
+    #[test]
+    fn set_font_size_clamps_to_the_readable_range_and_keeps_cell_in_ratio() {
+        let mut app = App::new(80, 24);
+        app.set_font_size(1.0); // absurdly small
+        assert_eq!(app.font_size, MIN_FONT_SIZE);
+        app.set_font_size(500.0); // absurdly large
+        assert_eq!(app.font_size, MAX_FONT_SIZE);
+        app.set_font_size(20.0);
+        assert_eq!(app.font_size, 20.0);
+        assert!((app.cell.0 - 20.0 * CELL_W_RATIO).abs() < 1e-4);
+        assert!((app.cell.1 - 20.0 * CELL_H_RATIO).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_pinch_and_apply_settings_share_the_same_clamped_setter() {
+        // regression guard for the three-duplicated-magic-numbers bug: both paths must land on
+        // exactly the same cell size for the same font size, since they now delegate to the same
+        // set_font_size rather than each recomputing cell independently.
+        let mut a = App::new(80, 24);
+        let mut b = App::new(80, 24);
+        a.set_font_size(22.0);
+        b.apply_pinch(22.0 / DEFAULT_FONT_SIZE);
+        assert!((a.cell.0 - b.cell.0).abs() < 1e-3);
+        assert!((a.cell.1 - b.cell.1).abs() < 1e-3);
+        assert_eq!(a.font_size, b.font_size);
+    }
+
+    #[test]
+    fn tap_selects_the_word_and_long_press_selects_the_line() {
+        let mut app = App::new(80, 24);
+        app.terminal.feed("hello world");
+        let origin = egui::pos2(0.0, 0.0);
+        let (cw, ch) = app.cell;
+        // a tap in the middle of "world" (col ~8) should select "world"
+        let tap_pos = egui::pos2(cw * 8.5, ch * 0.5);
+        if let Some((col, row)) = app.cell_at(origin, tap_pos) {
+            let word = word_at(&app.terminal.grid.row_text(row), col);
+            app.selection = Some(Selection { row: Some(row), text: word });
+        }
+        assert_eq!(app.selection.as_ref().map(|s| s.text.as_str()), Some("world"));
+    }
+
+    #[test]
+    fn cell_at_returns_none_outside_the_grid() {
+        let app = App::new(80, 24);
+        assert!(app.cell_at(egui::pos2(0.0, 0.0), egui::pos2(-5.0, -5.0)).is_none(), "negative offset is off-grid");
+        let far = egui::pos2(app.cell.0 * 1000.0, app.cell.1 * 1000.0);
+        assert!(app.cell_at(egui::pos2(0.0, 0.0), far).is_none(), "far past the last column/row is off-grid");
+    }
 
     #[test]
     fn cursor_slide_glides_to_target_and_stops() {
