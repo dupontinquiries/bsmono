@@ -20,6 +20,12 @@ pub struct AppEntry {
     pub name: String,
     pub is_cargo: bool, // has Cargo.toml (a Rust app/workspace)
     pub is_git: bool,   // has a .git (a recognised repository)
+    /// The registered egui port's manifest path + curated notes, if `manifest/projects.toml` has
+    /// one for this app (e.g. `apps/voiceterm` → `apps/voiceterm/egui-frontend`) — lets gitmind's
+    /// own app catalog point straight at "here's the egui port and how it's built", instead of a
+    /// developer needing to separately know about the manifest and `build/build.sh`. `None` when
+    /// the manifest wasn't available to check, or the app has no registered port yet.
+    pub egui_port: Option<ManifestEntry>,
 }
 
 impl AppEntry {
@@ -27,6 +33,69 @@ impl AppEntry {
     pub fn is_app(&self) -> bool {
         self.is_cargo || self.is_git
     }
+}
+
+/// One `[apps.*]` entry read from `manifest/projects.toml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestEntry {
+    pub app_id: String,
+    pub path: String,
+    pub notes: String,
+}
+
+/// Parse `manifest/projects.toml`'s `[apps.*]` sections into a flat list. Minimal hand-rolled
+/// line scanning (matching this file's existing `json_field`-style tiny extractors) rather than
+/// a full TOML dependency — the manifest's shape (`[apps.NAME]` sections, quoted string values)
+/// doesn't need one. Pure — no filesystem access; the caller reads the file.
+pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
+    let mut out = Vec::new();
+    let mut cur: Option<(String, String, String)> = None; // (app_id, path, notes)
+    let flush = |cur: &mut Option<(String, String, String)>, out: &mut Vec<ManifestEntry>| {
+        if let Some((id, path, notes)) = cur.take() {
+            if !path.is_empty() {
+                out.push(ManifestEntry { app_id: id, path, notes });
+            }
+        }
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if let Some(rest) = line.strip_prefix("[apps.").and_then(|r| r.strip_suffix(']')) {
+            flush(&mut cur, &mut out);
+            cur = Some((rest.to_string(), String::new(), String::new()));
+            continue;
+        }
+        if line.starts_with('[') {
+            flush(&mut cur, &mut out); // a different table — this app's section ended
+            continue;
+        }
+        if let Some((_, path, notes)) = cur.as_mut() {
+            if let Some(v) = toml_string_value(line, "path") { *path = v; }
+            if let Some(v) = toml_string_value(line, "notes") { *notes = v; }
+        }
+    }
+    flush(&mut cur, &mut out);
+    out
+}
+
+/// `key = "value"` (ignoring inline `# comments` after the closing quote) → `value`. `None` if
+/// `line` isn't an assignment to `key` or the value isn't a quoted string.
+fn toml_string_value(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Find the manifest entry (if any) whose path is `apps/{app_name}/...` or `games/{app_name}/...`
+/// — the egui port registered for a locally-browsed app directory.
+pub fn egui_port_for(app_name: &str, manifest_entries: &[ManifestEntry]) -> Option<ManifestEntry> {
+    manifest_entries.iter()
+        .find(|e| {
+            let p = &e.path;
+            p.starts_with(&format!("apps/{app_name}/")) || p.starts_with(&format!("games/{app_name}/"))
+        })
+        .cloned()
 }
 
 /// Richer details shown once an app is selected.
@@ -63,6 +132,7 @@ pub fn parse_app_listing(body: &str) -> Vec<AppEntry> {
                 name: name.to_string(),
                 is_cargo: flags.contains('c'),
                 is_git: flags.contains('g'),
+                egui_port: None, // remote listings don't carry the local manifest
             })
         })
         .collect()
@@ -164,10 +234,22 @@ pub fn scan_dir(root: &Path) -> Vec<AppEntry> {
             name: name.clone(),
             is_cargo: ent.path().join("Cargo.toml").exists(),
             is_git: ent.path().join(".git").exists(),
+            egui_port: None, // scan_dir alone doesn't read the manifest — see enrich_with_manifest
         });
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Fill in each entry's `egui_port` from an already-read `manifest/projects.toml`. Separate from
+/// `scan_dir` itself so the plain directory scan stays filesystem-only and testable without a
+/// manifest fixture; callers that have the manifest (gitmind's own cockpit, browsing the
+/// monorepo's `apps/`/`games/` dirs) call this right after.
+pub fn enrich_with_manifest(entries: &mut [AppEntry], manifest_text: &str) {
+    let parsed = parse_manifest(manifest_text);
+    for e in entries.iter_mut() {
+        e.egui_port = egui_port_for(&e.name, &parsed);
+    }
 }
 
 /// Gather one app's details from the local filesystem. Local — unit-tested.
@@ -228,6 +310,90 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SAMPLE_MANIFEST: &str = r#"
+[apps.voiceterm]
+path = "apps/voiceterm"
+kind = "cargo"
+
+[apps.voiceterm-egui]
+path = "apps/voiceterm/egui-frontend"
+kind = "cargo"
+role = "app"
+runtime = "none"
+notes = "the egui-primary port of voiceterm (Qt/QML terminal) — see UI_STRATEGY.md. Defaults to the Voice palette."
+
+[apps.bo-suite-egui]
+path = "apps/bo-suite/egui-frontend"
+kind = "cargo"
+notes = "the egui-primary port of bo-controller."
+
+[apps.logscope]
+path = "apps/logscope"
+kind = "cargo"
+"#;
+
+    #[test]
+    fn parse_manifest_reads_path_and_notes_per_app_section() {
+        let entries = parse_manifest(SAMPLE_MANIFEST);
+        let egui = entries.iter().find(|e| e.app_id == "voiceterm-egui").expect("voiceterm-egui entry");
+        assert_eq!(egui.path, "apps/voiceterm/egui-frontend");
+        assert!(egui.notes.contains("Qt/QML terminal"));
+        // an app section with no notes field should still parse (empty notes, not dropped)
+        let logscope = entries.iter().find(|e| e.app_id == "logscope").expect("logscope entry");
+        assert_eq!(logscope.notes, "");
+    }
+
+    #[test]
+    fn parse_manifest_handles_multiple_sections_and_stops_at_the_next_table() {
+        let entries = parse_manifest(SAMPLE_MANIFEST);
+        assert_eq!(entries.len(), 4);
+        // voiceterm's section shouldn't have picked up voiceterm-egui's notes
+        let voiceterm = entries.iter().find(|e| e.app_id == "voiceterm").unwrap();
+        assert_eq!(voiceterm.notes, "");
+    }
+
+    #[test]
+    fn egui_port_for_matches_the_apps_prefix_convention() {
+        let entries = parse_manifest(SAMPLE_MANIFEST);
+        let port = egui_port_for("voiceterm", &entries).expect("voiceterm should have a registered egui port");
+        assert_eq!(port.app_id, "voiceterm-egui");
+        assert_eq!(port.path, "apps/voiceterm/egui-frontend");
+
+        let bo = egui_port_for("bo-suite", &entries).expect("bo-suite should have a registered egui port");
+        assert_eq!(bo.app_id, "bo-suite-egui");
+
+        assert!(egui_port_for("logscope", &entries).is_none(), "logscope has no separate -egui entry in this sample");
+        assert!(egui_port_for("nonexistent-app", &entries).is_none());
+    }
+
+    #[test]
+    fn enrich_with_manifest_fills_in_scanned_entries() {
+        let mut entries = vec![
+            AppEntry { name: "voiceterm".into(), is_cargo: true, is_git: false, egui_port: None },
+            AppEntry { name: "logscope".into(), is_cargo: true, is_git: false, egui_port: None },
+        ];
+        enrich_with_manifest(&mut entries, SAMPLE_MANIFEST);
+        assert!(entries[0].egui_port.is_some(), "voiceterm should get its egui port filled in");
+        assert_eq!(entries[0].egui_port.as_ref().unwrap().app_id, "voiceterm-egui");
+        assert!(entries[1].egui_port.is_none(), "logscope has none in this sample");
+    }
+
+    #[test]
+    fn parse_manifest_against_the_real_manifest_finds_known_egui_ports() {
+        // a light integration check against the actual file, not just the hand-built sample —
+        // if this ever goes empty, either the manifest moved or the parser regressed.
+        let real = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../manifest/projects.toml")
+        );
+        let Ok(real) = real else { return }; // path layout may differ off this checkout; skip gracefully
+        let entries = parse_manifest(&real);
+        for known in ["voiceterm-egui", "rusty-board-egui", "bo-suite-egui", "bot-arena-egui", "snapclone-egui"] {
+            assert!(entries.iter().any(|e| e.app_id == known), "expected {known} in the real manifest");
+        }
+        assert!(egui_port_for("voiceterm", &entries).is_some());
+        assert!(egui_port_for("rusty-board", &entries).is_some());
+    }
 
     #[test]
     fn parses_remote_listing_flags() {
