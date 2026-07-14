@@ -13,6 +13,11 @@ name = "voiceterm-egui"
 path = "src/bin/voiceterm_egui.rs"
 required-features = ["app"]
 
+[[bin]]
+name = "terminal-standalone"
+path = "src/bin/terminal_standalone.rs"
+required-features = ["app"]
+
 [features]
 default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
