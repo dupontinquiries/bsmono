@@ -50,6 +50,10 @@ impl eframe::App for VoicetermApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.app.handle_input(ui);
             let term_rect = ui.available_rect_before_wrap();
+            self.app.fit_to(term_rect.size()); // keep the grid matching the actual pane size
+            if self.app.handle_gestures(ctx, term_rect.min) {
+                ctx.request_repaint(); // fling momentum still gliding
+            }
             self.app.render(ui, &self.colors);
             paint_terminal_border(ui, term_rect, &self.colors);
 
@@ -65,7 +69,15 @@ impl eframe::App for VoicetermApp {
 
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
-    app.terminal.feed("$ echo hello\r\nhello\r\n$ ls\r\nfeel.rs  main.rs  Cargo.toml\r\n$ ");
+    // realistic content, not a toy script — to actually surface rendering gotchas (colors,
+    // wrapping, unicode) rather than just confirming an empty prompt renders.
+    app.terminal.feed("$ ls --color\r\n");
+    app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
+    app.terminal.feed("$ echo \"a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\"\r\n");
+    app.terminal.feed("a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\r\n");
+    app.terminal.feed("$ echo café 🚀 你好\r\n"); // multibyte + emoji + CJK, straight in the source
+    app.terminal.feed("café 🚀 你好\r\n");
+    app.terminal.feed("$ ");
     let colors = uikit_egui::palette_colors("voice");
     let sidebar = Sidebar::new(vec![
         Session { name: "kesslerd".into(), count: 5 },
