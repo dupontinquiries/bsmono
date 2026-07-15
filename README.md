@@ -17,7 +17,7 @@ GPUs under Asahi Linux — where PyTorch has no GPU backend at all.
 
 | Path         | What it is | Language |
 |--------------|------------|----------|
-| `pipeline/`  | The music GAN: sharded-SQLite mel cache (stable hash-based sharding), DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, and a cache diagnostic. | Python / PyTorch |
+| `pipeline/`  | The music GAN: sharded-SQLite mel cache (stable hash-based sharding), DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, a cache diagnostic, and a coevolutionary population trainer. | Python / PyTorch |
 | `vocoder/`   | HiFi-GAN-style neural vocoder that inverts the pipeline's exact mel representation (mel → waveform), replacing Griffin-Lim. | Python / PyTorch |
 | `gpu/`       | Rust port of both trainers (GAN + vocoder) on the Burn framework's **Vulkan** backend, so training runs on the Apple GPU with no CUDA. Reads the same SQLite cache. | Rust / Burn |
 | `explorer/`  | Web-based latent-space explorer — live mel spectrogram, 2D navigator, latent sliders, A/B morph, presets. Runs standalone (demo synth) or against a model server. | HTML/JS + FastAPI |
@@ -77,7 +77,21 @@ python augment.py groups   --cache cache   # see how many tracks got a blend par
 ```
 Then wrap your dataset in training: `AugmentedDataset(OpusMelDataset(cfg), cache_dir=cfg.cache_dir, blend_prob=0.35)`.
 
+**Population-based (coevolutionary) training** — trains a population of
+generators and discriminators, cross-playing every pair each round and using
+the resulting score matrix to select and mutate. Guards against the kind of
+single-pairing stagnation this project has already hit once (a frozen
+discriminator, or a generator that only learns to exploit one discriminator's
+blind spot):
+```bash
+cd pipeline
+python population_trainer.py train --data ./music --pop 4 --rounds 500 --inner-iters 20
+python population_trainer.py test    # synthetic self-check, no audio needed
+```
+Checkpoints (`gen_best_*.pt`) are ordinary `Generator` state_dicts — load them
+anywhere a `gan-zai-v5.3.py` checkpoint works (the explorer, `server.py`, etc).
 
+**Train the vocoder** (better + faster than Griffin-Lim):
 ```bash
 cd vocoder
 python vocoder.py train --data ./music --iters 200000 --batch 16
