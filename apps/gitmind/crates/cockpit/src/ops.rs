@@ -273,6 +273,67 @@ pub fn build_locally_logged(
     }
 }
 
+/// Run the fleet-wide `build/build.sh` orchestrator (the same script driving CI/manual builds —
+/// the manifest/projects.toml-driven "build everything" path, distinct from `build_locally_logged`
+/// above which builds ONE app's crate directly). `only` narrows to a single manifest app id
+/// (matches `build.sh --only NAME`); `None` builds the whole fleet. Always passes `--run` — a plan-
+/// only dry run wouldn't give the GUI anything meaningful to report back. Streams both stdout and
+/// stderr live, interleaved in the order the script actually produced them (build.sh writes plan
+/// info to stdout and per-app build progress to stderr-or-stdout depending on the tool; separating
+/// the two would reorder them in a way that's harder to follow, not easier).
+pub fn run_build_all_script(repo_root: &Path, only: Option<&str>, on_line: &mut dyn FnMut(&str)) -> Result<String, String> {
+    use std::io::{BufRead, BufReader};
+    let script = repo_root.join("build").join("build.sh");
+    if !script.exists() {
+        return Err(format!("no build/build.sh at {} — is this the monorepo root?", repo_root.display()));
+    }
+    let mut argv = vec!["--run".to_string()];
+    if let Some(name) = only {
+        argv.push("--only".to_string());
+        argv.push(name.to_string());
+    }
+    on_line(&format!("$ bash build/build.sh {}", argv.join(" ")));
+    let mut child = std::process::Command::new("bash")
+        .arg(&script)
+        .args(&argv)
+        .current_dir(repo_root)
+        .env("PATH", tool_path_env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run build.sh: {e}"))?;
+    // interleave stdout/stderr by reading stdout on this thread and stderr on a spawned one,
+    // both pushing into the same on_line sink — `on_line` itself isn't required to be Sync, so
+    // route stderr lines through a channel instead of sharing the callback across threads.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stderr = child.stderr.take();
+    let stderr_thread = stderr.map(|err| {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        })
+    });
+    drop(tx);
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            on_line(&line);
+        }
+    }
+    if let Some(h) = stderr_thread { let _ = h.join(); }
+    for line in rx.try_iter() { on_line(&line); }
+    let status = child.wait().map_err(|e| format!("build.sh wait failed: {e}"))?;
+    if status.success() {
+        Ok(match only {
+            Some(name) => format!("✓ {name} built"),
+            None => "✓ fleet build complete".to_string(),
+        })
+    } else {
+        Err(format!("build.sh failed (exit {})", status.code().unwrap_or(-1)))
+    }
+}
+
 /// Does a workspace under `dir` contain a MEMBER package literally named `name`? If so, `-p name`
 /// resolves (build that member); if not (gitmind: members are `gitmind-cli` etc., no `gitmind`), we
 /// must build `--bin name` instead. Bounded walk; skips target/.git.
