@@ -45,6 +45,12 @@ python gan-zai-v5.3.py plot  --log checkpoints/train_log.csv --out progress.png
 >
 > Both mean **old checkpoints aren't worth resuming from** — start a fresh run
 > rather than `--resume`.
+>
+> v5.3 also fixed a dataset-size-dependent slowdown: training restarted its
+> DataLoader iterator every epoch, and a small (or bugged, artificially
+> shrunk) dataset hit that restart far more often than a correctly-sized one —
+> a real, verifiable code cause, not thermal throttling. Fixed with an
+> infinite sampler so the iterator is built once for the whole run.
 
 **Explore what it learned.** Open `explorer/index.html` for the standalone demo,
 or serve a checkpoint for real output:
