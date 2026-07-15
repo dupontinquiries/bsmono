@@ -44,6 +44,48 @@ pub fn launch_argv(g: &GameEntry) -> Vec<String> {
     }
 }
 
+/// The quick-match hook: same launch, plus a `--quick-match` flag each game can read to skip
+/// straight into a simple match instead of the main menu. Today every game just ignores the flag
+/// (none read it yet — this is the seam the per-game menu work builds on, one game at a time; see
+/// `games/soldier/src/multiplayer.rs` for the first real online-play wiring it'll eventually hook
+/// into). Separate from `launch_argv` so a game can diverge further later (its own binary flag
+/// spelling, a distinct quick-match entry point, etc.) without disturbing the plain launch path.
+pub fn quick_match_argv(g: &GameEntry) -> Vec<String> {
+    let mut argv = launch_argv(g);
+    match &g.kind {
+        LaunchKind::Cargo => argv.push("--quick-match".into()),
+        LaunchKind::CmakeBin(_) => argv.push("--quick-match".into()),
+    }
+    argv
+}
+
+/// Add a friend by id: looks them up first (so a typo'd/unknown id gives a clear error instead of
+/// silently growing the friends list with a dead entry), appends if not already a friend, and
+/// republishes `me`. Returns the friend's display name on success.
+pub fn add_friend<P: ProfileBackend, F: ProfileBackend>(
+    me: &mut Profile,
+    svc: &mut netcode::store::ProfileService<P, F>,
+    friend_id: &str,
+) -> Result<String, String> {
+    let friend_id = friend_id.trim();
+    if friend_id.is_empty() {
+        return Err("enter a friend's id first".into());
+    }
+    if friend_id == me.id {
+        return Err("that's your own id".into());
+    }
+    let (found, _reach) = svc.lookup(friend_id);
+    let Some(friend) = found else {
+        return Err(format!("no one is published under \"{friend_id}\" yet"));
+    };
+    if me.friends.iter().any(|f| f == friend_id) {
+        return Err(format!("{} is already a friend", friend.name));
+    }
+    me.friends.push(friend_id.to_string());
+    svc.publish(me);
+    Ok(friend.name)
+}
+
 /// A friend row for the centre's roster.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FriendRow {
@@ -98,6 +140,48 @@ mod tests {
         assert_eq!(launch_argv(claw), vec!["cargo", "run", "--release", "--manifest-path", "games/clawbound/Cargo.toml"]);
         let cyber = r.iter().find(|g| g.id == "blackstar").unwrap();
         assert_eq!(launch_argv(cyber), vec!["games/blackstar/build/blackstar"]);
+    }
+
+    #[test]
+    fn quick_match_argv_appends_the_flag_to_the_plain_launch() {
+        let r = registry();
+        let claw = r.iter().find(|g| g.id == "clawbound").unwrap();
+        let mut want = launch_argv(claw);
+        want.push("--quick-match".into());
+        assert_eq!(quick_match_argv(claw), want);
+    }
+
+    #[test]
+    fn add_friend_requires_the_id_to_be_published() {
+        let mut svc = svc();
+        let mut me = Profile::new("me@0", "Me");
+        let err = add_friend(&mut me, &mut svc, "nobody@1").unwrap_err();
+        assert!(err.contains("nobody@1"));
+        assert!(me.friends.is_empty());
+    }
+
+    #[test]
+    fn add_friend_rejects_your_own_id_and_blank_input() {
+        let mut svc = svc();
+        let mut me = Profile::new("me@0", "Me");
+        assert!(add_friend(&mut me, &mut svc, "me@0").is_err());
+        assert!(add_friend(&mut me, &mut svc, "  ").is_err());
+    }
+
+    #[test]
+    fn add_friend_succeeds_once_and_rejects_the_duplicate() {
+        let mut svc = svc();
+        let bob = Profile::new("bob@1", "Bob");
+        svc.publish(&bob);
+        let mut me = Profile::new("me@0", "Me");
+
+        let name = add_friend(&mut me, &mut svc, "bob@1").expect("bob is published");
+        assert_eq!(name, "Bob");
+        assert_eq!(me.friends, vec!["bob@1".to_string()]);
+
+        let err = add_friend(&mut me, &mut svc, "bob@1").unwrap_err();
+        assert!(err.contains("already a friend"));
+        assert_eq!(me.friends.len(), 1, "must not add bob twice");
     }
 
     fn svc() -> ProfileService<SnapcoreStore, SnapcoreStore> {
