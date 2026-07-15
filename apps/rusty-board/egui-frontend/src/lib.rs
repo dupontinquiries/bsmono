@@ -348,6 +348,27 @@ pub fn keyboard_ui(ui: &mut Ui, layout: &Layout, adaptive: &Adaptive, palette: &
     emitted
 }
 
+/// Same as `keyboard_ui`, but also routes the tapped key's emit code through `registry` under the
+/// key's own id (the same `SignalRegistry<()>` shape rusty-board's GTK original uses via
+/// `signal_kit::Signal<Key>` on `KeyWidget` — see key_widget.rs). Additive: `keyboard_ui` itself
+/// is untouched (existing callers reading its `Option<String>` return keep working unchanged);
+/// this is for a caller that wants shared app logic (something both the GTK and egui front-ends
+/// can subscribe to identically) to also see key presses, without threading the return value
+/// through by hand at every call site.
+pub fn keyboard_ui_with_signal(
+    ui: &mut Ui,
+    layout: &Layout,
+    adaptive: &Adaptive,
+    palette: &str,
+    registry: &signal_kit::SignalRegistry<()>,
+) -> Option<String> {
+    let emitted = keyboard_ui(ui, layout, adaptive, palette);
+    if let Some(id) = &emitted {
+        registry.emit(id, ());
+    }
+    emitted
+}
+
 /// Paint one key as a carved rounded tile with a centered label; returns true on tap.
 ///
 /// When `glass` is set (the System palette — gitmind/rusty-board's shared "system utilities" look), keys
