@@ -11,6 +11,7 @@ keywords = ["keyboard", "input-method", "gtk", "wayland", "voice"]
 categories = ["accessibility", "gui"]
 
 [dependencies]
+signal-kit = { path = "../../shared/signal-kit" }
 # GTK4 and Adwaita
 # All gtk-rs crates must be from the same release matrix; mixing causes
 # duplicate `links = "gtk-4"` errors at link time. The 0.10/0.21 matrix
