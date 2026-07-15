@@ -50,6 +50,26 @@ WHAT CHANGED vs v5.2 (fixes the "5535 mels built but only 740 valid" bug)
     new hash-based scheme (the whole point is that index-based shard identity
     is unreliable). A full cache rebuild is required once; re-run
     `diagnose_cache.py` afterward to confirm rows==matched for every shard.
+  * DATASET-SIZE-DEPENDENT SLOWDOWN. Training wrapped a normal DataLoader in
+    a generator that called `for batch in dataloader` repeatedly, so every
+    time one epoch's worth of batches was exhausted (N_tracks / batch_size
+    batches), the DataLoader's iterator was torn down and rebuilt, re-syncing
+    the persistent worker pool. With a small (or bugged, artificially shrunk
+    by the sharding issue above) dataset this happened far more often than
+    with a correctly-sized one -- e.g. every ~23 batches at 740 tracks vs.
+    every ~176 at 5630 -- a plausible, code-level (not thermal) source of a
+    per-iteration slowdown that tracked track count. Fixed with an
+    `_InfiniteSampler` that yields shuffled indices forever, so the
+    DataLoader's iterator is created exactly once for the entire run,
+    independent of dataset size. Verified stable ~17-20ms/it with zero
+    climbing on a deliberately tiny 20-track dataset (the worst-case regime
+    for the old restart pattern).
+  * The printed/logged `ms/it` used to be a CUMULATIVE average from the start
+    of training (total elapsed / total iterations so far), which mathematically
+    lags any real change in per-iteration cost -- a real regime change looks
+    like a slow drift rather than what it actually is, and always understates
+    the current rate. It's now a windowed average over just the iterations
+    since the last log line, so it reflects the true current rate.
   * GENERATOR EMA. A shadow copy of G is kept as an exponential moving average
     of its weights (decay --ema-decay, default 0.999, with an early warmup so it
     tracks fast while weights move fast). The raw generator's output oscillates
@@ -541,13 +561,6 @@ def save_checkpoint(cfg, step, netG, netD, optG, optD, netG_ema=None):
     torch.save(export.state_dict(), os.path.join(cfg.ckpt_dir, f"gen_{step}.pt"))
 
 
-def _infinite(dataloader):
-    """Yield batches forever so the loop is driven by iteration count."""
-    while True:
-        for batch in dataloader:
-            yield batch
-
-
 # --------------------------------------------------------------------------- #
 # Training
 # --------------------------------------------------------------------------- #
@@ -556,6 +569,35 @@ def _instance_noise_sigma(cfg: Config, step: int) -> float:
     if cfg.instance_noise_sigma <= 0 or step >= cfg.instance_noise_iters:
         return 0.0
     return cfg.instance_noise_sigma * (1.0 - step / cfg.instance_noise_iters)
+
+
+class _InfiniteSampler(torch.utils.data.Sampler):
+    """Yields shuffled indices forever, so the DataLoader's iterator never
+    hits an end-of-epoch and never has to be re-created.
+
+    v5.3 fix: training used to wrap a normal DataLoader in a Python generator
+    that called `for batch in dataloader` repeatedly, re-invoking __iter__()
+    every time one epoch's worth of batches was exhausted. With N tracks and
+    batch size B that's every N/B batches -- e.g. every ~23 batches for a
+    740-track dataset (the sharding bug's symptom) vs. every ~176 for the
+    correct 5630-track one. Each restart re-syncs the persistent worker pool
+    and index sampler, so a smaller (or buggy, artificially-shrunk) dataset
+    paid this cost far more often -- a plausible, code-level (not thermal)
+    contributor to a per-iteration slowdown that varies with track count.
+    An infinite sampler removes the restart boundary entirely: one iterator,
+    one worker handshake, for the whole run, independent of dataset size."""
+    def __init__(self, n: int, seed: int = 0):
+        self.n = n
+        self.seed = seed
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        while True:
+            yield from torch.randperm(self.n, generator=g).tolist()
+
+    def __len__(self):
+        return 2**62  # DataLoader only uses this for a (harmless) length hint
 
 
 def train(cfg: Config, batch_size: int, device: torch.device,
@@ -570,7 +612,8 @@ def train(cfg: Config, batch_size: int, device: torch.device,
     dataset = OpusMelDataset(cfg)
     if len(dataset) < batch_size:
         raise SystemExit(f"Only {len(dataset)} tracks available; need >= batch size {batch_size}.")
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+    dataloader = DataLoader(dataset, batch_size=batch_size,
+                            sampler=_InfiniteSampler(len(dataset)),
                             drop_last=True, num_workers=workers,
                             persistent_workers=workers > 0)
 
@@ -605,8 +648,9 @@ def train(cfg: Config, batch_size: int, device: torch.device,
 
     print(f"Training on {device} ({workers} loader workers). "
           f"Target {cfg.max_iters} iters. Ctrl-C is safe -- resume with --resume.")
-    batches = _infinite(dataloader)
-    t0 = time.time()
+    batches = iter(dataloader)  # one iterator, never restarted, for the whole run
+    t_window = time.time()
+    its_since_log = 0
 
     for step in range(start_step, cfg.max_iters):
         real_imgs = next(batches).to(device)
@@ -644,12 +688,15 @@ def train(cfg: Config, batch_size: int, device: torch.device,
             ema_update(netG_ema, netG, decay)
 
         sampleG = netG_ema if netG_ema is not None else netG
+        its_since_log += 1
 
         if step % cfg.log_every == 0:
             with torch.no_grad():
                 d_real = torch.sigmoid(d_real_logits).mean().item()
                 d_fake = torch.sigmoid(d_fake_logits).mean().item()
-            ms = (time.time() - t0) / (step - start_step + 1) * 1000
+            ms = (time.time() - t_window) / its_since_log * 1000
+            t_window = time.time()
+            its_since_log = 0
             print(f"[{step}/{cfg.max_iters}] D: {lossD.item():.4f} G: {lossG.item():.4f} "
                   f"| D(real): {d_real:.2f} D(fake): {d_fake:.2f} "
                   f"| noise: {sigma:.3f} ({ms:.0f}ms/it)")
