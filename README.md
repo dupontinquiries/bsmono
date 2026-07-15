@@ -32,10 +32,19 @@ cd pipeline
 python gan-zai-v5.3.py train --data ./music --batch 32 --workers 4
 python gan-zai-v5.3.py plot  --log checkpoints/train_log.csv --out progress.png
 ```
-> v5.3 fixed a real cache-sharding bug (files could silently get orphaned from
-> their shard whenever the library size changed, e.g. 5535 mels built but only
-> 740 "valid"). If you have a cache built with v5.2 or earlier, delete `cache/`
-> and rebuild once — `diagnose_cache.py` (below) confirms whether you need to.
+> v5.3 fixed two real bugs found from actual training runs:
+> 1. **Cache sharding** — files could silently get orphaned from their shard
+>    whenever the library size changed (5535 mels built, only 740 "valid").
+>    Delete `cache/` and rebuild once; `diagnose_cache.py` confirms if you need to.
+> 2. **Discriminator gradient death** — a hard activation-sparsity threshold in
+>    `SparseBlock` had exactly zero gradient below threshold, and could (and
+>    did, in a real run) collapse the whole discriminator into a permanently
+>    frozen, input-independent state after ~150 iterations: identical
+>    D/G/D(real)/D(fake) logged for 40,000+ iterations straight. Fixed with a
+>    smooth sigmoid gate that's never exactly zero-gradient.
+>
+> Both mean **old checkpoints aren't worth resuming from** — start a fresh run
+> rather than `--resume`.
 
 **Explore what it learned.** Open `explorer/index.html` for the standalone demo,
 or serve a checkpoint for real output:

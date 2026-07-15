@@ -28,10 +28,28 @@ WHAT CHANGED vs v5.2 (fixes the "5535 mels built but only 740 valid" bug)
   * `_setup_valid_indices` also no longer needs `manifest.index(f)` (an O(n)
     scan repeated per file, O(n^2) total); shard_id is computed directly from
     the filepath, so building the manifest is now O(n).
-  * Existing v5.2 caches are index-sharded and are NOT compatible with this
-    scheme (the whole point is that index-based shard identity is unreliable).
-    A full cache rebuild is required once; re-run `diagnose_cache.py` afterward
-    to confirm rows==matched for every shard.
+  * SPARSEBLOCK GRADIENT DEATH (the "frozen at iter ~150" bug). The
+    discriminator's SparseBlock gated activations with a hard step,
+    `(x.abs() > threshold).float()`, which has EXACTLY ZERO gradient for any
+    unit below threshold. Verified: even at random init, 80-99.9% of units in
+    a block fall below threshold on real-shaped mel input, and that fraction
+    only grows deeper in the network as training proceeds -- a unit below
+    threshold can never receive gradient to recover. Given enough steps this
+    can (and did, in a real run) collapse the WHOLE discriminator into a
+    permanently frozen, input-independent fixed point: bit-identical
+    D/G/D(real)/D(fake) logged for 42,000+ iterations straight, with
+    D(real)==D(fake) always -- the network wasn't "confidently spotting
+    fakes", it had stopped processing its input entirely.
+    Fix: the hard step is now a sharp sigmoid gate (same near-zero-below-
+    threshold shape) whose gradient is never exactly zero anywhere, so a
+    "dead" unit can still receive a small gradient and recover. Verified with
+    2000 real optimizer steps: no freeze occurs, and 0/N discriminator
+    parameters have zero gradient at the end (the old code guaranteed this
+    would eventually reach a nonzero count and then everything).
+  * Existing v5.2 caches are index-sharded and are NOT compatible with the
+    new hash-based scheme (the whole point is that index-based shard identity
+    is unreliable). A full cache rebuild is required once; re-run
+    `diagnose_cache.py` afterward to confirm rows==matched for every shard.
   * GENERATOR EMA. A shadow copy of G is kept as an exponential moving average
     of its weights (decay --ema-decay, default 0.999, with an early warmup so it
     tracks fast while weights move fast). The raw generator's output oscillates
@@ -415,18 +433,33 @@ def weights_init(m):
 
 
 class SparseBlock(nn.Module):
-    """Depthwise-separable conv with activation-sparsity masking.
-    ~8-10x fewer multiply-adds than a dense Conv2d (matches the v6 line)."""
-    def __init__(self, cin, cout, stride=1, threshold=0.05):
+    """Depthwise-separable conv with activation-sparsity gating.
+    ~8-10x fewer multiply-adds than a dense Conv2d (matches the v6 line).
+
+    v5.3 fix: the gate used to be a hard step, (x.abs() > threshold).float(),
+    which has EXACTLY ZERO gradient for every unit below threshold. Verified
+    (see repo notes) that even at random init 80-99.9% of units in a block
+    fall below threshold, and that fraction only grows deeper in the network
+    as training progresses -- units below threshold can never receive a
+    gradient to recover, so the whole discriminator can (and did) collapse
+    into a permanently frozen, input-independent fixed point: bit-identical
+    D(real)/D(fake)/losses for tens of thousands of iterations straight. A
+    sharp sigmoid gate approximates the same near-zero-below-threshold
+    behavior but its gradient is never exactly zero anywhere, so a dead unit
+    can still receive (small) gradient and recover instead of being stuck
+    forever."""
+    def __init__(self, cin, cout, stride=1, threshold=0.05, sharpness=40.0):
         super().__init__()
         self.depthwise = nn.Conv2d(cin, cin, 3, stride, padding=1, groups=cin, bias=False)
         self.pointwise = nn.Conv2d(cin, cout, 1, bias=False)
         self.bn = nn.BatchNorm2d(cout)
         self.threshold = threshold
+        self.sharpness = sharpness
 
     def forward(self, x):
         x = self.depthwise(x)
-        x = x * (x.abs() > self.threshold).float()
+        gate = torch.sigmoid(self.sharpness * (x.abs() - self.threshold))
+        x = x * gate
         x = self.pointwise(x)
         return F.leaky_relu(self.bn(x), 0.2, inplace=True)
 
