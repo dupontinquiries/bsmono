@@ -7,6 +7,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 netview = { path = "../../shared/netview" }
+# Real online play control-plane: session announce/discover over the fleet DHT (the same seam
+# bsgames proves in host_then_join_over_the_fleet_dht). Pure Rust, no native deps — builds headless.
+netcode = { path = "../shared/netcode" }
 # Pure-Rust immediate-mode GUI. The whole game core renders into egui::epaint::Mesh,
 # so it builds & tests with NO native/windowing deps. This is the reference path.
 egui = "0.34"
