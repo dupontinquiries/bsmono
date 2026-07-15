@@ -1,0 +1,10 @@
+[package]
+name = "signal-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A single, toolkit-agnostic Signal<T> that GTK, Qt/QML, and egui bridges all connect the same way — so app logic subscribes once instead of being re-wired per GUI backend. No dependency on any GUI toolkit; pure Rust."
+
+[dependencies]
+
+[workspace]
