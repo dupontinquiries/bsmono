@@ -100,10 +100,11 @@ generate -> Wrote mel tensors to samp_test/  (mel_0_32x32.bin, mel_1_32x32.bin)
 The mel dumps read back correctly as f32 [-1,1] in numpy, and `tools/mel2audio.py` converts
 them to wav.
 
-## Two GPU trainers (full pipeline on Vulkan)
+## Three GPU trainers (full pipeline on Vulkan)
 
-Both models in the pipeline now train on the Apple GPU — this crate builds two
-binaries sharing the same Burn/Vulkan setup:
+The pipeline's models train on the Apple GPU, plus the coevolutionary
+population trainer — this crate builds three binaries sharing the same
+Burn/Vulkan setup:
 
 - **`beatspace-gpu`** (`src/main.rs`) — the music GAN.
 - **`vocoder`** (`src/bin/vocoder.rs`) — the HiFi-GAN-style neural vocoder
@@ -112,27 +113,45 @@ binaries sharing the same Burn/Vulkan setup:
   DFT-matmul** — GPUs run matmuls well. Generator (Conv1d / ConvTranspose1d at
   8·8·2·2 = 256 = hop, dilated residual blocks), a 5-period discriminator, LS-GAN
   + feature-matching + multi-res STFT losses.
+- **`population`** (`src/bin/population.rs`) — the GPU port of
+  `pipeline/population_trainer.py`. Maintains a population of generators and
+  discriminators, cross-plays every pair each round (a full score matrix),
+  and replaces weak members with a Gaussian-perturbed (mutated) copy of a
+  random survivor, using a hand-written `ModuleMapper` (`AddNoise`) to perturb
+  every parameter tensor in a cloned model — Burn's public mechanism for
+  "apply this transform to every tensor in the module tree" (the same one
+  the framework itself uses internally for things like `no_grad()`). Reuses
+  `model.rs`'s `Generator`/`Discriminator` directly, shared via
+  `#[path = "../model.rs"] mod model;` (binary targets in a lib-less crate
+  don't share modules by default).
 
 ```bash
 WGPU_BACKEND=vulkan cargo run --release --bin beatspace-gpu -- train --cache cache
 WGPU_BACKEND=vulkan cargo run --release --bin vocoder      -- train --iters 200000
+WGPU_BACKEND=vulkan cargo run --release --bin population   -- train --pop 4 --rounds 200 --inner-iters 20
 ```
 
-Both verified running through a real Vulkan ICD (lavapipe here; Honeykrisp on
-your GPU). The vocoder on Vulkan:
+All three verified running through a real Vulkan ICD (lavapipe here; Honeykrisp
+on your GPU). The population trainer on Vulkan (small config for a fast check):
 ```
-G: mel[2,32,8] -> wav[2,1,2048]          # smoke: exact 8·256 upsample
-MPD(period 3): logits[2,27], 6 feature maps
-[0/3] D:5.011 G:27.480 stft:8.200 adv:4.654 fm:1.163
-[2/3] D:4.144 G:27.115 stft:8.279 adv:3.766 fm:1.326   # D + adv decreasing
+one (G,D) pair, 2 inner iters: D(real)=0.416 D(fake)=0.412
+mutated generator forward -> [2, 1, 32, 32]   # mutation + forward both OK
+[round 0/4] G fitness best=0.499 mean=0.493 | D fitness best=0.001 mean=-0.001 | replaced G[1,2] D[2,1]
+[round 3/4] G fitness best=0.522 mean=0.522 | D fitness best=0.002 mean=0.000 | replaced G[1,2] D[1,0]
+Done. Best generator fitness: 0.522
 ```
-Env `BS_NMELS / BS_CH / BS_SEG / BS_BATCH` shrink the vocoder for quick checks;
-unset for the real 128-mel model.
+Per-round timing (24s -> 12s -> 4s -> 4s) shows the same Vulkan kernel-cache
+warm-up pattern seen in the other two binaries. `BS_MUTATE_FRAC`/
+`BS_MUTATION_STD` tune the population; `BS_NMELS/BS_TF/BS_GF/BS_DF` shrink it
+for quick checks, unset for the real 128-mel model.
 
-The vocoder trainer uses synthetic (mel, wav) pairs for the GPU-compute proof;
-real training needs waveform targets, so wire in an audio→(mel,wav) loader — the
-same pattern as `src/data.rs`, but reading audio (e.g. via `symphonia`) and
+The vocoder and population trainers both use synthetic data for the
+GPU-compute proof; real training needs waveform targets (vocoder) or the real
+mel cache (population), so wire in an audio→(mel,wav) loader — the same
+pattern as `src/data.rs`, but reading audio (e.g. via `symphonia`) and
 computing the aligned mel, exactly as `vocoder.py` does on the Python side.
+Since population training is `pop_size^2` pairings per round, it's the mode
+where GPU throughput matters most once real data is wired in.
 
 ## Full GAN run on your Apple GPU
 

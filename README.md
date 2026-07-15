@@ -19,7 +19,7 @@ GPUs under Asahi Linux — where PyTorch has no GPU backend at all.
 |--------------|------------|----------|
 | `pipeline/`  | The music GAN: sharded-SQLite mel cache (stable hash-based sharding), DCGAN generator/discriminator, resumable iteration-based training with health metrics, generator EMA, progress plots, a BPM/key-aware augmentation module, a cache diagnostic, and a coevolutionary population trainer. | Python / PyTorch |
 | `vocoder/`   | HiFi-GAN-style neural vocoder that inverts the pipeline's exact mel representation (mel → waveform), replacing Griffin-Lim. | Python / PyTorch |
-| `gpu/`       | Rust port of both trainers (GAN + vocoder) on the Burn framework's **Vulkan** backend, so training runs on the Apple GPU with no CUDA. Reads the same SQLite cache. | Rust / Burn |
+| `gpu/`       | Rust port of all three trainers (GAN + vocoder + coevolutionary population) on the Burn framework's **Vulkan** backend, so training runs on the Apple GPU with no CUDA. Reads the same SQLite cache. | Rust / Burn |
 | `explorer/`  | Web-based latent-space explorer — live mel spectrogram, 2D navigator, latent sliders, A/B morph, presets. Runs standalone (demo synth) or against a model server. | HTML/JS + FastAPI |
 
 Each directory has its own README with details and exact commands.
@@ -102,6 +102,7 @@ python vocoder.py train --data ./music --iters 200000 --batch 16
 cd gpu
 WGPU_BACKEND=vulkan cargo run --release --bin beatspace-gpu -- train --cache ../pipeline/cache
 WGPU_BACKEND=vulkan cargo run --release --bin vocoder       -- train
+WGPU_BACKEND=vulkan cargo run --release --bin population    -- train --pop 4 --rounds 200
 ```
 
 ## The GPU story
