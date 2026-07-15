@@ -61,66 +61,80 @@ pub struct Layout {
     pub rows: Vec<Row>,
 }
 
+/// Schema for rusty-board's REAL layout files (`resources/layouts/*.json`) — the GTK app's actual
+/// source of truth, not a hand-copied approximation of it. This is the concrete fix for the
+/// "layout matching" problem: rusty-board-egui used to hardcode its own `Layout::qwerty()` with
+/// numbers someone typed by hand and never re-checked against the real file — which had already
+/// drifted (the real bottom row is `?123(1.5) | 🎤(1.0) | space(5.0) | ⏎(1.5)`; the hardcoded
+/// version was missing `?123`/`🎤` entirely and had space at 6.0, ⏎ at 2.0 — silently wrong
+/// proportions AND missing keys, not just a rounding difference). Loading the real file at compile
+/// time (`include_str!`) means the two front-ends can never drift again on THIS layout, short of
+/// someone deliberately hand-editing one side — which is a much smaller, much more visible thing
+/// to review than the two files quietly diverging with no test ever comparing them.
+#[derive(serde::Deserialize)]
+struct JsonLayout {
+    #[serde(default)]
+    name: String,
+    rows: Vec<JsonRow>,
+}
+#[derive(serde::Deserialize)]
+struct JsonRow {
+    #[serde(default = "one")]
+    weight: f32,
+    keys: Vec<JsonKey>,
+}
+#[derive(serde::Deserialize)]
+struct JsonKey {
+    label: String,
+    #[serde(default)]
+    extended: Vec<String>,
+    #[serde(default = "one")]
+    width: f32,
+    #[serde(default)]
+    action: Option<JsonAction>,
+}
+#[derive(serde::Deserialize)]
+struct JsonAction {
+    kind: String,
+}
+fn one() -> f32 { 1.0 }
+
+/// The literal control string a key's `action.kind` emits (backspace/return/space are the only
+/// ones with an unambiguous single control character; anything else — voice, symbols_toggle, or
+/// no action at all — falls through to emitting the key's own label, matching `Key::new`'s
+/// existing default).
+fn emit_for_action(kind: &str) -> Option<&'static str> {
+    match kind {
+        "backspace" => Some("\u{8}"),
+        "return" => Some("\n"),
+        "space" => Some(" "),
+        _ => None,
+    }
+}
+
+/// Parse a rusty-board layout JSON string (the real `resources/layouts/*.json` schema) into this
+/// crate's `Layout`. Pure — no filesystem access; callers `include_str!` the real file so the
+/// binary always carries an exact, byte-identical copy of whatever the GTK app ships.
+fn layout_from_json(text: &str) -> Result<Layout, serde_json::Error> {
+    let parsed: JsonLayout = serde_json::from_str(text)?;
+    let rows = parsed.rows.into_iter().map(|r| Row {
+        weight: r.weight,
+        keys: r.keys.into_iter().map(|k| {
+            let emit = k.action.as_ref().and_then(|a| emit_for_action(&a.kind)).unwrap_or(&k.label).to_string();
+            let mut key = Key { label: k.label, weight: k.width, emit, variants: Vec::new(), cardinal: Vec::new() };
+            if !k.extended.is_empty() { key.variants = k.extended; }
+            key
+        }).collect(),
+    }).collect();
+    Ok(Layout { name: if parsed.name.is_empty() { "qwerty".into() } else { parsed.name }, rows })
+}
+
 impl Layout {
-    /// A compact QWERTY, mirroring rusty-board's `default_qwerty` shape.
+    /// A compact QWERTY, loaded from rusty-board's REAL layout file — see `layout_from_json`'s
+    /// doc comment for why this replaced a hand-copied approximation.
     pub fn qwerty() -> Layout {
-        fn variants_for(k: &str) -> Option<&'static [&'static str]> {
-            Some(match k {
-                "a" => &["à", "á", "â", "ä", "æ"],
-                "e" => &["é", "è", "ê", "ë"],
-                "i" => &["í", "ì", "î", "ï"],
-                "o" => &["ó", "ò", "ô", "ö", "œ"],
-                "u" => &["ú", "ù", "û", "ü"],
-                "n" => &["ñ"],
-                "c" => &["ç"],
-                "y" => &["ÿ"],
-                "s" => &["ß"],
-                _ => return None,
-            })
-        }
-        fn row(keys: &[&str]) -> Row {
-            Row {
-                keys: keys
-                    .iter()
-                    .map(|k| {
-                        let key = Key::new(k);
-                        match variants_for(k) {
-                            Some(vs) => key.with_variants(vs),
-                            None => key,
-                        }
-                    })
-                    .collect(),
-                weight: 1.0,
-            }
-        }
-        Layout {
-            name: "qwerty".into(),
-            rows: vec![
-                row(&["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]),
-                row(&["a", "s", "d", "f", "g", "h", "j", "k", "l"]),
-                Row {
-                    keys: vec![
-                        Key::wide("⇧", 1.5),
-                        Key::new("z"),
-                        Key::new("x"),
-                        Key::new("c"),
-                        Key::new("v"),
-                        Key::new("b"),
-                        Key::new("n"),
-                        Key::new("m"),
-                        Key::emitting("⌫", "\u{8}", 1.5),
-                    ],
-                    weight: 1.0,
-                },
-                Row {
-                    keys: vec![
-                        Key::emitting("space", " ", 6.0),
-                        Key::emitting("⏎", "\n", 2.0),
-                    ],
-                    weight: 1.0,
-                },
-            ],
-        }
+        layout_from_json(include_str!("../../resources/layouts/en_us_qwerty.json"))
+            .expect("bundled en_us_qwerty.json must parse — this is a compile-time asset, not user input")
     }
 
     /// An experimental MessagEase-style **cardinal** keyboard: a 3×3 of high-frequency letters where a
@@ -525,6 +539,37 @@ mod tests {
     }
 
     #[test]
+    fn qwerty_bottom_row_matches_the_real_layout_exactly_not_a_hand_copied_guess() {
+        // regression test for the actual "layout matching" bug: this crate used to hardcode its
+        // own approximate copy of the bottom row (space=6.0, ⏎=2.0, missing ?123/🎤 entirely) that
+        // had already drifted from resources/layouts/en_us_qwerty.json, the GTK app's real source
+        // of truth. Now that qwerty() loads the real file, this locks the two back together —
+        // if this ever fails, either the real JSON changed (update this test) or the loader
+        // regressed (fix the loader), but the two can't silently drift apart unnoticed again.
+        let l = Layout::qwerty();
+        let bottom = &l.rows[3].keys;
+        assert_eq!(bottom.len(), 6, "the real bottom row is ?123, 🎤, space, comma, period, ⏎ — not just space+enter");
+        let labels: Vec<&str> = bottom.iter().map(|k| k.label.as_str()).collect();
+        assert_eq!(labels, vec!["?123", "🎤", " ", ",", ".", "⏎"]);
+        let weights: Vec<f32> = bottom.iter().map(|k| k.weight).collect();
+        assert_eq!(weights, vec![1.5, 1.0, 5.0, 1.0, 1.0, 1.5], "these are the real file's widths, not the old hand-typed 6.0/2.0");
+        let space = bottom.iter().find(|k| k.label == " ").unwrap();
+        assert_eq!(space.emit, " ");
+        let enter = bottom.iter().find(|k| k.label == "⏎").unwrap();
+        assert_eq!(enter.emit, "\n");
+    }
+
+    #[test]
+    fn qwerty_long_press_variants_come_from_the_real_extended_field() {
+        // the old hardcoded layout had its own separate accented-letter table (`variants_for`)
+        // that had to be kept in sync by hand; now `variants` comes directly from the real
+        // file's `extended` array, so there's nothing to keep in sync — it just IS the source.
+        let l = Layout::qwerty();
+        let e = l.rows[0].keys.iter().find(|k| k.label == "e").unwrap();
+        assert!(e.variants.contains(&"é".to_string()), "expected é among e's real extended entries: {:?}", e.variants);
+    }
+
+    #[test]
     fn phone_keys_are_taller_than_desktop() {
         let phone = Adaptive { class: DeviceClass::Phone, touch: true, min_touch_target: 44.0, ..Adaptive::default() };
         let desktop = Adaptive { class: DeviceClass::Desktop, ..Adaptive::default() };
@@ -575,7 +620,7 @@ mod tests {
     #[test]
     fn swipe_switches_layout() {
         let mut b = Board::new();
-        assert_eq!(b.current().name, "qwerty");
+        assert_eq!(b.current().name, "en_us_qwerty");
         b.swipe(1);
         assert_eq!(b.current().name, "symbols");
         b.swipe(1);
@@ -583,7 +628,7 @@ mod tests {
         b.swipe(1);
         assert_eq!(b.current().name, "cardinal8");
         b.swipe(1); // wraps back
-        assert_eq!(b.current().name, "qwerty");
+        assert_eq!(b.current().name, "en_us_qwerty");
         b.swipe(-1); // wraps backward to the last layout
         assert_eq!(b.current().name, "cardinal8");
     }
@@ -597,7 +642,7 @@ mod tests {
         prefs.touch.text_scale = 1.4;
         // adopting cross-app settings doesn't disturb the current layout
         b.apply_settings(&ctx, &prefs);
-        assert_eq!(b.current().name, "qwerty");
+        assert_eq!(b.current().name, "en_us_qwerty");
         // text scale reached the shared egui context
         let body = ctx.style().text_styles.get(&egui::TextStyle::Body).map(|f| f.size).unwrap_or(0.0);
         assert!(body > 0.0);
