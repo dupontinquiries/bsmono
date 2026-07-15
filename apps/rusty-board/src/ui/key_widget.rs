@@ -13,6 +13,12 @@ pub struct KeyWidget {
     button: gtk4::Button,
     label: gtk4::Label,
     key: Key,
+    /// Toolkit-agnostic press signal — GTK's `connect_clicked` (wired once in `new`) is the only
+    /// thing that ever emits it; `add_pressed_callback` is now just `pressed.connect(...)`. Same
+    /// vocabulary rusty-board-egui's port uses for its own key-press handling (see signal-kit's
+    /// own docs for the GTK/Qt/egui shapes this bridges) — the two front-ends' Rust code calls the
+    /// same `Signal<Key>` pattern even though they're separate binaries, not a live shared bus.
+    pressed: signal_kit::Signal<Key>,
 }
 
 impl KeyWidget {
@@ -119,11 +125,19 @@ impl KeyWidget {
             button.set_child(Some(&label));
         }
 
-        Self {
-            button,
-            label,
-            key,
-        }
+        Self::finish(button, label, key)
+    }
+
+    /// Wire the toolkit-agnostic `pressed` signal so GTK's native `connect_clicked` is its only
+    /// emitter — everything else (this widget's own `add_pressed_callback`, and any future
+    /// non-GTK-specific logic) subscribes through `pressed` instead of touching `connect_clicked`
+    /// directly.
+    fn finish(button: gtk4::Button, label: gtk4::Label, key: Key) -> Self {
+        let pressed = signal_kit::Signal::new();
+        let emit_side = pressed.clone();
+        let key_for_emit = key.clone();
+        button.connect_clicked(move |_| emit_side.emit(key_for_emit.clone()));
+        Self { button, label, key, pressed }
     }
 
     pub fn widget(&self) -> &gtk4::Button {
@@ -184,10 +198,11 @@ impl KeyWidget {
     where
         F: Fn(&Key) + 'static,
     {
-        let key = self.key.clone();
-        self.button.connect_clicked(move |_| {
-            cb(&key);
-        });
+        // routes through the toolkit-agnostic `pressed` signal (see the struct doc) rather than
+        // touching `self.button.connect_clicked` directly — GTK's own signal fires exactly once,
+        // in `finish`, into `pressed`; every other subscriber (including this method's callers)
+        // goes through the shared vocabulary instead of GTK's API.
+        let _conn = self.pressed.connect(move |k| cb(k));
     }
 
     /// Register press AND release callbacks. The press fires the
