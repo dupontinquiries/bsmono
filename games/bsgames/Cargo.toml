@@ -17,6 +17,9 @@ netcode = { path = "../shared/netcode" }
 coord-core = { path = "../../shared/coord-core" }
 share-kit = { path = "../../shared/share-kit" }
 snapcore = { path = "../../shared/snapcore" }
+# Standards-compliant QR generation for the "share my ID" wizard step — a phone's stock camera
+# app can scan it (unlike a custom module pattern), and it's pure Rust, no native deps.
+qrcode = { version = "0.14", default-features = false, optional = true }
 egui = { version = "0.34", optional = true }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 uikit-egui = { path = "../../shared/uikit/crates/uikit-egui", optional = true }
@@ -25,4 +28,4 @@ settings-kit = { path = "../../shared/settings-kit", optional = true }
 [features]
 default = []
 app = ["gui", "dep:eframe"]
-gui = ["dep:egui", "dep:uikit-egui", "dep:settings-kit"]
+gui = ["dep:egui", "dep:uikit-egui", "dep:settings-kit", "dep:qrcode"]
