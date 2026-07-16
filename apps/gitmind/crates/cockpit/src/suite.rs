@@ -14,17 +14,28 @@ pub struct SuiteApp {
     pub no_default: bool,
     pub target: String,    // "" = build native for whatever device installs it
     pub run_flags: String,
+    /// Override the binary actually built/resolved, when it doesn't match `name` — e.g.
+    /// unendlich's real game binary is `unendlich-fullgame` (a workspace-root app with several
+    /// benchmark/probe bins alongside it; `--bin unendlich` matches none of them). `None` (the
+    /// common case) uses `name` itself, same as before this field existed.
+    pub bin_name: Option<String>,
 }
 
 impl SuiteApp {
     /// A sane-default entry: native build, default features, no flags.
     pub fn simple(name: &str, path: &str) -> SuiteApp {
-        SuiteApp { name: name.into(), path: path.into(), features: vec![], no_default: false, target: String::new(), run_flags: String::new() }
+        SuiteApp { name: name.into(), path: path.into(), features: vec![], no_default: false, target: String::new(), run_flags: String::new(), bin_name: None }
+    }
+    /// The actual binary/build identifier — `bin_name` when set, else `name`. What
+    /// `install_suite_app_logged` hands to `ops::build_locally_logged` as the app id.
+    pub fn build_app_id(&self) -> &str {
+        self.bin_name.as_deref().unwrap_or(&self.name)
     }
     pub fn to_value(&self) -> Value {
         json!({
             "name": self.name, "path": self.path, "features": self.features,
             "no_default": self.no_default, "target": self.target, "run_flags": self.run_flags,
+            "bin_name": self.bin_name,
         })
     }
     fn from_value(v: &Value) -> Option<SuiteApp> {
@@ -36,6 +47,7 @@ impl SuiteApp {
             no_default: v.get("no_default").and_then(|b| b.as_bool()).unwrap_or(false),
             target: v.get("target").and_then(|s| s.as_str()).unwrap_or("").to_string(),
             run_flags: v.get("run_flags").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            bin_name: v.get("bin_name").and_then(|s| s.as_str()).map(String::from),
         })
     }
 }
@@ -116,13 +128,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn build_app_id_falls_back_to_name_when_bin_name_is_unset() {
+        let a = SuiteApp::simple("voiceterm", "apps/voiceterm");
+        assert_eq!(a.build_app_id(), "voiceterm");
+    }
+
+    #[test]
+    fn build_app_id_uses_the_override_when_set() {
+        // the exact bug report: unendlich's real game binary is `unendlich-fullgame`, not
+        // `unendlich` — `--bin unendlich` matches none of the workspace's actual bin targets.
+        let mut a = SuiteApp::simple("unendlich", "unendlich");
+        a.bin_name = Some("unendlich-fullgame".into());
+        assert_eq!(a.build_app_id(), "unendlich-fullgame");
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let s = Suite {
             name: "all".into(),
             description: "everything".into(),
             apps: vec![
                 SuiteApp::simple("gitmind-gui", "/home/u/Code/gitmind/crates/gui"),
-                SuiteApp { name: "logscope".into(), path: "/home/u/Code/logscope".into(), features: vec!["gpu".into()], no_default: true, target: "aarch64-unknown-linux-musl".into(), run_flags: "--fullscreen".into() },
+                SuiteApp { name: "logscope".into(), path: "/home/u/Code/logscope".into(), features: vec!["gpu".into()], no_default: true, target: "aarch64-unknown-linux-musl".into(), run_flags: "--fullscreen".into(), bin_name: None },
             ],
         };
         let parsed = Suite::parse(&s.to_json()).expect("parse");

@@ -276,7 +276,7 @@ daemon = false
 flatpak = true
 runtime = "freedesktop"
 targets = ["desktop", "phone", "x86"]
-notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets"
+notes = "voxel GPU engine; Vulkan (--device=dri); large download; shaders+assets. A workspace root with no [package] of its own — several benchmark/probe bins (perf-probe, gpu-mesh-bench, octree-bench, …) live alongside the real game, which is a DIFFERENTLY NAMED bin: `cargo build --release --bin unendlich-fullgame --features render,window,ui-overlay` (NOT `--bin unendlich` — that matches none of the workspace's bin targets)."
 
 [games.paperbound]
 path = "games/paperbound"
