@@ -95,6 +95,10 @@ pub struct FriendRow {
     pub status: String,
     /// True when they're in a joinable session (presence carries a session token).
     pub joinable: bool,
+    /// The raw game id (`GameEntry::id`, e.g. `"soldier"`) they're in, straight off
+    /// `Presence::InGame`'s `game` field — `status` is for display, this is for dispatch (which
+    /// game to spawn, and with which handoff env). `None` when offline/online-not-in-game.
+    pub raw_game: Option<String>,
 }
 
 fn status_of(p: &Presence) -> String {
@@ -103,6 +107,42 @@ fn status_of(p: &Presence) -> String {
         Presence::Online => "online".to_string(),
         Presence::InGame { game, .. } => format!("in {game}"),
     }
+}
+
+fn raw_game_of(p: &Presence) -> Option<String> {
+    match p {
+        Presence::InGame { game, .. } => Some(game.clone()),
+        _ => None,
+    }
+}
+
+/// Which role the launched game should take on startup, per the handoff env protocol below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandoffRole {
+    Host,
+    Join,
+}
+
+/// The "skip the menu" handoff: environment variables set on the spawned game process so it can
+/// jump straight into a match instead of sitting at its main menu — the piece that makes
+/// bsgames→game "passing off" actually work across every game's *own* menu system, without each
+/// game needing to know anything about bsgames beyond reading three env vars. A game with no
+/// handoff env set (launched directly, standalone) behaves exactly as it does today — this is
+/// additive, not a replacement for the game's normal menu-driven flow.
+///
+/// `BSGAMES_HANDOFF_ROLE`   — "host" or "join"
+/// `BSGAMES_HANDOFF_PEER`   — the friend's id (join only — who to dial)
+/// `BSGAMES_HANDOFF_ME`     — our own id + display name, `"<id>|<name>"` (so the launched game
+///                            doesn't have to re-derive an identity separately from bsgames')
+pub fn handoff_env(role: HandoffRole, me: &Profile, peer_id: Option<&str>) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("BSGAMES_HANDOFF_ROLE".to_string(), match role { HandoffRole::Host => "host".to_string(), HandoffRole::Join => "join".to_string() }),
+        ("BSGAMES_HANDOFF_ME".to_string(), format!("{}|{}", me.id, me.name)),
+    ];
+    if let (HandoffRole::Join, Some(id)) = (role, peer_id) {
+        env.push(("BSGAMES_HANDOFF_PEER".to_string(), id.to_string()));
+    }
+    env
 }
 
 /// Resolve a player's friends into roster rows via the profile service, sorted online-first.
@@ -118,6 +158,7 @@ pub fn friend_rows<P: ProfileBackend, F: ProfileBackend>(
             name: f.name.clone(),
             status: status_of(&f.presence),
             joinable: matches!(&f.presence, Presence::InGame { session: Some(_), .. }),
+            raw_game: raw_game_of(&f.presence),
         })
         .collect();
     // online (and especially joinable) first
@@ -129,6 +170,7 @@ pub fn friend_rows<P: ProfileBackend, F: ProfileBackend>(
 mod tests {
     use super::*;
     
+    use netcode::session::{SessionExt, SessionRecord};
     use netcode::store::{ProfileService, SnapcoreStore};
 
     #[test]
@@ -186,6 +228,38 @@ mod tests {
 
     fn svc() -> ProfileService<SnapcoreStore, SnapcoreStore> {
         ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new())
+    }
+
+    #[test]
+    fn handoff_env_join_carries_role_peer_and_me() {
+        let me = Profile::new("me@0", "Kessler");
+        let env = handoff_env(HandoffRole::Join, &me, Some("bob@1"));
+        assert_eq!(env.iter().find(|(k, _)| k == "BSGAMES_HANDOFF_ROLE").unwrap().1, "join");
+        assert_eq!(env.iter().find(|(k, _)| k == "BSGAMES_HANDOFF_PEER").unwrap().1, "bob@1");
+        assert_eq!(env.iter().find(|(k, _)| k == "BSGAMES_HANDOFF_ME").unwrap().1, "me@0|Kessler");
+    }
+
+    #[test]
+    fn handoff_env_host_carries_no_peer() {
+        let me = Profile::new("me@0", "Kessler");
+        let env = handoff_env(HandoffRole::Host, &me, None);
+        assert_eq!(env.iter().find(|(k, _)| k == "BSGAMES_HANDOFF_ROLE").unwrap().1, "host");
+        assert!(env.iter().all(|(k, _)| k != "BSGAMES_HANDOFF_PEER"));
+    }
+
+    #[test]
+    fn friend_rows_carry_the_raw_game_id_for_dispatch() {
+        let mut svc = svc();
+        let mut bob = Profile::new("bob@1", "Bob");
+        let rec = SessionRecord::new("soldier", "bob@1", "udp", "127.0.0.1:1");
+        svc.announce_session(&mut bob, "soldier@bob@1", &rec);
+        let mut me = Profile::new("me@0", "Me");
+        me.friends.push("bob@1".to_string());
+
+        let rows = friend_rows(&me, &svc);
+        let bob_row = rows.iter().find(|r| r.id == "bob@1").unwrap();
+        assert_eq!(bob_row.raw_game.as_deref(), Some("soldier"));
+        assert!(bob_row.status.contains("soldier"));
     }
 
     #[test]

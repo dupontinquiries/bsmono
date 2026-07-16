@@ -361,6 +361,10 @@ pub struct FpsApp {
     mp: Multiplayer,
     mp_status: String,
     mp_friend_input: String,
+    /// Set true for one frame when a bsgames handoff (see handoff.rs) successfully hosted/joined
+    /// on startup, so `update()`'s first frame calls `start_new_game` and skips the main menu —
+    /// the "passing off amongst all the menus" piece. Never true on a normal standalone launch.
+    pending_handoff_start: bool,
     /// Per-life kill bookkeeping so deaths fold cleanly into the profile.
     recorded_kills: u32,
     life_best_streak: u32,
@@ -397,7 +401,39 @@ pub struct FpsApp {
 impl FpsApp {
     pub fn new(seed: u64) -> Self {
         let db = Db::load();
-        let mp = Multiplayer::new(&db.profile.name, &db.profile.name);
+        // A bsgames handoff (see handoff.rs) supplies its own identity + who to dial, overriding
+        // the locally-saved profile name for this one launch — the launched process should present
+        // as the same player bsgames already published, not mint a separate identity.
+        let handoff = crate::handoff::from_env();
+        let mut mp = match &handoff {
+            Some(crate::handoff::Handoff::Host { me_id, me_name }) | Some(crate::handoff::Handoff::Join { me_id, me_name, .. }) => {
+                Multiplayer::new(me_id, me_name)
+            }
+            None => Multiplayer::new(&db.profile.name, &db.profile.name),
+        };
+        let mut mp_status = String::new();
+        let mut pending_handoff_start = false;
+        if handoff.is_some() {
+            eprintln!("[handoff] {handoff:?}");
+        }
+        match &handoff {
+            Some(crate::handoff::Handoff::Host { .. }) => {
+                mp_status = match mp.host("0.0.0.0:0") {
+                    Ok(token) => { pending_handoff_start = true; format!("hosting: {token}") }
+                    Err(e) => format!("couldn't host: {e}"),
+                };
+            }
+            Some(crate::handoff::Handoff::Join { peer_id, .. }) => {
+                mp_status = match mp.join(peer_id) {
+                    Ok(addr) => { pending_handoff_start = true; format!("connected to {peer_id} at {addr}") }
+                    Err(e) => e,
+                };
+            }
+            None => {}
+        }
+        if handoff.is_some() {
+            eprintln!("[handoff] result: {mp_status}");
+        }
         let mut app = Self {
             game: Game::new(seed),
             settings: Settings::default(),
@@ -417,8 +453,9 @@ impl FpsApp {
             sel_preset: None,
             mp_online: false,
             mp,
-            mp_status: String::new(),
+            mp_status,
             mp_friend_input: String::new(),
+            pending_handoff_start,
             recorded_kills: 0,
             life_best_streak: 0,
             was_alive: true,
@@ -1542,6 +1579,14 @@ impl eframe::App for FpsApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // bsgames handoff: skip the main menu entirely and go straight into a match — the one
+        // frame this fires on is the very first, since `new()` is the only place it's set true.
+        if self.pending_handoff_start {
+            self.pending_handoff_start = false;
+            self.mp_online = true;
+            self.start_new_game(&ctx);
+        }
 
         // Persist the renderer preference the moment it's toggled on the settings page (it's read at launch).
         if self.settings.gpu_renderer != self.db.gpu_renderer {
