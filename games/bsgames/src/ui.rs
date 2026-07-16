@@ -2,6 +2,8 @@
 //! profile service), and a snapclone chat panel. Edits are local; launching spawns the game, and
 //! chat/join route out to snapclone + the game's netcode (the I/O seams are marked).
 use crate::centre::{self, GameEntry};
+use crate::identity::LocalIdentity;
+use crate::wizard::{self, WizardEvent, WizardPhase};
 use netcode::profile::Profile;
 use netcode::store::{ProfileService, SnapcoreStore};
 
@@ -20,10 +22,24 @@ pub struct GameCentre {
     /// The fleet DHT store the chat Mailbox rides on (real share-kit/snapcore path).
     pub store: snapcore::store::Store,
     pub now: u64,
+
+    /// Persisted local profile (id + display name); `me` above is the *published* wire copy kept
+    /// in sync with it. Onboarding wizard walks Welcome → Name → ShareId → AddFriend → Done.
+    pub identity: LocalIdentity,
+    pub wizard_phase: WizardPhase,
+    pub name_edit: String,
+    pub add_friend_input: String,
+    pub qr_texture: Option<egui::TextureHandle>,
+    pub show_qr: bool,
 }
 
 impl GameCentre {
     pub fn new(me: Profile, svc: Service) -> Self {
+        let first_run = LocalIdentity::is_first_run();
+        let identity = LocalIdentity::load_or_create();
+        let mut me = me;
+        me.id = identity.id.clone();
+        me.name = identity.name.clone();
         GameCentre {
             prefs: settings_kit::Prefs::default(),
             me,
@@ -34,13 +50,23 @@ impl GameCentre {
             chat_input: String::new(),
             store: snapcore::store::Store::new(),
             now: 1,
+            wizard_phase: wizard::initial_phase(first_run),
+            name_edit: identity.name.clone(),
+            identity,
+            add_friend_input: String::new(),
+            qr_texture: None,
+            show_qr: false,
         }
     }
 
     #[allow(deprecated)] // eframe hands app code only a Context; top-level Panel::show(ctx) is the only path
     pub fn ui(&mut self, ctx: &egui::Context) {
         uikit_egui::apply_prefs(ctx, &self.prefs);
-        egui::SidePanel::right("friends").min_width(220.0).show(ctx, |ui| self.friends_panel(ui));
+        if self.wizard_phase != WizardPhase::Done {
+            egui::CentralPanel::default().show(ctx, |ui| self.wizard_panel(ui, ctx));
+            return;
+        }
+        egui::SidePanel::right("friends").min_width(240.0).show(ctx, |ui| self.friends_panel(ui, ctx));
         egui::CentralPanel::default().show(ctx, |ui| self.games_grid(ui));
     }
 
@@ -55,9 +81,17 @@ impl GameCentre {
                     ui.vertical(|ui| {
                         ui.label(egui::RichText::new(&g.name).strong());
                         ui.label(egui::RichText::new(format!("engine: {}", g.engine)).weak().small());
-                        if ui.button("▶ launch").clicked() {
-                            self.launch(g);
-                        }
+                        ui.horizontal(|ui| {
+                            if ui.button("▶ launch").clicked() {
+                                self.launch(g);
+                            }
+                            // Quick-match hook: same launch, plus --quick-match (see
+                            // centre::quick_match_argv's doc comment — no game reads the flag yet,
+                            // this is the seam future per-game wiring lands on one at a time).
+                            if ui.button("⚡ quick match").clicked() {
+                                self.quick_match(g);
+                            }
+                        });
                     });
                 });
                 if i % 2 == 1 {
@@ -72,7 +106,14 @@ impl GameCentre {
     }
 
     fn launch(&mut self, g: &GameEntry) {
-        let argv = centre::launch_argv(g);
+        self.spawn(centre::launch_argv(g), g);
+    }
+
+    fn quick_match(&mut self, g: &GameEntry) {
+        self.spawn(centre::quick_match_argv(g), g);
+    }
+
+    fn spawn(&mut self, argv: Vec<String>, g: &GameEntry) {
         // I/O seam: spawn the game process, fire-and-forget.
         let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).spawn();
         match spawned {
@@ -89,12 +130,179 @@ impl GameCentre {
         }
     }
 
-    fn friends_panel(&mut self, ui: &mut egui::Ui) {
+    /// The "passing off amongst all the menus" handoff: a friend is InGame in some `raw_game`, so
+    /// spawn *that same game* for us too, but with `BSGAMES_HANDOFF_*` env vars set (see
+    /// `centre::handoff_env`) so it skips its own main menu and dials the friend directly, instead
+    /// of us having to re-navigate that game's Multiplayer → Join screen by hand. If we don't have
+    /// that game installed/registered, or the friend's raw_game doesn't match anything in our
+    /// registry, fails with a clear status message rather than silently doing nothing.
+    fn join_friend(&mut self, r: &centre::FriendRow) {
+        let Some(raw_game) = &r.raw_game else {
+            self.status = format!("{} isn't in a game right now", r.name);
+            return;
+        };
+        let Some(g) = self.games.iter().find(|g| &g.id == raw_game).cloned() else {
+            self.status = format!("{} is playing {raw_game}, which isn't in this game centre", r.name);
+            return;
+        };
+        let argv = centre::launch_argv(&g);
+        let env = centre::handoff_env(centre::HandoffRole::Join, &self.me, Some(&r.id));
+        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).envs(env).spawn();
+        match spawned {
+            Ok(_) => self.status = format!("joining {} in {}…", r.name, g.name),
+            Err(e) => self.status = format!("couldn't launch {}: {e}", g.name),
+        }
+    }
+
+    /// The Profile section: editable display name, read-only id + Copy, and a QR toggle — reused
+    /// as-is inside the wizard's ShareId step and standing permanently in the friends panel.
+    fn profile_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Name:").weak().small());
+            if ui.text_edit_singleline(&mut self.name_edit).lost_focus() && !self.name_edit.trim().is_empty() {
+                let name = self.name_edit.trim().to_string();
+                self.identity.name = name.clone();
+                self.identity.save();
+                self.me.name = name;
+                self.svc.publish(&self.me);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Your ID:").weak().small());
+            ui.label(egui::RichText::new(&self.identity.id).monospace().strong());
+            if ui.small_button("copy").clicked() {
+                ctx.copy_text(self.identity.id.clone());
+                self.status = "copied your id".into();
+            }
+        });
+        if ui.small_button(if self.show_qr { "hide QR" } else { "show QR" }).clicked() {
+            self.show_qr = !self.show_qr;
+        }
+        if self.show_qr {
+            self.qr_image(ui, ctx);
+        }
+    }
+
+    fn qr_image(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.qr_texture.is_none() {
+            if let Some(img) = crate::qr::render(&format!("bsgames:{}", self.identity.id), 6) {
+                let color = egui::ColorImage::from_gray([img.side, img.side], &img.pixels);
+                self.qr_texture = Some(ctx.load_texture("my-qr", color, egui::TextureOptions::NEAREST));
+            }
+        }
+        if let Some(tex) = &self.qr_texture {
+            ui.add(egui::Image::new(tex).max_width(200.0));
+        }
+    }
+
+    /// The friend-adding section: paste a friend's id, "Add" validates via `centre::add_friend`.
+    /// Reused as-is inside the wizard's AddFriend step and permanently in the friends panel.
+    fn add_friend_section(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Add a friend by id:").weak().small());
+            ui.text_edit_singleline(&mut self.add_friend_input);
+            if ui.button("add").clicked() {
+                match centre::add_friend(&mut self.me, &mut self.svc, &self.add_friend_input) {
+                    Ok(name) => {
+                        self.status = format!("added {name} as a friend");
+                        self.add_friend_input.clear();
+                        if self.wizard_phase == WizardPhase::AddFriend {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::FriendAdded);
+                        }
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+        });
+    }
+
+    fn wizard_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(40.0);
+            match self.wizard_phase {
+                WizardPhase::Welcome => {
+                    ui.heading("Welcome to BigSilicon Games");
+                    ui.label("Let's get you set up with a name and a couple of friends.");
+                    ui.add_space(16.0);
+                    if ui.button("Get Started").clicked() {
+                        self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Next);
+                    }
+                    if ui.small_button("skip setup").clicked() {
+                        self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Skip);
+                    }
+                }
+                WizardPhase::Name => {
+                    ui.heading("What should friends call you?");
+                    ui.add_space(8.0);
+                    ui.text_edit_singleline(&mut self.name_edit);
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Back);
+                        }
+                        let can_continue = !self.name_edit.trim().is_empty();
+                        if ui.add_enabled(can_continue, egui::Button::new("Continue")).clicked() {
+                            let name = self.name_edit.trim().to_string();
+                            self.identity.name = name.clone();
+                            self.identity.save();
+                            self.me.name = name;
+                            self.svc.publish(&self.me);
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Next);
+                        }
+                    });
+                }
+                WizardPhase::ShareId => {
+                    ui.heading("Here's your id");
+                    ui.label("Share it (or the QR) so friends can add you.");
+                    ui.add_space(8.0);
+                    self.profile_section(ui, ctx);
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Back);
+                        }
+                        if ui.button("Continue").clicked() {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Next);
+                        }
+                    });
+                }
+                WizardPhase::AddFriend => {
+                    ui.heading("Add a friend");
+                    ui.label("Paste a friend's id (they can copy it from their own Profile).");
+                    ui.add_space(8.0);
+                    self.add_friend_section(ui);
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Back);
+                        }
+                        if ui.small_button("I'll do this later").clicked() {
+                            self.wizard_phase = wizard::next_phase(self.wizard_phase, &WizardEvent::Skip);
+                        }
+                    });
+                    if !self.status.is_empty() {
+                        ui.add_space(6.0);
+                        ui.label(egui::RichText::new(&self.status).monospace().small());
+                    }
+                }
+                WizardPhase::Done => {} // unreachable: `ui()` doesn't route here
+            }
+        });
+    }
+
+    fn friends_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.heading("Profile");
+        ui.separator();
+        self.profile_section(ui, ctx);
+        ui.add_space(10.0);
+        self.add_friend_section(ui);
+        ui.add_space(14.0);
+        ui.separator();
         ui.heading("Friends");
         ui.separator();
         let rows = centre::friend_rows(&self.me, &self.svc);
         if rows.is_empty() {
-            ui.label(egui::RichText::new("no friends online").weak());
+            ui.label(egui::RichText::new("no friends yet — add one above").weak());
         }
         for r in &rows {
             ui.horizontal(|ui| {
@@ -105,8 +313,7 @@ impl GameCentre {
             });
             ui.horizontal(|ui| {
                 if r.joinable && ui.small_button("join").clicked() {
-                    // netcode I/O seam: join their session via the game's transport.
-                    self.status = format!("joining {}…", r.name);
+                    self.join_friend(r);
                 }
                 if ui.small_button("chat").clicked() {
                     self.chat_to = Some(r.id.clone());

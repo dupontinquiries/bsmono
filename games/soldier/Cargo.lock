@@ -762,11 +762,17 @@ dependencies = [
  "bytemuck",
  "eframe",
  "egui",
+ "gpu-kit",
  "image",
+ "netcode",
+ "netview",
  "pollster",
  "rodio",
  "serde",
  "serde_json",
+ "settings-kit",
+ "snapclone-theme",
+ "uikit-egui",
  "wgpu 22.1.0",
  "winit 0.29.15",
 ]
@@ -1267,6 +1273,10 @@ checksum = "fdf242682df893b86f33a73828fb09ca4b2d3bb6cc95249707fc684d27484b91"
 dependencies = [
  "bitflags 2.13.0",
 ]
+
+[[package]]
+name = "gpu-kit"
+version = "0.1.0"
 
 [[package]]
 name = "half"
@@ -1868,6 +1878,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys 0.3.1",
+]
+
+[[package]]
+name = "netcode"
+version = "0.1.0"
+dependencies = [
+ "snapcore",
+]
+
+[[package]]
+name = "netview"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2750,6 +2775,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "settings-kit"
+version = "0.1.0"
+dependencies = [
+ "uikit-gesture",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2910,6 +2942,17 @@ checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "snapclone-theme"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "snapcore"
+version = "0.1.0"
 
 [[package]]
 name = "spirv"
@@ -3100,6 +3143,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "touchkit"
+version = "0.1.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "tracing"
 version = "0.1.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3130,6 +3180,21 @@ checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash 2.1.2",
 ]
+
+[[package]]
+name = "uikit-egui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "settings-kit",
+ "snapclone-theme",
+ "touchkit",
+ "uikit-gesture",
+]
+
+[[package]]
+name = "uikit-gesture"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

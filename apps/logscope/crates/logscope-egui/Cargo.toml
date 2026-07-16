@@ -93,6 +93,10 @@ name = "logscope-fabricd"
 path = "src/bin/logscope-fabricd.rs"
 
 [[bin]]
+name = "scene-critique"
+path = "src/bin/scene-critique.rs"
+
+[[bin]]
 name = "status-view"
 path = "src/bin/status-view.rs"
 required-features = ["gpu-scene"]

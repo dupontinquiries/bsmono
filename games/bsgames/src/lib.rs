@@ -4,6 +4,10 @@
 //! renders these; `main` (behind `app`) is the eframe shell.
 pub mod centre;
 pub mod wiring;
+pub mod identity;
+pub mod wizard;
+#[cfg(feature = "gui")]
+pub mod qr;
 #[cfg(feature = "gui")]
 pub mod ui;
 
