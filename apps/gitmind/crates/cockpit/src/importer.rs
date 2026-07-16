@@ -101,6 +101,52 @@ pub fn overlay_command(src: &str, dst: &str, mirror: bool) -> String {
     )
 }
 
+/// Shell command that imports `source` (a git bundle file path, or any git remote URL) as a
+/// subtree under `prefix` in the CURRENT repo, preserving its full commit history as real
+/// ancestor commits (inspectable via `git log <prefix>^2`, same as `git log <merge-commit>^2`)
+/// rather than squashing it into one opaque commit — the mechanism for bringing in a completely
+/// unrelated project (no shared history) as a managed subdirectory, alongside a normal `git merge`
+/// for anything that already shares history with this repo. `branch` is which branch to pull from
+/// `source` (almost always "main"). Pure — unit-tested.
+pub fn subtree_add_command(prefix: &str, source: &str, branch: &str, message: &str) -> String {
+    format!(
+        "git subtree add --prefix={} {} {} -m {}",
+        q(prefix), q(source), q(branch), q(message)
+    )
+}
+
+/// Run `subtree_add_command` in `repo_root`, streaming output live. Mirrors
+/// `ops::run_build_all_script`'s shape (a background-task-friendly logged runner returning
+/// `Result<String, String>`) rather than introducing a different convention for this one caller.
+pub fn subtree_add_logged(repo_root: &Path, prefix: &str, source: &str, branch: &str, message: &str, on_line: &mut dyn FnMut(&str)) -> Result<String, String> {
+    use std::io::{BufRead, BufReader};
+    if repo_root.join(prefix).exists() {
+        return Err(format!("{} already exists — pick a different prefix or remove it first", prefix));
+    }
+    let cmd = subtree_add_command(prefix, source, branch, message);
+    on_line(&format!("$ {cmd}"));
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(repo_root)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run git subtree: {e}"))?;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) { on_line(&line); }
+    }
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(Result::ok) { on_line(&line); }
+    }
+    let status = child.wait().map_err(|e| format!("subtree wait failed: {e}"))?;
+    if status.success() {
+        Ok(format!("✓ imported {source} → {prefix} (history preserved)"))
+    } else {
+        Err(format!("git subtree add failed (exit {})", status.code().unwrap_or(-1)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +173,35 @@ mod tests {
         let root = find_crate_root(&base).unwrap();
         assert!(root.ends_with("myapp-1.0"), "picks the top-level crate, not the vendored one: {root:?}");
         assert!(find_crate_root(&base.join("nope")).is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn subtree_add_command_shapes_the_git_invocation_and_quotes_arguments() {
+        let cmd = subtree_add_command("tools/kbm3", "/tmp/uploads/kbm3.bundle", "main", "merge(tools/kbm3): import");
+        assert!(cmd.contains("git subtree add"));
+        assert!(cmd.contains("--prefix='tools/kbm3'"));
+        assert!(cmd.contains("'/tmp/uploads/kbm3.bundle'"));
+        assert!(cmd.contains("'main'"));
+        assert!(cmd.contains("-m 'merge(tools/kbm3): import'"));
+    }
+
+    #[test]
+    fn subtree_add_command_escapes_a_single_quote_in_the_message() {
+        let cmd = subtree_add_command("x", "y", "main", "kBM3's import");
+        assert!(cmd.contains(r"kBM3'\''s import"), "single quotes must be shell-escaped, not left raw: {cmd}");
+    }
+
+    #[test]
+    fn subtree_add_logged_refuses_to_clobber_an_existing_prefix() {
+        let base = std::env::temp_dir().join(format!("gm-subtree-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("tools/kbm3")).unwrap();
+        let mut lines = Vec::new();
+        let r = subtree_add_logged(&base, "tools/kbm3", "/tmp/whatever.bundle", "main", "msg", &mut |l| lines.push(l.to_string()));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().contains("already exists"));
+        assert!(lines.is_empty(), "should fail before ever running git, so no command line is logged");
         let _ = fs::remove_dir_all(&base);
     }
 
