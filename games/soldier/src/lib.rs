@@ -56,3 +56,5 @@ pub mod gpu;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_egui;
+#[cfg(feature = "gpu")]
+pub mod gpu_menu;

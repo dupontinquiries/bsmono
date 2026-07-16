@@ -190,7 +190,9 @@ impl EguiOverlay {
 
     /// Run one egui frame (the `ui` closure draws the HUD via `egui::Context`), upload its textures +
     /// meshes, and record the draw list. Call once per frame before `paint`. `width`/`height` are
-    /// physical pixels; `scale` is the DPI scale (pixels per point).
+    /// physical pixels; `scale` is the DPI scale (pixels per point). `events` feeds real pointer/
+    /// keyboard input for frames where something needs to actually be clickable (the menu) — pass
+    /// `&[]` for a purely-drawn overlay (the HUD, which never needs interaction).
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -198,12 +200,14 @@ impl EguiOverlay {
         width: u32,
         height: u32,
         scale: f32,
+        events: Vec<egui::Event>,
         ui: impl FnMut(&Context),
     ) {
         self.pixels_per_point = scale.max(0.1);
         let points = egui::vec2(width as f32 / self.pixels_per_point, height as f32 / self.pixels_per_point);
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), points)),
+            events,
             ..Default::default()
         };
         #[allow(deprecated)] // run() (Context closure) is the ergonomic API for our painter HUD;

@@ -13,6 +13,8 @@
 
 use crate::camera::FpsCam;
 use crate::game::Game;
+use crate::gpu_menu::{self, MenuAction, MenuScreen};
+use crate::loadout::Loadout;
 use crate::math::Vec3;
 use crate::mesh::{atlas_slot, build_material_atlas, Mesh3, ATLAS_COLS};
 use crate::player::Input;
@@ -577,13 +579,14 @@ impl State {
         up(&self.device, &self.queue, &mut self.vbuf_trans, &mut self.vcap_trans, &mut self.vcount_trans, trans, "vt");
     }
 
-    fn render(&mut self, u: &U, game: &crate::game::Game) {
+    fn render(&mut self, u: &U, game: &crate::game::Game, menu: &mut Option<MenuScreen>, loadout: &mut Loadout, menu_events: Vec<egui::Event>) -> MenuAction {
+        let mut action = MenuAction::None;
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(u));
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(_) => {
                 self.surface.configure(&self.device, &self.config);
-                return;
+                return action;
             }
         };
         let view = frame.texture.create_view(&Default::default());
@@ -655,7 +658,11 @@ impl State {
             let w = self.config.width;
             let h = self.config.height;
             let scale = self.scale;
-            self.egui.prepare(&self.device, &self.queue, w, h, scale, |ctx| {
+            self.egui.prepare(&self.device, &self.queue, w, h, scale, menu_events, |ctx| {
+                if let Some(screen) = menu {
+                    action = gpu_menu::ui(ctx, screen, loadout);
+                    return;
+                }
                 let painter = ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Foreground,
                     egui::Id::new("gpu_hud"),
@@ -685,6 +692,7 @@ impl State {
         }
         self.queue.submit([enc.finish()]);
         frame.present();
+        action
     }
 }
 
@@ -721,6 +729,19 @@ impl Keys {
     }
 }
 
+/// Grab + hide the cursor for gameplay (FPS look), or release + show it for the menu — called
+/// whenever the menu opens/closes so the player can actually point at buttons instead of fighting
+/// a locked, invisible cursor.
+fn set_cursor_state(window: &Window, menu_open: bool) {
+    if menu_open {
+        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+        window.set_cursor_visible(true);
+    } else {
+        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+        window.set_cursor_visible(false);
+    }
+}
+
 pub fn run() {
     let event_loop = EventLoop::new().unwrap();
     let window = Arc::new(WindowBuilder::new().with_title("early-fps (GPU)").build(&event_loop).unwrap());
@@ -731,37 +752,84 @@ pub fn run() {
     let mut game = Game::new(1234);
     let mut keys = Keys::default();
     let mut last = Instant::now();
+    // menu state: None = playing (the previous, only, behaviour); Some(screen) = paused, showing
+    // that screen. Escape used to just quit the whole app (elwt.exit()) — now it opens/navigates/
+    // closes this instead.
+    let mut menu: Option<MenuScreen> = None;
+    let mut loadout = Loadout::default();
+    let mut cursor_pos = egui::pos2(0.0, 0.0);
+    // real pointer/keyboard events for the menu's egui widgets to actually be clickable — the HUD
+    // never needed this (paint-only), so EguiOverlay::prepare previously had no events path at all.
+    let mut menu_events: Vec<egui::Event> = Vec::new();
 
     event_loop
         .run(move |event, elwt| match event {
             Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
-                keys.dyaw += delta.0 as f32 * 0.0025;
-                keys.dpitch += -delta.1 as f32 * 0.0025;
+                if menu.is_none() {
+                    keys.dyaw += delta.0 as f32 * 0.0025;
+                    keys.dpitch += -delta.1 as f32 * 0.0025;
+                }
             }
             Event::WindowEvent { window_id, event } if window_id == window.id() => match event {
                 WindowEvent::CloseRequested => elwt.exit(),
                 WindowEvent::Resized(sz) => state.resize(sz.width, sz.height),
+                WindowEvent::CursorMoved { position, .. } => {
+                    // only matters while the menu is open — cursor_pos feeds egui's PointerMoved;
+                    // during gameplay the cursor is locked and look comes from DeviceEvent::MouseMotion.
+                    if menu.is_some() {
+                        let scale = window.scale_factor() as f32;
+                        cursor_pos = egui::pos2(position.x as f32 / scale.max(0.01), position.y as f32 / scale.max(0.01));
+                        menu_events.push(egui::Event::PointerMoved(cursor_pos));
+                    }
+                }
                 WindowEvent::MouseInput { state: st, button, .. } => {
                     let down = st == ElementState::Pressed;
-                    match button {
-                        MouseButton::Left => keys.fire = down,
-                        MouseButton::Right => keys.ads = down,
-                        _ => {}
+                    if menu.is_some() {
+                        let btn = match button {
+                            MouseButton::Left => Some(egui::PointerButton::Primary),
+                            MouseButton::Right => Some(egui::PointerButton::Secondary),
+                            _ => None,
+                        };
+                        if let Some(b) = btn {
+                            menu_events.push(egui::Event::PointerButton { pos: cursor_pos, button: b, pressed: down, modifiers: egui::Modifiers::default() });
+                        }
+                    } else {
+                        match button {
+                            MouseButton::Left => keys.fire = down,
+                            MouseButton::Right => keys.ads = down,
+                            _ => {}
+                        }
                     }
                 }
                 WindowEvent::KeyboardInput { event: ke, .. } => {
                     let down = ke.state == ElementState::Pressed;
                     if let PhysicalKey::Code(code) = ke.physical_key {
-                        match code {
-                            KeyCode::KeyW => keys.w = down,
-                            KeyCode::KeyA => keys.a = down,
-                            KeyCode::KeyS => keys.s = down,
-                            KeyCode::KeyD => keys.d = down,
-                            KeyCode::Space => keys.space = down,
-                            KeyCode::ShiftLeft => keys.shift = down,
-                            KeyCode::ControlLeft => keys.ctrl = down,
-                            KeyCode::Escape => elwt.exit(),
-                            _ => {}
+                        if code == KeyCode::Escape {
+                            if down {
+                                menu = match menu {
+                                    None => {
+                                        keys = Keys::default(); // don't carry held movement into the pause
+                                        Some(MenuScreen::Main)
+                                    }
+                                    Some(MenuScreen::Main) => {
+                                        last = Instant::now(); // don't let menu time count as a huge dt
+                                        None
+                                    }
+                                    Some(_) => Some(MenuScreen::Main), // a submenu backs out to Main first
+                                };
+                                set_cursor_state(&window, menu.is_some());
+                            }
+                        } else if menu.is_none() {
+                            match code {
+                                KeyCode::KeyW => keys.w = down,
+                                KeyCode::KeyA => keys.a = down,
+                                KeyCode::KeyS => keys.s = down,
+                                KeyCode::KeyD => keys.d = down,
+                                KeyCode::Space => keys.space = down,
+                                KeyCode::ShiftLeft => keys.shift = down,
+                                KeyCode::ControlLeft => keys.ctrl = down,
+                                _ => {}
+                            }
                         }
                     }
                 }
@@ -770,8 +838,11 @@ pub fn run() {
                     let dt = (now - last).as_secs_f32().min(0.05);
                     last = now;
 
-                    let inp = keys.to_input();
-                    game.step(&inp, dt);
+                    if menu.is_none() {
+                        let inp = keys.to_input();
+                        game.step(&inp, dt);
+                    } // paused: the world holds at its last stepped state, same idea as the HUD's
+                      // existing "YOU WERE KILLED" freeze-frame — nothing new here, just gated wider.
 
                     let cam = game.player.view_cam();
                     let fwd = cam_forward(&cam);
@@ -819,7 +890,24 @@ pub fn run() {
                         hud: [hf, af, low, 0.0],
                         plights,
                     };
-                    state.render(&u, &game);
+                    let events = std::mem::take(&mut menu_events);
+                    match state.render(&u, &game, &mut menu, &mut loadout, events) {
+                        MenuAction::None => {}
+                        MenuAction::Resume => {
+                            menu = None;
+                            last = Instant::now(); // don't let time spent in the menu count as a dt jump
+                            set_cursor_state(&window, false);
+                        }
+                        MenuAction::StartGame(theme) => {
+                            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+                            let seed = (nanos as u64) ^ 0x9E3779B97F4A7C15;
+                            game = Game::new_with(seed, Some(theme), loadout);
+                            menu = None;
+                            last = Instant::now();
+                            set_cursor_state(&window, false);
+                        }
+                        MenuAction::Quit => elwt.exit(),
+                    }
                     window.request_redraw();
                 }
                 _ => {}
