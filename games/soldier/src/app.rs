@@ -17,6 +17,7 @@ use crate::math::Vec3;
 use crate::game::Game;
 use crate::hud::*; // shared HUD painters (draw_hud, draw_killfeed, …)
 use crate::level::MapTheme;
+use crate::multiplayer::Multiplayer;
 use crate::player::Input;
 use crate::creatures::{Creature, HuntRole};
 use crate::builder::{AssetKind, CustomMap, Placed};
@@ -354,6 +355,16 @@ pub struct FpsApp {
     /// Map selector state: chosen biome (None = random / quick play) and whether we arrived via "online".
     sel_preset: Option<usize>,
     mp_online: bool,
+    /// Real online-play control-plane state (see multiplayer.rs): session announce/discover over
+    /// the fleet DHT. `mp_status` is the last host/join result shown in the Multiplayer menu;
+    /// `mp_friend_input` is the "Join" text field.
+    mp: Multiplayer,
+    mp_status: String,
+    mp_friend_input: String,
+    /// Set true for one frame when a bsgames handoff (see handoff.rs) successfully hosted/joined
+    /// on startup, so `update()`'s first frame calls `start_new_game` and skips the main menu —
+    /// the "passing off amongst all the menus" piece. Never true on a normal standalone launch.
+    pending_handoff_start: bool,
     /// Per-life kill bookkeeping so deaths fold cleanly into the profile.
     recorded_kills: u32,
     life_best_streak: u32,
@@ -389,6 +400,40 @@ pub struct FpsApp {
 
 impl FpsApp {
     pub fn new(seed: u64) -> Self {
+        let db = Db::load();
+        // A bsgames handoff (see handoff.rs) supplies its own identity + who to dial, overriding
+        // the locally-saved profile name for this one launch — the launched process should present
+        // as the same player bsgames already published, not mint a separate identity.
+        let handoff = crate::handoff::from_env();
+        let mut mp = match &handoff {
+            Some(crate::handoff::Handoff::Host { me_id, me_name }) | Some(crate::handoff::Handoff::Join { me_id, me_name, .. }) => {
+                Multiplayer::new(me_id, me_name)
+            }
+            None => Multiplayer::new(&db.profile.name, &db.profile.name),
+        };
+        let mut mp_status = String::new();
+        let mut pending_handoff_start = false;
+        if handoff.is_some() {
+            eprintln!("[handoff] {handoff:?}");
+        }
+        match &handoff {
+            Some(crate::handoff::Handoff::Host { .. }) => {
+                mp_status = match mp.host("0.0.0.0:0") {
+                    Ok(token) => { pending_handoff_start = true; format!("hosting: {token}") }
+                    Err(e) => format!("couldn't host: {e}"),
+                };
+            }
+            Some(crate::handoff::Handoff::Join { peer_id, .. }) => {
+                mp_status = match mp.join(peer_id) {
+                    Ok(addr) => { pending_handoff_start = true; format!("connected to {peer_id} at {addr}") }
+                    Err(e) => e,
+                };
+            }
+            None => {}
+        }
+        if handoff.is_some() {
+            eprintln!("[handoff] result: {mp_status}");
+        }
         let mut app = Self {
             game: Game::new(seed),
             settings: Settings::default(),
@@ -404,9 +449,13 @@ impl FpsApp {
             runs: 0,
             settings_from: Mode::Pause,
             screen: MenuScreen::Main,
-            db: Db::load(),
+            db,
             sel_preset: None,
             mp_online: false,
+            mp,
+            mp_status,
+            mp_friend_input: String::new(),
+            pending_handoff_start,
             recorded_kills: 0,
             life_best_streak: 0,
             was_alive: true,
@@ -1040,7 +1089,9 @@ impl FpsApp {
                         ui.label(egui::RichText::new("MULTIPLAYER").monospace().size(22.0).color(gold));
                         ui.add_space(10.0);
                         if menu_button(ui, "Online  —  Find Match").clicked() {
-                            // No netcode yet: matchmaking is simulated locally vs bots, seeded by skill.
+                            // No real matchmaker (stranger pairing) yet: quick play is still bots,
+                            // seeded by skill. Real online play against a specific person is the
+                            // Host/Join section below, wired to the fleet DHT (multiplayer.rs).
                             self.mp_online = true;
                             self.sel_preset = None;
                             start_game = true;
@@ -1055,6 +1106,39 @@ impl FpsApp {
                         if menu_button(ui, "Custom Match").clicked() {
                             self.mp_online = false;
                             self.screen = MenuScreen::CustomMatch;
+                        }
+                        ui.add_space(18.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                        ui.label(egui::RichText::new("PLAY WITH A FRIEND").monospace().size(15.0).color(cyan));
+                        ui.add_space(6.0);
+                        if let Some(token) = self.mp.token.clone() {
+                            ui.label(egui::RichText::new(format!("Hosting as \"{token}\" — tell a friend your name to join.")).monospace().size(12.0).color(gold));
+                            if menu_button(ui, "Stop Hosting").clicked() {
+                                self.mp.stop_hosting();
+                                self.mp_status.clear();
+                            }
+                        } else if menu_button(ui, "Host a Match").clicked() {
+                            self.mp_status = match self.mp.host("0.0.0.0:0") {
+                                Ok(token) => format!("hosting: {token}"),
+                                Err(e) => format!("couldn't host: {e}"),
+                            };
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Friend's name:").monospace().size(12.0).color(dim()));
+                            ui.text_edit_singleline(&mut self.mp_friend_input);
+                        });
+                        if menu_button(ui, "Join").clicked() {
+                            let friend = self.mp_friend_input.trim().to_string();
+                            self.mp_status = match self.mp.join(&friend) {
+                                Ok(addr) => format!("connected to {friend} at {addr}"),
+                                Err(e) => e,
+                            };
+                        }
+                        if !self.mp_status.is_empty() {
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(&self.mp_status).monospace().size(11.0).color(dim()));
                         }
                         ui.add_space(14.0);
                         if menu_button(ui, "Back").clicked() {
@@ -1495,6 +1579,14 @@ impl eframe::App for FpsApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // bsgames handoff: skip the main menu entirely and go straight into a match — the one
+        // frame this fires on is the very first, since `new()` is the only place it's set true.
+        if self.pending_handoff_start {
+            self.pending_handoff_start = false;
+            self.mp_online = true;
+            self.start_new_game(&ctx);
+        }
 
         // Persist the renderer preference the moment it's toggled on the settings page (it's read at launch).
         if self.settings.gpu_renderer != self.db.gpu_renderer {

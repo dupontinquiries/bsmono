@@ -15,6 +15,113 @@ pub trait ProfileBackend {
     fn get(&self, key: &str) -> Option<Vec<u8>>;
 }
 
+/// A shared-file-backed `ProfileBackend`: every process on the same machine reads/writes the same
+/// file, so (unlike `SnapcoreStore`, which is a private in-process `HashMap` — real for one process,
+/// invisible to any other) two separate game processes can actually discover each other. This is a
+/// **same-machine/shared-filesystem stand-in for real network transport** (no sockets, no real DHT
+/// protocol) — good enough for local dev/testing of cross-process flows like a bsgames→game
+/// handoff, until the real OpenDHT/UDP networking layer lands (see
+/// `games/GAMES_UNIFICATION.md`'s "remaining seams"). Not for use across machines.
+///
+/// Format: one `key\thex(value)` line per entry, whole file rewritten atomically (temp file +
+/// rename) on every `put` so a reader never sees a half-written file. A sibling `.lock` file
+/// (create-new spin-wait) serializes concurrent writers.
+pub struct FileStore {
+    path: std::path::PathBuf,
+}
+
+impl FileStore {
+    /// `path` is the shared file every process points at — callers agree on it out of band (e.g.
+    /// a fixed temp-dir path for local testing). Created empty on first use if it doesn't exist.
+    pub fn at(path: impl Into<std::path::PathBuf>) -> Self {
+        FileStore { path: path.into() }
+    }
+
+    /// The conventional shared path for local same-machine testing: one file per OS temp dir, so
+    /// every process on the box that doesn't override it finds the same store.
+    pub fn dev_default() -> Self {
+        FileStore::at(Self::dev_default_path())
+    }
+
+    /// Just the path `dev_default()` uses, for callers that want to construct their own
+    /// `FileStore`/pass it elsewhere rather than getting one back directly.
+    pub fn dev_default_path() -> std::path::PathBuf {
+        std::env::temp_dir().join("bsgames-dev-store.jsonl")
+    }
+
+    fn lock_path(&self) -> std::path::PathBuf {
+        let mut p = self.path.clone();
+        p.set_extension("lock");
+        p
+    }
+
+    /// Spin-wait to create the lock file (exclusive create), retrying briefly; gives up (and lets
+    /// the caller proceed unlocked) after ~200ms rather than deadlocking on a stale lock forever.
+    fn acquire_lock(&self) -> Option<std::fs::File> {
+        let lock = self.lock_path();
+        for _ in 0..200 {
+            if let Ok(f) = std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                return Some(f);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        None
+    }
+
+    fn release_lock(&self) {
+        let _ = std::fs::remove_file(self.lock_path());
+    }
+
+    fn read_all(&self) -> Vec<(String, Vec<u8>)> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else { return Vec::new() };
+        text.lines()
+            .filter_map(|line| {
+                let (k, hexval) = line.split_once('\t')?;
+                Some((k.to_string(), decode_hex(hexval)))
+            })
+            .collect()
+    }
+
+    fn write_all(&self, entries: &[(String, Vec<u8>)]) -> bool {
+        let mut text = String::new();
+        for (k, v) in entries {
+            text.push_str(k);
+            text.push('\t');
+            for b in v { text.push_str(&format!("{b:02x}")); }
+            text.push('\n');
+        }
+        let tmp = self.path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, text).is_ok() && std::fs::rename(&tmp, &self.path).is_ok()
+    }
+}
+
+fn decode_hex(s: &str) -> Vec<u8> {
+    (0..s.len() / 2).filter_map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
+}
+
+impl ProfileBackend for FileStore {
+    fn available(&self) -> bool {
+        true
+    }
+
+    fn put(&mut self, key: &str, value: Vec<u8>) -> bool {
+        let _lock = self.acquire_lock();
+        let mut entries = self.read_all();
+        if let Some(existing) = entries.iter_mut().find(|(k, _)| k == key) {
+            existing.1 = value;
+        } else {
+            entries.push((key.to_string(), value));
+        }
+        let ok = self.write_all(&entries);
+        self.release_lock();
+        ok
+    }
+
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
+        self.read_all().into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+}
+
 /// Hash an arbitrary key string to a snapcore 20-byte NodeId (dependency-free FNV mix). The DHT's
 /// own placement/hashing takes over from here; this only maps our string ids into its key space.
 pub fn key_id(s: &str) -> NodeId {
@@ -173,6 +280,68 @@ mod tests {
     use super::*;
     use crate::profile::{Presence, Profile};
     use std::collections::HashMap;
+
+    fn tmp_store_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("netcode-test-{name}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn file_store_round_trips_within_one_instance() {
+        let path = tmp_store_path("roundtrip");
+        let mut fs = FileStore::at(&path);
+        assert!(fs.get("k").is_none());
+        assert!(fs.put("k", b"hello".to_vec()));
+        assert_eq!(fs.get("k"), Some(b"hello".to_vec()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_store_updates_in_place_not_duplicated() {
+        let path = tmp_store_path("update");
+        let mut fs = FileStore::at(&path);
+        fs.put("k", b"first".to_vec());
+        fs.put("k", b"second".to_vec());
+        assert_eq!(fs.get("k"), Some(b"second".to_vec()));
+        assert_eq!(fs.read_all().iter().filter(|(k, _)| k == "k").count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_second_file_store_instance_sees_the_first_ones_writes() {
+        // This is the whole point: two SEPARATE FileStore values (standing in for two separate
+        // OS processes — bsgames and a spawned game, or a host and a joiner) pointed at the same
+        // path see each other's data, unlike SnapcoreStore's private in-process HashMap.
+        let path = tmp_store_path("cross-instance");
+        let mut writer = FileStore::at(&path);
+        writer.put("bob@1", b"bob's profile bytes".to_vec());
+
+        let reader = FileStore::at(&path); // a fresh instance, nothing shared but the path
+        assert_eq!(reader.get("bob@1"), Some(b"bob's profile bytes".to_vec()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn missing_key_and_missing_file_both_return_none() {
+        let fs = FileStore::at(tmp_store_path("nonexistent"));
+        assert!(fs.get("anything").is_none());
+    }
+
+    #[test]
+    fn profile_service_over_two_file_stores_lets_a_friend_resolve_a_real_session() {
+        // The actual scenario the bsgames→soldier handoff depends on: host and joiner are
+        // different `ProfileService` values (as they are in different processes), sharing a
+        // FileStore path instead of each having an isolated SnapcoreStore.
+        let path = tmp_store_path("handoff-shape");
+        let mut host_svc = ProfileService::new(FileStore::at(&path), FileStore::at(&path));
+        let mut host = Profile::new("amy@host", "Amy");
+        let rec = crate::session::SessionRecord::new("soldier", "amy@host", "udp", "127.0.0.1:4000");
+        crate::session::SessionExt::announce_session(&mut host_svc, &mut host, "soldier@amy@host", &rec);
+
+        let joiner_svc = ProfileService::new(FileStore::at(&path), FileStore::at(&path));
+        let dial = crate::session::SessionExt::join_via_friend(&joiner_svc, "amy@host").expect("amy is hosting, over the shared file store");
+        assert_eq!(dial.addr, "127.0.0.1:4000");
+        let _ = std::fs::remove_file(&path);
+    }
 
     /// Toggleable fake standing in for OpenDHT.
     #[derive(Default)]
