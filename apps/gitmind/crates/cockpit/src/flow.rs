@@ -559,6 +559,29 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn unendlich_builds_the_real_fullgame_binary_not_the_bare_app_name() {
+        // the exact bug report: `cargo build --release --bin unendlich` fails because unendlich is
+        // a workspace root with no [package] of its own — the real game bin is `unendlich-fullgame`,
+        // gated behind render/window/ui-overlay, alongside several benchmark/probe bins that don't
+        // need those features. Every store group that includes unendlich must carry the override.
+        for group_name in ["media", "bigsilicons-apps"] {
+            let group = store_groups().into_iter().find(|g| g.name == group_name).unwrap_or_else(|| panic!("missing group {group_name}"));
+            let u = group.apps.iter().find(|a| a.name == "unendlich").unwrap_or_else(|| panic!("{group_name} is missing unendlich"));
+            assert_eq!(u.build_app_id(), "unendlich-fullgame");
+            for feat in ["render", "window", "ui-overlay"] {
+                assert!(u.features.iter().any(|f| f == feat), "{group_name}'s unendlich entry is missing the {feat} feature: {:?}", u.features);
+            }
+        }
+        // and it must NOT also appear as a bare simple() entry anywhere (that would silently
+        // reintroduce the bug — the plain string list must not carry "unendlich" alongside the
+        // custom push)
+        for group in store_groups() {
+            let hits: Vec<_> = group.apps.iter().filter(|a| a.name == "unendlich").collect();
+            assert!(hits.len() <= 1, "{} has unendlich listed more than once: {:?}", group.name, hits);
+        }
+    }
+
     fn g(repo: &Path, args: &[&str]) {
         let mut full: Vec<&str> = vec!["-c", "user.name=T", "-c", "user.email=t@t"];
         full.extend_from_slice(args);
@@ -728,7 +751,7 @@ pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn 
 
     if is_cargo {
         let (bin, _) = crate::ops::build_locally_logged(
-            &app.name,
+            app.build_app_id(),
             &app_dir,
             &target,
             &app.features,
@@ -835,7 +858,7 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         }
     }
     let coding = ["gitmind", "logscope", "bot-arena"];
-    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound", "unendlich"];
+    let media = ["av1tuner", "av1tuner-m1", "snapclone", "paperbound"];
     let music = ["beatspace", "krapper", "bo-suite", "fao-codec"];
     let work = ["voiceterm", "ambient-learner", "rusty-board"];
     let all: Vec<&str> = coding.iter().chain(&media).chain(&music).chain(&work).copied().collect();
@@ -848,14 +871,32 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         no_default: false,
         target: String::new(),
         run_flags: String::new(),
+        bin_name: None,
+    };
+    // unendlich is a workspace root with no [package] of its own — several benchmark/probe bins
+    // (perf-probe, gpu-mesh-bench, octree-bench, …) live alongside the real game, which is its own
+    // differently-named bin (`unendlich-fullgame`) gated behind render/window/ui-overlay. Without
+    // `bin_name` here, the simple-entry default (`--bin unendlich`) matches NONE of the workspace's
+    // actual bin targets — exactly the reported "no bin target named `unendlich`" error.
+    let unendlich = || crate::suite::SuiteApp {
+        name: "unendlich".into(),
+        path: "unendlich".into(),
+        features: vec!["render".into(), "window".into(), "ui-overlay".into()],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("unendlich-fullgame".into()),
     };
     let mut work_group = group("work", "Productivity, comms & input", &work);
     work_group.apps.push(bsettings());
+    let mut media_group = group("media", "Video, camera, imaging & games", &media);
+    media_group.apps.push(unendlich());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
+    all_group.apps.push(unendlich());
     vec![
         group("coding", "Development & analysis tools", &coding),
-        group("media", "Video, camera, imaging & games", &media),
+        media_group,
         group("music", "Audio synthesis, codecs & music", &music),
         work_group,
         all_group,
