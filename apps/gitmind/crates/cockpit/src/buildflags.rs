@@ -103,6 +103,16 @@ pub fn crate_name(toml: &str) -> Option<String> {
     read_section_string(toml, "[package]", "name").filter(|s| !s.is_empty())
 }
 
+/// The actual cargo package/binary identifier to build with — `app`'s real name can differ from
+/// the manifest/display id it's known by (e.g. voiceterm's crate is still named "web2qml" from
+/// before the app was renamed, so `-p voiceterm` / a `target/release/voiceterm` binary lookup both
+/// fail even though the app itself builds fine). Reads the REAL `[package] name` from `toml` when
+/// present; falls back to `app` when there's no `[package]` section to read at all (the workspace-
+/// root case, where `app` already names the real binary via `--bin`). Pure — unit-tested.
+pub fn build_id(app: &str, toml: &str) -> String {
+    crate_name(toml).unwrap_or_else(|| app.to_string())
+}
+
 /// The crate's `[package] description`, if any. Pure — unit-tested.
 pub fn package_description(toml: &str) -> Option<String> {
     read_section_string(toml, "[package]", "description").filter(|s| !s.is_empty())
@@ -417,6 +427,22 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn build_id_uses_the_real_package_name_when_it_differs_from_the_app_id() {
+        // the exact bug report: voiceterm's crate is still named "web2qml" (kept from before the
+        // app was renamed) — `-p voiceterm` / a `target/release/voiceterm` binary lookup both fail
+        // with cargo's "package ID specification did not match any packages" even though the app
+        // itself builds fine. build_id must resolve to the REAL name, not the manifest/display id.
+        let voiceterm_toml = "[package]\nname = \"web2qml\"\nversion = \"0.1.0\"\n\n[features]\ndefault = []\nvoice = [\"whisper-rs\"]\n";
+        assert_eq!(build_id("voiceterm", voiceterm_toml), "web2qml");
+        // the common case: package name matches the app id — no surprise remapping
+        let normal_toml = "[package]\nname = \"logscope\"\n";
+        assert_eq!(build_id("logscope", normal_toml), "logscope");
+        // no [package] at all (a bare workspace root, e.g. gitmind's `gitmind-cli` crate under the
+        // `gitmind` app id) — falls back to the app id itself, matching the existing --bin path
+        assert_eq!(build_id("gitmind", "[workspace]\nmembers = [\"crates/*\"]\n"), "gitmind");
+    }
 
     #[test]
     fn feature_toggles_matches_defaults_and_preserves_declaration_order() {

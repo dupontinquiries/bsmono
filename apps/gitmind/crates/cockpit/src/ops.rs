@@ -237,7 +237,13 @@ pub fn build_locally_logged(
     let as_bin = crate::buildflags::declares_workspace(&root_toml)
         && crate::buildflags::crate_name(&root_toml).is_none()
         && !has_member_package(app_dir, app); // logscope HAS a member pkg `logscope` → keep -p
-    let argv = crate::buildflags::cargo_build_argv_kind(app, &cargo_target, feats, no_default, as_bin);
+    // The REAL cargo package (and, absent an explicit [[bin]] override, binary) name — this can
+    // differ from `app`, the manifest/display id (e.g. voiceterm's crate is still named "web2qml"
+    // from before the app was renamed; `-p voiceterm`/a `target/release/voiceterm` lookup both
+    // fail even though the app itself builds fine). Falls back to `app` when there's no [package]
+    // name to read at all (the as_bin workspace-root case above, where `app` IS the real bin name).
+    let build_id = crate::buildflags::build_id(app, &root_toml);
+    let argv = crate::buildflags::cargo_build_argv_kind(&build_id, &cargo_target, feats, no_default, as_bin);
     on_line(&format!("$ cargo {}", argv[1..].join(" ")));
     on_line(&format!("  (in {})", app_dir.display()));
     let mut child = std::process::Command::new(&cargo)
@@ -264,7 +270,7 @@ pub fn build_locally_logged(
     }
     let status = child.wait().map_err(|e| format!("build wait failed: {e}"))?;
     if status.success() {
-        let bin = resolve_binary(&cargo, app_dir, &cargo_target, app, Some(&build_dir.display().to_string()));
+        let bin = resolve_binary(&cargo, app_dir, &cargo_target, &build_id, Some(&build_dir.display().to_string()));
         let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
         on_line(&format!("✓ built {} ({} KB)", app, size / 1024));
         Ok((bin, size))
