@@ -12,6 +12,7 @@ pub mod genome;
 pub mod evolve;
 pub mod profile;
 pub mod multiplayer;
+pub mod handoff;
 pub mod loadout;
 pub mod class;
 pub mod mapeval;

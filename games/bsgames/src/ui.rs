@@ -130,6 +130,30 @@ impl GameCentre {
         }
     }
 
+    /// The "passing off amongst all the menus" handoff: a friend is InGame in some `raw_game`, so
+    /// spawn *that same game* for us too, but with `BSGAMES_HANDOFF_*` env vars set (see
+    /// `centre::handoff_env`) so it skips its own main menu and dials the friend directly, instead
+    /// of us having to re-navigate that game's Multiplayer → Join screen by hand. If we don't have
+    /// that game installed/registered, or the friend's raw_game doesn't match anything in our
+    /// registry, fails with a clear status message rather than silently doing nothing.
+    fn join_friend(&mut self, r: &centre::FriendRow) {
+        let Some(raw_game) = &r.raw_game else {
+            self.status = format!("{} isn't in a game right now", r.name);
+            return;
+        };
+        let Some(g) = self.games.iter().find(|g| &g.id == raw_game).cloned() else {
+            self.status = format!("{} is playing {raw_game}, which isn't in this game centre", r.name);
+            return;
+        };
+        let argv = centre::launch_argv(&g);
+        let env = centre::handoff_env(centre::HandoffRole::Join, &self.me, Some(&r.id));
+        let spawned = std::process::Command::new(&argv[0]).args(&argv[1..]).envs(env).spawn();
+        match spawned {
+            Ok(_) => self.status = format!("joining {} in {}…", r.name, g.name),
+            Err(e) => self.status = format!("couldn't launch {}: {e}", g.name),
+        }
+    }
+
     /// The Profile section: editable display name, read-only id + Copy, and a QR toggle — reused
     /// as-is inside the wizard's ShareId step and standing permanently in the friends panel.
     fn profile_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -289,8 +313,7 @@ impl GameCentre {
             });
             ui.horizontal(|ui| {
                 if r.joinable && ui.small_button("join").clicked() {
-                    // netcode I/O seam: join their session via the game's transport.
-                    self.status = format!("joining {}…", r.name);
+                    self.join_friend(r);
                 }
                 if ui.small_button("chat").clicked() {
                     self.chat_to = Some(r.id.clone());
