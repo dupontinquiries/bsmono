@@ -4,6 +4,10 @@ This is the GPU port of the kBM3 music GAN for **Asahi Fedora Remix**. It trains
 exact v5 generator/discriminator on the Apple GPU through **Mesa's conformant Vulkan
 driver** ("Honeykrisp"), using the **Burn** ML framework's `wgpu`/Vulkan backend.
 
+See **[ASAHI_NOTES.md](ASAHI_NOTES.md)** for AGX/Honeykrisp-specific findings
+(single queue family, kernel-cache vs. fusion, coalesced memory access) pulled
+from real hardware testing on this monorepo's other Vulkan/Asahi projects.
+
 ## Why this exists (the GPU situation on Asahi)
 
 Your training log said `No GPU backend found` because **PyTorch has no backend for the
