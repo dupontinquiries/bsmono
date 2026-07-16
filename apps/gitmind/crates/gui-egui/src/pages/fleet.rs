@@ -57,17 +57,27 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         // re-scan the REAL Cargo.toml + manifest only when the selection actually changed —
         // matches Fleet.qml's local_build_options call on selection, not every frame.
         if app.fleet.scanned_path.as_deref() != Some(sel.path.as_str()) {
-            let cargo = std::fs::read_to_string(std::path::Path::new(&sel.path).join("Cargo.toml")).unwrap_or_default();
+            // sel.path is often just the bare app NAME (e.g. "voiceterm", from SuiteApp::simple —
+            // store_groups() deliberately doesn't hard-code apps/ vs games/), not a real filesystem
+            // path — reading `sel.path` directly as a path (as this used to) silently fails
+            // (read_to_string errors, unwrap_or_default() swallows it), so the scan always came back
+            // empty and no checkboxes ever showed. resolve_app_dir does the SAME apps/-vs-games/
+            // discovery build_locally_logged uses at actual build time.
+            let real_dir = cockpit::ops::resolve_app_dir(&sel.path);
+            let cargo = std::fs::read_to_string(real_dir.join("Cargo.toml")).unwrap_or_default();
             app.fleet.feature_toggles = buildflags::feature_toggles(&cargo, &sel.target);
-            app.fleet.egui_port = std::fs::read_to_string(cockpit::ops::repo_root().join("manifest/projects.toml"))
-                .ok()
-                .and_then(|manifest| {
+            // manifest paths are repo-relative (e.g. "apps/voiceterm"); strip repo_root off the
+            // resolved absolute dir to compare like-for-like instead of against the bare sel.path.
+            let real_rel = real_dir.strip_prefix(cockpit::ops::repo_root()).ok().map(|p| p.display().to_string());
+            app.fleet.egui_port = real_rel.and_then(|rel| {
+                std::fs::read_to_string(cockpit::ops::repo_root().join("manifest/projects.toml")).ok().and_then(|manifest| {
                     appcatalog::parse_manifest(&manifest).into_iter().find(|m| {
                         // the app's own path (e.g. "apps/voiceterm") is a prefix of the port's path
                         // (e.g. "apps/voiceterm/egui-frontend") for every port registered this way.
-                        m.path.starts_with(sel.path.trim_end_matches('/')) && m.path != sel.path
+                        m.path.starts_with(rel.trim_end_matches('/')) && m.path != rel
                     })
-                });
+                })
+            });
             app.fleet.scanned_path = Some(sel.path.clone());
         }
 
