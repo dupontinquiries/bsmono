@@ -4,7 +4,18 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "gitmind",
         opts,
-        Box::new(|_cc| Ok(Box::new(GitmindApp::default()))),
+        Box::new(|_cc| {
+            let mut app = GitmindApp::default();
+            // GITMIND_EGUI_TAB overrides the default starting tab — for automated screenshots/
+            // testing (no UI-driving harness exists to click a tab button), not a user-facing
+            // setting; unset, behaviour is identical to before.
+            if let Ok(name) = std::env::var("GITMIND_EGUI_TAB") {
+                if let Some(t) = gitmind_egui::app::Tab::ALL.iter().find(|t| t.label().eq_ignore_ascii_case(&name)) {
+                    app.app.tab = *t;
+                }
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 

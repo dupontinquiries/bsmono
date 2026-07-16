@@ -148,6 +148,16 @@ pub fn arch_default_features(toml: &str, triple: &str) -> Vec<String> {
     scan_cargo_features(toml).default
 }
 
+/// Every feature paired with whether it should start checked for `triple` — the exact shape a
+/// checkbox list needs (name + on), computed once so Qt's Fleet.qml and gitmind-egui's fleet page
+/// don't each re-derive "which features are on by default" independently. Order matches
+/// `scan_cargo_features`'s `all` (declaration order in Cargo.toml). Pure — unit-tested.
+pub fn feature_toggles(toml: &str, triple: &str) -> Vec<(String, bool)> {
+    let feats = scan_cargo_features(toml);
+    let defaults = arch_default_features(toml, triple);
+    feats.all.into_iter().map(|name| { let on = defaults.contains(&name); (name, on) }).collect()
+}
+
 /// Scan CMakeLists.txt for `option(...)`. Pure — unit-tested. (One option per line,
 /// the common form.)
 pub fn scan_cmake_options(text: &str) -> Vec<CmakeOption> {
@@ -407,6 +417,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn feature_toggles_matches_defaults_and_preserves_declaration_order() {
+        let toml = "[package]\nname = \"x\"\n[features]\ndefault = [\"b\"]\na = []\nb = []\nc = []\n\n[package.metadata.gitmind]\ndefault-features-musl = [\"a\", \"c\"]\n";
+        // native (no triple match) falls through to the plain [features] default = [\"b\"]
+        let native = feature_toggles(toml, "");
+        assert_eq!(native.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"], "order matches declaration, not the default set");
+        assert_eq!(native, vec![("a".into(), false), ("b".into(), true), ("c".into(), false)]);
+        // musl triple picks up the per-arch override instead
+        let musl = feature_toggles(toml, "aarch64-unknown-linux-musl");
+        assert_eq!(musl, vec![("a".into(), true), ("b".into(), false), ("c".into(), true)]);
+    }
 
     #[test]
     fn native_build_omits_target() {
