@@ -11,11 +11,11 @@
 
 use netcode::profile::Profile;
 use netcode::session::{SessionExt, SessionRecord};
-use netcode::store::{ProfileService, SnapcoreStore};
+use netcode::store::{FileStore, ProfileService};
 use std::net::UdpSocket;
 
 pub struct Multiplayer {
-    svc: ProfileService<SnapcoreStore, SnapcoreStore>,
+    svc: ProfileService<FileStore, FileStore>,
     pub me: Profile,
     pub socket: Option<UdpSocket>,
     pub token: Option<String>,
@@ -23,8 +23,19 @@ pub struct Multiplayer {
 
 impl Multiplayer {
     pub fn new(player_id: &str, display_name: &str) -> Self {
+        Self::at_store(player_id, display_name, FileStore::dev_default_path())
+    }
+
+    /// Same as `new`, but pointed at an explicit shared-store file rather than the real
+    /// machine-wide default — every test needs its own path so parallel test runs (and repeated
+    /// runs leaving stale data behind) can't interfere with each other or with a real running game.
+    pub fn at_store(player_id: &str, display_name: &str, store_path: std::path::PathBuf) -> Self {
+        // FileStore (a shared-file stand-in for real network transport — see its doc comment in
+        // netcode::store) rather than SnapcoreStore: two separate Soldier processes (or bsgames and
+        // a spawned Soldier, the handoff case) need to actually see each other's announcements for
+        // local/LAN testing, which an isolated in-process SnapcoreStore never could.
         let mut m = Multiplayer {
-            svc: ProfileService::new(SnapcoreStore::new(), SnapcoreStore::new()),
+            svc: ProfileService::new(FileStore::at(&store_path), FileStore::at(&store_path)),
             me: Profile::new(player_id, display_name),
             socket: None,
             token: None,
@@ -93,82 +104,92 @@ impl Multiplayer {
 mod tests {
     use super::*;
 
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        // Every test gets its own file so parallel test runs (and this crate's other tests, and a
+        // real running game on the same machine) can't interfere with each other via the shared
+        // dev-default path `Multiplayer::new` actually uses outside tests.
+        std::env::temp_dir().join(format!("soldier-mp-test-{name}-{}.jsonl", std::process::id()))
+    }
+
     #[test]
     fn host_announces_and_a_friend_can_resolve_the_dial_target() {
-        let mut host = Multiplayer::new("kesslerd", "Kessler");
+        let path = tmp_path("resolve");
+        let mut host = Multiplayer::at_store("kesslerd", "Kessler", path.clone());
         let token = host.host("127.0.0.1:0").expect("bind should succeed");
         assert_eq!(token, "soldier@kesslerd");
         assert_eq!(host.token.as_deref(), Some("soldier@kesslerd"));
 
-        // A friend's client (its own ProfileService instance) resolves kesslerd's session through
-        // the same underlying store, exactly like bsgames' host_then_join_over_the_fleet_dht.
-        let dial = host
-            .svc
-            .join_via_friend("kesslerd")
-            .expect("host is joinable");
+        // A SEPARATE Multiplayer value — standing in for a friend's own process — resolves
+        // kesslerd's session over the shared FileStore, not a reused/shared `svc` instance. This is
+        // the actual bsgames→soldier handoff shape: two independent processes, one file on disk.
+        let friend = Multiplayer::at_store("friendclient", "Friend", path.clone());
+        let dial = friend.svc.join_via_friend("kesslerd").expect("host is joinable, over the shared file store");
         assert_eq!(dial.game, "soldier");
         assert_eq!(dial.transport, "udp");
         assert!(dial.addr.starts_with("127.0.0.1:"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn joining_a_non_soldier_session_is_rejected() {
-        let mut host = Multiplayer::new("amy", "Amy");
+        let path = tmp_path("wrong-game");
+        let mut host = Multiplayer::at_store("amy", "Amy", path.clone());
         // amy is hosting a DIFFERENT game — soldier's join() must refuse it, not silently connect.
         let rec = SessionRecord::new("blackstar", "amy", "udp", "127.0.0.1:9999");
         host.svc.announce_session(&mut host.me, "blackstar@amy", &rec);
 
-        // NOTE: `snapcore::store::Store` (netcode's fallback backend) is a pure in-memory routing
-        // structure with no real socket binding yet — cross-instance discovery between two separate
-        // `Multiplayer::new()`s isn't wired anywhere in the fleet today (see
-        // games/GAMES_UNIFICATION.md's "remaining seams: OpenDHT FFI primary"). Until that lands,
-        // "a friend resolves our session" means the same shared store, exactly like bsgames' own
-        // `host_then_join_over_the_fleet_dht` reference test — so this reuses `host.svc` rather than
-        // standing up an unreachable second instance.
-        let err = host.join("amy").unwrap_err();
+        let mut joiner = Multiplayer::at_store("bob", "Bob", path.clone());
+        let err = joiner.join("amy").unwrap_err();
         assert!(err.contains("blackstar"), "error should name the actual game: {err}");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn joining_someone_not_hosting_fails_cleanly() {
-        let mut host = Multiplayer::new("zed", "Zed"); // published (by ::new), never hosts a session
-        assert!(host.join("zed").is_err(), "zed is online but not in a game — not joinable");
-        assert!(host.join("nobody-with-this-id").is_err(), "unknown id — not joinable");
+        let path = tmp_path("not-hosting");
+        let _host = Multiplayer::at_store("zed", "Zed", path.clone()); // published, never hosts
+        let mut joiner = Multiplayer::at_store("bob2", "Bob", path.clone());
+        assert!(joiner.join("zed").is_err(), "zed is online but not in a game — not joinable");
+        assert!(joiner.join("nobody-with-this-id").is_err(), "unknown id — not joinable");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn stop_hosting_clears_local_session_state() {
-        let mut host = Multiplayer::new("carla", "Carla");
+        let path = tmp_path("stop-hosting");
+        let mut host = Multiplayer::at_store("carla", "Carla", path.clone());
         host.host("127.0.0.1:0").unwrap();
         assert!(host.token.is_some());
         host.stop_hosting();
         assert!(host.token.is_none());
         assert!(host.socket.is_none());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn a_real_udp_hello_reaches_the_host_socket() {
-        // Proves the data-plane handoff isn't just discovery-on-paper: bind a real host socket,
-        // resolve its address through the control plane, then actually send bytes to it and
-        // observe them arrive — the same address a real joiner's socket.connect() would use.
-        let mut host = Multiplayer::new("dana", "Dana");
+    fn a_real_udp_hello_reaches_the_host_socket_via_a_separate_joiner_instance() {
+        // Proves the FULL handoff shape end to end: two independent Multiplayer values (host +
+        // joiner, standing in for bsgames spawning a separate Soldier process), the joiner resolves
+        // the host's real address purely through the shared FileStore, then actually dials it —
+        // the same path a real bsgames→soldier handoff takes.
+        let path = tmp_path("udp-hello");
+        let mut host = Multiplayer::at_store("dana", "Dana", path.clone());
         host.host("127.0.0.1:0").unwrap();
         let host_addr = host.socket.as_ref().unwrap().local_addr().unwrap();
 
-        let dial = host.svc.join_via_friend("dana").expect("host is joinable");
-        assert_eq!(dial.addr, host_addr.to_string());
-
-        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
-        sender.send_to(b"hello", &dial.addr).unwrap();
+        let mut joiner = Multiplayer::at_store("erin", "Erin", path.clone());
+        let addr = joiner.join("dana").expect("dana is hosting, resolved via the shared FileStore");
+        assert_eq!(addr, host_addr.to_string());
+        joiner.send_hello().expect("joiner's connected socket can send");
 
         let mut buf = [0u8; 16];
-        // give the (nonblocking) host socket a moment; retry briefly rather than sleeping blind
         let mut got = None;
         for _ in 0..200 {
             if let Some((n, _from)) = host.poll(&mut buf) { got = Some(n); break; }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let n = got.expect("host should receive the hello datagram");
+        let n = got.expect("host should receive the joiner's hello datagram");
         assert_eq!(&buf[..n], b"hello");
+        let _ = std::fs::remove_file(&path);
     }
 }
