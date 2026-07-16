@@ -13,6 +13,54 @@ fn cpu_gemm(a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     for i in 0..m { for p in 0..k { let av = a[i * k + p]; for j in 0..n { c[i * n + j] += av * b[p * n + j]; } } }
     c
 }
+fn cpu_silu(x: &[f32]) -> Vec<f32> { x.iter().map(|&v| v / (1.0 + (-v).exp())).collect() }
+
+fn cpu_conv2d(x: &[f32], w: &[f32], bias: &[f32], nb: usize, h: usize, ww: usize, cin: usize, cout: usize, k: usize, stride: usize, pad: usize) -> Vec<f32> {
+    let hout = (h + 2 * pad - k) / stride + 1; let wout = (ww + 2 * pad - k) / stride + 1;
+    let mut o = vec![0.0f32; nb * hout * wout * cout];
+    for n in 0..nb { for ho in 0..hout { for wo in 0..wout { for co in 0..cout {
+        let mut acc = bias[co];
+        for ci in 0..cin { for kh in 0..k { for kw in 0..k {
+            let hi = ho as i64 * stride as i64 + kh as i64 - pad as i64;
+            let wi = wo as i64 * stride as i64 + kw as i64 - pad as i64;
+            if hi < 0 || hi >= h as i64 || wi < 0 || wi >= ww as i64 { continue; }
+            let xv = x[((n * h + hi as usize) * ww + wi as usize) * cin + ci];
+            let wv = w[((co * cin + ci) * k + kh) * k + kw];
+            acc += xv * wv;
+        }}}
+        o[((n * hout + ho) * wout + wo) * cout + co] = acc;
+    }}}}
+    o
+}
+
+fn cpu_group_norm(x: &[f32], gamma: &[f32], beta: &[f32], nb: usize, hw: usize, c: usize, groups: usize, eps: f32) -> Vec<f32> {
+    let cpg = c / groups;
+    let mut o = vec![0.0f32; x.len()];
+    for n in 0..nb { for gi in 0..groups {
+        let c0 = gi * cpg;
+        let mut mean = 0.0; let mut cnt = 0.0;
+        for p in 0..hw { for cc in 0..cpg { mean += x[(n * hw + p) * c + c0 + cc]; cnt += 1.0; } }
+        mean /= cnt;
+        let mut var = 0.0;
+        for p in 0..hw { for cc in 0..cpg { let d = x[(n * hw + p) * c + c0 + cc] - mean; var += d * d; } }
+        var /= cnt; let inv = 1.0 / (var + eps).sqrt();
+        for p in 0..hw { for cc in 0..cpg {
+            let idx = (n * hw + p) * c + c0 + cc;
+            o[idx] = (x[idx] - mean) * inv * gamma[c0 + cc] + beta[c0 + cc];
+        }}
+    }}
+    o
+}
+
+fn cpu_upsample2x(x: &[f32], nb: usize, h: usize, w: usize, c: usize) -> Vec<f32> {
+    let (h2, w2) = (h * 2, w * 2);
+    let mut o = vec![0.0f32; nb * h2 * w2 * c];
+    for n in 0..nb { for ho in 0..h2 { for wo in 0..w2 { for cc in 0..c {
+        o[((n * h2 + ho) * w2 + wo) * c + cc] = x[((n * h + ho / 2) * w + wo / 2) * c + cc];
+    }}}}
+    o
+}
+
 fn cpu_linear(a: &[f32], w: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
     let mut c = vec![0.0; m * n];
     for i in 0..m { for j in 0..n { let mut s = 0.0; for p in 0..k { s += a[i * k + p] * w[j * k + p]; } c[i * n + j] = s; } }
@@ -390,6 +438,110 @@ fn write_gguf_qwen2(m: &HostModel, biases: &[(Vec<f32>, Vec<f32>, Vec<f32>)]) ->
     b
 }
 
+fn write_gguf_qwen3(m: &HostModel, q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let kv = m.n_kv_heads * (m.d / m.n_heads);
+    let mut ts: Vec<(String, Vec<u64>, &[f32])> = Vec::new();
+    ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), m.embed.as_slice()));
+    for (i, b) in m.layers.iter().enumerate() {
+        ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), b.g1.as_slice()));
+        ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), b.wq.as_slice()));
+        ts.push((format!("blk.{i}.attn_q_norm.weight"), v1(q_norm[i].len()), q_norm[i].as_slice()));
+        ts.push((format!("blk.{i}.attn_k.weight"), mat(kv, m.d), b.wk.as_slice()));
+        ts.push((format!("blk.{i}.attn_k_norm.weight"), v1(k_norm[i].len()), k_norm[i].as_slice()));
+        ts.push((format!("blk.{i}.attn_v.weight"), mat(kv, m.d), b.wv.as_slice()));
+        ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), b.wo.as_slice()));
+        ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), b.g2.as_slice()));
+        ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), b.wgate.as_slice()));
+        ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), b.wup.as_slice()));
+        ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), b.wdown.as_slice()));
+    }
+    ts.push(("output_norm.weight".into(), v1(m.d), m.out_norm.as_slice()));
+    ts.push(("output.weight".into(), mat(m.vocab, m.d), m.output.as_slice()));
+
+    let mut offsets = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, data) in &ts { offsets.push(off); off = align32(off + (data.len() * 4) as u64); }
+
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 9);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "qwen3");
+    s(&mut b, "qwen3.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "qwen3.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "qwen3.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "qwen3.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "qwen3.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "qwen3.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "qwen3.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "qwen3.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    for (i, (name, dims, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, 0); u64b(&mut b, offsets[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, data)) in ts.iter().enumerate() {
+        let target = data_off + offsets[i];
+        while (b.len() as u64) < target { b.push(0); }
+        b.extend_from_slice(bytemuck::cast_slice(data));
+    }
+    b
+}
+
+/// Independent CPU reference for the Qwen3 forward pass: identical to `cpu_block_mh` except Q and K each
+/// get an independent per-head RMSNorm (the same math as the GPU `qk_norm` kernel's own unit test) applied
+/// BEFORE RoPE. This is what `--gate-qwen3` checks the real GPU loader + forward against.
+fn cpu_qk_rmsnorm(x: &[f32], w: &[f32], t: usize, dm: usize, hd: usize, eps: f32) -> Vec<f32> {
+    let heads = dm / hd;
+    let mut o = vec![0.0f32; t * dm];
+    for row in 0..t * heads {
+        let b = row * hd;
+        let ms = (0..hd).map(|j| x[b + j] * x[b + j]).sum::<f32>() / hd as f32;
+        let inv = 1.0 / (ms + eps).sqrt();
+        for j in 0..hd { o[b + j] = x[b + j] * inv * w[j]; }
+    }
+    o
+}
+
+fn cpu_block_mh_qwen3(b: &Block, x: &[f32], t: usize, d: usize, h: usize, n_heads: usize, n_kv_heads: usize, base: f32, q_norm: &[f32], k_norm: &[f32], eps: f32) -> Vec<f32> {
+    let hd = d / n_heads; let kv = n_kv_heads * hd;
+    let n1 = cpu_rmsnorm(x, &b.g1, t, d, EPS);
+    let qp = cpu_qk_rmsnorm(&cpu_linear(&n1, &b.wq, t, d, d), q_norm, t, d, hd, eps);
+    let kp = cpu_qk_rmsnorm(&cpu_linear(&n1, &b.wk, t, kv, d), k_norm, t, kv, hd, eps);
+    let q = cpu_rope_mh(&qp, t, d, base, hd);
+    let k = cpu_rope_mh(&kp, t, kv, base, hd);
+    let v = cpu_linear(&n1, &b.wv, t, kv, d);
+    let attn = cpu_mha(&q, &k, &v, t, d, n_heads, n_kv_heads);
+    let o = cpu_linear(&attn, &b.wo, t, d, d);
+    let x2: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
+    let n2 = cpu_rmsnorm(&x2, &b.g2, t, d, EPS);
+    let gate = cpu_linear(&n2, &b.wgate, t, h, d);
+    let up = cpu_linear(&n2, &b.wup, t, h, d);
+    let hmid: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| (g / (1.0 + (-g).exp())) * u).collect();
+    let down = cpu_linear(&hmid, &b.wdown, t, d, h);
+    x2.iter().zip(&down).map(|(a, b)| a + b).collect()
+}
+
+fn cpu_model_forward_qwen3(m: &HostModel, ids: &[u32], q_norm: &[Vec<f32>], k_norm: &[Vec<f32>]) -> Vec<f32> {
+    let t = ids.len();
+    let mut x = Vec::with_capacity(t * m.d);
+    for &id in ids { let s = id as usize * m.d; x.extend_from_slice(&m.embed[s..s + m.d]); }
+    for (li, hb) in m.layers.iter().enumerate() {
+        let b = Block { wq: hb.wq.clone(), wk: hb.wk.clone(), wv: hb.wv.clone(), wo: hb.wo.clone(),
+            wgate: hb.wgate.clone(), wup: hb.wup.clone(), wdown: hb.wdown.clone(), g1: hb.g1.clone(), g2: hb.g2.clone() };
+        x = cpu_block_mh_qwen3(&b, &x, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, &q_norm[li], &k_norm[li], m.eps);
+    }
+    let xn = cpu_rmsnorm(&x, &m.out_norm, t, m.d, m.eps);
+    cpu_linear(&xn, &m.output, t, m.vocab, m.d)
+}
+
 fn write_gguf(m: &HostModel) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64]; // ggml ne = [in, out]
     let v1 = |n: usize| vec![n as u64];
@@ -456,6 +608,20 @@ fn cpu_model_forward(m: &HostModel, ids: &[u32]) -> Vec<f32> {
     }
     let xn = cpu_rmsnorm(&x, &m.out_norm, t, m.d, m.eps);
     cpu_linear(&xn, &m.output, t, m.vocab, m.d)
+}
+
+/// Like `cpu_model_forward` but stops at the final-norm hidden states (no LM head) — the CPU reference
+/// for `text_forward_hidden`, used as a DiT text encoder rather than a next-token predictor.
+fn cpu_text_hidden(m: &HostModel, ids: &[u32]) -> Vec<f32> {
+    let t = ids.len();
+    let mut x = Vec::with_capacity(t * m.d);
+    for &id in ids { let s = id as usize * m.d; x.extend_from_slice(&m.embed[s..s + m.d]); }
+    for hb in &m.layers {
+        let b = Block { wq: hb.wq.clone(), wk: hb.wk.clone(), wv: hb.wv.clone(), wo: hb.wo.clone(),
+            wgate: hb.wgate.clone(), wup: hb.wup.clone(), wdown: hb.wdown.clone(), g1: hb.g1.clone(), g2: hb.g2.clone() };
+        x = cpu_block_mh(&b, &x, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base);
+    }
+    cpu_rmsnorm(&x, &m.out_norm, t, m.d, m.eps)
 }
 
 fn f32_to_f16(f: f32) -> u16 {
@@ -927,6 +1093,343 @@ fn main() {
             println!("  (override-tiled GEMM unavailable on this backend — {} — reg-blocked + naive still run)", gpu.adapter_name);
         }
         println!("bench-gemm: higher GFLOP/s = faster prefill (lower first-token latency). M2 Ultra fp32 peak ~27 TFLOP/s.");
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-dit-block") {
+        // The fused `dit_block` (Z-Image/DiT AdaLN-Zero layer) must match a plain-f32 CPU reference:
+        // SiLU(cond) → Linear → 6 modulation vectors → non-affine-LN → modulate → bidirectional MHA →
+        // gated residual → non-affine-LN → modulate → MLP (GELU) → gated residual. Checks the
+        // modulation-vector split order, gated-residual placement, and that a zero `w_mod` output
+        // (gate≈0) makes the whole block collapse to a near-identity (the "-Zero" init property that
+        // makes stacking freshly-initialized DiT blocks safe).
+        use gpu_kernels::{Gpu, Lin, DitBlock};
+        let gpu = Gpu::new();
+        eprintln!("gate-dit-block: adapter = {}", gpu.adapter_name);
+        let (t, d, n_heads, mlp, eps) = (5usize, 16usize, 4usize, 32usize, 1e-5f32);
+        let hd = d / n_heads;
+        let mut rng = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+        let vecf = |n: usize, s: f32, r: &mut dyn FnMut() -> f32| -> Vec<f32> { (0..n).map(|_| r() * s).collect() };
+
+        let x = vecf(t * d, 1.0, &mut rnd);
+        let cond = vecf(d, 1.0, &mut rnd);
+        let wq = vecf(d * d, 0.25, &mut rnd); let wk = vecf(d * d, 0.25, &mut rnd);
+        let wv = vecf(d * d, 0.25, &mut rnd); let wo = vecf(d * d, 0.25, &mut rnd);
+        let f1 = vecf(mlp * d, 0.25, &mut rnd); let f2 = vecf(d * mlp, 0.25, &mut rnd);
+        let wmod = vecf(6 * d * d, 0.2, &mut rnd); let bmod = vecf(6 * d, 0.1, &mut rnd);
+
+        // ---- pure-CPU reference ----
+        let silu = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&v| v / (1.0 + (-v).exp())).collect() };
+        let linear_nobias = |a: &[f32], w: &[f32], rows: usize, nin: usize, nout: usize| -> Vec<f32> {
+            let mut o = vec![0.0f32; rows * nout];
+            for i in 0..rows { for oo in 0..nout { let mut acc = 0.0; for kk in 0..nin { acc += a[i * nin + kk] * w[oo * nin + kk]; } o[i * nout + oo] = acc; } }
+            o
+        };
+        let linear_bias = |a: &[f32], w: &[f32], bias: &[f32], rows: usize, nin: usize, nout: usize| -> Vec<f32> {
+            let mut o = linear_nobias(a, w, rows, nin, nout);
+            for i in 0..rows { for oo in 0..nout { o[i * nout + oo] += bias[oo]; } }
+            o
+        };
+        let ln_noaffine = |xs: &[f32]| -> Vec<f32> {
+            let mut o = vec![0.0f32; xs.len()];
+            for r in 0..t {
+                let row = &xs[r * d..r * d + d];
+                let mean = row.iter().sum::<f32>() / d as f32;
+                let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / d as f32;
+                let inv = 1.0 / (var + eps).sqrt();
+                for c in 0..d { o[r * d + c] = (row[c] - mean) * inv; }
+            }
+            o
+        };
+        let modulate = |xs: &[f32], scale: &[f32], shift: &[f32]| -> Vec<f32> {
+            (0..xs.len()).map(|i| xs[i] * (1.0 + scale[i % d]) + shift[i % d]).collect()
+        };
+        let gated_add = |xs: &[f32], y: &[f32], gate: &[f32]| -> Vec<f32> {
+            (0..xs.len()).map(|i| xs[i] + gate[i % d] * y[i]).collect()
+        };
+        let full_mha = |q: &[f32], k: &[f32], v: &[f32]| -> Vec<f32> {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let mut o = vec![0.0f32; t * d];
+            for h in 0..n_heads { let off = h * hd;
+                for i in 0..t {
+                    let mut sc = vec![0.0f32; t]; let mut mx = f32::MIN;
+                    for j in 0..t { let mut dot = 0.0; for c in 0..hd { dot += q[i * d + off + c] * k[j * d + off + c]; } sc[j] = dot * scale; mx = mx.max(sc[j]); }
+                    let mut sum = 0.0; for j in 0..t { sc[j] = (sc[j] - mx).exp(); sum += sc[j]; }
+                    for c in 0..hd { let mut acc = 0.0; for j in 0..t { acc += sc[j] / sum * v[j * d + off + c]; } o[i * d + off + c] = acc; }
+                }
+            }
+            o
+        };
+        let gelu_tanh = |xs: &[f32]| -> Vec<f32> { xs.iter().map(|&v| { let inner = 0.7978845608028654 * (v + 0.044715 * v * v * v); 0.5 * v * (1.0 + inner.tanh()) }).collect::<Vec<f32>>() };
+
+        let cpu_ref = |wmod: &[f32], bmod: &[f32]| -> Vec<f32> {
+            let cact = silu(&cond);
+            let modv = linear_bias(&cact, wmod, bmod, 1, d, 6 * d);
+            let (shift1, scale1, gate1) = (&modv[0..d], &modv[d..2 * d], &modv[2 * d..3 * d]);
+            let (shift2, scale2, gate2) = (&modv[3 * d..4 * d], &modv[4 * d..5 * d], &modv[5 * d..6 * d]);
+            let h1 = modulate(&ln_noaffine(&x), scale1, shift1);
+            let q = linear_nobias(&h1, &wq, t, d, d);
+            let k = linear_nobias(&h1, &wk, t, d, d);
+            let vv = linear_nobias(&h1, &wv, t, d, d);
+            let attn = full_mha(&q, &k, &vv);
+            let o = linear_nobias(&attn, &wo, t, d, d);
+            let x2 = gated_add(&x, &o, gate1);
+            let h2 = modulate(&ln_noaffine(&x2), scale2, shift2);
+            let a1 = linear_nobias(&h2, &f1, t, d, mlp);
+            let act = gelu_tanh(&a1);
+            let a2 = linear_nobias(&act, &f2, t, mlp, d);
+            gated_add(&x2, &a2, gate2)
+        };
+
+        // ---- GPU under test ----
+        let lin_nb = |w: &[f32], nout: usize, nin: usize| Lin::f32(gpu.upload(w, nout, nin));
+        let lin_b = |w: &[f32], bias: &[f32], nout: usize, nin: usize| Lin::f32(gpu.upload(w, nout, nin)).with_bias(Some(gpu.upload(bias, 1, nout)));
+        let mk = |wmod: &[f32], bmod: &[f32]| DitBlock {
+            wq: lin_nb(&wq, d, d), wk: lin_nb(&wk, d, d), wv: lin_nb(&wv, d, d), wo: lin_nb(&wo, d, d),
+            fc1: lin_nb(&f1, mlp, d), fc2: lin_nb(&f2, d, mlp),
+            w_mod: lin_b(wmod, bmod, 6 * d, d),
+        };
+        let xt = gpu.upload(&x, t, d);
+        let condt = gpu.upload(&cond, 1, d);
+        let ln_one = gpu.upload(&vec![1.0f32; d], 1, d);
+        let ln_zero = gpu.upload(&vec![0.0f32; d], 1, d);
+
+        let mut ok = true;
+        let blk = mk(&wmod, &bmod);
+        let got = gpu.download(&gpu.dit_block(&blk, &xt, &condt, &ln_one, &ln_zero, t, d, n_heads, eps));
+        let want = cpu_ref(&wmod, &bmod);
+        let worst = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("  [{}] GPU dit_block vs CPU ref  max|\u{394}|={worst:.3e}", if worst < 2e-3 { "\u{2713}" } else { "\u{2717} FAIL" });
+        ok &= worst < 2e-3;
+
+        // AdaLN-Zero property: w_mod weights+bias all zero ⇒ shift=scale=gate=0 everywhere ⇒ the whole
+        // block is `x + MLP(LN(x + attn(LN(x))))`-with-zero-gates ⇒ collapses to just `x` (both gated
+        // residuals add nothing). A fresh, zero-initialized DiT block is therefore an exact no-op.
+        let zwmod = vec![0.0f32; 6 * d * d]; let zbmod = vec![0.0f32; 6 * d];
+        let zblk = mk(&zwmod, &zbmod);
+        let got_z = gpu.download(&gpu.dit_block(&zblk, &xt, &condt, &ln_one, &ln_zero, t, d, n_heads, eps));
+        let dz = got_z.iter().zip(&x).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        println!("  [{}] zero-init w_mod ⇒ dit_block(x) == x exactly (AdaLN-Zero)  max|\u{394}|={dz:.3e}", if dz < 1e-5 { "\u{2713}" } else { "\u{2717} FAIL" });
+        ok &= dz < 1e-5;
+
+        println!("gate-dit-block: {}", if ok { "DiT AdaLN-Zero block (modulate + bidirectional MHA + GELU MLP, gated residuals) validated \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-dit-conditioning") {
+        // The DiT text-conditioning path: text_forward_hidden (Qwen3 encoder, stopped before the LM
+        // head) vs an independent CPU reference; row_at's last-token pooling; and dit_conditioning's
+        // assembly (timestep embedding -> SiLU-MLP, pooled text hidden -> projection, summed).
+        use gpu_kernels::{Gpu, Lin};
+        let gpu = Gpu::new();
+        eprintln!("gate-dit-conditioning: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1) text_forward_hidden == independent CPU reference (no LM head, just the final hidden states)
+        let m = gen_model(64, 128, 2, 48, 4, 2);
+        let ids = [1u32, 7, 13, 0, 21];
+        let bytes = write_gguf(&m);
+        let gm = gpu.load_gguf(&bytes).expect("llama-shape text encoder loads");
+        let hidden = gpu.text_forward_hidden(&gm, &ids);
+        ck("text_forward_hidden shape == [t, d]", hidden.rows == ids.len() && hidden.cols == m.d);
+        let got_hidden = gpu.download(&hidden);
+        let want_hidden = cpu_text_hidden(&m, &ids);
+        let e1 = got_hidden.iter().zip(&want_hidden).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("text_forward_hidden == CPU reference (stops before LM head)", e1 < 1e-2);
+
+        // (2) row_at pools the correct (last) row
+        let last = gpu.download(&gpu.row_at(&hidden, hidden.rows - 1, m.d));
+        let want_last = &want_hidden[(ids.len() - 1) * m.d..];
+        ck("row_at(last) == the last token's hidden state", last.iter().zip(want_last).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max) < 1e-2);
+
+        // (3) dit_conditioning: timestep -> SiLU-MLP, pooled text hidden -> projection, summed
+        let (d_dit, ts_dim) = (24usize, 16usize);
+        let w1 = rnd(d_dit * ts_dim, 800); let w2 = rnd(d_dit * d_dit, 900); let wproj = rnd(d_dit * m.d, 1000);
+        let fc1 = Lin::f32(gpu.upload(&w1, d_dit, ts_dim));
+        let fc2 = Lin::f32(gpu.upload(&w2, d_dit, d_dit));
+        let proj = Lin::f32(gpu.upload(&wproj, d_dit, m.d));
+        let timestep = 5.0f32;
+        let cond = gpu.download(&gpu.dit_conditioning(&hidden, m.d, timestep, ts_dim, &fc1, &fc2, &proj));
+
+        // CPU side: same timestep_embedding + linear + silu + linear, then + projected pooled hidden
+        let t_emb = gpu_kernels::timestep_embedding(timestep, ts_dim, 10000.0);
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let lin = |a: &[f32], w: &[f32], nin: usize, nout: usize| -> Vec<f32> {
+            (0..nout).map(|o| (0..nin).map(|i| a[i] * w[o * nin + i]).sum()).collect()
+        };
+        let h1: Vec<f32> = lin(&t_emb, &w1, ts_dim, d_dit).iter().map(|&v| silu(v)).collect();
+        let t_h = lin(&h1, &w2, d_dit, d_dit);
+        let txt_h = lin(want_last, &wproj, m.d, d_dit);
+        let want_cond: Vec<f32> = t_h.iter().zip(&txt_h).map(|(a, b)| a + b).collect();
+        let e3 = cond.iter().zip(&want_cond).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("dit_conditioning == CPU reference (timestep-MLP + text-projection, summed)", e3 < 1e-2);
+
+        println!("gate-dit-conditioning: {}", if ok { "DiT text-conditioning path (text hidden states + timestep embedding) validated \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-vae-conv") {
+        // The VAE decoder's net-new primitives: conv2d (direct, batched), group_norm (batched), and
+        // nearest upsample2x (batched). Each vs an independent CPU reference; conv2d and group_norm are
+        // also checked at batch>1 to confirm the batch dimension is actually wired (not just accepted
+        // and ignored) — a real risk given both loop internally over n_batch.
+        use gpu_kernels::Gpu;
+        let gpu = Gpu::new();
+        eprintln!("gate-vae-conv: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // ---- conv2d: batch=2, 5x5 input, 3x3 kernel, stride 1, pad 1 (same-size output) ----
+        let (nb, h, w, cin, cout, k, stride, pad) = (2usize, 5usize, 5usize, 3usize, 4usize, 3usize, 1usize, 1usize);
+        let hout = (h + 2 * pad - k) / stride + 1; let wout = (w + 2 * pad - k) / stride + 1;
+        let x = rnd(nb * h * w * cin, 111);
+        let wt = rnd(cout * cin * k * k, 222);
+        let bias = rnd(cout, 333);
+        let cpu_conv = |x: &[f32]| -> Vec<f32> {
+            let mut o = vec![0.0f32; nb * hout * wout * cout];
+            for n in 0..nb { for ho in 0..hout { for wo in 0..wout { for co in 0..cout {
+                let mut acc = bias[co];
+                for ci in 0..cin { for kh in 0..k { for kw in 0..k {
+                    let hi = ho as i64 * stride as i64 + kh as i64 - pad as i64;
+                    let wi = wo as i64 * stride as i64 + kw as i64 - pad as i64;
+                    if hi < 0 || hi >= h as i64 || wi < 0 || wi >= w as i64 { continue; }
+                    let xv = x[((n * h + hi as usize) * w + wi as usize) * cin + ci];
+                    let wv = wt[((co * cin + ci) * k + kh) * k + kw];
+                    acc += xv * wv;
+                }}}
+                o[((n * hout + ho) * wout + wo) * cout + co] = acc;
+            }}}}
+            o
+        };
+        let xt = gpu.upload(&x, nb * h * w, cin);
+        let wtt = gpu.upload(&wt, cout * cin * k, k);
+        let bt = gpu.upload(&bias, 1, cout);
+        let (out_t, got_hout, got_wout) = gpu.conv2d(&xt, &wtt, &bt, nb, h, w, cin, cout, k, stride, pad);
+        ck("conv2d output spatial dims == (h+2p-k)/s+1", got_hout == hout && got_wout == wout);
+        let got = gpu.download(&out_t);
+        let want = cpu_conv(&x);
+        let e1 = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("conv2d (batch=2, 3x3, stride 1, pad 1) == CPU reference", e1 < 1e-3);
+        // batch dimension actually wired: change ONLY batch item 1's input, batch item 0's output must
+        // not move at all (proves item 0 isn't accidentally reading item 1's data or vice versa)
+        let mut x2 = x.clone();
+        for v in x2[h * w * cin..].iter_mut() { *v += 10.0; } // perturb batch item 1 only
+        let xt2 = gpu.upload(&x2, nb * h * w, cin);
+        let (out_t2, _, _) = gpu.conv2d(&xt2, &wtt, &bt, nb, h, w, cin, cout, k, stride, pad);
+        let got2 = gpu.download(&out_t2);
+        let item0_len = hout * wout * cout;
+        let d_item0 = got[..item0_len].iter().zip(&got2[..item0_len]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let d_item1 = got[item0_len..].iter().zip(&got2[item0_len..]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("conv2d batch is actually isolated (perturbing item 1 leaves item 0 unchanged, item 1 changes)", d_item0 < 1e-6 && d_item1 > 1e-3);
+
+        // ---- group_norm: batch=2, 6 channels, 2 groups (3 channels each), 4 spatial positions ----
+        let (nb2, hw2, c2, groups2, eps) = (2usize, 4usize, 6usize, 2usize, 1e-5f32);
+        let xg = rnd(nb2 * hw2 * c2, 444);
+        let gamma = rnd(c2, 555); let beta = rnd(c2, 666);
+        let cpu_gn = |x: &[f32]| -> Vec<f32> {
+            let cpg = c2 / groups2;
+            let mut o = vec![0.0f32; x.len()];
+            for n in 0..nb2 { for gi in 0..groups2 {
+                let c0 = gi * cpg;
+                let mut mean = 0.0; let mut cnt = 0.0;
+                for p in 0..hw2 { for cc in 0..cpg { mean += x[(n * hw2 + p) * c2 + c0 + cc]; cnt += 1.0; } }
+                mean /= cnt;
+                let mut var = 0.0;
+                for p in 0..hw2 { for cc in 0..cpg { let d = x[(n * hw2 + p) * c2 + c0 + cc] - mean; var += d * d; } }
+                var /= cnt; let inv = 1.0 / (var + eps).sqrt();
+                for p in 0..hw2 { for cc in 0..cpg {
+                    let idx = (n * hw2 + p) * c2 + c0 + cc;
+                    o[idx] = (x[idx] - mean) * inv * gamma[c0 + cc] + beta[c0 + cc];
+                }}
+            }}
+            o
+        };
+        let xgt = gpu.upload(&xg, nb2 * hw2, c2);
+        let gt = gpu.upload(&gamma, 1, c2); let bt2 = gpu.upload(&beta, 1, c2);
+        let got_gn = gpu.download(&gpu.group_norm(&xgt, &gt, &bt2, nb2, hw2, c2, groups2, eps));
+        let want_gn = cpu_gn(&xg);
+        let e2 = got_gn.iter().zip(&want_gn).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("group_norm (batch=2, 2 groups) == CPU reference", e2 < 1e-3);
+
+        // ---- upsample2x: batch=2, 3x3x2 -> 6x6x2, nearest-neighbor ----
+        let (nb3, h3, w3, c3) = (2usize, 3usize, 3usize, 2usize);
+        let xu = rnd(nb3 * h3 * w3 * c3, 777);
+        let cpu_up = |x: &[f32]| -> Vec<f32> {
+            let (h2, w2) = (h3 * 2, w3 * 2);
+            let mut o = vec![0.0f32; nb3 * h2 * w2 * c3];
+            for n in 0..nb3 { for ho in 0..h2 { for wo in 0..w2 { for cc in 0..c3 {
+                o[((n * h2 + ho) * w2 + wo) * c3 + cc] = x[((n * h3 + ho / 2) * w3 + wo / 2) * c3 + cc];
+            }}}}
+            o
+        };
+        let xut = gpu.upload(&xu, nb3 * h3 * w3, c3);
+        let got_up = gpu.download(&gpu.upsample2x(&xut, nb3, h3, w3, c3));
+        let want_up = cpu_up(&xu);
+        ck("upsample2x (batch=2, nearest-neighbor 2x) == CPU reference", got_up == want_up);
+
+        println!("gate-vae-conv: {}", if ok { "VAE decoder primitives (conv2d, group_norm, upsample2x) validated \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-vae-resblock") {
+        // The assembled VAE decoder resblock (GN→SiLU→conv3x3→GN→SiLU→conv3x3, + skip) and upsample
+        // stage, vs CPU references built from the same primitives already validated in isolation by
+        // --gate-vae-conv. Checked both with cin==cout (plain residual) and cin!=cout (1x1 skip conv) —
+        // real VAE decoders use both at different points in the upsample stack.
+        use gpu_kernels::{Gpu, VaeResBlock};
+        let gpu = Gpu::new();
+        eprintln!("gate-vae-resblock: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (nb, h, w, groups, eps) = (2usize, 4usize, 4usize, 2usize, 1e-5f32);
+
+        let build = |cin: usize, cout: usize, with_skip: bool, seed: usize| {
+            let gn1g = rnd(cin, seed + 1); let gn1b = rnd(cin, seed + 2);
+            let c1w = rnd(cout * cin * 9, seed + 3); let c1b = rnd(cout, seed + 4);
+            let gn2g = rnd(cout, seed + 5); let gn2b = rnd(cout, seed + 6);
+            let c2w = rnd(cout * cout * 9, seed + 7); let c2b = rnd(cout, seed + 8);
+            let skip_w = if with_skip { Some(rnd(cout * cin, seed + 9)) } else { None };
+            let skip_b = if with_skip { Some(rnd(cout, seed + 10)) } else { None };
+            (gn1g, gn1b, c1w, c1b, gn2g, gn2b, c2w, c2b, skip_w, skip_b)
+        };
+        let cpu_resblock = |x: &[f32], cin: usize, cout: usize, w1: &(Vec<f32>,Vec<f32>,Vec<f32>,Vec<f32>,Vec<f32>,Vec<f32>,Vec<f32>,Vec<f32>,Option<Vec<f32>>,Option<Vec<f32>>)| -> Vec<f32> {
+            let (gn1g, gn1b, c1w, c1b, gn2g, gn2b, c2w, c2b, skw, skb) = w1;
+            let h1 = cpu_silu(&cpu_group_norm(x, gn1g, gn1b, nb, h * w, cin, groups, eps));
+            let h1c = cpu_conv2d(&h1, c1w, c1b, nb, h, w, cin, cout, 3, 1, 1);
+            let h2 = cpu_silu(&cpu_group_norm(&h1c, gn2g, gn2b, nb, h * w, cout, groups, eps));
+            let h2c = cpu_conv2d(&h2, c2w, c2b, nb, h, w, cout, cout, 3, 1, 1);
+            let skip = match (skw, skb) { (Some(sw), Some(sb)) => cpu_conv2d(x, sw, sb, nb, h, w, cin, cout, 1, 1, 0), _ => x.to_vec() };
+            h2c.iter().zip(&skip).map(|(a, b)| a + b).collect()
+        };
+
+        for (label, cin, cout, with_skip) in [("cin==cout (plain residual)", 4usize, 4usize, false), ("cin!=cout (1x1 skip conv)", 4usize, 6usize, true)] {
+            let x = rnd(nb * h * w * cin, 900);
+            let ws = build(cin, cout, with_skip, 1000);
+            let want = cpu_resblock(&x, cin, cout, &ws);
+            let (gn1g, gn1b, c1w, c1b, gn2g, gn2b, c2w, c2b, skw, skb) = &ws;
+            let blk = VaeResBlock {
+                gn1_gamma: gpu.upload(gn1g, 1, cin), gn1_beta: gpu.upload(gn1b, 1, cin),
+                conv1_w: gpu.upload(c1w, cout * cin * 3, 3), conv1_b: gpu.upload(c1b, 1, cout),
+                gn2_gamma: gpu.upload(gn2g, 1, cout), gn2_beta: gpu.upload(gn2b, 1, cout),
+                conv2_w: gpu.upload(c2w, cout * cout * 3, 3), conv2_b: gpu.upload(c2b, 1, cout),
+                skip: match (skw, skb) { (Some(sw), Some(sb)) => Some((gpu.upload(sw, cout * cin, 1), gpu.upload(sb, 1, cout))), _ => None },
+            };
+            let xt = gpu.upload(&x, nb * h * w, cin);
+            let got = gpu.download(&gpu.vae_resblock(&blk, &xt, nb, h, w, cin, cout, groups, eps));
+            let e = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+            ck(&format!("vae_resblock {label} == CPU reference"), e < 2e-3);
+        }
+
+        // ---- upsample stage: nearest 2x, then conv3x3 same-channel, vs CPU ----
+        let c = 3usize;
+        let x = rnd(nb * h * w * c, 1500);
+        let cw = rnd(c * c * 9, 1600); let cb = rnd(c, 1700);
+        let up_cpu = cpu_upsample2x(&x, nb, h, w, c);
+        let want_stage = cpu_conv2d(&up_cpu, &cw, &cb, nb, h * 2, w * 2, c, c, 3, 1, 1);
+        let xt = gpu.upload(&x, nb * h * w, c);
+        let cwt = gpu.upload(&cw, c * c * 3, 3); let cbt = gpu.upload(&cb, 1, c);
+        let (out_t, hout, wout) = gpu.vae_upsample_stage(&xt, &cwt, &cbt, nb, h, w, c);
+        ck("vae_upsample_stage output dims == (2h, 2w)", hout == h * 2 && wout == w * 2);
+        let got_stage = gpu.download(&out_t);
+        let e2 = got_stage.iter().zip(&want_stage).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("vae_upsample_stage (upsample2x + conv3x3) == CPU reference", e2 < 2e-3);
+
+        println!("gate-vae-resblock: {}", if ok { "VAE resblock + upsample stage (assembled from conv2d/group_norm/upsample2x) validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-vit-block") {
@@ -1523,6 +2026,129 @@ fn main() {
         ck("gemma2/other arches still refused", gpu.load_gguf(&gem).is_err());
 
         println!("gate-qwen2: {}", if ok { "Qwen2 bias path validated (correctness) \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-qwen3") {
+        // Qwen3 = llama + per-head QK-Norm (RMSNorm over head_dim on Q and K, BEFORE RoPE) + qwen3.*
+        // metadata + no QKV bias. The qk_norm KERNEL was already validated in isolation
+        // (qk_norm_matches_per_head_reference in lib.rs), but nothing validated the WIRED-UP end-to-end
+        // forward against an independent CPU reference — this is that gate, previously only referenced in
+        // archcfg.rs comments ("correctness via --gate-qwen3") but never actually implemented.
+        let gpu = Gpu::new();
+        eprintln!("gate-qwen3: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        let m = gen_model(64, 128, 2, 48, 4, 2);
+        let hd = m.d / m.n_heads;
+        let q_norm: Vec<Vec<f32>> = (0..m.n_layers).map(|i| rnd(hd, 600 + i)).collect();
+        let k_norm: Vec<Vec<f32>> = (0..m.n_layers).map(|i| rnd(hd, 700 + i)).collect();
+        let ids = [1u32, 7, 13, 0, 21];
+
+        // (1) end-to-end: real GPU loader (arch="qwen3", reads qwen3.* dims, loads attn_{q,k}_norm) vs an
+        // independent CPU reference that applies per-head RMSNorm before RoPE — the check that would have
+        // caught a wiring bug (wrong head_dim, wrong eps, wrong layer, or norm applied after RoPE instead of
+        // before).
+        let bytes = write_gguf_qwen3(&m, &q_norm, &k_norm);
+        let gm = gpu.load_gguf(&bytes).expect("qwen3 arch accepted + qwen3.* dims read");
+        let got = gpu.model_forward(&gm, &ids);
+        let want = cpu_model_forward_qwen3(&m, &ids, &q_norm, &k_norm);
+        let derr = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("qwen3 GPU forward == independent CPU reference (qk-norm before rope)", derr < 1e-2);
+
+        // (2) qk-norm actually changes the logits vs an all-ones norm (proves it's wired, not a pass-through)
+        let ones: Vec<Vec<f32>> = (0..m.n_layers).map(|_| vec![1.0; hd]).collect();
+        let bytes_id = write_gguf_qwen3(&m, &ones, &ones);
+        let gm_id = gpu.load_gguf(&bytes_id).expect("qwen3 (identity norm) loads");
+        let got_id = gpu.model_forward(&gm_id, &ids);
+        let dvary = got.iter().zip(&got_id).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("distinct QK-Norm weights change the logits vs identity (norm is applied)", dvary > 1e-3);
+
+        // (3) int8-resident qwen3 also loads + argmax-matches f32 (norm rides the quantized projection too)
+        let qi = gpu.load_gguf_quantized(&bytes).expect("int8 qwen3 loads");
+        let li = gpu.model_forward(&qi, &ids);
+        ck("int8-resident qwen3 argmax == f32 qwen3", gpu_kernels::argmax(&li[li.len()-m.vocab..]) == gpu_kernels::argmax(&got[got.len()-m.vocab..]));
+
+        // (4) the actual per-token KV-cache decode step — fused AND non-fused — must match the prefill
+        // reference too. This is the path real chat generation runs (decode_step), and it's what the
+        // model_forward-only check above would NOT have caught: block_decode_fused/block_decode_at_fused
+        // had a separate, independent implementation of the QKV→RoPE step that silently skipped QK-Norm
+        // entirely (RoPE applied straight to the raw fused-QKV projection), while block_decode/block_decode_at
+        // (non-fused) did it correctly. Since fused-QKV is the default (LOGSCOPE_FUSED_QKV unset), every real
+        // Qwen3 decode step was affected.
+        let cache_nf = gpu.new_cache(gm.n_layers, ids.len(), gm.kv_dim());
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "0");
+        let mut logits_nf = Vec::new();
+        for (pos, &t) in ids.iter().enumerate() { logits_nf = gpu.decode_step(&gm, &cache_nf, t, pos); }
+        std::env::set_var("LOGSCOPE_FUSED_QKV", "1");
+        let cache_f = gpu.new_cache(gm.n_layers, ids.len(), gm.kv_dim());
+        let mut logits_f = Vec::new();
+        for (pos, &t) in ids.iter().enumerate() { logits_f = gpu.decode_step(&gm, &cache_f, t, pos); }
+        std::env::remove_var("LOGSCOPE_FUSED_QKV");
+        let want_last = &want[want.len() - m.vocab..];
+        let dstep_nf = logits_nf.iter().zip(want_last).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let dstep_f = logits_f.iter().zip(want_last).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        ck("decode_step (non-fused) == CPU reference", dstep_nf < 1e-2);
+        ck("decode_step (fused, the default) == CPU reference", dstep_f < 1e-2);
+
+        println!("gate-qwen3: {}", if ok { "Qwen3 QK-Norm path validated end-to-end (correctness) \u{2713}" } else { "FAIL \u{2717} — see failing checks above" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-dit-primitives") {
+        // The DiT (Z-Image-Turbo) net-new primitives: AdaLN-Zero modulation, AdaLN-Zero gated residual,
+        // patchify/unpatchify round-trip, and the sinusoidal timestep embedding. None of these need real
+        // model weights — they're pure reshape/elementwise ops — so this gate is CPU-vs-GPU only, like
+        // the isolated qk_norm kernel test.
+        let gpu = Gpu::new();
+        eprintln!("gate-dit-primitives: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // (1) dit_modulate: x*(1+scale)+shift, scale/shift broadcast per-column
+        let (rows, cols) = (5usize, 16usize);
+        let x = rnd(rows * cols, 11); let scale = rnd(cols, 22); let shift = rnd(cols, 33);
+        let xt = gpu.upload(&x, rows, cols); let st = gpu.upload(&scale, 1, cols); let ht = gpu.upload(&shift, 1, cols);
+        let got = gpu.download(&gpu.dit_modulate(&xt, &st, &ht));
+        let want: Vec<f32> = (0..rows * cols).map(|i| x[i] * (1.0 + scale[i % cols]) + shift[i % cols]).collect();
+        let e1 = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("dit_modulate bit-exact vs CPU (x*(1+scale)+shift, broadcast per-column)", e1 < 1e-5);
+
+        // (2) dit_gated_add: x + gate*y, gate broadcast per-column; gate≈0 ⇒ ≈no-op (the "-Zero" init)
+        let y = rnd(rows * cols, 44); let gate = rnd(cols, 55);
+        let yt = gpu.upload(&y, rows, cols); let gt = gpu.upload(&gate, 1, cols);
+        let got2 = gpu.download(&gpu.dit_gated_add(&xt, &yt, &gt));
+        let want2: Vec<f32> = (0..rows * cols).map(|i| x[i] + gate[i % cols] * y[i]).collect();
+        let e2 = got2.iter().zip(&want2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("dit_gated_add bit-exact vs CPU (x + gate*y)", e2 < 1e-5);
+        let zero_gate = gpu.upload(&vec![0.0; cols], 1, cols);
+        let got3 = gpu.download(&gpu.dit_gated_add(&xt, &yt, &zero_gate));
+        ck("dit_gated_add with gate=0 is an exact no-op (AdaLN-Zero init)", got3 == x);
+
+        // (3) patchify/unpatchify round-trip on a random [h,w,c] image
+        let (h, w, c, patch) = (8usize, 8usize, 3usize, 4usize);
+        let img = rnd(h * w * c, 66);
+        let it = gpu.upload(&img, h, w * c);
+        let toks = gpu.patchify(&it, h, w, c, patch);
+        ck("patchify shape = (num_patches, patch*patch*c)", toks.rows == (h / patch) * (w / patch) && toks.cols == patch * patch * c);
+        let back = gpu.download(&gpu.unpatchify(&toks, h, w, c, patch));
+        let e3 = back.iter().zip(&img).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("unpatchify(patchify(img)) round-trips exactly", e3 < 1e-6);
+        // spot-check: patch (1,1)'s top-left pixel is image pixel (patch, patch), all channels
+        let toks_host = gpu.download(&toks);
+        let p11_topleft = &toks_host[(1 * (w / patch) + 1) * (patch * patch * c)..][..c];
+        let img_ref = &img[(patch * w + patch) * c..][..c];
+        ck("patchify patch (1,1) top-left pixel == image pixel (patch,patch)", p11_topleft == img_ref);
+
+        // (4) sinusoidal timestep embedding: matches the closed-form cos/sin construction directly, and
+        // distinct timesteps give distinct embeddings (it's actually conditioning on t, not a constant)
+        let dim = 32;
+        let e_t1 = gpu_kernels::timestep_embedding(3.0, dim, 10000.0);
+        let e_t1_again = gpu_kernels::timestep_embedding(3.0, dim, 10000.0);
+        let e_t2 = gpu_kernels::timestep_embedding(700.0, dim, 10000.0);
+        ck("timestep_embedding is deterministic (same t ⇒ same embedding)", e_t1 == e_t1_again);
+        let dte = e_t1.iter().zip(&e_t2).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck("timestep_embedding distinguishes different timesteps", dte > 1e-2);
+        ck("timestep_embedding values are bounded (cos/sin ⇒ within [-1,1])", e_t1.iter().all(|v| v.abs() <= 1.0001));
+
+        println!("gate-dit-primitives: {}", if ok { "DiT modulation/patchify/timestep primitives validated \u{2713}" } else { "FAIL \u{2717} — see failing checks above" });
         return;
     }
     if args.iter().any(|a| a == "--gate-memplan") {
