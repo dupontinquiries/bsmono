@@ -6404,6 +6404,8 @@ def draw_expansions(screen, fonts, t, mouse):
     EXPANSIONS_SCENE.draw(screen, fonts, mouse, shade, PAGE, INK, GOLD)
     button(screen, pygame.Rect(b.right - 190, b.bottom - 66, 150, 48), "Back", font, mouse, key="back")
     menu_vignette(screen)
+
+def draw_lobby_waiting(screen, fonts, t, mouse, mp_state):
     """Waiting-room shown after hosting or joining, before the match starts.
     Shows your assigned team, deck-slot picker, and connected players."""
     font, bfont, sfont = fonts
