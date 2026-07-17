@@ -802,6 +802,7 @@ pub struct Chat {
     agent_run: Option<crate::workspace_exec::AgentRun>, // active NON-BLOCKING agent driver (channel-driven state machine)
     agent_fan: Option<crate::workspace_exec::AgentFan>, // active MULTI-branch fan (parallel agent branches, round-robin)
     agent_candidates: Vec<crate::workspace_exec::BranchSummary>, // folded branch summaries to prune to the keeper
+    fan_is_docs: bool, // the active/just-finished fan is a DOC fan → suggest :merge-docs (union) over :pick (keep one)
     agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
     agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
     rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
@@ -890,6 +891,7 @@ impl Default for Chat {
             agent_run: None,
             agent_fan: None,
             agent_candidates: Vec::new(),
+            fan_is_docs: false,
             agent_pending_submit: None,
             agent_task: String::new(),
             rep_monitor: crate::repetition::RepeatMonitor::default(),
@@ -1828,6 +1830,87 @@ impl Chat {
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
 
+    /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
+    fn start_fan(&mut self, task: &str, cfg: crate::workspace_exec::AgentConfig, doc_fan: bool, label: &str) {
+        let task = task.trim().to_string();
+        if task.is_empty() {
+            self.note = format!(":{label} needs a task");
+        } else if self.gitmind_session.is_none() {
+            self.note = format!(":{label} — load a workspace first (:load-gitmind <path>)");
+        } else if self.agent_run.is_some() || self.agent_fan.is_some() || self.stream.is_some() {
+            self.note = format!(":{label} — the model is busy (:stop to cancel)");
+        } else {
+            let base_goal = self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_else(|| task.clone());
+            let goals = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
+            let goals = if goals.is_empty() { vec![task.clone()] } else { goals };
+            let session = self.gitmind_session.as_ref().unwrap();
+            let mount = match crate::mount::detect(&session.project) { Ok(m) => m, Err(e) => { self.note = format!(":{label} — {e}"); return; } };
+            let fan_root = std::env::temp_dir().join("logscope-fan");
+            let mut specs = Vec::new();
+            for (i, goal) in goals.iter().enumerate() {
+                match crate::mount::isolate(&mount, &fan_root.join(format!("branch{i}"))) {
+                    Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), format!("branch {}", i + 1))),
+                    Err(e) => { self.note = format!(":{label} — isolate failed: {e}"); return; }
+                }
+            }
+            let diff_fn = Box::new(|dir: &std::path::Path| -> String {
+                std::process::Command::new("git").arg("-C").arg(dir).args(["diff", "logscope-base"])
+                    .output().ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect())
+                    .unwrap_or_default()
+            });
+            let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg, diff_fn);
+            self.agent_candidates.clear();
+            self.agent_task = task.clone();
+            self.fan_is_docs = doc_fan;
+            match fan.next() {
+                crate::workspace_exec::FanStep::Submit { prompt, .. } => {
+                    self.agent_pending_submit = Some(prompt);
+                    let n = fan.len();
+                    self.agent_fan = Some(fan);
+                    self.note = format!("{label}: {n} branches spinning up — planning…");
+                }
+                crate::workspace_exec::FanStep::AllDone => self.note = format!(":{label} — nothing to run"),
+            }
+        }
+    }
+
+    /// Merge the doc fan's branches into one organized tree: union each branch's `docs/**`, regenerate the
+    /// index from front-matter, and commit into the project. Collisions (a path written by >1 branch) are
+    /// reported for the user to resolve rather than silently overwritten.
+    fn merge_fan_docs(&mut self) {
+        if self.agent_candidates.is_empty() {
+            self.note = ":merge-docs — no fan branches (run :docs <task> first)".into();
+            return;
+        }
+        let Some(session) = self.gitmind_session.as_ref() else {
+            self.note = ":merge-docs — no .gitmind session loaded".into(); return;
+        };
+        let project = session.project.clone();
+        let title = session.name.clone();
+        let branches: Vec<(String, std::path::PathBuf)> = self.agent_candidates.iter()
+            .map(|c| (c.label.clone(), c.root.clone())).collect();
+        let (result, index_md) = crate::workspace_exec::merge_branch_docs(&branches, &title);
+        if result.merged.is_empty() {
+            self.note = ":merge-docs — the branches produced no docs (docs/**/*.md)".into();
+            return;
+        }
+        // write the unioned docs + the generated index
+        let mut files = result.merged.clone();
+        files.push(("docs/README.md".to_string(), index_md));
+        match crate::gitmind_session::write_and_commit(&project, &files, "merge docs") {
+            Ok(hash) => {
+                let coll = if result.collisions.is_empty() { String::new() }
+                    else { format!(" · ⚠ {} collision(s): {}", result.collisions.len(),
+                        result.collisions.iter().map(|c| c.path.clone()).collect::<Vec<_>>().join(", ")) };
+                let warn = if result.index.warnings.is_empty() { String::new() } else { format!(" · {} warning(s)", result.index.warnings.len()) };
+                self.agent_candidates.clear();
+                self.note = format!("merged {} docs → commit {} · index regenerated{coll}{warn}", result.merged.len(), &hash[..hash.len().min(10)]);
+            }
+            Err(e) => self.note = format!(":merge-docs — {e}"),
+        }
+    }
+
     /// Land fan branch `n` (1-based) over the project and clear the candidates. Shared by :pick and the
     /// in-scene candidate panel click.
     fn pick_branch(&mut self, n: usize) {
@@ -1882,7 +1965,11 @@ impl Chat {
         let verified = self.agent_candidates.iter().filter(|b| b.verified).count();
         let approved = self.agent_candidates.iter().filter(|b| b.approved == Some(true)).count();
         let n = self.agent_candidates.len();
-        self.note = format!("fan-agent: {n} branches · {approved} approved · {verified} verified · reviewer suggests branch {best} · :pick <n> to keep");
+        if self.fan_is_docs {
+            self.note = format!("docs: {n} branches done — :merge-docs to union them into one organized tree");
+        } else {
+            self.note = format!("fan-agent: {n} branches · {approved} approved · {verified} verified · reviewer suggests branch {best} · :pick <n> to keep");
+        }
     }
 
     /// Reveal a path in the desktop file manager (best-effort; Linux xdg-open, macOS open).
@@ -4530,52 +4617,16 @@ impl Chat {
                 }
             }
             Command::FanAgent(task) => {
-                let task = task.trim().to_string();
-                if task.is_empty() {
-                    self.note = ":fan-agent needs a task (e.g. :fan-agent try it with anyhow and thiserror)".into();
-                } else if self.gitmind_session.is_none() {
-                    self.note = ":fan-agent — load a workspace first (:load-gitmind <path>)".into();
-                } else if self.agent_run.is_some() || self.agent_fan.is_some() || self.stream.is_some() {
-                    self.note = ":fan-agent — the model is busy (:stop to cancel)".into();
-                } else {
-                    // Seed parallel branch goals from the task/reaction (5): a multi-clause task fans into
-                    // several approaches. Each branch gets its OWN isolated workspace so they never clobber.
-                    let base_goal = self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_else(|| task.clone());
-                    let goals = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
-                    let goals = if goals.is_empty() { vec![task.clone()] } else { goals };
-                    let session = self.gitmind_session.as_ref().unwrap();
-                    let mount = match crate::mount::detect(&session.project) { Ok(m) => m, Err(e) => { self.note = format!(":fan-agent — {e}"); return; } };
-                    let fan_root = std::env::temp_dir().join("logscope-fan");
-                    let mut specs = Vec::new();
-                    for (i, goal) in goals.iter().enumerate() {
-                        match crate::mount::isolate(&mount, &fan_root.join(format!("branch{i}"))) {
-                            Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), format!("branch {}", i + 1))),
-                            Err(e) => { self.note = format!(":fan-agent — isolate failed: {e}"); return; }
-                        }
-                    }
-                    let cfg = crate::workspace_exec::AgentConfig::default();
-                    // diff closure for the review phase: each branch is an isolated git workspace with a
-                    // `logscope-base` baseline tag (mount::isolate), so its diff is `git diff logscope-base`.
-                    let diff_fn = Box::new(|dir: &std::path::Path| -> String {
-                        std::process::Command::new("git").arg("-C").arg(dir).args(["diff", "logscope-base"])
-                            .output().ok()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect())
-                            .unwrap_or_default()
-                    });
-                    let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg, diff_fn);
-                    self.agent_candidates.clear();
-                    self.agent_task = task.clone();
-                    match fan.next() {
-                        crate::workspace_exec::FanStep::Submit { prompt, .. } => {
-                            self.agent_pending_submit = Some(prompt);
-                            let n = fan.len();
-                            self.agent_fan = Some(fan);
-                            self.note = format!("fan-agent: {n} branches spinning up — planning…");
-                        }
-                        crate::workspace_exec::FanStep::AllDone => self.note = ":fan-agent — nothing to run".into(),
-                    }
-                }
+                let cfg = crate::workspace_exec::AgentConfig::default();
+                self.start_fan(task.trim(), cfg, false, "fan-agent");
             }
+            Command::DocFan(task) => {
+                // A DOC fan: each branch writes a slice of the docs under the organization convention, so the
+                // outputs merge cleanly (:merge-docs). Doc mode = convention in the prompt, no code-verify.
+                let cfg = crate::workspace_exec::AgentConfig::docs();
+                self.start_fan(task.trim(), cfg, true, "docs");
+            }
+            Command::MergeDocs => self.merge_fan_docs(),
             Command::Pick(n) => self.pick_branch(n),
             Command::Reapply => match self.gitmind_session.take() {
                 None => self.note = ":reapply — no .gitmind session loaded (:load-gitmind <path> first)".into(),

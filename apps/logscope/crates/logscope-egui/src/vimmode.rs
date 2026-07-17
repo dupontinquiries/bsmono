@@ -105,6 +105,9 @@ pub enum Command {
     FanAgent(String),    // :fan-agent <task> — spin up several agent branches (one isolated workspace each),
                          // run them interleaved on the one worker, then prune to the keeper
     Pick(usize),         // :pick <n> — land fan branch n's changes over the project (keep it, discard the rest)
+    DocFan(String),      // :docs <task> — fan out several agents to WRITE DOCS (doc-organization convention on),
+                         // each a slice of the tree in its own workspace; then :merge-docs to union them
+    MergeDocs,           // :merge-docs — merge all fan branches' docs into one organized tree + generated index
     Compact(String),   // :compact [ratio] / :refresh — student/teacher self-compaction: fold older turns into
                        // a shorter briefing (staged as the working context) to grow effective context, speed
                        // decode, and create a pinnable KV checkpoint reused by descendant paths
@@ -467,6 +470,8 @@ pub fn parse_command(line: &str) -> Command {
         "agent" | "ag" => Command::Agent(arg.to_string()),
         "fan-agent" | "faa" => Command::FanAgent(arg.to_string()),
         "pick" => Command::Pick(arg.trim().parse::<usize>().unwrap_or(0)),
+        "docs" | "doc-fan" => Command::DocFan(arg.to_string()),
+        "merge-docs" | "mergedocs" => Command::MergeDocs,
         "compact" | "refresh" | "cp" => Command::Compact(arg.to_string()),
         "race" => Command::Race(arg.to_string()),
         "why" | "diagnose" => { let (refs, _) = parse_strategy_args(arg); Command::Diagnose(refs) }
@@ -591,6 +596,8 @@ mod tests {
         assert_eq!(parse_command(":ag build a CLI"), Command::Agent("build a CLI".into()));
         assert_eq!(parse_command(":fan-agent try anyhow and thiserror"), Command::FanAgent("try anyhow and thiserror".into()));
         assert_eq!(parse_command(":pick 2"), Command::Pick(2));
+        assert_eq!(parse_command(":docs write user + api docs"), Command::DocFan("write user + api docs".into()));
+        assert_eq!(parse_command(":merge-docs"), Command::MergeDocs);
         assert_eq!(parse_command(":race 0.4"), Command::Race("0.4".into()));
         assert_eq!(parse_command(":why -1,-3"), Command::Diagnose(vec!["-1".into(), "-3".into()]));
         assert_eq!(parse_command(":diagnose"), Command::Diagnose(Vec::new()));
