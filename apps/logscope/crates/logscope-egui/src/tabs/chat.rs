@@ -1950,7 +1950,13 @@ impl Chat {
 
     /// A live reaction during an active RUNNING fan seeds more parallel branches (5): each isolated in its
     /// own workspace, joining the round-robin without stopping the in-flight work. Returns true if it seeded.
+    /// If instead a SINGLE run is active, the reaction FORKS it into a fan (the run becomes branch 1,
+    /// preserving its work; the reaction's approaches become branches 2+).
     fn seed_reaction_branches(&mut self, reaction: &str) -> bool {
+        // Case A: a single run is active → upgrade it into a fan around the reaction.
+        if self.agent_run.is_some() && self.agent_fan.is_none() {
+            return self.fork_run_to_fan(reaction);
+        }
         let running = self.agent_fan.as_ref().map_or(false, |f| !f.reviewing() && !f.all_done());
         if !running { return false; }
         let project = match self.gitmind_session.as_ref() { Some(s) => s.project.clone(), None => return false };
@@ -1969,6 +1975,46 @@ impl Chat {
             }
         }
         if added > 0 { self.note = format!("reaction seeded {added} branch(es) — spinning up in parallel"); true } else { false }
+    }
+
+    /// Fork the active single `agent_run` into a fan on a reaction: the run continues as branch 1 (its work
+    /// preserved), and the reaction's approaches spin up as branches 2+ — so ANY run becomes parallel the
+    /// moment you react, without stopping or discarding the in-flight work.
+    fn fork_run_to_fan(&mut self, reaction: &str) -> bool {
+        let project = match self.gitmind_session.as_ref() { Some(s) => s.project.clone(), None => return false };
+        let base_goal = self.agent_task.clone();
+        let goals = crate::workspace_exec::seed_agent_branches(reaction, &base_goal, 3);
+        if goals.is_empty() { return false; }
+        let run = match self.agent_run.take() { Some(r) => r, None => return false };
+        // the run's next prompt is queued in agent_pending_submit if it's between turns; None ⇒ mid-generation
+        let pending = self.agent_pending_submit.take();
+        let cfg = crate::workspace_exec::AgentConfig::default();
+        let diff_fn = Box::new(|dir: &std::path::Path| -> String {
+            std::process::Command::new("git").arg("-C").arg(dir).args(["diff", "logscope-base"])
+                .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect()).unwrap_or_default()
+        });
+        let mut fan = crate::workspace_exec::AgentFan::adopt(run, pending, &base_goal, "original", &cfg, diff_fn);
+        // add the reaction's parallel approaches in fresh isolated workspaces
+        let mut added = 0usize;
+        if let Ok(mount) = crate::mount::detect(&project) {
+            let fan_root = std::env::temp_dir().join("logscope-fan");
+            for (k, goal) in goals.into_iter().enumerate() {
+                if let Ok(ws) = crate::mount::isolate(&mount, &fan_root.join(format!("fork{k}"))) {
+                    if fan.add_branch(ws.dir.clone(), &goal, &format!("reaction {}", k + 1)) { added += 1; }
+                }
+            }
+        }
+        // if the adopted branch was between turns, re-arm its queued prompt through the fan
+        if self.agent_pending_submit.is_none() {
+            if let crate::workspace_exec::FanStep::Submit { prompt, .. } = fan.next() {
+                self.agent_pending_submit = Some(prompt);
+            }
+        }
+        let n = fan.len();
+        self.fan_is_docs = false;
+        self.agent_fan = Some(fan);
+        self.note = format!("forked into a fan: original + {added} reaction branch(es) = {n} parallel");
+        true
     }
 
     /// Finalize a fan: fold the per-branch summaries for pruning. Doesn't auto-land anything — the user
@@ -5066,8 +5112,9 @@ impl Chat {
                 let text = if self.code_voice { crate::voice_dict::dictate(text.trim()) } else { text.trim().to_string() };
                 let text = text.trim();
                 if text.is_empty() { return; }
-                // A reaction spoken during a RUNNING fan seeds parallel branches without stopping it (5).
-                if self.agent_fan.is_some() && self.seed_reaction_branches(text) { return; }
+                // A reaction spoken during a RUNNING agent (single run OR fan) forks/seeds parallel branches
+                // without stopping it (5): a single run becomes a fan, a fan gains branches.
+                if (self.agent_fan.is_some() || self.agent_run.is_some()) && self.seed_reaction_branches(text) { return; }
                 if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) { self.input.push(' '); }
                 self.input.push_str(text);
             }
