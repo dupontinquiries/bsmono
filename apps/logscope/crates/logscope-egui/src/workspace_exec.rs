@@ -42,6 +42,13 @@ pub enum Tool {
     ListDir { path: String },
     /// Run an allowlisted command (argv, no shell) with `cwd` inside the workspace.
     Run { argv: Vec<String> },
+    /// Search files for a regex/substring (grep-style). For COORDINATOR-spawned workers that need cheap
+    /// navigation of a big repo without pulling whole files into a small context window. `path` scopes it
+    /// ("" = whole workspace). Not offered to the primary agent, which reads files whole (local compute is
+    /// cheap; more context up front is better — see `ReadPolicy`).
+    Search { pattern: String, path: String },
+    /// Read a line range of a file (1-based, inclusive) — the surgical companion to `Search` for workers.
+    ReadRange { path: String, start: usize, end: usize },
 }
 
 impl Tool {
@@ -52,6 +59,8 @@ impl Tool {
             Tool::ReadFile { path } => format!("read {path}"),
             Tool::ListDir { path } => format!("ls {}", if path.is_empty() { "." } else { path }),
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
+            Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
+            Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
         }
     }
 }
@@ -152,7 +161,51 @@ impl Workspace {
             Tool::ReadFile { path } => self.read_file(path),
             Tool::ListDir { path } => self.list_dir(path),
             Tool::Run { argv } => self.run(argv),
+            Tool::Search { pattern, path } => self.search(pattern, path),
+            Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
         }
+    }
+
+    fn search(&self, pattern: &str, rel: &str) -> ToolResult {
+        let base = if rel.is_empty() || rel == "." {
+            self.root.clone()
+        } else {
+            match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
+        };
+        let mut hits = Vec::new();
+        fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize) {
+            if hits.len() >= cap { return; }
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                if hits.len() >= cap { return; }
+                let p = e.path();
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == ".git" || name == "target" { continue; }
+                if p.is_dir() { walk(&p, root, pat, hits, cap); }
+                else if let Ok(text) = std::fs::read_to_string(&p) {
+                    let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().into_owned();
+                    for (i, line) in text.lines().enumerate() {
+                        if line.contains(pat) {
+                            hits.push(format!("{}:{}: {}", rel, i + 1, line.trim()));
+                            if hits.len() >= cap { return; }
+                        }
+                    }
+                }
+            }
+        }
+        walk(&base, &self.root, pattern, &mut hits, 200);
+        ToolResult::ok(if hits.is_empty() { format!("no matches for /{pattern}/") } else { hits.join("\n") })
+    }
+
+    fn read_range(&self, rel: &str, start: usize, end: usize) -> ToolResult {
+        let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        let text = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
+        let (start, end) = (start.max(1), end.max(start));
+        let out: String = text.lines().enumerate()
+            .filter(|(i, _)| *i + 1 >= start && *i + 1 <= end)
+            .map(|(i, l)| format!("{}: {}", i + 1, l))
+            .collect::<Vec<_>>().join("\n");
+        ToolResult::ok(if out.is_empty() { format!("{rel}: no lines in {start}..{end}") } else { out })
     }
 
     /// Ingest raw external bytes (a DRAG-AND-DROPPED file) to a sandboxed workspace path, recording a
@@ -291,6 +344,101 @@ fn default_allow() -> BTreeSet<String> {
         .iter().map(|s| s.to_string()).collect()
 }
 
+// ── agent configuration: plan-then-act (2), verify-as-you-go (1), read policy (4) ────────────────
+
+/// How the agent is told to read files. FULL is the default and preferred for the primary agent — local
+/// compute is cheap, so more context up front beats round-tripping. SURGICAL is for COORDINATOR-spawned
+/// workers optimizing for speed on a big repo: search + read_range instead of whole files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadPolicy { Full, Surgical }
+
+/// Agent run configuration.
+#[derive(Clone, Debug)]
+pub struct AgentConfig {
+    pub max_steps: usize,
+    /// Verify-as-you-go (1): after a turn that WROTE a file whose extension is in `verify_exts`, run this
+    /// command and fold its output into the next observation — so the model sees compiler errors every
+    /// turn instead of being trusted to self-check. Empty = off. `["cargo","check"]` is the Rust default.
+    pub verify_cmd: Vec<String>,
+    pub verify_exts: Vec<String>,
+    /// Require verification to PASS before accepting the model's `TASK_COMPLETE` (6/done-gating): a claim
+    /// of done is only honored if the last verify was green (or verification is off).
+    pub gate_done_on_verify: bool,
+    pub read_policy: ReadPolicy,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: 24,
+            verify_cmd: vec!["cargo".into(), "check".into()],
+            verify_exts: vec!["rs".into()],
+            gate_done_on_verify: true,
+            read_policy: ReadPolicy::Full,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// The worker preset: surgical reads, no auto-verify (the coordinator verifies the stitched whole),
+    /// tighter step budget — for fast parallel spin-off, per the coordinator-mode discussion.
+    pub fn worker() -> Self {
+        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Surgical }
+    }
+}
+
+/// A parsed plan step (2): the visible checklist the model commits to before acting. `done` is flipped as
+/// the run progresses so the UI can tick it off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep { pub text: String, pub done: bool }
+
+/// The plan the model emits up front. Empty if it dove straight into tool calls.
+#[derive(Clone, Debug, Default)]
+pub struct Plan { pub steps: Vec<PlanStep> }
+impl Plan {
+    pub fn is_empty(&self) -> bool { self.steps.is_empty() }
+    pub fn progress(&self) -> (usize, usize) { (self.steps.iter().filter(|s| s.done).count(), self.steps.len()) }
+    /// Mark the first not-yet-done step done (called once per completed action batch).
+    pub fn advance(&mut self) { if let Some(s) = self.steps.iter_mut().find(|s| !s.done) { s.done = true; } }
+}
+
+/// Parse a plan from the model's turn: a fenced ```plan block, or a leading numbered/bulleted list. Each
+/// non-empty line becomes a step (stripped of its marker). Empty if neither shape is present.
+pub fn parse_plan(text: &str) -> Plan {
+    // fenced ```plan … ```
+    if let Some(start) = text.find("```plan") {
+        let after = &text[start + "```plan".len()..];
+        if let Some(end) = after.find("```") {
+            return Plan { steps: lines_to_steps(after[..end].trim()) };
+        }
+    }
+    // otherwise: a leading run of numbered/bulleted lines (before any tool block)
+    let head = text.split("```tool").next().unwrap_or(text);
+    let steps: Vec<PlanStep> = head.lines()
+        .map(|l| l.trim())
+        .filter(|l| is_list_item(l))
+        .map(|l| PlanStep { text: strip_marker(l), done: false })
+        .collect();
+    Plan { steps }
+}
+
+fn lines_to_steps(block: &str) -> Vec<PlanStep> {
+    block.lines().map(|l| l.trim()).filter(|l| !l.is_empty())
+        .map(|l| PlanStep { text: strip_marker(l), done: false }).collect()
+}
+fn is_list_item(l: &str) -> bool {
+    l.starts_with("- ") || l.starts_with("* ") ||
+    l.chars().next().map_or(false, |c| c.is_ascii_digit()) && l.contains(['.', ')'])
+}
+fn strip_marker(l: &str) -> String {
+    let l = l.trim_start_matches(['-', '*', ' ']);
+    // strip a leading "N." / "N)"
+    let l = if let Some(pos) = l.find(['.', ')']) {
+        if l[..pos].chars().all(|c| c.is_ascii_digit()) && pos <= 3 { l[pos + 1..].trim_start() } else { l }
+    } else { l };
+    l.trim().to_string()
+}
+
 // ── the model seam ──────────────────────────────────────────────────────────────────────────────
 
 /// The one thing the loop needs from a model: given the running prompt, produce the next turn's text.
@@ -352,6 +500,18 @@ fn parse_one(block: &str) -> Option<Tool> {
             contents: json_str(block, "contents").unwrap_or_default(),
         }),
         "read_file" => Some(Tool::ReadFile { path: json_str(block, "path")? }),
+        "read_range" => {
+            let path = json_str(block, "path")?;
+            let start = json_str(block, "start").and_then(|s| s.parse().ok())
+                .or_else(|| json_num(block, "start")).unwrap_or(1);
+            let end = json_str(block, "end").and_then(|s| s.parse().ok())
+                .or_else(|| json_num(block, "end")).unwrap_or(start);
+            Some(Tool::ReadRange { path, start, end })
+        }
+        "search" => Some(Tool::Search {
+            pattern: json_str(block, "pattern").or_else(|| json_str(block, "query"))?,
+            path: json_str(block, "path").unwrap_or_default(),
+        }),
         "list_dir" => Some(Tool::ListDir { path: json_str(block, "path").unwrap_or_default() }),
         "run" => {
             let argv = json_str_array(block, "argv")
@@ -400,6 +560,17 @@ fn json_str(src: &str, key: &str) -> Option<String> {
     None // unterminated
 }
 
+/// Extract a JSON numeric value for `key` (for line numbers in read_range).
+fn json_num(src: &str, key: &str) -> Option<usize> {
+    let pat = format!("\"{key}\"");
+    let k = src.find(&pat)?;
+    let after = &src[k + pat.len()..];
+    let colon = after.find(':')?;
+    let digits: String = after[colon + 1..].chars().skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// Extract a JSON array-of-strings for `key`.
 fn json_str_array(src: &str, key: &str) -> Option<Vec<String>> {
     let pat = format!("\"{key}\"");
@@ -445,25 +616,56 @@ pub enum Stop {
     ModelError(String),
 }
 
-/// The full record a session produces: every turn + why it stopped + the file-event feed.
+/// The full record a session produces: every turn + why it stopped + the file-event feed + the plan the
+/// model committed to (2) + whether the final state passed verification (1/6).
 pub struct Session {
     pub turns: Vec<Turn>,
     pub stop: Stop,
     pub files: Vec<FileEvent>,
+    pub plan: Plan,
+    pub verified: bool,
 }
 
 /// The sentinel a model prints when the task is complete.
 pub const DONE_MARKER: &str = "TASK_COMPLETE";
 
 /// Build the system prompt that teaches a local model the tool protocol. Kept explicit and example-led
-/// because small models follow a shown format far more reliably than a described one.
-pub fn system_prompt(task: &str) -> String {
+/// because small models follow a shown format far more reliably than a described one. `cfg` shapes it:
+/// the read tools offered depend on `read_policy`, and the verify promise is stated when verification is on.
+pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
+    let read_tools = match cfg.read_policy {
+        ReadPolicy::Full => "\
+- read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (reads the whole file — prefer this; context is cheap)"
+            .to_string(),
+        ReadPolicy::Surgical => "\
+- search      { \"tool\":\"search\", \"pattern\":\"<text>\", \"path\":\"<rel or empty>\" }  (grep the repo — use this first)
+- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (read just the lines you need)"
+            .to_string(),
+    };
+    let verify_note = if cfg.verify_cmd.is_empty() {
+        String::new()
+    } else {
+        format!(
+"\n\nVERIFICATION IS AUTOMATIC: after any turn that writes a {} file, `{}` runs and its result is shown to \
+you. Favor code that compiles over clever code that might not; when you see errors, fix them before moving on.{}",
+            cfg.verify_exts.join("/"),
+            cfg.verify_cmd.join(" "),
+            if cfg.gate_done_on_verify { format!(" You may only reply {DONE_MARKER} once verification is green.") } else { String::new() },
+        )
+    };
     format!(
 "You are a coding agent working inside an isolated workspace. Complete this task:
 
 {task}
 
-You act by emitting TOOL CALLS. Each tool call is a fenced block:
+FIRST, emit a short PLAN — the steps you will take — as a fenced block:
+
+```plan
+1. <step>
+2. <step>
+```
+
+THEN act by emitting TOOL CALLS. Each tool call is a fenced block:
 
 ```tool
 {{ \"tool\": \"write_file\", \"path\": \"src/lib.rs\", \"contents\": \"fn add(a:i32,b:i32)->i32{{a+b}}\\n\" }}
@@ -471,7 +673,7 @@ You act by emitting TOOL CALLS. Each tool call is a fenced block:
 
 Available tools (one JSON object per block):
 - write_file  {{ \"tool\":\"write_file\", \"path\":\"<rel path>\", \"contents\":\"<file text>\" }}
-- read_file   {{ \"tool\":\"read_file\", \"path\":\"<rel path>\" }}
+{read_tools}
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
 
@@ -481,7 +683,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results."
+Emit one or a few tool calls per turn, then wait for results.{verify_note}"
     )
 }
 
@@ -497,44 +699,156 @@ fn observation(results: &[(Tool, ToolResult)]) -> String {
     s
 }
 
-/// Run the agentic loop: the model drives tool calls against `ws` until it prints `TASK_COMPLETE`, errors,
-/// or hits `max_steps`. Pure w.r.t. the model (any `Llm`), so it unit-tests with a scripted model. The
-/// growing `prompt` IS the context window — each turn appends the model's text and the tool observations,
-/// which is the standard tool-use transcript shape (`llm_backend::generate` sees the whole thing).
+/// Back-compat: run with defaults but an explicit step budget.
 pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: usize) -> Session {
-    let mut prompt = system_prompt(task);
-    let mut turns = Vec::new();
+    run_agent_cfg(llm, ws, task, &AgentConfig { max_steps, ..Default::default() })
+}
 
-    for _ in 0..max_steps {
+/// Run the agentic loop with full configuration. The model drives tool calls against `ws` until it prints
+/// `TASK_COMPLETE` (gated on verification if configured), errors, or hits `cfg.max_steps`. Pure w.r.t. the
+/// model (any `Llm`), so it unit-tests with a scripted model. Implements plan-then-act (2), verify-as-you-go
+/// (1), and done-gating (6); read-mode (4) is carried in the system prompt.
+pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &AgentConfig) -> Session {
+    let mut prompt = system_prompt(task, cfg);
+    let mut turns = Vec::new();
+    let mut plan = Plan::default();
+    let mut verified = cfg.verify_cmd.is_empty(); // vacuously "verified" when verification is off
+
+    for step in 0..cfg.max_steps {
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
-            Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec() },
+            Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified },
         };
         prompt.push_str("\n\nASSISTANT:\n");
         prompt.push_str(&text);
 
-        if text.contains(DONE_MARKER) && parse_tools(&text).is_empty() {
-            turns.push(Turn { model_text: text, results: Vec::new() });
-            return Session { turns, stop: Stop::Done, files: ws.events().to_vec() };
+        // Capture the plan from the first turn that carries one (2).
+        if plan.is_empty() {
+            let p = parse_plan(&text);
+            if !p.is_empty() { plan = p; }
         }
 
         let tools = parse_tools(&text);
+
+        // Done handling — gated on verification (6): a claim of done is only honored if the last verify
+        // was green (or verification is off). Otherwise we nudge the model to fix it first.
+        if text.contains(DONE_MARKER) && tools.is_empty() {
+            if !cfg.gate_done_on_verify || verified {
+                turns.push(Turn { model_text: text, results: Vec::new() });
+                return Session { turns, stop: Stop::Done, files: ws.events().to_vec(), plan, verified };
+            } else {
+                prompt.push_str(&format!("\n\n(Not accepted: `{}` is not green yet. Fix the errors, then reply {DONE_MARKER}.)\n", cfg.verify_cmd.join(" ")));
+                turns.push(Turn { model_text: text, results: Vec::new() });
+                continue;
+            }
+        }
+
         let mut results = Vec::new();
         if tools.is_empty() {
-            // No parseable call and not done — nudge and continue (small models sometimes narrate first).
             prompt.push_str("\n\n(No tool call parsed. Emit a ```tool block, or reply TASK_COMPLETE.)\n");
             turns.push(Turn { model_text: text, results });
             continue;
         }
+
+        let mut wrote_verifiable = false;
         for tool in tools {
+            if let Tool::WriteFile { path, .. } = &tool {
+                if cfg.verify_exts.iter().any(|e| path.rsplit('.').next() == Some(e.as_str())) {
+                    wrote_verifiable = true;
+                }
+            }
             let res = ws.apply(&tool);
             results.push((tool, res));
         }
         prompt.push_str(&observation(&results));
+
+        // Verify-as-you-go (1): if this turn wrote a verifiable file, run the check now and fold the result
+        // back — the model sees compiler errors every turn instead of being trusted to self-check. This is
+        // the last step's budget too: don't verify on the final iteration if it can't act on it.
+        if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
+            let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
+            verified = vres.ok;
+            prompt.push_str(&format!(
+                "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
+                cfg.verify_cmd.join(" "),
+                if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
+                vres.output,
+            ));
+        }
+
+        plan.advance();
         turns.push(Turn { model_text: text, results });
     }
 
-    Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec() }
+    Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified }
+}
+
+// ── two-tier review (3): a depth model reviews the fast model's diff before it lands ─────────────
+
+/// A review verdict from the depth model over the agent's diff.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Verdict { pub approve: bool, pub notes: String }
+
+/// The review prompt: hand the depth model the task + the unified diff the fast model produced and ask for
+/// an APPROVE/REVISE verdict with reasons. Kept terse and format-pinned so a small depth model's verdict is
+/// parseable.
+pub fn review_prompt(task: &str, diff: &str) -> String {
+    format!(
+"You are reviewing another model's code changes before they are committed. The task was:
+
+{task}
+
+Here is the unified diff of what it produced:
+
+{diff}
+
+Reply with exactly one of these on the first line:
+  APPROVE — if the changes correctly and safely accomplish the task
+  REVISE — if they are wrong, incomplete, or unsafe
+Then, on the following lines, give your reasons (for REVISE, be specific about what to fix)."
+    )
+}
+
+/// Parse the depth model's review into a `Verdict`. APPROVE only if the first meaningful line says so.
+pub fn parse_verdict(text: &str) -> Verdict {
+    let first = text.lines().map(|l| l.trim()).find(|l| !l.is_empty()).unwrap_or("");
+    let up = first.to_ascii_uppercase();
+    let approve = up.starts_with("APPROVE");
+    let notes = text.lines().skip_while(|l| l.trim().is_empty()).skip(1)
+        .collect::<Vec<_>>().join("\n").trim().to_string();
+    Verdict { approve, notes }
+}
+
+/// Run one review pass with a (typically stronger) model over the diff. Pure w.r.t. the model.
+pub fn run_review(reviewer: &mut dyn Llm, task: &str, diff: &str) -> Result<Verdict, String> {
+    reviewer.generate(&review_prompt(task, diff)).map(|t| parse_verdict(&t))
+}
+
+// ── reaction seeding (5): a reaction spins up speculative agent branches, folded/pruned later ────
+
+/// Turn a spoken/typed REACTION into speculative agent sub-goals, WITHOUT stopping the current flow. This
+/// is the bridge from the voice-fan philosophy (`voicefan`/`speculate`: a reaction expands into parallel
+/// investigation lanes) to the agent: each returned goal seeds an independent worker branch (run with
+/// `AgentConfig::worker()`); the branches spin up in parallel and the keep-vs-prune decision happens after,
+/// on the convo graph — the same fan→fold→prune shape the fleet already uses for chat.
+///
+/// `reaction` is the new utterance; `base_goal` is the task in flight. Returns up to `max` concrete
+/// sub-goals (empty if the reaction is too thin to seed anything — the caller then treats it as steering
+/// dictation rather than a fan).
+pub fn seed_agent_branches(reaction: &str, base_goal: &str, max: usize) -> Vec<String> {
+    let r = reaction.trim();
+    if r.chars().count() < 4 { return Vec::new(); }
+    let mut goals = Vec::new();
+    goals.push(format!("{base_goal}\n\nAdjustment from the user: {r}"));
+    // If the reaction names multiple clauses ("and" / ","), split into parallel branches so several
+    // approaches spin up at once — pruned to the keeper afterward.
+    for clause in r.split(',').flat_map(|s| s.split(" and ")).map(str::trim).filter(|s| s.len() > 3) {
+        if goals.len() >= max { break; }
+        let g = format!("{base_goal}\n\nFocus for this branch: {clause}");
+        if !goals.contains(&g) { goals.push(g); }
+    }
+    goals.truncate(max.max(1));
+    goals
 }
 
 // ── real-model adapter: the loop over a local GGUF via llm_backend ───────────────────────────────
@@ -563,14 +877,14 @@ impl Llm for LocalLlm {
     }
 }
 
-/// Convenience: run an agent turn-loop against `ws` using the active local model. Returns `Err` if no
-/// local model is loaded (so the UI can prompt the user to load one).
+/// Convenience: run an agent turn-loop against `ws` using the active local model + config. Returns `Err`
+/// if no local model is loaded (so the UI can prompt the user to load one).
 pub fn run_local_agent(
-    ws: &mut Workspace, task: &str, max_steps: usize, params: logscope::llm_backend::GenParams,
+    ws: &mut Workspace, task: &str, cfg: &AgentConfig, params: logscope::llm_backend::GenParams,
 ) -> Result<Session, String> {
     let mut llm = LocalLlm::from_active(params)
         .ok_or_else(|| "no local model loaded — pick a .gguf (MODEL selector) and load it first".to_string())?;
-    Ok(run_agent(&mut llm, ws, task, max_steps))
+    Ok(run_agent_cfg(&mut llm, ws, task, cfg))
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
@@ -679,18 +993,86 @@ mod tests {
     fn full_loop_writes_files_then_completes() {
         let mut ws = Workspace::new(tmp("loop"));
         let mut llm = Scripted { i: 0, turns: vec![
-            "I'll create the file.\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/main.rs\",\"contents\":\"fn main(){}\\n\"}\n```".into(),
+            "Here's the plan.\n```plan\n1. create main.rs\n2. list src\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/main.rs\",\"contents\":\"fn main(){}\\n\"}\n```".into(),
             "Now list it.\n```tool\n{\"tool\":\"list_dir\",\"path\":\"src\"}\n```".into(),
             format!("All set. {DONE_MARKER}"),
         ]};
-        let s = run_agent(&mut llm, &mut ws, "make a hello world", 8);
+        // verification off (scripted model, no cargo in the sandbox); tests the plan + loop + files.
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
         assert_eq!(s.files[0].path, "src/main.rs");
         assert_eq!(s.files[0].change, FileChange::Created);
         assert!(std::fs::read_to_string(ws.root().join("src/main.rs")).unwrap().contains("fn main"));
-        // three turns: write, list, done
         assert_eq!(s.turns.len(), 3);
+        // the plan was captured (2)
+        assert_eq!(s.plan.steps.len(), 2);
+        assert_eq!(s.plan.steps[0].text, "create main.rs");
+        assert!(s.verified, "verification off ⇒ vacuously verified");
+    }
+
+    #[test]
+    fn parse_plan_fenced_and_numbered() {
+        let fenced = "ok\n```plan\n1. do a\n2. do b\n- do c\n```\nthen act";
+        let p = parse_plan(fenced);
+        assert_eq!(p.steps.len(), 3);
+        assert_eq!(p.steps[0].text, "do a");
+        assert_eq!(p.steps[2].text, "do c");
+        // leading numbered list (no fence), stops before the tool block
+        let numbered = "1. first\n2. second\n```tool\n{...}\n```\n3. not-a-plan-step";
+        let p2 = parse_plan(numbered);
+        assert_eq!(p2.steps.len(), 2);
+        // plan progress
+        let mut p3 = p2; p3.advance();
+        assert_eq!(p3.progress(), (1, 2));
+    }
+
+    #[test]
+    fn done_is_gated_on_verification() {
+        // model claims done before anything is green; with gating on, the loop must NOT accept it.
+        let mut ws = Workspace::new(tmp("gate"));
+        struct ClaimsDone;
+        impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
+        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full };
+        let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
+        // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
+        assert_eq!(s.stop, Stop::StepLimit);
+        assert!(!s.verified);
+    }
+
+    #[test]
+    fn review_verdict_parses_approve_and_revise() {
+        assert!(parse_verdict("APPROVE\nlooks correct").approve);
+        let v = parse_verdict("REVISE\nmissing error handling on line 12");
+        assert!(!v.approve);
+        assert!(v.notes.contains("missing error handling"));
+        // scripted reviewer
+        struct Rev;
+        impl Llm for Rev { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok("APPROVE\nfine".into()) } }
+        assert!(run_review(&mut Rev, "t", "diff").unwrap().approve);
+    }
+
+    #[test]
+    fn surgical_reads_search_and_range() {
+        let root = tmp("surg");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "fn a(){}\nfn target(){}\nfn c(){}\n").unwrap();
+        let mut ws = Workspace::new(root);
+        let hit = ws.apply(&Tool::Search { pattern: "target".into(), path: "".into() });
+        assert!(hit.ok && hit.output.contains("src/lib.rs:2"));
+        let rng = ws.apply(&Tool::ReadRange { path: "src/lib.rs".into(), start: 2, end: 2 });
+        assert!(rng.ok && rng.output.contains("2: fn target"));
+    }
+
+    #[test]
+    fn reaction_seeds_parallel_branches() {
+        let goals = seed_agent_branches("use anyhow and add tests", "build a parser", 4);
+        assert!(goals.len() >= 2, "a two-clause reaction fans into ≥2 branches");
+        assert!(goals[0].contains("build a parser") && goals[0].contains("use anyhow and add tests"));
+        assert!(goals.iter().any(|g| g.contains("add tests")));
+        // too-thin reaction seeds nothing (caller treats it as dictation)
+        assert!(seed_agent_branches("ok", "build a parser", 4).is_empty());
     }
 
     #[test]
