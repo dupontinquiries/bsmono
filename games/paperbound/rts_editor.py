@@ -93,7 +93,19 @@ EFFECT_PRIMITIVES = {
     "pull":      dict(amount=120),
     "spawn":     dict(unit="soldier", count=2),
     "reveal":    dict(),
+    # ── splash primitives (engine: rts._run_effect) ──
+    "splinter":  dict(count=6, range=110, amount=30, sub_radius=44),
+    "inkpool":   dict(duration=6.0, dps=12, slow=2.0),
+    "quake":     dict(amount=70, duration=1.2),
 }
+
+# delivery modes the engine understands ("rain" drops a staggered volley
+# across the radius; rain_count / rain_radius tune it)
+DELIVERY_MODES = ["area", "bolt", "chain", "rain"]
+
+# projectile styles units/factions can wear ('projectile' on the spec)
+PROJECTILE_STYLES = ["dart", "quill", "cinder", "inkglob", "gale",
+                     "thorn", "sting"]
 
 
 def new_map(map_id):
@@ -1775,7 +1787,16 @@ class _EditorState:
                 active = self.active_field == (spec, k)
                 # lists/dicts editable as comma-separated text (e.g. makes, researches)
                 # the 'ability' dict gets a dedicated spell composer
-                if k == "ability" and isinstance(v, dict):
+                if k == "projectile":
+                    # cycle through the engine's missile styles — the unit's
+                    # ranged shots wear this (faction-level default supported
+                    # by setting it on the faction itself)
+                    pygame.draw.rect(screen, (58, 50, 62), rect, border_radius=4)
+                    pygame.draw.rect(screen, (190, 160, 210), rect, 1, border_radius=4)
+                    screen.blit(self.sfont.render(f"style: {v}", True, (226, 212, 236)),
+                                (rect.x + 5, rect.y + 3))
+                    self.data_rects.append((rect, ("cycleproj", k)))
+                elif k == "ability" and isinstance(v, dict):
                     n_eff = len(v.get("effects", []))
                     pygame.draw.rect(screen, (50,60,74), rect, border_radius=4)
                     pygame.draw.rect(screen, (150,190,220), rect, 1, border_radius=4)
@@ -1830,6 +1851,15 @@ class _EditorState:
                     spec = fac.get(self.data_cat, {}).get(self.data_sel, {})
                     self.spell_edit = spec.get("ability"); self.modal_off = [0, 0]
                 elif kind == "spellop": self._spell_op(val)
+                elif kind == "cycleproj":
+                    fac = self.data["factions"][self.data_fac]
+                    spec = fac.get(self.data_cat, {}).get(self.data_sel, {})
+                    cur = spec.get("projectile", "dart")
+                    nxt = PROJECTILE_STYLES[
+                        (PROJECTILE_STYLES.index(cur) + 1) % len(PROJECTILE_STYLES)] \
+                        if cur in PROJECTILE_STYLES else PROJECTILE_STYLES[0]
+                    spec["projectile"] = nxt
+                    self.flash(f"Projectile → {nxt}")
                 self.active_field = None
                 return True
         return False
@@ -1881,6 +1911,13 @@ class _EditorState:
                                ("if_hp_below", 0.5), ("if_hp_above", 0.5)):
                     if mk not in effs[i]:
                         effs[i][mk] = mv; self.flash(f"Added {mk}"); break
+        elif isinstance(val, tuple) and val[0] == "cycledelivery":
+            cur = ab.get("delivery", "area")
+            nxt = DELIVERY_MODES[(DELIVERY_MODES.index(cur) + 1)
+                                 % len(DELIVERY_MODES)] \
+                if cur in DELIVERY_MODES else DELIVERY_MODES[0]
+            ab["delivery"] = nxt
+            self.flash(f"Delivery → {nxt}")
         elif isinstance(val, tuple) and val[0] == "chainparams":
             # toggle chain params onto the ability when delivery is chain
             ab.setdefault("chain_count", 3); ab.setdefault("chain_range", 240)
@@ -1905,6 +1942,30 @@ class _EditorState:
         for k in ("name", "radius", "cast_range", "dur", "cost", "cooldown",
                   "delivery", "sfx", "desc"):
             if k not in ab: continue
+            if k == "delivery":
+                # click-to-cycle through the engine's delivery modes; rain
+                # grows its tuning knobs the moment it's chosen
+                screen.blit(self.sfont.render(k, True, (200, 192, 176)), (fx + 16, y + 2))
+                rect = pygame.Rect(fx + 110, y, 110, 20)
+                pygame.draw.rect(screen, (50, 62, 56), rect, border_radius=4)
+                pygame.draw.rect(screen, (120, 170, 130), rect, 1, border_radius=4)
+                screen.blit(self.sfont.render(str(ab.get("delivery", "area")),
+                                              True, (214, 232, 216)),
+                            (rect.x + 8, rect.y + 3))
+                self.data_rects.append((rect, ("spellop", ("cycledelivery", None))))
+                if ab.get("delivery") == "rain":
+                    for pi, pk in enumerate(("rain_count", "rain_radius")):
+                        ab.setdefault(pk, 6 if pk == "rain_count" else 60)
+                        pr = pygame.Rect(rect.right + 8 + pi * 116, y, 108, 20)
+                        pactive = self.active_field == (ab, pk)
+                        pygame.draw.rect(screen, (52, 56, 66) if not pactive
+                                         else (72, 76, 86), pr, border_radius=4)
+                        screen.blit(self.sfont.render(f"{pk}={ab[pk]}", True,
+                                                      (208, 200, 184)),
+                                    (pr.x + 6, pr.y + 3))
+                        self.field_rects.append((pr, (ab, pk)))
+                y += 26
+                continue
             screen.blit(self.sfont.render(k, True, (200,192,176)), (fx+16, y+2))
             rect = pygame.Rect(fx+110, y, 180, 20)
             active = self.active_field == (ab, k)
