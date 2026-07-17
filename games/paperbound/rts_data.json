@@ -1,4390 +1,4390 @@
 {
- "schema": "foldworks-rts/1",
- "factions": {
-  "court": {
-   "name": "The Folded Court",
-   "blurb": "Versatile and balanced \u2014 no glaring weakness.",
-   "color": [
-    90,
-    150,
-    220
-   ],
-   "dark": [
-    54,
-    92,
-    150
-   ],
-   "trait": "Formation: units take LESS damage the more allies stand with them. Fight as a tight block.",
-   "econ": 1.05,
-   "structures": {
-    "scriptorium": {
-     "name": "Scriptorium",
-     "cost": 0,
-     "hp": 1200,
-     "r": 54,
-     "build": 6.0,
-     "makes": [
-      "scribe"
-     ],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "S",
-     "desc": "Town hall. Trains Scribes; ink drop-off.",
-     "supply": 10
-    },
-    "table": {
-     "name": "Folding Table",
-     "cost": 120,
-     "hp": 800,
-     "r": 42,
-     "build": 8.0,
-     "makes": [
-      "soldier",
-      "archer"
-     ],
-     "requires": [],
-     "researches": [
-      "sharp"
-     ],
-     "tier": 1,
-     "key": "T",
-     "desc": "Trains soldiers & archers."
-    },
-    "well": {
-     "name": "Ink Reservoir",
-     "cost": 90,
-     "hp": 500,
-     "r": 34,
-     "build": 6.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "R",
-     "desc": "Raises ink cap & income.",
-     "supply": 10
-    },
-    "spire": {
-     "name": "Watch Spire",
-     "cost": 150,
-     "hp": 900,
-     "r": 38,
-     "build": 9.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "P",
-     "desc": "Defensive tower.",
-     "detector": true,
-     "detect_range": 300
-    },
-    "bindery": {
-     "name": "Grand Bindery",
-     "cost": 200,
-     "hp": 1000,
-     "r": 46,
-     "build": 12.0,
-     "makes": [
-      "brute",
-      "inkspeaker",
-      "foldshade"
-     ],
-     "requires": [
-      "table"
-     ],
-     "researches": [
-      "thick",
-      "swift"
-     ],
-     "tier": 2,
-     "key": "B",
-     "desc": "Tier 2. Unlocks Brutes & fold upgrades."
-    },
-    "menagerie": {
-     "name": "Paper Menagerie",
-     "cost": 320,
-     "hp": 1300,
-     "r": 52,
-     "build": 16.0,
-     "makes": [
-      "colossus"
-     ],
-     "requires": [
-      "bindery"
-     ],
-     "researches": [
-      "colossal"
-     ],
-     "tier": 3,
-     "key": "M",
-     "desc": "Tier 3. Folds the Origami Colossus."
-    }
-   },
-   "units": {
-    "scribe": {
-     "name": "Scribe",
-     "cost": 25,
-     "hp": 60,
-     "dmg": 4,
-     "spd": 95,
-     "rng": 14,
-     "r": 11,
-     "card": "beekeeper",
-     "worker": true,
-     "build_t": 3.0,
-     "tier": 1,
-     "key": "E",
-     "desc": "Harvests ink; raises structures.",
-     "supply": 1
-    },
-    "soldier": {
-     "name": "Folded Soldier",
-     "cost": 50,
-     "hp": 160,
-     "dmg": 15,
-     "spd": 88,
-     "rng": 16,
-     "r": 13,
-     "card": "gorilla",
-     "build_t": 4.0,
-     "tier": 1,
-     "key": "A",
-     "desc": "Sturdy melee line.",
-     "supply": 2
-    },
-    "archer": {
-     "name": "Quill Archer",
-     "cost": 65,
-     "hp": 90,
-     "dmg": 16,
-     "spd": 92,
-     "rng": 150,
-     "r": 12,
-     "card": "crane",
-     "build_t": 5.0,
-     "tier": 1,
-     "key": "D",
-     "desc": "Ranged; fragile.",
-     "supply": 2
-    },
-    "brute": {
-     "name": "Paper Brute",
-     "cost": 110,
-     "hp": 360,
-     "dmg": 34,
-     "spd": 70,
-     "rng": 18,
-     "r": 18,
-     "card": "mammoth",
-     "build_t": 8.0,
-     "tier": 2,
-     "key": "F",
-     "desc": "Heavy shock unit.",
-     "supply": 3
-    },
-    "colossus": {
-     "name": "Origami Colossus",
-     "cost": 240,
-     "hp": 900,
-     "dmg": 70,
-     "spd": 58,
-     "rng": 22,
-     "r": 26,
-     "card": "foldwright",
-     "build_t": 14.0,
-     "tier": 3,
-     "key": "C",
-     "desc": "Towering elite.",
-     "supply": 5
-    },
-    "inkspeaker": {
-     "name": "Inkspeaker",
-     "cost": 95,
-     "hp": 110,
-     "dmg": 10,
-     "spd": 86,
-     "rng": 130,
-     "r": 13,
-     "card": "crane",
-     "build_t": 7.0,
-     "tier": 2,
-     "key": "K",
-     "supply": 2,
-     "energy": 100,
-     "energy_start": 50,
-     "ability": {
-      "id": "rally",
-      "name": "Rally Fold",
-      "cost": 55,
-      "cast_range": 340,
-      "radius": 120,
-      "kind": "heal",
-      "amount": 90,
-      "dur": 3.0,
-      "desc": "Heal & shield allies in an area."
-     },
-     "desc": "Support caster \u2014 mends and rallies the Court."
-    },
-    "foldshade": {
-     "name": "Foldshade",
-     "cost": 90,
-     "hp": 85,
-     "dmg": 26,
-     "spd": 112,
-     "rng": 18,
-     "r": 12,
-     "card": "crane",
-     "build_t": 6.0,
-     "tier": 2,
-     "key": "J",
-     "supply": 2,
-     "cloak": true,
-     "desc": "Cloaked raider \u2014 unseen without enemy detection."
-    }
-   },
-   "upgrades": {
-    "sharp": {
-     "name": "Sharper Folds",
-     "cost": 100,
-     "time": 18,
-     "stat": "dmg",
-     "mult": 1.25,
-     "applies": "army",
-     "desc": "+25% army attack."
-    },
-    "thick": {
-     "name": "Thicker Paper",
-     "cost": 120,
-     "time": 22,
-     "stat": "maxhp",
-     "mult": 1.3,
-     "applies": "army",
-     "desc": "+30% army health."
-    },
-    "swift": {
-     "name": "Swift Creases",
-     "cost": 90,
-     "time": 16,
-     "stat": "spd",
-     "mult": 1.2,
-     "applies": "army",
-     "desc": "+20% army speed."
-    },
-    "colossal": {
-     "name": "Colossal Folds",
-     "cost": 160,
-     "time": 26,
-     "stat": "dmg",
-     "mult": 1.3,
-     "applies": [
-      "colossus",
-      "brute"
-     ],
-     "desc": "+30% brute & colossus attack."
-    }
-   },
-   "mechanic": "cohesion"
-  },
-  "ember": {
-   "name": "The Ember Bindery",
-   "blurb": "Aggressive glass cannon \u2014 cheap, fast, fragile, burns.",
-   "color": [
-    224,
-    132,
-    70
-   ],
-   "dark": [
-    150,
-    78,
-    40
-   ],
-   "trait": "Aggro: cheap fast units that BURN foes over time and COMBUST on death. Punish clumps.",
-   "econ": 0.95,
-   "structures": {
-    "scriptorium": {
-     "name": "Kiln-Hall",
-     "cost": 0,
-     "hp": 1050,
-     "r": 52,
-     "build": 6.0,
-     "makes": [
-      "scribe"
-     ],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "S",
-     "desc": "Town hall. Trains Ashscribes; ink drop-off.",
-     "supply": 10
-    },
-    "table": {
-     "name": "Forge",
-     "cost": 100,
-     "hp": 680,
-     "r": 40,
-     "build": 7.0,
-     "makes": [
-      "soldier",
-      "archer"
-     ],
-     "requires": [],
-     "researches": [
-      "hot"
-     ],
-     "tier": 1,
-     "key": "T",
-     "desc": "Trains ember troops."
-    },
-    "well": {
-     "name": "Ember Well",
-     "cost": 90,
-     "hp": 460,
-     "r": 34,
-     "build": 6.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "R",
-     "desc": "Raises ink cap & income.",
-     "supply": 10
-    },
-    "spire": {
-     "name": "Flame Spire",
-     "cost": 140,
-     "hp": 780,
-     "r": 36,
-     "build": 8.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "P",
-     "desc": "Defensive tower; burns attackers.",
-     "detector": true,
-     "detect_range": 300
-    },
-    "bindery": {
-     "name": "Pyre",
-     "cost": 180,
-     "hp": 850,
-     "r": 44,
-     "build": 11.0,
-     "makes": [
-      "brute",
-      "emberpriest",
-      "cinderwraith"
-     ],
-     "requires": [
-      "table"
-     ],
-     "researches": [
-      "ash",
-      "regrow"
-     ],
-     "tier": 2,
-     "key": "B",
-     "desc": "Tier 2. Unlocks Molten Brutes & fire upgrades."
-    },
-    "menagerie": {
-     "name": "Inferno Gate",
-     "cost": 300,
-     "hp": 1100,
-     "r": 50,
-     "build": 15.0,
-     "makes": [
-      "colossus"
-     ],
-     "requires": [
-      "bindery"
-     ],
-     "researches": [
-      "wild"
-     ],
-     "tier": 3,
-     "key": "M",
-     "desc": "Tier 3. Looses the Wildfire."
-    }
-   },
-   "units": {
-    "scribe": {
-     "name": "Ashscribe",
-     "cost": 22,
-     "hp": 52,
-     "dmg": 4,
-     "spd": 102,
-     "rng": 14,
-     "r": 11,
-     "card": "beekeeper",
-     "worker": true,
-     "build_t": 2.6,
-     "tier": 1,
-     "key": "E",
-     "desc": "Harvests ink; raises structures.",
-     "supply": 1
-    },
-    "soldier": {
-     "name": "Ember Soldier",
-     "cost": 42,
-     "hp": 110,
-     "dmg": 16,
-     "spd": 98,
-     "rng": 16,
-     "r": 12,
-     "card": "gorilla",
-     "build_t": 3.2,
-     "tier": 1,
-     "key": "A",
-     "desc": "Fast, fragile melee.",
-     "supply": 2
-    },
-    "archer": {
-     "name": "Cinder Archer",
-     "cost": 58,
-     "hp": 70,
-     "dmg": 19,
-     "spd": 100,
-     "rng": 155,
-     "r": 11,
-     "card": "crane",
-     "build_t": 4.0,
-     "tier": 1,
-     "key": "D",
-     "desc": "Glass-cannon ranged.",
-     "supply": 2
-    },
-    "brute": {
-     "name": "Molten Brute",
-     "cost": 95,
-     "hp": 250,
-     "dmg": 42,
-     "spd": 82,
-     "rng": 18,
-     "r": 17,
-     "card": "mammoth",
-     "build_t": 6.5,
-     "tier": 2,
-     "key": "F",
-     "desc": "Fast heavy hitter.",
-     "supply": 3
-    },
-    "colossus": {
-     "name": "Wildfire",
-     "cost": 210,
-     "hp": 620,
-     "dmg": 88,
-     "spd": 72,
-     "rng": 20,
-     "r": 24,
-     "card": "phoenix",
-     "build_t": 11.0,
-     "tier": 3,
-     "key": "C",
-     "desc": "Blazing elite.",
-     "supply": 5
-    },
-    "emberpriest": {
-     "name": "Emberpriest",
-     "cost": 95,
-     "hp": 90,
-     "dmg": 12,
-     "spd": 92,
-     "rng": 140,
-     "r": 12,
-     "card": "phoenix",
-     "build_t": 7.0,
-     "tier": 2,
-     "key": "K",
-     "supply": 2,
-     "energy": 100,
-     "energy_start": 50,
-     "ability": {
-      "id": "storm",
-      "name": "Ink Storm",
-      "cost": 75,
-      "cast_range": 360,
-      "radius": 100,
-      "kind": "storm",
-      "dps": 55,
-      "dur": 3.0,
-      "desc": "A searing storm that burns everything beneath it."
-     },
-     "desc": "Glass-cannon caster \u2014 rains an Ink Storm of fire."
-    },
-    "cinderwraith": {
-     "name": "Cinderwraith",
-     "cost": 90,
-     "hp": 85,
-     "dmg": 26,
-     "spd": 112,
-     "rng": 18,
-     "r": 12,
-     "card": "phoenix",
-     "build_t": 6.0,
-     "tier": 2,
-     "key": "J",
-     "supply": 2,
-     "cloak": true,
-     "desc": "Cloaked raider \u2014 unseen without enemy detection."
-    }
-   },
-   "upgrades": {
-    "hot": {
-     "name": "Hotter Flames",
-     "cost": 90,
-     "time": 15,
-     "stat": "dmg",
-     "mult": 1.3,
-     "applies": "army",
-     "desc": "+30% army attack."
-    },
-    "ash": {
-     "name": "Ashen Speed",
-     "cost": 80,
-     "time": 14,
-     "stat": "spd",
-     "mult": 1.25,
-     "applies": "army",
-     "desc": "+25% army speed."
-    },
-    "regrow": {
-     "name": "Ember Regrowth",
-     "cost": 110,
-     "time": 20,
-     "stat": "maxhp",
-     "mult": 1.18,
-     "applies": "army",
-     "desc": "+18% army health."
-    },
-    "wild": {
-     "name": "Wildfire Spread",
-     "cost": 150,
-     "time": 24,
-     "stat": "dmg",
-     "mult": 1.35,
-     "applies": [
-      "colossus"
-     ],
-     "desc": "+35% Wildfire attack."
-    }
-   },
-   "mechanic": "burn"
-  },
-  "tide": {
-   "name": "The Deepfold Tide",
-   "blurb": "Defensive & economic \u2014 tanky, slow, out-lasts foes.",
-   "color": [
-    70,
-    170,
-    168
-   ],
-   "dark": [
-    40,
-    108,
-    106
-   ],
-   "trait": "Turtle: tanky units that slowly REGENERATE. Out-last and grind them down.",
-   "econ": 1.03,
-   "structures": {
-    "scriptorium": {
-     "name": "Tidehall",
-     "cost": 0,
-     "hp": 1400,
-     "r": 56,
-     "build": 6.0,
-     "makes": [
-      "scribe"
-     ],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "S",
-     "desc": "Town hall. Trains Pearlscribes; ink drop-off.",
-     "supply": 10
-    },
-    "table": {
-     "name": "Coral Table",
-     "cost": 130,
-     "hp": 950,
-     "r": 44,
-     "build": 9.0,
-     "makes": [
-      "soldier",
-      "archer"
-     ],
-     "requires": [],
-     "researches": [
-      "plate"
-     ],
-     "tier": 1,
-     "key": "T",
-     "desc": "Trains tide troops."
-    },
-    "well": {
-     "name": "Deep Reservoir",
-     "cost": 80,
-     "hp": 560,
-     "r": 36,
-     "build": 6.0,
-     "makes": [],
-     "requires": [],
-     "researches": [
-      "current"
-     ],
-     "tier": 1,
-     "key": "R",
-     "desc": "Raises ink cap & income (rich).",
-     "supply": 10
-    },
-    "spire": {
-     "name": "Tide Spire",
-     "cost": 150,
-     "hp": 1100,
-     "r": 40,
-     "build": 10.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "P",
-     "desc": "Sturdy defensive tower.",
-     "detector": true,
-     "detect_range": 300
-    },
-    "bindery": {
-     "name": "Abyssal Bindery",
-     "cost": 210,
-     "hp": 1200,
-     "r": 48,
-     "build": 13.0,
-     "makes": [
-      "brute",
-      "tidecaller",
-      "deepstalker"
-     ],
-     "requires": [
-      "table"
-     ],
-     "researches": [
-      "might"
-     ],
-     "tier": 2,
-     "key": "B",
-     "desc": "Tier 2. Unlocks Bulwarks & tide upgrades."
-    },
-    "menagerie": {
-     "name": "Leviathan Pool",
-     "cost": 340,
-     "hp": 1500,
-     "r": 54,
-     "build": 17.0,
-     "makes": [
-      "colossus"
-     ],
-     "requires": [
-      "bindery"
-     ],
-     "researches": [
-      "deep"
-     ],
-     "tier": 3,
-     "key": "M",
-     "desc": "Tier 3. Raises the Leviathan."
-    }
-   },
-   "units": {
-    "scribe": {
-     "name": "Pearlscribe",
-     "cost": 25,
-     "hp": 70,
-     "dmg": 4,
-     "spd": 88,
-     "rng": 14,
-     "r": 11,
-     "card": "beekeeper",
-     "worker": true,
-     "build_t": 3.0,
-     "tier": 1,
-     "key": "E",
-     "desc": "Harvests ink (richer hauls); raises structures.",
-     "supply": 1
-    },
-    "soldier": {
-     "name": "Tide Guard",
-     "cost": 54,
-     "hp": 195,
-     "dmg": 13,
-     "spd": 76,
-     "rng": 16,
-     "r": 14,
-     "card": "gorilla",
-     "build_t": 4.6,
-     "tier": 1,
-     "key": "A",
-     "desc": "Very sturdy line.",
-     "supply": 2
-    },
-    "archer": {
-     "name": "Coral Slinger",
-     "cost": 68,
-     "hp": 120,
-     "dmg": 15,
-     "spd": 80,
-     "rng": 150,
-     "r": 12,
-     "card": "crane",
-     "build_t": 5.4,
-     "tier": 1,
-     "key": "D",
-     "desc": "Durable ranged.",
-     "supply": 2
-    },
-    "brute": {
-     "name": "Deepfold Bulwark",
-     "cost": 120,
-     "hp": 480,
-     "dmg": 32,
-     "spd": 60,
-     "rng": 18,
-     "r": 19,
-     "card": "mammoth",
-     "build_t": 9.0,
-     "tier": 2,
-     "key": "F",
-     "desc": "Immense wall of paper.",
-     "supply": 3
-    },
-    "colossus": {
-     "name": "Ink Leviathan",
-     "cost": 260,
-     "hp": 1200,
-     "dmg": 64,
-     "spd": 52,
-     "rng": 24,
-     "r": 28,
-     "card": "leviathan",
-     "build_t": 16.0,
-     "tier": 3,
-     "key": "C",
-     "desc": "Colossal sea-beast.",
-     "supply": 5
-    },
-    "tidecaller": {
-     "name": "Tidecaller",
-     "cost": 100,
-     "hp": 140,
-     "dmg": 10,
-     "spd": 76,
-     "rng": 130,
-     "r": 13,
-     "card": "leviathan",
-     "build_t": 8.0,
-     "tier": 2,
-     "key": "K",
-     "supply": 2,
-     "energy": 100,
-     "energy_start": 50,
-     "ability": {
-      "id": "undertow",
-      "name": "Undertow",
-      "cost": 60,
-      "cast_range": 340,
-      "radius": 110,
-      "kind": "snare",
-      "dps": 18,
-      "slow": 0.5,
-      "dur": 3.5,
-      "desc": "Drag foes into the deep \u2014 slows and drowns them."
-     },
-     "desc": "Control caster \u2014 snares foes in a crushing undertow."
-    },
-    "deepstalker": {
-     "name": "Deepstalker",
-     "cost": 90,
-     "hp": 85,
-     "dmg": 26,
-     "spd": 112,
-     "rng": 18,
-     "r": 12,
-     "card": "leviathan",
-     "build_t": 6.0,
-     "tier": 2,
-     "key": "J",
-     "supply": 2,
-     "cloak": true,
-     "desc": "Cloaked raider \u2014 unseen without enemy detection."
-    }
-   },
-   "upgrades": {
-    "plate": {
-     "name": "Coral Plating",
-     "cost": 110,
-     "time": 20,
-     "stat": "maxhp",
-     "mult": 1.35,
-     "applies": "army",
-     "desc": "+35% army health."
-    },
-    "current": {
-     "name": "Deep Currents",
-     "cost": 90,
-     "time": 16,
-     "stat": "harvest",
-     "mult": 1.35,
-     "applies": "workers",
-     "desc": "+35% ink per haul."
-    },
-    "might": {
-     "name": "Tidal Might",
-     "cost": 120,
-     "time": 22,
-     "stat": "dmg",
-     "mult": 1.25,
-     "applies": "army",
-     "desc": "+25% army attack."
-    },
-    "deep": {
-     "name": "Deep Awakening",
-     "cost": 170,
-     "time": 28,
-     "stat": "maxhp",
-     "mult": 1.25,
-     "applies": [
-      "colossus",
-      "brute"
-     ],
-     "desc": "+25% bulwark & leviathan health."
-    }
-   },
-   "mechanic": "regen"
-  },
-  "press": {
-   "name": "The Gilded Press",
-   "blurb": "Relentless printing-house \u2014 units wind up, hitting harder the longer they stay on a target.",
-   "color": [
-    206,
-    170,
-    92
-   ],
-   "dark": [
-    140,
-    110,
-    52
-   ],
-   "trait": "Momentum: the longer a unit hammers the same foe, the more damage it deals. Commit and grind.",
-   "econ": 1.0,
-   "mechanic": "momentum",
-   "structures": {
-    "scriptorium": {
-     "name": "Printworks",
-     "cost": 0,
-     "hp": 1080,
-     "r": 52,
-     "build": 6.0,
-     "makes": [
-      "scribe"
-     ],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "S",
-     "desc": "Town hall. Trains Typesetters; ink drop-off.",
-     "supply": 10
-    },
-    "table": {
-     "name": "Composing Room",
-     "cost": 100,
-     "hp": 720,
-     "r": 40,
-     "build": 7.0,
-     "makes": [
-      "soldier",
-      "archer"
-     ],
-     "requires": [],
-     "researches": [
-      "press"
-     ],
-     "tier": 1,
-     "key": "T",
-     "desc": "Trains press troops."
-    },
-    "well": {
-     "name": "Ink Vat",
-     "cost": 90,
-     "hp": 470,
-     "r": 34,
-     "build": 6.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "R",
-     "desc": "Raises ink cap & income.",
-     "supply": 10
-    },
-    "spire": {
-     "name": "Lantern Tower",
-     "cost": 140,
-     "hp": 800,
-     "r": 36,
-     "build": 8.0,
-     "makes": [],
-     "requires": [],
-     "researches": [],
-     "tier": 1,
-     "key": "P",
-     "desc": "Defensive tower; reveals cloaked foes.",
-     "detector": true,
-     "detect_range": 300
-    },
-    "bindery": {
-     "name": "Foundry",
-     "cost": 180,
-     "hp": 880,
-     "r": 44,
-     "build": 11.0,
-     "makes": [
-      "brute",
-      "pressmaster",
-      "leadghost"
-     ],
-     "requires": [
-      "table"
-     ],
-     "researches": [
-      "roll",
-      "temper"
-     ],
-     "tier": 2,
-     "key": "B",
-     "desc": "Tier 2. Unlocks Platen Brutes & press upgrades."
-    },
-    "menagerie": {
-     "name": "Great Rotary",
-     "cost": 300,
-     "hp": 1160,
-     "r": 50,
-     "build": 15.0,
-     "makes": [
-      "colossus"
-     ],
-     "requires": [
-      "bindery"
-     ],
-     "researches": [
-      "gild"
-     ],
-     "tier": 3,
-     "key": "M",
-     "desc": "Tier 3. Looses the Rotary Titan."
-    }
-   },
-   "units": {
-    "scribe": {
-     "name": "Typesetter",
-     "cost": 22,
-     "hp": 58,
-     "dmg": 4,
-     "spd": 100,
-     "rng": 14,
-     "r": 11,
-     "card": "beekeeper",
-     "worker": true,
-     "build_t": 2.6,
-     "tier": 1,
-     "key": "S",
-     "desc": "Harvests ink.",
-     "supply": 1
-    },
-    "soldier": {
-     "name": "Presshand",
-     "cost": 44,
-     "hp": 130,
-     "dmg": 14,
-     "spd": 92,
-     "rng": 16,
-     "r": 12,
-     "card": "gorilla",
-     "build_t": 3.3,
-     "tier": 1,
-     "key": "A",
-     "desc": "Sturdy melee that winds up.",
-     "supply": 2
-    },
-    "archer": {
-     "name": "Type-Thrower",
-     "cost": 52,
-     "hp": 92,
-     "dmg": 15,
-     "spd": 90,
-     "rng": 150,
-     "r": 12,
-     "card": "crane",
-     "build_t": 3.6,
-     "tier": 1,
-     "key": "D",
-     "desc": "Ranged; hurls hot type.",
-     "supply": 2
-    },
-    "brute": {
-     "name": "Platen Brute",
-     "cost": 100,
-     "hp": 300,
-     "dmg": 40,
-     "spd": 76,
-     "rng": 18,
-     "r": 18,
-     "card": "mammoth",
-     "build_t": 6.8,
-     "tier": 2,
-     "key": "F",
-     "desc": "Heavy press-ram.",
-     "supply": 3
-    },
-    "colossus": {
-     "name": "Rotary Titan",
-     "cost": 220,
-     "hp": 700,
-     "dmg": 84,
-     "spd": 66,
-     "rng": 20,
-     "r": 25,
-     "card": "foldwright",
-     "build_t": 11.5,
-     "tier": 3,
-     "key": "C",
-     "desc": "Unstoppable once it gets going.",
-     "supply": 5
-    },
-    "pressmaster": {
-     "name": "Pressmaster",
-     "cost": 95,
-     "hp": 120,
-     "dmg": 11,
-     "spd": 84,
-     "rng": 135,
-     "r": 13,
-     "card": "foldwright",
-     "build_t": 7.0,
-     "tier": 2,
-     "key": "K",
-     "supply": 2,
-     "energy": 100,
-     "energy_start": 50,
-     "ability": {
-      "id": "impress",
-      "name": "Impression",
-      "cost": 60,
-      "cast_range": 340,
-      "radius": 120,
-      "kind": "buff",
-      "amount": 1.4,
-      "dur": 5.0,
-      "desc": "Allies in the area deal +40% damage for a time."
-     },
-     "desc": "Support caster \u2014 stamps allies with force."
-    },
-    "leadghost": {
-     "name": "Leadghost",
-     "cost": 90,
-     "hp": 90,
-     "dmg": 27,
-     "spd": 114,
-     "rng": 18,
-     "r": 12,
-     "card": "phoenix",
-     "build_t": 6.0,
-     "tier": 2,
-     "key": "J",
-     "supply": 2,
-     "cloak": true,
-     "desc": "Cloaked raider \u2014 unseen without enemy detection."
-    }
-   },
-   "upgrades": {
-    "press": {
-     "name": "Heavier Type",
-     "cost": 90,
-     "time": 15,
-     "stat": "dmg",
-     "mult": 1.28,
-     "applies": "army",
-     "desc": "+28% army attack."
-    },
-    "roll": {
-     "name": "Oiled Rollers",
-     "cost": 80,
-     "time": 14,
-     "stat": "spd",
-     "mult": 1.22,
-     "applies": "army",
-     "desc": "+22% army speed."
-    },
-    "temper": {
-     "name": "Tempered Frames",
-     "cost": 110,
-     "time": 20,
-     "stat": "maxhp",
-     "mult": 1.2,
-     "applies": "army",
-     "desc": "+20% army health."
-    },
-    "gild": {
-     "name": "Gilded Drum",
-     "cost": 150,
-     "time": 24,
-     "stat": "dmg",
-     "mult": 1.35,
-     "applies": [
-      "colossus"
-     ],
-     "desc": "+35% Rotary Titan attack."
-    }
-   }
-  }
- },
- "maps": {
-  "leaflock": {
-   "name": "Leaflock Basin",
-   "size": [
-    4200,
-    2800
-   ],
-   "spawns": [
-    [
-     340,
-     2460
-    ],
-    [
-     3860,
-     340
-    ]
-   ],
-   "seed": 1234,
-   "nodes": 16,
-   "desc": "A broad open basin. Classic macro map, room to maneuver.",
-   "objects": [
-    {
-     "kind": "ruin",
-     "x": 2100,
-     "y": 1400,
-     "r": 70,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Folded Ruin",
-     "desc": "Impassable wreckage."
-    },
-    {
-     "kind": "ruin",
-     "x": 1500,
-     "y": 900,
-     "r": 54,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Folded Ruin"
-    },
-    {
-     "kind": "ruin",
-     "x": 2700,
-     "y": 1900,
-     "r": 54,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Folded Ruin"
-    },
-    {
-     "kind": "richnode",
-     "x": 2100,
-     "y": 1100,
-     "r": 32,
-     "amount": 4000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Deep Ink Well",
-     "desc": "A rich central prize."
-    },
-    {
-     "kind": "richnode",
-     "x": 2100,
-     "y": 1700,
-     "r": 32,
-     "amount": 4000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Deep Ink Well"
-    },
-    {
-     "kind": "relic",
-     "x": 2100,
-     "y": 1400,
-     "r": 26,
-     "bonus": "ink",
-     "color": [
-      230,
-      200,
-      110
-     ],
-     "label": "Binder's Seal",
-     "desc": "Hold the centre for a slow ink bounty."
-    }
-   ],
-   "highground": [
-    [
-     2100,
-     1400,
-     260
-    ],
-    [
-     700,
-     700,
-     200
-    ],
-    [
-     3500,
-     2100,
-     200
-    ]
-   ],
-   "theme": {
-    "ground": [
-     196,
-     182,
-     150
-    ],
-    "grid": [
-     184,
-     168,
-     136
-    ],
-    "ruled": [
-     150,
-     175,
-     140
-    ],
-    "crease": [
-     168,
-     156,
-     126
-    ],
-    "accent": [
-     120,
-     150,
-     110
-    ],
-    "name_tint": [
-     90,
-     140,
-     90
-    ]
-   },
-   "stains": [
-    [
-     3873,
-     1258,
-     14.2,
-     0.151
-    ],
-    [
-     3769,
-     1597,
-     34.1,
-     0.068
-    ],
-    [
-     3113,
-     768,
-     14.9,
-     0.139
-    ],
-    [
-     1515,
-     1696,
-     32.5,
-     0.075
-    ],
-    [
-     896,
-     475,
-     14.4,
-     0.109
-    ],
-    [
-     3867,
-     355,
-     30.2,
-     0.107
-    ],
-    [
-     2486,
-     413,
-     31.4,
-     0.087
-    ],
-    [
-     2314,
-     1747,
-     28.4,
-     0.096
-    ],
-    [
-     1147,
-     2440,
-     27.6,
-     0.113
-    ],
-    [
-     273,
-     1419,
-     14.2,
-     0.074
-    ],
-    [
-     1997,
-     1106,
-     15.6,
-     0.119
-    ],
-    [
-     823,
-     1538,
-     18.3,
-     0.154
-    ],
-    [
-     3130,
-     2497,
-     18.2,
-     0.091
-    ],
-    [
-     350,
-     864,
-     38.2,
-     0.078
-    ]
-   ],
-   "weather": {
-    "kind": "clear",
-    "tint": [
-     255,
-     240,
-     205
-    ],
-    "strength": 0.12
-   },
-   "bands": [
-    [
-     3725,
-     866,
-     2032,
-     -343,
-     93
-    ],
-    [
-     4156,
-     519,
-     1682,
-     -1248,
-     81
-    ]
-   ],
-   "pools": [
-    [
-     2100,
-     2350,
-     190
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 3625,
-     "y": 2406,
-     "r": 13,
-     "rot": 4.16
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 852,
-     "y": 2026,
-     "r": 12,
-     "rot": 3.9
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1353,
-     "y": 1596,
-     "r": 19,
-     "rot": 3.15
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1046,
-     "y": 2175,
-     "r": 14,
-     "rot": 5.38
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 473,
-     "y": 573,
-     "r": 17,
-     "rot": 0.71
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1941,
-     "y": 572,
-     "r": 17,
-     "rot": 3.23
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 2832,
-     "y": 359,
-     "r": 16,
-     "rot": 4.03
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1275,
-     "y": 2002,
-     "r": 18,
-     "rot": 6.2
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 3709,
-     "y": 1110,
-     "r": 12,
-     "rot": 2.61
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 686,
-     "y": 1166,
-     "r": 19,
-     "rot": 5.68
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1453,
-     "y": 657,
-     "r": 12,
-     "rot": 2.41
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 1460,
-     "y": 224,
-     "r": 11,
-     "rot": 0.59
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 212,
-     "y": 1076,
-     "r": 17,
-     "rot": 2.94
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 3082,
-     "y": 847,
-     "r": 16,
-     "rot": 1.32
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 2329,
-     "y": 2546,
-     "r": 20,
-     "rot": 2.3
-    },
-    {
-     "kind": "prop",
-     "style": "leaf",
-     "x": 722,
-     "y": 1846,
-     "r": 10,
-     "rot": 0.59
-    }
-   ]
-  },
-  "creases": {
-   "name": "The Creases",
-   "size": [
-    3400,
-    3400
-   ],
-   "spawns": [
-    [
-     340,
-     3060
-    ],
-    [
-     3060,
-     340
-    ]
-   ],
-   "seed": 77,
-   "nodes": 12,
-   "desc": "Square & compact. Fast fights, short rushes.",
-   "objects": [
-    {
-     "kind": "ruin",
-     "x": 700,
-     "y": 1700,
-     "r": 60,
-     "blocks": true,
-     "color": [
-      120,
-      108,
-      90
-     ],
-     "label": "Crease Wall"
-    },
-    {
-     "kind": "ruin",
-     "x": 1200,
-     "y": 1700,
-     "r": 60,
-     "blocks": true,
-     "color": [
-      120,
-      108,
-      90
-     ],
-     "label": "Crease Wall"
-    },
-    {
-     "kind": "ruin",
-     "x": 1700,
-     "y": 1700,
-     "r": 60,
-     "blocks": true,
-     "color": [
-      120,
-      108,
-      90
-     ],
-     "label": "Crease Wall"
-    },
-    {
-     "kind": "ruin",
-     "x": 2200,
-     "y": 1700,
-     "r": 60,
-     "blocks": true,
-     "color": [
-      120,
-      108,
-      90
-     ],
-     "label": "Crease Wall"
-    },
-    {
-     "kind": "ruin",
-     "x": 2700,
-     "y": 1700,
-     "r": 60,
-     "blocks": true,
-     "color": [
-      120,
-      108,
-      90
-     ],
-     "label": "Crease Wall"
-    }
-   ],
-   "highground": [
-    [
-     1700,
-     900,
-     220
-    ],
-    [
-     1700,
-     2500,
-     220
-    ]
-   ],
-   "theme": {
-    "ground": [
-     200,
-     186,
-     158
-    ],
-    "grid": [
-     188,
-     172,
-     142
-    ],
-    "ruled": [
-     205,
-     150,
-     120
-    ],
-    "crease": [
-     176,
-     158,
-     128
-    ],
-    "accent": [
-     150,
-     120,
-     80
-    ],
-    "name_tint": [
-     150,
-     110,
-     80
-    ]
-   },
-   "stains": [
-    [
-     2597,
-     1178,
-     21.2,
-     0.142
-    ],
-    [
-     545,
-     1629,
-     30.7,
-     0.121
-    ],
-    [
-     636,
-     2092,
-     29.0,
-     0.145
-    ],
-    [
-     285,
-     3072,
-     19.2,
-     0.141
-    ],
-    [
-     1722,
-     2707,
-     19.5,
-     0.092
-    ],
-    [
-     462,
-     2536,
-     30.0,
-     0.08
-    ],
-    [
-     775,
-     443,
-     20.0,
-     0.116
-    ],
-    [
-     1513,
-     2313,
-     16.3,
-     0.144
-    ],
-    [
-     3146,
-     2419,
-     36.3,
-     0.145
-    ],
-    [
-     485,
-     1584,
-     16.4,
-     0.138
-    ],
-    [
-     1814,
-     519,
-     27.3,
-     0.138
-    ],
-    [
-     1856,
-     564,
-     42.1,
-     0.066
-    ],
-    [
-     2729,
-     3122,
-     36.5,
-     0.155
-    ],
-    [
-     1793,
-     857,
-     28.2,
-     0.134
-    ]
-   ],
-   "weather": {
-    "kind": "clear",
-    "tint": [
-     250,
-     238,
-     210
-    ],
-    "strength": 0.1
-   },
-   "bands": [
-    [
-     1339,
-     3055,
-     2792,
-     4093,
-     62
-    ],
-    [
-     2590,
-     3236,
-     1376,
-     4103,
-     74
-    ],
-    [
-     1800,
-     51,
-     2907,
-     842,
-     107
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 2474,
-     "y": 2334,
-     "r": 11,
-     "rot": 5.52
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 1575,
-     "y": 1326,
-     "r": 12,
-     "rot": 2.92
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 2894,
-     "y": 1814,
-     "r": 11,
-     "rot": 0.05
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 3121,
-     "y": 2060,
-     "r": 14,
-     "rot": 2.67
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 1744,
-     "y": 2942,
-     "r": 18,
-     "rot": 0.22
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 549,
-     "y": 1272,
-     "r": 19,
-     "rot": 2.55
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 932,
-     "y": 296,
-     "r": 19,
-     "rot": 3.42
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 2129,
-     "y": 1186,
-     "r": 13,
-     "rot": 2.06
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 2853,
-     "y": 887,
-     "r": 11,
-     "rot": 0.6
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 414,
-     "y": 1547,
-     "r": 14,
-     "rot": 2.15
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 2162,
-     "y": 1335,
-     "r": 20,
-     "rot": 1.11
-    },
-    {
-     "kind": "prop",
-     "style": "boat",
-     "x": 616,
-     "y": 1979,
-     "r": 17,
-     "rot": 3.57
-    }
-   ]
-  },
-  "spine": {
-   "name": "Foldspine Pass",
-   "size": [
-    4800,
-    2400
-   ],
-   "spawns": [
-    [
-     320,
-     1200
-    ],
-    [
-     4480,
-     1200
-    ]
-   ],
-   "seed": 909,
-   "nodes": 14,
-   "desc": "A long horizontal corridor \u2014 a lane to hold or break.",
-   "objects": [
-    {
-     "kind": "ruin",
-     "x": 2400,
-     "y": 900,
-     "r": 90,
-     "blocks": true,
-     "color": [
-      116,
-      104,
-      88
-     ],
-     "label": "Spine Rock"
-    },
-    {
-     "kind": "ruin",
-     "x": 2400,
-     "y": 1500,
-     "r": 90,
-     "blocks": true,
-     "color": [
-      116,
-      104,
-      88
-     ],
-     "label": "Spine Rock"
-    },
-    {
-     "kind": "richnode",
-     "x": 2400,
-     "y": 1200,
-     "r": 34,
-     "amount": 5000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Contested Vein",
-     "desc": "The prize in the middle of the pass."
-    }
-   ],
-   "highground": [
-    [
-     2400,
-     1200,
-     240
-    ]
-   ],
-   "theme": {
-    "ground": [
-     188,
-     186,
-     178
-    ],
-    "grid": [
-     176,
-     174,
-     166
-    ],
-    "ruled": [
-     150,
-     160,
-     190
-    ],
-    "crease": [
-     168,
-     166,
-     158
-    ],
-    "accent": [
-     110,
-     120,
-     160
-    ],
-    "name_tint": [
-     100,
-     110,
-     160
-    ]
-   },
-   "stains": [
-    [
-     1106,
-     995,
-     38.4,
-     0.084
-    ],
-    [
-     3557,
-     778,
-     25.3,
-     0.159
-    ],
-    [
-     2462,
-     674,
-     32.6,
-     0.14
-    ],
-    [
-     4346,
-     328,
-     32.3,
-     0.099
-    ],
-    [
-     1231,
-     1768,
-     29.8,
-     0.065
-    ],
-    [
-     4359,
-     1357,
-     25.0,
-     0.073
-    ],
-    [
-     4187,
-     734,
-     19.8,
-     0.128
-    ],
-    [
-     801,
-     783,
-     37.7,
-     0.086
-    ],
-    [
-     275,
-     1234,
-     33.9,
-     0.075
-    ],
-    [
-     2914,
-     458,
-     14.3,
-     0.094
-    ],
-    [
-     1083,
-     704,
-     37.6,
-     0.062
-    ],
-    [
-     2724,
-     990,
-     22.4,
-     0.087
-    ],
-    [
-     3056,
-     1211,
-     14.7,
-     0.109
-    ],
-    [
-     3943,
-     859,
-     19.8,
-     0.075
-    ]
-   ],
-   "weather": {
-    "kind": "overcast",
-    "tint": [
-     190,
-     200,
-     220
-    ],
-    "strength": 0.18
-   },
-   "bands": [
-    [
-     3558,
-     2234,
-     5598,
-     3691,
-     63
-    ],
-    [
-     234,
-     2396,
-     -2354,
-     4245,
-     68
-    ],
-    [
-     3896,
-     2110,
-     1705,
-     545,
-     104
-    ],
-    [
-     3495,
-     2252,
-     5075,
-     1123,
-     110
-    ]
-   ],
-   "pools": [
-    [
-     1200,
-     2100,
-     170
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 3638,
-     "y": 1442,
-     "r": 15,
-     "rot": 1.43
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 2566,
-     "y": 510,
-     "r": 10,
-     "rot": 4.28
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 1609,
-     "y": 1065,
-     "r": 16,
-     "rot": 4.0
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 3439,
-     "y": 412,
-     "r": 19,
-     "rot": 2.35
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 4532,
-     "y": 311,
-     "r": 10,
-     "rot": 3.16
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 3122,
-     "y": 1768,
-     "r": 20,
-     "rot": 1.15
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 1343,
-     "y": 442,
-     "r": 11,
-     "rot": 2.15
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 4361,
-     "y": 315,
-     "r": 17,
-     "rot": 0.45
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 4119,
-     "y": 2039,
-     "r": 20,
-     "rot": 5.99
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 3802,
-     "y": 397,
-     "r": 12,
-     "rot": 1.4
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 480,
-     "y": 1790,
-     "r": 18,
-     "rot": 3.18
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 2144,
-     "y": 1375,
-     "r": 19,
-     "rot": 0.99
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 1672,
-     "y": 352,
-     "r": 11,
-     "rot": 3.71
-    },
-    {
-     "kind": "prop",
-     "style": "blot",
-     "x": 4447,
-     "y": 274,
-     "r": 10,
-     "rot": 0.53
-    }
-   ]
-  },
-  "quill": {
-   "name": "Quillmarsh",
-   "size": [
-    3800,
-    3200
-   ],
-   "spawns": [
-    [
-     360,
-     2840
-    ],
-    [
-     3440,
-     360
-    ]
-   ],
-   "seed": 451,
-   "nodes": 20,
-   "desc": "Node-rich wetland. Reward map for greedy expanders.",
-   "overlay": {
-    "units": {
-     "strider": {
-      "name": "Marsh Strider",
-      "cost": 70,
-      "hp": 130,
-      "dmg": 20,
-      "spd": 120,
-      "rng": 20,
-      "r": 13,
-      "card": "heron",
-      "build_t": 4.5,
-      "tier": 1,
-      "key": "G",
-      "desc": "Fast marsh raider \u2014 only foldable in Quillmarsh.",
-      "supply": 2
-     }
-    },
-    "structures": {
-     "reedhut": {
-      "name": "Reed Hut",
-      "cost": 110,
-      "hp": 620,
-      "r": 40,
-      "build": 8.0,
-      "makes": [
-       "strider"
-      ],
-      "requires": [],
-      "researches": [],
-      "tier": 1,
-      "key": "H",
-      "desc": "Marsh-only: trains Striders."
-     }
-    },
-    "faction_add_structures": [
-     "reedhut"
-    ],
-    "objects": [
-     {
-      "kind": "richnode",
-      "x": 1900,
-      "y": 1600,
-      "r": 30,
-      "amount": 3000,
+  "schema": "foldworks-rts/1",
+  "factions": {
+    "court": {
+      "name": "The Folded Court",
+      "blurb": "Versatile and balanced \u2014 no glaring weakness.",
       "color": [
-       150,
-       120,
-       210
+        90,
+        150,
+        220
       ],
-      "label": "Bog Ink"
-     }
-    ]
-   },
-   "highground": [
-    [
-     1900,
-     1600,
-     240
-    ]
-   ],
-   "theme": {
-    "ground": [
-     186,
-     192,
-     168
-    ],
-    "grid": [
-     172,
-     180,
-     154
-    ],
-    "ruled": [
-     140,
-     170,
-     150
-    ],
-    "crease": [
-     160,
-     170,
-     146
-    ],
-    "accent": [
-     110,
-     150,
-     120
-    ],
-    "name_tint": [
-     90,
-     140,
-     110
-    ]
-   },
-   "stains": [
-    [
-     337,
-     560,
-     36.0,
-     0.064
-    ],
-    [
-     523,
-     2378,
-     35.4,
-     0.09
-    ],
-    [
-     780,
-     2671,
-     15.5,
-     0.082
-    ],
-    [
-     1484,
-     2106,
-     41.0,
-     0.112
-    ],
-    [
-     796,
-     793,
-     33.2,
-     0.114
-    ],
-    [
-     2124,
-     2430,
-     38.1,
-     0.121
-    ],
-    [
-     772,
-     2461,
-     30.4,
-     0.124
-    ],
-    [
-     1330,
-     1736,
-     20.4,
-     0.158
-    ],
-    [
-     563,
-     1138,
-     40.0,
-     0.1
-    ],
-    [
-     2749,
-     1378,
-     16.9,
-     0.104
-    ],
-    [
-     1473,
-     2230,
-     36.7,
-     0.131
-    ],
-    [
-     917,
-     330,
-     19.9,
-     0.08
-    ],
-    [
-     1922,
-     1017,
-     39.6,
-     0.07
-    ],
-    [
-     2240,
-     361,
-     15.3,
-     0.126
-    ]
-   ],
-   "weather": {
-    "kind": "mist",
-    "tint": [
-     200,
-     225,
-     200
-    ],
-    "strength": 0.16
-   },
-   "bands": [
-    [
-     2232,
-     1719,
-     4219,
-     3138,
-     87
-    ],
-    [
-     3072,
-     477,
-     1120,
-     1871,
-     67
-    ],
-    [
-     823,
-     690,
-     -555,
-     -294,
-     130
-    ]
-   ],
-   "pools": [
-    [
-     900,
-     1000,
-     220
-    ],
-    [
-     2800,
-     2400,
-     190
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1087,
-     "y": 1664,
-     "r": 14,
-     "rot": 2.99
+      "dark": [
+        54,
+        92,
+        150
+      ],
+      "trait": "Formation: units take LESS damage the more allies stand with them. Fight as a tight block.",
+      "econ": 1.05,
+      "structures": {
+        "scriptorium": {
+          "name": "Scriptorium",
+          "cost": 0,
+          "hp": 1200,
+          "r": 54,
+          "build": 6.0,
+          "makes": [
+            "scribe"
+          ],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "S",
+          "desc": "Town hall. Trains Scribes; ink drop-off.",
+          "supply": 10
+        },
+        "table": {
+          "name": "Folding Table",
+          "cost": 120,
+          "hp": 800,
+          "r": 42,
+          "build": 8.0,
+          "makes": [
+            "soldier",
+            "archer"
+          ],
+          "requires": [],
+          "researches": [
+            "sharp"
+          ],
+          "tier": 1,
+          "key": "T",
+          "desc": "Trains soldiers & archers."
+        },
+        "well": {
+          "name": "Ink Reservoir",
+          "cost": 90,
+          "hp": 500,
+          "r": 34,
+          "build": 6.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "R",
+          "desc": "Raises ink cap & income.",
+          "supply": 10
+        },
+        "spire": {
+          "name": "Watch Spire",
+          "cost": 150,
+          "hp": 900,
+          "r": 38,
+          "build": 9.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "P",
+          "desc": "Defensive tower.",
+          "detector": true,
+          "detect_range": 300
+        },
+        "bindery": {
+          "name": "Grand Bindery",
+          "cost": 200,
+          "hp": 1000,
+          "r": 46,
+          "build": 12.0,
+          "makes": [
+            "brute",
+            "inkspeaker",
+            "foldshade"
+          ],
+          "requires": [
+            "table"
+          ],
+          "researches": [
+            "thick",
+            "swift"
+          ],
+          "tier": 2,
+          "key": "B",
+          "desc": "Tier 2. Unlocks Brutes & fold upgrades."
+        },
+        "menagerie": {
+          "name": "Paper Menagerie",
+          "cost": 320,
+          "hp": 1300,
+          "r": 52,
+          "build": 16.0,
+          "makes": [
+            "colossus"
+          ],
+          "requires": [
+            "bindery"
+          ],
+          "researches": [
+            "colossal"
+          ],
+          "tier": 3,
+          "key": "M",
+          "desc": "Tier 3. Folds the Origami Colossus."
+        }
+      },
+      "units": {
+        "scribe": {
+          "name": "Scribe",
+          "cost": 25,
+          "hp": 60,
+          "dmg": 4,
+          "spd": 95,
+          "rng": 14,
+          "r": 11,
+          "card": "beekeeper",
+          "worker": true,
+          "build_t": 3.0,
+          "tier": 1,
+          "key": "E",
+          "desc": "Harvests ink; raises structures.",
+          "supply": 1
+        },
+        "soldier": {
+          "name": "Folded Soldier",
+          "cost": 50,
+          "hp": 160,
+          "dmg": 15,
+          "spd": 88,
+          "rng": 16,
+          "r": 13,
+          "card": "foldknight",
+          "build_t": 4.0,
+          "tier": 1,
+          "key": "A",
+          "desc": "Sturdy melee line.",
+          "supply": 2
+        },
+        "archer": {
+          "name": "Quill Archer",
+          "cost": 65,
+          "hp": 90,
+          "dmg": 16,
+          "spd": 92,
+          "rng": 150,
+          "r": 12,
+          "card": "inkwitch",
+          "build_t": 5.0,
+          "tier": 1,
+          "key": "D",
+          "desc": "Ranged; fragile.",
+          "supply": 2
+        },
+        "brute": {
+          "name": "Paper Brute",
+          "cost": 110,
+          "hp": 360,
+          "dmg": 34,
+          "spd": 70,
+          "rng": 18,
+          "r": 18,
+          "card": "marbleaegis",
+          "build_t": 8.0,
+          "tier": 2,
+          "key": "F",
+          "desc": "Heavy shock unit.",
+          "supply": 3
+        },
+        "colossus": {
+          "name": "Origami Colossus",
+          "cost": 240,
+          "hp": 900,
+          "dmg": 70,
+          "spd": 58,
+          "rng": 22,
+          "r": 26,
+          "card": "foldwright",
+          "build_t": 14.0,
+          "tier": 3,
+          "key": "C",
+          "desc": "Towering elite.",
+          "supply": 5
+        },
+        "inkspeaker": {
+          "name": "Inkspeaker",
+          "cost": 95,
+          "hp": 110,
+          "dmg": 10,
+          "spd": 86,
+          "rng": 130,
+          "r": 13,
+          "card": "crane",
+          "build_t": 7.0,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "rally",
+            "name": "Rally Fold",
+            "cost": 55,
+            "cast_range": 340,
+            "radius": 120,
+            "kind": "heal",
+            "amount": 90,
+            "dur": 3.0,
+            "desc": "Heal & shield allies in an area."
+          },
+          "desc": "Support caster \u2014 mends and rallies the Court."
+        },
+        "foldshade": {
+          "name": "Foldshade",
+          "cost": 90,
+          "hp": 85,
+          "dmg": 26,
+          "spd": 112,
+          "rng": 18,
+          "r": 12,
+          "card": "crane",
+          "build_t": 6.0,
+          "tier": 2,
+          "key": "J",
+          "supply": 2,
+          "cloak": true,
+          "desc": "Cloaked raider \u2014 unseen without enemy detection."
+        }
+      },
+      "upgrades": {
+        "sharp": {
+          "name": "Sharper Folds",
+          "cost": 100,
+          "time": 18,
+          "stat": "dmg",
+          "mult": 1.25,
+          "applies": "army",
+          "desc": "+25% army attack."
+        },
+        "thick": {
+          "name": "Thicker Paper",
+          "cost": 120,
+          "time": 22,
+          "stat": "maxhp",
+          "mult": 1.3,
+          "applies": "army",
+          "desc": "+30% army health."
+        },
+        "swift": {
+          "name": "Swift Creases",
+          "cost": 90,
+          "time": 16,
+          "stat": "spd",
+          "mult": 1.2,
+          "applies": "army",
+          "desc": "+20% army speed."
+        },
+        "colossal": {
+          "name": "Colossal Folds",
+          "cost": 160,
+          "time": 26,
+          "stat": "dmg",
+          "mult": 1.3,
+          "applies": [
+            "colossus",
+            "brute"
+          ],
+          "desc": "+30% brute & colossus attack."
+        }
+      },
+      "mechanic": "cohesion"
     },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2523,
-     "y": 1343,
-     "r": 19,
-     "rot": 1.23
+    "ember": {
+      "name": "The Ember Bindery",
+      "blurb": "Aggressive glass cannon \u2014 cheap, fast, fragile, burns.",
+      "color": [
+        224,
+        132,
+        70
+      ],
+      "dark": [
+        150,
+        78,
+        40
+      ],
+      "trait": "Aggro: cheap fast units that BURN foes over time and COMBUST on death. Punish clumps.",
+      "econ": 0.95,
+      "structures": {
+        "scriptorium": {
+          "name": "Kiln-Hall",
+          "cost": 0,
+          "hp": 1050,
+          "r": 52,
+          "build": 6.0,
+          "makes": [
+            "scribe"
+          ],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "S",
+          "desc": "Town hall. Trains Ashscribes; ink drop-off.",
+          "supply": 10
+        },
+        "table": {
+          "name": "Forge",
+          "cost": 100,
+          "hp": 680,
+          "r": 40,
+          "build": 7.0,
+          "makes": [
+            "soldier",
+            "archer"
+          ],
+          "requires": [],
+          "researches": [
+            "hot"
+          ],
+          "tier": 1,
+          "key": "T",
+          "desc": "Trains ember troops."
+        },
+        "well": {
+          "name": "Ember Well",
+          "cost": 90,
+          "hp": 460,
+          "r": 34,
+          "build": 6.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "R",
+          "desc": "Raises ink cap & income.",
+          "supply": 10
+        },
+        "spire": {
+          "name": "Flame Spire",
+          "cost": 140,
+          "hp": 780,
+          "r": 36,
+          "build": 8.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "P",
+          "desc": "Defensive tower; burns attackers.",
+          "detector": true,
+          "detect_range": 300
+        },
+        "bindery": {
+          "name": "Pyre",
+          "cost": 180,
+          "hp": 850,
+          "r": 44,
+          "build": 11.0,
+          "makes": [
+            "brute",
+            "emberpriest",
+            "cinderwraith"
+          ],
+          "requires": [
+            "table"
+          ],
+          "researches": [
+            "ash",
+            "regrow"
+          ],
+          "tier": 2,
+          "key": "B",
+          "desc": "Tier 2. Unlocks Molten Brutes & fire upgrades."
+        },
+        "menagerie": {
+          "name": "Inferno Gate",
+          "cost": 300,
+          "hp": 1100,
+          "r": 50,
+          "build": 15.0,
+          "makes": [
+            "colossus"
+          ],
+          "requires": [
+            "bindery"
+          ],
+          "researches": [
+            "wild"
+          ],
+          "tier": 3,
+          "key": "M",
+          "desc": "Tier 3. Looses the Wildfire."
+        }
+      },
+      "units": {
+        "scribe": {
+          "name": "Ashscribe",
+          "cost": 22,
+          "hp": 52,
+          "dmg": 4,
+          "spd": 102,
+          "rng": 14,
+          "r": 11,
+          "card": "cinderling",
+          "worker": true,
+          "build_t": 2.6,
+          "tier": 1,
+          "key": "E",
+          "desc": "Harvests ink; raises structures.",
+          "supply": 1
+        },
+        "soldier": {
+          "name": "Ember Soldier",
+          "cost": 42,
+          "hp": 110,
+          "dmg": 16,
+          "spd": 98,
+          "rng": 16,
+          "r": 12,
+          "card": "cinderhound",
+          "build_t": 3.2,
+          "tier": 1,
+          "key": "A",
+          "desc": "Fast, fragile melee.",
+          "supply": 2
+        },
+        "archer": {
+          "name": "Cinder Archer",
+          "cost": 58,
+          "hp": 70,
+          "dmg": 19,
+          "spd": 100,
+          "rng": 155,
+          "r": 11,
+          "card": "embermoth",
+          "build_t": 4.0,
+          "tier": 1,
+          "key": "D",
+          "desc": "Glass-cannon ranged.",
+          "supply": 2
+        },
+        "brute": {
+          "name": "Molten Brute",
+          "cost": 95,
+          "hp": 250,
+          "dmg": 42,
+          "spd": 82,
+          "rng": 18,
+          "r": 17,
+          "card": "rhino",
+          "build_t": 6.5,
+          "tier": 2,
+          "key": "F",
+          "desc": "Fast heavy hitter.",
+          "supply": 3
+        },
+        "colossus": {
+          "name": "Wildfire",
+          "cost": 210,
+          "hp": 620,
+          "dmg": 88,
+          "spd": 72,
+          "rng": 20,
+          "r": 24,
+          "card": "phoenix",
+          "build_t": 11.0,
+          "tier": 3,
+          "key": "C",
+          "desc": "Blazing elite.",
+          "supply": 5
+        },
+        "emberpriest": {
+          "name": "Emberpriest",
+          "cost": 95,
+          "hp": 90,
+          "dmg": 12,
+          "spd": 92,
+          "rng": 140,
+          "r": 12,
+          "card": "phoenix",
+          "build_t": 7.0,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "storm",
+            "name": "Ink Storm",
+            "cost": 75,
+            "cast_range": 360,
+            "radius": 100,
+            "kind": "storm",
+            "dps": 55,
+            "dur": 3.0,
+            "desc": "A searing storm that burns everything beneath it."
+          },
+          "desc": "Glass-cannon caster \u2014 rains an Ink Storm of fire."
+        },
+        "cinderwraith": {
+          "name": "Cinderwraith",
+          "cost": 90,
+          "hp": 85,
+          "dmg": 26,
+          "spd": 112,
+          "rng": 18,
+          "r": 12,
+          "card": "phoenix",
+          "build_t": 6.0,
+          "tier": 2,
+          "key": "J",
+          "supply": 2,
+          "cloak": true,
+          "desc": "Cloaked raider \u2014 unseen without enemy detection."
+        }
+      },
+      "upgrades": {
+        "hot": {
+          "name": "Hotter Flames",
+          "cost": 90,
+          "time": 15,
+          "stat": "dmg",
+          "mult": 1.3,
+          "applies": "army",
+          "desc": "+30% army attack."
+        },
+        "ash": {
+          "name": "Ashen Speed",
+          "cost": 80,
+          "time": 14,
+          "stat": "spd",
+          "mult": 1.25,
+          "applies": "army",
+          "desc": "+25% army speed."
+        },
+        "regrow": {
+          "name": "Ember Regrowth",
+          "cost": 110,
+          "time": 20,
+          "stat": "maxhp",
+          "mult": 1.18,
+          "applies": "army",
+          "desc": "+18% army health."
+        },
+        "wild": {
+          "name": "Wildfire Spread",
+          "cost": 150,
+          "time": 24,
+          "stat": "dmg",
+          "mult": 1.35,
+          "applies": [
+            "colossus"
+          ],
+          "desc": "+35% Wildfire attack."
+        }
+      },
+      "mechanic": "burn"
     },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2259,
-     "y": 2243,
-     "r": 10,
-     "rot": 3.56
+    "tide": {
+      "name": "The Deepfold Tide",
+      "blurb": "Defensive & economic \u2014 tanky, slow, out-lasts foes.",
+      "color": [
+        70,
+        170,
+        168
+      ],
+      "dark": [
+        40,
+        108,
+        106
+      ],
+      "trait": "Turtle: tanky units that slowly REGENERATE. Out-last and grind them down.",
+      "econ": 1.03,
+      "structures": {
+        "scriptorium": {
+          "name": "Tidehall",
+          "cost": 0,
+          "hp": 1400,
+          "r": 56,
+          "build": 6.0,
+          "makes": [
+            "scribe"
+          ],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "S",
+          "desc": "Town hall. Trains Pearlscribes; ink drop-off.",
+          "supply": 10
+        },
+        "table": {
+          "name": "Coral Table",
+          "cost": 130,
+          "hp": 950,
+          "r": 44,
+          "build": 9.0,
+          "makes": [
+            "soldier",
+            "archer"
+          ],
+          "requires": [],
+          "researches": [
+            "plate"
+          ],
+          "tier": 1,
+          "key": "T",
+          "desc": "Trains tide troops."
+        },
+        "well": {
+          "name": "Deep Reservoir",
+          "cost": 80,
+          "hp": 560,
+          "r": 36,
+          "build": 6.0,
+          "makes": [],
+          "requires": [],
+          "researches": [
+            "current"
+          ],
+          "tier": 1,
+          "key": "R",
+          "desc": "Raises ink cap & income (rich).",
+          "supply": 10
+        },
+        "spire": {
+          "name": "Tide Spire",
+          "cost": 150,
+          "hp": 1100,
+          "r": 40,
+          "build": 10.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "P",
+          "desc": "Sturdy defensive tower.",
+          "detector": true,
+          "detect_range": 300
+        },
+        "bindery": {
+          "name": "Abyssal Bindery",
+          "cost": 210,
+          "hp": 1200,
+          "r": 48,
+          "build": 13.0,
+          "makes": [
+            "brute",
+            "tidecaller",
+            "deepstalker"
+          ],
+          "requires": [
+            "table"
+          ],
+          "researches": [
+            "might"
+          ],
+          "tier": 2,
+          "key": "B",
+          "desc": "Tier 2. Unlocks Bulwarks & tide upgrades."
+        },
+        "menagerie": {
+          "name": "Leviathan Pool",
+          "cost": 340,
+          "hp": 1500,
+          "r": 54,
+          "build": 17.0,
+          "makes": [
+            "colossus"
+          ],
+          "requires": [
+            "bindery"
+          ],
+          "researches": [
+            "deep"
+          ],
+          "tier": 3,
+          "key": "M",
+          "desc": "Tier 3. Raises the Leviathan."
+        }
+      },
+      "units": {
+        "scribe": {
+          "name": "Pearlscribe",
+          "cost": 25,
+          "hp": 70,
+          "dmg": 4,
+          "spd": 88,
+          "rng": 14,
+          "r": 11,
+          "card": "inkling",
+          "worker": true,
+          "build_t": 3.0,
+          "tier": 1,
+          "key": "E",
+          "desc": "Harvests ink (richer hauls); raises structures.",
+          "supply": 1
+        },
+        "soldier": {
+          "name": "Tide Guard",
+          "cost": 54,
+          "hp": 195,
+          "dmg": 13,
+          "spd": 76,
+          "rng": 16,
+          "r": 14,
+          "card": "mudcrab",
+          "build_t": 4.6,
+          "tier": 1,
+          "key": "A",
+          "desc": "Very sturdy line.",
+          "supply": 2
+        },
+        "archer": {
+          "name": "Coral Slinger",
+          "cost": 68,
+          "hp": 120,
+          "dmg": 15,
+          "spd": 80,
+          "rng": 150,
+          "r": 12,
+          "card": "lanternfish",
+          "build_t": 5.4,
+          "tier": 1,
+          "key": "D",
+          "desc": "Durable ranged.",
+          "supply": 2
+        },
+        "brute": {
+          "name": "Deepfold Bulwark",
+          "cost": 120,
+          "hp": 480,
+          "dmg": 32,
+          "spd": 60,
+          "rng": 18,
+          "r": 19,
+          "card": "glasstortoise",
+          "build_t": 9.0,
+          "tier": 2,
+          "key": "F",
+          "desc": "Immense wall of paper.",
+          "supply": 3
+        },
+        "colossus": {
+          "name": "Ink Leviathan",
+          "cost": 260,
+          "hp": 1200,
+          "dmg": 64,
+          "spd": 52,
+          "rng": 24,
+          "r": 28,
+          "card": "leviathan",
+          "build_t": 16.0,
+          "tier": 3,
+          "key": "C",
+          "desc": "Colossal sea-beast.",
+          "supply": 5
+        },
+        "tidecaller": {
+          "name": "Tidecaller",
+          "cost": 100,
+          "hp": 140,
+          "dmg": 10,
+          "spd": 76,
+          "rng": 130,
+          "r": 13,
+          "card": "leviathan",
+          "build_t": 8.0,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "undertow",
+            "name": "Undertow",
+            "cost": 60,
+            "cast_range": 340,
+            "radius": 110,
+            "kind": "snare",
+            "dps": 18,
+            "slow": 0.5,
+            "dur": 3.5,
+            "desc": "Drag foes into the deep \u2014 slows and drowns them."
+          },
+          "desc": "Control caster \u2014 snares foes in a crushing undertow."
+        },
+        "deepstalker": {
+          "name": "Deepstalker",
+          "cost": 90,
+          "hp": 85,
+          "dmg": 26,
+          "spd": 112,
+          "rng": 18,
+          "r": 12,
+          "card": "leviathan",
+          "build_t": 6.0,
+          "tier": 2,
+          "key": "J",
+          "supply": 2,
+          "cloak": true,
+          "desc": "Cloaked raider \u2014 unseen without enemy detection."
+        }
+      },
+      "upgrades": {
+        "plate": {
+          "name": "Coral Plating",
+          "cost": 110,
+          "time": 20,
+          "stat": "maxhp",
+          "mult": 1.35,
+          "applies": "army",
+          "desc": "+35% army health."
+        },
+        "current": {
+          "name": "Deep Currents",
+          "cost": 90,
+          "time": 16,
+          "stat": "harvest",
+          "mult": 1.35,
+          "applies": "workers",
+          "desc": "+35% ink per haul."
+        },
+        "might": {
+          "name": "Tidal Might",
+          "cost": 120,
+          "time": 22,
+          "stat": "dmg",
+          "mult": 1.25,
+          "applies": "army",
+          "desc": "+25% army attack."
+        },
+        "deep": {
+          "name": "Deep Awakening",
+          "cost": 170,
+          "time": 28,
+          "stat": "maxhp",
+          "mult": 1.25,
+          "applies": [
+            "colossus",
+            "brute"
+          ],
+          "desc": "+25% bulwark & leviathan health."
+        }
+      },
+      "mechanic": "regen"
     },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2529,
-     "y": 1846,
-     "r": 11,
-     "rot": 3.38
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2720,
-     "y": 304,
-     "r": 17,
-     "rot": 0.92
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 787,
-     "y": 356,
-     "r": 14,
-     "rot": 0.62
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1491,
-     "y": 2039,
-     "r": 20,
-     "rot": 1.44
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1431,
-     "y": 2540,
-     "r": 11,
-     "rot": 3.74
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1374,
-     "y": 2664,
-     "r": 13,
-     "rot": 4.14
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2218,
-     "y": 1456,
-     "r": 18,
-     "rot": 3.52
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2414,
-     "y": 2704,
-     "r": 16,
-     "rot": 4.09
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1481,
-     "y": 1106,
-     "r": 16,
-     "rot": 4.71
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1690,
-     "y": 1580,
-     "r": 18,
-     "rot": 5.29
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 1285,
-     "y": 2682,
-     "r": 14,
-     "rot": 3.72
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 791,
-     "y": 472,
-     "r": 11,
-     "rot": 0.37
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 3244,
-     "y": 2852,
-     "r": 11,
-     "rot": 0.32
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 2168,
-     "y": 683,
-     "r": 11,
-     "rot": 0.39
-    },
-    {
-     "kind": "prop",
-     "style": "reed",
-     "x": 3136,
-     "y": 1619,
-     "r": 18,
-     "rot": 3.0
+    "press": {
+      "name": "The Gilded Press",
+      "blurb": "Relentless printing-house \u2014 units wind up, hitting harder the longer they stay on a target.",
+      "color": [
+        206,
+        170,
+        92
+      ],
+      "dark": [
+        140,
+        110,
+        52
+      ],
+      "trait": "Momentum: the longer a unit hammers the same foe, the more damage it deals. Commit and grind.",
+      "econ": 1.0,
+      "mechanic": "momentum",
+      "structures": {
+        "scriptorium": {
+          "name": "Printworks",
+          "cost": 0,
+          "hp": 1080,
+          "r": 52,
+          "build": 6.0,
+          "makes": [
+            "scribe"
+          ],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "S",
+          "desc": "Town hall. Trains Typesetters; ink drop-off.",
+          "supply": 10
+        },
+        "table": {
+          "name": "Composing Room",
+          "cost": 100,
+          "hp": 720,
+          "r": 40,
+          "build": 7.0,
+          "makes": [
+            "soldier",
+            "archer"
+          ],
+          "requires": [],
+          "researches": [
+            "press"
+          ],
+          "tier": 1,
+          "key": "T",
+          "desc": "Trains press troops."
+        },
+        "well": {
+          "name": "Ink Vat",
+          "cost": 90,
+          "hp": 470,
+          "r": 34,
+          "build": 6.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "R",
+          "desc": "Raises ink cap & income.",
+          "supply": 10
+        },
+        "spire": {
+          "name": "Lantern Tower",
+          "cost": 140,
+          "hp": 800,
+          "r": 36,
+          "build": 8.0,
+          "makes": [],
+          "requires": [],
+          "researches": [],
+          "tier": 1,
+          "key": "P",
+          "desc": "Defensive tower; reveals cloaked foes.",
+          "detector": true,
+          "detect_range": 300
+        },
+        "bindery": {
+          "name": "Foundry",
+          "cost": 180,
+          "hp": 880,
+          "r": 44,
+          "build": 11.0,
+          "makes": [
+            "brute",
+            "pressmaster",
+            "leadghost"
+          ],
+          "requires": [
+            "table"
+          ],
+          "researches": [
+            "roll",
+            "temper"
+          ],
+          "tier": 2,
+          "key": "B",
+          "desc": "Tier 2. Unlocks Platen Brutes & press upgrades."
+        },
+        "menagerie": {
+          "name": "Great Rotary",
+          "cost": 300,
+          "hp": 1160,
+          "r": 50,
+          "build": 15.0,
+          "makes": [
+            "colossus"
+          ],
+          "requires": [
+            "bindery"
+          ],
+          "researches": [
+            "gild"
+          ],
+          "tier": 3,
+          "key": "M",
+          "desc": "Tier 3. Looses the Rotary Titan."
+        }
+      },
+      "units": {
+        "scribe": {
+          "name": "Typesetter",
+          "cost": 22,
+          "hp": 58,
+          "dmg": 4,
+          "spd": 100,
+          "rng": 14,
+          "r": 11,
+          "card": "sparkmouse",
+          "worker": true,
+          "build_t": 2.6,
+          "tier": 1,
+          "key": "S",
+          "desc": "Harvests ink.",
+          "supply": 1
+        },
+        "soldier": {
+          "name": "Presshand",
+          "cost": 44,
+          "hp": 130,
+          "dmg": 14,
+          "spd": 92,
+          "rng": 16,
+          "r": 12,
+          "card": "legion",
+          "build_t": 3.3,
+          "tier": 1,
+          "key": "A",
+          "desc": "Sturdy melee that winds up.",
+          "supply": 2
+        },
+        "archer": {
+          "name": "Type-Thrower",
+          "cost": 52,
+          "hp": 92,
+          "dmg": 15,
+          "spd": 90,
+          "rng": 150,
+          "r": 12,
+          "card": "papercutkite",
+          "build_t": 3.6,
+          "tier": 1,
+          "key": "D",
+          "desc": "Ranged; hurls hot type.",
+          "supply": 2
+        },
+        "brute": {
+          "name": "Platen Brute",
+          "cost": 100,
+          "hp": 300,
+          "dmg": 40,
+          "spd": 76,
+          "rng": 18,
+          "r": 18,
+          "card": "saltgolem",
+          "build_t": 6.8,
+          "tier": 2,
+          "key": "F",
+          "desc": "Heavy press-ram.",
+          "supply": 3
+        },
+        "colossus": {
+          "name": "Rotary Titan",
+          "cost": 220,
+          "hp": 700,
+          "dmg": 84,
+          "spd": 66,
+          "rng": 20,
+          "r": 25,
+          "card": "foldwright",
+          "build_t": 11.5,
+          "tier": 3,
+          "key": "C",
+          "desc": "Unstoppable once it gets going.",
+          "supply": 5
+        },
+        "pressmaster": {
+          "name": "Pressmaster",
+          "cost": 95,
+          "hp": 120,
+          "dmg": 11,
+          "spd": 84,
+          "rng": 135,
+          "r": 13,
+          "card": "foldwright",
+          "build_t": 7.0,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "impress",
+            "name": "Impression",
+            "cost": 60,
+            "cast_range": 340,
+            "radius": 120,
+            "kind": "buff",
+            "amount": 1.4,
+            "dur": 5.0,
+            "desc": "Allies in the area deal +40% damage for a time."
+          },
+          "desc": "Support caster \u2014 stamps allies with force."
+        },
+        "leadghost": {
+          "name": "Leadghost",
+          "cost": 90,
+          "hp": 90,
+          "dmg": 27,
+          "spd": 114,
+          "rng": 18,
+          "r": 12,
+          "card": "phoenix",
+          "build_t": 6.0,
+          "tier": 2,
+          "key": "J",
+          "supply": 2,
+          "cloak": true,
+          "desc": "Cloaked raider \u2014 unseen without enemy detection."
+        }
+      },
+      "upgrades": {
+        "press": {
+          "name": "Heavier Type",
+          "cost": 90,
+          "time": 15,
+          "stat": "dmg",
+          "mult": 1.28,
+          "applies": "army",
+          "desc": "+28% army attack."
+        },
+        "roll": {
+          "name": "Oiled Rollers",
+          "cost": 80,
+          "time": 14,
+          "stat": "spd",
+          "mult": 1.22,
+          "applies": "army",
+          "desc": "+22% army speed."
+        },
+        "temper": {
+          "name": "Tempered Frames",
+          "cost": 110,
+          "time": 20,
+          "stat": "maxhp",
+          "mult": 1.2,
+          "applies": "army",
+          "desc": "+20% army health."
+        },
+        "gild": {
+          "name": "Gilded Drum",
+          "cost": 150,
+          "time": 24,
+          "stat": "dmg",
+          "mult": 1.35,
+          "applies": [
+            "colossus"
+          ],
+          "desc": "+35% Rotary Titan attack."
+        }
+      }
     }
-   ]
   },
-  "corners": {
-   "name": "Four Corners",
-   "size": [
-    4000,
-    4000
-   ],
-   "spawns": [
-    [
-     360,
-     3640
-    ],
-    [
-     3640,
-     360
-    ]
-   ],
-   "seed": 2025,
-   "nodes": 18,
-   "desc": "A large square with rich corners far from home.",
-   "objects": [
-    {
-     "kind": "richnode",
-     "x": 500,
-     "y": 500,
-     "r": 34,
-     "amount": 4500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Corner Vein"
+  "maps": {
+    "leaflock": {
+      "name": "Leaflock Basin",
+      "size": [
+        4200,
+        2800
+      ],
+      "spawns": [
+        [
+          340,
+          2460
+        ],
+        [
+          3860,
+          340
+        ]
+      ],
+      "seed": 1234,
+      "nodes": 16,
+      "desc": "A broad open basin. Classic macro map, room to maneuver.",
+      "objects": [
+        {
+          "kind": "ruin",
+          "x": 2100,
+          "y": 1400,
+          "r": 70,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Folded Ruin",
+          "desc": "Impassable wreckage."
+        },
+        {
+          "kind": "ruin",
+          "x": 1500,
+          "y": 900,
+          "r": 54,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Folded Ruin"
+        },
+        {
+          "kind": "ruin",
+          "x": 2700,
+          "y": 1900,
+          "r": 54,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Folded Ruin"
+        },
+        {
+          "kind": "richnode",
+          "x": 2100,
+          "y": 1100,
+          "r": 32,
+          "amount": 4000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Deep Ink Well",
+          "desc": "A rich central prize."
+        },
+        {
+          "kind": "richnode",
+          "x": 2100,
+          "y": 1700,
+          "r": 32,
+          "amount": 4000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Deep Ink Well"
+        },
+        {
+          "kind": "relic",
+          "x": 2100,
+          "y": 1400,
+          "r": 26,
+          "bonus": "ink",
+          "color": [
+            230,
+            200,
+            110
+          ],
+          "label": "Binder's Seal",
+          "desc": "Hold the centre for a slow ink bounty."
+        }
+      ],
+      "highground": [
+        [
+          2100,
+          1400,
+          260
+        ],
+        [
+          700,
+          700,
+          200
+        ],
+        [
+          3500,
+          2100,
+          200
+        ]
+      ],
+      "theme": {
+        "ground": [
+          196,
+          182,
+          150
+        ],
+        "grid": [
+          184,
+          168,
+          136
+        ],
+        "ruled": [
+          150,
+          175,
+          140
+        ],
+        "crease": [
+          168,
+          156,
+          126
+        ],
+        "accent": [
+          120,
+          150,
+          110
+        ],
+        "name_tint": [
+          90,
+          140,
+          90
+        ]
+      },
+      "stains": [
+        [
+          3873,
+          1258,
+          14.2,
+          0.151
+        ],
+        [
+          3769,
+          1597,
+          34.1,
+          0.068
+        ],
+        [
+          3113,
+          768,
+          14.9,
+          0.139
+        ],
+        [
+          1515,
+          1696,
+          32.5,
+          0.075
+        ],
+        [
+          896,
+          475,
+          14.4,
+          0.109
+        ],
+        [
+          3867,
+          355,
+          30.2,
+          0.107
+        ],
+        [
+          2486,
+          413,
+          31.4,
+          0.087
+        ],
+        [
+          2314,
+          1747,
+          28.4,
+          0.096
+        ],
+        [
+          1147,
+          2440,
+          27.6,
+          0.113
+        ],
+        [
+          273,
+          1419,
+          14.2,
+          0.074
+        ],
+        [
+          1997,
+          1106,
+          15.6,
+          0.119
+        ],
+        [
+          823,
+          1538,
+          18.3,
+          0.154
+        ],
+        [
+          3130,
+          2497,
+          18.2,
+          0.091
+        ],
+        [
+          350,
+          864,
+          38.2,
+          0.078
+        ]
+      ],
+      "weather": {
+        "kind": "clear",
+        "tint": [
+          255,
+          240,
+          205
+        ],
+        "strength": 0.12
+      },
+      "bands": [
+        [
+          3725,
+          866,
+          2032,
+          -343,
+          93
+        ],
+        [
+          4156,
+          519,
+          1682,
+          -1248,
+          81
+        ]
+      ],
+      "pools": [
+        [
+          2100,
+          2350,
+          190
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 3625,
+          "y": 2406,
+          "r": 13,
+          "rot": 4.16
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 852,
+          "y": 2026,
+          "r": 12,
+          "rot": 3.9
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1353,
+          "y": 1596,
+          "r": 19,
+          "rot": 3.15
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1046,
+          "y": 2175,
+          "r": 14,
+          "rot": 5.38
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 473,
+          "y": 573,
+          "r": 17,
+          "rot": 0.71
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1941,
+          "y": 572,
+          "r": 17,
+          "rot": 3.23
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 2832,
+          "y": 359,
+          "r": 16,
+          "rot": 4.03
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1275,
+          "y": 2002,
+          "r": 18,
+          "rot": 6.2
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 3709,
+          "y": 1110,
+          "r": 12,
+          "rot": 2.61
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 686,
+          "y": 1166,
+          "r": 19,
+          "rot": 5.68
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1453,
+          "y": 657,
+          "r": 12,
+          "rot": 2.41
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 1460,
+          "y": 224,
+          "r": 11,
+          "rot": 0.59
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 212,
+          "y": 1076,
+          "r": 17,
+          "rot": 2.94
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 3082,
+          "y": 847,
+          "r": 16,
+          "rot": 1.32
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 2329,
+          "y": 2546,
+          "r": 20,
+          "rot": 2.3
+        },
+        {
+          "kind": "prop",
+          "style": "leaf",
+          "x": 722,
+          "y": 1846,
+          "r": 10,
+          "rot": 0.59
+        }
+      ]
     },
-    {
-     "kind": "richnode",
-     "x": 3500,
-     "y": 3500,
-     "r": 34,
-     "amount": 4500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Corner Vein"
+    "creases": {
+      "name": "The Creases",
+      "size": [
+        3400,
+        3400
+      ],
+      "spawns": [
+        [
+          340,
+          3060
+        ],
+        [
+          3060,
+          340
+        ]
+      ],
+      "seed": 77,
+      "nodes": 12,
+      "desc": "Square & compact. Fast fights, short rushes.",
+      "objects": [
+        {
+          "kind": "ruin",
+          "x": 700,
+          "y": 1700,
+          "r": 60,
+          "blocks": true,
+          "color": [
+            120,
+            108,
+            90
+          ],
+          "label": "Crease Wall"
+        },
+        {
+          "kind": "ruin",
+          "x": 1200,
+          "y": 1700,
+          "r": 60,
+          "blocks": true,
+          "color": [
+            120,
+            108,
+            90
+          ],
+          "label": "Crease Wall"
+        },
+        {
+          "kind": "ruin",
+          "x": 1700,
+          "y": 1700,
+          "r": 60,
+          "blocks": true,
+          "color": [
+            120,
+            108,
+            90
+          ],
+          "label": "Crease Wall"
+        },
+        {
+          "kind": "ruin",
+          "x": 2200,
+          "y": 1700,
+          "r": 60,
+          "blocks": true,
+          "color": [
+            120,
+            108,
+            90
+          ],
+          "label": "Crease Wall"
+        },
+        {
+          "kind": "ruin",
+          "x": 2700,
+          "y": 1700,
+          "r": 60,
+          "blocks": true,
+          "color": [
+            120,
+            108,
+            90
+          ],
+          "label": "Crease Wall"
+        }
+      ],
+      "highground": [
+        [
+          1700,
+          900,
+          220
+        ],
+        [
+          1700,
+          2500,
+          220
+        ]
+      ],
+      "theme": {
+        "ground": [
+          200,
+          186,
+          158
+        ],
+        "grid": [
+          188,
+          172,
+          142
+        ],
+        "ruled": [
+          205,
+          150,
+          120
+        ],
+        "crease": [
+          176,
+          158,
+          128
+        ],
+        "accent": [
+          150,
+          120,
+          80
+        ],
+        "name_tint": [
+          150,
+          110,
+          80
+        ]
+      },
+      "stains": [
+        [
+          2597,
+          1178,
+          21.2,
+          0.142
+        ],
+        [
+          545,
+          1629,
+          30.7,
+          0.121
+        ],
+        [
+          636,
+          2092,
+          29.0,
+          0.145
+        ],
+        [
+          285,
+          3072,
+          19.2,
+          0.141
+        ],
+        [
+          1722,
+          2707,
+          19.5,
+          0.092
+        ],
+        [
+          462,
+          2536,
+          30.0,
+          0.08
+        ],
+        [
+          775,
+          443,
+          20.0,
+          0.116
+        ],
+        [
+          1513,
+          2313,
+          16.3,
+          0.144
+        ],
+        [
+          3146,
+          2419,
+          36.3,
+          0.145
+        ],
+        [
+          485,
+          1584,
+          16.4,
+          0.138
+        ],
+        [
+          1814,
+          519,
+          27.3,
+          0.138
+        ],
+        [
+          1856,
+          564,
+          42.1,
+          0.066
+        ],
+        [
+          2729,
+          3122,
+          36.5,
+          0.155
+        ],
+        [
+          1793,
+          857,
+          28.2,
+          0.134
+        ]
+      ],
+      "weather": {
+        "kind": "clear",
+        "tint": [
+          250,
+          238,
+          210
+        ],
+        "strength": 0.1
+      },
+      "bands": [
+        [
+          1339,
+          3055,
+          2792,
+          4093,
+          62
+        ],
+        [
+          2590,
+          3236,
+          1376,
+          4103,
+          74
+        ],
+        [
+          1800,
+          51,
+          2907,
+          842,
+          107
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 2474,
+          "y": 2334,
+          "r": 11,
+          "rot": 5.52
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 1575,
+          "y": 1326,
+          "r": 12,
+          "rot": 2.92
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 2894,
+          "y": 1814,
+          "r": 11,
+          "rot": 0.05
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 3121,
+          "y": 2060,
+          "r": 14,
+          "rot": 2.67
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 1744,
+          "y": 2942,
+          "r": 18,
+          "rot": 0.22
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 549,
+          "y": 1272,
+          "r": 19,
+          "rot": 2.55
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 932,
+          "y": 296,
+          "r": 19,
+          "rot": 3.42
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 2129,
+          "y": 1186,
+          "r": 13,
+          "rot": 2.06
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 2853,
+          "y": 887,
+          "r": 11,
+          "rot": 0.6
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 414,
+          "y": 1547,
+          "r": 14,
+          "rot": 2.15
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 2162,
+          "y": 1335,
+          "r": 20,
+          "rot": 1.11
+        },
+        {
+          "kind": "prop",
+          "style": "boat",
+          "x": 616,
+          "y": 1979,
+          "r": 17,
+          "rot": 3.57
+        }
+      ]
     },
-    {
-     "kind": "ruin",
-     "x": 2000,
-     "y": 2000,
-     "r": 100,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Great Fold",
-     "desc": "A vast impassable crease."
+    "spine": {
+      "name": "Foldspine Pass",
+      "size": [
+        4800,
+        2400
+      ],
+      "spawns": [
+        [
+          320,
+          1200
+        ],
+        [
+          4480,
+          1200
+        ]
+      ],
+      "seed": 909,
+      "nodes": 14,
+      "desc": "A long horizontal corridor \u2014 a lane to hold or break.",
+      "objects": [
+        {
+          "kind": "ruin",
+          "x": 2400,
+          "y": 900,
+          "r": 90,
+          "blocks": true,
+          "color": [
+            116,
+            104,
+            88
+          ],
+          "label": "Spine Rock"
+        },
+        {
+          "kind": "ruin",
+          "x": 2400,
+          "y": 1500,
+          "r": 90,
+          "blocks": true,
+          "color": [
+            116,
+            104,
+            88
+          ],
+          "label": "Spine Rock"
+        },
+        {
+          "kind": "richnode",
+          "x": 2400,
+          "y": 1200,
+          "r": 34,
+          "amount": 5000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Contested Vein",
+          "desc": "The prize in the middle of the pass."
+        }
+      ],
+      "highground": [
+        [
+          2400,
+          1200,
+          240
+        ]
+      ],
+      "theme": {
+        "ground": [
+          188,
+          186,
+          178
+        ],
+        "grid": [
+          176,
+          174,
+          166
+        ],
+        "ruled": [
+          150,
+          160,
+          190
+        ],
+        "crease": [
+          168,
+          166,
+          158
+        ],
+        "accent": [
+          110,
+          120,
+          160
+        ],
+        "name_tint": [
+          100,
+          110,
+          160
+        ]
+      },
+      "stains": [
+        [
+          1106,
+          995,
+          38.4,
+          0.084
+        ],
+        [
+          3557,
+          778,
+          25.3,
+          0.159
+        ],
+        [
+          2462,
+          674,
+          32.6,
+          0.14
+        ],
+        [
+          4346,
+          328,
+          32.3,
+          0.099
+        ],
+        [
+          1231,
+          1768,
+          29.8,
+          0.065
+        ],
+        [
+          4359,
+          1357,
+          25.0,
+          0.073
+        ],
+        [
+          4187,
+          734,
+          19.8,
+          0.128
+        ],
+        [
+          801,
+          783,
+          37.7,
+          0.086
+        ],
+        [
+          275,
+          1234,
+          33.9,
+          0.075
+        ],
+        [
+          2914,
+          458,
+          14.3,
+          0.094
+        ],
+        [
+          1083,
+          704,
+          37.6,
+          0.062
+        ],
+        [
+          2724,
+          990,
+          22.4,
+          0.087
+        ],
+        [
+          3056,
+          1211,
+          14.7,
+          0.109
+        ],
+        [
+          3943,
+          859,
+          19.8,
+          0.075
+        ]
+      ],
+      "weather": {
+        "kind": "overcast",
+        "tint": [
+          190,
+          200,
+          220
+        ],
+        "strength": 0.18
+      },
+      "bands": [
+        [
+          3558,
+          2234,
+          5598,
+          3691,
+          63
+        ],
+        [
+          234,
+          2396,
+          -2354,
+          4245,
+          68
+        ],
+        [
+          3896,
+          2110,
+          1705,
+          545,
+          104
+        ],
+        [
+          3495,
+          2252,
+          5075,
+          1123,
+          110
+        ]
+      ],
+      "pools": [
+        [
+          1200,
+          2100,
+          170
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 3638,
+          "y": 1442,
+          "r": 15,
+          "rot": 1.43
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 2566,
+          "y": 510,
+          "r": 10,
+          "rot": 4.28
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 1609,
+          "y": 1065,
+          "r": 16,
+          "rot": 4.0
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 3439,
+          "y": 412,
+          "r": 19,
+          "rot": 2.35
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 4532,
+          "y": 311,
+          "r": 10,
+          "rot": 3.16
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 3122,
+          "y": 1768,
+          "r": 20,
+          "rot": 1.15
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 1343,
+          "y": 442,
+          "r": 11,
+          "rot": 2.15
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 4361,
+          "y": 315,
+          "r": 17,
+          "rot": 0.45
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 4119,
+          "y": 2039,
+          "r": 20,
+          "rot": 5.99
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 3802,
+          "y": 397,
+          "r": 12,
+          "rot": 1.4
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 480,
+          "y": 1790,
+          "r": 18,
+          "rot": 3.18
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 2144,
+          "y": 1375,
+          "r": 19,
+          "rot": 0.99
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 1672,
+          "y": 352,
+          "r": 11,
+          "rot": 3.71
+        },
+        {
+          "kind": "prop",
+          "style": "blot",
+          "x": 4447,
+          "y": 274,
+          "r": 10,
+          "rot": 0.53
+        }
+      ]
+    },
+    "quill": {
+      "name": "Quillmarsh",
+      "size": [
+        3800,
+        3200
+      ],
+      "spawns": [
+        [
+          360,
+          2840
+        ],
+        [
+          3440,
+          360
+        ]
+      ],
+      "seed": 451,
+      "nodes": 20,
+      "desc": "Node-rich wetland. Reward map for greedy expanders.",
+      "overlay": {
+        "units": {
+          "strider": {
+            "name": "Marsh Strider",
+            "cost": 70,
+            "hp": 130,
+            "dmg": 20,
+            "spd": 120,
+            "rng": 20,
+            "r": 13,
+            "card": "heron",
+            "build_t": 4.5,
+            "tier": 1,
+            "key": "G",
+            "desc": "Fast marsh raider \u2014 only foldable in Quillmarsh.",
+            "supply": 2
+          }
+        },
+        "structures": {
+          "reedhut": {
+            "name": "Reed Hut",
+            "cost": 110,
+            "hp": 620,
+            "r": 40,
+            "build": 8.0,
+            "makes": [
+              "strider"
+            ],
+            "requires": [],
+            "researches": [],
+            "tier": 1,
+            "key": "H",
+            "desc": "Marsh-only: trains Striders."
+          }
+        },
+        "faction_add_structures": [
+          "reedhut"
+        ],
+        "objects": [
+          {
+            "kind": "richnode",
+            "x": 1900,
+            "y": 1600,
+            "r": 30,
+            "amount": 3000,
+            "color": [
+              150,
+              120,
+              210
+            ],
+            "label": "Bog Ink"
+          }
+        ]
+      },
+      "highground": [
+        [
+          1900,
+          1600,
+          240
+        ]
+      ],
+      "theme": {
+        "ground": [
+          186,
+          192,
+          168
+        ],
+        "grid": [
+          172,
+          180,
+          154
+        ],
+        "ruled": [
+          140,
+          170,
+          150
+        ],
+        "crease": [
+          160,
+          170,
+          146
+        ],
+        "accent": [
+          110,
+          150,
+          120
+        ],
+        "name_tint": [
+          90,
+          140,
+          110
+        ]
+      },
+      "stains": [
+        [
+          337,
+          560,
+          36.0,
+          0.064
+        ],
+        [
+          523,
+          2378,
+          35.4,
+          0.09
+        ],
+        [
+          780,
+          2671,
+          15.5,
+          0.082
+        ],
+        [
+          1484,
+          2106,
+          41.0,
+          0.112
+        ],
+        [
+          796,
+          793,
+          33.2,
+          0.114
+        ],
+        [
+          2124,
+          2430,
+          38.1,
+          0.121
+        ],
+        [
+          772,
+          2461,
+          30.4,
+          0.124
+        ],
+        [
+          1330,
+          1736,
+          20.4,
+          0.158
+        ],
+        [
+          563,
+          1138,
+          40.0,
+          0.1
+        ],
+        [
+          2749,
+          1378,
+          16.9,
+          0.104
+        ],
+        [
+          1473,
+          2230,
+          36.7,
+          0.131
+        ],
+        [
+          917,
+          330,
+          19.9,
+          0.08
+        ],
+        [
+          1922,
+          1017,
+          39.6,
+          0.07
+        ],
+        [
+          2240,
+          361,
+          15.3,
+          0.126
+        ]
+      ],
+      "weather": {
+        "kind": "mist",
+        "tint": [
+          200,
+          225,
+          200
+        ],
+        "strength": 0.16
+      },
+      "bands": [
+        [
+          2232,
+          1719,
+          4219,
+          3138,
+          87
+        ],
+        [
+          3072,
+          477,
+          1120,
+          1871,
+          67
+        ],
+        [
+          823,
+          690,
+          -555,
+          -294,
+          130
+        ]
+      ],
+      "pools": [
+        [
+          900,
+          1000,
+          220
+        ],
+        [
+          2800,
+          2400,
+          190
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1087,
+          "y": 1664,
+          "r": 14,
+          "rot": 2.99
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2523,
+          "y": 1343,
+          "r": 19,
+          "rot": 1.23
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2259,
+          "y": 2243,
+          "r": 10,
+          "rot": 3.56
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2529,
+          "y": 1846,
+          "r": 11,
+          "rot": 3.38
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2720,
+          "y": 304,
+          "r": 17,
+          "rot": 0.92
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 787,
+          "y": 356,
+          "r": 14,
+          "rot": 0.62
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1491,
+          "y": 2039,
+          "r": 20,
+          "rot": 1.44
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1431,
+          "y": 2540,
+          "r": 11,
+          "rot": 3.74
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1374,
+          "y": 2664,
+          "r": 13,
+          "rot": 4.14
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2218,
+          "y": 1456,
+          "r": 18,
+          "rot": 3.52
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2414,
+          "y": 2704,
+          "r": 16,
+          "rot": 4.09
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1481,
+          "y": 1106,
+          "r": 16,
+          "rot": 4.71
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1690,
+          "y": 1580,
+          "r": 18,
+          "rot": 5.29
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 1285,
+          "y": 2682,
+          "r": 14,
+          "rot": 3.72
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 791,
+          "y": 472,
+          "r": 11,
+          "rot": 0.37
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 3244,
+          "y": 2852,
+          "r": 11,
+          "rot": 0.32
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 2168,
+          "y": 683,
+          "r": 11,
+          "rot": 0.39
+        },
+        {
+          "kind": "prop",
+          "style": "reed",
+          "x": 3136,
+          "y": 1619,
+          "r": 18,
+          "rot": 3.0
+        }
+      ]
+    },
+    "corners": {
+      "name": "Four Corners",
+      "size": [
+        4000,
+        4000
+      ],
+      "spawns": [
+        [
+          360,
+          3640
+        ],
+        [
+          3640,
+          360
+        ]
+      ],
+      "seed": 2025,
+      "nodes": 18,
+      "desc": "A large square with rich corners far from home.",
+      "objects": [
+        {
+          "kind": "richnode",
+          "x": 500,
+          "y": 500,
+          "r": 34,
+          "amount": 4500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Corner Vein"
+        },
+        {
+          "kind": "richnode",
+          "x": 3500,
+          "y": 3500,
+          "r": 34,
+          "amount": 4500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Corner Vein"
+        },
+        {
+          "kind": "ruin",
+          "x": 2000,
+          "y": 2000,
+          "r": 100,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Great Fold",
+          "desc": "A vast impassable crease."
+        }
+      ],
+      "highground": [
+        [
+          2000,
+          2000,
+          300
+        ],
+        [
+          600,
+          600,
+          180
+        ],
+        [
+          3400,
+          3400,
+          180
+        ]
+      ],
+      "theme": {
+        "ground": [
+          198,
+          178,
+          158
+        ],
+        "grid": [
+          186,
+          166,
+          146
+        ],
+        "ruled": [
+          200,
+          150,
+          130
+        ],
+        "crease": [
+          172,
+          152,
+          132
+        ],
+        "accent": [
+          160,
+          120,
+          90
+        ],
+        "name_tint": [
+          150,
+          110,
+          80
+        ]
+      },
+      "stains": [
+        [
+          2208,
+          2525,
+          28.3,
+          0.077
+        ],
+        [
+          202,
+          3704,
+          31.1,
+          0.067
+        ],
+        [
+          1643,
+          356,
+          37.0,
+          0.158
+        ],
+        [
+          558,
+          377,
+          14.8,
+          0.111
+        ],
+        [
+          3004,
+          899,
+          19.7,
+          0.131
+        ],
+        [
+          3732,
+          3585,
+          33.2,
+          0.152
+        ],
+        [
+          1476,
+          3484,
+          31.9,
+          0.115
+        ],
+        [
+          949,
+          1076,
+          15.0,
+          0.138
+        ],
+        [
+          2190,
+          1525,
+          43.6,
+          0.106
+        ],
+        [
+          1200,
+          3126,
+          31.3,
+          0.142
+        ],
+        [
+          1367,
+          1808,
+          38.0,
+          0.106
+        ],
+        [
+          2685,
+          2925,
+          30.9,
+          0.125
+        ],
+        [
+          2315,
+          2928,
+          39.7,
+          0.144
+        ],
+        [
+          1439,
+          2158,
+          32.0,
+          0.076
+        ]
+      ],
+      "weather": {
+        "kind": "clear",
+        "tint": [
+          252,
+          236,
+          200
+        ],
+        "strength": 0.11
+      },
+      "bands": [
+        [
+          3313,
+          2827,
+          4800,
+          3889,
+          85
+        ],
+        [
+          2446,
+          2107,
+          598,
+          3427,
+          109
+        ],
+        [
+          808,
+          8,
+          -493,
+          -922,
+          129
+        ]
+      ],
+      "pools": [
+        [
+          2000,
+          700,
+          160
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 3579,
+          "y": 1158,
+          "r": 13,
+          "rot": 3.48
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 3523,
+          "y": 3566,
+          "r": 15,
+          "rot": 4.25
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 2718,
+          "y": 3210,
+          "r": 20,
+          "rot": 2.25
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 1419,
+          "y": 717,
+          "r": 20,
+          "rot": 0.85
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 1141,
+          "y": 1781,
+          "r": 13,
+          "rot": 4.67
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 758,
+          "y": 1369,
+          "r": 19,
+          "rot": 6.22
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 2113,
+          "y": 2408,
+          "r": 10,
+          "rot": 3.71
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 527,
+          "y": 741,
+          "r": 10,
+          "rot": 4.84
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 2384,
+          "y": 1539,
+          "r": 20,
+          "rot": 4.72
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 1115,
+          "y": 2723,
+          "r": 10,
+          "rot": 5.76
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 2646,
+          "y": 1350,
+          "r": 17,
+          "rot": 5.51
+        },
+        {
+          "kind": "prop",
+          "style": "crane",
+          "x": 223,
+          "y": 1150,
+          "r": 14,
+          "rot": 3.5
+        }
+      ]
+    },
+    "sliver": {
+      "name": "Paper Sliver",
+      "size": [
+        4600,
+        2000
+      ],
+      "spawns": [
+        [
+          320,
+          1000
+        ],
+        [
+          4280,
+          1000
+        ]
+      ],
+      "seed": 13,
+      "nodes": 10,
+      "desc": "Thin & tense. Little room; expect early aggression.",
+      "highground": [
+        [
+          2300,
+          1000,
+          220
+        ]
+      ],
+      "theme": {
+        "ground": [
+          204,
+          192,
+          166
+        ],
+        "grid": [
+          192,
+          180,
+          154
+        ],
+        "ruled": [
+          190,
+          160,
+          140
+        ],
+        "crease": [
+          180,
+          166,
+          142
+        ],
+        "accent": [
+          150,
+          130,
+          100
+        ],
+        "name_tint": [
+          140,
+          120,
+          90
+        ]
+      },
+      "stains": [
+        [
+          1288,
+          1296,
+          34.5,
+          0.145
+        ],
+        [
+          980,
+          569,
+          18.4,
+          0.083
+        ],
+        [
+          3283,
+          408,
+          29.9,
+          0.081
+        ],
+        [
+          1438,
+          891,
+          39.1,
+          0.121
+        ],
+        [
+          261,
+          641,
+          18.4,
+          0.147
+        ],
+        [
+          3601,
+          1490,
+          38.8,
+          0.134
+        ],
+        [
+          4187,
+          1470,
+          21.7,
+          0.145
+        ],
+        [
+          2244,
+          1408,
+          30.9,
+          0.103
+        ],
+        [
+          1730,
+          888,
+          23.4,
+          0.072
+        ],
+        [
+          3643,
+          1477,
+          43.6,
+          0.129
+        ],
+        [
+          2528,
+          1397,
+          18.0,
+          0.128
+        ],
+        [
+          2062,
+          483,
+          20.1,
+          0.112
+        ],
+        [
+          1264,
+          935,
+          32.2,
+          0.1
+        ],
+        [
+          749,
+          985,
+          21.1,
+          0.084
+        ]
+      ],
+      "weather": {
+        "kind": "storm",
+        "tint": [
+          120,
+          125,
+          150
+        ],
+        "strength": 0.3
+      },
+      "bands": [
+        [
+          2158,
+          570,
+          861,
+          -357,
+          79
+        ],
+        [
+          1023,
+          593,
+          -1338,
+          -1094,
+          62
+        ],
+        [
+          1014,
+          1206,
+          -522,
+          109,
+          97
+        ]
+      ],
+      "pools": [
+        [
+          2300,
+          1700,
+          150
+        ]
+      ],
+      "props": [
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2949,
+          "y": 1723,
+          "r": 12,
+          "rot": 5.4
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 629,
+          "y": 385,
+          "r": 18,
+          "rot": 4.85
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2982,
+          "y": 715,
+          "r": 11,
+          "rot": 3.22
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 3379,
+          "y": 779,
+          "r": 17,
+          "rot": 4.11
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1116,
+          "y": 1028,
+          "r": 15,
+          "rot": 3.73
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1906,
+          "y": 861,
+          "r": 12,
+          "rot": 2.97
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 684,
+          "y": 1506,
+          "r": 16,
+          "rot": 3.53
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1438,
+          "y": 1174,
+          "r": 16,
+          "rot": 3.01
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 659,
+          "y": 1608,
+          "r": 19,
+          "rot": 2.42
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1130,
+          "y": 785,
+          "r": 11,
+          "rot": 5.82
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 4042,
+          "y": 447,
+          "r": 11,
+          "rot": 0.85
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1854,
+          "y": 470,
+          "r": 16,
+          "rot": 3.44
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2442,
+          "y": 1662,
+          "r": 20,
+          "rot": 1.3
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1339,
+          "y": 300,
+          "r": 12,
+          "rot": 2.69
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2363,
+          "y": 244,
+          "r": 11,
+          "rot": 3.43
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 1683,
+          "y": 324,
+          "r": 19,
+          "rot": 1.49
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 898,
+          "y": 1383,
+          "r": 19,
+          "rot": 5.12
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2401,
+          "y": 761,
+          "r": 10,
+          "rot": 2.2
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 3576,
+          "y": 390,
+          "r": 18,
+          "rot": 2.92
+        },
+        {
+          "kind": "prop",
+          "style": "scrap",
+          "x": 2741,
+          "y": 1521,
+          "r": 20,
+          "rot": 1.31
+        }
+      ]
+    },
+    "crown": {
+      "name": "The Crown Fold",
+      "size": [
+        3600,
+        3600
+      ],
+      "spawns": [
+        [
+          420,
+          3180
+        ],
+        [
+          3180,
+          420
+        ]
+      ],
+      "seed": 7001,
+      "nodes": 12,
+      "desc": "A central plateau crowns the map. Take the high ground.",
+      "objects": [
+        {
+          "kind": "richnode",
+          "x": 1800,
+          "y": 1800,
+          "r": 34,
+          "amount": 6000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Crown Well",
+          "desc": "The richest prize, atop the plateau."
+        },
+        {
+          "kind": "relic",
+          "x": 1800,
+          "y": 1800,
+          "r": 26,
+          "bonus": "ink",
+          "color": [
+            230,
+            200,
+            110
+          ],
+          "label": "The Crown",
+          "desc": "Hold the summit for a steady bounty."
+        },
+        {
+          "kind": "ruin",
+          "x": 1200,
+          "y": 1200,
+          "r": 64,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Toppled Arch"
+        },
+        {
+          "kind": "ruin",
+          "x": 2400,
+          "y": 2400,
+          "r": 64,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Toppled Arch"
+        },
+        {
+          "kind": "ruin",
+          "x": 1200,
+          "y": 2400,
+          "r": 54,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Toppled Arch"
+        },
+        {
+          "kind": "ruin",
+          "x": 2400,
+          "y": 1200,
+          "r": 54,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "Toppled Arch"
+        },
+        {
+          "kind": "richnode",
+          "x": 700,
+          "y": 1900,
+          "r": 30,
+          "amount": 3500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Side Well"
+        },
+        {
+          "kind": "richnode",
+          "x": 2900,
+          "y": 1700,
+          "r": 30,
+          "amount": 3500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Side Well"
+        }
+      ],
+      "highground": [
+        [
+          1800,
+          1800,
+          520
+        ]
+      ],
+      "theme": {
+        "ground": [
+          204,
+          186,
+          150
+        ],
+        "grid": [
+          190,
+          172,
+          138
+        ],
+        "ruled": [
+          200,
+          160,
+          120
+        ],
+        "crease": [
+          176,
+          160,
+          128
+        ],
+        "accent": [
+          160,
+          130,
+          90
+        ],
+        "name_tint": [
+          150,
+          120,
+          70
+        ]
+      },
+      "weather": {
+        "kind": "clear",
+        "tint": [
+          255,
+          244,
+          214
+        ],
+        "strength": 0.08
+      },
+      "stains": [
+        [
+          423.0,
+          1154.0,
+          30.4,
+          0.125
+        ],
+        [
+          2456.0,
+          2384.0,
+          32.2,
+          0.123
+        ],
+        [
+          2342.0,
+          833.0,
+          30.8,
+          0.115
+        ],
+        [
+          860.0,
+          2980.0,
+          31.8,
+          0.186
+        ],
+        [
+          2642.0,
+          3594.0,
+          28.3,
+          0.096
+        ],
+        [
+          2115.0,
+          63.0,
+          26.4,
+          0.136
+        ],
+        [
+          1971.0,
+          284.0,
+          36.1,
+          0.085
+        ],
+        [
+          471.0,
+          1080.0,
+          37.0,
+          0.2
+        ],
+        [
+          2864.0,
+          910.0,
+          26.9,
+          0.107
+        ],
+        [
+          1021.0,
+          2204.0,
+          15.8,
+          0.195
+        ]
+      ],
+      "props": [
+        {
+          "x": 1416,
+          "y": 2960,
+          "r": 19,
+          "style": "leaf",
+          "rot": 0.38
+        },
+        {
+          "x": 1181,
+          "y": 3248,
+          "r": 15,
+          "style": "leaf",
+          "rot": 0.86
+        },
+        {
+          "x": 902,
+          "y": 501,
+          "r": 21,
+          "style": "leaf",
+          "rot": 5.72
+        },
+        {
+          "x": 2251,
+          "y": 458,
+          "r": 20,
+          "style": "leaf",
+          "rot": 0.31
+        },
+        {
+          "x": 2141,
+          "y": 207,
+          "r": 16,
+          "style": "leaf",
+          "rot": 5.23
+        },
+        {
+          "x": 1825,
+          "y": 1381,
+          "r": 15,
+          "style": "leaf",
+          "rot": 6.19
+        },
+        {
+          "x": 325,
+          "y": 1351,
+          "r": 21,
+          "style": "leaf",
+          "rot": 0.68
+        },
+        {
+          "x": 2590,
+          "y": 2695,
+          "r": 19,
+          "style": "leaf",
+          "rot": 3.28
+        },
+        {
+          "x": 1671,
+          "y": 2593,
+          "r": 21,
+          "style": "leaf",
+          "rot": 1.27
+        },
+        {
+          "x": 1212,
+          "y": 327,
+          "r": 13,
+          "style": "leaf",
+          "rot": 2.08
+        },
+        {
+          "x": 559,
+          "y": 3095,
+          "r": 18,
+          "style": "leaf",
+          "rot": 2.91
+        },
+        {
+          "x": 703,
+          "y": 1846,
+          "r": 16,
+          "style": "leaf",
+          "rot": 1.55
+        },
+        {
+          "x": 2439,
+          "y": 2238,
+          "r": 13,
+          "style": "leaf",
+          "rot": 3.36
+        },
+        {
+          "x": 3232,
+          "y": 3388,
+          "r": 18,
+          "style": "leaf",
+          "rot": 1.89
+        }
+      ]
+    },
+    "seam": {
+      "name": "The Binding Seam",
+      "size": [
+        5000,
+        2200
+      ],
+      "spawns": [
+        [
+          360,
+          1100
+        ],
+        [
+          4640,
+          1100
+        ]
+      ],
+      "seed": 7002,
+      "nodes": 12,
+      "desc": "A long corridor pinched by two chokepoints. Hold the gaps.",
+      "objects": [
+        {
+          "kind": "ruin",
+          "x": 2500,
+          "y": 300,
+          "r": 70,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "The Seam"
+        },
+        {
+          "kind": "ruin",
+          "x": 2500,
+          "y": 1100,
+          "r": 90,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "The Seam"
+        },
+        {
+          "kind": "ruin",
+          "x": 2500,
+          "y": 1900,
+          "r": 70,
+          "blocks": true,
+          "color": [
+            110,
+            100,
+            86
+          ],
+          "label": "The Seam"
+        },
+        {
+          "kind": "richnode",
+          "x": 2500,
+          "y": 600,
+          "r": 30,
+          "amount": 4500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Gap Well"
+        },
+        {
+          "kind": "richnode",
+          "x": 2500,
+          "y": 1600,
+          "r": 30,
+          "amount": 4500,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Gap Well"
+        },
+        {
+          "kind": "relic",
+          "x": 2500,
+          "y": 1100,
+          "r": 26,
+          "bonus": "ink",
+          "color": [
+            230,
+            200,
+            110
+          ],
+          "label": "Seam Seal",
+          "desc": "Contest the centre wall."
+        }
+      ],
+      "highground": [
+        [
+          2500,
+          600,
+          200
+        ],
+        [
+          2500,
+          1600,
+          200
+        ]
+      ],
+      "theme": {
+        "ground": [
+          188,
+          192,
+          196
+        ],
+        "grid": [
+          172,
+          176,
+          182
+        ],
+        "ruled": [
+          140,
+          150,
+          165
+        ],
+        "crease": [
+          158,
+          162,
+          170
+        ],
+        "accent": [
+          110,
+          120,
+          140
+        ],
+        "name_tint": [
+          90,
+          110,
+          150
+        ]
+      },
+      "weather": {
+        "kind": "overcast",
+        "tint": [
+          210,
+          214,
+          224
+        ],
+        "strength": 0.16
+      },
+      "stains": [
+        [
+          2796.0,
+          1142.0,
+          37.1,
+          0.162
+        ],
+        [
+          3332.0,
+          655.0,
+          34.8,
+          0.186
+        ],
+        [
+          1403.0,
+          128.0,
+          20.8,
+          0.163
+        ],
+        [
+          2555.0,
+          1720.0,
+          22.8,
+          0.125
+        ],
+        [
+          1899.0,
+          199.0,
+          32.8,
+          0.13
+        ],
+        [
+          817.0,
+          1376.0,
+          24.2,
+          0.161
+        ],
+        [
+          3114.0,
+          1265.0,
+          21.2,
+          0.173
+        ],
+        [
+          2696.0,
+          571.0,
+          17.6,
+          0.146
+        ],
+        [
+          979.0,
+          957.0,
+          33.1,
+          0.129
+        ],
+        [
+          3288.0,
+          2036.0,
+          13.9,
+          0.151
+        ],
+        [
+          2179.0,
+          1031.0,
+          35.2,
+          0.088
+        ],
+        [
+          3053.0,
+          610.0,
+          30.3,
+          0.155
+        ]
+      ],
+      "props": [
+        {
+          "x": 1556,
+          "y": 1214,
+          "r": 20,
+          "style": "scrap",
+          "rot": 4.04
+        },
+        {
+          "x": 2817,
+          "y": 1428,
+          "r": 19,
+          "style": "scrap",
+          "rot": 4.3
+        },
+        {
+          "x": 1981,
+          "y": 1131,
+          "r": 16,
+          "style": "scrap",
+          "rot": 2.06
+        },
+        {
+          "x": 1534,
+          "y": 1682,
+          "r": 22,
+          "style": "scrap",
+          "rot": 5.11
+        },
+        {
+          "x": 3909,
+          "y": 222,
+          "r": 12,
+          "style": "scrap",
+          "rot": 5.8
+        },
+        {
+          "x": 3215,
+          "y": 204,
+          "r": 21,
+          "style": "scrap",
+          "rot": 0.06
+        },
+        {
+          "x": 2982,
+          "y": 964,
+          "r": 21,
+          "style": "scrap",
+          "rot": 1.81
+        },
+        {
+          "x": 3164,
+          "y": 732,
+          "r": 11,
+          "style": "scrap",
+          "rot": 5.98
+        },
+        {
+          "x": 3698,
+          "y": 960,
+          "r": 19,
+          "style": "scrap",
+          "rot": 1.0
+        },
+        {
+          "x": 4311,
+          "y": 969,
+          "r": 14,
+          "style": "scrap",
+          "rot": 4.48
+        },
+        {
+          "x": 3734,
+          "y": 222,
+          "r": 15,
+          "style": "scrap",
+          "rot": 1.79
+        },
+        {
+          "x": 1153,
+          "y": 898,
+          "r": 19,
+          "style": "scrap",
+          "rot": 3.39
+        },
+        {
+          "x": 4359,
+          "y": 1070,
+          "r": 18,
+          "style": "scrap",
+          "rot": 0.81
+        },
+        {
+          "x": 2519,
+          "y": 1055,
+          "r": 17,
+          "style": "scrap",
+          "rot": 1.29
+        }
+      ]
+    },
+    "delta": {
+      "name": "Inkwater Delta",
+      "size": [
+        4400,
+        4000
+      ],
+      "spawns": [
+        [
+          500,
+          500
+        ],
+        [
+          3900,
+          3500
+        ]
+      ],
+      "seed": 7003,
+      "nodes": 20,
+      "desc": "A sprawling, node-rich delta. Expand and out-produce.",
+      "objects": [
+        {
+          "kind": "richnode",
+          "x": 2200,
+          "y": 2000,
+          "r": 34,
+          "amount": 5000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Delta Heart"
+        },
+        {
+          "kind": "richnode",
+          "x": 1200,
+          "y": 2600,
+          "r": 30,
+          "amount": 3600,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Silt Well"
+        },
+        {
+          "kind": "richnode",
+          "x": 3200,
+          "y": 1400,
+          "r": 30,
+          "amount": 3600,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Silt Well"
+        },
+        {
+          "kind": "richnode",
+          "x": 1400,
+          "y": 1200,
+          "r": 28,
+          "amount": 3000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Silt Well"
+        },
+        {
+          "kind": "richnode",
+          "x": 3000,
+          "y": 2800,
+          "r": 28,
+          "amount": 3000,
+          "color": [
+            150,
+            120,
+            210
+          ],
+          "label": "Silt Well"
+        },
+        {
+          "kind": "obstacle",
+          "x": 2200,
+          "y": 1200,
+          "r": 50,
+          "blocks": true,
+          "color": [
+            120,
+            130,
+            110
+          ],
+          "label": "Reed Bank"
+        },
+        {
+          "kind": "obstacle",
+          "x": 2200,
+          "y": 2800,
+          "r": 50,
+          "blocks": true,
+          "color": [
+            120,
+            130,
+            110
+          ],
+          "label": "Reed Bank"
+        },
+        {
+          "kind": "relic",
+          "x": 2200,
+          "y": 2000,
+          "r": 26,
+          "bonus": "ink",
+          "color": [
+            230,
+            200,
+            110
+          ],
+          "label": "Delta Seal",
+          "desc": "The delta's beating heart."
+        }
+      ],
+      "highground": [
+        [
+          1200,
+          2600,
+          220
+        ],
+        [
+          3200,
+          1400,
+          220
+        ]
+      ],
+      "theme": {
+        "ground": [
+          150,
+          170,
+          140
+        ],
+        "grid": [
+          138,
+          158,
+          128
+        ],
+        "ruled": [
+          108,
+          142,
+          104
+        ],
+        "crease": [
+          124,
+          146,
+          118
+        ],
+        "accent": [
+          92,
+          124,
+          84
+        ],
+        "name_tint": [
+          80,
+          120,
+          80
+        ]
+      },
+      "weather": {
+        "kind": "mist",
+        "tint": [
+          200,
+          220,
+          200
+        ],
+        "strength": 0.2
+      },
+      "stains": [
+        [
+          2900.0,
+          499.0,
+          38.7,
+          0.091
+        ],
+        [
+          1705.0,
+          3444.0,
+          15.7,
+          0.199
+        ],
+        [
+          2600.0,
+          1359.0,
+          14.7,
+          0.189
+        ],
+        [
+          392.0,
+          3995.0,
+          29.7,
+          0.196
+        ],
+        [
+          4063.0,
+          1299.0,
+          18.1,
+          0.137
+        ],
+        [
+          1038.0,
+          97.0,
+          13.8,
+          0.092
+        ],
+        [
+          1358.0,
+          973.0,
+          12.2,
+          0.176
+        ],
+        [
+          294.0,
+          438.0,
+          32.6,
+          0.121
+        ],
+        [
+          1377.0,
+          2863.0,
+          31.0,
+          0.191
+        ],
+        [
+          481.0,
+          355.0,
+          30.6,
+          0.144
+        ],
+        [
+          4362.0,
+          2502.0,
+          14.7,
+          0.158
+        ],
+        [
+          3642.0,
+          3893.0,
+          27.4,
+          0.14
+        ],
+        [
+          3090.0,
+          2128.0,
+          39.6,
+          0.09
+        ],
+        [
+          485.0,
+          819.0,
+          18.7,
+          0.144
+        ]
+      ],
+      "props": [
+        {
+          "x": 1045,
+          "y": 3194,
+          "r": 12,
+          "style": "reed",
+          "rot": 5.88
+        },
+        {
+          "x": 4121,
+          "y": 2378,
+          "r": 10,
+          "style": "reed",
+          "rot": 0.92
+        },
+        {
+          "x": 2895,
+          "y": 2490,
+          "r": 19,
+          "style": "reed",
+          "rot": 1.46
+        },
+        {
+          "x": 1329,
+          "y": 626,
+          "r": 16,
+          "style": "reed",
+          "rot": 3.5
+        },
+        {
+          "x": 3221,
+          "y": 3425,
+          "r": 11,
+          "style": "reed",
+          "rot": 3.55
+        },
+        {
+          "x": 2091,
+          "y": 2983,
+          "r": 18,
+          "style": "reed",
+          "rot": 0.9
+        },
+        {
+          "x": 1378,
+          "y": 3543,
+          "r": 11,
+          "style": "reed",
+          "rot": 4.2
+        },
+        {
+          "x": 1092,
+          "y": 2652,
+          "r": 21,
+          "style": "reed",
+          "rot": 5.12
+        },
+        {
+          "x": 1798,
+          "y": 1430,
+          "r": 19,
+          "style": "reed",
+          "rot": 4.34
+        },
+        {
+          "x": 2339,
+          "y": 1819,
+          "r": 13,
+          "style": "reed",
+          "rot": 4.59
+        },
+        {
+          "x": 2712,
+          "y": 2637,
+          "r": 16,
+          "style": "reed",
+          "rot": 1.42
+        },
+        {
+          "x": 3224,
+          "y": 942,
+          "r": 19,
+          "style": "reed",
+          "rot": 2.52
+        },
+        {
+          "x": 1158,
+          "y": 935,
+          "r": 18,
+          "style": "reed",
+          "rot": 4.82
+        },
+        {
+          "x": 412,
+          "y": 1879,
+          "r": 17,
+          "style": "reed",
+          "rot": 2.39
+        },
+        {
+          "x": 2336,
+          "y": 2720,
+          "r": 11,
+          "style": "reed",
+          "rot": 5.9
+        },
+        {
+          "x": 2061,
+          "y": 3475,
+          "r": 15,
+          "style": "reed",
+          "rot": 0.6
+        },
+        {
+          "x": 1967,
+          "y": 2216,
+          "r": 17,
+          "style": "reed",
+          "rot": 6.27
+        },
+        {
+          "x": 313,
+          "y": 1222,
+          "r": 11,
+          "style": "reed",
+          "rot": 5.83
+        },
+        {
+          "x": 2226,
+          "y": 230,
+          "r": 16,
+          "style": "reed",
+          "rot": 5.36
+        },
+        {
+          "x": 3444,
+          "y": 2618,
+          "r": 18,
+          "style": "reed",
+          "rot": 2.68
+        }
+      ]
     }
-   ],
-   "highground": [
-    [
-     2000,
-     2000,
-     300
-    ],
-    [
-     600,
-     600,
-     180
-    ],
-    [
-     3400,
-     3400,
-     180
-    ]
-   ],
-   "theme": {
-    "ground": [
-     198,
-     178,
-     158
-    ],
-    "grid": [
-     186,
-     166,
-     146
-    ],
-    "ruled": [
-     200,
-     150,
-     130
-    ],
-    "crease": [
-     172,
-     152,
-     132
-    ],
-    "accent": [
-     160,
-     120,
-     90
-    ],
-    "name_tint": [
-     150,
-     110,
-     80
-    ]
-   },
-   "stains": [
-    [
-     2208,
-     2525,
-     28.3,
-     0.077
-    ],
-    [
-     202,
-     3704,
-     31.1,
-     0.067
-    ],
-    [
-     1643,
-     356,
-     37.0,
-     0.158
-    ],
-    [
-     558,
-     377,
-     14.8,
-     0.111
-    ],
-    [
-     3004,
-     899,
-     19.7,
-     0.131
-    ],
-    [
-     3732,
-     3585,
-     33.2,
-     0.152
-    ],
-    [
-     1476,
-     3484,
-     31.9,
-     0.115
-    ],
-    [
-     949,
-     1076,
-     15.0,
-     0.138
-    ],
-    [
-     2190,
-     1525,
-     43.6,
-     0.106
-    ],
-    [
-     1200,
-     3126,
-     31.3,
-     0.142
-    ],
-    [
-     1367,
-     1808,
-     38.0,
-     0.106
-    ],
-    [
-     2685,
-     2925,
-     30.9,
-     0.125
-    ],
-    [
-     2315,
-     2928,
-     39.7,
-     0.144
-    ],
-    [
-     1439,
-     2158,
-     32.0,
-     0.076
-    ]
-   ],
-   "weather": {
-    "kind": "clear",
-    "tint": [
-     252,
-     236,
-     200
-    ],
-    "strength": 0.11
-   },
-   "bands": [
-    [
-     3313,
-     2827,
-     4800,
-     3889,
-     85
-    ],
-    [
-     2446,
-     2107,
-     598,
-     3427,
-     109
-    ],
-    [
-     808,
-     8,
-     -493,
-     -922,
-     129
-    ]
-   ],
-   "pools": [
-    [
-     2000,
-     700,
-     160
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 3579,
-     "y": 1158,
-     "r": 13,
-     "rot": 3.48
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 3523,
-     "y": 3566,
-     "r": 15,
-     "rot": 4.25
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 2718,
-     "y": 3210,
-     "r": 20,
-     "rot": 2.25
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 1419,
-     "y": 717,
-     "r": 20,
-     "rot": 0.85
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 1141,
-     "y": 1781,
-     "r": 13,
-     "rot": 4.67
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 758,
-     "y": 1369,
-     "r": 19,
-     "rot": 6.22
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 2113,
-     "y": 2408,
-     "r": 10,
-     "rot": 3.71
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 527,
-     "y": 741,
-     "r": 10,
-     "rot": 4.84
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 2384,
-     "y": 1539,
-     "r": 20,
-     "rot": 4.72
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 1115,
-     "y": 2723,
-     "r": 10,
-     "rot": 5.76
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 2646,
-     "y": 1350,
-     "r": 17,
-     "rot": 5.51
-    },
-    {
-     "kind": "prop",
-     "style": "crane",
-     "x": 223,
-     "y": 1150,
-     "r": 14,
-     "rot": 3.5
-    }
-   ]
   },
-  "sliver": {
-   "name": "Paper Sliver",
-   "size": [
-    4600,
-    2000
-   ],
-   "spawns": [
-    [
-     320,
-     1000
-    ],
-    [
-     4280,
-     1000
-    ]
-   ],
-   "seed": 13,
-   "nodes": 10,
-   "desc": "Thin & tense. Little room; expect early aggression.",
-   "highground": [
-    [
-     2300,
-     1000,
-     220
-    ]
-   ],
-   "theme": {
-    "ground": [
-     204,
-     192,
-     166
-    ],
-    "grid": [
-     192,
-     180,
-     154
-    ],
-    "ruled": [
-     190,
-     160,
-     140
-    ],
-    "crease": [
-     180,
-     166,
-     142
-    ],
-    "accent": [
-     150,
-     130,
-     100
-    ],
-    "name_tint": [
-     140,
-     120,
-     90
-    ]
-   },
-   "stains": [
-    [
-     1288,
-     1296,
-     34.5,
-     0.145
-    ],
-    [
-     980,
-     569,
-     18.4,
-     0.083
-    ],
-    [
-     3283,
-     408,
-     29.9,
-     0.081
-    ],
-    [
-     1438,
-     891,
-     39.1,
-     0.121
-    ],
-    [
-     261,
-     641,
-     18.4,
-     0.147
-    ],
-    [
-     3601,
-     1490,
-     38.8,
-     0.134
-    ],
-    [
-     4187,
-     1470,
-     21.7,
-     0.145
-    ],
-    [
-     2244,
-     1408,
-     30.9,
-     0.103
-    ],
-    [
-     1730,
-     888,
-     23.4,
-     0.072
-    ],
-    [
-     3643,
-     1477,
-     43.6,
-     0.129
-    ],
-    [
-     2528,
-     1397,
-     18.0,
-     0.128
-    ],
-    [
-     2062,
-     483,
-     20.1,
-     0.112
-    ],
-    [
-     1264,
-     935,
-     32.2,
-     0.1
-    ],
-    [
-     749,
-     985,
-     21.1,
-     0.084
-    ]
-   ],
-   "weather": {
-    "kind": "storm",
-    "tint": [
-     120,
-     125,
-     150
-    ],
-    "strength": 0.3
-   },
-   "bands": [
-    [
-     2158,
-     570,
-     861,
-     -357,
-     79
-    ],
-    [
-     1023,
-     593,
-     -1338,
-     -1094,
-     62
-    ],
-    [
-     1014,
-     1206,
-     -522,
-     109,
-     97
-    ]
-   ],
-   "pools": [
-    [
-     2300,
-     1700,
-     150
-    ]
-   ],
-   "props": [
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2949,
-     "y": 1723,
-     "r": 12,
-     "rot": 5.4
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 629,
-     "y": 385,
-     "r": 18,
-     "rot": 4.85
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2982,
-     "y": 715,
-     "r": 11,
-     "rot": 3.22
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 3379,
-     "y": 779,
-     "r": 17,
-     "rot": 4.11
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1116,
-     "y": 1028,
-     "r": 15,
-     "rot": 3.73
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1906,
-     "y": 861,
-     "r": 12,
-     "rot": 2.97
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 684,
-     "y": 1506,
-     "r": 16,
-     "rot": 3.53
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1438,
-     "y": 1174,
-     "r": 16,
-     "rot": 3.01
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 659,
-     "y": 1608,
-     "r": 19,
-     "rot": 2.42
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1130,
-     "y": 785,
-     "r": 11,
-     "rot": 5.82
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 4042,
-     "y": 447,
-     "r": 11,
-     "rot": 0.85
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1854,
-     "y": 470,
-     "r": 16,
-     "rot": 3.44
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2442,
-     "y": 1662,
-     "r": 20,
-     "rot": 1.3
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1339,
-     "y": 300,
-     "r": 12,
-     "rot": 2.69
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2363,
-     "y": 244,
-     "r": 11,
-     "rot": 3.43
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 1683,
-     "y": 324,
-     "r": 19,
-     "rot": 1.49
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 898,
-     "y": 1383,
-     "r": 19,
-     "rot": 5.12
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2401,
-     "y": 761,
-     "r": 10,
-     "rot": 2.2
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 3576,
-     "y": 390,
-     "r": 18,
-     "rot": 2.92
-    },
-    {
-     "kind": "prop",
-     "style": "scrap",
-     "x": 2741,
-     "y": 1521,
-     "r": 20,
-     "rot": 1.31
-    }
-   ]
-  },
-  "crown": {
-   "name": "The Crown Fold",
-   "size": [
-    3600,
-    3600
-   ],
-   "spawns": [
-    [
-     420,
-     3180
-    ],
-    [
-     3180,
-     420
-    ]
-   ],
-   "seed": 7001,
-   "nodes": 12,
-   "desc": "A central plateau crowns the map. Take the high ground.",
-   "objects": [
-    {
-     "kind": "richnode",
-     "x": 1800,
-     "y": 1800,
-     "r": 34,
-     "amount": 6000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Crown Well",
-     "desc": "The richest prize, atop the plateau."
-    },
-    {
-     "kind": "relic",
-     "x": 1800,
-     "y": 1800,
-     "r": 26,
-     "bonus": "ink",
-     "color": [
-      230,
-      200,
-      110
-     ],
-     "label": "The Crown",
-     "desc": "Hold the summit for a steady bounty."
-    },
-    {
-     "kind": "ruin",
-     "x": 1200,
-     "y": 1200,
-     "r": 64,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Toppled Arch"
-    },
-    {
-     "kind": "ruin",
-     "x": 2400,
-     "y": 2400,
-     "r": 64,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Toppled Arch"
-    },
-    {
-     "kind": "ruin",
-     "x": 1200,
-     "y": 2400,
-     "r": 54,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Toppled Arch"
-    },
-    {
-     "kind": "ruin",
-     "x": 2400,
-     "y": 1200,
-     "r": 54,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "Toppled Arch"
-    },
-    {
-     "kind": "richnode",
-     "x": 700,
-     "y": 1900,
-     "r": 30,
-     "amount": 3500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Side Well"
-    },
-    {
-     "kind": "richnode",
-     "x": 2900,
-     "y": 1700,
-     "r": 30,
-     "amount": 3500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Side Well"
-    }
-   ],
-   "highground": [
-    [
-     1800,
-     1800,
-     520
-    ]
-   ],
-   "theme": {
-    "ground": [
-     204,
-     186,
-     150
-    ],
-    "grid": [
-     190,
-     172,
-     138
-    ],
-    "ruled": [
-     200,
-     160,
-     120
-    ],
-    "crease": [
-     176,
-     160,
-     128
-    ],
-    "accent": [
-     160,
-     130,
-     90
-    ],
-    "name_tint": [
-     150,
-     120,
-     70
-    ]
-   },
-   "weather": {
-    "kind": "clear",
-    "tint": [
-     255,
-     244,
-     214
-    ],
-    "strength": 0.08
-   },
-   "stains": [
-    [
-     423.0,
-     1154.0,
-     30.4,
-     0.125
-    ],
-    [
-     2456.0,
-     2384.0,
-     32.2,
-     0.123
-    ],
-    [
-     2342.0,
-     833.0,
-     30.8,
-     0.115
-    ],
-    [
-     860.0,
-     2980.0,
-     31.8,
-     0.186
-    ],
-    [
-     2642.0,
-     3594.0,
-     28.3,
-     0.096
-    ],
-    [
-     2115.0,
-     63.0,
-     26.4,
-     0.136
-    ],
-    [
-     1971.0,
-     284.0,
-     36.1,
-     0.085
-    ],
-    [
-     471.0,
-     1080.0,
-     37.0,
-     0.2
-    ],
-    [
-     2864.0,
-     910.0,
-     26.9,
-     0.107
-    ],
-    [
-     1021.0,
-     2204.0,
-     15.8,
-     0.195
-    ]
-   ],
-   "props": [
-    {
-     "x": 1416,
-     "y": 2960,
-     "r": 19,
-     "style": "leaf",
-     "rot": 0.38
-    },
-    {
-     "x": 1181,
-     "y": 3248,
-     "r": 15,
-     "style": "leaf",
-     "rot": 0.86
-    },
-    {
-     "x": 902,
-     "y": 501,
-     "r": 21,
-     "style": "leaf",
-     "rot": 5.72
-    },
-    {
-     "x": 2251,
-     "y": 458,
-     "r": 20,
-     "style": "leaf",
-     "rot": 0.31
-    },
-    {
-     "x": 2141,
-     "y": 207,
-     "r": 16,
-     "style": "leaf",
-     "rot": 5.23
-    },
-    {
-     "x": 1825,
-     "y": 1381,
-     "r": 15,
-     "style": "leaf",
-     "rot": 6.19
-    },
-    {
-     "x": 325,
-     "y": 1351,
-     "r": 21,
-     "style": "leaf",
-     "rot": 0.68
-    },
-    {
-     "x": 2590,
-     "y": 2695,
-     "r": 19,
-     "style": "leaf",
-     "rot": 3.28
-    },
-    {
-     "x": 1671,
-     "y": 2593,
-     "r": 21,
-     "style": "leaf",
-     "rot": 1.27
-    },
-    {
-     "x": 1212,
-     "y": 327,
-     "r": 13,
-     "style": "leaf",
-     "rot": 2.08
-    },
-    {
-     "x": 559,
-     "y": 3095,
-     "r": 18,
-     "style": "leaf",
-     "rot": 2.91
-    },
-    {
-     "x": 703,
-     "y": 1846,
-     "r": 16,
-     "style": "leaf",
-     "rot": 1.55
-    },
-    {
-     "x": 2439,
-     "y": 2238,
-     "r": 13,
-     "style": "leaf",
-     "rot": 3.36
-    },
-    {
-     "x": 3232,
-     "y": 3388,
-     "r": 18,
-     "style": "leaf",
-     "rot": 1.89
-    }
-   ]
-  },
-  "seam": {
-   "name": "The Binding Seam",
-   "size": [
-    5000,
-    2200
-   ],
-   "spawns": [
-    [
-     360,
-     1100
-    ],
-    [
-     4640,
-     1100
-    ]
-   ],
-   "seed": 7002,
-   "nodes": 12,
-   "desc": "A long corridor pinched by two chokepoints. Hold the gaps.",
-   "objects": [
-    {
-     "kind": "ruin",
-     "x": 2500,
-     "y": 300,
-     "r": 70,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "The Seam"
-    },
-    {
-     "kind": "ruin",
-     "x": 2500,
-     "y": 1100,
-     "r": 90,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "The Seam"
-    },
-    {
-     "kind": "ruin",
-     "x": 2500,
-     "y": 1900,
-     "r": 70,
-     "blocks": true,
-     "color": [
-      110,
-      100,
-      86
-     ],
-     "label": "The Seam"
-    },
-    {
-     "kind": "richnode",
-     "x": 2500,
-     "y": 600,
-     "r": 30,
-     "amount": 4500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Gap Well"
-    },
-    {
-     "kind": "richnode",
-     "x": 2500,
-     "y": 1600,
-     "r": 30,
-     "amount": 4500,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Gap Well"
-    },
-    {
-     "kind": "relic",
-     "x": 2500,
-     "y": 1100,
-     "r": 26,
-     "bonus": "ink",
-     "color": [
-      230,
-      200,
-      110
-     ],
-     "label": "Seam Seal",
-     "desc": "Contest the centre wall."
-    }
-   ],
-   "highground": [
-    [
-     2500,
-     600,
-     200
-    ],
-    [
-     2500,
-     1600,
-     200
-    ]
-   ],
-   "theme": {
-    "ground": [
-     188,
-     192,
-     196
-    ],
-    "grid": [
-     172,
-     176,
-     182
-    ],
-    "ruled": [
-     140,
-     150,
-     165
-    ],
-    "crease": [
-     158,
-     162,
-     170
-    ],
-    "accent": [
-     110,
-     120,
-     140
-    ],
-    "name_tint": [
-     90,
-     110,
-     150
-    ]
-   },
-   "weather": {
-    "kind": "overcast",
-    "tint": [
-     210,
-     214,
-     224
-    ],
-    "strength": 0.16
-   },
-   "stains": [
-    [
-     2796.0,
-     1142.0,
-     37.1,
-     0.162
-    ],
-    [
-     3332.0,
-     655.0,
-     34.8,
-     0.186
-    ],
-    [
-     1403.0,
-     128.0,
-     20.8,
-     0.163
-    ],
-    [
-     2555.0,
-     1720.0,
-     22.8,
-     0.125
-    ],
-    [
-     1899.0,
-     199.0,
-     32.8,
-     0.13
-    ],
-    [
-     817.0,
-     1376.0,
-     24.2,
-     0.161
-    ],
-    [
-     3114.0,
-     1265.0,
-     21.2,
-     0.173
-    ],
-    [
-     2696.0,
-     571.0,
-     17.6,
-     0.146
-    ],
-    [
-     979.0,
-     957.0,
-     33.1,
-     0.129
-    ],
-    [
-     3288.0,
-     2036.0,
-     13.9,
-     0.151
-    ],
-    [
-     2179.0,
-     1031.0,
-     35.2,
-     0.088
-    ],
-    [
-     3053.0,
-     610.0,
-     30.3,
-     0.155
-    ]
-   ],
-   "props": [
-    {
-     "x": 1556,
-     "y": 1214,
-     "r": 20,
-     "style": "scrap",
-     "rot": 4.04
-    },
-    {
-     "x": 2817,
-     "y": 1428,
-     "r": 19,
-     "style": "scrap",
-     "rot": 4.3
-    },
-    {
-     "x": 1981,
-     "y": 1131,
-     "r": 16,
-     "style": "scrap",
-     "rot": 2.06
-    },
-    {
-     "x": 1534,
-     "y": 1682,
-     "r": 22,
-     "style": "scrap",
-     "rot": 5.11
-    },
-    {
-     "x": 3909,
-     "y": 222,
-     "r": 12,
-     "style": "scrap",
-     "rot": 5.8
-    },
-    {
-     "x": 3215,
-     "y": 204,
-     "r": 21,
-     "style": "scrap",
-     "rot": 0.06
-    },
-    {
-     "x": 2982,
-     "y": 964,
-     "r": 21,
-     "style": "scrap",
-     "rot": 1.81
-    },
-    {
-     "x": 3164,
-     "y": 732,
-     "r": 11,
-     "style": "scrap",
-     "rot": 5.98
-    },
-    {
-     "x": 3698,
-     "y": 960,
-     "r": 19,
-     "style": "scrap",
-     "rot": 1.0
-    },
-    {
-     "x": 4311,
-     "y": 969,
-     "r": 14,
-     "style": "scrap",
-     "rot": 4.48
-    },
-    {
-     "x": 3734,
-     "y": 222,
-     "r": 15,
-     "style": "scrap",
-     "rot": 1.79
-    },
-    {
-     "x": 1153,
-     "y": 898,
-     "r": 19,
-     "style": "scrap",
-     "rot": 3.39
-    },
-    {
-     "x": 4359,
-     "y": 1070,
-     "r": 18,
-     "style": "scrap",
-     "rot": 0.81
-    },
-    {
-     "x": 2519,
-     "y": 1055,
-     "r": 17,
-     "style": "scrap",
-     "rot": 1.29
-    }
-   ]
-  },
-  "delta": {
-   "name": "Inkwater Delta",
-   "size": [
-    4400,
-    4000
-   ],
-   "spawns": [
-    [
-     500,
-     500
-    ],
-    [
-     3900,
-     3500
-    ]
-   ],
-   "seed": 7003,
-   "nodes": 20,
-   "desc": "A sprawling, node-rich delta. Expand and out-produce.",
-   "objects": [
-    {
-     "kind": "richnode",
-     "x": 2200,
-     "y": 2000,
-     "r": 34,
-     "amount": 5000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Delta Heart"
-    },
-    {
-     "kind": "richnode",
-     "x": 1200,
-     "y": 2600,
-     "r": 30,
-     "amount": 3600,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Silt Well"
-    },
-    {
-     "kind": "richnode",
-     "x": 3200,
-     "y": 1400,
-     "r": 30,
-     "amount": 3600,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Silt Well"
-    },
-    {
-     "kind": "richnode",
-     "x": 1400,
-     "y": 1200,
-     "r": 28,
-     "amount": 3000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Silt Well"
-    },
-    {
-     "kind": "richnode",
-     "x": 3000,
-     "y": 2800,
-     "r": 28,
-     "amount": 3000,
-     "color": [
-      150,
-      120,
-      210
-     ],
-     "label": "Silt Well"
-    },
-    {
-     "kind": "obstacle",
-     "x": 2200,
-     "y": 1200,
-     "r": 50,
-     "blocks": true,
-     "color": [
-      120,
-      130,
-      110
-     ],
-     "label": "Reed Bank"
-    },
-    {
-     "kind": "obstacle",
-     "x": 2200,
-     "y": 2800,
-     "r": 50,
-     "blocks": true,
-     "color": [
-      120,
-      130,
-      110
-     ],
-     "label": "Reed Bank"
-    },
-    {
-     "kind": "relic",
-     "x": 2200,
-     "y": 2000,
-     "r": 26,
-     "bonus": "ink",
-     "color": [
-      230,
-      200,
-      110
-     ],
-     "label": "Delta Seal",
-     "desc": "The delta's beating heart."
-    }
-   ],
-   "highground": [
-    [
-     1200,
-     2600,
-     220
-    ],
-    [
-     3200,
-     1400,
-     220
-    ]
-   ],
-   "theme": {
-    "ground": [
-     150,
-     170,
-     140
-    ],
-    "grid": [
-     138,
-     158,
-     128
-    ],
-    "ruled": [
-     108,
-     142,
-     104
-    ],
-    "crease": [
-     124,
-     146,
-     118
-    ],
-    "accent": [
-     92,
-     124,
-     84
-    ],
-    "name_tint": [
-     80,
-     120,
-     80
-    ]
-   },
-   "weather": {
-    "kind": "mist",
-    "tint": [
-     200,
-     220,
-     200
-    ],
-    "strength": 0.2
-   },
-   "stains": [
-    [
-     2900.0,
-     499.0,
-     38.7,
-     0.091
-    ],
-    [
-     1705.0,
-     3444.0,
-     15.7,
-     0.199
-    ],
-    [
-     2600.0,
-     1359.0,
-     14.7,
-     0.189
-    ],
-    [
-     392.0,
-     3995.0,
-     29.7,
-     0.196
-    ],
-    [
-     4063.0,
-     1299.0,
-     18.1,
-     0.137
-    ],
-    [
-     1038.0,
-     97.0,
-     13.8,
-     0.092
-    ],
-    [
-     1358.0,
-     973.0,
-     12.2,
-     0.176
-    ],
-    [
-     294.0,
-     438.0,
-     32.6,
-     0.121
-    ],
-    [
-     1377.0,
-     2863.0,
-     31.0,
-     0.191
-    ],
-    [
-     481.0,
-     355.0,
-     30.6,
-     0.144
-    ],
-    [
-     4362.0,
-     2502.0,
-     14.7,
-     0.158
-    ],
-    [
-     3642.0,
-     3893.0,
-     27.4,
-     0.14
-    ],
-    [
-     3090.0,
-     2128.0,
-     39.6,
-     0.09
-    ],
-    [
-     485.0,
-     819.0,
-     18.7,
-     0.144
-    ]
-   ],
-   "props": [
-    {
-     "x": 1045,
-     "y": 3194,
-     "r": 12,
-     "style": "reed",
-     "rot": 5.88
-    },
-    {
-     "x": 4121,
-     "y": 2378,
-     "r": 10,
-     "style": "reed",
-     "rot": 0.92
-    },
-    {
-     "x": 2895,
-     "y": 2490,
-     "r": 19,
-     "style": "reed",
-     "rot": 1.46
-    },
-    {
-     "x": 1329,
-     "y": 626,
-     "r": 16,
-     "style": "reed",
-     "rot": 3.5
-    },
-    {
-     "x": 3221,
-     "y": 3425,
-     "r": 11,
-     "style": "reed",
-     "rot": 3.55
-    },
-    {
-     "x": 2091,
-     "y": 2983,
-     "r": 18,
-     "style": "reed",
-     "rot": 0.9
-    },
-    {
-     "x": 1378,
-     "y": 3543,
-     "r": 11,
-     "style": "reed",
-     "rot": 4.2
-    },
-    {
-     "x": 1092,
-     "y": 2652,
-     "r": 21,
-     "style": "reed",
-     "rot": 5.12
-    },
-    {
-     "x": 1798,
-     "y": 1430,
-     "r": 19,
-     "style": "reed",
-     "rot": 4.34
-    },
-    {
-     "x": 2339,
-     "y": 1819,
-     "r": 13,
-     "style": "reed",
-     "rot": 4.59
-    },
-    {
-     "x": 2712,
-     "y": 2637,
-     "r": 16,
-     "style": "reed",
-     "rot": 1.42
-    },
-    {
-     "x": 3224,
-     "y": 942,
-     "r": 19,
-     "style": "reed",
-     "rot": 2.52
-    },
-    {
-     "x": 1158,
-     "y": 935,
-     "r": 18,
-     "style": "reed",
-     "rot": 4.82
-    },
-    {
-     "x": 412,
-     "y": 1879,
-     "r": 17,
-     "style": "reed",
-     "rot": 2.39
-    },
-    {
-     "x": 2336,
-     "y": 2720,
-     "r": 11,
-     "style": "reed",
-     "rot": 5.9
-    },
-    {
-     "x": 2061,
-     "y": 3475,
-     "r": 15,
-     "style": "reed",
-     "rot": 0.6
-    },
-    {
-     "x": 1967,
-     "y": 2216,
-     "r": 17,
-     "style": "reed",
-     "rot": 6.27
-    },
-    {
-     "x": 313,
-     "y": 1222,
-     "r": 11,
-     "style": "reed",
-     "rot": 5.83
-    },
-    {
-     "x": 2226,
-     "y": 230,
-     "r": 16,
-     "style": "reed",
-     "rot": 5.36
-    },
-    {
-     "x": 3444,
-     "y": 2618,
-     "r": 18,
-     "style": "reed",
-     "rot": 2.68
-    }
-   ]
-  }
- },
- "default_faction": "court",
- "default_map": "leaflock"
+  "default_faction": "court",
+  "default_map": "leaflock"
 }

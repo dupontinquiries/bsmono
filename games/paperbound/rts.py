@@ -4720,13 +4720,33 @@ class RTS:
         row = 0
         for (label, hk, action, cost, enabled) in actions[:12]:
             rect = pygame.Rect(col_x, by + row * (cellh + 3), cellw, cellh)
-            hover = rect.collidepoint(pygame.mouse.get_pos())
+            mouse = self.mouse_pos or (-1, -1)     # canvas space, not window
+            hover = rect.collidepoint(mouse)
             base = (58, 50, 40) if enabled else (40, 36, 32)
             pygame.draw.rect(screen, base if not hover else (78, 66, 52), rect, border_radius=5)
             pygame.draw.rect(screen, (110, 96, 74) if enabled else (70, 62, 52), rect, 1, border_radius=5)
             txtcol = (230, 222, 206) if enabled else (120, 112, 100)
+            # the card design: train buttons wear the folded troop, build
+            # buttons a faction-trimmed tent glyph
+            tx = rect.x + 6
+            icon = None
+            if action[0] == "train":
+                uspec = self.uspec(0, action[1]) or {}
+                icon = self._mini_icon(uspec.get("card"), cellh - 4)
+            elif action[0] == "build":
+                icon = self._struct_glyph(action[1], cellh - 4)
+            if icon is not None:
+                if not enabled:
+                    icon = icon.copy(); icon.set_alpha(110)
+                screen.blit(icon, (rect.x + 3, rect.y + 2))
+                tx = rect.x + cellh + 2
             pre = f"[{hk}] " if hk else ""
-            screen.blit(sf.render(f"{pre}{label}", True, txtcol), (rect.x + 6, rect.y + 4))
+            lbl = sf.render(f"{pre}{label}", True, txtcol)
+            avail = rect.right - 28 - tx
+            if lbl.get_width() > avail:            # squeeze long names
+                lbl = pygame.transform.smoothscale(
+                    lbl, (max(10, avail), lbl.get_height()))
+            screen.blit(lbl, (tx, rect.y + 4))
             if cost:
                 screen.blit(sf.render(f"{cost}", True, (150, 200, 235)), (rect.right - 26, rect.y + 4))
             if enabled:
@@ -4734,6 +4754,66 @@ class RTS:
             row += 1
             if by + row * (cellh + 3) > self.H - 6:
                 row = 0; col_x -= cellw + 6
+
+    def _mini_icon(self, card_key, size):
+        """A tiny folded model of a card, rendered once through the real
+        origami pipeline and cached — the command card wears the actual
+        troops it trains. Falls back to a folded diamond when the host gave
+        us no renderer (headless tests, degraded modes)."""
+        cache = getattr(self, "_icon_cache", None)
+        if cache is None:
+            cache = self._icon_cache = {}
+        ck = (card_key, size)
+        if ck in cache:
+            return cache[ck]
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        og = self.ctx.get("origami"); cards = self.ctx.get("cards") or {}
+        card = cards.get(card_key)
+        drawn = False
+        if og is not None and card is not None:
+            try:
+                fam = card.get("family", "figure")
+                recipe = og.recipe_for(card_key, fam, card)
+                anim = dict(t=0.35, move=0.0, phase=0.0, attack=0.0,
+                            breathe=0.2, style="", size=size * 0.42)
+                paper = tuple(card.get("paper", (200, 190, 170)))
+                for part in recipe:
+                    og.draw_part(surf, part, size * 0.5, size * 0.56,
+                                 size * 0.42, 1, paper, size * 0.3, 0.35, 0.0, anim)
+                drawn = True
+            except Exception:
+                drawn = False
+        if not drawn:
+            c = tuple((card or {}).get("paper", (204, 190, 168)))
+            m = size // 2
+            pygame.draw.polygon(surf, c, [(m, 2), (size - 3, m), (m, size - 2), (3, m)])
+            pygame.draw.polygon(surf, tuple(int(x * 0.6) for x in c),
+                                [(m, 2), (size - 3, m), (m, size - 2), (3, m)], 1)
+        cache[ck] = surf
+        return surf
+
+    def _struct_glyph(self, kind, size):
+        """A tiny folded-tent glyph for a build button, trimmed in the
+        faction's skin colour. Cached like the unit icons."""
+        cache = getattr(self, "_icon_cache", None)
+        if cache is None:
+            cache = self._icon_cache = {}
+        ck = ("__struct__", kind, size)
+        if ck in cache:
+            return cache[ck]
+        surf = pygame.Surface((size, size), pygame.SRCALPHA)
+        col = self._tcol(0)
+        skin = self.facdata(0).get("skin") or {}
+        trim = tuple(skin.get("trim", (200, 190, 160)))
+        body = tuple(int(c * 0.55 + p * 0.45) for c, p in zip(col, (216, 204, 178)))
+        w = size
+        pygame.draw.polygon(surf, body, [(3, w - 4), (w - 3, w - 4),
+                                         (w - 5, w * 0.45), (5, w * 0.45)])
+        pygame.draw.polygon(surf, tuple(int(x * 1.15) for x in body),
+                            [(4, w * 0.46), (w - 4, w * 0.46), (w // 2, 3)])
+        pygame.draw.line(surf, trim, (4, int(w * 0.46)), (w - 4, int(w * 0.46)), 1)
+        cache[ck] = surf
+        return surf
 
     def _build_minimap_bg(self, w, h):
         """Pre-render the minimap terrain once: themed ground, fold-valley bands,
