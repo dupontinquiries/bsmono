@@ -173,6 +173,38 @@ pub fn flinch(t: f32) -> Pose {
     p
 }
 
+/// Caught — hauled up short, back arched, legs kicking uselessly. The moment right
+/// after the hunter closes the catch, before a respawn resets the round.
+pub fn caught(t: f32) -> Pose {
+    let mut p = base();
+    let kick = (t * TAU * 3.0).sin();
+    p.pitch = 0.5; p.head = -0.4; p.head_yaw = 0.3 * (t * TAU * 2.0).sin();
+    p.crouch = -0.3;   // arched up and back, not settled down
+    p.swing = [0.5 * kick, -0.5 * kick, 0.5 * -kick, -0.5 * -kick];
+    p.knee = [0.9, 0.9, 0.9, 0.9];
+    p.tail = -0.6 - 0.2 * kick;
+    p.breath = 0.5 + 0.5 * (t * TAU * 4.0).sin();   // quick, panicked breaths
+    p
+}
+
+/// Low-profile swim stroke — paddling, body flattened toward the water. The Otter's
+/// (and any class's) moving pose while in deep water.
+pub fn swim(t: f32) -> Pose {
+    let mut p = base();
+    let ph = t * TAU;
+    p.crouch = 0.55;
+    p.pitch = -0.1;
+    for i in 0..4 {
+        let a = if i < 2 { ph } else { ph + PI * 0.5 };   // fore/hind paddle out of phase
+        p.swing[i] = 0.55 * a.sin();
+        p.knee[i] = 0.5 + 0.35 * (-a.cos()).max(0.0);
+    }
+    p.bob = 0.05 * (ph * 2.0).sin();
+    p.tail = 0.1 * ph.sin();
+    p.head = 0.15;
+    p
+}
+
 /// Combat ready-stance — low and coiled on the haunches, tail lashing, eyes on the foe.
 pub fn stance(t: f32) -> Pose {
     let mut p = base();
@@ -492,6 +524,25 @@ mod tests {
         let open = gait(6.0, 0.3, 0.0).crouch;
         let thick = wade(6.0, 0.3, 0.0, 1.0).crouch;
         assert!(thick > open, "wading through cover hunches the cat lower");
+    }
+
+    #[test]
+    fn caught_arches_up_and_kicks() {
+        // caught should arch the body up (negative crouch, not a settled-down stance)
+        // and the legs should actually be kicking, not still
+        assert!(caught(0.1).crouch < 0.0, "caught should arch the body up and back, not settle down");
+        let a = caught(0.1).swing[0];
+        let b = caught(0.3).swing[0];
+        assert!((a - b).abs() > 0.05, "the caught kick should actually move over time, not freeze");
+    }
+
+    #[test]
+    fn swim_flattens_low_and_paddles_out_of_phase() {
+        // swimming should crouch the body low (flattened toward the water) and the
+        // fore/hind pairs should paddle out of phase with each other, not in lockstep
+        assert!(swim(0.1).crouch > 0.3, "swimming should flatten the body low toward the water");
+        let s = swim(0.1);
+        assert!((s.swing[0] - s.swing[2]).abs() > 0.1, "fore and hind pairs should paddle out of phase");
     }
 
     #[test]
