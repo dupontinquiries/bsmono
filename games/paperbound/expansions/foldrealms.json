@@ -885,7 +885,9 @@
           "hp": 800,
           "r": 42,
           "build": 10.0,
-          "makes": [],
+          "makes": [
+            "broodherald"
+          ],
           "requires": [
             "table"
           ],
@@ -895,7 +897,7 @@
           ],
           "tier": 2,
           "key": "V",
-          "desc": "Tier 2 branch: gilding & the Royal Writ that wakes the elite guard."
+          "desc": "Tier 2 branch: gilding, the Royal Writ, and the Brood Herald's volleys."
         }
       },
       "units": {
@@ -984,6 +986,49 @@
           "key": "G",
           "requires_research": "royal_writ",
           "desc": "Gilded elite mites \u2014 the writ made flesh."
+        },
+        "broodherald": {
+          "name": "Brood Herald",
+          "cost": 100,
+          "hp": 100,
+          "dmg": 10,
+          "spd": 88,
+          "rng": 140,
+          "r": 12,
+          "card": "broodqueen",
+          "build_t": 7.5,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "gildedvolley",
+            "name": "Gilded Volley",
+            "cost": 70,
+            "cast_range": 360,
+            "radius": 150,
+            "dur": 1.6,
+            "delivery": "rain",
+            "rain_count": 7,
+            "rain_radius": 55,
+            "kind": "custom",
+            "effects": [
+              {
+                "effect": "damage",
+                "amount": 26
+              },
+              {
+                "effect": "splinter",
+                "count": 5,
+                "range": 90,
+                "amount": 16,
+                "sub_radius": 40
+              }
+            ],
+            "desc": "A rain of gilded stings; every strike bursts into shrapnel."
+          },
+          "desc": "The swarm speaks through her \u2014 and it speaks in volleys."
         }
       },
       "upgrades": {
@@ -1043,7 +1088,8 @@
           186,
           96
         ]
-      }
+      },
+      "projectile": "sting"
     },
     "windwrit": {
       "name": "The Windwrit Riders",
@@ -1172,7 +1218,9 @@
           "hp": 720,
           "r": 40,
           "build": 9.5,
-          "makes": [],
+          "makes": [
+            "skycaller"
+          ],
           "requires": [
             "table"
           ],
@@ -1271,6 +1319,45 @@
           "key": "K",
           "requires_research": "farsight",
           "desc": "A charted skiff that outranges and outruns everything."
+        },
+        "skycaller": {
+          "name": "Skycaller",
+          "cost": 105,
+          "hp": 95,
+          "dmg": 12,
+          "spd": 96,
+          "rng": 150,
+          "r": 12,
+          "card": "stormherald",
+          "build_t": 7.5,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "shearline",
+            "name": "Shearline",
+            "cost": 75,
+            "cast_range": 380,
+            "radius": 120,
+            "dur": 0.9,
+            "delivery": "bolt",
+            "kind": "custom",
+            "effects": [
+              {
+                "effect": "quake",
+                "amount": 55,
+                "duration": 1.1
+              },
+              {
+                "effect": "knockback",
+                "amount": 160
+              }
+            ],
+            "desc": "A pressed-air bolt that bucks the page and hurls foes outward."
+          },
+          "desc": "He charts a line in the sky and the sky obliges."
         }
       },
       "upgrades": {
@@ -1335,7 +1422,8 @@
           190,
           226
         ]
-      }
+      },
+      "projectile": "gale"
     },
     "rootbound": {
       "name": "The Rootbound Grove",
@@ -1477,7 +1565,9 @@
           "hp": 900,
           "r": 42,
           "build": 11.0,
-          "makes": [],
+          "makes": [
+            "sapwarden"
+          ],
           "requires": [
             "well"
           ],
@@ -1576,6 +1666,46 @@
           "key": "G",
           "requires_research": "verdance",
           "desc": "An elder briar \u2014 the hedge that walks."
+        },
+        "sapwarden": {
+          "name": "Sap Warden",
+          "cost": 100,
+          "hp": 140,
+          "dmg": 10,
+          "spd": 52,
+          "rng": 130,
+          "r": 13,
+          "card": "elderbough",
+          "build_t": 8.5,
+          "tier": 2,
+          "key": "K",
+          "supply": 2,
+          "energy": 100,
+          "energy_start": 50,
+          "ability": {
+            "id": "sapwell",
+            "name": "Sapwell",
+            "cost": 70,
+            "cast_range": 320,
+            "radius": 130,
+            "dur": 2.0,
+            "kind": "custom",
+            "effects": [
+              {
+                "effect": "inkpool",
+                "duration": 7.0,
+                "dps": 14,
+                "slow": 2.0
+              },
+              {
+                "effect": "heal",
+                "amount": 60,
+                "dot": true
+              }
+            ],
+            "desc": "Opens a well of dark sap: foes mire and wither, roots mend."
+          },
+          "desc": "Where he plants his staff, the grove drinks."
         }
       },
       "upgrades": {
@@ -1635,7 +1765,8 @@
           186,
           116
         ]
-      }
+      },
+      "projectile": "thorn"
     }
   },
   "rts_maps": {
