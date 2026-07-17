@@ -595,11 +595,22 @@ struct BufferPool { free: Mutex<HashMap<u64, Vec<wgpu::Buffer>>> }
 /// few large GPU buffers as offset views instead of thousands of separate buffer objects — fewer driver
 /// allocations + bind bindings, and on some drivers (Asahi) it dodges per-object VMA/count ceilings that
 /// reject a large model even when total memory would fit. Slabs are sized to the device's max buffer.
-struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64 }
+struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64, mapped: bool }
 /// Clears the active arena when a load finishes (or unwinds) so the bump state never leaks into the next
-/// load; the slab buffers themselves stay alive via the weight tensors that cloned them.
+/// load; the slab buffers themselves stay alive via the weight tensors that cloned them. In zero-copy
+/// (UMA `mapped`) mode it also UNMAPS the final slab here — every earlier slab is unmapped when its
+/// successor is created, so this makes the last one bindable too. Safe ordering: `load()` returns before
+/// the caller runs autotune/prewarm/inference, and nothing inside `load()` dispatches on arena weights.
 struct ArenaGuard<'a>(&'a Mutex<Option<ResidentArena>>);
-impl Drop for ArenaGuard<'_> { fn drop(&mut self) { *self.0.lock().unwrap() = None; } }
+impl Drop for ArenaGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock().unwrap();
+        if let Some(a) = g.as_ref() {
+            if a.mapped { if let Some(last) = a.slabs.last() { last.unmap(); } }
+        }
+        *g = None;
+    }
+}
 
 pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)> }
 impl Drop for Tensor {
@@ -930,30 +941,38 @@ impl Gpu {
         let a = guard.as_mut().expect("arena active");
         let mut off = a.used.next_multiple_of(ALIGN);
         if a.slabs.is_empty() || off + len > a.slab_size {
-            // Drain the PREVIOUS slab's staged writes before allocating the next. wgpu's write_buffer stages
-            // through internal buffers that are only reclaimed after a submit+poll; without this, staging for
-            // every slab accumulates ON TOP OF the growing arena, so the load-time peak is ~2× the resident
-            // size — that's what overran the ~56 GiB GPU VA ceiling loading the 70B (40 GiB arena + ~40 GiB
-            // un-drained staging). Flushing per slab caps staging at roughly one slab.
-            if !a.slabs.is_empty() {
+            if a.mapped {
+                // ZERO-COPY: the previous slab is full — unmap it so it can be bound. No staging belt exists
+                // in this mode, so there's nothing to drain (this is where the ~2× load peak went away).
+                if let Some(prev) = a.slabs.last() { prev.unmap(); }
+            } else if !a.slabs.is_empty() {
+                // Staging path: drain the PREVIOUS slab's staged writes before allocating the next. wgpu's
+                // write_buffer stages through internal buffers that are only reclaimed after a submit+poll;
+                // without this, staging for every slab accumulates ON TOP OF the growing arena, so the
+                // load-time peak is ~2× the resident size — that's what overran the ~56 GiB GPU VA ceiling
+                // loading the 70B (40 GiB arena + ~40 GiB un-drained staging). Flushing per slab caps it.
                 self.queue.submit(std::iter::empty());
                 let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             }
             let size = a.slab_size.max(len.next_multiple_of(ALIGN)); // size up for a rare oversized weight
+            // mapped slabs are filled by memcpy into their mapped range (no COPY_DST); staged slabs need COPY_DST
+            let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
+                        else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+                usage, mapped_at_creation: a.mapped });
             a.slabs.push(slab);
             a.used = 0;
             off = 0;
         }
         let slab = a.slabs.last().unwrap().clone();
-        // NOTE (UMA zero-copy, next step): on unified memory this `write_buffer` still stages. Creating each
-        // slab `mapped_at_creation:true` and memcpy'ing weights into its mapped range (then unmapping the
-        // slab before the first dispatch binds it) would drop the staging belt entirely here — eliminating
-        // BOTH the per-slab drain above and the ~2× load-time peak (arena + un-drained staging) that overran
-        // the 70B's GPU-VA ceiling. Deferred: it changes the slab map/unmap lifecycle (a mapped buffer can't
-        // be bound), so it needs on-hardware validation that every slab is unmapped before inference starts.
-        self.queue.write_buffer(&slab, off, bytes);
+        if a.mapped {
+            // UMA zero-copy: write straight into the mapped slab's device-visible backing at `off` — no
+            // staging copy. Sub-ranges are non-overlapping (distinct weights), so per-weight views are legal.
+            let mut view = slab.slice(off..off + len).get_mapped_range_mut();
+            view.copy_from_slice(bytes);
+        } else {
+            self.queue.write_buffer(&slab, off, bytes);
+        }
         a.used = off + len;
         Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
     }
@@ -3164,7 +3183,7 @@ impl Gpu {
             let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
                 .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
             eprintln!("wgpu-engine: arena ON — packing resident weights into ≤{} MiB slabs (fewer buffer objects)", slab >> 20);
-            *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0 });
+            *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0, mapped: self.unified });
             Some(ArenaGuard(&self.arena))
         } else { None };
         let lin = |name: &str, n: usize, k: usize, quantize: bool| -> Result<Lin, String> {

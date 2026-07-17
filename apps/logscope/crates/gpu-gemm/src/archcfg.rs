@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen4, Llama4, Gemma2, Phi3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -75,6 +75,18 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
             note: "Qwen3.5 dense (Ornith): QK-Norm before RoPE, qwen3_5.* metadata; correctness via --gate-qwen3. M2-gated for bit-exactness.",
+        },
+        // Qwen3-MoE (general.architecture = "qwen3moe"): the Qwen3 QK-Norm attention base + mixture-of-
+        // experts — a router (ffn_gate_inp) selecting top-k of N experts (ffn_{gate,up,down}_exps), NO shared
+        // expert (unlike Qwen2-MoE). This is Qwen3-30B-A3B / Qwen3-Coder-30B-A3B (128 experts, 8 active).
+        // Softmax gating. Same expert shape as a dense Qwen3 FFN, so each selected expert reuses the existing
+        // matvec/SwiGLU kernels; the router is a small matvec + top-k (moe::route).
+        "qwen3moe" => ArchConfig {
+            arch: Arch::Qwen3Moe, prefix: "qwen3moe", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: true, moe: true, moe_shared_expert: false, interleaved_nope: false,
+            logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: false, dense_supported: false,
+            note: "Qwen3-MoE (e.g. Qwen3-30B-A3B / Qwen3-Coder-30B-A3B): Qwen3 QK-Norm attention + mixture-of-experts (ffn_gate_inp router → top-k of N experts, no shared expert). Router + expert FFNs reuse the existing matvec/SwiGLU kernels; needs the MoE forward wired (loader: per-expert quant of the stacked ffn_*_exps; forward: route→top-k→weighted expert sum). Router logic is ready (moe::route).",
         },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
         // mixture-of-experts — a router (blk.N.ffn_gate_inp.weight) selecting top-k of N expert FFNs
@@ -263,6 +275,25 @@ mod tests {
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_shexp.weight"));
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_exps.weight"));
         assert!(c.note.contains("NoPE") && c.note.contains("shared expert"));
+    }
+
+    #[test]
+    fn qwen3moe_is_qwen3_qk_norm_plus_moe_no_shared() {
+        let c = for_arch("qwen3moe");
+        assert_eq!(c.arch, Arch::Qwen3Moe);
+        assert!(c.attn_qk_norm && !c.attn_qkv_bias, "Qwen3 QK-Norm base");
+        assert!(c.moe && !c.moe_shared_expert, "MoE with NO shared expert (unlike Qwen2-MoE)");
+        assert_eq!(route_norm(&c), crate::moe::RouteNorm::Softmax);
+        // Qwen3-30B-A3B: 128 experts, 8 active, no shared
+        let mc = moe_config(&c, 128, 8, 0);
+        assert_eq!(mc.n_routed, 128);
+        assert_eq!(mc.n_used, 8);
+        assert_eq!(mc.n_shared, 0);
+        assert!(c.note.contains("30B-A3B"));
+        // router + expert tensors named, no shared-expert tensors
+        let mt = moe_tensors(&c, 0);
+        assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_inp.weight"));
+        assert!(!mt.iter().any(|t| t.contains("shexp")));
     }
 
     #[test]
