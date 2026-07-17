@@ -319,6 +319,15 @@ pub fn build_scene(world: &World, plateaus: &[Plateau], team_cols: [[f32; 3]; 2]
         m.tri(l, r, tip, mix(rgb(0xEDE4CC), tc, 0.6));
         m.tri(r, back, tip, shade(mix(rgb(0xEDE4CC), tc, 0.6), 0.84));
         m.tri(back, l, tip, shade(mix(rgb(0xEDE4CC), tc, 0.6), 0.72));
+        // an Ember-burning unit smoulders: a fire facet licks up the fold
+        if u.burn > 0.0 {
+            m.tri(
+                v3(u.x - s * 0.4, e + s * 0.6, u.y),
+                v3(u.x + s * 0.4, e + s * 0.7, u.y),
+                v3(u.x, e + s * 2.1, u.y),
+                rgb(0xF08432),
+            );
+        }
         // a fighting unit flashes its blade facet brighter
         if matches!(u.job, Job::Fight { .. }) {
             m.tri(
