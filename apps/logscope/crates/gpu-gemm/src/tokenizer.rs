@@ -213,16 +213,29 @@ impl Tokenizer {
         let mut tk = Self::build(tokens, merges, byte_level);
         // Register control (3) / user-defined (4) tokens as verbatim specials so
         // chat markers like "<|eot_id|>" tokenize to a single id and decode literally.
+        let mut specials = Vec::new();
         if let Some(Value::Arr(types)) = g.metadata.get("tokenizer.ggml.token_type") {
-            let mut specials = Vec::new();
             for (i, ty) in types.iter().enumerate() {
                 let t = match ty { Value::I32(v) => *v, Value::U32(v) => *v as i32, _ => 0 };
                 if (t == 3 || t == 4) && i < tk.tokens.len() {
                     specials.push((String::from_utf8_lossy(&tk.tokens[i]).into_owned(), i as u32));
                 }
             }
-            tk.set_specials(specials);
         }
+        // Fallback: control markers shaped like <|...|> (ChatML <|im_start|>/<|im_end|>, Llama <|eot_id|>,
+        // <|endoftext|>) MUST tokenize to a single id, else the chat template's turn structure is encoded as
+        // literal text and the model sees a malformed prompt. Some GGUF conversions omit or mis-set
+        // token_type (Qwen3 showed "0 special tokens" while Llama3 got 8), so register marker-shaped vocab
+        // tokens here even when token_type didn't flag them.
+        let flagged: std::collections::HashSet<u32> = specials.iter().map(|(_, id)| *id).collect();
+        for (i, tok) in tk.tokens.iter().enumerate() {
+            if flagged.contains(&(i as u32)) { continue; }
+            let s = String::from_utf8_lossy(tok);
+            if s.len() >= 4 && s.starts_with("<|") && s.ends_with("|>") {
+                specials.push((s.into_owned(), i as u32));
+            }
+        }
+        tk.set_specials(specials);
         Ok(tk)
     }
 }
