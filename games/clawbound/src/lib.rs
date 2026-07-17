@@ -32,3 +32,4 @@ pub mod ring;
 pub mod sim;
 pub mod weather;
 pub mod world;
+pub mod worldscript;
