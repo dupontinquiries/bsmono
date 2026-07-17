@@ -4,7 +4,7 @@
 //! renders any gait phase or special pose (leap, startle, climb).
 
 use crate::math::{v3, Vec3};
-use crate::mesh::{rgb, shade, Mesh};
+use crate::mesh::{mix, rgb, shade, Mesh};
 
 const TAU: f32 = std::f32::consts::TAU;
 const PI: f32 = std::f32::consts::PI;
@@ -140,6 +140,39 @@ pub fn climb() -> Pose {
     p
 }
 
+/// Hovering/gliding flight — legs tucked under, body banking gently side to side.
+/// The Hawk's moving pose (it flies over every terrain, so its "gait" is airborne).
+pub fn hover(t: f32) -> Pose {
+    let mut p = base();
+    let ph = t * TAU;
+    p.bob = 0.12 * (ph * 1.7).sin();               // wingbeat bob, a little faster than a walk
+    p.pitch = 0.15 + 0.05 * ph.cos();               // banking glide, nose slightly down
+    p.swing = [0.15 * ph.sin(); 4];                 // legs tucked, barely trailing
+    p.knee = [0.75; 4];
+    p.tail = 0.15 * ph.sin();
+    p.head_yaw = 0.08 * (ph * 0.5).sin();
+    p
+}
+/// Hovering in place — same idea as `hover` but stationary (no forward bank).
+pub fn hover_idle(t: f32) -> Pose {
+    let mut p = hover(t);
+    p.pitch = 0.05;
+    p
+}
+
+/// Flinch — a staggered reaction: head snapped back, weight dropped, momentarily
+/// off-balance. Used whenever a hit lands (hunter stagger, rival dazed, jungle guard hit).
+pub fn flinch(t: f32) -> Pose {
+    let mut p = base();
+    let k = (1.0 - t.clamp(0.0, 1.0)).powf(1.6);    // sharp snap, eases out
+    p.head = -0.5 * k; p.head_yaw = 0.3 * k * (t * 6.0).sin();
+    p.crouch = 0.35 * k;
+    p.pitch = -0.2 * k;
+    p.tail = -0.3 * k;
+    p.knee = [0.5 + 0.3 * k; 4];
+    p
+}
+
 /// Combat ready-stance — low and coiled on the haunches, tail lashing, eyes on the foe.
 pub fn stance(t: f32) -> Pose {
     let mut p = base();
@@ -255,8 +288,11 @@ pub fn build(m: &mut Mesh, at: Vec3, yaw: f32, p: &Pose, class: crate::class::Cl
 
     // Frog's leap-built rear haunches are bigger than the fore quarter; everyone else is even
     let hind_wid = if class == Class::Frog { 0.34 * wid_mul * 1.35 } else { 0.34 * wid_mul };
+    let belly = mix(pelt, rgb(0xf0e6d0), 0.55);   // a lighter underbelly — the one bit of texture variation this rig has
     m.boxx_yaw(place(0.0, hind_y, -0.35 * len_mul), v3(hind_wid, 0.30 * breath, 0.45 * len_mul), yaw, pelt);
     m.boxx_yaw(place(0.0, fore_y, 0.30 * len_mul), v3(0.32 * wid_mul, 0.30 * breath, 0.42 * len_mul), yaw, pelt);
+    m.boxx_yaw(place(0.0, hind_y - 0.13 * breath, -0.35 * len_mul), v3(hind_wid * 0.65, 0.09 * breath, 0.4 * len_mul), yaw, belly);
+    m.boxx_yaw(place(0.0, fore_y - 0.13 * breath, 0.30 * len_mul), v3(0.32 * wid_mul * 0.65, 0.09 * breath, 0.38 * len_mul), yaw, belly);
 
     // head turns with head_yaw; ears (or Hawk's beak) ride on top, rotated with it
     let head_c = place(0.0, fore_y + 0.22 + p.head * 0.12, 0.78 * len_mul);
@@ -470,5 +506,30 @@ mod tests {
         for m in [Move::Pounce, Move::Jump, Move::Roll, Move::Dodge, Move::UnderbellySwipe, Move::HindKick, Move::Swat] {
             let _ = move_pose(m, 0.5);
         }
+    }
+
+    #[test]
+    fn hover_keeps_legs_tucked_and_banks_gently() {
+        // the Hawk's flight pose should tuck the legs (high knee flex throughout,
+        // never a grounded stride) and bank with a pitch that varies over the cycle
+        for t in [0.0, 0.15, 0.3, 0.45] {
+            let h = hover(t);
+            assert!(h.knee.iter().all(|&k| k > 0.5), "hover should keep the legs tucked, not extended for a stride");
+        }
+        let p0 = hover(0.0).pitch;
+        let p1 = hover(0.25).pitch;
+        assert!((p0 - p1).abs() > 0.01, "the glide should bank/vary its pitch over the cycle, not hold rigid");
+        // hovering in place shouldn't carry the same forward bank as gliding
+        assert!(hover_idle(0.1).pitch.abs() < hover(0.1).pitch.abs() + 0.2);
+    }
+
+    #[test]
+    fn flinch_snaps_back_then_eases() {
+        // the flinch should be sharpest right at the hit (t=0) and ease out toward t=1
+        let start = flinch(0.0).head.abs();
+        let mid = flinch(0.4).head.abs();
+        let end = flinch(1.0).head.abs();
+        assert!(start > mid && mid > end, "the flinch should snap hardest at the hit and ease out ({start:.2}/{mid:.2}/{end:.2})");
+        assert!(flinch(0.0).crouch > 0.2, "a landed hit should knock the stance off-balance");
     }
 }
