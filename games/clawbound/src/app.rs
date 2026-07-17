@@ -460,9 +460,10 @@ impl State {
             self.mleft_prev = self.keys.mleft;
             self.prowl.as_mut().unwrap().step(dt);
             if self.keys.restart {
-                let (c, k, diff) = { let p = self.prowl.as_ref().unwrap(); (p.class, p.hunter_kind, p.difficulty) };
+                let (c, k, diff, fw) = { let p = self.prowl.as_ref().unwrap(); (p.class, p.hunter_kind, p.difficulty, p.fixed_wind) };
                 let mut p = clawbound_rs::prowl::Prowl::new(c, k);
                 p.difficulty = diff;
+                p.set_fixed_wind(fw);
                 self.prowl = Some(p);
                 self.keys.restart = false;
             }
@@ -497,6 +498,7 @@ impl State {
             let p = self.prowl.as_ref().unwrap();
             (p.player_move.map(|(m, _)| m.name()), p.combo_flash, p.combo_name)
         };
+        let ((wind_dx, wind_dz), wind_strength) = self.prowl.as_ref().unwrap().wind();
         let jungle_hint = {
             let p = self.prowl.as_ref().unwrap();
             p.jungle.iter().filter(|c| {
@@ -540,6 +542,11 @@ impl State {
                     ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
                     if let Some(jh) = &jungle_hint { ui.label(RichText::new(jh).size(13.0).color(Color32::from_rgb(200, 210, 140))); }
+                    ui.add_space(3.0);
+                    let wind_deg = wind_dx.atan2(wind_dz).to_degrees();
+                    ui.label(RichText::new(format!("Wind {:.0}° · {}", wind_deg.rem_euclid(360.0),
+                        if wind_strength > 0.9 { "strong" } else if wind_strength > 0.35 { "breezy" } else { "calm" }))
+                        .size(11.0).color(Color32::from_rgb(160, 200, 210)));
                     if exposed { ui.label(RichText::new("! EXPOSED - get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
                 });
             });
@@ -1142,7 +1149,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                                 state.prowl = None; state.capture = None;
                                                 let diff = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty);
                                                 match g {
-                                                    GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; state.prowl = Some(p); }
+                                                    GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; p.set_fixed_wind(state.menu.settings.prowl_fixed_wind); state.prowl = Some(p); }
                                                     GameMode::Capture => { state.capture = Some(clawbound_rs::capture::Capture::new(c)); }
                                                     _ => { state.menu.open = true; }
                                                 }

@@ -14,6 +14,7 @@ use crate::hunter::{self, HState, Kind};
 use crate::objectives;
 use crate::powerup::{Buffs, Power};
 use crate::ring::Ring;
+use crate::weather::Weather;
 use crate::world;
 
 const PROWL_SCALE: f32 = 1.9;      // lift class speeds to open-world chase pace
@@ -54,6 +55,8 @@ const CAMP_ALERT_R: f32 = 9.0;   // a guard notices an un-hidden prowler inside 
 const CAMP_HERB_R: f32 = 3.0;    // reach to take the herb
 const CAMP_GUARD_SPEED: f32 = 5.2;
 const CAMP_REGROW: f32 = 45.0;   // seconds before a taken (but not cleared) herb is worth retaking
+const SCENT_RATE: f32 = 1.6;     // suspicion/second added when moving hard downwind of the hunter at full strength
+const SCENT_RANGE: f32 = 45.0;   // scent only carries this far
 const MOVE_REACH: f32 = 3.6;    // how close an autoattack move connects with a target
 const STAGGER_DUR: f32 = 0.9;   // seconds a landed hit dazes the hunter/a rival
 const ULT_CD_MULT: f32 = 1.8;   // stretches the shared Ability's cooldown to feel like an ultimate
@@ -199,6 +202,8 @@ pub struct Prowl {
     pub minions: Vec<Minion>,               // clan cats on border patrol
     pub rivals: Vec<Rival>,                 // rival clans' AI prowlers
     pub jungle: Vec<JungleCamp>,            // guarded herb camps off the lanes
+    pub weather: Weather,                   // wind (and sky/wetness) driving the scent game
+    pub fixed_wind: bool,                    // settings toggle: freeze the wind for a more readable map
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -241,6 +246,8 @@ impl Prowl {
             minions,
             rivals,
             jungle: Self::place_jungle_camps(),
+            weather: Weather::new(crate::weather::Season::Greenleaf),
+            fixed_wind: false,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -430,7 +437,16 @@ impl Prowl {
             camp.cooldown = (camp.cooldown - dt).max(0.0);
             if !camp.guard_alive { continue; }
             let d = dist(self.x, self.z, camp.gx, camp.gz);
-            if !camp.alert && d < CAMP_ALERT_R && (self.moving && !self.hidden) { camp.alert = true; }
+            let downwind_bonus = {
+                let (dx, dz) = (camp.gx - self.x, camp.gz - self.z);
+                let dd = (dx * dx + dz * dz).sqrt();
+                if self.moving && dd > 0.5 {
+                    let (wdx, wdz) = self.weather.wind_dir_vec();
+                    let align = (dx / dd * wdx + dz / dd * wdz).max(0.0);
+                    align * self.weather.total_wind()
+                } else { 0.0 }
+            };
+            if !camp.alert && (d < CAMP_ALERT_R * (1.0 + downwind_bonus) && (self.moving && (!self.hidden || downwind_bonus > 0.3))) { camp.alert = true; }
             if camp.alert {
                 let (dx, dz) = norm(self.x - camp.gx, self.z - camp.gz);
                 camp.gx += dx * CAMP_GUARD_SPEED * dt; camp.gz += dz * CAMP_GUARD_SPEED * dt;
@@ -472,6 +488,11 @@ impl Prowl {
     }
 
     /// Press the class's ultimate ability (consumed on the next `step`).
+    /// Freeze the wind (a settings toggle for a more readable, planned-around map).
+    pub fn set_fixed_wind(&mut self, on: bool) { self.fixed_wind = on; }
+    /// Unit wind direction (the way scent drifts) and its 0..~1.4 strength, for a HUD arrow.
+    pub fn wind(&self) -> ((f32, f32), f32) { (self.weather.wind_dir_vec(), self.weather.total_wind()) }
+
     pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
 
     /// Perform a flick — the gesture-driven autoattack. `dir_local` is the flick in the
@@ -611,6 +632,7 @@ impl Prowl {
         self.respawn_flash = (self.respawn_flash - dt).max(0.0);
         self.shielded_flash = (self.shielded_flash - dt).max(0.0);
         self.buffs.tick(dt);
+        if !self.fixed_wind { self.weather.step(dt); }
         let input = self.input.take();
 
         // ── player movement ──
@@ -768,7 +790,19 @@ impl Prowl {
             let stage_bonus = if self.on_staging { 1.2 } else { 0.0 };   // a claimed tree cools the hunt
             // Frog's Camouflage passive: suspicion melts away faster while hidden
             let camo_bonus = if eff_hidden && self.class == Class::Frog { 1.0 } else { 0.0 };
-            self.suspicion = (self.suspicion - dt * (if eff_hidden { 1.6 } else { 0.5 } + stage_bonus + camo_bonus)).max(0.0);
+            let decay = dt * (if eff_hidden { 1.6 } else { 0.5 } + stage_bonus + camo_bonus);
+            // wind/scent: moving downwind of the hunter carries your scent to it even out
+            // of sight — this can offset (or beat) the usual decay, so the wind matters
+            // for which way you sneak.
+            let (dxh, dzh) = (self.hx - self.x, self.hz - self.z);
+            let dh = (dxh * dxh + dzh * dzh).sqrt();
+            let scent_gain = if self.moving && dh > 0.5 && dh < SCENT_RANGE {
+                let (wdx, wdz) = self.weather.wind_dir_vec();
+                let align = (dxh / dh * wdx + dzh / dh * wdz).max(0.0);   // > 0: wind carries you toward the hunter
+                SCENT_RATE * self.weather.total_wind() * align * dt
+            } else { 0.0 };
+            self.suspicion = (self.suspicion + scent_gain - decay).clamp(0.0, 1.5);
+            if scent_gain > decay * 1.5 { self.last_seen = Some((self.x, self.z)); }   // a strong whiff gives a rough fix
         }
         let prev = self.hstate;
         self.hstate = if sees && self.suspicion > 0.9 { HState::Chase }
@@ -1258,6 +1292,52 @@ mod tests {
         g.set_input(0.0, 0.0, false, false, false);
         g.step(1.0 / 30.0);
         assert_eq!((g.hx, g.hz), (hx0, hz0), "a dazed hunter shouldn't move");
+    }
+
+    #[test]
+    fn moving_downwind_of_the_hunter_builds_suspicion_even_hidden() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.set_fixed_wind(true);
+        g.weather.wind_dir = std::f32::consts::FRAC_PI_2;   // (sin,cos) convention: blows toward +x
+        g.weather.wind_strength = 1.0; g.weather.gust = 0.0;
+        g.x = 0.0; g.z = 0.0;
+        g.hx = 20.0; g.hz = 0.0;   // due +x of the player — squarely downwind
+        g.hidden = true;
+        g.suspicion = 0.5;
+        g.set_input(1.0, 0.0, false, false, false);   // moving — leaves a scent
+        g.step(1.0 / 30.0);
+        assert!(g.suspicion > 0.0, "a strong downwind scent should build suspicion despite being hidden");
+    }
+
+    #[test]
+    fn moving_upwind_of_the_hunter_only_decays() {
+        let decay = |dir: f32| -> f32 {
+            let mut g = Prowl::new(Class::Cat, Kind::Fox);
+            g.set_fixed_wind(true);
+            g.weather.wind_dir = dir;
+            g.weather.wind_strength = 1.0; g.weather.gust = 0.0;
+            g.x = 0.0; g.z = 0.0;
+            g.hx = 20.0; g.hz = 0.0;
+            g.hidden = true;
+            g.suspicion = 0.5;
+            g.set_input(1.0, 0.0, false, false, false);   // moving — leaves a scent
+            g.step(1.0 / 30.0);
+            g.suspicion
+        };
+        // wind toward -x (away from the hunter, i.e. blowing from the hunter to the player)
+        let upwind = decay(-std::f32::consts::FRAC_PI_2);
+        // wind toward +x (toward the hunter)
+        let downwind = decay(std::f32::consts::FRAC_PI_2);
+        assert!(upwind < downwind, "upwind of the hunter should decay faster than downwind");
+    }
+
+    #[test]
+    fn fixed_wind_never_veers() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.set_fixed_wind(true);
+        let before = g.wind();
+        for _ in 0..300 { g.set_input(0.3, 0.1, false, false, false); g.step(1.0 / 30.0); }
+        assert_eq!(g.wind(), before, "the wind shouldn't change while fixed");
     }
 
     #[test]
