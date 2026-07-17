@@ -32,6 +32,8 @@ Entry points used by game.py:
 import math
 import random
 import copy
+import os
+import json
 import pygame
 
 
@@ -269,6 +271,32 @@ DEFAULT_MAP = "leaflock"
 # without touching code. _MAP_OBJECTS[map_id] holds the parsed objects.
 _MAP_OBJECTS = {}
 _MAP_HIGH = {}                    # map_id -> list of (x,y,r) high-ground plateaus
+
+
+def _load_palette_scripts():
+    """User-authored command-palette scripts (palette_scripts.json beside this
+    module; authored in the map editor's 'Palette scripts' window). Each script
+    is a name + a list of ops the palette can run as one command. Bad scripts
+    are reported and skipped — one typo never voids the file."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "palette_scripts.json")
+    try:
+        with open(path) as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return []
+    except Exception as ex:
+        print(f"[palette] bad palette_scripts.json: {ex}")
+        return []
+    out = []
+    for i, s in enumerate(doc.get("scripts", [])):
+        try:
+            name = str(s["name"]); ops = list(s.get("ops", []))
+            assert all(isinstance(o, dict) and "op" in o for o in ops)
+            out.append({"name": name, "desc": str(s.get("desc", "")), "ops": ops})
+        except Exception:
+            print(f"[palette] skipping bad script #{i}")
+    return out
 
 def _deep_merge(base, over):
     """Recursively merge dict `over` onto a copy of `base` (over wins)."""
@@ -581,6 +609,12 @@ class RTS:
         self.zoom = 0.7                     # start zoomed out to see the big map
         self.mid_drag = None                # (mouse_x, mouse_y, cam_x, cam_y) while middle-drag panning
         self.mouse_pos = None               # last pointer pos in CANVAS space (from translated events)
+        self._ink_anim = {}                 # ui key -> 0..1 ink-pop expansion state
+        self._frame_dt = 1 / 60.0           # last update dt, drives ui pops in drawers
+        self._pan_ramp = 0.0                # edge-pan ease-in (0..1) so panning never jerks
+        self._grp_tap = (None, -9.0)        # (digit, time) for double-tap → centre camera
+        self.pal = None                     # command palette: None | {"q": str, "sel": int}
+        self.pal_scripts = _load_palette_scripts()
         # selection & control
         self.selected = []
         self.groups = {i: [] for i in range(1, 10)}
@@ -964,22 +998,57 @@ class RTS:
         if self.mid_drag:
             mx0, my0, cx0, cy0 = self.mid_drag
             self.cam_x = cx0 - (ev.pos[0] - mx0) / self.zoom
-            self.cam_y = cy0 - (ev.pos[1] - my0) / self.zoom
+            self.cam_y = cy0 - (ev.pos[1] - my0) / (self.zoom * ISO)
             self._clamp_cam()
         if self.wheel:
             self.wheel_hot = self._wheel_slice_at(ev.pos)
 
+    def _group(self, n):
+        """Group n with the fallen pruned out (kept pruned in place)."""
+        g = [u for u in self.groups.get(n, []) if u.alive]
+        self.groups[n] = g
+        return g
+
+    def _centre_on(self, x, y):
+        self.cam_x = x - self.W / (2 * self.zoom)
+        self.cam_y = y - (self.H - 118) / (2 * self.zoom * ISO)
+        self._clamp_cam()
+
     def _on_key(self, ev):
         k = ev.key
-        # control groups: Ctrl+N assigns, N selects
+        # ── command palette: typing goes to it while open; "/" or Ctrl+P opens ──
+        if self.pal is not None:
+            self._pal_key(ev)
+            return
+        if k == pygame.K_SLASH or (k == pygame.K_p and
+                                   pygame.key.get_mods() & pygame.KMOD_CTRL):
+            self._pal_open()
+            return
+        # control groups: Ctrl+N assigns, Shift+N adds the selection to the
+        # group, N selects, and a quick double-tap of N centres the camera on
+        # the group (classic RTS muscle memory).
         if k in range(pygame.K_1, pygame.K_9 + 1):
             n = k - pygame.K_0
             mods = pygame.key.get_mods()
+            sel_units = [u for u in self.selected if isinstance(u, Unit) and u.alive]
             if mods & pygame.KMOD_CTRL:
-                self.groups[n] = [u for u in self.selected if isinstance(u, Unit) and u.alive]
+                self.groups[n] = sel_units
                 self.flash(f"Control group {n} set ({len(self.groups[n])})")
+            elif mods & pygame.KMOD_SHIFT:
+                g = self._group(n)
+                for u in sel_units:
+                    if u not in g:
+                        g.append(u)
+                self.flash(f"Added to group {n} ({len(g)})")
             else:
-                self._select(list(self.groups.get(n, [])))
+                g = self._group(n)
+                self._select(list(g))
+                last_n, last_t = self._grp_tap
+                if last_n == n and self.match_t - last_t < 0.35 and g:
+                    cx = sum(u.x for u in g) / len(g)
+                    cy = sum(u.y for u in g) / len(g)
+                    self._centre_on(cx, cy)
+                self._grp_tap = (n, self.match_t)
             return
         # command hotkeys act on the current selection / palette
         ch = getattr(ev, "unicode", "").lower()
@@ -1060,10 +1129,17 @@ class RTS:
             if self.mm_rect and self.mm_rect.collidepoint(mx, my):
                 self._minimap_jump(mx, my)
             return
-        # quick-command buttons (Select Army, etc.)
+        # command palette: a click anywhere just closes it
+        if self.pal is not None:
+            self.pal = None; return
+        # quick-command buttons (Select Army, etc.) and group badges
         for rect, action in self.buttons:
             if rect.collidepoint(mx, my):
-                self._quick_action(action); return
+                if isinstance(action, tuple) and action[0] == "group":
+                    self._script_op({"op": "group", "n": action[1], "do": "select"})
+                else:
+                    self._quick_action(action[1] if isinstance(action, tuple) else action)
+                return
         # minimap click → jump camera
         if self.mm_rect and self.mm_rect.collidepoint(mx, my):
             self._minimap_jump(mx, my); return
@@ -1117,7 +1193,10 @@ class RTS:
         elif len(self.fingers) == 1:
             for rect, action in self.buttons:
                 if rect.collidepoint(x, y):
-                    self._quick_action(action[1] if isinstance(action, tuple) else action)
+                    if isinstance(action, tuple) and action[0] == "group":
+                        self._script_op({"op": "group", "n": action[1], "do": "select"})
+                    else:
+                        self._quick_action(action[1] if isinstance(action, tuple) else action)
                     self.fingers.pop(fid, None); return
             for rect, action in self.palette_rects:
                 if rect.collidepoint(x, y):
@@ -1978,6 +2057,7 @@ class RTS:
 
     # ── update ──
     def update(self, dt):
+        self._frame_dt = dt
         if self.phase == "setup":
             return
         if self.done:
@@ -2508,30 +2588,42 @@ class RTS:
         self.cam_y = max(-60, min(WORLD_H - vh + 60, self.cam_y))
 
     def _edge_scroll(self, dt):
-        sp = 620 * dt
+        # Screen-speed feel is constant across zoom levels: world speed scales
+        # with 1/zoom (zoomed out pans more world, same apparent pace).
+        base = 640 * dt / max(0.55, self.zoom)
         # ── mouse edge panning ──
         # CRITICAL: use the last event-translated CANVAS-space position, NOT
-        # pygame.mouse.get_pos(). The host renders to a fixed canvas that is
-        # scaled/letterboxed into the window; get_pos() is window space, which
-        # made the pan box sit in the window's upper-left — a cursor near the
-        # middle of a big window landed past (W-edge, H-edge) and triggered a
-        # phantom bottom-right pan. Only pan once armed (a short grace period
-        # has passed AND we've actually seen a pointer event), and only while
-        # the pointer is inside the canvas.
+        # pygame.mouse.get_pos() (window space — the old phantom-pan bug).
+        # Only pan once armed and while the pointer is inside the canvas.
+        px_ = py_ = 0.0
         if self.edge_pan_armed and self.mouse_pos is not None:
             mx, my = self.mouse_pos
             if 0 <= mx <= self.W and 0 <= my <= self.H:
-                edge = 48                       # comfortable trigger band (canvas px)
-                if mx < edge:            self.cam_x -= sp
-                if mx > self.W - edge:   self.cam_x += sp   # 'if', not 'elif': corners pan diagonally
-                if my < edge:            self.cam_y -= sp
-                if my > self.H - edge - 120: self.cam_y += sp   # leave room for HUD
+                edge = 56                     # trigger band (canvas px)
+                # PROPORTIONAL: depth into the band drives speed 0→1 with a
+                # squared curve, so grazing the band drifts and the rim flies.
+                if mx < edge:                 px_ = -((edge - mx) / edge) ** 2
+                elif mx > self.W - edge:      px_ = ((mx - (self.W - edge)) / edge) ** 2
+                bot = self.H - 120
+                if my < edge:                 py_ = -((edge - my) / edge) ** 2
+                elif my > bot - edge:         py_ = min(1.0, ((my - (bot - edge)) / edge)) ** 2
+        # diagonal corners shouldn't pan √2 faster — normalise the vector
+        mag = math.hypot(px_, py_)
+        if mag > 1.0:
+            px_ /= mag; py_ /= mag
+        # ease the pan in/out (~120ms) so motion starts and stops soft-footed
+        target = 1.0 if mag > 0.001 else 0.0
+        k = min(1.0, dt / 0.12)
+        self._pan_ramp += (target - self._pan_ramp) * k
+        if self._pan_ramp > 0.003:
+            self.cam_x += px_ * base * self._pan_ramp
+            self.cam_y += py_ * base * self._pan_ramp
         # arrow keys too (always available, independent of arming)
         keys = pygame.key.get_pressed()
-        if keys[pygame.K_LEFT]: self.cam_x -= sp
-        if keys[pygame.K_RIGHT]: self.cam_x += sp
-        if keys[pygame.K_UP]: self.cam_y -= sp
-        if keys[pygame.K_DOWN]: self.cam_y += sp
+        if keys[pygame.K_LEFT]: self.cam_x -= base
+        if keys[pygame.K_RIGHT]: self.cam_x += base
+        if keys[pygame.K_UP]: self.cam_y -= base
+        if keys[pygame.K_DOWN]: self.cam_y += base
         self._clamp_cam()
 
     # ── AI ──
@@ -2797,8 +2889,9 @@ class RTS:
             self._draw_wheel(screen)
         if self.show_tech:
             self._draw_tech_tree(screen)
-        if self.msg_t > 0:
+        if self.msg_t > 0 or self._ink_anim.get("toast", 0) > 0:
             self._draw_msg(screen)
+        self._draw_palette_overlay(screen)
         if self.done:
             self._draw_end(screen)
 
@@ -3012,28 +3105,63 @@ class RTS:
                 y += 108
 
     def _draw_quick_buttons(self, screen):
-        """Halo Wars-style always-available army buttons, top-left of the HUD."""
+        """Minimal army chips above the HUD: quiet ghost outlines at rest that
+        ink-pop solid on hover; the Idle chip only pops into existence when a
+        worker is actually idle. Control-group badges dock on the right."""
         self.buttons = []
         sf = self.ctx["sfont"]
+        mouse = self.mouse_pos or (-1, -1)      # CANVAS space (window get_pos misfires)
         n_idle = sum(1 for u in self.units if u.team == 0 and u.worker and u.alive
                      and u.state == "idle" and u.goal is None and u.target is None
                      and u.carrying == 0)
-        defs = [("Army", ("quick", "army")), ("Scribes", ("quick", "workers")),
-                (f"Idle ({n_idle})" if n_idle else "Idle", ("quick", "idle")),
-                ("Base", ("quick", "base"))]
-        x = 12; y = self.H - 118 - 34
-        for label, action in defs:
-            rect = pygame.Rect(x, y, 84, 28)
-            hover = rect.collidepoint(pygame.mouse.get_pos())
-            # the Idle button glows amber when workers are standing around
-            idle_glow = action == ("quick", "idle") and n_idle > 0
-            base = (86, 66, 34) if idle_glow else (58, 50, 40)
-            pygame.draw.rect(screen, base if not hover else (80, 68, 54), rect, border_radius=6)
-            pygame.draw.rect(screen, (220, 180, 90) if idle_glow else (120, 104, 80), rect, 1, border_radius=6)
-            screen.blit(sf.render(label, True, (232, 224, 208)),
-                        (rect.centerx - sf.size(label)[0] / 2, rect.y + 6))
-            self.buttons.append((rect, action))
-            x += 90
+        defs = [("Army", "army", True), ("Scribes", "workers", True),
+                (f"Idle {n_idle}", "idle", n_idle > 0), ("Base", "base", True)]
+        x = 12; y = self.H - 118 - 32
+        for label, arg, present in defs:
+            pres = self._ink_t("qb_" + arg, present)
+            if pres <= 0.001:
+                continue
+            rect = pygame.Rect(x, y, 76, 26)
+            hover = rect.collidepoint(mouse)
+            hp_ = self._ink_t("qbh_" + arg, hover)
+            idle_glow = arg == "idle"
+            # rest state: a quiet outline; hover: the chip fills with ink
+            w = int(rect.w * (0.9 + 0.1 * pres)); h = int(rect.h * pres)
+            r = pygame.Rect(rect.centerx - w // 2, rect.bottom - h, w, max(2, h))
+            fill_a = int(40 + 185 * hp_)
+            base = (150, 120, 55) if idle_glow else (52, 46, 38)
+            chip = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+            pygame.draw.rect(chip, (*base, fill_a), chip.get_rect(), border_radius=7)
+            pygame.draw.rect(chip, (220, 180, 90) if idle_glow else (128, 112, 86),
+                             chip.get_rect(), 1, border_radius=7)
+            screen.blit(chip, r.topleft)
+            if pres > 0.5:
+                col = (246, 236, 214) if hover else (206, 196, 178)
+                screen.blit(sf.render(label, True, col),
+                            (rect.centerx - sf.size(label)[0] / 2, rect.y + 5))
+            self.buttons.append((rect, ("quick", arg)))
+            x += 82
+        # ── control-group badges: pop in as groups come into being ──
+        bx = self.W - 292
+        for n in range(1, 10):
+            g = self._group(n)
+            t = self._ink_t(f"grp_{n}", bool(g))
+            if t <= 0.001:
+                continue
+            rect = pygame.Rect(bx + (n - 1) * 30, y, 26, 26)
+            hover = rect.collidepoint(mouse)
+            hh = int(rect.h * t)
+            r = pygame.Rect(rect.x, rect.bottom - hh, rect.w, max(2, hh))
+            badge = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+            pygame.draw.rect(badge, (48, 42, 56, 235 if hover else 175),
+                             badge.get_rect(), border_radius=6)
+            pygame.draw.rect(badge, (170, 150, 210), badge.get_rect(), 1, border_radius=6)
+            screen.blit(badge, r.topleft)
+            if t > 0.5:
+                screen.blit(sf.render(str(n), True, (236, 228, 246)), (rect.x + 5, rect.y + 4))
+                cnt = sf.render(str(len(g)), True, (176, 160, 200))
+                screen.blit(cnt, (rect.right - cnt.get_width() - 3, rect.bottom - 13))
+            self.buttons.append((rect, ("group", n)))
 
     def _draw_wheel(self, screen):
         w = self.wheel
@@ -3959,7 +4087,7 @@ class RTS:
         sf = self.ctx["sfont"]
         us = self._sel_units(); ss = self._sel_structs()
         if not us and not ss:
-            screen.blit(sf.render("Select units (drag) · right-click to move/attack · Ctrl+# groups",
+            screen.blit(sf.render("Drag select · right-click move/attack · Ctrl/Shift+# groups (tap ## to jump) · / palette",
                                   True, (150, 140, 124)), (x, y))
             return
         if us:
@@ -4123,14 +4251,289 @@ class RTS:
             if int(p["t"] * 6) % 2 == 0:
                 pygame.draw.circle(screen, (240, 90, 80), (px, py), pulse, 2)
 
+    # ── ink-pop UI: panels expand in with a sharp 150ms ink blot ────────────
+    def _ink_t(self, key, active, dur=0.15):
+        """Advance and return the eased 0..1 expansion for a UI element. Sharp:
+        ease-out cubic over `dur` seconds, symmetric collapse."""
+        t = self._ink_anim.get(key, 0.0)
+        step = self._frame_dt / max(0.001, dur)
+        t = min(1.0, t + step) if active else max(0.0, t - step)
+        self._ink_anim[key] = t
+        e = 1.0 - (1.0 - t) ** 3
+        return e
+
+    def _ink_panel(self, screen, rect, t, fill=(26, 23, 32), edge=(120, 104, 80),
+                   alpha=225, anchor="center"):
+        """Draw a panel expanding from its anchor as a paper-ink blot: sharp
+        scale-in with a whisker of overshoot, plus tiny ink beads on the rim
+        while it's still spreading. Returns the current (scaled) rect."""
+        if t <= 0.001:
+            return None
+        s = t * (1.0 + 0.05 * math.sin(min(1.0, t) * math.pi))
+        w = max(4, int(rect.w * s)); h = max(4, int(rect.h * s))
+        if anchor == "bottom":
+            r = pygame.Rect(rect.centerx - w // 2, rect.bottom - h, w, h)
+        elif anchor == "topleft":
+            r = pygame.Rect(rect.x, rect.y, w, h)
+        else:
+            r = pygame.Rect(rect.centerx - w // 2, rect.centery - h // 2, w, h)
+        panel = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
+        pygame.draw.rect(panel, (*fill, int(alpha * min(1.0, t * 1.4))),
+                         panel.get_rect(), border_radius=9)
+        pygame.draw.rect(panel, (*edge, 235), panel.get_rect(), 1, border_radius=9)
+        screen.blit(panel, r.topleft)
+        if t < 0.999:                      # ink beads racing along the rim
+            rng = random.Random(key_hash := (rect.x * 31 + rect.y))
+            for b in range(4):
+                a = rng.uniform(0, math.tau) + t * 9.0
+                bx = r.centerx + math.cos(a) * (r.w / 2)
+                by = r.centery + math.sin(a) * (r.h / 2)
+                pygame.draw.circle(screen, edge, (int(bx), int(by)),
+                                   max(1, int(3 * (1 - t))))
+        return r
+
+    # ── command palette ─────────────────────────────────────────────────────
+    def _pal_open(self):
+        self.pal = {"q": "", "sel": 0}
+        self._sfx("select", 0.4)
+
+    def _pal_commands(self):
+        """The live command list: core verbs, production for what you own,
+        research you can start, control groups with members, user scripts."""
+        cmds = [
+            ("Select: Army", lambda: self._quick_action("army")),
+            ("Select: Scribes", lambda: self._quick_action("workers")),
+            ("Select: Idle workers", lambda: self._quick_action("idle")),
+            ("Camera: Base", lambda: self._quick_action("base")),
+            ("Order: Stop", lambda: self._script_op({"op": "stop"})),
+            ("Order: Hold position", lambda: self._script_op({"op": "hold"})),
+            ("Toggle: Fog of war", lambda: self._script_op({"op": "fog"})),
+            ("Toggle: Tech tree", lambda: setattr(self, "show_tech", not self.show_tech)),
+        ]
+        for n in range(1, 10):
+            g = self._group(n)
+            if g:
+                cmds.append((f"Group {n}: select ({len(g)})",
+                             (lambda nn: lambda: self._script_op(
+                                 {"op": "group", "n": nn, "do": "select"}))(n)))
+        for sk, spec in self.facdata(0)["structures"].items():
+            if self._struct_available(0, sk) and spec.get("cost", 0) > 0:
+                cmds.append((f"Build: {spec['name']}  ·  {spec['cost']} ink",
+                             (lambda k: lambda: self._palette_action(("build", k)))(sk)))
+        makers = [s for s in self.structs if s.team == 0 and s.complete]
+        seen_units = set()
+        for s in makers:
+            for uk in self.sspec(0, s.kind).get("makes", []):
+                if uk in seen_units:
+                    continue
+                seen_units.add(uk)
+                uspec = self.uspec(0, uk)
+                cmds.append((f"Train: {uspec['name']}  ·  {uspec['cost']} ink",
+                             (lambda k: lambda: self._script_op(
+                                 {"op": "train", "unit": k}))(uk)))
+        for s in makers:
+            for up in self.sspec(0, s.kind).get("researches", []):
+                if up in self.upgrades[0] or (s.research and s.research[0] == up):
+                    continue
+                u = self.facdata(0)["upgrades"][up]
+                cmds.append((f"Research: {u['name']}  ·  {u['cost']} ink",
+                             (lambda st, uu: lambda: self._start_research(st, uu))(s, up)))
+        for sc in self.pal_scripts:
+            cmds.append((f"Script: {sc['name']}",
+                         (lambda ops: lambda: self._run_script(ops))(sc["ops"])))
+        return cmds
+
+    @staticmethod
+    def _fuzzy(q, label):
+        """Subsequence match score: higher is better, None = no match."""
+        if not q:
+            return 0
+        ql, ll = q.lower(), label.lower()
+        pos = -1; score = 0
+        for c in ql:
+            nxt = ll.find(c, pos + 1)
+            if nxt < 0:
+                return None
+            score += 3 if nxt == pos + 1 else 1     # reward runs
+            if nxt == 0 or ll[nxt - 1] in " :·":
+                score += 2                          # reward word starts
+            pos = nxt
+        return score
+
+    def _pal_filtered(self):
+        q = self.pal["q"]
+        scored = []
+        for i, (label, fn) in enumerate(self._pal_commands()):
+            sc = self._fuzzy(q, label)
+            if sc is not None:
+                scored.append((-sc, i, label, fn))
+        scored.sort()
+        return [(label, fn) for _, _, label, fn in scored[:12]]
+
+    def _pal_key(self, ev):
+        k = ev.key
+        if k == pygame.K_ESCAPE:
+            self.pal = None; return
+        rows = self._pal_filtered()
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if rows:
+                _, fn = rows[min(self.pal["sel"], len(rows) - 1)]
+                self.pal = None
+                fn()
+            else:
+                self.pal = None
+            return
+        if k == pygame.K_UP:
+            self.pal["sel"] = max(0, self.pal["sel"] - 1); return
+        if k == pygame.K_DOWN:
+            self.pal["sel"] = min(max(0, len(rows) - 1), self.pal["sel"] + 1); return
+        if k == pygame.K_BACKSPACE:
+            self.pal["q"] = self.pal["q"][:-1]; self.pal["sel"] = 0; return
+        ch = getattr(ev, "unicode", "")
+        if ch and ch.isprintable():
+            self.pal["q"] += ch; self.pal["sel"] = 0
+
+    def _draw_palette_overlay(self, screen):
+        t = self._ink_t("palette", self.pal is not None)
+        if t <= 0.001:
+            return
+        f = self.ctx["font"]; sf = self.ctx["sfont"]
+        rows = self._pal_filtered() if self.pal else []
+        w = min(560, self.W - 80)
+        h = 54 + 30 * max(1, len(rows))
+        box = pygame.Rect(self.W // 2 - w // 2, 64, w, h)
+        r = self._ink_panel(screen, box, t, fill=(24, 21, 30), edge=(190, 160, 90),
+                            anchor="topleft")
+        if r is None or t < 0.55 or not self.pal:
+            return
+        q = self.pal["q"] or ""
+        prompt = f.render("› " + q + "▏", True, (240, 230, 205))
+        screen.blit(prompt, (box.x + 16, box.y + 12))
+        pygame.draw.line(screen, (90, 78, 58), (box.x + 12, box.y + 40),
+                         (box.right - 12, box.y + 40), 1)
+        y = box.y + 48
+        for i, (label, _fn) in enumerate(rows):
+            hot = (i == self.pal["sel"])
+            if hot:
+                hr = pygame.Rect(box.x + 8, y - 3, box.w - 16, 27)
+                pygame.draw.rect(screen, (58, 48, 34), hr, border_radius=6)
+                pygame.draw.rect(screen, (190, 160, 90), hr, 1, border_radius=6)
+            screen.blit(sf.render(label, True,
+                                  (244, 234, 210) if hot else (196, 186, 168)),
+                        (box.x + 20, y))
+            y += 30
+        if not rows:
+            screen.blit(sf.render("no matching command", True, (150, 140, 126)),
+                        (box.x + 20, y))
+
+    # ── palette script executor (buildscript ethos: bad ops flash & skip) ───
+    def _run_script(self, ops):
+        for op in ops:
+            try:
+                self._script_op(op)
+            except Exception as ex:
+                self.flash(f"script op {op.get('op')}: {ex}")
+
+    def _script_op(self, op):
+        t = op.get("op")
+        if t == "flash":
+            self.flash(str(op.get("text", "")))
+        elif t == "select":
+            self._quick_action(op.get("what", "army"))
+        elif t == "camera":
+            if "x" in op and "y" in op:
+                self._centre_on(float(op["x"]), float(op["y"]))
+            else:
+                self._quick_action("base")
+        elif t == "stop":
+            for u in self._sel_units():
+                u.goal = None; u.target = None
+                u.attack_move = False; u.state = "idle"
+                u.stance = "aggressive"; u.patrol = None
+        elif t == "hold":
+            for u in self._sel_units():
+                u.goal = None; u.state = "idle"; u.stance = "hold"; u.patrol = None
+        elif t == "fog":
+            self.fog_on = not self.fog_on
+            if self.fog_on and self.fog:
+                self._update_fog(force=True)
+        elif t == "group":
+            n = int(op.get("n", 1))
+            if op.get("do", "select") == "assign":
+                self.groups[n] = [u for u in self.selected
+                                  if isinstance(u, Unit) and u.alive]
+            else:
+                self._select(list(self._group(n)))
+        elif t == "train":
+            uk = op.get("unit"); count = int(op.get("count", 1))
+            makers = [s for s in self.structs if s.team == 0 and s.complete
+                      and uk in self.sspec(0, s.kind).get("makes", [])]
+            if not makers:
+                self.flash(f"Nothing can train '{uk}'."); return
+            for _ in range(count):
+                s = min(makers, key=lambda s: len(s.queue))
+                self._queue_train(s, uk)
+        elif t == "research":
+            up = op.get("upgrade")
+            for s in self.structs:
+                if s.team == 0 and s.complete and                         up in self.sspec(0, s.kind).get("researches", []):
+                    self._start_research(s, up); return
+            self.flash(f"Nothing can research '{up}'.")
+        elif t == "build":
+            self._script_build(op.get("kind"))
+        else:
+            self.flash(f"Unknown script op '{t}'.")
+
+    def _script_build(self, sk):
+        """Auto-place a structure near the town hall at the first clear spot
+        (a widening ring search), assigning the nearest worker — so scripts can
+        raise buildings without a placement click."""
+        if sk not in self.facdata(0)["structures"]:
+            self.flash(f"Unknown structure '{sk}'."); return
+        spec = self.sspec(0, sk)
+        if not self._struct_available(0, sk):
+            self.flash(f"{spec['name']} requires more tech."); return
+        if self.ink[0] < spec["cost"]:
+            self.flash("Not enough ink."); return
+        hall = next((s for s in self.structs
+                     if s.team == 0 and s.kind == "scriptorium"), None)
+        workers = [u for u in self.units if u.team == 0 and u.worker and u.alive]
+        if hall is None or not workers:
+            self.flash("No base / no workers."); return
+        spot = None
+        for ring in range(1, 10):
+            rr = hall.r + spec["r"] + 24 + ring * 46
+            for k in range(10):
+                a = k / 10 * math.tau + ring * 0.35
+                wx = hall.x + math.cos(a) * rr
+                wy = hall.y + math.sin(a) * rr
+                if not self._placement_blocked(wx, wy, spec["r"]):
+                    spot = (wx, wy); break
+            if spot:
+                break
+        if spot is None:
+            self.flash("No room near the base."); return
+        wx, wy = spot
+        self.ink[0] -= spec["cost"]
+        st = Structure(sk, wx, wy, 0, complete=False, spec=spec)
+        self.structs.append(st); self.stats[0]["structs"] += 1
+        w = min(workers, key=lambda u: math.hypot(u.x - wx, u.y - wy))
+        w.goal = (wx, wy); w.state = "move"
+        self._sfx("deploy", 0.7)
+        self.flash(f"Raising {spec['name']}…")
+
     def _draw_msg(self, screen):
         f = self.ctx["font"]
+        t = self._ink_t("toast", self.msg_t > 0.25)
+        if t <= 0.001:
+            return
         lbl = f.render(self.msg, True, (245, 238, 222))
         bg = pygame.Rect(self.W // 2 - lbl.get_width() // 2 - 12, 14,
                          lbl.get_width() + 24, lbl.get_height() + 10)
-        s = pygame.Surface((bg.w, bg.h), pygame.SRCALPHA); s.fill((20, 16, 12, 180))
-        screen.blit(s, bg.topleft)
-        screen.blit(lbl, (bg.x + 12, bg.y + 5))
+        self._ink_panel(screen, bg, t, fill=(22, 18, 14), edge=(150, 128, 92),
+                        alpha=195)
+        if t > 0.6:
+            screen.blit(lbl, (bg.x + 12, bg.y + 5))
 
     def _draw_end(self, screen):
         f = self.ctx["bfont"]; nf = self.ctx["font"]; sf = self.ctx["sfont"]
