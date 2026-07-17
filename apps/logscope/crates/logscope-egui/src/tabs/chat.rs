@@ -4274,7 +4274,13 @@ impl Chat {
                                 crate::workspace_exec::Stop::StepLimit => "hit step limit".to_string(),
                                 crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
                             };
-                            self.note = format!("agent: {stop} · {touched} file(s) touched · :reapply to land them");
+                            // Snapshot the agent's work as a commit on the /tmp work branch — a diffable,
+                            // rollbackable point per run, before :reapply lands it on the real project.
+                            let snap = self.gitmind_session.as_ref()
+                                .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {task}")).ok())
+                                .unwrap_or(false);
+                            let snap_note = if snap { " · snapshotted" } else { "" };
+                            self.note = format!("agent: {stop} · {touched} file(s) touched{snap_note} · :reapply to land them");
                         }
                         Err(e) => self.note = format!(":agent — {e}"),
                     }
