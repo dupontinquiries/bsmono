@@ -924,6 +924,122 @@ pub fn seed_agent_branches(reaction: &str, base_goal: &str, max: usize) -> Vec<S
     goals
 }
 
+// ── multi-run fan (5): several agent branches spin up interleaved, folded/pruned to the keeper ───
+
+/// Per-branch scheduling state within a fan.
+enum BranchState { Ready(String), InFlight, Finished(Stop) }
+
+struct AgentBranch { run: AgentRun, state: BranchState, label: String }
+
+/// A read-only snapshot of one branch, for the UI to fold/prune on.
+#[derive(Clone, Debug)]
+pub struct BranchSummary {
+    pub index: usize,
+    pub label: String,
+    pub files: usize,
+    pub verified: bool,
+    pub finished: bool,
+    pub root: PathBuf,
+}
+
+/// What the fan wants next: submit a specific branch's prompt to the (single) worker, or everything's done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FanStep {
+    Submit { branch: usize, prompt: String },
+    AllDone,
+}
+
+/// A fan of agent branches sharing ONE inference worker (there's one local model). "Parallel" here means
+/// ROUND-ROBIN interleaving: exactly one branch generates at a time, and the scheduler rotates to the next
+/// ready branch on each `Evt::Done`, so all branches make progress turn-by-turn. Each branch edits its own
+/// isolated workspace (the caller passes pre-isolated dirs, one per `seed_agent_branches` goal), so they
+/// never clobber each other; when they all finish you fold/prune to the keeper and `:reapply` that one.
+///
+/// This is the agent form of the fleet's existing chat fan (`:ca`/`:continue-all`): serial through the
+/// worker, conceptually parallel branches, pruned on the convo graph afterward.
+pub struct AgentFan {
+    branches: Vec<AgentBranch>,
+    cursor: usize,
+    in_flight: Option<usize>,
+}
+
+impl AgentFan {
+    /// Build a fan from `(work_dir, task, label)` specs — one isolated workspace per branch. Nothing is
+    /// submitted yet; call `next` to get the first branch to run.
+    pub fn new(specs: Vec<(PathBuf, String, String)>, cfg: &AgentConfig) -> Self {
+        let branches = specs.into_iter().map(|(dir, task, label)| {
+            let (run, first) = AgentRun::start(dir, &task, cfg.clone());
+            AgentBranch { run, state: BranchState::Ready(first), label }
+        }).collect();
+        Self { branches, cursor: 0, in_flight: None }
+    }
+
+    pub fn len(&self) -> usize { self.branches.len() }
+    pub fn is_empty(&self) -> bool { self.branches.is_empty() }
+    pub fn active_branch(&self) -> Option<usize> { self.in_flight }
+    pub fn all_done(&self) -> bool { self.branches.iter().all(|b| matches!(b.state, BranchState::Finished(_))) }
+
+    /// Pick the next READY branch (round-robin from the cursor), mark it in-flight, and return its prompt to
+    /// submit. `AllDone` when no branch is ready and none is in flight.
+    pub fn next(&mut self) -> FanStep {
+        if self.in_flight.is_some() { return FanStep::AllDone; } // caller must wait for the in-flight Done
+        let n = self.branches.len();
+        for off in 0..n {
+            let i = (self.cursor + off) % n;
+            if matches!(self.branches[i].state, BranchState::Ready(_)) {
+                let prompt = match std::mem::replace(&mut self.branches[i].state, BranchState::InFlight) {
+                    BranchState::Ready(p) => p,
+                    _ => unreachable!(),
+                };
+                self.in_flight = Some(i);
+                self.cursor = (i + 1) % n;
+                return FanStep::Submit { branch: i, prompt };
+            }
+        }
+        FanStep::AllDone
+    }
+
+    /// Stream a token to whichever branch is in flight.
+    pub fn on_token(&mut self, t: &str) {
+        if let Some(i) = self.in_flight { self.branches[i].run.on_token(t); }
+    }
+
+    /// The in-flight branch's turn finished: advance it, then rotate to the next ready branch.
+    pub fn on_done(&mut self) -> FanStep {
+        if let Some(i) = self.in_flight.take() {
+            match self.branches[i].run.on_done() {
+                AgentStep::Submit(p) => self.branches[i].state = BranchState::Ready(p),
+                AgentStep::Finished(s) => self.branches[i].state = BranchState::Finished(s),
+            }
+        }
+        self.next()
+    }
+
+    /// The in-flight branch errored: finish it, then rotate.
+    pub fn on_error(&mut self, e: String) -> FanStep {
+        if let Some(i) = self.in_flight.take() {
+            let _ = self.branches[i].run.on_error(e.clone());
+            self.branches[i].state = BranchState::Finished(Stop::ModelError(e));
+        }
+        self.next()
+    }
+
+    /// Fold: a summary per branch for the prune UI.
+    pub fn summaries(&self) -> Vec<BranchSummary> {
+        self.branches.iter().enumerate().map(|(i, b)| BranchSummary {
+            index: i,
+            label: b.label.clone(),
+            files: b.run.events().len(),
+            verified: b.run.verified(),
+            finished: matches!(b.state, BranchState::Finished(_)),
+            root: b.run.root().to_path_buf(),
+        }).collect()
+    }
+
+    /// The workspace root of a branch (for `:reapply`-ing the keeper).
+    pub fn branch_root(&self, i: usize) -> Option<&Path> { self.branches.get(i).map(|b| b.run.root()) }
+}
+
 // ── real-model adapter: the loop over a local GGUF via llm_backend ───────────────────────────────
 
 /// Bridges [`Llm`] to the process-global active local model (`llm_backend::active_model`), so `run_agent`
@@ -1083,6 +1199,50 @@ mod tests {
         assert_eq!(s.plan.steps.len(), 2);
         assert_eq!(s.plan.steps[0].text, "create main.rs");
         assert!(s.verified, "verification off ⇒ vacuously verified");
+    }
+
+    #[test]
+    fn agent_fan_interleaves_branches_and_isolates_workspaces() {
+        let base = tmp("fan");
+        let (d0, d1) = (base.join("b0"), base.join("b1"));
+        std::fs::create_dir_all(&d0).unwrap();
+        std::fs::create_dir_all(&d1).unwrap();
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let mut fan = AgentFan::new(vec![
+            (d0.clone(), "goal A".into(), "anyhow".into()),
+            (d1.clone(), "goal B".into(), "thiserror".into()),
+        ], &cfg);
+        assert_eq!(fan.len(), 2);
+
+        // scripted per-branch replies: each writes its own file, then done
+        let replies: [[&str; 2]; 2] = [
+            ["```tool\n{\"tool\":\"write_file\",\"path\":\"a.rs\",\"contents\":\"//A\\n\"}\n```", "TASK_COMPLETE"],
+            ["```tool\n{\"tool\":\"write_file\",\"path\":\"b.rs\",\"contents\":\"//B\\n\"}\n```", "TASK_COMPLETE"],
+        ];
+        let mut turn_of = [0usize, 0usize];
+
+        let mut order = Vec::new();
+        let mut step = fan.next();
+        while let FanStep::Submit { branch, .. } = step {
+            order.push(branch);
+            let reply = replies[branch][turn_of[branch]];
+            turn_of[branch] += 1;
+            for ch in reply.chars() { fan.on_token(&ch.to_string()); }
+            step = fan.on_done();
+        }
+        assert_eq!(step, FanStep::AllDone);
+        // round-robin interleave: b0, b1, b0, b1
+        assert_eq!(order, vec![0, 1, 0, 1]);
+        assert!(fan.all_done());
+        // isolation: each branch wrote ONLY its own file into its own dir
+        assert!(d0.join("a.rs").exists() && !d0.join("b.rs").exists());
+        assert!(d1.join("b.rs").exists() && !d1.join("a.rs").exists());
+        // fold: two finished summaries with the right labels
+        let s = fan.summaries();
+        assert_eq!(s.len(), 2);
+        assert!(s.iter().all(|b| b.finished && b.files == 1));
+        assert_eq!(s[0].label, "anyhow");
+        assert_eq!(s[1].label, "thiserror");
     }
 
     #[test]

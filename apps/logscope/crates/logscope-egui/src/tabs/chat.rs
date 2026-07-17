@@ -800,6 +800,8 @@ pub struct Chat {
     agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
     agent_plan: Vec<(String, bool)>, // the agent's committed plan (2): (step text, done) — rendered as an in-scene checklist
     agent_run: Option<crate::workspace_exec::AgentRun>, // active NON-BLOCKING agent driver (channel-driven state machine)
+    agent_fan: Option<crate::workspace_exec::AgentFan>, // active MULTI-branch fan (parallel agent branches, round-robin)
+    agent_candidates: Vec<crate::workspace_exec::BranchSummary>, // folded branch summaries to prune to the keeper
     agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
     agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
     stream: Option<Stream>,
@@ -885,6 +887,8 @@ impl Default for Chat {
             agent_files: Vec::new(),
             agent_plan: Vec::new(),
             agent_run: None,
+            agent_fan: None,
+            agent_candidates: Vec::new(),
             agent_pending_submit: None,
             agent_task: String::new(),
             stream: None, last: None, ctx: Ctx::default(),
@@ -983,6 +987,37 @@ impl Chat {
     }
 
     pub fn apply_evt(&mut self, e: Evt) {
+        // FAN INTERCEPT: a multi-branch agent fan owns the worker while active — route to the scheduler,
+        // which rotates branches round-robin on each Done.
+        if self.agent_fan.is_some() {
+            use crate::workspace_exec::FanStep;
+            match e {
+                Evt::Token(t) => { if let Some(f) = self.agent_fan.as_mut() { f.on_token(&t); } return; }
+                Evt::Done { .. } => {
+                    let step = self.agent_fan.as_mut().map(|f| f.on_done());
+                    match step {
+                        Some(FanStep::Submit { branch, prompt }) => {
+                            if let Some(f) = self.agent_fan.as_ref() { self.note = format!("fan-agent: branch {} generating · {} branches", branch + 1, f.len()); }
+                            self.agent_pending_submit = Some(prompt);
+                        }
+                        Some(FanStep::AllDone) => self.finish_agent_fan(),
+                        None => {}
+                    }
+                    return;
+                }
+                Evt::Error(err) => {
+                    let step = self.agent_fan.as_mut().map(|f| f.on_error(err));
+                    match step {
+                        Some(FanStep::Submit { prompt, .. }) => self.agent_pending_submit = Some(prompt),
+                        Some(FanStep::AllDone) => self.finish_agent_fan(),
+                        None => {}
+                    }
+                    return;
+                }
+                Evt::Loaded(Ok(info)) => { self.template = info.template; return; }
+                Evt::Loaded(Err(_)) => { return; }
+            }
+        }
         // AGENT INTERCEPT: while a non-blocking agent run is active, its generation owns the Evt stream —
         // route tokens/turns to the driver instead of the chat message log. (The two can't run at once: one
         // model, one worker.)
@@ -1621,7 +1656,7 @@ impl Chat {
                 // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
                 // soon as the current reply finishes. This is what makes branching non-blocking. An active
                 // agent run owns the model too, so queue behind it rather than colliding.
-                if self.stream.is_some() || self.agent_run.is_some() { self.queue.push_back((qt, parent)); return; }
+                if self.stream.is_some() || self.agent_run.is_some() || self.agent_fan.is_some() { self.queue.push_back((qt, parent)); return; }
                 self.start_generation(qt, parent, infer, doc);
             }
         }
@@ -1771,6 +1806,20 @@ impl Chat {
         let vnote = if verified { " · ✓ verified" } else { " · ⚠ unverified" };
         let snap_note = if snap { " · snapshotted" } else { "" };
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
+    }
+
+    /// Finalize a fan: fold the per-branch summaries for pruning. Doesn't auto-land anything — the user
+    /// picks the keeper (:pick N) after comparing. Highlights which branches verified.
+    fn finish_agent_fan(&mut self) {
+        let fan = match self.agent_fan.take() { Some(f) => f, None => return };
+        self.agent_candidates = fan.summaries();
+        let verified = self.agent_candidates.iter().filter(|b| b.verified).count();
+        let n = self.agent_candidates.len();
+        // surface the winner-ish (most files among verified, else most files) as a hint
+        let best = self.agent_candidates.iter()
+            .max_by_key(|b| (b.verified as usize, b.files))
+            .map(|b| b.index + 1).unwrap_or(1);
+        self.note = format!("fan-agent: {n} branches done · {verified} verified · suggest branch {best} · :pick <n> to keep it");
     }
 
     /// Reveal a path in the desktop file manager (best-effort; Linux xdg-open, macOS open).
@@ -4059,7 +4108,7 @@ impl Chat {
             }
             Command::Stop => {
                 let n = self.queue.len(); self.queue.clear(); self.fan = None;
-                if self.agent_run.take().is_some() {
+                if self.agent_run.take().is_some() || self.agent_fan.take().is_some() {
                     self.agent_pending_submit = None;
                     self.pending_cancel = true; // stop the in-flight generation too
                     self.note = "agent run cancelled".into();
@@ -4363,6 +4412,64 @@ impl Chat {
                     self.agent_files.clear();
                     self.agent_plan.clear();
                     self.note = format!("agent started: {task} — planning…");
+                }
+            }
+            Command::FanAgent(task) => {
+                let task = task.trim().to_string();
+                if task.is_empty() {
+                    self.note = ":fan-agent needs a task (e.g. :fan-agent try it with anyhow and thiserror)".into();
+                } else if self.gitmind_session.is_none() {
+                    self.note = ":fan-agent — load a workspace first (:load-gitmind <path>)".into();
+                } else if self.agent_run.is_some() || self.agent_fan.is_some() || self.stream.is_some() {
+                    self.note = ":fan-agent — the model is busy (:stop to cancel)".into();
+                } else {
+                    // Seed parallel branch goals from the task/reaction (5): a multi-clause task fans into
+                    // several approaches. Each branch gets its OWN isolated workspace so they never clobber.
+                    let base_goal = self.msgs.iter().rev().find(|m| m.role == Role::User).map(|m| m.text().to_string()).unwrap_or_else(|| task.clone());
+                    let goals = crate::workspace_exec::seed_agent_branches(&task, &base_goal, 4);
+                    let goals = if goals.is_empty() { vec![task.clone()] } else { goals };
+                    let session = self.gitmind_session.as_ref().unwrap();
+                    let mount = match crate::mount::detect(&session.project) { Ok(m) => m, Err(e) => { self.note = format!(":fan-agent — {e}"); return; } };
+                    let fan_root = std::env::temp_dir().join("logscope-fan");
+                    let mut specs = Vec::new();
+                    for (i, goal) in goals.iter().enumerate() {
+                        match crate::mount::isolate(&mount, &fan_root.join(format!("branch{i}"))) {
+                            Ok(ws) => specs.push((ws.dir.clone(), goal.clone(), format!("branch {}", i + 1))),
+                            Err(e) => { self.note = format!(":fan-agent — isolate failed: {e}"); return; }
+                        }
+                    }
+                    let cfg = crate::workspace_exec::AgentConfig::default();
+                    let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg);
+                    self.agent_candidates.clear();
+                    self.agent_task = task.clone();
+                    match fan.next() {
+                        crate::workspace_exec::FanStep::Submit { prompt, .. } => {
+                            self.agent_pending_submit = Some(prompt);
+                            let n = fan.len();
+                            self.agent_fan = Some(fan);
+                            self.note = format!("fan-agent: {n} branches spinning up — planning…");
+                        }
+                        crate::workspace_exec::FanStep::AllDone => self.note = ":fan-agent — nothing to run".into(),
+                    }
+                }
+            }
+            Command::Pick(n) => {
+                if self.agent_candidates.is_empty() {
+                    self.note = ":pick — no fan candidates (run :fan-agent first)".into();
+                } else if n == 0 || n > self.agent_candidates.len() {
+                    self.note = format!(":pick <n> — choose 1..{}", self.agent_candidates.len());
+                } else if let Some(session) = self.gitmind_session.as_ref() {
+                    let cand = self.agent_candidates[n - 1].clone();
+                    let project = session.project.clone();
+                    match crate::gitmind_session::reapply_dir(&cand.root, &project, &format!("fan {}", cand.label)) {
+                        Ok(hash) => {
+                            self.agent_candidates.clear();
+                            self.note = format!("picked {} → commit {} · {} file(s) landed", cand.label, &hash[..hash.len().min(10)], cand.files);
+                        }
+                        Err(e) => self.note = format!(":pick — {e}"),
+                    }
+                } else {
+                    self.note = ":pick — no .gitmind session loaded".into();
                 }
             }
             Command::Reapply => match self.gitmind_session.take() {
@@ -4724,7 +4831,7 @@ impl Chat {
             if let Some(r) = &tick.reaction {
                 if r.is_cancel() {
                     infer.cancel(); // spoke over the model
-                    if self.agent_run.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
+                    if self.agent_run.take().is_some() || self.agent_fan.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
                 }
             }
         }
@@ -4799,7 +4906,7 @@ impl Chat {
         self.check_restore(); // first frame: offer to recover a crashed/closed conversation
         if self.pending_cancel { infer.cancel(); self.pending_cancel = false; }
         let streaming = self.stream.is_some();
-        if streaming || self.agent_run.is_some() { ui.ctx().request_repaint(); }
+        if streaming || self.agent_run.is_some() || self.agent_fan.is_some() { ui.ctx().request_repaint(); }
         self.pump_voice(infer, doc, ui, streaming); // mic → whisper → route utterances / barge-in (no-op when mic off)
         self.handle_modal(ui, infer, doc); // modal (vim) keys — both views; default Insert keeps typing free
 
@@ -5722,7 +5829,7 @@ impl Chat {
         if do_send { self.send(infer, doc, ui); }
         // Drain one queued (branch) turn as soon as the model is free — serial, but non-blocking from
         // the user's side: they fired it mid-generation and it runs the moment the current reply ends.
-        if self.stream.is_none() && self.agent_run.is_none() {
+        if self.stream.is_none() && self.agent_run.is_none() && self.agent_fan.is_none() {
             // Between rounds of a depth fan: once this round's generations have all finished and drained,
             // fire the next round on the NEW frontier (this is what makes :Nca / :Nfa go N deep).
             if self.queue.is_empty() && self.fan.is_some() { self.fan_step(); }
