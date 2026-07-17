@@ -227,6 +227,19 @@ impl Panel {
         None
     }
 
+    /// Update a Selector's option COUNT (e.g. the Ollama model list is discovered at runtime, after the
+    /// Panel is built with a placeholder count). No-op for non-selectors. Clamps the current index down if
+    /// the list shrank so it never points past the end.
+    pub fn set_selector_count(&mut self, id: usize, n: usize) {
+        let n = n.max(1);
+        if let Some(c) = self.get_mut(id) {
+            if let ControlKind::Selector(_) = c.kind {
+                c.kind = ControlKind::Selector(n);
+                c.index = c.index.min(n - 1);
+            }
+        }
+    }
+
     /// Sync a selector's option from outside (e.g. theme changed by a command, not a press).
     pub fn set_index(&mut self, id: usize, index: usize) {
         if let Some(c) = self.get_mut(id) {
