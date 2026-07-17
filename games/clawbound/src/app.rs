@@ -14,6 +14,43 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use clawbound_rs::math::{look_at, perspective, v3};
 use clawbound_rs::sim::Game;
 
+/// Small vector icons for the buff badges — a paw print, a shield, three claw
+/// marks — drawn with egui shapes so the HUD reads at a glance instead of just
+/// text, without needing an image-asset pipeline.
+fn icon_paw(ui: &mut egui::Ui, color: egui::Color32) {
+    use egui::{epaint::CircleShape, pos2, Shape};
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    let p = ui.painter();
+    p.add(Shape::Circle(CircleShape::filled(pos2(c.x, c.y + 3.0), 5.0, color)));
+    for (dx, dy, r) in [(-5.5, -3.0, 2.6), (-1.8, -5.5, 2.6), (1.8, -5.5, 2.6), (5.5, -3.0, 2.6)] {
+        p.add(Shape::Circle(CircleShape::filled(pos2(c.x + dx, c.y + dy), r * 0.62, color)));
+    }
+}
+fn icon_pelt(ui: &mut egui::Ui, color: egui::Color32) {
+    use egui::{epaint::PathShape, pos2, Shape};
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    let pts = vec![
+        pos2(c.x, c.y - 7.0), pos2(c.x + 6.0, c.y - 4.5), pos2(c.x + 6.0, c.y + 1.5),
+        pos2(c.x, c.y + 7.0), pos2(c.x - 6.0, c.y + 1.5), pos2(c.x - 6.0, c.y - 4.5),
+    ];
+    ui.painter().add(Shape::Path(PathShape::convex_polygon(pts, color, egui::Stroke::NONE)));
+}
+fn icon_claw(ui: &mut egui::Ui, color: egui::Color32) {
+    use egui::{pos2, Shape, Stroke};
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    for dx in [-4.0f32, 0.0, 4.0] {
+        ui.painter().add(Shape::line_segment([pos2(c.x + dx - 2.0, c.y - 6.0), pos2(c.x + dx + 2.0, c.y + 6.0)], Stroke::new(2.2, color)));
+    }
+}
+/// Draw the right icon for a `Power` buff badge.
+fn icon_power(ui: &mut egui::Ui, power: clawbound_rs::powerup::Power, color: egui::Color32) {
+    use clawbound_rs::powerup::Power;
+    match power { Power::Speed => icon_paw(ui, color), Power::Shield => icon_pelt(ui, color), Power::Triple => icon_claw(ui, color) }
+}
+
 #[derive(Default)]
 struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, ability: bool, mleft: bool, mmiddle: bool, mright: bool }
 impl Keys {
@@ -576,7 +613,13 @@ impl State {
                     let mut buffs = String::new();
                     if b_speed { buffs.push_str("PAW "); }
                     if b_shield { buffs.push_str("PELT "); }
-                    if !buffs.is_empty() { ui.label(RichText::new(buffs).size(13.0).strong().color(Color32::from_rgb(120, 200, 255))); }
+                    if !buffs.is_empty() {
+                        ui.horizontal(|ui| {
+                            if b_speed { icon_power(ui, clawbound_rs::powerup::Power::Speed, Color32::from_rgb(255, 214, 120)); }
+                            if b_shield { icon_power(ui, clawbound_rs::powerup::Power::Shield, Color32::from_rgb(120, 200, 255)); }
+                            ui.label(RichText::new(buffs).size(13.0).strong().color(Color32::from_rgb(120, 200, 255)));
+                        });
+                    }
                     let pv_state = if pv_name == "Nine Lives" { if pv_used { " (spent)" } else { " (ready)" } } else { "" };
                     ui.label(RichText::new(format!("Passive · {pv_name}{pv_state}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
                     ui.label(RichText::new(pv_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
@@ -761,8 +804,15 @@ impl State {
                     let mut pu = String::new();
                     if b_speed { pu.push_str("PAW "); }
                     if b_shield { pu.push_str("PELT "); }
-                    if b_triple { pu.push_str("3X "); }
-                    if !pu.is_empty() { ui.label(RichText::new(pu).size(13.0).strong().color(Color32::from_rgb(255, 224, 120))); }
+                    if b_triple { pu.push_str("CLAW "); }
+                    if !pu.is_empty() {
+                        ui.horizontal(|ui| {
+                            if b_speed { icon_power(ui, clawbound_rs::powerup::Power::Speed, Color32::from_rgb(255, 214, 120)); }
+                            if b_shield { icon_power(ui, clawbound_rs::powerup::Power::Shield, Color32::from_rgb(120, 200, 255)); }
+                            if b_triple { icon_power(ui, clawbound_rs::powerup::Power::Triple, Color32::from_rgb(255, 106, 207)); }
+                            ui.label(RichText::new(pu).size(13.0).strong().color(Color32::from_rgb(255, 224, 120)));
+                        });
+                    }
                     if cd > 0.0 { ui.label(RichText::new(format!("firecracker {:.1}s", cd)).size(12.0).color(Color32::from_rgb(230, 150, 120))); }
                     else { ui.label(RichText::new("firecracker READY").size(12.0).color(Color32::from_rgb(150, 220, 150))); }
                     let (ustate, ucol) = if ult_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ult_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
