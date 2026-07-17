@@ -1,0 +1,52 @@
+{
+  "parts": {
+    "sail": {
+      "desc": "a tall dorsal fin/sail rising from the back — sail-lizards, ships, ridge-backs",
+      "kind": "poly",
+      "points": [[-0.55, 0.05], [-0.15, -1.05], [0.25, -0.85], [0.5, 0.05]],
+      "raised": true, "thick": 2, "tone_mult": 1.08, "sway": 0.10
+    },
+    "horn": {
+      "desc": "a single curved horn sweeping up and back",
+      "kind": "poly",
+      "points": [[-0.12, 0.0], [0.35, -0.55], [0.75, -0.95], [0.55, -0.5], [0.15, -0.05]],
+      "raised": true, "thick": 1, "tone_mult": 1.35
+    },
+    "claw": {
+      "desc": "a paired forward talon — raptors, crabs, war machines",
+      "kind": "poly",
+      "points": [[0.0, 0.0], [0.55, 0.1], [0.85, 0.45], [0.5, 0.32], [0.1, 0.22]],
+      "pair": true, "thick": 1, "tone_mult": 0.8
+    },
+    "banner": {
+      "desc": "a fluttering pennant on a short staff — standards, war-rigs, heralds",
+      "kind": "poly",
+      "points": [[0.0, 0.1], [0.05, -1.1], [0.85, -0.95], [0.45, -0.75], [0.8, -0.55], [0.08, -0.6]],
+      "raised": true, "thick": 2, "tone_mult": 1.2, "sway": 0.22
+    },
+    "halo": {
+      "desc": "a floating ring above the crown — spirits, saints, constructs",
+      "kind": "lines",
+      "points": [[-0.45, -1.1], [-0.2, -1.28], [0.2, -1.28], [0.45, -1.1], [0.2, -0.95], [-0.2, -0.95], [-0.45, -1.1]],
+      "raised": true, "thick": 2, "tone_mult": 1.5, "sway": 0.06
+    },
+    "plume": {
+      "desc": "an arcing feather spray — headdresses, tails, fountains",
+      "kind": "poly",
+      "points": [[0.0, 0.0], [-0.35, -0.7], [-0.15, -1.0], [0.12, -0.75], [0.4, -0.95], [0.42, -0.55], [0.18, -0.15]],
+      "raised": true, "thick": 1, "tone_mult": 1.15, "sway": 0.16, "flap": 0.12
+    },
+    "plate": {
+      "desc": "an angled armour slab hung on the flank — knights, beetles, siege hulls",
+      "kind": "prism",
+      "points": [[-0.65, -0.3], [0.6, -0.42], [0.72, 0.34], [-0.55, 0.4]],
+      "thick": 1, "tone_mult": 0.85
+    },
+    "fang": {
+      "desc": "a paired down-curving tusk/fang under the head",
+      "kind": "lines",
+      "points": [[0.15, 0.0], [0.32, 0.3], [0.28, 0.55]],
+      "pair": true, "raised": true, "thick": 3, "tone_mult": 1.45
+    }
+  }
+}

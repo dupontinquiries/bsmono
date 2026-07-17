@@ -51,6 +51,75 @@ _ATY = (-1.8, 1.4)      # local y anchor range
 
 _DRAW = {}              # injected: {"prism":fn, "poly":fn, "shade":fn}
 
+# ── JSON-defined parts ───────────────────────────────────────────────────────
+# Beyond the built-ins above, extra parts can ship as DATA in parts.json beside
+# this module (and packs may layer more via load_parts_json). A JSON part is a
+# small template the generic renderer folds like any built-in:
+#
+#   "sail": {
+#     "desc":  "a tall dorsal fin",
+#     "kind":  "poly",                  # poly | prism | lines | disc
+#     "points": [[-0.5, 0.1], [0.0, -1.1], [0.5, 0.1]],   # body-local, ×size
+#     "raised": true,                   # sit on top of the body height (y -= h)
+#     "pair":  false,                   # draw twice, mirrored about the anchor
+#     "thick": 2,                       # outline weight (poly) / line width
+#     "tone_mult": 1.0,                 # multiplies the recipe's tone
+#     "sway":  0.12,                    # idle sway amplitude (breathe-driven)
+#     "flap":  0.0                      # flap coupling (wing-like motion)
+#   }
+#
+# Registered names join PART_TYPES, so fold_sanitize() accepts them and the AI
+# Director / pack editor can use them exactly like built-ins.
+_JSON_PARTS = {}
+
+def load_parts_json(path=None, merge=True):
+    """Load extra part templates from JSON. Missing file is fine (returns 0).
+    Bad entries are skipped, never fatal — same tolerance as fold_sanitize."""
+    import json, os
+    if path is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "parts.json")
+    try:
+        with open(path) as fh:
+            doc = json.load(fh)
+    except Exception:
+        return 0
+    n = 0
+    for name, spec in (doc.get("parts", doc) or {}).items():
+        try:
+            name = str(name).lower()
+            if not name or name in PART_TYPES and name not in _JSON_PARTS and not merge:
+                continue
+            kind = spec.get("kind", "poly")
+            if kind not in ("poly", "prism", "lines", "disc"):
+                continue
+            pts = spec.get("points", [])
+            if kind in ("poly", "prism", "lines"):
+                pts = [(float(p[0]), float(p[1])) for p in pts]
+                if kind in ("poly", "prism") and len(pts) < 3:
+                    continue
+                if kind == "lines" and len(pts) < 2:
+                    continue
+            _JSON_PARTS[name] = {
+                "kind": kind,
+                "points": pts,
+                "radius": float(spec.get("radius", 0.4)),
+                "raised": bool(spec.get("raised", False)),
+                "pair": bool(spec.get("pair", False)),
+                "thick": int(spec.get("thick", 2)),
+                "tone_mult": float(spec.get("tone_mult", 1.0)),
+                "sway": float(spec.get("sway", 0.0)),
+                "flap": float(spec.get("flap", 0.0)),
+            }
+            PART_TYPES.add(name)
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+def json_part_names():
+    return sorted(_JSON_PARTS.keys())
+
 
 def bind_drawing(draw_prism, draw_poly_paper, shade):
     """Wire in the game's paper-drawing helpers (called once at import time)."""
@@ -455,7 +524,44 @@ def draw_part(screen, part, x, y, s, f, base, hgt, tnow, flap, anim=None):
     elif pt == "orb":
         import pygame
         pygame.draw.circle(screen, shade(base, tone), (int(cx), int(cy - ph)), max(2, int(ps)))
+    elif pt in _JSON_PARTS:
+        # ── generic renderer for JSON-defined parts ──
+        spec = _JSON_PARTS[pt]
+        col2 = shade(base, tone * spec["tone_mult"])
+        base_y = cy - ph if spec["raised"] else cy
+        # idle sway (breathe-driven) and optional flap coupling
+        sway = 0.0
+        if anim and spec["sway"]:
+            sway = anim.get("breathe", 0.0) * spec["sway"]
+        lift2 = flap * ps * spec["flap"]
+        ca, sa = math.cos(ang + sway), math.sin(ang + sway)
+        def _tx(p, mirror):
+            lx, ly = p[0] * ps * mirror, p[1] * ps - lift2
+            return (cx + (lx * ca - ly * sa) * f, base_y + lx * sa + ly * ca)
+        mirrors = (1, -1) if spec["pair"] else (1,)
+        for mir in mirrors:
+            if spec["kind"] == "disc":
+                import pygame
+                px, py = _tx((0.0, 0.0), mir)
+                pygame.draw.circle(screen, col2, (int(px), int(py)),
+                                   max(2, int(spec["radius"] * ps)))
+            elif spec["kind"] == "lines":
+                import pygame
+                pts2 = [_tx(p, mir) for p in spec["points"]]
+                pygame.draw.lines(screen, col2, False, pts2,
+                                  max(1, int(spec["thick"])))
+            elif spec["kind"] == "prism":
+                r2 = prism(screen, [_tx(p, mir) for p in spec["points"]], ph, col2)
+                if not spec["pair"]:
+                    return r2
+            else:   # poly
+                poly(screen, [_tx(p, mir) for p in spec["points"]], col2,
+                     thick=spec["thick"])
     return None
+
+
+# auto-load the base parts.json beside this module (extra parts ship as data)
+load_parts_json()
 
 
 if __name__ == "__main__":
