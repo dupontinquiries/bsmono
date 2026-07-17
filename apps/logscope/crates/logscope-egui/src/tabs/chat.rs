@@ -799,6 +799,9 @@ pub struct Chat {
     gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
     agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
     agent_plan: Vec<(String, bool)>, // the agent's committed plan (2): (step text, done) — rendered as an in-scene checklist
+    agent_run: Option<crate::workspace_exec::AgentRun>, // active NON-BLOCKING agent driver (channel-driven state machine)
+    agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
+    agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -881,6 +884,9 @@ impl Default for Chat {
             gitmind_session: None,
             agent_files: Vec::new(),
             agent_plan: Vec::new(),
+            agent_run: None,
+            agent_pending_submit: None,
+            agent_task: String::new(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -977,6 +983,38 @@ impl Chat {
     }
 
     pub fn apply_evt(&mut self, e: Evt) {
+        // AGENT INTERCEPT: while a non-blocking agent run is active, its generation owns the Evt stream —
+        // route tokens/turns to the driver instead of the chat message log. (The two can't run at once: one
+        // model, one worker.)
+        if self.agent_run.is_some() {
+            match e {
+                Evt::Token(t) => { if let Some(r) = self.agent_run.as_mut() { r.on_token(&t); } return; }
+                Evt::Done { .. } => {
+                    let stepv = self.agent_run.as_mut().map(|r| r.on_done());
+                    match stepv {
+                        Some(crate::workspace_exec::AgentStep::Submit(prompt)) => {
+                            // reflect live progress, then queue the next turn's prompt for sync_worker
+                            if let Some(r) = self.agent_run.as_ref() {
+                                self.agent_files = r.events().to_vec();
+                                self.agent_plan = r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect();
+                                self.note = format!("agent: turn {} · {} file(s)…", r.turns(), r.events().len());
+                            }
+                            self.agent_pending_submit = Some(prompt);
+                        }
+                        Some(crate::workspace_exec::AgentStep::Finished(stop)) => self.finish_agent_run(stop),
+                        None => {}
+                    }
+                    return;
+                }
+                Evt::Error(err) => {
+                    let stepv = self.agent_run.as_mut().map(|r| r.on_error(err));
+                    if let Some(crate::workspace_exec::AgentStep::Finished(stop)) = stepv { self.finish_agent_run(stop); }
+                    return;
+                }
+                Evt::Loaded(Ok(info)) => { self.template = info.template; return; }
+                Evt::Loaded(Err(_)) => { return; }
+            }
+        }
         match e {
             Evt::Token(t) => {
                 let mut stop = false;
@@ -1581,8 +1619,9 @@ impl Chat {
                 // Branch point: a human interjection forks off the selected node (or the previous tip).
                 let parent = self.branch_from.take().or(self.active_leaf).or(self.msgs.len().checked_sub(1));
                 // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
-                // soon as the current reply finishes. This is what makes branching non-blocking.
-                if self.stream.is_some() { self.queue.push_back((qt, parent)); return; }
+                // soon as the current reply finishes. This is what makes branching non-blocking. An active
+                // agent run owns the model too, so queue behind it rather than colliding.
+                if self.stream.is_some() || self.agent_run.is_some() { self.queue.push_back((qt, parent)); return; }
                 self.start_generation(qt, parent, infer, doc);
             }
         }
@@ -1705,6 +1744,33 @@ impl Chat {
         if self.sent_backend != Some(self.backend) { infer.set_backend(self.backend); self.sent_backend = Some(self.backend); }
         let key = (self.ctx.n_ctx, self.ctx.max_tokens, (self.ctx.temperature * 100.0) as i32, self.ctx.history_turns);
         if self.sent_params != Some(key) { infer.set_params(self.params()); self.sent_params = Some(key); }
+        // Drain a queued agent prompt (initial or next-turn) to the worker — this is where the non-blocking
+        // agent actually submits generations, since `infer` is in scope here every frame.
+        if let Some(prompt) = self.agent_pending_submit.take() { infer.generate(prompt); }
+    }
+
+    /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
+    fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
+        let (files, plan, verified, turns) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns()),
+            None => return,
+        };
+        self.agent_files = files;
+        self.agent_plan = plan;
+        let touched = self.agent_files.len();
+        let done = self.agent_plan.iter().filter(|(_, d)| *d).count();
+        let total = self.agent_plan.len();
+        let stopdesc = match &stop {
+            crate::workspace_exec::Stop::Done => "done".to_string(),
+            crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
+            crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
+        };
+        let snap = self.gitmind_session.as_ref()
+            .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {}", self.agent_task)).ok())
+            .unwrap_or(false);
+        let vnote = if verified { " · ✓ verified" } else { " · ⚠ unverified" };
+        let snap_note = if snap { " · snapshotted" } else { "" };
+        self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
 
     /// Reveal a path in the desktop file manager (best-effort; Linux xdg-open, macOS open).
@@ -3991,7 +4057,16 @@ impl Chat {
                     self.note = format!("fuzzy-all depth {depth} × width {width} — fanning (:stop to cancel)");
                 }
             }
-            Command::Stop => { let n = self.queue.len(); self.queue.clear(); self.fan = None; self.note = format!("stopped — cleared {n} queued, fan cancelled"); }
+            Command::Stop => {
+                let n = self.queue.len(); self.queue.clear(); self.fan = None;
+                if self.agent_run.take().is_some() {
+                    self.agent_pending_submit = None;
+                    self.pending_cancel = true; // stop the in-flight generation too
+                    self.note = "agent run cancelled".into();
+                } else {
+                    self.note = format!("stopped — cleared {n} queued, fan cancelled");
+                }
+            }
             // :continue [N] / :cont — deepen the FOCUSED line N times. Unlike :ca (every leaf), this pins the
             // fan to the current line via `only`, and fan_step descends to that line's live tip each round.
             Command::Continue(n) => {
@@ -4271,44 +4346,23 @@ impl Chat {
                     self.note = ":agent needs a task (e.g. :agent add a unit test for the parser)".into();
                 } else if self.gitmind_session.is_none() {
                     self.note = ":agent — load a workspace first (:load-gitmind <path>), then :agent <task>".into();
+                } else if self.agent_run.is_some() {
+                    self.note = ":agent — a run is already active (:stop to cancel it first)".into();
+                } else if self.stream.is_some() {
+                    self.note = ":agent — the model is busy; wait for the reply or :stop".into();
                 } else {
-                    // Build the sandboxed exec surface over the session's isolated /tmp workspace and run the
-                    // local-LLM tool-calling loop. Params come from the live Ctx dials so the physical panel
-                    // drives the agent too. NOTE: this call blocks the frame for the duration of the loop —
-                    // acceptable for a first cut / short tasks; the next step is to run it on the inference
-                    // worker (same seam as :ca fan-out) and stream turns into the transcript.
+                    // NON-BLOCKING: build the driver over the session's isolated /tmp workspace and hand its
+                    // first prompt to the inference worker. The Evt loop (apply_evt) advances it turn by turn
+                    // via on_token/on_done; the frame never blocks, and :stop / barge-in interrupt it.
                     let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
-                    let mut ws = crate::workspace_exec::Workspace::new(work_dir);
-                    let params = logscope::llm_backend::GenParams {
-                        max_tokens: self.ctx.max_tokens as usize,
-                        n_ctx: self.ctx.n_ctx,
-                        n_batch: self.ctx.n_ctx,
-                        temperature: self.ctx.temperature,
-                        ..Default::default()
-                    };
-                    // Default config: plan-then-act, verify-as-you-go (cargo check after each Rust write),
-                    // full reads (local compute is cheap), done gated on a green check.
                     let cfg = crate::workspace_exec::AgentConfig::default();
-                    match crate::workspace_exec::run_local_agent(&mut ws, &task, &cfg, params) {
-                        Ok(session) => {
-                            self.agent_files = session.files.clone();
-                            self.agent_plan = session.plan.steps.iter().map(|s| (s.text.clone(), s.done)).collect();
-                            let touched = session.files.len();
-                            let (pd, pt) = session.plan.progress();
-                            let stop = match &session.stop {
-                                crate::workspace_exec::Stop::Done => "done".to_string(),
-                                crate::workspace_exec::Stop::StepLimit => "hit step limit".to_string(),
-                                crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
-                            };
-                            let snap = self.gitmind_session.as_ref()
-                                .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {task}")).ok())
-                                .unwrap_or(false);
-                            let snap_note = if snap { " · snapshotted" } else { "" };
-                            let vnote = if session.verified { " · ✓ verified" } else { " · ⚠ unverified" };
-                            self.note = format!("agent: {stop} · plan {pd}/{pt} · {touched} file(s){vnote}{snap_note} · :reapply to land");
-                        }
-                        Err(e) => self.note = format!(":agent — {e}"),
-                    }
+                    let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
+                    self.agent_run = Some(run);
+                    self.agent_task = task.clone();
+                    self.agent_pending_submit = Some(first);
+                    self.agent_files.clear();
+                    self.agent_plan.clear();
+                    self.note = format!("agent started: {task} — planning…");
                 }
             }
             Command::Reapply => match self.gitmind_session.take() {
@@ -4667,7 +4721,12 @@ impl Chat {
             None => return,
         };
         if streaming {
-            if let Some(r) = &tick.reaction { if r.is_cancel() { infer.cancel(); } } // spoke over the model
+            if let Some(r) = &tick.reaction {
+                if r.is_cancel() {
+                    infer.cancel(); // spoke over the model
+                    if self.agent_run.take().is_some() { self.agent_pending_submit = None; self.note = "agent run cancelled (barge-in)".into(); }
+                }
+            }
         }
         for u in tick.utterances { self.on_voice_utterance(u, infer, doc, ui, streaming); }
     }
@@ -4740,7 +4799,7 @@ impl Chat {
         self.check_restore(); // first frame: offer to recover a crashed/closed conversation
         if self.pending_cancel { infer.cancel(); self.pending_cancel = false; }
         let streaming = self.stream.is_some();
-        if streaming { ui.ctx().request_repaint(); }
+        if streaming || self.agent_run.is_some() { ui.ctx().request_repaint(); }
         self.pump_voice(infer, doc, ui, streaming); // mic → whisper → route utterances / barge-in (no-op when mic off)
         self.handle_modal(ui, infer, doc); // modal (vim) keys — both views; default Insert keeps typing free
 
@@ -5663,7 +5722,7 @@ impl Chat {
         if do_send { self.send(infer, doc, ui); }
         // Drain one queued (branch) turn as soon as the model is free — serial, but non-blocking from
         // the user's side: they fired it mid-generation and it runs the moment the current reply ends.
-        if self.stream.is_none() {
+        if self.stream.is_none() && self.agent_run.is_none() {
             // Between rounds of a depth fan: once this round's generations have all finished and drained,
             // fire the next round on the NEW frontier (this is what makes :Nca / :Nfa go N deep).
             if self.queue.is_empty() && self.fan.is_some() { self.fan_step(); }
