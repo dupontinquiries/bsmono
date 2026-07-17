@@ -699,88 +699,161 @@ fn observation(results: &[(Tool, ToolResult)]) -> String {
     s
 }
 
+/// Process ONE turn given the model's completed `text`: append it to the running `prompt`, capture the
+/// plan if not yet seen, run any tool calls against `ws`, fold in verify-as-you-go, and decide whether the
+/// run terminates. Shared by the synchronous `run_agent_cfg` and the async `AgentRun` so there's ONE
+/// implementation of the loop body. Returns the executed (tool, result) pairs and `Some(stop)` if the run
+/// should end this turn. Mutates `prompt`/`plan`/`verified` in place.
+fn step_turn(
+    text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
+    plan: &mut Plan, verified: &mut bool, step: usize,
+) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
+    prompt.push_str("\n\nASSISTANT:\n");
+    prompt.push_str(text);
+
+    if plan.is_empty() {
+        let p = parse_plan(text);
+        if !p.is_empty() { *plan = p; }
+    }
+
+    let tools = parse_tools(text);
+
+    // Done handling — gated on verification (6).
+    if text.contains(DONE_MARKER) && tools.is_empty() {
+        if !cfg.gate_done_on_verify || *verified {
+            return (Vec::new(), Some(Stop::Done));
+        } else {
+            prompt.push_str(&format!("\n\n(Not accepted: `{}` is not green yet. Fix the errors, then reply {DONE_MARKER}.)\n", cfg.verify_cmd.join(" ")));
+            return (Vec::new(), None);
+        }
+    }
+
+    if tools.is_empty() {
+        prompt.push_str("\n\n(No tool call parsed. Emit a ```tool block, or reply TASK_COMPLETE.)\n");
+        return (Vec::new(), None);
+    }
+
+    let mut results = Vec::new();
+    let mut wrote_verifiable = false;
+    for tool in tools {
+        if let Tool::WriteFile { path, .. } = &tool {
+            if cfg.verify_exts.iter().any(|e| path.rsplit('.').next() == Some(e.as_str())) {
+                wrote_verifiable = true;
+            }
+        }
+        let res = ws.apply(&tool);
+        results.push((tool, res));
+    }
+    prompt.push_str(&observation(&results));
+
+    // Verify-as-you-go (1): don't verify on the final step (the model can't act on it).
+    if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
+        let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
+        *verified = vres.ok;
+        prompt.push_str(&format!(
+            "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
+            cfg.verify_cmd.join(" "),
+            if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
+            vres.output,
+        ));
+    }
+
+    plan.advance();
+    (results, None)
+}
+
 /// Back-compat: run with defaults but an explicit step budget.
 pub fn run_agent(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, max_steps: usize) -> Session {
     run_agent_cfg(llm, ws, task, &AgentConfig { max_steps, ..Default::default() })
 }
 
-/// Run the agentic loop with full configuration. The model drives tool calls against `ws` until it prints
-/// `TASK_COMPLETE` (gated on verification if configured), errors, or hits `cfg.max_steps`. Pure w.r.t. the
-/// model (any `Llm`), so it unit-tests with a scripted model. Implements plan-then-act (2), verify-as-you-go
-/// (1), and done-gating (6); read-mode (4) is carried in the system prompt.
+/// Run the agentic loop with full configuration (SYNCHRONOUS — blocks until done; used by tests and the
+/// blocking `:agent` path). Pure w.r.t. the model. See `AgentRun` for the non-blocking, interruptible
+/// driver that shares the same `step_turn` body.
 pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &AgentConfig) -> Session {
     let mut prompt = system_prompt(task, cfg);
     let mut turns = Vec::new();
     let mut plan = Plan::default();
-    let mut verified = cfg.verify_cmd.is_empty(); // vacuously "verified" when verification is off
+    let mut verified = cfg.verify_cmd.is_empty();
 
     for step in 0..cfg.max_steps {
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified },
         };
-        prompt.push_str("\n\nASSISTANT:\n");
-        prompt.push_str(&text);
-
-        // Capture the plan from the first turn that carries one (2).
-        if plan.is_empty() {
-            let p = parse_plan(&text);
-            if !p.is_empty() { plan = p; }
-        }
-
-        let tools = parse_tools(&text);
-
-        // Done handling — gated on verification (6): a claim of done is only honored if the last verify
-        // was green (or verification is off). Otherwise we nudge the model to fix it first.
-        if text.contains(DONE_MARKER) && tools.is_empty() {
-            if !cfg.gate_done_on_verify || verified {
-                turns.push(Turn { model_text: text, results: Vec::new() });
-                return Session { turns, stop: Stop::Done, files: ws.events().to_vec(), plan, verified };
-            } else {
-                prompt.push_str(&format!("\n\n(Not accepted: `{}` is not green yet. Fix the errors, then reply {DONE_MARKER}.)\n", cfg.verify_cmd.join(" ")));
-                turns.push(Turn { model_text: text, results: Vec::new() });
-                continue;
-            }
-        }
-
-        let mut results = Vec::new();
-        if tools.is_empty() {
-            prompt.push_str("\n\n(No tool call parsed. Emit a ```tool block, or reply TASK_COMPLETE.)\n");
-            turns.push(Turn { model_text: text, results });
-            continue;
-        }
-
-        let mut wrote_verifiable = false;
-        for tool in tools {
-            if let Tool::WriteFile { path, .. } = &tool {
-                if cfg.verify_exts.iter().any(|e| path.rsplit('.').next() == Some(e.as_str())) {
-                    wrote_verifiable = true;
-                }
-            }
-            let res = ws.apply(&tool);
-            results.push((tool, res));
-        }
-        prompt.push_str(&observation(&results));
-
-        // Verify-as-you-go (1): if this turn wrote a verifiable file, run the check now and fold the result
-        // back — the model sees compiler errors every turn instead of being trusted to self-check. This is
-        // the last step's budget too: don't verify on the final iteration if it can't act on it.
-        if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
-            let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
-            verified = vres.ok;
-            prompt.push_str(&format!(
-                "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
-                cfg.verify_cmd.join(" "),
-                if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
-                vres.output,
-            ));
-        }
-
-        plan.advance();
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step);
         turns.push(Turn { model_text: text, results });
+        if let Some(stop) = stop {
+            return Session { turns, stop, files: ws.events().to_vec(), plan, verified };
+        }
     }
 
     Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified }
+}
+
+// ── async driver (non-blocking, interruptible): the agent as a channel-driven state machine ──────
+
+/// What the async driver wants next after a completed model turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentStep {
+    /// Submit this prompt to the inference worker for the next turn.
+    Submit(String),
+    /// The run is finished (done / step limit / model error).
+    Finished(Stop),
+}
+
+/// The non-blocking agent driver. It owns the workspace + growing context but NOT the model: the model
+/// lives on the `Inference` worker thread (which may hold `!Send` GPU state), and this driver talks to it
+/// over the same `Cmd::Generate`/`Evt` channel the chat uses — so the frame never blocks and the existing
+/// cancel/barge-in interrupts a run for free (just drop the `AgentRun`). One model turn per `on_done`.
+///
+/// Lifecycle: `start` → submit its `first prompt` to the worker → feed tokens via `on_token` → on the
+/// worker's `Done`, call `on_done` and act on the returned `AgentStep` (submit the next prompt, or finish).
+pub struct AgentRun {
+    ws: Workspace,
+    cfg: AgentConfig,
+    prompt: String,   // the growing context window
+    reply: String,    // accumulates this turn's streamed tokens
+    plan: Plan,
+    verified: bool,
+    step: usize,
+    turns: usize,
+}
+
+impl AgentRun {
+    /// Begin a run over `work_dir`. Returns the driver plus the first prompt to submit to the worker.
+    pub fn start(work_dir: impl Into<std::path::PathBuf>, task: &str, cfg: AgentConfig) -> (Self, String) {
+        let prompt = system_prompt(task, &cfg);
+        let verified = cfg.verify_cmd.is_empty();
+        let run = Self {
+            ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
+            plan: Plan::default(), verified, step: 0, turns: 0, cfg,
+        };
+        (run, prompt)
+    }
+
+    /// Append a streamed token to the current turn's reply.
+    pub fn on_token(&mut self, t: &str) { self.reply.push_str(t); }
+
+    /// The worker finished a turn: process the accumulated reply and decide the next action.
+    pub fn on_done(&mut self) -> AgentStep {
+        let text = std::mem::take(&mut self.reply);
+        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step);
+        self.turns += 1;
+        self.step += 1;
+        if let Some(stop) = stop { return AgentStep::Finished(stop); }
+        if self.step >= self.cfg.max_steps { return AgentStep::Finished(Stop::StepLimit); }
+        AgentStep::Submit(self.prompt.clone())
+    }
+
+    /// The worker reported an error mid-turn.
+    pub fn on_error(&mut self, e: String) -> AgentStep { AgentStep::Finished(Stop::ModelError(e)) }
+
+    pub fn events(&self) -> &[FileEvent] { self.ws.events() }
+    pub fn plan(&self) -> &Plan { &self.plan }
+    pub fn verified(&self) -> bool { self.verified }
+    pub fn root(&self) -> &Path { self.ws.root() }
+    pub fn turns(&self) -> usize { self.turns }
 }
 
 // ── two-tier review (3): a depth model reviews the fast model's diff before it lands ─────────────
@@ -1010,6 +1083,29 @@ mod tests {
         assert_eq!(s.plan.steps.len(), 2);
         assert_eq!(s.plan.steps[0].text, "create main.rs");
         assert!(s.verified, "verification off ⇒ vacuously verified");
+    }
+
+    #[test]
+    fn async_driver_matches_sync_behavior() {
+        // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
+        // captures the plan, and finishes — the same state machine the sync loop uses.
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
+        assert!(first.contains("PLAN")); // prompt asks for a plan
+        let replies = [
+            "```plan\n1. write lib\n```\n```tool\n{\"tool\":\"write_file\",\"path\":\"src/lib.rs\",\"contents\":\"pub fn x(){}\\n\"}\n```",
+            &format!("{DONE_MARKER}"),
+        ];
+        // turn 1
+        for ch in replies[0].chars() { run.on_token(&ch.to_string()); }
+        let step1 = run.on_done();
+        assert!(matches!(step1, AgentStep::Submit(_)));
+        assert_eq!(run.events().len(), 1);
+        assert_eq!(run.plan().steps.len(), 1);
+        // turn 2 → done
+        for ch in replies[1].chars() { run.on_token(&ch.to_string()); }
+        assert_eq!(run.on_done(), AgentStep::Finished(Stop::Done));
+        assert!(std::fs::read_to_string(run.root().join("src/lib.rs")).unwrap().contains("pub fn x"));
     }
 
     #[test]
