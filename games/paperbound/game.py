@@ -7955,6 +7955,16 @@ def _kbd_select(g, side, idx):
 
 def main():
     pygame.init()
+    # gamepads: open every connected stick so JOY* events flow (the Foldworks
+    # RTS has Halo Wars-style console controls; harmless without a pad)
+    try:
+        pygame.joystick.init()
+        pads = [pygame.joystick.Joystick(i)
+                for i in range(pygame.joystick.get_count())]
+        for p in pads:
+            p.init()
+    except Exception:
+        pass
     if not _FONT_OK:
         # fonts couldn't initialise (see the guidance printed at import). Don't
         # limp into a cryptic mid-render crash — exit cleanly with the fix shown.
@@ -8161,6 +8171,11 @@ def main():
                     RTS_GAME.handle_event(ce)
                 elif e.type == pygame.MOUSEWHEEL:
                     RTS_GAME.handle_event(e)
+                elif e.type in (pygame.JOYAXISMOTION, pygame.JOYBUTTONDOWN,
+                                pygame.JOYBUTTONUP, pygame.JOYHATMOTION):
+                    RTS_GAME.handle_event(e)
+                    if getattr(RTS_GAME, "exit_requested", False):
+                        globals()["RTS_GAME"] = None; scene = "menu"; start_flip("menu")
                 elif e.type in (pygame.FINGERDOWN, pygame.FINGERUP, pygame.FINGERMOTION):
                     # convert normalized finger coords → window px → canvas space
                     ww, wh = screen.get_size()

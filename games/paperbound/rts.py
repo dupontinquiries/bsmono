@@ -35,6 +35,10 @@ import copy
 import os
 import json
 import pygame
+try:
+    import rts_tournament as tourney
+except Exception:
+    tourney = None
 
 
 # ── world constants ──────────────────────────────────────────────────────────
@@ -618,6 +622,14 @@ class RTS:
         self._grp_tap = (None, -9.0)        # (digit, time) for double-tap → centre camera
         self.pal = None                     # command palette: None | {"q": str, "sel": int}
         self.pal_scripts = _load_palette_scripts()
+        # ── gamepad (Halo Wars-style console controls) ──
+        # All state is fed by JOY* events (never polled), so it's testable and
+        # works with whatever stick the host inits. Reticle rides the middle of
+        # the view; the left stick steers the camera, the right stick fine-aims.
+        self.pad = dict(active=False, ax={}, cx=self.W / 2, cy=(self.H - 118) / 2,
+                        a_down=0.0, painting=False, paint_r=0.0, base_i=0)
+        self.tournament = None              # active tournament state (dict)
+        self._t_reported = False            # this match's result recorded?
         # selection & control
         self.selected = []
         self.groups = {i: [] for i in range(1, 10)}
@@ -649,9 +661,14 @@ class RTS:
         fac_keys = list(FACTIONS.keys())
         map_keys = list(MAPS.keys())
         self.fac[0] = fac_keys[self.setup_fac % len(fac_keys)]
-        # enemy picks a different faction for variety
-        others = [k for k in fac_keys if k != self.fac[0]] or fac_keys
-        self.fac[1] = random.choice(others)
+        # enemy picks a different faction for variety — unless a tournament
+        # (or a test) has forced the pairing
+        forced = getattr(self, "forced_enemy", None)
+        if forced and forced in fac_keys:
+            self.fac[1] = forced
+        else:
+            others = [k for k in fac_keys if k != self.fac[0]] or fac_keys
+            self.fac[1] = random.choice(others)
         self.map_id = map_keys[self.setup_map % len(map_keys)]
         self.mapdef = MAPS[self.map_id]
         global STRUCTURES, UNITS, WORLD_W, WORLD_H
@@ -1013,6 +1030,13 @@ class RTS:
 
     # ── input ──
     def handle_event(self, ev):
+        if ev.type in (pygame.JOYAXISMOTION, pygame.JOYBUTTONDOWN,
+                       pygame.JOYBUTTONUP, pygame.JOYHATMOTION):
+            if self.phase == "setup":
+                self._pad_setup_input(ev)
+            else:
+                self._on_joy(ev)
+            return
         if self.phase == "setup":
             self._setup_input(ev)
             return
@@ -1069,8 +1093,173 @@ class RTS:
         self.cam_y = y - (self.H - 118) / (2 * self.zoom * ISO)
         self._clamp_cam()
 
+    # ── gamepad: Halo Wars-style console controls ───────────────────────────
+    #   Left stick   steer the camera (reticle rides the view)
+    #   Right stick  fine-aim the reticle
+    #   A            select at reticle;  HOLD A grows a paint-select ball
+    #   B            cancel (wheel / build / cast / selection)
+    #   X            select the whole army (global)
+    #   Y            radial command wheel at the reticle (A confirms, B cancels)
+    #   LB / RB      zoom out / in
+    #   RT           smart order at the reticle (move / attack / harvest)
+    #   D-pad        up: base camera · down: idle worker · left/right: cycle bases
+    #   Start        tech tree
+    _PAD_DEAD = 0.18
+
+    def _pad_pos(self):
+        return self.pad["cx"], self.pad["cy"]
+
+    def _on_joy(self, ev):
+        p = self.pad
+        if ev.type == pygame.JOYAXISMOTION:
+            p["ax"][ev.axis] = ev.value
+            if abs(ev.value) > 0.3:
+                p["active"] = True
+            # RT edge → smart order (axis 5 or 2 by driver; triggers rest at -1)
+            if ev.axis in (5, 2) and ev.value > 0.6 and not p.get("rt_held"):
+                p["rt_held"] = True
+                wx, wy = self.s2w(*self._pad_pos())
+                self._command(wx, wy)
+                self._emit(wx, wy, 3, "ink", (240, 230, 120),
+                           spread=10, life=0.3, up=30)
+            elif ev.axis in (5, 2) and ev.value < 0.3:
+                p["rt_held"] = False
+            return
+        if ev.type == pygame.JOYHATMOTION:
+            p["active"] = True
+            hx, hy = ev.value
+            if hy > 0:
+                self._quick_action("base")
+            elif hy < 0:
+                self._quick_action("idle")
+            elif hx != 0:
+                bases = [s for s in self.structs if s.team == 0 and s.complete
+                         and self.sspec(0, s.kind).get("makes")]
+                if bases:
+                    p["base_i"] = (p["base_i"] + (1 if hx > 0 else -1)) % len(bases)
+                    b = bases[p["base_i"]]
+                    self._centre_on(b.x, b.y)
+                    self._select([b])
+            return
+        if ev.type == pygame.JOYBUTTONDOWN:
+            p["active"] = True
+            b = ev.button
+            if b == 0:                       # A — arm select / confirm wheel
+                if self.wheel:
+                    self._wheel_click(self._pad_pos()); return
+                p["a_down"] = 0.0001; p["painting"] = False; p["paint_r"] = 0.0
+            elif b == 1:                     # B — cancel, HW priority order
+                if self.wheel:
+                    self.wheel = None; self.wheel_hot = None
+                elif self.cast_mode:
+                    self.cast_mode = None
+                elif self.build_mode:
+                    self.build_mode = None
+                elif self.pal is not None:
+                    self.pal = None
+                elif self.selected:
+                    self.selected = []; self._resync_selected()
+            elif b == 2:                     # X — the classic "everyone!"
+                self._quick_action("army")
+            elif b == 3:                     # Y — radial wheel at the reticle
+                if self.wheel:
+                    self.wheel = None; self.wheel_hot = None
+                else:
+                    self._open_wheel(*self._pad_pos())
+            elif b == 4:                     # LB — zoom out
+                self._zoom_step(-1)
+            elif b == 5:                     # RB — zoom in
+                self._zoom_step(1)
+            elif b == 7:                     # Start — tech tree
+                self.show_tech = not self.show_tech
+            return
+        if ev.type == pygame.JOYBUTTONUP and ev.button == 0:
+            if p["painting"]:
+                wx, wy = self.s2w(*self._pad_pos())
+                wr = p["paint_r"] / self.zoom
+                picked = [u for u in self.units
+                          if u.team == 0 and u.alive
+                          and math.hypot(u.x - wx, u.y - wy) <= wr]
+                if picked:
+                    self._select(picked)
+                    self.flash(f"Selected {len(picked)}")
+            elif p["a_down"] > 0:
+                self._click_select(*self._pad_pos(), add=False)
+            p["a_down"] = 0.0; p["painting"] = False; p["paint_r"] = 0.0
+
+    def _pad_setup_input(self, ev):
+        """Setup-screen navigation on a pad: d-pad/stick picks faction & map,
+        A starts, B backs out."""
+        if ev.type == pygame.JOYHATMOTION:
+            hx, hy = ev.value
+            if hx:
+                self.setup_fac = (self.setup_fac + hx) % max(1, len(FACTIONS))
+            if hy:
+                self.setup_map = (self.setup_map - hy) % max(1, len(MAPS))
+        elif ev.type == pygame.JOYBUTTONDOWN:
+            if ev.button == 0:
+                self._begin_match()
+            elif ev.button == 1:
+                self.exit_requested = True
+
+    def _zoom_step(self, direction):
+        self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom * (1.18 ** direction)))
+        self._clamp_cam()
+
+    def _pad_tick(self, dt):
+        """Per-frame stick integration: camera pan, reticle aim, paint growth,
+        wheel highlight tracking. Idle pads cost nothing."""
+        p = self.pad
+        if not p["active"]:
+            return
+        ax = p["ax"]
+        d = self._PAD_DEAD
+        lx = ax.get(0, 0.0); ly = ax.get(1, 0.0)
+        rx = ax.get(3, 0.0); ry = ax.get(4, 0.0)
+        if abs(lx) > d or abs(ly) > d:
+            sp = 900 * dt / max(0.55, self.zoom)
+            self.cam_x += lx * sp
+            self.cam_y += ly * sp
+            self._clamp_cam()
+        if abs(rx) > d or abs(ry) > d:
+            p["cx"] = max(10, min(self.W - 10, p["cx"] + rx * 620 * dt))
+            p["cy"] = max(10, min(self.H - 128, p["cy"] + ry * 620 * dt))
+        else:
+            # the reticle relaxes back toward the view centre, HW-style
+            p["cx"] += (self.W / 2 - p["cx"]) * min(1.0, dt * 3.0)
+            p["cy"] += ((self.H - 118) / 2 - p["cy"]) * min(1.0, dt * 3.0)
+        if p["a_down"] > 0:
+            p["a_down"] += dt
+            if p["a_down"] > 0.25:           # the selection ball starts to grow
+                p["painting"] = True
+                p["paint_r"] = min(240.0, p["paint_r"] + 320 * dt)
+        if self.wheel:
+            self.wheel_hot = self._wheel_slice_at(self._pad_pos())
+        # keep the canvas-pointer story coherent for hover/ghost drawing
+        self.mouse_pos = self._pad_pos()
+
+    def _draw_pad_reticle(self, screen):
+        if not self.pad["active"]:
+            return
+        cx, cy = self._pad_pos()
+        t = getattr(self, "_anim_t", 0.0)
+        g = 8 + math.sin(t * 4) * 1.5
+        for sxd, syd in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            x0 = cx + sxd * g; y0 = cy + syd * g
+            pygame.draw.line(screen, (245, 236, 210), (x0, y0), (x0 + sxd * 6, y0), 2)
+            pygame.draw.line(screen, (245, 236, 210), (x0, y0), (x0, y0 + syd * 6), 2)
+        pygame.draw.circle(screen, (245, 236, 210), (int(cx), int(cy)), 2)
+        if self.pad["painting"] and self.pad["paint_r"] > 4:
+            wx, wy = self.s2w(cx, cy)
+            self.disc(screen, (240, 230, 120), wx, wy,
+                      self.pad["paint_r"] / self.zoom, 2)
+
     def _on_key(self, ev):
         k = ev.key
+        # end screen: N advances a tournament to its next round
+        if self.done and k == pygame.K_n and self.tournament is not None:
+            self._tournament_next()
+            return
         # ── command palette: typing goes to it while open; "/" or Ctrl+P opens ──
         if self.pal is not None:
             self._pal_key(ev)
@@ -2251,6 +2440,7 @@ class RTS:
             p["t"] += dt
         self.pings = [p for p in self.pings if p["t"] < 4.0]
         self.msg_t = max(0.0, self.msg_t - dt)
+        self._pad_tick(dt)
         self._tick_life(dt)
         # arm edge panning only after the grace period AND once we've seen a
         # real (canvas-translated) pointer event — never on a stale OS cursor.
@@ -3008,6 +3198,10 @@ class RTS:
         elif not p:
             self.done = True; self.result = "lose"; self._sfx("defeat", 0.8)
             self.flash("Defeat — your Scriptorium has fallen.")
+        if self.done and self.tournament is not None and not self._t_reported:
+            self._t_reported = True
+            self.tournament = tourney.report_player(
+                self.tournament, self.result == "win", self._factbook())
 
     # ── rendering ──
     def draw(self, screen):
@@ -3078,6 +3272,7 @@ class RTS:
             self._draw_tech_tree(screen)
         if self.msg_t > 0 or self._ink_anim.get("toast", 0) > 0:
             self._draw_msg(screen)
+        self._draw_pad_reticle(screen)
         self._draw_palette_overlay(screen)
         if self.done:
             self._draw_end(screen)
@@ -3217,6 +3412,22 @@ class RTS:
         st = f.render("Begin Battle", True, (240, 228, 200))
         screen.blit(st, (start.centerx - st.get_width() // 2, start.centery - st.get_height() // 2))
         self.setup_rects.append((start, ("start", 0)))
+        # tournament button — starts a fresh ladder or resumes the saved one
+        if tourney is not None:
+            trun = tourney.active()
+            tb = pygame.Rect(self.W // 2 - 230, self.H - 122, 460, 40)
+            hovert = tb.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(screen, (96, 70, 96) if hovert else (70, 52, 72),
+                             tb, border_radius=8)
+            pygame.draw.rect(screen, (216, 170, 220), tb, 2, border_radius=8)
+            if trun:
+                label = f"Continue Tournament — {tourney.round_name(trun)}"
+            else:
+                label = "Tournament — every bindery enters the bracket"
+            tl = self.ctx["font"].render(label, True, (238, 224, 240))
+            screen.blit(tl, (tb.centerx - tl.get_width() // 2,
+                             tb.centery - tl.get_height() // 2))
+            self.setup_rects.append((tb, ("tournament", 0)))
         # watch AI-vs-AI button
         watch = pygame.Rect(self.W // 2 + 10, self.H - 70, 220, 44)
         hoverw = watch.collidepoint(pygame.mouse.get_pos())
@@ -3246,7 +3457,61 @@ class RTS:
                 elif kind == "diff": self.difficulty = idx
                 elif kind == "start": self._begin_match()
                 elif kind == "watch": self._begin_match(spectate=True)
+                elif kind == "tournament": self._begin_tournament_match()
                 return
+
+    def _begin_tournament_match(self):
+        """Start (or resume) the ladder: seed a bracket on first press, then
+        play the player's pairing with the enemy faction FORCED to the draw."""
+        if tourney is None:
+            return
+        fac_keys = list(FACTIONS.keys())
+        state = tourney.active()
+        if state is None:
+            player = fac_keys[self.setup_fac % len(fac_keys)]
+            state = tourney.new(player, fac_keys)
+            self.flash(f"The bracket is drawn — {tourney.round_name(state)}.")
+        m = tourney.current_match(state)
+        if m is None:                        # a bye, or the run has finished
+            state = tourney.report_player(state, True, self._factbook())
+            m = tourney.current_match(state)
+            if m is None:
+                self.flash("The tournament is decided.")
+                return
+        self.tournament = state
+        self._t_reported = False
+        # the player plays their own faction; the opponent is the draw
+        self.setup_fac = fac_keys.index(state["player_fac"])
+        self.forced_enemy = m["b"] if m["player_side"] == 0 else m["a"]
+        self._begin_match()
+        self.flash(f"{tourney.round_name(state)} — "
+                   f"{self.facdata(0)['name']} vs {self.facdata(1)['name']}")
+
+    def _tournament_next(self):
+        """From the end screen: hop straight into the next round's match."""
+        if self.tournament is None or tourney is None:
+            return
+        if self.tournament.get("done"):
+            champ = tourney.champion(self.tournament)
+            name = self._factbook().get(champ, {}).get("name", champ)
+            self.flash(f"Champion: {name}")
+            return
+        if not tourney.player_alive(self.tournament):
+            self.flash("Your run is over — the herald plays out the rest.")
+            return
+        m = tourney.current_match(self.tournament)
+        if m is None:
+            self.tournament = tourney.report_player(
+                self.tournament, True, self._factbook())
+            m = tourney.current_match(self.tournament)
+            if m is None:
+                return
+        self.done = False; self.result = None
+        self._t_reported = False
+        self.forced_enemy = m["b"] if m["player_side"] == 0 else m["a"]
+        self._begin_match()
+        self.flash(f"{tourney.round_name(self.tournament)} — "
+                   f"{self.facdata(0)['name']} vs {self.facdata(1)['name']}")
 
     def _draw_tech_tree(self, screen):
         """A full-screen overlay of the player faction's tech tree: structures by
@@ -4857,6 +5122,31 @@ class RTS:
         sub = nf.render(f"{self.facdata(0)['name']} vs {self.facdata(1)['name']}  ·  "
                         f"{self.mapdef['name']}  ·  {mm}:{ss:02d}", True, (222, 214, 198))
         screen.blit(sub, (self.W // 2 - sub.get_width() // 2, 210))
+        # ── tournament bracket panel ──
+        if self.tournament is not None and tourney is not None:
+            names = {k: v.get("name", k) for k, v in self._factbook().items()}
+            lines = tourney.bracket_lines(self.tournament, names)
+            if self.tournament.get("done"):
+                champ = tourney.champion(self.tournament)
+                lines = ["TOURNAMENT CHAMPION",
+                         names.get(champ, champ) +
+                         ("  —  that's you!" if self.result == "win" and
+                          tourney.champion(self.tournament) == self.fac[0] else "")]
+                hint = "the bracket is complete"
+            elif tourney.player_alive(self.tournament):
+                hint = "press  N  for the next round"
+            else:
+                hint = "your run is over — press N to watch the herald finish it"
+            px = self.W - 360
+            py = 100
+            panel = pygame.Rect(px - 16, py - 12, 352, 30 + 22 * len(lines) + 26)
+            pygame.draw.rect(screen, (24, 20, 28), panel, border_radius=9)
+            pygame.draw.rect(screen, (216, 170, 220), panel, 1, border_radius=9)
+            for i, ln in enumerate(lines):
+                colr = (238, 224, 240) if i == 0 else (198, 186, 204)
+                screen.blit(sf.render(ln, True, colr), (px, py + i * 22))
+            screen.blit(sf.render(hint, True, (216, 170, 220)),
+                        (px, py + len(lines) * 22 + 10))
         # a two-column stat table (you vs enemy)
         rows = [("Units built", "built"), ("Units lost", "lost"),
                 ("Enemy units slain", "killed"), ("Veterans promoted", "vets"),
