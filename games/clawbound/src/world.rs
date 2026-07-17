@@ -512,6 +512,11 @@ pub fn tree_positions(count: usize) -> Vec<(f32, f32)> {
         if hash2(i as i32, 7, 0xC3) > (biome.tree * jungle_density_boost(x, z)).min(1.0) { continue; }
         v.push((x, z));
     }
+    if let Some(ws) = crate::worldscript::active() {
+        let pins: Vec<(f32, f32)> =
+            ws.pinned_trees().into_iter().map(|(x, z, _k)| (x, z)).collect();
+        v = ws.shape_positions(v, |t| (t.0, t.1), pins);
+    }
     v
 }
 
@@ -551,6 +556,11 @@ pub fn bush_positions(count: usize) -> Vec<(f32, f32, f32)> {
         if hash2(i as i32, 9, 0xE3) > (0.62 * jungle_density_boost(x, z)).min(1.0) { continue; }
         let r = 1.6 + hash2(i as i32, 3, 0xE4) * 1.3;
         v.push((x, z, r));
+    }
+    // a worldscript (if active) carves its cleared arenas out of the scatter
+    // and appends its hand-pinned brambles
+    if let Some(ws) = crate::worldscript::active() {
+        v = ws.shape_positions(v, |b| (b.0, b.1), ws.pinned_bushes());
     }
     v
 }
