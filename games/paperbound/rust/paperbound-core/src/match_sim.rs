@@ -19,7 +19,9 @@ use crate::data::Faction;
 use crate::sim::Refusal;
 use std::collections::HashSet;
 
-pub const ATTACK_COOL: f64 = 0.9; // rts.py: u.cool = 0.9 after a swing
+pub const ATTACK_COOL: f64 = 0.6; // rts.py:2746 — u.cool = 0.6 after a swing
+                                  // (an earlier port slice said 0.9; that
+                                  // was a parity bug, caught by re-reading)
 pub const AGGRO: f64 = 260.0; //      auto-acquire radius
 pub const HARVEST_DWELL: f64 = 1.1; // seconds mining at the well
 pub const HAUL: f64 = 10.0; //        base ink per trip (× econ × upgrades)
@@ -28,6 +30,9 @@ pub const HAUL: f64 = 10.0; //        base ink per trip (× econ × upgrades)
 pub enum Job {
     Idle,
     Seek { x: f64, y: f64 },
+    /// rts.py's A-move: advance, but engage anything inside aggro on the way,
+    /// then resume the march when the field is clear
+    AttackMove { x: f64, y: f64 },
     ToNode(usize),
     Harvest { node: usize, t: f64 },
     ToBase(usize),
@@ -49,6 +54,12 @@ pub struct MUnit {
     pub supply: i64,
     pub cool: f64,
     pub job: Job,
+    // ── faction-mechanic state (rts.py per-unit attrs) ──
+    pub burn: f64,        // seconds of Ember fire left
+    pub burn_dps: f64,
+    pub momentum: f64,    // Press wind-up 0..1
+    pub mom_target: Option<usize>,
+    pub combusted: bool,  // an Ember corpse detonates exactly once
 }
 
 impl MUnit {
@@ -92,6 +103,8 @@ pub struct World<'a> {
     pub units: Vec<MUnit>,
     pub buildings: Vec<MBuilding>,
     pub nodes: Vec<Node>,
+    /// high-ground plateaus (x, y, r) — the SC ramp defence lives here
+    pub plateaus: Vec<(f64, f64, f64)>,
     pub t: f64,
     pub winner: Option<usize>,
 }
@@ -105,6 +118,7 @@ impl<'a> World<'a> {
             units: Vec::new(),
             buildings: Vec::new(),
             nodes: Vec::new(),
+            plateaus: Vec::new(),
             t: 0.0,
             winner: None,
         }
@@ -144,6 +158,11 @@ impl<'a> World<'a> {
             supply: spec.supply,
             cool: 0.0,
             job: Job::Idle,
+            burn: 0.0,
+            burn_dps: 0.0,
+            momentum: 0.0,
+            mom_target: None,
+            combusted: false,
         };
         // bake finished upgrades (sim.rs semantics)
         for uk in &self.upgrades[team] {
@@ -264,6 +283,42 @@ impl<'a> World<'a> {
             .map(|(i, _)| i)
     }
 
+    pub fn on_high(&self, x: f64, y: f64) -> bool {
+        self.plateaus
+            .iter()
+            .any(|&(px, py, r)| (x - px).powi(2) + (y - py).powi(2) < r * r)
+    }
+
+    /// rts.py _hurt: cohesion soak (−11% per ally within 100px, capped −42%)
+    /// then the high-ground defence (×0.7 attacking uphill).
+    pub fn hurt_unit(&mut self, ti: usize, mut dmg: f64, attacker: Option<usize>) {
+        let (tx, ty, tteam) = {
+            let t = &self.units[ti];
+            (t.x, t.y, t.team)
+        };
+        if self.facs[tteam].mechanic.as_deref() == Some("cohesion") {
+            let allies = self
+                .units
+                .iter()
+                .enumerate()
+                .filter(|(j, a)| {
+                    *j != ti
+                        && a.team == tteam
+                        && a.alive()
+                        && ((a.x - tx).powi(2) + (a.y - ty).powi(2)).sqrt() < 100.0
+                })
+                .count();
+            dmg *= 1.0 - (allies as f64 * 0.11).min(0.42);
+        }
+        if let Some(ai) = attacker {
+            let (ax, ay) = (self.units[ai].x, self.units[ai].y);
+            if self.on_high(tx, ty) && !self.on_high(ax, ay) {
+                dmg *= 0.7;
+            }
+        }
+        self.units[ti].hp -= dmg;
+    }
+
     fn seek(u: &mut MUnit, tx: f64, ty: f64, dt: f64) -> f64 {
         let dx = tx - u.x;
         let dy = ty - u.y;
@@ -281,6 +336,66 @@ impl<'a> World<'a> {
             return;
         }
         self.t += dt;
+
+        // ── faction passives (rts.py _tick_mechanics) ──
+        for i in 0..self.units.len() {
+            if !self.units[i].alive() {
+                continue;
+            }
+            // Ember burns chip while their timer runs
+            if self.units[i].burn > 0.0 {
+                self.units[i].burn -= dt;
+                let dps = self.units[i].burn_dps;
+                self.units[i].hp -= dps * dt;
+                if self.units[i].burn <= 0.0 {
+                    self.units[i].burn = 0.0;
+                    self.units[i].burn_dps = 0.0;
+                }
+            }
+            // regen: 1.5%/s of maxhp, 4%/s within r+140 of an own complete structure
+            let team = self.units[i].team;
+            if self.facs[team].mechanic.as_deref() == Some("regen")
+                && self.units[i].hp < self.units[i].maxhp
+            {
+                let (x, y) = (self.units[i].x, self.units[i].y);
+                let near_home = self.buildings.iter().any(|b| {
+                    b.team == team
+                        && b.complete
+                        && b.alive()
+                        && ((b.x - x).powi(2) + (b.y - y).powi(2)).sqrt() < b.r + 140.0
+                });
+                let rate = if near_home { 0.04 } else { 0.015 };
+                self.units[i].hp =
+                    (self.units[i].hp + self.units[i].maxhp * rate * dt).min(self.units[i].maxhp);
+            }
+        }
+        // Ember combustion (rts.py _cull): a dying burn-faction fighter
+        // detonates once — area damage + ignition on everything hostile in 70px
+        for i in 0..self.units.len() {
+            if self.units[i].alive() || self.units[i].combusted {
+                continue;
+            }
+            let team = self.units[i].team;
+            if self.facs[team].mechanic.as_deref() != Some("burn") || self.units[i].worker {
+                continue;
+            }
+            self.units[i].combusted = true;
+            let (ux, uy, maxhp, udmg) = {
+                let u = &self.units[i];
+                (u.x, u.y, u.maxhp, u.dmg)
+            };
+            for j in 0..self.units.len() {
+                if j == i || !self.units[j].alive() || self.units[j].team == team {
+                    continue;
+                }
+                let d = ((self.units[j].x - ux).powi(2) + (self.units[j].y - uy).powi(2)).sqrt();
+                if d < 70.0 {
+                    self.hurt_unit(j, maxhp * 0.12, None);
+                    self.units[j].burn = (self.units[j].burn + 1.5).min(4.0);
+                    self.units[j].burn_dps = self.units[j].burn_dps.max(udmg * 0.2);
+                }
+            }
+        }
 
         // ── construction + training + tower fire ──
         for bi in 0..self.buildings.len() {
@@ -321,7 +436,7 @@ impl<'a> World<'a> {
                 self.buildings[bi].cool = (self.buildings[bi].cool - dt).max(0.0);
                 if self.buildings[bi].cool <= 0.0 {
                     if let Some(ei) = self.nearest_enemy(team, bx, by, rng) {
-                        self.units[ei].hp -= dmg;
+                        self.hurt_unit(ei, dmg, None);
                         self.buildings[bi].cool = cool;
                     }
                 }
@@ -362,6 +477,22 @@ impl<'a> World<'a> {
                     }
                 }
                 Job::Seek { x: tx, y: ty } => {
+                    let d = Self::seek(&mut self.units[i], tx, ty, dt);
+                    if d < 4.0 {
+                        self.units[i].job = Job::Idle;
+                    }
+                }
+                Job::AttackMove { x: tx, y: ty } => {
+                    if !worker {
+                        if let Some(ei) = self.nearest_enemy(team, x, y, AGGRO) {
+                            // engage, remembering nothing: when the foe falls
+                            // the Fight arm drops to Idle and the commander's
+                            // next order (or fresh aggro) picks the unit up —
+                            // matching rts.py where A-move re-scans each tick
+                            self.units[i].job = Job::Fight { enemy: ei };
+                            continue;
+                        }
+                    }
                     let d = Self::seek(&mut self.units[i], tx, ty, dt);
                     if d < 4.0 {
                         self.units[i].job = Job::Idle;
@@ -418,8 +549,22 @@ impl<'a> World<'a> {
                     if d > self.units[i].rng {
                         Self::seek(&mut self.units[i], ex, ey, dt);
                     } else if self.units[i].cool <= 0.0 {
-                        let dmg = self.units[i].dmg;
-                        self.units[enemy].hp -= dmg;
+                        // Gilded Press momentum: staying on one target winds up
+                        // to +70%; switching keeps some wind-up (−0.4), rts.py
+                        let mut mult = 1.0;
+                        if self.facs[team].mechanic.as_deref() == Some("momentum") {
+                            if self.units[i].mom_target == Some(enemy) {
+                                self.units[i].momentum =
+                                    (self.units[i].momentum + 0.28).min(1.0);
+                            } else {
+                                self.units[i].mom_target = Some(enemy);
+                                self.units[i].momentum =
+                                    (self.units[i].momentum - 0.4).max(0.0);
+                            }
+                            mult = 1.0 + 0.7 * self.units[i].momentum;
+                        }
+                        let dmg = self.units[i].dmg * mult;
+                        self.hurt_unit(enemy, dmg, Some(i));
                         self.units[i].cool = ATTACK_COOL;
                     }
                 }
@@ -444,6 +589,154 @@ mod tests {
     use super::*;
     use crate::data::load_factbook;
     use std::path::Path;
+
+    #[test]
+    fn parity_cohesion_soak() {
+        // rts.py _hurt: −11% per ally within 100px, capped at −42%
+        let b = book();
+        let mut w = World::new(&b["court"], &b["ember"]);
+        w.add_building(0, "scriptorium", 0.0, 0.0, true);
+        w.add_building(1, "scriptorium", 5000.0, 0.0, true);
+        let t = w.add_unit(0, "soldier", 500.0, 500.0);
+        for k in 0..2 {
+            w.add_unit(0, "soldier", 520.0 + k as f64 * 10.0, 500.0);
+        }
+        let hp0 = w.units[t].hp;
+        w.hurt_unit(t, 100.0, None);
+        assert!((hp0 - w.units[t].hp - 100.0 * (1.0 - 0.22)).abs() < 1e-9,
+                "2 allies → −22%");
+        // pile on 6 allies: capped at 42
+        for k in 0..4 {
+            w.add_unit(0, "soldier", 460.0 - k as f64 * 8.0, 500.0);
+        }
+        let hp1 = w.units[t].hp;
+        w.hurt_unit(t, 100.0, None);
+        assert!((hp1 - w.units[t].hp - 58.0).abs() < 1e-9, "cap at −42%");
+        // ember (no cohesion) takes it raw
+        let e = w.add_unit(1, "soldier", 500.0, 900.0);
+        let hp2 = w.units[e].hp;
+        w.hurt_unit(e, 100.0, None);
+        assert!((hp2 - w.units[e].hp - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parity_regen_rates() {
+        // rts.py: 1.5%/s of maxhp in the field, 4%/s within r+140 of home
+        let b = book();
+        let mut w = World::new(&b["tide"], &b["court"]);
+        w.add_building(0, "scriptorium", 200.0, 200.0, true);
+        w.add_building(1, "scriptorium", 5000.0, 5000.0, true);
+        let field = w.add_unit(0, "soldier", 2000.0, 2000.0);
+        let home = w.add_unit(0, "soldier", 240.0, 220.0);
+        for i in [field, home] {
+            w.units[i].hp = w.units[i].maxhp * 0.5;
+            w.units[i].job = Job::Seek { x: w.units[i].x, y: w.units[i].y };
+        }
+        let (f0, h0) = (w.units[field].hp, w.units[home].hp);
+        for _ in 0..30 {
+            w.tick(1.0 / 30.0);
+        }
+        let fg = w.units[field].hp - f0;
+        let hg = w.units[home].hp - h0;
+        let max = w.units[field].maxhp;
+        assert!((fg - max * 0.015).abs() < max * 0.002, "field ≈1.5%/s: {fg}");
+        assert!((hg - max * 0.04).abs() < max * 0.004, "home ≈4%/s: {hg}");
+    }
+
+    #[test]
+    fn parity_momentum_windup() {
+        // rts.py: +0.28 per same-target swing (cap 1.0), −0.4 on switch,
+        // damage × (1 + 0.7 × momentum)
+        let b = book();
+        let mut w = World::new(&b["press"], &b["court"]);
+        w.add_building(0, "scriptorium", 0.0, 5000.0, true);
+        w.add_building(1, "scriptorium", 5000.0, 5000.0, true);
+        let a = w.add_unit(0, "soldier", 100.0, 100.0);
+        let v = w.add_unit(1, "colossus", 120.0, 100.0); // fat target survives
+        w.units[a].job = Job::Fight { enemy: v };
+        // turn the colossus into a training dummy: parked, harmless, vast —
+        // so the ramp can be observed over many swings
+        w.units[v].job = Job::Seek { x: 120.0, y: 100.0 };
+        w.units[v].dmg = 0.0;
+        w.units[v].maxhp = 1.0e9;
+        w.units[v].hp = 1.0e9;
+        let base = w.units[a].dmg;
+        let mut deltas = Vec::new();
+        let mut last = w.units[v].hp;
+        for _ in 0..(4 * 30) {
+            w.tick(1.0 / 30.0);
+            if w.units[v].hp < last {
+                deltas.push(last - w.units[v].hp);
+                last = w.units[v].hp;
+            }
+        }
+        assert!(deltas.len() >= 5, "{deltas:?}");
+        // swing 1 lands at momentum 0 — a FRESH target routes through the
+        // switch branch (rts.py: _mom_target is None ≠ tgt → −0.4 floor 0);
+        // each further same-target swing winds +0.28 toward the +70% cap
+        assert!((deltas[0] - base).abs() < 1e-4, "{deltas:?}");
+        assert!((deltas[1] - base * (1.0 + 0.7 * 0.28)).abs() < 1e-4);
+        assert!((deltas[2] - base * (1.0 + 0.7 * 0.56)).abs() < 1e-4);
+        let cap = base * 1.7;
+        assert!((deltas.last().unwrap() - cap).abs() < 1e-4, "cap at +70%");
+        assert!(deltas.windows(2).all(|p| p[1] >= p[0] - 1e-6), "monotone ramp");
+    }
+
+    #[test]
+    fn parity_ember_combustion_chain() {
+        // rts.py _cull: a dying Ember fighter deals maxhp×0.12 in 70px and
+        // ignites (burn 1.5s at dmg×0.2); burning then chips over time
+        let b = book();
+        let mut w = World::new(&b["ember"], &b["court"]);
+        w.add_building(0, "scriptorium", 0.0, 5000.0, true);
+        w.add_building(1, "scriptorium", 5000.0, 5000.0, true);
+        let bomb = w.add_unit(0, "soldier", 100.0, 100.0);
+        let near = w.add_unit(1, "soldier", 140.0, 100.0);
+        let far = w.add_unit(1, "soldier", 400.0, 100.0);
+        // park everyone so nobody closes distance mid-test
+        for i in [near, far] {
+            w.units[i].job = Job::Seek { x: w.units[i].x, y: w.units[i].y };
+        }
+        let (maxhp, hp_near0, hp_far0) = (w.units[bomb].maxhp, w.units[near].hp, w.units[far].hp);
+        w.units[bomb].hp = -1.0;
+        w.tick(1.0 / 30.0);
+        assert!(w.units[bomb].combusted);
+        let blast = hp_near0 - w.units[near].hp;
+        assert!(blast >= maxhp * 0.12 - 1e-6, "blast: {blast}");
+        assert!(w.units[near].burn > 0.0, "ignited");
+        assert!((hp_far0 - w.units[far].hp).abs() < 1e-6, "out of radius");
+        // the burn keeps chipping afterwards
+        let hp1 = w.units[near].hp;
+        for _ in 0..30 {
+            w.tick(1.0 / 30.0);
+        }
+        assert!(w.units[near].hp < hp1, "burn dps ticked");
+        // a second detonation never happens
+        let hp2 = w.units[near].hp;
+        w.tick(1.0 / 30.0);
+        let chip = hp2 - w.units[near].hp;
+        assert!(chip < maxhp * 0.12 * 0.5, "no re-detonation");
+    }
+
+    #[test]
+    fn parity_high_ground_defence() {
+        // rts.py: attacking uphill deals ×0.7
+        let b = book();
+        let mut w = World::new(&b["ember"], &b["ember"]);
+        w.add_building(0, "scriptorium", 0.0, 5000.0, true);
+        w.add_building(1, "scriptorium", 5000.0, 5000.0, true);
+        w.plateaus.push((500.0, 500.0, 120.0));
+        let low = w.add_unit(0, "soldier", 700.0, 500.0);
+        let high = w.add_unit(1, "soldier", 520.0, 500.0);
+        let hp0 = w.units[high].hp;
+        let d = 100.0;
+        w.hurt_unit(high, d, Some(low));
+        assert!((hp0 - w.units[high].hp - 70.0).abs() < 1e-9, "uphill ×0.7");
+        // high hitting low is full strength
+        let hp1 = w.units[low].hp;
+        w.hurt_unit(low, d, Some(high));
+        assert!((hp1 - w.units[low].hp - 100.0).abs() < 1e-9);
+    }
 
     fn book() -> std::collections::BTreeMap<String, Faction> {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
