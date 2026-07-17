@@ -15,6 +15,7 @@ pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) befo
 pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
+#[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 pub mod netserve;
 pub mod store;
 
@@ -124,6 +125,17 @@ pub struct Gpu {
 /// Which decode mat-vec kernel a profile uses. The autotuner measures all of these per shape and keeps the
 /// fastest ON THIS GPU — so the optimum (which differs by platform: wg128@4 won on M2 Ultra, but another
 /// GPU may prefer v2@8 or the plain v1) is discovered at runtime, not hardcoded.
+///
+/// ASAHI/AGX GROUNDING (Mesa Honeykrisp Vulkan, from Apple-GPU compute docs + ggml-metal practice): the
+/// AGX SIMD group is 32 threads (the true execution unit — think in subgroups, not threads), and each GPU
+/// core has ~32 KB of threadgroup memory. A workgroup that reserves a large threadgroup-memory reduction
+/// buffer PINS occupancy to few concurrent workgroups per core (asking for the full 32 KB → exactly one),
+/// which on a memory-LATENCY-bound decode matvec is the dominant cost. Implication for the next tuning pass:
+/// the SG kernel (`V2WgSg`, native `subgroupAdd`, minimal/zero threadgroup memory) should out-occupy the
+/// `red[tile*128]` barrier-tree kernels on Asahi even though wg128 won on M2 Ultra under Metal — worth
+/// re-benching SG@2/4 as the Honeykrisp default, and keeping any threadgroup reduction buffer as small as
+/// possible. The ggml-metal analogue is "rows per SIMD group": one 32-wide subgroup cooperatively reduces a
+/// column-tile with no threadgroup memory at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3 }
 impl MatvecKernel {
