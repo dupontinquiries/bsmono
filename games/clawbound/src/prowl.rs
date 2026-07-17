@@ -52,16 +52,16 @@ const YOWL_RANGE: f32 = 22.0;      // ranged minions cast from further out than 
 const YOWL_CD: f32 = 6.0;
 const YOWL_REVEAL_DUR: f32 = 2.2;  // seconds a landed yowl outs your position (forces you out of hiding)
 pub const BEACON_RADIUS: f32 = 14.0;   // an owned tree's aura reaches this far
-pub const BEACON_PULSE: f32 = 8.0;     // seconds between pulses — refresh the buff before it lapses
+pub const BEACON_PULSE: f32 = 5.0;     // matches Swift Paw's duration — continuous uptime while camping the aura
 pub const N_MARKERS: usize = 5;
 const MARKER_R: f32 = 4.0;
 pub const MARKER_CLAIM_TIME: f32 = 3.0;
 const MARKER_DRIFT_BACK: f32 = 20.0;   // seconds unattended before a held marker drifts back to its nearest clan
-const CONVERGENCE_INTERVAL: f32 = 70.0;
-const CONVERGENCE_WARN: f32 = 15.0;    // the last stretch before a convergence, worth flagging to the player
-pub const RITUAL_WIN: f32 = 100.0;
+const CONVERGENCE_INTERVAL: f32 = 40.0;  // a Prowl round runs ~120s (the ring's shrink timer) — this gives 2-3 convergences per round
+const CONVERGENCE_WARN: f32 = 10.0;    // the last stretch before a convergence, worth flagging to the player
+pub const RITUAL_WIN: f32 = 70.0;      // reachable by a dominant clan across 2-3 convergences in one round, not several matches
 const ROCK_BONUS_R: f32 = 10.0;        // being at the Rock when a convergence resolves adds a bonus
-const SUSTENANCE_DECAY: f32 = 0.012;   // per second — a slow hunger clock
+const SUSTENANCE_DECAY: f32 = 0.0098;  // per second — with no prey at all, sickness sets in around the 90s mark of a 120s round
 const SUSTENANCE_PER_PREY: f32 = 0.22;
 const SUSTENANCE_SICK_AT: f32 = 0.12;
 const SUSTENANCE_WELL_AT: f32 = 0.4;   // sickness clears once it's recovered back above this
@@ -1589,7 +1589,6 @@ mod tests {
             let mut g = Prowl::new(Class::Cat, Kind::Fox);
             g.hx = 900.0; g.hz = 900.0;
             // find a spot with the cover level we want
-            let mut px = 0.0; let mut pz = 0.0;
             let mut best = (-1.0f32, 0.0f32, 0.0f32);
             for i in -140..140 {
                 for j in -140..140 {
@@ -1600,7 +1599,7 @@ mod tests {
                     if score > best.0 { best = (score, x, z); }
                 }
             }
-            px = best.1; pz = best.2;
+            let (px, pz) = (best.1, best.2);
             g.x = px; g.z = pz;
             let x0 = g.x;
             g.set_input(1.0, 0.0, false, false, false);
@@ -1723,6 +1722,43 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sustenance_matters_within_a_single_round_but_not_instantly() {
+        // a Prowl round runs ~120s (the ring's shrink timer). With no prey at all,
+        // sustenance should hold up for the early game but turn sick well before the
+        // round ends — it's meant to push you toward at least one catch or a rest at
+        // a staging ground per round, not be irrelevant, and not bite in the first 30s.
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        for t in 0..(30 * 30) {
+            g.set_input((t as f32 * 0.05).sin(), (t as f32 * 0.04).cos(), false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert!(!g.sick, "sustenance shouldn't bite in the first 30 seconds of a round");
+        for t in 0..(70 * 30) {
+            g.set_input((t as f32 * 0.05).sin(), (t as f32 * 0.04).cos(), false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert!(g.sick, "with no prey at all, sickness should set in well before a ~120s round ends");
+    }
+
+    #[test]
+    fn convergence_fires_a_couple_times_across_one_round() {
+        // one Prowl round runs ~120s; the ritual should get a real chance to matter
+        // inside that single round, not need several matches to ever fire.
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let mut fires = 0;
+        let mut last = g.convergence_t;
+        for _ in 0..(120 * 30) {
+            g.set_input(0.3, 0.1, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.convergence_t > last { fires += 1; }
+            last = g.convergence_t;
+        }
+        assert!((2..=4).contains(&fires), "expected 2-4 convergences across a ~120s round, got {fires}");
     }
 
     #[test]
