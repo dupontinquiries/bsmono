@@ -575,7 +575,9 @@ impl State {
         // rival clan prowlers — full-size clan-tinted cats
         for rv in &g.rivals {
             let gy = world::height_at(rv.x, rv.z);
-            let pose = cat::walk((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0));
+            let pose = if rv.stagger > 0.0 { cat::flinch(1.0 - (rv.stagger / 0.9).min(1.0)) }
+                else if rv.class == clawbound_rs::class::Class::Hawk { cat::hover((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0)) }
+                else { cat::walk((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0)) };
             cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose, rv.class);
             m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
         }
@@ -596,7 +598,10 @@ impl State {
         // the prowler + a class-tint marker
         let pgy = world::height_at(g.x, g.z);
         let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
-        let pose = if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
+        let pose = if g.class == clawbound_rs::class::Class::Hawk {
+            if g.leap_t > 0.0 { cat::leap() } else if g.moving { cat::hover((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::hover_idle(self.anim_t * 0.6) }
+        }
+        else if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
         cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose, g.class);
         m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
         // the stalking hunter
@@ -817,7 +822,8 @@ impl State {
         for mob in &g.mobs {
             let gy = world::height_at(mob.x, mob.z);
             let moving = mob.stun_t <= 0.0;
-            let pose = if mob.stunned() { cat::startle() }
+            let pose = if mob.stunned() { cat::flinch(1.0 - (mob.stun_t / mob.class.def().stun).clamp(0.0, 1.0)) }
+                else if mob.class == clawbound_rs::class::Class::Hawk { cat::hover((self.anim_t * 1.5 + mob.x * 0.1).rem_euclid(1.0)) }
                 else if moving { cat::walk((self.anim_t * 1.5 + mob.x * 0.1).rem_euclid(1.0)) }
                 else { cat::idle(self.anim_t * 0.6 + mob.x * 0.05) };
             cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose, mob.class);
