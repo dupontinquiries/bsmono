@@ -797,6 +797,7 @@ pub struct Chat {
     show_help: bool,               // `?` keybinding overlay is open
     note: String,                  // transient status line (e.g. export path), cleared on next action
     gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
+    agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -877,6 +878,7 @@ impl Default for Chat {
             show_help: false,
             note: String::new(),
             gitmind_session: None,
+            agent_files: Vec::new(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -1741,6 +1743,36 @@ impl Chat {
     /// dispatches it.
     fn spatial_ui(&mut self, ui: &mut egui::Ui, mut model: Option<&mut ModelState>) -> bool {
         let mut send_now = false;
+        // DRAG-AND-DROP INGEST: files dropped onto the scene land in the active workspace session. This is
+        // what makes the tmp workspace a real drop target — you can weave external files into the agent's
+        // codebase by dropping them. Desktop drops carry a path; some stacks carry bytes; we handle both.
+        if self.gitmind_session.is_some() {
+            let drops = ui.ctx().input(|i| i.raw.dropped_files.clone());
+            if !drops.is_empty() {
+                let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
+                let mut ws = crate::workspace_exec::Workspace::new(work_dir);
+                let mut ok = 0usize;
+                for f in &drops {
+                    let name = f.name.rsplit(['/', '\\']).next().filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .or_else(|| f.path.as_ref().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())))
+                        .unwrap_or_else(|| "dropped.bin".into());
+                    let dest = format!("dropped/{name}");
+                    let res = if let Some(bytes) = &f.bytes {
+                        ws.ingest(&dest, bytes)
+                    } else if let Some(path) = &f.path {
+                        match std::fs::read(path) { Ok(b) => ws.ingest(&dest, &b), Err(e) => crate::workspace_exec::ToolResult { ok: false, output: e.to_string() } }
+                    } else {
+                        crate::workspace_exec::ToolResult { ok: false, output: "empty drop".into() }
+                    };
+                    if res.ok { ok += 1; }
+                }
+                for ev in ws.take_events() { self.agent_files.push(ev); }
+                self.note = format!("dropped {ok}/{} file(s) into the workspace → dropped/", drops.len());
+                ui.ctx().request_repaint();
+            }
+        }
+
         let g = self.convo_graph(self.msgs.len());
         if g.nodes.is_empty() {
             if !self.backdrop {
@@ -3160,7 +3192,11 @@ impl Chat {
                     if let Some(rect) = project_slab_rect(&view_cam, comp_c, right, up, comp_w, comp_h, cx, cy, scale) {
                         let pearl_t = ui.input(|i| i.time) as f32;
                         let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
-                        let band = self.pearl_input.show_at(ui, rect, &self.input, &vpartial, pearl_t, theme::CYAN());
+                        // scene accent (the panel idiom's text colour) so the composer pearl belongs to
+                        // THIS world — Atlantis prismarine · Canopy leaf-glow · Mistfall rune-blue · Archive
+                        // ink — rather than a fixed cyan. Same (tc) the mic pearl and reading plaque use.
+                        let comp_accent = egui::Color32::from_rgb(tc[0], tc[1], tc[2]);
+                        let band = self.pearl_input.show_at(ui, rect, &self.input, &vpartial, pearl_t, comp_accent);
                         ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
                         ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x4d, 0xd6, 0xe6, 36);
                         let resp = ui.put(band, egui::TextEdit::multiline(&mut self.input)
@@ -3179,6 +3215,84 @@ impl Chat {
                             self.pearl_input.pulse();
                             send_now = true;
                         }
+
+                        // ── PHYSICAL ACTION ROW — Attach / Mic / Send as in-scene slabs, mirroring the 2D
+                        // composer's buttons so full-screen spatial mode (bottom bar hidden) can still attach,
+                        // dictate, and send. A small three-button ledge just under the composer pearl.
+                        let miced = self.voice.is_some();
+                        let acts: [(&str, &str); 3] = [
+                            ("ATT", "attach a text file"),
+                            (if miced { "REC" } else { "MIC" }, if miced { "stop mic" } else { "dictate" }),
+                            ("SEND", "send"),
+                        ];
+                        let arow_c = anchor(0.5, 0.985); // just below the composer
+                        let btn_w = (0.08 * win_w / ppw).clamp(0.35, 0.9);
+                        let gap = btn_w * 1.35;
+                        for (i, (glyph, hint)) in acts.iter().enumerate() {
+                            let dx = (i as f32 - 1.0) * gap; // centre the middle button
+                            let bc = V3::new(arow_c.x + right.x * dx, arow_c.y + right.y * dx, arow_c.z + right.z * dx);
+                            let mut btn = m3::panel(bc, right, up, btn_w, btn_w * 0.8, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                            btn.mat = pmat; btn.emissive = 0.14 * tglow * sheen; m3::set_alpha(&mut btn, 200);
+                            graph.push(btn);
+                            let gcen = V3::new(bc.x - toward.x * 0.30, bc.y - toward.y * 0.30, bc.z - toward.z * 0.30);
+                            for cell in m3::label_cells(gcen, right, up, toward, glyph, 0.013 * (btn_w / 0.6), t, egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            if let Some(tr) = project_slab_rect(&view_cam, bc, right, up, btn_w * 1.15, btn_w * 0.95, cx, cy, scale) {
+                                let resp = ui.interact(tr, egui::Id::new(("scene_action_btn", i)), egui::Sense::click()).on_hover_text(*hint);
+                                if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                if resp.clicked() {
+                                    match i {
+                                        0 => { // attach
+                                            let start = self.save_dir.clone()
+                                                .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
+                                                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+                                            self.attach_picker.open_file(&start, "Attach a file", &[]);
+                                        }
+                                        1 => { // mic toggle
+                                            if self.voice.is_some() { self.voice = None; }
+                                            else {
+                                                match crate::voice_session::VoiceSession::start() {
+                                                    Ok(s) => { self.voice = Some(s); self.voice_err = None; ui.ctx().request_repaint(); }
+                                                    Err(e) => { self.voice_err = Some(format!("voice: {e}")); }
+                                                }
+                                            }
+                                        }
+                                        _ => { // send
+                                            if !self.input.trim().is_empty() { self.pearl_input.pulse(); send_now = true; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── WORKSPACE FILES — live feed of files the agent wrote / you dropped, so file creation
+                // is VISIBLE in the scene (the ask: "see file creation"). Right-edge plaque, newest last,
+                // colour-coded (created = accent, modified = dim). Only when a session has touched files.
+                if !self.backdrop && !self.agent_files.is_empty() {
+                    let fc = anchor(0.86, 0.42);
+                    let fw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
+                    let fs = fw / 1.3;
+                    let back = |o: f32| V3::new(fc.x - toward.x * o, fc.y - toward.y * o, fc.z - toward.z * o);
+                    let mut plaque = m3::panel(back(-0.06 * fs), right, up, 1.3 * fs, 1.7 * fs, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                    plaque.mat = pmat; plaque.emissive = 0.07 * tglow * sheen; m3::set_alpha(&mut plaque, 150);
+                    graph.push(plaque);
+                    let title_c = V3::new(fc.x - toward.x * 0.30 + up.x * 0.72 * fs, fc.y - toward.y * 0.30 + up.y * 0.72 * fs, fc.z - toward.z * 0.30 + up.z * 0.72 * fs);
+                    for cell in m3::label_cells(title_c, right, up, toward, "WORKSPACE", 0.010 * fs, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    let n = self.agent_files.len();
+                    let show = self.agent_files.iter().rev().take(8).collect::<Vec<_>>();
+                    for (row, ev) in show.iter().enumerate() {
+                        let off = (0.52 - row as f32 * 0.15) * fs;
+                        let rc = V3::new(fc.x + up.x * off - toward.x * 0.30, fc.y + up.y * off - toward.y * 0.30, fc.z + up.z * off - toward.z * 0.30);
+                        let created = matches!(ev.change, crate::workspace_exec::FileChange::Created);
+                        let col = if created { egui::Color32::from_rgb(tc[0], tc[1], tc[2]) } else { egui::Color32::from_rgb(150, 160, 178) };
+                        let mark = if created { "+ " } else { "~ " };
+                        let name: String = ev.path.rsplit('/').next().unwrap_or(&ev.path).chars().take(16).collect();
+                        for cell in m3::label_cells(rc, right, up, toward, &format!("{mark}{name}"), 0.008 * fs, t, col, if created { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    }
+                    if n > 8 {
+                        let mc = V3::new(fc.x + up.x * (0.52 - 8.0 * 0.15) * fs - toward.x * 0.30, fc.y + up.y * (0.52 - 8.0 * 0.15) * fs - toward.y * 0.30, fc.z + up.z * (0.52 - 8.0 * 0.15) * fs - toward.z * 0.30);
+                        for cell in m3::label_cells(mc, right, up, toward, &format!("+{} more", n - 8), 0.008 * fs, t, egui::Color32::from_rgb(120, 130, 148), 0.5, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
                     }
                 }
 
@@ -4127,6 +4241,42 @@ impl Chat {
                             self.gitmind_session = Some(s);
                         }
                         Err(e) => self.note = format!(":load-gitmind — {e}"),
+                    }
+                }
+            }
+            Command::Agent(task) => {
+                let task = task.trim().to_string();
+                if task.is_empty() {
+                    self.note = ":agent needs a task (e.g. :agent add a unit test for the parser)".into();
+                } else if self.gitmind_session.is_none() {
+                    self.note = ":agent — load a workspace first (:load-gitmind <path>), then :agent <task>".into();
+                } else {
+                    // Build the sandboxed exec surface over the session's isolated /tmp workspace and run the
+                    // local-LLM tool-calling loop. Params come from the live Ctx dials so the physical panel
+                    // drives the agent too. NOTE: this call blocks the frame for the duration of the loop —
+                    // acceptable for a first cut / short tasks; the next step is to run it on the inference
+                    // worker (same seam as :ca fan-out) and stream turns into the transcript.
+                    let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
+                    let mut ws = crate::workspace_exec::Workspace::new(work_dir);
+                    let params = logscope::llm_backend::GenParams {
+                        max_tokens: self.ctx.max_tokens as usize,
+                        n_ctx: self.ctx.n_ctx,
+                        n_batch: self.ctx.n_ctx,
+                        temperature: self.ctx.temperature,
+                        ..Default::default()
+                    };
+                    match crate::workspace_exec::run_local_agent(&mut ws, &task, 24, params) {
+                        Ok(session) => {
+                            self.agent_files = session.files.clone();
+                            let touched = session.files.len();
+                            let stop = match &session.stop {
+                                crate::workspace_exec::Stop::Done => "done".to_string(),
+                                crate::workspace_exec::Stop::StepLimit => "hit step limit".to_string(),
+                                crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
+                            };
+                            self.note = format!("agent: {stop} · {touched} file(s) touched · :reapply to land them");
+                        }
+                        Err(e) => self.note = format!(":agent — {e}"),
                     }
                 }
             }

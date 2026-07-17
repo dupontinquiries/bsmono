@@ -102,6 +102,8 @@ pub const SPECS: &[CmdSpec] = &[
         help: "mirror a .gitmind project to an isolated /tmp work session for editing", example: ":load-gitmind ~/work/monorepo" },
     CmdSpec { name: "reapply", aliases: &["ra"], usage: ":reapply", arg: ArgKind::None,
         help: "reapply the loaded session's changes over the project as one new commit", example: ":reapply" },
+    CmdSpec { name: "agent", aliases: &["ag"], usage: ":agent <task>", arg: ArgKind::Free,
+        help: "run the local-LLM tool-calling loop in the loaded workspace (writes/reads/runs to build the task)", example: ":agent add a unit test for the parser" },
     CmdSpec { name: "longterm", aliases: &["lt"], usage: ":longterm [--deep|--quick] <objective>", arg: ArgKind::Free,
         help: "plan + orchestrate a long-horizon objective: decompose into sibling lanes, fan out by directive, prune/expand under budget", example: ":longterm unify the code duplications across the repo" },
     CmdSpec { name: "interject", aliases: &["ij"], usage: ":interject <change>", arg: ArgKind::Free,
