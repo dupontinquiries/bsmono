@@ -1,0 +1,390 @@
+{
+  "id": "foldrealms",
+  "name": "Foldrealms",
+  "blurb": "Three alternate binderies — swarm, wind, and root — with new actors, terraced ramp maps, and spilled ink fields.",
+  "cards": {
+    "gildedmite": {
+      "id": "gildedmite", "name": "Gilded Mites", "cost": 2, "hp": 120, "dmg": 30,
+      "spd": 82, "rng": 18, "size": 15, "flying": false, "building": false,
+      "riverhop": false, "count": 3, "paper": [196, 164, 74], "ability": "manyfold",
+      "rarity": "common", "rotation": true,
+      "blurb": "A skittering handful of gilt-backed mites.",
+      "model": [
+        {"part": "shell", "at": [0, 0.05], "size": 0.7, "h": 0.35, "tone": 1.1},
+        {"part": "claw",  "at": [0.45, 0.15], "size": 0.45, "tone": 0.85},
+        {"part": "fang",  "at": [0.5, -0.05], "size": 0.4, "tone": 1.3},
+        {"part": "leg",   "at": [-0.3, 0.35], "size": 0.3, "h": 0.4},
+        {"part": "leg",   "at": [0.15, 0.35], "size": 0.3, "h": 0.4}
+      ]
+    },
+    "mantisblade": {
+      "id": "mantisblade", "name": "Mantis Blade", "cost": 4, "hp": 520, "dmg": 88,
+      "spd": 74, "rng": 22, "size": 24, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [140, 178, 96], "ability": "doublestrike",
+      "rarity": "epic", "rotation": true,
+      "blurb": "A duelling mantis whose forelimbs scissor twice per fold.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],   "size": 0.75, "h": 0.5, "tone": 1.0},
+        {"part": "sail",  "at": [-0.15, -0.1], "size": 0.7, "tone": 1.1},
+        {"part": "claw",  "at": [0.55, 0.0],  "size": 0.75, "tone": 0.8},
+        {"part": "wedge", "at": [0.7, -0.35], "size": 0.45, "ang": -0.2, "tone": 1.15},
+        {"part": "leg",   "at": [-0.35, 0.45], "size": 0.4, "h": 0.55},
+        {"part": "leg",   "at": [0.25, 0.45],  "size": 0.4, "h": 0.55}
+      ]
+    },
+    "broodqueen": {
+      "id": "broodqueen", "name": "Brood Queen", "cost": 7, "hp": 1500, "dmg": 95,
+      "spd": 34, "rng": 26, "size": 33, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [172, 140, 62], "ability": "beacon",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "The gilded matriarch — her presence spurs the swarm on.",
+      "model": [
+        {"part": "shell", "at": [0, 0.05],   "size": 1.1, "h": 0.6, "tone": 1.0},
+        {"part": "plume", "at": [-0.5, -0.3], "size": 0.8, "tone": 1.15},
+        {"part": "fang",  "at": [0.7, 0.0],   "size": 0.6, "tone": 1.35},
+        {"part": "plate", "at": [0.1, 0.05],  "size": 0.7, "h": 0.3, "tone": 0.85},
+        {"part": "leg",   "at": [-0.55, 0.5], "size": 0.45, "h": 0.5},
+        {"part": "leg",   "at": [0.0, 0.5],   "size": 0.45, "h": 0.5},
+        {"part": "leg",   "at": [0.5, 0.5],   "size": 0.45, "h": 0.5}
+      ]
+    },
+    "windskiff": {
+      "id": "windskiff", "name": "Wind Skiff", "cost": 3, "hp": 240, "dmg": 42,
+      "spd": 88, "rng": 150, "size": 21, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [170, 196, 214], "ability": "gale",
+      "rarity": "rare", "rotation": true,
+      "blurb": "A darting paper skiff riding its own gust.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.15],  "size": 0.8, "h": 0.25, "tone": 1.0},
+        {"part": "sail",  "at": [0.0, -0.1], "size": 1.0, "tone": 1.12},
+        {"part": "banner","at": [-0.5, -0.2], "size": 0.55, "tone": 1.2},
+        {"part": "wedge", "at": [0.75, 0.05], "size": 0.4, "ang": -0.05, "tone": 1.1}
+      ]
+    },
+    "galecharger": {
+      "id": "galecharger", "name": "Gale Charger", "cost": 5, "hp": 680, "dmg": 84,
+      "spd": 86, "rng": 24, "size": 26, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [128, 158, 190], "ability": "charge",
+      "rarity": "epic", "rotation": true,
+      "blurb": "A rider folded into the wind — faster with every stride.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],    "size": 0.9, "h": 0.45, "tone": 1.0},
+        {"part": "banner","at": [-0.35, -0.35], "size": 0.7, "tone": 1.25},
+        {"part": "plume", "at": [0.4, -0.4],  "size": 0.55, "tone": 1.1},
+        {"part": "wedge", "at": [0.8, -0.1],  "size": 0.5, "ang": -0.1, "tone": 1.12},
+        {"part": "leg",   "at": [-0.45, 0.45], "size": 0.45, "h": 0.6},
+        {"part": "leg",   "at": [0.35, 0.45],  "size": 0.45, "h": 0.6},
+        {"part": "tail",  "at": [-0.85, 0.0],  "size": 0.6, "ang": 0.3, "tone": 0.85}
+      ]
+    },
+    "stormherald": {
+      "id": "stormherald", "name": "Storm Herald", "cost": 7, "hp": 900, "dmg": 70,
+      "spd": 62, "rng": 140, "size": 29, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [110, 130, 186], "ability": "dazzle",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "A haloed harbinger whose arrival blinds the unready.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],  "size": 0.85, "h": 0.45, "tone": 1.0},
+        {"part": "wing",  "at": [-0.3, -0.2], "size": 1.2, "ang": 0.55, "tone": 0.9},
+        {"part": "wing",  "at": [0.4, -0.15], "size": 1.15, "ang": -0.4, "tone": 1.08},
+        {"part": "halo",  "at": [0.0, -0.15], "size": 0.7, "tone": 1.4},
+        {"part": "plume", "at": [-0.6, 0.05], "size": 0.6, "tone": 1.1},
+        {"part": "sail",  "at": [0.1, 0.0],  "size": 0.5, "tone": 1.15}
+      ]
+    },
+    "rootling": {
+      "id": "rootling", "name": "Rootlings", "cost": 2, "hp": 260, "dmg": 28,
+      "spd": 44, "rng": 18, "size": 17, "flying": false, "building": false,
+      "riverhop": false, "count": 2, "paper": [122, 138, 88], "ability": "thorns",
+      "rarity": "common", "rotation": true,
+      "blurb": "Stubborn sapling folk — pricklier than they look.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.15],  "size": 0.6, "h": 0.5, "tone": 1.0},
+        {"part": "horn",  "at": [-0.1, -0.35], "size": 0.5, "tone": 0.9},
+        {"part": "plume", "at": [0.15, -0.3],  "size": 0.45, "tone": 1.12},
+        {"part": "leg",   "at": [-0.25, 0.45], "size": 0.35, "h": 0.5},
+        {"part": "leg",   "at": [0.2, 0.45],   "size": 0.35, "h": 0.5}
+      ]
+    },
+    "thornwarden": {
+      "id": "thornwarden", "name": "Thorn Warden", "cost": 5, "hp": 1150, "dmg": 66,
+      "spd": 38, "rng": 24, "size": 28, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [104, 126, 76], "ability": "thorns",
+      "rarity": "epic", "rotation": true,
+      "blurb": "A briar-plated sentinel; striking it costs the striker.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],   "size": 0.95, "h": 0.55, "tone": 1.0},
+        {"part": "plate", "at": [-0.15, 0.0], "size": 0.75, "h": 0.35, "tone": 0.82},
+        {"part": "horn",  "at": [0.3, -0.4],  "size": 0.65, "tone": 0.95},
+        {"part": "spine", "at": [-0.2, -0.35], "size": 0.6, "count": 4, "tone": 1.1},
+        {"part": "fang",  "at": [0.55, -0.1],  "size": 0.45, "tone": 1.3},
+        {"part": "leg",   "at": [-0.35, 0.45], "size": 0.45, "h": 0.5},
+        {"part": "leg",   "at": [0.3, 0.45],   "size": 0.45, "h": 0.5}
+      ]
+    },
+    "elderbough": {
+      "id": "elderbough", "name": "Elderbough", "cost": 8, "hp": 2400, "dmg": 130,
+      "spd": 24, "rng": 30, "size": 38, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [96, 116, 72], "ability": "taunt",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "An ancient walking bough — the grove's slow, vast answer.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.15],   "size": 1.2, "h": 0.8, "tone": 1.0},
+        {"part": "plume", "at": [-0.35, -0.75], "size": 0.9, "tone": 1.18},
+        {"part": "plume", "at": [0.35, -0.7],   "size": 0.85, "tone": 1.05},
+        {"part": "horn",  "at": [-0.6, -0.45],  "size": 0.7, "tone": 0.88},
+        {"part": "horn",  "at": [0.6, -0.5],    "size": 0.65, "ang": 0.4, "tone": 0.92},
+        {"part": "plate", "at": [0.0, 0.1],     "size": 0.8, "h": 0.35, "tone": 0.8},
+        {"part": "leg",   "at": [-0.5, 0.6],    "size": 0.55, "h": 0.7},
+        {"part": "leg",   "at": [0.4, 0.6],     "size": 0.55, "h": 0.7}
+      ]
+    }
+  },
+  "rts_factions": {
+    "swarm": {
+      "name": "The Gilded Swarm", "blurb": "Numbers over nerve — cheap, fast, stronger together.",
+      "color": [200, 168, 70], "dark": [130, 106, 44],
+      "trait": "Swarm: cheap fast units that take less damage per nearby ally.",
+      "econ": 0.92, "mechanic": "cohesion",
+      "structures": {
+        "scriptorium": {"name": "Hive Ledger", "cost": 0, "hp": 1300, "r": 52, "build": 6.0,
+                        "makes": ["scribe"], "requires": [], "researches": [], "tier": 1, "key": "S",
+                        "desc": "Town hall. Trains Mitescribes; ink drop-off."},
+        "table": {"name": "Brood Table", "cost": 100, "hp": 700, "r": 40, "build": 6.5,
+                  "makes": ["soldier", "archer"], "requires": [], "researches": ["chitin"], "tier": 1, "key": "T",
+                  "desc": "Folds mites & sting casters — quickly."},
+        "well": {"name": "Honey Sump", "cost": 85, "hp": 460, "r": 34, "build": 5.5,
+                 "makes": [], "requires": [], "researches": [], "tier": 1, "key": "R",
+                 "desc": "Raises ink cap & income."},
+        "spire": {"name": "Sting Spire", "cost": 140, "hp": 820, "r": 36, "build": 8.0,
+                  "makes": [], "requires": [], "researches": [], "tier": 1, "key": "P",
+                  "desc": "Defensive tower."},
+        "bindery": {"name": "Moult Chamber", "cost": 190, "hp": 900, "r": 44, "build": 11.0,
+                    "makes": ["brute"], "requires": ["table"], "researches": ["frenzy2", "gild"], "tier": 2, "key": "B",
+                    "desc": "Tier 2. Unlocks Mantis Blades & swarm upgrades."},
+        "menagerie": {"name": "Queen's Cell", "cost": 300, "hp": 1200, "r": 50, "build": 15.0,
+                      "makes": ["colossus"], "requires": ["bindery"], "researches": ["royal"], "tier": 3, "key": "M",
+                      "desc": "Tier 3. Wakes the Brood Queen."}
+      },
+      "units": {
+        "scribe": {"name": "Mitescribe", "cost": 22, "hp": 55, "dmg": 4, "spd": 98, "rng": 14, "r": 10,
+                   "card": "beekeeper", "worker": true, "build_t": 2.6, "tier": 1, "key": "E",
+                   "desc": "Harvests ink; raises structures fast."},
+        "soldier": {"name": "Mite Swarm", "cost": 38, "hp": 105, "dmg": 12, "spd": 96, "rng": 15, "r": 11,
+                    "card": "gildedmite", "build_t": 3.0, "tier": 1, "key": "A",
+                    "desc": "Cheap, fast, disposable — and never alone."},
+        "archer": {"name": "Sting Caster", "cost": 55, "hp": 80, "dmg": 15, "spd": 90, "rng": 145, "r": 11,
+                   "card": "locust", "build_t": 4.4, "tier": 1, "key": "D",
+                   "desc": "Ranged; fragile; quick to fold."},
+        "brute": {"name": "Mantis Blade", "cost": 95, "hp": 300, "dmg": 34, "spd": 82, "rng": 18, "r": 16,
+                  "card": "mantisblade", "build_t": 7.0, "tier": 2, "key": "F",
+                  "desc": "A fast duelist that scissors twice."},
+        "colossus": {"name": "Brood Queen", "cost": 230, "hp": 850, "dmg": 62, "spd": 44, "rng": 22, "r": 26,
+                     "card": "broodqueen", "build_t": 14.0, "tier": 3, "key": "C",
+                     "desc": "The matriarch — the swarm fights harder around her."}
+      },
+      "upgrades": {
+        "chitin": {"name": "Gilded Chitin", "cost": 90, "time": 16, "stat": "maxhp", "mult": 1.25,
+                   "applies": "army", "desc": "+25% army health."},
+        "frenzy2": {"name": "Feeding Frenzy", "cost": 100, "time": 18, "stat": "dmg", "mult": 1.22,
+                    "applies": "army", "desc": "+22% army attack."},
+        "gild": {"name": "Quick Moult", "cost": 80, "time": 14, "stat": "spd", "mult": 1.18,
+                 "applies": "army", "desc": "+18% army speed."},
+        "royal": {"name": "Royal Jelly", "cost": 150, "time": 24, "stat": "maxhp", "mult": 1.3,
+                  "applies": ["colossus", "brute"], "desc": "+30% blade & queen health."}
+      }
+    },
+    "windwrit": {
+      "name": "The Windwrit Riders", "blurb": "Speed is armour — strike moving, never stand still.",
+      "color": [126, 168, 208], "dark": [76, 108, 140],
+      "trait": "Momentum: units hit harder while moving. Keep the charge rolling.",
+      "econ": 1.0, "mechanic": "momentum",
+      "structures": {
+        "scriptorium": {"name": "Gale Hall", "cost": 0, "hp": 1350, "r": 52, "build": 6.0,
+                        "makes": ["scribe"], "requires": [], "researches": [], "tier": 1, "key": "S",
+                        "desc": "Town hall. Trains Windscribes; ink drop-off."},
+        "table": {"name": "Skiff Yard", "cost": 115, "hp": 760, "r": 42, "build": 7.5,
+                  "makes": ["soldier", "archer"], "requires": [], "researches": ["tailwind"], "tier": 1, "key": "T",
+                  "desc": "Folds chargers & skiffs."},
+        "well": {"name": "Updraft Well", "cost": 90, "hp": 500, "r": 34, "build": 6.0,
+                 "makes": [], "requires": [], "researches": [], "tier": 1, "key": "R",
+                 "desc": "Raises ink cap & income."},
+        "spire": {"name": "Weathervane Spire", "cost": 145, "hp": 860, "r": 38, "build": 9.0,
+                  "makes": [], "requires": [], "researches": [], "tier": 1, "key": "P",
+                  "desc": "Defensive tower with far sight.", "detector": true, "detect_range": 340},
+        "bindery": {"name": "Storm Loft", "cost": 205, "hp": 950, "r": 46, "build": 12.0,
+                    "makes": ["brute"], "requires": ["table"], "researches": ["squall", "keen"], "tier": 2, "key": "B",
+                    "desc": "Tier 2. Unlocks Gale Chargers & wind upgrades."},
+        "menagerie": {"name": "Eye of the Storm", "cost": 320, "hp": 1250, "r": 52, "build": 16.0,
+                      "makes": ["colossus"], "requires": ["bindery"], "researches": ["tempest"], "tier": 3, "key": "M",
+                      "desc": "Tier 3. Calls the Storm Herald."}
+      },
+      "units": {
+        "scribe": {"name": "Windscribe", "cost": 25, "hp": 60, "dmg": 4, "spd": 100, "rng": 14, "r": 11,
+                   "card": "beekeeper", "worker": true, "build_t": 3.0, "tier": 1, "key": "E",
+                   "desc": "Harvests ink; the fastest courier on the page."},
+        "soldier": {"name": "Wind Skiff", "cost": 50, "hp": 130, "dmg": 15, "spd": 95, "rng": 150, "r": 12,
+                    "card": "windskiff", "build_t": 4.2, "tier": 1, "key": "A",
+                    "desc": "A darting ranged skirmisher — kite and cut."},
+        "archer": {"name": "Quill Lancer", "cost": 62, "hp": 100, "dmg": 17, "spd": 92, "rng": 150, "r": 12,
+                   "card": "crane", "build_t": 5.0, "tier": 1, "key": "D",
+                   "desc": "Ranged; fragile; deadly on the move."},
+        "brute": {"name": "Gale Charger", "cost": 112, "hp": 330, "dmg": 36, "spd": 92, "rng": 18, "r": 17,
+                  "card": "galecharger", "build_t": 8.0, "tier": 2, "key": "F",
+                  "desc": "Cavalry that hits hardest at full stride."},
+        "colossus": {"name": "Storm Herald", "cost": 245, "hp": 880, "dmg": 66, "spd": 66, "rng": 130, "r": 26,
+                     "card": "stormherald", "build_t": 15.0, "tier": 3, "key": "C",
+                     "desc": "A haloed harbinger raining bolts on the run."}
+      },
+      "upgrades": {
+        "tailwind": {"name": "Tailwind", "cost": 85, "time": 15, "stat": "spd", "mult": 1.22,
+                     "applies": "army", "desc": "+22% army speed."},
+        "squall": {"name": "Squall Edge", "cost": 105, "time": 18, "stat": "dmg", "mult": 1.25,
+                   "applies": "army", "desc": "+25% army attack."},
+        "keen": {"name": "Keen Rigging", "cost": 95, "time": 16, "stat": "maxhp", "mult": 1.2,
+                 "applies": "army", "desc": "+20% army health."},
+        "tempest": {"name": "Tempest Writ", "cost": 165, "time": 26, "stat": "dmg", "mult": 1.3,
+                    "applies": ["colossus", "brute"], "desc": "+30% charger & herald attack."}
+      }
+    },
+    "rootbound": {
+      "name": "The Rootbound Grove", "blurb": "Patience made bark — slow, vast, and always healing.",
+      "color": [116, 150, 92], "dark": [72, 96, 58],
+      "trait": "Regrowth: units regenerate, faster near your structures. Grow, don't rush.",
+      "econ": 1.08, "mechanic": "regen",
+      "structures": {
+        "scriptorium": {"name": "Heartwood Hall", "cost": 0, "hp": 1700, "r": 58, "build": 6.5,
+                        "makes": ["scribe"], "requires": [], "researches": [], "tier": 1, "key": "S",
+                        "desc": "Town hall. Trains Sapscribes; ink drop-off."},
+        "table": {"name": "Grafting Bench", "cost": 135, "hp": 980, "r": 44, "build": 9.5,
+                  "makes": ["soldier", "archer"], "requires": [], "researches": ["bark"], "tier": 1, "key": "T",
+                  "desc": "Grows rootlings & sap slingers."},
+        "well": {"name": "Tap Root", "cost": 78, "hp": 580, "r": 36, "build": 6.5,
+                 "makes": [], "requires": [], "researches": ["deeproots"], "tier": 1, "key": "R",
+                 "desc": "Raises ink cap & income (rich)."},
+        "spire": {"name": "Bramble Spire", "cost": 155, "hp": 1150, "r": 40, "build": 10.5,
+                  "makes": [], "requires": [], "researches": [], "tier": 1, "key": "P",
+                  "desc": "A thorned defensive tower."},
+        "bindery": {"name": "Thorn Bindery", "cost": 220, "hp": 1300, "r": 48, "build": 13.5,
+                    "makes": ["brute"], "requires": ["table"], "researches": ["sap"], "tier": 2, "key": "B",
+                    "desc": "Tier 2. Unlocks Thorn Wardens & grove upgrades."},
+        "menagerie": {"name": "Elder Ring", "cost": 350, "hp": 1600, "r": 54, "build": 18.0,
+                      "makes": ["colossus"], "requires": ["bindery"], "researches": ["elder"], "tier": 3, "key": "M",
+                      "desc": "Tier 3. Wakes the Elderbough."}
+      },
+      "units": {
+        "scribe": {"name": "Sapscribe", "cost": 26, "hp": 75, "dmg": 4, "spd": 82, "rng": 14, "r": 11,
+                   "card": "beekeeper", "worker": true, "build_t": 3.2, "tier": 1, "key": "E",
+                   "desc": "Harvests ink (richer hauls); raises structures."},
+        "soldier": {"name": "Rootlings", "cost": 46, "hp": 200, "dmg": 12, "spd": 62, "rng": 16, "r": 13,
+                    "card": "rootling", "build_t": 4.8, "tier": 1, "key": "A",
+                    "desc": "Stubborn saplings — pricklier than they look."},
+        "archer": {"name": "Sap Slinger", "cost": 66, "hp": 125, "dmg": 15, "spd": 68, "rng": 145, "r": 12,
+                   "card": "crane", "build_t": 5.6, "tier": 1, "key": "D",
+                   "desc": "Durable ranged growth."},
+        "brute": {"name": "Thorn Warden", "cost": 125, "hp": 520, "dmg": 30, "spd": 52, "rng": 18, "r": 19,
+                  "card": "thornwarden", "build_t": 9.5, "tier": 2, "key": "F",
+                  "desc": "A briar-plated wall that heals as it holds."},
+        "colossus": {"name": "Elderbough", "cost": 270, "hp": 1350, "dmg": 62, "spd": 40, "rng": 24, "r": 29,
+                     "card": "elderbough", "build_t": 17.0, "tier": 3, "key": "C",
+                     "desc": "The grove's slow, vast answer."}
+      },
+      "upgrades": {
+        "bark": {"name": "Iron Bark", "cost": 115, "time": 20, "stat": "maxhp", "mult": 1.35,
+                 "applies": "army", "desc": "+35% army health."},
+        "deeproots": {"name": "Deep Roots", "cost": 95, "time": 16, "stat": "harvest", "mult": 1.3,
+                      "applies": "workers", "desc": "+30% ink per haul."},
+        "sap": {"name": "Rising Sap", "cost": 120, "time": 22, "stat": "dmg", "mult": 1.25,
+                "applies": "army", "desc": "+25% army attack."},
+        "elder": {"name": "Elder Rings", "cost": 175, "time": 28, "stat": "maxhp", "mult": 1.28,
+                  "applies": ["colossus", "brute"], "desc": "+28% warden & elderbough health."}
+      }
+    }
+  },
+  "rts_maps": {
+    "terraces": {
+      "name": "The Paper Terraces",
+      "size": [4600, 3200], "seed": 8101, "nodes": 10,
+      "desc": "Two stepped tiers per side, each climbed by folded ramps. Hold the high paper or bleed on the stairs.",
+      "spawns": [[520, 2700], [4080, 500]],
+      "theme": {"ground": [198, 180, 150], "grid": [186, 168, 138], "ruled": [200, 150, 118],
+                "crease": [172, 152, 122], "accent": [160, 120, 80], "name_tint": [150, 110, 70]},
+      "weather": {"kind": "clear", "tint": [255, 240, 205], "strength": 0.12},
+      "highground": [[1500, 2100, 260], [3100, 1100, 260], [2300, 1600, 300]],
+      "ramps": [
+        [1500, 2480, 150, 160, "n"],
+        [1180, 2100, 150, 160, "e"],
+        [3100, 720, 150, 160, "s"],
+        [3420, 1100, 150, 160, "w"],
+        [2300, 2020, 170, 180, "n"],
+        [2300, 1180, 170, 180, "s"]
+      ],
+      "node_clusters": [
+        [1500, 2100, 4, 130, 1700],
+        [3100, 1100, 4, 130, 1700]
+      ],
+      "objects": [
+        {"kind": "watchtower", "x": 2300, "y": 1600, "r": 46, "sight": 560},
+        {"kind": "relic", "x": 2300, "y": 2500, "r": 44},
+        {"kind": "relic", "x": 2300, "y": 700, "r": 44},
+        {"kind": "ruin", "x": 1000, "y": 1000, "r": 70},
+        {"kind": "ruin", "x": 3600, "y": 2200, "r": 70}
+      ]
+    },
+    "inkfields": {
+      "name": "The Spilled Fields",
+      "size": [4200, 3000], "seed": 8202, "nodes": 6,
+      "desc": "Dense spilled-ink fields — whole clusters of wells pooled together. Claim a field, then defend the glut.",
+      "spawns": [[500, 1500], [3700, 1500]],
+      "theme": {"ground": [162, 172, 158], "grid": [150, 160, 146], "ruled": [130, 156, 150],
+                "crease": [140, 152, 140], "accent": [100, 130, 120], "name_tint": [90, 130, 120]},
+      "weather": {"kind": "mist", "tint": [200, 225, 200], "strength": 0.18},
+      "highground": [],
+      "ramps": [],
+      "node_clusters": [
+        [1300, 700, 7, 170, 1500],
+        [1300, 2300, 7, 170, 1500],
+        [2900, 700, 7, 170, 1500],
+        [2900, 2300, 7, 170, 1500],
+        [2100, 1500, 5, 140, 2400]
+      ],
+      "pools": [[2100, 900, 130], [2100, 2100, 130]],
+      "objects": [
+        {"kind": "richnode", "x": 2100, "y": 1500, "r": 40, "amount": 5200},
+        {"kind": "rock", "x": 1700, "y": 1500, "r": 52, "hp": 700},
+        {"kind": "rock", "x": 2500, "y": 1500, "r": 52, "hp": 700},
+        {"kind": "decoration", "x": 700, "y": 700, "r": 30},
+        {"kind": "decoration", "x": 3500, "y": 2300, "r": 30}
+      ]
+    },
+    "causeway": {
+      "name": "Highfold Causeway",
+      "size": [5000, 2800], "seed": 8303, "nodes": 8,
+      "desc": "A raised spine of paper runs the map's length; ramps at the ends and flanks. The causeway sees everything.",
+      "spawns": [[500, 1400], [4500, 1400]],
+      "theme": {"ground": [188, 186, 178], "grid": [176, 174, 166], "ruled": [150, 160, 190],
+                "crease": [168, 166, 158], "accent": [110, 120, 160], "name_tint": [100, 110, 160]},
+      "weather": {"kind": "overcast", "tint": [190, 200, 220], "strength": 0.18},
+      "highground": [[1900, 1400, 280], [2500, 1400, 280], [3100, 1400, 280]],
+      "ramps": [
+        [1520, 1400, 160, 170, "e"],
+        [3480, 1400, 160, 170, "w"],
+        [2500, 1780, 160, 170, "n"],
+        [2500, 1020, 160, 170, "s"]
+      ],
+      "node_clusters": [
+        [900, 600, 5, 150, 1600],
+        [900, 2200, 5, 150, 1600],
+        [4100, 600, 5, 150, 1600],
+        [4100, 2200, 5, 150, 1600]
+      ],
+      "objects": [
+        {"kind": "watchtower", "x": 1900, "y": 1400, "r": 46, "sight": 600},
+        {"kind": "watchtower", "x": 3100, "y": 1400, "r": 46, "sight": 600},
+        {"kind": "relic", "x": 2500, "y": 1400, "r": 44},
+        {"kind": "ruin", "x": 2500, "y": 500, "r": 74},
+        {"kind": "ruin", "x": 2500, "y": 2300, "r": 74}
+      ]
+    }
+  }
+}
