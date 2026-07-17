@@ -616,9 +616,23 @@ def main():
     font_lbl = pygame.font.SysFont("monospace", 16, bold=True)
     fonts    = (font_big, font, font_sm)
 
-    cli_name = sys.argv[1] if len(sys.argv)>1 else ""
+    cli_name = sys.argv[1] if len(sys.argv)>1 and not sys.argv[1].startswith("-") else ""
     if not cli_name:
         cli_name = username_prompt(screen, clock, font_big, font)
+
+    # ── optional hand-authored maze pack (see maze_editor.py) ──
+    # `--pack mazes/mypack.json` plays the pack's mazes in order, then falls
+    # back to random generation once the pack is exhausted.
+    global COLS, ROWS
+    pack, pack_idx = None, 0
+    if "--pack" in sys.argv:
+        try:
+            from maze_editor import load_pack, pack_walls
+            pack = load_pack(sys.argv[sys.argv.index("--pack") + 1])
+            print(f"[maze pack] loaded '{pack['name']}' — {len(pack['mazes'])} mazes")
+        except Exception as ex:
+            print(f"[maze pack] failed to load: {ex}")
+            pack = None
 
     # Load avatar after pygame.init so image module is ready
     avatar = load_avatar(size=36)
@@ -632,6 +646,14 @@ def main():
 
     maze_seed  = net.maze_seed or random.randint(0,2**31)
     maze_walls = generate_maze(COLS, ROWS, seed=maze_seed)
+    goal_cell  = None                      # None = classic bottom-right
+    start_cell = (0, 0)
+    if pack:
+        m0 = pack["mazes"][0]; pack_idx = 1
+        COLS, ROWS = m0["cols"], m0["rows"]
+        from maze_editor import pack_walls as _pw
+        maze_walls = _pw(m0)
+        goal_cell  = tuple(m0["goal"]); start_cell = tuple(m0["start"])
 
     rot_supported = detect_rotation_support()
     rot_locked    = False
@@ -651,8 +673,8 @@ def main():
     # Ball position stored as maze-relative (independent of window size / OX,OY shifts).
     # Converted to screen coords each frame: screen_x = OX + ball_rx, etc.
     SAFE = float(WALL_THICKNESS + BALL_RADIUS + 2)
-    ball_rx = SAFE   # maze-relative X
-    ball_ry = SAFE   # maze-relative Y
+    ball_rx = start_cell[0]*CELL_W + SAFE   # maze-relative X
+    ball_ry = start_cell[1]*CELL_H + SAFE   # maze-relative Y
     vx = vy = 0.0
     won = False; win_time = 0.0
     show_cal = False
@@ -663,11 +685,20 @@ def main():
     net_timer = 0.0
 
     def reset():
-        nonlocal ball_rx,ball_ry,vx,vy,won,maze_walls,maze_seed
-        maze_seed=random.randint(0,2**31)
-        net.maze_seed=maze_seed
-        maze_walls=generate_maze(COLS,ROWS,seed=maze_seed)
-        ball_rx=SAFE; ball_ry=SAFE
+        nonlocal ball_rx,ball_ry,vx,vy,won,maze_walls,maze_seed,pack_idx,goal_cell,start_cell
+        global COLS, ROWS
+        if pack and pack_idx < len(pack["mazes"]):
+            from maze_editor import pack_walls as _pw
+            m = pack["mazes"][pack_idx]; pack_idx += 1
+            COLS, ROWS = m["cols"], m["rows"]
+            maze_walls = _pw(m)
+            goal_cell  = tuple(m["goal"]); start_cell = tuple(m["start"])
+        else:
+            goal_cell = None; start_cell = (0, 0)
+            maze_seed=random.randint(0,2**31)
+            net.maze_seed=maze_seed
+            maze_walls=generate_maze(COLS,ROWS,seed=maze_seed)
+        ball_rx=start_cell[0]*CELL_W + SAFE; ball_ry=start_cell[1]*CELL_H + SAFE
         vx=vy=0.0; won=False
 
     # ─── game loop ─────────────────────────────────────────────────────────────
@@ -707,8 +738,9 @@ def main():
 
         # wall rects & goal live every frame
         wall_rects = maze_to_rects(maze_walls, CELL_W, CELL_H, OX, OY, COLS, ROWS)
-        goal_x = OX + (COLS-1)*CELL_W + CELL_W//2
-        goal_y = OY + (ROWS-1)*CELL_H + CELL_H//2
+        gc, gr = goal_cell if goal_cell else (COLS-1, ROWS-1)
+        goal_x = OX + gc*CELL_W + CELL_W//2
+        goal_y = OY + gr*CELL_H + CELL_H//2
 
         # arrow key impulses this frame
         akx=aky=0.0
