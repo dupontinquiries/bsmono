@@ -155,6 +155,28 @@ impl Workspace {
         }
     }
 
+    /// Ingest raw external bytes (a DRAG-AND-DROPPED file) to a sandboxed workspace path, recording a
+    /// `FileEvent`. Unlike `WriteFile` (UTF-8 contents from the model), this takes bytes, so dropped
+    /// binaries land intact. `dest_rel` is workspace-relative.
+    pub fn ingest(&mut self, dest_rel: &str, bytes: &[u8]) -> ToolResult {
+        let abs = match self.sandbox_path(dest_rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        let existed = abs.exists();
+        if let Some(parent) = abs.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return ToolResult::err(format!("mkdir {dest_rel}: {e}"));
+            }
+        }
+        if let Err(e) = std::fs::write(&abs, bytes) {
+            return ToolResult::err(format!("ingest {dest_rel}: {e}"));
+        }
+        self.events.push(FileEvent {
+            path: dest_rel.to_string(),
+            change: if existed { FileChange::Modified } else { FileChange::Created },
+            bytes: bytes.len() as u64,
+        });
+        ToolResult::ok(format!("ingested {dest_rel} ({} bytes)", bytes.len()))
+    }
+
     fn write_file(&mut self, rel: &str, contents: &str) -> ToolResult {
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let existed = abs.exists();
@@ -639,6 +661,18 @@ mod tests {
             self.i += 1;
             Ok(t)
         }
+    }
+
+    #[test]
+    fn ingest_drops_bytes_and_records_event() {
+        let mut ws = Workspace::new(tmp("ingest"));
+        let r = ws.ingest("assets/logo.bin", &[0u8, 1, 2, 3]);
+        assert!(r.ok, "{}", r.output);
+        assert_eq!(ws.events()[0].path, "assets/logo.bin");
+        assert_eq!(ws.events()[0].change, FileChange::Created);
+        assert_eq!(std::fs::read(ws.root().join("assets/logo.bin")).unwrap(), vec![0u8, 1, 2, 3]);
+        // escape attempt is rejected
+        assert!(!ws.ingest("../evil", b"x").ok);
     }
 
     #[test]

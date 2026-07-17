@@ -99,6 +99,9 @@ pub enum Command {
                        // ask the model for a per-file summary (fan-out friendly)
     LoadGitmind(String), // :load-gitmind <path> — mirror a .gitmind project into an isolated /tmp session
     Reapply,             // :reapply — land the loaded session's changes over the project as one new commit
+    Agent(String),       // :agent <task> — run the local-LLM agentic loop (tool-calling) in the loaded
+                         // session's isolated workspace: the model writes/reads/runs to build the task,
+                         // files appear live in the scene, then :reapply lands them as one commit
     Compact(String),   // :compact [ratio] / :refresh — student/teacher self-compaction: fold older turns into
                        // a shorter briefing (staged as the working context) to grow effective context, speed
                        // decode, and create a pinnable KV checkpoint reused by descendant paths
@@ -458,6 +461,7 @@ pub fn parse_command(line: &str) -> Command {
         "summarize-files" | "summarise-files" | "sf" => Command::SummarizeFiles(arg.to_string()),
         "load-gitmind" | "lgm" => Command::LoadGitmind(arg.to_string()),
         "reapply" | "ra" => Command::Reapply,
+        "agent" | "ag" => Command::Agent(arg.to_string()),
         "compact" | "refresh" | "cp" => Command::Compact(arg.to_string()),
         "race" => Command::Race(arg.to_string()),
         "why" | "diagnose" => { let (refs, _) = parse_strategy_args(arg); Command::Diagnose(refs) }
@@ -578,6 +582,8 @@ mod tests {
         assert_eq!(parse_command(":lgm /x"), Command::LoadGitmind("/x".into()));
         assert_eq!(parse_command(":reapply"), Command::Reapply);
         assert_eq!(parse_command(":ra"), Command::Reapply);
+        assert_eq!(parse_command(":agent add a test for foo"), Command::Agent("add a test for foo".into()));
+        assert_eq!(parse_command(":ag build a CLI"), Command::Agent("build a CLI".into()));
         assert_eq!(parse_command(":race 0.4"), Command::Race("0.4".into()));
         assert_eq!(parse_command(":why -1,-3"), Command::Diagnose(vec!["-1".into(), "-3".into()]));
         assert_eq!(parse_command(":diagnose"), Command::Diagnose(Vec::new()));
