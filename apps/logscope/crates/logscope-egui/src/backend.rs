@@ -782,9 +782,9 @@ impl Inference {
         Self { tx: cmd_tx, rx: evt_rx, cancel }
     }
     pub fn load(&self, path: String) { let _ = self.tx.send(Cmd::Load(path)); }
-    pub fn generate(&self, prompt: String) { let _ = self.tx.send(Cmd::Generate(prompt)); }
+    pub fn generate(&self, prompt: String) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::Generate(prompt)); }
     /// Resume the last reply in place (warm KV); `fallback` is used only if the backend can't resume.
-    pub fn continue_stream(&self, fallback: String) { let _ = self.tx.send(Cmd::Continue(fallback)); }
+    pub fn continue_stream(&self, fallback: String) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::Continue(fallback)); }
     pub fn set_params(&self, p: GenParams) { let _ = self.tx.send(Cmd::SetParams(p)); }
     pub fn set_backend(&self, k: BackendKind) { let _ = self.tx.send(Cmd::SetBackend(k)); }
     /// Request cancellation of the in-flight generation. The worker is blocked
@@ -819,7 +819,10 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 }
             }
             Cmd::Generate(prompt) => {
-                cancel.store(false, Ordering::Relaxed); // clear any stale request
+                // NOTE: cancel is cleared by the SENDER (Inference::generate) on the UI thread, ordered
+                // before any Stop the user then clicks — resetting it here (on dequeue) could clobber a
+                // Stop clicked in the window between send and dequeue, which is exactly the "subsequent
+                // turns don't abort" bug (the worker is busy finishing the prior turn when Stop is hit).
                 let start = Instant::now();
                 if backend.loaded() {
                     let evt2 = evt.clone();
@@ -841,7 +844,7 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>) {
                 }
             }
             Cmd::Continue(prompt) => {
-                cancel.store(false, Ordering::Relaxed);
+                // cancel cleared by the sender (Inference::continue_stream) — see Cmd::Generate.
                 let start = Instant::now();
                 if backend.loaded() {
                     let evt2 = evt.clone();
