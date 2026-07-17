@@ -570,6 +570,9 @@ class RTS:
         self._blockers = []                 # blocking obstacles (for avoidance)
         self._high = []                     # high-ground plateaus (x,y,r)
         self._ramps = []                    # resolved ramps (x,y,w,len,ddx,ddy)
+        self.fauna = []                     # ambient living-map agents
+        self.surge = None                   # active ink surge
+        self.surge_timer = 999.0
         self.dying = []                     # display-only crumpling corpses
         base_ink = 120
         self.ink = {0: base_ink, 1: base_ink}
@@ -682,15 +685,24 @@ class RTS:
         return self._factbook()[self.fac[team]]
 
     def _struct_available(self, team, kind):
-        """Tech gate: are this structure's prerequisites all built & complete?"""
-        req = self.sspec(team, kind).get("requires", [])
-        for r in req:
+        """Tech gate: prerequisites built & complete, and any required research
+        finished — trees can branch through upgrades, not just buildings."""
+        spec = self.sspec(team, kind)
+        for r in spec.get("requires", []):
             if not any(s.team == team and s.kind == r and s.complete for s in self.structs):
                 return False
+        need = spec.get("requires_research")
+        if need and need not in self.upgrades[team]:
+            return False
         return True
 
     def _unit_available(self, team, kind):
-        """A unit is trainable if some COMPLETE structure of ours makes it."""
+        """A unit is trainable if some COMPLETE structure of ours makes it AND
+        any research it demands is finished."""
+        spec = self.uspec(team, kind) or {}
+        need = spec.get("requires_research")
+        if need and need not in self.upgrades[team]:
+            return False
         for s in self.structs:
             if s.team == team and s.complete and kind in self.sspec(team, s.kind).get("makes", []):
                 return True
@@ -717,6 +729,8 @@ class RTS:
                 u.dmg *= up["mult"]
             elif st == "spd":
                 u.spd *= up["mult"]
+            elif st == "rng":
+                u.rng *= up["mult"]
             # "harvest" handled at drop-off time via _harvest_mult
 
     def _retro_upgrade(self, team, uk):
@@ -741,6 +755,8 @@ class RTS:
                 u.dmg *= up["mult"]
             elif up["stat"] == "spd":
                 u.spd *= up["mult"]
+            elif up["stat"] == "rng":
+                u.rng *= up["mult"]
 
     def _start_research(self, s, uk):
         if not s.complete or s.research is not None:
@@ -863,6 +879,45 @@ class RTS:
         self.props = [dict(p) for p in self.mapdef.get("props", [])]   # themed decor
         self.bands = [tuple(b) for b in self.mapdef.get("bands", [])]
         self.pools = [tuple(p) for p in self.mapdef.get("pools", [])]
+        # ── living map: ambient fauna + dynamic ink surges ──
+        # fauna is authored per map ("fauna": [{"kind","count"}...]) with
+        # sensible defaults derived from the terrain: paper birds always cross
+        # the page, ink fish live wherever there are pools, beetles skitter
+        # where there's enough decor to hide under.
+        fauna_spec = self.mapdef.get("fauna")
+        if fauna_spec is None:
+            fauna_spec = [{"kind": "birds", "count": 6}]
+            if self.pools:
+                fauna_spec.append({"kind": "fish", "count": 3 * len(self.pools)})
+            if len(self.props) >= 6:
+                fauna_spec.append({"kind": "beetles", "count": 4})
+        self.fauna = []
+        frng = random.Random(int(self.mapdef.get("seed", 1)) ^ 0xFA0A)
+        for fs in fauna_spec:
+            kind = fs.get("kind"); cnt = int(fs.get("count", 4))
+            if kind == "birds":
+                # one flock: a heading + per-bird offsets; loops around the map
+                hx = frng.uniform(-1, 1); hy = frng.uniform(-0.4, 0.4)
+                mag = math.hypot(hx, hy) or 1.0
+                self.fauna.append(dict(kind="birds",
+                    x=frng.uniform(0, WORLD_W), y=frng.uniform(0, WORLD_H),
+                    vx=hx / mag * 46, vy=hy / mag * 46,
+                    offs=[(frng.uniform(-70, 70), frng.uniform(-40, 40),
+                           frng.uniform(0, math.tau)) for _ in range(cnt)]))
+            elif kind == "fish" and self.pools:
+                for _ in range(cnt):
+                    px, py, pr = self.pools[frng.randrange(len(self.pools))]
+                    self.fauna.append(dict(kind="fish", pool=(px, py, pr),
+                        a=frng.uniform(0, math.tau), spd=frng.uniform(0.3, 0.7),
+                        r=frng.uniform(0.3, 0.75) * pr, ph=frng.uniform(0, 9)))
+            elif kind == "beetles":
+                for _ in range(cnt):
+                    x = frng.uniform(200, WORLD_W - 200)
+                    y = frng.uniform(200, WORLD_H - 200)
+                    self.fauna.append(dict(kind="beetle", x=x, y=y, tx=x, ty=y,
+                                           rest=frng.uniform(1, 4)))
+        self.surge = None                    # active ink surge: dict | None
+        self.surge_timer = frng.uniform(18, 30)
         # event scripts authored in the map editor (trigger → actions)
         self.events = copy.deepcopy(self.mapdef.get("events", []))
         for e in self.events:
@@ -1453,6 +1508,12 @@ class RTS:
     # ── production & building ──
     def _queue_train(self, s, uk):
         spec = self.uspec(s.team, uk)
+        need = spec.get("requires_research")
+        if need and need not in self.upgrades[s.team]:
+            if s.team == 0:
+                upname = self.facdata(0)["upgrades"].get(need, {}).get("name", need)
+                self.flash(f"Requires research: {upname}.")
+            return
         if not self._supply_free(s.team, uk):
             if s.team == 0: self.flash("Supply blocked — raise an Ink Reservoir.")
             return
@@ -1592,6 +1653,122 @@ class RTS:
                 if math.hypot(s.x - u.x, s.y - u.y) < self.sspec(s.team, s.kind).get("detect_range", 300):
                     return True
         return False
+
+    # ── living map: fauna + ink surges ──────────────────────────────────────
+    def _tick_life(self, dt):
+        """Advance ambient fauna and the occasional ink surge. All cosmetic
+        except the surge's small +ink on a node — a reason to watch the map."""
+        tnow = getattr(self, "_anim_t", 0.0)
+        for f in self.fauna:
+            k = f["kind"]
+            if k == "birds":
+                f["x"] += f["vx"] * dt; f["y"] += f["vy"] * dt
+                # wrap the flock around the page with margin
+                if f["x"] < -160: f["x"] = WORLD_W + 150
+                if f["x"] > WORLD_W + 160: f["x"] = -150
+                if f["y"] < -160: f["y"] = WORLD_H + 150
+                if f["y"] > WORLD_H + 160: f["y"] = -150
+            elif k == "beetle":
+                f["rest"] -= dt
+                dx, dy = f["tx"] - f["x"], f["ty"] - f["y"]
+                d = math.hypot(dx, dy)
+                if d > 3:                      # darting to the next hidey spot
+                    sp = 120 * dt
+                    f["x"] += dx / d * sp; f["y"] += dy / d * sp
+                elif f["rest"] <= 0:           # pick a new dash
+                    f["tx"] = min(WORLD_W - 100, max(100, f["x"] + random.uniform(-260, 260)))
+                    f["ty"] = min(WORLD_H - 100, max(100, f["y"] + random.uniform(-260, 260)))
+                    f["rest"] = random.uniform(1.5, 5.0)
+            # fish advance their orbit lazily in the drawer (pure function of t)
+        # ── ink surges: a random living well periodically boils over ──
+        if self.surge is None:
+            self.surge_timer -= dt
+            if self.surge_timer <= 0:
+                live = [n for n in self.nodes if n.amount > 0]
+                if live:
+                    n = random.choice(live)
+                    n.amount += 220           # the well runs rich for a while
+                    self.surge = dict(node=n, t=0.0, dur=6.0)
+                    if self._cell_state(n.x, n.y) != 0 or not self.fog_on:
+                        self.flash("An ink well surges…")
+                self.surge_timer = random.uniform(22, 40)
+        else:
+            self.surge["t"] += dt
+            n = self.surge["node"]
+            if self.surge["t"] < self.surge["dur"] and random.random() < 12 * dt:
+                self._emit(n.x, n.y, 3, "ink", (140, 124, 210),
+                           spread=int(n.r), life=0.7, up=70)
+            if self.surge["t"] >= self.surge["dur"]:
+                self.surge = None
+
+    def _draw_fauna(self, screen):
+        if self.zoom < 0.45:
+            return
+        tnow = getattr(self, "_anim_t", 0.0)
+        for f in self.fauna:
+            k = f["kind"]
+            if k == "birds":
+                for (ox, oy, ph) in f["offs"]:
+                    bx, by = f["x"] + ox, f["y"] + oy
+                    if self.fog_on and self._cell_state(bx, by) == 0:
+                        continue
+                    sx, sy = self.w2s(bx, by)
+                    if not (-20 < sx < self.W + 20 and -20 < sy < self.H - 100):
+                        continue
+                    sy -= 34 * self.zoom          # they fly above the page
+                    flap = math.sin(tnow * 9 + ph)
+                    w = max(3, int(6 * self.zoom)); h = int(w * 0.6 * (0.4 + abs(flap)))
+                    hd = 1 if f["vx"] >= 0 else -1
+                    pygame.draw.lines(screen, (246, 242, 230), False,
+                        [(sx - w * hd, sy - h * flap), (sx, sy), (sx + w * 0.6 * hd, sy - h * flap * 0.8)], 2)
+                    # a faint travelling shadow sells the altitude
+                    gsx, gsy = self.w2s(bx, by)
+                    pygame.draw.ellipse(screen, (0, 0, 0),
+                        (int(gsx - 3), int(gsy - 1), 6, 2), 1)
+            elif k == "fish":
+                px, py, pr = f["pool"]
+                if self.fog_on and self._cell_state(px, py) == 0:
+                    continue
+                a = f["a"] + tnow * f["spd"]
+                fx = px + math.cos(a) * f["r"]
+                fy = py + math.sin(a) * f["r"] * 0.8
+                sx, sy = self.w2s(fx, fy)
+                if not (-20 < sx < self.W + 20 and -20 < sy < self.H - 100):
+                    continue
+                # a fin breaking the ink + an expanding ripple every few beats
+                fin = math.sin(tnow * 2.0 + f["ph"])
+                if fin > 0.2:
+                    ln = max(2, int(5 * self.zoom * fin))
+                    pygame.draw.line(screen, (150, 140, 205),
+                                     (sx, sy - ln), (sx + ln, sy), 2)
+                rp = (tnow * 0.6 + f["ph"]) % 1.0
+                rr = int(pr * 0.25 * rp * self.zoom)
+                if rr > 2:
+                    self.disc(screen, (110, 100, 168), fx, fy, pr * 0.25 * rp, 1)
+            elif k == "beetle":
+                if self.fog_on and self._cell_state(f["x"], f["y"]) == 0:
+                    continue
+                sx, sy = self.wpos(f["x"], f["y"])
+                if not (-10 < sx < self.W + 10 and -10 < sy < self.H - 100):
+                    continue
+                moving = math.hypot(f["tx"] - f["x"], f["ty"] - f["y"]) > 3
+                jitter = math.sin(tnow * 22 + f["x"]) if moving else 0
+                pygame.draw.ellipse(screen, (74, 62, 48),
+                    (int(sx - 3), int(sy - 2 + jitter), 6, 4))
+                pygame.draw.line(screen, (120, 104, 82),
+                                 (int(sx - 2), int(sy)), (int(sx + 2), int(sy)), 1)
+        # ── surge halo + relic pulse (pure functions of time) ──
+        if self.surge is not None:
+            n = self.surge["node"]
+            ph = (self.surge["t"] * 1.4) % 1.0
+            self.disc(screen, (150, 136, 220), n.x, n.y, n.r * (1.0 + ph * 1.6),
+                      max(1, int(3 * (1 - ph))))
+        for o in self.objects:
+            if o.kind == "relic":
+                ph = (tnow * 0.5 + o.x * 0.001) % 1.0
+                if not self.fog_on or self._cell_state(o.x, o.y) != 0:
+                    self.disc(screen, (214, 186, 120), o.x, o.y,
+                              o.r * (0.8 + ph * 1.1), max(1, int(2 * (1 - ph))))
 
     def _draw_pools(self, screen):
         """Rippling ink pools — dark water regions with animated concentric
@@ -2074,6 +2251,7 @@ class RTS:
             p["t"] += dt
         self.pings = [p for p in self.pings if p["t"] < 4.0]
         self.msg_t = max(0.0, self.msg_t - dt)
+        self._tick_life(dt)
         # arm edge panning only after the grace period AND once we've seen a
         # real (canvas-translated) pointer event — never on a stale OS cursor.
         if not self.edge_pan_armed and self.match_t >= self.pan_grace and self.mouse_pos is not None:
@@ -2148,13 +2326,21 @@ class RTS:
                 s.research = None
             else:
                 s.research = (uk, left)
-        # watch spire fires
-        if s.kind == "spire":
+        # defensive fire: any structure with tower stats shoots (the classic
+        # Watch Spire keeps its numbers as the defaults) — factions tune their
+        # towers into stingers, long-eyes, or thorned bulwarks via data.
+        sp = self.sspec(s.team, s.kind)
+        tdmg = sp.get("tower_dmg", 22 if s.kind == "spire" else 0)
+        if tdmg > 0:
             s.cool = max(0.0, s.cool - dt)
             if s.cool <= 0:
-                foe = self._nearest_enemy(s.x, s.y, s.team, 240)
+                foe = self._nearest_enemy(s.x, s.y, s.team,
+                                          sp.get("tower_rng", 240))
                 if foe:
-                    self._hurt(foe, 22); s.cool = 0.8
+                    self._hurt(foe, tdmg)
+                    s.cool = sp.get("tower_cool", 0.8)
+                    self._emit(s.x, s.y - s.r * 0.6, 2, "ink",
+                               self._tcol(s.team), spread=8, life=0.25, up=30)
 
     def _spawn_from(self, s, uk):
         ang = random.uniform(0, math.tau)
@@ -2834,6 +3020,7 @@ class RTS:
         self._draw_pools(screen)
         self._draw_motes(screen)
         self._draw_props(screen)
+        self._draw_fauna(screen)
         self._draw_nodes(screen)
         self._draw_objects(screen)
         # structures under units — enemy structures only if in vision (last-seen
@@ -3665,6 +3852,7 @@ class RTS:
         #    recognisable at a glance, not just by its letter ──
         self._draw_struct_body(screen, s, sx, sy, r, col, dark, light, tnow)
         self._draw_faction_accent(screen, s, sx, sy, r, col, dark, light, tnow)
+        self._draw_struct_skin(screen, s, sx, sy, r)
         self._draw_struct_motif(screen, s, sx, sy, r, tnow)
         # damage state: cracks appear as the building is worn down
         frac = s.hp / s.maxhp
@@ -3708,10 +3896,99 @@ class RTS:
         pygame.draw.polygon(screen, light, flag)
         pygame.draw.polygon(screen, dark, flag, 1)
 
+    def _draw_struct_skin(self, screen, s, sx, sy, r):
+        """The faction's paper 'skin': a subtle pattern texture + a trim line
+        over the finished building, so every race's architecture reads at a
+        glance. Declared in faction data: skin = {pattern, trim}."""
+        if not s.complete or self.zoom < 0.45:
+            return
+        skin = self.facdata(s.team).get("skin")
+        if not skin:
+            # core factions get a derived skin from their mechanic, so every
+            # race is textured even without explicit data
+            skin = {"cohesion": {"pattern": "hatch", "trim": (214, 178, 108)},
+                    "burn":     {"pattern": "scale", "trim": (235, 140, 70)},
+                    "regen":    {"pattern": "weave", "trim": (110, 200, 196)},
+                    "momentum": {"pattern": "dots",  "trim": (208, 196, 150)},
+                    }.get(self.facdata(s.team).get("mechanic"))
+            if not skin:
+                return
+        pat = skin.get("pattern", "")
+        trim = tuple(skin.get("trim", (200, 200, 200)))
+        top = int(sy - r * 1.05)
+        body = pygame.Rect(int(sx - r * 0.72), top, int(r * 1.44), int(r * 0.95))
+        tex = pygame.Surface(body.size, pygame.SRCALPHA)
+        w, h = body.size
+        if pat == "dots":                    # gilded wax cells
+            step = max(6, r // 4)
+            for yy in range(step // 2, h, step):
+                for xx in range((yy // step % 2) * step // 2, w, step):
+                    pygame.draw.circle(tex, (*trim, 46), (xx, yy), max(1, step // 5))
+        elif pat == "weave":                 # wind-loom cross weave
+            step = max(7, r // 3)
+            for d in range(-h, w, step):
+                pygame.draw.line(tex, (*trim, 34), (d, 0), (d + h, h), 1)
+                pygame.draw.line(tex, (*trim, 34), (d + h, 0), (d, h), 1)
+        elif pat == "rings":                 # heartwood growth rings
+            for k in range(3):
+                rr = int(r * (0.35 + k * 0.28))
+                pygame.draw.circle(tex, (*trim, 40), (w // 2, h), rr, 1)
+        elif pat == "hatch":                 # scribing hatch
+            step = max(6, r // 4)
+            for d in range(0, w + h, step):
+                pygame.draw.line(tex, (*trim, 34), (d, 0), (d - h, h), 1)
+        elif pat == "scale":                 # overlapping folded scales
+            step = max(8, r // 3)
+            for yy in range(0, h, step):
+                for xx in range((yy // step % 2) * step // 2, w, step):
+                    pygame.draw.arc(tex, (*trim, 44),
+                                    (xx, yy, step, step), 0, math.pi, 1)
+        screen.blit(tex, body.topleft)
+        # trim: a fine faction-coloured line along the roof edge
+        pygame.draw.line(screen, trim, (body.left + 2, body.top + 2),
+                         (body.right - 2, body.top + 2), 1)
+
     def _draw_struct_motif(self, screen, s, sx, sy, r, tnow):
         """A per-faction visual signature over each building — procedural (driven
         by time, no sim state) so factions read distinctly at a glance."""
         if not s.complete or self.zoom < 0.4:
+            return
+        fk = self.fac[s.team]
+        if fk == "swarm":
+            # a ring of gilded mites orbiting the building
+            for k in range(4):
+                a = tnow * (1.2 + k * 0.13) + k * math.tau / 4 + s.uid
+                mx = sx + math.cos(a) * r * 1.15
+                my = sy - r * 0.5 + math.sin(a) * r * 0.5
+                pygame.draw.circle(screen, (222, 186, 96), (int(mx), int(my)), 2)
+                pygame.draw.circle(screen, (150, 118, 52), (int(mx), int(my)), 2, 1)
+            return
+        if fk == "windwrit":
+            # wind streamers trailing off the roof, rippling
+            for k in range(2):
+                base_x = sx + (k * 2 - 1) * r * 0.45
+                base_y = sy - r * 1.05
+                pts = []
+                for i in range(6):
+                    t2 = i / 5
+                    pts.append((base_x + t2 * r * 0.9 * (k * 2 - 1) * -1
+                                + math.sin(tnow * 5 + i + s.uid) * 2,
+                                base_y - t2 * r * 0.25
+                                + math.sin(tnow * 6 + i * 1.4 + k * 2) * 3 * t2))
+                pygame.draw.lines(screen, (150, 190, 226), False, pts, 2)
+            return
+        if fk == "rootbound":
+            # leaf sprigs slowly unfurling around the base
+            for k in range(3):
+                ph = (tnow * 0.25 + k * 0.33 + s.uid * 0.07) % 1.0
+                a = k * 2.1 + s.uid
+                lx = sx + math.cos(a) * r * 0.95
+                ly = sy + math.sin(a) * r * 0.4 * ISO + r * 0.15
+                gl = min(1.0, ph * 2)
+                tip = (lx + math.cos(a - 0.6) * 7 * gl, ly - 9 * gl)
+                pygame.draw.line(screen, (110, 140, 84), (lx, ly), tip, 2)
+                pygame.draw.circle(screen, (156, 186, 116),
+                                   (int(tip[0]), int(tip[1])), max(1, int(3 * gl)))
             return
         mech = self.facdata(s.team).get("mechanic")
         if mech == "burn":
@@ -4006,8 +4283,12 @@ class RTS:
         # attack lunge: atk_anim runs 0.3→0; map to a 0..1 lunge pulse
         atk = getattr(u, "atk_anim", 0.0)
         lunge = math.sin((0.3 - min(0.3, atk)) / 0.3 * math.pi) if atk > 0 else 0.0
+        fam_style = {"bird": "flap", "insect": "flicker", "fish": "undulate",
+                     "serpent": "undulate", "wisp": "pulse", "tree": "sway",
+                     "beast": "", "figure": ""}.get(fam, "")
         anim = dict(t=tnow, move=moving, phase=(u.uid % 17) * 0.37, attack=lunge,
-                    style="", size=s)
+                    breathe=math.sin(tnow * 2.2 + (u.uid % 31) * 0.4),
+                    style=fam_style, size=s)
         lean = lunge * r * 0.35 * f
         # gentle idle sway when standing still — a breathing paper wobble
         sway = 0.0
