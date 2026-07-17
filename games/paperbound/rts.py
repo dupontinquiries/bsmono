@@ -41,6 +41,10 @@ WORLD_W, WORLD_H = 4200, 2800          # world units (the full map)
 INK_PER_TRIP = 8
 HARVEST_TIME = 2.2                     # seconds a scribe spends mining a node
 ZOOM_MIN, ZOOM_MAX = 0.45, 1.6         # how far out / in the camera can go
+ISO = 0.62                             # vertical squash: the page is seen at an
+                                       # angle, like the main game's board, not
+                                       # flat from directly above
+HG_LIFT = 26.0                         # world units of visual lift for high ground
 LONGPRESS_T = 0.4                      # seconds a touch/hold takes to open the wheel
 
 # structure + unit catalogues (kept tiny & self-describing). `card` maps a combat
@@ -537,6 +541,7 @@ class RTS:
         self.objects = []                   # MapObjects from the JSON overlay
         self._blockers = []                 # blocking obstacles (for avoidance)
         self._high = []                     # high-ground plateaus (x,y,r)
+        self._ramps = []                    # resolved ramps (x,y,w,len,ddx,ddy)
         self.dying = []                     # display-only crumpling corpses
         base_ink = 120
         self.ink = {0: base_ink, 1: base_ink}
@@ -783,11 +788,39 @@ class RTS:
             self.objects.append(obj)
             if obj.kind == "richnode":
                 self.nodes.append(InkNode(obj.x, obj.y, obj.amount or 3000))
+        # authored ink FIELDS: clusters of wells packed around a point —
+        # [x, y, count, spread, amount_each]; mirrored like the scatter so both
+        # players face the same economy.
+        for cl in self.mapdef.get("node_clusters", []):
+            try:
+                fx, fy, cnt, spread = cl[0], cl[1], int(cl[2]), cl[3]
+                amt = cl[4] if len(cl) > 4 else 1600
+            except Exception:
+                continue
+            crng = random.Random(int(self.mapdef.get("seed", 1)) ^ (int(fx) * 7919) ^ int(fy))
+            for _ in range(cnt):
+                a = crng.uniform(0, math.tau)
+                d = spread * math.sqrt(crng.uniform(0.05, 1.0))
+                self.nodes.append(InkNode(fx + math.cos(a) * d,
+                                          fy + math.sin(a) * d * 0.8, amt))
         # cache the blocking obstacles for movement avoidance
         self._blockers = [o for o in self.objects if o.blocks]
         self.rocks = [o for o in self.objects if o.destructible]
         self.watchtowers = [o for o in self.objects if o.watchtower]
         self._high = list(_MAP_HIGH.get(self.map_id, []))
+        # ramps: authored runs up onto the plateaus — [x, y, width, length, dir]
+        # where (x,y) is the FOOT of the ramp and dir ("n"/"s"/"e"/"w") points UP
+        # toward the plateau. Stored resolved as (x, y, w, len, ddx, ddy).
+        self._ramps = []
+        _DIRS = {"n": (0, -1), "s": (0, 1), "e": (1, 0), "w": (-1, 0)}
+        for r in self.mapdef.get("ramps", []):
+            try:
+                rx, ry, rw, rl, d = r
+                ddx, ddy = _DIRS.get(str(d).lower(), (0, -1))
+                self._ramps.append((float(rx), float(ry), float(rw), float(rl),
+                                    float(ddx), float(ddy)))
+            except Exception:
+                pass
         # art theme (paper palette) for this map, with sane defaults
         self.theme = self.mapdef.get("theme", dict(
             ground=[196, 178, 148], grid=[186, 168, 138], ruled=[205, 150, 120],
@@ -847,10 +880,44 @@ class RTS:
         self.msg_t = 4.0
 
     # ── coordinate transforms ──
+    # The page is viewed at an angle (like the main game's board): world y is
+    # foreshortened by ISO, and points on high ground / ramps additionally rise
+    # by a screen-vertical lift. w2s/s2w are the pure GROUND-PLANE mapping (all
+    # picking runs through them, so clicks land on the ground point); wpos() is
+    # the elevation-aware position drawers use.
     def w2s(self, x, y):
-        return (x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom
+        return (x - self.cam_x) * self.zoom, (y - self.cam_y) * self.zoom * ISO
     def s2w(self, sx, sy):
-        return sx / self.zoom + self.cam_x, sy / self.zoom + self.cam_y
+        return sx / self.zoom + self.cam_x, sy / (self.zoom * ISO) + self.cam_y
+    def _lift(self, x, y):
+        """Visual elevation (world units) at a point: full on a plateau, a smooth
+        run up along a ramp, zero on the flat page."""
+        for hx, hy, hr in self._high:
+            if (x - hx) ** 2 + (y - hy) ** 2 < hr * hr:
+                return HG_LIFT
+        for (rx, ry, rw, rl, ddx, ddy) in getattr(self, "_ramps", []):
+            # ramp-local coords: `along` runs 0 (foot) → rl (top edge)
+            lx, ly = x - rx, y - ry
+            along = lx * ddx + ly * ddy
+            across = abs(lx * -ddy + ly * ddx)
+            if 0.0 <= along <= rl and across <= rw * 0.5:
+                return HG_LIFT * (along / rl)
+        return 0.0
+    def wpos(self, x, y):
+        sx, sy = self.w2s(x, y)
+        lf = self._lift(x, y)
+        if lf:
+            sy -= lf * self.zoom
+        return sx, sy
+    def disc(self, screen, col, x, y, wr, width=0, lift=True):
+        """A disc lying ON the page: an ellipse foreshortened by ISO, lifted if
+        it sits on high ground. The workhorse for rings/footprints/pools."""
+        sx, sy = (self.wpos if lift else self.w2s)(x, y)
+        rr = max(1, int(wr * self.zoom))
+        ry = max(1, int(rr * ISO))
+        rect = pygame.Rect(int(sx - rr), int(sy - ry), rr * 2, ry * 2)
+        pygame.draw.ellipse(screen, col, rect, width)
+        return rect
     def _on_screen(self, wx, wy, margin=40):
         sx, sy = self.w2s(wx, wy)
         return -margin < sx < self.W + margin and -margin < sy < self.H - 118 + margin
@@ -1472,7 +1539,10 @@ class RTS:
             hx = rr + 2 + math.cos(tnow * 0.7) * rr * 0.3
             hy = rr + 2 + math.sin(tnow * 0.6) * rr * 0.25
             pygame.draw.circle(pool, (150, 140, 210, 90), (int(hx), int(hy)), max(2, rr // 4))
-            screen.blit(pool, (int(sx - rr - 2), int(sy - rr - 2)))
+            # foreshorten the composed pool to the page's viewing angle
+            ph_ = max(2, int((rr * 2 + 4) * ISO))
+            pool = pygame.transform.smoothscale(pool, (rr * 2 + 4, ph_))
+            screen.blit(pool, (int(sx - rr - 2), int(sy - ph_ // 2)))
 
     def _draw_props(self, screen):
         """Themed decorative biome props — folded paper leaves, boats, cranes,
@@ -1487,7 +1557,7 @@ class RTS:
             wx, wy = p["x"], p["y"]
             if self.fog_on and self._cell_state(wx, wy) == 0:
                 continue
-            sx, sy = self.w2s(wx, wy)
+            sx, sy = self.wpos(wx, wy)
             rr = p["r"] * self.zoom
             if not (-30 < sx < self.W + 30 and -30 < sy < self.H - 88):
                 continue
@@ -2433,7 +2503,7 @@ class RTS:
 
     def _clamp_cam(self):
         # viewport size in world units grows as we zoom out
-        vw = self.W / self.zoom; vh = (self.H - 118) / self.zoom
+        vw = self.W / self.zoom; vh = (self.H - 118) / (self.zoom * ISO)
         self.cam_x = max(-60, min(WORLD_W - vw + 60, self.cam_x))
         self.cam_y = max(-60, min(WORLD_H - vh + 60, self.cam_y))
 
@@ -2771,6 +2841,19 @@ class RTS:
             pygame.draw.circle(screen, dark, (cx, cy), int(r * 0.6), 1)
             pygame.draw.rect(screen, light,
                              (int(cx - r * 0.22), int(cy - r * 0.22), int(r * 0.44), int(r * 0.44)))
+        else:
+            # expansion factions: a generic folded star in the faction colour —
+            # deterministic in the key so each race keeps a stable crest.
+            pts = 5 + (sum(ord(c) for c in fk) % 3)          # 5..7 points
+            outer, inner = r, r * 0.45
+            star = []
+            for k in range(pts * 2):
+                rad = outer if k % 2 == 0 else inner
+                a = -math.pi / 2 + k * math.pi / pts
+                star.append((cx + math.cos(a) * rad, cy + math.sin(a) * rad))
+            pygame.draw.polygon(screen, col, star)
+            pygame.draw.polygon(screen, light, star, 1)
+            pygame.draw.circle(screen, dark, (cx, cy), int(r * 0.28))
         pygame.draw.circle(screen, dark, (cx, cy), r + 2, 1)
 
     def _draw_setup(self, screen):
@@ -3133,27 +3216,28 @@ class RTS:
         tnow = getattr(self, "_anim_t", 0.0)
         for n in self.nodes:
             if n.amount <= 0: continue
-            sx, sy = self.w2s(n.x, n.y)
+            sx, sy = self.wpos(n.x, n.y)
             if -40 < sx < self.W + 40 and -40 < sy < self.H + 40:
                 rr = int(n.r * self.zoom)
-                # a well rim, an ink pool, and a slow shimmer ripple
-                pygame.draw.circle(screen, (36, 32, 58), (int(sx), int(sy)), rr + 2)
-                pygame.draw.circle(screen, (54, 48, 88), (int(sx), int(sy)), rr, 2)
+                # a well rim, an ink pool, and a slow shimmer ripple — flat on
+                # the page, so foreshortened to ellipses by the iso view
+                self.disc(screen, (36, 32, 58), n.x, n.y, n.r + 2 / self.zoom)
+                self.disc(screen, (54, 48, 88), n.x, n.y, n.r, 2)
                 f = max(0.15, n.amount / 2000.0)
                 pool = int(rr * f)
-                pygame.draw.circle(screen, (78, 68, 130), (int(sx), int(sy)), pool)
-                pygame.draw.circle(screen, (120, 108, 190), (int(sx), int(sy)), max(2, int(pool * 0.7)))
+                self.disc(screen, (78, 68, 130), n.x, n.y, n.r * f)
+                self.disc(screen, (120, 108, 190), n.x, n.y, max(2 / self.zoom, n.r * f * 0.7))
                 # shimmer highlight that drifts
                 if self.zoom > 0.5 and pool > 4:
                     hx = sx + math.cos(tnow * 1.3 + n.x) * pool * 0.4
-                    hy = sy + math.sin(tnow * 1.1 + n.x) * pool * 0.3
+                    hy = sy + math.sin(tnow * 1.1 + n.x) * pool * 0.3 * ISO
                     pygame.draw.circle(screen, (170, 160, 220), (int(hx), int(hy)), max(1, pool // 4))
                     # rising ink bubbles that surface and pop (procedural, timed)
                     for b in range(3):
                         ph = (tnow * 0.8 + b * 0.33 + n.x * 0.01) % 1.0
                         ba = int(200 * (1 - ph))
                         bx = sx + math.sin((ph + b) * 5 + n.x) * pool * 0.35
-                        by = sy + pool * 0.4 - ph * pool * 0.9
+                        by = sy + pool * ISO * 0.4 - ph * pool * 0.9
                         bub = pygame.Surface((6, 6), pygame.SRCALPHA)
                         pygame.draw.circle(bub, (150, 138, 210, ba), (3, 3), max(1, int(pool * 0.12)))
                         screen.blit(bub, (int(bx - 3), int(by - 3)))
@@ -3273,28 +3357,71 @@ class RTS:
         screen.blit(vg, (0, 0))
 
     def _draw_highground(self, screen):
-        """A raised, lighter plateau with a soft cliff edge to read as elevated."""
+        """Raised plateaus seen at the page's angle: a foreshortened elliptical
+        top LIFTED off the ground, a visible cliff wall filling the gap, and any
+        authored ramps drawn as shaded runs up the face."""
         g = self.theme["ground"]
         top = tuple(min(255, int(c * 1.12)) for c in g)
-        cliff = tuple(int(c * 0.82) for c in g)
+        cliff = tuple(int(c * 0.72) for c in g)
+        cliff_lit = tuple(int(c * 0.86) for c in g)
         rim = tuple(int(c * 0.92) for c in g)
+        lift = HG_LIFT * self.zoom
         for hx, hy, hr in self._high:
             sx, sy = self.w2s(hx, hy)
             rr = int(hr * self.zoom)
-            if not (-rr < sx < self.W + rr and -rr < sy < self.H + rr):
+            ry = max(1, int(rr * ISO))
+            if not (-rr < sx < self.W + rr and -ry - lift < sy < self.H + ry):
                 continue
-            pygame.draw.circle(screen, cliff, (int(sx), int(sy + 6)), rr)
-            pygame.draw.circle(screen, top, (int(sx), int(sy)), rr)
-            pygame.draw.circle(screen, rim, (int(sx), int(sy)), rr, 2)
+            # cliff wall: the band between the ground footprint and the lifted
+            # top — a rect capped by the bottom halves of the two ellipses.
+            wall = pygame.Rect(int(sx - rr), int(sy - lift), rr * 2, int(lift) + ry)
+            pygame.draw.rect(screen, cliff, (wall.x, int(sy - lift), wall.w, int(lift)))
+            pygame.draw.ellipse(screen, cliff,
+                                (int(sx - rr), int(sy - ry), rr * 2, ry * 2))
+            # a lit sliver down the sunward (left) face of the wall
+            pygame.draw.rect(screen, cliff_lit,
+                             (wall.x, int(sy - lift), max(2, rr // 6), int(lift)))
+            # the lifted plateau top
+            pygame.draw.ellipse(screen, top,
+                                (int(sx - rr), int(sy - lift - ry), rr * 2, ry * 2))
+            pygame.draw.ellipse(screen, rim,
+                                (int(sx - rr), int(sy - lift - ry), rr * 2, ry * 2), 2)
+            # crease marks around the top rim
             if self.zoom > 0.5:
                 for k in range(8):
                     a = k / 8 * math.tau
-                    ex = sx + math.cos(a) * (rr - 6); ey = sy + math.sin(a) * (rr - 6)
+                    ex = sx + math.cos(a) * (rr - 6)
+                    ey = sy - lift + math.sin(a) * (ry - 4)
                     pygame.draw.circle(screen, rim, (int(ex), int(ey)), 2)
+        # ── ramps: a folded paper run from the page up onto the plateau ──
+        for (rx, ry_, rw, rl, ddx, ddy) in self._ramps:
+            # foot edge (on the ground) and top edge (lifted, at the plateau)
+            px, py = -ddy, ddx                       # across-axis
+            f0 = self.w2s(rx - px * rw / 2, ry_ - py * rw / 2)
+            f1 = self.w2s(rx + px * rw / 2, ry_ + py * rw / 2)
+            tx, ty = rx + ddx * rl, ry_ + ddy * rl
+            t0 = self.w2s(tx - px * rw / 2, ty - py * rw / 2)
+            t1 = self.w2s(tx + px * rw / 2, ty + py * rw / 2)
+            t0 = (t0[0], t0[1] - lift)
+            t1 = (t1[0], t1[1] - lift)
+            if not any(-80 < x < self.W + 80 and -80 < y < self.H + 80
+                       for x, y in (f0, f1, t0, t1)):
+                continue
+            # slope tone: ramps facing the light (up/left) read brighter
+            face = 1.06 if (ddy < 0 or ddx < 0) else 0.9
+            slope = tuple(min(255, int(c * face)) for c in g)
+            pygame.draw.polygon(screen, slope, [f0, f1, t1, t0])
+            pygame.draw.polygon(screen, rim, [f0, f1, t1, t0], 2)
+            # fold creases across the run
+            if self.zoom > 0.5:
+                for k in (0.25, 0.5, 0.75):
+                    a0 = (f0[0] + (t0[0] - f0[0]) * k, f0[1] + (t0[1] - f0[1]) * k)
+                    a1 = (f1[0] + (t1[0] - f1[0]) * k, f1[1] + (t1[1] - f1[1]) * k)
+                    pygame.draw.line(screen, tuple(int(c * 0.88) for c in g), a0, a1, 1)
 
     def _draw_objects(self, screen):
         for o in self.objects:
-            sx, sy = self.w2s(o.x, o.y)
+            sx, sy = self.wpos(o.x, o.y)
             rr = int(o.r * self.zoom)
             if not (-rr - 20 < sx < self.W + rr + 20 and -rr - 20 < sy < self.H + rr + 20):
                 continue
@@ -3365,7 +3492,7 @@ class RTS:
                 screen.blit(lbl, (sx - lbl.get_width() / 2, sy + rr + 2))
 
     def _draw_struct(self, screen, s):
-        sx, sy = self.w2s(s.x, s.y)
+        sx, sy = self.wpos(s.x, s.y)
         if not (-80 < sx < self.W + 80 and -80 < sy < self.H + 80):
             return
         col = self._tcol(s.team); dark = self._tdark(s.team)
@@ -3611,7 +3738,7 @@ class RTS:
         ~0.6s — a paper unit collapsing into a crushed heap."""
         og = self.ctx.get("origami"); cards = self.ctx.get("cards")
         for d in self.dying:
-            sx, sy = self.w2s(d["x"], d["y"])
+            sx, sy = self.wpos(d["x"], d["y"])
             if not (-30 < sx < self.W + 30 and -30 < sy < self.H + 30):
                 continue
             prog = d["t"] / 0.6
@@ -3641,7 +3768,7 @@ class RTS:
             pygame.draw.polygon(screen, fade, [(sx, sy - r), (sx + r, sy), (sx, sy + r), (sx - r, sy)])
 
     def _draw_unit(self, screen, u):
-        sx, sy = self.w2s(u.x, u.y)
+        sx, sy = self.wpos(u.x, u.y)
         if not (-30 < sx < self.W + 30 and -30 < sy < self.H + 30):
             return
         col = self._tcol(u.team)
@@ -3691,7 +3818,7 @@ class RTS:
             pygame.draw.circle(screen, (120, 108, 190), (int(sx), gy), 3)
             pygame.draw.circle(screen, (180, 168, 235), (int(sx - 1), gy - 1), 1)
         if u.selected:
-            pygame.draw.circle(screen, (240, 230, 120), (int(sx), int(sy)), r + 5, 2)
+            self.disc(screen, (240, 230, 120), u.x, u.y, (r + 5) / self.zoom, 2)
         # cloak shimmer: own cloaked units get a faint shifting ring; a detected
         # enemy cloaked unit gets a red "revealed" ring
         if getattr(u, "cloak", False):
@@ -3795,13 +3922,17 @@ class RTS:
 
     def _draw_ghost(self, screen):
         spec = STRUCTURES[self.build_mode]
-        mx, my = pygame.mouse.get_pos()
+        # canvas-space pointer (window-space get_pos() misplaces the preview on
+        # scaled windows — the same coordinate bug edge-scroll had)
+        mx, my = self.mouse_pos if self.mouse_pos is not None else pygame.mouse.get_pos()
         wx, wy = self.s2w(mx, my)
         ok = not self._placement_blocked(wx, wy, spec["r"])
         r = int(spec["r"] * self.zoom)
         col = (120, 220, 140) if ok else (220, 100, 90)
-        pygame.draw.circle(screen, col, (mx, my), r, 2)
-        pygame.draw.polygon(screen, col, [(mx, my - r), (mx + r, my), (mx, my + r * 0.7), (mx - r, my)], 1)
+        gx, gy = self.wpos(wx, wy)          # preview lifts onto high ground
+        self.disc(screen, col, wx, wy, spec["r"], 2)
+        pygame.draw.polygon(screen, col, [(gx, gy - r), (gx + r, gy),
+                                          (gx, gy + r * 0.7), (gx - r, gy)], 1)
 
     # ── HUD: command palette + resources ──
     def _draw_hud(self, screen):
@@ -3982,7 +4113,7 @@ class RTS:
             screen.blit(veil, (r.x, r.y))
         # camera viewport rect (zoom-aware)
         vx = r.x + self.cam_x * sx; vy = r.y + self.cam_y * sy
-        vw = (self.W / self.zoom) * sx; vh = ((self.H - 118) / self.zoom) * sy
+        vw = (self.W / self.zoom) * sx; vh = ((self.H - 118) / (self.zoom * ISO)) * sy
         pygame.draw.rect(screen, (240, 230, 120),
                          (int(vx), int(vy), int(vw), int(vh)), 1)
         # flashing under-attack pings
