@@ -1811,6 +1811,28 @@ impl Chat {
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
 
+    /// Land fan branch `n` (1-based) over the project and clear the candidates. Shared by :pick and the
+    /// in-scene candidate panel click.
+    fn pick_branch(&mut self, n: usize) {
+        if self.agent_candidates.is_empty() {
+            self.note = ":pick — no fan candidates (run :fan-agent first)".into();
+        } else if n == 0 || n > self.agent_candidates.len() {
+            self.note = format!(":pick <n> — choose 1..{}", self.agent_candidates.len());
+        } else if let Some(session) = self.gitmind_session.as_ref() {
+            let cand = self.agent_candidates[n - 1].clone();
+            let project = session.project.clone();
+            match crate::gitmind_session::reapply_dir(&cand.root, &project, &format!("fan {}", cand.label)) {
+                Ok(hash) => {
+                    self.agent_candidates.clear();
+                    self.note = format!("picked {} → commit {} · {} file(s) landed", cand.label, &hash[..hash.len().min(10)], cand.files);
+                }
+                Err(e) => self.note = format!(":pick — {e}"),
+            }
+        } else {
+            self.note = ":pick — no .gitmind session loaded".into();
+        }
+    }
+
     /// A live reaction during an active RUNNING fan seeds more parallel branches (5): each isolated in its
     /// own workspace, joining the round-robin without stopping the in-flight work. Returns true if it seeded.
     fn seed_reaction_branches(&mut self, reaction: &str) -> bool {
@@ -3456,6 +3478,58 @@ impl Chat {
                     }
                 }
 
+                // ── CANDIDATES — the fan's folded branches as a clickable prune panel. Each card shows the
+                // branch's review verdict (✓ approved / ~ verified / · plain), file count, and a short review
+                // note; the reviewer-suggested branch is ringed. Click a card to LAND that branch (:pick).
+                // This is the fold/prune decision made visual — the keeper is one click, not a typed command.
+                if !self.backdrop && !self.agent_candidates.is_empty() {
+                    let cc = anchor(0.17, 0.22);
+                    let cw = (0.30 * win_w / ppw).clamp(1.4, 3.6);
+                    let cs = cw / 2.0;
+                    let best = self.agent_candidates.iter().max_by_key(|b| (b.approved == Some(true), b.verified, b.files)).map(|b| b.index);
+                    let title_c = V3::new(cc.x - toward.x * 0.30 + up.x * 0.5 * cs, cc.y - toward.y * 0.30 + up.y * 0.5 * cs, cc.z - toward.z * 0.30 + up.z * 0.5 * cs);
+                    for cell in m3::label_cells(title_c, right, up, toward, "PICK A BRANCH", 0.011 * cs, t, egui::Color32::from_rgb(232, 238, 252), 0.75, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    let mut clicked_pick: Option<usize> = None;
+                    let rowh = 0.30 * cs;
+                    for (row, cand) in self.agent_candidates.iter().take(6).enumerate() {
+                        let off = -(row as f32) * rowh;
+                        let rc = V3::new(cc.x + up.x * off, cc.y + up.y * off, cc.z + up.z * off);
+                        let is_best = best == Some(cand.index);
+                        // card slab (accent-tinted for the suggested keeper)
+                        let (cr, cg, cb) = if is_best { (tc[0], tc[1], tc[2]) } else { (pc[0], pc[1], pc[2]) };
+                        let mut card = m3::panel(rc, right, up, cw, rowh * 0.82, egui::Color32::from_rgb(cr, cg, cb));
+                        card.mat = pmat; card.emissive = if is_best { 0.28 } else { 0.12 } * tglow * sheen; m3::set_alpha(&mut card, if is_best { 210 } else { 170 });
+                        graph.push(card);
+                        // status glyph + label
+                        let (mark, mcol) = match cand.approved {
+                            Some(true) => ("[OK]", egui::Color32::from_rgb(140, 230, 150)),
+                            Some(false) => ("[--]", egui::Color32::from_rgb(230, 150, 140)),
+                            None if cand.verified => ("[~]", egui::Color32::from_rgb(tc[0], tc[1], tc[2])),
+                            None => ("[ ]", egui::Color32::from_rgb(160, 170, 188)),
+                        };
+                        let head = format!("{mark} {} · {}f", cand.label.chars().take(14).collect::<String>(), cand.files);
+                        let hc = V3::new(rc.x - toward.x * 0.30 + up.x * 0.06 * cs, rc.y - toward.y * 0.30 + up.y * 0.06 * cs, rc.z - toward.z * 0.30 + up.z * 0.06 * cs);
+                        for cell in m3::label_cells(hc, right, up, toward, &head, 0.0085 * cs, t, mcol, 0.8, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        // review note (one truncated line under the head)
+                        if !cand.review_notes.is_empty() {
+                            let note: String = cand.review_notes.lines().next().unwrap_or("").chars().take(28).collect();
+                            let nc = V3::new(rc.x - toward.x * 0.30 - up.x * 0.06 * cs, rc.y - toward.y * 0.30 - up.y * 0.06 * cs, rc.z - toward.z * 0.30 - up.z * 0.06 * cs);
+                            for cell in m3::label_cells(nc, right, up, toward, &note, 0.0072 * cs, t, egui::Color32::from_rgb(150, 160, 178), 0.55, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                        }
+                        // click → land this branch
+                        if let Some(tr) = project_slab_rect(&view_cam, rc, right, up, cw * 1.05, rowh * 0.9, cx, cy, scale) {
+                            let hint = format!("branch {} · {} file(s){}{} — click to land it",
+                                cand.index + 1, cand.files,
+                                if cand.verified { " · verified" } else { "" },
+                                match cand.approved { Some(true) => " · approved", Some(false) => " · needs revision", None => "" });
+                            let resp = ui.interact(tr, egui::Id::new(("fan_candidate", cand.index)), egui::Sense::click()).on_hover_text(hint);
+                            if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                            if resp.clicked() { clicked_pick = Some(cand.index + 1); }
+                        }
+                    }
+                    if let Some(n) = clicked_pick { self.pick_branch(n); }
+                }
+
                 // ── MESSAGE READING BOX — the focused turn as a physical env-styled plaque ──────────
                 // Clicking a node focuses it; its turn text then reads as a real in-world plaque (bezel + shadow
                 // + slab + wrapped label_cells text) carrying the scene's palette/material/emissive — an object,
@@ -4485,25 +4559,7 @@ impl Chat {
                     }
                 }
             }
-            Command::Pick(n) => {
-                if self.agent_candidates.is_empty() {
-                    self.note = ":pick — no fan candidates (run :fan-agent first)".into();
-                } else if n == 0 || n > self.agent_candidates.len() {
-                    self.note = format!(":pick <n> — choose 1..{}", self.agent_candidates.len());
-                } else if let Some(session) = self.gitmind_session.as_ref() {
-                    let cand = self.agent_candidates[n - 1].clone();
-                    let project = session.project.clone();
-                    match crate::gitmind_session::reapply_dir(&cand.root, &project, &format!("fan {}", cand.label)) {
-                        Ok(hash) => {
-                            self.agent_candidates.clear();
-                            self.note = format!("picked {} → commit {} · {} file(s) landed", cand.label, &hash[..hash.len().min(10)], cand.files);
-                        }
-                        Err(e) => self.note = format!(":pick — {e}"),
-                    }
-                } else {
-                    self.note = ":pick — no .gitmind session loaded".into();
-                }
-            }
+            Command::Pick(n) => self.pick_branch(n),
             Command::Reapply => match self.gitmind_session.take() {
                 None => self.note = ":reapply — no .gitmind session loaded (:load-gitmind <path> first)".into(),
                 Some(s) => match crate::gitmind_session::reapply(&s) {
