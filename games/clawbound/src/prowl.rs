@@ -53,6 +53,18 @@ const YOWL_CD: f32 = 6.0;
 const YOWL_REVEAL_DUR: f32 = 2.2;  // seconds a landed yowl outs your position (forces you out of hiding)
 pub const BEACON_RADIUS: f32 = 14.0;   // an owned tree's aura reaches this far
 pub const BEACON_PULSE: f32 = 8.0;     // seconds between pulses — refresh the buff before it lapses
+pub const N_MARKERS: usize = 5;
+const MARKER_R: f32 = 4.0;
+pub const MARKER_CLAIM_TIME: f32 = 3.0;
+const MARKER_DRIFT_BACK: f32 = 20.0;   // seconds unattended before a held marker drifts back to its nearest clan
+const CONVERGENCE_INTERVAL: f32 = 70.0;
+const CONVERGENCE_WARN: f32 = 15.0;    // the last stretch before a convergence, worth flagging to the player
+pub const RITUAL_WIN: f32 = 100.0;
+const ROCK_BONUS_R: f32 = 10.0;        // being at the Rock when a convergence resolves adds a bonus
+const SUSTENANCE_DECAY: f32 = 0.012;   // per second — a slow hunger clock
+const SUSTENANCE_PER_PREY: f32 = 0.22;
+const SUSTENANCE_SICK_AT: f32 = 0.12;
+const SUSTENANCE_WELL_AT: f32 = 0.4;   // sickness clears once it's recovered back above this
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -69,6 +81,9 @@ const ULT_CD_MULT: f32 = 1.8;   // stretches the shared Ability's cooldown to fe
 /// The four clan colours (Ember / Tide / Moss / Amber).
 pub fn clan_color(clan: u8) -> u32 {
     match clan & 3 { 0 => 0xd8623c, 1 => 0x3d7fd8, 2 => 0x5aa054, _ => 0xd8a53c }
+}
+pub fn clan_name(clan: u8) -> &'static str {
+    match clan & 3 { 0 => "your clan", 1 => "the Rival clan", 2 => "the Wildwood clan", _ => "the Border clan" }
 }
 
 fn hashf(mut h: u32) -> f32 {
@@ -167,6 +182,19 @@ impl JungleCamp {
     pub fn cleared(&self) -> bool { !self.guard_alive }
 }
 
+/// A territory marker — one of the stakes the Rock of Nine Lives ritual is built from.
+/// Naturally belongs to whichever clan is nearest, but the player can flip it by
+/// dwelling at it; leave it unattended long enough and it drifts back to whoever's
+/// closest, so holding ground is an active, ongoing choice, not a one-time capture.
+#[derive(Clone, Copy)]
+pub struct TerritoryMarker {
+    pub x: f32, pub z: f32,
+    pub held_by: u8,       // the clan that currently holds it (always someone — territory is never truly neutral)
+    pub dwell: f32,        // the player's capture progress, 0..MARKER_CLAIM_TIME
+    pub idle: f32,         // seconds since the player last contested it — drives the drift-back
+    pub nearest_clan: u8,  // whichever clan's home is closest — where it drifts back to
+}
+
 pub struct Objective {
     pub kind: ProwlObj,
     pub tx: f32, pub tz: f32, pub name: &'static str,
@@ -215,6 +243,13 @@ pub struct Prowl {
     pub weather: Weather,                   // wind (and sky/wetness) driving the scent game
     pub fixed_wind: bool,                    // settings toggle: freeze the wind for a more readable map
     pub yowled_t: f32,                        // > 0 while a landed yowl has outed you (forces you visible)
+    pub markers: Vec<TerritoryMarker>,        // territory stakes feeding the ritual
+    pub rock: (f32, f32),                     // the Rock of Nine Lives — the ritual's site
+    pub ritual_progress: [f32; 4],            // per-clan progress toward the ritual (0..RITUAL_WIN)
+    pub convergence_t: f32,                    // seconds until the next convergence (territory tally)
+    pub convergence_result: Option<u8>,        // brief flash of who won the last convergence
+    pub sustenance: f32,                       // 0..1 — falls without prey, restored by a catch or by resting at a staging ground
+    pub sick: bool,                            // true once sustenance bottoms out — slower until it recovers
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -239,6 +274,7 @@ impl Prowl {
         let lanes = Self::place_lanes(&ancestors);
         let minions = Self::spawn_minions(&ancestors);
         let rivals = Self::spawn_rivals(&ancestors);
+        let markers = Self::place_markers(&ancestors);
         let mut g = Prowl {
             class, x: 0.0, z: 0.0, heading: 0.0, stamina: 1.0,
             moving: false, crouched: false, hidden: false,
@@ -260,6 +296,13 @@ impl Prowl {
             weather: Weather::new(crate::weather::Season::Greenleaf),
             fixed_wind: false,
             yowled_t: 0.0,
+            markers,
+            rock: (0.0, 0.0),
+            ritual_progress: [0.0; 4],
+            convergence_t: CONVERGENCE_INTERVAL,
+            convergence_result: None,
+            sustenance: 1.0,
+            sick: false,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -486,6 +529,76 @@ impl Prowl {
         }
     }
 
+    /// Territory markers — the ritual's stakes — scattered at their own radius, distinct
+    /// from both the ancestor trees and the jungle camps. Each starts belonging to
+    /// whichever clan's home is nearest, since territory is never truly neutral ground.
+    fn place_markers(ancestors: &[AncestorTree]) -> Vec<TerritoryMarker> {
+        let mut v = Vec::new();
+        for k in 0..N_MARKERS {
+            let a = (k as f32 + 0.2) / N_MARKERS as f32 * std::f32::consts::TAU;
+            let (mut x, mut z) = (a.cos() * 75.0, a.sin() * 75.0);
+            for r in 0..14 {
+                let rad = 75.0 - r as f32 * 4.0;
+                let (tx, tz) = (a.cos() * rad, a.sin() * rad);
+                if world::height_at(tx, tz) >= world::WATER_Y + 0.3 { x = tx; z = tz; break; }
+            }
+            let nearest_clan = (0..ancestors.len()).min_by(|&i, &j| dist(x, z, ancestors[i].x, ancestors[i].z).partial_cmp(&dist(x, z, ancestors[j].x, ancestors[j].z)).unwrap()).unwrap_or(0) as u8;
+            v.push(TerritoryMarker { x, z, held_by: nearest_clan, dwell: 0.0, idle: 0.0, nearest_clan });
+        }
+        v
+    }
+
+    /// Advance the territory markers (drift back when unattended by the player) and the
+    /// convergence clock: every `CONVERGENCE_INTERVAL` seconds, tally who holds the most
+    /// markers and award ritual progress — with a bonus for being at the Rock itself.
+    /// Reaching `RITUAL_WIN` is a big score swing (folded into the existing score-threshold
+    /// win check), not an instant match-ender on its own.
+    fn step_ritual(&mut self, dt: f32) {
+        for mk in self.markers.iter_mut() {
+            let d = dist(self.x, self.z, mk.x, mk.z);
+            if d < MARKER_R {
+                mk.idle = 0.0;
+                if mk.held_by != PLAYER_CLAN {
+                    mk.dwell += dt;
+                    if mk.dwell >= MARKER_CLAIM_TIME { mk.held_by = PLAYER_CLAN; mk.dwell = 0.0; self.clan_scores[0] += 15; }
+                } else {
+                    mk.dwell = 0.0;
+                }
+            } else {
+                mk.dwell = (mk.dwell - dt * 0.6).max(0.0);
+                if mk.held_by == PLAYER_CLAN {
+                    mk.idle += dt;
+                    if mk.idle >= MARKER_DRIFT_BACK { mk.held_by = mk.nearest_clan; mk.idle = 0.0; }
+                }
+            }
+        }
+        self.convergence_t -= dt;
+        if self.convergence_t <= 0.0 {
+            let mut counts = [0u32; 4];
+            for mk in &self.markers { if (mk.held_by as usize) < 4 { counts[mk.held_by as usize] += 1; } }
+            if let Some((winner, _)) = counts.iter().enumerate().max_by_key(|&(_, c)| *c) {
+                if counts[winner] > 0 {
+                    let mut gain = counts[winner] as f32 * 6.0;
+                    if winner == PLAYER_CLAN as usize && dist(self.x, self.z, self.rock.0, self.rock.1) < ROCK_BONUS_R { gain += 20.0; }
+                    self.ritual_progress[winner] = (self.ritual_progress[winner] + gain).min(RITUAL_WIN);
+                    self.clan_scores[winner] += gain as i32;
+                    self.convergence_result = Some(winner as u8);
+                }
+            }
+            self.convergence_t = CONVERGENCE_INTERVAL;
+        }
+    }
+
+    /// Sustenance — a slow hunger clock. It falls on its own; a caught bit of prey (or
+    /// resting at a staging ground) restores it. Bottom it out and you fall sick — slower
+    /// until it recovers, same idea as needing to fall back and eat.
+    fn step_sustenance(&mut self, dt: f32) {
+        self.sustenance = (self.sustenance - SUSTENANCE_DECAY * dt).max(0.0);
+        if self.on_staging { self.sustenance = (self.sustenance + 0.05 * dt).min(1.0); }   // resting at base helps too
+        if self.sustenance <= SUSTENANCE_SICK_AT { self.sick = true; }
+        else if self.sustenance >= SUSTENANCE_WELL_AT { self.sick = false; }
+    }
+
     /// Advance the jungle camps: a guard notices a loud/visible prowler nearby and closes
     /// in; taking the herb needs the guard dead *or* never having noticed you.
     fn step_jungle(&mut self, dt: f32) {
@@ -548,6 +661,9 @@ impl Prowl {
     pub fn set_fixed_wind(&mut self, on: bool) { self.fixed_wind = on; }
     /// Unit wind direction (the way scent drifts) and its 0..~1.4 strength, for a HUD arrow.
     pub fn wind(&self) -> ((f32, f32), f32) { (self.weather.wind_dir_vec(), self.weather.total_wind()) }
+
+    /// Whether the next convergence is imminent — worth a HUD warning ("the Rock stirs...").
+    pub fn convergence_warning(&self) -> bool { self.convergence_t <= CONVERGENCE_WARN }
 
     pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
 
@@ -697,7 +813,7 @@ impl Prowl {
         let sprinting = (dx.abs() + dz.abs() > 1e-4) && !want_crouch;
         let can_sprint = self.stamina > 0.12;
         self.on_lane = self.on_lane_at(self.x, self.z);
-        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 } * self.buffs.move_mult() * if self.on_lane { LANE_BONUS } else { 1.0 };
+        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 } * self.buffs.move_mult() * if self.on_lane { LANE_BONUS } else { 1.0 } * if self.sick { 0.75 } else { 1.0 };
 
         // dodge (i-frames) and leap (airborne) bursts
         self.dodge_cd = (self.dodge_cd - dt).max(0.0);
@@ -799,12 +915,17 @@ impl Prowl {
             if eaten > 0 {
                 self.prey_caught += eaten;
                 self.stamina = (self.stamina + 0.25 * eaten as f32).min(1.0);
+                self.sustenance = (self.sustenance + SUSTENANCE_PER_PREY * eaten as f32).min(1.0);
                 self.clan_scores[0] += 25 * eaten as i32;
             }
         }
 
         // ── claimed ancestor trees pulse their owner's beacon buff to nearby allies ──
         self.step_beacons(dt);
+
+        // ── territory markers + the Rock of Nine Lives ritual ──
+        self.step_ritual(dt);
+        self.step_sustenance(dt);
 
         // ── autoattack: advance the in-progress move, land hits on the hunter/rivals ──
         self.step_combat(dt);
@@ -1123,6 +1244,101 @@ mod tests {
     }
 
     #[test]
+    fn dwelling_at_a_rival_held_marker_flips_it_to_the_player() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let idx = g.markers.iter().position(|m| m.held_by != PLAYER_CLAN).expect("some marker should start rival-held");
+        let (mx, mz) = (g.markers[idx].x, g.markers[idx].z);
+        for _ in 0..((MARKER_CLAIM_TIME + 0.3) * 30.0) as i32 {
+            g.x = mx; g.z = mz;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert_eq!(g.markers[idx].held_by, PLAYER_CLAN, "dwelling long enough should flip the marker to the player");
+    }
+
+    #[test]
+    fn an_unattended_marker_drifts_back_to_its_nearest_clan() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        g.markers[0].held_by = PLAYER_CLAN;
+        g.markers[0].idle = 0.0;
+        for _ in 0..((MARKER_DRIFT_BACK + 1.0) * 30.0) as i32 {
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert_eq!(g.markers[0].held_by, g.markers[0].nearest_clan, "an unattended marker should drift back to whoever's closest");
+    }
+
+    #[test]
+    fn a_convergence_awards_ritual_progress_to_the_marker_leader() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        for mk in g.markers.iter_mut() { mk.held_by = PLAYER_CLAN; }
+        g.convergence_t = 0.01;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.convergence_result, Some(PLAYER_CLAN));
+        assert!(g.ritual_progress[PLAYER_CLAN as usize] > 0.0, "holding all the markers at a convergence should award ritual progress");
+        assert!(g.convergence_t > 0.0, "the convergence clock should reset");
+    }
+
+    #[test]
+    fn being_at_the_rock_during_a_convergence_adds_a_bonus() {
+        let progress_at = |at_rock: bool| -> f32 {
+            let mut g = Prowl::new(Class::Cat, Kind::Fox);
+            g.hx = 900.0; g.hz = 900.0;
+            for mk in g.markers.iter_mut() { mk.held_by = PLAYER_CLAN; }
+            g.x = if at_rock { g.rock.0 } else { 900.0 };
+            g.z = if at_rock { g.rock.1 } else { 900.0 };
+            g.convergence_t = 0.01;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            g.ritual_progress[PLAYER_CLAN as usize]
+        };
+        assert!(progress_at(true) > progress_at(false), "being at the Rock when it resolves should add a bonus");
+    }
+
+    #[test]
+    fn sustenance_falls_over_time_and_a_caught_prey_restores_it() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let s0 = g.sustenance;
+        for _ in 0..300 { g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); }
+        assert!(g.sustenance < s0, "sustenance should fall on its own over time");
+        let before = g.sustenance;
+        g.critters.clear();
+        g.critters.push(Critter::new(crate::ecology::Species::Hare, g.x, g.z + 1.0, 7));
+        g.heading = 0.0;
+        g.set_input(0.0, 1.0, true, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.sustenance > before, "a caught bit of prey should restore sustenance");
+    }
+
+    #[test]
+    fn bottoming_out_sustenance_makes_the_prowler_sick_and_slower() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.sustenance = 0.0;
+        g.set_input(1.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.sick, "bottoming out sustenance should make the prowler sick");
+        let x1 = g.x;
+        g.set_input(1.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        let sick_delta = g.x - x1;
+        let mut h = Prowl::new(Class::Cat, Kind::Fox);
+        h.hx = 900.0; h.hz = 900.0;
+        h.set_input(1.0, 0.0, false, false, false);
+        h.step(1.0 / 30.0);
+        let hx1 = h.x;
+        h.set_input(1.0, 0.0, false, false, false);
+        h.step(1.0 / 30.0);
+        let healthy_delta = h.x - hx1;
+        assert!(sick_delta < healthy_delta, "sickness should slow the prowler down relative to healthy");
+    }
+
+    #[test]
     fn respawn_rallies_at_a_claimed_ancestor() {
         let mut g = Prowl::new(Class::Cat, Kind::Dog);
         g.nine_lives_used = true;   // test the rally point, not Nine Lives
@@ -1332,6 +1548,10 @@ mod tests {
                     for r in &g.rivals { assert!(r.stagger >= 0.0 && r.x.is_finite() && r.z.is_finite(), "rival state broke"); }
                     for c in &g.jungle { assert!(c.hp.is_finite() && c.cooldown >= 0.0 && c.gx.is_finite() && c.gz.is_finite(), "jungle camp state broke"); }
                     for m in &g.minions { assert!(m.yowl_cd >= 0.0 && m.x.is_finite() && m.z.is_finite(), "minion state broke"); }
+                    for mk in &g.markers { assert!(mk.dwell >= 0.0 && mk.idle >= 0.0 && (mk.held_by as usize) < 4, "marker state broke"); }
+                    assert!(g.sustenance >= 0.0 && g.sustenance <= 1.0, "sustenance out of range");
+                    assert!(g.convergence_t.is_finite(), "convergence clock broke");
+                    for &p in &g.ritual_progress { assert!(p >= 0.0 && p <= RITUAL_WIN, "ritual progress out of range"); }
                     assert!(g.yowled_t >= 0.0, "yowled_t went negative");
                     pc = g.prey_caught; cc = g.times_caught;
                 }

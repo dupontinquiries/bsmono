@@ -112,8 +112,8 @@ impl Class {
     }
 
     /// The aura a claimed ancestor tree pulses to allies nearby, based on whoever claimed
-    /// it — mobile classes plant a Speed beacon, sturdier ones a Shield, "like a beacon"
-    /// keyed to the character chosen, not a fixed slot on the tree.
+    /// it — mobile classes plant a Swift Paw beacon, sturdier ones a Thick Pelt beacon,
+    /// "like a beacon" keyed to the character chosen, not a fixed slot on the tree.
     pub fn beacon_buff(self) -> Power {
         match self {
             Class::Squirrel | Class::Hawk | Class::Otter => Power::Speed,
