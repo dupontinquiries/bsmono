@@ -287,3 +287,14 @@ flatpak = false
 runtime = "none"
 targets = []
 notes = "origami lane-battler (pygame-ce); 30 cards/9 arenas/LAN lockstep; consolidated from paperbound drop (was a 2-file stub in apps/)"
+
+[games.paperbound-core]
+path = "games/paperbound/rust/paperbound-core"
+kind = "cargo"
+role = "lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "x86"]
+notes = "Rust port of paperbound's gamemodes and tooling: data/tech/economy (sim), live RTS matches with the four faction mechanics (match_sim), the clawbound-facet papercraft renderer with std-only PNG out (render), self-playing skirmishes (skirmish + bin), the base lane-battler mode with the shipped MODES table (battler), single-elim tournaments where every match is actually fought (tournament + bin), and a headless data editor whose validator encodes every match-start crash the project has shipped and fixed (editor + pbedit bin). Uses shared/cli-kit for all binaries. 35 tests, all against the real game data at games/paperbound."
+
