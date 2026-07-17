@@ -543,6 +543,12 @@ class RTS:
         self.cap = {0: 400, 1: 400}
         self.done = False
         self.result = None
+        self.exit_requested = False         # ESC-to-menu signal for the host (game.py)
+        # Edge-pan gating: don't pan until the mouse has actually entered the
+        # window AND a short grace period has passed, so the camera doesn't fly
+        # off toward wherever the OS cursor happened to be at scene start.
+        self.edge_pan_armed = False
+        self.pan_grace = 1.5                # seconds before edge panning arms
         self.msg = ""
         self.msg_t = 0.0
         self.show_tech = False              # tech-tree overlay toggle
@@ -569,6 +575,7 @@ class RTS:
         self.cam_y = 0.0
         self.zoom = 0.7                     # start zoomed out to see the big map
         self.mid_drag = None                # (mouse_x, mouse_y, cam_x, cam_y) while middle-drag panning
+        self.mouse_pos = None               # last pointer pos in CANVAS space (from translated events)
         # selection & control
         self.selected = []
         self.groups = {i: [] for i in range(1, 10)}
@@ -882,6 +889,9 @@ class RTS:
         self._clamp_cam()
 
     def _on_mouse_motion(self, ev):
+        # ev.pos is already translated into canvas space by the host, unlike
+        # pygame.mouse.get_pos() which is window space — remember it for edge-pan.
+        self.mouse_pos = ev.pos
         if self.box:
             self.box = (self.box[0], self.box[1], ev.pos[0], ev.pos[1])
         if self.mid_drag:
@@ -923,8 +933,15 @@ class RTS:
                 self.build_mode = None
             return
         if k == pygame.K_ESCAPE:
-            self.selected = []
-            self._resync_selected()
+            if self.selected:
+                # first ESC clears the selection…
+                self.selected = []
+                self._resync_selected()
+            else:
+                # …a second ESC (nothing selected, no pending mode) asks the
+                # host to leave the RTS scene and return to the menu.
+                self.exit_requested = True
+            return
         elif ch == "s":                     # stop
             for u in self._sel_units():
                 u.goal = None; u.target = None; u.attack_move = False; u.state = "idle"
@@ -963,6 +980,7 @@ class RTS:
 
     def _on_mouse_down(self, ev):
         mx, my = ev.pos
+        self.mouse_pos = ev.pos
         # if a radial wheel is open, a click selects the slice under it
         if self.wheel:
             self._wheel_click(ev.pos); return
@@ -1906,6 +1924,10 @@ class RTS:
             p["t"] += dt
         self.pings = [p for p in self.pings if p["t"] < 4.0]
         self.msg_t = max(0.0, self.msg_t - dt)
+        # arm edge panning only after the grace period AND once we've seen a
+        # real (canvas-translated) pointer event — never on a stale OS cursor.
+        if not self.edge_pan_armed and self.match_t >= self.pan_grace and self.mouse_pos is not None:
+            self.edge_pan_armed = True
         self._touch_tick(dt)
         self._edge_scroll(dt)
         self._income(dt)
@@ -2416,14 +2438,25 @@ class RTS:
         self.cam_y = max(-60, min(WORLD_H - vh + 60, self.cam_y))
 
     def _edge_scroll(self, dt):
-        mx, my = pygame.mouse.get_pos()
         sp = 620 * dt
-        edge = 24
-        if mx < edge: self.cam_x -= sp
-        elif mx > self.W - edge: self.cam_x += sp
-        if my < edge: self.cam_y -= sp
-        elif my > self.H - edge - 120: self.cam_y += sp   # leave room for HUD
-        # arrow keys too
+        # ── mouse edge panning ──
+        # CRITICAL: use the last event-translated CANVAS-space position, NOT
+        # pygame.mouse.get_pos(). The host renders to a fixed canvas that is
+        # scaled/letterboxed into the window; get_pos() is window space, which
+        # made the pan box sit in the window's upper-left — a cursor near the
+        # middle of a big window landed past (W-edge, H-edge) and triggered a
+        # phantom bottom-right pan. Only pan once armed (a short grace period
+        # has passed AND we've actually seen a pointer event), and only while
+        # the pointer is inside the canvas.
+        if self.edge_pan_armed and self.mouse_pos is not None:
+            mx, my = self.mouse_pos
+            if 0 <= mx <= self.W and 0 <= my <= self.H:
+                edge = 48                       # comfortable trigger band (canvas px)
+                if mx < edge:            self.cam_x -= sp
+                if mx > self.W - edge:   self.cam_x += sp   # 'if', not 'elif': corners pan diagonally
+                if my < edge:            self.cam_y -= sp
+                if my > self.H - edge - 120: self.cam_y += sp   # leave room for HUD
+        # arrow keys too (always available, independent of arming)
         keys = pygame.key.get_pressed()
         if keys[pygame.K_LEFT]: self.cam_x -= sp
         if keys[pygame.K_RIGHT]: self.cam_x += sp
@@ -2838,6 +2871,8 @@ class RTS:
             pt = self._finger_pos(ev)
         elif ev.type == pygame.KEYDOWN and ev.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_SPACE):
             self._begin_match(); return
+        elif ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+            self.exit_requested = True; return
         if pt is None:
             return
         for rect, action in self.setup_rects:
