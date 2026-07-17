@@ -253,6 +253,7 @@ pub struct Prowl {
     pub convergence_result: Option<u8>,        // brief flash of who won the last convergence
     pub sustenance: f32,                       // 0..1 — falls without prey, restored by a catch or by resting at a staging ground
     pub sick: bool,                            // true once sustenance bottoms out — slower until it recovers
+    pub tutorial_mode: bool,                    // a safe sandbox: the hunter and minions never engage
     pub twigs: Vec<(f32, f32)>,                // forest-floor twigs — snap one running and the hunt hears it
     pub logs: Vec<(f32, f32)>,                 // fallen logs — a natural little bound when running past
     pub snag_t: f32,                           // > 0 while dragging free of a bramble
@@ -309,6 +310,7 @@ impl Prowl {
             convergence_result: None,
             sustenance: 1.0,
             sick: false,
+            tutorial_mode: false,
             twigs: world::twig_positions(900),
             logs: world::log_positions(110),
             snag_t: 0.0,
@@ -364,7 +366,7 @@ impl Prowl {
             m.yowl_flash = (m.yowl_flash - dt * 2.0).max(0.0);
             let to_p = dist(m.x, m.z, px, pz);
             let aggro_r = if m.ranged { YOWL_RANGE } else { MINION_AGGRO_R };
-            m.aggro = m.clan != PLAYER_CLAN && to_p < aggro_r;
+            m.aggro = !self.tutorial_mode && m.clan != PLAYER_CLAN && to_p < aggro_r;
             let (tx, tz) = if m.aggro && m.ranged {
                 // hold a standoff distance rather than closing to melee
                 let standoff = YOWL_RANGE * 0.55;
@@ -687,6 +689,9 @@ impl Prowl {
 
     /// Whether the next convergence is imminent — worth a HUD warning ("the Rock stirs...").
     pub fn convergence_warning(&self) -> bool { self.convergence_t <= CONVERGENCE_WARN }
+
+    /// A safe practice sandbox for the tutorial: the hunter and minions never engage.
+    pub fn set_tutorial_mode(&mut self, on: bool) { self.tutorial_mode = on; }
 
     pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
 
@@ -1012,6 +1017,7 @@ impl Prowl {
     }
 
     fn step_hunter(&mut self, dt: f32) {
+        if self.tutorial_mode { self.suspicion = 0.0; return; }   // a safe sandbox — the hunter never engages
         if self.hunter_stagger > 0.0 { return; }   // dazed by a landed hit — frozen this frame
         let p = self.hunter_kind.params();
         // outside the ring, cover no longer conceals you
@@ -1158,6 +1164,24 @@ mod tests {
         g.set_input(0.0, 1.0, true, false, false);
         g.step(1.0 / 30.0);
         assert!(g.prey_caught > before, "a leap onto prey should score");
+    }
+
+    #[test]
+    fn tutorial_mode_makes_the_hunter_and_minions_harmless() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.set_tutorial_mode(true);
+        g.hstate = HState::Chase; g.suspicion = 1.4;
+        g.hx = 0.0; g.hz = 0.0; g.x = 0.0; g.z = 0.0;   // point-blank, would normally be an instant catch
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.times_caught, 0, "the hunter shouldn't be able to catch the player in tutorial mode");
+        assert_eq!(g.suspicion, 0.0, "suspicion should stay pinned at zero in tutorial mode");
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN).unwrap();
+        let (mx, mz) = (g.minions[idx].x, g.minions[idx].z);
+        g.x = mx; g.z = mz;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(!g.minions[idx].aggro, "minions shouldn't turn aggressive on the player in tutorial mode");
     }
 
     #[test]
