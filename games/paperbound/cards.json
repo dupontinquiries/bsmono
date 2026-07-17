@@ -4815,71 +4815,99 @@
    "blurb": "",
    "model": [
     {
-     "part": "slab",
+     "part": "wing",
+     "at": [
+      -0.55,
+      -0.25
+     ],
+     "size": 0.95,
+     "ang": 0.55,
+     "tone": 1.12
+    },
+    {
+     "part": "wing",
+     "at": [
+      0.55,
+      -0.25
+     ],
+     "size": 0.95,
+     "ang": -0.55,
+     "tone": 1.12
+    },
+    {
+     "part": "wing",
+     "at": [
+      -0.45,
+      0.15
+     ],
+     "size": 0.6,
+     "ang": 0.9,
+     "tone": 0.95
+    },
+    {
+     "part": "wing",
+     "at": [
+      0.45,
+      0.15
+     ],
+     "size": 0.6,
+     "ang": -0.9,
+     "tone": 0.95
+    },
+    {
+     "part": "robe",
      "at": [
       0,
-      0.05
+      0.22
      ],
-     "size": 0.72,
-     "ang": 0.0,
-     "tone": 1.0,
-     "h": 0.45
+     "size": 0.85,
+     "tone": 1.0
     },
     {
-     "part": "wing",
+     "part": "sleeve",
      "at": [
-      -0.1,
-      -0.25
-     ],
-     "size": 1.0,
-     "ang": 0.65,
-     "tone": 0.8,
-     "h": 0.5
-    },
-    {
-     "part": "wing",
-     "at": [
-      0.3,
-      -0.25
-     ],
-     "size": 1.0,
-     "ang": -0.65,
-     "tone": 0.8,
-     "h": 0.5
-    },
-    {
-     "part": "tusk",
-     "at": [
-      0.8,
-      -0.2
+      0.42,
+      -0.05
      ],
      "size": 0.55,
-     "ang": 0.2,
-     "tone": 1.0,
-     "h": 0.5
+     "tone": 0.9
     },
     {
-     "part": "spine",
-     "at": [
-      -0.2,
-      -0.1
-     ],
-     "size": 0.5,
-     "ang": 0.0,
-     "tone": 0.7,
-     "h": 0.5,
-     "count": 3
-    },
-    {
-     "part": "crest",
+     "part": "wedge",
      "at": [
       0,
-      -0.45
+      -0.42
      ],
-     "size": 0.5,
+     "size": 0.4,
      "ang": 0.0,
-     "tone": 1.1,
-     "h": 0.35
+     "tone": 1.15
+    },
+    {
+     "part": "wizardhat",
+     "at": [
+      0,
+      -0.72
+     ],
+     "size": 0.62,
+     "tone": 1.1
+    },
+    {
+     "part": "staff",
+     "at": [
+      0.6,
+      0.05
+     ],
+     "size": 0.9,
+     "tone": 0.75
+    },
+    {
+     "part": "halo",
+     "at": [
+      0.66,
+      -0.72
+     ],
+     "size": 0.22,
+     "tone": 1.3
     }
    ]
   },
@@ -8131,6 +8159,199 @@
      ],
      "size": 0.13,
      "tone": 1.3
+    }
+   ]
+  },
+  "foldknight": {
+   "id": "foldknight",
+   "name": "Fold Knight",
+   "cost": 4,
+   "hp": 470,
+   "dmg": 78,
+   "spd": 58,
+   "rng": 26,
+   "size": 24,
+   "flying": false,
+   "building": false,
+   "riverhop": false,
+   "count": 1,
+   "paper": [
+    186,
+    176,
+    200
+   ],
+   "ability": "bulwark",
+   "rarity": "common",
+   "set": "core",
+   "rotation": true,
+   "blurb": "A tabard of pressed pleats, a blade of one clean crease.",
+   "model": [
+    {
+     "part": "robe",
+     "at": [
+      0,
+      0.25
+     ],
+     "size": 0.8,
+     "tone": 0.95
+    },
+    {
+     "part": "plate",
+     "at": [
+      0,
+      -0.12
+     ],
+     "size": 0.66,
+     "h": 0.5,
+     "tone": 1.08
+    },
+    {
+     "part": "sleeve",
+     "at": [
+      0.4,
+      -0.02
+     ],
+     "size": 0.5,
+     "tone": 0.85
+    },
+    {
+     "part": "wedge",
+     "at": [
+      0,
+      -0.5
+     ],
+     "size": 0.42,
+     "ang": 0.0,
+     "tone": 1.12
+    },
+    {
+     "part": "crest",
+     "at": [
+      0,
+      -0.78
+     ],
+     "size": 0.4,
+     "h": 0.4,
+     "tone": 1.2
+    },
+    {
+     "part": "fang",
+     "at": [
+      0.62,
+      -0.1
+     ],
+     "size": 0.85,
+     "ang": -1.2,
+     "tone": 1.25
+    },
+    {
+     "part": "shell",
+     "at": [
+      -0.5,
+      0.05
+     ],
+     "size": 0.5,
+     "tone": 0.9
+    },
+    {
+     "part": "banner",
+     "at": [
+      -0.15,
+      -0.6
+     ],
+     "size": 0.55,
+     "tone": 1.05
+    }
+   ]
+  },
+  "inkwitch": {
+   "id": "inkwitch",
+   "name": "Ink Witch",
+   "cost": 3,
+   "hp": 300,
+   "dmg": 58,
+   "spd": 60,
+   "rng": 34,
+   "size": 22,
+   "flying": false,
+   "building": false,
+   "riverhop": false,
+   "count": 1,
+   "paper": [
+    120,
+    104,
+    150
+   ],
+   "ability": "chill",
+   "rarity": "common",
+   "set": "core",
+   "rotation": true,
+   "blurb": "She folds the dark between the pages, and it holds her shape.",
+   "model": [
+    {
+     "part": "robe",
+     "at": [
+      0,
+      0.2
+     ],
+     "size": 0.85,
+     "tone": 0.88
+    },
+    {
+     "part": "sleeve",
+     "at": [
+      0.4,
+      -0.05
+     ],
+     "size": 0.6,
+     "tone": 0.8
+    },
+    {
+     "part": "hood",
+     "at": [
+      0,
+      -0.5
+     ],
+     "size": 0.55,
+     "tone": 0.92
+    },
+    {
+     "part": "staff",
+     "at": [
+      -0.58,
+      0.02
+     ],
+     "size": 0.95,
+     "tone": 0.7
+    },
+    {
+     "part": "orb",
+     "at": [
+      -0.62,
+      -0.72
+     ],
+     "size": 0.16,
+     "tone": 1.4
+    },
+    {
+     "part": "plume",
+     "at": [
+      0.15,
+      -0.75
+     ],
+     "size": 0.5,
+     "ang": -0.3,
+     "tone": 0.85
+    },
+    {
+     "part": "tail",
+     "at": [
+      -0.4,
+      0.5
+     ],
+     "size": 0.5,
+     "ang": 0.6,
+     "tone": 0.82
     }
    ]
   }

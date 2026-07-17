@@ -4300,11 +4300,12 @@ _CARD_FAMILY = {
     "baobab": "tree", "dragontree": "tree", "monkeypuzzle": "tree",
     "obelisk": "monolith", "ironsmith": "monolith", "piper": "monolith",
     "inkgolem": "golem", "voidcritter": "blob", "mimic": "blob",
-    "frostmage": "figure", "willowisp": "wisp", "jackalope": "rabbit",
+    "frostmage": "figure", "mothmage": "figure", "foldknight": "figure",
+    "inkwitch": "figure", "willowisp": "wisp", "jackalope": "rabbit",
     "tortoise": "shelled",
     # ── expanse set ──
     "stagbeetle": "insect", "emberfox": "canine", "leech": "amphibian",
-    "legion": "figure", "mothmage": "insect", "bellfrog": "amphibian",
+    "legion": "figure", "bellfrog": "amphibian",
     "condor": "bird", "mushroom": "tree", "rhino": "tusker",
     "wisppack": "wisp", "golemsm": "golem", "serpent": "cephalopod",
     # ── tideturn set ──
@@ -4494,6 +4495,13 @@ def _sil_body(fam, cx, cy, s, rr):
     if fam == "insect":
         return [(cx - s * 0.5, cy), (cx, cy - s * 0.5), (cx + s * 0.6, cy - s * 0.1),
                 (cx + s * 0.4, cy + s * 0.4), (cx - s * 0.3, cy + s * 0.45)]
+    if fam == "figure":
+        # a robed biped: head, shoulders, and a hem that flares at the floor
+        return [(cx - s * 0.7, cy + s * 0.85), (cx - s * 0.32, cy + s * 0.1),
+                (cx - s * 0.4, cy - s * 0.3), (cx - s * 0.18, cy - s * 0.55),
+                (cx - s * 0.14, cy - s * 0.8), (cx + s * 0.14, cy - s * 0.8),
+                (cx + s * 0.18, cy - s * 0.55), (cx + s * 0.4, cy - s * 0.3),
+                (cx + s * 0.32, cy + s * 0.1), (cx + s * 0.7, cy + s * 0.85)]
     if fam in ("fish", "cephalopod"):
         return [(cx - s, cy), (cx - s * 0.4, cy - s * 0.5), (cx + s * 0.5, cy - s * 0.35),
                 (cx + s, cy), (cx + s * 0.5, cy + s * 0.35), (cx - s * 0.4, cy + s * 0.5)]
@@ -4537,6 +4545,20 @@ def make_card_sketch(key, w, h):
     elif fam == "tusker":
         _ink_stroke(surf, [(cx + s * 0.8, cy + s * 0.2), (cx + s * 1.2, cy + s * 0.5)], 4, 3)
         _ink_stroke(surf, [(cx + s * 0.9, cy + s * 0.1), (cx + s * 1.15, cy + s * 0.35)], 6, 2)
+    elif fam == "figure":
+        # the wizard outfit: a wide hat brim with a bent tip…
+        _ink_stroke(surf, [(cx - s * 0.55, cy - s * 0.62), (cx + s * 0.55, cy - s * 0.62)], 31, 3)
+        _ink_stroke(surf, [(cx - s * 0.14, cy - s * 0.66), (cx + s * 0.05, cy - s * 1.15),
+                           (cx + s * 0.38, cy - s * 1.32)], 33, 2)
+        # …a gnarled staff with an orb at the crown…
+        _ink_stroke(surf, [(cx + s * 0.62, cy + s * 0.85), (cx + s * 0.55, cy - s * 0.1),
+                           (cx + s * 0.64, cy - s * 0.62)], 37, 2)
+        pygame.draw.circle(surf, INK_BLACK, (int(cx + s * 0.63), int(cy - s * 0.7)),
+                           max(2, int(s * 0.09)), 2)
+        # …a rope belt at the waist, and a face kept in hood-shadow
+        _ink_stroke(surf, [(cx - s * 0.3, cy + s * 0.06), (cx + s * 0.3, cy + s * 0.1)], 41, 2)
+        pygame.draw.circle(surf, INK_BLACK, (int(cx), int(cy - s * 0.68)),
+                           max(2, int(s * 0.1)))
     elif fam == "insect":
         for i in range(3):
             _ink_stroke(surf, [(cx - s * 0.2 + i * s * 0.3, cy + s * 0.3),
