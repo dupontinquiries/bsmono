@@ -408,6 +408,20 @@ impl State {
             cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose);
             m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
         }
+        // jungle camps — a guard cat (tinted by species) circling its herb marker
+        for c in &g.jungle {
+            let col = match c.kind { clawbound_rs::prowl::CampKind::Raccoon => 0x808080, clawbound_rs::prowl::CampKind::Fox => 0xd8623c, clawbound_rs::prowl::CampKind::Snake => 0x5aa054 };
+            if c.guard_alive {
+                let ggy = world::height_at(c.gx, c.gz);
+                let pose = if c.alert { cat::walk((self.anim_t * 1.6 + c.gx * 0.2).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.5 + c.gx) };
+                cat::build(&mut m, v3(c.gx, ggy, c.gz), 0.0, &pose);
+                m.boxx(v3(c.gx, ggy + 1.3, c.gz), v3(0.3, 0.14, 0.3), rgb(col));
+            }
+            if c.cooldown <= 0.0 && (c.cleared() || !c.alert) {
+                let hgy = world::height_at(c.x, c.z) + 0.9 + (self.frame * 0.05 + c.x).sin() * 0.15;
+                m.boxx(v3(c.x, hgy, c.z), v3(0.4, 0.4, 0.4), rgb(c.kind.reward().color()));
+            }
+        }
         // the prowler + a class-tint marker
         let pgy = world::height_at(g.x, g.z);
         let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
@@ -483,6 +497,17 @@ impl State {
             let p = self.prowl.as_ref().unwrap();
             (p.player_move.map(|(m, _)| m.name()), p.combo_flash, p.combo_name)
         };
+        let jungle_hint = {
+            let p = self.prowl.as_ref().unwrap();
+            p.jungle.iter().filter(|c| {
+                let d = ((p.x - c.x).powi(2) + (p.z - c.z).powi(2)).sqrt();
+                d < 16.0
+            }).map(|c| {
+                if c.cleared() { format!("{} camp cleared — herb free", c.kind.name()) }
+                else if c.alert { format!("{} camp — guard alerted!", c.kind.name()) }
+                else { format!("{} camp — sneak in, or clear it out", c.kind.name()) }
+            }).next()
+        };
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
@@ -514,6 +539,7 @@ impl State {
                     ui.label(RichText::new(format!("ULT (Q) · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
                     ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
+                    if let Some(jh) = &jungle_hint { ui.label(RichText::new(jh).size(13.0).color(Color32::from_rgb(200, 210, 140))); }
                     if exposed { ui.label(RichText::new("! EXPOSED - get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
                 });
             });
