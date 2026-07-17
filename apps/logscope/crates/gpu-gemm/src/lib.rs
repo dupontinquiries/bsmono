@@ -3066,6 +3066,12 @@ impl Gpu {
         // would die deep in tokenizer loading with a cryptic error. Classify up front and refuse with a
         // message that points at the right subsystem (the image pipeline) instead.
         let kind = crate::model_kind::classify(&g);
+        // Self-service GGUF introspection (llama.cpp's gguf-dump may not build on the box): dump the tensor
+        // table on request. LOGSCOPE_GGUF_DUMP=1 dumps all; =blk.0. (or any prefix) filters to one layer.
+        if let Ok(v) = std::env::var("LOGSCOPE_GGUF_DUMP") {
+            let prefix = if v == "1" || v.is_empty() { "" } else { v.as_str() };
+            eprintln!("{}", g.dump_tensors(prefix));
+        }
         if !kind.is_llm() {
             return Err(format!("not a language model: {}", kind.guidance()));
         }
@@ -3086,8 +3092,11 @@ impl Gpu {
             let dense_ok = acfg.dense_supported && expert_count == 0;
             if !dense_ok {
                 let moe_hint = if expert_count > 0 { format!(" (this is a {expert_count}-expert MoE checkpoint)") } else { String::new() };
+                // Append layer-0's tensors so the exact expert stacking layout is visible right here — the
+                // one thing needed to wire the MoE forward, without a separate dump run.
+                let layout = g.dump_tensors("blk.0.");
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {}. \
-                    Use the llama.cpp backend for this model.", acfg.note));
+                    Use the llama.cpp backend for this model.\n{layout}", acfg.note));
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
