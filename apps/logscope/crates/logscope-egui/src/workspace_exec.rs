@@ -612,6 +612,9 @@ pub enum Stop {
     Done,
     /// Hit the step budget without finishing.
     StepLimit,
+    /// Aborted: the model was stuck repeating itself (caught by the loop guard) — a bad actor, cut so its
+    /// speed stops being a runaway train.
+    Stalled,
     /// The model call itself failed (e.g. generation error).
     ModelError(String),
 }
@@ -706,7 +709,7 @@ fn observation(results: &[(Tool, ToolResult)]) -> String {
 /// should end this turn. Mutates `prompt`/`plan`/`verified` in place.
 fn step_turn(
     text: &str, prompt: &mut String, ws: &mut Workspace, cfg: &AgentConfig,
-    plan: &mut Plan, verified: &mut bool, step: usize,
+    plan: &mut Plan, verified: &mut bool, step: usize, guard: &mut crate::repetition::LoopGuard,
 ) -> (Vec<(Tool, ToolResult)>, Option<Stop>) {
     prompt.push_str("\n\nASSISTANT:\n");
     prompt.push_str(text);
@@ -717,6 +720,27 @@ fn step_turn(
     }
 
     let tools = parse_tools(text);
+
+    // ── loop management (bad-actor detection) ────────────────────────────────────────────────────
+    // Signature of what this turn DID (its tool calls, or "done"/"noop") so the guard can tell a repeating
+    // agent from a progressing one. A repeat or an internally-looping reply escalates: nudge, then abort.
+    let action_sig = if text.contains(DONE_MARKER) && tools.is_empty() {
+        "done".to_string()
+    } else if tools.is_empty() {
+        "noop".to_string()
+    } else {
+        tools.iter().map(|t| t.summary()).collect::<Vec<_>>().join(";")
+    };
+    match guard.observe(text, &action_sig) {
+        crate::repetition::LoopAction::Abort => return (Vec::new(), Some(Stop::Stalled)),
+        crate::repetition::LoopAction::Nudge(msg) => {
+            // Re-steer BEFORE running a repeated action: inject the nudge and skip executing this turn's
+            // (repeated) tools, so the model gets a chance to change tack instead of re-doing the loop.
+            prompt.push_str(&format!("\n\n(⚠ loop detected: {msg})\n"));
+            return (Vec::new(), None);
+        }
+        crate::repetition::LoopAction::Proceed => {}
+    }
 
     // Done handling — gated on verification (6).
     if text.contains(DONE_MARKER) && tools.is_empty() {
@@ -775,13 +799,14 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
     let mut turns = Vec::new();
     let mut plan = Plan::default();
     let mut verified = cfg.verify_cmd.is_empty();
+    let mut guard = crate::repetition::LoopGuard::default();
 
     for step in 0..cfg.max_steps {
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
             Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified },
         };
-        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step);
+        let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard);
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
             return Session { turns, stop, files: ws.events().to_vec(), plan, verified };
@@ -818,6 +843,7 @@ pub struct AgentRun {
     verified: bool,
     step: usize,
     turns: usize,
+    guard: crate::repetition::LoopGuard,
 }
 
 impl AgentRun {
@@ -828,6 +854,7 @@ impl AgentRun {
         let run = Self {
             ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
+            guard: crate::repetition::LoopGuard::default(),
         };
         (run, prompt)
     }
@@ -838,7 +865,7 @@ impl AgentRun {
     /// The worker finished a turn: process the accumulated reply and decide the next action.
     pub fn on_done(&mut self) -> AgentStep {
         let text = std::mem::take(&mut self.reply);
-        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step);
+        let (_results, stop) = step_turn(&text, &mut self.prompt, &mut self.ws, &self.cfg, &mut self.plan, &mut self.verified, self.step, &mut self.guard);
         self.turns += 1;
         self.step += 1;
         if let Some(stop) = stop { return AgentStep::Finished(stop); }
@@ -1345,6 +1372,22 @@ mod tests {
         // after branch 0 finishes its (only) turn → done, the fan rotates to the newly-added branch 1
         let s1 = fan.on_done();
         assert!(matches!(s1, FanStep::Submit { branch: 1, .. }), "added branch is scheduled");
+    }
+
+    #[test]
+    fn agent_aborts_a_looping_bad_actor() {
+        // a model that emits the SAME write every turn (never progresses) must be cut, not run to the cap.
+        let mut ws = Workspace::new(tmp("loopactor"));
+        struct Repeater;
+        impl Llm for Repeater {
+            fn generate(&mut self, _p: &str) -> Result<String, String> {
+                Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
+            }
+        }
+        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
+        assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
+        assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
     }
 
     #[test]
