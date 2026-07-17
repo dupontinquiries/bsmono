@@ -129,6 +129,20 @@ pub fn reapply_dir(work_dir: &Path, project: &Path, label: &str) -> Result<Strin
     git(project, &["rev-parse", "HEAD"])
 }
 
+/// Write a set of `(relative_path, text)` files into `project` and commit them as one commit. Used by the
+/// doc merge to land the unioned doc tree + generated index. Returns the new commit hash.
+pub fn write_and_commit(project: &Path, files: &[(String, String)], label: &str) -> Result<String, String> {
+    if files.is_empty() { return Err("nothing to write".into()); }
+    for (rel, text) in files {
+        let dst = project.join(rel);
+        if let Some(parent) = dst.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+        std::fs::write(&dst, text).map_err(|e| format!("write {rel}: {e}"))?;
+    }
+    git(project, &["add", "-A"])?;
+    git(project, &["commit", "-m", &commit_message(label)])?;
+    git(project, &["rev-parse", "HEAD"])
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("git")
         .args(args)
