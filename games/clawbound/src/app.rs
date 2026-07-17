@@ -537,10 +537,10 @@ impl State {
         };
         let ((wind_dx, wind_dz), wind_strength) = self.prowl.as_ref().unwrap().wind();
         let yowled = self.prowl.as_ref().unwrap().yowled_t > 0.0;
-        let (sustenance, sick, ritual_p, markers_held, convergence_soon, convergence_result) = {
+        let (sustenance, sick, ritual_p, markers_held, convergence_soon, convergence_result, convergence_t) = {
             let p = self.prowl.as_ref().unwrap();
             let held = p.markers.iter().filter(|mk| mk.held_by == 0).count();
-            (p.sustenance, p.sick, p.ritual_progress[0], held, p.convergence_warning(), p.convergence_result)
+            (p.sustenance, p.sick, p.ritual_progress[0], held, p.convergence_warning(), p.convergence_result, p.convergence_t)
         };
         let jungle_hint = {
             let p = self.prowl.as_ref().unwrap();
@@ -591,7 +591,7 @@ impl State {
                         .text(RichText::new(if sick { "sustenance - SICK" } else { "sustenance" }).size(11.0).color(Color32::WHITE)));
                     ui.label(RichText::new(format!("Territory {markers_held}/{} · Ritual {:.0}/{:.0}", clawbound_rs::prowl::N_MARKERS, ritual_p, clawbound_rs::prowl::RITUAL_WIN))
                         .size(12.0).color(Color32::from_rgb(200, 180, 220)));
-                    if convergence_soon { ui.label(RichText::new("* the Rock stirs... a convergence is near").size(12.0).color(Color32::from_rgb(200, 160, 255))); }
+                    if convergence_soon { ui.label(RichText::new(format!("* the Rock stirs... convergence in {:.0}s", convergence_t.max(0.0).ceil())).size(12.0).color(Color32::from_rgb(200, 160, 255))); }
                     if let Some(w) = convergence_result { ui.label(RichText::new(format!("Convergence resolved — {} led the territory", clawbound_rs::prowl::clan_name(w))).size(11.0).italics().color(Color32::from_rgb(180, 200, 220))); }
                     let wind_deg = wind_dx.atan2(wind_dz).to_degrees();
                     ui.label(RichText::new(format!("Wind {:.0}° · {}", wind_deg.rem_euclid(360.0),
@@ -611,6 +611,15 @@ impl State {
                 egui::Area::new("pcombo".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -80.0]).show(ctx, |ui| {
                     ui.label(RichText::new(prowl_combo_name).size(20.0 + prowl_combo_flash * 12.0).strong()
                         .color(Color32::from_rgba_unmultiplied(255, 210, 90, (255.0 * prowl_combo_flash.min(1.0)) as u8)));
+                });
+            }
+            if convergence_t <= 5.0 && convergence_t > 0.0 {
+                let pulse = (self.frame as f32 * 0.4).sin() * 0.5 + 0.5;
+                egui::Area::new("convergence".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -140.0]).show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("THE RITUAL STIRS").size(22.0 + pulse * 4.0).strong().color(Color32::from_rgb(200, 160, 255)));
+                        ui.label(RichText::new(format!("{:.0}", convergence_t.ceil())).size(30.0).strong().color(Color32::from_rgb(230, 200, 255)));
+                    });
                 });
             }
             egui::Area::new("phint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
