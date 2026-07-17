@@ -14,6 +14,38 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use clawbound_rs::math::{look_at, perspective, v3};
 use clawbound_rs::sim::Game;
 
+/// A scripted first-pass tutorial for Prowl: a short non-interactive intro pan,
+/// then a sequence of steps that each show a prompt and unlock the next once the
+/// player actually does the thing — a real (if modest) interactive walkthrough
+/// rather than a wall of text.
+struct TutorialRun {
+    step: usize,
+    intro_t: f32,      // > 0 during the opening camera pan, before the player gets control
+    advance_flash: f32,
+}
+const TUTORIAL_STEPS: &[(&str, &str)] = &[
+    ("Find your paws", "Move with your bound movement keys (WASD by default — rebind anytime in Settings > Keybinds)."),
+    ("Slip out of sight", "Hold your Hide/Climb key near a bush to vanish from view."),
+    ("Claim a tree", "Walk up to an ancestor tree and stay close until it lights up for your clan."),
+    ("Strike", "Flick the mouse and left-click to land an autoattack."),
+    ("Your ultimate", "Press your Ultimate key (Q by default) to unleash your class's signature move."),
+    ("Raid the jungle", "Sneak past — or fight through — a jungle camp's guard to take its herb."),
+    ("Hold the ground", "Stand at a territory marker until it flips to your clan — this is what the Rock of Nine Lives ritual is built from."),
+    ("You're ready", "That's the core of Prowl. Press Enter to head back to the menu."),
+];
+fn tutorial_step_done(step: usize, p: &clawbound_rs::prowl::Prowl) -> bool {
+    match step {
+        0 => p.moving,
+        1 => p.hidden,
+        2 => p.ancestors.iter().any(|a| a.owned_by(0)),
+        3 => p.combo_last.is_some() || p.times_caught > 0,
+        4 => p.ability_cd > 0.0 || p.ability_t > 0.0,
+        5 => p.jungle.iter().any(|c| c.cleared() || c.cooldown > 0.0),
+        6 => p.markers.iter().any(|m| m.held_by == 0),
+        _ => false,   // the final step waits for Enter, handled separately
+    }
+}
+
 /// Small vector icons for the buff badges — a paw print, a shield, three claw
 /// marks — drawn with egui shapes so the HUD reads at a glance instead of just
 /// text, without needing an image-asset pipeline.
@@ -151,19 +183,37 @@ fn icon_ultimate(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: eg
 #[derive(Default)]
 struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, ability: bool, mleft: bool, mmiddle: bool, mright: bool }
 impl Keys {
-    fn set(&mut self, code: KeyCode, down: bool) {
+    /// The canonical bind-name for a physical key — matches what `Menu::feed_rebind`
+    /// stores when the player rebinds an action, so a stored name here always
+    /// resolves back to the same physical key.
+    fn keycode_name(code: KeyCode) -> String { format!("{:?}", code).replace("Key", "").replace("Digit", "") }
+
+    /// Set the right field(s) for a physical key press/release, per the *current*
+    /// keybinds — not hardcoded, so remapping (including to non-QWERTY-adjacent keys,
+    /// PageUp/PageDown, etc.) actually takes effect. Arrow keys always work for
+    /// movement too, regardless of binding, as a baseline that's never taken away.
+    fn set(&mut self, code: KeyCode, down: bool, kb: &clawbound_rs::menu::Keybinds) {
+        use clawbound_rs::menu::Action;
         match code {
-            KeyCode::KeyW | KeyCode::ArrowUp => self.w = down,
-            KeyCode::KeyS | KeyCode::ArrowDown => self.s = down,
-            KeyCode::KeyA | KeyCode::ArrowLeft => self.a = down,
-            KeyCode::KeyD | KeyCode::ArrowRight => self.d = down,
-            KeyCode::ShiftLeft | KeyCode::ControlLeft | KeyCode::KeyC => self.crouch = down,
-            KeyCode::Space => self.dodge = down,
-            KeyCode::KeyF | KeyCode::KeyE => self.leap = down,
-            KeyCode::KeyQ => self.ability = down,
-            KeyCode::KeyR => self.restart = down,
+            KeyCode::ArrowUp => self.w = down,
+            KeyCode::ArrowDown => self.s = down,
+            KeyCode::ArrowLeft => self.a = down,
+            KeyCode::ArrowRight => self.d = down,
             _ => {}
         }
+        let name = Self::keycode_name(code);
+        if name == kb.key_for(Action::Up) { self.w = down; }
+        if name == kb.key_for(Action::Down) { self.s = down; }
+        if name == kb.key_for(Action::Left) { self.a = down; }
+        if name == kb.key_for(Action::Right) { self.d = down; }
+        if name == kb.key_for(Action::Crouch) { self.crouch = down; }
+        if name == kb.key_for(Action::Dodge) { self.dodge = down; }
+        if name == kb.key_for(Action::Leap) { self.leap = down; }
+        if name == kb.key_for(Action::Ability) { self.ability = down; }
+        if name == kb.key_for(Action::Restart) { self.restart = down; }
+        // Shift/Ctrl and C are always accepted for Crouch too, so a rebind to
+        // something else doesn't strand a player who instinctively reaches for Shift.
+        if matches!(code, KeyCode::ShiftLeft | KeyCode::ControlLeft) { self.crouch = down; }
     }
     fn move_vec(&self) -> (f32, f32) {
         ((self.d as i32 - self.a as i32) as f32, (self.w as i32 - self.s as i32) as f32)
@@ -227,6 +277,7 @@ struct State {
     game: Game,
     prowl: Option<clawbound_rs::prowl::Prowl>,
     capture: Option<clawbound_rs::capture::Capture>,
+    tutorial: Option<TutorialRun>,
     kind: clawbound_rs::hunter::Kind,
     mode: clawbound_rs::sim::Mode,
     over_timer: f32,
@@ -379,7 +430,7 @@ impl State {
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
         let menu = clawbound_rs::menu::Menu::new();
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -620,6 +671,14 @@ impl State {
         self.set_capture(!self.menu.open);   // prowl is endless — capture while playing
 
         if !self.menu.open {
+            let intro = self.tutorial.as_ref().map(|t| t.intro_t).unwrap_or(0.0);
+            if intro > 0.0 {
+                // a short, non-interactive opening pan before handing control to the player
+                self.yaw += dt * 0.25;
+                self.prowl.as_mut().unwrap().set_input(0.0, 0.0, false, false, false);
+                self.prowl.as_mut().unwrap().step(dt);
+                if let Some(t) = self.tutorial.as_mut() { t.intro_t -= dt; }
+            } else {
             let (ix, iz) = self.keys.move_vec();
             let (mx, mz) = move_world(self.yaw, ix, iz);
             {
@@ -640,13 +699,22 @@ impl State {
             }
             self.mleft_prev = self.keys.mleft;
             self.prowl.as_mut().unwrap().step(dt);
+            // tutorial: advance to the next step once the current one's condition is met
+            if let Some(t) = self.tutorial.as_mut() {
+                t.advance_flash = (t.advance_flash - dt * 1.5).max(0.0);
+                if t.step < TUTORIAL_STEPS.len() - 1 && tutorial_step_done(t.step, self.prowl.as_ref().unwrap()) {
+                    t.step += 1; t.advance_flash = 1.0;
+                }
+            }
             if self.keys.restart {
                 let (c, k, diff, fw) = { let p = self.prowl.as_ref().unwrap(); (p.class, p.hunter_kind, p.difficulty, p.fixed_wind) };
                 let mut p = clawbound_rs::prowl::Prowl::new(c, k);
                 p.difficulty = diff;
                 p.set_fixed_wind(fw);
+                if let Some(t) = self.tutorial.as_mut() { p.set_tutorial_mode(true); *t = TutorialRun { step: 0, intro_t: 0.0, advance_flash: 0.0 }; }
                 self.prowl = Some(p);
                 self.keys.restart = false;
+            }
             }
         }
 
@@ -697,11 +765,38 @@ impl State {
                 else { format!("{} camp — sneak in, or clear it out", c.kind.name()) }
             }).next()
         };
+        let tutorial_ui: Option<(&'static str, &'static str, bool, f32)> = self.tutorial.as_ref().map(|t| {
+            let (title, prompt) = TUTORIAL_STEPS[t.step];
+            (title, prompt, t.step == TUTORIAL_STEPS.len() - 1, t.advance_flash)
+        });
+        let tutorial_intro = self.tutorial.as_ref().map(|t| t.intro_t > 0.0).unwrap_or(false);
         let ppp = self.egui_ctx.pixels_per_point();
         let raw = self.egui_state.take_egui_input(&self._window);
         let full = self.egui_ctx.run(raw, |ctx| {
             use egui::{Align2, Color32, RichText};
             if open { draw_menu(ctx, &items, cursor, screen); return; }
+            if let Some((title, prompt, is_last, flash)) = tutorial_ui {
+                egui::Area::new("tutorial".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_BOTTOM, [0.0, -70.0]).show(ctx, |ui| {
+                    egui::Frame::none().fill(Color32::from_rgba_unmultiplied(20, 16, 28, 210))
+                        .inner_margin(egui::Margin::symmetric(18.0, 12.0)).rounding(8.0).show(ui, |ui| {
+                        ui.set_max_width(460.0);
+                        ui.vertical_centered(|ui| {
+                            let glow = (255.0 * (0.6 + 0.4 * flash)) as u8;
+                            ui.label(RichText::new(title).size(17.0).strong().color(Color32::from_rgb(glow, 214, 120)));
+                            ui.label(RichText::new(prompt).size(13.5).color(Color32::from_rgb(220, 218, 228)));
+                            if is_last { ui.label(RichText::new("Press Enter to finish").size(11.5).italics().color(Color32::from_rgb(160, 200, 170))); }
+                        });
+                    });
+                });
+                if tutorial_intro {
+                    egui::Area::new("tutorial_intro".into()).order(egui::Order::Foreground).anchor(Align2::CENTER_CENTER, [0.0, -40.0]).show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("PROWL").size(38.0).strong().color(Color32::from_rgb(220, 200, 255)));
+                            ui.label(RichText::new("a training walk through the clan grounds").size(14.0).italics().color(Color32::from_rgb(200, 200, 210)));
+                        });
+                    });
+                }
+            }
             egui::Area::new("phud".into()).anchor(Align2::LEFT_TOP, [16.0, 14.0]).show(ctx, |ui| {
                 egui::Frame::none().fill(Color32::from_rgba_unmultiplied(14, 12, 20, 150))
                     .inner_margin(egui::Margin::symmetric(12.0, 9.0)).rounding(6.0).show(ui, |ui| {
@@ -1370,16 +1465,23 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                         KeyCode::ArrowLeft | KeyCode::KeyA => state.menu.adjust(-1),
                                         KeyCode::ArrowRight | KeyCode::KeyD => state.menu.adjust(1),
                                         KeyCode::Enter | KeyCode::NumpadEnter | KeyCode::Space => match state.menu.activate() {
-                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
+                                            MenuCmd::StartSingle(k, m) => { state.prowl = None; state.capture = None; state.tutorial = None; state.kind = k; state.mode = m; let seed = (state.frame as u32).wrapping_mul(2_654_435_761) | 1; state.game = Game::new_match_seeded(k, m, seed); state.game.difficulty = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty); state.game.clan = state.menu.sel_clan; state.game.set_abilities_on(state.menu.settings.clan_abilities); state.over_timer = 0.0; }
                                             MenuCmd::StartMode(g, k, c) => {
                                                 use clawbound_rs::menu::GameMode;
-                                                state.prowl = None; state.capture = None;
+                                                state.prowl = None; state.capture = None; state.tutorial = None;
                                                 let diff = clawbound_rs::menu::difficulty_mult(state.menu.settings.difficulty);
                                                 match g {
                                                     GameMode::Prowl => { let mut p = clawbound_rs::prowl::Prowl::new(c, k); p.difficulty = diff; p.set_fixed_wind(state.menu.settings.prowl_fixed_wind); state.prowl = Some(p); }
                                                     GameMode::Capture => { state.capture = Some(clawbound_rs::capture::Capture::new(c)); }
                                                     _ => { state.menu.open = true; }
                                                 }
+                                            }
+                                            MenuCmd::StartTutorial => {
+                                                state.capture = None;
+                                                let mut p = clawbound_rs::prowl::Prowl::new(clawbound_rs::class::Class::Cat, clawbound_rs::hunter::Kind::Fox);
+                                                p.set_tutorial_mode(true);
+                                                state.prowl = Some(p);
+                                                state.tutorial = Some(TutorialRun { step: 0, intro_t: 4.0, advance_flash: 0.0 });
                                             }
                                             MenuCmd::Quit => elwt.exit(),
                                             MenuCmd::Close => state.menu.open = false,
@@ -1391,6 +1493,10 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                 }
                             }
                         } else if code == KeyCode::Escape && down {
+                            state.menu.open = true; state.menu.screen = clawbound_rs::menu::Screen::Title; state.menu.cursor = 0;
+                        } else if down && (code == KeyCode::Enter || code == KeyCode::NumpadEnter)
+                            && state.tutorial.as_ref().map(|t| t.step == TUTORIAL_STEPS.len() - 1).unwrap_or(false) {
+                            state.tutorial = None; state.prowl = None;
                             state.menu.open = true; state.menu.screen = clawbound_rs::menu::Screen::Title; state.menu.cursor = 0;
                         } else {
                             if down {
@@ -1408,7 +1514,7 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                     state.game = Game::new_match(state.kind, state.mode); state.over_timer = 0.0;
                                 }
                             }
-                            state.keys.set(code, down);
+                            state.keys.set(code, down, &state.menu.settings.keybinds);
                         }
                     }
                 }
