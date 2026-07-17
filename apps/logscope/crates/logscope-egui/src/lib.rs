@@ -44,6 +44,7 @@ pub mod voice_intent;
 pub mod imprint;
 pub mod picking;
 pub mod physui;
+pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
 pub mod assets;
 pub mod mediagen;
