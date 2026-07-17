@@ -804,6 +804,7 @@ pub struct Chat {
     agent_candidates: Vec<crate::workspace_exec::BranchSummary>, // folded branch summaries to prune to the keeper
     agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
     agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
+    rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -891,6 +892,7 @@ impl Default for Chat {
             agent_candidates: Vec::new(),
             agent_pending_submit: None,
             agent_task: String::new(),
+            rep_monitor: crate::repetition::RepeatMonitor::default(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -1057,14 +1059,26 @@ impl Chat {
             Evt::Token(t) => {
                 let mut stop = false;
                 let plain = self.backend != BackendKind::Wgpu; // template path stops on <|eot_id|>
+                let mut check_text: Option<String> = None;
                 if let Some(s) = &mut self.stream {
                     s.tokens += 1;
+                    let ntok = s.tokens;
                     if let Some(m) = self.msgs.get_mut(s.idx) {
                         m.cur_mut().push_str(&t);
                         if plain {
                             let cut = ["\nUser:", "\nuser:", "\nUSER:"].iter().filter_map(|mk| m.text().find(mk)).min();
                             if let Some(cut) = cut { m.cur_mut().truncate(cut); stop = true; }
                         }
+                        // sample the reply periodically for a repetition loop (cheap; bounded window)
+                        if !stop && ntok % 24 == 0 { check_text = Some(m.text().to_string()); }
+                    }
+                }
+                // Repetition recovery (all backends): if the reply has locked into a loop, cut it now so the
+                // model's speed stops being a runaway train instead of burning the whole token budget.
+                if let Some(txt) = check_text {
+                    if matches!(self.rep_monitor.observe(&txt).1, crate::repetition::Recovery::Cut) {
+                        stop = true;
+                        self.note = "cut a repetition loop (model was looping)".into();
                     }
                 }
                 if stop {
@@ -1081,6 +1095,7 @@ impl Chat {
                 }
                 self.last = Some((tokens, secs));
                 self.stream = None;
+                self.rep_monitor.reset();
                 if self.last_prompt_tokens > 0 { // bank this run for future progress estimates
                     self.gen_samples.push(crate::estimate::GenSample { prompt_tokens: self.last_prompt_tokens, output_tokens: tokens, secs });
                     let n = self.gen_samples.len();
@@ -1105,6 +1120,7 @@ impl Chat {
                     }
                 }
                 self.stream = None;
+                self.rep_monitor.reset();
             }
             Evt::Loaded(Ok(info)) => { self.template = info.template; }
             Evt::Loaded(Err(_)) => {}
@@ -1801,6 +1817,7 @@ impl Chat {
         let stopdesc = match &stop {
             crate::workspace_exec::Stop::Done => "done".to_string(),
             crate::workspace_exec::Stop::StepLimit => format!("hit step limit ({turns} turns)"),
+            crate::workspace_exec::Stop::Stalled => format!("stopped — model was looping ({turns} turns)"),
             crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
         };
         let snap = self.gitmind_session.as_ref()
