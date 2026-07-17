@@ -65,6 +65,9 @@ const SUSTENANCE_DECAY: f32 = 0.012;   // per second — a slow hunger clock
 const SUSTENANCE_PER_PREY: f32 = 0.22;
 const SUSTENANCE_SICK_AT: f32 = 0.12;
 const SUSTENANCE_WELL_AT: f32 = 0.4;   // sickness clears once it's recovered back above this
+const TWIG_HEAR_R: f32 = 26.0;         // how far a snapped twig carries, hunter-side
+const TWIG_SUSPICION: f32 = 0.5;
+const LOG_BOUND_R: f32 = 1.6;
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -250,6 +253,9 @@ pub struct Prowl {
     pub convergence_result: Option<u8>,        // brief flash of who won the last convergence
     pub sustenance: f32,                       // 0..1 — falls without prey, restored by a catch or by resting at a staging ground
     pub sick: bool,                            // true once sustenance bottoms out — slower until it recovers
+    pub twigs: Vec<(f32, f32)>,                // forest-floor twigs — snap one running and the hunt hears it
+    pub logs: Vec<(f32, f32)>,                 // fallen logs — a natural little bound when running past
+    pub snag_t: f32,                           // > 0 while dragging free of a bramble
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -303,6 +309,9 @@ impl Prowl {
             convergence_result: None,
             sustenance: 1.0,
             sick: false,
+            twigs: world::twig_positions(900),
+            logs: world::log_positions(110),
+            snag_t: 0.0,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -870,10 +879,41 @@ impl Prowl {
 
         self.crouched = want_crouch && !airborne;
         let mv = (dx.abs() + dz.abs() > 1e-4) && !self.crouched;
+
+        // ── undergrowth: brambles drag at you, and now and then snag a beat you have to
+        //    pull free of — creeping through slips clean, running through doesn't ──
+        self.snag_t = (self.snag_t - dt).max(0.0);
+        if mv && !airborne {
+            let cover = world::cover_at(self.x, self.z);
+            if cover > 0.35 { speed *= 1.0 - cover * 0.18; }
+            if cover > 0.6 && self.snag_t <= 0.0 && sprinting
+                && hashf(self.tick.wrapping_mul(2_654_435_761) ^ 0x9e37) < 0.010 {
+                self.snag_t = 0.35;
+            }
+            if self.snag_t > 0.0 { speed *= 0.45; }
+        }
+
         if mv {
             self.x = (self.x + dx * speed * dt).clamp(-MAP, MAP);
             self.z = (self.z + dz * speed * dt).clamp(-MAP, MAP);
             self.heading = dx.atan2(dz);
+            // a fallen log along the route: a natural little bound over it, airborne and
+            // briefly uncatchable — the fast, exposed line through the woods
+            if self.leap_t <= 0.0 && self.leap_cd <= 0.0 && self.dodge_t <= 0.0
+                && self.logs.iter().any(|&(lx, lz)| dist(self.x, self.z, lx, lz) < LOG_BOUND_R) {
+                self.leap_t = LEAP_DUR * 0.7; self.leap_cd = 0.7; self.bx = dx; self.bz = dz;
+            }
+            // a snapped twig underfoot — the quiet, slow route around them stays hidden,
+            // running through the woods risks giving you away
+            if sprinting && !self.crouched {
+                if let Some(&(tx, tz)) = self.twigs.iter().find(|&&(tx, tz)| dist(self.x, self.z, tx, tz) < 0.5) {
+                    let hd = dist(self.hx, self.hz, tx, tz);
+                    if hd < TWIG_HEAR_R {
+                        self.suspicion = (self.suspicion + TWIG_SUSPICION * (1.0 - hd / TWIG_HEAR_R)).min(1.5);
+                        self.last_seen = Some((tx, tz));
+                    }
+                }
+            }
         }
         self.moving = mv;
         self.hidden = self.crouched && self.bushes.iter().any(|(bx, bz, r)| dist(self.x, self.z, *bx, *bz) < *r);
@@ -1544,6 +1584,74 @@ mod tests {
     }
 
     #[test]
+    fn thick_cover_drags_at_a_sprinting_prowler() {
+        let speed_at = |cover_heavy: bool| -> f32 {
+            let mut g = Prowl::new(Class::Cat, Kind::Fox);
+            g.hx = 900.0; g.hz = 900.0;
+            // find a spot with the cover level we want
+            let mut px = 0.0; let mut pz = 0.0;
+            let mut best = (-1.0f32, 0.0f32, 0.0f32);
+            for i in -140..140 {
+                for j in -140..140 {
+                    let (x, z) = (i as f32 * 2.0, j as f32 * 2.0);
+                    if Class::terrain_at(x, z) != 1 { continue; }   // strictly land — keep the base speed comparable
+                    let c = world::cover_at(x, z);
+                    let score = if cover_heavy { c } else { -c };
+                    if score > best.0 { best = (score, x, z); }
+                }
+            }
+            px = best.1; pz = best.2;
+            g.x = px; g.z = pz;
+            let x0 = g.x;
+            g.set_input(1.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            (g.x - x0).abs()
+        };
+        assert!(speed_at(true) < speed_at(false), "thick cover should drag at a running prowler more than open ground");
+    }
+
+    #[test]
+    fn a_log_gives_a_running_prowler_a_natural_bound() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.logs = vec![(2.0, 0.0)];   // a fallen log just ahead
+        g.x = 0.0; g.z = 0.0; g.heading = 0.0;
+        for _ in 0..20 {
+            g.set_input(1.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.leap_t > 0.0 { break; }
+        }
+        assert!(g.leap_t > 0.0, "running past a fallen log should trigger a natural little bound");
+    }
+
+    #[test]
+    fn sprinting_over_a_twig_near_the_hunter_raises_suspicion() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.twigs = vec![(2.0, 0.0)];
+        g.x = 0.0; g.z = 0.0; g.heading = 0.0;
+        g.hx = 5.0; g.hz = 0.0;   // close enough to hear it
+        g.suspicion = 0.0;
+        for _ in 0..20 {
+            g.set_input(1.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.suspicion > 0.0 { break; }
+        }
+        assert!(g.suspicion > 0.0, "sprinting over a twig within earshot of the hunter should raise suspicion");
+    }
+
+    #[test]
+    fn crouching_past_a_twig_stays_quiet() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.twigs = vec![(0.0, 0.0)];
+        g.x = 0.0; g.z = 0.0;
+        g.hx = 5.0; g.hz = 0.0;
+        g.suspicion = 0.0;
+        g.set_input(0.0, 0.0, false, false, true);   // crouched — no twig noise from standing still, either
+        g.step(1.0 / 30.0);
+        assert_eq!(g.suspicion, 0.0, "a crouched, stationary prowler shouldn't snap a twig");
+    }
+
+    #[test]
     fn cat_second_wind_refills_and_shields() {
         let mut g = Prowl::new(Class::Cat, Kind::Dog);
         g.x = 20.0; g.z = 0.0; g.hx = 20.0; g.hz = 0.0;
@@ -1609,6 +1717,7 @@ mod tests {
                     assert!(g.sustenance >= 0.0 && g.sustenance <= 1.0, "sustenance out of range");
                     assert!(g.convergence_t.is_finite(), "convergence clock broke");
                     for &p in &g.ritual_progress { assert!(p >= 0.0 && p <= RITUAL_WIN, "ritual progress out of range"); }
+                    assert!(g.snag_t >= 0.0, "snag_t went negative");
                     assert!(g.yowled_t >= 0.0, "yowled_t went negative");
                     pc = g.prey_caught; cc = g.times_caught;
                 }
