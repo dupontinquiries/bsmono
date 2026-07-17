@@ -527,6 +527,13 @@ VFX_THEMES = {
 }
 
 
+class _CasterProxy:
+    """A stand-in caster for detached sub-spells (splinter bursts) whose true
+    caster may already be gone — carries only the team."""
+    def __init__(self, team):
+        self.team = team
+
+
 def _ability_effects(ability):
     """Return the ability's effect list. New abilities carry an explicit
     'effects' list; legacy ones (kind = storm/heal/snare) are mapped on the fly
@@ -605,6 +612,8 @@ class RTS:
         self.spells = []                    # active spell effects on the field
         self.particles = []                 # transient visual particles
         self.projectiles = []               # in-flight paper darts / ink bolts
+        self.ground_pools = []              # lingering inkpool zones
+        self.quakes = []                    # expanding page-crack rings
         self.spell_bolts = []               # travelling spell projectiles (bolt delivery)
         self.phase = "setup"                # "setup" (pick faction/map) → "play"
         self.setup_fac = 0                  # index into faction list
@@ -1804,6 +1813,20 @@ class RTS:
             for i, (hx, hy) in enumerate(hops):
                 self._spawn_area_spell(ability, hx, hy, caster,
                                        delay=i * 0.12, radius=90)
+        elif delivery == "rain":
+            # a volley falls across the area: N bolts drop from the sky at
+            # scattered points, each detonating a small sub-burst on landing
+            n = int(ability.get("rain_count", 6))
+            rad = ability.get("radius", 140)
+            rng = random.Random((int(wx) * 73856093) ^ (int(wy) * 19349663))
+            for i in range(n):
+                a = rng.uniform(0, math.tau); rr = rng.uniform(0, rad * 0.9)
+                hx, hy = wx + math.cos(a) * rr, wy + math.sin(a) * rr
+                delay = 0.15 + i * 0.14
+                self.spell_bolts.append(dict(
+                    x=hx, y=hy - 420, tx=hx, ty=hy, t=0.0, dur=delay,
+                    ab={**ability, "radius": ability.get("rain_radius", 60)},
+                    team=caster.team, caster=caster, fall=True))
         else:
             self._spawn_area_spell(ability, wx, wy, caster)
 
@@ -2116,9 +2139,21 @@ class RTS:
         self.projectiles = [pr for pr in self.projectiles if pr["t"] < pr["dur"]]
 
     def _draw_spell_bolts(self, screen):
-        """A glowing spell bolt in flight toward its detonation point."""
+        """A glowing spell bolt in flight toward its detonation point. Rain
+        bolts drop straight from the sky with a comet streak."""
         for b in self.spell_bolts:
             f = b["t"] / b["dur"]
+            if b.get("fall"):
+                x = b["tx"]; y = b["ty"] - (1.0 - f) * 420
+                sx, sy = self.w2s(x, b["ty"])
+                sy -= (1.0 - f) * 420 * self.zoom
+                if -12 < sx < self.W + 12 and -12 < sy < self.H + 12:
+                    r = max(2, int(4 * self.zoom))
+                    pygame.draw.line(screen, (238, 224, 180),
+                                     (int(sx), int(sy - 26 * self.zoom)),
+                                     (int(sx), int(sy)), max(1, int(2 * self.zoom)))
+                    pygame.draw.circle(screen, (250, 240, 205), (int(sx), int(sy)), r)
+                continue
             x = b["x"] + (b["tx"] - b["x"]) * f
             y = b["y"] + (b["ty"] - b["y"]) * f - math.sin(f * math.pi) * 24
             sx, sy = self.w2s(x, y)
@@ -2131,7 +2166,48 @@ class RTS:
             pygame.draw.circle(screen, (245, 232, 200), (int(sx), int(sy)), r)
             pygame.draw.circle(screen, (200, 170, 110), (int(sx), int(sy)), r, 1)
 
+    def _draw_ground_pools(self, screen):
+        """Lingering inkpool zones: a dark stain that breathes and slowly
+        drinks its edge back in as the pool dries."""
+        for p in self.ground_pools:
+            life = 1.0 - p["t"] / p["dur"]
+            rr = p["rad"] * (0.75 + 0.25 * life)
+            self.disc(screen, (30, 26, 52), p["x"], p["y"], rr, 0)
+            self.disc(screen, (70, 60, 118), p["x"], p["y"],
+                      rr * (0.8 + 0.06 * math.sin(self._anim_t * 3 + p["x"])), 1)
+        for q in self.quakes:
+            f = q["t"] / q["dur"]
+            # a jagged crack ring racing outward through the page
+            n = 14
+            rr = q["rad"] * (0.3 + 0.7 * f)
+            pts = []
+            for k in range(n + 1):
+                a = k / n * math.tau
+                jag = 1.0 + 0.14 * math.sin(k * 4.7 + q["x"])
+                wx = q["x"] + math.cos(a) * rr * jag
+                wy = q["y"] + math.sin(a) * rr * jag
+                pts.append(self.wpos(wx, wy))
+            if len(pts) > 2:
+                pygame.draw.lines(screen, (92, 76, 58), False, pts,
+                                  max(1, int(3 * (1 - f))))
+
+    _PROJ_STYLES = {
+        # style: (draw fn key) — resolved per faction via data ('projectile'
+        # on the unit or the faction) with a mechanic fallback
+        "dart", "quill", "cinder", "inkglob", "gale", "thorn", "sting", "splinter",
+    }
+
+    def _proj_style(self, u):
+        spec = self.uspec(u.team, u.kind) or {}
+        st = spec.get("projectile") or self.facdata(u.team).get("projectile")
+        if st in self._PROJ_STYLES:
+            return st
+        return {"burn": "cinder", "regen": "inkglob", "momentum": "gale",
+                "cohesion": "quill"}.get(
+                    self.facdata(u.team).get("mechanic"), "dart")
+
     def _draw_projectiles(self, screen):
+        tnow = getattr(self, "_anim_t", 0.0)
         for pr in self.projectiles:
             f = pr["t"] / pr["dur"]
             x = pr["x"] + (pr["tx"] - pr["x"]) * f
@@ -2142,8 +2218,74 @@ class RTS:
             ang = math.atan2((pr["ty"] - pr["y"]), (pr["tx"] - pr["x"]))
             ln = max(4, int(7 * self.zoom))
             ex = sx - math.cos(ang) * ln; ey = sy - math.sin(ang) * ln
-            pygame.draw.line(screen, pr["col"], (ex, ey), (sx, sy), max(1, int(2 * self.zoom)))
-            pygame.draw.circle(screen, (240, 232, 210), (int(sx), int(sy)), max(1, int(self.zoom * 1.5)))
+            style = pr.get("style", "dart")
+            z = self.zoom
+            if style == "quill":
+                # a fletched court quill: shaft, nib, and two feather barbs
+                pygame.draw.line(screen, (238, 230, 210), (ex, ey), (sx, sy),
+                                 max(1, int(2 * z)))
+                for side in (-1, 1):
+                    bx = ex + math.cos(ang + side * 2.2) * 5 * z
+                    by = ey + math.sin(ang + side * 2.2) * 5 * z
+                    pygame.draw.line(screen, (214, 178, 108), (ex, ey), (bx, by), 1)
+                pygame.draw.circle(screen, (60, 50, 40), (int(sx), int(sy)),
+                                   max(1, int(1.5 * z)))
+            elif style == "cinder":
+                # a tumbling ember fleck with a smoke smudge behind it
+                sm = pygame.Surface((int(10 * z) + 2,) * 2, pygame.SRCALPHA)
+                pygame.draw.circle(sm, (60, 50, 46, 70), (sm.get_width() // 2,) * 2,
+                                   sm.get_width() // 2)
+                screen.blit(sm, (int(ex - 5 * z), int(ey - 5 * z)))
+                flick = 1 + 0.4 * math.sin(tnow * 40 + pr["x"])
+                pygame.draw.circle(screen, (250, 160, 60), (int(sx), int(sy)),
+                                   max(1, int(2.4 * z * flick)))
+                pygame.draw.circle(screen, (255, 226, 140), (int(sx), int(sy)),
+                                   max(1, int(1.2 * z)))
+            elif style == "inkglob":
+                # a wobbling droplet that leaves a drip
+                wob = math.sin(tnow * 26 + pr["y"]) * 1.6 * z
+                pygame.draw.circle(screen, (56, 48, 96),
+                                   (int(sx), int(sy + wob)), max(2, int(3 * z)))
+                pygame.draw.circle(screen, (120, 108, 190),
+                                   (int(sx - 1), int(sy + wob - 1)), max(1, int(z)))
+                pygame.draw.circle(screen, (56, 48, 96), (int(ex), int(ey)),
+                                   max(1, int(1.2 * z)))
+            elif style == "gale":
+                # a spinning crescent slash of pressed air
+                spin = tnow * 18 + pr["x"]
+                rr = 6 * z
+                rect = pygame.Rect(int(sx - rr), int(sy - rr), int(rr * 2), int(rr * 2))
+                pygame.draw.arc(screen, (222, 230, 240), rect, spin, spin + 2.4,
+                                max(1, int(2 * z)))
+                pygame.draw.arc(screen, (160, 180, 205), rect, spin + math.pi,
+                                spin + math.pi + 2.0, 1)
+            elif style == "thorn":
+                # a spinning briar cross
+                spin = tnow * 14 + pr["x"]
+                for k in range(3):
+                    a2 = spin + k * math.tau / 3
+                    pygame.draw.line(screen, (110, 140, 84),
+                                     (int(sx - math.cos(a2) * 5 * z),
+                                      int(sy - math.sin(a2) * 5 * z)),
+                                     (int(sx + math.cos(a2) * 5 * z),
+                                      int(sy + math.sin(a2) * 5 * z)),
+                                     max(1, int(1.6 * z)))
+                pygame.draw.circle(screen, (156, 186, 116), (int(sx), int(sy)),
+                                   max(1, int(1.4 * z)))
+            elif style == "sting":
+                # a triplet of gold needle tracers
+                for k in (-1, 0, 1):
+                    ox = math.cos(ang + math.pi / 2) * k * 3 * z
+                    oy = math.sin(ang + math.pi / 2) * k * 3 * z
+                    pygame.draw.line(screen, (232, 198, 110),
+                                     (ex + ox, ey + oy), (sx + ox, sy + oy), 1)
+            elif style == "splinter":
+                pygame.draw.line(screen, (232, 206, 120), (ex, ey), (sx, sy),
+                                 max(1, int(2 * z)))
+            else:
+                pygame.draw.line(screen, pr["col"], (ex, ey), (sx, sy), max(1, int(2 * z)))
+                pygame.draw.circle(screen, (240, 232, 210), (int(sx), int(sy)),
+                                   max(1, int(z * 1.5)))
 
     def _draw_particles(self, screen):
         for p in self.particles:
@@ -2236,6 +2378,23 @@ class RTS:
                     u = Unit(uk, ux + (off % 80), uy + (off // 80) * 26, team, spec=spec)
                     self._apply_upgrades(u)
                     self.units.append(u)
+
+    def _tick_pools(self, dt):
+        for p in self.ground_pools:
+            p["t"] += dt
+            for u in self.units:
+                if u.alive and u.team != p["team"] and \
+                        math.hypot(u.x - p["x"], u.y - p["y"]) < p["rad"]:
+                    self._hurt(u, p["dps"] * dt)
+                    u.slow_t = max(getattr(u, "slow_t", 0), p["slow"] * 0.4)
+            if random.random() < 6 * dt:
+                a = random.uniform(0, math.tau); rr = random.uniform(0, p["rad"])
+                self._emit(p["x"] + math.cos(a) * rr, p["y"] + math.sin(a) * rr,
+                           1, "ink", (96, 84, 150), spread=6, life=0.6, up=14)
+        self.ground_pools = [p for p in self.ground_pools if p["t"] < p["dur"]]
+        for q in self.quakes:
+            q["t"] += dt
+        self.quakes = [q for q in self.quakes if q["t"] < q["dur"]]
 
     def _tick_spells(self, dt):
         # travelling bolts: fly to their point, then detonate into an area spell
@@ -2337,6 +2496,48 @@ class RTS:
             elif once:
                 done.add(ei)
                 for u in tgts: u.hp = min(u.maxhp, u.hp + amt)
+        elif kind == "splinter":
+            # a shrapnel burst: darts fly outward and detonate small
+            # sub-bursts on a ring — fired once when the spell lands
+            if once:
+                n = int(eff.get("count", 6)); reach = eff.get("range", 120)
+                for k in range(n):
+                    a = k / n * math.tau + (sp["x"] * 0.01)
+                    hx = sx + math.cos(a) * reach
+                    hy = sy + math.sin(a) * reach
+                    self.projectiles.append(dict(
+                        x=sx, y=sy, tx=hx, ty=hy, t=0.0, dur=0.22,
+                        col=(232, 206, 120), team=team, style="splinter"))
+                    sub = dict(name="splinter", radius=eff.get("sub_radius", 46),
+                               dur=0.25, kind="custom",
+                               effects=[dict(effect="damage",
+                                             amount=eff.get("amount", 34))])
+                    self._spawn_area_spell(sub, hx, hy,
+                                           caster or _CasterProxy(team), delay=0.22)
+        elif kind == "inkpool":
+            # a lingering ground pool that slows and eats at everything
+            # hostile standing in it — registered once, ticked by the pools
+            if once:
+                self.ground_pools.append(dict(
+                    x=sx, y=sy, rad=rad * eff.get("scale", 1.0),
+                    dur=eff.get("duration", 6.0), t=0.0, team=team,
+                    dps=eff.get("dps", 12), slow=eff.get("slow", 2.0)))
+        elif kind == "quake":
+            # the page itself bucks: heavy stun + damage falling off from
+            # the centre, and a jagged crack ring in the paper
+            if once:
+                amt = eff.get("amount", 70)
+                for u in self.units:
+                    if u.alive and u.team != team:
+                        d = math.hypot(u.x - sx, u.y - sy)
+                        if d < rad:
+                            fall = 1.0 - 0.6 * (d / rad)
+                            self._hurt(u, amt * fall)
+                            u.stun_t = max(getattr(u, "stun_t", 0),
+                                           eff.get("duration", 1.2) * fall)
+                self.quakes.append(dict(x=sx, y=sy, rad=rad, t=0.0, dur=0.7))
+                self._emit(sx, sy, 14, "scrap", (150, 132, 104),
+                           spread=int(rad), life=0.6, up=60)
         elif kind == "slow":
             for u in tgts:
                 u.slow_t = max(getattr(u, "slow_t", 0), eff.get("duration", 3.0))
@@ -2468,6 +2669,7 @@ class RTS:
         self._tick_relics(dt)
         self._tick_rocks_towers(dt)
         self._tick_spells(dt)
+        self._tick_pools(dt)
         self._tick_particles(dt)
         self._tick_events(dt)
         self.fog_t += dt
@@ -2762,7 +2964,8 @@ class RTS:
                     self.projectiles.append(dict(
                         x=u.x, y=u.y - u.r * 0.4, tx=tgt.x, ty=tgt.y - getattr(tgt, "r", 10) * 0.4,
                         t=0.0, dur=max(0.12, math.hypot(tgt.x - u.x, tgt.y - u.y) / 900),
-                        col=self._tdark(u.team), team=u.team))
+                        col=self._tdark(u.team), team=u.team,
+                        style=self._proj_style(u)))
                 else:
                     # melee: a small burst of paper scraps at the point of impact
                     self._emit(tgt.x, tgt.y, 3, "scrap", (230, 220, 190), spread=40, life=0.35, up=15)
@@ -3226,6 +3429,7 @@ class RTS:
         self._draw_motes(screen)
         self._draw_props(screen)
         self._draw_fauna(screen)
+        self._draw_ground_pools(screen)
         self._draw_nodes(screen)
         self._draw_objects(screen)
         # structures under units — enemy structures only if in vision (last-seen
