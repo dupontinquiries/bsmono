@@ -1,0 +1,32 @@
+{
+  "id": "ashen_reach",
+  "name": "Ashen Reach",
+  "blurb": "A scorched, dried-out overworld: lowered seas, cinder flats, and rare humid oasis pockets scattered by seed.",
+  "climate": {"temperature_offset": 0.35, "humidity_offset": -0.2, "sea_level_delta": -6},
+  "biomes": {
+    "ashen_reach:cinder_flats": {
+      "_id": "ashen_reach:cinder_flats",
+      "_comment": "hot, near-rainless basalt plains — the pack's signature ground",
+      "temperature": 1.8, "downfall": 0.05,
+      "surface_block": "basalt"
+    },
+    "ashen_reach:oasis_verge": {
+      "_id": "ashen_reach:oasis_verge",
+      "_comment": "the green rim the humidity brushes carve out of the ash",
+      "temperature": 1.1, "downfall": 0.75,
+      "surface_block": "grass"
+    }
+  },
+  "field_mods": [
+    {"field": "humidity", "at": "spawn", "radius": 24.0, "peak": 3.0,
+     "_why": "a guaranteed survivable pocket where the player lands"},
+    {"field": "humidity", "at": "scatter_ring",
+     "r_min": 300.0, "r_max": 1400.0, "count": 10, "salt": 11,
+     "radius": 20.0, "peak": 4.0, "falloff": "smooth",
+     "_why": "seed-scattered oases — same spots for every peer of a seed"},
+    {"field": "temperature", "at": "scatter_ring",
+     "r_min": 150.0, "r_max": 900.0, "count": 14, "salt": 7,
+     "radius": 16.0, "peak": 5.0, "falloff": "linear",
+     "_why": "roaming heat blooms that push weather toward dust and shimmer"}
+  ]
+}
