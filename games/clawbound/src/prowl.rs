@@ -48,6 +48,9 @@ const MINIONS_PER_CLAN: usize = 3;
 const BORDER_R: f32 = 20.0;     // radius of a clan's border-patrol loop around its home
 const MINION_SPEED: f32 = 6.5;
 const MINION_AGGRO_R: f32 = 12.0;
+const YOWL_RANGE: f32 = 22.0;      // ranged minions cast from further out than the melee aggro radius
+const YOWL_CD: f32 = 6.0;
+const YOWL_REVEAL_DUR: f32 = 2.2;  // seconds a landed yowl outs your position (forces you out of hiding)
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -112,6 +115,9 @@ pub struct Minion {
     pub home: (f32, f32),
     pub phase: f32,      // position along the patrol loop
     pub aggro: bool,     // currently defending against an intruder
+    pub ranged: bool,    // a yowler: casts from range instead of closing to melee
+    pub yowl_cd: f32,    // ranged only: seconds until it can cast again
+    pub yowl_flash: f32, // > 0 briefly after a cast, for the visual
 }
 
 /// A rival clan's AI prowler. It roams to the nearest ancestor tree it doesn't own, dwells to
@@ -204,6 +210,7 @@ pub struct Prowl {
     pub jungle: Vec<JungleCamp>,            // guarded herb camps off the lanes
     pub weather: Weather,                   // wind (and sky/wetness) driving the scent game
     pub fixed_wind: bool,                    // settings toggle: freeze the wind for a more readable map
+    pub yowled_t: f32,                        // > 0 while a landed yowl has outed you (forces you visible)
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -248,6 +255,7 @@ impl Prowl {
             jungle: Self::place_jungle_camps(),
             weather: Weather::new(crate::weather::Season::Greenleaf),
             fixed_wind: false,
+            yowled_t: 0.0,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -282,6 +290,7 @@ impl Prowl {
                     clan: ci as u8,
                     x: a.x + phase.cos() * BORDER_R, z: a.z + phase.sin() * BORDER_R,
                     heading: 0.0, home: (a.x, a.z), phase, aggro: false,
+                    ranged: j % 2 == 1, yowl_cd: 0.0, yowl_flash: 0.0,
                 });
             }
         }
@@ -292,10 +301,18 @@ impl Prowl {
     /// (rival clan). A rival minion that spots you raises the hunt alarm.
     fn step_minions(&mut self, dt: f32) {
         let (px, pz) = (self.x, self.z);
+        self.yowled_t = (self.yowled_t - dt).max(0.0);
         for m in self.minions.iter_mut() {
+            m.yowl_cd = (m.yowl_cd - dt).max(0.0);
+            m.yowl_flash = (m.yowl_flash - dt * 2.0).max(0.0);
             let to_p = dist(m.x, m.z, px, pz);
-            m.aggro = m.clan != PLAYER_CLAN && to_p < MINION_AGGRO_R;
-            let (tx, tz) = if m.aggro {
+            let aggro_r = if m.ranged { YOWL_RANGE } else { MINION_AGGRO_R };
+            m.aggro = m.clan != PLAYER_CLAN && to_p < aggro_r;
+            let (tx, tz) = if m.aggro && m.ranged {
+                // hold a standoff distance rather than closing to melee
+                let standoff = YOWL_RANGE * 0.55;
+                if to_p > standoff { (px, pz) } else { (m.x, m.z) }
+            } else if m.aggro {
                 (px, pz)                                     // charge the intruder
             } else {
                 m.phase += (MINION_SPEED / BORDER_R) * dt;   // walk the border loop
@@ -305,6 +322,17 @@ impl Prowl {
             m.x = (m.x + dx * MINION_SPEED * dt).clamp(-MAP, MAP);
             m.z = (m.z + dz * MINION_SPEED * dt).clamp(-MAP, MAP);
             if dx.abs() + dz.abs() > 1e-4 { m.heading = dx.atan2(dz); }
+            // melee contact: a shove back, same feel as a jungle guard
+            if m.aggro && !m.ranged && to_p < 2.2 {
+                let (px2, pz2) = norm(px - m.home.0, pz - m.home.1);
+                self.x = m.home.0 + px2 * (MINION_AGGRO_R + 1.0); self.z = m.home.1 + pz2 * (MINION_AGGRO_R + 1.0);
+            }
+            // a yowl: a ranged minion's cast — a sharp cry that outs your position and calls the hunt
+            if m.aggro && m.ranged && m.yowl_cd <= 0.0 {
+                m.yowl_cd = YOWL_CD; m.yowl_flash = 1.0;
+                self.yowled_t = YOWL_REVEAL_DUR;
+                self.suspicion = (self.suspicion + 0.6).min(1.5);
+            }
         }
         if self.minions.iter().any(|m| m.aggro) {            // spotted trespassing → alarm
             self.suspicion = (self.suspicion + dt * 0.8).min(1.5);
@@ -754,6 +782,7 @@ impl Prowl {
 
         // ── clan minions: border patrol + intruder defense ──
         self.step_minions(dt);
+        if self.yowled_t > 0.0 { self.hidden = false; }   // a landed yowl outs you — cover doesn't help for a beat
 
         // ── the stalker: sense → chase → catch (respawn) ──
         self.step_hunter(dt);
@@ -1038,6 +1067,48 @@ mod tests {
     }
 
     #[test]
+    fn a_ranged_minion_yowls_from_a_standoff_instead_of_closing_to_melee() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 800.0; g.hz = 800.0;
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN && m.ranged).unwrap();
+        let (mx, mz) = (g.minions[idx].x, g.minions[idx].z);
+        g.x = mx + (YOWL_RANGE - 1.0); g.z = mz;   // inside yowl range but outside melee aggro
+        g.suspicion = 0.0;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.minions[idx].aggro, "a ranged minion should notice from beyond the melee radius");
+        assert!(dist(g.minions[idx].x, g.minions[idx].z, g.x, g.z) > 2.5, "it should hold a standoff, not close to melee");
+    }
+
+    #[test]
+    fn a_landed_yowl_outs_a_hidden_prowler() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 800.0; g.hz = 800.0;
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN && m.ranged).unwrap();
+        let (mx, mz) = (g.minions[idx].x, g.minions[idx].z);
+        g.x = mx + (YOWL_RANGE - 1.0); g.z = mz;
+        g.hidden = true;
+        g.suspicion = 0.0;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.yowled_t > 0.0, "the yowl should land and out the player for a beat");
+        assert!(!g.hidden, "an outed player shouldn't be able to hide");
+        assert!(g.suspicion > 0.0, "a landed yowl should spike suspicion");
+    }
+
+    #[test]
+    fn a_melee_minion_shoves_the_player_back_on_contact() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 800.0; g.hz = 800.0;
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN && !m.ranged).unwrap();
+        let (mx, mz) = (g.minions[idx].x, g.minions[idx].z);
+        g.x = mx; g.z = mz;   // right on top of it
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(dist(g.x, g.z, g.minions[idx].home.0, g.minions[idx].home.1) > 2.5, "contact should shove the player back out toward the border");
+    }
+
+    #[test]
     fn clan_minions_border_patrol_their_home() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.hx = 800.0; g.hz = 800.0; g.x = 800.0; g.z = 800.0;   // player far → no aggro
@@ -1170,6 +1241,8 @@ mod tests {
                     assert!(g.hunter_stagger >= 0.0 && g.combo_flash >= 0.0, "combat timers went negative");
                     for r in &g.rivals { assert!(r.stagger >= 0.0 && r.x.is_finite() && r.z.is_finite(), "rival state broke"); }
                     for c in &g.jungle { assert!(c.hp.is_finite() && c.cooldown >= 0.0 && c.gx.is_finite() && c.gz.is_finite(), "jungle camp state broke"); }
+                    for m in &g.minions { assert!(m.yowl_cd >= 0.0 && m.x.is_finite() && m.z.is_finite(), "minion state broke"); }
+                    assert!(g.yowled_t >= 0.0, "yowled_t went negative");
                     pc = g.prey_caught; cc = g.times_caught;
                 }
             }
