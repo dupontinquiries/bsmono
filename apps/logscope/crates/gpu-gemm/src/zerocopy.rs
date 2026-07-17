@@ -22,6 +22,45 @@
 
 // ── pure planner (always compiled, tested) — decides WHEN import is worth it ──────────────────────────────
 
+/// Which upload path to use for resident weights. On UNIFIED memory the two paths differ in cost:
+/// `MapAtCreation` writes bytes straight into the buffer's device-visible backing (host==device RAM on
+/// Asahi/Apple), so there is NO staging copy and NO transient staging allocation; `StagingWrite`
+/// (`queue.write_buffer`) copies into an internal staging belt first, then GPU-copies to the buffer — a
+/// second pass over the bytes plus a transient buffer as big as the data. On a discrete GPU staging is
+/// unavoidable, but on UMA it's pure waste (it's what doubled the 70B load-time peak and overran the VA
+/// ceiling). This is the extension-FREE zero-copy that works on Honeykrisp, unlike the external-memory-host
+/// import below (which Mesa doesn't advertise).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UploadPath {
+    /// Zero-copy: `create_buffer(mapped_at_creation:true)` + one memcpy into the mapped range. UMA only.
+    MapAtCreation,
+    /// `create_buffer` + `queue.write_buffer` (staging belt). Required on discrete GPUs.
+    StagingWrite,
+}
+
+/// Pick the upload path from whether the device is unified-memory. Zero-copy only pays off (and is only
+/// safe to prefer over the OOM-catchable staging path) on UMA, where the buffer's backing is host RAM.
+pub fn upload_path(unified: bool) -> UploadPath {
+    if unified { UploadPath::MapAtCreation } else { UploadPath::StagingWrite }
+}
+
+/// Whether this adapter is a unified-memory GPU (host and device share physical RAM), where zero-copy
+/// map-at-creation uploads win. Apple Silicon via Honeykrisp reports as an integrated GPU; some Mesa
+/// builds report `Other` with an AGX/Apple/Honeykrisp name, so we accept those too. Discrete GPUs
+/// (DiscreteGpu) are excluded — they genuinely need staging.
+pub fn is_unified_memory(device_type: AdapterDeviceType, name: &str) -> bool {
+    if matches!(device_type, AdapterDeviceType::Integrated) { return true; }
+    let n = name.to_ascii_lowercase();
+    matches!(device_type, AdapterDeviceType::Other | AdapterDeviceType::Cpu | AdapterDeviceType::Virtual)
+        && (n.contains("apple") || n.contains("agx") || n.contains("honeykrisp") || n.contains("asahi") || n.contains("m1") || n.contains("m2") || n.contains("m3") || n.contains("m4"))
+}
+
+/// A backend-agnostic mirror of `wgpu::DeviceType` so the planner stays pure/testable without a wgpu dep in
+/// the test build. The caller maps `wgpu::DeviceType` → this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdapterDeviceType { Integrated, Discrete, Virtual, Cpu, Other }
+
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportDecision {
     /// Upload normally — the weights fit the GPU buffer-upload budget (the original path handles it).
@@ -220,6 +259,22 @@ pub mod imp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uma_detection_and_upload_path() {
+        use AdapterDeviceType::*;
+        // integrated (Apple/Asahi/APU) → unified → zero-copy
+        assert!(is_unified_memory(Integrated, "Apple M2 Pro"));
+        assert_eq!(upload_path(true), UploadPath::MapAtCreation);
+        // Mesa sometimes reports Other with an AGX/Honeykrisp name
+        assert!(is_unified_memory(Other, "Apple M2 (Honeykrisp)"));
+        assert!(is_unified_memory(Other, "AGX G14X"));
+        // a discrete GPU is NOT unified → must stage
+        assert!(!is_unified_memory(Discrete, "NVIDIA GeForce RTX 4090"));
+        assert_eq!(upload_path(false), UploadPath::StagingWrite);
+        // a generic 'Other' with no Apple markers is treated as non-unified (conservative)
+        assert!(!is_unified_memory(Other, "Some Vulkan Device"));
+    }
 
     #[test]
     fn should_import_only_in_the_gap() {
