@@ -114,6 +114,8 @@ pub struct Gpu {
     pool: std::sync::Arc<BufferPool>,
     arena: Mutex<Option<ResidentArena>>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
+    unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
+                     // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
     sg_ok: std::sync::atomic::AtomicBool, // sg kernel passed the load-time self-check on THIS driver
     gemm_ok: std::sync::atomic::AtomicBool, // tiled prefill GEMM compiles + matches naive on THIS backend
     valid_gemm_tiles: std::sync::RwLock<Vec<u32>>, // GEMM tiles whose shader actually compiles here (load probe)
@@ -286,12 +288,25 @@ impl Gpu {
             memory_hints: wgpu::MemoryHints::Performance, trace: wgpu::Trace::Off,
         })).expect("no device");
         let subgroups = want_subgroup;
+        // Unified-memory detection: on Apple/Asahi the buffer backing IS host RAM, so weight uploads can
+        // skip the staging-belt copy (zero-copy map-at-creation). Env override for testing on other HW.
+        let unified = match std::env::var("LOGSCOPE_UMA").ok().as_deref() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => crate::zerocopy::is_unified_memory(match info.device_type {
+                wgpu::DeviceType::IntegratedGpu => crate::zerocopy::AdapterDeviceType::Integrated,
+                wgpu::DeviceType::DiscreteGpu => crate::zerocopy::AdapterDeviceType::Discrete,
+                wgpu::DeviceType::VirtualGpu => crate::zerocopy::AdapterDeviceType::Virtual,
+                wgpu::DeviceType::Cpu => crate::zerocopy::AdapterDeviceType::Cpu,
+                wgpu::DeviceType::Other => crate::zerocopy::AdapterDeviceType::Other,
+            }, &info.name),
+        };
         let env_tile = std::env::var("LOGSCOPE_MATVEC_TILE").ok().and_then(|v| v.parse::<u32>().ok());
         let profile_forced = env_tile.is_some();
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -717,17 +732,31 @@ impl Lin {
 
 impl Gpu {
     pub fn upload(&self, data: &[f32], rows: usize, cols: usize) -> Tensor {
-        // create_buffer + write_buffer (NOT create_buffer_init): if the GPU is out of memory this records
-        // a CATCHABLE OutOfMemory error, whereas create_buffer_init maps-on-create and its get_mapped_range
-        // on the failed buffer is a FATAL validation error that aborts the process. Load-time only (not the
-        // per-dispatch path), so no inference cost — and it lets a too-big load fail gracefully.
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("tensor"),
-            size: (bytes.len().max(4)) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false });
-        if !bytes.is_empty() { self.queue.write_buffer(&buf, 0, bytes); }
-        Tensor { buf, rows, cols, pool: None, view: None }
+        Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, view: None }
+    }
+    /// Upload `bytes` as a resident STORAGE buffer, zero-copy on unified memory. On UMA (Apple/Asahi) the
+    /// buffer's backing IS host RAM, so `mapped_at_creation` + one memcpy writes straight into device memory
+    /// — no staging-belt copy, no transient staging allocation (which is what doubled the 70B load peak).
+    /// On discrete GPUs we keep `create_buffer` + `write_buffer`: staging is required there, and write_buffer
+    /// records a CATCHABLE OutOfMemory instead of the fatal get_mapped_range abort a failed map-on-create
+    /// gives. The UMA map path is safe because weight loads memplan-preflight the fit before any upload.
+    fn upload_bytes(&self, bytes: &[u8], label: &'static str) -> wgpu::Buffer {
+        let size = (bytes.len().max(4)) as u64;
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
+        if self.unified && !bytes.is_empty() {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
+            {
+                let mut view = buf.slice(..).get_mapped_range_mut();
+                view.slice(..bytes.len()).copy_from_slice(bytes);
+            }
+            buf.unmap();
+            buf
+        } else {
+            let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
+            if !bytes.is_empty() { self.queue.write_buffer(&buf, 0, bytes); }
+            buf
+        }
     }
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
         let size = (rows * cols * 4) as u64;
@@ -875,15 +904,10 @@ impl Gpu {
         let out = self.alloc(m, n); let dims = [m as u32, n as u32, k as u32, 0];
         self.dispatch(LINEAR, &[a, w], &out, bytemuck::cast_slice(&dims), ((n as u32).div_ceil(TILE), (m as u32).div_ceil(TILE), 1)); out
     }
-    /// Upload raw u32 words as a resident storage buffer (used for packed int8 weights).
+    /// Upload raw u32 words as a resident storage buffer (used for packed int8 weights). Zero-copy on UMA.
     pub fn upload_u32(&self, data: &[u32]) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
-        let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("qw"),
-            size: (bytes.len().max(4)) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false });
-        if !bytes.is_empty() { self.queue.write_buffer(&buf, 0, bytes); }
-        Tensor { buf, rows: 1, cols: data.len(), pool: None, view: None }
+        Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, view: None }
     }
     /// Resident-weight uploads: when an arena is active (LOGSCOPE_ARENA, set up by the loader) the bytes
     /// are packed into a shared slab and returned as an offset view; otherwise a dedicated buffer (the
@@ -923,6 +947,12 @@ impl Gpu {
             off = 0;
         }
         let slab = a.slabs.last().unwrap().clone();
+        // NOTE (UMA zero-copy, next step): on unified memory this `write_buffer` still stages. Creating each
+        // slab `mapped_at_creation:true` and memcpy'ing weights into its mapped range (then unmapping the
+        // slab before the first dispatch binds it) would drop the staging belt entirely here — eliminating
+        // BOTH the per-slab drain above and the ~2× load-time peak (arena + un-drained staging) that overran
+        // the 70B's GPU-VA ceiling. Deferred: it changes the slab map/unmap lifecycle (a mapped buffer can't
+        // be bound), so it needs on-hardware validation that every slab is unmapped before inference starts.
         self.queue.write_buffer(&slab, off, bytes);
         a.used = off + len;
         Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
