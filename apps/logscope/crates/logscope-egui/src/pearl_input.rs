@@ -35,11 +35,23 @@ impl PearlInput {
     /// Trigger the send ripple (call when the message is committed) — a bright ring sweeps the pearl.
     pub fn pulse(&mut self) { self.ripple_t = 1.0; }
 
-    /// Draw the pearl backdrop + the temporally-stable resonance text for `text`, in a band `height` tall.
-    /// Returns the band rect (the caller overlays the real TextEdit on it). `t` is the animation clock.
+    /// Draw the pearl backdrop + the temporally-stable resonance text for `text`, in a band `height` tall,
+    /// allocated from the current 2D layout (the docked/bottom-bar composer). `t` is the animation clock.
     pub fn show(&mut self, ui: &mut egui::Ui, text: &str, preview: &str, t: f32, height: f32, accent: Color32) -> Rect {
         let avail = ui.available_width();
         let (rect, _resp) = ui.allocate_exact_size(Vec2::new(avail, height), Sense::hover());
+        self.paint(ui, rect, text, preview, t, accent)
+    }
+
+    /// Same pearl, but painted into a caller-supplied `rect` instead of allocated from the current layout —
+    /// e.g. the on-screen projection of a 3D-anchored slab (`project_slab_rect`), so the composer can live
+    /// as a physical object IN THE SCENE (sized/positioned by the camera) rather than docked in a 2D toolbar.
+    pub fn show_at(&mut self, ui: &mut egui::Ui, rect: Rect, text: &str, preview: &str, t: f32, accent: Color32) -> Rect {
+        self.paint(ui, rect, text, preview, t, accent)
+    }
+
+    fn paint(&mut self, ui: &mut egui::Ui, rect: Rect, text: &str, preview: &str, t: f32, accent: Color32) -> Rect {
+        let height = rect.height();
         let p = ui.painter_at(rect);
 
         let cr = (height * 0.5).min(120.0) as u8;            // stadium ends → reads round, not a box
