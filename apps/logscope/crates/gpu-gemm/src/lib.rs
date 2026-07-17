@@ -604,7 +604,11 @@ struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64, mapp
 struct ArenaGuard<'a>(&'a Mutex<Option<ResidentArena>>);
 impl Drop for ArenaGuard<'_> {
     fn drop(&mut self) {
-        let mut g = self.0.lock().unwrap();
+        // Tolerate a poisoned mutex: if a load step panicked while holding the arena lock, `.lock().unwrap()`
+        // would panic again HERE, inside Drop → non-unwinding panic → abort (killing the process and hiding
+        // the real error). We're resetting the bump state to None regardless of prior contents, so the
+        // poisoned data is exactly what we want to discard — recover the guard instead of unwrapping.
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(a) = g.as_ref() {
             if a.mapped { if let Some(last) = a.slabs.last() { last.unmap(); } }
         }
@@ -954,7 +958,9 @@ impl Gpu {
                 self.queue.submit(std::iter::empty());
                 let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             }
-            let size = a.slab_size.max(len.next_multiple_of(ALIGN)); // size up for a rare oversized weight
+            // size % COPY_BUFFER_ALIGNMENT (4) == 0 is REQUIRED for a mapped_at_creation buffer; both inputs
+            // above are 256-aligned so this is a no-op today, but it guards any future unaligned size source.
+            let size = a.slab_size.max(len.next_multiple_of(ALIGN)).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
             // mapped slabs are filled by memcpy into their mapped range (no COPY_DST); staged slabs need COPY_DST
             let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
@@ -3199,6 +3205,11 @@ impl Gpu {
             let max_buf = self.device.limits().max_buffer_size;
             let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
                 .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
+            // Align the slab size DOWN to 256 (≥ COPY_BUFFER_ALIGNMENT=4). A UMA zero-copy slab is created
+            // mapped_at_creation, which requires size % 4 == 0 — and some drivers report max_buffer_size as
+            // an odd value (Honeykrisp/Asahi: ~2047 MiB = 2^31-1), so `.min(max_buf)` can land on an
+            // unaligned size. Rounding DOWN (not up) keeps it within the device limit.
+            let slab = slab & !255;
             eprintln!("wgpu-engine: arena ON — packing resident weights into ≤{} MiB slabs (fewer buffer objects)", slab >> 20);
             *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0, mapped: self.unified });
             Some(ArenaGuard(&self.arena))
