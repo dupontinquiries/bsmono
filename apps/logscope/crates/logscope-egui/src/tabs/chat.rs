@@ -997,7 +997,10 @@ impl Chat {
                     let step = self.agent_fan.as_mut().map(|f| f.on_done());
                     match step {
                         Some(FanStep::Submit { branch, prompt }) => {
-                            if let Some(f) = self.agent_fan.as_ref() { self.note = format!("fan-agent: branch {} generating · {} branches", branch + 1, f.len()); }
+                            if let Some(f) = self.agent_fan.as_ref() {
+                                self.note = if f.reviewing() { format!("fan-agent: reviewing branch {} · {} branches", branch + 1, f.len()) }
+                                            else { format!("fan-agent: branch {} generating · {} branches", branch + 1, f.len()) };
+                            }
                             self.agent_pending_submit = Some(prompt);
                         }
                         Some(FanStep::AllDone) => self.finish_agent_fan(),
@@ -1808,18 +1811,39 @@ impl Chat {
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
 
+    /// A live reaction during an active RUNNING fan seeds more parallel branches (5): each isolated in its
+    /// own workspace, joining the round-robin without stopping the in-flight work. Returns true if it seeded.
+    fn seed_reaction_branches(&mut self, reaction: &str) -> bool {
+        let running = self.agent_fan.as_ref().map_or(false, |f| !f.reviewing() && !f.all_done());
+        if !running { return false; }
+        let project = match self.gitmind_session.as_ref() { Some(s) => s.project.clone(), None => return false };
+        let base_goal = self.agent_task.clone();
+        let goals = crate::workspace_exec::seed_agent_branches(reaction, &base_goal, 3);
+        if goals.is_empty() { return false; }
+        let mount = match crate::mount::detect(&project) { Ok(m) => m, Err(_) => return false };
+        let fan_root = std::env::temp_dir().join("logscope-fan");
+        let start_idx = self.agent_fan.as_ref().map(|f| f.len()).unwrap_or(0);
+        let mut added = 0usize;
+        for (k, goal) in goals.into_iter().enumerate() {
+            if let Ok(ws) = crate::mount::isolate(&mount, &fan_root.join(format!("react{}", start_idx + k))) {
+                if let Some(f) = self.agent_fan.as_mut() {
+                    if f.add_branch(ws.dir.clone(), &goal, &format!("reaction {}", start_idx + k + 1)) { added += 1; }
+                }
+            }
+        }
+        if added > 0 { self.note = format!("reaction seeded {added} branch(es) — spinning up in parallel"); true } else { false }
+    }
+
     /// Finalize a fan: fold the per-branch summaries for pruning. Doesn't auto-land anything — the user
     /// picks the keeper (:pick N) after comparing. Highlights which branches verified.
     fn finish_agent_fan(&mut self) {
         let fan = match self.agent_fan.take() { Some(f) => f, None => return };
+        let best = fan.best().map(|i| i + 1).unwrap_or(1);
         self.agent_candidates = fan.summaries();
         let verified = self.agent_candidates.iter().filter(|b| b.verified).count();
+        let approved = self.agent_candidates.iter().filter(|b| b.approved == Some(true)).count();
         let n = self.agent_candidates.len();
-        // surface the winner-ish (most files among verified, else most files) as a hint
-        let best = self.agent_candidates.iter()
-            .max_by_key(|b| (b.verified as usize, b.files))
-            .map(|b| b.index + 1).unwrap_or(1);
-        self.note = format!("fan-agent: {n} branches done · {verified} verified · suggest branch {best} · :pick <n> to keep it");
+        self.note = format!("fan-agent: {n} branches · {approved} approved · {verified} verified · reviewer suggests branch {best} · :pick <n> to keep");
     }
 
     /// Reveal a path in the desktop file manager (best-effort; Linux xdg-open, macOS open).
@@ -4439,7 +4463,15 @@ impl Chat {
                         }
                     }
                     let cfg = crate::workspace_exec::AgentConfig::default();
-                    let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg);
+                    // diff closure for the review phase: each branch is an isolated git workspace with a
+                    // `logscope-base` baseline tag (mount::isolate), so its diff is `git diff logscope-base`.
+                    let diff_fn = Box::new(|dir: &std::path::Path| -> String {
+                        std::process::Command::new("git").arg("-C").arg(dir).args(["diff", "logscope-base"])
+                            .output().ok()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).chars().take(8000).collect())
+                            .unwrap_or_default()
+                    });
+                    let mut fan = crate::workspace_exec::AgentFan::new(specs, &cfg, diff_fn);
                     self.agent_candidates.clear();
                     self.agent_task = task.clone();
                     match fan.next() {
@@ -4895,6 +4927,8 @@ impl Chat {
                 let text = if self.code_voice { crate::voice_dict::dictate(text.trim()) } else { text.trim().to_string() };
                 let text = text.trim();
                 if text.is_empty() { return; }
+                // A reaction spoken during a RUNNING fan seeds parallel branches without stopping it (5).
+                if self.agent_fan.is_some() && self.seed_reaction_branches(text) { return; }
                 if !self.input.is_empty() && !self.input.ends_with(char::is_whitespace) { self.input.push(' '); }
                 self.input.push_str(text);
             }
