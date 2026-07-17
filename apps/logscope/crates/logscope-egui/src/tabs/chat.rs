@@ -104,6 +104,14 @@ const PARAM_DIALS: [(usize, &str, f32, f32, bool); 5] = [
     (PARAM_MINP,   "MINP",  0.0,   0.3,     false),
 ];
 
+// The right-sidebar popout's remaining controls (backend, persona, model), ported to physical SELECTORS
+// beside the dials — a press cycles to the next option, wrapping (physui::ControlKind::Selector). MODEL_SEL's
+// option count is discovered at runtime (the Ollama/local model list), so it's registered with a placeholder
+// count of 1 and corrected every frame via `Panel::set_selector_count` once the real list is known.
+const BACKEND_SEL: usize = 620; // LlamaCpp / Wgpu
+const PERSONA_SEL: usize = 621; // PERSONAS table
+const MODEL_SEL: usize = 622;   // ModelState::items — dynamic count
+
 /// Read a `Ctx` field as an f32 by its physical-dial id (for syncing the dial handle to the live value).
 fn ctx_get(ctx: &Ctx, id: usize) -> f32 {
     match id {
@@ -139,6 +147,9 @@ fn phys_dock() -> crate::physui::Panel {
     p.add(DOCK_UNPRUNE, ControlKind::Momentary, false);
     let cd = Ctx::default();
     for &(id, _, lo, hi, _) in &PARAM_DIALS { p.add_dial(id, lo, hi, ctx_get(&cd, id)); }
+    p.add_selector(BACKEND_SEL, BackendKind::ALL.len(), 0);
+    p.add_selector(PERSONA_SEL, PERSONAS.len(), 0);
+    p.add_selector(MODEL_SEL, 1, 0); // real count set each frame via set_selector_count once known
     p
 }
 
@@ -1171,7 +1182,7 @@ impl Chat {
     /// fork for headless visual iteration on the themed environments.
     pub fn scene_ui(&mut self, ui: &mut egui::Ui) {
         self.spatial_view = true;
-        self.spatial_ui(ui);
+        let _ = self.spatial_ui(ui, None);
     }
 
     /// Render the 3D mind-palace ONLY — no spatial chrome (Overview/Prune buttons, focused-node hint), filling
@@ -1186,7 +1197,7 @@ impl Chat {
         self.backdrop = true;
         self.frost_a = frost_a;
         self.frost_b = frost_b;
-        self.spatial_ui(ui);
+        let _ = self.spatial_ui(ui, None);
         self.backdrop = false;
         self.spatial_view = prev;
     }
@@ -1725,7 +1736,11 @@ impl Chat {
     /// The spatial (3D) message view — messages as nodes in space, drag to orbit, scroll to zoom,
     /// click a node to focus it (preview below). Replaces the linear chat in aggressive mode. Renders
     /// via 2D projection of `spatial::layout` through `self.orbit`; the linear chat is left untouched.
-    fn spatial_ui(&mut self, ui: &mut egui::Ui) {
+    /// Returns `true` if the in-scene composer wants to send this frame (Enter pressed with non-empty
+    /// input) — `spatial_ui` has no `Inference`/`Doc` to call `self.send()` itself, so the caller in `ui()`
+    /// dispatches it.
+    fn spatial_ui(&mut self, ui: &mut egui::Ui, mut model: Option<&mut ModelState>) -> bool {
+        let mut send_now = false;
         let g = self.convo_graph(self.msgs.len());
         if g.nodes.is_empty() {
             if !self.backdrop {
@@ -1735,7 +1750,7 @@ impl Chat {
                 ui.label(RichText::new("Nodes appear here as you converse — drag to orbit, scroll to zoom.").color(theme::FAINT()).small());
             });
             }
-            return;
+            return false;
         }
         let parents: Vec<Option<usize>> = g.nodes.iter().map(|n| n.parent).collect();
         let n = g.nodes.len();
@@ -2676,6 +2691,10 @@ impl Chat {
                 // box, so this third boxy plaque is redundant (and some of its layers weren't rendering cleanly).
                 // LOGSCOPE_PANEL=1 restores it. The MIC pearl (voice state) + node/voice highlights stay — they're
                 // not part of the box.
+                // RETIRED as the composer: superseded by the pearl composer further down (reuses
+                // pearl_input's proven cell-pool rendering, anchored/scaled the same way as the dial panel
+                // and reading box, instead of this block's fixed world offsets — which is exactly what was
+                // drifting it off-frame on other aspect ratios). Kept opt-in for comparison only.
                 let draw_panel = std::env::var("LOGSCOPE_PANEL").ok().as_deref() == Some("1");
                 if draw_panel {
                 // DROP SHADOW — a larger, dark, soft quad set further back and offset down-right (as if lit
@@ -3076,6 +3095,90 @@ impl Chat {
                                 if resp.hovered() || dragging_this { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
                             }
                         }
+
+                        // ── SELECTOR ROWS — backend / persona / model, the popout's remaining controls,
+                        // as physical cycle-plaques below the dials. A click advances to the next option
+                        // (physui::ControlKind::Selector, wrapping); the label shows the CURRENT option so
+                        // the whole thing reads as a labeled dial rather than a dropdown pretending to be 3D.
+                        self.phys.set_index(BACKEND_SEL, if self.backend == BackendKind::ALL[0] { 0 } else { 1 });
+                        let persona_idx = PERSONAS.iter().position(|(_, _, body)| self.context.trim() == body.trim()).unwrap_or(usize::MAX);
+                        if persona_idx != usize::MAX { self.phys.set_index(PERSONA_SEL, persona_idx); }
+                        if let Some(m) = model.as_deref_mut() {
+                            self.phys.set_selector_count(MODEL_SEL, m.items.len());
+                            self.phys.set_index(MODEL_SEL, m.selected);
+                        }
+                        let sel_rows: &[(usize, &str)] = &[(BACKEND_SEL, "BACKEND"), (PERSONA_SEL, "PERSONA"), (MODEL_SEL, "MODEL")];
+                        for (row, &(id, label)) in sel_rows.iter().enumerate() {
+                            if id == MODEL_SEL && model.is_none() { continue; } // no model context (headless/backdrop scene)
+                            let off = (0.42 - (PARAM_DIALS.len() + row) as f32 * 0.26) * ps;
+                            let rc = V3::new(panel_c.x + up.x * off, panel_c.y + up.y * off, panel_c.z + up.z * off);
+                            let track_rect = project_slab_rect(&view_cam, rc, right, up, tw, th * 3.2, cx, cy, scale);
+                            let cur = match id {
+                                BACKEND_SEL => BackendKind::ALL[self.phys.index_of(id).min(1)].label().to_string(),
+                                PERSONA_SEL => PERSONAS.get(self.phys.index_of(id)).map(|(_, title, _)| title.to_string()).unwrap_or_default(),
+                                MODEL_SEL => model.as_deref().and_then(|m| m.items.get(m.selected)).map(|it| it.name().to_string()).unwrap_or_else(|| "—".into()),
+                                _ => String::new(),
+                            };
+                            let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
+                            trk.mat = pmat; trk.emissive = 0.12 * tglow * sheen; m3::set_alpha(&mut trk, 185);
+                            graph.push(trk);
+                            let lx = -(tw * 0.5 + 0.20 * ps);
+                            let lcen = V3::new(rc.x - toward.x * 0.30 + right.x * lx + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + right.y * lx + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + right.z * lx + up.z * 0.11 * ps);
+                            for cell in m3::label_cells(lcen, right, up, toward, label, 0.010 * ps, t, egui::Color32::from_rgb(206, 214, 234), 0.6, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            let vcen = V3::new(rc.x - toward.x * 0.30 + up.x * 0.11 * ps, rc.y - toward.y * 0.30 + up.y * 0.11 * ps, rc.z - toward.z * 0.30 + up.z * 0.11 * ps);
+                            for cell in m3::label_cells(vcen, right, up, toward, &cur, 0.010 * ps, t, egui::Color32::from_rgb(0x8a, 0xe0, 0xff), 0.62, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                            if let Some(tr) = track_rect {
+                                let resp = ui.interact(tr, egui::Id::new(("scene_phys_sel", id)), egui::Sense::click()).on_hover_text(format!("{label}: {cur} — click to cycle"));
+                                if resp.hovered() { ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand); }
+                                if resp.clicked() {
+                                    if let Some(crate::physui::ControlEvent::Selected(_, idx)) = self.phys.nudge_selector(id, 1) {
+                                        match id {
+                                            BACKEND_SEL => { self.backend = BackendKind::ALL[idx.min(1)]; }
+                                            PERSONA_SEL => { if let Some((_, _, body)) = PERSONAS.get(idx) { self.context = (*body).to_string(); } }
+                                            MODEL_SEL => { if let Some(m) = model.as_deref_mut() { if idx < m.items.len() { m.selected = idx; } } }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── IN-SCENE COMPOSER — the pearl, projected from a 3D-anchored slab ────────────────
+                // Only needed when the 2D bottom bar is hidden (hide_bottom_bar): that's the toggle that
+                // currently has no physical replacement, leaving no way to type at all in full-screen
+                // spatial mode. Reuses pearl_input's proven cell-pool rendering via show_at(rect) — sized
+                // from win_w/win_h/ppw like the dial panel and reading box above, instead of the old
+                // draw_panel's fixed world offsets that put it below the visible frame on other aspect
+                // ratios/window sizes. Only the text field + Enter-to-send are ported here; the fuller
+                // attach/mic/export row stays 2D-only for now (toggle the bar back on to reach those).
+                if self.hide_bottom_bar {
+                    let comp_c = anchor(0.5, 0.90); // bottom-centre, adapts to window size
+                    let comp_w = (0.62 * win_w / ppw).clamp(2.2, 6.5);
+                    let comp_h = (0.20 * win_h / ppw).clamp(0.55, 1.3);
+                    if let Some(rect) = project_slab_rect(&view_cam, comp_c, right, up, comp_w, comp_h, cx, cy, scale) {
+                        let pearl_t = ui.input(|i| i.time) as f32;
+                        let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
+                        let band = self.pearl_input.show_at(ui, rect, &self.input, &vpartial, pearl_t, theme::CYAN());
+                        ui.visuals_mut().text_cursor.stroke = egui::Stroke::NONE;
+                        ui.visuals_mut().selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0x4d, 0xd6, 0xe6, 36);
+                        let resp = ui.put(band, egui::TextEdit::multiline(&mut self.input)
+                            .id(egui::Id::new("logscope_chat_composer"))
+                            .desired_width(f32::INFINITY)
+                            .frame(egui::Frame::NONE)
+                            .text_color(egui::Color32::TRANSPARENT)
+                            .font(egui::FontId::new(14.0, egui::FontFamily::Monospace)));
+                        let enter = resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift);
+                        if enter && self.input.ends_with('\n') { self.input.pop(); }
+                        if resp.changed() {
+                            self.mode = crate::vimmode::Mode::Insert;
+                            if !resp.has_focus() { resp.request_focus(); }
+                        }
+                        if enter && !self.input.trim().is_empty() {
+                            self.pearl_input.pulse();
+                            send_now = true;
+                        }
                     }
                 }
 
@@ -3443,6 +3546,7 @@ impl Chat {
             }
             }); });
         }
+        send_now
     }
 
     /// Modal key handling for the spatial view. Runs BEFORE the composer is built this frame (see the
@@ -4644,7 +4748,18 @@ impl Chat {
                 egui::ScrollArea::vertical().id_salt("right_page").auto_shrink([false, false]).show(ui, |ui| {
                     match self.right_page {
                         RightPage::Context => {
+                            // The physical PARAMS panel (dials + backend/persona/model selectors, in the
+                            // spatial scene) is now the primary place for these controls. When it's active
+                            // don't duplicate them here — a slider changed in two places at once is a bug
+                            // waiting to happen. LOGSCOPE_PHYS_PARAMS=0 (or non-spatial view) falls back to
+                            // this page as before.
+                            let phys_params_on = self.spatial_view
+                                && std::env::var("LOGSCOPE_PHYS_PARAMS").map(|v| v != "0").unwrap_or(true);
                             ui.label(RichText::new("CONTEXT (system prompt)").color(theme::DIM()).small().strong());
+                            if phys_params_on {
+                                ui.label(RichText::new("Sampling/backend/model moved into the scene — drag the PARAMS dials on the left, click BACKEND/PERSONA/MODEL to cycle them. Persona is still editable here.").color(theme::FAINT()).small());
+                                ui.add_space(6.0);
+                            }
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("persona").color(theme::DIM()).small());
                                 for (key, title, body) in PERSONAS {
@@ -4656,6 +4771,7 @@ impl Chat {
                             });
                             ui.add(egui::TextEdit::multiline(&mut self.context).desired_rows(4).desired_width(f32::INFINITY)
                                 .hint_text("System prompt / persistent context for every turn…"));
+                            if !phys_params_on {
                             ui.add_space(6.0);
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new("backend").color(theme::DIM()).small());
@@ -4669,6 +4785,7 @@ impl Chat {
                             ui.add(egui::Slider::new(&mut self.ctx.repeat_penalty, 1.0..=1.5).text("repeat penalty"));
                             ui.add(egui::Slider::new(&mut self.ctx.min_p, 0.0..=0.3).step_by(0.01).text("min-p"));
                             ui.add_enabled(self.threading, egui::Slider::new(&mut self.ctx.history_turns, 1..=32).text("history turns"));
+                            }
                             let used: usize = est(&self.context) + self.msgs.iter().map(|m| est(m.text()) + 4).sum::<usize>();
                             let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens).max(1) as usize;
                             let frac = (used as f32 / budget as f32).min(1.0);
@@ -5233,7 +5350,11 @@ impl Chat {
 
         // ── center: the message log fills whatever height remains above the pinned bottom ──
         egui::CentralPanel::default().show_inside(ui, |ui| {
-            if self.spatial_view { self.spatial_ui(ui); return; } // aggressive: spatial graph replaces the linear log
+            if self.spatial_view {
+                let want_send = self.spatial_ui(ui, Some(model));
+                if want_send { self.send(infer, doc, ui); }
+                return;
+            } // aggressive: spatial graph replaces the linear log
             egui::ScrollArea::vertical().id_salt("chat_log").auto_shrink([false, false]).stick_to_bottom(true)
                 .show(ui, |ui| {
                     if let Some(n) = self.recover {
