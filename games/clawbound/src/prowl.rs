@@ -348,6 +348,7 @@ impl Prowl {
     /// (rival clan). A rival minion that spots you raises the hunt alarm.
     fn step_minions(&mut self, dt: f32) {
         let (px, pz) = (self.x, self.z);
+        let converging = self.convergence_warning();
         self.yowled_t = (self.yowled_t - dt).max(0.0);
         for m in self.minions.iter_mut() {
             m.yowl_cd = (m.yowl_cd - dt).max(0.0);
@@ -361,6 +362,8 @@ impl Prowl {
                 if to_p > standoff { (px, pz) } else { (m.x, m.z) }
             } else if m.aggro {
                 (px, pz)                                     // charge the intruder
+            } else if converging {
+                self.rock                                     // the convergence draws minions off the border too
             } else {
                 m.phase += (MINION_SPEED / BORDER_R) * dt;   // walk the border loop
                 (m.home.0 + m.phase.cos() * BORDER_R, m.home.1 + m.phase.sin() * BORDER_R)
@@ -1295,6 +1298,20 @@ mod tests {
         g.step(1.0 / 30.0);
         let d1 = dist(g.rivals[0].x, g.rivals[0].z, g.rock.0, g.rock.1);
         assert!(d1 < d0, "a convergence warning should pull rivals toward the Rock");
+    }
+
+    #[test]
+    fn a_convergence_warning_also_pulls_idle_minions_toward_the_rock() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        let idx = g.minions.iter().position(|m| m.clan != PLAYER_CLAN).unwrap();
+        g.minions[idx].x = 200.0; g.minions[idx].z = 200.0;
+        let d0 = dist(g.minions[idx].x, g.minions[idx].z, g.rock.0, g.rock.1);
+        g.convergence_t = CONVERGENCE_WARN - 1.0;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        let d1 = dist(g.minions[idx].x, g.minions[idx].z, g.rock.0, g.rock.1);
+        assert!(d1 < d0, "a convergence warning should draw idle minions off the border toward the Rock too");
     }
 
     #[test]
