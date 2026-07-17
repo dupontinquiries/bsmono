@@ -1744,14 +1744,14 @@ impl Gpu {
 
     /// One Llama-style transformer block, fully resident (weights uploaded once,
     /// no intermediate leaves the GPU). `n_heads` splits `d` into attention heads.
-    pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, d, hd, eps), ff, t, d, base, 0, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
         let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
         let v = w.wv.apply(self, &n1, t);
-        let attn = self.attention_mh_t(&q, &k, &v, t, d, n_heads, n_kv_heads);
-        let o = w.wo.apply(self, &attn, t);
+        let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
+        let o = w.wo.apply(self, &attn, t); // wo: [d, ad] projects the attention width back to d
         let x2 = self.add_t(x, &o);
         let n2 = self.rmsnorm_t(&x2, &w.g2, t, d, eps);
         let gu = w.wgate_up.apply(self, &n2, t);
@@ -1764,15 +1764,15 @@ impl Gpu {
     /// the per-position K/V are also written into the cache (rows 0..t) so incremental
     /// decode can continue from position `t`. K is rope'd per-row at positions 0..t-1,
     /// which is exactly what sequential decode would have stored.
-    fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, d, hd, eps), ff, t, d, base, 0, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
         let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
         let v = w.wv.apply(self, &n1, t);
         self.write_rows(kc, &k, 0, t, kv);
         self.write_rows(vc, &v, 0, t, kv);
-        let attn = self.attention_mh_t(&q, &k, &v, t, d, n_heads, n_kv_heads);
+        let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, t);
         let x2 = self.add_t(x, &o);
         let n2 = self.rmsnorm_t(&x2, &w.g2, t, d, eps);
@@ -1786,15 +1786,15 @@ impl Gpu {
     /// `[base, base+s)`; its K/V are rope'd at those positions and appended to the cache
     /// rows `[base, base+s)`, then segment attention runs over the full `[0, base+s)` cache.
     /// Mirrors `block_prefill` but starting from a non-zero base with a populated cache.
-    fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, d, hd, eps), ff, s, d, base_freq, base, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd);
         let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, s), &w.k_norm, s, kv, hd, eps), ff, s, kv, base_freq, base, hd);
         let v = w.wv.apply(self, &n1, s);
         self.write_rows(kc, &k, base, s, kv);
         self.write_rows(vc, &v, base, s, kv);
-        let attn = self.attention_mh_ext(&q, kc, vc, base, s, d, n_heads, n_kv_heads);
+        let attn = self.attention_mh_ext(&q, kc, vc, base, s, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, s);
         let x2 = self.add_t(x, &o);
         let n2 = self.rmsnorm_t(&x2, &w.g2, s, d, eps);
@@ -1815,7 +1815,7 @@ impl Gpu {
         for &id in prompt { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
         for li in 0..m.n_layers {
-            x = self.block_prefill(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], t, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps);
+            x = self.block_prefill(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
         let last = self.alloc(1, m.d);
@@ -1844,7 +1844,7 @@ impl Gpu {
             let mut x = self.upload(&xh, s, m.d);
             for li in 0..m.n_layers {
                 x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                           start, s, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps);
+                                           start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
             }
             if end == t {
                 let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
@@ -3003,12 +3003,15 @@ pub struct Model {
     /// llama3 long-context scaling from `rope_freqs.weight`; all 1.0 when absent.
     rope_factors: Tensor,
     pub d: usize, pub h: usize, pub vocab: usize, pub n_layers: usize, pub n_heads: usize,
-    pub n_kv_heads: usize,
+    pub n_kv_heads: usize, pub head_dim: usize,
     pub base: f32, pub eps: f32,
 }
 impl Model {
-    /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA).
-    pub fn kv_dim(&self) -> usize { self.n_kv_heads * (self.d / self.n_heads) }
+    /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
+    /// head_dim is decoupled from d/n_heads).
+    pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+    /// The width Q and attention operate on = n_heads × head_dim (== d for plain MHA).
+    pub fn attn_dim(&self) -> usize { self.n_heads * self.head_dim }
     /// The per-rotary-pair RoPE frequency factors (llama3 scaling); all-ones if none loaded.
     pub fn rope_factors(&self) -> &Tensor { &self.rope_factors }
     /// Whether the output projection is kept resident as int8.
@@ -3141,7 +3144,16 @@ impl Gpu {
         let eps = g.get_f32(&format!("{pfx}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
         let n_heads = g.get_u32(&format!("{pfx}.attention.head_count")).unwrap_or(1) as usize;
         let n_kv_heads = g.get_u32(&format!("{pfx}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
-        let kv = n_kv_heads * (d / n_heads); // K/V projection width (GQA when < d)
+        // head_dim is NOT always d/n_heads (Qwen3: head_dim=128 while d/n_heads can be 64/80). Prefer the
+        // explicit key_length metadata; else derive from the real attn_q tensor width (output/n_heads); else
+        // fall back to d/n_heads. attn_dim = n_heads*head_dim is the width Q and attention operate on (== d
+        // for plain MHA, so dense/llama models are unchanged); attn_output projects it back down to d.
+        let head_dim = g.get_u32(&format!("{pfx}.attention.key_length")).map(|v| v as usize)
+            .or_else(|| g.tensor("blk.0.attn_q.weight").map(|t| (t.dims.iter().product::<u64>() as usize / d) / n_heads))
+            .filter(|&hd| hd > 0)
+            .unwrap_or_else(|| d / n_heads.max(1));
+        let attn_dim = n_heads * head_dim;      // Q / attention width (e.g. 4096 for Qwen3-4B, while d=2560)
+        let kv = n_kv_heads * head_dim;         // K/V projection + cache row width (GQA when < attn_dim)
         // Bigger-model memory pre-flight: estimate the resident footprint from metadata (cheap — tensor
         // dims only, no dequant) and refuse gracefully WITH the number instead of OOMing mid-load.
         let vocab_est = vocab_meta.unwrap_or_else(|| g.tensor("token_embd.weight")
@@ -3243,20 +3255,20 @@ impl Gpu {
                 let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
-                let fused = self.make_lin(&qkv, d + 2 * kv, d, q, q4_mode);
+                let fused = self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode);
                 if has_qkv_bias {
-                    let mut b = Vec::with_capacity(d + 2 * kv);
+                    let mut b = Vec::with_capacity(attn_dim + 2 * kv);
                     b.extend_from_slice(&fbq); b.extend_from_slice(&fbk); b.extend_from_slice(&fbv);
-                    fused.with_bias(Some(self.upload(&b, 1, d + 2 * kv)))
+                    fused.with_bias(Some(self.upload(&b, 1, attn_dim + 2 * kv)))
                 } else { fused }
             };
             layers.push(BlockWeights {
                 g1: self.upload(&fetch(&format!("blk.{i}.attn_norm.weight"))?, 1, d),
                 wqkv,
-                wq: lin(&format!("blk.{i}.attn_q.weight"), d, d, q)?.with_bias(bq),
+                wq: lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq),
                 wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
                 wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
-                wo: lin(&format!("blk.{i}.attn_output.weight"), d, d, q)?,
+                wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
                 g2: self.upload(&fetch(&format!("blk.{i}.ffn_norm.weight"))?, 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
                 // [t, 2h] = [gate(h) | up(h)] per row, which SWIGLU_PACKED then consumes.
@@ -3271,8 +3283,8 @@ impl Gpu {
                 },
                 wdown: lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)?,
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
-                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, d / n_heads)) } else { None },
-                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, d / n_heads)) } else { None },
+                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) } else { None },
+                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) } else { None },
             });
         }
         let out_norm = self.upload(&fetch("output_norm.weight")?, 1, d);
@@ -3285,13 +3297,13 @@ impl Gpu {
         };
         // RoPE frequency factors (llama3 long-context scaling). GGUF ships them as
         // `rope_freqs.weight` (length head_dim/2); absent → all 1.0 (plain RoPE).
-        let hd_half = (d / n_heads) / 2;
+        let hd_half = head_dim / 2;
         let rope_vals = match g.tensor("rope_freqs.weight") {
             Some(_) => { let v = fetch("rope_freqs.weight")?; if v.len() == hd_half { v } else { vec![1.0; hd_half] } }
             None => vec![1.0; hd_half],
         };
         let rope_factors = self.upload(&rope_vals, 1, hd_half);
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, base, eps })
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -3366,7 +3378,7 @@ impl Gpu {
             let g2 = self.read_tensor(&mut r)?;
             layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None });
         }
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, base, eps })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -3407,7 +3419,7 @@ impl Gpu {
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
-        for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps); }
+        for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
         let logits = m.output.apply(self, &xn, t);
         self.download(&logits)
@@ -3423,7 +3435,7 @@ impl Gpu {
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in ids { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
-        for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps); }
+        for layer in &m.layers { x = self.block_forward(layer, &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
         self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps)
     }
 
@@ -3463,14 +3475,14 @@ impl Gpu {
         for &id in ids { let s = (id as usize).min(m.vocab - 1) * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         eprintln!("    eps={:.2e} embed rms={:.4}", m.eps, stat(&xh));
         let mut x = self.upload(&xh, t, m.d);
-        let hd = m.d / m.n_heads; let kv = m.n_kv_heads * hd;
+        let hd = m.head_dim; let kv = m.n_kv_heads * hd; let ad = m.n_heads * hd;
         for (li, w) in m.layers.iter().enumerate() {
             // inline of block_forward, measuring each contribution's last-token RMS
             let n1 = self.rmsnorm_t(&x, &w.g1, t, m.d, m.eps);
-            let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, m.d, hd, m.eps), ff, t, m.d, m.base, 0, hd);
+            let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, m.eps), ff, t, ad, m.base, 0, hd);
             let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, m.eps), ff, t, kv, m.base, 0, hd);
             let v = w.wv.apply(self, &n1, t);
-            let attn = self.attention_mh_t(&q, &k, &v, t, m.d, m.n_heads, m.n_kv_heads);
+            let attn = self.attention_mh_t(&q, &k, &v, t, ad, m.n_heads, m.n_kv_heads);
             let o = w.wo.apply(self, &attn, t);
             let x2 = self.add_t(&x, &o);
             let n2 = self.rmsnorm_t(&x2, &w.g2, t, m.d, m.eps);
@@ -4137,17 +4149,17 @@ impl Gpu {
     }
     /// One decode block using the int8 KV cache: compute q/k/v (f32), quantize this
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
-    fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
         let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
-        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, d, n_heads, n_kv_heads);
+        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4157,20 +4169,29 @@ impl Gpu {
     /// Fused-QKV counterpart of block_decode_q8 (int8 KV cache). Same slice-and-quantize: one wqkv
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
-    fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
-        let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
-        let q  = self.slice_cols(&qk, 0, d);
-        let kr = self.slice_cols(&qk, d, kv);
-        let vr = self.slice_cols(&qkv, d + kv, kv);
+        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
+            // Qwen3/3.5: QK-Norm has its own per-head weight for Q vs K, so it can't ride the single
+            // combined RoPE dispatch — split, normalize each, then RoPE each (matches block_decode_fused).
+            let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
+            let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
+            let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
+            let kr = self.rope_mh_t(&kn, ff, 1, kv, base, pos, hd);
+            (qr, kr)
+        } else {
+            // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
+            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, ad + kv), ff, 1, ad + kv, base, pos, hd);
+            (self.slice_cols(&qk, 0, ad), self.slice_cols(&qk, ad, kv))
+        };
+        let vr = self.slice_cols(&qkv, ad + kv, kv);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
-        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, d, n_heads, n_kv_heads);
+        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4185,8 +4206,8 @@ impl Gpu {
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let l = &m.layers[li]; let (kq, ks, vq, vs) = (&c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li]);
-            x = if fused { self.block_decode_q8_fused(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode_q8(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            x = if fused { self.block_decode_q8_fused(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
+                else { self.block_decode_q8(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
@@ -4206,22 +4227,22 @@ impl Gpu {
             self.begin_frame();
             let s = t as usize * m.d;
             let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
-            for li in 0..m.n_layers { x = self.block_decode_q8_fused(&m.layers[li], &x, &m.rope_factors, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], pos, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps); }
+            for li in 0..m.n_layers { x = self.block_decode_q8_fused(&m.layers[li], &x, &m.rope_factors, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&m.output.apply(self, &xn, 1));
         }
         logits
     }
     /// One block for a single token at absolute `pos`, attending to its KV cache.
-    fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
         let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
-        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, d, n_heads, n_kv_heads);
+        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4241,33 +4262,30 @@ impl Gpu {
     /// rope'd together in ONE dispatch (they're contiguous and the q|k split lands on a head boundary,
     /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
     /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
-    fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, _h: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, d+2kv] — one matmul (was three)
+        let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, ad+2kv] — one matmul (was three)
         let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
             // Qwen3/3.5: QK-Norm is a per-head RMSNorm with its OWN weight for Q vs K, so it can't ride
             // the single combined RoPE dispatch below — Q and K must be split, normalized separately,
-            // then roped separately. (This branch was missing entirely — the fused decode path applied
-            // RoPE straight to the raw fused-QKV projection, silently skipping QK-Norm for every Qwen3
-            // decode step since fused-QKV is the default. Non-fused `block_decode_at` already did this
-            // correctly; this now matches it.)
-            let qn = self.qk_norm(self.slice_cols(&qkv, 0, d), &w.q_norm, 1, d, hd, eps);
-            let kn = self.qk_norm(self.slice_cols(&qkv, d, kv), &w.k_norm, 1, kv, hd, eps);
-            let qr = self.rope_mh_t(&qn, ff, 1, d, base, pos, hd);
+            // then roped separately.
+            let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
+            let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
+            let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
             let kr = self.rope_mh_t(&kn, ff, 1, kv, base, pos, hd);
             self.write_row(kc, &kr, pos, kv);
             (qr, kr)
         } else {
-            // RoPE q and k in one pass: [0,d)=q heads, [d,d+kv)=k heads are contiguous and head-aligned.
-            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, pos, hd);
-            let q = self.slice_cols(&qk, 0, d);
-            self.copy_buf(&qk, (d * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
-            (q, self.slice_cols(&qk, d, kv))
+            // RoPE q and k in one pass: [0,ad)=q heads, [ad,ad+kv)=k heads are contiguous and head-aligned.
+            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, ad + kv), ff, 1, ad + kv, base, pos, hd);
+            let q = self.slice_cols(&qk, 0, ad);
+            self.copy_buf(&qk, (ad * 4) as u64, kc, (pos * kv * 4) as u64, (kv * 4) as u64);   // roped k → K-cache row
+            (q, self.slice_cols(&qk, ad, kv))
         };
         let _ = &kr; // k already written to cache above in both branches
-        self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
-        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, d, n_heads, n_kv_heads);
+        self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
+        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4286,15 +4304,15 @@ impl Gpu {
     /// at its true position before storage, attention is order-independent across rows —
     /// so a ring buffer can overwrite an evicted slot with no shifting. `block_decode` is
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
-    fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, d, hd, eps), ff, 1, d, base, rope_pos, hd);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd);
         let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, rope_pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, slot, kv);
         self.write_row(vc, &vr, slot, kv);
-        let attn = self.decode_attention_mh(&q, kc, vc, attend_len, d, n_heads, n_kv_heads);
+        let attn = self.decode_attention_mh(&q, kc, vc, attend_len, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4304,28 +4322,28 @@ impl Gpu {
 
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
-    fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
-        let hd = d / n_heads; let kv = n_kv_heads * hd;
+    fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
         let q = if w.q_norm.is_some() || w.k_norm.is_some() {
             // Qwen3/3.5: see block_decode_fused — QK-Norm needs Q and K split and normalized with their
             // own weight before RoPE, so it can't ride the single combined dispatch below.
-            let qn = self.qk_norm(self.slice_cols(&qkv, 0, d), &w.q_norm, 1, d, hd, eps);
-            let kn = self.qk_norm(self.slice_cols(&qkv, d, kv), &w.k_norm, 1, kv, hd, eps);
-            let qr = self.rope_mh_t(&qn, ff, 1, d, base, rope_pos, hd);
+            let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
+            let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
+            let qr = self.rope_mh_t(&qn, ff, 1, ad, base, rope_pos, hd);
             let kr = self.rope_mh_t(&kn, ff, 1, kv, base, rope_pos, hd);
             self.write_row(kc, &kr, slot, kv);
             qr
         } else {
             // RoPE q and k together (contiguous, head-aligned) — one dispatch, bit-exact to roping separately.
-            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, d + kv), ff, 1, d + kv, base, rope_pos, hd);
-            let q  = self.slice_cols(&qk, 0, d);
-            self.copy_buf(&qk, (d * 4) as u64, kc, (slot * kv * 4) as u64, (kv * 4) as u64);   // roped k → slot
+            let qk = self.rope_mh_t(&self.slice_cols(&qkv, 0, ad + kv), ff, 1, ad + kv, base, rope_pos, hd);
+            let q  = self.slice_cols(&qk, 0, ad);
+            self.copy_buf(&qk, (ad * 4) as u64, kc, (slot * kv * 4) as u64, (kv * 4) as u64);   // roped k → slot
             q
         };
-        self.copy_buf(&qkv, ((d + kv) * 4) as u64, vc, (slot * kv * 4) as u64, (kv * 4) as u64);
-        let attn = self.decode_attention_mh(&q, kc, vc, attend_len, d, n_heads, n_kv_heads);
+        self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (slot * kv * 4) as u64, (kv * 4) as u64);
+        let attn = self.decode_attention_mh(&q, kc, vc, attend_len, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
         let gu = w.wgate_up.apply(self, &n2, 1);
@@ -4344,8 +4362,8 @@ impl Gpu {
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (l, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
-            x = if fused { self.block_decode_at_fused(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode_at(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            x = if fused { self.block_decode_at_fused(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
+                else { self.block_decode_at(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
@@ -4358,8 +4376,8 @@ impl Gpu {
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
-            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
+                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
@@ -4397,7 +4415,7 @@ impl Gpu {
         let n = sessions.len();
         if n == 0 { return; }
         self.begin_frame();
-        let d = m.d; let hd = d / m.n_heads; let kv = m.kv_dim();
+        let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
         for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed[s..s + d]); }
         let mut x = self.upload(&xh, n, d);
@@ -4406,19 +4424,19 @@ impl Gpu {
         for li in 0..m.n_layers {
             let w = &m.layers[li];
             let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
-            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, d, m.base, hd);
+            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, m.base, hd);
             let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, m.base, hd);
             let vb = w.wv.apply(self, &n1, n);
             // per-session: append this layer's K/V to each cache, attend each cache
-            let attn = self.alloc(n, d);
+            let attn = self.alloc(n, ad);
             for i in 0..n {
                 let p = sessions[i].pos;
                 self.copy_row(&sessions[i].cache.k[li], p, &kb, i, kv);
                 self.copy_row(&sessions[i].cache.v[li], p, &vb, i, kv);
-                let q1 = self.alloc(1, d);
-                self.copy_row(&q1, 0, &qb, i, d);
-                let a = self.decode_attention_mh(&q1, &sessions[i].cache.k[li], &sessions[i].cache.v[li], p + 1, d, m.n_heads, m.n_kv_heads);
-                self.copy_row(&attn, i, &a, 0, d);
+                let q1 = self.alloc(1, ad);
+                self.copy_row(&q1, 0, &qb, i, ad);
+                let a = self.decode_attention_mh(&q1, &sessions[i].cache.k[li], &sessions[i].cache.v[li], p + 1, ad, m.n_heads, m.n_kv_heads);
+                self.copy_row(&attn, i, &a, 0, ad);
             }
             let o = w.wo.apply(self, &attn, n);
             let x2 = self.add_t(&x, &o);
@@ -4576,7 +4594,7 @@ impl Gpu {
         let mut x = self.upload(&xh, s, m.d);
         for li in 0..m.n_layers {
             x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                       parent_len, s, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps);
+                                       parent_len, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         c
     }
@@ -4735,7 +4753,7 @@ impl Gpu {
     pub fn decode_batched_q8(&self, m: &Model, sessions: &mut [SessionQ8], tokens: &[u32]) {
         let n = sessions.len();
         if n == 0 { return; }
-        let d = m.d; let hd = d / m.n_heads; let kv = m.kv_dim();
+        let d = m.d; let hd = m.head_dim; let kv = m.kv_dim(); let ad = m.n_heads * hd;
         let mut xh = Vec::with_capacity(n * d);
         for &t in tokens { let s = t as usize * d; xh.extend_from_slice(&m.embed[s..s + d]); }
         let mut x = self.upload(&xh, n, d);
@@ -4744,20 +4762,20 @@ impl Gpu {
         for li in 0..m.n_layers {
             let w = &m.layers[li];
             let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
-            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, d, m.base, hd);
+            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, m.base, hd);
             let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, m.base, hd);
             let vb = w.wv.apply(self, &n1, n);
             // quantize this layer's K/V for the whole batch once, then scatter per session
             let (kqb, ksb) = self.quantize_rows(&kb, n, kv);
             let (vqb, vsb) = self.quantize_rows(&vb, n, kv);
-            let attn = self.alloc(n, d);
+            let attn = self.alloc(n, ad);
             for i in 0..n {
                 let p = sessions[i].pos; let c = &sessions[i].cache;
                 self.copy_row(&c.kq[li], p, &kqb, i, kv / 4); self.copy_row(&c.ks[li], p, &ksb, i, 1);
                 self.copy_row(&c.vq[li], p, &vqb, i, kv / 4); self.copy_row(&c.vs[li], p, &vsb, i, 1);
-                let q1 = self.alloc(1, d); self.copy_row(&q1, 0, &qb, i, d);
-                let a = self.decode_attention_mh_q8(&q1, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], p + 1, d, m.n_heads, m.n_kv_heads);
-                self.copy_row(&attn, i, &a, 0, d);
+                let q1 = self.alloc(1, ad); self.copy_row(&q1, 0, &qb, i, ad);
+                let a = self.decode_attention_mh_q8(&q1, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], p + 1, ad, m.n_heads, m.n_kv_heads);
+                self.copy_row(&attn, i, &a, 0, ad);
             }
             let o = w.wo.apply(self, &attn, n);
             let x2 = self.add_t(&x, &o);
@@ -4843,8 +4861,8 @@ impl Gpu {
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
-            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
+                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         m.output.apply(self, &xn, 1)
@@ -4923,7 +4941,7 @@ impl Gpu {
         let mut x = self.upload(&xh, s, m.d);
         for li in 0..m.n_layers {
             x = self.block_prefill_ext(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li],
-                                       start, s, m.d, m.n_heads, m.n_kv_heads, m.base, m.eps);
+                                       start, s, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, s, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, s)) // all `s` rows projected
@@ -5012,7 +5030,7 @@ impl Gpu {
             self.begin_frame();
             let s = t as usize * m.d;
             let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
-            for li in 0..m.n_layers { x = self.block_decode_fused(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], pos, m.d, m.h, m.n_heads, m.n_kv_heads, m.base, m.eps); }
+            for li in 0..m.n_layers { x = self.block_decode_fused(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&m.output.apply(self, &xn, 1));
         }
