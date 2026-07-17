@@ -799,6 +799,18 @@ try:
 except Exception as _cd_ex:
     CARDDATA_OK = False
 
+# Expansions: set/pack toggles layered over carddata's rotation gate. External
+# packs in expansions/*.json are merged here (cards get set=pack id); the
+# toggle screen lives under Options → Expansions.
+try:
+    import expansions as expmod
+    if CARDDATA_OK:
+        expmod.init(carddata)
+    EXPANSIONS_OK = True
+except Exception as _exp_ex:
+    expmod = None
+    EXPANSIONS_OK = False
+
 try:
     import collection as PBCOLLECTION
     COLLECTION_OK = True
@@ -836,6 +848,7 @@ except Exception:
     rtsmod = None
     RTS_OK = False
 RTS_GAME = None               # active RTS match while in the "rts" scene
+EXPANSIONS_SCENE = None       # lazy expansions.Scene while in the "expansions" scene
 
 def _register_seasonal_variant():
     """If a holiday is active and it offers a card skin, register its variant spec
@@ -5097,6 +5110,13 @@ def apply_shockwaves(screen, g):
         sc = 1.0 + (mag / max(1, radius)) * 1.6
         bw, bh = int(w * sc), int(h * sc)
         big = pygame.transform.smoothscale(patch, (bw, bh))
+        # The patch was copied from the DISPLAY surface, which has NO per-pixel
+        # alpha. BLEND_RGBA_MULT with the ring's transparent interior (0,0,0,0)
+        # would multiply the RGB to black while leaving the pixels opaque — the
+        # "black circle on card placement" bug in hi-gfx. Convert to a per-pixel
+        # alpha surface first so the masked interior becomes transparent instead.
+        if not (big.get_flags() & pygame.SRCALPHA):
+            big = big.convert_alpha()
         # mask to a ring so only the annulus is displaced (soft alpha ring)
         ring = pygame.Surface((bw, bh), pygame.SRCALPHA)
         ccx, ccy = bw // 2, bh // 2
@@ -6367,9 +6387,23 @@ def draw_options(screen, fonts, t, mouse):
     HOT["volslider"] = pygame.Rect(track.x, track.y - 12, track.w, 34)
 
     button(screen, pygame.Rect(b.right - 190, b.bottom - 66, 150, 48), "Back", font, mouse, key="back")
+    if EXPANSIONS_OK:
+        button(screen, pygame.Rect(b.right - 400, b.bottom - 66, 190, 48),
+               "Expansions…", font, mouse, key="expansions")
     menu_vignette(screen)
 
-def draw_lobby_waiting(screen, fonts, t, mouse, mp_state):
+def draw_expansions(screen, fonts, t, mouse):
+    """The set/pack toggle screen — rows are owned by expansions.Scene."""
+    font, bfont, sfont = fonts
+    draw_desk_and_book(screen, t, "EXPANSIONS", "toggle card sets & content packs")
+    b = MENU_BOOK
+    HOT.clear()
+    global EXPANSIONS_SCENE
+    if EXPANSIONS_SCENE is None:
+        EXPANSIONS_SCENE = expmod.Scene(b)
+    EXPANSIONS_SCENE.draw(screen, fonts, mouse, shade, PAGE, INK, GOLD)
+    button(screen, pygame.Rect(b.right - 190, b.bottom - 66, 150, 48), "Back", font, mouse, key="back")
+    menu_vignette(screen)
     """Waiting-room shown after hosting or joining, before the match starts.
     Shows your assigned team, deck-slot picker, and connected players."""
     font, bfont, sfont = fonts
@@ -8139,6 +8173,10 @@ def main():
                         globals()["RTS_GAME"] = None; scene = "menu"; start_flip("menu")
                     else:
                         RTS_GAME.handle_event(e)
+                        # ESC-to-menu: the RTS raises exit_requested when ESC is
+                        # pressed with nothing selected (or on the setup screen).
+                        if getattr(RTS_GAME, "exit_requested", False):
+                            globals()["RTS_GAME"] = None; scene = "menu"; start_flip("menu")
                 elif e.type == pygame.QUIT:
                     running = False
             elif e.type == pygame.VIDEORESIZE:
@@ -8225,6 +8263,9 @@ def main():
                     elif HOT.get("mp") and HOT["mp"].collidepoint(m):
                         mp_state.update(status="", role=None); scene = "mp"; start_flip("mp")
                     elif HOT.get("rts") and HOT["rts"].collidepoint(m) and RTS_OK:
+                        if EXPANSIONS_OK:
+                            try: expmod.apply_rts(rtsmod)   # merge enabled packs' maps
+                            except Exception: pass
                         globals()["RTS_GAME"] = rtsmod.RTS(dict(
                             W=W, H=H, font=font, sfont=sfont, bfont=bfont,
                             draw_unit=None, cards=CARDS, origami=origami,
@@ -8316,6 +8357,8 @@ def main():
                 elif scene == "options":
                     if HOT.get("back") and HOT["back"].collidepoint(m):
                         sfx("back"); scene = "menu"; start_flip("menu")
+                    if HOT.get("expansions") and HOT["expansions"].collidepoint(m) and EXPANSIONS_OK:
+                        sfx("select"); scene = "expansions"; start_flip("expansions")
                     for r, preset in HOT.get("gfx", []):
                         if r.collidepoint(m):
                             globals()["GFX"] = preset
@@ -8360,6 +8403,11 @@ def main():
                         if SOUND_OK and sound: sound.set_master(v)
                         dragging_vol = True         # begin dragging the knob
                         sfx("click")
+                elif scene == "expansions":
+                    if HOT.get("back") and HOT["back"].collidepoint(m):
+                        sfx("back"); scene = "options"; start_flip("options")
+                    elif EXPANSIONS_SCENE is not None and EXPANSIONS_SCENE.clicked(m):
+                        sfx("toggle")
                 elif scene == "mp":
                     if HOT.get("back") and HOT["back"].collidepoint(m):
                         if mp_state["peer"]: mp_state["peer"].stop(); mp_state["peer"] = None
@@ -8996,6 +9044,7 @@ def main():
         elif scene == "deck": draw_deckbuilder(canvas, fonts, t, mouse, 0)
         elif scene == "arena": draw_arena_select(canvas, fonts, t, mouse, sel_arena)
         elif scene == "options": draw_options(canvas, fonts, t, mouse)
+        elif scene == "expansions" and EXPANSIONS_OK: draw_expansions(canvas, fonts, t, mouse)
         elif scene == "collection": draw_collection(canvas, fonts, t, mouse)
         elif scene == "towers": draw_towers(canvas, fonts, t, mouse)
         elif scene == "mp": draw_multiplayer(canvas, fonts, t, mouse, mp_state)
