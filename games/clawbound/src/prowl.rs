@@ -49,6 +49,11 @@ const MINION_SPEED: f32 = 6.5;
 const MINION_AGGRO_R: f32 = 12.0;
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
+const N_CAMPS: usize = 3;
+const CAMP_ALERT_R: f32 = 9.0;   // a guard notices an un-hidden prowler inside this range
+const CAMP_HERB_R: f32 = 3.0;    // reach to take the herb
+const CAMP_GUARD_SPEED: f32 = 5.2;
+const CAMP_REGROW: f32 = 45.0;   // seconds before a taken (but not cleared) herb is worth retaking
 const MOVE_REACH: f32 = 3.6;    // how close an autoattack move connects with a target
 const STAGGER_DUR: f32 = 0.9;   // seconds a landed hit dazes the hunter/a rival
 const ULT_CD_MULT: f32 = 1.8;   // stretches the shared Ability's cooldown to feel like an ultimate
@@ -120,6 +125,35 @@ pub struct Rival {
     pub stagger: f32,     // > 0 while dazed by a landed hit — freezes it, interrupts its claim
 }
 
+/// A jungle camp guardian species. Each favors a different herb buff and plays a little
+/// differently to fight, but the sneak-vs-clear choice is the same for all three.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CampKind { Raccoon, Fox, Snake }
+impl CampKind {
+    pub fn name(self) -> &'static str { match self { CampKind::Raccoon => "Raccoon", CampKind::Fox => "Fox", CampKind::Snake => "Snake" } }
+    pub fn reward(self) -> Power { match self { CampKind::Raccoon => Power::Shield, CampKind::Fox => Power::Speed, CampKind::Snake => Power::Shield } }
+    pub fn guard_hp(self) -> f32 { match self { CampKind::Raccoon => 3.0, CampKind::Fox => 2.0, CampKind::Snake => 2.5 } }
+}
+
+/// A jungle camp: a guarded herb patch off the lanes. Clear the guard for good and the herb
+/// is free from then on; leave it alive and you can still slip in and take the herb *if*
+/// you never alert it (crouched, out of its sense range) — sneaking works, but clearing it
+/// out is the safer long-term play.
+#[derive(Clone, Copy)]
+pub struct JungleCamp {
+    pub kind: CampKind,
+    pub x: f32, pub z: f32,          // the herb
+    pub gx: f32, pub gz: f32,        // the guard's current position
+    pub home_x: f32, pub home_z: f32,
+    pub guard_alive: bool,
+    pub alert: bool,
+    pub hp: f32,
+    pub cooldown: f32,               // > 0 while the herb is spent and regrowing (guard cleared: never set again)
+}
+impl JungleCamp {
+    pub fn cleared(&self) -> bool { !self.guard_alive }
+}
+
 pub struct Objective {
     pub kind: ProwlObj,
     pub tx: f32, pub tz: f32, pub name: &'static str,
@@ -164,6 +198,7 @@ pub struct Prowl {
     pub lanes: Vec<(f32, f32, f32, f32)>,   // beaten paths between the staging grounds
     pub minions: Vec<Minion>,               // clan cats on border patrol
     pub rivals: Vec<Rival>,                 // rival clans' AI prowlers
+    pub jungle: Vec<JungleCamp>,            // guarded herb camps off the lanes
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -205,6 +240,7 @@ impl Prowl {
             ancestors, lanes, on_staging: false, on_lane: false,
             minions,
             rivals,
+            jungle: Self::place_jungle_camps(),
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -367,7 +403,54 @@ impl Prowl {
         v
     }
 
-    /// Scatter Speed/Shield power-ups on dry land in a ring around the middle.
+    /// Place the jungle camps off the lanes, at a middle radius between the staging
+    /// grounds and the map's heart — close enough to fight over, far enough to be a
+    /// detour rather than a lane stop.
+    fn place_jungle_camps() -> Vec<JungleCamp> {
+        let kinds = [CampKind::Raccoon, CampKind::Fox, CampKind::Snake];
+        let mut v = Vec::new();
+        for k in 0..N_CAMPS {
+            let a = (k as f32 + 0.5) / N_CAMPS as f32 * std::f32::consts::TAU;
+            let (mut x, mut z) = (a.cos() * 55.0, a.sin() * 55.0);
+            for r in 0..14 {
+                let rad = 55.0 - r as f32 * 4.0;
+                let (tx, tz) = (a.cos() * rad, a.sin() * rad);
+                if world::height_at(tx, tz) >= world::WATER_Y + 0.3 { x = tx; z = tz; break; }
+            }
+            let kind = kinds[k % kinds.len()];
+            v.push(JungleCamp { kind, x, z, gx: x, gz: z, home_x: x, home_z: z, guard_alive: true, alert: false, hp: kind.guard_hp(), cooldown: 0.0 });
+        }
+        v
+    }
+
+    /// Advance the jungle camps: a guard notices a loud/visible prowler nearby and closes
+    /// in; taking the herb needs the guard dead *or* never having noticed you.
+    fn step_jungle(&mut self, dt: f32) {
+        for camp in self.jungle.iter_mut() {
+            camp.cooldown = (camp.cooldown - dt).max(0.0);
+            if !camp.guard_alive { continue; }
+            let d = dist(self.x, self.z, camp.gx, camp.gz);
+            if !camp.alert && d < CAMP_ALERT_R && (self.moving && !self.hidden) { camp.alert = true; }
+            if camp.alert {
+                let (dx, dz) = norm(self.x - camp.gx, self.z - camp.gz);
+                camp.gx += dx * CAMP_GUARD_SPEED * dt; camp.gz += dz * CAMP_GUARD_SPEED * dt;
+                if dist(self.x, self.z, camp.gx, camp.gz) < 2.4 && self.ability_t <= 0.0 {
+                    // a caught-out prowler is shoved back toward the camp's edge, no other penalty
+                    let (px, pz) = norm(self.x - camp.home_x, self.z - camp.home_z);
+                    self.x = camp.home_x + px * (CAMP_ALERT_R + 1.0); self.z = camp.home_z + pz * (CAMP_ALERT_R + 1.0);
+                }
+            } else if camp.gx != camp.home_x || camp.gz != camp.home_z {
+                // lost interest — amble back home
+                let (dx, dz) = norm(camp.home_x - camp.gx, camp.home_z - camp.gz);
+                if dist(camp.gx, camp.gz, camp.home_x, camp.home_z) > 0.3 { camp.gx += dx * 2.0 * dt; camp.gz += dz * 2.0 * dt; } else { camp.gx = camp.home_x; camp.gz = camp.home_z; }
+            }
+        }
+        // taking the herb: reach it while the guard is cleared, or while it's alive but never alerted
+        if let Some(camp) = self.jungle.iter_mut().find(|c| dist(self.x, self.z, c.x, c.z) < CAMP_HERB_R && c.cooldown <= 0.0 && (c.cleared() || !c.alert)) {
+            self.buffs.grant(camp.kind.reward());
+            camp.cooldown = CAMP_REGROW;
+        }
+    }
     fn scatter_pickups() -> Vec<(f32, f32, Power)> {
         let powers = [Power::Speed, Power::Shield, Power::Speed, Power::Shield, Power::Speed, Power::Shield];
         let mut v = Vec::new();
@@ -439,6 +522,11 @@ impl Prowl {
                     if dist(self.x, self.z, r.x, r.z) < MOVE_REACH {
                         r.stagger = r.stagger.max(STAGGER_DUR * (0.5 + power * 0.35));
                     }
+                }
+                // a jungle guard: a landed hit chips its health; clearing it frees the herb for good
+                if let Some(camp) = self.jungle.iter_mut().find(|c| c.guard_alive && dist(self.x, self.z, c.gx, c.gz) < MOVE_REACH) {
+                    camp.hp -= 0.5 + power * 0.5;
+                    if camp.hp <= 0.0 { camp.guard_alive = false; camp.alert = false; camp.cooldown = 0.0; }
                 }
             }
             self.player_move = if nt >= mv.total() { self.combo_last = Some((mv, 0.0)); None } else { Some((mv, nt)) };
@@ -638,6 +726,9 @@ impl Prowl {
 
         // ── autoattack: advance the in-progress move, land hits on the hunter/rivals ──
         self.step_combat(dt);
+
+        // ── jungle camps: guarded herb buffs off the lanes ──
+        self.step_jungle(dt);
 
         // ── clan minions: border patrol + intruder defense ──
         self.step_minions(dt);
@@ -1044,6 +1135,7 @@ mod tests {
                     assert!(g.prey_caught >= pc && g.times_caught >= cc, "a tally went backwards");
                     assert!(g.hunter_stagger >= 0.0 && g.combo_flash >= 0.0, "combat timers went negative");
                     for r in &g.rivals { assert!(r.stagger >= 0.0 && r.x.is_finite() && r.z.is_finite(), "rival state broke"); }
+                    for c in &g.jungle { assert!(c.hp.is_finite() && c.cooldown >= 0.0 && c.gx.is_finite() && c.gz.is_finite(), "jungle camp state broke"); }
                     pc = g.prey_caught; cc = g.times_caught;
                 }
             }
@@ -1166,6 +1258,52 @@ mod tests {
         g.set_input(0.0, 0.0, false, false, false);
         g.step(1.0 / 30.0);
         assert_eq!((g.hx, g.hz), (hx0, hz0), "a dazed hunter shouldn't move");
+    }
+
+    #[test]
+    fn sneaking_a_hidden_prowler_past_an_unalerted_guard_takes_the_herb() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let (cx, cz) = (g.jungle[0].x, g.jungle[0].z);
+        g.x = cx; g.z = cz;
+        g.set_input(0.0, 0.0, false, false, true);   // crouched — quiet and unseen
+        assert!(!g.buffs.speed_boosted() && !g.buffs.shield);
+        g.step(1.0 / 30.0);
+        assert!(!g.jungle[0].alert, "a crouched approach shouldn't alert the guard");
+        assert!(g.buffs.speed_boosted() || g.buffs.shield, "reaching the herb unnoticed should grant its buff");
+    }
+
+    #[test]
+    fn a_loud_approach_alerts_the_guard_and_blocks_the_herb() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let (cx, cz) = (g.jungle[0].x, g.jungle[0].z);
+        g.x = cx + CAMP_ALERT_R - 1.0; g.z = cz;
+        g.set_input(1.0, 0.0, false, false, false);   // running in, not hidden
+        g.step(1.0 / 30.0);
+        assert!(g.jungle[0].alert, "moving in unhidden within range should alert the guard");
+        g.x = cx; g.z = cz;   // now at the herb, but the guard is alive and alert
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(!g.buffs.speed_boosted() && !g.buffs.shield, "the herb shouldn't grant while the live guard is alert");
+    }
+
+    #[test]
+    fn clearing_a_jungle_guard_frees_the_herb_for_good() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let (cx, cz) = (g.jungle[0].x, g.jungle[0].z);
+        g.x = cx; g.z = cz; g.jungle[0].gx = cx; g.jungle[0].gz = cz;
+        for _ in 0..20 {
+            g.player_flick((0.0, 1.0), 1.0, true);   // underbelly swipe — an attack with no movement of its own
+            for _ in 0..12 { g.set_input(0.0, 0.0, false, false, false); g.step(1.0 / 30.0); if g.player_move.is_none() { break; } }
+            g.x = cx; g.z = cz; g.leap_t = 0.0; g.dodge_t = 0.0; g.jungle[0].gx = cx; g.jungle[0].gz = cz;
+            if g.jungle[0].cleared() { break; }
+        }
+        assert!(g.jungle[0].cleared(), "enough landed hits should clear the guard");
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.buffs.speed_boosted() || g.buffs.shield, "a cleared camp's herb should be free to take");
     }
 
     #[test]
