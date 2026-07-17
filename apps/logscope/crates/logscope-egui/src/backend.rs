@@ -165,6 +165,12 @@ mod engine {
                 tok.special_id("<|im_end|>"),
                 tok.special_id("<｜end▁of▁sentence｜>"),
                 tok.special_id("<|endoftext|>"),
+                // Turn-START markers are also stops: in a single assistant turn the model must never open a
+                // new turn — emitting one means it ran past its real stop and is hallucinating the next turn
+                // (the "untamed stopping" runaway). These now tokenize atomically, so the id-based decode
+                // stop check halts cleanly instead of leaking "<|im_start|>user…" into the reply.
+                tok.special_id("<|im_start|>"),
+                tok.special_id("<|start_header_id|>"),
             ]).into_iter().collect();
             // Template family: a ChatML model carries <|im_end|> but none of the Llama-3 header
             // markers; a Llama-3 model carries <|eot_id|>/<|start_header_id|>. Anything else → Plain.
