@@ -108,6 +108,27 @@ pub fn reapply(session: &Session) -> Result<String, String> {
     git(&session.project, &["rev-parse", "HEAD"])
 }
 
+/// Reapply changed files from an arbitrary `work_dir` (e.g. a fan branch's isolated workspace) over
+/// `project` as one new commit. Same mechanism as `reapply` but for a raw directory rather than a Session —
+/// used by `:pick` to land the keeper branch of an agent fan.
+pub fn reapply_dir(work_dir: &Path, project: &Path, label: &str) -> Result<String, String> {
+    let changed = changed_files(work_dir, project);
+    if changed.is_empty() {
+        return Err("no changes to reapply".into());
+    }
+    for rel in &changed {
+        let src = work_dir.join(rel);
+        let dst = project.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("copy {rel}: {e}"))?;
+    }
+    git(project, &["add", "-A"])?;
+    git(project, &["commit", "-m", &commit_message(label)])?;
+    git(project, &["rev-parse", "HEAD"])
+}
+
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     let out = std::process::Command::new("git")
         .args(args)
