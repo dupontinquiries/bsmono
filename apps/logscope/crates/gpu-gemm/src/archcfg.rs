@@ -86,7 +86,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             rope_interleaved: true, moe: true, moe_shared_expert: false, interleaved_nope: false,
             logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: false, dense_supported: false,
-            note: "Qwen3-MoE (e.g. Qwen3-30B-A3B / Qwen3-Coder-30B-A3B): Qwen3 QK-Norm attention + mixture-of-experts (ffn_gate_inp router → top-k of N experts, no shared expert). Router + expert FFNs reuse the existing matvec/SwiGLU kernels; needs the MoE forward wired (loader: per-expert quant of the stacked ffn_*_exps; forward: route→top-k→weighted expert sum). Router logic is ready (moe::route).",
+            note: "Qwen3-MoE (Qwen3-Coder-30B-A3B confirmed: d=2048, 48 layers, n_heads=32, n_kv_heads=4, head_dim=128 [NOTE head_dim != d/n_heads=64], 128 experts × ff=768, top-8, NO shared expert; ffn_*_exps stacked with the expert dim OUTERMOST, each slice contiguous & 256-divisible; attn_v/ffn_down_exps are mixed Q6_K/Q4_K per layer). Needs: (1) head_dim decoupled from d/n_heads in the attention path [moe::layer_shape], (2) per-expert dequant→requant of the stacked ffn_*_exps in the loader, (3) MoE forward route→top-8→weighted expert sum [moe::route, ready]. Reuses the existing matvec/SwiGLU kernels per expert.",
         },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
         // mixture-of-experts — a router (blk.N.ffn_gate_inp.weight) selecting top-k of N expert FFNs

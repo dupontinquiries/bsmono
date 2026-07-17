@@ -104,6 +104,35 @@ pub fn expert_row_offset(expert: u32, rows: usize) -> usize { expert as usize * 
 /// the streaming/residency estimate (only this many experts are touched per token, per Colibri).
 pub fn active_expert_count(cfg: &MoeConfig) -> u32 { cfg.n_used.min(cfg.n_routed) + cfg.n_shared }
 
+/// Per-layer attention + expert shapes, derived from the real GGUF tensor dims (not assumed from `d`).
+/// The Qwen3 gotcha this captures: `head_dim` is NOT `d / n_heads` — it comes from the K-projection width
+/// (`attn_k` output) divided by `n_kv_heads`. So the attention operates on `attn_dim = n_heads * head_dim`
+/// (e.g. 4096 for Qwen3-Coder-30B, while `d` = 2048), and `attn_output` projects that back down to `d`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayerShape {
+    pub d: usize,          // model/residual width (2048)
+    pub head_dim: usize,   // per-head dim (128) — independent of d/n_heads
+    pub n_heads: usize,    // query heads (32)
+    pub n_kv_heads: usize, // kv heads (4, GQA)
+    pub attn_dim: usize,   // n_heads * head_dim (4096) — the width Q/attn operate on
+    pub kv_dim: usize,     // n_kv_heads * head_dim (512) — K/V projection + cache row width
+    pub n_ff_expert: usize,// per-expert FFN width (768)
+    pub n_expert: usize,   // total routed experts (128)
+}
+
+/// Derive the layer shape. `attn_k_out` is the K-projection output dim (`attn_k.weight`'s output rows);
+/// `expert_ff` is the per-expert FFN width (`ffn_gate_exps` middle dim). head_dim = attn_k_out / n_kv_heads.
+pub fn layer_shape(d: usize, n_heads: usize, n_kv_heads: usize, attn_k_out: usize, expert_ff: usize, n_expert: usize) -> LayerShape {
+    let head_dim = if n_kv_heads > 0 && attn_k_out % n_kv_heads == 0 { attn_k_out / n_kv_heads } else { d / n_heads.max(1) };
+    LayerShape {
+        d, head_dim, n_heads, n_kv_heads,
+        attn_dim: n_heads * head_dim,
+        kv_dim: n_kv_heads * head_dim,
+        n_ff_expert: expert_ff,
+        n_expert,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +189,26 @@ mod tests {
         assert_eq!(sel.len(), 3, "k clamps to the number of experts");
         assert_eq!(expert_row_offset(0, 4096), 0);
         assert_eq!(expert_row_offset(5, 4096), 5 * 4096);
+    }
+
+    #[test]
+    fn layer_shape_matches_qwen3_coder_30b_dump() {
+        // from the confirmed GGUF dump: d=2048, n_heads=32, n_kv_heads=4, attn_k out=512, expert ff=768, 128 experts
+        let s = layer_shape(2048, 32, 4, 512, 768, 128);
+        assert_eq!(s.head_dim, 128, "head_dim = attn_k_out / n_kv_heads = 512/4, NOT d/n_heads = 64");
+        assert_eq!(s.attn_dim, 4096, "attention width = n_heads*head_dim (matches attn_q output)");
+        assert_eq!(s.kv_dim, 512, "kv width = n_kv_heads*head_dim (matches attn_k/v output)");
+        assert_eq!(s.n_ff_expert, 768);
+        assert_eq!(s.n_expert, 128);
+    }
+
+    #[test]
+    fn layer_shape_preserves_dense_head_dim() {
+        // DeepSeek-8B (llama): d=4096, n_heads=32, n_kv_heads=8, attn_k out=1024 → head_dim=128=d/n_heads (unchanged)
+        let s = layer_shape(4096, 32, 8, 1024, 0, 0);
+        assert_eq!(s.head_dim, 128);
+        assert_eq!(s.attn_dim, 4096, "== d for a dense model, so behavior is identical");
+        assert_eq!(s.kv_dim, 1024);
     }
 
     #[test]
