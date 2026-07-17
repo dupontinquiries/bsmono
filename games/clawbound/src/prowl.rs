@@ -57,18 +57,18 @@ pub const N_MARKERS: usize = 5;
 const MARKER_R: f32 = 4.0;
 pub const MARKER_CLAIM_TIME: f32 = 3.0;
 const MARKER_DRIFT_BACK: f32 = 20.0;   // seconds unattended before a held marker drifts back to its nearest clan
-const CONVERGENCE_INTERVAL: f32 = 40.0;  // a Prowl round runs ~120s (the ring's shrink timer) — this gives 2-3 convergences per round
-const CONVERGENCE_WARN: f32 = 10.0;    // the last stretch before a convergence, worth flagging to the player
-pub const RITUAL_WIN: f32 = 70.0;      // reachable by a dominant clan across 2-3 convergences in one round, not several matches
+const CONVERGENCE_INTERVAL: f32 = 240.0;  // a Prowl round now runs ~30 min — a convergence every 4 min, ~7 per round
+const CONVERGENCE_WARN: f32 = 20.0;    // the last stretch before a convergence, worth flagging to the player
+pub const RITUAL_WIN: f32 = 160.0;     // reachable by a dominant clan across several convergences over the round, not any one of them
 const ROCK_BONUS_R: f32 = 10.0;        // being at the Rock when a convergence resolves adds a bonus
-const SUSTENANCE_DECAY: f32 = 0.0098;  // per second — with no prey at all, sickness sets in around the 90s mark of a 120s round
+const SUSTENANCE_DECAY: f32 = 0.0035;  // per second — with no prey at all, sickness sets in around the 4-5 min mark, recurring across the round
 const SUSTENANCE_PER_PREY: f32 = 0.22;
 const SUSTENANCE_SICK_AT: f32 = 0.12;
 const SUSTENANCE_WELL_AT: f32 = 0.4;   // sickness clears once it's recovered back above this
 const TWIG_HEAR_R: f32 = 26.0;         // how far a snapped twig carries, hunter-side
 const TWIG_SUSPICION: f32 = 0.5;
 const LOG_BOUND_R: f32 = 1.6;
-const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
+const WIN_SCORE: i32 = 3200;   // first clan to this many points wins outright — sized for a ~30 min round
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
 const CAMP_ALERT_R: f32 = 9.0;   // a guard notices an un-hidden prowler inside this range
@@ -288,7 +288,7 @@ impl Prowl {
             hunter_kind, hx: 60.0, hz: 60.0, hheading: 0.0,
             hstate: HState::Patrol, suspicion: 0.0, last_seen: None,
             critters, bushes, pois,
-            ring: Ring::new(0.0, 0.0, world::SIZE * 0.34, world::SIZE * 0.12, 120.0, 0.0),
+            ring: Ring::new(0.0, 0.0, world::SIZE * 0.34, world::SIZE * 0.12, 1800.0, 0.0),
             exposed: false,
             obj: Objective { kind: ProwlObj::Reach, tx: 0.0, tz: 0.0, name: "", progress: 0.0, time_left: 0.0, start_caught: 0, done: false, next_t: 0.0 },
             cleared: 0, prey_caught: 0, escapes: 0, times_caught: 0,
@@ -1725,40 +1725,59 @@ mod tests {
     }
 
     #[test]
-    fn sustenance_matters_within_a_single_round_but_not_instantly() {
-        // a Prowl round runs ~120s (the ring's shrink timer). With no prey at all,
-        // sustenance should hold up for the early game but turn sick well before the
-        // round ends — it's meant to push you toward at least one catch or a rest at
-        // a staging ground per round, not be irrelevant, and not bite in the first 30s.
+    fn sustenance_recurs_every_few_minutes_across_a_thirty_minute_round() {
+        // a Prowl round runs ~30 minutes. With no prey at all, sustenance should hold
+        // up for the first minute but turn sick within the first several minutes —
+        // it's meant to recur, pushing you back to hunt or rest every so often across
+        // the whole round, not be a one-time event or bite immediately.
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.hx = 900.0; g.hz = 900.0;
-        for t in 0..(30 * 30) {
+        for t in 0..(60 * 30) {
             g.set_input((t as f32 * 0.05).sin(), (t as f32 * 0.04).cos(), false, false, false);
             g.step(1.0 / 30.0);
         }
-        assert!(!g.sick, "sustenance shouldn't bite in the first 30 seconds of a round");
-        for t in 0..(70 * 30) {
+        assert!(!g.sick, "sustenance shouldn't bite in the first minute of a round");
+        for t in 0..(360 * 30) {
             g.set_input((t as f32 * 0.05).sin(), (t as f32 * 0.04).cos(), false, false, false);
             g.step(1.0 / 30.0);
         }
-        assert!(g.sick, "with no prey at all, sickness should set in well before a ~120s round ends");
+        assert!(g.sick, "with no prey at all, sickness should set in within the first several minutes");
     }
 
     #[test]
-    fn convergence_fires_a_couple_times_across_one_round() {
-        // one Prowl round runs ~120s; the ritual should get a real chance to matter
-        // inside that single round, not need several matches to ever fire.
+    fn a_dominant_clan_still_takes_most_of_the_round_to_win_outright() {
+        // even in the worst case — one clan snowballing totally uncontested while the
+        // player does nothing about it — the score-threshold win shouldn't trigger
+        // early into what's meant to be a ~30 minute round. It's fine for a total
+        // stomp to end a little early (mirrors a real MOBA), just not in the first
+        // few minutes.
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        let mut ended_at = None;
+        for i in 0..(1800 * 30) {
+            g.set_input(0.3, 0.1, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.outcome.is_some() { ended_at = Some(i as f32 / 30.0); break; }
+        }
+        let t = ended_at.expect("the round should resolve one way or another within 30 minutes");
+        assert!(t > 900.0, "even an unchecked snowball shouldn't decide the round before the 15-minute mark, ended at {t}s");
+    }
+
+    #[test]
+    fn convergence_fires_several_times_across_a_thirty_minute_round() {
+        // a Prowl round runs ~30 minutes; the ritual should get several real chances to
+        // matter across it, not need several matches to ever fire.
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.hx = 900.0; g.hz = 900.0;
         let mut fires = 0;
         let mut last = g.convergence_t;
-        for _ in 0..(120 * 30) {
+        for _ in 0..(1800 * 30) {
             g.set_input(0.3, 0.1, false, false, false);
             g.step(1.0 / 30.0);
             if g.convergence_t > last { fires += 1; }
             last = g.convergence_t;
         }
-        assert!((2..=4).contains(&fires), "expected 2-4 convergences across a ~120s round, got {fires}");
+        assert!((5..=9).contains(&fires), "expected roughly one convergence every ~4 min across a ~30 min round, got {fires}");
     }
 
     #[test]
