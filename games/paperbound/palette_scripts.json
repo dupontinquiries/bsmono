@@ -1,0 +1,42 @@
+{
+  "scripts": [
+    {
+      "name": "Opening: economy first",
+      "desc": "Raise an ink well, queue two extra workers, and camera home.",
+      "ops": [
+        {"op": "build", "kind": "well"},
+        {"op": "train", "unit": "scribe", "count": 2},
+        {"op": "camera", "what": "base"},
+        {"op": "flash", "text": "Economy opening under way."}
+      ]
+    },
+    {
+      "name": "Opening: fast barracks",
+      "desc": "Raise the troop table and start the first two soldiers.",
+      "ops": [
+        {"op": "build", "kind": "table"},
+        {"op": "train", "unit": "soldier", "count": 2},
+        {"op": "flash", "text": "Fast military opening."}
+      ]
+    },
+    {
+      "name": "Muster: everyone to 1",
+      "desc": "Select the whole army, bind it to group 1, hold position.",
+      "ops": [
+        {"op": "select", "what": "army"},
+        {"op": "group", "n": 1, "do": "assign"},
+        {"op": "hold"},
+        {"op": "flash", "text": "Army mustered as group 1."}
+      ]
+    },
+    {
+      "name": "Panic: back to base",
+      "desc": "Grab the army, stop everything, and snap the camera home.",
+      "ops": [
+        {"op": "select", "what": "army"},
+        {"op": "stop"},
+        {"op": "camera", "what": "base"}
+      ]
+    }
+  ]
+}
