@@ -157,7 +157,7 @@ fn build_scene() -> (Mesh, Vec3) {
     }
     let along = best.safe_reach(5.0).min(0.7).max(0.3);
     let perch = best.point(along);
-    cat::build(&mut m, v3(perch.x, perch.y - 0.12, perch.z), 1.0, &cat::climb());
+    cat::build(&mut m, v3(perch.x, perch.y - 0.12, perch.z), 1.0, &cat::climb(), clawbound_rs::class::Class::Cat);
 
     // a fox prowling the ground below
     let fy = world::height_at(13.0, 20.0);
@@ -179,11 +179,11 @@ fn build_poses() -> (Mesh, Vec3) {
         cat::bound(0.7), cat::coil(), cat::leap(), cat::startle(),
     ];
     let mut x = -8.4;
-    for p in &poses { cat::build(&mut m, v3(x, 0.0, 0.0), 1.0, p); x += 2.4; }
+    for p in &poses { cat::build(&mut m, v3(x, 0.0, 0.0), 1.0, p, clawbound_rs::class::Class::Cat); x += 2.4; }
     // climb pose on a branch stub
     let bx = x + 0.4;
     m.segment(v3(bx, 0.0, 0.0), v3(bx, 2.6, 0.7), 0.16, 0.11, 6, rgb(0x6b4b32));
-    cat::build(&mut m, v3(bx - 0.05, 1.15, 0.28), 1.0, &cat::climb());
+    cat::build(&mut m, v3(bx - 0.05, 1.15, 0.28), 1.0, &cat::climb(), clawbound_rs::class::Class::Cat);
 
     (m, v3((x - 8.4) * 0.5 + 0.5, 0.7, 0.2))
 }
@@ -212,14 +212,14 @@ fn build_sequence() -> (Mesh, Vec3) {
         let z = -12.0 + t * ((ztree - 3.5) - (-12.0));
         let ph = (t * 3.2).fract();
         let pose = if t < 0.62 { cat::walk(ph) } else { cat::bound(ph) };
-        cat::build(&mut m, v3(0.0, 0.0, z), 1.0, &pose);
+        cat::build(&mut m, v3(0.0, 0.0, z), 1.0, &pose, clawbound_rs::class::Class::Cat);
     }
     // climb the limb in steps, stopping at safe reach (further out would snap)
     let amax = best.safe_reach(5.0).min(0.85);
     for i in 0..3 {
         let along = 0.18 + (i as f32 / 2.0) * (amax - 0.18);
         let p = best.point(along);
-        cat::build(&mut m, v3(p.x, p.y - 0.1, p.z), 1.0, &cat::climb());
+        cat::build(&mut m, v3(p.x, p.y - 0.1, p.z), 1.0, &cat::climb(), clawbound_rs::class::Class::Cat);
     }
 
     (m, v3(0.0, 1.0, 1.5))
@@ -281,7 +281,7 @@ fn build_senses() -> (Mesh, Vec3) {
     }
 
     // the cat, its scent trail drifting downwind, and a wind arrow
-    cat::build(&mut m, v3(catx, 0.0, catz), 1.0, &cat::stand());
+    cat::build(&mut m, v3(catx, 0.0, catz), 1.0, &cat::stand(), clawbound_rs::class::Class::Cat);
     // scent dots trailing back + drifted -x (downwind)
     for i in 0..7 {
         let t = i as f32;
@@ -379,7 +379,7 @@ fn build_clans() -> (Mesh, Vec3) {
         let z = 0.0;
         let gy = world::height_at(x, z);
         let t = clan::trait_of(c);
-        cat::build(&mut m, v3(x, gy, z), 0.0, &cat::idle(0.2 + c as f32 * 0.3));
+        cat::build(&mut m, v3(x, gy, z), 0.0, &cat::idle(0.2 + c as f32 * 0.3), clawbound_rs::class::Class::Cat);
         m.boxx(v3(x, gy + 2.15, z), v3(0.55, 0.2, 0.55), rgb(t.color));   // clan banner
         trait_bars(&mut m, x, gy + 6.4, z, &t);
         eprintln!("{} ({}) — {}", t.name, clan::specialty(c), t.home);
@@ -415,7 +415,7 @@ fn build_game() -> (Mesh, Vec3) {
     for c in g.cats.iter().filter(|c| c.alive) {
         let gy = world::height_at(c.x, c.z);
         let (yoff, pose) = if c.climb_t > 0.01 { (c.climb_height(), cat::climb()) } else if c.crouched { (0.0, cat::coil()) } else if c.moving { (0.0, cat::gait(c.speed, g.tick as f32 * 0.05, c.id as f32 * 0.37)) } else { (0.0, cat::idle(g.tick as f32 * 0.03 + c.id as f32 * 0.3)) };
-        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose);
+        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose, clawbound_rs::class::Class::Cat);
         cx_sum += c.x; cz_sum += c.z; n += 1.0;
     }
     let hp = g.hunter.kind.params();
@@ -570,21 +570,21 @@ fn build_prowl() -> (Mesh, Vec3) {
     for mm in &g.minions {
         let gy = world::height_at(mm.x, mm.z);
         let pose = cat::walk((g.time * 5.0 + mm.x) % 1.0);
-        cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose);
+        cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose, clawbound_rs::class::Class::Cat);
         m.boxx(v3(mm.x, gy + 1.3, mm.z), v3(0.28, 0.12, 0.28), rgb(clawbound_rs::prowl::clan_color(mm.clan)));
     }
     // rival clan prowlers — full-size clan-tinted cats
     for rv in &g.rivals {
         let gy = world::height_at(rv.x, rv.z);
         let pose = cat::walk((g.time * 5.0 + rv.x) % 1.0);
-        cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose);
+        cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose, rv.class);
         m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
     }
 
     // the prowler (player) + a class-tint marker; then the stalking hunter
     let pgy = world::height_at(g.x, g.z);
     let pose = if g.leap_t > 0.0 { cat::leap() } else if g.crouched { cat::coil() } else if g.moving { cat::walk((g.time * 6.0) % 1.0) } else { cat::stand() };
-    cat::build(&mut m, v3(g.x, pgy + g.leap_t.max(0.0) * 2.0, g.z), g.heading, &pose);
+    cat::build(&mut m, v3(g.x, pgy + g.leap_t.max(0.0) * 2.0, g.z), g.heading, &pose, g.class);
     m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
 
     let hgy = world::height_at(g.hx, g.hz);
@@ -646,7 +646,7 @@ fn build_capture() -> (Mesh, Vec3) {
     for mob in &g.mobs {
         let gy = world::height_at(mob.x, mob.z);
         let pose = if mob.stunned() { cat::startle() } else { cat::stand() };
-        cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose);
+        cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose, mob.class);
         let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
         m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);          // team collar/flag
         m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color)); // class tint
@@ -791,7 +791,7 @@ fn build_entities(g: &clawbound_rs::sim::Game, anim_t: f32, show_cone: bool) -> 
             }
             else if c.player && g.danger > 0.35 { (0.0, cat::taste_air(anim_t * 0.9)) }   // frozen, reading the wind
             else { (0.0, cat::idle(anim_t * 0.6 + off)) };   // breathing idle when standing still
-        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose);
+        cat::build(&mut m, v3(c.x, gy + yoff, c.z), c.heading, &pose, clawbound_rs::class::Class::Cat);
         m.boxx(v3(c.x, gy + yoff + 1.55, c.z), v3(0.22, 0.1, 0.22), rgb(clawbound_rs::clan::color(g.clan))); // clan collar
     }
     let hp = g.hunter.kind.params();
@@ -861,7 +861,7 @@ fn build_nightmare_extras(center: Vec3) -> Mesh {
         let gx = center.x + a.cos() * r;
         let gz = center.z + a.sin() * r + i as f32 * 3.0;
         let gy = world::height_at(gx, gz) + 0.4 + (i as f32 * 0.7).sin() * 0.6; // hovering
-        cat::build(&mut m, v3(gx, gy, gz), if i % 2 == 0 { 1.0 } else { -1.0 }, &cat::walk((i as f32 * 0.17) % 1.0));
+        cat::build(&mut m, v3(gx, gy, gz), if i % 2 == 0 { 1.0 } else { -1.0 }, &cat::walk((i as f32 * 0.17) % 1.0), clawbound_rs::class::Class::Cat);
     }
     m.set_op(1.0);
     m
