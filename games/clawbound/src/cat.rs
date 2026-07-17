@@ -4,7 +4,7 @@
 //! renders any gait phase or special pose (leap, startle, climb).
 
 use crate::math::{v3, Vec3};
-use crate::mesh::{rgb, Mesh};
+use crate::mesh::{rgb, shade, Mesh};
 
 const TAU: f32 = std::f32::consts::TAU;
 const PI: f32 = std::f32::consts::PI;
@@ -220,50 +220,121 @@ pub fn move_pose(m: crate::combat::Move, t: f32) -> Pose {
     }
 }
 
-/// Build the cat facing `yaw` radians (0 = +z, matching `heading = dx.atan2(dz)`).
-pub fn build(m: &mut Mesh, at: Vec3, yaw: f32, p: &Pose) {
-    let pelt = rgb(0x9a7b53);
-    let dark = rgb(0x6f5638);
+/// Per-leg (thigh, shank) length for a species. The Frog's hind legs (index 2,3) are
+/// noticeably longer than everyone else's — built for its huge leap.
+fn leg_scale(class: crate::class::Class, i: usize, lt: f32, ls: f32) -> (f32, f32) {
+    if class == crate::class::Class::Frog && i >= 2 { (lt * 1.4, ls * 1.4) } else { (lt, ls) }
+}
+
+/// Build the creature facing `yaw` radians (0 = +z, matching `heading = dx.atan2(dz)`),
+/// as its `class` — each of the six has its own silhouette (color, tail, ears, body
+/// proportions, and a signature feature) rather than sharing one undifferentiated rig.
+pub fn build(m: &mut Mesh, at: Vec3, yaw: f32, p: &Pose, class: crate::class::Class) {
+    use crate::class::Class;
+    let pelt = rgb(class.def().color);
+    let dark = shade(pelt, 0.62);
     let (s, co) = (yaw.sin(), yaw.cos());
     // rotate a body-local point (forward = +z) into world, pivoting about `at`
     let place = |lx: f32, wy: f32, lz: f32| v3(at.x + lx * co + lz * s, wy, at.z - lx * s + lz * co);
 
-    let stand_h = 0.52;
+    // per-species body proportions: Otter long and low, Frog rear-heavy for its leap,
+    // Goat stocky, Hawk slight and light, Squirrel small and quick
+    let (len_mul, wid_mul, stand_h): (f32, f32, f32) = match class {
+        Class::Cat => (1.0, 1.0, 0.52),
+        Class::Squirrel => (0.85, 0.85, 0.42),
+        Class::Otter => (1.25, 0.92, 0.38),
+        Class::Frog => (1.0, 1.05, 0.48),
+        Class::Goat => (1.05, 1.2, 0.62),
+        Class::Hawk => (0.9, 0.85, 0.5),
+    };
+
     let breath = 1.0 + p.breath * 0.05;
     let body_y = at.y + stand_h * (1.0 - p.crouch * 0.35) + p.bob;
     let fore_y = body_y + p.pitch * 0.25 + 0.03;
     let hind_y = body_y - p.pitch * 0.25;
 
-    m.boxx_yaw(place(0.0, hind_y, -0.35), v3(0.34, 0.30 * breath, 0.45), yaw, pelt);
-    m.boxx_yaw(place(0.0, fore_y, 0.30), v3(0.32, 0.30 * breath, 0.42), yaw, pelt);
+    // Frog's leap-built rear haunches are bigger than the fore quarter; everyone else is even
+    let hind_wid = if class == Class::Frog { 0.34 * wid_mul * 1.35 } else { 0.34 * wid_mul };
+    m.boxx_yaw(place(0.0, hind_y, -0.35 * len_mul), v3(hind_wid, 0.30 * breath, 0.45 * len_mul), yaw, pelt);
+    m.boxx_yaw(place(0.0, fore_y, 0.30 * len_mul), v3(0.32 * wid_mul, 0.30 * breath, 0.42 * len_mul), yaw, pelt);
 
-    // head turns with head_yaw; ears ride on top, rotated with it
-    let head_c = place(0.0, fore_y + 0.22 + p.head * 0.12, 0.78);
-    m.boxx_yaw(head_c, v3(0.27, 0.24, 0.25), yaw + p.head_yaw, pelt);
+    // head turns with head_yaw; ears (or Hawk's beak) ride on top, rotated with it
+    let head_c = place(0.0, fore_y + 0.22 + p.head * 0.12, 0.78 * len_mul);
+    m.boxx_yaw(head_c, v3(0.27 * wid_mul, 0.24, 0.25), yaw + p.head_yaw, pelt);
     let (hs, hc) = (p.head_yaw.sin(), p.head_yaw.cos());
-    for ex in [-0.15f32, 0.15] {
-        let ear = place(ex * hc, head_c.y + 0.24, 0.78 - ex * hs);
-        m.cone(ear, 0.1, 0.22, 4, dark);
+    match class {
+        Class::Hawk => {
+            // a short hooked beak instead of ears
+            let beak = place(0.0 * hc, head_c.y - 0.02, 0.78 * len_mul + 0.22 * hc);
+            m.cone(beak, 0.07, 0.2, 4, rgb(0xd8a53c));
+        }
+        Class::Goat => {
+            // small back-swept horns, rising well above where the ears would sit
+            for ex in [-0.12f32, 0.12] {
+                let base_p = place(ex * hc, head_c.y + 0.2, 0.78 * len_mul - ex * hs - 0.05);
+                let tip = place(ex * 1.4 * hc, head_c.y + 0.62, 0.78 * len_mul - ex * hs - 0.2);
+                m.segment(base_p, tip, 0.05, 0.02, 4, rgb(0xe8e0d0));
+            }
+        }
+        _ => {
+            let ear_r = if class == Class::Squirrel { 0.12 } else { 0.1 };
+            for ex in [-0.15f32, 0.15] {
+                let ear = place(ex * hc, head_c.y + 0.24, 0.78 * len_mul - ex * hs);
+                m.cone(ear, ear_r, 0.22, 4, dark);
+            }
+        }
     }
 
-    // tail sweeps out behind (−z)
-    let tb = place(0.0, hind_y + 0.05, -0.78);
-    let ttip = place(p.tail * 0.3, tb.y + 0.2 + p.tail.abs() * 0.25, -0.78 - 0.5);
-    m.segment(tb, ttip, 0.08, 0.04, 5, pelt);
+    // Hawk's wings — a flat swept panel each side, angled with the pitch/bob for a
+    // little lift-and-glide read even standing still
+    if class == Class::Hawk {
+        let lift = 0.15 + p.bob.abs() * 0.6;
+        for side in [-1.0f32, 1.0] {
+            let root = place(side * 0.16, body_y + 0.05, 0.0);
+            let tip = place(side * (0.7 + lift), body_y + 0.1 + lift * 0.3, -0.15);
+            let back = place(side * 0.55, body_y - 0.05, -0.5);
+            m.tri(root, tip, back, shade(pelt, 0.85));
+        }
+    }
+
+    // tail sweeps out behind (−z) — species-specific style
+    let tb = place(0.0, hind_y + 0.05, -0.78 * len_mul);
+    match class {
+        Class::Squirrel => {
+            // big bushy tail, curled up and forward over the back
+            let mid = place(p.tail * 0.15, tb.y + 0.35, -0.9 * len_mul);
+            let tip = place(p.tail * 0.25, tb.y + 0.6, -0.55 * len_mul);
+            m.segment(tb, mid, 0.13, 0.11, 6, pelt);
+            m.segment(mid, tip, 0.11, 0.08, 6, pelt);
+        }
+        Class::Otter => {
+            // long, flat, paddle-shaped
+            let mid = place(p.tail * 0.1, tb.y + 0.05, -1.15 * len_mul);
+            let tip = place(p.tail * 0.15, tb.y + 0.02, -1.5 * len_mul);
+            m.segment(tb, mid, 0.09, 0.09, 5, pelt);
+            m.segment(mid, tip, 0.09, 0.02, 5, pelt);
+        }
+        _ => {
+            let ttip = place(p.tail * 0.3, tb.y + 0.2 + p.tail.abs() * 0.25, -0.78 * len_mul - 0.5);
+            m.segment(tb, ttip, 0.08, 0.04, 5, pelt);
+        }
+    }
 
     // four two-bone legs; swing rotates each leg in its own fore/aft (z–y) plane
     let (lt, ls) = (0.28, 0.28);
-    let hip_lx = [-0.22, 0.22, -0.22, 0.22];
-    let hip_lz = [0.32, 0.32, -0.32, -0.32];
+    let hip_lx = [-0.22 * wid_mul, 0.22 * wid_mul, -0.22 * wid_mul, 0.22 * wid_mul];
+    let hip_lz = [0.32 * len_mul, 0.32 * len_mul, -0.32 * len_mul, -0.32 * len_mul];
+    let leg_dims = |i: usize| leg_scale(class, i, lt, ls);
     for i in 0..4 {
+        let (lt_i, ls_i) = leg_dims(i);
         let sw = p.swing[i];
         let kn = p.knee[i] + p.crouch * 0.4;
         let hip = place(hip_lx[i], body_y, hip_lz[i]);
-        let knee_lz = hip_lz[i] + lt * sw.sin();
-        let knee_y = body_y - lt * sw.cos();
+        let knee_lz = hip_lz[i] + lt_i * sw.sin();
+        let knee_y = body_y - lt_i * sw.cos();
         let knee = place(hip_lx[i], knee_y, knee_lz);
-        let foot_lz = knee_lz + ls * (sw + kn).sin();
-        let foot_y = knee_y - ls * (sw + kn).cos();
+        let foot_lz = knee_lz + ls_i * (sw + kn).sin();
+        let foot_y = knee_y - ls_i * (sw + kn).cos();
         let foot = place(hip_lx[i], foot_y, foot_lz);
         m.segment(hip, knee, 0.09, 0.075, 5, dark);
         m.segment(knee, foot, 0.075, 0.05, 5, dark);
@@ -276,13 +347,67 @@ mod tests {
 
     fn spans(yaw: f32) -> (f32, f32) {
         let mut m = Mesh::new();
-        build(&mut m, v3(0.0, 0.0, 0.0), yaw, &stand());
+        build(&mut m, v3(0.0, 0.0, 0.0), yaw, &stand(), crate::class::Class::Cat);
         let (mut xmin, mut xmax, mut zmin, mut zmax) = (1e9f32, -1e9f32, 1e9f32, -1e9f32);
         for v in &m.verts {
             xmin = xmin.min(v.pos[0]); xmax = xmax.max(v.pos[0]);
             zmin = zmin.min(v.pos[2]); zmax = zmax.max(v.pos[2]);
         }
         (xmax - xmin, zmax - zmin)
+    }
+
+    #[test]
+    fn every_species_has_a_distinct_silhouette() {
+        use crate::class::CLASSES;
+        // each species should produce a mesh with its own vertex count (extra features
+        // like wings/horns/beak, or an extra tail segment, add geometry) and its own
+        // pelt color — a real visual difference, not one rig with a tinted marker.
+        use std::collections::HashSet;
+        let mut counts = HashSet::new();
+        let mut colors = HashSet::new();
+        for c in CLASSES {
+            let mut m = Mesh::new();
+            build(&mut m, v3(0.0, 0.0, 0.0), 0.0, &stand(), c);
+            assert!(!m.verts.is_empty(), "{c:?} should build a non-empty mesh");
+            counts.insert(m.verts.len());
+            colors.insert(c.def().color);
+        }
+        assert_eq!(colors.len(), 6, "every species should have its own pelt color");
+        assert!(counts.len() >= 4, "species with signature features (wings/horns/beak/extra tail) should differ in geometry, got {} distinct vertex counts across 6 species", counts.len());
+    }
+
+    #[test]
+    fn hawk_has_a_wingspan_wider_than_the_base_rig() {
+        // the wings sweep out to the sides much further than any leg or ear does —
+        // check for that extra x-extent rather than raw vertex count (fewer verts
+        // than a two-eared rig is fine; a beak cone is cheaper than two ear cones).
+        fn x_extent(c: crate::class::Class) -> f32 {
+            let mut m = Mesh::new();
+            build(&mut m, v3(0.0, 0.0, 0.0), 0.0, &stand(), c);
+            m.verts.iter().map(|v| v.pos[0].abs()).fold(0.0f32, f32::max)
+        }
+        assert!(x_extent(crate::class::Class::Hawk) > x_extent(crate::class::Class::Cat) + 0.3, "the Hawk's wingspan should reach well beyond the base rig's width");
+    }
+
+    #[test]
+    fn goat_has_horns_rising_above_the_base_rig() {
+        // horns rise noticeably higher off the head than a pair of ears does
+        fn max_head_height(c: crate::class::Class) -> f32 {
+            let mut m = Mesh::new();
+            build(&mut m, v3(0.0, 0.0, 0.0), 0.0, &stand(), c);
+            m.verts.iter().map(|v| v.pos[1]).fold(0.0f32, f32::max)
+        }
+        assert!(max_head_height(crate::class::Class::Goat) > max_head_height(crate::class::Class::Cat) + 0.1, "the Goat's horns should rise well above the base rig's ears");
+    }
+
+    #[test]
+    fn frog_has_notably_longer_hind_legs_for_its_leap() {
+        use crate::class::Class;
+        let (lt, ls) = (0.28, 0.28);
+        assert_eq!(leg_scale(Class::Frog, 0, lt, ls), (lt, ls), "the Frog's fore legs are normal length");
+        let (flt, fls) = leg_scale(Class::Frog, 2, lt, ls);
+        assert!(flt > lt * 1.2 && fls > ls * 1.2, "the Frog's hind legs should be noticeably longer, built for its leap");
+        assert_eq!(leg_scale(Class::Cat, 2, lt, ls), (lt, ls), "only the Frog gets the longer hind legs");
     }
 
     #[test]
