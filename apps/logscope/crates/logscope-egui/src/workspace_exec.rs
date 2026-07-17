@@ -849,6 +849,11 @@ impl AgentRun {
     /// The worker reported an error mid-turn.
     pub fn on_error(&mut self, e: String) -> AgentStep { AgentStep::Finished(Stop::ModelError(e)) }
 
+    /// Take the accumulated reply text (used by the fan's review phase, which reads a completed review
+    /// generation without advancing the agent loop).
+    pub fn take_reply(&mut self) -> String { std::mem::take(&mut self.reply) }
+    pub fn config(&self) -> &AgentConfig { &self.cfg }
+
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
     pub fn verified(&self) -> bool { self.verified }
@@ -929,7 +934,15 @@ pub fn seed_agent_branches(reaction: &str, base_goal: &str, max: usize) -> Vec<S
 /// Per-branch scheduling state within a fan.
 enum BranchState { Ready(String), InFlight, Finished(Stop) }
 
-struct AgentBranch { run: AgentRun, state: BranchState, label: String }
+struct AgentBranch { run: AgentRun, state: BranchState, label: String, verdict: Option<Verdict> }
+
+/// Which pass the fan is in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Phase { Running, Reviewing, Done }
+
+/// What's currently generating on the worker: an agent turn for a branch, or that branch's review.
+#[derive(Clone, Copy)]
+struct InFlight { branch: usize, review: bool }
 
 /// A read-only snapshot of one branch, for the UI to fold/prune on.
 #[derive(Clone, Debug)]
@@ -939,6 +952,8 @@ pub struct BranchSummary {
     pub files: usize,
     pub verified: bool,
     pub finished: bool,
+    pub approved: Option<bool>, // depth-model review verdict (None until reviewed)
+    pub review_notes: String,
     pub root: PathBuf,
 }
 
@@ -953,78 +968,131 @@ pub enum FanStep {
 /// ROUND-ROBIN interleaving: exactly one branch generates at a time, and the scheduler rotates to the next
 /// ready branch on each `Evt::Done`, so all branches make progress turn-by-turn. Each branch edits its own
 /// isolated workspace (the caller passes pre-isolated dirs, one per `seed_agent_branches` goal), so they
-/// never clobber each other; when they all finish you fold/prune to the keeper and `:reapply` that one.
+/// never clobber each other.
 ///
-/// This is the agent form of the fleet's existing chat fan (`:ca`/`:continue-all`): serial through the
-/// worker, conceptually parallel branches, pruned on the convo graph afterward.
+/// Two phases: once every branch FINISHES its agent loop, the fan enters a REVIEW pass — one depth-model
+/// generation per branch over that branch's diff (obtained via the injected `diff_fn`), parsed into an
+/// APPROVE/REVISE `Verdict` — so the final `summaries`/ranking are grounded in a real review, not a
+/// file-count heuristic. When reviews finish, fold/prune to the keeper and `:reapply` that one.
 pub struct AgentFan {
     branches: Vec<AgentBranch>,
     cursor: usize,
-    in_flight: Option<usize>,
+    in_flight: Option<InFlight>,
+    phase: Phase,
+    task: String,
+    cfg: AgentConfig,
+    diff_fn: Box<dyn Fn(&Path) -> String>,
 }
 
 impl AgentFan {
-    /// Build a fan from `(work_dir, task, label)` specs — one isolated workspace per branch. Nothing is
-    /// submitted yet; call `next` to get the first branch to run.
-    pub fn new(specs: Vec<(PathBuf, String, String)>, cfg: &AgentConfig) -> Self {
+    /// Build a fan from `(work_dir, task, label)` specs — one isolated workspace per branch. `diff_fn` yields
+    /// a branch's unified diff for the review pass (in production: `git -C <dir> diff <base>`; in tests: a
+    /// canned string). Nothing is submitted yet; call `next` to get the first branch to run.
+    pub fn new(specs: Vec<(PathBuf, String, String)>, cfg: &AgentConfig, diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
+        let task = specs.first().map(|(_, t, _)| t.clone()).unwrap_or_default();
         let branches = specs.into_iter().map(|(dir, task, label)| {
             let (run, first) = AgentRun::start(dir, &task, cfg.clone());
-            AgentBranch { run, state: BranchState::Ready(first), label }
+            AgentBranch { run, state: BranchState::Ready(first), label, verdict: None }
         }).collect();
-        Self { branches, cursor: 0, in_flight: None }
+        Self { branches, cursor: 0, in_flight: None, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
     }
 
     pub fn len(&self) -> usize { self.branches.len() }
     pub fn is_empty(&self) -> bool { self.branches.is_empty() }
-    pub fn active_branch(&self) -> Option<usize> { self.in_flight }
-    pub fn all_done(&self) -> bool { self.branches.iter().all(|b| matches!(b.state, BranchState::Finished(_))) }
+    pub fn active_branch(&self) -> Option<usize> { self.in_flight.map(|f| f.branch) }
+    pub fn reviewing(&self) -> bool { self.phase == Phase::Reviewing }
+    pub fn all_done(&self) -> bool { self.phase == Phase::Done }
 
-    /// Pick the next READY branch (round-robin from the cursor), mark it in-flight, and return its prompt to
-    /// submit. `AllDone` when no branch is ready and none is in flight.
-    pub fn next(&mut self) -> FanStep {
-        if self.in_flight.is_some() { return FanStep::AllDone; } // caller must wait for the in-flight Done
+    /// Add a branch mid-run (a live reaction seeding another parallel approach). Only during the Running
+    /// phase — once reviewing has begun, the field is closed. The new branch joins the round-robin.
+    pub fn add_branch(&mut self, dir: impl Into<PathBuf>, task: &str, label: &str) -> bool {
+        if self.phase != Phase::Running { return false; }
+        let (run, first) = AgentRun::start(dir, task, self.cfg.clone());
+        self.branches.push(AgentBranch { run, state: BranchState::Ready(first), label: label.to_string(), verdict: None });
+        true
+    }
+
+    fn take_ready(&mut self) -> Option<(usize, String)> {
         let n = self.branches.len();
         for off in 0..n {
             let i = (self.cursor + off) % n;
             if matches!(self.branches[i].state, BranchState::Ready(_)) {
-                let prompt = match std::mem::replace(&mut self.branches[i].state, BranchState::InFlight) {
-                    BranchState::Ready(p) => p,
-                    _ => unreachable!(),
+                let p = match std::mem::replace(&mut self.branches[i].state, BranchState::InFlight) {
+                    BranchState::Ready(p) => p, _ => unreachable!(),
                 };
-                self.in_flight = Some(i);
                 self.cursor = (i + 1) % n;
-                return FanStep::Submit { branch: i, prompt };
+                return Some((i, p));
             }
         }
-        FanStep::AllDone
+        None
     }
 
-    /// Stream a token to whichever branch is in flight.
+    /// Pick the next thing to run: a ready branch's agent turn (Running), or the next unreviewed branch's
+    /// review (Reviewing). Transitions Running→Reviewing→Done as each pass drains.
+    pub fn next(&mut self) -> FanStep {
+        if self.in_flight.is_some() { return FanStep::AllDone; } // caller must wait for the in-flight Done
+        match self.phase {
+            Phase::Running => {
+                if let Some((i, prompt)) = self.take_ready() {
+                    self.in_flight = Some(InFlight { branch: i, review: false });
+                    return FanStep::Submit { branch: i, prompt };
+                }
+                if self.branches.iter().all(|b| matches!(b.state, BranchState::Finished(_))) {
+                    self.phase = Phase::Reviewing;
+                    return self.next();
+                }
+                FanStep::AllDone
+            }
+            Phase::Reviewing => {
+                if let Some(i) = self.branches.iter().position(|b| b.verdict.is_none()) {
+                    let diff = (self.diff_fn)(self.branches[i].run.root());
+                    let prompt = review_prompt(&self.task, &diff);
+                    self.in_flight = Some(InFlight { branch: i, review: true });
+                    return FanStep::Submit { branch: i, prompt };
+                }
+                self.phase = Phase::Done;
+                FanStep::AllDone
+            }
+            Phase::Done => FanStep::AllDone,
+        }
+    }
+
+    /// Stream a token to whichever branch is in flight (agent turn or review).
     pub fn on_token(&mut self, t: &str) {
-        if let Some(i) = self.in_flight { self.branches[i].run.on_token(t); }
+        if let Some(f) = self.in_flight { self.branches[f.branch].run.on_token(t); }
     }
 
-    /// The in-flight branch's turn finished: advance it, then rotate to the next ready branch.
+    /// The in-flight generation finished: advance the branch (agent turn) or record its verdict (review),
+    /// then schedule the next.
     pub fn on_done(&mut self) -> FanStep {
-        if let Some(i) = self.in_flight.take() {
-            match self.branches[i].run.on_done() {
-                AgentStep::Submit(p) => self.branches[i].state = BranchState::Ready(p),
-                AgentStep::Finished(s) => self.branches[i].state = BranchState::Finished(s),
+        if let Some(f) = self.in_flight.take() {
+            if f.review {
+                let text = self.branches[f.branch].run.take_reply();
+                self.branches[f.branch].verdict = Some(parse_verdict(&text));
+            } else {
+                match self.branches[f.branch].run.on_done() {
+                    AgentStep::Submit(p) => self.branches[f.branch].state = BranchState::Ready(p),
+                    AgentStep::Finished(s) => self.branches[f.branch].state = BranchState::Finished(s),
+                }
             }
         }
         self.next()
     }
 
-    /// The in-flight branch errored: finish it, then rotate.
+    /// The in-flight generation errored.
     pub fn on_error(&mut self, e: String) -> FanStep {
-        if let Some(i) = self.in_flight.take() {
-            let _ = self.branches[i].run.on_error(e.clone());
-            self.branches[i].state = BranchState::Finished(Stop::ModelError(e));
+        if let Some(f) = self.in_flight.take() {
+            if f.review {
+                self.branches[f.branch].verdict = Some(Verdict { approve: false, notes: format!("review errored: {e}") });
+            } else {
+                let _ = self.branches[f.branch].run.on_error(e.clone());
+                self.branches[f.branch].state = BranchState::Finished(Stop::ModelError(e));
+            }
         }
         self.next()
     }
 
-    /// Fold: a summary per branch for the prune UI.
+    /// Fold: a summary per branch for the prune UI, carrying the review verdict.
     pub fn summaries(&self) -> Vec<BranchSummary> {
         self.branches.iter().enumerate().map(|(i, b)| BranchSummary {
             index: i,
@@ -1032,8 +1100,17 @@ impl AgentFan {
             files: b.run.events().len(),
             verified: b.run.verified(),
             finished: matches!(b.state, BranchState::Finished(_)),
+            approved: b.verdict.as_ref().map(|v| v.approve),
+            review_notes: b.verdict.as_ref().map(|v| v.notes.clone()).unwrap_or_default(),
             root: b.run.root().to_path_buf(),
         }).collect()
+    }
+
+    /// The suggested keeper: highest by (review-approved, verified, file count). `None` if empty.
+    pub fn best(&self) -> Option<usize> {
+        self.summaries().into_iter()
+            .max_by_key(|b| (b.approved == Some(true), b.verified, b.files))
+            .map(|b| b.index)
     }
 
     /// The workspace root of a branch (for `:reapply`-ing the keeper).
@@ -1202,47 +1279,72 @@ mod tests {
     }
 
     #[test]
-    fn agent_fan_interleaves_branches_and_isolates_workspaces() {
+    fn agent_fan_interleaves_reviews_and_ranks() {
         let base = tmp("fan");
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
         let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        // diff_fn returns a per-branch canned diff (no git needed in the test)
+        let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
             (d0.clone(), "goal A".into(), "anyhow".into()),
             (d1.clone(), "goal B".into(), "thiserror".into()),
-        ], &cfg);
+        ], &cfg, diff_fn);
         assert_eq!(fan.len(), 2);
 
-        // scripted per-branch replies: each writes its own file, then done
-        let replies: [[&str; 2]; 2] = [
+        // Running-phase replies (write a file, then done) and Reviewing-phase verdicts (branch 1 approved).
+        let agent_replies: [[&str; 2]; 2] = [
             ["```tool\n{\"tool\":\"write_file\",\"path\":\"a.rs\",\"contents\":\"//A\\n\"}\n```", "TASK_COMPLETE"],
             ["```tool\n{\"tool\":\"write_file\",\"path\":\"b.rs\",\"contents\":\"//B\\n\"}\n```", "TASK_COMPLETE"],
         ];
-        let mut turn_of = [0usize, 0usize];
+        let review_replies = ["REVISE\nbranch A needs work", "APPROVE\nbranch B looks right"];
+        let mut agent_turn = [0usize, 0usize];
 
         let mut order = Vec::new();
+        let mut reviewed = 0usize;
         let mut step = fan.next();
         while let FanStep::Submit { branch, .. } = step {
-            order.push(branch);
-            let reply = replies[branch][turn_of[branch]];
-            turn_of[branch] += 1;
+            let reply = if fan.reviewing() {
+                let r = review_replies[branch]; reviewed += 1; r
+            } else {
+                order.push(branch);
+                let r = agent_replies[branch][agent_turn[branch]]; agent_turn[branch] += 1; r
+            };
             for ch in reply.chars() { fan.on_token(&ch.to_string()); }
             step = fan.on_done();
         }
         assert_eq!(step, FanStep::AllDone);
-        // round-robin interleave: b0, b1, b0, b1
-        assert_eq!(order, vec![0, 1, 0, 1]);
         assert!(fan.all_done());
-        // isolation: each branch wrote ONLY its own file into its own dir
+        assert_eq!(order, vec![0, 1, 0, 1]); // round-robin agent turns
+        assert_eq!(reviewed, 2);             // one review per branch
+        // isolation held
         assert!(d0.join("a.rs").exists() && !d0.join("b.rs").exists());
         assert!(d1.join("b.rs").exists() && !d1.join("a.rs").exists());
-        // fold: two finished summaries with the right labels
+        // ranking: branch 1 (thiserror) was APPROVEd → it's the suggested keeper
         let s = fan.summaries();
-        assert_eq!(s.len(), 2);
-        assert!(s.iter().all(|b| b.finished && b.files == 1));
-        assert_eq!(s[0].label, "anyhow");
-        assert_eq!(s[1].label, "thiserror");
+        assert_eq!(s[0].approved, Some(false));
+        assert_eq!(s[1].approved, Some(true));
+        assert_eq!(fan.best(), Some(1));
+    }
+
+    #[test]
+    fn agent_fan_add_branch_mid_run() {
+        let base = tmp("fanadd");
+        std::fs::create_dir_all(base.join("b0")).unwrap();
+        std::fs::create_dir_all(base.join("b1")).unwrap();
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
+        // first branch starts running
+        let s0 = fan.next();
+        assert!(matches!(s0, FanStep::Submit { branch: 0, .. }));
+        // a reaction adds a second branch mid-run — it joins the round-robin
+        assert!(fan.add_branch(base.join("b1"), "B", "two"));
+        assert_eq!(fan.len(), 2);
+        for ch in "TASK_COMPLETE".chars() { fan.on_token(&ch.to_string()); }
+        // after branch 0 finishes its (only) turn → done, the fan rotates to the newly-added branch 1
+        let s1 = fan.on_done();
+        assert!(matches!(s1, FanStep::Submit { branch: 1, .. }), "added branch is scheduled");
     }
 
     #[test]
