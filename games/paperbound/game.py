@@ -4495,6 +4495,43 @@ def _sil_body(fam, cx, cy, s, rr):
     if fam == "insect":
         return [(cx - s * 0.5, cy), (cx, cy - s * 0.5), (cx + s * 0.6, cy - s * 0.1),
                 (cx + s * 0.4, cy + s * 0.4), (cx - s * 0.3, cy + s * 0.45)]
+    if fam == "golem":
+        # a hulking stack of slabs: huge shoulders, small head notch, stumpy legs
+        return [(cx - s * 0.9, cy + s * 0.7), (cx - s * 0.95, cy - s * 0.1),
+                (cx - s * 0.55, cy - s * 0.6), (cx - s * 0.2, cy - s * 0.55),
+                (cx - s * 0.15, cy - s * 0.8), (cx + s * 0.15, cy - s * 0.8),
+                (cx + s * 0.2, cy - s * 0.55), (cx + s * 0.55, cy - s * 0.6),
+                (cx + s * 0.95, cy - s * 0.1), (cx + s * 0.9, cy + s * 0.7)]
+    if fam == "monolith":
+        # a leaning standing stone with a chipped crown
+        return [(cx - s * 0.42, cy + s * 0.85), (cx - s * 0.5, cy - s * 0.55),
+                (cx - s * 0.28, cy - s * 0.9), (cx + s * 0.1, cy - s * 0.98),
+                (cx + s * 0.34, cy - s * 0.7), (cx + s * 0.46, cy + s * 0.85)]
+    if fam == "armored":
+        # a low dome of plates with a small snout
+        return [(cx - s * 0.95, cy + s * 0.4), (cx - s * 0.7, cy - s * 0.3),
+                (cx - s * 0.2, cy - s * 0.6), (cx + s * 0.35, cy - s * 0.55),
+                (cx + s * 0.8, cy - s * 0.15), (cx + s * 1.05, cy + s * 0.2),
+                (cx + s * 0.9, cy + s * 0.4)]
+    if fam == "amphibian":
+        # a squat crouch: wide haunches, throat bulge
+        return [(cx - s * 0.85, cy + s * 0.45), (cx - s * 0.9, cy),
+                (cx - s * 0.4, cy - s * 0.45), (cx + s * 0.25, cy - s * 0.5),
+                (cx + s * 0.75, cy - s * 0.1), (cx + s * 0.85, cy + s * 0.3),
+                (cx + s * 0.5, cy + s * 0.5)]
+    if fam == "wisp":
+        # a rising teardrop flame with a curling tail
+        return [(cx - s * 0.15, cy + s * 0.75), (cx - s * 0.45, cy + s * 0.25),
+                (cx - s * 0.35, cy - s * 0.35), (cx, cy - s * 0.85),
+                (cx + s * 0.35, cy - s * 0.3), (cx + s * 0.42, cy + s * 0.3),
+                (cx + s * 0.1, cy + s * 0.7)]
+    if fam == "rabbit":
+        # a sitting silhouette with the ears the whole point
+        return [(cx - s * 0.55, cy + s * 0.55), (cx - s * 0.6, cy),
+                (cx - s * 0.25, cy - s * 0.4), (cx - s * 0.22, cy - s * 1.0),
+                (cx - s * 0.05, cy - s * 0.45), (cx + s * 0.12, cy - s * 1.05),
+                (cx + s * 0.28, cy - s * 0.4), (cx + s * 0.6, cy + s * 0.1),
+                (cx + s * 0.45, cy + s * 0.55)]
     if fam == "figure":
         # a robed biped: head, shoulders, and a hem that flares at the floor
         return [(cx - s * 0.7, cy + s * 0.85), (cx - s * 0.32, cy + s * 0.1),
@@ -4545,6 +4582,45 @@ def make_card_sketch(key, w, h):
     elif fam == "tusker":
         _ink_stroke(surf, [(cx + s * 0.8, cy + s * 0.2), (cx + s * 1.2, cy + s * 0.5)], 4, 3)
         _ink_stroke(surf, [(cx + s * 0.9, cy + s * 0.1), (cx + s * 1.15, cy + s * 0.35)], 6, 2)
+    elif fam == "golem":
+        # slab seams + two deep-set eye pits
+        _ink_stroke(surf, [(cx - s * 0.7, cy), (cx + s * 0.7, cy - s * 0.05)], 51, 2)
+        _ink_stroke(surf, [(cx - s * 0.5, cy + s * 0.35), (cx + s * 0.55, cy + s * 0.3)], 53, 2)
+        for ex in (-0.07, 0.07):
+            pygame.draw.circle(surf, INK_BLACK, (int(cx + s * ex * 2), int(cy - s * 0.68)), 2)
+    elif fam == "monolith":
+        # carved rune notches down the face
+        for i in range(3):
+            _ink_stroke(surf, [(cx - s * 0.15, cy - s * 0.4 + i * s * 0.35),
+                               (cx + s * 0.15, cy - s * 0.32 + i * s * 0.35)], 55 + i, 2)
+    elif fam == "armored":
+        # overlapping plate arcs across the dome
+        for i in range(3):
+            pygame.draw.arc(surf, INK_BLACK,
+                            (int(cx - s * 0.8 + i * s * 0.4), int(cy - s * 0.55),
+                             int(s * 0.8), int(s * 0.9)), 0.4, 2.6, 2)
+    elif fam == "amphibian":
+        # a wide mouth line + a big round eye + splayed toes
+        _ink_stroke(surf, [(cx + s * 0.2, cy - s * 0.1), (cx + s * 0.75, cy - s * 0.05)], 61, 2)
+        pygame.draw.circle(surf, INK_BLACK, (int(cx + s * 0.35), int(cy - s * 0.35)), int(s * 0.1), 2)
+        for i in range(3):
+            _ink_stroke(surf, [(cx - s * 0.5 + i * 8, cy + s * 0.45),
+                               (cx - s * 0.65 + i * 8, cy + s * 0.62)], 63 + i, 1)
+    elif fam == "wisp":
+        # inner flame curl + drifting sparks
+        _ink_stroke(surf, [(cx - s * 0.1, cy + s * 0.4), (cx - s * 0.2, cy - s * 0.1),
+                           (cx + s * 0.05, cy - s * 0.45)], 67, 2)
+        for i in range(3):
+            pygame.draw.circle(surf, INK_BLACK,
+                               (int(cx + s * (0.4 + i * 0.12)), int(cy - s * (0.5 + i * 0.2))), 1)
+    elif fam == "rabbit":
+        # inner-ear lines, an eye, whiskers
+        _ink_stroke(surf, [(cx - s * 0.18, cy - s * 0.5), (cx - s * 0.16, cy - s * 0.9)], 71, 1)
+        _ink_stroke(surf, [(cx + s * 0.16, cy - s * 0.5), (cx + s * 0.18, cy - s * 0.95)], 73, 1)
+        pygame.draw.circle(surf, INK_BLACK, (int(cx + s * 0.18), int(cy - s * 0.18)), 2)
+        for i in range(2):
+            _ink_stroke(surf, [(cx + s * 0.3, cy - s * 0.05 + i * 4),
+                               (cx + s * 0.6, cy - s * 0.12 + i * 6)], 75 + i, 1)
     elif fam == "figure":
         # the wizard outfit: a wide hat brim with a bent tip…
         _ink_stroke(surf, [(cx - s * 0.55, cy - s * 0.62), (cx + s * 0.55, cy - s * 0.62)], 31, 3)
