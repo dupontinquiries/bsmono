@@ -51,6 +51,103 @@ fn icon_power(ui: &mut egui::Ui, power: clawbound_rs::powerup::Power, color: egu
     match power { Power::Speed => icon_paw(ui, color), Power::Shield => icon_pelt(ui, color), Power::Triple => icon_claw(ui, color) }
 }
 
+/// Small vector icons for the 6 classes' passives and ultimates. Same idea as the buff
+/// badges — simple egui shapes standing in for icon art.
+fn icon_passive(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egui::Color32) {
+    use clawbound_rs::class::Class;
+    use egui::{epaint::CircleShape, pos2, Shape, Stroke};
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    let p = ui.painter();
+    match class {
+        Class::Cat => {
+            // Nine Lives — a small sparkle/star
+            for a in 0..4 {
+                let ang = a as f32 * std::f32::consts::FRAC_PI_2 + 0.2;
+                let (dx, dy) = (ang.cos() * 6.0, ang.sin() * 6.0);
+                p.add(Shape::line_segment([c, pos2(c.x + dx, c.y + dy)], Stroke::new(1.8, color)));
+            }
+        }
+        Class::Squirrel => {
+            // Cache — an acorn: a round cap over a pointed body
+            p.add(Shape::Circle(CircleShape::filled(pos2(c.x, c.y - 2.0), 4.5, color)));
+            p.add(Shape::convex_polygon(vec![pos2(c.x - 4.0, c.y + 1.0), pos2(c.x + 4.0, c.y + 1.0), pos2(c.x, c.y + 7.0)], color, Stroke::NONE));
+        }
+        Class::Otter => {
+            // Slipstream — water ripples
+            for (dy, r) in [(-3.0, 6.5), (2.0, 5.0), (6.0, 3.2)] {
+                p.add(Shape::Path(egui::epaint::PathShape::line(
+                    (0..=8).map(|i| { let t = i as f32 / 8.0; pos2(c.x - r + t * 2.0 * r, c.y + dy + (t * std::f32::consts::PI).sin() * 1.6) }).collect(),
+                    Stroke::new(1.6, color))));
+            }
+        }
+        Class::Frog => {
+            // Camouflage — a leaf outline
+            let pts: Vec<_> = (0..=12).map(|i| {
+                let t = i as f32 / 12.0 * std::f32::consts::PI;
+                pos2(c.x + (t.cos()) * 6.0, c.y - 6.0 + t.sin() * 7.0)
+            }).collect();
+            p.add(Shape::Path(egui::epaint::PathShape::closed_line(pts, Stroke::new(1.6, color))));
+        }
+        Class::Goat => {
+            // Sure-Footed — a small mountain peak
+            p.add(Shape::convex_polygon(vec![pos2(c.x - 7.0, c.y + 6.0), pos2(c.x, c.y - 6.0), pos2(c.x + 7.0, c.y + 6.0)], color, Stroke::NONE));
+        }
+        Class::Hawk => {
+            // Keen Eyes — an eye
+            p.add(Shape::Path(egui::epaint::PathShape::closed_line(
+                vec![pos2(c.x - 7.0, c.y), pos2(c.x, c.y - 4.5), pos2(c.x + 7.0, c.y), pos2(c.x, c.y + 4.5)], Stroke::new(1.6, color))));
+            p.add(Shape::Circle(CircleShape::filled(c, 2.0, color)));
+        }
+    }
+}
+fn icon_ultimate(ui: &mut egui::Ui, class: clawbound_rs::class::Class, color: egui::Color32) {
+    use clawbound_rs::class::Class;
+    use egui::{pos2, Shape, Stroke};
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    let c = rect.center();
+    let p = ui.painter();
+    match class {
+        Class::Cat => {
+            // Second Wind — a swirling breath
+            let pts: Vec<_> = (0..=16).map(|i| {
+                let t = i as f32 / 16.0 * std::f32::consts::PI * 1.6;
+                pos2(c.x + t.cos() * (2.0 + t * 1.3), c.y + t.sin() * (2.0 + t * 1.3))
+            }).collect();
+            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.6, color))));
+        }
+        Class::Squirrel => {
+            // Scamper — motion streaks
+            for dx in [-4.0f32, 0.0, 4.0] {
+                p.add(Shape::line_segment([pos2(c.x + dx - 5.0, c.y - 2.0), pos2(c.x + dx + 3.0, c.y - 2.0)], Stroke::new(1.8, color)));
+            }
+        }
+        Class::Otter => {
+            // Dive — a droplet
+            p.add(Shape::convex_polygon(vec![pos2(c.x, c.y - 7.0), pos2(c.x + 5.0, c.y + 3.0), pos2(c.x - 5.0, c.y + 3.0)], color, Stroke::NONE));
+            p.add(Shape::Circle(egui::epaint::CircleShape::filled(pos2(c.x, c.y + 4.0), 3.5, color)));
+        }
+        Class::Frog => {
+            // Bound — an arcing leap trajectory
+            let pts: Vec<_> = (0..=10).map(|i| { let t = i as f32 / 10.0; pos2(c.x - 6.0 + t * 12.0, c.y + 5.0 - (t * std::f32::consts::PI).sin() * 9.0) }).collect();
+            p.add(Shape::Path(egui::epaint::PathShape::line(pts, Stroke::new(1.8, color))));
+        }
+        Class::Goat => {
+            // Charge — a forward chevron burst
+            for off in [0.0f32, 5.0] {
+                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y - 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8, color)));
+                p.add(Shape::line_segment([pos2(c.x - 5.0 + off, c.y + 5.0), pos2(c.x + 2.0 + off, c.y)], Stroke::new(1.8, color)));
+            }
+        }
+        Class::Hawk => {
+            // Stoop — a sharp diving arrow
+            p.add(Shape::line_segment([pos2(c.x - 5.0, c.y - 5.0), pos2(c.x + 5.0, c.y + 5.0)], Stroke::new(2.0, color)));
+            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x - 1.0, c.y + 5.0)], Stroke::new(2.0, color)));
+            p.add(Shape::line_segment([pos2(c.x + 5.0, c.y + 5.0), pos2(c.x + 5.0, c.y - 1.0)], Stroke::new(2.0, color)));
+        }
+    }
+}
+
 #[derive(Default)]
 struct Keys { w: bool, a: bool, s: bool, d: bool, crouch: bool, restart: bool, dodge: bool, leap: bool, ability: bool, mleft: bool, mmiddle: bool, mright: bool }
 impl Keys {
@@ -559,11 +656,11 @@ impl State {
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
-        let (obj_text, prey, caught, escapes, stamina, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb, pv_name, pv_blurb, pv_used) = {
+        let (obj_text, prey, caught, escapes, stamina, cls, cls_name, clans, b_speed, b_shield, staging, outcome, ab_name, ab_ready, ab_cd, ab_blurb, pv_name, pv_blurb, pv_used) = {
             let p = self.prowl.as_ref().unwrap();
             let ab = p.class.ability();
             let pv = p.class.passive();
-            (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class.name(),
+            (p.objective_text(), p.prey_caught, p.times_caught, p.escapes, p.stamina, p.class, p.class.name(),
              p.clan_scores, p.buffs.speed_boosted(), p.buffs.shield, p.on_staging, p.outcome,
              ab.name(), p.ability_ready(), p.ability_cd, ab.blurb(),
              pv.name(), pv.blurb(), p.nine_lives_used)
@@ -621,10 +718,16 @@ impl State {
                         });
                     }
                     let pv_state = if pv_name == "Nine Lives" { if pv_used { " (spent)" } else { " (ready)" } } else { "" };
-                    ui.label(RichText::new(format!("Passive · {pv_name}{pv_state}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
+                    ui.horizontal(|ui| {
+                        icon_passive(ui, cls, Color32::from_rgb(150, 220, 235));
+                        ui.label(RichText::new(format!("Passive · {pv_name}{pv_state}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
+                    });
                     ui.label(RichText::new(pv_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     let (astate, acol) = if ab_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ab_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
-                    ui.label(RichText::new(format!("ULT (Q) · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
+                    ui.horizontal(|ui| {
+                        icon_ultimate(ui, cls, if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol });
+                        ui.label(RichText::new(format!("ULT (Q) · {ab_name}  [{astate}]")).size(13.0).strong().color(if ab_ready { Color32::from_rgb(255, 214, 120) } else { acol }));
+                    });
                     ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
                     if let Some(jh) = &jungle_hint { ui.label(RichText::new(jh).size(13.0).color(Color32::from_rgb(200, 210, 140))); }
@@ -770,10 +873,10 @@ impl State {
 
         let items = self.menu.items();
         let (cursor, open, screen) = (self.menu.cursor, self.menu.open, self.menu.screen);
-        let (s0, s1, period, ptime, outcome, carrying, caps, stuns, cls, b_speed, b_shield, b_triple, cd, overtime) = {
+        let (s0, s1, period, ptime, outcome, carrying, caps, stuns, cls_raw, cls, b_speed, b_shield, b_triple, cd, overtime) = {
             let g = self.capture.as_ref().unwrap();
             let p = &g.mobs[0];
-            (g.score[0], g.score[1], g.period, g.period_t.max(0.0), g.outcome, p.carrying, p.captures, p.stuns, p.class.name(),
+            (g.score[0], g.score[1], g.period, g.period_t.max(0.0), g.outcome, p.carrying, p.captures, p.stuns, p.class, p.class.name(),
              p.buffs.speed_boosted(), p.buffs.shield, p.buffs.triple_active(), p.cd, g.overtime)
         };
         let (cap_move_name, cap_combo_flash, cap_combo_name, ult_name, ult_ready, ult_cd, ult_blurb) = {
@@ -816,7 +919,10 @@ impl State {
                     if cd > 0.0 { ui.label(RichText::new(format!("firecracker {:.1}s", cd)).size(12.0).color(Color32::from_rgb(230, 150, 120))); }
                     else { ui.label(RichText::new("firecracker READY").size(12.0).color(Color32::from_rgb(150, 220, 150))); }
                     let (ustate, ucol) = if ult_ready { ("READY".to_string(), Color32::from_rgb(150, 230, 160)) } else { (format!("{:.0}s", ult_cd.ceil()), Color32::from_rgb(180, 180, 190)) };
-                    ui.label(RichText::new(format!("ULT (Q) · {ult_name}  [{ustate}]")).size(12.0).strong().color(if ult_ready { Color32::from_rgb(255, 214, 120) } else { ucol }));
+                    ui.horizontal(|ui| {
+                        icon_ultimate(ui, cls_raw, if ult_ready { Color32::from_rgb(255, 214, 120) } else { ucol });
+                        ui.label(RichText::new(format!("ULT (Q) · {ult_name}  [{ustate}]")).size(12.0).strong().color(if ult_ready { Color32::from_rgb(255, 214, 120) } else { ucol }));
+                    });
                     ui.label(RichText::new(ult_blurb).size(10.0).italics().color(Color32::from_rgb(150, 150, 165)));
                 });
             });
