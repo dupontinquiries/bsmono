@@ -218,10 +218,20 @@ def apply_rts(rts_module):
         if enabled(pid):
             for mk, m in maps.items():
                 m = copy.deepcopy(m)
-                if "size" in m:
-                    m["size"] = tuple(m["size"])
-                if "spawns" in m:
-                    m["spawns"] = [tuple(s) for s in m["spawns"]]
+                # required geometry: without these a match can't even start —
+                # skip the map loudly rather than shipping a crasher
+                if "size" not in m or "spawns" not in m:
+                    print(f"[expansions] map '{mk}' in pack '{pid}' lacks "
+                          f"size/spawns — skipped")
+                    continue
+                m["size"] = tuple(m["size"])
+                m["spawns"] = [tuple(s) for s in m["spawns"]]
+                # everything else defaults (this exact gap crashed the Watch
+                # button on Dragonspire: the pack shipped no 'nodes')
+                m.setdefault("nodes", 12)
+                m.setdefault("seed", sum(ord(c) for c in mk) * 7717)
+                m.setdefault("name", mk.title())
+                m.setdefault("desc", "")
                 rts_module._MAP_OBJECTS[mk] = list(m.get("objects", []))
                 rts_module._MAP_HIGH[mk] = [tuple(h) for h in m.get("highground", [])]
                 rts_module.MAPS[mk] = m
@@ -320,6 +330,10 @@ def _selftest():
             toggle(pid, on=True)
             apply_rts(stub)
             assert set(pack.get("rts_maps", {})) <= set(stub.MAPS), "pack maps not merged"
+            for mk in pack.get("rts_maps", {}):
+                md = stub.MAPS[mk]
+                for req in ("nodes", "seed", "size", "spawns", "name"):
+                    assert req in md, f"map {mk} missing '{req}' after merge"
             assert set(pack.get("rts_factions", {})) <= set(stub.FACTIONS), \
                 "pack factions not merged"
             toggle(pid, on=False)

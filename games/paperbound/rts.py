@@ -559,7 +559,7 @@ class RTS:
         self.fac = {0: factions[0], 1: factions[1]}
         # point the module aliases at the player faction so the HUD reads right
         global STRUCTURES, UNITS
-        _fb = self.mapdef.get("_factions") or FACTIONS
+        _fb = self._factbook()
         STRUCTURES = _fb[self.fac[0]]["structures"]
         UNITS = _fb[self.fac[0]]["units"]
         # researched upgrades + in-progress research per team
@@ -672,7 +672,9 @@ class RTS:
         self.map_id = map_keys[self.setup_map % len(map_keys)]
         self.mapdef = MAPS[self.map_id]
         global STRUCTURES, UNITS, WORLD_W, WORLD_H
-        fb = self.mapdef.get("_factions") or FACTIONS
+        ov = self.mapdef.get("_factions")
+        self._match_fb = {**FACTIONS, **ov} if ov else FACTIONS
+        fb = self._match_fb
         STRUCTURES = fb[self.fac[0]]["structures"]
         UNITS = fb[self.fac[0]]["units"]
         WORLD_W, WORLD_H = self.mapdef["size"]
@@ -691,9 +693,16 @@ class RTS:
 
     # ── faction catalogue lookups (per team, map-overlay aware) ──
     def _factbook(self):
-        """The faction catalogue for THIS match — the map's overlay set if it has
-        one, else the global FACTIONS."""
-        return self.mapdef.get("_factions") or FACTIONS
+        """The faction catalogue for THIS match: the map's overlay snapshot
+        where it exists, with the global FACTIONS filling any faction the
+        snapshot predates (expansion races are merged after load_data, so
+        overlay maps' snapshots don't know them — without this fallback,
+        drawing one as player or enemy was a KeyError at match start)."""
+        book = getattr(self, "_match_fb", None)
+        if book is not None:
+            return book
+        ov = self.mapdef.get("_factions")
+        return {**FACTIONS, **ov} if ov else FACTIONS
     def sspec(self, team, kind):
         return self._factbook()[self.fac[team]]["structures"][kind]
     def uspec(self, team, kind):
@@ -833,9 +842,11 @@ class RTS:
         # scatter neutral ink nodes, mirrored across the map centre so both
         # spawns get identical resource access (fairness). We place half at
         # random and reflect each through the centre point.
-        rng = random.Random(self.mapdef["seed"])
+        # tolerate sparse pack maps (buildscript ethos): a missing count gets a
+        # sane default instead of a KeyError at match start
+        rng = random.Random(self.mapdef.get("seed", len(self.map_id) * 7717))
         cx, cy = WORLD_W / 2, WORLD_H / 2
-        half = max(1, self.mapdef["nodes"] // 2)
+        half = max(1, self.mapdef.get("nodes", 12) // 2)
         for _ in range(half):
             x = rng.uniform(300, WORLD_W - 300)
             y = rng.uniform(300, WORLD_H - 300)
