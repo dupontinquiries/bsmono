@@ -3067,10 +3067,18 @@ impl Gpu {
         // message that points at the right subsystem (the image pipeline) instead.
         let kind = crate::model_kind::classify(&g);
         // Self-service GGUF introspection (llama.cpp's gguf-dump may not build on the box): dump the tensor
-        // table on request. LOGSCOPE_GGUF_DUMP=1 dumps all; =blk.0. (or any prefix) filters to one layer.
+        // table on request. LOGSCOPE_GGUF_DUMP=1 dumps all to stderr; =blk.0. filters to one layer; a value
+        // containing '/' is treated as a FILE PATH and the full dump is written there (easiest to share).
         if let Ok(v) = std::env::var("LOGSCOPE_GGUF_DUMP") {
-            let prefix = if v == "1" || v.is_empty() { "" } else { v.as_str() };
-            eprintln!("{}", g.dump_tensors(prefix));
+            if v.contains('/') {
+                match std::fs::write(&v, g.dump_tensors("")) {
+                    Ok(()) => eprintln!("wgpu-engine: wrote GGUF tensor dump → {v} ({} tensors)", g.tensors.len()),
+                    Err(e) => eprintln!("wgpu-engine: GGUF dump write to {v} failed: {e}"),
+                }
+            } else {
+                let prefix = if v == "1" || v.is_empty() { "" } else { v.as_str() };
+                eprintln!("{}", g.dump_tensors(prefix));
+            }
         }
         if !kind.is_llm() {
             return Err(format!("not a language model: {}", kind.guidance()));
