@@ -1,0 +1,97 @@
+//! pbedit — headless editor CLI over paperbound's data files, on the
+//! monorepo's shared cli-kit (the same argument grammar as the rest of the
+//! portfolio).
+//!
+//!   pbedit list factions [--file PATH]
+//!   pbedit list maps     [--file PATH]
+//!   pbedit get  court.units.soldier.dmg
+//!   pbedit set  court.units.soldier.dmg 88 [--out PATH]
+//!   pbedit validate [--file PATH]           # incl. every expansion pack
+
+use cli_kit::Cli;
+use paperbound_core::editor::Editor;
+use std::path::{Path, PathBuf};
+
+fn game_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn main() {
+    let cli = Cli::from_env();
+    let file: PathBuf = cli
+        .opt("--file")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| game_dir().join("rts_data.json"));
+    let pos = cli.positionals();
+    match pos.first().copied() {
+        Some("list") => {
+            let ed = Editor::open(&file).unwrap_or_else(|e| die(&e));
+            let what = pos.get(1).copied().unwrap_or("factions");
+            for k in ed.list(what) {
+                println!("{k}");
+            }
+        }
+        Some("get") => {
+            let ed = Editor::open(&file).unwrap_or_else(|e| die(&e));
+            let path = pos.get(1).unwrap_or_else(|| die("get needs a dotted path"));
+            match ed.get(path) {
+                Some(v) => println!("{v}"),
+                None => die(&format!("nothing at '{path}'")),
+            }
+        }
+        Some("set") => {
+            let mut ed = Editor::open(&file).unwrap_or_else(|e| die(&e));
+            let path = pos.get(1).unwrap_or_else(|| die("set needs a dotted path"));
+            let val = pos.get(2).unwrap_or_else(|| die("set needs a value"));
+            match ed.set(path, val) {
+                Ok(old) => {
+                    let out = cli.opt("--out").map(PathBuf::from);
+                    ed.save(out.as_deref()).unwrap_or_else(|e| die(&e));
+                    println!("{path}: {} → {val}", old.map(|o| o.to_string()).unwrap_or("∅".into()));
+                }
+                Err(e) => die(&e),
+            }
+        }
+        Some("validate") => {
+            let mut files = vec![file.clone()];
+            if cli.opt("--file").is_none() {
+                if let Ok(rd) = std::fs::read_dir(game_dir().join("expansions")) {
+                    for e in rd.flatten() {
+                        if e.path().extension().map(|x| x == "json").unwrap_or(false) {
+                            files.push(e.path());
+                        }
+                    }
+                }
+            }
+            let mut total = 0;
+            for f in files {
+                match Editor::open(&f) {
+                    Ok(ed) => {
+                        for finding in ed.validate() {
+                            println!("{}: {finding}", f.file_name().unwrap().to_string_lossy());
+                            total += 1;
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}: unreadable: {e}", f.display());
+                        total += 1;
+                    }
+                }
+            }
+            if total == 0 {
+                println!("✅ all data validates clean");
+            } else {
+                std::process::exit(1);
+            }
+        }
+        _ => {
+            eprintln!("usage: pbedit <list|get|set|validate> … [--file PATH] [--out PATH]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("pbedit: {msg}");
+    std::process::exit(1)
+}

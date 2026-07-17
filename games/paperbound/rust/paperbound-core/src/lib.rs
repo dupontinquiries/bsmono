@@ -12,3 +12,6 @@ pub mod sim;
 pub mod match_sim;
 pub mod render;
 pub mod skirmish;
+pub mod battler;
+pub mod tournament;
+pub mod editor;
