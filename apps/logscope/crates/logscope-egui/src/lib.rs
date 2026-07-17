@@ -110,4 +110,5 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod longterm;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod interject;
 #[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
+#[allow(dead_code)] pub mod workspace_exec; // pure (std-only agent loop over an isolated tmp workspace) → not gui-gated
 #[cfg(feature = "gui")] pub mod tabs;
