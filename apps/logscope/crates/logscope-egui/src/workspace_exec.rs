@@ -365,6 +365,9 @@ pub struct AgentConfig {
     /// of done is only honored if the last verify was green (or verification is off).
     pub gate_done_on_verify: bool,
     pub read_policy: ReadPolicy,
+    /// Doc mode: teach the agent the document-organization convention (front-matter + section tree +
+    /// generated index) so its docs stay organized and, in a fan, merge cleanly across branches.
+    pub doc_mode: bool,
 }
 
 impl Default for AgentConfig {
@@ -375,15 +378,20 @@ impl Default for AgentConfig {
             verify_exts: vec!["rs".into()],
             gate_done_on_verify: true,
             read_policy: ReadPolicy::Full,
+            doc_mode: false,
         }
     }
 }
 
 impl AgentConfig {
+    /// The doc-writing preset: organization convention on, no code-verify (docs don't compile), full reads.
+    pub fn docs() -> Self {
+        Self { verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, doc_mode: true, ..Default::default() }
+    }
     /// The worker preset: surgical reads, no auto-verify (the coordinator verifies the stitched whole),
     /// tighter step budget — for fast parallel spin-off, per the coordinator-mode discussion.
     pub fn worker() -> Self {
-        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Surgical }
+        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Surgical, doc_mode: false }
     }
 }
 
@@ -656,6 +664,7 @@ you. Favor code that compiles over clever code that might not; when you see erro
             if cfg.gate_done_on_verify { format!(" You may only reply {DONE_MARKER} once verification is green.") } else { String::new() },
         )
     };
+    let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
     format!(
 "You are a coding agent working inside an isolated workspace. Complete this task:
 
@@ -686,7 +695,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{verify_note}"
+Emit one or a few tool calls per turn, then wait for results.{verify_note}{doc_note}"
     )
 }
 
@@ -1180,6 +1189,45 @@ pub fn run_local_agent(
     Ok(run_agent_cfg(&mut llm, ws, task, cfg))
 }
 
+// ── doc gathering + merge across fan branches ────────────────────────────────────────────────────
+
+/// Read every `docs/**/*.md` under `root` as `(relative_path, text)`. Skips non-doc files so the merge sees
+/// only documents. Used to gather a fan branch's produced docs for merging.
+pub fn scan_docs(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let docs_root = root.join("docs");
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() { walk(&p, root, out); }
+            else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                if let Ok(text) = std::fs::read_to_string(&p) {
+                    let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().replace('\\', "/");
+                    out.push((rel, text));
+                }
+            }
+        }
+    }
+    walk(&docs_root, root, &mut out);
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Merge the docs produced across several fan branches into one organized tree. `branches` is
+/// `(label, root)` per branch; returns the merge result (unified index + collisions + merged files) plus the
+/// rendered `docs/README.md` index. The caller writes `merged` + the index into the project.
+pub fn merge_branch_docs(branches: &[(String, std::path::PathBuf)], project_title: &str)
+    -> (crate::docorg::MergeResult, String)
+{
+    let bdocs: Vec<crate::docorg::BranchDocs> = branches.iter()
+        .map(|(label, root)| crate::docorg::BranchDocs { branch: label.clone(), docs: scan_docs(root) })
+        .collect();
+    let result = crate::docorg::merge_branches(&bdocs, project_title);
+    let index_md = crate::docorg::render_index_markdown(&result.index, project_title);
+    (result, index_md)
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1291,7 +1339,7 @@ mod tests {
             format!("All set. {DONE_MARKER}"),
         ]};
         // verification off (scripted model, no cargo in the sandbox); tests the plan + loop + files.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -1311,7 +1359,7 @@ mod tests {
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -1360,7 +1408,7 @@ mod tests {
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -1375,6 +1423,34 @@ mod tests {
     }
 
     #[test]
+    fn scan_and_merge_branch_docs_over_real_dirs() {
+        let base = tmp("docmerge");
+        let (r0, r1) = (base.join("b0"), base.join("b1"));
+        std::fs::create_dir_all(r0.join("docs/guide")).unwrap();
+        std::fs::create_dir_all(r1.join("docs/reference")).unwrap();
+        std::fs::write(r0.join("docs/guide/install.md"),
+            "---\ntitle: Install\nsection: guide\norder: 1\nstatus: draft\nsummary: how to install\n---\n# Install\n").unwrap();
+        std::fs::write(r1.join("docs/reference/api.md"),
+            "---\ntitle: API\nsection: reference\norder: 1\nstatus: draft\nsummary: the api\n---\n# API\n").unwrap();
+        // scan finds only the md under docs/
+        assert_eq!(scan_docs(&r0).len(), 1);
+        let (merge, index_md) = merge_branch_docs(&[("guides".into(), r0), ("ref".into(), r1)], "My Docs");
+        assert_eq!(merge.merged.len(), 2);
+        assert!(merge.collisions.is_empty());
+        // index groups guide before reference and links both
+        assert!(index_md.contains("## Guides") && index_md.contains("## Reference"));
+        assert!(index_md.contains("docs/guide/install.md") && index_md.contains("docs/reference/api.md"));
+    }
+
+    #[test]
+    fn doc_mode_prompt_carries_the_convention() {
+        let cfg = AgentConfig::docs();
+        assert!(cfg.doc_mode && cfg.verify_cmd.is_empty());
+        let p = system_prompt("write the docs", &cfg);
+        assert!(p.contains("DOCUMENT ORGANIZATION") && p.contains("front-matter"));
+    }
+
+    #[test]
     fn agent_aborts_a_looping_bad_actor() {
         // a model that emits the SAME write every turn (never progresses) must be cut, not run to the cap.
         let mut ws = Workspace::new(tmp("loopactor"));
@@ -1384,7 +1460,7 @@ mod tests {
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -1394,7 +1470,7 @@ mod tests {
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -1435,7 +1511,7 @@ mod tests {
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full };
+        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
