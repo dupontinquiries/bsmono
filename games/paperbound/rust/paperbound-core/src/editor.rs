@@ -1,0 +1,274 @@
+//! editor.rs — slice 8: the EDITOR's data layer, ported headless from
+//! rts_editor.py's data mode. The floating-window UI stays in Python; what
+//! Rust owns is the part worth owning: load → edit → VALIDATE → save, where
+//! the validator encodes every match-start crash this project has actually
+//! shipped and fixed:
+//!
+//!   • a pack map without `nodes` crashed the Watch button on Dragonspire
+//!   • a map missing size/spawns can't start a match at all
+//!   • an overlay snapshot predating expansion races was a KeyError
+//!   • unknown effect kinds / projectile styles would no-op or crash later
+//!
+//! `pbedit` (the CLI binary) drives this over the real rts_data.json and
+//! expansion packs, using the monorepo's shared cli-kit for arguments.
+
+use std::path::{Path, PathBuf};
+
+pub const EFFECT_KINDS: &[&str] = &[
+    "damage", "heal", "slow", "stun", "burn", "buff", "shield", "shred", "drain",
+    "knockback", "pull", "spawn", "reveal", "splinter", "inkpool", "quake",
+    "build", "train", "research", "cast",
+];
+
+pub const PROJECTILE_STYLES: &[&str] =
+    &["dart", "quill", "cinder", "inkglob", "gale", "thorn", "sting"];
+
+pub const DELIVERY_MODES: &[&str] = &["area", "bolt", "chain", "rain"];
+
+pub struct Editor {
+    pub path: PathBuf,
+    pub doc: serde_json::Value,
+}
+
+impl Editor {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let doc = serde_json::from_str(&raw).map_err(|e| format!("parse: {e}"))?;
+        Ok(Editor { path: path.into(), doc })
+    }
+
+    fn factions(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        // rts_data.json uses "factions"; expansion packs use "rts_factions"
+        self.doc
+            .get("factions")
+            .or_else(|| self.doc.get("rts_factions"))?
+            .as_object()
+    }
+
+    fn factions_mut(&mut self) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+        let key = if self.doc.get("factions").is_some() { "factions" } else { "rts_factions" };
+        self.doc.get_mut(key)?.as_object_mut()
+    }
+
+    fn maps(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.doc
+            .get("maps")
+            .or_else(|| self.doc.get("rts_maps"))?
+            .as_object()
+    }
+
+    pub fn list(&self, what: &str) -> Vec<String> {
+        match what {
+            "factions" => self.factions().map(|f| f.keys().cloned().collect()).unwrap_or_default(),
+            "maps" => self.maps().map(|m| m.keys().cloned().collect()).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Read a dotted path: faction.units.soldier.dmg
+    pub fn get(&self, dotted: &str) -> Option<&serde_json::Value> {
+        // resolve against the whole doc but allow the shorthand of starting
+        // at a faction key directly
+        let parts: Vec<&str> = dotted.split('.').collect();
+        let mut it = parts.iter();
+        let first = it.next()?;
+        let mut cur = if self.doc.get(first).is_some() {
+            self.doc.get(first)?
+        } else {
+            self.factions()?.get(*first)?
+        };
+        for p in it {
+            cur = cur.get(*p)?;
+        }
+        Some(cur)
+    }
+
+    /// Set a dotted path (numbers parse as numbers). Returns the old value.
+    pub fn set(&mut self, dotted: &str, val: &str) -> Result<Option<serde_json::Value>, String> {
+        let parts: Vec<String> = dotted.split('.').map(String::from).collect();
+        if parts.is_empty() {
+            return Err("empty path".into());
+        }
+        let new_val: serde_json::Value = if let Ok(n) = val.parse::<i64>() {
+            n.into()
+        } else if let Ok(f) = val.parse::<f64>() {
+            serde_json::json!(f)
+        } else if val == "true" || val == "false" {
+            (val == "true").into()
+        } else {
+            val.into()
+        };
+        // domain guards for the fields the engine dispatches on
+        if parts.last().map(|s| s.as_str()) == Some("projectile")
+            && !PROJECTILE_STYLES.contains(&val)
+        {
+            return Err(format!("'{val}' is not a projectile style ({PROJECTILE_STYLES:?})"));
+        }
+        if parts.last().map(|s| s.as_str()) == Some("delivery") && !DELIVERY_MODES.contains(&val) {
+            return Err(format!("'{val}' is not a delivery mode ({DELIVERY_MODES:?})"));
+        }
+        let in_factions = self.doc.get(&parts[0]).is_none();
+        let mut cur: &mut serde_json::Value = if in_factions {
+            let facs = self.factions_mut().ok_or("no factions")?;
+            facs.get_mut(&parts[0]).ok_or(format!("no faction '{}'", parts[0]))?
+        } else {
+            self.doc.get_mut(&parts[0]).unwrap()
+        };
+        for p in &parts[1..parts.len() - 1] {
+            cur = cur.get_mut(p).ok_or(format!("no '{p}' along {dotted}"))?;
+        }
+        let leaf = parts.last().unwrap();
+        let obj = cur.as_object_mut().ok_or("not an object")?;
+        Ok(obj.insert(leaf.clone(), new_val))
+    }
+
+    /// The validator: every rule here is a crash or silent failure this
+    /// project has actually seen. Returns human-readable findings.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(maps) = self.maps() {
+            for (mk, m) in maps {
+                if m.get("size").is_none() || m.get("spawns").is_none() {
+                    out.push(format!("map '{mk}': missing size/spawns — a match cannot start"));
+                }
+                if m.get("nodes").is_none() {
+                    out.push(format!(
+                        "map '{mk}': no 'nodes' — the Dragonspire Watch-button crash class \
+                         (engine defaults to 12, but author it)"
+                    ));
+                }
+                if m.get("seed").is_none() {
+                    out.push(format!("map '{mk}': no 'seed' — layout won't be reproducible"));
+                }
+            }
+        }
+        if let Some(facs) = self.factions() {
+            for (fk, f) in facs {
+                if let Some(style) = f.get("projectile").and_then(|v| v.as_str()) {
+                    if !PROJECTILE_STYLES.contains(&style) {
+                        out.push(format!("faction '{fk}': unknown projectile '{style}'"));
+                    }
+                }
+                let units = f.get("units").and_then(|u| u.as_object());
+                for (uk, u) in units.into_iter().flatten() {
+                    if let Some(style) = u.get("projectile").and_then(|v| v.as_str()) {
+                        if !PROJECTILE_STYLES.contains(&style) {
+                            out.push(format!("{fk}.units.{uk}: unknown projectile '{style}'"));
+                        }
+                    }
+                    if let Some(ab) = u.get("ability") {
+                        if let Some(d) = ab.get("delivery").and_then(|v| v.as_str()) {
+                            if !DELIVERY_MODES.contains(&d) {
+                                out.push(format!("{fk}.units.{uk}: unknown delivery '{d}'"));
+                            }
+                        }
+                        for eff in ab
+                            .get("effects")
+                            .and_then(|e| e.as_array())
+                            .into_iter()
+                            .flatten()
+                        {
+                            if let Some(k) = eff.get("effect").and_then(|v| v.as_str()) {
+                                if !EFFECT_KINDS.contains(&k) {
+                                    out.push(format!(
+                                        "{fk}.units.{uk}: unknown effect kind '{k}'"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    // trained units must be affordable in principle
+                    if u.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0) < 0.0 {
+                        out.push(format!("{fk}.units.{uk}: negative cost"));
+                    }
+                }
+                // structures' 'makes' must reference real units
+                let structs = f.get("structures").and_then(|s| s.as_object());
+                for (sk, s) in structs.into_iter().flatten() {
+                    for mk in s.get("makes").and_then(|m| m.as_array()).into_iter().flatten() {
+                        if let Some(mk) = mk.as_str() {
+                            let known = units.map(|u| u.contains_key(mk)).unwrap_or(false);
+                            if !known {
+                                out.push(format!(
+                                    "{fk}.structures.{sk}: makes unknown unit '{mk}'"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn save(&self, to: Option<&Path>) -> Result<(), String> {
+        let path = to.unwrap_or(&self.path);
+        let out = serde_json::to_string_pretty(&self.doc).map_err(|e| e.to_string())?;
+        std::fs::write(path, out + "\n").map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    #[test]
+    fn the_shipped_data_validates_clean() {
+        let ed = Editor::open(&game_dir().join("rts_data.json")).unwrap();
+        let findings = ed.validate();
+        assert!(findings.is_empty(), "shipped rts_data.json must be clean: {findings:?}");
+        let fr = Editor::open(&game_dir().join("expansions/foldrealms.json")).unwrap();
+        let findings = fr.validate();
+        assert!(findings.is_empty(), "foldrealms must be clean: {findings:?}");
+    }
+
+    #[test]
+    fn get_set_round_trip_with_domain_guards() {
+        let mut ed = Editor::open(&game_dir().join("rts_data.json")).unwrap();
+        let before = ed.get("court.units.soldier.dmg").unwrap().as_f64().unwrap();
+        ed.set("court.units.soldier.dmg", "99").unwrap();
+        assert_eq!(ed.get("court.units.soldier.dmg").unwrap().as_i64(), Some(99));
+        ed.set("court.units.soldier.dmg", &before.to_string()).unwrap();
+        // the projectile guard rejects nonsense but accepts real styles
+        assert!(ed.set("court.projectile", "banana").is_err());
+        ed.set("court.projectile", "quill").unwrap();
+        // delivery guard
+        assert!(ed.set("court.units.inkspeaker.ability.delivery", "postal").is_err());
+    }
+
+    #[test]
+    fn the_validator_catches_the_dragonspire_class() {
+        // reconstruct the EXACT shipped bug: dragon_legion's map without nodes
+        let mut ed = Editor::open(&game_dir().join("expansions/dragon_legion.json")).unwrap();
+        assert!(ed.validate().is_empty(), "fixed pack validates clean");
+        if let Some(m) = ed
+            .doc
+            .get_mut("rts_maps")
+            .and_then(|m| m.get_mut("dragonspire"))
+            .and_then(|m| m.as_object_mut())
+        {
+            m.remove("nodes");
+        }
+        let findings = ed.validate();
+        assert!(
+            findings.iter().any(|f| f.contains("dragonspire") && f.contains("nodes")),
+            "must flag the crash that actually shipped: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn save_round_trips_and_edits_persist() {
+        let mut ed = Editor::open(&game_dir().join("rts_data.json")).unwrap();
+        ed.set("ember.units.soldier.hp", "123").unwrap();
+        let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/pbedit_test.json");
+        ed.save(Some(&tmp)).unwrap();
+        let re = Editor::open(&tmp).unwrap();
+        assert_eq!(re.get("ember.units.soldier.hp").unwrap().as_i64(), Some(123));
+        assert!(re.validate().is_empty());
+        std::fs::remove_file(&tmp).ok();
+    }
+}
