@@ -217,8 +217,8 @@ mod engine {
             if let Ok(md) = std::fs::metadata(&cache) {
                 eprintln!("wgpu-engine: int8 resident footprint ≈ {:.2} GiB", md.len() as f64 / (1u64 << 30) as f64);
             }
-            eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
-                t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.h, model.vocab,
+            eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
+                t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
             // first user token runs at steady speed instead of crawling up from ~0.1 tok/s
