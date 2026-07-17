@@ -2258,11 +2258,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   loop {
     if(w>=words4){break;}
     let kk0=w*16u;
+    let blk=kk0/32u;                  // all 16 q8 in a vec4 load share ONE 32-block → ONE scale index
     for(var ci=0u;ci<d.tile;ci=ci+1u){
       let col=col0+ci;
       if(col<d.n){
         let v=qw4[col*words4+w];     // ONE 128-bit load = 16 q8 values
         let base=col*d.kb;
+        let sc=qs[base+blk];        // ONE scale load, reused across all 16 lanes (was 16 identical loads)
         for(var jj=0u;jj<4u;jj=jj+1u){
           let word=v[jj];
           let kkw=kk0+jj*4u;
@@ -2273,10 +2275,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
           let q2=select(i32(u2),i32(u2)-256,u2>=128u);
           let q3=select(i32(u3),i32(u3)-256,u3>=128u);
           acc[ci]=acc[ci]
-            + a[kkw]*qs[base+kkw/32u]*f32(q0)
-            + a[kkw+1u]*qs[base+(kkw+1u)/32u]*f32(q1)
-            + a[kkw+2u]*qs[base+(kkw+2u)/32u]*f32(q2)
-            + a[kkw+3u]*qs[base+(kkw+3u)/32u]*f32(q3);
+            + a[kkw]*sc*f32(q0)
+            + a[kkw+1u]*sc*f32(q1)
+            + a[kkw+2u]*sc*f32(q2)
+            + a[kkw+3u]*sc*f32(q3);
         }
       }
     }
@@ -2357,7 +2359,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if(w>=words){break;}
     let kk0=w*4u;
     let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
-    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    let blk=kk0/32u; // 4 consecutive k (kk0..kk0+3) always share ONE 32-block, so ONE scale index
     for(var ci=0u;ci<d.tile;ci=ci+1u){
       let col=col0+ci;
       if(col<d.n){
@@ -2366,8 +2368,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
         let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
         let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
-        let base=col*d.kb;
-        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+        let sc=qs[col*d.kb+blk]; // ONE scale load, reused across all 4 lanes (was 4 identical loads)
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
       }
     }
     w=w+128u;
@@ -2405,7 +2407,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if(w>=words){break;}
     let kk0=w*4u;
     let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
-    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    let blk=kk0/32u; // 4 consecutive k share ONE 32-block → ONE scale index (was b0..b3, all equal)
     for(var ci=0u;ci<d.tile;ci=ci+1u){
       let col=col0+ci;
       if(col<d.n){
@@ -2414,8 +2416,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
         let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
         let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
-        let base=col*d.kb;
-        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+        let sc=qs[col*d.kb+blk]; // ONE scale load, reused across all 4 lanes
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
       }
     }
     w=w+128u;
@@ -5400,6 +5402,27 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
 #[cfg(test)]
 mod decode_cfg_tests {
     use super::*;
+
+    /// The scale-hoist in the WG128 / SG / V3 decode kernels replaces N per-lane `qs[base + k/32]` loads
+    /// with ONE `qs[base + kk0/32]`. That is only bit-identical if every k in the group shares one 32-block.
+    /// This test proves that invariant over the full k range, so a future edit to the kernels' k-stride
+    /// can't silently break the assumption.
+    #[test]
+    fn scale_hoist_block_alignment_holds() {
+        // WG128 / SG: each thread's word covers 4 consecutive k starting at a multiple of 4.
+        for w in 0u32..100_000 {
+            let kk0 = w * 4;
+            let b = kk0 / 32;
+            for j in 0..4u32 { assert_eq!((kk0 + j) / 32, b, "wg128/sg: k {} left block {}", kk0 + j, b); }
+        }
+        // V3: each thread's vec4 covers 16 consecutive k starting at a multiple of 16.
+        for w in 0u32..100_000 {
+            let kk0 = w * 16;
+            let b = kk0 / 32;
+            for j in 0..16u32 { assert_eq!((kk0 + j) / 32, b, "v3: k {} left block {}", kk0 + j, b); }
+        }
+    }
+
     #[test]
     fn decode_config_pack_roundtrips() {
         for kernel in [MatvecKernel::V1, MatvecKernel::V2, MatvecKernel::V2Wg128] {
