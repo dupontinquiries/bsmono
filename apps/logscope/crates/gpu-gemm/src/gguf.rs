@@ -165,6 +165,38 @@ pub fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// Bytes occupied by `n` elements of the given ggml type (F32/F16/Q4_0).
+/// Human-readable ggml quant type name (for diagnostics / the tensor dump).
+pub fn ggml_type_name(t: u32) -> &'static str {
+    match t {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
+        8 => "Q8_0", 9 => "Q8_1", 10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
+        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S",
+        _ => "?",
+    }
+}
+
+/// Format a GGUF's tensor table for diagnostics — the engine's own `gguf-dump` (llama.cpp's tool needs a
+/// build that may not exist on the box). `prefix` filters (e.g. "blk.0." to see one layer's exact tensor
+/// names + dims + quant type, which is what we need to wire a new architecture like a MoE FFN). Empty
+/// prefix dumps everything.
+impl Gguf {
+    pub fn dump_tensors(&self, prefix: &str) -> String {
+        let mut lines: Vec<String> = self.tensors.iter()
+            .filter(|t| prefix.is_empty() || t.name.starts_with(prefix))
+            .map(|t| {
+                let dims = t.dims.iter().map(|d| d.to_string()).collect::<Vec<_>>().join("×");
+                format!("  {:<40} [{}] {}", t.name, dims, ggml_type_name(t.ggml_type))
+            })
+            .collect();
+        lines.sort();
+        let arch = self.get_str("general.architecture").unwrap_or("?");
+        format!("GGUF tensor dump (arch={arch}, {} tensors{}):\n{}",
+            self.tensors.len(),
+            if prefix.is_empty() { String::new() } else { format!(", prefix '{prefix}'") },
+            lines.join("\n"))
+    }
+}
+
 pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
     match ggml_type {
         0 => Some(n * 4),
@@ -376,6 +408,34 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             Ok(out)
         }
         other => Err(format!("unsupported ggml type {other}")),
+    }
+}
+
+#[cfg(test)]
+mod dump_tests {
+    use super::*;
+    use std::collections::HashMap;
+    #[test]
+    fn dump_filters_and_formats() {
+        let g = Gguf {
+            version: 3,
+            metadata: [("general.architecture".to_string(), Value::Str("qwen3moe".into()))].into_iter().collect::<HashMap<_,_>>(),
+            tensors: vec![
+                TensorInfo { name: "token_embd.weight".into(), dims: vec![2048, 151936], ggml_type: 12, offset: 0 },
+                TensorInfo { name: "blk.0.ffn_gate_inp.weight".into(), dims: vec![2048, 128], ggml_type: 0, offset: 0 },
+                TensorInfo { name: "blk.0.ffn_gate_exps.weight".into(), dims: vec![2048, 768, 128], ggml_type: 12, offset: 0 },
+                TensorInfo { name: "blk.1.ffn_gate_inp.weight".into(), dims: vec![2048, 128], ggml_type: 0, offset: 0 },
+            ],
+            data_offset: 0,
+        };
+        let d = g.dump_tensors("blk.0.");
+        assert!(d.contains("arch=qwen3moe"));
+        assert!(d.contains("blk.0.ffn_gate_inp.weight") && d.contains("2048×128"));
+        assert!(d.contains("blk.0.ffn_gate_exps.weight") && d.contains("2048×768×128") && d.contains("Q4_K"));
+        assert!(!d.contains("blk.1."), "prefix filter excludes other layers");
+        assert!(!d.contains("token_embd"), "prefix filter excludes top-level tensors");
+        // full dump includes everything
+        assert!(g.dump_tensors("").contains("token_embd.weight"));
     }
 }
 
