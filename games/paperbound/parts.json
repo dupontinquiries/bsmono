@@ -1,52 +1,424 @@
 {
-  "parts": {
-    "sail": {
-      "desc": "a tall dorsal fin/sail rising from the back — sail-lizards, ships, ridge-backs",
-      "kind": "poly",
-      "points": [[-0.55, 0.05], [-0.15, -1.05], [0.25, -0.85], [0.5, 0.05]],
-      "raised": true, "thick": 2, "tone_mult": 1.08, "sway": 0.10
-    },
-    "horn": {
-      "desc": "a single curved horn sweeping up and back",
-      "kind": "poly",
-      "points": [[-0.12, 0.0], [0.35, -0.55], [0.75, -0.95], [0.55, -0.5], [0.15, -0.05]],
-      "raised": true, "thick": 1, "tone_mult": 1.35
-    },
-    "claw": {
-      "desc": "a paired forward talon — raptors, crabs, war machines",
-      "kind": "poly",
-      "points": [[0.0, 0.0], [0.55, 0.1], [0.85, 0.45], [0.5, 0.32], [0.1, 0.22]],
-      "pair": true, "thick": 1, "tone_mult": 0.8
-    },
-    "banner": {
-      "desc": "a fluttering pennant on a short staff — standards, war-rigs, heralds",
-      "kind": "poly",
-      "points": [[0.0, 0.1], [0.05, -1.1], [0.85, -0.95], [0.45, -0.75], [0.8, -0.55], [0.08, -0.6]],
-      "raised": true, "thick": 2, "tone_mult": 1.2, "sway": 0.22
-    },
-    "halo": {
-      "desc": "a floating ring above the crown — spirits, saints, constructs",
-      "kind": "lines",
-      "points": [[-0.45, -1.1], [-0.2, -1.28], [0.2, -1.28], [0.45, -1.1], [0.2, -0.95], [-0.2, -0.95], [-0.45, -1.1]],
-      "raised": true, "thick": 2, "tone_mult": 1.5, "sway": 0.06
-    },
-    "plume": {
-      "desc": "an arcing feather spray — headdresses, tails, fountains",
-      "kind": "poly",
-      "points": [[0.0, 0.0], [-0.35, -0.7], [-0.15, -1.0], [0.12, -0.75], [0.4, -0.95], [0.42, -0.55], [0.18, -0.15]],
-      "raised": true, "thick": 1, "tone_mult": 1.15, "sway": 0.16, "flap": 0.12
-    },
-    "plate": {
-      "desc": "an angled armour slab hung on the flank — knights, beetles, siege hulls",
-      "kind": "prism",
-      "points": [[-0.65, -0.3], [0.6, -0.42], [0.72, 0.34], [-0.55, 0.4]],
-      "thick": 1, "tone_mult": 0.85
-    },
-    "fang": {
-      "desc": "a paired down-curving tusk/fang under the head",
-      "kind": "lines",
-      "points": [[0.15, 0.0], [0.32, 0.3], [0.28, 0.55]],
-      "pair": true, "raised": true, "thick": 3, "tone_mult": 1.45
-    }
+ "parts": {
+  "sail": {
+   "desc": "a tall dorsal fin/sail rising from the back \u2014 sail-lizards, ships, ridge-backs",
+   "kind": "poly",
+   "points": [
+    [
+     -0.55,
+     0.05
+    ],
+    [
+     -0.15,
+     -1.05
+    ],
+    [
+     0.25,
+     -0.85
+    ],
+    [
+     0.5,
+     0.05
+    ]
+   ],
+   "raised": true,
+   "thick": 2,
+   "tone_mult": 1.08,
+   "sway": 0.1
+  },
+  "horn": {
+   "desc": "a single curved horn sweeping up and back",
+   "kind": "poly",
+   "points": [
+    [
+     -0.12,
+     0.0
+    ],
+    [
+     0.35,
+     -0.55
+    ],
+    [
+     0.75,
+     -0.95
+    ],
+    [
+     0.55,
+     -0.5
+    ],
+    [
+     0.15,
+     -0.05
+    ]
+   ],
+   "raised": true,
+   "thick": 1,
+   "tone_mult": 1.35
+  },
+  "claw": {
+   "desc": "a paired forward talon \u2014 raptors, crabs, war machines",
+   "kind": "poly",
+   "points": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     0.55,
+     0.1
+    ],
+    [
+     0.85,
+     0.45
+    ],
+    [
+     0.5,
+     0.32
+    ],
+    [
+     0.1,
+     0.22
+    ]
+   ],
+   "pair": true,
+   "thick": 1,
+   "tone_mult": 0.8
+  },
+  "banner": {
+   "desc": "a fluttering pennant on a short staff \u2014 standards, war-rigs, heralds",
+   "kind": "poly",
+   "points": [
+    [
+     0.0,
+     0.1
+    ],
+    [
+     0.05,
+     -1.1
+    ],
+    [
+     0.85,
+     -0.95
+    ],
+    [
+     0.45,
+     -0.75
+    ],
+    [
+     0.8,
+     -0.55
+    ],
+    [
+     0.08,
+     -0.6
+    ]
+   ],
+   "raised": true,
+   "thick": 2,
+   "tone_mult": 1.2,
+   "sway": 0.22
+  },
+  "halo": {
+   "desc": "a floating ring above the crown \u2014 spirits, saints, constructs",
+   "kind": "lines",
+   "points": [
+    [
+     -0.45,
+     -1.1
+    ],
+    [
+     -0.2,
+     -1.28
+    ],
+    [
+     0.2,
+     -1.28
+    ],
+    [
+     0.45,
+     -1.1
+    ],
+    [
+     0.2,
+     -0.95
+    ],
+    [
+     -0.2,
+     -0.95
+    ],
+    [
+     -0.45,
+     -1.1
+    ]
+   ],
+   "raised": true,
+   "thick": 2,
+   "tone_mult": 1.5,
+   "sway": 0.06
+  },
+  "plume": {
+   "desc": "an arcing feather spray \u2014 headdresses, tails, fountains",
+   "kind": "poly",
+   "points": [
+    [
+     0.0,
+     0.0
+    ],
+    [
+     -0.35,
+     -0.7
+    ],
+    [
+     -0.15,
+     -1.0
+    ],
+    [
+     0.12,
+     -0.75
+    ],
+    [
+     0.4,
+     -0.95
+    ],
+    [
+     0.42,
+     -0.55
+    ],
+    [
+     0.18,
+     -0.15
+    ]
+   ],
+   "raised": true,
+   "thick": 1,
+   "tone_mult": 1.15,
+   "sway": 0.16,
+   "flap": 0.12
+  },
+  "plate": {
+   "desc": "an angled armour slab hung on the flank \u2014 knights, beetles, siege hulls",
+   "kind": "prism",
+   "points": [
+    [
+     -0.65,
+     -0.3
+    ],
+    [
+     0.6,
+     -0.42
+    ],
+    [
+     0.72,
+     0.34
+    ],
+    [
+     -0.55,
+     0.4
+    ]
+   ],
+   "thick": 1,
+   "tone_mult": 0.85
+  },
+  "fang": {
+   "desc": "a paired down-curving tusk/fang under the head",
+   "kind": "lines",
+   "points": [
+    [
+     0.15,
+     0.0
+    ],
+    [
+     0.32,
+     0.3
+    ],
+    [
+     0.28,
+     0.55
+    ]
+   ],
+   "pair": true,
+   "raised": true,
+   "thick": 3,
+   "tone_mult": 1.45
+  },
+  "robe": {
+   "desc": "a tapering floor-length robe fold \u2014 wizards, monks, witches; sways as if in a breeze",
+   "kind": "poly",
+   "points": [
+    [
+     -0.5,
+     -0.55
+    ],
+    [
+     0.5,
+     -0.55
+    ],
+    [
+     0.72,
+     0.62
+    ],
+    [
+     0.3,
+     0.55
+    ],
+    [
+     0.0,
+     0.66
+    ],
+    [
+     -0.3,
+     0.55
+    ],
+    [
+     -0.72,
+     0.62
+    ]
+   ],
+   "raised": false,
+   "thick": 2,
+   "tone_mult": 1.0,
+   "sway": 0.12
+  },
+  "wizardhat": {
+   "desc": "a wide brim and a tall bent cone \u2014 THE wizard silhouette",
+   "kind": "poly",
+   "points": [
+    [
+     -0.75,
+     0.28
+    ],
+    [
+     0.75,
+     0.28
+    ],
+    [
+     0.42,
+     0.12
+    ],
+    [
+     0.3,
+     -0.5
+    ],
+    [
+     0.55,
+     -1.05
+    ],
+    [
+     0.05,
+     -0.62
+    ],
+    [
+     -0.18,
+     0.1
+    ],
+    [
+     -0.42,
+     0.12
+    ]
+   ],
+   "raised": true,
+   "thick": 2,
+   "tone_mult": 1.12,
+   "sway": 0.08
+  },
+  "staff": {
+   "desc": "a gnarled carrying staff \u2014 one crooked stroke; tip it with 'halo' or 'orb'",
+   "kind": "lines",
+   "points": [
+    [
+     0.06,
+     0.95
+    ],
+    [
+     -0.02,
+     0.35
+    ],
+    [
+     0.07,
+     -0.3
+    ],
+    [
+     -0.04,
+     -0.75
+    ],
+    [
+     0.12,
+     -0.98
+    ]
+   ],
+   "raised": true,
+   "thick": 3,
+   "tone_mult": 0.72,
+   "sway": 0.1
+  },
+  "sleeve": {
+   "desc": "a hanging bell sleeve fold (paired) \u2014 robed arms mid-gesture",
+   "kind": "poly",
+   "points": [
+    [
+     0.0,
+     -0.5
+    ],
+    [
+     0.6,
+     -0.3
+    ],
+    [
+     0.85,
+     0.35
+    ],
+    [
+     0.5,
+     0.2
+    ],
+    [
+     0.28,
+     0.5
+    ]
+   ],
+   "raised": false,
+   "pair": true,
+   "thick": 2,
+   "tone_mult": 0.88,
+   "sway": 0.16
+  },
+  "hood": {
+   "desc": "a deep peaked hood with the face in shadow \u2014 witches, monks, wardens",
+   "kind": "poly",
+   "points": [
+    [
+     -0.55,
+     0.4
+    ],
+    [
+     -0.6,
+     -0.25
+    ],
+    [
+     -0.1,
+     -0.75
+    ],
+    [
+     0.45,
+     -0.55
+    ],
+    [
+     0.6,
+     0.1
+    ],
+    [
+     0.35,
+     0.45
+    ],
+    [
+     0.0,
+     0.2
+    ]
+   ],
+   "raised": true,
+   "thick": 2,
+   "tone_mult": 0.94,
+   "sway": 0.04
   }
+ }
 }
