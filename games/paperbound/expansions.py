@@ -206,12 +206,14 @@ def _apply_rotation():
 
 
 def apply_rts(rts_module):
-    """Merge enabled packs' RTS maps into a live `rts` module (post load_data).
-    Safe to call every time the RTS scene starts — merges are idempotent and
-    maps from packs toggled off since last time are removed again."""
+    """Merge enabled packs' RTS maps AND factions into a live `rts` module
+    (post load_data). Safe to call every time the RTS scene starts — merges
+    are idempotent and content from packs toggled off since last time is
+    removed again."""
     for pid, pack in _packs.items():
         maps = pack.get("rts_maps") or {}
-        if not maps:
+        facs = pack.get("rts_factions") or {}
+        if not maps and not facs:
             continue
         if enabled(pid):
             for mk, m in maps.items():
@@ -223,12 +225,20 @@ def apply_rts(rts_module):
                 rts_module._MAP_OBJECTS[mk] = list(m.get("objects", []))
                 rts_module._MAP_HIGH[mk] = [tuple(h) for h in m.get("highground", [])]
                 rts_module.MAPS[mk] = m
+            for fk, fac in facs.items():
+                fac = copy.deepcopy(fac)
+                for ck in ("color", "dark"):
+                    if ck in fac:
+                        fac[ck] = tuple(fac[ck])
+                rts_module.FACTIONS[fk] = fac
             _rts_applied.add(pid)
         elif pid in _rts_applied:
             for mk in maps:
                 rts_module.MAPS.pop(mk, None)
                 rts_module._MAP_OBJECTS.pop(mk, None)
                 rts_module._MAP_HIGH.pop(mk, None)
+            for fk in facs:
+                rts_module.FACTIONS.pop(fk, None)
             _rts_applied.discard(pid)
 
 
@@ -303,16 +313,20 @@ def _selftest():
     assert not carddata.in_rotation(keys[0]), "disable did not leave rotation"
     toggle(victim, on=True)
     assert carddata.in_rotation(keys[0]) == _base_rotation[keys[0]], "restore failed"
-    # RTS merge round-trip against a stub module
-    stub = types.SimpleNamespace(MAPS={}, _MAP_OBJECTS={}, _MAP_HIGH={})
+    # RTS merge round-trip against a stub module (maps AND factions)
+    stub = types.SimpleNamespace(MAPS={}, _MAP_OBJECTS={}, _MAP_HIGH={}, FACTIONS={})
     for pid, pack in _packs.items():
-        if pack.get("rts_maps"):
+        if pack.get("rts_maps") or pack.get("rts_factions"):
             toggle(pid, on=True)
             apply_rts(stub)
-            assert set(pack["rts_maps"]) <= set(stub.MAPS), "pack maps not merged"
+            assert set(pack.get("rts_maps", {})) <= set(stub.MAPS), "pack maps not merged"
+            assert set(pack.get("rts_factions", {})) <= set(stub.FACTIONS), \
+                "pack factions not merged"
             toggle(pid, on=False)
             apply_rts(stub)
-            assert not (set(pack["rts_maps"]) & set(stub.MAPS)), "pack maps not removed"
+            assert not (set(pack.get("rts_maps", {})) & set(stub.MAPS)), "pack maps not removed"
+            assert not (set(pack.get("rts_factions", {})) & set(stub.FACTIONS)), \
+                "pack factions not removed"
             toggle(pid, on=True)
     print(f"[expansions] selftest OK — {len(rows)} sets, {len(_packs)} packs")
 
