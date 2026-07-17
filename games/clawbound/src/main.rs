@@ -1012,14 +1012,11 @@ async fn run() {
     });
 
     // ── post pipeline (paper + ink + grain + vignette) ──
-    let post_src = POST_WGSL.replace("TWf", &format!("{:.8}", 1.0 / W as f32))
-        .replace("THf", &format!("{:.8}", 1.0 / H as f32))
-        .replace("WPIX", &format!("{:.1}", W as f32))
-        .replace("HPIX", &format!("{:.1}", H as f32));
+    let post_src = POST_WGSL;
     let post_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(post_src.into()) });
-    let samp = device.create_sampler(&wgpu::SamplerDescriptor { label: None, ..Default::default() });
+    let samp = device.create_sampler(&wgpu::SamplerDescriptor { label: None, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
     let fxbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("fx"), contents: bytemuck::cast_slice(&[nightmare, night, 0.0f32, 0.0f32]), usage: wgpu::BufferUsages::UNIFORM,
+        label: Some("fx"), contents: bytemuck::cast_slice(&[nightmare, night, 0.0f32, 0.0f32, 1.0 / W as f32, 1.0 / H as f32, W as f32, H as f32]), usage: wgpu::BufferUsages::UNIFORM,
     });
     let pbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None, entries: &[
@@ -1124,7 +1121,8 @@ fn bayer4(p: vec2<u32>) -> f32 {
 const POST_WGSL: &str = r#"
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var tex: texture_2d<f32>;
-@group(0) @binding(2) var<uniform> fx: vec4<f32>;   // (nightmare, night, time, 0)
+struct FxUniform { misc: vec4<f32>, screen: vec4<f32> };  // misc=(nightmare,night,time,danger), screen=(texelX,texelY,wpix,hpix)
+@group(0) @binding(2) var<uniform> fx: FxUniform;
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> VO {
   var p = array<vec2<f32>,3>(vec2<f32>(-1.0,-1.0), vec2<f32>(3.0,-1.0), vec2<f32>(-1.0,3.0));
@@ -1145,8 +1143,8 @@ fn bayer4(c: vec2<f32>) -> f32 {
 }
 @fragment fn fs(i: VO) -> @location(0) vec4<f32> {
   let uv = i.uv;
-  let nightmare = fx.x; let night = fx.y; let t = fx.z;
-  let texel = vec2<f32>(TWf, THf);
+  let nightmare = fx.misc.x; let night = fx.misc.y; let t = fx.misc.z;
+  let texel = fx.screen.xy;
   let c = textureSample(tex, samp, uv);
   let dC = c.a;
   let dR = textureSample(tex, samp, uv + vec2<f32>(texel.x, 0.0)).a;
@@ -1154,7 +1152,7 @@ fn bayer4(c: vec2<f32>) -> f32 {
   let dL = textureSample(tex, samp, uv - vec2<f32>(texel.x, 0.0)).a;
   let dU = textureSample(tex, samp, uv - vec2<f32>(0.0, texel.y)).a;
   let edge = clamp((abs(dC-dR)+abs(dC-dD)+abs(dC-dL)+abs(dC-dU)) * 350.0, 0.0, 1.0);
-  let px = uv * vec2<f32>(WPIX, HPIX);
+  let px = uv * fx.screen.zw;
   let paper = 0.94 + 0.06 * h21(floor(px * 0.5));
   let grain = 0.965 + 0.035 * h21(px);
   var col = c.rgb * paper * grain;
@@ -1178,9 +1176,9 @@ fn bayer4(c: vec2<f32>) -> f32 {
     col = col + vec3<f32>(0.06, 0.03, 0.09) * nightmare;                        // faint violet underglow so shapes read
   }
 
-  // ── suspense: a heartbeat that pounds faster and harder as danger (fx.w) rises,
+  // ── suspense: a heartbeat that pounds faster and harder as danger (fx.misc.w) rises,
   //    closing the vignette in on each beat and bleeding the edges red near a catch ──
-  let danger = fx.w;
+  let danger = fx.misc.w;
   let hr = 3.0 + danger * 6.5;
   let beat = pow(max(sin(t * hr), 0.0), 6.0);
   let pulse = danger * (0.35 + 0.65 * beat);

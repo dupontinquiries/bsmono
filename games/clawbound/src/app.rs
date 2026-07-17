@@ -242,6 +242,7 @@ struct State {
     scene_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     ss_on: bool,
+    scene_w: f32, scene_h: f32,   // actual scene texture size (post shader needs this, not the window size, to avoid a moiré at High graphics)
     flick: (f32, f32),
     mleft_prev: bool,
     pbg: wgpu::BindGroup,
@@ -347,12 +348,10 @@ impl State {
         });
 
         // post pipeline (targets the surface)
-        let post_src = crate::POST_WGSL
-            .replace("TWf", &format!("{:.8}", 1.0 / w as f32)).replace("THf", &format!("{:.8}", 1.0 / h as f32))
-            .replace("WPIX", &format!("{:.1}", w as f32)).replace("HPIX", &format!("{:.1}", h as f32));
+        let post_src = crate::POST_WGSL;
         let post_sh = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(post_src.into()) });
-        let samp = device.create_sampler(&wgpu::SamplerDescriptor { label: None, ..Default::default() });
-        let fxbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("fx"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let samp = device.create_sampler(&wgpu::SamplerDescriptor { label: None, mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
+        let fxbuf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("fx"), size: 32, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let pbgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None, entries: &[
                 wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
@@ -380,7 +379,7 @@ impl State {
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
         let menu = clawbound_rs::menu::Menu::new();
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -402,6 +401,7 @@ impl State {
         let th = ((self.config.height as f32 * s) as u32).min(max).max(1);
         let (sv, dv) = make_targets(&self.device, tw, th);
         self.scene_view = sv; self.depth_view = dv;
+        self.scene_w = tw as f32; self.scene_h = th as f32;
         self.ss_on = self.menu.settings.hires;
         self.pbg = self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &self.pbgl, entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Sampler(&self.samp) },
@@ -661,7 +661,7 @@ impl State {
         let grim = ((flash / 1.2).clamp(0.0, 1.0) * 0.8 + if exposed { 0.25 } else { 0.0 }).min(1.0);
         // a shield-soak spares you, so it shows no damage tint
         let fx0 = if shield_flash > 0.0 { 0.0 } else { grim };
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
         self.write_camera(20.0);
 
         let items = self.menu.items();
@@ -879,7 +879,7 @@ impl State {
 
         let stunned = { self.capture.as_ref().unwrap().mobs[0].stunned() };
         let grim = if stunned { 0.4 } else { 0.0 };
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
         self.write_camera(34.0);
 
         let items = self.menu.items();
@@ -1068,7 +1068,7 @@ impl State {
         // death fade reuses the nightmare desaturate/vignette in the post shader
         let death = (self.death_t / 1.6).clamp(0.0, 1.0);
         let grim = nightmare.max(death * 0.9);
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, self.game.danger]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, self.game.danger, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
 
         // third-person orbit positioned from mouse-driven yaw/pitch
         let (sy, cy) = (self.yaw.sin(), self.yaw.cos());
