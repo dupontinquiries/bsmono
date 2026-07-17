@@ -388,6 +388,18 @@ impl State {
         for a in &g.ancestors {
             let gy = world::height_at(a.x, a.z);
             crate::build_ancestor(&mut m, a.x, a.z, gy, self.frame * 0.03 + a.x * 0.05, a.ready(), a.claimed_by);
+            // a claimed tree is a beacon — a faint aura ring, colored by whoever claimed it,
+            // that brightens right as it's about to pulse
+            if let Some(bc) = a.beacon_class {
+                let pulse_phase = 1.0 - (a.pulse_t / clawbound_rs::prowl::BEACON_PULSE).clamp(0.0, 1.0);
+                m.set_op(0.15 + pulse_phase * 0.35);
+                for k in 0..28 {
+                    let ang = k as f32 / 28.0 * std::f32::consts::TAU;
+                    let (rx, rz) = (a.x + ang.cos() * clawbound_rs::prowl::BEACON_RADIUS, a.z + ang.sin() * clawbound_rs::prowl::BEACON_RADIUS);
+                    m.segment(v3(rx, gy, rz), v3(rx, gy + 0.4, rz), 0.15, 0.15, 4, rgb(bc.beacon_buff().color()));
+                }
+                m.set_op(1.0);
+            }
         }
         // power-up pickups — floating coloured markers that bob
         for (px, pz, kind) in &g.pickups {

@@ -7,6 +7,7 @@
 //! Flying classes ignore the terrain entirely. This is the key shared mechanic —
 //! it reads the same `world` heightfield the rest of the engine uses.
 
+use crate::powerup::Power;
 use crate::world;
 
 /// Height above which terrain counts as "mountain" for movement (matches the
@@ -107,6 +108,16 @@ impl Class {
             Class::Frog => Passive::Camouflage,
             Class::Goat => Passive::SureFooted,
             Class::Hawk => Passive::KeenEyes,
+        }
+    }
+
+    /// The aura a claimed ancestor tree pulses to allies nearby, based on whoever claimed
+    /// it — mobile classes plant a Speed beacon, sturdier ones a Shield, "like a beacon"
+    /// keyed to the character chosen, not a fixed slot on the tree.
+    pub fn beacon_buff(self) -> Power {
+        match self {
+            Class::Squirrel | Class::Hawk | Class::Otter => Power::Speed,
+            Class::Cat | Class::Frog | Class::Goat => Power::Shield,
         }
     }
 
@@ -234,5 +245,12 @@ mod tests {
         assert_eq!(seen.len(), 6);
         assert_eq!(Class::Otter.passive(), Passive::Slipstream, "the river king never tires in water");
         assert_eq!(Class::Hawk.passive(), Passive::KeenEyes, "the flyer always senses the hunter");
+    }
+
+    #[test]
+    fn every_class_keys_a_beacon_buff() {
+        for c in CLASSES { let _ = c.beacon_buff(); }   // just needs to not panic / be exhaustive
+        assert_eq!(Class::Squirrel.beacon_buff(), Power::Speed);
+        assert_eq!(Class::Goat.beacon_buff(), Power::Shield);
     }
 }
