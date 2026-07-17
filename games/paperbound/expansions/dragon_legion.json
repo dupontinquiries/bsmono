@@ -1,0 +1,262 @@
+{
+  "id": "dragon_legion",
+  "name": "Dragon Legion",
+  "blurb": "Dragon-mounted cavalry, ancient infantry, and siege engines.",
+  "cards": {
+    "dragonrider": {
+      "id": "dragonrider", "name": "Dragon Rider", "cost": 6, "hp": 980, "dmg": 92,
+      "spd": 52, "rng": 30, "size": 30, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [176, 60, 52], "ability": "molten",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "An elite knight astride a battle dragon, trailing fire.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],    "size": 0.95, "h": 0.4,  "tone": 1.0},
+        {"part": "wing",  "at": [-0.35, -0.25], "size": 1.5, "ang": 0.65, "tone": 0.88},
+        {"part": "wing",  "at": [0.5, -0.2],  "size": 1.4,  "ang": -0.45, "tone": 1.06},
+        {"part": "spine", "at": [0.05, -0.15], "size": 0.8, "ang": 0.0,  "tone": 0.8},
+        {"part": "wedge", "at": [1.05, -0.2], "size": 0.6,  "ang": -0.15, "tone": 1.15},
+        {"part": "tail",  "at": [-1.0, 0.1],  "size": 0.9,  "ang": 0.3,  "tone": 0.82},
+        {"part": "crest", "at": [0.15, -0.55], "size": 0.5, "ang": 0.0,  "tone": 1.25}
+      ]
+    },
+    "wyvernlancer": {
+      "id": "wyvernlancer", "name": "Wyvern Lancer", "cost": 4, "hp": 520, "dmg": 78,
+      "spd": 78, "rng": 26, "size": 24, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [92, 118, 140], "ability": "swiftdive",
+      "rarity": "epic", "rotation": true,
+      "blurb": "Fast aerial cavalry that dives onto stragglers.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],  "size": 0.8,  "h": 0.34, "tone": 1.0},
+        {"part": "wing",  "at": [-0.25, -0.2], "size": 1.2, "ang": 0.7,  "tone": 0.9},
+        {"part": "wing",  "at": [0.4, -0.15], "size": 1.1,  "ang": -0.5, "tone": 1.08},
+        {"part": "wedge", "at": [0.95, -0.1], "size": 0.7,  "ang": -0.05, "tone": 1.12},
+        {"part": "tail",  "at": [-0.9, 0.1],  "size": 0.7,  "ang": 0.35, "tone": 0.85}
+      ]
+    },
+    "stormdrake": {
+      "id": "stormdrake", "name": "Storm Drake", "cost": 5, "hp": 560, "dmg": 46,
+      "spd": 56, "rng": 130, "size": 26, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [72, 108, 190], "ability": "inksplash",
+      "rarity": "epic", "rotation": true,
+      "blurb": "Its crackling breath splashes through packed ranks.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],  "size": 0.85, "h": 0.36, "tone": 1.0},
+        {"part": "wing",  "at": [-0.3, -0.25], "size": 1.3, "ang": 0.6, "tone": 0.86},
+        {"part": "wing",  "at": [0.45, -0.2], "size": 1.25, "ang": -0.4, "tone": 1.1},
+        {"part": "spine", "at": [0.0, -0.2],  "size": 0.7,  "ang": 0.1,  "tone": 1.3},
+        {"part": "wedge", "at": [1.0, -0.15], "size": 0.55, "ang": -0.1, "tone": 1.2},
+        {"part": "tail",  "at": [-0.95, 0.05], "size": 0.8, "ang": 0.3,  "tone": 0.8}
+      ]
+    },
+    "icewyrm": {
+      "id": "icewyrm", "name": "Ice Wyrm", "cost": 5, "hp": 640, "dmg": 44,
+      "spd": 48, "rng": 120, "size": 27, "flying": true, "building": false,
+      "riverhop": false, "count": 1, "paper": [150, 200, 228], "ability": "freeze",
+      "rarity": "epic", "rotation": true,
+      "blurb": "An ancient frost serpent whose breath locks armies in place.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],   "size": 0.9,  "h": 0.32, "tone": 1.0},
+        {"part": "spine", "at": [-0.35, -0.2], "size": 0.65, "ang": 0.15, "tone": 1.2},
+        {"part": "spine", "at": [0.15, -0.25], "size": 0.7,  "ang": -0.05, "tone": 1.25},
+        {"part": "wing",  "at": [0.35, -0.1],  "size": 0.95, "ang": -0.35, "tone": 1.05},
+        {"part": "wing",  "at": [-0.2, -0.1],  "size": 0.95, "ang": 0.45,  "tone": 0.9},
+        {"part": "tail",  "at": [-1.0, 0.1],   "size": 1.0,  "ang": 0.4,  "tone": 0.8},
+        {"part": "wedge", "at": [1.0, -0.1],   "size": 0.5,  "ang": -0.05, "tone": 1.15}
+      ]
+    },
+    "dragoncommander": {
+      "id": "dragoncommander", "name": "Dragon Commander", "cost": 7, "hp": 1150, "dmg": 88,
+      "spd": 42, "rng": 28, "size": 32, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [120, 84, 48], "ability": "beacon",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "A legendary rider whose banner spurs nearby allies onward.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],    "size": 1.0,  "h": 0.5,  "tone": 1.0},
+        {"part": "shell", "at": [0.05, -0.1], "size": 0.7,  "tone": 0.9},
+        {"part": "crest", "at": [0.0, -0.6],  "size": 0.6,  "ang": 0.0, "tone": 1.35},
+        {"part": "leg",   "at": [-0.55, 0.4], "size": 0.45, "h": 0.5},
+        {"part": "leg",   "at": [0.5, 0.4],   "size": 0.45, "h": 0.5},
+        {"part": "spine", "at": [-0.4, -0.45], "size": 0.9, "ang": 0.9, "tone": 1.2}
+      ]
+    },
+    "legionnaires": {
+      "id": "legionnaires", "name": "Imperial Legionnaires", "cost": 4, "hp": 300, "dmg": 42,
+      "spd": 50, "rng": 22, "size": 20, "flying": false, "building": false,
+      "riverhop": false, "count": 3, "paper": [150, 122, 88], "ability": "phalanx",
+      "rarity": "rare", "rotation": true,
+      "blurb": "Disciplined shield-bearers who fight in formation.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],  "size": 0.75, "h": 0.5, "tone": 1.0},
+        {"part": "panel", "at": [-0.3, 0.0], "size": 0.7,  "ang": 0.1, "tone": 0.85},
+        {"part": "wedge", "at": [0.55, -0.2], "size": 0.5, "ang": -0.3, "tone": 1.1},
+        {"part": "leg",   "at": [-0.35, 0.45], "size": 0.35, "h": 0.45},
+        {"part": "leg",   "at": [0.3, 0.45],   "size": 0.35, "h": 0.45}
+      ]
+    },
+    "royalhoplite": {
+      "id": "royalhoplite", "name": "Royal Hoplite", "cost": 4, "hp": 760, "dmg": 70,
+      "spd": 46, "rng": 30, "size": 25, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [80, 96, 168], "ability": "sharp",
+      "rarity": "rare", "rotation": true,
+      "blurb": "An elite spear-warrior with a devastating opening thrust.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],   "size": 0.85, "h": 0.55, "tone": 1.0},
+        {"part": "panel", "at": [-0.35, 0.0], "size": 0.8,  "ang": 0.05, "tone": 0.82},
+        {"part": "spine", "at": [0.55, -0.35], "size": 1.1, "ang": -0.55, "tone": 1.2},
+        {"part": "crest", "at": [0.0, -0.6],   "size": 0.45, "ang": 0.0, "tone": 1.25},
+        {"part": "leg",   "at": [-0.3, 0.45],  "size": 0.4, "h": 0.5},
+        {"part": "leg",   "at": [0.3, 0.45],   "size": 0.4, "h": 0.5}
+      ]
+    },
+    "warelephant": {
+      "id": "warelephant", "name": "War Elephant", "cost": 7, "hp": 1850, "dmg": 120,
+      "spd": 28, "rng": 30, "size": 37, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [124, 104, 88], "ability": "slam",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "A tower-backed colossus that crushes whatever it reaches.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],   "size": 1.15, "h": 0.6, "tone": 1.0},
+        {"part": "shell", "at": [0.0, -0.25], "size": 0.85, "tone": 0.88},
+        {"part": "tusk",  "at": [0.75, 0.1],  "size": 0.55, "ang": -0.2, "tone": 1.3},
+        {"part": "tusk",  "at": [0.7, 0.2],   "size": 0.5,  "ang": -0.35, "tone": 1.25},
+        {"part": "leg",   "at": [-0.65, 0.5], "size": 0.5,  "h": 0.6},
+        {"part": "leg",   "at": [-0.25, 0.5], "size": 0.5,  "h": 0.6},
+        {"part": "leg",   "at": [0.25, 0.5],  "size": 0.5,  "h": 0.6},
+        {"part": "leg",   "at": [0.6, 0.5],   "size": 0.5,  "h": 0.6},
+        {"part": "panel", "at": [-0.05, -0.55], "size": 0.55, "ang": 0.0, "tone": 1.1}
+      ]
+    },
+    "praetorian": {
+      "id": "praetorian", "name": "Praetorian Guard", "cost": 5, "hp": 1050, "dmg": 82,
+      "spd": 42, "rng": 26, "size": 27, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [110, 110, 116], "ability": "armored",
+      "rarity": "epic", "rotation": true,
+      "blurb": "The king's finest — armor folded thick against every blow.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],   "size": 0.9,  "h": 0.55, "tone": 1.0},
+        {"part": "shell", "at": [0.0, -0.05], "size": 0.75, "tone": 0.85},
+        {"part": "panel", "at": [-0.4, 0.0],  "size": 0.75, "ang": 0.08, "tone": 0.8},
+        {"part": "crest", "at": [0.0, -0.55], "size": 0.5,  "ang": 0.0, "tone": 1.2},
+        {"part": "leg",   "at": [-0.3, 0.45], "size": 0.42, "h": 0.5},
+        {"part": "leg",   "at": [0.3, 0.45],  "size": 0.42, "h": 0.5}
+      ]
+    },
+    "templeguardian": {
+      "id": "templeguardian", "name": "Temple Guardian", "cost": 5, "hp": 900, "dmg": 48,
+      "spd": 34, "rng": 26, "size": 28, "flying": false, "building": false,
+      "riverhop": false, "count": 1, "paper": [210, 178, 96], "ability": "radiance",
+      "rarity": "epic", "rotation": true,
+      "blurb": "A holy protector whose presence mends nearby allies.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.05],   "size": 0.95, "h": 0.55, "tone": 1.0},
+        {"part": "orb",   "at": [0.0, -0.5],  "size": 0.4,  "tone": 1.4},
+        {"part": "panel", "at": [-0.35, 0.0], "size": 0.7,  "ang": 0.05, "tone": 0.9},
+        {"part": "panel", "at": [0.35, 0.0],  "size": 0.7,  "ang": -0.05, "tone": 1.05},
+        {"part": "leg",   "at": [-0.3, 0.45], "size": 0.4,  "h": 0.5},
+        {"part": "leg",   "at": [0.3, 0.45],  "size": 0.4,  "h": 0.5}
+      ]
+    },
+    "ballista": {
+      "id": "ballista", "name": "Ballista", "cost": 5, "hp": 620, "dmg": 96,
+      "spd": 0, "rng": 200, "size": 28, "flying": false, "building": true,
+      "riverhop": false, "count": 1, "paper": [130, 100, 70], "ability": "snipe",
+      "rarity": "rare", "rotation": true,
+      "blurb": "A long-arm siege engine built to pin armored targets.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.15],  "size": 1.0, "h": 0.35, "tone": 1.0},
+        {"part": "spine", "at": [0.0, -0.2], "size": 1.2, "ang": -0.15, "tone": 1.15},
+        {"part": "wedge", "at": [-0.5, -0.1], "size": 0.6, "ang": 0.6, "tone": 0.85},
+        {"part": "wedge", "at": [0.5, -0.1],  "size": 0.6, "ang": -0.6, "tone": 0.85},
+        {"part": "leg",   "at": [-0.5, 0.45], "size": 0.4, "h": 0.4},
+        {"part": "leg",   "at": [0.5, 0.45],  "size": 0.4, "h": 0.4}
+      ]
+    },
+    "trebuchet": {
+      "id": "trebuchet", "name": "Trebuchet", "cost": 6, "hp": 780, "dmg": 150,
+      "spd": 0, "rng": 230, "size": 32, "flying": false, "building": true,
+      "riverhop": false, "count": 1, "paper": [116, 88, 60], "ability": "artillery",
+      "rarity": "epic", "rotation": true,
+      "blurb": "Hurls folded boulders clean across the river.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.2],    "size": 1.05, "h": 0.4, "tone": 1.0},
+        {"part": "spine", "at": [-0.1, -0.35], "size": 1.5, "ang": -0.7, "tone": 1.1},
+        {"part": "wedge", "at": [-0.55, 0.0],  "size": 0.7, "ang": 0.5,  "tone": 0.85},
+        {"part": "wedge", "at": [0.55, 0.0],   "size": 0.7, "ang": -0.5, "tone": 0.85},
+        {"part": "orb",   "at": [0.75, -0.75], "size": 0.3, "tone": 0.7},
+        {"part": "leg",   "at": [-0.55, 0.5],  "size": 0.45, "h": 0.4},
+        {"part": "leg",   "at": [0.55, 0.5],   "size": 0.45, "h": 0.4}
+      ]
+    },
+    "siegetower": {
+      "id": "siegetower", "name": "Siege Tower", "cost": 6, "hp": 1250, "dmg": 0,
+      "spd": 0, "rng": 0, "size": 33, "flying": false, "building": true,
+      "riverhop": false, "count": 1, "paper": [140, 112, 84], "ability": "forge",
+      "rarity": "rare", "rotation": true,
+      "blurb": "A rolling barracks that keeps folding fresh legionnaires.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.1],    "size": 1.0,  "h": 0.9, "tone": 1.0},
+        {"part": "panel", "at": [0.0, -0.35], "size": 0.8,  "ang": 0.0, "tone": 0.85},
+        {"part": "panel", "at": [0.0, 0.15],  "size": 0.8,  "ang": 0.0, "tone": 0.92},
+        {"part": "crest", "at": [0.0, -0.85], "size": 0.5,  "ang": 0.0, "tone": 1.2},
+        {"part": "leg",   "at": [-0.45, 0.55], "size": 0.4, "h": 0.35},
+        {"part": "leg",   "at": [0.45, 0.55],  "size": 0.4, "h": 0.35}
+      ]
+    },
+    "dragonroost": {
+      "id": "dragonroost", "name": "Dragon Roost", "cost": 7, "hp": 1050, "dmg": 0,
+      "spd": 0, "rng": 0, "size": 34, "flying": false, "building": true,
+      "riverhop": false, "count": 1, "paper": [150, 62, 54], "ability": "kindle",
+      "rarity": "legendary", "rotation": true,
+      "blurb": "An ancient nesting crag, warm with the next brood.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.15],   "size": 1.1,  "h": 0.6, "tone": 1.0},
+        {"part": "shell", "at": [0.0, -0.15], "size": 0.9,  "tone": 0.85},
+        {"part": "orb",   "at": [-0.25, -0.2], "size": 0.35, "tone": 1.3},
+        {"part": "orb",   "at": [0.2, -0.3],   "size": 0.3,  "tone": 1.35},
+        {"part": "spine", "at": [-0.55, -0.4], "size": 0.7,  "ang": 0.6, "tone": 1.1},
+        {"part": "spine", "at": [0.55, -0.4],  "size": 0.7,  "ang": -0.6, "tone": 1.1}
+      ]
+    },
+    "warbanner": {
+      "id": "warbanner", "name": "War Banner", "cost": 3, "hp": 480, "dmg": 0,
+      "spd": 0, "rng": 0, "size": 24, "flying": false, "building": true,
+      "riverhop": false, "count": 1, "paper": [178, 60, 52], "ability": "beacon",
+      "rarity": "rare", "rotation": true,
+      "blurb": "A standard planted in the field, rallying every fold nearby.",
+      "model": [
+        {"part": "slab",  "at": [0, 0.25],   "size": 0.6, "h": 0.3, "tone": 1.0},
+        {"part": "spine", "at": [0.0, -0.35], "size": 1.4, "ang": 0.0, "tone": 0.8},
+        {"part": "panel", "at": [0.35, -0.75], "size": 0.75, "ang": -0.1, "tone": 1.25},
+        {"part": "crest", "at": [0.0, -1.05],  "size": 0.35, "ang": 0.0, "tone": 1.3}
+      ]
+    }
+  },
+  "rts_maps": {
+    "dragonspire": {
+      "name": "Dragonspire Pass",
+      "size": [4600, 3000],
+      "seed": 771,
+      "desc": "A high mountain pass ringed by roosts. Watch perches command the lanes; deep wells hide in the crags.",
+      "spawns": [[520, 1500], [4080, 1500]],
+      "theme": {
+        "ground": [196, 176, 160], "grid": [182, 162, 146], "ruled": [190, 140, 120],
+        "crease": [168, 148, 132], "accent": [170, 90, 70], "name_tint": [160, 80, 60]
+      },
+      "weather": {"kind": "overcast", "tint": [205, 190, 200], "strength": 0.2},
+      "highground": [[2300, 700, 420], [2300, 2300, 420], [1150, 1500, 300], [3450, 1500, 300]],
+      "objects": [
+        {"kind": "watchtower", "x": 2300, "y": 700,  "r": 46, "sight": 560},
+        {"kind": "watchtower", "x": 2300, "y": 2300, "r": 46, "sight": 560},
+        {"kind": "richnode",   "x": 1150, "y": 1500, "r": 40, "amount": 4200},
+        {"kind": "richnode",   "x": 3450, "y": 1500, "r": 40, "amount": 4200},
+        {"kind": "ruin",       "x": 2050, "y": 1500, "r": 74},
+        {"kind": "ruin",       "x": 2550, "y": 1500, "r": 74},
+        {"kind": "rock",       "x": 1700, "y": 950,  "r": 50, "hp": 650},
+        {"kind": "rock",       "x": 2900, "y": 2050, "r": 50, "hp": 650},
+        {"kind": "relic",      "x": 2300, "y": 1500, "r": 44},
+        {"kind": "decoration", "x": 800,  "y": 700,  "r": 30},
+        {"kind": "decoration", "x": 3800, "y": 2300, "r": 30}
+      ]
+    }
+  }
+}
