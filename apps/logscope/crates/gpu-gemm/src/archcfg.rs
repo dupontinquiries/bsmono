@@ -167,6 +167,25 @@ pub fn moe_tensors(cfg: &ArchConfig, layer: usize) -> Vec<String> {
     v
 }
 
+/// The router gate normalization for this arch: softmax for the Qwen family, sigmoid for Llama4-style gating.
+pub fn route_norm(cfg: &ArchConfig) -> crate::moe::RouteNorm {
+    match cfg.arch {
+        Arch::Llama4 => crate::moe::RouteNorm::Sigmoid,
+        _ => crate::moe::RouteNorm::Softmax,
+    }
+}
+
+/// Build the MoE routing config from an arch + the checkpoint's expert counts (from `dim_keys`). `n_used`
+/// falls back to a sensible default when the metadata omits it.
+pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -> crate::moe::MoeConfig {
+    crate::moe::MoeConfig {
+        n_routed,
+        n_used: if n_used == 0 { 8.min(n_routed.max(1)) } else { n_used },
+        n_shared: if cfg.moe_shared_expert { n_shared.max(1) } else { n_shared },
+        norm: route_norm(cfg),
+    }
+}
+
 /// Per-block bias tensor names — present only when `attn_qkv_bias` (Qwen2). Empty otherwise.
 pub fn qkv_bias_tensors(cfg: &ArchConfig, layer: usize) -> Vec<String> {
     if cfg.attn_qkv_bias {
@@ -244,6 +263,23 @@ mod tests {
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_shexp.weight"));
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_exps.weight"));
         assert!(c.note.contains("NoPE") && c.note.contains("shared expert"));
+    }
+
+    #[test]
+    fn moe_config_maps_arch_to_router() {
+        // Qwen4: softmax gating, no shared expert
+        let q = for_arch("qwen4");
+        let qc = moe_config(&q, 128, 8, 0);
+        assert_eq!(qc.norm, crate::moe::RouteNorm::Softmax);
+        assert_eq!(qc.n_used, 8);
+        assert_eq!(qc.n_shared, 0);
+        // Llama4: sigmoid gating, at least one shared expert
+        let l = for_arch("llama4");
+        let lc = moe_config(&l, 128, 1, 1);
+        assert_eq!(lc.norm, crate::moe::RouteNorm::Sigmoid);
+        assert!(lc.n_shared >= 1, "llama4 forces a shared expert");
+        // n_used defaults when metadata omits it
+        assert_eq!(moe_config(&q, 64, 0, 0).n_used, 8);
     }
 
     #[test]
