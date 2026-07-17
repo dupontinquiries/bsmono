@@ -1033,6 +1033,21 @@ impl AgentFan {
         Self { branches, cursor: 0, in_flight: None, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
     }
 
+    /// Upgrade a single, already-running `AgentRun` into a fan whose FIRST branch IS that run — so a reaction
+    /// during a plain `:agent` run can fork parallel approaches WITHOUT discarding the work in progress. The
+    /// adopted run keeps its context + workspace. `pending` is its queued next prompt if it has one (→ Ready);
+    /// `None` means a generation is in flight for it right now (→ InFlight, and the fan takes over its stream:
+    /// the next `Evt::Done` advances branch 0). Add the reaction's approaches afterward via `add_branch`.
+    pub fn adopt(run: AgentRun, pending: Option<String>, task: &str, label: &str,
+                 cfg: &AgentConfig, diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
+        let (state, in_flight) = match pending {
+            Some(p) => (BranchState::Ready(p), None),
+            None => (BranchState::InFlight, Some(InFlight { branch: 0, review: false })),
+        };
+        let branches = vec![AgentBranch { run, state, label: label.to_string(), verdict: None }];
+        Self { branches, cursor: 0, in_flight, phase: Phase::Running, task: task.to_string(), cfg: cfg.clone(), diff_fn }
+    }
+
     pub fn len(&self) -> usize { self.branches.len() }
     pub fn is_empty(&self) -> bool { self.branches.is_empty() }
     pub fn active_branch(&self) -> Option<usize> { self.in_flight.map(|f| f.branch) }
@@ -1442,6 +1457,28 @@ mod tests {
         // after branch 0 finishes its (only) turn → done, the fan rotates to the newly-added branch 1
         let s1 = fan.on_done();
         assert!(matches!(s1, FanStep::Submit { branch: 1, .. }), "added branch is scheduled");
+    }
+
+    #[test]
+    fn adopt_forks_a_single_run_into_a_fan() {
+        let base = tmp("adopt");
+        std::fs::create_dir_all(base.join("orig")).unwrap();
+        std::fs::create_dir_all(base.join("react")).unwrap();
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        // a single run in progress, with a queued next prompt
+        let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
+        let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
+        assert_eq!(fan.len(), 1);
+        // a reaction adds a parallel approach
+        assert!(fan.add_branch(base.join("react"), "build a thing\n\nAdjustment: use a trait", "reaction 1"));
+        assert_eq!(fan.len(), 2);
+        // branch 0 (the original, preserved) is scheduled first
+        let s0 = fan.next();
+        assert!(matches!(s0, FanStep::Submit { branch: 0, .. }), "the original run's work continues as branch 0");
+        for ch in "TASK_COMPLETE".chars() { fan.on_token(&ch.to_string()); }
+        // then it rotates to the reaction branch
+        let s1 = fan.on_done();
+        assert!(matches!(s1, FanStep::Submit { branch: 1, .. }), "the reaction approach runs as branch 1");
     }
 
     #[test]
