@@ -12,11 +12,11 @@ pub enum Screen { Title, Play, Settings, Keybinds }
 
 /// A bindable in-game action.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Action { Up, Down, Left, Right, Crouch, Dodge, Restart, Menu }
+pub enum Action { Up, Down, Left, Right, Crouch, Dodge, Leap, Ability, Restart, Menu }
 
-pub const ACTIONS: [Action; 8] = [
+pub const ACTIONS: [Action; 10] = [
     Action::Up, Action::Down, Action::Left, Action::Right,
-    Action::Crouch, Action::Dodge, Action::Restart, Action::Menu,
+    Action::Crouch, Action::Dodge, Action::Leap, Action::Ability, Action::Restart, Action::Menu,
 ];
 
 impl Action {
@@ -24,19 +24,20 @@ impl Action {
         match self {
             Action::Up => "Move up", Action::Down => "Move down", Action::Left => "Move left",
             Action::Right => "Move right", Action::Crouch => "Hide / Climb", Action::Dodge => "Dodge roll",
-            Action::Restart => "Restart round", Action::Menu => "Menu",
+            Action::Leap => "Leap", Action::Ability => "Ultimate", Action::Restart => "Restart round", Action::Menu => "Menu",
         }
     }
     fn default_key(self) -> &'static str {
         match self {
             Action::Up => "W", Action::Down => "S", Action::Left => "A", Action::Right => "D",
-            Action::Crouch => "Shift", Action::Dodge => "Space", Action::Restart => "R", Action::Menu => "Esc",
+            Action::Crouch => "Shift", Action::Dodge => "Space", Action::Leap => "F", Action::Ability => "Q",
+            Action::Restart => "R", Action::Menu => "Esc",
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Keybinds { pub keys: [(Action, String); 8] }
+pub struct Keybinds { pub keys: [(Action, String); 10] }
 impl Default for Keybinds {
     fn default() -> Self {
         let mut i = 0;
@@ -83,7 +84,7 @@ impl GameMode {
 
 /// What the app should do when the player commits a menu choice.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum MenuCmd { None, StartSingle(Kind, Mode), StartMode(GameMode, Kind, Class), Multiplayer, Quit, Close }
+pub enum MenuCmd { None, StartSingle(Kind, Mode), StartMode(GameMode, Kind, Class), StartTutorial, Multiplayer, Quit, Close }
 
 pub struct Menu {
     pub open: bool,
@@ -109,7 +110,7 @@ impl Menu {
     /// Menu item labels for the current screen (top-to-bottom).
     pub fn items(&self) -> Vec<String> {
         match self.screen {
-            Screen::Title => vec!["Single Player".into(), "Multiplayer".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
+            Screen::Title => vec!["Single Player".into(), "Multiplayer".into(), "Tutorial".into(), "Settings".into(), "Keybinds".into(), "Quit".into()],
             Screen::Play => vec![
                 format!("Game: {}", self.sel_game.name()),
                 format!("Hunter: {}", self.sel_hunter.params().name),
@@ -186,8 +187,9 @@ impl Menu {
             Screen::Title => match self.cursor {
                 0 => { self.screen = Screen::Play; self.cursor = 0; MenuCmd::None }
                 1 => MenuCmd::Multiplayer,
-                2 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
-                3 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
+                2 => { self.open = false; MenuCmd::StartTutorial }
+                3 => { self.screen = Screen::Settings; self.cursor = 0; MenuCmd::None }
+                4 => { self.screen = Screen::Keybinds; self.cursor = 0; MenuCmd::None }
                 _ => MenuCmd::Quit,
             },
             Screen::Play => match self.cursor {
@@ -232,6 +234,14 @@ mod tests {
         assert_eq!(m.cursor, 0);
         m.up(); assert_eq!(m.cursor, m.len() - 1);  // wraps to bottom
         m.down(); assert_eq!(m.cursor, 0);
+    }
+
+    #[test]
+    fn tutorial_entry_launches_from_the_title_screen() {
+        let mut m = Menu::new();
+        m.cursor = 2;   // Tutorial row
+        assert_eq!(m.activate(), MenuCmd::StartTutorial);
+        assert!(!m.open, "starting the tutorial should close the menu");
     }
 
     #[test]
@@ -281,5 +291,23 @@ mod tests {
         assert_eq!(m.rebinding, Some(Action::Dodge));
         assert!(m.feed_rebind("Q"));
         assert_eq!(m.settings.keybinds.key_for(Action::Dodge), "Q");
+    }
+
+    #[test]
+    fn leap_and_ability_are_independently_bindable() {
+        assert_eq!(ACTIONS.len(), 10, "Leap and Ability should be real, separately-bindable actions");
+        let mut m = Menu::new();
+        m.screen = Screen::Keybinds; m.cursor = 6; // Leap row
+        m.activate();
+        assert_eq!(m.rebinding, Some(Action::Leap));
+        assert!(m.feed_rebind("PageUp"));
+        assert_eq!(m.settings.keybinds.key_for(Action::Leap), "PageUp");
+        m.cursor = 7; // Ability row
+        m.activate();
+        assert_eq!(m.rebinding, Some(Action::Ability));
+        assert!(m.feed_rebind("PageDown"));
+        assert_eq!(m.settings.keybinds.key_for(Action::Ability), "PageDown");
+        // rebinding one action doesn't disturb another
+        assert_eq!(m.settings.keybinds.key_for(Action::Leap), "PageUp");
     }
 }
