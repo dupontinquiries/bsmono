@@ -426,6 +426,15 @@ impl Prowl {
                 continue;   // no claiming while running for its life
             }
 
+            // opportunistic territory: passing near a marker held by someone else, a
+            // rival snaps it to its own clan — no dwelling needed, unlike the player
+            for mk in self.markers.iter_mut() {
+                if mk.held_by != rclan && dist(rx, rz, mk.x, mk.z) < MARKER_R { mk.held_by = rclan; mk.idle = 0.0; mk.dwell = 0.0; }
+            }
+
+            // a convergence draws every clan toward the Rock — the forced close encounter
+            let pulled_to_rock = self.convergence_warning();
+
             // pick the nearest ancestor this clan doesn't already own (ready trees preferred)
             let mut best = (f32::MAX, rclan as usize);
             for (ai, a) in self.ancestors.iter().enumerate() {
@@ -435,7 +444,9 @@ impl Prowl {
             }
             let target = best.1;
             self.rivals[i].target = target;
-            let (tx, tz, tready) = { let a = &self.ancestors[target]; (a.x, a.z, a.ready()) };
+            let (tx, tz, tready) = if pulled_to_rock { (self.rock.0, self.rock.1, false) } else {
+                let a = &self.ancestors[target]; (a.x, a.z, a.ready())
+            };
 
             if dist(rx, rz, tx, tz) > CLAIM_R * 0.75 {
                 let speed = self.rivals[i].class.speed_at(rx, rz) * PROWL_SCALE * self.rivals[i].buffs.move_mult() * 0.95;
@@ -1247,14 +1258,43 @@ mod tests {
     fn dwelling_at_a_rival_held_marker_flips_it_to_the_player() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.hx = 900.0; g.hz = 900.0;
+        for r in g.rivals.iter_mut() { r.x = 900.0; r.z = 900.0; }   // keep rivals from opportunistically re-flipping it
         let idx = g.markers.iter().position(|m| m.held_by != PLAYER_CLAN).expect("some marker should start rival-held");
         let (mx, mz) = (g.markers[idx].x, g.markers[idx].z);
         for _ in 0..((MARKER_CLAIM_TIME + 0.3) * 30.0) as i32 {
             g.x = mx; g.z = mz;
+            for r in g.rivals.iter_mut() { r.x = 900.0; r.z = 900.0; }
             g.set_input(0.0, 0.0, false, false, false);
             g.step(1.0 / 30.0);
         }
         assert_eq!(g.markers[idx].held_by, PLAYER_CLAN, "dwelling long enough should flip the marker to the player");
+    }
+
+    #[test]
+    fn a_passing_rival_snaps_a_player_held_marker_back() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        let rclan = g.rivals[0].clan;
+        g.markers[0].held_by = PLAYER_CLAN; g.markers[0].idle = 0.0;
+        g.rivals[0].x = g.markers[0].x; g.rivals[0].z = g.markers[0].z;
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert_eq!(g.markers[0].held_by, rclan, "a rival passing right by a player-held marker should snap it back");
+    }
+
+    #[test]
+    fn a_convergence_warning_pulls_rivals_toward_the_rock() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        // put a rival far from the Rock and out of range of any ancestor it doesn't own,
+        // so under normal play it wouldn't be heading toward the Rock's coordinates
+        g.rivals[0].x = 200.0; g.rivals[0].z = 200.0;
+        let d0 = dist(g.rivals[0].x, g.rivals[0].z, g.rock.0, g.rock.1);
+        g.convergence_t = CONVERGENCE_WARN - 1.0;   // inside the warning window
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        let d1 = dist(g.rivals[0].x, g.rivals[0].z, g.rock.0, g.rock.1);
+        assert!(d1 < d0, "a convergence warning should pull rivals toward the Rock");
     }
 
     #[test]
