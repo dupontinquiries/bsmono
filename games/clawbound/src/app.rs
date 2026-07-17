@@ -401,6 +401,22 @@ impl State {
                 m.set_op(1.0);
             }
         }
+        // territory markers — small clan-tinted stakes, with a pulsing ring while contested
+        for mk in &g.markers {
+            let gy = world::height_at(mk.x, mk.z);
+            m.segment(v3(mk.x, gy, mk.z), v3(mk.x, gy + 1.6, mk.z), 0.14, 0.06, 6, rgb(clawbound_rs::prowl::clan_color(mk.held_by)));
+            if mk.dwell > 0.0 {
+                let frac = (mk.dwell / clawbound_rs::prowl::MARKER_CLAIM_TIME).clamp(0.0, 1.0);
+                m.set_op(0.5); m.boxx(v3(mk.x, gy + 1.9, mk.z), v3(0.5 * frac, 0.08, 0.5 * frac), rgb(0xffe040)); m.set_op(1.0);
+            }
+        }
+        // the Rock of Nine Lives — the ritual's site
+        {
+            let (rx, rz) = g.rock;
+            let gy = world::height_at(rx, rz);
+            m.boxx(v3(rx, gy + 0.8, rz), v3(1.6, 1.6, 1.6), rgb(0x8a7a9a));
+            if g.convergence_warning() { m.set_op(0.35 + 0.25 * (self.frame * 0.15).sin()); m.segment(v3(rx, gy, rz), v3(rx, gy + 3.0, rz), 2.2, 0.4, 10, rgb(0xc9a6ff)); m.set_op(1.0); }
+        }
         // power-up pickups — floating coloured markers that bob
         for (px, pz, kind) in &g.pickups {
             let gy = world::height_at(*px, *pz) + 1.4 + (self.frame * 0.06 + *px).sin() * 0.2;
@@ -521,6 +537,11 @@ impl State {
         };
         let ((wind_dx, wind_dz), wind_strength) = self.prowl.as_ref().unwrap().wind();
         let yowled = self.prowl.as_ref().unwrap().yowled_t > 0.0;
+        let (sustenance, sick, ritual_p, markers_held, convergence_soon, convergence_result) = {
+            let p = self.prowl.as_ref().unwrap();
+            let held = p.markers.iter().filter(|mk| mk.held_by == 0).count();
+            (p.sustenance, p.sick, p.ritual_progress[0], held, p.convergence_warning(), p.convergence_result)
+        };
         let jungle_hint = {
             let p = self.prowl.as_ref().unwrap();
             p.jungle.iter().filter(|c| {
@@ -553,8 +574,8 @@ impl State {
                         .fill(if stamina > 0.25 { Color32::from_rgb(120, 200, 150) } else { Color32::from_rgb(215, 120, 90) })
                         .text(RichText::new("stamina").size(11.0).color(Color32::WHITE)));
                     let mut buffs = String::new();
-                    if b_speed { buffs.push_str("SPD "); }
-                    if b_shield { buffs.push_str("SHLD "); }
+                    if b_speed { buffs.push_str("PAW "); }
+                    if b_shield { buffs.push_str("PELT "); }
                     if !buffs.is_empty() { ui.label(RichText::new(buffs).size(13.0).strong().color(Color32::from_rgb(120, 200, 255))); }
                     let pv_state = if pv_name == "Nine Lives" { if pv_used { " (spent)" } else { " (ready)" } } else { "" };
                     ui.label(RichText::new(format!("Passive · {pv_name}{pv_state}")).size(12.0).strong().color(Color32::from_rgb(150, 220, 235)));
@@ -565,6 +586,13 @@ impl State {
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
                     if let Some(jh) = &jungle_hint { ui.label(RichText::new(jh).size(13.0).color(Color32::from_rgb(200, 210, 140))); }
                     ui.add_space(3.0);
+                    ui.add(egui::ProgressBar::new(sustenance).desired_width(168.0)
+                        .fill(if sick { Color32::from_rgb(200, 110, 70) } else { Color32::from_rgb(150, 190, 110) })
+                        .text(RichText::new(if sick { "sustenance - SICK" } else { "sustenance" }).size(11.0).color(Color32::WHITE)));
+                    ui.label(RichText::new(format!("Territory {markers_held}/{} · Ritual {:.0}/{:.0}", clawbound_rs::prowl::N_MARKERS, ritual_p, clawbound_rs::prowl::RITUAL_WIN))
+                        .size(12.0).color(Color32::from_rgb(200, 180, 220)));
+                    if convergence_soon { ui.label(RichText::new("* the Rock stirs... a convergence is near").size(12.0).color(Color32::from_rgb(200, 160, 255))); }
+                    if let Some(w) = convergence_result { ui.label(RichText::new(format!("Convergence resolved — {} led the territory", clawbound_rs::prowl::clan_name(w))).size(11.0).italics().color(Color32::from_rgb(180, 200, 220))); }
                     let wind_deg = wind_dx.atan2(wind_dz).to_degrees();
                     ui.label(RichText::new(format!("Wind {:.0}° · {}", wind_deg.rem_euclid(360.0),
                         if wind_strength > 0.9 { "strong" } else if wind_strength > 0.35 { "breezy" } else { "calm" }))
@@ -722,8 +750,8 @@ impl State {
                     ui.label(RichText::new(format!("{cls} - TEAM TAWNY")).size(14.0).strong().color(Color32::from_rgb(255, 160, 110)));
                     ui.label(RichText::new(format!("captures {caps}  -  stuns {stuns}")).size(13.0).color(Color32::from_rgb(210, 215, 225)));
                     let mut pu = String::new();
-                    if b_speed { pu.push_str("SPD "); }
-                    if b_shield { pu.push_str("SHLD "); }
+                    if b_speed { pu.push_str("PAW "); }
+                    if b_shield { pu.push_str("PELT "); }
                     if b_triple { pu.push_str("3X "); }
                     if !pu.is_empty() { ui.label(RichText::new(pu).size(13.0).strong().color(Color32::from_rgb(255, 224, 120))); }
                     if cd > 0.0 { ui.label(RichText::new(format!("firecracker {:.1}s", cd)).size(12.0).color(Color32::from_rgb(230, 150, 120))); }
