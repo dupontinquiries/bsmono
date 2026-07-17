@@ -2220,6 +2220,8 @@ class RTS:
             ex = sx - math.cos(ang) * ln; ey = sy - math.sin(ang) * ln
             style = pr.get("style", "dart")
             z = self.zoom
+            if style == "cinder" and not hasattr(self, "_smoke_cache"):
+                self._smoke_cache = {}
             if style == "quill":
                 # a fletched court quill: shaft, nib, and two feather barbs
                 pygame.draw.line(screen, (238, 230, 210), (ex, ey), (sx, sy),
@@ -2232,9 +2234,12 @@ class RTS:
                                    max(1, int(1.5 * z)))
             elif style == "cinder":
                 # a tumbling ember fleck with a smoke smudge behind it
-                sm = pygame.Surface((int(10 * z) + 2,) * 2, pygame.SRCALPHA)
-                pygame.draw.circle(sm, (60, 50, 46, 70), (sm.get_width() // 2,) * 2,
-                                   sm.get_width() // 2)
+                ssz = int(10 * z) + 2
+                sm = self._smoke_cache.get(ssz)
+                if sm is None:
+                    sm = pygame.Surface((ssz, ssz), pygame.SRCALPHA)
+                    pygame.draw.circle(sm, (60, 50, 46, 70), (ssz // 2,) * 2, ssz // 2)
+                    self._smoke_cache[ssz] = sm
                 screen.blit(sm, (int(ex - 5 * z), int(ey - 5 * z)))
                 flick = 1 + 0.4 * math.sin(tnow * 40 + pr["x"])
                 pygame.draw.circle(screen, (250, 160, 60), (int(sx), int(sy)),
@@ -3422,7 +3427,8 @@ class RTS:
         if self.phase == "setup":
             self._draw_setup(screen)
             return
-        screen.fill(tuple(self.theme["ground"]))
+        screen.fill(tuple(self.theme["ground"]),
+                    pygame.Rect(0, self.H - 118, self.W, 118))
         self._draw_grid(screen)
         self._draw_highground(screen)
         self._draw_pools(screen)
@@ -3450,10 +3456,6 @@ class RTS:
         # fog overlay (drawn over the world, under the HUD)
         if self.fog_on:
             self._draw_fog(screen)
-        # soft paper vignette around the play area
-        vg = getattr(self, "_vignette", None)
-        if vg is not None:
-            screen.blit(vg, (0, 0))
         self._draw_spells(screen)
         self._draw_particles(screen)
         self._draw_projectiles(screen)
@@ -3462,7 +3464,7 @@ class RTS:
         self._draw_weather(screen)
         if self.cast_mode:
             self._draw_cast_ghost(screen)
-        self._draw_vignette(screen)
+        # (vignette now rides the weather layer — one blit for both)
         # waypoint paths for selected units (shift-queued orders)
         for u in self._sel_units():
             if u.waypoints:
@@ -3884,13 +3886,35 @@ class RTS:
                 a = 10 + i * 8
                 pygame.draw.rect(ov, (20, 22, 40, a),
                                  (i * 4, i * 4, self.W - i * 8, self.H - 118 - i * 8), 3)
+        # bake the paper vignette into the same layer: one full-screen alpha
+        # blit instead of two every frame (the frame darkening now sits over
+        # particles too, which reads as MORE physical, not less). This is the
+        # STRONG framing vignette that _draw_vignette used to blit — not the
+        # subtle paper-tile one, which stays retired.
+        self._stamp_vignette(ov)
         self._weather_ov = ov
 
+    def _stamp_vignette(self, ov):
+        """Draw the strong framing vignette DIRECTLY into an overlay surface.
+        (Blitting an SRCALPHA vignette onto an SRCALPHA overlay silently keeps
+        the overlay's near-zero alpha — the classic compositing pitfall — so
+        the rings are drawn in, which writes their alpha for real.)"""
+        edge = 90
+        for i in range(edge):
+            a = int(70 * (1 - i / edge) ** 2)
+            pygame.draw.rect(ov, (20, 16, 12, a),
+                             (i, i, self.W - 2 * i, (self.H - 118) - 2 * i), 1)
+
     def _draw_weather(self, screen):
-        """Blit the lighting grade + animated precipitation over the world."""
+        """Blit the lighting grade + animated precipitation over the world.
+        The paper vignette rides this same layer; weatherless maps get a
+        vignette-only overlay so the frame never disappears."""
         ov = getattr(self, "_weather_ov", None)
-        if ov is not None:
-            screen.blit(ov, (0, 0))
+        if ov is None:
+            ov = pygame.Surface((self.W, self.H - 118), pygame.SRCALPHA)
+            self._stamp_vignette(ov)
+            self._weather_ov = ov
+        screen.blit(ov, (0, 0))
         w = self.weather; tnow = getattr(self, "_anim_t", 0.0)
         if w["kind"] == "storm":
             for dp in self.wdrops:
@@ -3936,10 +3960,28 @@ class RTS:
                              (i * 3, i * 3, self.W - i * 6, self.H - 118 - i * 6), 2)
 
     def _draw_grid(self, screen):
-        """Themed paper terrain: tiled fibre texture, decorative ink stains, faint
-        ruled lines (notebook feel), a wider grid, and long fold-creases."""
+        """Themed paper terrain, drawn through a cache: the full ground layer
+        (fibre tiles, valley bands, stains, ruled lines, grid, creases) is
+        rendered once per camera position and re-blitted while the camera
+        holds still — which is exactly when battles rage and every ms counts.
+        Panning invalidates the key and pays what the old per-frame path paid."""
+        hcut = self.H - 118
+        key = (int(self.cam_x * self.zoom), int(self.cam_y * self.zoom),
+               int(self.zoom * 1000), id(self.theme), len(self.stains))
+        cached = getattr(self, "_ground_cache", None)
+        if cached is not None and cached[0] == key:
+            screen.blit(cached[1], (0, 0))
+            return
+        gsurf = pygame.Surface((self.W, hcut))
+        self._render_ground(gsurf)
+        self._ground_cache = (key, gsurf)
+        screen.blit(gsurf, (0, 0))
+
+    def _render_ground(self, screen):
+        """The actual ground painting (see _draw_grid for the cache)."""
         th = self.theme
         hcut = self.H - 118
+        screen.fill(tuple(th["ground"]))
         # tile the pre-rendered paper texture, offset by the camera
         tile = getattr(self, "_paper_tile", None)
         if tile is not None:
@@ -4033,9 +4075,12 @@ class RTS:
                         ba = int(200 * (1 - ph))
                         bx = sx + math.sin((ph + b) * 5 + n.x) * pool * 0.35
                         by = sy + pool * ISO * 0.4 - ph * pool * 0.9
-                        bub = pygame.Surface((6, 6), pygame.SRCALPHA)
-                        pygame.draw.circle(bub, (150, 138, 210, ba), (3, 3), max(1, int(pool * 0.12)))
-                        screen.blit(bub, (int(bx - 3), int(by - 3)))
+                        # direct draw — an unblended dot reads the same at
+                        # this size and saves a Surface per bubble per frame
+                        if ba > 60:
+                            pygame.draw.circle(screen, (150, 138, 210),
+                                               (int(bx), int(by)),
+                                               max(1, int(pool * 0.12)))
 
     def _update_fog(self, force=False):
         """Recompute the player's vision: mark cells visible within sight radius
@@ -4652,6 +4697,19 @@ class RTS:
             # fallback: a shrinking faded diamond
             pygame.draw.polygon(screen, fade, [(sx, sy - r), (sx + r, sy), (sx, sy + r), (sx - r, sy)])
 
+    def _shadow_sprite(self, r):
+        """A soft elliptical unit shadow, cached by radius — combat draws
+        dozens per frame and they never change."""
+        cache = getattr(self, "_shadow_cache", None)
+        if cache is None:
+            cache = self._shadow_cache = {}
+        s = cache.get(r)
+        if s is None:
+            s = pygame.Surface((r * 2 + 6, r + 4), pygame.SRCALPHA)
+            pygame.draw.ellipse(s, (40, 34, 26, 90), (0, 0, r * 2 + 6, r + 4))
+            cache[r] = s
+        return s
+
     def _draw_unit(self, screen, u):
         sx, sy = self.wpos(u.x, u.y)
         if not (-30 < sx < self.W + 30 and -30 < sy < self.H + 30):
@@ -4667,8 +4725,7 @@ class RTS:
         else:
             unfold = 1.0
         # soft, scaled ground shadow (alpha ellipse)
-        shs = pygame.Surface((r * 2 + 6, r + 4), pygame.SRCALPHA)
-        pygame.draw.ellipse(shs, (40, 34, 26, 90), (0, 0, r * 2 + 6, r + 4))
+        shs = self._shadow_sprite(r)
         screen.blit(shs, (int(sx - r - 3), int(sy + r * 0.35)))
         drew = False
         # ── origami model: if the host game handed us its renderer, draw the
@@ -4697,8 +4754,10 @@ class RTS:
         if u.carrying > 0:
             # a glowing ink drop bobbing above a laden worker
             gy = int(sy - r - 4 + math.sin(getattr(self, "_anim_t", 0) * 5 + u.uid) * 2)
-            gl = pygame.Surface((10, 10), pygame.SRCALPHA)
-            pygame.draw.circle(gl, (150, 130, 220, 120), (5, 5), 5)
+            gl = getattr(self, "_ink_glow", None)
+            if gl is None:
+                gl = self._ink_glow = pygame.Surface((10, 10), pygame.SRCALPHA)
+                pygame.draw.circle(gl, (150, 130, 220, 120), (5, 5), 5)
             screen.blit(gl, (int(sx - 5), gy - 5))
             pygame.draw.circle(screen, (120, 108, 190), (int(sx), gy), 3)
             pygame.draw.circle(screen, (180, 168, 235), (int(sx - 1), gy - 1), 1)
