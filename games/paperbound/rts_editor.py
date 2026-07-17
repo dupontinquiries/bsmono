@@ -292,6 +292,8 @@ class _EditorState:
         self.status = "Loaded rts_data.json"
         self.status_t = 0.0
         self.active_field = None     # (owner, key) currently typed into
+        self.pal_doc = None          # palette_scripts.json, loaded on first open
+        self.pal_sel = 0             # selected script index in the palette window
         self.buffer = ""
         self.field_rects = []        # [(rect, owner, key)]
         self.tool_rects = []
@@ -862,6 +864,169 @@ class _EditorState:
             screen.blit(self.sfont.render(label, True, col), (rect.x + 8, rect.y + 4))
             cm["_hot"].append((rect, action))
 
+    # ── command-palette script editing ────────────────────────────────────
+    # The in-match command palette (press "/" in the RTS) runs user scripts —
+    # sequences of the same safe ops the executor understands. This window
+    # authors palette_scripts.json: add/rename scripts, add ops, click an op's
+    # name to cycle its type, click any parameter to type a new value.
+    _PAL_OPS = [
+        ("build",    {"kind": "well"}),
+        ("train",    {"unit": "scribe", "count": 1}),
+        ("research", {"upgrade": ""}),
+        ("select",   {"what": "army"}),
+        ("group",    {"n": 1, "do": "assign"}),
+        ("camera",   {"what": "base"}),
+        ("stop",     {}),
+        ("hold",     {}),
+        ("fog",      {}),
+        ("flash",    {"text": "…"}),
+    ]
+
+    def _pal_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "palette_scripts.json")
+
+    def _pal_load(self):
+        import json
+        if self.pal_doc is not None:
+            return
+        try:
+            with open(self._pal_path()) as f:
+                self.pal_doc = json.load(f)
+            self.pal_doc.setdefault("scripts", [])
+        except Exception:
+            self.pal_doc = {"scripts": []}
+
+    def _pal_save(self):
+        import json, os
+        tmp = self._pal_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.pal_doc, f, indent=1)
+        os.replace(tmp, self._pal_path())
+        self.flash(f"Saved {len(self.pal_doc['scripts'])} palette scripts")
+
+    def _win_palette(self, screen, w):
+        import pygame
+        self._pal_load()
+        r = w["rect"]; w["_hot"] = []
+        oy = self._win_oy(w)
+        scripts = self.pal_doc["scripts"]
+        y = r.y + 8 - oy
+        # toolbar
+        for label, tag in (("+ New script", ("pal", ("new", None))),
+                           ("Save", ("pal", ("save", None)))):
+            tw = self.sfont.size(label)[0] + 18
+            rect = pygame.Rect(r.x + 10 if label.startswith("+") else r.right - tw - 10,
+                               y, tw, 24)
+            pygame.draw.rect(screen, (52, 62, 52), rect, border_radius=5)
+            pygame.draw.rect(screen, (120, 170, 120), rect, 1, border_radius=5)
+            screen.blit(self.sfont.render(label, True, (222, 236, 222)),
+                        (rect.x + 9, rect.y + 5))
+            w["_hot"].append((rect, tag))
+        y += 32
+        # script list
+        for i, sc in enumerate(scripts):
+            hot = (i == self.pal_sel)
+            row = pygame.Rect(r.x + 8, y, r.w - 16, 24)
+            pygame.draw.rect(screen, (58, 54, 44) if hot else (46, 48, 56), row,
+                             border_radius=5)
+            if hot:
+                pygame.draw.rect(screen, (200, 170, 90), row, 1, border_radius=5)
+            editing = self.active_field == (sc, "name")
+            name = (self.buffer + "▏") if editing else sc.get("name", "?")
+            screen.blit(self.sfont.render(name, True, (232, 226, 208)),
+                        (row.x + 8, row.y + 4))
+            nops = self.sfont.render(f"{len(sc.get('ops', []))} ops", True, (160, 152, 138))
+            screen.blit(nops, (row.right - 92, row.y + 4))
+            del_r = pygame.Rect(row.right - 24, row.y + 3, 18, 18)
+            pygame.draw.rect(screen, (92, 52, 48), del_r, border_radius=4)
+            screen.blit(self.sfont.render("×", True, (240, 200, 190)),
+                        (del_r.x + 5, del_r.y + 1))
+            w["_hot"].append((del_r, ("pal", ("del", i))))
+            w["_hot"].append((pygame.Rect(row.x, row.y, row.w - 100, row.h),
+                              ("pal", ("sel", i))))
+            y += 28
+        # selected script's ops
+        if 0 <= self.pal_sel < len(scripts):
+            sc = scripts[self.pal_sel]
+            pygame.draw.line(screen, (88, 92, 104), (r.x + 8, y + 4),
+                             (r.right - 8, y + 4), 1)
+            y += 12
+            screen.blit(self.sfont.render(
+                "ops — click a name to cycle its type, click a value to edit",
+                True, (150, 156, 168)), (r.x + 10, y))
+            y += 22
+            for j, op in enumerate(sc.setdefault("ops", [])):
+                name_r = pygame.Rect(r.x + 10, y, 84, 22)
+                pygame.draw.rect(screen, (50, 58, 74), name_r, border_radius=4)
+                screen.blit(self.sfont.render(op.get("op", "?"), True, (210, 222, 240)),
+                            (name_r.x + 7, name_r.y + 4))
+                w["_hot"].append((name_r, ("pal", ("opcycle", j))))
+                x = name_r.right + 8
+                for pk, pv in list(op.items()):
+                    if pk == "op":
+                        continue
+                    editing = self.active_field == (op, pk)
+                    txt = f"{pk}={self.buffer + chr(9615) if editing else pv}"
+                    tw = self.sfont.size(txt)[0] + 12
+                    pr = pygame.Rect(x, y, tw, 22)
+                    pygame.draw.rect(screen, (60, 56, 48) if not editing else (78, 68, 44),
+                                     pr, border_radius=4)
+                    screen.blit(self.sfont.render(txt, True, (226, 220, 204)),
+                                (pr.x + 6, pr.y + 4))
+                    w["_hot"].append((pr, ("pal", ("field", (j, pk)))))
+                    x = pr.right + 6
+                del_r = pygame.Rect(r.right - 30, y + 2, 18, 18)
+                pygame.draw.rect(screen, (92, 52, 48), del_r, border_radius=4)
+                screen.blit(self.sfont.render("×", True, (240, 200, 190)),
+                            (del_r.x + 5, del_r.y + 1))
+                w["_hot"].append((del_r, ("pal", ("opdel", j))))
+                y += 26
+            add_r = pygame.Rect(r.x + 10, y + 2, 70, 22)
+            pygame.draw.rect(screen, (52, 62, 52), add_r, border_radius=4)
+            screen.blit(self.sfont.render("+ op", True, (210, 232, 210)),
+                        (add_r.x + 12, add_r.y + 4))
+            w["_hot"].append((add_r, ("pal", ("opadd", None))))
+
+    def _pal_action(self, tag):
+        act, val = tag
+        scripts = self.pal_doc["scripts"]
+        if act == "new":
+            scripts.append({"name": f"Script {len(scripts) + 1}", "desc": "",
+                            "ops": [{"op": "flash", "text": "hello"}]})
+            self.pal_sel = len(scripts) - 1
+        elif act == "save":
+            self._pal_save()
+        elif act == "sel":
+            self.pal_sel = val
+            self._begin_field(scripts[val], "name")
+        elif act == "del":
+            if 0 <= val < len(scripts):
+                scripts.pop(val)
+                self.pal_sel = max(0, min(self.pal_sel, len(scripts) - 1))
+        elif act == "opadd" and 0 <= self.pal_sel < len(scripts):
+            name, params = self._PAL_OPS[0]
+            scripts[self.pal_sel]["ops"].append({"op": name, **params})
+        elif act == "opdel" and 0 <= self.pal_sel < len(scripts):
+            ops = scripts[self.pal_sel]["ops"]
+            if 0 <= val < len(ops):
+                ops.pop(val)
+        elif act == "opcycle" and 0 <= self.pal_sel < len(scripts):
+            ops = scripts[self.pal_sel]["ops"]
+            if 0 <= val < len(ops):
+                names = [n for n, _ in self._PAL_OPS]
+                cur = ops[val].get("op", names[0])
+                nxt = names[(names.index(cur) + 1) % len(names)] \
+                    if cur in names else names[0]
+                _, params = next(p for p in self._PAL_OPS if p[0] == nxt)
+                ops[val] = {"op": nxt, **params}
+        elif act == "field" and 0 <= self.pal_sel < len(scripts):
+            j, pk = val
+            ops = scripts[self.pal_sel]["ops"]
+            if 0 <= j < len(ops):
+                self._begin_field(ops[j], pk)
+
     # ── text field editing ──
     def _begin_field(self, owner, key):
         self.active_field = (owner, key)
@@ -1167,7 +1332,8 @@ class _EditorState:
         "assets":   ("Assets", (260, 90, 380, 460)),
         "models":   ("Model Picker", (300, 120, 420, 420)),
         "triggers": ("Trigger Browser", (200, 100, 560, 400)),
-        "sections": ("Sections", (40, 90, 200, 260)),
+        "sections": ("Sections", (40, 90, 200, 296)),
+        "palette":  ("Palette Scripts", (240, 80, 560, 480)),
     }
 
     def _open_window(self, wid):
@@ -1261,6 +1427,8 @@ class _EditorState:
             elif act == "open": self._open_window(val)
             elif act == "help": self.show_help = True
             return
+        if wid == "palette" and isinstance(tag, tuple) and tag[0] == "pal":
+            self._pal_action(tag[1]); return
         if wid == "models" and isinstance(tag, str):
             # assign the picked card model to the selected unit
             fac = self.data["factions"].get(self.data_fac, {})
@@ -1395,6 +1563,7 @@ class _EditorState:
                  ("Triggers", ("open", "triggers")),
                  ("Assets", ("open", "assets")),
                  ("Models", ("open", "models")),
+                 ("Palette scripts", ("open", "palette")),
                  ("Help (F1)", ("help", None))]
         y = r.y + 10
         for label, act in items:
