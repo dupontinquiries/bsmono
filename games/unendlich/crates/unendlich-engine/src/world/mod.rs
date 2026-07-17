@@ -100,6 +100,8 @@ pub mod collapse;
 pub mod erosion;
 pub mod effects;
 pub mod field_brush;
+pub mod worldpack;
+pub mod terrain_llm;
 pub mod elemental;
 
 // Worker-03 WORLD/PERF pure cores (logic only; coordinator wires into octree/
