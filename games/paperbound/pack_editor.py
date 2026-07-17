@@ -33,8 +33,20 @@ import os, sys, json, math, copy
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_PACK = os.path.join(HERE, "expansions", "dragon_legion.json")
 
-PART_KINDS = ["slab", "wing", "leg", "wedge", "tail", "crest", "spine",
-              "panel", "shell", "orb", "tusk"]
+def _part_vocabulary():
+    """The full part list: origami's built-ins + any JSON-defined parts, with
+    the JSON templates returned too so the preview can fold them accurately."""
+    builtins = ["slab", "wing", "leg", "wedge", "tail", "crest", "spine",
+                "panel", "shell", "orb", "tusk"]
+    try:
+        import origami
+        extra = [p for p in origami.json_part_names() if p not in builtins]
+        templates = {n: origami._JSON_PARTS[n] for n in extra}
+        return builtins + extra, templates
+    except Exception:
+        return builtins, {}
+
+PART_KINDS, JSON_PART_TEMPLATES = _part_vocabulary()
 RARITIES = ["common", "rare", "epic", "legendary"]
 
 STAT_FIELDS = [("cost", int, 1, 10), ("hp", int, 10, 6000), ("dmg", int, 0, 400),
@@ -183,6 +195,17 @@ def draw_model_preview(pygame, surf, rect, card, sel_part=None):
                         for i in range(steps)])
         if kind == "tusk":
             return rot([(0, -s * 0.12), (s, -s * 0.35), (s * 0.9, -s * 0.1), (0, s * 0.12)])
+        if kind in JSON_PART_TEMPLATES:
+            spec = JSON_PART_TEMPLATES[kind]
+            if spec["kind"] == "disc":
+                steps = 10; rr = spec.get("radius", 0.4) * s
+                return rot([(math.cos(2 * math.pi * i / steps) * rr,
+                             math.sin(2 * math.pi * i / steps) * rr)
+                            for i in range(steps)])
+            pts = [(px2 * s, py2 * s) for px2, py2 in spec["points"]]
+            if spec.get("pair"):
+                pts = pts + [(-px2, py2) for px2, py2 in reversed(pts)]
+            return rot(pts)
         return rot([(-s * 0.4, -s * 0.4), (s * 0.4, -s * 0.4),
                     (s * 0.4, s * 0.4), (-s * 0.4, s * 0.4)])
 
