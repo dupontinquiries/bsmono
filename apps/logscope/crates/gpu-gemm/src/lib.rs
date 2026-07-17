@@ -3017,8 +3017,18 @@ impl Gpu {
         let arch = g.arch();
         let acfg = crate::archcfg::for_arch(&arch);
         if !acfg.supported {
-            return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet — {}. \
-                Use the llama.cpp backend for this model.", acfg.note));
+            // MoE-aware escape: some architectures (e.g. Qwen4) are only PARTIALLY unsupported — their MoE
+            // routing kernel isn't wired, but a DENSE checkpoint of the same arch runs on the existing
+            // forward path. Read the expert count from metadata: 0/absent ⇒ dense ⇒ allow; >0 ⇒ real MoE ⇒
+            // refuse with the arch's precise note. Architectures with no dense form (Llama4) never escape.
+            let expert_count = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+            let dense_ok = acfg.dense_supported && expert_count == 0;
+            if !dense_ok {
+                let moe_hint = if expert_count > 0 { format!(" (this is a {expert_count}-expert MoE checkpoint)") } else { String::new() };
+                return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {}. \
+                    Use the llama.cpp backend for this model.", acfg.note));
+            }
+            eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
         let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
         let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
