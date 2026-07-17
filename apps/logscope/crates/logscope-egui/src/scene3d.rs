@@ -2316,7 +2316,13 @@ fn rock_arch(s: &mut Scene, center: Vec3, dir: Vec3, scale: f32, seed: u32, lo: 
 /// elsewhere — see TODO.)
 fn render_quality() -> f32 {
     let p = crate::theme::power_mode(); // battery-saver thins procedural scatter density (smarter LOD/cull)
-    (std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0) * (0.6 + 0.4 * p)).clamp(0.45, 1.3)
+    let base = std::env::var("LOGSCOPE_QUALITY").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0);
+    // Graph-size LOD: a big conversation makes the world BIGGER (scene_fit), so thin per-unit scatter density
+    // to keep total geometry — and the frame budget — bounded. Sub-linear, floored so a large world still
+    // reads as populated; the expansion (footprint) wins, the density cost doesn't run away with it.
+    let nodes = env_params().nodes as f32;
+    let size_lod = (1.0 - (nodes / 700.0).min(0.4)).max(0.6);
+    (base * (0.6 + 0.4 * p) * size_lod).clamp(0.4, 1.3)
 }
 
 /// Value-noise fractal (3 octaves), 0..1. Cheap hills for the sea floor.
@@ -4113,7 +4119,12 @@ fn slate() -> Scene {
 /// at 1.0 so the room never shrinks below its hand-tuned base.
 fn scene_fit(base: f32) -> f32 {
     let pr = env_params();
-    let reach = (pr.ext_x.max(pr.ext_z) as f32) + 9.0; // graph half-extent + clearance
+    // The world must contain BOTH the graph's spatial extent AND its size. A wide layout expands via
+    // ext; a big-but-compact one (deep chains fold tight, keeping ext small) expands via node count, so a
+    // long conversation always gets a bigger world. sqrt keeps growth sensible; the clamp bounds it.
+    let ext_reach = pr.ext_x.max(pr.ext_z) as f32;
+    let size_reach = (pr.nodes as f32).sqrt() * 2.2;
+    let reach = ext_reach.max(size_reach) + 9.0; // graph reach + clearance
     (reach / base).clamp(1.0, 5.0)
 }
 
@@ -5545,10 +5556,12 @@ fn titan_ribcage() -> Scene {
         let mut slab = m3::panel(v(mx, yf, mz), v(1.0, 0.0, 0.0), v(0.0, 0.0, 1.0), (3.0 + hash(k as i32, 3) * 5.0) * sc, (3.0 + hash(k as i32, 4) * 5.0) * sc, c(0xc6, 0xc2, 0xb0));
         m3::tint_up(&mut slab, c(0xdc, 0xd8, 0xc6), c(0x9a, 0x96, 0x84)); slab.mat = M::STONE; s.add(slab, Float::STILL);
     }
-    // THE THREE COLOSSAL RIBS — fossilised bone arches straddling the central lane, pitted, gouged to grey marrow
+    // THE COLOSSAL RIBS — fossilised bone arches straddling the central lane, pitted, gouged to grey marrow.
+    // Rib COUNT grows with the conversation: a longer talk is a longer fallen skeleton down the lane.
     let (bone_lo, bone_hi, marrow) = (c(0xb6, 0xae, 0x7e), c(0xe4, 0xdc, 0xae), c(0x86, 0x82, 0x74));
-    for r in 0..3 {
-        let lz = (r as f32 - 1.0) * half_l * 0.52;                       // three ribs down the lane
+    let nribs = (3 + pr.nodes / 40).clamp(3, 9) as i32;
+    for r in 0..nribs {
+        let lz = (r as f32 / (nribs - 1).max(1) as f32 - 0.5) * 2.0 * half_l * 0.52; // ribs spread down the lane
         let span = half_w * 1.5; let rise = (44.0 + hash(r, 5) * 12.0) * sc;
         let segs = 22;
         for i in 0..segs {                                              // arch as a chain of tapered bone segments
@@ -5985,7 +5998,7 @@ fn room_variant(idx: usize) -> Scene {
 
 // Conversation-derived parameters that drive PROCEDURAL layout of the hall (size, colonnade, tint, life).
 // Set per-frame from the live graph before building the env; the baked scene is re-generated when they change.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub struct EnvParams { pub nodes: u32, pub branches: u32, pub segments: u32, pub seed: u32, pub ext_x: u32, pub ext_z: u32, pub bear: [u16; 6], pub color_salience: f32,
     /// Procedural TREE character (Forest): overall size, trunk height (length) factor, trunk girth (radius) factor,
     /// and the per-node branching factor (children per fork). Seed-derived per conversation so each wood differs.
@@ -5997,6 +6010,31 @@ thread_local! { static ENV_PARAMS: std::cell::Cell<EnvParams> = const { std::cel
 /// Feed the live conversation's shape to the environment generator (call before `with_env`/`render_env`).
 pub fn set_env_params(p: EnvParams) { ENV_PARAMS.with(|c| c.set(p)); }
 pub fn env_params() -> EnvParams { ENV_PARAMS.with(|c| c.get()) }
+
+impl EnvParams {
+    /// A coarsely-bucketed copy for the scene-cache key. The baked environment is expensive to rebuild, but
+    /// `set_env_params` runs every frame and its continuous fields (node count as messages stream, `ext_*` as
+    /// the layout animates, `bear`/salience as it settles) jitter constantly — so an exact-equality cache key
+    /// rebuilds the whole world almost every frame. Bucketing those fields means a rebuild fires only when
+    /// the conversation has changed MEANINGFULLY (grew ~8 nodes, spread a few units, doors swung ~6°), which
+    /// is the dominant renderer-cost win for a live, growing graph. Seed-derived fields (tree/prop character)
+    /// are stable within a conversation and pass through unchanged.
+    pub fn quantized(self) -> EnvParams {
+        let q = |v: u32, step: u32| (v / step.max(1)) * step.max(1);
+        let mut bear = self.bear;
+        for b in &mut bear { *b &= 0xFC00; } // keep the top 6 bits (~64 buckets over a full turn ≈ 5.6°)
+        EnvParams {
+            nodes: q(self.nodes, 8),
+            branches: q(self.branches, 2),
+            segments: q(self.segments, 4),
+            ext_x: q(self.ext_x, 4),
+            ext_z: q(self.ext_z, 4),
+            bear,
+            color_salience: (self.color_salience * 10.0).round() / 10.0,
+            ..self
+        }
+    }
+}
 
 /// Atlantis hall semi-axes (rx along the spine, rz across it) — large enough to CONTAIN the conversation
 /// flow on each axis. `ext_x/ext_z` are the graph's world-space half-spans (fed from the live layout);
@@ -6046,7 +6084,7 @@ pub fn with_env(palette_name: &str, t: f32, f: impl FnOnce(&[Mesh3])) {
     ENV.with(|cell| {
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
-        let pr = env_params();
+        let pr = env_params().quantized(); // bucketed cache key — rebuild only on meaningful growth
         if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
             *b = Some((palette_name.to_string(), var, pr, build(palette_name), t)); // record build time for the build-in
         }
@@ -6065,7 +6103,7 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
     ENV.with(|cell| {
         let mut b = cell.borrow_mut();
         let var = crate::theme::variant();
-        let pr = env_params();
+        let pr = env_params().quantized(); // bucketed cache key — rebuild only on meaningful growth
         if b.as_ref().map_or(true, |(n, v, p, _, _)| n != palette_name || *v != var || *p != pr) {
             *b = Some((palette_name.to_string(), var, pr, build(palette_name), t));
         }
@@ -6081,6 +6119,57 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_quality_thins_for_big_graphs_but_stays_floored() {
+        std::env::remove_var("LOGSCOPE_QUALITY");
+        set_env_params(EnvParams { nodes: 20, ..Default::default() });
+        let small = render_quality();
+        set_env_params(EnvParams { nodes: 800, ..Default::default() });
+        let big = render_quality();
+        assert!(big < small, "a big graph should thin per-unit density ({small} → {big})");
+        assert!(big >= 0.4, "quality stays floored so the world still reads as populated");
+        set_env_params(EnvParams::default());
+    }
+
+    #[test]
+    fn graph_aware_scenes_expand_with_conversation_size() {
+        // These scenes previously keyed off spatial extent only (or a fixed count), so a big-but-compact
+        // conversation left them unchanged. With scene_fit factoring node count (+ the boneyard's rib count),
+        // they now grow with the conversation even at fixed extent.
+        let small = EnvParams { nodes: 10, ..Default::default() };
+        let big = EnvParams { nodes: 220, ..Default::default() };
+        for scene in ["Alley", "Canopy", "Titan's Ribcage"] {
+            set_env_params(small);
+            let s = build(scene).meshes.len();
+            set_env_params(big);
+            let b = build(scene).meshes.len();
+            assert!(b > s, "{scene}: a bigger conversation should expand the map ({s} → {b})");
+        }
+        set_env_params(EnvParams::default());
+    }
+
+    #[test]
+    fn quantized_key_absorbs_jitter_but_tracks_growth() {
+        let base = EnvParams { nodes: 40, ext_x: 18, ext_z: 14, ..Default::default() };
+        // a small jitter (one new node, layout shifts a unit, doors swing a hair) → SAME bucketed key ⇒ no rebuild
+        let jittered = EnvParams { nodes: 41, ext_x: 19, ext_z: 15, ..base };
+        assert_eq!(base.quantized(), jittered.quantized(), "small jitter must not force a scene rebuild");
+        // meaningful growth → DIFFERENT key ⇒ rebuild
+        let grown = EnvParams { nodes: 96, ext_x: 40, ..base };
+        assert_ne!(base.quantized(), grown.quantized(), "real growth should change the cache key");
+    }
+
+    #[test]
+    fn scene_fit_grows_with_nodes_at_fixed_extent() {
+        // the core reshape-to-fit improvement: with extent held constant, more nodes → a larger fit factor.
+        set_env_params(EnvParams { nodes: 8, ext_x: 10, ext_z: 10, ..Default::default() });
+        let small = scene_fit(20.0);
+        set_env_params(EnvParams { nodes: 400, ext_x: 10, ext_z: 10, ..Default::default() });
+        let big = scene_fit(20.0);
+        assert!(big > small, "scene_fit should grow with conversation size ({small} → {big})");
+        set_env_params(EnvParams::default());
+    }
 
     #[test]
     fn scenes_respond_to_conversation_size() {
