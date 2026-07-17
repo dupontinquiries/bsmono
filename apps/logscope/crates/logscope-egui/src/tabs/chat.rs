@@ -798,6 +798,7 @@ pub struct Chat {
     note: String,                  // transient status line (e.g. export path), cleared on next action
     gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
     agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
+    agent_plan: Vec<(String, bool)>, // the agent's committed plan (2): (step text, done) — rendered as an in-scene checklist
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -879,6 +880,7 @@ impl Default for Chat {
             note: String::new(),
             gitmind_session: None,
             agent_files: Vec::new(),
+            agent_plan: Vec::new(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -3266,6 +3268,25 @@ impl Chat {
                     }
                 }
 
+                // ── AGENT PLAN — the committed step list (2), rendered as a checklist that ticks off as
+                // the run progresses, so the agent's intent is visible and you can steer/interrupt. Sits
+                // just above the workspace-files feed on the right edge. Only when a plan exists.
+                if !self.backdrop && !self.agent_plan.is_empty() {
+                    let pc0 = anchor(0.86, 0.13);
+                    let pw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
+                    let pscale = pw / 1.3;
+                    let title_c = V3::new(pc0.x - toward.x * 0.30, pc0.y - toward.y * 0.30, pc0.z - toward.z * 0.30);
+                    for cell in m3::label_cells(title_c, right, up, toward, "PLAN", 0.010 * pscale, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    for (row, (text, done)) in self.agent_plan.iter().take(8).enumerate() {
+                        let off = -(row as f32 + 1.0) * 0.15 * pscale;
+                        let rc = V3::new(pc0.x + up.x * off - toward.x * 0.30, pc0.y + up.y * off - toward.y * 0.30, pc0.z + up.z * off - toward.z * 0.30);
+                        let mark = if *done { "[x] " } else { "[ ] " };
+                        let col = if *done { egui::Color32::from_rgb(tc[0], tc[1], tc[2]) } else { egui::Color32::from_rgb(150, 160, 178) };
+                        let line: String = format!("{mark}{}", text.chars().take(18).collect::<String>());
+                        for cell in m3::label_cells(rc, right, up, toward, &line, 0.008 * pscale, t, col, if *done { 0.75 } else { 0.5 }, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
+                    }
+                }
+
                 // ── WORKSPACE FILES — live feed of files the agent wrote / you dropped, so file creation
                 // is VISIBLE in the scene (the ask: "see file creation"). Right-edge plaque, newest last,
                 // colour-coded (created = accent, modified = dim). Only when a session has touched files.
@@ -4265,22 +4286,26 @@ impl Chat {
                         temperature: self.ctx.temperature,
                         ..Default::default()
                     };
-                    match crate::workspace_exec::run_local_agent(&mut ws, &task, 24, params) {
+                    // Default config: plan-then-act, verify-as-you-go (cargo check after each Rust write),
+                    // full reads (local compute is cheap), done gated on a green check.
+                    let cfg = crate::workspace_exec::AgentConfig::default();
+                    match crate::workspace_exec::run_local_agent(&mut ws, &task, &cfg, params) {
                         Ok(session) => {
                             self.agent_files = session.files.clone();
+                            self.agent_plan = session.plan.steps.iter().map(|s| (s.text.clone(), s.done)).collect();
                             let touched = session.files.len();
+                            let (pd, pt) = session.plan.progress();
                             let stop = match &session.stop {
                                 crate::workspace_exec::Stop::Done => "done".to_string(),
                                 crate::workspace_exec::Stop::StepLimit => "hit step limit".to_string(),
                                 crate::workspace_exec::Stop::ModelError(e) => format!("model error: {e}"),
                             };
-                            // Snapshot the agent's work as a commit on the /tmp work branch — a diffable,
-                            // rollbackable point per run, before :reapply lands it on the real project.
                             let snap = self.gitmind_session.as_ref()
                                 .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {task}")).ok())
                                 .unwrap_or(false);
                             let snap_note = if snap { " · snapshotted" } else { "" };
-                            self.note = format!("agent: {stop} · {touched} file(s) touched{snap_note} · :reapply to land them");
+                            let vnote = if session.verified { " · ✓ verified" } else { " · ⚠ unverified" };
+                            self.note = format!("agent: {stop} · plan {pd}/{pt} · {touched} file(s){vnote}{snap_note} · :reapply to land");
                         }
                         Err(e) => self.note = format!(":agent — {e}"),
                     }
