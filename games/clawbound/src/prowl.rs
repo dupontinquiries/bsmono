@@ -51,6 +51,8 @@ const MINION_AGGRO_R: f32 = 12.0;
 const YOWL_RANGE: f32 = 22.0;      // ranged minions cast from further out than the melee aggro radius
 const YOWL_CD: f32 = 6.0;
 const YOWL_REVEAL_DUR: f32 = 2.2;  // seconds a landed yowl outs your position (forces you out of hiding)
+pub const BEACON_RADIUS: f32 = 14.0;   // an owned tree's aura reaches this far
+pub const BEACON_PULSE: f32 = 8.0;     // seconds between pulses — refresh the buff before it lapses
 const WIN_SCORE: i32 = 600;     // first clan to this many points wins outright
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -98,6 +100,8 @@ pub struct AncestorTree {
     pub claim: f32,       // 0..CLAIM_TIME the player's dwell progress
     pub cooldown: f32,    // >0 = spent, recharging
     pub claimed_by: Option<u8>,   // which clan currently owns this tree (None = wild)
+    pub beacon_class: Option<Class>,   // the class of whoever last claimed it — sets the aura it pulses
+    pub pulse_t: f32,                   // seconds until the next beacon pulse
 }
 impl AncestorTree {
     pub fn ready(&self) -> bool { self.cooldown <= 0.0 }
@@ -405,6 +409,8 @@ impl Prowl {
                     let stored = self.ancestors[target].stored;
                     self.ancestors[target].claimed_by = Some(rclan);
                     self.ancestors[target].cooldown = ANCESTOR_CD;
+                    self.ancestors[target].beacon_class = Some(self.rivals[i].class);
+                    self.ancestors[target].pulse_t = 0.0;
                     self.rivals[i].buffs.grant(stored);
                     self.clan_scores[rclan as usize] += 40;
                 }
@@ -433,7 +439,7 @@ impl Prowl {
                 let (tx, tz) = (a.cos() * rad, a.sin() * rad);
                 if world::height_at(tx, tz) >= world::WATER_Y + 0.3 { x = tx; z = tz; break; }
             }
-            v.push(AncestorTree { x, z, stored: stored[k], claim: 0.0, cooldown: 0.0, claimed_by: None });
+            v.push(AncestorTree { x, z, stored: stored[k], claim: 0.0, cooldown: 0.0, claimed_by: None, beacon_class: None, pulse_t: 0.0 });
         }
         v
     }
@@ -456,6 +462,28 @@ impl Prowl {
             v.push(JungleCamp { kind, x, z, gx: x, gz: z, home_x: x, home_z: z, guard_alive: true, alert: false, hp: kind.guard_hp(), cooldown: 0.0 });
         }
         v
+    }
+
+    /// A claimed ancestor tree is a beacon: every few seconds it pulses its owner's
+    /// class-keyed buff (Speed or Shield) to allies of that clan standing nearby —
+    /// the player if it's their own clan's tree, or the owning rival if it's theirs.
+    fn step_beacons(&mut self, dt: f32) {
+        for anc in self.ancestors.iter_mut() {
+            let Some(owner) = anc.claimed_by else { continue };
+            let Some(bc) = anc.beacon_class else { continue };
+            anc.pulse_t = (anc.pulse_t - dt).max(0.0);
+            if anc.pulse_t > 0.0 { continue; }
+            let mut pulsed = false;
+            if owner == PLAYER_CLAN && dist(self.x, self.z, anc.x, anc.z) < BEACON_RADIUS {
+                self.buffs.grant(bc.beacon_buff()); pulsed = true;
+            }
+            for r in self.rivals.iter_mut() {
+                if r.clan == owner && dist(r.x, r.z, anc.x, anc.z) < BEACON_RADIUS {
+                    r.buffs.grant(bc.beacon_buff()); pulsed = true;
+                }
+            }
+            if pulsed { anc.pulse_t = BEACON_PULSE; }
+        }
     }
 
     /// Advance the jungle camps: a guard notices a loud/visible prowler nearby and closes
@@ -747,6 +775,7 @@ impl Prowl {
                 anc.claim += dt * cache_mult;
                 if anc.claim >= CLAIM_TIME {
                     anc.claim = 0.0; anc.cooldown = ANCESTOR_CD; anc.claimed_by = Some(PLAYER_CLAN);
+                    anc.beacon_class = Some(self.class); anc.pulse_t = 0.0;
                     self.buffs.grant(anc.stored);       // the ancestors bestow their stored buff
                     self.clan_scores[0] += 40;
                 }
@@ -773,6 +802,9 @@ impl Prowl {
                 self.clan_scores[0] += 25 * eaten as i32;
             }
         }
+
+        // ── claimed ancestor trees pulse their owner's beacon buff to nearby allies ──
+        self.step_beacons(dt);
 
         // ── autoattack: advance the in-progress move, land hits on the hunter/rivals ──
         self.step_combat(dt);
@@ -1030,6 +1062,64 @@ mod tests {
             _ => {}
         }
         assert!(g.on_staging, "standing at a claimed tree is a staging ground");
+    }
+
+    #[test]
+    fn claiming_a_tree_sets_its_beacon_to_the_claiming_class() {
+        let mut g = Prowl::new(Class::Squirrel, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        let (ax, az) = (g.ancestors[0].x, g.ancestors[0].z);
+        for _ in 0..((CLAIM_TIME + 0.3) * 30.0) as i32 {
+            g.x = ax; g.z = az;
+            g.set_input(0.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+        }
+        assert_eq!(g.ancestors[0].beacon_class, Some(Class::Squirrel), "the tree's beacon should key to whoever claimed it");
+    }
+
+    #[test]
+    fn a_beacon_pulses_its_buff_to_the_player_standing_in_its_aura() {
+        let mut g = Prowl::new(Class::Squirrel, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.ancestors[0].claimed_by = Some(PLAYER_CLAN);
+        g.ancestors[0].beacon_class = Some(Class::Squirrel);   // Speed beacon
+        g.ancestors[0].pulse_t = 0.0;
+        g.x = g.ancestors[0].x; g.z = g.ancestors[0].z;
+        g.buffs = crate::powerup::Buffs::new();
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.buffs.speed_boosted(), "standing in a Speed beacon's aura should grant Speed");
+        assert!(g.ancestors[0].pulse_t > 0.0, "the pulse should reset its own cooldown");
+    }
+
+    #[test]
+    fn a_beacon_does_not_pulse_outside_its_radius() {
+        let mut g = Prowl::new(Class::Squirrel, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.ancestors[0].claimed_by = Some(PLAYER_CLAN);
+        g.ancestors[0].beacon_class = Some(Class::Squirrel);
+        g.ancestors[0].pulse_t = 0.0;
+        g.x = g.ancestors[0].x + BEACON_RADIUS + 5.0; g.z = g.ancestors[0].z;
+        g.buffs = crate::powerup::Buffs::new();
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(!g.buffs.speed_boosted(), "too far from the tree shouldn't get the beacon's buff");
+    }
+
+    #[test]
+    fn a_beacon_also_buffs_the_owning_rival_nearby() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0; g.x = 900.0; g.z = 900.0;
+        let rclan = g.rivals[0].clan;
+        g.ancestors[rclan as usize].claimed_by = Some(rclan);
+        g.ancestors[rclan as usize].beacon_class = Some(Class::Squirrel);
+        g.ancestors[rclan as usize].pulse_t = 0.0;
+        let (ax, az) = (g.ancestors[rclan as usize].x, g.ancestors[rclan as usize].z);
+        g.rivals[0].x = ax; g.rivals[0].z = az;
+        g.rivals[0].buffs = crate::powerup::Buffs::new();
+        g.set_input(0.0, 0.0, false, false, false);
+        g.step(1.0 / 30.0);
+        assert!(g.rivals[0].buffs.speed_boosted(), "the beacon should also buff its owning clan's rival prowler");
     }
 
     #[test]
