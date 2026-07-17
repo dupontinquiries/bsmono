@@ -394,12 +394,21 @@ impl State {
             let gy = world::height_at(*px, *pz) + 1.4 + (self.frame * 0.06 + *px).sin() * 0.2;
             m.boxx(v3(*px, gy, *pz), v3(0.5, 0.5, 0.5), rgb(kind.color()));
         }
-        // clan minions — small cats on border patrol, tinted by clan
+        // clan minions — small cats on border patrol, tinted by clan; ranged ones (yowlers)
+        // get a paler marker and a brief flash of white when they cry out
         for mm in &g.minions {
             let gy = world::height_at(mm.x, mm.z);
             let pose = cat::walk((self.anim_t * 1.3 + mm.x * 0.2).rem_euclid(1.0));
             cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose);
-            m.boxx(v3(mm.x, gy + 1.3, mm.z), v3(0.28, 0.12, 0.28), rgb(clawbound_rs::prowl::clan_color(mm.clan)));
+            let base = clawbound_rs::prowl::clan_color(mm.clan);
+            let col = if mm.yowl_flash > 0.0 { 0xffffff } else if mm.ranged { (base & 0xfefefe) | 0x404040 } else { base };
+            let sz = if mm.ranged { v3(0.24, 0.10, 0.24) } else { v3(0.28, 0.12, 0.28) };
+            m.boxx(v3(mm.x, gy + 1.3, mm.z), sz, rgb(col));
+            if mm.ranged && mm.yowl_flash > 0.0 {
+                m.set_op(mm.yowl_flash);
+                m.segment(v3(mm.x, gy + 1.0, mm.z), v3(mm.x, gy + 1.0 + mm.yowl_flash * 3.0, mm.z), 0.15, 0.02, 6, rgb(0xffffff));
+                m.set_op(1.0);
+            }
         }
         // rival clan prowlers — full-size clan-tinted cats
         for rv in &g.rivals {
@@ -499,6 +508,7 @@ impl State {
             (p.player_move.map(|(m, _)| m.name()), p.combo_flash, p.combo_name)
         };
         let ((wind_dx, wind_dz), wind_strength) = self.prowl.as_ref().unwrap().wind();
+        let yowled = self.prowl.as_ref().unwrap().yowled_t > 0.0;
         let jungle_hint = {
             let p = self.prowl.as_ref().unwrap();
             p.jungle.iter().filter(|c| {
@@ -548,6 +558,7 @@ impl State {
                         if wind_strength > 0.9 { "strong" } else if wind_strength > 0.35 { "breezy" } else { "calm" }))
                         .size(11.0).color(Color32::from_rgb(160, 200, 210)));
                     if exposed { ui.label(RichText::new("! EXPOSED - get back inside the ring").size(13.0).color(Color32::from_rgb(230, 150, 120))); }
+                    if yowled { ui.label(RichText::new("! OUTED - a yowl gave you away").size(13.0).strong().color(Color32::from_rgb(255, 200, 90))); }
                 });
             });
             // autoattack: the current move, and a combo banner when a chain lands
