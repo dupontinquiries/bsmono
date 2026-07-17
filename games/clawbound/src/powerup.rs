@@ -1,10 +1,10 @@
 //! powerup.rs — pickups and the timed **buffs** they grant, shared across modes.
 //!
-//! Ported from Pop Island 2: Speed Boost (a burst of pace for a few seconds),
-//! Shield (soaks the next hit — a stun or a catch — then pops), and Triple Toss
-//! (your next throws fire three projectiles). The `Buffs` struct is the portable
-//! per-creature state; a mode ticks it each frame and queries it when resolving
-//! movement, hits and throws.
+//! Ported from Pop Island 2: Swift Paw (a burst of pace for a few seconds),
+//! Thick Pelt (soaks the next hit — a stun or a catch — then pops), and Claw
+//! Volley (your next throws fire three projectiles). The `Buffs` struct is the
+//! portable per-creature state; a mode ticks it each frame and queries it when
+//! resolving movement, hits and throws.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Power { Speed, Shield, Triple }
@@ -13,7 +13,7 @@ pub const POWERS: [Power; 3] = [Power::Speed, Power::Shield, Power::Triple];
 
 impl Power {
     pub fn name(self) -> &'static str {
-        match self { Power::Speed => "Speed Boost", Power::Shield => "Shield", Power::Triple => "Triple Toss" }
+        match self { Power::Speed => "Swift Paw", Power::Shield => "Thick Pelt", Power::Triple => "Claw Volley" }
     }
     pub fn color(self) -> u32 {
         match self { Power::Speed => 0xffe040, Power::Shield => 0x5a9aff, Power::Triple => 0xff6acf }
@@ -27,12 +27,12 @@ impl Power {
 /// The buffs currently active on one creature.
 #[derive(Clone, Copy, Default)]
 pub struct Buffs {
-    pub speed_t: f32,   // seconds of Speed Boost remaining
-    pub triple_t: f32,  // seconds of Triple Toss remaining
-    pub shield: bool,   // a Shield charge waiting to soak the next hit
+    pub speed_t: f32,   // seconds of Swift Paw remaining
+    pub triple_t: f32,  // seconds of Claw Volley remaining
+    pub shield: bool,   // a Thick Pelt charge waiting to soak the next hit
 }
 
-/// Speed multiplier applied while the Speed Boost is up.
+/// Speed multiplier applied while Swift Paw is up.
 pub const SPEED_MULT: f32 = 1.6;
 
 impl Buffs {
@@ -64,7 +64,7 @@ impl Buffs {
         if self.shield { self.shield = false; false } else { true }
     }
 
-    /// How many projectiles a throw fires right now (3 while Triple Toss is up).
+    /// How many projectiles a throw fires right now (3 while Claw Volley is up).
     pub fn throw_count(&self) -> u32 { if self.triple_active() { 3 } else { 1 } }
 }
 
