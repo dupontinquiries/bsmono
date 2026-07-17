@@ -427,7 +427,7 @@ impl State {
         for mm in &g.minions {
             let gy = world::height_at(mm.x, mm.z);
             let pose = cat::walk((self.anim_t * 1.3 + mm.x * 0.2).rem_euclid(1.0));
-            cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose);
+            cat::build(&mut m, v3(mm.x, gy, mm.z), mm.heading, &pose, clawbound_rs::class::Class::Cat);
             let base = clawbound_rs::prowl::clan_color(mm.clan);
             let col = if mm.yowl_flash > 0.0 { 0xffffff } else if mm.ranged { (base & 0xfefefe) | 0x404040 } else { base };
             let sz = if mm.ranged { v3(0.24, 0.10, 0.24) } else { v3(0.28, 0.12, 0.28) };
@@ -442,7 +442,7 @@ impl State {
         for rv in &g.rivals {
             let gy = world::height_at(rv.x, rv.z);
             let pose = cat::walk((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0));
-            cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose);
+            cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose, rv.class);
             m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
         }
         // jungle camps — a guard cat (tinted by species) circling its herb marker
@@ -451,7 +451,7 @@ impl State {
             if c.guard_alive {
                 let ggy = world::height_at(c.gx, c.gz);
                 let pose = if c.alert { cat::walk((self.anim_t * 1.6 + c.gx * 0.2).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.5 + c.gx) };
-                cat::build(&mut m, v3(c.gx, ggy, c.gz), 0.0, &pose);
+                cat::build(&mut m, v3(c.gx, ggy, c.gz), 0.0, &pose, clawbound_rs::class::Class::Cat);
                 m.boxx(v3(c.gx, ggy + 1.3, c.gz), v3(0.3, 0.14, 0.3), rgb(col));
             }
             if c.cooldown <= 0.0 && (c.cleared() || !c.alert) {
@@ -463,7 +463,7 @@ impl State {
         let pgy = world::height_at(g.x, g.z);
         let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
         let pose = if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() } else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
-        cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose);
+        cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose, g.class);
         m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
         // the stalking hunter
         let hgy = world::height_at(g.hx, g.hz);
@@ -674,7 +674,7 @@ impl State {
             let pose = if mob.stunned() { cat::startle() }
                 else if moving { cat::walk((self.anim_t * 1.5 + mob.x * 0.1).rem_euclid(1.0)) }
                 else { cat::idle(self.anim_t * 0.6 + mob.x * 0.05) };
-            cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose);
+            cat::build(&mut m, v3(mob.x, gy, mob.z), mob.heading, &pose, mob.class);
             let team_col = if mob.team == TAWNY { rgb(0xff7030) } else { rgb(0x3070ff) };
             m.boxx(v3(mob.x, gy + 2.1, mob.z), v3(0.5, 0.18, 0.5), team_col);
             m.boxx(v3(mob.x, gy + 1.2, mob.z), v3(0.32, 0.32, 0.32), rgb(mob.class.def().color));
