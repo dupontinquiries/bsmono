@@ -183,11 +183,89 @@ pub struct BranchDocs { pub branch: String, pub docs: Vec<(String, String)> } //
 #[derive(Clone, Debug, Default)]
 pub struct MergeResult {
     pub index: Index,                 // unified, organized index across all branches
-    pub collisions: Vec<Collision>,   // same path written by >1 branch (needs a human/depth-model choice)
-    pub merged: Vec<(String, String)>,// (path, text) to write — the non-colliding union
+    pub collisions: Vec<Collision>,   // GENUINE conflicts: same path, substantially-different content (need reconcile)
+    pub auto_resolved: Vec<String>,   // paths where near-duplicate versions were auto-merged (kept the richer)
+    pub needs_merge: Vec<(String, Vec<(String, String)>)>, // (path, versions) for the conflicts, for the model reconcile
+    pub merged: Vec<(String, String)>,// (path, text) to write — the union with near-dups resolved
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Collision { pub path: String, pub branches: Vec<String> }
+
+/// Strip a doc's front-matter block, returning just the body (for content comparison).
+fn body_of(text: &str) -> &str {
+    let t = text.trim_start();
+    if let Some(rest) = t.strip_prefix("---") {
+        if let Some(end) = rest.find("\n---") {
+            return rest[end + 4..].trim_start_matches('\n');
+        }
+    }
+    text
+}
+
+/// Word-set Jaccard similarity of two doc bodies (0..1). Cheap near-duplicate signal.
+fn body_similarity(a: &str, b: &str) -> f64 {
+    use std::collections::HashSet;
+    let wa: HashSet<&str> = body_of(a).split_whitespace().collect();
+    let wb: HashSet<&str> = body_of(b).split_whitespace().collect();
+    if wa.is_empty() && wb.is_empty() { return 1.0; }
+    let inter = wa.intersection(&wb).count();
+    let union = wa.union(&wb).count();
+    if union == 0 { 0.0 } else { inter as f64 / union as f64 }
+}
+
+/// "Richness" score for picking the better of two near-identical versions: more front-matter + longer body.
+fn richness(text: &str, path: &str) -> usize {
+    let fm = parse_front_matter(text, path, "");
+    let fm_score = fm.as_ref().map(|m| {
+        (!m.summary.is_empty()) as usize + (m.order != 0 && m.order != 999) as usize
+        + (m.section != Section::Other) as usize
+    }).unwrap_or(0);
+    fm_score * 100 + body_of(text).split_whitespace().count()
+}
+
+/// How a collision (same path from multiple branches) resolves.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resolution {
+    /// Near-identical versions — keep the richer one automatically, no merge needed.
+    KeepRicher { branch: String, text: String },
+    /// Genuinely different content — needs a merge (depth model or human). Carries every version.
+    NeedsMerge { versions: Vec<(String, String)> }, // (branch, text)
+}
+
+/// Classify a collision from its `(branch, text)` versions. If all versions are near-identical (high body
+/// similarity), keep the richest and move on; otherwise it's a genuine conflict that needs reconciliation.
+pub fn resolve_collision(path: &str, versions: &[(String, String)]) -> Resolution {
+    if versions.len() < 2 {
+        let (b, t) = versions.first().cloned().unwrap_or_default();
+        return Resolution::KeepRicher { branch: b, text: t };
+    }
+    // near-duplicate iff every pair is above the similarity threshold
+    let mut near_dup = true;
+    'outer: for i in 0..versions.len() {
+        for j in (i + 1)..versions.len() {
+            if body_similarity(&versions[i].1, &versions[j].1) < 0.8 { near_dup = false; break 'outer; }
+        }
+    }
+    if near_dup {
+        let (branch, text) = versions.iter().max_by_key(|(_, t)| richness(t, path)).cloned().unwrap();
+        Resolution::KeepRicher { branch, text }
+    } else {
+        Resolution::NeedsMerge { versions: versions.to_vec() }
+    }
+}
+
+/// The prompt for the depth model to reconcile genuinely-different versions of one doc into a single coherent
+/// document. Kept format-pinned (keep the front-matter, one merged body) so the output drops straight back in.
+pub fn reconcile_prompt(path: &str, versions: &[(String, String)]) -> String {
+    let mut p = format!(
+"Several parallel agents each wrote a different version of the document `{path}`. Merge them into ONE \
+coherent document that keeps the best of each, with no duplicated sections. Preserve the front-matter block \
+(--- … ---) at the top with a single title/section/order/status/summary. Output ONLY the merged document.\n");
+    for (i, (branch, text)) in versions.iter().enumerate() {
+        p.push_str(&format!("\n===== version {} (branch: {branch}) =====\n{text}\n", i + 1));
+    }
+    p
+}
 
 /// Merge complementary docs from parallel agent branches. Each branch owns distinct docs (its slice of the
 /// tree); the union is the merged doc set. A path written by more than one branch is a COLLISION (reported,
@@ -203,15 +281,29 @@ pub fn merge_branches(branches: &[BranchDocs], project_title: &str) -> MergeResu
         }
     }
     let mut collisions = Vec::new();
+    let mut auto_resolved = Vec::new();
+    let mut needs_merge = Vec::new();
     let mut merged: Vec<(String, String)> = Vec::new();
     let mut metas: Vec<DocMeta> = Vec::new();
     let mut warnings = Vec::new();
     for (path, writers) in by_path {
-        if writers.len() > 1 {
-            collisions.push(Collision { path: path.clone(), branches: writers.iter().map(|(b, _)| b.clone()).collect() });
-            // keep the first deterministically so the tree is still usable; the collision is surfaced to resolve
-        }
-        let (branch, text) = writers.into_iter().next().unwrap();
+        let (branch, text) = if writers.len() > 1 {
+            // a collision — try to resolve near-duplicates automatically; only report genuine conflicts
+            match resolve_collision(&path, &writers) {
+                Resolution::KeepRicher { branch, text } => {
+                    auto_resolved.push(path.clone());
+                    (branch, text)
+                }
+                Resolution::NeedsMerge { versions } => {
+                    collisions.push(Collision { path: path.clone(), branches: versions.iter().map(|(b, _)| b.clone()).collect() });
+                    needs_merge.push((path.clone(), versions.clone()));
+                    // keep the richest deterministically so the tree is still usable pending reconcile
+                    versions.into_iter().max_by_key(|(_, t)| richness(t, &path)).unwrap()
+                }
+            }
+        } else {
+            writers.into_iter().next().unwrap()
+        };
         match parse_front_matter(&text, &path, &branch) {
             Some(m) => metas.push(m),
             None => { warnings.push(format!("{path}: no front-matter (from branch {branch})")); metas.push(infer_meta(&text, &path, &branch)); }
@@ -220,7 +312,7 @@ pub fn merge_branches(branches: &[BranchDocs], project_title: &str) -> MergeResu
     }
     let index = finalize_index(metas, warnings);
     let _ = project_title;
-    MergeResult { index, collisions, merged }
+    MergeResult { index, collisions, auto_resolved, needs_merge, merged }
 }
 
 /// The system-prompt fragment that teaches the doc-organization convention. Appended to an agent's prompt in
@@ -320,14 +412,33 @@ mod tests {
     }
 
     #[test]
-    fn merge_flags_a_collision() {
-        // both branches wrote the SAME path — a collision to resolve, not a silent overwrite
-        let b1 = BranchDocs { branch: "x".into(), docs: vec![("docs/guide/setup.md".into(), doc("guide", 1, "Setup X", ""))] };
-        let b2 = BranchDocs { branch: "y".into(), docs: vec![("docs/guide/setup.md".into(), doc("guide", 1, "Setup Y", ""))] };
+    fn near_duplicate_collision_auto_resolves_to_the_richer() {
+        // both branches wrote nearly the same doc — auto-resolve, keeping the richer (has summary + order).
+        let thin = "---\ntitle: Setup\nsection: guide\norder: 0\nstatus: draft\nsummary:\n---\n# Setup\ninstall then run the thing\n";
+        let rich = "---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: how to set up\n---\n# Setup\ninstall then run the thing please\n";
+        let b1 = BranchDocs { branch: "x".into(), docs: vec![("docs/guide/setup.md".into(), thin.into())] };
+        let b2 = BranchDocs { branch: "y".into(), docs: vec![("docs/guide/setup.md".into(), rich.into())] };
+        let m = merge_branches(&[b1, b2], "Docs");
+        assert!(m.collisions.is_empty(), "near-duplicate is auto-resolved, not a reported conflict");
+        assert_eq!(m.auto_resolved, vec!["docs/guide/setup.md"]);
+        assert_eq!(m.merged.len(), 1);
+        assert!(m.merged[0].1.contains("how to set up"), "kept the richer version");
+    }
+
+    #[test]
+    fn genuine_conflict_is_reported_with_versions_for_reconcile() {
+        // two substantially-different docs at the same path → a real conflict + versions carried for the model.
+        let a = "---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: docker path\n---\n# Setup\nUse docker compose up to start the stack in containers with volumes and ports.\n";
+        let b = "---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: bare metal\n---\n# Setup\nCompile from source with cargo build release then run the native binary directly.\n";
+        let b1 = BranchDocs { branch: "docker".into(), docs: vec![("docs/guide/setup.md".into(), a.into())] };
+        let b2 = BranchDocs { branch: "native".into(), docs: vec![("docs/guide/setup.md".into(), b.into())] };
         let m = merge_branches(&[b1, b2], "Docs");
         assert_eq!(m.collisions.len(), 1);
-        assert_eq!(m.collisions[0].path, "docs/guide/setup.md");
-        assert_eq!(m.collisions[0].branches, vec!["x", "y"]);
-        assert_eq!(m.merged.len(), 1, "kept one deterministically; collision surfaced to resolve");
+        assert_eq!(m.needs_merge.len(), 1, "versions carried for the reconcile step");
+        assert_eq!(m.needs_merge[0].1.len(), 2);
+        // reconcile prompt carries both versions + the path
+        let p = reconcile_prompt(&m.needs_merge[0].0, &m.needs_merge[0].1);
+        assert!(p.contains("docs/guide/setup.md") && p.contains("branch: docker") && p.contains("branch: native"));
+        assert!(p.contains("Merge them into ONE"));
     }
 }

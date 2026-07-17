@@ -1890,22 +1890,37 @@ impl Chat {
         let title = session.name.clone();
         let branches: Vec<(String, std::path::PathBuf)> = self.agent_candidates.iter()
             .map(|c| (c.label.clone(), c.root.clone())).collect();
-        let (result, index_md) = crate::workspace_exec::merge_branch_docs(&branches, &title);
+        let (mut result, _) = crate::workspace_exec::merge_branch_docs(&branches, &title);
         if result.merged.is_empty() {
             self.note = ":merge-docs — the branches produced no docs (docs/**/*.md)".into();
             return;
         }
-        // write the unioned docs + the generated index
+        // Reconcile genuine conflicts with the depth model if one is loaded (near-dups already auto-resolved).
+        let mut reconciled = 0;
+        if !result.needs_merge.is_empty() {
+            let params = logscope::llm_backend::GenParams {
+                max_tokens: self.ctx.max_tokens as usize, n_ctx: self.ctx.n_ctx, n_batch: self.ctx.n_ctx,
+                temperature: self.ctx.temperature, ..Default::default()
+            };
+            if let Some(mut llm) = crate::workspace_exec::LocalLlm::from_active(params) {
+                reconciled = crate::workspace_exec::reconcile_doc_conflicts(&mut llm, &mut result);
+            }
+        }
+        // regenerate the index AFTER reconciliation (reconciled bodies may change titles/summaries)
+        let scanned: Vec<(String, String)> = result.merged.clone();
+        let index = crate::docorg::build_index_for(&scanned, "");
+        let index_md = crate::docorg::render_index_markdown(&index, &title);
         let mut files = result.merged.clone();
         files.push(("docs/README.md".to_string(), index_md));
         match crate::gitmind_session::write_and_commit(&project, &files, "merge docs") {
             Ok(hash) => {
+                let auto = if result.auto_resolved.is_empty() { String::new() } else { format!(" · {} auto-merged", result.auto_resolved.len()) };
+                let rec = if reconciled > 0 { format!(" · {reconciled} reconciled") } else { String::new() };
                 let coll = if result.collisions.is_empty() { String::new() }
-                    else { format!(" · ⚠ {} collision(s): {}", result.collisions.len(),
+                    else { format!(" · ⚠ {} unresolved conflict(s): {}", result.collisions.len(),
                         result.collisions.iter().map(|c| c.path.clone()).collect::<Vec<_>>().join(", ")) };
-                let warn = if result.index.warnings.is_empty() { String::new() } else { format!(" · {} warning(s)", result.index.warnings.len()) };
                 self.agent_candidates.clear();
-                self.note = format!("merged {} docs → commit {} · index regenerated{coll}{warn}", result.merged.len(), &hash[..hash.len().min(10)]);
+                self.note = format!("merged {} docs → commit {} · index regenerated{auto}{rec}{coll}", result.merged.len(), &hash[..hash.len().min(10)]);
             }
             Err(e) => self.note = format!(":merge-docs — {e}"),
         }

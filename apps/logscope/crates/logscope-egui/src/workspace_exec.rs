@@ -1228,6 +1228,28 @@ pub fn merge_branch_docs(branches: &[(String, std::path::PathBuf)], project_titl
     (result, index_md)
 }
 
+/// Reconcile the GENUINE conflicts in a doc merge with a (depth) model: for each conflicting path, ask the
+/// model to merge the branch versions into one coherent document (via `docorg::reconcile_prompt`) and splice
+/// the result back into `merged`. Near-duplicate collisions are already auto-resolved by `merge_branches`;
+/// this handles only the substantive conflicts. Returns the count reconciled. Pure w.r.t. the model.
+pub fn reconcile_doc_conflicts(llm: &mut dyn Llm, result: &mut crate::docorg::MergeResult) -> usize {
+    let mut reconciled = 0;
+    for (path, versions) in std::mem::take(&mut result.needs_merge) {
+        let prompt = crate::docorg::reconcile_prompt(&path, &versions);
+        if let Ok(text) = llm.generate(&prompt) {
+            let text = text.trim();
+            if !text.is_empty() {
+                if let Some(slot) = result.merged.iter_mut().find(|(p, _)| *p == path) {
+                    slot.1 = text.to_string();
+                    reconciled += 1;
+                }
+            }
+        }
+    }
+    if reconciled > 0 { result.collisions.clear(); } // resolved
+    reconciled
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1420,6 +1442,28 @@ mod tests {
         // after branch 0 finishes its (only) turn → done, the fan rotates to the newly-added branch 1
         let s1 = fan.on_done();
         assert!(matches!(s1, FanStep::Submit { branch: 1, .. }), "added branch is scheduled");
+    }
+
+    #[test]
+    fn model_reconciles_genuine_doc_conflicts() {
+        let a = "---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: docker\n---\n# Setup\nUse docker compose to run the stack in containers with mounted volumes and exposed ports.\n";
+        let b = "---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: native\n---\n# Setup\nCompile from source with cargo build release and run the native binary directly on the host.\n";
+        let b1 = crate::docorg::BranchDocs { branch: "docker".into(), docs: vec![("docs/guide/setup.md".into(), a.into())] };
+        let b2 = crate::docorg::BranchDocs { branch: "native".into(), docs: vec![("docs/guide/setup.md".into(), b.into())] };
+        let mut m = crate::docorg::merge_branches(&[b1, b2], "Docs");
+        assert_eq!(m.collisions.len(), 1);
+        // a scripted reconciler returns a merged doc
+        struct Reconciler;
+        impl Llm for Reconciler {
+            fn generate(&mut self, _p: &str) -> Result<String, String> {
+                Ok("---\ntitle: Setup\nsection: guide\norder: 1\nstatus: draft\nsummary: docker or native\n---\n# Setup\nRun via docker compose, OR compile from source and run natively.\n".into())
+            }
+        }
+        let n = reconcile_doc_conflicts(&mut Reconciler, &mut m);
+        assert_eq!(n, 1);
+        assert!(m.collisions.is_empty(), "conflict resolved");
+        let setup = m.merged.iter().find(|(p, _)| p == "docs/guide/setup.md").unwrap();
+        assert!(setup.1.contains("docker compose, OR compile"), "reconciled text spliced in");
     }
 
     #[test]
