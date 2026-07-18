@@ -195,9 +195,12 @@ pub fn gpu_buffer_budget(ram_budget: u64) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
     }
-    // conservative default: half of RAM budget, capped at 48 GiB — big enough for most quants, small enough
-    // that a 70B-int8 (~70 GiB) is rejected up front (→ q4) instead of crashing mid-upload. Tune per box.
-    (ram_budget / 2).min((48.0 * GIB) as u64)
+    // conservative default: half of RAM budget, capped at 24 GiB. Empirical (M2 Ultra Asahi/Honeykrisp):
+    // a 40.3 GiB q4-70B and a ~31 GiB MoE-int8 BOTH passed the old 48 GiB cap and then died in BO VMA
+    // allocation mid-upload — the driver's addressable-buffer ceiling is well below what it advertises.
+    // 24 GiB keeps every observed-working load in and pushes oversized ones to q4/refusal up front.
+    // Boxes that can take more (macOS/Metal) override with LOGSCOPE_MAX_GPU_GB.
+    (ram_budget / 2).min((24.0 * GIB) as u64)
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
