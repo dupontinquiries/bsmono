@@ -14,7 +14,7 @@
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, LinkAction, PaneAction};
-use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -80,6 +80,9 @@ impl eframe::App for VoicetermApp {
                     self.theme_menu.show(ui, &theme_host, &theme_menu())
                 {
                     self.theme = snapclone_theme::PaletteId::from_str(&id);
+                    // persist: the pick survives restarts (theme.palette in the kv prefs file)
+                    self.app.prefs.palette = id;
+                    let _ = save_prefs(&self.app.prefs);
                 }
                 let brace_host = ui.button("{\u{22EF}}");
                 if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
@@ -183,6 +186,16 @@ impl eframe::App for VoicetermApp {
 
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
+    // First run (no prefs file yet): voiceterm's Voice identity, NOT settings-kit's generic
+    // "Dark" default — Prefs::default() can't know which app it's defaulting for.
+    let first_run = !voiceterm_egui::shell::prefs_path().exists();
+    app.prefs = load_prefs();
+    let boot_theme = if first_run {
+        app.prefs.palette = "voice".into();
+        snapclone_theme::PaletteId::Voice
+    } else {
+        snapclone_theme::PaletteId::from_str(&app.prefs.palette)
+    };
     // realistic content, not a toy script — to actually surface rendering gotchas (colors,
     // wrapping, unicode) rather than just confirming an empty prompt renders.
     app.terminal.feed("$ ls --color\r\n");
@@ -213,7 +226,7 @@ fn main() -> eframe::Result<()> {
                 link_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-link-menu").columns(2),
                 link_url: None,
                 workspace: Workspace::new(&["main", "logs"]),
-                theme: snapclone_theme::PaletteId::Voice,
+                theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
             }))
         }),
