@@ -3251,7 +3251,11 @@ impl Gpu {
         let mut auto_q4 = false;
         if vocab_est > 0 {
             if let Some(budget) = store::resident_budget_bytes() {
-                let shape = crate::memplan::ModelShape { d, ffn: h, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
+                // MoE: the FFN weight mass is the EXPERTS — n_expert stacked [expert_ff, d] matrices per
+                // kind — not the dense feed_forward_length. Sizing with `h` alone made plan() see the 30B
+                // MoE as a ~5 GiB model → int8 → ~31 GiB real → BO VMA death. Effective width fixes the est.
+                let ffn_eff = if is_moe { n_expert * expert_ff } else { h };
+                let shape = crate::memplan::ModelShape { d, ffn: ffn_eff, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
                 if q {
                     use crate::memplan::{Fit, Residency, gib, plan, gpu_buffer_budget};
                     // Weights live in GPU BUFFERS, whose total is capped far below RAM on unified-memory
