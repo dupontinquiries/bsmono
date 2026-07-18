@@ -142,6 +142,18 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
     dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
+// ── theme picker ("long-press to show all vibes") ────────────────────────────
+
+/// The theme grid the settings screenshot shows behind a long-press — one cell per fleet palette
+/// (snapclone-theme's catalog, not the QML app's private hex sets: egui front-ends share the kit
+/// substrate per UI_STRATEGY.md). Cell id round-trips `PaletteId::from_str`.
+pub fn theme_menu() -> Vec<uikit_egui::slide_menu::SlideOption> {
+    snapclone_theme::PaletteId::all()
+        .iter()
+        .map(|p| uikit_egui::slide_menu::SlideOption::new(p.as_str(), p.display_name()))
+        .collect()
+}
+
 // ── workspace tab sidebar (QML vTabBar, v0.1.796) ────────────────────────────
 
 /// One workspace tab in the vertical tab sidebar. `fence_after` draws the accent divider under
@@ -271,6 +283,16 @@ mod tests {
         for expect in ["C-r", "C-a", "C-e", "~", "/", "-", "_"] {
             assert!(ext.contains(expect), "missing extended key {expect}");
         }
+    }
+
+    #[test]
+    fn theme_menu_covers_every_fleet_palette_and_round_trips_ids() {
+        let opts = theme_menu();
+        assert_eq!(opts.len(), snapclone_theme::PaletteId::all().len());
+        for o in &opts {
+            assert_eq!(snapclone_theme::PaletteId::from_str(&o.id).as_str(), o.id);
+        }
+        assert!(opts.iter().any(|o| o.id == "voice"));
     }
 
     #[test]
