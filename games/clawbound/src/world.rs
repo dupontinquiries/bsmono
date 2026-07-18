@@ -382,6 +382,29 @@ pub fn gen_tree(m: &mut Mesh, x: f32, z: f32, kind: u8, leaf: [f32; 3], scale: f
         }
         m.set_op(0.62);
         m.cone(v3(x, y + trunk_h - 0.5 * scale, z), 2.6 * scale, 3.0 * scale, 10, leaf);
+    } else if kind == 2 {
+        // willow — long drooping branches hanging from a high crown, a soft trailing silhouette
+        let crown_y = y + trunk_h * 0.92;
+        let nb = 7 + ((h1 * 4.0) as usize);
+        for i in 0..nb {
+            let ang = i as f32 / nb as f32 * tau + h1 * tau;
+            let out = (1.1 + hash2(i as i32, x as i32, 0x62) * 0.6) * scale;
+            let droop = (2.2 + hash2(i as i32, z as i32, 0x63) * 1.4) * scale;
+            let bstart = v3(x, crown_y, z);
+            let bmid = v3(x + ang.cos() * out, crown_y - droop * 0.35, z + ang.sin() * out);
+            let btip = v3(x + ang.cos() * out * 0.85, crown_y - droop, z + ang.sin() * out * 0.85);
+            let br = base_r * 0.22;
+            let branch = Branch { a: bstart, b: btip, r: br };
+            let risk = branch.snap_risk(cat_kg, 1.0).min(1.0);
+            m.set_op(1.0);
+            m.segment(bstart, bmid, br, br * 0.7, 5, mix(bark, rgb(0xc0503a), risk));
+            m.segment(bmid, btip, br * 0.7, br * 0.3, 5, mix(bark, rgb(0xc0503a), risk));
+            m.set_op(0.6);
+            m.cone(btip, 0.55 * scale, 1.0 * scale, 6, shade(leaf, 0.95 + hash2(i as i32, 3, 0x64) * 0.15));
+            branches.push(branch);
+        }
+        m.set_op(0.62);
+        m.cone(v3(x, crown_y - 0.3 * scale, z), 2.0 * scale, 2.2 * scale, 10, shade(leaf, 1.05));
     } else {
         m.set_op(0.62);
         for l in 0..4 {
@@ -461,7 +484,8 @@ pub fn build_trees(count: usize) -> Mesh {
         let tint = (hash2(x as i32 + 7, z as i32 + 3, 0x51F7) - 0.5) * 0.3;
         let mut leaf = rgb(biome.leaf);
         for k in 0..3 { leaf[k] = (leaf[k] + tint).clamp(0.0, 1.0); }
-        let kind = if hash2(i as i32, 5, 0x77) < 0.85 { biome.kind } else { 1 - biome.kind };
+        let kind_roll = hash2(i as i32, 5, 0x77);
+        let kind = if kind_roll < 0.08 { 2 } else if kind_roll < 0.85 { biome.kind } else { 1 - biome.kind };
         gen_tree(&mut m, x, z, kind, leaf, 0.9 + gh * 0.4, 0.0, false);
         if m.count() > 400_000 { break; }
     }
@@ -493,13 +517,29 @@ pub fn build_bushes(count: usize) -> Mesh {
     for (idx, (x, z, r)) in bush_positions(count).into_iter().enumerate() {
         let i = idx as i32;
         let biome = biome_at(x, z);
-        let leaf = shade(rgb(biome.leaf), 0.82);
-        for b in 0..6 {
-            let a = b as f32 / 6.0 * std::f32::consts::TAU;
-            let rr = if b == 0 { 0.0 } else { r * (0.35 + hash2(i, b, 0xE7) * 0.3) };
-            let cx = x + a.cos() * rr; let cz = z + a.sin() * rr;
-            let lh = r * (0.85 + hash2(i, b, 0xE8) * 0.4);
-            m.cone(v3(cx, height_at(cx, cz), cz), r * 0.7, lh, 9, shade(leaf, 0.9 + hash2(b, i, 0xE9) * 0.2));
+        let mut leaf = shade(rgb(biome.leaf), 0.82);
+        // the occasional berry bush — a warm tint standing out from the usual green
+        if hash2(i, 17, 0xEB) < 0.12 {
+            leaf = mix(leaf, rgb(0x9a3a44), 0.35);
+        }
+        let spiky = hash2(i, 29, 0xEC) < 0.3;   // an upright, spikier shrub instead of the round blob
+        if spiky {
+            let nb = 4 + (hash2(i, 2, 0xED) * 3.0) as usize;
+            for b in 0..nb {
+                let a = b as f32 / nb as f32 * std::f32::consts::TAU + hash2(i, b as i32, 0xEE) * 0.5;
+                let rr = r * (0.15 + hash2(i, b as i32, 0xE7) * 0.25);
+                let cx = x + a.cos() * rr; let cz = z + a.sin() * rr;
+                let lh = r * (1.3 + hash2(i, b as i32, 0xE8) * 0.7);
+                m.cone(v3(cx, height_at(cx, cz), cz), r * 0.28, lh, 6, shade(leaf, 0.88 + hash2(b as i32, i, 0xE9) * 0.24));
+            }
+        } else {
+            for b in 0..6 {
+                let a = b as f32 / 6.0 * std::f32::consts::TAU;
+                let rr = if b == 0 { 0.0 } else { r * (0.35 + hash2(i, b as i32, 0xE7) * 0.3) };
+                let cx = x + a.cos() * rr; let cz = z + a.sin() * rr;
+                let lh = r * (0.85 + hash2(i, b as i32, 0xE8) * 0.4);
+                m.cone(v3(cx, height_at(cx, cz), cz), r * 0.7, lh, 9, shade(leaf, 0.9 + hash2(b as i32, i, 0xE9) * 0.2));
+            }
         }
     }
     m.set_op(1.0);
@@ -691,6 +731,38 @@ pub fn build_reeds(count: usize) -> Mesh {
 #[cfg(test)]
 mod biome_blend_tests {
     use super::*;
+
+    #[test]
+    fn all_three_tree_kinds_produce_geometry() {
+        init_world();
+        for kind in [0u8, 1, 2] {
+            let mut m = Mesh::new();
+            gen_tree(&mut m, 5.0, 5.0, kind, rgb(0x5a8a3a), 1.0, 0.0, false);
+            assert!(!m.verts.is_empty(), "tree kind {kind} should build a non-empty mesh");
+        }
+    }
+
+    #[test]
+    fn willow_has_a_trailing_drooping_silhouette() {
+        // the willow's branch tips should hang well below its crown, unlike the
+        // upright conifer/broadleaf canopies
+        init_world();
+        let mut willow = Mesh::new();
+        gen_tree(&mut willow, 0.0, 0.0, 2, rgb(0x5a8a3a), 1.0, 0.0, false);
+        let ymin = willow.verts.iter().map(|v| v.pos[1]).fold(f32::MAX, f32::min);
+        let ymax = willow.verts.iter().map(|v| v.pos[1]).fold(f32::MIN, f32::max);
+        assert!(ymax - ymin > 4.0, "the willow's droop should give it real vertical spread");
+    }
+
+    #[test]
+    fn bushes_vary_between_round_and_spiky_shapes() {
+        init_world();
+        let m = build_bushes(60);
+        assert!(!m.verts.is_empty());
+        // just a smoke test that a decent-sized batch of bushes still builds a sane mesh
+        // with the new shape-branch and berry-tint logic in place
+        assert!(m.verts.len() > 100);
+    }
 
     #[test]
     fn cover_is_thick_in_the_woods_thin_in_the_open() {
