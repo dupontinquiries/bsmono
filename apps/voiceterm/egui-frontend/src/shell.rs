@@ -335,6 +335,20 @@ impl Workspace {
     }
 }
 
+/// v0.1.803's "N more" pill math: how many whole rows are hidden above and below a scrolled
+/// viewport, given the scroll offset, viewport height, total content height, and the row pitch
+/// (row height + spacing — QML's 30 + 3). Pure; the pills render these counts and tapping them
+/// scrolls by a page.
+pub fn overflow_counts(offset: f32, viewport_h: f32, content_h: f32, pitch: f32) -> (usize, usize) {
+    if pitch <= 0.0 || content_h <= viewport_h {
+        return (0, 0);
+    }
+    let above = (offset / pitch).floor().max(0.0) as usize;
+    let below_px = (content_h - offset - viewport_h).max(0.0);
+    let below = (below_px / pitch).floor() as usize;
+    (above, below)
+}
+
 /// One tab row of the vertical tab sidebar: the QML row shape — name (📌-suffixed when pinned),
 /// active highlight, and the accent fence divider under the row when `fence_after`. Returns the
 /// row's Response so the caller can wire click-to-activate AND the hold menu on the same host.
@@ -418,6 +432,27 @@ mod tests {
             assert_eq!(snapclone_theme::PaletteId::from_str(&o.id).as_str(), o.id);
         }
         assert!(opts.iter().any(|o| o.id == "voice"));
+    }
+
+    #[test]
+    fn overflow_counts_hide_whole_rows_only_and_zero_when_it_fits() {
+        const P: f32 = 33.0; // QML row pitch: 30 row + 3 spacing
+        // fits: no pills
+        assert_eq!(overflow_counts(0.0, 200.0, 150.0, P), (0, 0));
+        // 20 rows (660px) in a 200px viewport, at top: none above, the rest below
+        let (a, b) = overflow_counts(0.0, 200.0, 660.0, P);
+        assert_eq!(a, 0);
+        assert_eq!(b, ((660.0 - 200.0) / P) as usize); // 13 whole rows hidden below
+        // scrolled 100px: 3 whole rows above (partial rows don't count)
+        let (a, b2) = overflow_counts(100.0, 200.0, 660.0, P);
+        assert_eq!(a, 3);
+        assert!(b2 < b);
+        // at the bottom: rows above, none below
+        let (a, b3) = overflow_counts(460.0, 200.0, 660.0, P);
+        assert_eq!(b3, 0);
+        assert!(a > 0);
+        // degenerate pitch
+        assert_eq!(overflow_counts(50.0, 100.0, 900.0, 0.0), (0, 0));
     }
 
     #[test]
