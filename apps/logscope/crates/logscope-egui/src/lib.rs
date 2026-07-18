@@ -45,6 +45,7 @@ pub mod imprint;
 pub mod picking;
 pub mod physui;
 pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
+pub mod stepwise;   // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
 pub mod docorg; // document-organization convention: front-matter, generated index, branch merge
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
 pub mod assets;
