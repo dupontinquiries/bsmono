@@ -820,6 +820,11 @@ pub struct Chat {
     last_saved: Option<std::path::PathBuf>, // folder of the most recent save (for "Open folder")
     preview: Option<usize>,                 // index of the generated file whose body is expanded
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
+    stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
+    step_last_paused: u32,                  // dedup: highest step number already paused on this reply
+    step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
+    step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
+    step_arm_continue: bool,                // set by the Done handler; consumed by the frame loop
     hit_cap: bool,                          // last finished reply ran the full budget (offer manual Continue)
     checkpoints: Vec<Checkpoint>,           // restorable conversation snapshots (rollback)
     show_checkpoints: bool,                 // checkpoints panel open
@@ -899,7 +904,7 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, hit_cap: false,
+            auto_continue: true, stepwise: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -1075,6 +1080,23 @@ impl Chat {
                         if !stop && ntok % 24 == 0 { check_text = Some(m.text().to_string()); }
                     }
                 }
+                // Stepwise checkpoints: a fresh ⏸ STEP k/n marker in the stream pauses generation here.
+                // The Done handler then auto-continues (warm-KV resume — a pause costs ~nothing), giving a
+                // natural injection point per step and a checklist for the UI. Scan the live text directly
+                // (cheap: markers are line-anchored and we only look when streaming).
+                if !stop && self.stepwise {
+                    if let Some(s) = &self.stream {
+                        if let Some(m) = self.msgs.get(s.idx) {
+                            if let Some(mark) = crate::stepwise::should_pause(m.text(), self.step_last_paused) {
+                                self.step_last_paused = mark.k;
+                                let cont = crate::stepwise::should_continue(&mark, m.text(), self.step_continues, 12);
+                                self.step_pending_continue = cont;
+                                self.note = format!("step {}/{} — {}", mark.k, mark.n, mark.summary);
+                                stop = true;
+                            }
+                        }
+                    }
+                }
                 // Repetition recovery (all backends): if the reply has locked into a loop, cut it now so the
                 // model's speed stops being a runaway train instead of burning the whole token budget.
                 if let Some(txt) = check_text {
@@ -1098,6 +1120,14 @@ impl Chat {
                 self.last = Some((tokens, secs));
                 self.stream = None;
                 self.rep_monitor.reset();
+                // Stepwise: the pause we requested has landed — arm the auto-continue. It fires in the
+                // frame loop (continue_generation), resuming the SAME reply on warm KV. Fan-out results
+                // for this step boundary can be spliced into the continue prompt here later.
+                if self.step_pending_continue {
+                    self.step_pending_continue = false;
+                    self.step_continues += 1;
+                    self.step_arm_continue = true;
+                }
                 if self.last_prompt_tokens > 0 { // bank this run for future progress estimates
                     self.gen_samples.push(crate::estimate::GenSample { prompt_tokens: self.last_prompt_tokens, output_tokens: tokens, secs });
                     let n = self.gen_samples.len();
@@ -1378,7 +1408,9 @@ impl Chat {
 
     /// Build the prompt from history `msgs[..upto]` (so regenerate/edit can re-run from a point).
     fn build_prompt_upto(&self, upto: usize, doc: &crate::analysis::Doc) -> String {
-        let sys = neutralize_markers(&self.full_system(doc));
+        let mut sys = neutralize_markers(&self.full_system(doc));
+        if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        let sys = sys;
         match self.backend {
             BackendKind::Wgpu => match self.template {
                 TemplateKind::ChatML => self.build_prompt_chatml(&sys, upto),
@@ -1398,7 +1430,9 @@ impl Chat {
     /// into the same message. Uses the turns BEFORE the partial (chosen_msgs(.., last)) so the user
     /// question is still present even in single-shot mode.
     fn build_continue_prompt(&self, doc: &crate::analysis::Doc) -> String {
-        let sys = neutralize_markers(&self.full_system(doc));
+        let mut sys = neutralize_markers(&self.full_system(doc));
+        if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
         let partial = neutralize_markers(&self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default());
         let chatml = self.backend == BackendKind::Wgpu && self.template == TemplateKind::ChatML;
@@ -1695,6 +1729,8 @@ impl Chat {
     /// Actually begin a generation: checkpoint, append the user turn (forked at `parent`) + an empty
     /// assistant turn, build the prompt for the live branch, and stream. Shared by send + the queue.
     fn start_generation(&mut self, qt: String, parent: Option<usize>, infer: &Inference, doc: &crate::analysis::Doc) {
+        // fresh reply → fresh stepwise accounting
+        self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
         if !self.msgs.is_empty() {
             let preview: String = qt.chars().take(40).collect();
             self.checkpoint(format!("before: {preview}"));
@@ -5868,6 +5904,8 @@ impl Chat {
                         ui.label(RichText::new(e).color(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c)).small());
                     }
                     ui.label(RichText::new(if self.threading { "threaded" } else { "single-shot" }).color(theme::FAINT()).small());
+                    ui.checkbox(&mut self.stepwise, RichText::new("stepwise").small())
+                        .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
                     ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
                         .on_hover_text("When a reply hits the length cap, keep generating to finish it");
                     if self.hit_cap && !streaming {
@@ -6071,6 +6109,11 @@ impl Chat {
             }
         }
         if do_continue { self.continue_generation(infer, doc); }
+        // Stepwise auto-continue: resume the paused reply on the user's behalf (warm-KV, one per pause).
+        if self.step_arm_continue && self.stream.is_none() {
+            self.step_arm_continue = false;
+            self.continue_generation(infer, doc);
+        }
         if do_checkpoint { self.checkpoint(format!("manual · {} msgs", self.msgs.len())); }
         if do_export {
             let note = match self.export_chat(ui.ctx()) {
