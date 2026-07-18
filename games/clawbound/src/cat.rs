@@ -116,6 +116,36 @@ pub fn leap() -> Pose {
     p
 }
 
+/// A low, scrabbling four-beat climb up steep mountain ground — knees driven higher
+/// than a normal walk, weight forward, claws digging in. The mountain-terrain gait.
+pub fn scramble(t: f32) -> Pose {
+    let off = [0.0, 0.5, 0.75, 0.25];
+    let mut p = base();
+    for i in 0..4 {
+        let ph = (t + off[i]) * TAU;
+        p.swing[i] = 0.42 * ph.sin();
+        p.knee[i] = 0.55 + 0.4 * (-ph.cos()).max(0.0);   // driven higher than a walk's knee lift
+    }
+    p.crouch = 0.35;
+    p.pitch = 0.35;               // weight thrown forward into the slope
+    p.bob = 0.03 * (2.0 * t * TAU).sin();
+    p.tail = 0.15;
+    p
+}
+
+/// A quick, compact hop over a rock — shorter and lower than a full leap, forelimbs
+/// tucked tight rather than stretched out.
+pub fn vault(t: f32) -> Pose {
+    let mut p = base();
+    let ph = (1.0 - t.clamp(0.0, 1.0)) * PI;   // eases in, peaks, eases out
+    p.swing = [0.55, 0.55, -0.5, -0.5];
+    p.knee = [0.75; 4];
+    p.pitch = 0.15;
+    p.bob = 0.14 * ph.sin();
+    p.tail = 0.3; p.head = 0.15;
+    p
+}
+
 /// Anticipation crouch before a leap.
 pub fn coil() -> Pose {
     let mut p = base();
@@ -557,6 +587,22 @@ mod tests {
         for m in [Move::Pounce, Move::Jump, Move::Roll, Move::Dodge, Move::UnderbellySwipe, Move::HindKick, Move::Swat] {
             let _ = move_pose(m, 0.5);
         }
+    }
+
+    #[test]
+    fn scramble_lifts_knees_higher_than_a_walk_and_leans_forward() {
+        let w = walk(0.15);
+        let s = scramble(0.15);
+        assert!(s.knee[0] > w.knee[0], "scrambling up a slope should drive the knees higher than a normal walk");
+        assert!(s.pitch > 0.2, "the scramble should lean the weight forward into the climb");
+    }
+
+    #[test]
+    fn vault_is_shorter_and_lower_than_a_full_leap() {
+        let l = leap();
+        let v = vault(0.5);
+        assert!(v.bob <= l.bob, "a vault over a rock should be lower than a full committed leap");
+        assert!(v.knee[0] > l.knee[0], "a vault's legs should stay more tucked than a leap's fully extended reach");
     }
 
     #[test]
