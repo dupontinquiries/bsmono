@@ -2632,6 +2632,7 @@ dependencies = [
  "gpu-gemm",
  "libc",
  "logscope",
+ "noise-kit",
  "png",
  "regex",
  "repo-map",
@@ -2810,6 +2811,10 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "noise-kit"
+version = "0.1.0"
 
 [[package]]
 name = "nom"

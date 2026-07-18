@@ -19,36 +19,13 @@ pub mod mat {
 }
 
 // value noise on a lattice that WRAPS at `period` cells → the tile is seamless when repeated.
-#[inline] fn hashp(xi: i32, yi: i32, period: i32, seed: u32) -> f32 {
-    let x = xi.rem_euclid(period.max(1)) as u32;
-    let y = yi.rem_euclid(period.max(1)) as u32;
-    let mut h = x.wrapping_mul(374_761_393).wrapping_add(y.wrapping_mul(668_265_263)).wrapping_add(seed.wrapping_mul(362_437));
-    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
-    ((h ^ (h >> 16)) & 0xFF_FFFF) as f32 / 0xFF_FFFF as f32
-}
-#[inline] fn smooth(t: f32) -> f32 { t * t * (3.0 - 2.0 * t) }
-fn vnoise(x: f32, y: f32, period: i32, seed: u32) -> f32 {
-    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
-    let (fx, fy) = (smooth(x - x0 as f32), smooth(y - y0 as f32));
-    let a = hashp(x0, y0, period, seed);
-    let b = hashp(x0 + 1, y0, period, seed);
-    let c = hashp(x0, y0 + 1, period, seed);
-    let d = hashp(x0 + 1, y0 + 1, period, seed);
-    let ab = a + (b - a) * fx;
-    let cd = c + (d - c) * fx;
-    ab + (cd - ab) * fy
-}
+// The hashp/vnoise/fbm family that lived here moved to `shared/noise-kit` bit-identically (this
+// file was the origin of those constants — soldier mesh.rs adapted them from here, and the kit
+// golden-pins the outputs of both). `fbm` keeps its local name/signature for the ~15 call sites.
 /// fBm whose octaves all tile within uv∈[0,1): octave o uses lattice period `cells·2^o`.
+#[inline]
 fn fbm(u: f32, v: f32, cells: i32, oct: u32, seed: u32) -> f32 {
-    let (mut sum, mut amp, mut freq, mut p, mut norm) = (0.0f32, 0.5f32, 1.0f32, cells, 0.0f32);
-    for o in 0..oct {
-        sum += vnoise(u * cells as f32 * freq, v * cells as f32 * freq, p, seed + o) * amp;
-        norm += amp;
-        amp *= 0.5;
-        freq *= 2.0;
-        p *= 2;
-    }
-    sum / norm.max(1e-4)
+    noise_kit::fbm2_tiled(u, v, cells, oct, seed)
 }
 #[inline] fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t]
