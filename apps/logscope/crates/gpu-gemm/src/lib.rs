@@ -667,9 +667,40 @@ pub struct MoeLayer {
     /// Per-expert FUSED gate||up projection [2ff, d] — same fusion as the dense wgate_up (one matmul emits
     /// [t, 2ff] = [gate | up], consumed by SWIGLU_PACKED); per-row quant of the concat is identical to
     /// quantizing separately. Cuts one matvec dispatch + weight bind per expert per token.
-    pub gate_up: Vec<Lin>,           // n_expert × [2ff, d]
-    pub down: Vec<Lin>,              // n_expert × [d, ff]
+    pub gate_up: Vec<Lin>,           // n_expert × [2ff, d] — zero-copy row VIEWS into stacked_gu (prefill path)
+    pub down: Vec<Lin>,              // n_expert × [d, ff] — views into stacked_down
+    /// The full expert stacks as single quantized Lins ([n_expert·2ff, d] / [n_expert·d, ff]) — what the
+    /// v2 decode kernels index by GPU-side expert selection (row = sel[slot]·rstride + col, no readback).
+    pub stacked_gu: Lin,
+    pub stacked_down: Lin,
     pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
+}
+/// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
+/// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
+/// slice of the qwen3moe shapes (k=2048/768; scales 32-block → whole f32s per row). F32 Lins (router)
+/// aren't row-viewed. Returns None if the Lin kind can't be viewed.
+fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
+    fn tview(t: &Tensor, byte_off: u64, byte_len: u64, rows: usize, cols: usize) -> Tensor {
+        let base = t.view.map(|(o, _)| o).unwrap_or(0);
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((base + byte_off, byte_len)) }
+    }
+    match &l.kind {
+        LinKind::Q8(w) => {
+            let kb = w.k / 32;
+            Some(Lin { kind: LinKind::Q8(QWeight {
+                qw: tview(&w.qw, (row0 * w.k) as u64, (rows * w.k) as u64, rows, w.k),
+                qs: tview(&w.qs, (row0 * kb * 4) as u64, (rows * kb * 4) as u64, rows, kb),
+                n: rows, k: w.k }), bias: None })
+        }
+        LinKind::Q4(w) => {
+            let kb = w.k / 32;
+            Some(Lin { kind: LinKind::Q4(Q4Weight {
+                qw: tview(&w.qw, (row0 * w.k / 2) as u64, (rows * w.k / 2) as u64, rows, w.k / 2),
+                qs: tview(&w.qs, (row0 * kb * 4) as u64, (rows * kb * 4) as u64, rows, kb),
+                n: rows, k: w.k }), bias: None })
+        }
+        LinKind::F32(_) => None,
+    }
 }
 /// One Z-Image/DiT transformer block (Peebles & Xie AdaLN-Zero design): non-affine LayerNorm →
 /// AdaLN modulate → bidirectional MHA → AdaLN gated residual → non-affine LayerNorm → AdaLN modulate →
@@ -1601,6 +1632,16 @@ impl Gpu {
     /// then weighted SCATTER-ADD into the output. Correctness-first v1: the per-layer router readback is a
     /// GPU sync (~1-3 ms) — the known perf ceiling (~5-10 tok/s decode) until GPU-side top-k lands.
     fn moe_ffn(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        // v2 DECODE FAST PATH: route ON the GPU — top-k kernel + expert-indexed matvecs over the stacked
+        // weights. Zero readbacks (v1 paid 48 submit+poll syncs per token ≈ 340 ms on Asahi — ~90% of the
+        // 2.7 tok/s wall time). Prefill (t>1) keeps the v1 grouped path over the SAME weights via row
+        // views — which is also the built-in cross-check: if prefill output is coherent and decode isn't,
+        // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
+        if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax)
+            && std::env::var("LOGSCOPE_MOE_V1").is_err()
+        {
+            if let Some(out) = self.moe_ffn_gpu_routed(m, n2, d, x2) { return out; }
+        }
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
         let ne = m.cfg.n_routed as usize;
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
@@ -1630,6 +1671,55 @@ impl Gpu {
             self.dispatch(SCATTER_ADD_W, &[&dn, &idx, &wgt], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
         }
         out
+    }
+
+    /// The GPU-routed MoE decode step (t=1): router matvec → MOE_TOPK (selection + softmax weights stay
+    /// on-GPU) → per-slot expert-indexed matvecs over the stacked gate_up/down → weighted combine folded
+    /// with the residual. ~20 dispatches, ZERO polls. Returns None if the stacked weights aren't a
+    /// quantized kind these kernels read (then the caller runs the v1 readback path).
+    fn moe_ffn_gpu_routed(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<Tensor> {
+        let (gu_qw, gu_qs, gu_k, sh) = match &m.stacked_gu.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            LinKind::F32(_) => return None,
+        };
+        let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            LinKind::F32(_) => return None,
+        };
+        let slots = m.cfg.n_used.clamp(1, 16) as usize;
+        let ne = m.cfg.n_routed as usize;
+        let ff2 = 2 * dn_k;              // fused gate||up rows per expert = 2·ff (ff == down's k)
+        // 1) router logits stay on-GPU
+        let logits = m.router.apply(self, n2, 1);
+        // 2) top-k selection + combine weights → selw [k idx (u32) | k weights (f32 bitcast)]
+        let selw = self.alloc(1, 2 * slots);
+        let tk = [ne as u32, slots as u32, 0, 0];
+        self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
+        // 3) fused gate||up for each selected expert (broadcast activation)
+        let gu_out = self.alloc(slots, ff2);
+        for slot in 0..slots {
+            let gx = (ff2 as u32).min(32768);
+            let gy = (ff2 as u32).div_ceil(gx);
+            let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, slot as u32, ff2 as u32, 0u32, 0u32];
+            self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        }
+        // 4) SwiGLU over the packed [slots, 2ff]
+        let hmid = self.swiglu_packed(&gu_out);
+        // 5) down projection per expert (per-slot activation rows)
+        let dn_out = self.alloc(slots, d);
+        for slot in 0..slots {
+            let gx = (d as u32).min(32768);
+            let gy = (d as u32).div_ceil(gx);
+            let dims = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx, slot as u32, d as u32, 1u32, 0u32];
+            self.dispatch(sh_dn, &[&hmid, dn_qw, dn_qs, &selw], &dn_out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        }
+        // 6) weighted combine + residual
+        let out = self.alloc(1, d);
+        let wd = [d as u32, slots as u32, 0, 0];
+        self.dispatch(MOE_WSUM, &[&dn_out, &selw, x2], &out, bytemuck::cast_slice(&wd), wg1(d as u32));
+        Some(out)
     }
 
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
@@ -2723,6 +2813,117 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[d0+1u]=x0*s+x1*c;
 }"#;
 
+// ===== MoE v2 decode kernels: GPU-side routing (zero readbacks) =====
+// MOE_TOPK: serial top-k over the router logits (n<=512, k<=16 — trivial work, the win is staying on-GPU).
+// Selection order = descending logit; weights = softmax over the SELECTED logits (bit-faithful to
+// moe::route's Softmax path: global softmax renormalized to the top-k == softmax over the selected).
+// Output selw: [0..k) = expert index (u32), [k..2k) = combine weight (f32 bitcast to u32).
+const MOE_TOPK: &str = r#"
+struct D { n:u32,k:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> logits: array<f32>;
+@group(0)@binding(1) var<storage,read_write> selw: array<u32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(1,1,1)
+fn main(){
+  var idx: array<u32,16>; var lg: array<f32,16>;
+  for(var s=0u;s<d.k;s=s+1u){
+    var bi=0u; var bv=-3.4e38;
+    for(var i=0u;i<d.n;i=i+1u){
+      var taken=false;
+      for(var t=0u;t<s;t=t+1u){ if(idx[t]==i){ taken=true; } }
+      if(!taken && logits[i]>bv){ bv=logits[i]; bi=i; }
+    }
+    idx[s]=bi; lg[s]=bv;
+  }
+  // softmax over the selected (max = lg[0], selection is descending)
+  var sum=0.0;
+  for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-lg[0]); sum=sum+lg[s]; }
+  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/sum); }
+}"#;
+
+// MOE_MATVEC_Q8 / MOE_MATVEC_Q4: the base MATVEC_Q8_0/MATVEC_Q4 kernels with the weight row indexed
+// through a GPU-side expert selection — row = sel[slot]*rstride + col — so the CPU never learns which
+// experts won (no readback). `xper=1` reads a per-slot activation row (the down projection consumes
+// hmid[slot]); `xper=0` broadcasts one activation row (gate_up consumes n2). Output c[slot*n + col].
+const MOE_MATVEC_Q8: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let row=selw[d.slot]*d.rstride+col;
+  let wbase=row*(d.k/4u); let sbase=row*d.kb;
+  let abase=select(0u, d.slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[d.slot*d.n+col]=red[0]; }
+}"#;
+
+const MOE_MATVEC_Q4: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let row=selw[d.slot]*d.rstride+col;
+  let wbase=row*(d.k/8u); let sbase=row*d.kb;
+  let abase=select(0u, d.slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[d.slot*d.n+col]=red[0]; }
+}"#;
+
+// MOE_WSUM: out[col] = resid[col] + Σ_s weight[s] · down[s·d + col] — the routed-expert combine, folded
+// with the residual add. Weights come from MOE_TOPK's selw (f32 bitcast at [k..2k)).
+const MOE_WSUM: &str = r#"
+struct D { n:u32,k:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> selw: array<u32>;
+@group(0)@binding(2) var<storage,read> resid: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;}
+  var acc=resid[i];
+  for(var s=0u;s<d.k;s=s+1u){ acc=acc+bitcast<f32>(selw[d.k+s])*src[s*d.n+i]; }
+  o[i]=acc;
+}"#;
+
 const GATHER_ROWS: &str = r#"
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;
@@ -3392,22 +3593,32 @@ impl Gpu {
                     // Stacked expert tensors: expert dim OUTERMOST, so expert e's matrix is the contiguous
                     // f32 slice [e·rows·cols, (e+1)·rows·cols) after fetch's dequant (which reads each
                     // tensor's ACTUAL ggml type — Q4_K vs Q6_K varies per layer). gate/up: [ff, d]; down: [d, ff].
-                    // Fuse each expert's gate||up at load (same pattern as dense wgate_up): one [2ff, d]
-                    // Lin per expert instead of two [ff, d] — one matvec + one bind saved per expert/token.
+                    // v2 layout: ONE quantized Lin per kind for the whole expert stack (interleaved
+                    // [e: gate||up] for the fused projection), then per-expert Lins are zero-copy row
+                    // VIEWS into it. One quant pass instead of n_expert (faster load), and the stacked
+                    // buffer is what the GPU-routed decode kernels index (row = sel·rstride + col).
                     let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
                     let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
                     let ec = expert_ff * d;
-                    let gate_up: Vec<Lin> = (0..n_expert).map(|e| {
-                        let mut gu = Vec::with_capacity(2 * ec);
-                        gu.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
-                        gu.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
-                        self.make_lin(&gu, 2 * expert_ff, d, q, q4_mode)
-                    }).collect();
+                    let mut inter = Vec::with_capacity(2 * ec * n_expert);
+                    for e in 0..n_expert {
+                        inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                        inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                    }
                     drop(gsrc); drop(usrc);
+                    let stacked_gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
+                    drop(inter);
                     let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                    let down: Vec<Lin> = (0..n_expert).map(|e| self.make_lin(&dsrc[e * ec..(e + 1) * ec], d, expert_ff, q, q4_mode)).collect();
+                    let stacked_down = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
                     drop(dsrc);
-                    Some(Box::new(MoeLayer { router, gate_up, down,
+                    let gate_up: Vec<Lin> = (0..n_expert)
+                        .filter_map(|e| lin_row_view(&stacked_gu, e * 2 * expert_ff, 2 * expert_ff)).collect();
+                    let down: Vec<Lin> = (0..n_expert)
+                        .filter_map(|e| lin_row_view(&stacked_down, e * d, d)).collect();
+                    if gate_up.len() != n_expert || down.len() != n_expert {
+                        return Err("MoE expert stack isn't row-viewable (unexpected residency format)".into());
+                    }
+                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
