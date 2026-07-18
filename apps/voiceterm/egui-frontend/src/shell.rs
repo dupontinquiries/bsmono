@@ -21,6 +21,7 @@
 //! multi-theme picker (Dark/Light/Nord/Solar/Mono/Rose/Gruv/Ocean/Mocha, "long-press to show all
 //! vibes") is a real, separate feature visible in the settings screenshot — not ported here.
 
+use crate::gesture_menus::WsCall;
 use egui::{Rect, Response, Ui};
 use uikit_egui::dock::{self, Chip, Corner};
 use uikit_egui::PaletteColors;
@@ -141,9 +142,108 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
     dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
+// ── workspace tab sidebar (QML vTabBar, v0.1.796) ────────────────────────────
+
+/// One workspace tab in the vertical tab sidebar. `fence_after` draws the accent divider under
+/// this tab (the QML fence — a horizontal rule now that the strip is vertical).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WsTab {
+    pub name: String,
+    pub pinned: bool,
+    pub fence_after: bool,
+}
+
+impl WsTab {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into(), pinned: false, fence_after: false }
+    }
+}
+
+/// The tab-strip model the per-tab action menu drives — the egui side of what QML kept in
+/// `termTabStrip._tabs` behind `backend.ws_command`. Single-pane for now: pane-level calls
+/// (split / close pane / web pane) report unhandled so the caller can surface or stub them.
+#[derive(Clone, Debug, Default)]
+pub struct Workspace {
+    pub tabs: Vec<WsTab>,
+    pub active: usize,
+}
+
+impl Workspace {
+    pub fn new(names: &[&str]) -> Self {
+        Self { tabs: names.iter().map(|n| WsTab::new(*n)).collect(), active: 0 }
+    }
+
+    /// Apply one typed backend call (see `gesture_menus::tab_dispatch`). Returns `true` when the
+    /// call is handled by this model; pane-level calls return `false` (single-pane model).
+    /// Semantics mirror the QML backend: "new tab" appends AND activates; "go to tab N" is
+    /// 1-based and clamps; "close tab" keeps at least one tab and clamps `active`.
+    pub fn apply(&mut self, call: &WsCall) -> bool {
+        match call {
+            WsCall::ToggleFence(i) => {
+                if let Some(t) = self.tabs.get_mut(*i) {
+                    t.fence_after = !t.fence_after;
+                }
+                true
+            }
+            WsCall::TogglePin(i) => {
+                if let Some(t) = self.tabs.get_mut(*i) {
+                    t.pinned = !t.pinned;
+                }
+                true
+            }
+            WsCall::Command(c) => {
+                if c == "new tab" {
+                    self.tabs.push(WsTab::new(format!("shell {}", self.tabs.len() + 1)));
+                    self.active = self.tabs.len() - 1;
+                    true
+                } else if let Some(n) = c.strip_prefix("go to tab ").and_then(|n| n.parse::<usize>().ok()) {
+                    self.active = n.saturating_sub(1).min(self.tabs.len().saturating_sub(1));
+                    true
+                } else if c == "close tab" {
+                    if self.tabs.len() > 1 {
+                        self.tabs.remove(self.active);
+                        self.active = self.active.min(self.tabs.len() - 1);
+                    }
+                    true
+                } else {
+                    false // split down/right, close pane, … — pane-level, not modeled yet
+                }
+            }
+            WsCall::OpenWebPane => false,
+        }
+    }
+
+    /// Apply a whole dispatch sequence in order; `true` iff every call was handled.
+    pub fn apply_all(&mut self, calls: &[WsCall]) -> bool {
+        let mut all = true;
+        for c in calls {
+            all &= self.apply(c);
+        }
+        all
+    }
+}
+
+/// One tab row of the vertical tab sidebar: the QML row shape — name (📌-suffixed when pinned),
+/// active highlight, and the accent fence divider under the row when `fence_after`. Returns the
+/// row's Response so the caller can wire click-to-activate AND the hold menu on the same host.
+pub fn tab_row(ui: &mut Ui, tab: &WsTab, active: bool, c: &PaletteColors) -> Response {
+    let label = if tab.pinned { format!("{} \u{1F4CC}", tab.name) } else { tab.name.clone() };
+    let resp = dock::list_row(ui, &label, active, 30.0, c);
+    if tab.fence_after {
+        // the fence: a 2px accent rule spanning the row's width, just under it (QML bottomMargin -3)
+        let r = resp.rect;
+        let y = r.bottom() + 2.0;
+        ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], egui::Stroke::new(2.0, c.accent));
+        ui.add_space(3.0);
+    }
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gesture_menus::{tab_dispatch, WsCall};
+    use uikit_egui::slide_menu::Variant;
 
     #[test]
     fn fab_docks_at_the_corner_overlapping_slightly() {
@@ -171,6 +271,47 @@ mod tests {
         for expect in ["C-r", "C-a", "C-e", "~", "/", "-", "_"] {
             assert!(ext.contains(expect), "missing extended key {expect}");
         }
+    }
+
+    #[test]
+    fn workspace_applies_the_tab_menu_calls_with_qml_semantics() {
+        let mut ws = Workspace::new(&["main", "logs", "build"]);
+        // pin + fence toggle
+        assert!(ws.apply(&WsCall::TogglePin(1)) && ws.tabs[1].pinned);
+        assert!(ws.apply(&WsCall::ToggleFence(0)) && ws.tabs[0].fence_after);
+        assert!(ws.apply(&WsCall::ToggleFence(0)) && !ws.tabs[0].fence_after);
+        // new tab appends AND activates
+        assert!(ws.apply(&WsCall::Command("new tab".into())));
+        assert_eq!((ws.tabs.len(), ws.active), (4, 3));
+        // goto is 1-based and clamps
+        assert!(ws.apply(&WsCall::Command("go to tab 2".into())));
+        assert_eq!(ws.active, 1);
+        assert!(ws.apply(&WsCall::Command("go to tab 99".into())));
+        assert_eq!(ws.active, 3);
+        // close removes the active tab, keeps at least one, clamps
+        assert!(ws.apply(&WsCall::Command("close tab".into())));
+        assert_eq!((ws.tabs.len(), ws.active), (3, 2));
+        for _ in 0..5 {
+            ws.apply(&WsCall::Command("close tab".into()));
+        }
+        assert_eq!(ws.tabs.len(), 1); // the last tab survives
+    }
+
+    #[test]
+    fn tab_menu_dispatch_flows_end_to_end_into_the_workspace() {
+        let mut ws = Workspace::new(&["main", "logs", "build"]);
+        // hold tab 3, drag up on the split cell: goto happens, the split itself is (honestly) unhandled
+        let calls = tab_dispatch("split", Variant::Vertical, 2);
+        assert!(!ws.apply_all(&calls));
+        assert_eq!(ws.active, 2);
+        // hold tab 1, close with the default (tab) variant: fully handled
+        let calls = tab_dispatch("close", Variant::Tab, 0);
+        assert!(ws.apply_all(&calls));
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.tabs[0].name, "logs");
+        // fence via the menu on the (new) first tab
+        assert!(ws.apply_all(&tab_dispatch("fence", Variant::Single, 0)));
+        assert!(ws.tabs[0].fence_after);
     }
 
     #[test]

@@ -13,8 +13,8 @@
 
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
-use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, LinkAction, PaneAction};
-use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, Session, Sidebar, SidebarAction, TERMINAL_KEYCAPS};
+use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, LinkAction, PaneAction};
+use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, tab_row, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -36,6 +36,9 @@ struct VoicetermApp {
     /// context argument).
     link_menu: voiceterm_egui::slide_menu::SlideMenu,
     link_url: Option<String>,
+    /// The workspace tab sidebar (QML vTabBar, v0.1.796): click activates, HOLD a tab opens the
+    /// per-tab action menu (v0.1.790) with the tab's name in the title band.
+    workspace: Workspace,
 }
 
 impl eframe::App for VoicetermApp {
@@ -76,6 +79,32 @@ impl eframe::App for VoicetermApp {
             });
             if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
                 self.app.terminal.feed(send);
+            }
+        });
+
+        // the vertical tab sidebar sits between the session sidebar and the terminal
+        egui::SidePanel::left("tabbar").resizable(false).exact_width(120.0).show(ctx, |ui| {
+            ui.add_space(4.0);
+            let mut apply: Vec<voiceterm_egui::gesture_menus::WsCall> = Vec::new();
+            for i in 0..self.workspace.tabs.len() {
+                let tab = self.workspace.tabs[i].clone();
+                let resp = tab_row(ui, &tab, i == self.workspace.active, &self.colors);
+                if resp.clicked() {
+                    self.workspace.active = i;
+                }
+                // hold-to-open the per-tab menu on the same row host (0.35 s, QML hold feel);
+                // the held tab's name rides in the title band
+                let menu = tab_slide_menu(("vt-tab-menu", i), &tab.name).hold(0.35);
+                if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
+                    menu.show_stored(ui, egui::Id::new(("vt-tab-menu", i)), &resp, &tab_menu())
+                {
+                    apply = tab_dispatch(&id, variant, i);
+                }
+            }
+            for call in &apply {
+                // pane-level calls (split / close pane / web pane) are unhandled by the
+                // single-pane model — same on-device status as the other workspace stubs
+                let _ = self.workspace.apply(call);
             }
         });
 
@@ -172,6 +201,7 @@ fn main() -> eframe::Result<()> {
                 pane_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-pane-menu").columns(3),
                 link_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-link-menu").columns(2),
                 link_url: None,
+                workspace: Workspace::new(&["main", "logs"]),
             }))
         }),
     )
