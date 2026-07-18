@@ -236,6 +236,15 @@ impl Tokenizer {
             }
         }
         tk.set_specials(specials);
+        // Diagnostic: did the ChatML/Llama markers actually register? If these are None, the vocab doesn't
+        // store them as literal "<|...|>" strings (so the <|...|> scan can't see them); if they're Some but
+        // the prompt still shows "0 special tokens", the mismatch is in encode, not registration. Also dump
+        // the raw stored strings at the known Qwen special ids to see what the vocab actually holds.
+        let show = |id: u32| tk.tokens.get(id as usize).map(|t| String::from_utf8_lossy(t).into_owned());
+        eprintln!("tokenizer: {} specials registered | im_start={:?} im_end={:?} endoftext={:?} eot_id={:?} | raw[151643..=151645]={:?},{:?},{:?}",
+            tk.specials.len(), tk.special_id("<|im_start|>"), tk.special_id("<|im_end|>"),
+            tk.special_id("<|endoftext|>"), tk.special_id("<|eot_id|>"),
+            show(151643), show(151644), show(151645));
         Ok(tk)
     }
 }
