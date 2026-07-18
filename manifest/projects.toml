@@ -256,6 +256,26 @@ runtime = "none"
 targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
 notes = "DSP: goertzel/spectrogram/level/pitch/window/gen; -> core-kit; consumed by bo-suite + voiceterm (repointed)"
 
+[shared.math-kit]
+path = "shared/math-kit"
+kind = "cargo"
+role = "shared-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
+notes = "non-crypto math: scalar/easing, Vec2/Vec3, Mat4 (wgpu conv), AABB, seg/poly geom, stats, fnv1a; zero-dep; clawbound math.rs adopted verbatim (repointed)"
+
+[shared.noise-kit]
+path = "shared/noise-kit"
+kind = "cargo"
+role = "shared-lib"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone", "x86", "alpine"]   # pure Rust -> cross-clean
+notes = "lattice hash + value noise + fbm (plain & tileable), bit-identical lift of soldier mesh.rs / logscope texgen.rs (both repointed); golden-pinned"
+
 [shared.voice-kit]
 path = "shared/voice-kit"
 kind = "cargo"

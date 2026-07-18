@@ -1,0 +1,9 @@
+[package]
+name = "math-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Shared non-crypto math for the monorepo: scalar interpolation/easing, Vec2/Vec3, a column-major Mat4 (wgpu/WGSL convention), AABBs, segment/polygon geometry, descriptive stats, and FNV-1a hashing. Zero-dependency (std + f32 math). Lifted from the copies in clawbound math.rs (Vec3/Mat4/perspective/look_at — adopted verbatim, bit-identical), soldier math.rs, logscope spatial.rs, fao-codec geometry.rs, bo-controller room_geometry.rs, and the lerp/smoothstep/percentile scattered through soldier's examples, voiceterm, and bo-suite. RNG lives in core-kit; DSP in audio-kit; noise in noise-kit."
+
+[lib]
+path = "src/lib.rs"
