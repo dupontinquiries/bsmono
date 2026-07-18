@@ -117,7 +117,7 @@ impl ChatPanel {
                 SlideOption::new("gpt", "gpt"),
                 SlideOption::new("claude", "claude"),
             ];
-            if let SlideOutcome::Selected(id) = self.provider_menu.show(ui, &badge, &providers) {
+            if let SlideOutcome::Selected(id, _) = self.provider_menu.show(ui, &badge, &providers) {
                 self.provider = id;
             }
             let enter =

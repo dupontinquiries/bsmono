@@ -117,7 +117,7 @@ impl ActionCompass {
             .into_iter()
             .map(|(d, a)| (d, SlideOption::new(a.id(), a.label())))
             .collect();
-        if let SlideOutcome::Selected(chosen) = self.menu.show_cardinal(ui, id, resp, &tap, &dirs) {
+        if let SlideOutcome::Selected(chosen, _) = self.menu.show_cardinal(ui, id, resp, &tap, &dirs) {
             if let Some(action) = TermAction::from_id(&chosen) {
                 apply(action, app, ui.ctx());
                 return Some(action);

@@ -13,7 +13,9 @@
 
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
+use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, pipe_char, pipe_menu, pipe_slide_menu};
 use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, Session, Sidebar, SidebarAction, TERMINAL_KEYCAPS};
+use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
 
@@ -22,6 +24,10 @@ struct VoicetermApp {
     sidebar: Sidebar,
     compass: ActionCompass,
     colors: PaletteColors,
+    /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
+    /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
+    pipe_menu: voiceterm_egui::slide_menu::SlideMenu,
+    brace_menu: voiceterm_egui::slide_menu::SlideMenu,
 }
 
 impl eframe::App for VoicetermApp {
@@ -42,6 +48,24 @@ impl eframe::App for VoicetermApp {
         });
 
         egui::TopBottomPanel::bottom("keycaps").show(ctx, |ui| {
+            // The pipe/brace gesture chips sit on their own row above the keycaps (the QML toolbar
+            // put them in modRow): hold + drag to a cell + release. The brace menu's deadband makes
+            // each cell 3-zone — left of center emits the opener, right the closer, center the pair
+            // with the cursor backed between (see gesture_menus::brace_bytes).
+            ui.horizontal(|ui| {
+                let pipe_host = ui.button("|\u{22EF}");
+                if let SlideOutcome::Selected(id, _) = self.pipe_menu.show(ui, &pipe_host, &pipe_menu()) {
+                    if let Some(ch) = pipe_char(&id) {
+                        self.app.terminal.feed(ch);
+                    }
+                }
+                let brace_host = ui.button("{\u{22EF}}");
+                if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
+                    if let Some(bytes) = brace_bytes(&id, variant) {
+                        self.app.terminal.feed(&bytes);
+                    }
+                }
+            });
             if let Some(send) = keycap_bar_ui(ui, TERMINAL_KEYCAPS, &self.colors) {
                 self.app.terminal.feed(send);
             }
@@ -92,6 +116,9 @@ fn main() -> eframe::Result<()> {
                 sidebar,
                 compass: ActionCompass::default(),
                 colors,
+                pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
+                // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
+                brace_menu: brace_slide_menu("voiceterm-brace-menu", false),
             }))
         }),
     )
