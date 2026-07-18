@@ -436,7 +436,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
             .map(|(d, s)| (*d, uikit_egui::slide_menu::SlideOption::new(s.clone(), s.clone())))
             .collect();
         let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
-        if let uikit_egui::slide_menu::SlideOutcome::Selected(v) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
+        if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
             return Some(v);
         }
         return None;
@@ -451,7 +451,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
             .collect();
         let menu = uikit_egui::slide_menu::SlideMenu::new(id).columns(key.variants.len().min(5)).hold(0.3);
         match menu.show_stored(ui, id, &resp, &opts) {
-            uikit_egui::slide_menu::SlideOutcome::Selected(v) => return Some(v),
+            uikit_egui::slide_menu::SlideOutcome::Selected(v, _) => return Some(v),
             uikit_egui::slide_menu::SlideOutcome::Cancelled => return None, // opened then released without a pick
             uikit_egui::slide_menu::SlideOutcome::Idle => {}
         }
