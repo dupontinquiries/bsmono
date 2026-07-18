@@ -111,3 +111,50 @@ mod tests {
         assert_eq!(steps[1].summary, "b");
     }
 }
+
+/// Does this step call for running tests/build? (the tests→cargo stepwise hook)
+pub fn step_wants_tests(summary: &str) -> bool {
+    let l = summary.to_ascii_lowercase();
+    ["test", "cargo build", "cargo check", "compile", "verify"].iter().any(|k| l.contains(k))
+}
+
+/// Extract `// file: <path>` + fenced blocks from a reply (fence-nesting aware: a block ends at the LAST
+/// fence before the next `// file:` header or end-of-text, so contents containing ``` survive intact).
+pub fn extract_files(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    let bytes = text;
+    while let Some(h) = bytes[idx..].find("// file:") {
+        let h = idx + h;
+        let line_end = bytes[h..].find('\n').map(|e| h + e).unwrap_or(bytes.len());
+        let path = bytes[h + "// file:".len()..line_end].trim().trim_end_matches(':').to_string();
+        let Some(fs_rel) = bytes[line_end..].find("```") else { break };
+        let fence_open = line_end + fs_rel;
+        let body_start = bytes[fence_open..].find('\n').map(|e| fence_open + e + 1).unwrap_or(bytes.len());
+        // block ends at the LAST fence before the next `// file:` (or end)
+        let next_hdr = bytes[body_start..].find("// file:").map(|e| body_start + e).unwrap_or(bytes.len());
+        let region = &bytes[body_start..next_hdr];
+        let Some(last_fence) = region.rfind("\n```") else { idx = next_hdr; continue };
+        if !path.is_empty() && !path.contains("..") {
+            out.push((path, region[..last_fence + 1].to_string()));
+        }
+        idx = next_hdr.max(body_start + last_fence + 4);
+    }
+    out
+}
+
+#[cfg(test)]
+mod file_extract_tests {
+    use super::*;
+    #[test]
+    fn nested_fences_survive_extraction() {
+        let t = "// file: README.md\n```markdown\n# X\n```rust\nfn a(){}\n```\ntail\n```\n\n// file: src/lib.rs\n```rust\npub fn b(){}\n```\n";
+        let files = extract_files(t);
+        assert_eq!(files.len(), 2);
+        assert!(files[0].1.contains("```rust"), "inner fence kept in README");
+        assert!(files[0].1.contains("tail"));
+        assert_eq!(files[1].0, "src/lib.rs");
+        assert!(step_wants_tests("ran cargo test on the parser"));
+        assert!(!step_wants_tests("wrote the README"));
+    }
+}

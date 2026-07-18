@@ -825,6 +825,8 @@ pub struct Chat {
     step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
     step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
     step_arm_continue: bool,                // set by the Done handler; consumed by the frame loop
+    step_shell: Option<std::sync::mpsc::Receiver<String>>, // in-flight cargo test at a step pause
+    step_inject: Option<String>,            // shell results to splice into the next continue
     hit_cap: bool,                          // last finished reply ran the full budget (offer manual Continue)
     checkpoints: Vec<Checkpoint>,           // restorable conversation snapshots (rollback)
     show_checkpoints: bool,                 // checkpoints panel open
@@ -904,7 +906,7 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, hit_cap: false,
+            auto_continue: true, stepwise: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -1092,6 +1094,39 @@ impl Chat {
                                 let cont = crate::stepwise::should_continue(&mark, m.text(), self.step_continues, 12);
                                 self.step_pending_continue = cont;
                                 self.note = format!("step {}/{} — {}", mark.k, mark.n, mark.summary);
+                                // tests→cargo hook: a test/build step pauses, we materialize the reply's
+                                // `// file:` blocks into a scratch workspace and run `cargo test` OFF-thread;
+                                // the tail of its output is spliced into the continue so the model sees real
+                                // compiler/test results at exactly the boundary it created.
+                                if cont && crate::stepwise::step_wants_tests(&mark.summary) && self.step_shell.is_none() {
+                                    let files = crate::stepwise::extract_files(m.text());
+                                    if !files.is_empty() {
+                                        let (tx, rx) = std::sync::mpsc::channel();
+                                        self.step_shell = Some(rx);
+                                        std::thread::spawn(move || {
+                                            let dir = std::env::temp_dir().join(format!("logscope-step-{}", std::process::id()));
+                                            let _ = std::fs::remove_dir_all(&dir);
+                                            for (path, body) in &files {
+                                                let p = dir.join(path);
+                                                if let Some(parent) = p.parent() { let _ = std::fs::create_dir_all(parent); }
+                                                let _ = std::fs::write(&p, body);
+                                            }
+                                            let out = std::process::Command::new("cargo")
+                                                .args(["test", "--offline"]).current_dir(&dir)
+                                                .output();
+                                            let msg = match out {
+                                                Ok(o) => {
+                                                    let all = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                                                    let tail: String = all.lines().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+                                                    format!("(harness ran `cargo test` on the files so far — {}; output tail:)\n{}",
+                                                        if o.status.success() { "PASSED" } else { "FAILED" }, tail)
+                                                }
+                                                Err(e) => format!("(harness could not run cargo test: {e})"),
+                                            };
+                                            let _ = tx.send(msg);
+                                        });
+                                    }
+                                }
                                 stop = true;
                             }
                         }
@@ -6110,8 +6145,21 @@ impl Chat {
         }
         if do_continue { self.continue_generation(infer, doc); }
         // Stepwise auto-continue: resume the paused reply on the user's behalf (warm-KV, one per pause).
+        // If a cargo-test run is in flight for this pause, wait for its result and splice it in first.
         if self.step_arm_continue && self.stream.is_none() {
+            if let Some(rx) = &self.step_shell {
+                match rx.try_recv() {
+                    Ok(msg) => { self.step_inject = Some(msg); self.step_shell = None; }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { ui.ctx().request_repaint(); return; } // keep waiting
+                    Err(_) => { self.step_shell = None; }
+                }
+            }
             self.step_arm_continue = false;
+            if let Some(msg) = self.step_inject.take() {
+                if let Some(m) = self.msgs.last_mut() {
+                    m.cur_mut().push_str(&format!("\n\n{msg}\n"));
+                }
+            }
             self.continue_generation(infer, doc);
         }
         if do_checkpoint { self.checkpoint(format!("manual · {} msgs", self.msgs.len())); }
