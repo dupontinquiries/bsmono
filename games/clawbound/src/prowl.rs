@@ -69,6 +69,8 @@ const TWIG_HEAR_R: f32 = 26.0;         // how far a snapped twig carries, hunter
 const TWIG_SUSPICION: f32 = 0.5;
 const LOG_BOUND_R: f32 = 1.6;
 const SPLASH_HEAR_R: f32 = 20.0;   // how far a loud water entry carries, hunter-side
+const CLIMB_R: f32 = 2.6;
+const CLIMB_RATE: f32 = 0.55;   // per second, dwelling still at the base of a tree
 const WIN_SCORE: i32 = 3200;   // first clan to this many points wins outright — sized for a ~30 min round
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -262,6 +264,9 @@ pub struct Prowl {
     pub was_in_water: bool,                    // tracks water transitions for the splash event
     pub splash_flash: f32,                     // > 0 briefly after a splash, for the visual
     pub vault_t: f32,                          // > 0 briefly while hopping a rock (cosmetic — doesn't gate catch immunity)
+    pub trees: Vec<(f32, f32)>,                // climbable trunks
+    pub climbing: bool,                        // perched — hidden from ground hunters, scouts the land
+    pub climb_t: f32,                          // 0..1 dwell progress up the trunk
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -277,6 +282,7 @@ pub struct Prowl {
 
 impl Prowl {
     pub fn new(class: Class, hunter_kind: Kind) -> Prowl {
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // roll this match's terrain pool (mountain bias, season) — a counter-based hash
         // rather than a wall-clock read, so this stays portable to wasm builds
         static ROLL_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -333,6 +339,9 @@ impl Prowl {
             was_in_water: false,
             splash_flash: 0.0,
             vault_t: 0.0,
+            trees: world::tree_positions(160),
+            climbing: false,
+            climb_t: 0.0,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -712,6 +721,16 @@ impl Prowl {
     /// A safe practice sandbox for the tutorial: the hunter and minions never engage.
     pub fn set_tutorial_mode(&mut self, on: bool) { self.tutorial_mode = on; }
 
+    /// Perched atop a tree, a prowler can pick out the nearest ancestor tree it doesn't
+    /// yet own — the same thing a Clan cat does climbing a tree to spot a landmark and
+    /// get its bearings. Returns `None` unless fully climbed.
+    pub fn scouted_landmark(&self) -> Option<(f32, f32)> {
+        if !self.climbing { return None; }
+        self.ancestors.iter().filter(|a| !a.owned_by(PLAYER_CLAN))
+            .map(|a| (a.x, a.z))
+            .min_by(|&(ax, az), &(bx, bz)| dist(self.x, self.z, ax, az).partial_cmp(&dist(self.x, self.z, bx, bz)).unwrap())
+    }
+
     pub fn set_ability(&mut self, on: bool) { if on { self.ability_want = true; } }
 
     /// Perform a flick — the gesture-driven autoattack. `dir_local` is the flick in the
@@ -960,6 +979,13 @@ impl Prowl {
         }
         self.was_in_water = now_in_water;
         self.hidden = self.crouched && self.bushes.iter().any(|(bx, bz, r)| dist(self.x, self.z, *bx, *bz) < *r);
+        let at_tree = self.trees.iter().any(|&(tx, tz)| dist(self.x, self.z, tx, tz) < CLIMB_R);
+        if self.crouched && !mv && at_tree {
+            self.climb_t = (self.climb_t + CLIMB_RATE * dt).min(1.0);
+        } else {
+            self.climb_t = (self.climb_t - CLIMB_RATE * 1.6 * dt).max(0.0);
+        }
+        self.climbing = self.climb_t >= 1.0;
         let slipstream = self.class == Class::Otter && Class::terrain_at(self.x, self.z) == 0;
         self.stamina = (self.stamina + if sprinting && !slipstream { -0.30 } else if sprinting { 0.0 } else { 0.18 } * dt).clamp(0.0, 1.0);
         if self.exposed { self.stamina = (self.stamina - 0.12 * dt).max(0.0); }   // the ring wears you down
@@ -1059,7 +1085,7 @@ impl Prowl {
         if self.hunter_stagger > 0.0 { return; }   // dazed by a landed hit — frozen this frame
         let p = self.hunter_kind.params();
         // outside the ring, cover no longer conceals you
-        let eff_hidden = self.hidden && !self.exposed;
+        let eff_hidden = (self.hidden || (self.climbing && self.hunter_kind != Kind::Hawk)) && !self.exposed;
         let sees = hunter::detects(self.hunter_kind, self.hx, self.hz, self.hheading, self.x, self.z, self.moving, eff_hidden);
         // Goat's Sure-Footed passive: harder to spot while up in the mountains
         let sure_footed = self.class == Class::Goat && Class::terrain_at(self.x, self.z) == 2;
@@ -1716,6 +1742,52 @@ mod tests {
     }
 
     #[test]
+    fn dwelling_crouched_at_a_tree_climbs_it() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.trees = vec![(0.0, 0.0)];
+        g.x = 0.0; g.z = 0.0;
+        for _ in 0..(3 * 30) {
+            g.set_input(0.0, 0.0, false, false, true);   // crouched and still, at the tree's base
+            g.step(1.0 / 30.0);
+        }
+        assert!(g.climbing, "dwelling crouched at a tree's base should climb it");
+        assert_eq!(g.scouted_landmark().is_some(), true, "perched up top, a prowler should be able to scout a landmark");
+    }
+
+    #[test]
+    fn climbing_down_or_walking_off_ends_the_climb() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.climbing = true; g.climb_t = 1.0;
+        g.x = 0.0; g.z = 0.0;
+        g.set_input(1.0, 0.0, false, false, false);   // walks off, uncrouched
+        for _ in 0..30 { g.step(1.0 / 30.0); }
+        assert!(!g.climbing, "walking off should climb back down");
+        assert_eq!(g.scouted_landmark(), None, "no scouting once you're back on the ground");
+    }
+
+    #[test]
+    fn a_climbing_prowler_is_hidden_from_a_ground_hunter_but_not_a_hawk() {
+        let hides_from = |hunter_kind: Kind| -> bool {
+            let mut g = Prowl::new(Class::Cat, hunter_kind);
+            g.trees = vec![(0.0, 0.0)];
+            g.climbing = true; g.climb_t = 1.0;
+            g.x = 0.0; g.z = 0.0;
+            g.hx = 3.0; g.hz = 0.0; g.hheading = -std::f32::consts::FRAC_PI_2;   // facing the prowler, point-blank
+            g.suspicion = 0.0;
+            for _ in 0..30 {
+                g.hx = 3.0; g.hz = 0.0; g.hheading = -std::f32::consts::FRAC_PI_2;
+                g.set_input(0.0, 0.0, false, false, true);
+                g.step(1.0 / 30.0);
+            }
+            g.suspicion < 0.5
+        };
+        assert!(hides_from(Kind::Fox), "a ground hunter shouldn't easily spot a prowler perched in a tree");
+        assert!(!hides_from(Kind::Hawk), "but a Hawk, hunting from the air, should still see it");
+    }
+
+    #[test]
     fn sprinting_over_a_twig_near_the_hunter_raises_suspicion() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.twigs = vec![(2.0, 0.0)];
@@ -2078,6 +2150,10 @@ mod tests {
     fn a_loud_approach_alerts_the_guard_and_blocks_the_herb() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.hx = 900.0; g.hz = 900.0;
+        // pin the camp to a known, flat, dry spot rather than trusting wherever this
+        // particular run's (randomized) terrain pool happened to place it — this test
+        // is about the alert mechanic, not procedural placement.
+        g.jungle[0].x = 0.0; g.jungle[0].z = 0.0; g.jungle[0].gx = 0.0; g.jungle[0].gz = 0.0;
         let (cx, cz) = (g.jungle[0].x, g.jungle[0].z);
         g.x = cx + CAMP_ALERT_R - 1.0; g.z = cz;
         g.set_input(1.0, 0.0, false, false, false);   // running in, not hidden
