@@ -16,6 +16,12 @@
 
 #[path = "../model.rs"]
 mod model;
+// data.rs reaches for crate::audio (cache building decodes+mels real files),
+// and with #[path] inclusion this bin IS the crate root — so audio must be
+// declared here too, as the vocoder bin already does.
+#[path = "../audio.rs"]
+#[allow(dead_code)]
+mod audio;
 #[path = "../data.rs"]
 mod data;
 
