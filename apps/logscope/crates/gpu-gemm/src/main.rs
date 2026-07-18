@@ -2688,6 +2688,7 @@ fn main() {
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
+        moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
     let ones = gpu.upload(&vec![1.0f32; bd / 2], 1, bd / 2); // plain RoPE (no llama3 scaling)
