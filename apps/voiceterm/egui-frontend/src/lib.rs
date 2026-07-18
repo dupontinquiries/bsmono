@@ -20,6 +20,10 @@ pub mod repl_voice_glow;
 pub mod setup_wizard;
 pub mod action_compass;
 pub mod shell;
+pub mod gesture_menus;
+// The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
+// the shared kit; re-exported under a voiceterm-familiar name.
+pub use uikit_egui::slide_menu;
 // `web` (HTML → egui RichDoc renderer) now lives in the shared uikit-web kit; re-export as `web`.
 pub use uikit_web as web;
 
