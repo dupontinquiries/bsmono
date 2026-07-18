@@ -142,6 +142,70 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
     dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
+// ── blocks drawer (QML blocksDrawer, left edge) ──────────────────────────────
+
+/// One frame of the blocks drawer body: rows most-recent-first, each with the command, an
+/// output preview, an exit/duration badge, the inline ▶ 📋 📥 buttons, and a ⋯ whose HOLD opens
+/// the 2×2 block menu (shared across rows — the row's block id rides in the return, the egui
+/// equivalent of the QML gestureContext). Returns the first action fired this frame.
+pub fn blocks_drawer_ui(
+    ui: &mut Ui,
+    blocks: &[uikit_term::blocks::CommandBlock],
+    c: &PaletteColors,
+) -> Option<(u32, crate::gesture_menus::BlockAction)> {
+    use crate::gesture_menus::{block_dispatch, block_menu, BlockAction};
+    let mut fired = None;
+    egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+        for b in blocks.iter().rev() {
+            ui.push_id(b.id, |ui| {
+                // header line: command + exit/duration badge
+                ui.horizontal(|ui| {
+                    let ok = b.exit_code == Some(0);
+                    let badge = match (b.exit_code, b.duration_ms) {
+                        (Some(e), Some(d)) => format!("[{e}] {d}ms"),
+                        (Some(e), None) => format!("[{e}]"),
+                        (None, _) => "[…]".to_string(),
+                    };
+                    ui.colored_label(if ok { c.accent } else { c.text }, egui::RichText::new(&b.command).monospace().strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.weak(badge);
+                    });
+                });
+                // preview: first output line, dimmed
+                if let Some(first) = b.output.lines().next() {
+                    ui.weak(egui::RichText::new(first).monospace().small());
+                }
+                // inline actions + the ⋯ hold-menu host
+                ui.horizontal(|ui| {
+                    if ui.small_button("\u{25B6}").clicked() {
+                        fired = fired.or(Some((b.id, BlockAction::Rerun)));
+                    }
+                    if ui.small_button("\u{1F4CB}").clicked() {
+                        fired = fired.or(Some((b.id, BlockAction::CopyCommand)));
+                    }
+                    if ui.small_button("\u{1F4E5}").clicked() {
+                        fired = fired.or(Some((b.id, BlockAction::CopyOutput)));
+                    }
+                    let dots = ui.small_button("\u{22EF}");
+                    let menu = uikit_egui::slide_menu::SlideMenu::new(("vt-block-menu", b.id)).columns(2);
+                    if let uikit_egui::slide_menu::SlideOutcome::Selected(id, _) =
+                        menu.show_stored(ui, egui::Id::new(("vt-block-menu", b.id)), &dots, &block_menu())
+                    {
+                        if let Some(a) = block_dispatch(&id) {
+                            fired = fired.or(Some((b.id, a)));
+                        }
+                    }
+                });
+                ui.separator();
+            });
+        }
+        if blocks.is_empty() {
+            ui.weak("No command blocks yet — run something.");
+        }
+    });
+    fired
+}
+
 // ── prefs persistence (the fleet's XDG convention, as pbedit/config-kit use) ─
 
 /// `$XDG_CONFIG_HOME/voiceterm-egui/prefs.kv` (or `~/.config/...`) — one `key=value` per line,

@@ -91,6 +91,44 @@ pub fn brace_slide_menu(id_source: impl std::hash::Hash, compact: bool) -> Slide
     SlideMenu::new(id_source).columns(1).deadband(db).item_size(item)
 }
 
+// ── block row menu (blocks drawer ⋯) ─────────────────────────────────────────
+
+/// `blockRowMenuModel`: the 2×2 per-block grid behind a block row's ⋯ button. Inline ▶ 📋 📥
+/// stay on the row (power users keep single-tap access); the popup is the thumb-friendly
+/// alternative with room for the extras.
+pub fn block_menu() -> Vec<SlideOption> {
+    vec![
+        SlideOption::new("rerun", "\u{25B6}").at(0, 0),
+        SlideOption::new("copy-cmd", "\u{1F4CB}").at(1, 0),
+        SlideOption::new("copy-out", "\u{1F4E5}").at(0, 1),
+        SlideOption::new("summary", "\u{2728}").at(1, 1),
+    ]
+}
+
+/// A block-row action — shared by the inline buttons and the ⋯ menu, so both paths dispatch
+/// identically (the QML popup read the row's blockId from gestureContext; here the id rides in
+/// the return value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockAction {
+    /// Feed the block's command (+ Enter) back to the shell.
+    Rerun,
+    CopyCommand,
+    CopyOutput,
+    /// Toggle the summary worker (global toggle in the reference — per-block needs backend
+    /// state, filed there).
+    Summary,
+}
+
+pub fn block_dispatch(id: &str) -> Option<BlockAction> {
+    Some(match id {
+        "rerun" => BlockAction::Rerun,
+        "copy-cmd" => BlockAction::CopyCommand,
+        "copy-out" => BlockAction::CopyOutput,
+        "summary" => BlockAction::Summary,
+        _ => return None,
+    })
+}
+
 // ── link action menu ─────────────────────────────────────────────────────────
 
 /// `linkMenuModel` (v0.1.538): the 2×2 intent grid a blue-link tap opens.
@@ -244,6 +282,16 @@ mod tests {
         // directional flags are on the right cells
         assert!(tab_menu().iter().find(|o| o.id == "split").unwrap().split_dir);
         assert!(tab_menu().iter().find(|o| o.id == "close").unwrap().close_dir);
+    }
+
+    #[test]
+    fn block_menu_matches_the_qml_grid_and_dispatch() {
+        assert_eq!(layout_dims(&block_menu(), 3), (2, 2));
+        assert_eq!(block_dispatch("rerun"), Some(BlockAction::Rerun));
+        assert_eq!(block_dispatch("copy-cmd"), Some(BlockAction::CopyCommand));
+        assert_eq!(block_dispatch("copy-out"), Some(BlockAction::CopyOutput));
+        assert_eq!(block_dispatch("summary"), Some(BlockAction::Summary));
+        assert_eq!(block_dispatch("nope"), None);
     }
 
     #[test]
