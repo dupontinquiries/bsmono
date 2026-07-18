@@ -207,11 +207,12 @@ mod engine {
                     let incoming = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     gpu_kernels::store::make_room_for(cap, incoming);
                     match gpu.save_int8_cache(&m, &cache, fp) {
-                        Ok(()) => {
+                        Ok(true) => {
                             let (n, freed) = gpu_kernels::store::evict_to_cap(cap);
                             let evicted = if n > 0 { format!("; evicted {n}, freed {:.1} GiB", freed as f64 / (1u64 << 30) as f64) } else { String::new() };
                             eprintln!("wgpu-engine: wrote int8 cache [{}] (central, content-addressed){evicted}", cache.display());
                         }
+                        Ok(false) => eprintln!("wgpu-engine: int8 cache skipped (bias/QK-Norm/MoE/q4 layouts aren't cacheable yet — reloads from the GGUF)"),
                         Err(e) => eprintln!("wgpu-engine: int8 cache write skipped: {e}"),
                     }
                     m
@@ -810,6 +811,31 @@ impl Inference {
     pub fn cancel(&self) { self.cancel.store(true, Ordering::Relaxed); }
 }
 
+/// Translate a prompt built with the WRONG family's markers to the loaded model's template. The UI caches
+/// template state per tab and has been observed going stale (a ChatML model receiving Llama-3 headers —
+/// byte-split into garbage since they're not in its vocab → "0 special tokens" → word salad). The worker
+/// knows the loaded template authoritatively, so it repairs here as the last line of defense and logs it.
+fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
+    match t {
+        TemplateKind::ChatML if prompt.contains("<|start_header_id|>") => {
+            let s = prompt.replace("<|begin_of_text|>", "")
+                .replace("<|start_header_id|>", "<|im_start|>")
+                .replace("<|end_header_id|>\n\n", "\n")
+                .replace("<|eot_id|>", "<|im_end|>\n");
+            Some(s)
+        }
+        TemplateKind::Llama3 if prompt.contains("<|im_start|>") => {
+            let mut b = prompt.replace("<|im_start|>", "<|start_header_id|>");
+            for r in ["system", "user", "assistant"] {
+                b = b.replace(&format!("<|start_header_id|>{r}\n"), &format!("<|start_header_id|>{r}<|end_header_id|>\n\n"));
+            }
+            b = b.replace("<|im_end|>\n", "<|eot_id|>");
+            Some(format!("<|begin_of_text|>{b}"))
+        }
+        _ => None,
+    }
+}
+
 fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, template_out: Arc<std::sync::atomic::AtomicU8>) {
     // Default to the backend that's actually compiled in (llama.cpp if available),
     // so the header Load and the chat tab operate on the same, working backend.
@@ -836,6 +862,13 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
                 }
             }
             Cmd::Generate(prompt) => {
+                // Last-line-of-defense template repair (see normalize_prompt_template): the worker knows
+                // the loaded model's template; if the UI built the prompt with the other family's markers,
+                // translate and say so loudly — this is the bug that garbled every ChatML model.
+                let prompt = match normalize_prompt_template(&prompt, backend.template()) {
+                    Some(fixed) => { eprintln!("worker: PROMPT TEMPLATE MISMATCH — UI sent {} markers to a {:?} model; translated (UI template state is stale — report this)", if fixed.contains("<|im_start|>") { "Llama-3" } else { "ChatML" }, backend.template()); fixed }
+                    None => prompt,
+                };
                 // NOTE: cancel is cleared by the SENDER (Inference::generate) on the UI thread, ordered
                 // before any Stop the user then clicks — resetting it here (on dequeue) could clobber a
                 // Stop clicked in the window between send and dequeue, which is exactly the "subsequent
@@ -862,6 +895,7 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
             }
             Cmd::Continue(prompt) => {
                 // cancel cleared by the sender (Inference::continue_stream) — see Cmd::Generate.
+                let prompt = normalize_prompt_template(&prompt, backend.template()).unwrap_or(prompt);
                 let start = Instant::now();
                 if backend.loaded() {
                     let evt2 = evt.clone();
