@@ -4015,8 +4015,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let c=cos(freq); let s=sin(freq);
   // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
   // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
-  let j0=select(off+2u*i, off+i, dd.neox==1u);
-  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
   let x0=x[j0]; let x1=x[j1];
   o[j0]=x0*c-x1*s;
   o[j1]=x0*s+x1*c;
@@ -4039,8 +4042,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(pos[tok])/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
   let c=cos(freq); let s=sin(freq);
-  let j0=select(off+2u*i, off+i, dd.neox==1u);
-  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
   let x0=x[j0]; let x1=x[j1];
   o[j0]=x0*c-x1*s;
   o[j1]=x0*s+x1*c;
