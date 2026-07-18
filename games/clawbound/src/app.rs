@@ -478,7 +478,11 @@ impl State {
 
     /// Raw mouse motion → orbit the camera. Yaw wraps; pitch is clamped off the poles.
     fn on_mouse(&mut self, dx: f32, dy: f32) {
-        self.yaw += dx * 0.0026;
+        // NB: with this game's forward/right convention (see cam_forward_right —
+        // forward=(sin,cos), right=(-cos,sin)), *increasing* yaw rotates the view
+        // left, not right. Moving the mouse right (dx > 0) must therefore *decrease*
+        // yaw for the camera to turn right — the opposite of the usual '+=' hookup.
+        self.yaw -= dx * 0.0026;
         self.pitch = (self.pitch + dy * 0.0022).clamp(0.12, 1.32);
         self.flick.0 += dx; self.flick.1 += dy;   // accumulate for flick-move detection
     }
