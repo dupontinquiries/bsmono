@@ -1121,7 +1121,7 @@ fn bayer4(p: vec2<u32>) -> f32 {
 const POST_WGSL: &str = r#"
 @group(0) @binding(0) var samp: sampler;
 @group(0) @binding(1) var tex: texture_2d<f32>;
-struct FxUniform { misc: vec4<f32>, screen: vec4<f32> };  // misc=(nightmare,night,time,danger), screen=(texelX,texelY,wpix,hpix)
+struct FxUniform { misc: vec4<f32>, screen: vec4<f32> };  // misc=(nightmare,night,time,danger), screen=(texelX,texelY, outputWpx,outputHpx)
 @group(0) @binding(2) var<uniform> fx: FxUniform;
 struct VO { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> VO {
