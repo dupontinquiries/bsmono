@@ -80,6 +80,10 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
 pub const WATER_Y: f32 = -1.9;
 pub struct HeightGrid { pub w: usize, pub half: f32, pub h: Vec<f32> }
 static GRID: std::sync::RwLock<Option<HeightGrid>> = std::sync::RwLock::new(None);
+/// Guards the "roll the terrain pool, then rebake" sequence so two concurrent callers
+/// (parallel tests constructing several matches at once is the main case — production
+/// only ever has one active match) can't interleave and read a half-rebaked world.
+pub static TERRAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Talus thermal erosion — ported from unendlich `world/thermal_erosion.rs`:
 /// material slides to lower neighbours when the slope exceeds `talus`.
