@@ -14,7 +14,7 @@
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, LinkAction, PaneAction};
-use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, tab_row, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -39,13 +39,17 @@ struct VoicetermApp {
     /// The workspace tab sidebar (QML vTabBar, v0.1.796): click activates, HOLD a tab opens the
     /// per-tab action menu (v0.1.790) with the tab's name in the title band.
     workspace: Workspace,
+    /// The active fleet palette ("long-press 🎨 to show all vibes"); Voice is voiceterm's
+    /// baseline identity.
+    theme: snapclone_theme::PaletteId,
+    theme_menu: voiceterm_egui::slide_menu::SlideMenu,
 }
 
 impl eframe::App for VoicetermApp {
     fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(snapclone_theme::PaletteId::Voice));
+        uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
 
         egui::SidePanel::left("sidebar").resizable(true).default_width(160.0).width_range(120.0..=320.0).show(ctx, |ui| {
             if let Some(action) = self.sidebar.ui(ui, &self.colors) {
@@ -69,6 +73,13 @@ impl eframe::App for VoicetermApp {
                     if let Some(ch) = pipe_char(&id) {
                         self.app.terminal.feed(ch);
                     }
+                }
+                // hold the palette chip to show all vibes (the settings screenshot's theme grid)
+                let theme_host = ui.button("\u{1F3A8}");
+                if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
+                    self.theme_menu.show(ui, &theme_host, &theme_menu())
+                {
+                    self.theme = snapclone_theme::PaletteId::from_str(&id);
                 }
                 let brace_host = ui.button("{\u{22EF}}");
                 if let SlideOutcome::Selected(id, variant) = self.brace_menu.show(ui, &brace_host, &brace_menu()) {
@@ -202,6 +213,8 @@ fn main() -> eframe::Result<()> {
                 link_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-link-menu").columns(2),
                 link_url: None,
                 workspace: Workspace::new(&["main", "logs"]),
+                theme: snapclone_theme::PaletteId::Voice,
+                theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
             }))
         }),
     )
