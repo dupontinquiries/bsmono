@@ -35,6 +35,25 @@ fn warp(x: f32, z: f32, amp: f32) -> (f32, f32) {
 
 const HILL: f32 = 7.0;
 
+/// The "terrain pool" — a few knobs each match rolls fresh, so the map isn't the exact
+/// same shape and mood every time: how mountainous the land is, and what season it is
+/// (which tints the whole world's foliage, not just the sky/prey like `weather::Season`
+/// already did).
+static MOUNTAIN_BIAS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x3F800000); // 1.0
+static TERRAIN_SEASON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // Greenleaf
+
+/// Configure the terrain pool before `init_world()`. `mountain_bias` scales how much of
+/// the map crosses into real mountain height (1.0 = the original baseline; try 1.4-1.8
+/// for a noticeably craggier map). `season` is 0=Newleaf, 1=Greenleaf, 2=Leaf-fall,
+/// 3=Leaf-bare, matching `weather::Season`'s ordinal.
+pub fn set_terrain_pool(mountain_bias: f32, season: u8) {
+    MOUNTAIN_BIAS.store(mountain_bias.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    TERRAIN_SEASON.store(season, std::sync::atomic::Ordering::Relaxed);
+}
+fn mountain_bias() -> f32 { f32::from_bits(MOUNTAIN_BIAS.load(std::sync::atomic::Ordering::Relaxed)) }
+/// The terrain pool's current season ordinal (0=Newleaf .. 3=Leaf-bare).
+pub fn terrain_season() -> u8 { TERRAIN_SEASON.load(std::sync::atomic::Ordering::Relaxed) }
+
 /// Meandering river channel carved into the base terrain (fills to WATER_Y).
 fn river_carve(x: f32, z: f32) -> f32 {
     let rx = 46.0 * (z * 0.011).sin() + 22.0 * (z * 0.031).cos();
@@ -53,13 +72,14 @@ pub fn raw_height(x: f32, z: f32) -> f32 {
     }
     h /= sum;
     let r = (wx * wx + wz * wz).sqrt() / 300.0;
-    (h - 0.5) * 2.0 * HILL - (1.0 - r).max(0.0) * 3.0 + river_carve(x, z)
+    let peaks = (h - 0.5) * 2.0 * HILL * mountain_bias();
+    peaks - (1.0 - r).max(0.0) * 3.0 + river_carve(x, z)
 }
 
 // ── stored, eroded heightfield (adapted from unendlich thermal_erosion + water_field) ──
 pub const WATER_Y: f32 = -1.9;
 pub struct HeightGrid { pub w: usize, pub half: f32, pub h: Vec<f32> }
-static GRID: std::sync::OnceLock<HeightGrid> = std::sync::OnceLock::new();
+static GRID: std::sync::RwLock<Option<HeightGrid>> = std::sync::RwLock::new(None);
 
 /// Talus thermal erosion — ported from unendlich `world/thermal_erosion.rs`:
 /// material slides to lower neighbours when the slope exceeds `talus`.
@@ -107,7 +127,7 @@ pub fn init_world() {
         }
     }
     for _ in 0..10 { erode_step(&mut h, w, 0.55, 0.5); }   // carve valleys, soften ridges
-    let _ = GRID.set(HeightGrid { w, half, h });
+    *GRID.write().unwrap() = Some(HeightGrid { w, half, h });
 }
 
 fn sample_grid(g: &HeightGrid, x: f32, z: f32) -> f32 {
@@ -125,7 +145,7 @@ fn sample_grid(g: &HeightGrid, x: f32, z: f32) -> f32 {
 }
 
 pub fn height_at(x: f32, z: f32) -> f32 {
-    match GRID.get() { Some(g) => sample_grid(g, x, z), None => raw_height(x, z) }
+    match GRID.read().unwrap().as_ref() { Some(g) => sample_grid(g, x, z), None => raw_height(x, z) }
 }
 
 /// Nearest water cell (below WATER_Y) to a point, within `search` units — the
@@ -348,6 +368,27 @@ pub fn build_terrain(seg: usize) -> Mesh {
 /// conifer (kind=0) stacks layered cones with a few short branches. Returns the
 /// branches (for climbing/perching). Branch colour tints toward red where a
 /// `cat_kg` load at the tip would risk snapping it.
+/// Shift a leaf color for the terrain pool's current season: Newleaf brightens toward
+/// fresh spring green, Leaf-fall shifts warm (orange/red), Leaf-bare desaturates toward
+/// bare grey-brown. Greenleaf (the default) passes through unchanged.
+pub fn season_tint(c: [f32; 3]) -> [f32; 3] {
+    match terrain_season() {
+        0 => [c[0] * 0.85 + 0.05, (c[1] * 1.15 + 0.05).min(1.0), c[2] * 0.85],           // Newleaf — fresh and bright
+        2 => [(c[0] * 1.35 + 0.12).min(1.0), c[1] * 0.75, c[2] * 0.55],                  // Leaf-fall — warm oranges/reds
+        3 => { let g = (c[0] + c[1] + c[2]) / 3.0; mix(c, [g * 0.9 + 0.05, g * 0.85, g * 0.8], 0.75) }  // Leaf-bare — desaturated, bare
+        _ => c,   // Greenleaf — unchanged
+    }
+}
+
+/// A denser ring of vegetation at the mid radius (roughly where jungle camps and
+/// off-lane objectives tend to sit) — tightens that band into real enclosed jungle
+/// instead of the same open density as everywhere else. 1.0 outside the band.
+fn jungle_density_boost(x: f32, z: f32) -> f32 {
+    let r = (x * x + z * z).sqrt();
+    let band = 1.0 - ((r - 55.0).abs() / 20.0).clamp(0.0, 1.0);   // peaks at r=55, fades out by ±20
+    1.0 + band * 0.9
+}
+
 pub fn gen_tree(m: &mut Mesh, x: f32, z: f32, kind: u8, leaf: [f32; 3], scale: f32, cat_kg: f32, detail: bool) -> Vec<Branch> {
     let tau = std::f32::consts::TAU;
     let y = height_at(x, z);
@@ -464,7 +505,7 @@ pub fn tree_positions(count: usize) -> Vec<(f32, f32)> {
         let y = height_at(x, z);
         if y > 5.2 { continue; }
         let biome = biome_at(x, z);
-        if hash2(i as i32, 7, 0xC3) > biome.tree { continue; }
+        if hash2(i as i32, 7, 0xC3) > (biome.tree * jungle_density_boost(x, z)).min(1.0) { continue; }
         v.push((x, z));
     }
     v
@@ -479,10 +520,10 @@ pub fn build_trees(count: usize) -> Mesh {
         let y = height_at(x, z);
         if y > 5.2 { continue; }
         let biome = biome_at(x, z);
-        if hash2(i as i32, 7, 0xC3) > biome.tree { continue; }
+        if hash2(i as i32, 7, 0xC3) > (biome.tree * jungle_density_boost(x, z)).min(1.0) { continue; }
         let gh = 0.8 + hash2(x as i32, z as i32, 0x6E0E) * 1.7;
         let tint = (hash2(x as i32 + 7, z as i32 + 3, 0x51F7) - 0.5) * 0.3;
-        let mut leaf = rgb(biome.leaf);
+        let mut leaf = season_tint(rgb(biome.leaf));
         for k in 0..3 { leaf[k] = (leaf[k] + tint).clamp(0.0, 1.0); }
         let kind_roll = hash2(i as i32, 5, 0x77);
         let kind = if kind_roll < 0.08 { 2 } else if kind_roll < 0.85 { biome.kind } else { 1 - biome.kind };
@@ -503,7 +544,7 @@ pub fn bush_positions(count: usize) -> Vec<(f32, f32, f32)> {
         if y > 4.6 { continue; }
         let biome = biome_at(x, z);
         if biome.tree < 0.06 { continue; }
-        if hash2(i as i32, 9, 0xE3) > 0.62 { continue; }
+        if hash2(i as i32, 9, 0xE3) > (0.62 * jungle_density_boost(x, z)).min(1.0) { continue; }
         let r = 1.6 + hash2(i as i32, 3, 0xE4) * 1.3;
         v.push((x, z, r));
     }
@@ -517,7 +558,7 @@ pub fn build_bushes(count: usize) -> Mesh {
     for (idx, (x, z, r)) in bush_positions(count).into_iter().enumerate() {
         let i = idx as i32;
         let biome = biome_at(x, z);
-        let mut leaf = shade(rgb(biome.leaf), 0.82);
+        let mut leaf = season_tint(shade(rgb(biome.leaf), 0.82));
         // the occasional berry bush — a warm tint standing out from the usual green
         if hash2(i, 17, 0xEB) < 0.12 {
             leaf = mix(leaf, rgb(0x9a3a44), 0.35);
@@ -565,7 +606,7 @@ pub fn build_grass(count: usize) -> Mesh {
         if hash2(i as i32, 5, 0xA1) > lush { continue; }
         let g = [0.30 + hash2(i as i32, 1, 0x11) * 0.12, 0.50 + hash2(i as i32, 2, 0x12) * 0.18, 0.16 + hash2(i as i32, 3, 0x13) * 0.10];
         let gr = rgb(biome.ground);
-        let base_g = [g[0] * 0.7 + gr[0] * 0.3, g[1] * 0.7 + gr[1] * 0.3, g[2] * 0.7 + gr[2] * 0.3];
+        let base_g = season_tint([g[0] * 0.7 + gr[0] * 0.3, g[1] * 0.7 + gr[1] * 0.3, g[2] * 0.7 + gr[2] * 0.3]);
         let blades = 3 + (hash2(i as i32, 7, 0xB2) * 3.0) as usize;
         for b in 0..blades {
             let a = hash2(i as i32, b as i32, 0x33) * tau;
@@ -731,6 +772,50 @@ pub fn build_reeds(count: usize) -> Mesh {
 #[cfg(test)]
 mod biome_blend_tests {
     use super::*;
+
+    #[test]
+    fn a_higher_mountain_bias_yields_more_mountain_terrain() {
+        fn mountain_fraction() -> f32 {
+            let (mut mtn, mut total) = (0, 0);
+            for i in -60..60 { for j in -60..60 {
+                let (x, z) = (i as f32 * 3.0, j as f32 * 3.0);
+                if height_at(x, z) > 1.9 { mtn += 1; }
+                total += 1;
+            }}
+            mtn as f32 / total as f32
+        }
+        set_terrain_pool(1.0, 1); init_world();
+        let baseline = mountain_fraction();
+        set_terrain_pool(1.7, 1); init_world();
+        let biased = mountain_fraction();
+        assert!(biased >= baseline, "a higher mountain bias shouldn't produce less mountain terrain (baseline {baseline:.4}, biased {biased:.4})");
+        set_terrain_pool(1.0, 1); init_world();   // leave the pool at baseline for other tests
+    }
+
+    #[test]
+    fn season_tint_shifts_leaf_color_by_season() {
+        let base = [0.4f32, 0.55, 0.2];
+        set_terrain_pool(1.0, 1);   // Greenleaf
+        let green = season_tint(base);
+        assert_eq!(green, base, "Greenleaf should pass the color through unchanged");
+        set_terrain_pool(1.0, 2);   // Leaf-fall
+        let fall = season_tint(base);
+        assert!(fall[0] > green[0] && fall[1] < green[1], "Leaf-fall should shift warmer — more red, less green");
+        set_terrain_pool(1.0, 3);   // Leaf-bare
+        let bare = season_tint(base);
+        let sat_bare = (bare[0] - bare[2]).abs();
+        let sat_green = (green[0] - green[2]).abs();
+        assert!(sat_bare < sat_green, "Leaf-bare should desaturate toward grey");
+        set_terrain_pool(1.0, 1);   // reset
+    }
+
+    #[test]
+    fn the_jungle_band_is_denser_than_the_open_map() {
+        let boost_in_band = jungle_density_boost(55.0, 0.0);
+        let boost_outside = jungle_density_boost(150.0, 0.0);
+        assert!(boost_in_band > boost_outside, "the mid-radius jungle band should be denser than the open map");
+        assert!((boost_outside - 1.0).abs() < 1e-6, "well outside the band, density should be unboosted");
+    }
 
     #[test]
     fn all_three_tree_kinds_produce_geometry() {
