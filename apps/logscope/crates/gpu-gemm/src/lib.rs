@@ -119,6 +119,10 @@ pub struct Gpu {
     sg_ok: std::sync::atomic::AtomicBool, // sg kernel passed the load-time self-check on THIS driver
     gemm_ok: std::sync::atomic::AtomicBool, // tiled prefill GEMM compiles + matches naive on THIS backend
     valid_gemm_tiles: std::sync::RwLock<Vec<u32>>, // GEMM tiles whose shader actually compiles here (load probe)
+    /// NEOX (split-half) RoPE pairing for the CURRENTLY loaded model (qwen/gemma/phi families);
+    /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
+    /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
+    pub rope_neox: std::sync::atomic::AtomicBool,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -306,7 +310,7 @@ impl Gpu {
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -3198,6 +3202,11 @@ impl Gpu {
         }
         let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
         let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
+        // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
+        // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
+        // real-word, positionally-scrambled output (the dense-Qwen salad). Set from the arch registry.
+        self.rope_neox.store(!acfg.rope_interleaved, std::sync::atomic::Ordering::Relaxed);
+        if !acfg.rope_interleaved { eprintln!("loader: NEOX (split-half) RoPE pairing for '{arch}'"); }
         let d = g.get_u32(&format!("{pfx}.embedding_length"))
             .ok_or_else(|| {
                 let key = format!("{pfx}.embedding_length");
@@ -3500,6 +3509,8 @@ impl Gpu {
             let g2 = self.read_tensor(&mut r)?;
             layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, moe: None });
         }
+        // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
+        self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
         Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
@@ -3632,7 +3643,7 @@ impl Gpu {
 }
 
 const ROPE_MH: &str = r#"
-struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,_a:u32,_b:u32,_c:u32 };
+struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)
 @group(0)@binding(2) var<storage,read_write> o: array<f32>;
@@ -3644,17 +3655,20 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(tok+dd.pos0)/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
   let c=cos(freq); let s=sin(freq);
-  let d0=off+2u*i;
-  let x0=x[d0]; let x1=x[d0+1u];
-  o[d0]=x0*c-x1*s;
-  o[d0+1u]=x0*s+x1*c;
+  // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
+  // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
+  let j0=select(off+2u*i, off+i, dd.neox==1u);
+  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  let x0=x[j0]; let x1=x[j1];
+  o[j0]=x0*c-x1*s;
+  o[j1]=x0*s+x1*c;
 }"#;
 
 // Per-row-position RoPE: like ROPE_MH but each row reads its own absolute position
 // from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
 // are N different sessions at N different positions.
 const ROPE_MH_ROWS: &str = r#"
-struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,_a:u32,_b:u32,_c:u32 };
+struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;
 @group(0)@binding(2) var<storage,read> pos: array<u32>;
@@ -3667,10 +3681,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(pos[tok])/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
   let c=cos(freq); let s=sin(freq);
-  let d0=off+2u*i;
-  let x0=x[d0]; let x1=x[d0+1u];
-  o[d0]=x0*c-x1*s;
-  o[d0+1u]=x0*s+x1*c;
+  let j0=select(off+2u*i, off+i, dd.neox==1u);
+  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  let x0=x[j0]; let x1=x[j1];
+  o[j0]=x0*c-x1*s;
+  o[j1]=x0*s+x1*c;
 }"#;
 
 const ATTENTION_MH: &str = r#"
@@ -4175,7 +4190,8 @@ impl Gpu {
     /// RoPE applied per head (split-half within each head_dim slice) at position `pos0`.
     pub fn rope_mh_t(&self, x: &Tensor, ff: &Tensor, t: usize, dm: usize, base: f32, pos0: usize, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
-        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, 0, 0, 0];
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, 0, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
@@ -4407,7 +4423,8 @@ impl Gpu {
     /// Per-row-position RoPE: each row uses its own absolute position from `pos`.
     pub fn rope_mh_rows(&self, x: &Tensor, ff: &Tensor, pos: &Tensor, t: usize, dm: usize, base: f32, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
-        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, 0, 0, 0];
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, 0, 0];
         self.dispatch(ROPE_MH_ROWS, &[x, ff, pos], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
     /// Process one token through all layers using the cache; returns logits [vocab].
