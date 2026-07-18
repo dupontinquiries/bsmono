@@ -9,6 +9,9 @@
 //
 #![recursion_limit = "256"]
 
+#[path = "../audio.rs"]
+mod audio;
+
 use std::time::Instant;
 
 use burn::backend::wgpu::WgpuDevice;
@@ -26,9 +29,9 @@ use burn::tensor::{Distribution, TensorData};
 type BE = Wgpu<f32, i32>;
 type AB = Autodiff<BE>;
 
-const HOP: usize = 256; // fixed: upsample rates below multiply to this
-const UPS: [usize; 4] = [8, 8, 2, 2];
-const UPK: [usize; 4] = [16, 16, 4, 4];
+const HOP: usize = 512; // fixed: upsample rates below multiply to this
+const UPS: [usize; 4] = [8, 8, 4, 2];
+const UPK: [usize; 4] = [16, 16, 8, 4];
 const RES_K: [usize; 3] = [3, 7, 11];
 const RES_D: [usize; 3] = [1, 3, 5]; // one dilation set per resblock kernel
 
@@ -244,6 +247,88 @@ impl<B: Backend> PeriodDisc<B> {
 }
 
 // --------------------------------------------------------------------------- //
+// Real data: discover audio files once, decode + extract a matching (mel, wav)
+// segment per draw. Mirrors vocoder.py's VocoderDataset (which also decodes a
+// random file per __getitem__ -- this isn't a regression vs. the Python side).
+// --------------------------------------------------------------------------- //
+struct RealVocoderData {
+    files: Vec<std::path::PathBuf>,
+    sr: u32,
+    n_fft: usize,
+    hop: usize,
+    n_mels: usize,
+    db_floor: f64,
+    db_ceil: f64,
+}
+impl RealVocoderData {
+    fn discover(data_dir: &str, sr: u32, n_fft: usize, hop: usize, n_mels: usize) -> Self {
+        let mut files = Vec::new();
+        for entry in walk(std::path::Path::new(data_dir)) {
+            if let Some(ext) = entry.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("opus") || ext.eq_ignore_ascii_case("wav") {
+                    files.push(entry);
+                }
+            }
+        }
+        if files.is_empty() {
+            eprintln!("warning: no .opus/.wav files found under {data_dir}");
+        } else {
+            println!("RealVocoderData: {} audio files under {data_dir}", files.len());
+        }
+        Self { files, sr, n_fft, hop, n_mels, db_floor: -80.0, db_ceil: 40.0 }
+    }
+
+    /// One (mel, wav) pair: mel [n_mels, seg_frames], wav [seg_frames*hop] f32.
+    /// Retries a few times on decode failure / too-short files, then falls
+    /// back to silence (matches vocoder.py's fallback behavior).
+    fn next_pair(&self, seg_frames: usize) -> (Vec<f32>, Vec<f32>) {
+        let seg_len = seg_frames * self.hop;
+        for _ in 0..4 {
+            if self.files.is_empty() {
+                break;
+            }
+            let path = &self.files[fastrand::usize(0..self.files.len())];
+            let y = match audio::decode_audio(path, self.sr) {
+                Ok(y) => y,
+                Err(_) => continue,
+            };
+            if y.len() < seg_len + self.hop {
+                continue;
+            }
+            let start = fastrand::usize(0..(y.len() - seg_len - self.hop));
+            let wav_seg = y[start..start + seg_len].to_vec();
+            // mel spans the segment + one hop, matching vocoder.py's alignment
+            let mel_input = &y[start..start + seg_len + self.hop];
+            let (mel, n_frames) = audio::wav_to_unit_mel(mel_input, self.sr as f64, self.n_fft, self.hop, self.n_mels, self.db_floor, self.db_ceil);
+            if n_frames < seg_frames {
+                continue;
+            }
+            // crop to exactly seg_frames columns (row-major [n_mels, n_frames])
+            let mut cropped = vec![0f32; self.n_mels * seg_frames];
+            for m in 0..self.n_mels {
+                cropped[m * seg_frames..(m + 1) * seg_frames].copy_from_slice(&mel[m * n_frames..m * n_frames + seg_frames]);
+            }
+            return (cropped, wav_seg);
+        }
+        (vec![-1.0; self.n_mels * seg_frames], vec![0.0; seg_len])
+    }
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+// --------------------------------------------------------------------------- //
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(String::as_str).unwrap_or("smoke");
@@ -254,9 +339,11 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(200000usize);
     let batch = envu("BS_BATCH", 8);
-    let n_mels = envu("BS_NMELS", 128);
+    let n_mels = envu("BS_NMELS", 256);
     let ch = envu("BS_CH", 128);
     let seg = envu("BS_SEG", 32); // mel frames per segment
+    let data_dir = arg::<String>(&args, "--data");
+    let synthetic = args.iter().any(|a| a == "--synthetic") || data_dir.is_none();
 
     let device = WgpuDevice::default();
     println!("Backend: Wgpu (Vulkan). Device: {device:?}");
@@ -282,7 +369,7 @@ fn main() {
             println!("MPD(period 3): logits{:?}, {} feature maps", logit.dims(), feats.len());
             println!("first forward (incl. kernel compile): {} ms", t0.elapsed().as_millis());
         }
-        "train" => train(n_mels, ch, seg, batch, iters, &periods, &stft_cfgs, &device),
+        "train" => train(n_mels, ch, seg, batch, iters, &periods, &stft_cfgs, &device, data_dir.as_deref(), synthetic),
         other => {
             eprintln!("unknown '{other}'. use: smoke | train");
             std::process::exit(2);
@@ -299,8 +386,17 @@ fn train(
     periods: &[usize],
     stft_cfgs: &[(usize, usize)],
     device: &WgpuDevice,
+    data_dir: Option<&str>,
+    synthetic: bool,
 ) {
     let wav_len = seg * HOP;
+    const SR: u32 = 48000;
+    const N_FFT: usize = 4096;
+    let real_data = if synthetic {
+        None
+    } else {
+        Some(RealVocoderData::discover(data_dir.unwrap(), SR, N_FFT, HOP, n_mels))
+    };
     let mut g = VocGen::<AB>::new(n_mels, ch, device);
     let mut discs: Vec<PeriodDisc<AB>> = periods.iter().map(|&p| PeriodDisc::new(p, device)).collect();
     let mut opt_g = AdamConfig::new().with_beta_1(0.8).init();
@@ -309,12 +405,26 @@ fn train(
     let lr = 2e-4;
     let (lambda_stft, lambda_fm) = (2.5f32, 2.0f32);
 
-    println!("Training {iters} iters, batch {batch}, on GPU (Vulkan). Synthetic pairs.");
+    println!("Training {iters} iters, batch {batch}, on GPU (Vulkan). {}",
+             if real_data.is_some() { "Real audio data." } else { "Synthetic pairs." });
     let t0 = Instant::now();
     for step in 0..iters {
-        // Synthetic aligned pair (swap for a real mel+wav cache loader).
-        let mel = Tensor::<AB, 3>::random([batch, n_mels, seg], Distribution::Uniform(-1.0, 1.0), device);
-        let wav = Tensor::<AB, 3>::random([batch, 1, wav_len], Distribution::Uniform(-1.0, 1.0), device);
+        let (mel, wav) = if let Some(ref rd) = real_data {
+            let mut mel_buf = Vec::with_capacity(batch * n_mels * seg);
+            let mut wav_buf = Vec::with_capacity(batch * wav_len);
+            for _ in 0..batch {
+                let (m, w) = rd.next_pair(seg);
+                mel_buf.extend_from_slice(&m);
+                wav_buf.extend_from_slice(&w);
+            }
+            let mel = Tensor::<AB, 1>::from_floats(mel_buf.as_slice(), device).reshape([batch, n_mels, seg]);
+            let wav = Tensor::<AB, 1>::from_floats(wav_buf.as_slice(), device).reshape([batch, 1, wav_len]);
+            (mel, wav)
+        } else {
+            let mel = Tensor::<AB, 3>::random([batch, n_mels, seg], Distribution::Uniform(-1.0, 1.0), device);
+            let wav = Tensor::<AB, 3>::random([batch, 1, wav_len], Distribution::Uniform(-1.0, 1.0), device);
+            (mel, wav)
+        };
 
         let fake = g.forward(mel);
         let fake = fake.clone().slice([0..batch, 0..1, 0..wav_len]);
@@ -366,4 +476,9 @@ fn train(
     }
     println!("Done in {:.1}s.", t0.elapsed().as_secs_f64());
     let _ = Module::num_params(&g);
+}
+
+fn arg<T: std::str::FromStr>(args: &[String], key: &str) -> Option<T> {
+    let i = args.iter().position(|a| a == key)?;
+    args.get(i + 1)?.parse().ok()
 }
