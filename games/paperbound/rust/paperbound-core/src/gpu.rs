@@ -160,3 +160,22 @@ mod tests {
         let _ = vulkan_probe();
     }
 }
+
+/// The real engine link, feature-gated: `--features gpu-engine` (cargo >=
+/// 1.96 — unendlich's lockfile is v4). Proves at compile+run time that
+/// paperbound-core and the monorepo's Vulkan engine live in one build.
+#[cfg(feature = "gpu-engine")]
+pub mod engine {
+    /// The engine crate is linked; report what the bridge hands it.
+    pub fn linkage_report(buffers: &super::SceneBuffers) -> String {
+        // referencing the engine crate root proves the cross-workspace link
+        let engine = std::any::type_name::<unendlich_engine::render::world_renderer::WorldRenderer>();
+        format!(
+            "paperbound-core → {} · {} verts ({} bytes) · {} indices",
+            engine,
+            buffers.vertex_count(),
+            buffers.vertex_bytes().len(),
+            buffers.indices.len()
+        )
+    }
+}
