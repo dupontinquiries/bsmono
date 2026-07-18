@@ -14,7 +14,7 @@
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
-use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -47,6 +47,8 @@ struct VoicetermApp {
     /// toggles the left-edge drawer.
     blocks: uikit_term::blocks::BlockTracker,
     blocks_open: bool,
+    /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
+    tabbar_scroll_to: Option<f32>,
 }
 
 impl eframe::App for VoicetermApp {
@@ -147,19 +149,53 @@ impl eframe::App for VoicetermApp {
         egui::SidePanel::left("tabbar").resizable(false).exact_width(120.0).show(ctx, |ui| {
             ui.add_space(4.0);
             let mut apply: Vec<voiceterm_egui::gesture_menus::WsCall> = Vec::new();
-            for i in 0..self.workspace.tabs.len() {
-                let tab = self.workspace.tabs[i].clone();
-                let resp = tab_row(ui, &tab, i == self.workspace.active, &self.colors);
-                if resp.clicked() {
-                    self.workspace.active = i;
+            const ROW_PITCH: f32 = 33.0; // QML v0.1.803: 30px row + 3px spacing
+            let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+            if let Some(target) = self.tabbar_scroll_to.take() {
+                scroll = scroll.vertical_scroll_offset(target);
+            }
+            let out = scroll.show(ui, |ui| {
+                for i in 0..self.workspace.tabs.len() {
+                    let tab = self.workspace.tabs[i].clone();
+                    let resp = tab_row(ui, &tab, i == self.workspace.active, &self.colors);
+                    if resp.clicked() {
+                        self.workspace.active = i;
+                    }
+                    // hold-to-open the per-tab menu on the same row host (0.35 s, QML hold
+                    // feel); the held tab's name rides in the title band
+                    let menu = tab_slide_menu(("vt-tab-menu", i), &tab.name).hold(0.35);
+                    if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
+                        menu.show_stored(ui, egui::Id::new(("vt-tab-menu", i)), &resp, &tab_menu())
+                    {
+                        apply = tab_dispatch(&id, variant, i);
+                    }
                 }
-                // hold-to-open the per-tab menu on the same row host (0.35 s, QML hold feel);
-                // the held tab's name rides in the title band
-                let menu = tab_slide_menu(("vt-tab-menu", i), &tab.name).hold(0.35);
-                if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
-                    menu.show_stored(ui, egui::Id::new(("vt-tab-menu", i)), &resp, &tab_menu())
+            });
+            // v0.1.803 "N more" pills, pinned to the viewport top/bottom while rows overflow;
+            // tapping scrolls a page in that direction
+            let (above, below) = overflow_counts(
+                out.state.offset.y,
+                out.inner_rect.height(),
+                out.content_size.y,
+                ROW_PITCH,
+            );
+            let page = out.inner_rect.height() * 0.8;
+            if above > 0 {
+                let pos = egui::pos2(out.inner_rect.center().x, out.inner_rect.top() + 10.0);
+                if ui
+                    .put(egui::Rect::from_center_size(pos, egui::vec2(90.0, 18.0)), egui::Button::new(format!("\u{2191} {above} more")).small())
+                    .clicked()
                 {
-                    apply = tab_dispatch(&id, variant, i);
+                    self.tabbar_scroll_to = Some((out.state.offset.y - page).max(0.0));
+                }
+            }
+            if below > 0 {
+                let pos = egui::pos2(out.inner_rect.center().x, out.inner_rect.bottom() - 10.0);
+                if ui
+                    .put(egui::Rect::from_center_size(pos, egui::vec2(90.0, 18.0)), egui::Button::new(format!("\u{2193} {below} more")).small())
+                    .clicked()
+                {
+                    self.tabbar_scroll_to = Some(out.state.offset.y + page);
                 }
             }
             for call in &apply {
@@ -292,6 +328,7 @@ fn main() -> eframe::Result<()> {
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks: blocks,
                 blocks_open: false,
+                tabbar_scroll_to: None,
             }))
         }),
     )
