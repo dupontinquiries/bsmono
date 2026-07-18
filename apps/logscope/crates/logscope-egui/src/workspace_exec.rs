@@ -474,6 +474,38 @@ pub fn parse_tools(text: &str) -> Vec<Tool> {
     out
 }
 
+/// Find the ``` that actually terminates a fenced JSON payload: the first fence position where the text
+/// before it is brace-balanced OUTSIDE of JSON strings (escape-aware). Fences INSIDE a JSON string (a
+/// README/doc-comment being written via write_file) don't end the block. Falls back to the first fence if
+/// the payload never balances (malformed JSON — same behavior as before).
+fn balanced_fence_end(after: &str) -> Option<usize> {
+    let bytes = after.as_bytes();
+    let (mut depth, mut in_str, mut esc) = (0i32, false, false);
+    let mut first_fence = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if esc { esc = false; }
+            else if b == b'\\' { esc = true; }
+            else if b == b'"' { in_str = false; }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b'`' if after[i..].starts_with("```") => {
+                    if first_fence.is_none() { first_fence = Some(i); }
+                    if depth <= 0 { return Some(i); }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    first_fence
+}
+
 /// Extract the raw JSON-ish payloads from either supported block shape.
 fn extract_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
@@ -481,10 +513,16 @@ fn extract_blocks(text: &str) -> Vec<String> {
     let mut rest = text;
     while let Some(start) = rest.find("```tool") {
         let after = &rest[start + "```tool".len()..];
-        if let Some(end) = after.find("```") {
-            blocks.push(after[..end].trim().to_string());
-            rest = &after[end + 3..];
-        } else { break; }
+        // End the block at a fence where the payload is BALANCED JSON — not the first ``` blindly.
+        // A write_file whose contents contain a fence (README with ```rust examples, doc comments
+        // with ```) otherwise truncates mid-JSON and the tail spills out as broken file fragments.
+        match balanced_fence_end(after) {
+            Some(end) => {
+                blocks.push(after[..end].trim().to_string());
+                rest = &after[end + 3..];
+            }
+            None => break,
+        }
     }
     // <tool_call> … </tool_call>
     let mut rest = text;
@@ -1337,6 +1375,23 @@ mod tests {
         let r = ws.apply(&Tool::ListDir { path: "".into() });
         assert!(r.ok);
         assert_eq!(r.output, "a_dir/\nb.txt"); // sorted, .git hidden
+    }
+
+        #[test]
+    fn tool_block_with_nested_fences_in_contents() {
+        // A write_file whose CONTENTS contain markdown fences (README with ```rust examples) must not be
+        // truncated at the inner fence — the block ends at the fence where the JSON is brace-balanced.
+        let t = "```tool\n{ \"tool\": \"write_file\", \"path\": \"README.md\", \"contents\": \"# X\\n```rust\\nfn a(){}\\n```\\ndone\" }\n```\nafter";
+        let tools = parse_tools(t);
+        assert_eq!(tools.len(), 1, "one intact tool call");
+        match &tools[0] {
+            Tool::WriteFile { path, contents } => {
+                assert_eq!(path, "README.md");
+                assert!(contents.contains("```rust"), "inner fence preserved in contents");
+                assert!(contents.ends_with("done"));
+            }
+            other => panic!("expected WriteFile, got {other:?}"),
+        }
     }
 
     #[test]
