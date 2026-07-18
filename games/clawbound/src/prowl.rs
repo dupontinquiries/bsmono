@@ -1099,7 +1099,10 @@ impl Prowl {
             _ => (self.obj.tx, self.obj.tz),
         };
         let (gx, gz) = norm(goal.0 - self.hx, goal.1 - self.hz);
-        let hspeed = p.speed * if self.hstate == HState::Chase { 1.0 } else { 0.55 } * self.difficulty;
+        // the hunter's speed constant predates PROWL_SCALE and doesn't auto-scale with it —
+        // preserve the original chase-speed ratio at the new (faster) pace rather than
+        // letting a sprinting player quietly outrun a chasing hunter outright
+        let hspeed = p.speed * (PROWL_SCALE / 1.9) * if self.hstate == HState::Chase { 1.0 } else { 0.55 } * self.difficulty;
         self.hx = (self.hx + gx * hspeed * dt).clamp(-MAP, MAP);
         self.hz = (self.hz + gz * hspeed * dt).clamp(-MAP, MAP);
         if gx.abs() + gz.abs() > 1e-4 { self.hheading = gx.atan2(gz); }
@@ -1643,6 +1646,19 @@ mod tests {
         g.set_input(0.0, 0.0, false, false, false);
         g.step(1.0 / 30.0);
         assert_eq!(g.outcome, Some(1), "the leader takes it when the ring closes");
+    }
+
+    #[test]
+    fn a_chasing_hunter_is_still_faster_than_a_sprinting_cat_on_open_ground() {
+        // this exact ratio has already broken once (bumping PROWL_SCALE for the player
+        // without also scaling the hunter's flat, PROWL_SCALE-independent speed constant
+        // let a sprinting cat quietly outrun a chasing hunter) — pin the design constants
+        // down directly, since exercising this via emergent detection AI is its own can
+        // of worms (the hunter's hstate resets off Chase the instant it can't currently
+        // see the target, which isn't what this test is about).
+        let hunter_chase_speed = Kind::Fox.params().speed * (PROWL_SCALE / 1.9);
+        let cat_sprint_speed = Class::Cat.speed_at(0.0, 0.0) * PROWL_SCALE * SPRINT;
+        assert!(hunter_chase_speed > cat_sprint_speed, "a chasing hunter should still outpace a flat-out sprinting cat on open ground ({hunter_chase_speed:.2} vs {cat_sprint_speed:.2})");
     }
 
     #[test]
