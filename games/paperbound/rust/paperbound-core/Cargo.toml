@@ -19,3 +19,10 @@ unendlich-engine = { path = "../../../unendlich/crates/unendlich-engine", defaul
 [features]
 default = []
 gpu-engine = ["dep:unendlich-engine"]
+
+# gpu_smoke links the unendlich engine — auto-discovery would compile it in
+# default (std-only) builds and fail on the feature-gated gpu::engine module.
+[[bin]]
+name = "gpu_smoke"
+path = "src/bin/gpu_smoke.rs"
+required-features = ["gpu-engine"]
