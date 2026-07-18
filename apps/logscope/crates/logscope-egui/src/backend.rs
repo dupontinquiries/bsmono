@@ -764,6 +764,10 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TemplateKind { Llama3, ChatML, Plain, Gemma }
+impl TemplateKind {
+    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3 } }
+    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, _ => return None }) }
+}
 
 /// What a successful load reports back to the UI.
 pub struct LoadInfo { pub path: String, pub template: TemplateKind }
@@ -771,15 +775,28 @@ pub struct LoadInfo { pub path: String, pub template: TemplateKind }
 pub enum Cmd { SetBackend(BackendKind), SetParams(GenParams), Load(String), Generate(String), Continue(String) }
 pub enum Evt { Loaded(Result<LoadInfo, String>), Token(String), Done { tokens: usize, secs: f32 }, Error(String) }
 
-pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<AtomicBool> }
+pub struct Inference { tx: Sender<Cmd>, pub rx: Receiver<Evt>, cancel: Arc<AtomicBool>,
+    /// Detected chat template of the CURRENTLY loaded model, published by the worker on every successful
+    /// load (255 = nothing loaded). UI tabs read this LIVE at prompt-build time instead of relying only on
+    /// per-tab cached state, so a tab created after the load (or one whose Loaded event another drain
+    /// consumed) can never silently build Llama-3 prompts for a ChatML model.
+    template: Arc<std::sync::atomic::AtomicU8> }
+impl Inference {
+    /// The worker-published template of the loaded model, if any.
+    pub fn detected_template(&self) -> Option<TemplateKind> {
+        TemplateKind::from_u8(self.template.load(Ordering::Relaxed))
+    }
+}
 impl Inference {
     pub fn spawn() -> Self {
         let (cmd_tx, cmd_rx) = channel::<Cmd>();
         let (evt_tx, evt_rx) = channel::<Evt>();
         let cancel = Arc::new(AtomicBool::new(false));
+        let template = Arc::new(std::sync::atomic::AtomicU8::new(255));
         let cw = cancel.clone();
-        std::thread::spawn(move || worker(cmd_rx, evt_tx, cw));
-        Self { tx: cmd_tx, rx: evt_rx, cancel }
+        let tw = template.clone();
+        std::thread::spawn(move || worker(cmd_rx, evt_tx, cw, tw));
+        Self { tx: cmd_tx, rx: evt_rx, cancel, template }
     }
     pub fn load(&self, path: String) { let _ = self.tx.send(Cmd::Load(path)); }
     pub fn generate(&self, prompt: String) { self.cancel.store(false, Ordering::Relaxed); let _ = self.tx.send(Cmd::Generate(prompt)); }
@@ -793,7 +810,7 @@ impl Inference {
     pub fn cancel(&self) { self.cancel.store(true, Ordering::Relaxed); }
 }
 
-fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>) {
+fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, template_out: Arc<std::sync::atomic::AtomicU8>) {
     // Default to the backend that's actually compiled in (llama.cpp if available),
     // so the header Load and the chat tab operate on the same, working backend.
     let mut kind = BackendKind::preferred();
@@ -814,7 +831,7 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>) {
             Cmd::Load(path) => {
                 eprintln!("worker: loading '{path}' via {} backend", backend.name());
                 match backend.load(&path, &params) {
-                    Ok(()) => { let template = backend.template(); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
+                    Ok(()) => { let template = backend.template(); template_out.store(template.to_u8(), Ordering::Relaxed); let _ = evt.send(Evt::Loaded(Ok(LoadInfo { path, template }))); }
                     Err(e) => { eprintln!("worker: load failed: {e}"); let _ = evt.send(Evt::Loaded(Err(e))); }
                 }
             }
