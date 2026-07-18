@@ -633,6 +633,7 @@ impl State {
             let pose = if rv.stagger > 0.0 { cat::flinch(1.0 - (rv.stagger / 0.9).min(1.0)) }
                 else if rv.class == clawbound_rs::class::Class::Hawk { cat::hover((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0)) }
                 else if gy < world::WATER_Y { cat::swim((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0)) }
+                else if clawbound_rs::class::Class::terrain_at(rv.x, rv.z) == 2 { cat::scramble((self.anim_t * 1.1 + rv.x * 0.2).rem_euclid(1.0)) }
                 else { cat::walk((self.anim_t * 1.3 + rv.x * 0.2).rem_euclid(1.0)) };
             cat::build(&mut m, v3(rv.x, gy, rv.z), rv.heading, &pose, rv.class);
             m.boxx(v3(rv.x, gy + 2.1, rv.z), v3(0.46, 0.2, 0.46), rgb(clawbound_rs::prowl::clan_color(rv.clan)));
