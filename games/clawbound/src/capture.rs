@@ -115,6 +115,7 @@ impl Capture {
     /// New match. The player is mob 0 on Tawny with the chosen class; the rest of
     /// each team is filled with a spread of classes.
     pub fn new(player_class: Class) -> Capture {
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let bases = [land_near(TAWNY_ANCHOR.0, TAWNY_ANCHOR.1), land_near(SILVER_ANCHOR.0, SILVER_ANCHOR.1)];
         let fill = [Class::Squirrel, Class::Otter, Class::Frog, Class::Goat, Class::Hawk, Class::Cat];

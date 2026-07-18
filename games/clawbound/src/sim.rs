@@ -161,6 +161,7 @@ impl Game {
     /// scatter so repeat matches aren't identical. `seed == 0` reproduces the legacy
     /// fixed layout exactly (so determinism and existing tests are unchanged).
     pub fn new_match_seeded(kind: Kind, mode: Mode, seed: u32) -> Game {
+        let _terrain_guard = world::TERRAIN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         world::init_world();
         let bushes = world::bush_positions(200);
         let trees = world::tree_positions(120);

@@ -237,6 +237,17 @@ fn move_world(yaw: f32, ix: f32, iz: f32) -> (f32, f32) {
     (ix * r.0 + iz * f.0, ix * r.1 + iz * f.1)
 }
 
+fn dist(x0: f32, z0: f32, x1: f32, z1: f32) -> f32 { ((x1 - x0).powi(2) + (z1 - z0).powi(2)).sqrt() }
+/// A rough 8-point compass word from one point toward another, world-space (not
+/// camera-relative) — good enough for a scouting call-out.
+fn bearing_word(x0: f32, z0: f32, x1: f32, z1: f32) -> &'static str {
+    let ang = (x1 - x0).atan2(z1 - z0).to_degrees().rem_euclid(360.0);
+    match ((ang + 22.5) / 45.0) as u32 % 8 {
+        0 => "north", 1 => "northeast", 2 => "east", 3 => "southeast",
+        4 => "south", 5 => "southwest", 6 => "west", _ => "northwest",
+    }
+}
+
 /// Draw the pause/title menu overlay (shared by the sim and prowl render paths).
 fn draw_menu(ctx: &egui::Context, items: &[String], cursor: usize, screen: clawbound_rs::menu::Screen) {
     use clawbound_rs::menu::Screen;
@@ -655,11 +666,13 @@ impl State {
         // the prowler + a class-tint marker
         let pgy = world::height_at(g.x, g.z);
         let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 }
-            else if g.vault_t > 0.0 { let ph = 1.0 - (g.vault_t / 0.4).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 0.9 } else { 0.0 };
+            else if g.vault_t > 0.0 { let ph = 1.0 - (g.vault_t / 0.4).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 0.9 }
+            else if g.climb_t > 0.01 { g.climb_t * 3.2 } else { 0.0 };
         let in_water = world::height_at(g.x, g.z) < world::WATER_Y;
         let on_mountain = clawbound_rs::class::Class::terrain_at(g.x, g.z) == 2;
         let pose = if g.respawn_flash > 0.0 { cat::caught(1.0 - (g.respawn_flash / 1.2).clamp(0.0, 1.0)) }
         else if g.vault_t > 0.0 { cat::vault(1.0 - (g.vault_t / 0.4).clamp(0.0, 1.0)) }
+        else if g.climb_t > 0.01 { cat::climb() }
         else if g.class == clawbound_rs::class::Class::Hawk {
             if g.leap_t > 0.0 { cat::leap() } else if g.moving { cat::hover((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::hover_idle(self.anim_t * 0.6) }
         }
@@ -785,6 +798,11 @@ impl State {
                 else { format!("{} camp — sneak in, or clear it out", c.kind.name()) }
             }).next()
         };
+        let scout_hint = self.prowl.as_ref().unwrap().scouted_landmark().map(|(lx, lz)| {
+            let p = self.prowl.as_ref().unwrap();
+            let d = dist(p.x, p.z, lx, lz);
+            format!("Scouting from the treetop — nearest unclaimed tree {:.0} paces {}", d, bearing_word(p.x, p.z, lx, lz))
+        });
         let tutorial_ui: Option<(&'static str, &'static str, bool, f32)> = self.tutorial.as_ref().map(|t| {
             let (title, prompt) = TUTORIAL_STEPS[t.step];
             (title, prompt, t.step == TUTORIAL_STEPS.len() - 1, t.advance_flash)
@@ -856,6 +874,7 @@ impl State {
                     ui.label(RichText::new(ab_blurb).size(10.5).italics().color(Color32::from_rgb(150, 150, 165)));
                     if staging { ui.label(RichText::new("* STAGING GROUND - sheltered by the ancestors").size(13.0).color(Color32::from_rgb(140, 220, 160))); }
                     if let Some(jh) = &jungle_hint { ui.label(RichText::new(jh).size(13.0).color(Color32::from_rgb(200, 210, 140))); }
+                    if let Some(sh) = &scout_hint { ui.label(RichText::new(sh).size(12.5).italics().color(Color32::from_rgb(180, 220, 200))); }
                     ui.add_space(3.0);
                     ui.add(egui::ProgressBar::new(sustenance).desired_width(168.0)
                         .fill(if sick { Color32::from_rgb(200, 110, 70) } else { Color32::from_rgb(150, 190, 110) })
@@ -894,7 +913,7 @@ impl State {
                 });
             }
             egui::Area::new("phint".into()).anchor(Align2::CENTER_BOTTOM, [0.0, -12.0]).show(ctx, |ui| {
-                ui.label(RichText::new("WASD move · mouse look · Shift hide · Space/M-click roll · F leap · flick+L-click autoattack (R-click low) · Q ultimate · R restart · Esc menu")
+                ui.label(RichText::new("WASD move · mouse look · Shift hide/climb (hold still at a tree) · Space/M-click roll · F leap · flick+L-click autoattack (R-click low) · Q ultimate · R restart · Esc menu")
                     .size(12.0).color(Color32::from_rgba_unmultiplied(235, 230, 220, 190)));
             });
             if exposed {
