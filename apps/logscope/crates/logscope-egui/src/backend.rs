@@ -227,6 +227,7 @@ mod engine {
             eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
                 t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
+            if std::env::var("LOGSCOPE_DISPATCH_BENCH").is_ok() { gpu.dispatch_bench(); }
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
             // first user token runs at steady speed instead of crawling up from ~0.1 tok/s
             // while shaders compile. The returned count is the "warm" signal.
