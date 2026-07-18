@@ -701,6 +701,10 @@ pub struct App {
     /// The grid size `fit_to` last resized to, so it's a no-op when the available area hasn't
     /// actually changed (resizing the grid drops any columns/rows that no longer fit).
     fitted_size: Option<(usize, usize)>,
+    /// Screen position of the most recent long-press, latched for the caller (the pane action
+    /// menu opens there) — take with [`App::take_long_press`]. The line selection still happens;
+    /// the two compose (the menu's "copy" copies the long-pressed line).
+    long_press: Option<egui::Pos2>,
 }
 
 impl App {
@@ -718,6 +722,7 @@ impl App {
             cursor_anim: CursorAnim::default(),
             selection: None,
             fitted_size: None,
+            long_press: None,
         }
     }
 
@@ -847,11 +852,18 @@ impl App {
                     if let Some((_, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
                         self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.row_text(row) });
                     }
+                    self.long_press = Some(egui::pos2(p.x, p.y));
                 }
                 _ => {}
             }
         }
         gliding
+    }
+
+    /// The latched long-press position, if one happened since the last take. One-shot: reading
+    /// clears it, so the pane menu opens exactly once per gesture.
+    pub fn take_long_press(&mut self) -> Option<egui::Pos2> {
+        self.long_press.take()
     }
 
     /// Draw the terminal into the current UI region.
