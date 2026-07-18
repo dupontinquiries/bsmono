@@ -660,8 +660,10 @@ pub struct BlockWeights {
 /// One MoE FFN layer: route(d → n_expert logits) → top-k → per-expert SwiGLU FFN → weighted sum.
 pub struct MoeLayer {
     pub router: Lin,                 // [n_expert, d] F32 — precision matters for routing
-    pub gate: Vec<Lin>,              // n_expert × [ff, d]
-    pub up: Vec<Lin>,                // n_expert × [ff, d]
+    /// Per-expert FUSED gate||up projection [2ff, d] — same fusion as the dense wgate_up (one matmul emits
+    /// [t, 2ff] = [gate | up], consumed by SWIGLU_PACKED); per-row quant of the concat is identical to
+    /// quantizing separately. Cuts one matvec dispatch + weight bind per expert per token.
+    pub gate_up: Vec<Lin>,           // n_expert × [2ff, d]
     pub down: Vec<Lin>,              // n_expert × [d, ff]
     pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
 }
@@ -1617,9 +1619,8 @@ impl Gpu {
             let dims = [n as u32, d as u32, 0, 0];
             self.dispatch(GATHER_ROWS, &[n2, &idx], &rows, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
             // expert FFN, batched over its n tokens (existing kernels; gate/up unfused per expert)
-            let g = m.gate[e].apply(self, &rows, n);
-            let u = m.up[e].apply(self, &rows, n);
-            let hmid = self.swiglu_t(&g, &u);
+            let gu = m.gate_up[e].apply(self, &rows, n);
+            let hmid = self.swiglu_packed(&gu);
             let dn = m.down[e].apply(self, &hmid, n);
             // out[token] += weight * dn[i]
             self.dispatch(SCATTER_ADD_W, &[&dn, &idx, &wgt], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
@@ -3382,16 +3383,22 @@ impl Gpu {
                     // Stacked expert tensors: expert dim OUTERMOST, so expert e's matrix is the contiguous
                     // f32 slice [e·rows·cols, (e+1)·rows·cols) after fetch's dequant (which reads each
                     // tensor's ACTUAL ggml type — Q4_K vs Q6_K varies per layer). gate/up: [ff, d]; down: [d, ff].
-                    let per_expert = |src: &[f32], rows: usize, cols: usize| -> Vec<Lin> {
-                        (0..n_expert).map(|e| self.make_lin(&src[e * rows * cols..(e + 1) * rows * cols], rows, cols, q, q4_mode)).collect()
-                    };
+                    // Fuse each expert's gate||up at load (same pattern as dense wgate_up): one [2ff, d]
+                    // Lin per expert instead of two [ff, d] — one matvec + one bind saved per expert/token.
                     let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
-                    let gate = per_expert(&gsrc, expert_ff, d); drop(gsrc);
                     let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
-                    let up = per_expert(&usrc, expert_ff, d); drop(usrc);
+                    let ec = expert_ff * d;
+                    let gate_up: Vec<Lin> = (0..n_expert).map(|e| {
+                        let mut gu = Vec::with_capacity(2 * ec);
+                        gu.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                        gu.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                        self.make_lin(&gu, 2 * expert_ff, d, q, q4_mode)
+                    }).collect();
+                    drop(gsrc); drop(usrc);
                     let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                    let down = per_expert(&dsrc, d, expert_ff); drop(dsrc);
-                    Some(Box::new(MoeLayer { router, gate, up, down,
+                    let down: Vec<Lin> = (0..n_expert).map(|e| self.make_lin(&dsrc[e * ec..(e + 1) * ec], d, expert_ff, q, q4_mode)).collect();
+                    drop(dsrc);
+                    Some(Box::new(MoeLayer { router, gate_up, down,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
