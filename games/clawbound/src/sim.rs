@@ -186,6 +186,7 @@ impl Game {
             0 => crate::weather::Season::Newleaf, 1 => crate::weather::Season::Greenleaf,
             2 => crate::weather::Season::LeafFall, _ => crate::weather::Season::LeafBare,
         };
+        world::set_terrain_pool(1.0, season as u8);   // match the terrain's foliage tint to this season
         let weather = crate::weather::Weather::new(season);
         let wind = weather.wind_dir_vec();
         let prey_n = (520.0 * weather.prey_abundance()) as usize;   // leaner in leaf-bare, plenty in greenleaf
