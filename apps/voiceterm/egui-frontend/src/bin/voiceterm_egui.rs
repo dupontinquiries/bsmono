@@ -13,7 +13,7 @@
 
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
-use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, pipe_char, pipe_menu, pipe_slide_menu};
+use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, PaneAction};
 use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, Session, Sidebar, SidebarAction, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
@@ -28,6 +28,9 @@ struct VoicetermApp {
     /// `|⋯` / `{⋯}` chips at the left of the keycap bar.
     pipe_menu: voiceterm_egui::slide_menu::SlideMenu,
     brace_menu: voiceterm_egui::slide_menu::SlideMenu,
+    /// The pane long-press marking menu (QML `paneActionPopup`, v0.1.838): hold the terminal to
+    /// open it right there; mic at dead center so a plain release is push-to-talk.
+    pane_menu: voiceterm_egui::slide_menu::SlideMenu,
 }
 
 impl eframe::App for VoicetermApp {
@@ -78,6 +81,30 @@ impl eframe::App for VoicetermApp {
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
             }
+            // Long-press on the pane opens the 3x3 marking menu at the press point (detached host:
+            // the terminal isn't a widget Response). The line selection the long-press also made is
+            // exactly what the menu's "copy" cell copies.
+            if let Some(p) = self.app.take_long_press() {
+                self.pane_menu.open_at(ui, p, &pane_menu());
+            }
+            if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
+                self.pane_menu.show_detached(ui, &pane_menu())
+            {
+                match pane_dispatch(&id, variant) {
+                    Some(PaneAction::Clear) => self.app.terminal.clear(), // the demo has no PTY; Terminal::clear is Ctrl+L's effect
+                    Some(PaneAction::CopySelection) => {
+                        let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(|| self.app.terminal.screen_text());
+                        ctx.copy_text(text);
+                    }
+                    Some(PaneAction::CommandPalette) => self.app.open_search(), // nearest on-device affordance today
+                    // Split/Close/NewTab drive the workspace (ws_command) and Mic starts capture —
+                    // on-device wiring, same status as the sidebar's New/Graph/Settings above.
+                    Some(PaneAction::Split(_)) | Some(PaneAction::Close(_)) | Some(PaneAction::NewTab) => {}
+                    Some(PaneAction::Mic) => {}
+                    Some(PaneAction::Paste) | Some(PaneAction::PageUpScrollback) => {}
+                    None => {}
+                }
+            }
             self.app.render(ui, &self.colors);
             paint_terminal_border(ui, term_rect, &self.colors);
 
@@ -119,6 +146,7 @@ fn main() -> eframe::Result<()> {
                 pipe_menu: pipe_slide_menu("voiceterm-pipe-menu"),
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
                 brace_menu: brace_slide_menu("voiceterm-brace-menu", false),
+                pane_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-pane-menu").columns(3),
             }))
         }),
     )
