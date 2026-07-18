@@ -673,8 +673,10 @@ impl State {
         if !self.menu.open {
             let intro = self.tutorial.as_ref().map(|t| t.intro_t).unwrap_or(0.0);
             if intro > 0.0 {
-                // a short, non-interactive opening pan before handing control to the player
-                self.yaw += dt * 0.25;
+                // a short, non-interactive opening beat before handing control to the player.
+                // (Camera yaw is deliberately left untouched here — panning it and not
+                // resetting exactly left the camera rotated away from where the player
+                // expected it when they gained control.)
                 self.prowl.as_mut().unwrap().set_input(0.0, 0.0, false, false, false);
                 self.prowl.as_mut().unwrap().step(dt);
                 if let Some(t) = self.tutorial.as_mut() { t.intro_t -= dt; }
