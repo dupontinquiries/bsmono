@@ -68,6 +68,7 @@ const SUSTENANCE_WELL_AT: f32 = 0.4;   // sickness clears once it's recovered ba
 const TWIG_HEAR_R: f32 = 26.0;         // how far a snapped twig carries, hunter-side
 const TWIG_SUSPICION: f32 = 0.5;
 const LOG_BOUND_R: f32 = 1.6;
+const SPLASH_HEAR_R: f32 = 20.0;   // how far a loud water entry carries, hunter-side
 const WIN_SCORE: i32 = 3200;   // first clan to this many points wins outright — sized for a ~30 min round
 const RIVAL_FLEE_R: f32 = 18.0; // a rival breaks off to flee the stalker inside this range
 const N_CAMPS: usize = 3;
@@ -257,6 +258,8 @@ pub struct Prowl {
     pub twigs: Vec<(f32, f32)>,                // forest-floor twigs — snap one running and the hunt hears it
     pub logs: Vec<(f32, f32)>,                 // fallen logs — a natural little bound when running past
     pub snag_t: f32,                           // > 0 while dragging free of a bramble
+    pub was_in_water: bool,                    // tracks water transitions for the splash event
+    pub splash_flash: f32,                     // > 0 briefly after a splash, for the visual
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -272,6 +275,16 @@ pub struct Prowl {
 
 impl Prowl {
     pub fn new(class: Class, hunter_kind: Kind) -> Prowl {
+        // roll this match's terrain pool (mountain bias, season) — a counter-based hash
+        // rather than a wall-clock read, so this stays portable to wasm builds
+        static ROLL_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = ROLL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let roll = hashf(n.wrapping_mul(2_654_435_761) ^ 0x9E3779B9);
+        // mountain bias only ever rolls at or above baseline — "more chance of mountains",
+        // never less craggy than the original map
+        let mountain_bias = 1.0 + roll * 0.7;   // 1.0..1.7
+        let season = (roll * 4.0) as u8 % 4;
+        world::set_terrain_pool(mountain_bias, season);
         world::init_world();
         let pois: Vec<(f32, f32, &'static str)> = objectives::place().into_iter()
             .map(|o| (o.x, o.z, world::biome_at(o.x, o.z).name)).collect();
@@ -314,6 +327,8 @@ impl Prowl {
             twigs: world::twig_positions(900),
             logs: world::log_positions(110),
             snag_t: 0.0,
+            was_in_water: false,
+            splash_flash: 0.0,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -921,6 +936,18 @@ impl Prowl {
             }
         }
         self.moving = mv;
+        self.splash_flash = (self.splash_flash - dt * 2.0).max(0.0);
+        let now_in_water = world::height_at(self.x, self.z) < world::WATER_Y;
+        if mv && now_in_water && !self.was_in_water && sprinting {
+            // a loud entry — a splash the hunter can hear, same idea as a snapped twig
+            self.splash_flash = 1.0;
+            let hd = dist(self.hx, self.hz, self.x, self.z);
+            if hd < SPLASH_HEAR_R {
+                self.suspicion = (self.suspicion + 0.4 * (1.0 - hd / SPLASH_HEAR_R)).min(1.5);
+                self.last_seen = Some((self.x, self.z));
+            }
+        }
+        self.was_in_water = now_in_water;
         self.hidden = self.crouched && self.bushes.iter().any(|(bx, bz, r)| dist(self.x, self.z, *bx, *bz) < *r);
         let slipstream = self.class == Class::Otter && Class::terrain_at(self.x, self.z) == 0;
         self.stamina = (self.stamina + if sprinting && !slipstream { -0.30 } else if sprinting { 0.0 } else { 0.18 } * dt).clamp(0.0, 1.0);
@@ -1663,6 +1690,29 @@ mod tests {
     }
 
     #[test]
+    fn sprinting_into_water_splashes_and_is_heard() {
+        let mut wx = 0.0; let mut wz = 0.0; let mut lx = 0.0; let mut lz = 0.0; let mut found = false;
+        for i in -80..80 {
+            let (x, z) = (i as f32 * 3.0, 0.0);
+            if world::height_at(x, z) < world::WATER_Y && world::height_at(x - 3.0, z) >= world::WATER_Y {
+                wx = x; wz = z; lx = x - 3.0; lz = z; found = true; break;
+            }
+        }
+        assert!(found, "expected a land/water edge on the map");
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.x = lx; g.z = lz; g.heading = 0.0;
+        g.hx = wx + 3.0; g.hz = wz;   // close enough to hear the splash
+        g.suspicion = 0.0;
+        for _ in 0..20 {
+            g.set_input((wx - g.x).signum(), 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.splash_flash > 0.0 { break; }
+        }
+        assert!(g.splash_flash > 0.0, "sprinting into water should trigger the splash");
+        assert!(g.suspicion > 0.0, "and a nearby hunter should hear it");
+    }
+
+    #[test]
     fn crouching_past_a_twig_stays_quiet() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.twigs = vec![(0.0, 0.0)];
@@ -1741,6 +1791,7 @@ mod tests {
                     assert!(g.convergence_t.is_finite(), "convergence clock broke");
                     for &p in &g.ritual_progress { assert!(p >= 0.0 && p <= RITUAL_WIN, "ritual progress out of range"); }
                     assert!(g.snag_t >= 0.0, "snag_t went negative");
+                    assert!(g.splash_flash >= 0.0, "splash_flash went negative");
                     assert!(g.yowled_t >= 0.0, "yowled_t went negative");
                     pc = g.prey_caught; cc = g.times_caught;
                 }

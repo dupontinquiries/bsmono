@@ -660,6 +660,15 @@ impl State {
         else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
         cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose, g.class);
         m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
+        if g.splash_flash > 0.0 {
+            m.set_op(g.splash_flash * 0.6);
+            for k in 0..8 {
+                let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                let rr = (1.0 - g.splash_flash) * 2.2 + 0.3;
+                m.segment(v3(g.x + a.cos() * rr, pgy + 0.05, g.z + a.sin() * rr), v3(g.x + a.cos() * (rr + 0.3), pgy + 0.05, g.z + a.sin() * (rr + 0.3)), 0.08, 0.02, 3, rgb(0xdff2ff));
+            }
+            m.set_op(1.0);
+        }
         // the stalking hunter
         let hgy = world::height_at(g.hx, g.hz);
         if g.hunter_kind.is_shadow() { crate::build_shadow(&mut m, v3(g.hx, hgy, g.hz)); } else { crate::build_fox(&mut m, v3(g.hx, hgy, g.hz)); }
