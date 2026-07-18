@@ -2890,9 +2890,12 @@ fn main(){
     }
     idx[s]=bi; lg[s]=bv;
   }
-  // softmax over the selected (max = lg[0], selection is descending)
+  // softmax over the selected (selection is descending, so lg[0] is the max — hoist it BEFORE the loop
+  // mutates lg in place; using lg[0] inside the loop reads exp(0)=1.0 for s>=1, mis-weighting slot 0 by
+  // exp(max-1) after normalization — the exact wgtΔmax the differential checker caught)
+  let mx=lg[0];
   var sum=0.0;
-  for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-lg[0]); sum=sum+lg[s]; }
+  for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
   for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/sum); }
 }"#;
 
