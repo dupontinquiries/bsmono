@@ -13,8 +13,8 @@
 
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
-use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, LinkAction, PaneAction};
-use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
+use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -43,6 +43,10 @@ struct VoicetermApp {
     /// baseline identity.
     theme: snapclone_theme::PaletteId,
     theme_menu: voiceterm_egui::slide_menu::SlideMenu,
+    /// Command blocks (QML blocksDrawer): tracked from what the demo feeds; `blocks_open`
+    /// toggles the left-edge drawer.
+    blocks: uikit_term::blocks::BlockTracker,
+    blocks_open: bool,
 }
 
 impl eframe::App for VoicetermApp {
@@ -74,6 +78,10 @@ impl eframe::App for VoicetermApp {
                         self.app.terminal.feed(ch);
                     }
                 }
+                // the 📜 chip toggles the blocks drawer (QML blocksDrawer.open())
+                if ui.button("\u{1F4DC}").clicked() {
+                    self.blocks_open = !self.blocks_open;
+                }
                 // hold the palette chip to show all vibes (the settings screenshot's theme grid)
                 let theme_host = ui.button("\u{1F3A8}");
                 if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
@@ -95,6 +103,45 @@ impl eframe::App for VoicetermApp {
                 self.app.terminal.feed(send);
             }
         });
+
+        // the blocks drawer slides in at the left edge (QML Drawer, LeftEdge)
+        if self.blocks_open {
+            egui::SidePanel::left("blocks-drawer").resizable(true).default_width(340.0).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Blocks");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("\u{2715}").clicked() {
+                            self.blocks_open = false;
+                        }
+                    });
+                });
+                ui.separator();
+                if let Some((id, action)) = blocks_drawer_ui(ui, &self.blocks.blocks, &self.colors) {
+                    match action {
+                        BlockAction::Rerun => {
+                            if let Some(cmd) = self.blocks.get_block_command(id).map(str::to_string) {
+                                // demo semantics: echo the command line into the grid (a PTY
+                                // would receive cmd + \r) and track it as a new block
+                                self.app.terminal.feed(&format!("$ {cmd}\r\n"));
+                                self.blocks.submit_command(&cmd, 0);
+                            }
+                        }
+                        BlockAction::CopyCommand => {
+                            if let Some(cmd) = self.blocks.get_block_command(id) {
+                                ctx.copy_text(cmd.to_string());
+                            }
+                        }
+                        BlockAction::CopyOutput => {
+                            if let Some(out) = self.blocks.get_block_output(id) {
+                                ctx.copy_text(out.to_string());
+                            }
+                        }
+                        // the summary worker is backend-side (global toggle in the reference)
+                        BlockAction::Summary => {}
+                    }
+                }
+            });
+        }
 
         // the vertical tab sidebar sits between the session sidebar and the terminal
         egui::SidePanel::left("tabbar").resizable(false).exact_width(120.0).show(ctx, |ui| {
@@ -198,10 +245,19 @@ fn main() -> eframe::Result<()> {
     };
     // realistic content, not a toy script — to actually surface rendering gotchas (colors,
     // wrapping, unicode) rather than just confirming an empty prompt renders.
+    // track the demo session as command blocks too, so the blocks drawer has content
+    let mut blocks = uikit_term::blocks::BlockTracker::new();
+    blocks.set_cwd("/home/kessler/proj");
     app.terminal.feed("$ ls --color\r\n");
+    blocks.submit_command("ls --color", 0);
     app.terminal.feed("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  \x1b[1;34msrc\x1b[0m  \x1b[1;31mold.bak\x1b[0m\r\n");
+    blocks.append_output("\x1b[1;34mCargo.toml\x1b[0m  \x1b[1;32mbuild.sh\x1b[0m  src  old.bak\n");
+    blocks.note_exit_code(0);
     app.terminal.feed("$ echo \"a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\"\r\n");
     app.terminal.feed("a very long line that should wrap across more than one terminal row so we can see how wrapping and the cursor position interact once it spills over\r\n");
+    blocks.submit_command("echo \"a very long line ...\"", 2);
+    blocks.append_output("a very long line that should wrap across more than one terminal row\n");
+    blocks.finish(Some(0));
     app.terminal.feed("$ echo café 🚀 你好\r\n"); // multibyte + emoji + CJK, straight in the source
     app.terminal.feed("café 🚀 你好\r\n");
     app.terminal.feed("$ ");
@@ -228,6 +284,8 @@ fn main() -> eframe::Result<()> {
                 workspace: Workspace::new(&["main", "logs"]),
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
+                blocks: blocks,
+                blocks_open: false,
             }))
         }),
     )
