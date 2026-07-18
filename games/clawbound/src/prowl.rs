@@ -17,7 +17,7 @@ use crate::ring::Ring;
 use crate::weather::Weather;
 use crate::world;
 
-const PROWL_SCALE: f32 = 1.9;      // lift class speeds to open-world chase pace
+const PROWL_SCALE: f32 = 2.3;      // lift class speeds to open-world chase pace (was 1.9 — movement felt sluggish)
 const SPRINT: f32 = 1.15;
 const CATCH_DIST: f32 = 2.3;
 const LEAP_DUR: f32 = 0.5;
@@ -257,9 +257,11 @@ pub struct Prowl {
     pub tutorial_mode: bool,                    // a safe sandbox: the hunter and minions never engage
     pub twigs: Vec<(f32, f32)>,                // forest-floor twigs — snap one running and the hunt hears it
     pub logs: Vec<(f32, f32)>,                 // fallen logs — a natural little bound when running past
+    pub rocks: Vec<(f32, f32)>,                // rock clusters — a quick vault when running past
     pub snag_t: f32,                           // > 0 while dragging free of a bramble
     pub was_in_water: bool,                    // tracks water transitions for the splash event
     pub splash_flash: f32,                     // > 0 briefly after a splash, for the visual
+    pub vault_t: f32,                          // > 0 briefly while hopping a rock (cosmetic — doesn't gate catch immunity)
     pub on_staging: bool,                    // currently within a claimed tree's grounds
     pub on_lane: bool,                       // currently travelling a lane (faster)
     pub clan_scores: [i32; 4],              // per-clan score (player = clan 0)
@@ -326,9 +328,11 @@ impl Prowl {
             tutorial_mode: false,
             twigs: world::twig_positions(900),
             logs: world::log_positions(110),
+            rocks: world::rock_positions(140),
             snag_t: 0.0,
             was_in_water: false,
             splash_flash: 0.0,
+            vault_t: 0.0,
             respawn_flash: 0.0, shielded_flash: 0.0, nine_lives_used: false, time: 0.0, difficulty: 1.0, tick: 0, input: None,
         };
         g.new_objective(Some(ProwlObj::Reach));
@@ -856,7 +860,7 @@ impl Prowl {
         let sprinting = (dx.abs() + dz.abs() > 1e-4) && !want_crouch;
         let can_sprint = self.stamina > 0.12;
         self.on_lane = self.on_lane_at(self.x, self.z);
-        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 } * self.buffs.move_mult() * if self.on_lane { LANE_BONUS } else { 1.0 } * if self.sick { 0.75 } else { 1.0 };
+        let mut speed = self.class.speed_at(self.x, self.z) * PROWL_SCALE * if sprinting && can_sprint { SPRINT } else { 1.0 } * self.buffs.move_mult() * if self.on_lane { LANE_BONUS } else { 1.0 } * if self.sick { 0.85 } else { 1.0 };
 
         // dodge (i-frames) and leap (airborne) bursts
         self.dodge_cd = (self.dodge_cd - dt).max(0.0);
@@ -905,14 +909,15 @@ impl Prowl {
         self.snag_t = (self.snag_t - dt).max(0.0);
         if mv && !airborne {
             let cover = world::cover_at(self.x, self.z);
-            if cover > 0.35 { speed *= 1.0 - cover * 0.18; }
-            if cover > 0.6 && self.snag_t <= 0.0 && sprinting
-                && hashf(self.tick.wrapping_mul(2_654_435_761) ^ 0x9e37) < 0.010 {
-                self.snag_t = 0.35;
+            if cover > 0.45 { speed *= 1.0 - cover * 0.10; }
+            if cover > 0.65 && self.snag_t <= 0.0 && sprinting
+                && hashf(self.tick.wrapping_mul(2_654_435_761) ^ 0x9e37) < 0.007 {
+                self.snag_t = 0.22;
             }
-            if self.snag_t > 0.0 { speed *= 0.45; }
+            if self.snag_t > 0.0 { speed *= 0.65; }
         }
 
+        self.vault_t = (self.vault_t - dt).max(0.0);
         if mv {
             self.x = (self.x + dx * speed * dt).clamp(-MAP, MAP);
             self.z = (self.z + dz * speed * dt).clamp(-MAP, MAP);
@@ -922,6 +927,12 @@ impl Prowl {
             if self.leap_t <= 0.0 && self.leap_cd <= 0.0 && self.dodge_t <= 0.0
                 && self.logs.iter().any(|&(lx, lz)| dist(self.x, self.z, lx, lz) < LOG_BOUND_R) {
                 self.leap_t = LEAP_DUR * 0.7; self.leap_cd = 0.7; self.bx = dx; self.bz = dz;
+            }
+            // a rock cluster along the route: a quick cosmetic vault (no catch-immunity
+            // window like the log bound — just a different way through the terrain)
+            if self.vault_t <= 0.0 && sprinting
+                && self.rocks.iter().any(|&(rx, rz)| dist(self.x, self.z, rx, rz) < LOG_BOUND_R) {
+                self.vault_t = 0.4;
             }
             // a snapped twig underfoot — the quiet, slow route around them stays hidden,
             // running through the woods risks giving you away
@@ -1675,6 +1686,20 @@ mod tests {
     }
 
     #[test]
+    fn a_rock_gives_a_sprinting_prowler_a_quick_vault() {
+        let mut g = Prowl::new(Class::Cat, Kind::Fox);
+        g.hx = 900.0; g.hz = 900.0;
+        g.rocks = vec![(2.0, 0.0)];   // a rock cluster just ahead
+        g.x = 0.0; g.z = 0.0; g.heading = 0.0;
+        for _ in 0..20 {
+            g.set_input(1.0, 0.0, false, false, false);
+            g.step(1.0 / 30.0);
+            if g.vault_t > 0.0 { break; }
+        }
+        assert!(g.vault_t > 0.0, "sprinting past a rock cluster should trigger a quick vault");
+    }
+
+    #[test]
     fn sprinting_over_a_twig_near_the_hunter_raises_suspicion() {
         let mut g = Prowl::new(Class::Cat, Kind::Fox);
         g.twigs = vec![(2.0, 0.0)];
@@ -1792,6 +1817,7 @@ mod tests {
                     for &p in &g.ritual_progress { assert!(p >= 0.0 && p <= RITUAL_WIN, "ritual progress out of range"); }
                     assert!(g.snag_t >= 0.0, "snag_t went negative");
                     assert!(g.splash_flash >= 0.0, "splash_flash went negative");
+                    assert!(g.vault_t >= 0.0, "vault_t went negative");
                     assert!(g.yowled_t >= 0.0, "yowled_t went negative");
                     pc = g.prey_caught; cc = g.times_caught;
                 }

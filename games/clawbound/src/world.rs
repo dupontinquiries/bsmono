@@ -715,6 +715,19 @@ pub fn log_positions(count: usize) -> Vec<(f32, f32)> {
 }
 
 /// Faceted paper boulders, clustered and half-sunk into the ground.
+/// Rock cluster centres — mirrors `build_rocks`, so a mode can let creatures vault
+/// over them the way `log_positions` lets them bound over logs.
+pub fn rock_positions(count: usize) -> Vec<(f32, f32)> {
+    let mut v = Vec::new();
+    for i in 0..count {
+        let x = (hash2(i as i32, 71, 0x1A) - 0.5) * SIZE * 1.5;
+        let z = (hash2(i as i32, 79, 0x2B) - 0.5) * SIZE * 1.5;
+        if hash2(i as i32, 9, 0x88) > biome_at(x, z).rocks { continue; }
+        v.push((x, z));
+    }
+    v
+}
+
 pub fn build_rocks(count: usize) -> Mesh {
     let mut m = Mesh::new();
     let gray = rgb(0x8a857b);
