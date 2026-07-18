@@ -117,3 +117,13 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 - [ ] Real UDP transport swapping `SimTransport` (STUN/UPnP/relay done in
       snapclone; the hole-punch FSM is the one port — user has field-validated the
       C++ `NatTraversal.cpp`). Can reuse net-kit `auth` + `wire`.
+
+## paperbound-core → unendlich GPU path (recorded 2026-07-18)
+`games/paperbound/rust/paperbound-core/src/gpu.rs` exports battle scenes as
+GPU-ready interleaved buffers (pos/nrm/col + u32 indices, per-face normals)
+and probes for a loadable libvulkan the vk-harness way. The actual
+`unendlich-engine --no-default-features --features render-core` dependency is
+BLOCKED in the headless sandbox by unendlich's version-4 Cargo.lock (needs a
+newer cargo than 1.75); wire it on a GPU host with a current toolchain — the
+buffer layout already matches the engine's mesh upload, so it's a consume,
+not a rewrite.
