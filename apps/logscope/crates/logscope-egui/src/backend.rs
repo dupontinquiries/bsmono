@@ -308,9 +308,20 @@ mod engine {
             } else if std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_some() {
                 None
             } else {
-                let t = gpu_kernels::SubmitTuner::new(gpu_kernels::SUBMIT_PROFILES, 2);
-                gpu.set_flush_every(t.current());
-                eprintln!("wgpu-engine: submit batch = adapting over next replies (SUBMIT_PROFILES {:?}, 2 samples each; pin with LOGSCOPE_FLUSH_EVERY)", gpu_kernels::SUBMIT_PROFILES);
+                // Startup stride probe: measure the whole ladder synthetically (~1 s worst-case, once per
+                // GPU until the live tuner's settle is cached), start at the winner, and hand the LIVE
+                // tuner only the winner's neighborhood — so real replies begin near-optimal and settling
+                // takes ~3 candidates instead of the full ladder. LOGSCOPE_FLUSH_EVERY still pins.
+                let probe = gpu.submit_stride_probe(gpu_kernels::SUBMIT_PROFILES);
+                let table: Vec<String> = probe.iter().map(|(c, ms)| format!("{c}:{ms:.0}ms")).collect();
+                let winner = probe.first().map(|&(c, _)| c).unwrap_or(64);
+                let neighborhood: Vec<u32> = gpu_kernels::SUBMIT_PROFILES.iter().cloned()
+                    .filter(|&c| c == winner || c == winner.saturating_mul(2) || c == winner / 2)
+                    .collect();
+                let t = gpu_kernels::SubmitTuner::new(
+                    Box::leak(neighborhood.clone().into_boxed_slice()), 2);
+                gpu.set_flush_every(winner);
+                eprintln!("wgpu-engine: submit batch = {winner} passes/submit (startup stride probe [{}]); live tuner refines {:?} over next replies; pin with LOGSCOPE_FLUSH_EVERY", table.join(" "), neighborhood);
                 Some(t)
             };
             let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
