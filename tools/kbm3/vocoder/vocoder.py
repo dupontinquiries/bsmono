@@ -37,18 +37,18 @@ from torch.utils.data import Dataset, DataLoader
 # --------------------------------------------------------------------------- #
 @dataclass
 class VocConfig:
-    sr: int = 22050
-    n_fft: int = 1024
-    hop: int = 256
-    n_mels: int = 128
+    sr: int = 48000
+    n_fft: int = 4096
+    hop: int = 512
+    n_mels: int = 256
     fmin: float = 0.0
     fmax: float | None = None
     db_floor: float = -80.0
     db_ceil: float = 40.0
 
     segment_frames: int = 32          # mel frames per training segment
-    upsample_rates: tuple = (8, 8, 2, 2)          # product == hop (256)
-    upsample_kernels: tuple = (16, 16, 4, 4)
+    upsample_rates: tuple = (8, 8, 4, 2)          # product == hop (512)
+    upsample_kernels: tuple = (16, 16, 8, 4)
     upsample_init_ch: int = 256
     resblock_kernels: tuple = (3, 7, 11)
     resblock_dilations: tuple = ((1, 3, 5), (1, 3, 5), (1, 3, 5))

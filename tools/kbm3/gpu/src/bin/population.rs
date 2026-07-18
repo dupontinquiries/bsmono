@@ -16,6 +16,8 @@
 
 #[path = "../model.rs"]
 mod model;
+#[path = "../data.rs"]
+mod data;
 
 use std::time::Instant;
 
@@ -27,6 +29,7 @@ use burn::tensor::activation::sigmoid;
 use burn::tensor::{Distribution, Tensor};
 
 use model::{bce_with_logits, Discriminator, GanConfig, Generator};
+use data::MelCache;
 
 type BE = Wgpu<f32, i32>;
 type AB = Autodiff<BE>;
@@ -99,16 +102,21 @@ fn play_pair(
     inner_iters: usize,
     batch: usize,
     device: &WgpuDevice,
+    cache: Option<&mut MelCache>,
 ) -> (f32, f32) {
     let lr = 2e-4;
     let (mut d_real, mut d_fake) = (0.5f32, 0.5f32);
+    let mut cache = cache;
 
     for _ in 0..inner_iters {
-        let real = Tensor::<AB, 4>::random(
-            [batch, 1, cfg.n_mels, cfg.time_frames],
-            Distribution::Uniform(-1.0, 1.0),
-            device,
-        );
+        let real = match cache.as_deref_mut() {
+            Some(c) => c.next_batch::<AB>(batch, device),
+            None => Tensor::<AB, 4>::random(
+                [batch, 1, cfg.n_mels, cfg.time_frames],
+                Distribution::Uniform(-1.0, 1.0),
+                device,
+            ),
+        };
         let z = Tensor::<AB, 2>::random([batch, cfg.latent], Distribution::Normal(0.0, 1.0), device);
 
         let fake = g.model.forward(z);
@@ -140,6 +148,7 @@ fn run_round(
     inner_iters: usize,
     batch: usize,
     device: &WgpuDevice,
+    mut cache: Option<&mut MelCache>,
 ) -> (Vec<f32>, Vec<f32>) {
     let (ng, nd) = (gs.len(), ds.len());
     let mut s_fool = vec![vec![0f32; nd]; ng];   // how much G_i fooled D_j
@@ -147,7 +156,7 @@ fn run_round(
 
     for i in 0..ng {
         for j in 0..nd {
-            let (dr, df) = play_pair(cfg, &mut gs[i], &mut ds[j], inner_iters, batch, device);
+            let (dr, df) = play_pair(cfg, &mut gs[i], &mut ds[j], inner_iters, batch, device, cache.as_deref_mut());
             s_fool[i][j] = df;
             s_sep[j][i] = dr - df;
         }
@@ -199,8 +208,8 @@ fn main() {
     println!("Backend: Wgpu (Vulkan on Asahi). Device: {device:?}");
 
     let cfg = GanConfig::new()
-        .with_n_mels(envu("BS_NMELS", 128))
-        .with_time_frames(envu("BS_TF", 256))
+        .with_n_mels(envu("BS_NMELS", 256))
+        .with_time_frames(envu("BS_TF", 560))
         .with_g_filters(envu("BS_GF", 256))
         .with_d_filters(envu("BS_DF", 64));
 
@@ -210,12 +219,13 @@ fn main() {
     let batch = arg(&args, "--batch").unwrap_or(8usize);
     let mutate_frac = envf("BS_MUTATE_FRAC", 0.5);
     let mutation_std = envf("BS_MUTATION_STD", 0.02);
+    let cache_dir = arg::<String>(&args, "--cache");
 
     match cmd {
         "smoke" => smoke(&cfg, &device),
-        "train" => train(&cfg, &device, pop, rounds, inner_iters, batch, mutate_frac, mutation_std),
+        "train" => train(&cfg, &device, pop, rounds, inner_iters, batch, mutate_frac, mutation_std, cache_dir.as_deref()),
         other => {
-            eprintln!("unknown '{other}'. use: smoke | train [--pop N --rounds N --inner-iters N --batch N]");
+            eprintln!("unknown '{other}'. use: smoke | train [--pop N --rounds N --inner-iters N --batch N --cache DIR]");
             std::process::exit(2);
         }
     }
@@ -225,7 +235,7 @@ fn smoke(cfg: &GanConfig, device: &WgpuDevice) {
     let mut g = GMember { model: cfg.init_generator::<AB>(device), opt: new_adam().init(), fitness: 0.0 };
     let mut d = DMember { model: cfg.init_discriminator::<AB>(device), opt: new_adam().init(), fitness: 0.0 };
     let t0 = Instant::now();
-    let (dr, df) = play_pair(cfg, &mut g, &mut d, 2, 4, device);
+    let (dr, df) = play_pair(cfg, &mut g, &mut d, 2, 4, device, None);
     println!("one (G,D) pair, 2 inner iters: D(real)={dr:.3} D(fake)={df:.3} ({} ms)", t0.elapsed().as_millis());
 
     let mutant = mutate_generator(&g.model, 0.02, device);
@@ -235,8 +245,13 @@ fn smoke(cfg: &GanConfig, device: &WgpuDevice) {
 }
 
 fn train(cfg: &GanConfig, device: &WgpuDevice, pop: usize, rounds: usize, inner_iters: usize,
-        batch: usize, mutate_frac: f32, mutation_std: f32) {
+        batch: usize, mutate_frac: f32, mutation_std: f32, cache_dir: Option<&str>) {
     println!("Population training on GPU (Vulkan): {pop}x{pop}, {rounds} rounds x {inner_iters} inner iters.");
+    let mut cache = cache_dir.map(|dir| {
+        let c = MelCache::open(dir, 32, cfg.n_mels, cfg.time_frames);
+        println!("Loaded cache '{dir}': {} valid tracks.", c.len());
+        c
+    });
     let mut gs: Vec<GMember> = (0..pop)
         .map(|_| GMember { model: cfg.init_generator::<AB>(device), opt: new_adam().init(), fitness: 0.0 })
         .collect();
@@ -246,7 +261,7 @@ fn train(cfg: &GanConfig, device: &WgpuDevice, pop: usize, rounds: usize, inner_
 
     for r in 0..rounds {
         let t0 = Instant::now();
-        let (fit_g, fit_d) = run_round(cfg, &mut gs, &mut ds, inner_iters, batch, device);
+        let (fit_g, fit_d) = run_round(cfg, &mut gs, &mut ds, inner_iters, batch, device, cache.as_mut());
         for (m, &f) in gs.iter_mut().zip(&fit_g) { m.fitness = f; }
         for (m, &f) in ds.iter_mut().zip(&fit_d) { m.fitness = f; }
 
