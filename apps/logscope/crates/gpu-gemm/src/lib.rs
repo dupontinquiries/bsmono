@@ -25,6 +25,25 @@ pub mod store;
 /// per-tensor f32 stay in RAM, and a content-key sample (head/mid/tail) faults a few pages, not GB.
 /// The returned `Mmap` derefs to `&[u8]` — pass it anywhere bytes are taken. Unsafe because the file
 /// could be mutated underneath us; for immutable model files that's fine.
+/// File bytes for loading: normally an mmap (pages in on demand), but LOGSCOPE_NO_MMAP=1 reads the whole
+/// file into RAM instead. Escape hatch for volumes where mmap returns ZEROS while read() returns real data
+/// (FUSE-backed mounts — exFAT/NTFS drivers, cloud-sync mounts — and some network filesystems don't
+/// implement mmap coherence; the checksum looks fine because checksums use read()). Costs file-size RAM
+/// transiently; on unified-memory boxes with headroom that's an acceptable diagnosis-and-workaround mode.
+pub enum FileBytes { Mapped(memmap2::Mmap), Owned(Vec<u8>) }
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { FileBytes::Mapped(m) => m, FileBytes::Owned(v) => v } }
+}
+/// Open model bytes honoring LOGSCOPE_NO_MMAP (see FileBytes).
+pub fn file_bytes(path: &str) -> std::io::Result<FileBytes> {
+    if std::env::var("LOGSCOPE_NO_MMAP").is_ok() {
+        eprintln!("wgpu-engine: LOGSCOPE_NO_MMAP — reading the whole file via read() (mmap bypass)");
+        return Ok(FileBytes::Owned(std::fs::read(path)?));
+    }
+    Ok(FileBytes::Mapped(mmap_ro(path)?))
+}
+
 pub fn mmap_ro(path: &str) -> std::io::Result<memmap2::Mmap> {
     let f = std::fs::File::open(path)?;
     unsafe { memmap2::Mmap::map(&f) }
