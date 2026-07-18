@@ -705,6 +705,9 @@ pub struct App {
     /// menu opens there) — take with [`App::take_long_press`]. The line selection still happens;
     /// the two compose (the menu's "copy" copies the long-pressed line).
     long_press: Option<egui::Pos2>,
+    /// A tap that landed on a URL: (position, the trimmed URL) — the QML blue-link tap. Take with
+    /// [`App::take_link_tap`]; the link action menu opens there.
+    link_tap: Option<(egui::Pos2, String)>,
 }
 
 impl App {
@@ -723,6 +726,7 @@ impl App {
             selection: None,
             fitted_size: None,
             long_press: None,
+            link_tap: None,
         }
     }
 
@@ -845,6 +849,11 @@ impl App {
                 uikit_egui::touch::Gesture::Tap(p) => {
                     if let Some((col, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
                         let word = word_at(&self.terminal.grid.row_text(row), col);
+                        // a tap on a URL is a link tap (the QML blue-link affordance); the word
+                        // selection still happens, so copy-word flows keep working
+                        if let Some(url) = url_in_word(&word) {
+                            self.link_tap = Some((egui::pos2(p.x, p.y), url));
+                        }
                         self.selection = Some(Selection { row: Some(row), text: word });
                     }
                 }
@@ -864,6 +873,11 @@ impl App {
     /// clears it, so the pane menu opens exactly once per gesture.
     pub fn take_long_press(&mut self) -> Option<egui::Pos2> {
         self.long_press.take()
+    }
+
+    /// The latched link tap (position + trimmed URL), one-shot like [`App::take_long_press`].
+    pub fn take_link_tap(&mut self) -> Option<(egui::Pos2, String)> {
+        self.link_tap.take()
     }
 
     /// Draw the terminal into the current UI region.
@@ -923,6 +937,28 @@ pub fn word_at(line: &str, col: usize) -> String {
     let start = chars[..col].iter().rposition(|c| c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
     let end = chars[col..].iter().position(|c| c.is_whitespace()).map(|i| col + i).unwrap_or(chars.len());
     chars[start..end].iter().collect()
+}
+
+/// If `word` is (or wraps) an http/https URL, the URL with trailing punctuation trimmed —
+/// `None` otherwise. This is the tap-side of the QML blue-link affordance: terminal output like
+/// `See https://example.com/x.` or `(https://a.b/c),` yields the clean URL. Pure.
+pub fn url_in_word(word: &str) -> Option<String> {
+    let start = word.find("http://").or_else(|| word.find("https://"))?;
+    let mut url = &word[start..];
+    // trim the punctuation shells output wraps URLs in: closers, sentence enders, quotes
+    while let Some(last) = url.chars().last() {
+        if matches!(last, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}' | '>' | '"' | '\'') {
+            url = &url[..url.len() - last.len_utf8()];
+        } else {
+            break;
+        }
+    }
+    // require something after the scheme
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 /// Case-insensitive search of `lines` for `query`, returning every non-overlapping hit in reading
@@ -989,6 +1025,18 @@ impl SearchState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_in_word_trims_wrapping_punctuation_and_rejects_non_urls() {
+        assert_eq!(url_in_word("https://example.com/x").as_deref(), Some("https://example.com/x"));
+        assert_eq!(url_in_word("https://example.com/x.").as_deref(), Some("https://example.com/x"));
+        assert_eq!(url_in_word("(https://a.b/c),").as_deref(), Some("https://a.b/c"));
+        assert_eq!(url_in_word("\"http://a.b\"").as_deref(), Some("http://a.b"));
+        assert_eq!(url_in_word("see:https://a.b/q?x=1").as_deref(), Some("https://a.b/q?x=1"));
+        assert_eq!(url_in_word("hello"), None);
+        assert_eq!(url_in_word("https://"), None); // scheme alone is not a link
+        assert_eq!(url_in_word("ftp://a.b"), None); // only http(s), as in the QML link detector
+    }
 
     #[test]
     fn word_at_finds_the_whitespace_delimited_word() {
