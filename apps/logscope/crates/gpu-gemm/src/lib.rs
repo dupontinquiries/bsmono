@@ -1709,8 +1709,19 @@ impl Gpu {
         let b = self.download(&v2);
         let out_dmax = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
         let out_ref = a.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
-        eprintln!("moe-check[{call:>2}]: sel {} (gpu {:?} vs cpu {:?}) | wgtΔmax {:.2e} | outΔmax {:.3e} (ref max {:.3e})",
+        let line = format!("moe-check[{call:>2}]: sel {} (gpu {:?} vs cpu {:?}) | wgtΔmax {:.2e} | outΔmax {:.3e} (ref max {:.3e})",
             if sel_ok { "OK " } else { "MISMATCH" }, gsel, csel, wgt_dmax, out_dmax, out_ref);
+        eprintln!("{line}");
+        // If the env value looks like a path (contains '/'), ALSO append there — the reliable sharing
+        // channel (attachments keep arriving empty; the GGUF dump-to-file pattern has worked every time).
+        if let Ok(v) = std::env::var("LOGSCOPE_MOE_V2_CHECK") {
+            if v.contains('/') {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&v) {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
         v1
     }
 
