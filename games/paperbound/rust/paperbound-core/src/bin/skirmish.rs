@@ -2,7 +2,8 @@
 //! Fights two factions on the ported Rust rules and prints the tale.
 
 use paperbound_core::data::load_factbook;
-use paperbound_core::skirmish::run_skirmish;
+use paperbound_core::origami::ModelBook;
+use paperbound_core::skirmish::run_skirmish_with;
 use std::path::{Path, PathBuf};
 
 fn main() {
@@ -21,7 +22,10 @@ fn main() {
         std::fs::create_dir_all(d).ok();
     }
     println!("⚔  {} vs {} — Foldworks rules, Rust engine", book[&a].name, book[&b].name);
-    let rep = run_skirmish(&book, &a, &b, 900.0, frames.as_deref(), 10.0);
+    // frames wear the real folded card models when the book loads
+    let models = ModelBook::load(&dir).ok();
+    let rep = run_skirmish_with(&book, &a, &b, 900.0, frames.as_deref(), 10.0,
+                                models.as_ref());
     let mm = (rep.t / 60.0) as u64;
     let ss = (rep.t % 60.0) as u64;
     match rep.winner {

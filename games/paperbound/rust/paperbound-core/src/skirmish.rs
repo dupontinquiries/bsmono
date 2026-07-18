@@ -13,7 +13,8 @@
 use crate::data::Faction;
 use crate::match_sim::{Job, Node, World};
 use crate::sim::Refusal;
-use crate::render::{render, save_png, Camera, Plateau};
+use crate::origami::ModelBook;
+use crate::render::{render_scene, save_png, Camera, Plateau};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -223,6 +224,20 @@ pub fn run_skirmish(
     out_dir: Option<&Path>,
     frame_every: f64,
 ) -> SkirmishReport {
+    run_skirmish_with(book, a, b, max_secs, out_dir, frame_every, None)
+}
+
+/// As run_skirmish, but frames render the units as their folded CARD MODELS
+/// when a ModelBook rides along (origami slice).
+pub fn run_skirmish_with(
+    book: &BTreeMap<String, Faction>,
+    a: &str,
+    b: &str,
+    max_secs: f64,
+    out_dir: Option<&Path>,
+    frame_every: f64,
+    models: Option<&ModelBook>,
+) -> SkirmishReport {
     let mut sim = SkirmishSim::new(book, a, b);
     let plats: Vec<Plateau> = sim
         .world
@@ -240,7 +255,7 @@ pub fn run_skirmish(
             frame_acc += dt;
             if frame_acc >= frame_every {
                 frame_acc = 0.0;
-                let f = render(&sim.world, &plats, &cam, 1280, 800);
+                let f = render_scene(&sim.world, &plats, &cam, 1280, 800, models);
                 let p = dir.join(format!("skirmish_{:04}.png", (sim.world.t * 10.0) as u64));
                 if save_png(&f, &p).is_ok() {
                     frames.push(p);
