@@ -129,7 +129,7 @@ mod engine {
             // cache HIT shouldn't pull GB into RAM just to compute a content key. The OS pages bytes
             // on demand; `bytes` derefs to &[u8] exactly like the old fs::read Vec, and the mapping
             // is dropped at the end of load once tensors are resident.
-            let mm = gpu_kernels::mmap_ro(path).map_err(|e| format!("mmap {path}: {e}"))?;
+            let mm = gpu_kernels::file_bytes(path).map_err(|e| format!("open {path}: {e}"))?;
             let bytes: &[u8] = &mm;
             let gpu = Gpu::new();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
