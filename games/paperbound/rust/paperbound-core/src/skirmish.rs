@@ -148,6 +148,71 @@ impl Commander {
     }
 }
 
+/// A stepped skirmish: the same battlefield run_skirmish drives, exposed a
+/// tick at a time so lockstep peers can hash state at checkpoints.
+pub struct SkirmishSim<'a> {
+    pub world: World<'a>,
+    c0: Commander,
+    c1: Commander,
+    think_acc: f64,
+}
+
+impl<'a> SkirmishSim<'a> {
+    pub fn new(book: &'a BTreeMap<String, Faction>, a: &str, b: &str) -> Self {
+        let mut w = World::new(&book[a], &book[b]);
+        w.add_building(0, "scriptorium", 300.0, 620.0, true);
+        w.add_building(1, "scriptorium", 1500.0, 380.0, true);
+        w.nodes.push(Node { x: 470.0, y: 560.0, amount: 3000.0 });
+        w.nodes.push(Node { x: 1330.0, y: 430.0, amount: 3000.0 });
+        w.nodes.push(Node { x: 900.0, y: 520.0, amount: 1500.0 });
+        w.plateaus.push((900.0, 500.0, 140.0));
+        for i in 0..3 {
+            w.add_unit(0, "scribe", 330.0 + i as f64 * 24.0, 640.0);
+            w.add_unit(1, "scribe", 1470.0 - i as f64 * 24.0, 400.0);
+        }
+        SkirmishSim {
+            world: w,
+            c0: Commander { team: 0, table: None, muster: 5, wells: 0 },
+            c1: Commander { team: 1, table: None, muster: 5, wells: 0 },
+            think_acc: 0.0,
+        }
+    }
+
+    pub fn step(&mut self, dt: f64) {
+        self.think_acc += dt;
+        if self.think_acc >= 0.5 {
+            self.think_acc = 0.0;
+            self.c0.think(&mut self.world);
+            self.c1.think(&mut self.world);
+        }
+        self.world.tick(dt);
+    }
+
+    /// A deterministic digest of the live state — the lockstep sync token.
+    pub fn state_hash(&self) -> u64 {
+        // FNV-1a over the quantities that matter; float bits are exact
+        // because the sim is bit-deterministic
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut eat = |v: u64| {
+            h ^= v;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        eat(self.world.ink[0].to_bits());
+        eat(self.world.ink[1].to_bits());
+        for u in &self.world.units {
+            if u.alive() {
+                eat(u.x.to_bits());
+                eat(u.y.to_bits());
+                eat(u.hp.to_bits());
+            }
+        }
+        for b in &self.world.buildings {
+            eat(b.hp.to_bits());
+        }
+        h
+    }
+}
+
 /// Fight `fac_a` vs `fac_b` for up to `max_secs`; render a frame every
 /// `frame_every` seconds into `out_dir` when given.
 pub fn run_skirmish(
@@ -158,20 +223,9 @@ pub fn run_skirmish(
     out_dir: Option<&Path>,
     frame_every: f64,
 ) -> SkirmishReport {
-    let mut w = World::new(&book[a], &book[b]);
-    w.add_building(0, "scriptorium", 300.0, 620.0, true);
-    w.add_building(1, "scriptorium", 1500.0, 380.0, true);
-    w.nodes.push(Node { x: 470.0, y: 560.0, amount: 3000.0 });
-    w.nodes.push(Node { x: 1330.0, y: 430.0, amount: 3000.0 });
-    w.nodes.push(Node { x: 900.0, y: 520.0, amount: 1500.0 });
-    w.plateaus.push((900.0, 500.0, 140.0));
-    for i in 0..3 {
-        w.add_unit(0, "scribe", 330.0 + i as f64 * 24.0, 640.0);
-        w.add_unit(1, "scribe", 1470.0 - i as f64 * 24.0, 400.0);
-    }
-    let mut c0 = Commander { team: 0, table: None, muster: 5, wells: 0 };
-    let mut c1 = Commander { team: 1, table: None, muster: 5, wells: 0 };
-    let plats: Vec<Plateau> = w
+    let mut sim = SkirmishSim::new(book, a, b);
+    let plats: Vec<Plateau> = sim
+        .world
         .plateaus
         .iter()
         .map(|&(x, y, r)| Plateau { x, y, r })
@@ -179,29 +233,23 @@ pub fn run_skirmish(
     let cam = Camera { cam_x: 150.0, cam_y: 150.0, zoom: 0.72 };
 
     let dt = 1.0 / 30.0;
-    let mut think_acc = 0.0;
     let mut frame_acc = frame_every; // render t=0 too
     let mut frames = Vec::new();
-    while w.winner.is_none() && w.t < max_secs {
-        think_acc += dt;
-        if think_acc >= 0.5 {
-            think_acc = 0.0;
-            c0.think(&mut w);
-            c1.think(&mut w);
-        }
+    while sim.world.winner.is_none() && sim.world.t < max_secs {
         if let Some(dir) = out_dir {
             frame_acc += dt;
             if frame_acc >= frame_every {
                 frame_acc = 0.0;
-                let f = render(&w, &plats, &cam, 1280, 800);
-                let p = dir.join(format!("skirmish_{:04}.png", (w.t * 10.0) as u64));
+                let f = render(&sim.world, &plats, &cam, 1280, 800);
+                let p = dir.join(format!("skirmish_{:04}.png", (sim.world.t * 10.0) as u64));
                 if save_png(&f, &p).is_ok() {
                     frames.push(p);
                 }
             }
         }
-        w.tick(dt);
+        sim.step(dt);
     }
+    let w = &sim.world;
     SkirmishReport {
         winner: w.winner,
         t: w.t,
