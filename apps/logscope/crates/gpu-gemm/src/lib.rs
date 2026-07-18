@@ -609,8 +609,14 @@ impl Drop for ArenaGuard<'_> {
         // the real error). We're resetting the bump state to None regardless of prior contents, so the
         // poisoned data is exactly what we want to discard — recover the guard instead of unwrapping.
         let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(a) = g.as_ref() {
-            if a.mapped { if let Some(last) = a.slabs.last() { last.unmap(); } }
+        // If we're unwinding from a panic (e.g. a slab allocation failing mid-load on a model too big for
+        // the GPU's VMA — the 70B on Asahi), do NOT touch the GPU: unmapping a slab whose mapped_at_creation
+        // view was never released would panic AGAIN inside this destructor → non-unwinding abort (SIGABRT).
+        // Skipping it lets the original panic propagate as a catchable load error instead of crashing.
+        if !std::thread::panicking() {
+            if let Some(a) = g.as_ref() {
+                if a.mapped { if let Some(last) = a.slabs.last() { last.unmap(); } }
+            }
         }
         *g = None;
     }
