@@ -652,6 +652,18 @@ pub struct BlockWeights {
     /// Qwen3/3.5 per-head QK-Norm weights ([head_dim] each), applied as an RMSNorm to Q and K before RoPE.
     /// None for llama/qwen2 (→ pass-through). Loaded from blk.N.attn_{q,k}_norm.weight.
     pub q_norm: Option<Tensor>, pub k_norm: Option<Tensor>,
+    /// Mixture-of-experts FFN (qwen3moe): replaces wgate_up/wdown (which hold 1-row placeholders when this
+    /// is Some). Router is a small F32 Lin [n_expert, d]; experts are per-expert quantized Lins so the
+    /// existing matvec/SwiGLU kernels apply unchanged at an expert's rows (no weight slicing needed).
+    pub moe: Option<Box<MoeLayer>>,
+}
+/// One MoE FFN layer: route(d → n_expert logits) → top-k → per-expert SwiGLU FFN → weighted sum.
+pub struct MoeLayer {
+    pub router: Lin,                 // [n_expert, d] F32 — precision matters for routing
+    pub gate: Vec<Lin>,              // n_expert × [ff, d]
+    pub up: Vec<Lin>,                // n_expert × [ff, d]
+    pub down: Vec<Lin>,              // n_expert × [d, ff]
+    pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
 }
 /// One Z-Image/DiT transformer block (Peebles & Xie AdaLN-Zero design): non-affine LayerNorm →
 /// AdaLN modulate → bidirectional MHA → AdaLN gated residual → non-affine LayerNorm → AdaLN modulate →
@@ -1566,6 +1578,55 @@ impl Gpu {
         let out = self.alloc(t, d); let dims = [t as u32, d as u32, 1u32, 0];
         self.dispatch(ATTENTION, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t as u32).div_ceil(64), 1, 1)); out
     }
+    /// FFN half of a transformer block: norm2 → (dense SwiGLU | MoE) → residual. Dense path is the exact
+    /// motif every block fn used inline (rmsnorm → wgate_up → swiglu → wdown+residual), factored so the
+    /// MoE branch slots in at every call site (prefill, all decode variants, batched) identically.
+    fn ffn_apply(&self, w: &BlockWeights, x2: &Tensor, t: usize, d: usize, eps: f32) -> Tensor {
+        let n2 = self.rmsnorm_t(x2, &w.g2, t, d, eps);
+        if let Some(m) = w.moe.as_deref() { return self.moe_ffn(m, &n2, t, d, x2); }
+        let gu = w.wgate_up.apply(self, &n2, t);
+        let hmid = self.swiglu_packed(&gu);
+        w.wdown.apply_add(self, &hmid, t, x2)
+    }
+
+    /// MoE FFN over `t` tokens (t=1 decode or t=thousands prefill — same path via expert grouping):
+    /// router matvec → READBACK [t×n_expert] logits → CPU top-k (moe::route, tested) → for each expert
+    /// that won ≥1 token: GATHER its token rows, run the expert's SwiGLU FFN batched (existing kernels),
+    /// then weighted SCATTER-ADD into the output. Correctness-first v1: the per-layer router readback is a
+    /// GPU sync (~1-3 ms) — the known perf ceiling (~5-10 tok/s decode) until GPU-side top-k lands.
+    fn moe_ffn(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
+        let ne = m.cfg.n_routed as usize;
+        // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
+        let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne]; // expert → [(token_row, weight)]
+        for tok in 0..t {
+            for sel in crate::moe::route(&logits[tok * ne..(tok + 1) * ne], &m.cfg) {
+                groups[sel.expert as usize].push((tok as u32, sel.weight));
+            }
+        }
+        // residual base: out starts as a copy of x2, experts scatter-add on top
+        let out = self.alloc(t, d);
+        self.copy_buf(x2, 0, &out, 0, (t * d * 4) as u64);
+        for (e, grp) in groups.iter().enumerate() {
+            if grp.is_empty() { continue; }
+            let n = grp.len();
+            let idx = self.upload_u32(&grp.iter().map(|&(r, _)| r).collect::<Vec<_>>());
+            let wgt = self.upload(&grp.iter().map(|&(_, w)| w).collect::<Vec<_>>(), 1, n);
+            // gather this expert's token rows → [n, d]
+            let rows = self.alloc(n, d);
+            let dims = [n as u32, d as u32, 0, 0];
+            self.dispatch(GATHER_ROWS, &[n2, &idx], &rows, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
+            // expert FFN, batched over its n tokens (existing kernels; gate/up unfused per expert)
+            let g = m.gate[e].apply(self, &rows, n);
+            let u = m.up[e].apply(self, &rows, n);
+            let hmid = self.swiglu_t(&g, &u);
+            let dn = m.down[e].apply(self, &hmid, n);
+            // out[token] += weight * dn[i]
+            self.dispatch(SCATTER_ADD_W, &[&dn, &idx, &wgt], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
+        }
+        out
+    }
+
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
         self.dispatch(ADD, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
@@ -1759,11 +1820,7 @@ impl Gpu {
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, t); // wo: [d, ad] projects the attention width back to d
         let x2 = self.add_t(x, &o);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, t, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, t);
-        let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, t);
-        self.add_t(&x2, &down)
+        self.ffn_apply(w, &x2, t, d, eps)
     }
 
     /// Prefill block: full causal attention over `t` tokens like `block_forward`, but
@@ -1781,11 +1838,7 @@ impl Gpu {
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, t);
         let x2 = self.add_t(x, &o);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, t, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, t);
-        let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, t);
-        self.add_t(&x2, &down)
+        self.ffn_apply(w, &x2, t, d, eps)
     }
 
     /// Prefill-extend a block: `x` is the segment `[s, d]` at global positions
@@ -1803,11 +1856,7 @@ impl Gpu {
         let attn = self.attention_mh_ext(&q, kc, vc, base, s, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, s);
         let x2 = self.add_t(x, &o);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, s, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, s);
-        let hmid = self.swiglu_packed(&gu);
-        let down = w.wdown.apply(self, &hmid, s);
-        self.add_t(&x2, &down)
+        self.ffn_apply(w, &x2, s, d, eps)
     }
     /// Batched prefill: run the whole prompt through every layer in one `[t,d]` pass,
     /// filling the KV cache, and return the LAST token's logits `[vocab]`. Equivalent
@@ -2669,6 +2718,29 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[d0+1u]=x0*s+x1*c;
 }"#;
 
+const GATHER_ROWS: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> idx: array<u32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  let r=i/d.c; let col=i%d.c; o[i]=src[idx[r]*d.c+col]; }"#;
+
+const SCATTER_ADD_W: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> idx: array<u32>;
+@group(0)@binding(2) var<storage,read> wgt: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  let r=i/d.c; let col=i%d.c; o[idx[r]*d.c+col]=o[idx[r]*d.c+col]+wgt[r]*src[i]; }"#;
+
 const ADD: &str = r#"
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -3142,7 +3214,17 @@ impl Gpu {
                         keys under '{pfx}.' present: {listed} — the file may be truncated, non-standard, or not a supported LLM")
                 }
             })? as usize;
-        let h = g.get_u32(&format!("{pfx}.feed_forward_length")).ok_or("missing feed_forward_length")? as usize;
+        // MoE (qwen3moe): expert config from metadata. is_moe additionally requires the stacked expert
+        // tensors to actually be present so a mislabeled dense file falls through to the dense path.
+        let n_expert = g.get_u32(&format!("{pfx}.expert_count")).unwrap_or(0) as usize;
+        let n_expert_used = g.get_u32(&format!("{pfx}.expert_used_count")).unwrap_or(8) as usize;
+        let expert_ff = g.get_u32(&format!("{pfx}.expert_feed_forward_length")).unwrap_or(0) as usize;
+        let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0 && g.tensor("blk.0.ffn_gate_exps.weight").is_some();
+        let h = match g.get_u32(&format!("{pfx}.feed_forward_length")) {
+            Some(v) => v as usize,
+            None if is_moe => expert_ff, // MoE GGUFs may omit the dense FFN width entirely
+            None => return Err("missing feed_forward_length".into()),
+        };
         let n = g.get_u32(&format!("{pfx}.block_count")).ok_or("missing block_count")? as usize;
         // vocab_size is often absent in real GGUFs; derive it from the embedding below.
         let vocab_meta = g.get_u32(&format!("{pfx}.vocab_size")).map(|v| v as usize);
@@ -3280,14 +3362,34 @@ impl Gpu {
                 // [t, 2h] = [gate(h) | up(h)] per row, which SWIGLU_PACKED then consumes.
                 // Halves the FFN projection dispatches/weight-binds; per-row int8 quant of
                 // the concatenation is identical to quantizing the two weights separately.
-                wgate_up: {
-                    let g = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
+                // MoE layers have no dense FFN tensors — tiny F32 placeholders, never applied
+                // (ffn_apply branches to the moe field first).
+                wgate_up: if is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+                    let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
                     let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
-                    let mut gu = Vec::with_capacity(g.len() + u.len());
-                    gu.extend_from_slice(&g); gu.extend_from_slice(&u);
+                    let mut gu = Vec::with_capacity(gt.len() + u.len());
+                    gu.extend_from_slice(&gt); gu.extend_from_slice(&u);
                     self.make_lin(&gu, 2 * h, d, q, q4_mode)
                 },
-                wdown: lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)?,
+                wdown: if is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else { lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)? },
+                moe: if is_moe {
+                    // Router stays F32 (small: [n_expert, d]) — routing precision decides WHICH weights run.
+                    let router = self.make_lin(&fetch(&format!("blk.{i}.ffn_gate_inp.weight"))?, n_expert, d, false, false);
+                    // Stacked expert tensors: expert dim OUTERMOST, so expert e's matrix is the contiguous
+                    // f32 slice [e·rows·cols, (e+1)·rows·cols) after fetch's dequant (which reads each
+                    // tensor's ACTUAL ggml type — Q4_K vs Q6_K varies per layer). gate/up: [ff, d]; down: [d, ff].
+                    let per_expert = |src: &[f32], rows: usize, cols: usize| -> Vec<Lin> {
+                        (0..n_expert).map(|e| self.make_lin(&src[e * rows * cols..(e + 1) * rows * cols], rows, cols, q, q4_mode)).collect()
+                    };
+                    let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
+                    let gate = per_expert(&gsrc, expert_ff, d); drop(gsrc);
+                    let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
+                    let up = per_expert(&usrc, expert_ff, d); drop(usrc);
+                    let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
+                    let down = per_expert(&dsrc, d, expert_ff); drop(dsrc);
+                    Some(Box::new(MoeLayer { router, gate, up, down,
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
+                } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
                 q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) } else { None },
                 k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) } else { None },
@@ -3382,7 +3484,7 @@ impl Gpu {
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, moe: None });
         }
         Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps })
     }
@@ -3491,6 +3593,8 @@ impl Gpu {
             let attn = self.attention_mh_t(&q, &k, &v, t, ad, m.n_heads, m.n_kv_heads);
             let o = w.wo.apply(self, &attn, t);
             let x2 = self.add_t(&x, &o);
+            // MoE layers: use the real routed FFN for correctness (the gu-cracking diag below only runs dense)
+            if w.moe.is_some() { x = self.ffn_apply(w, &x2, t, m.d, m.eps); continue; }
             let n2 = self.rmsnorm_t(&x2, &w.g2, t, m.d, m.eps);
             let gu = w.wgate_up.apply(self, &n2, t);
             let hmid = self.swiglu_packed(&gu);
@@ -4167,10 +4271,7 @@ impl Gpu {
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
         let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// Fused-QKV counterpart of block_decode_q8 (int8 KV cache). Same slice-and-quantize: one wqkv
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
@@ -4199,10 +4300,7 @@ impl Gpu {
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
         let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// One token through all layers using the int8 KV cache; returns logits [vocab].
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
@@ -4250,10 +4348,7 @@ impl Gpu {
         self.write_row(vc, &vr, pos, kv);
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// Extract columns [col_off, col_off+width) of a single-row [1, N] tensor as a fresh [1, width],
     /// via a buffer copy (a transfer, NOT a compute dispatch). Splits the fused QKV projection's
@@ -4293,10 +4388,7 @@ impl Gpu {
         self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// Per-row-position RoPE: each row uses its own absolute position from `pos`.
     pub fn rope_mh_rows(&self, x: &Tensor, ff: &Tensor, pos: &Tensor, t: usize, dm: usize, base: f32, head_dim: usize) -> Tensor {
@@ -4320,10 +4412,7 @@ impl Gpu {
         self.write_row(vc, &vr, slot, kv);
         let attn = self.decode_attention_mh(&q, kc, vc, attend_len, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
 
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
@@ -4351,10 +4440,7 @@ impl Gpu {
         self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (slot * kv * 4) as u64, (kv * 4) as u64);
         let attn = self.decode_attention_mh(&q, kc, vc, attend_len, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
-        let n2 = self.rmsnorm_t(&x2, &w.g2, 1, d, eps);
-        let gu = w.wgate_up.apply(self, &n2, 1);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, 1, &x2)
+        self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// Streaming-window decode: keep `sink` attention-sink tokens (the first few, pinned)
     /// plus a ring of the last `window` tokens, bounding the KV cache to `sink+window` rows
@@ -4446,11 +4532,7 @@ impl Gpu {
             }
             let o = w.wo.apply(self, &attn, n);
             let x2 = self.add_t(&x, &o);
-            let n2 = self.rmsnorm_t(&x2, &w.g2, n, d, m.eps);
-            let gu = w.wgate_up.apply(self, &n2, n);
-            let hmid = self.swiglu_packed(&gu);
-            let down = w.wdown.apply(self, &hmid, n);
-            x = self.add_t(&x2, &down);
+            x = self.ffn_apply(w, &x2, n, d, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, n, d, m.eps);
         let logits = self.download(&m.output.apply(self, &xn, n));
@@ -4785,11 +4867,7 @@ impl Gpu {
             }
             let o = w.wo.apply(self, &attn, n);
             let x2 = self.add_t(&x, &o);
-            let n2 = self.rmsnorm_t(&x2, &w.g2, n, d, m.eps);
-            let gu = w.wgate_up.apply(self, &n2, n);
-            let hmid = self.swiglu_packed(&gu);
-            let down = w.wdown.apply(self, &hmid, n);
-            x = self.add_t(&x2, &down);
+            x = self.ffn_apply(w, &x2, n, d, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, n, d, m.eps);
         let logits = self.download(&m.output.apply(self, &xn, n));

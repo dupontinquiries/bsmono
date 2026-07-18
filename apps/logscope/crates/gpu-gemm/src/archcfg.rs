@@ -85,7 +85,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             arch: Arch::Qwen3Moe, prefix: "qwen3moe", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: true, moe: true, moe_shared_expert: false, interleaved_nope: false,
             logit_softcap: None, attn_softcap: None, tied_embed_default: true,
-            supported: false, dense_supported: false,
+            supported: true, dense_supported: true,
             note: "Qwen3-MoE (Qwen3-Coder-30B-A3B confirmed: d=2048, 48 layers, n_heads=32, n_kv_heads=4, head_dim=128 [NOTE head_dim != d/n_heads=64], 128 experts × ff=768, top-8, NO shared expert; ffn_*_exps stacked with the expert dim OUTERMOST, each slice contiguous & 256-divisible; attn_v/ffn_down_exps are mixed Q6_K/Q4_K per layer). Needs: (1) head_dim decoupled from d/n_heads in the attention path [moe::layer_shape], (2) per-expert dequant→requant of the stacked ffn_*_exps in the loader, (3) MoE forward route→top-8→weighted expert sum [moe::route, ready]. Reuses the existing matvec/SwiGLU kernels per expert.",
         },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
