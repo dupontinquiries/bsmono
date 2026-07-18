@@ -11,3 +11,11 @@ serde_json = "1.0"
 cli-kit = { path = "../../../../shared/cli-kit" }
 net-kit = { path = "../../../../shared/net-kit" }
 config-kit = { path = "../../../../shared/config-kit" }
+# the monorepo's Vulkan engine (games/unendlich), headless render-core only.
+# Optional + feature-gated: needs cargo >= lockfile-v4 era (rust 1.96 tested);
+# the default build stays std-only and 1.75-compatible.
+unendlich-engine = { path = "../../../unendlich/crates/unendlich-engine", default-features = false, features = ["render-core"], optional = true }
+
+[features]
+default = []
+gpu-engine = ["dep:unendlich-engine"]
