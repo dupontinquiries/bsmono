@@ -3678,7 +3678,18 @@ impl Gpu {
         let vocab = vocab_meta.unwrap_or(embed.len() / d);
         // Build a resident linear, preferring the DIRECT q8_0 → int8 path (no f32 round-trip) when the
         // source tensor is q8_0 and we want int8 residency; otherwise dequant-then-quantize as before.
-        let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
+        let mut q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
+        // MoE ⇒ q4 residency, always. int8-resident MoE is the ONE configuration never validated anywhere
+        // (the M2's 24 GiB budget always auto-selects q4 for the 30B) — and when the M4's raised budget
+        // finally ran it, GPU-resident weights probed ZERO while the raw file bytes were real, producing
+        // symbol soup; the SAME machine + file on q4 generates correctly (4.81 tok/s). q4 experts are also
+        // simply the right call (half the residency of int8). The broken int8 path stays reachable via
+        // LOGSCOPE_MOE_INT8=1 for a dedicated hunt when it ever matters.
+        if is_moe && !q4_mode && std::env::var("LOGSCOPE_MOE_INT8").is_err() {
+            eprintln!("loader: MoE ⇒ q4-resident (int8-MoE residency is unvalidated/broken — override with LOGSCOPE_MOE_INT8=1)");
+            q4_mode = true;
+        }
+        let q4_mode = q4_mode;
         // Optional arena packing: route resident weights into a few large slabs instead of one buffer
         // per tensor. Guard clears the bump state when this load returns/unwinds (slabs persist via the
         // weight tensors). Off by default — opt in with LOGSCOPE_ARENA (slab MiB via LOGSCOPE_ARENA_SLAB_MB).
