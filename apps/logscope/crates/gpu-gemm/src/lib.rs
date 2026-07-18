@@ -1640,8 +1640,16 @@ impl Gpu {
         if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax)
             && std::env::var("LOGSCOPE_MOE_V1").is_err()
         {
+            if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
+                return self.moe_v2_check(m, n2, d, x2);
+            }
             if let Some(out) = self.moe_ffn_gpu_routed(m, n2, d, x2) { return out; }
         }
+        self.moe_ffn_v1(m, n2, t, d, x2)
+    }
+
+    /// v1 readback-routed MoE FFN (the proven path): router → download → CPU route → grouped experts.
+    fn moe_ffn_v1(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
         let ne = m.cfg.n_routed as usize;
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
@@ -1673,11 +1681,47 @@ impl Gpu {
         out
     }
 
+    /// Differential checker (LOGSCOPE_MOE_V2_CHECK=1): run BOTH MoE paths on the same token, report which
+    /// stage diverges, and RETURN THE V1 RESULT so output stays correct while diagnosing. Per layer it
+    /// compares (a) the GPU top-k selection vs the tested CPU route (indices + weights) and (b) the final
+    /// FFN output tensors (max |Δ|). Prints the first ~96 layer-calls (≈ 2 tokens) then goes quiet.
+    fn moe_v2_check(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Tensor {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
+        let v1 = self.moe_ffn_v1(m, n2, 1, d, x2);
+        if call >= 96 { return v1; }
+        let Some((v2, selw)) = self.moe_ffn_gpu_routed_inner(m, n2, d, x2) else {
+            eprintln!("moe-check[{call}]: v2 path unavailable (non-quant stacked)"); return v1;
+        };
+        // selection: GPU selw vs CPU route on the same logits
+        let logits = self.download(&m.router.apply(self, n2, 1));
+        let cpu = crate::moe::route(&logits, &m.cfg);
+        let raw = self.download_u32(&selw);
+        let k = m.cfg.n_used.clamp(1, 16) as usize;
+        let gsel: Vec<u32> = raw[..k].to_vec();
+        let gwgt: Vec<f32> = raw[k..2 * k].iter().map(|&b| f32::from_bits(b)).collect();
+        let csel: Vec<u32> = cpu.iter().map(|s| s.expert).collect();
+        let sel_ok = gsel == csel;
+        let wgt_dmax = cpu.iter().zip(&gwgt).map(|(c, g)| (c.weight - g).abs()).fold(0.0f32, f32::max);
+        // outputs
+        let a = self.download(&v1);
+        let b = self.download(&v2);
+        let out_dmax = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let out_ref = a.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        eprintln!("moe-check[{call:>2}]: sel {} (gpu {:?} vs cpu {:?}) | wgtΔmax {:.2e} | outΔmax {:.3e} (ref max {:.3e})",
+            if sel_ok { "OK " } else { "MISMATCH" }, gsel, csel, wgt_dmax, out_dmax, out_ref);
+        v1
+    }
+
     /// The GPU-routed MoE decode step (t=1): router matvec → MOE_TOPK (selection + softmax weights stay
     /// on-GPU) → per-slot expert-indexed matvecs over the stacked gate_up/down → weighted combine folded
     /// with the residual. ~20 dispatches, ZERO polls. Returns None if the stacked weights aren't a
     /// quantized kind these kernels read (then the caller runs the v1 readback path).
     fn moe_ffn_gpu_routed(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<Tensor> {
+        self.moe_ffn_gpu_routed_inner(m, n2, d, x2).map(|(t, _)| t)
+    }
+    fn moe_ffn_gpu_routed_inner(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<(Tensor, Tensor)> {
         let (gu_qw, gu_qs, gu_k, sh) = match &m.stacked_gu.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
@@ -1719,7 +1763,7 @@ impl Gpu {
         let out = self.alloc(1, d);
         let wd = [d as u32, slots as u32, 0, 0];
         self.dispatch(MOE_WSUM, &[&dn_out, &selw, x2], &out, bytemuck::cast_slice(&wd), wg1(d as u32));
-        Some(out)
+        Some((out, selw))
     }
 
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
