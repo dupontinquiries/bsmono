@@ -142,6 +142,42 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
     dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
+// ── prefs persistence (the fleet's XDG convention, as pbedit/config-kit use) ─
+
+/// `$XDG_CONFIG_HOME/voiceterm-egui/prefs.kv` (or `~/.config/...`) — one `key=value` per line,
+/// the settings-kit kv schema verbatim, so the file is greppable and hand-editable.
+pub fn prefs_path() -> std::path::PathBuf {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("voiceterm-egui").join("prefs.kv")
+}
+
+/// Load prefs from [`prefs_path`]; missing file (or any unreadable line) falls back to defaults —
+/// `Prefs::apply_kv` is tolerant of partial sets by design.
+pub fn load_prefs() -> settings_kit::Prefs {
+    let Ok(text) = std::fs::read_to_string(prefs_path()) else {
+        return settings_kit::Prefs::default();
+    };
+    let kv: Vec<(String, String)> = text
+        .lines()
+        .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+        .collect();
+    settings_kit::Prefs::from_kv(&kv)
+}
+
+/// Persist prefs to [`prefs_path`] (creating the directory). Errors are returned, not panicked —
+/// a read-only config dir shouldn't take the app down.
+pub fn save_prefs(prefs: &settings_kit::Prefs) -> std::io::Result<()> {
+    let path = prefs_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text: String = prefs.to_kv().into_iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    std::fs::write(path, text)
+}
+
 // ── theme picker ("long-press to show all vibes") ────────────────────────────
 
 /// The theme grid the settings screenshot shows behind a long-press — one cell per fleet palette
@@ -283,6 +319,31 @@ mod tests {
         for expect in ["C-r", "C-a", "C-e", "~", "/", "-", "_"] {
             assert!(ext.contains(expect), "missing extended key {expect}");
         }
+    }
+
+    #[test]
+    fn prefs_round_trip_through_the_kv_file_in_a_sandboxed_config_home() {
+        let dir = std::env::temp_dir().join(format!("vt-prefs-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // sandboxed XDG, the pbedit test pattern — but prefs_path reads the env at call time and
+        // tests share a process, so serialize access via a lock on a private mutex
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _g = ENV_LOCK.lock().unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let mut p = settings_kit::Prefs::default();
+        p.palette = "amber".into();
+        save_prefs(&p).unwrap();
+        assert!(prefs_path().starts_with(&dir));
+        let loaded = load_prefs();
+        assert_eq!(loaded.palette, "amber");
+
+        // a missing file yields defaults, not an error
+        std::fs::remove_file(prefs_path()).unwrap();
+        assert_eq!(load_prefs().palette, settings_kit::Prefs::default().palette);
+
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
