@@ -3376,6 +3376,26 @@ pub struct Model {
     pub base: f32, pub eps: f32,
 }
 impl Model {
+    /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
+    /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
+    /// a mismatch between boxes means the UPLOAD path corrupted weights on one of them (e.g. the UMA
+    /// zero-copy mapped write on one backend), independent of any kernel. Cheap: a few KB downloaded.
+    pub fn weight_probe(&self, gpu: &Gpu) -> String {
+        let f = |t: &Tensor, n: usize| -> (Vec<f32>, f64) {
+            let v = gpu.download(t);
+            let head: Vec<f32> = v.iter().take(n).cloned().collect();
+            let sum: f64 = v.iter().map(|x| x.abs() as f64).sum();
+            (head, sum)
+        };
+        let (g1h, g1s) = f(&self.layers[0].g1, 4);
+        let (onh, ons) = f(&self.out_norm, 4);
+        let (rfh, rfs) = f(&self.rope_factors, 4);
+        let qn = self.layers[0].q_norm.as_ref().map(|t| f(t, 4));
+        format!("weight-probe: blk0.g1 {:?} Σ|{:.4e}| | out_norm {:?} Σ|{:.4e}| | rope_ff {:?} Σ|{:.4e}|{}",
+            g1h, g1s, onh, ons, rfh, rfs,
+            qn.map(|(h, s)| format!(" | q_norm {h:?} Σ|{s:.4e}|")).unwrap_or_default())
+    }
+
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
