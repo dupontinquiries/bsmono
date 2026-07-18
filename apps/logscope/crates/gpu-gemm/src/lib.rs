@@ -3460,6 +3460,29 @@ impl Gpu {
     }
     pub fn load_gguf_opt(&self, bytes: &[u8], q: bool) -> Result<Model, String> {
         let g = gguf::parse(bytes)?;
+        // Data-integrity gate (unconditional, ~8 KB): read a small F32 tensor's RAW bytes straight from the
+        // mapped file — before any dequant, upload, or GPU involvement. An all-zeros norm weight is
+        // impossible in a real checkpoint; it means the file's DATA section is corrupt (partial download /
+        // bad copy — metadata parses fine, so size checks and dumps look healthy). This exact failure
+        // burned a full debugging cycle on the M4 (weights probed zero on GPU; every engine path was
+        // exonerated one by one). Refuse loudly with the fix instead of generating symbol soup.
+        if let Some(t) = g.tensor("blk.0.attn_norm.weight").filter(|t| t.ggml_type == 0) {
+            let off = (g.data_offset + t.offset) as usize;
+            let n = (t.dims.iter().product::<u64>() as usize * 4).min(8192);
+            if let Some(raw) = bytes.get(off..off + n) {
+                if raw.iter().all(|&b| b == 0) {
+                    return Err(format!(
+                        "GGUF data section is corrupt: blk.0.attn_norm.weight is ALL ZEROS in the file                          (raw bytes at offset {off}). The header parses fine, so the file LOOKS healthy —                          this is a partial download or bad copy. Re-download or re-copy the file                          (verify with a sha256 checksum against a known-good copy)."));
+                }
+                if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() {
+                    let head: Vec<f32> = raw.chunks_exact(4).take(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let sum: f64 = raw.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() as f64).sum();
+                    eprintln!("wgpu-engine: raw-file-probe blk0.attn_norm {head:?} Σ|{sum:.4e}| (read from disk, pre-GPU)");
+                }
+            }
+        }
         // Guard the LLM path: a diffusion checkpoint (z-image, flux, SD) or an mmproj has no tokenizer and
         // would die deep in tokenizer loading with a cryptic error. Classify up front and refuse with a
         // message that points at the right subsystem (the image pipeline) instead.
