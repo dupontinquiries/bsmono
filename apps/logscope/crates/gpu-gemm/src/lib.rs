@@ -3443,11 +3443,13 @@ impl Gpu {
     }
     /// Write the resident model to `path`, tagged with the source GGUF's (size, mtime) so a changed
     /// model invalidates the cache.
-    pub fn save_int8_cache(&self, m: &Model, path: &std::path::Path, fp: (u64, u64)) -> std::io::Result<()> {
-        // Biased (Qwen2), QK-Norm (Qwen3/3.5), and 4-bit-resident projections aren't in the int8 cache
-        // layout, so skip the cache for them — they reload from the GGUF. Keeps the cache layout identical.
+    /// Returns Ok(true) if a cache was written, Ok(false) if this model isn't cacheable (so the caller
+    /// can log honestly — "wrote" was previously printed even on skip).
+    pub fn save_int8_cache(&self, m: &Model, path: &std::path::Path, fp: (u64, u64)) -> std::io::Result<bool> {
+        // Biased (Qwen2), QK-Norm (Qwen3/3.5), MoE (expert weights aren't in the layout), and 4-bit-resident
+        // projections aren't in the int8 cache layout, so skip the cache — they reload from the GGUF.
         let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
-        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some()) { return Ok(()); }
+        if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some() || b.moe.is_some()) { return Ok(false); }
         let mut o = Vec::new();
         o.extend_from_slice(b"LSI8C\x03"); // v3: bumped after the head_dim/attention surgery — invalidates any cache written mid-refactor so weights regenerate from the GGUF with the current loader
         o.extend_from_slice(&fp.0.to_le_bytes()); o.extend_from_slice(&fp.1.to_le_bytes());
@@ -3464,7 +3466,8 @@ impl Gpu {
         }
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &o)?;
-        std::fs::rename(&tmp, path)  // never leave a half-written cache
+        std::fs::rename(&tmp, path)?;  // never leave a half-written cache
+        Ok(true)
     }
     /// Load the resident model from `path` iff it exists and its tag matches `fp`. None on any
     /// mismatch/corruption — the caller falls back to a fresh GGUF load.
