@@ -410,6 +410,32 @@ impl SlideMenu {
         out
     }
 
+    /// Open the menu programmatically at `press` — the detached equivalent of QML
+    /// `popup.show(host, x, y, ctx)` for hosts that aren't egui widgets (the terminal pane's
+    /// long-press, a canvas hit, ...). Placement + clamping are identical to the host path; drive
+    /// the open menu each frame with [`SlideMenu::show_detached`]. If the pointer is still held
+    /// from the originating gesture (the QML drag-multimenu flow), the release commits; a
+    /// subsequent press-drag-release works too.
+    pub fn open_at(&mut self, ui: &Ui, press: Pos2, options: &[SlideOption]) {
+        self.state.open = true;
+        self.state.hot = None;
+        self.state.variant = Variant::Single;
+        self.state.origin = self.place_at(ui, options, press);
+    }
+
+    /// Drive a menu opened by [`SlideMenu::open_at`] (no host `Response` involved). Call every
+    /// frame; safe to call while closed (returns `Idle`).
+    pub fn show_detached(&mut self, ui: &mut Ui, options: &[SlideOption]) -> SlideOutcome {
+        if options.is_empty() {
+            return SlideOutcome::Idle;
+        }
+        let id = self.id;
+        let mut st = self.state;
+        let out = drive(self, id, &mut st, ui, options);
+        self.state = st;
+        out
+    }
+
     /// Panel rect (grid + padding + title band) for a panel whose top-left is `origin`.
     fn panel_rect(&self, origin: Pos2, options: &[SlideOption]) -> Rect {
         let (cols, rows) = layout_dims(options, self.max_cols);
@@ -420,6 +446,11 @@ impl SlideMenu {
 
     /// QML show()'s placement: the press point lands on the GRID center, clamped into the screen.
     fn place(&self, ui: &Ui, _host: &Response, options: &[SlideOption], press: Pos2) -> Pos2 {
+        self.place_at(ui, options, press)
+    }
+
+    /// Placement core (no host needed) — used by both the host path and [`SlideMenu::open_at`].
+    fn place_at(&self, ui: &Ui, options: &[SlideOption], press: Pos2) -> Pos2 {
         let (cols, rows) = layout_dims(options, self.max_cols);
         let grid_w = cols as f32 * self.item_size + cols.saturating_sub(1) as f32 * self.spacing;
         let grid_h = rows as f32 * self.item_size + rows.saturating_sub(1) as f32 * self.spacing;
@@ -516,6 +547,11 @@ fn run(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, host: &Respon
     } else if !st.open {
         st.pressed_at = None;
     }
+    drive(menu, id, st, ui, options)
+}
+
+/// The drag-highlight-release phase, shared by the host-driven paths and the detached one.
+fn drive(menu: &SlideMenu, id: Id, st: &mut SlideState, ui: &mut Ui, options: &[SlideOption]) -> SlideOutcome {
     if !st.open {
         return SlideOutcome::Idle;
     }
