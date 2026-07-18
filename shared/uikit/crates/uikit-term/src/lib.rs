@@ -65,6 +65,10 @@ pub struct Grid {
     /// Lines that scrolled off the top (most-recent last), capped.
     pub scrollback: Vec<Vec<Cell>>,
     scrollback_cap: usize,
+    /// Scrollback view: how many lines ABOVE the live bottom the viewport is showing.
+    /// 0 = live. While scrolled back, new output does not move the view (the offset is bumped
+    /// as lines enter scrollback — the standard terminal pin), and the cursor is hidden.
+    pub view_offset: usize,
 }
 
 impl Grid {
@@ -80,6 +84,7 @@ impl Grid {
             pen: Style::default(),
             scrollback: Vec::new(),
             scrollback_cap: 1000,
+            view_offset: 0,
         }
     }
 
@@ -159,10 +164,50 @@ impl Grid {
         if self.scrollback.len() > self.scrollback_cap {
             self.scrollback.remove(0);
         }
+        // pin the view while scrolled back: the bottom moved one line away, so keep pointing at
+        // the same content (clamped — eviction above can shrink what's reachable)
+        if self.view_offset > 0 {
+            self.view_offset = (self.view_offset + 1).min(self.scrollback.len());
+        }
         self.cells.copy_within(self.cols.., 0);
         let last = self.cells.len() - self.cols;
         for c in &mut self.cells[last..] {
             *c = Cell::default();
+        }
+    }
+
+    /// Page the viewport up into scrollback by `n` lines (clamped to what exists).
+    pub fn page_up(&mut self, n: usize) {
+        self.view_offset = (self.view_offset + n).min(self.scrollback.len());
+    }
+
+    /// Page the viewport back down toward live by `n` lines.
+    pub fn page_down(&mut self, n: usize) {
+        self.view_offset = self.view_offset.saturating_sub(n);
+    }
+
+    /// Jump back to the live view.
+    pub fn scroll_to_bottom(&mut self) {
+        self.view_offset = 0;
+    }
+
+    pub fn is_scrolled_back(&self) -> bool {
+        self.view_offset > 0
+    }
+
+    /// The cell at viewport position (r, c) honoring [`Grid::view_offset`]: a window over
+    /// scrollback stitched onto the live rows. Scrollback rows captured before a resize may be
+    /// narrower/wider than `cols`; out-of-range columns read as blank (default cell).
+    pub fn display_cell(&self, r: usize, c: usize) -> Cell {
+        if self.view_offset == 0 {
+            return self.cell(r, c);
+        }
+        let sb = self.scrollback.len();
+        let virt = sb - self.view_offset + r;
+        if virt < sb {
+            self.scrollback[virt].get(c).copied().unwrap_or_default()
+        } else {
+            self.cell(virt - sb, c)
         }
     }
 
@@ -620,13 +665,13 @@ pub fn render_grid(
         let y = origin.y + r as f32 * cell_h;
         let mut c = 0;
         while c < grid.cols {
-            let start = grid.cell(r, c);
+            let start = grid.display_cell(r, c);
             // extend a run of identical style
             let mut end = c + 1;
-            while end < grid.cols && grid.cell(r, end).style == start.style {
+            while end < grid.cols && grid.display_cell(r, end).style == start.style {
                 end += 1;
             }
-            let text: String = (c..end).map(|cc| grid.cell(r, cc).ch).collect();
+            let text: String = (c..end).map(|cc| grid.display_cell(r, cc).ch).collect();
             let (fg, bg) = resolve_colors(start.style, colors);
             let x0 = origin.x + c as f32 * cell_w;
             let rect = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2((end - c) as f32 * cell_w, cell_h));
@@ -642,7 +687,7 @@ pub fn render_grid(
     }
     // cursor — ported from voiceterm's QML `termCursor` (see CursorAnim's doc comment for the
     // exact mode semantics/timings this matches).
-    if cursor_mode != CursorMode::Off {
+    if cursor_mode != CursorMode::Off && !grid.is_scrolled_back() {
         cursor_anim.set_target(grid.cur_col, grid.cur_row);
         let (cx_cells, cy_cells, opacity) = cursor_anim.tick(dt, cursor_mode);
         let cx = origin.x + cx_cells * cell_w;
@@ -770,7 +815,22 @@ impl App {
         ui.input(|i| {
             for ev in &i.events {
                 match ev {
-                    egui::Event::Text(t) => self.terminal.input.push_str(t),
+                    egui::Event::Text(t) => {
+                        self.terminal.grid.scroll_to_bottom(); // typing returns to live
+                        self.terminal.input.push_str(t);
+                    }
+                    egui::Event::Key { key: egui::Key::PageUp, pressed: true, modifiers, .. }
+                        if modifiers.shift =>
+                    {
+                        let page = self.terminal.grid.rows.saturating_sub(1).max(1);
+                        self.terminal.grid.page_up(page);
+                    }
+                    egui::Event::Key { key: egui::Key::PageDown, pressed: true, modifiers, .. }
+                        if modifiers.shift =>
+                    {
+                        let page = self.terminal.grid.rows.saturating_sub(1).max(1);
+                        self.terminal.grid.page_down(page);
+                    }
                     egui::Event::Paste(t) => self.terminal.paste(t),
                     egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
                         self.terminal.input.pop();
@@ -1114,6 +1174,35 @@ mod tests {
         assert!((a.cell.0 - b.cell.0).abs() < 1e-3);
         assert!((a.cell.1 - b.cell.1).abs() < 1e-3);
         assert_eq!(a.font_size, b.font_size);
+    }
+
+    #[test]
+    fn scrollback_paging_windows_and_pins_the_view() {
+        let mut g = Grid::new(4, 2); // 4 cols, 2 rows
+        let mut p = Parser::new();
+        for line in ["aa", "bb", "cc", "dd", "ee"] {
+            p.feed(&format!("{line}\r\n"), &mut g);
+        }
+        // 2 live rows; earlier lines went to scrollback
+        let sb = g.scrollback.len();
+        assert!(sb >= 3);
+        assert!(!g.is_scrolled_back());
+        // page up one line: the top viewport row shows the most recent scrollback line
+        g.page_up(1);
+        let top: String = (0..2).map(|c| g.display_cell(0, c).ch).collect();
+        let expected: String = g.scrollback[sb - 1][..2].iter().map(|c| c.ch).collect();
+        assert_eq!(top, expected);
+        // page_up clamps to what exists
+        g.page_up(999);
+        assert_eq!(g.view_offset, g.scrollback.len());
+        // new output pins the view: offset grows with the new scrollback line
+        let before = g.view_offset;
+        p.feed("ff\r\n", &mut g);
+        assert_eq!(g.view_offset, (before + 1).min(g.scrollback.len()));
+        // page back down to live
+        g.page_down(9999);
+        assert!(!g.is_scrolled_back());
+        assert_eq!(g.display_cell(0, 0).ch, g.cell(0, 0).ch);
     }
 
     #[test]
