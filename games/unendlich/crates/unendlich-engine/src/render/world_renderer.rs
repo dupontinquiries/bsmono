@@ -622,6 +622,7 @@ pub struct WorldRenderer {
     pub wizard_preview_dirty: bool,
     /// r185: click on the preview — (u,v in 0..1, negative?) latch.
     pub wizard_preview_click: Option<(f32, f32, bool)>,
+    #[cfg(feature = "ui-overlay")]
     wizard_preview_tex: Option<egui::TextureHandle>,
     pub wizard_title: String,
     pub wizard_summary: String,
@@ -1542,9 +1543,13 @@ impl WorldRenderer {
             egui_overlay,
             #[cfg(feature = "ui-overlay")]
             creative_selected: 0,
+            #[cfg(feature = "ui-overlay")]
             creative_hotbar: [None; 10],
+            #[cfg(feature = "ui-overlay")]
             creative_inventory: [None; 27],
+            #[cfg(feature = "ui-overlay")]
             creative_hotbar_sel: 0,
+            #[cfg(feature = "ui-overlay")]
             creative_place_item: None,
             #[cfg(feature = "ui-overlay")]
             creative_tab: crate::inventory_screen::Tab::All,
@@ -1570,9 +1575,13 @@ impl WorldRenderer {
             hud_status_lines: Vec::new(),
             hud_survival: None,
             backpack: Vec::new(),
+            #[cfg(feature = "ui-overlay")]
             inv_slots: Vec::new(),
+            #[cfg(feature = "ui-overlay")]
             inv_hotbar_size: 9,
+            #[cfg(feature = "ui-overlay")]
             inv_cursor: None,
+            #[cfg(feature = "ui-overlay")]
             inv_click: -1,
             menu_open: false,
             pause_menu_open: false,
@@ -1619,6 +1628,7 @@ impl WorldRenderer {
             wizard_preview_rgb: Vec::new(),
             wizard_preview_dirty: false,
             wizard_preview_click: None,
+            #[cfg(feature = "ui-overlay")]
             wizard_preview_tex: None,
             wizard_title: String::new(),
             wizard_summary: String::new(),
