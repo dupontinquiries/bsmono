@@ -91,6 +91,40 @@ pub fn brace_slide_menu(id_source: impl std::hash::Hash, compact: bool) -> Slide
     SlideMenu::new(id_source).columns(1).deadband(db).item_size(item)
 }
 
+// ── link action menu ─────────────────────────────────────────────────────────
+
+/// `linkMenuModel` (v0.1.538): the 2×2 intent grid a blue-link tap opens.
+pub fn link_menu() -> Vec<SlideOption> {
+    vec![
+        SlideOption::new("open", "Open").at(0, 0),
+        SlideOption::new("read", "Read").at(1, 0),
+        SlideOption::new("copy", "Copy").at(0, 1),
+        SlideOption::new("newtab", "New tab").at(1, 1),
+    ]
+}
+
+/// What a link-menu pick means for a tapped `url` — main.qml's dispatch, typed: Open navigates
+/// the web pane, Read hands the URL to the reader, Copy → clipboard, NewTab opens a new
+/// workspace web tab (v0.1.880's pane-infra model, with the legacy background-tab as fallback).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    Open(String),
+    Read(String),
+    CopyUrl(String),
+    NewTab(String),
+}
+
+/// `onSelected` for the link menu (always tap-select, always `Variant::Single` in QML).
+pub fn link_dispatch(id: &str, url: &str) -> Option<LinkAction> {
+    Some(match id {
+        "open" => LinkAction::Open(url.to_string()),
+        "read" => LinkAction::Read(url.to_string()),
+        "copy" => LinkAction::CopyUrl(url.to_string()),
+        "newtab" => LinkAction::NewTab(url.to_string()),
+        _ => return None,
+    })
+}
+
 // ── tab action menu ──────────────────────────────────────────────────────────
 
 /// `tabActionMenuModel` (v0.1.813 icon set): 3×2 with directional split/close.
@@ -210,6 +244,14 @@ mod tests {
         // directional flags are on the right cells
         assert!(tab_menu().iter().find(|o| o.id == "split").unwrap().split_dir);
         assert!(tab_menu().iter().find(|o| o.id == "close").unwrap().close_dir);
+    }
+
+    #[test]
+    fn link_menu_is_the_2x2_intent_grid_and_dispatch_carries_the_url() {
+        assert_eq!(layout_dims(&link_menu(), 3), (2, 2));
+        assert_eq!(link_dispatch("copy", "https://a.b"), Some(LinkAction::CopyUrl("https://a.b".into())));
+        assert_eq!(link_dispatch("newtab", "https://a.b"), Some(LinkAction::NewTab("https://a.b".into())));
+        assert_eq!(link_dispatch("nope", "https://a.b"), None);
     }
 
     #[test]

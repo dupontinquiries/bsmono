@@ -13,7 +13,7 @@
 
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
-use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, PaneAction};
+use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, LinkAction, PaneAction};
 use voiceterm_egui::shell::{fab_rect, keycap_bar_ui, mic_fab_ui, paint_terminal_border, Session, Sidebar, SidebarAction, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
@@ -31,6 +31,11 @@ struct VoicetermApp {
     /// The pane long-press marking menu (QML `paneActionPopup`, v0.1.838): hold the terminal to
     /// open it right there; mic at dead center so a plain release is push-to-talk.
     pane_menu: voiceterm_egui::slide_menu::SlideMenu,
+    /// The blue-link tap menu (QML `linkMenuModel`, v0.1.538): tap a URL in the output → 2×2
+    /// intent grid at the tap point. The tapped URL rides here while the menu is open (the QML
+    /// context argument).
+    link_menu: voiceterm_egui::slide_menu::SlideMenu,
+    link_url: Option<String>,
 }
 
 impl eframe::App for VoicetermApp {
@@ -86,6 +91,24 @@ impl eframe::App for VoicetermApp {
             // exactly what the menu's "copy" cell copies.
             if let Some(p) = self.app.take_long_press() {
                 self.pane_menu.open_at(ui, p, &pane_menu());
+            }
+            // A tap on a URL opens the link intent menu at the tap point, with the URL as context.
+            if let Some((p, url)) = self.app.take_link_tap() {
+                self.link_url = Some(url);
+                self.link_menu.open_at(ui, p, &link_menu());
+            }
+            if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, _) =
+                self.link_menu.show_detached(ui, &link_menu())
+            {
+                if let Some(url) = self.link_url.take() {
+                    match link_dispatch(&id, &url) {
+                        Some(LinkAction::CopyUrl(u)) => ctx.copy_text(u),
+                        // Open/Read/NewTab drive the web pane / reader — on-device wiring, same
+                        // status as the workspace actions above.
+                        Some(LinkAction::Open(_)) | Some(LinkAction::Read(_)) | Some(LinkAction::NewTab(_)) => {}
+                        None => {}
+                    }
+                }
             }
             if let voiceterm_egui::slide_menu::SlideOutcome::Selected(id, variant) =
                 self.pane_menu.show_detached(ui, &pane_menu())
@@ -147,6 +170,8 @@ fn main() -> eframe::Result<()> {
                 // comfort sizing (QML braceCompact defaults false): deadband 28 px, 120 px cells
                 brace_menu: brace_slide_menu("voiceterm-brace-menu", false),
                 pane_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-pane-menu").columns(3),
+                link_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-link-menu").columns(2),
+                link_url: None,
             }))
         }),
     )
