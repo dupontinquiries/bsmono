@@ -214,7 +214,13 @@ impl eframe::App for VoicetermApp {
                     // on-device wiring, same status as the sidebar's New/Graph/Settings above.
                     Some(PaneAction::Split(_)) | Some(PaneAction::Close(_)) | Some(PaneAction::NewTab) => {}
                     Some(PaneAction::Mic) => {}
-                    Some(PaneAction::Paste) | Some(PaneAction::PageUpScrollback) => {}
+                    Some(PaneAction::PageUpScrollback) => {
+                        let page = self.app.terminal.grid.rows.saturating_sub(1).max(1);
+                        self.app.terminal.grid.page_up(page);
+                    }
+                    // menu-triggered paste needs a clipboard READ; egui only delivers paste as
+                    // an input event (Ctrl+V works today via handle_input's Event::Paste)
+                    Some(PaneAction::Paste) => {}
                     None => {}
                 }
             }
