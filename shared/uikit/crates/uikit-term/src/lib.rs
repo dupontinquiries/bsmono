@@ -685,6 +685,27 @@ pub fn render_grid(
             c = end;
         }
     }
+    // scrolled-back badge: a small top-right pill showing how far above live the view is, so
+    // "why is nothing updating" is never a mystery (the cursor is hidden in this state).
+    if grid.is_scrolled_back() {
+        let label = format!("\u{2191} {} ", grid.view_offset);
+        let right = origin.x + grid.cols as f32 * cell_w - 4.0;
+        let pos = egui::pos2(right, origin.y + 4.0);
+        let galley_rect = painter.text(
+            pos,
+            egui::Align2::RIGHT_TOP,
+            &label,
+            egui::FontId::monospace(font_size * 0.9),
+            filt(colors.accent),
+        );
+        painter.rect_stroke(
+            galley_rect.expand(2.0),
+            egui::CornerRadius::same(4),
+            egui::Stroke::new(1.0, filt(colors.accent)),
+            egui::StrokeKind::Outside,
+        );
+    }
+
     // cursor — ported from voiceterm's QML `termCursor` (see CursorAnim's doc comment for the
     // exact mode semantics/timings this matches).
     if cursor_mode != CursorMode::Off && !grid.is_scrolled_back() {
@@ -755,6 +776,9 @@ pub struct App {
     /// A tap that landed on a URL: (position, the trimmed URL) — the QML blue-link tap. Take with
     /// [`App::take_link_tap`]; the link action menu opens there.
     link_tap: Option<(egui::Pos2, String)>,
+    /// Fractional-line accumulator for touch scrollback (pan/fling deltas arrive in px; whole
+    /// lines are consumed as they accrue, remainder carried).
+    scroll_accum: f32,
 }
 
 impl App {
@@ -774,6 +798,7 @@ impl App {
             fitted_size: None,
             long_press: None,
             link_tap: None,
+            scroll_accum: 0.0,
         }
     }
 
@@ -924,6 +949,19 @@ impl App {
                         self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.row_text(row) });
                     }
                     self.long_press = Some(egui::pos2(p.x, p.y));
+                }
+                // touch scrollback: content follows the finger — dragging DOWN reveals earlier
+                // lines. Same for momentum after a fling; whole lines consumed as px accrue.
+                uikit_egui::touch::Gesture::Pan { delta, .. }
+                | uikit_egui::touch::Gesture::MomentumTick { delta } => {
+                    self.scroll_accum += delta.y / self.cell.1.max(1.0);
+                    let whole = self.scroll_accum.trunc();
+                    self.scroll_accum -= whole;
+                    if whole >= 1.0 {
+                        self.terminal.grid.page_up(whole as usize);
+                    } else if whole <= -1.0 {
+                        self.terminal.grid.page_down((-whole) as usize);
+                    }
                 }
                 _ => {}
             }
