@@ -242,7 +242,7 @@ struct Frame { enc: wgpu::CommandEncoder, keep: Vec<Box<dyn std::any::Any + Send
 const FLUSH_EVERY_DEFAULT: u32 = 32;
 /// Candidate passes-per-submit the `SubmitTuner` sweeps on live decode tokens. Smaller = more submits =
 /// more overhead but smoother display; larger = fewer submits = less overhead but longer submits.
-pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256];
+pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256, 512];
 
 /// Online controller that adapts passes-per-submit on LIVE decode tokens. It sweeps `cands`, sampling
 /// `per_cand` tokens at each value, takes the median token time, and SETTLES on the fastest — then holds
@@ -1804,6 +1804,31 @@ impl Gpu {
         let wd = [d as u32, slots as u32, 0, 0];
         self.dispatch(MOE_WSUM, &[&dn_out, &selw, x2], &out, bytemuck::cast_slice(&wd), wg1(d as u32));
         Some((out, selw))
+    }
+
+    /// Startup submit-stride probe: measure the SUBMIT_PROFILES ladder with synthetic chained dispatches
+    /// (the decode regime — each depends on the previous) and return (candidate, ms) sorted fastest-first.
+    /// The per-submit sync tax is machine-specific (Asahi ~0.5 ms, Metal far less), so the best
+    /// passes-per-submit is too; probing at load lets every system find its stride immediately instead of
+    /// converging over ~a dozen live replies. The ceiling is one submit per TOKEN regardless (the logits
+    /// readback forces it), so past ~dispatches-per-token the ladder flattens — the probe sees that too.
+    /// Cost: ~256 tiny dispatches per candidate (≈1 s worst-case on Asahi, once per GPU until cached).
+    pub fn submit_stride_probe(&self, cands: &[u32]) -> Vec<(u32, f64)> {
+        let n = 2048usize;
+        let a = self.upload(&vec![1.0f32; n], 1, n);
+        let b = self.upload(&vec![0.5f32; n], 1, n);
+        let keep = self.flush_every();
+        let mut out: Vec<(u32, f64)> = cands.iter().map(|&c| {
+            self.set_flush_every(c);
+            let mut chain = self.add_t(&a, &b);
+            let t0 = std::time::Instant::now();
+            for _ in 0..256 { chain = self.add_t(&chain, &b); }
+            let _ = self.download(&chain); // final submit + poll, like a token boundary
+            (c, t0.elapsed().as_secs_f64() * 1000.0)
+        }).collect();
+        self.set_flush_every(keep);
+        out.sort_by(|x, y| x.1.total_cmp(&y.1));
+        out
     }
 
     /// Dispatch-latency microbench (LOGSCOPE_DISPATCH_BENCH=1, printed once after load): times 256 CHAINED
