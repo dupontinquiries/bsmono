@@ -26,6 +26,24 @@ Each directory has its own README with details and exact commands.
 
 ## Quickstart
 
+**Audio-quality config upgrade (latest v5.3 commit):** sample rate 22050→48000Hz,
+`n_fft` 1024→4096 (better frequency resolution, less metallic smearing),
+`hop_length` 256→512, `n_mels` 128→256, `latent` 128→256. **This changes the
+model's tensor shapes — any pre-existing `cache/` and checkpoints are
+incompatible and need a full rebuild/fresh training run.** The vocoder's
+`upsample_rates`/`upsample_kernels` were updated to match the new hop
+(product must equal `hop_length` — verified `8*8*4*2=512`).
+
+We deliberately did **not** scale `time_frames` up to cover a 30-second clip
+directly — the Generator's bottleneck FC layer scales as
+`latent * g_filters * (n_mels/16) * (time_frames/16)`, and at 30s with this
+config that's a ~184M-parameter FC layer alone (~10x the rest of the model).
+Instead, `pipeline/generate_long.py` produces long-form audio the way
+production spectrogram-GAN systems actually do it: generate several
+overlapping fixed-size windows along a smooth (slerp) latent-space walk, then
+crossfade the overlaps together. See its own docstring for the reasoning and
+`--seconds`/`--crossfade` usage.
+
 **Train the GAN (CPU or GPU).**
 ```bash
 cd pipeline
@@ -91,6 +109,16 @@ python population_trainer.py test    # synthetic self-check, no audio needed
 Checkpoints (`gen_best_*.pt`) are ordinary `Generator` state_dicts — load them
 anywhere a `gan-zai-v5.3.py` checkpoint works (the explorer, `server.py`, etc).
 
+**Long-form generation** (30s+, without exploding the model — see the note
+at the top of this section) by walking a smooth path through latent space
+and crossfading overlapping windows:
+```bash
+cd pipeline
+python generate_long.py --weights checkpoints/gen_20000.pt --seconds 30 --out long.wav
+python generate_long.py --weights checkpoints/gen_20000.pt --seconds 30 \
+    --vocoder ../vocoder/vocoder_ckpt/voc_100000.pt --out long.wav   # real vocoder instead of Griffin-Lim
+```
+
 **Train the vocoder** (better + faster than Griffin-Lim):
 ```bash
 cd vocoder
@@ -100,9 +128,9 @@ python vocoder.py train --data ./music --iters 200000 --batch 16
 **Train on the Apple GPU (Asahi Fedora Remix, Mesa Vulkan).**
 ```bash
 cd gpu
-WGPU_BACKEND=vulkan cargo run --release --bin beatspace-gpu -- train --cache ../pipeline/cache
-WGPU_BACKEND=vulkan cargo run --release --bin vocoder       -- train
-WGPU_BACKEND=vulkan cargo run --release --bin population    -- train --pop 4 --rounds 200
+WGPU_BACKEND=vulkan cargo run --release --bin beatspace-gpu -- train --cache ../pipeline/cache --iters 20000 --batch 32
+WGPU_BACKEND=vulkan cargo run --release --bin vocoder       -- train --data ../pipeline/music --iters 200000
+WGPU_BACKEND=vulkan cargo run --release --bin population    -- train --cache ../pipeline/cache --pop 4 --rounds 200
 ```
 
 ## The GPU story
@@ -111,16 +139,22 @@ The training log that started this all said `No GPU backend found` because
 PyTorch has no path to the Apple GPU on Linux — no CUDA, no ROCm, and MPS is
 macOS-only. But Asahi ships conformant **Vulkan 1.3/1.4** (Mesa "Honeykrisp")
 and **OpenCL 3.0** (rusticl). The `gpu/` crate uses Burn's Vulkan backend to run
-both models on that GPU. Both trainers are verified running through a real Vulkan
+all three trainers (GAN, vocoder, population) on that GPU, all on real data —
+the GAN and population trainer read the real SQLite mel cache, and the vocoder
+decodes real audio directly (Opus via `audiopus`, needs `libopus-dev`/
+`libopus-devel` installed). All three verified running through a real Vulkan
 ICD (lavapipe in CI; Honeykrisp on the target machine). See `gpu/README.md`.
 
 ## Status
 
-Everything here compiles and has been exercised end-to-end on synthetic or small
-inputs (shapes, a training step, checkpoint save/resume, inference). What each
-piece still needs from you: a music library to build the cache, real training
-time (ideally on the GPU), and — for the Rust vocoder — an audio→(mel, wav)
-loader to feed it real waveforms (the pattern is in `gpu/src/data.rs`).
+Everything here compiles and has been exercised end-to-end on real files where
+it matters (real cache reads, real audio decode + mel computation verified
+against librosa) and on synthetic/small inputs where a full run wasn't
+practical in this environment (shapes, a training step, checkpoint
+save/resume, inference). What each
+piece still needs from you: a music library to build the cache and real
+training time (ideally on the GPU) — the audio decode/mel-computation path
+described above is done and verified for all three trainers.
 
 ## Repo layout
 

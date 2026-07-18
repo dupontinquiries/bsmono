@@ -155,11 +155,11 @@ from torch.utils.data import Dataset, DataLoader
 # --------------------------------------------------------------------------- #
 @dataclass
 class Config:
-    sr: int = 22050
-    n_fft: int = 1024
-    hop_length: int = 256
-    n_mels: int = 128
-    time_frames: int = 256
+    sr: int = 48000
+    n_fft: int = 4096
+    hop_length: int = 512
+    n_mels: int = 256
+    time_frames: int = 560
     db_floor: float = -80.0
     db_ceil: float = 40.0
     shard_size: int = 250              # target files per shard (see num_shards)
@@ -167,7 +167,7 @@ class Config:
                                         # Fixed and independent of library size so a file's
                                         # shard never changes as the library grows/shrinks.
 
-    latent: int = 128
+    latent: int = 256
     g_filters: int = 256
     d_filters: int = 64
 
@@ -494,11 +494,20 @@ class Generator(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         f = cfg.g_filters
-        self.f = f
+        # The FC projects the latent to the seed feature map. Projecting to the
+        # full `f` channels makes this one weight matrix latent*(f*min_h*min_w)
+        # -- at the 256x560 config that's a single 140 MB tensor, which exceeds
+        # some GPUs' max buffer-binding size (e.g. 128 MB) and is a real
+        # bottleneck even where it fits. Project to f//2 seed channels (70 MB),
+        # then let the first ConvTranspose widen back into the pyramid. Same
+        # output shape, ~same capacity, half the FC. Kept identical to the Rust
+        # port (gpu/src/model.rs) so the two stay architecturally in sync.
+        fc_ch = max(1, f // 2)
+        self.f = fc_ch
         self.min_h, self.min_w = cfg.min_h, cfg.min_w
-        self.fc = nn.Linear(cfg.latent, self.min_h * self.min_w * f)
+        self.fc = nn.Linear(cfg.latent, self.min_h * self.min_w * fc_ch)
         self.main = nn.Sequential(
-            nn.ConvTranspose2d(f, f // 2, 4, 2, 1, bias=False),
+            nn.ConvTranspose2d(fc_ch, f // 2, 4, 2, 1, bias=False),
             nn.BatchNorm2d(f // 2), nn.ReLU(True),
             nn.ConvTranspose2d(f // 2, f // 4, 4, 2, 1, bias=False),
             nn.BatchNorm2d(f // 4), nn.ReLU(True),
