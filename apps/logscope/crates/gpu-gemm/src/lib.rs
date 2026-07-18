@@ -142,6 +142,9 @@ pub struct Gpu {
     /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
     /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
     pub rope_neox: std::sync::atomic::AtomicBool,
+    /// Vulkan-on-Apple (Asahi/Honeykrisp): the platform with the low BO-VMA ceiling; scopes the
+    /// conservative GPU-buffer budget clamp to where it's actually needed.
+    pub conservative_vma: bool,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -304,6 +307,10 @@ impl Gpu {
         // higher occupancy, the diagnosed decode bottleneck). Harmless where unsupported (flag stays false).
         let want_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         let backend = adapter.get_info().backend;
+        // Asahi/Honeykrisp detection (Vulkan driving an Apple GPU): the platform whose BO-VMA ceiling is
+        // far below its advertised limits — scoped budget clamp lives behind this, so macOS/Metal keeps
+        // its full addressable range (bigger dense residencies stay reachable there).
+        let conservative_vma = backend == wgpu::Backend::Vulkan && info.name.contains("Apple");
         let req_features = if want_subgroup { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kernels"), required_features: req_features,
@@ -329,7 +336,7 @@ impl Gpu {
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), conservative_vma };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -3639,7 +3646,7 @@ impl Gpu {
                     // drivers (Asahi/Honeykrisp). Plan against that cap, not RAM — otherwise int8 for a 70B
                     // (~70 GiB) "fits" the ~170 GiB RAM budget and then the driver refuses the allocation
                     // mid-upload ("Failed to allocate BO VMA"). The cap makes it pick q4 (or refuse) up front.
-                    let gpu_budget = gpu_buffer_budget(budget);
+                    let gpu_budget = gpu_buffer_budget(budget, self.conservative_vma);
                     match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
                         Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
