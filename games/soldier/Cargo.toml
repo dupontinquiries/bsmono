@@ -6,6 +6,7 @@ description = "An early-2000s-style first-person shooter in Rust + egui, softwar
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+noise-kit = { path = "../../shared/noise-kit" }
 netview = { path = "../../shared/netview" }
 # Real online play control-plane: session announce/discover over the fleet DHT (the same seam
 # bsgames proves in host_then_join_over_the_fleet_dht). Pure Rust, no native deps — builds headless.
