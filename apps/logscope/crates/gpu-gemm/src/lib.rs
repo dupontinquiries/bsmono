@@ -3337,7 +3337,7 @@ impl Gpu {
         let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
         if q4_mode || m.layers.iter().any(|b| b.wq.has_bias() || b.wk.has_bias() || b.wv.has_bias() || b.q_norm.is_some()) { return Ok(()); }
         let mut o = Vec::new();
-        o.extend_from_slice(b"LSI8C\x02");
+        o.extend_from_slice(b"LSI8C\x03"); // v3: bumped after the head_dim/attention surgery — invalidates any cache written mid-refactor so weights regenerate from the GGUF with the current loader
         o.extend_from_slice(&fp.0.to_le_bytes()); o.extend_from_slice(&fp.1.to_le_bytes());
         for v in [m.d, m.h, m.vocab, m.n_layers, m.n_heads, m.n_kv_heads] { o.extend_from_slice(&(v as u32).to_le_bytes()); }
         o.extend_from_slice(&m.base.to_le_bytes()); o.extend_from_slice(&m.eps.to_le_bytes());
@@ -3361,7 +3361,7 @@ impl Gpu {
         if std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() { return None; }
         let data = std::fs::read(path).ok()?;
         let mut r = Rd { d: &data, p: 0 };
-        if r.take(6)? != b"LSI8C\x02" || (r.u64()?, r.u64()?) != fp { return None; }
+        if r.take(6)? != b"LSI8C\x03" || (r.u64()?, r.u64()?) != fp { return None; }
         let (d, h, vocab) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
         let (n_layers, n_heads, n_kv_heads) = (r.u32()? as usize, r.u32()? as usize, r.u32()? as usize);
         let (base, eps) = (r.f32()?, r.f32()?);
