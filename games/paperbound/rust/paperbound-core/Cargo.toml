@@ -9,3 +9,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # the monorepo kit layer: shared argument parsing across the whole portfolio
 cli-kit = { path = "../../../../shared/cli-kit" }
+net-kit = { path = "../../../../shared/net-kit" }
+config-kit = { path = "../../../../shared/config-kit" }

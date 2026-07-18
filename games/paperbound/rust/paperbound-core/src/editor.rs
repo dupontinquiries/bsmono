@@ -206,6 +206,78 @@ impl Editor {
         let out = serde_json::to_string_pretty(&self.doc).map_err(|e| e.to_string())?;
         std::fs::write(path, out + "\n").map_err(|e| e.to_string())
     }
+
+    /// In-place save with a timestamped backup of the previous contents under
+    /// config-kit's data dir (`<data_home>/pbedit/backups/`) — the fleet's
+    /// XDG convention, so every app's state lands where the others' does.
+    pub fn save_with_backup(&self) -> Result<PathBuf, String> {
+        let backups = config_kit::data_dir("pbedit").join("backups");
+        std::fs::create_dir_all(&backups).map_err(|e| e.to_string())?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let name = self
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "data".into());
+        let bpath = backups.join(format!("{name}.{stamp}.json"));
+        if let Ok(prev) = std::fs::read(&self.path) {
+            std::fs::write(&bpath, prev).map_err(|e| e.to_string())?;
+        }
+        self.save(None)?;
+        Ok(bpath)
+    }
+}
+
+/// One REPL step for the interactive shell front: execute a line against the
+/// editor, return (output, keep_running). This is the UI seam — the terminal
+/// shell drives it today; per UI_STRATEGY.md an egui front drives the same
+/// function on a GUI host tomorrow.
+pub fn shell_exec(ed: &mut Editor, line: &str) -> (String, bool) {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    match parts.as_slice() {
+        [] => (String::new(), true),
+        ["quit"] | ["exit"] | ["q"] => ("folded.".into(), false),
+        ["help"] | ["?"] => (
+            "commands: list <factions|maps> · get <path> · set <path> <value>\n             validate · save [file] · help · quit"
+                .into(),
+            true,
+        ),
+        ["list", what] => (ed.list(what).join("\n"), true),
+        ["get", path] => match ed.get(path) {
+            Some(v) => (v.to_string(), true),
+            None => (format!("nothing at '{path}'"), true),
+        },
+        ["set", path, val] => match ed.set(path, val) {
+            Ok(old) => (
+                format!(
+                    "{path}: {} → {val}",
+                    old.map(|o| o.to_string()).unwrap_or_else(|| "∅".into())
+                ),
+                true,
+            ),
+            Err(e) => (format!("refused: {e}"), true),
+        },
+        ["validate"] => {
+            let f = ed.validate();
+            if f.is_empty() {
+                ("✅ clean".into(), true)
+            } else {
+                (f.join("\n"), true)
+            }
+        }
+        ["save"] => match ed.save_with_backup() {
+            Ok(b) => (format!("saved (backup at {})", b.display()), true),
+            Err(e) => (format!("save failed: {e}"), true),
+        },
+        ["save", to] => match ed.save(Some(Path::new(to))) {
+            Ok(()) => (format!("saved to {to}"), true),
+            Err(e) => (format!("save failed: {e}"), true),
+        },
+        _ => (format!("unknown: '{line}' — try 'help'"), true),
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +330,50 @@ mod tests {
             findings.iter().any(|f| f.contains("dragonspire") && f.contains("nodes")),
             "must flag the crash that actually shipped: {findings:?}"
         );
+    }
+
+    #[test]
+    fn the_shell_front_drives_every_editor_verb() {
+        let mut ed = Editor::open(&game_dir().join("rts_data.json")).unwrap();
+        let (out, k) = shell_exec(&mut ed, "list factions");
+        assert!(k && out.contains("court") && out.contains("press"));
+        let (out, _) = shell_exec(&mut ed, "get court.units.soldier.hp");
+        let hp = out.clone();
+        let (out, _) = shell_exec(&mut ed, "set court.units.soldier.hp 555");
+        assert!(out.contains("→ 555"));
+        let (out, _) = shell_exec(&mut ed, "set court.projectile banana");
+        assert!(out.contains("refused"), "domain guard speaks through the shell");
+        let (out, _) = shell_exec(&mut ed, "validate");
+        assert_eq!(out, "✅ clean");
+        shell_exec(&mut ed, &format!("set court.units.soldier.hp {hp}"));
+        let (out, keep) = shell_exec(&mut ed, "quit");
+        assert!(!keep && out.contains("folded"));
+        let (out, keep) = shell_exec(&mut ed, "frobnicate");
+        assert!(keep && out.contains("unknown"));
+    }
+
+    #[test]
+    fn backups_land_in_the_fleet_xdg_convention() {
+        // sandbox XDG into target/ so the test owns its filesystem
+        let sandbox = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/xdg_test");
+        std::fs::create_dir_all(&sandbox).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &sandbox);
+        let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/backup_edit.json");
+        std::fs::copy(game_dir().join("expansions/dragon_legion.json"), &tmp).unwrap();
+        let mut ed = Editor::open(&tmp).unwrap();
+        ed.set("rts_maps.dragonspire.nodes", "16").unwrap();
+        let bpath = ed.save_with_backup().unwrap();
+        assert!(bpath.starts_with(sandbox.join("pbedit/backups")), "{bpath:?}");
+        assert!(bpath.exists());
+        // the backup holds the OLD value; the file holds the new
+        let old: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&bpath).unwrap()).unwrap();
+        assert_eq!(old["rts_maps"]["dragonspire"]["nodes"], 14);
+        let new: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tmp).unwrap()).unwrap();
+        assert_eq!(new["rts_maps"]["dragonspire"]["nodes"], 16);
+        std::env::remove_var("XDG_DATA_HOME");
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]
