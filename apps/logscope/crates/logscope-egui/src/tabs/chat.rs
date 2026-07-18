@@ -1798,6 +1798,14 @@ impl Chat {
 
     fn sync_worker(&mut self, infer: &Inference) {
         if self.sent_backend != Some(self.backend) { infer.set_backend(self.backend); self.sent_backend = Some(self.backend); }
+        // Template: trust the worker's LIVE detected template over per-tab cached state. A tab created
+        // after the model loaded (or whose Evt::Loaded another drain consumed) otherwise keeps a stale
+        // default and silently builds Llama-3 prompts for a ChatML model — the markers byte-split
+        // (prompt diag: "0 special tokens"), the turn structure never reaches the model, and output
+        // degrades to word salad (seen on every Qwen3 while Llama models worked).
+        if let Some(t) = infer.detected_template() {
+            if self.template != t { self.template = t; }
+        }
         let key = (self.ctx.n_ctx, self.ctx.max_tokens, (self.ctx.temperature * 100.0) as i32, self.ctx.history_turns);
         if self.sent_params != Some(key) { infer.set_params(self.params()); self.sent_params = Some(key); }
         // Drain a queued agent prompt (initial or next-turn) to the worker — this is where the non-blocking
