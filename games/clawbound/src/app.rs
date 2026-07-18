@@ -653,14 +653,18 @@ impl State {
         }
         // the prowler + a class-tint marker
         let pgy = world::height_at(g.x, g.z);
-        let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 } else { 0.0 };
+        let arc = if g.leap_t > 0.0 { let ph = 1.0 - (g.leap_t / 0.5).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 1.7 }
+            else if g.vault_t > 0.0 { let ph = 1.0 - (g.vault_t / 0.4).clamp(0.0, 1.0); (ph * std::f32::consts::PI).sin() * 0.9 } else { 0.0 };
         let in_water = world::height_at(g.x, g.z) < world::WATER_Y;
+        let on_mountain = clawbound_rs::class::Class::terrain_at(g.x, g.z) == 2;
         let pose = if g.respawn_flash > 0.0 { cat::caught(1.0 - (g.respawn_flash / 1.2).clamp(0.0, 1.0)) }
+        else if g.vault_t > 0.0 { cat::vault(1.0 - (g.vault_t / 0.4).clamp(0.0, 1.0)) }
         else if g.class == clawbound_rs::class::Class::Hawk {
             if g.leap_t > 0.0 { cat::leap() } else if g.moving { cat::hover((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::hover_idle(self.anim_t * 0.6) }
         }
         else if g.leap_t > 0.0 { cat::leap() } else if g.dodge_t > 0.0 || g.crouched { cat::coil() }
         else if g.moving && in_water { cat::swim((self.anim_t * 1.5).rem_euclid(1.0)) }
+        else if g.moving && on_mountain { cat::scramble((self.anim_t * 1.3).rem_euclid(1.0)) }
         else if g.moving { cat::walk((self.anim_t * 1.5).rem_euclid(1.0)) } else { cat::idle(self.anim_t * 0.6) };
         cat::build(&mut m, v3(g.x, pgy + arc, g.z), g.heading, &pose, g.class);
         m.boxx(v3(g.x, pgy + 2.2, g.z), v3(0.4, 0.18, 0.4), rgb(g.class.def().color));
