@@ -740,7 +740,7 @@ impl State {
         let grim = ((flash / 1.2).clamp(0.0, 1.0) * 0.8 + if exposed { 0.25 } else { 0.0 }).min(1.0);
         // a shield-soak spares you, so it shows no damage tint
         let fx0 = if shield_flash > 0.0 { 0.0 } else { grim };
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[fx0, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.config.width as f32, self.config.height as f32]));
         self.write_camera(20.0);
 
         let items = self.menu.items();
@@ -985,7 +985,7 @@ impl State {
 
         let stunned = { self.capture.as_ref().unwrap().mobs[0].stunned() };
         let grim = if stunned { 0.4 } else { 0.0 };
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, 0.0f32, 1.0 / self.scene_w, 1.0 / self.scene_h, self.config.width as f32, self.config.height as f32]));
         self.write_camera(34.0);
 
         let items = self.menu.items();
@@ -1174,7 +1174,7 @@ impl State {
         // death fade reuses the nightmare desaturate/vignette in the post shader
         let death = (self.death_t / 1.6).clamp(0.0, 1.0);
         let grim = nightmare.max(death * 0.9);
-        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, self.game.danger, 1.0 / self.scene_w, 1.0 / self.scene_h, self.scene_w, self.scene_h]));
+        self.queue.write_buffer(&self.fxbuf, 0, bytemuck::cast_slice(&[grim, 0.2f32, self.frame * 0.016, self.game.danger, 1.0 / self.scene_w, 1.0 / self.scene_h, self.config.width as f32, self.config.height as f32]));
 
         // third-person orbit positioned from mouse-driven yaw/pitch
         let (sy, cy) = (self.yaw.sin(), self.yaw.cos());
