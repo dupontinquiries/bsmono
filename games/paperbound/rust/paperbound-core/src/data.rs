@@ -86,6 +86,9 @@ pub struct UnitSpec {
     pub tier: i32,
     #[serde(default)]
     pub requires_research: Option<String>,
+    /// The battler card whose folded model this unit wears on the field.
+    #[serde(default)]
+    pub card: Option<String>,
     /// rts.py `_supply_free`: `spec.get("supply", 1)`
     #[serde(default = "default_unit_supply")]
     pub supply: i64,
