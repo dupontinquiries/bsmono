@@ -1780,6 +1780,30 @@ impl Gpu {
         Some((out, selw))
     }
 
+    /// Dispatch-latency microbench (LOGSCOPE_DISPATCH_BENCH=1, printed once after load): times 256 CHAINED
+    /// tiny dispatches (each reads the previous output — hazard-serialized, the decode regime) vs 256
+    /// INDEPENDENT ones (parallelizable) vs 8 big matvec-sized ones, all in one submit each. Splits the
+    /// per-dispatch cost into launch latency vs serialization vs real compute — the number that decides
+    /// whether kernel FUSION is the right next investment (decode is currently ~0.4-0.5 ms × dispatch
+    /// count on Honeykrisp by inference; this measures it).
+    pub fn dispatch_bench(&self) {
+        let n = 4096usize;
+        let a = self.upload(&vec![1.0f32; n], 1, n);
+        let b = self.upload(&vec![2.0f32; n], 1, n);
+        let mut chain = self.add_t(&a, &b);
+        let t0 = std::time::Instant::now();
+        for _ in 0..256 { chain = self.add_t(&chain, &b); }
+        let _ = self.download(&chain);
+        let chained = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let outs: Vec<Tensor> = (0..256).map(|_| self.add_t(&a, &b)).collect();
+        let _ = self.download(outs.last().unwrap());
+        let indep = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("dispatch-bench: 256 chained tiny = {chained:.1} ms ({:.3} ms/dispatch) | 256 independent tiny = {indep:.1} ms ({:.3} ms/dispatch) | serialization tax = {:.3} ms/dispatch",
+            chained / 256.0, indep / 256.0, (chained - indep).max(0.0) / 256.0);
+        eprintln!("dispatch-bench: decode ≈ dispatches/token × the CHAINED number — if that matches observed ms/token, fusion (fewer, fatter kernels) is the speed lever; if independent ≈ chained, it's pure launch overhead and fan-out parallelism is near-free");
+    }
+
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let out = self.alloc(a.rows, a.cols); let dims = [a.len() as u32, 0, 0, 0];
         self.dispatch(ADD, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(a.len() as u32)); out
