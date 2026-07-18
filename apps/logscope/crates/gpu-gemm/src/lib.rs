@@ -1641,6 +1641,20 @@ impl Gpu {
         let out = self.alloc(t, d); let dims = [t as u32, d as u32, 1u32, 0];
         self.dispatch(ATTENTION, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t as u32).div_ceil(64), 1, 1)); out
     }
+    /// Fused QK-Norm + RoPE (decode t=1): one dispatch for what was a 4-dispatch chain. Input `qkv` is
+    /// the fused projection [1, ad+2kv]; returns [1, ad+kv] = roped q ‖ roped k (v stays in `qkv`).
+    fn qknorm_rope_fused(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor,
+                         n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
+        let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let out = self.alloc(1, ad + kv);
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
+                    pos as u32, neox, eps.to_bits(), 0u32];
+        self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
+                      ((n_heads + n_kv_heads) as u32, 1, 1));
+        out
+    }
+
     /// FFN half of a transformer block: norm2 → (dense SwiGLU | MoE) → residual. Dense path is the exact
     /// motif every block fn used inline (rmsnorm → wgate_up → swiglu → wdown+residual), factored so the
     /// MoE branch slots in at every call site (prefill, all decode variants, batched) identically.
@@ -3058,6 +3072,51 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   var acc=resid[i];
   for(var s=0u;s<d.k;s=s+1u){ acc=acc+bitcast<f32>(selw[d.k+s])*src[s*d.n+i]; }
   o[i]=acc;
+}"#;
+
+// Fused QK-Norm + RoPE for the decode step (t=1): ONE dispatch replaces the 4-chain
+// (qk_norm(q) → qk_norm(k) → rope(q) → rope(k)) on the Qwen path. One workgroup per HEAD (q heads then
+// k heads): 64 threads reduce the head's RMS (hd=128 → 2 elems/thread), normalize with the head's own
+// weight (q_norm for q heads, k_norm for k heads), then each thread rotates exactly one pair (hd/2=64
+// pairs) with the branch-free NORM/NEOX arithmetic. Output layout identical to the old chain:
+// [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
+// standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
+const QKNORM_ROPE: &str = r#"
+struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,_p:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> qn: array<f32>;
+@group(0)@binding(2) var<storage,read> kn: array<f32>;
+@group(0)@binding(3) var<storage,read> ff: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+var<workgroup> nx: array<f32,128>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let head=wg.x; let tid=lid.x; let hd=d.hd; let half=hd/2u;
+  let off=head*hd; // heads are contiguous: q heads [0,nq), then k heads
+  // per-head sum of squares (each thread covers hd/64 elems)
+  var ss=0.0; var i=tid;
+  loop { if(i>=hd){break;} let v=x[off+i]; ss=ss+v*v; i=i+64u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s2=32u;s2>0u;s2=s2>>1u){ if(tid<s2){ red[tid]=red[tid]+red[tid+s2]; } workgroupBarrier(); }
+  let inv=inverseSqrt(red[0]/f32(hd)+d.eps);
+  // normalize with the head-family weight into workgroup memory
+  i=tid;
+  loop { if(i>=hd){break;}
+    let w=select(kn[i], qn[i], head<d.nq);
+    nx[i]=x[off+i]*inv*w; i=i+64u; }
+  workgroupBarrier();
+  // one rotation pair per thread (branch-free NORM/NEOX pairing, same arithmetic as ROPE_MH)
+  if(tid<half){
+    let freq=f32(d.pos)/(pow(d.base,(2.0*f32(tid))/f32(hd))*ff[tid]);
+    let c=cos(freq); let s=sin(freq);
+    let j0=tid*(2u-d.neox);
+    let j1=j0 + 1u + d.neox*(half-1u);
+    let x0=nx[j0]; let x1=nx[j1];
+    o[off+j0]=x0*c-x1*s;
+    o[off+j1]=x0*s+x1*c;
+  }
 }"#;
 
 const GATHER_ROWS: &str = r#"
@@ -4736,9 +4795,11 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: QK-Norm has its own per-head weight for Q vs K, so it can't ride the single
-            // combined RoPE dispatch — split, normalize each, then RoPE each (matches block_decode_fused).
+        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Fused QK-Norm+RoPE (see block_decode_fused) — one dispatch for the old 4-chain.
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            (self.slice_cols(&qk, 0, ad), self.slice_cols(&qk, ad, kv))
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
@@ -4823,10 +4884,16 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, ad+2kv] — one matmul (was three)
-        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: QK-Norm is a per-head RMSNorm with its OWN weight for Q vs K, so it can't ride
-            // the single combined RoPE dispatch below — Q and K must be split, normalized separately,
-            // then roped separately.
+        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Qwen3/3.5 QK-Norm: FUSED norm+rope — one dispatch replaces the old 4-chain
+            // (norm q → norm k → rope q → rope k); output layout identical (q ‖ k).
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            let qr = self.slice_cols(&qk, 0, ad);
+            let kr = self.slice_cols(&qk, ad, kv);
+            self.write_row(kc, &kr, pos, kv);
+            (qr, kr)
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
+            // single-sided norm (no known arch does this) — keep the unfused chain for correctness
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
@@ -4878,9 +4945,14 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let q = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: see block_decode_fused — QK-Norm needs Q and K split and normalized with their
-            // own weight before RoPE, so it can't ride the single combined dispatch below.
+        let q = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Fused QK-Norm+RoPE (see block_decode_fused) — one dispatch for the old 4-chain.
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, rope_pos, eps);
+            let qr = self.slice_cols(&qk, 0, ad);
+            let kr = self.slice_cols(&qk, ad, kv);
+            self.write_row(kc, &kr, slot, kv);
+            qr
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, rope_pos, hd);
