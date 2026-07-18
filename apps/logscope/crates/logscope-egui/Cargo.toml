@@ -5,6 +5,7 @@ edition = "2021"
 description = "egui/eframe port skeleton of the logscope UI (replaces the GTK4/Adwaita shell)"
 
 [dependencies]
+noise-kit = { path = "../../../../shared/noise-kit" }
 libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
 png = "0.18"
