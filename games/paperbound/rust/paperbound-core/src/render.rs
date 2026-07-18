@@ -19,6 +19,7 @@
 //! an honest reference implementation for a wgpu backend tomorrow.
 
 use crate::match_sim::{Job, World};
+use crate::origami::{draw_model, ModelBook};
 
 pub const ISO: f64 = 0.62; //   rts.py's page angle
 pub const HG_LIFT: f64 = 26.0;
@@ -248,6 +249,15 @@ pub fn lift_at(plateaus: &[Plateau], x: f64, y: f64) -> f64 {
 
 /// Build the whole scene mesh from a live match. Palette = the game's theme.
 pub fn build_scene(world: &World, plateaus: &[Plateau], team_cols: [[f32; 3]; 2]) -> Mesh {
+    build_scene_inner(world, plateaus, team_cols, true)
+}
+
+pub fn build_scene_inner(
+    world: &World,
+    plateaus: &[Plateau],
+    team_cols: [[f32; 3]; 2],
+    with_units: bool,
+) -> Mesh {
     let ground = rgb(0xC4B294);
     let mut m = Mesh::new();
 
@@ -302,8 +312,10 @@ pub fn build_scene(world: &World, plateaus: &[Plateau], team_cols: [[f32; 3]; 2]
     }
 
     // units: little folded diamonds (two facing facets + a shadow), workers
-    // rounder, fighters sharper — the origami silhouette in three triangles
-    for u in &world.units {
+    // rounder, fighters sharper — the origami silhouette in three triangles.
+    // (When a ModelBook rides along, render_scene draws the REAL card models
+    // in a screen-space pass instead and this block is skipped.)
+    for u in world.units.iter().filter(|_| with_units) {
         if !u.alive() {
             continue;
         }
@@ -341,8 +353,91 @@ pub fn build_scene(world: &World, plateaus: &[Plateau], team_cols: [[f32; 3]; 2]
     m
 }
 
+/// Render with the units drawn as their actual folded CARD MODELS (origami
+/// slice): ground/buildings/wells go through the mesh as ever; units render
+/// in a painter-sorted screen-space pass via origami::draw_model, with a
+/// diamond fallback for units whose spec names no card.
+pub fn render_scene(
+    world: &World,
+    plateaus: &[Plateau],
+    cam: &Camera,
+    w: usize,
+    h: usize,
+    models: Option<&ModelBook>,
+) -> Frame {
+    let Some(book) = models else {
+        return render(world, plateaus, cam, w, h);
+    };
+    let mut f = render_base(world, plateaus, cam, w, h, false);
+    let team_cols = [rgb(0xD8B45A), rgb(0x8C7CC8)];
+    let mut order: Vec<usize> = (0..world.units.len())
+        .filter(|&i| world.units[i].alive())
+        .collect();
+    order.sort_by(|&a, &b| world.units[a].y.partial_cmp(&world.units[b].y).unwrap());
+    for i in order {
+        let u = &world.units[i];
+        let e = lift_at(plateaus, u.x, u.y);
+        let (sx, sy) = cam.project(crate::render::v3(u.x, e, u.y));
+        if sx < -60.0 || sy < -60.0 || sx > w as f64 + 60.0 || sy > h as f64 + 60.0 {
+            continue;
+        }
+        let s = (if u.worker { 13.0 } else { 17.0 }) * cam.zoom;
+        // ground shadow
+        let sh = shade(rgb(0xC4B294), 0.78);
+        for k in 0..8 {
+            let a0 = k as f64 / 8.0 * std::f64::consts::TAU;
+            let a1 = (k + 1) as f64 / 8.0 * std::f64::consts::TAU;
+            f.fill_tri(
+                [
+                    (sx, sy + s * 0.42),
+                    (sx + a0.cos() * s, sy + s * 0.42 + a0.sin() * s * 0.35),
+                    (sx + a1.cos() * s, sy + s * 0.42 + a1.sin() * s * 0.35),
+                ],
+                sh,
+            );
+        }
+        let fdir = if u.team == 0 { 1.0 } else { -1.0 };
+        let card = world.facs[u.team]
+            .units
+            .get(&u.kind)
+            .and_then(|spec| spec.card.clone());
+        let drew = match card {
+            Some(c) => draw_model(&mut f, book, &c, sx, sy, s, fdir, team_cols[u.team]),
+            None => false,
+        };
+        if !drew {
+            // the classic diamond fallback, screen-space
+            let tc = mix(rgb(0xEDE4CC), team_cols[u.team], 0.6);
+            f.fill_tri([(sx - s, sy + s * 0.3), (sx + s, sy + s * 0.3), (sx, sy - s * 1.4)], tc);
+        }
+        // an Ember burn smoulders over the model
+        if u.burn > 0.0 {
+            f.fill_tri(
+                [
+                    (sx - s * 0.35, sy - s * 0.4),
+                    (sx + s * 0.35, sy - s * 0.35),
+                    (sx, sy - s * 1.8),
+                ],
+                rgb(0xF08432),
+            );
+        }
+    }
+    f
+}
+
 /// Render a full frame: page ground with ruled grid, then the scene mesh.
 pub fn render(world: &World, plateaus: &[Plateau], cam: &Camera, w: usize, h: usize) -> Frame {
+    render_base(world, plateaus, cam, w, h, true)
+}
+
+fn render_base(
+    world: &World,
+    plateaus: &[Plateau],
+    cam: &Camera,
+    w: usize,
+    h: usize,
+    with_units: bool,
+) -> Frame {
     let mut f = Frame::new(w, h);
     let ground = rgb(0xC4B294);
     f.clear(ground);
@@ -370,7 +465,7 @@ pub fn render(world: &World, plateaus: &[Plateau], cam: &Camera, w: usize, h: us
     for y in 0..h as i64 {
         f.put((0.08 * w as f64) as i64, y, rule);
     }
-    let mesh = build_scene(world, plateaus, [rgb(0xD8B45A), rgb(0x8C7CC8)]);
+    let mesh = build_scene_inner(world, plateaus, [rgb(0xD8B45A), rgb(0x8C7CC8)], with_units);
     draw_mesh(&mut f, cam, &mesh);
     f
 }
@@ -500,6 +595,43 @@ mod tests {
         assert_eq!(png, png_bytes(&frame), "encoder must be deterministic");
         let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/rust_paper_frame.png");
         save_png(&frame, &out).unwrap();
+        assert!(out.metadata().unwrap().len() > 10_000);
+    }
+
+    #[test]
+    fn card_models_march_in_the_rendered_frame() {
+        use crate::origami::ModelBook;
+        use crate::skirmish::SkirmishSim;
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let book = load_factbook(&dir).unwrap();
+        let mb = ModelBook::load(&dir).unwrap();
+        let mut sim = SkirmishSim::new(&book, "court", "ember");
+        for _ in 0..(75 * 30) {
+            sim.step(1.0 / 30.0);
+            if sim.world.winner.is_some() {
+                break;
+            }
+        }
+        let cam = Camera { cam_x: 150.0, cam_y: 150.0, zoom: 0.72 };
+        let plats: Vec<Plateau> = sim.world.plateaus.iter()
+            .map(|&(x, y, r)| Plateau { x, y, r }).collect();
+        let plain = render(&sim.world, &plats, &cam, 1280, 800);
+        let modeled = render_scene(&sim.world, &plats, &cam, 1280, 800, Some(&mb));
+        let count = |f: &Frame| {
+            let mut s = std::collections::HashSet::new();
+            for p in f.px.chunks_exact(4).step_by(31) {
+                s.insert((p[0], p[1], p[2]));
+            }
+            s.len()
+        };
+        assert!(
+            count(&modeled) > count(&plain),
+            "folded models must be RICHER than diamonds: {} vs {}",
+            count(&modeled),
+            count(&plain)
+        );
+        let out = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/rust_origami_battle.png");
+        save_png(&modeled, &out).unwrap();
         assert!(out.metadata().unwrap().len() > 10_000);
     }
 
