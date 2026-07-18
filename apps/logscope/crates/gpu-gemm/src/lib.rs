@@ -1753,22 +1753,25 @@ impl Gpu {
         let tk = [ne as u32, slots as u32, 0, 0];
         self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
         // 3) fused gate||up for each selected expert (broadcast activation)
+        // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
+        // per-layer dispatch cost; on Asahi each submit batch costs ~4-5 ms of sync, so dispatch count
+        // is the wall clock now that the polls are gone)
         let gu_out = self.alloc(slots, ff2);
-        for slot in 0..slots {
+        {
             let gx = (ff2 as u32).min(32768);
             let gy = (ff2 as u32).div_ceil(gx);
-            let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, slot as u32, ff2 as u32, 0u32, 0u32];
-            self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+            let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
+            self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
         }
         // 4) SwiGLU over the packed [slots, 2ff]
         let hmid = self.swiglu_packed(&gu_out);
         // 5) down projection per expert (per-slot activation rows)
         let dn_out = self.alloc(slots, d);
-        for slot in 0..slots {
+        {
             let gx = (d as u32).min(32768);
             let gy = (d as u32).div_ceil(gx);
-            let dims = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx, slot as u32, d as u32, 1u32, 0u32];
-            self.dispatch(sh_dn, &[&hmid, dn_qw, dn_qs, &selw], &dn_out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+            let dims = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx, 0u32, d as u32, 1u32, 0u32];
+            self.dispatch(sh_dn, &[&hmid, dn_qw, dn_qs, &selw], &dn_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
         }
         // 6) weighted combine + residual
         let out = self.alloc(1, d);
@@ -2904,7 +2907,7 @@ fn main(){
 // experts won (no readback). `xper=1` reads a per-slot activation row (the down projection consumes
 // hmid[slot]); `xper=0` broadcasts one activation row (gate_up consumes n2). Output c[slot*n + col].
 const MOE_MATVEC_Q8: &str = r#"
-struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
 @group(0)@binding(2) var<storage,read> qs: array<f32>;
@@ -2914,11 +2917,11 @@ struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
   if(col>=d.n){ return; }
-  let row=selw[d.slot]*d.rstride+col;
+  let row=selw[slot]*d.rstride+col;
   let wbase=row*(d.k/4u); let sbase=row*d.kb;
-  let abase=select(0u, d.slot*d.k, d.xper==1u);
+  let abase=select(0u, slot*d.k, d.xper==1u);
   var acc=0.0; var kk=tid;
   loop {
     if(kk>=d.k){break;}
@@ -2931,11 +2934,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   red[tid]=acc; workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
-  if(tid==0u){ c[d.slot*d.n+col]=red[0]; }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
 }"#;
 
 const MOE_MATVEC_Q4: &str = r#"
-struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
 @group(0)@binding(1) var<storage,read> qw: array<u32>;
 @group(0)@binding(2) var<storage,read> qs: array<f32>;
@@ -2945,11 +2948,11 @@ struct D { n:u32,k:u32,kb:u32,gx:u32,slot:u32,rstride:u32,xper:u32,_p:u32 };
 var<workgroup> red: array<f32,64>;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
-  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
   if(col>=d.n){ return; }
-  let row=selw[d.slot]*d.rstride+col;
+  let row=selw[slot]*d.rstride+col;
   let wbase=row*(d.k/8u); let sbase=row*d.kb;
-  let abase=select(0u, d.slot*d.k, d.xper==1u);
+  let abase=select(0u, slot*d.k, d.xper==1u);
   var acc=0.0; var kk=tid;
   loop {
     if(kk>=d.k){break;}
@@ -2962,7 +2965,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   red[tid]=acc; workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
-  if(tid==0u){ c[d.slot*d.n+col]=red[0]; }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
 }"#;
 
 // MOE_WSUM: out[col] = resid[col] + Σ_s weight[s] · down[s·d + col] — the routed-expert combine, folded
