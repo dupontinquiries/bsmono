@@ -750,6 +750,20 @@ fn step_turn(
         }
         crate::repetition::LoopAction::Proceed => {}
     }
+    // File-write churn guard: the text/action signature can't see a model rewriting the same path each
+    // turn with different prose around it. Check every WriteFile BEFORE executing; on a hit, nudge + skip
+    // this turn's tools (same re-steer pattern as above) and escalate on the shared strike counter.
+    for t in &tools {
+        if let Tool::WriteFile { path, contents } = t {
+            if let Some(msg) = guard.observe_write(path, contents) {
+                if matches!(guard.note_strike(), crate::repetition::LoopAction::Abort) {
+                    return (Vec::new(), Some(Stop::Stalled));
+                }
+                prompt.push_str(&format!("\n\n(⚠ loop detected: {msg})\n"));
+                return (Vec::new(), None);
+            }
+        }
+    }
 
     // Done handling — gated on verification (6).
     if text.contains(DONE_MARKER) && tools.is_empty() {
