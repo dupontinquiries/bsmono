@@ -3548,7 +3548,23 @@ impl Gpu {
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
-        let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
+        // Metadata key prefix. Normally the registry's ("llama"/"qwen3"/...), but some conversions write
+        // general.architecture with one spelling and the hparam keys under ANOTHER (seen live: a Qwen3.5
+        // GGUF resolving to 'qwen3_5' with ZERO keys under that prefix). Rather than guess spellings,
+        // SNIFF the real prefix: any '<pfx>.embedding_length' key in the metadata names it authoritatively.
+        let pfx: &str = {
+            let reg = acfg.prefix;
+            if g.metadata.contains_key(&format!("{reg}.embedding_length")) { reg } else {
+                match g.metadata.keys().find_map(|k| k.strip_suffix(".embedding_length")) {
+                    Some(real) => {
+                        eprintln!("loader: hparam prefix is '{real}.' (registry expected '{reg}.') — using the file's prefix");
+                        // leak: one tiny string per load, avoids threading a String through 30 format! sites
+                        Box::leak(real.to_string().into_boxed_str())
+                    }
+                    None => reg,
+                }
+            }
+        };
         let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
@@ -3568,8 +3584,11 @@ impl Gpu {
                         .map(|s| s.as_str()).collect();
                     present.sort_unstable();
                     let listed = if present.is_empty() { "(none)".to_string() } else { present.join(", ") };
+                    // also name the prefixes that ARE in the file, so a spelling mismatch is visible at a glance
+                    let mut pfxs: Vec<&str> = g.metadata.keys().filter_map(|k| k.split('.').next()).collect();
+                    pfxs.sort_unstable(); pfxs.dedup();
                     format!("missing embedding_length: the GGUF has no '{key}' key (resolved arch '{pfx}'); \
-                        keys under '{pfx}.' present: {listed} — the file may be truncated, non-standard, or not a supported LLM")
+                        keys under '{pfx}.' present: {listed}; metadata prefixes in the file: {} — the file may be truncated, non-standard, or not a supported LLM", pfxs.join(", "))
                 }
             })? as usize;
         // MoE (qwen3moe): expert config from metadata. is_moe additionally requires the stacked expert
