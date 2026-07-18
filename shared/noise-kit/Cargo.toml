@@ -1,0 +1,9 @@
+[package]
+name = "noise-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Deterministic lattice hashing + value noise + fBm for procedural texture/terrain, extracted bit-identically from the copies in soldier mesh.rs (which itself adapted logscope texgen.rs — same mixing constants) and logscope's tileable texture baker. Two families: hash01 (the xxhash-finalizer-style i32 hash soldier uses for vertex dither) and the 374761393/668265263 lattice hash beneath value2/fbm2 and their period-wrapped tileable variants. Zero-dependency; parity pinned by golden-value tests computed from the original code. Seeded RNG streams live in core-kit; this is coordinate->value hashing."
+
+[lib]
+path = "src/lib.rs"
