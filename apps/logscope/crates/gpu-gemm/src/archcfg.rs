@@ -31,7 +31,7 @@ pub struct ArchConfig {
     pub attn_qk_norm: bool,           // per-head RMSNorm on Q and K before RoPE (Qwen3 / Qwen3.5 / Qwen4 / Llama4)
     pub norm: Norm,
     pub act: Act,
-    pub rope_interleaved: bool,       // llama-style interleaved-pair RoPE
+    pub rope_interleaved: bool,       // true = llama-style ADJACENT-pair RoPE (ggml NORM); false = NEOX split-half (qwen/gemma/phi). WIRED: loader sets Gpu.rope_neox = !this
     pub moe: bool,                    // mixture-of-experts: a router (ffn_gate_inp) + N expert FFNs (Qwen4 / Llama4)
     pub moe_shared_expert: bool,      // an always-on shared expert alongside the routed ones (Llama4)
     pub interleaved_nope: bool,       // some attention layers use NO positional encoding (Llama4 iRoPE)
@@ -55,7 +55,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         },
         "qwen2" => ArchConfig {
             arch: Arch::Qwen2, prefix: "qwen2", attn_qkv_bias: true, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
             note: "Q/K/V bias add (blk.N.attn_{q,k,v}.bias) loaded + applied in Lin::apply; validated by --gate-qwen2 (correctness). Bit-exact-vs-real-Qwen2 still M2-gated.",
         },
@@ -64,7 +64,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // (GQA, SwiGLU, RMSNorm). Reuses rmsnorm_t over [t*heads, head_dim], so no new kernel.
         "qwen3" => ArchConfig {
             arch: Arch::Qwen3, prefix: "qwen3", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
             note: "per-head QK-Norm (attn_q_norm/attn_k_norm) applied before RoPE; correctness via --gate-qwen3. Bit-exact-vs-real-Qwen3 M2-gated.",
         },
@@ -72,7 +72,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // for our purposes (QK-Norm, no QKV bias, GQA, SwiGLU, RMSNorm). Reads qwen3_5.* metadata.
         "qwen3_5" | "qwen35" => ArchConfig {
             arch: Arch::Qwen35, prefix: "qwen3_5", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
             note: "Qwen3.5 dense (Ornith): QK-Norm before RoPE, qwen3_5.* metadata; correctness via --gate-qwen3. M2-gated for bit-exactness.",
         },
@@ -83,7 +83,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // matvec/SwiGLU kernels; the router is a small matvec + top-k (moe::route).
         "qwen3moe" => ArchConfig {
             arch: Arch::Qwen3Moe, prefix: "qwen3moe", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: true, moe_shared_expert: false, interleaved_nope: false,
+            rope_interleaved: false, moe: true, moe_shared_expert: false, interleaved_nope: false,
             logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
             note: "Qwen3-MoE (Qwen3-Coder-30B-A3B confirmed: d=2048, 48 layers, n_heads=32, n_kv_heads=4, head_dim=128 [NOTE head_dim != d/n_heads=64], 128 experts × ff=768, top-8, NO shared expert; ffn_*_exps stacked with the expert dim OUTERMOST, each slice contiguous & 256-divisible; attn_v/ffn_down_exps are mixed Q6_K/Q4_K per layer). Needs: (1) head_dim decoupled from d/n_heads in the attention path [moe::layer_shape], (2) per-expert dequant→requant of the stacked ffn_*_exps in the loader, (3) MoE forward route→top-8→weighted expert sum [moe::route, ready]. Reuses the existing matvec/SwiGLU kernels per expert.",
@@ -95,7 +95,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         // checkpoint needs the top-k routing + expert-gather kernel (M2-gated, like the other new kernels).
         "qwen4" => ArchConfig {
             arch: Arch::Qwen4, prefix: "qwen4", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: true, moe_shared_expert: false, interleaved_nope: false,
+            rope_interleaved: false, moe: true, moe_shared_expert: false, interleaved_nope: false,
             logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: false, dense_supported: true,
             note: "Qwen4 adds mixture-of-experts (ffn_gate_inp router + ffn_{gate,up,down}_exps) on the Qwen3.5 QK-Norm base. A DENSE Qwen4 (expert_count 0) loads on the existing QK-Norm path; a MoE checkpoint needs the top-k routing + expert-gather kernel (M2-gated).",
@@ -113,13 +113,13 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         },
         "gemma" | "gemma2" => ArchConfig {
             arch: Arch::Gemma2, prefix: "gemma2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::RmsGemma, act: Act::GeGlu,
-            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: Some(30.0), attn_softcap: Some(50.0), tied_embed_default: true,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: Some(30.0), attn_softcap: Some(50.0), tied_embed_default: true,
             supported: false, dense_supported: false,
             note: "needs geglu activation, (1+w) rms norm, and tanh soft-cap on attn + final logits",
         },
         "phi3" => ArchConfig {
             arch: Arch::Phi3, prefix: "phi3", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
-            rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
             note: "fused qkv tensor + partial-rotary RoPE; needs a split + partial-dim rope kernel",
         },
@@ -275,6 +275,16 @@ mod tests {
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_shexp.weight"));
         assert!(mt.iter().any(|t| t == "blk.0.ffn_gate_exps.weight"));
         assert!(c.note.contains("NoPE") && c.note.contains("shared expert"));
+    }
+
+    #[test]
+    fn rope_pairing_by_family() {
+        // llama rotates adjacent pairs (ggml NORM); qwen/gemma/phi rotate split halves (NEOX).
+        // Wrong pairing = real words, scrambled meaning (the dense-Qwen salad, root-caused on M2 Ultra).
+        assert!(for_arch("llama").rope_interleaved);
+        for a in ["qwen2", "qwen3", "qwen3moe", "gemma2", "phi3"] {
+            assert!(!for_arch(a).rope_interleaved, "{a} must be NEOX");
+        }
     }
 
     #[test]
