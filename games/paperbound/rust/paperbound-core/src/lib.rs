@@ -15,3 +15,4 @@ pub mod skirmish;
 pub mod battler;
 pub mod tournament;
 pub mod editor;
+pub mod net_skirmish;

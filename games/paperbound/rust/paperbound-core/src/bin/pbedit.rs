@@ -9,19 +9,31 @@
 //!   pbedit validate [--file PATH]           # incl. every expansion pack
 
 use cli_kit::Cli;
-use paperbound_core::editor::Editor;
+use paperbound_core::editor::{shell_exec, Editor};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 fn game_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The data file, resolved the fleet way: --file flag beats the config-kit
+/// config (`~/.config/pbedit/pbedit.conf`, `[paths] data = …`) beats the
+/// in-repo default.
+fn resolve_file(cli: &Cli) -> PathBuf {
+    if let Some(f) = cli.opt("--file") {
+        return PathBuf::from(f);
+    }
+    let ini = config_kit::Ini::parse(&config_kit::load_or("pbedit", "pbedit.conf", ""));
+    if let Some(p) = ini.get("paths", "data") {
+        return PathBuf::from(p);
+    }
+    game_dir().join("rts_data.json")
+}
+
 fn main() {
     let cli = Cli::from_env();
-    let file: PathBuf = cli
-        .opt("--file")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| game_dir().join("rts_data.json"));
+    let file: PathBuf = resolve_file(&cli);
     let pos = cli.positionals();
     match pos.first().copied() {
         Some("list") => {
@@ -50,6 +62,32 @@ fn main() {
                     println!("{path}: {} → {val}", old.map(|o| o.to_string()).unwrap_or("∅".into()));
                 }
                 Err(e) => die(&e),
+            }
+        }
+        Some("config") => {
+            println!("config file : {}", config_kit::config_dir("pbedit").join("pbedit.conf").display());
+            println!("data file   : {}", file.display());
+            println!("backups     : {}", config_kit::data_dir("pbedit").join("backups").display());
+        }
+        Some("shell") => {
+            let mut ed = Editor::open(&file).unwrap_or_else(|e| die(&e));
+            println!("pbedit shell — editing {} ('help' for commands)", file.display());
+            let stdin = std::io::stdin();
+            let mut out = std::io::stdout();
+            loop {
+                print!("fold> ");
+                out.flush().ok();
+                let mut line = String::new();
+                if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 {
+                    break; // EOF folds the shell too
+                }
+                let (msg, keep) = shell_exec(&mut ed, line.trim());
+                if !msg.is_empty() {
+                    println!("{msg}");
+                }
+                if !keep {
+                    break;
+                }
             }
         }
         Some("validate") => {
@@ -85,7 +123,7 @@ fn main() {
             }
         }
         _ => {
-            eprintln!("usage: pbedit <list|get|set|validate> … [--file PATH] [--out PATH]");
+            eprintln!("usage: pbedit <list|get|set|validate|shell|config> … [--file PATH] [--out PATH]");
             std::process::exit(2);
         }
     }
