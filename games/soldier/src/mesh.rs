@@ -342,15 +342,9 @@ pub fn team_tint(src: Color32, team: Color32, amount: f32) -> Color32 {
 }
 
 /// Deterministic 0..1 hash — the reference's mixing constants; used to dither vertex colour for that
-/// noisy, low-budget "texture" look without any image assets.
-#[inline]
-pub fn hash01(x: i32, s: i32) -> f32 {
-    let mut h = (x as u32).wrapping_mul(0x9E37_79B1) ^ (s as u32).wrapping_mul(0x85EB_CA6B);
-    h ^= h >> 13;
-    h = h.wrapping_mul(0xC2B2_AE35);
-    h ^= h >> 16;
-    (h & 0xFF_FFFF) as f32 / 0xFF_FFFF as f32
-}
+/// noisy, low-budget "texture" look without any image assets. Now `noise-kit`'s
+/// `hash01`, which adopted this function verbatim (golden-pinned there).
+pub use noise_kit::hash01;
 /// Jitter a base colour by ±`amt` using a coordinate-derived hash — cheap procedural grime.
 pub fn dither(base: Color32, key: i32, amt: f32) -> Color32 {
     let d = (hash01(key, 17) - 0.5) * 2.0 * amt;
@@ -358,45 +352,13 @@ pub fn dither(base: Color32, key: i32, amt: f32) -> Color32 {
     Color32::from_rgb(f(base.r()), f(base.g()), f(base.b()))
 }
 
-// ── Procedural surface texture (adapted from logscope texgen.rs) ─────────────────────────────────────────
+// ── Procedural surface texture ───────────────────────────────────────────────────────────────────────
 // A small value-noise / fBm family sampled in WORLD space. Coincident tile-corner vertices share a world
 // position, so the field is continuous across tiles even though the mesh isn't welded — the grain reads as
-// one seamless material, not per-tile patches.
-#[inline]
-fn vhash(xi: i32, yi: i32, seed: u32) -> f32 {
-    let mut h = (xi as u32)
-        .wrapping_mul(374_761_393)
-        .wrapping_add((yi as u32).wrapping_mul(668_265_263))
-        .wrapping_add(seed.wrapping_mul(362_437));
-    h = (h ^ (h >> 13)).wrapping_mul(1_274_126_177);
-    ((h ^ (h >> 16)) & 0xFF_FFFF) as f32 / 0xFF_FFFF as f32
-}
-#[inline]
-fn vsmooth(t: f32) -> f32 {
-    t * t * (3.0 - 2.0 * t)
-}
-fn vnoise2(x: f32, y: f32, seed: u32) -> f32 {
-    let (x0, y0) = (x.floor() as i32, y.floor() as i32);
-    let (fx, fy) = (vsmooth(x - x0 as f32), vsmooth(y - y0 as f32));
-    let a = vhash(x0, y0, seed);
-    let b = vhash(x0 + 1, y0, seed);
-    let c = vhash(x0, y0 + 1, seed);
-    let d = vhash(x0 + 1, y0 + 1, seed);
-    let ab = a + (b - a) * fx;
-    let cd = c + (d - c) * fx;
-    ab + (cd - ab) * fy
-}
-/// Multi-octave value noise in [0,1].
-pub fn fbm2(x: f32, y: f32, oct: u32, seed: u32) -> f32 {
-    let (mut sum, mut amp, mut freq, mut norm) = (0.0f32, 0.5f32, 1.0f32, 0.0f32);
-    for o in 0..oct {
-        sum += vnoise2(x * freq, y * freq, seed.wrapping_add(o)) * amp;
-        norm += amp;
-        amp *= 0.5;
-        freq *= 2.0;
-    }
-    sum / norm.max(1e-4)
-}
+// one seamless material, not per-tile patches. This family was adapted from logscope texgen.rs and has
+// since moved to `noise-kit`, which adopted BOTH copies bit-identically (same lattice constants;
+// golden-pinned in the kit's tests): `fbm2` here is the kit's un-tiled world-space variant.
+pub use noise_kit::fbm2;
 
 /// A surface **material** — a distinct procedural treatment applied to a mesh's albedo. Biomes assign these to
 /// floors and walls so the world's surfaces have variety instead of one shared mottle.
