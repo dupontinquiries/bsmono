@@ -1181,7 +1181,16 @@ impl Gpu {
                 b.clone()
             } else {
                 DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let b = std::sync::Arc::new(dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dims"), contents: dims, usage: wgpu::BufferUsages::UNIFORM }));
+                // Create WITHOUT mapped_at_creation and fill via the queue. create_buffer_init maps
+                // at creation (get_mapped_range_mut) — on Metal, under memory pressure or a poisoned
+                // device that map ABORTS the process (the "Buffer 'dims' invalid" panic). A plain
+                // create_buffer + write_buffer records a recoverable error instead of aborting, and
+                // is what every other resident upload already uses on non-UMA. Uniform dims are tiny.
+                let b = std::sync::Arc::new(dev.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("dims"), size: (dims.len().max(16)) as u64,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false }));
+                self.queue.write_buffer(&b, 0, dims);
                 if cache.len() < 4096 { cache.insert(dims.to_vec(), b.clone()); }
                 b
             }
