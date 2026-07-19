@@ -789,6 +789,11 @@ pub struct MoeLayer {
     pub stacked_gu: Lin,
     pub stacked_down: Lin,
     pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
+    /// SHARED expert (GLM / DeepSeek / Qwen2-MoE): a dense SwiGLU FFN every token runs IN ADDITION
+    /// to its routed experts — out = x + Σ wᵢ·expertᵢ(n) + shared(n). Fused gate||up [2·sff, d] +
+    /// down [d, sff] (sff read from the tensor itself; shared width differs from the routed ff).
+    /// None for qwen3moe. This is the GLM-5.2 / DeepSeek-path stepping stone.
+    pub shared: Option<(Lin, Lin)>,
 }
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
@@ -1802,6 +1807,26 @@ impl Gpu {
     /// then weighted SCATTER-ADD into the output. Correctness-first v1: the per-layer router readback is a
     /// GPU sync (~1-3 ms) — the known perf ceiling (~5-10 tok/s decode) until GPU-side top-k lands.
     fn moe_ffn(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        let routed = self.moe_ffn_routed(m, n2, t, d, x2);
+        // Shared expert (GLM / DeepSeek / Qwen2-MoE): a dense SwiGLU FFN added on top of the routed
+        // sum for EVERY token — the standard shared+routed MoE decomposition. qwen3moe: None →
+        // byte-identical to before. Runs batched over t on the existing dense kernels (+3
+        // dispatches per MoE layer); a fused MOE_WSUM variant can absorb the add later.
+        match &m.shared {
+            None => routed,
+            Some((sgu, sdn)) => {
+                let gu = sgu.apply(self, n2, t);
+                let hmid = self.swiglu_packed(&gu);
+                let sh = sdn.apply(self, &hmid, t);
+                self.add_t(&routed, &sh)
+            }
+        }
+    }
+    /// Validation-facing entry for the whole MoE FFN (routing + experts + shared + residual).
+    pub fn moe_ffn_t(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        self.moe_ffn(m, n2, t, d, x2)
+    }
+    fn moe_ffn_routed(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
         // v2 DECODE FAST PATH: route ON the GPU — top-k kernel + expert-indexed matvecs over the stacked
         // weights. Zero readbacks (v1 paid 48 submit+poll syncs per token ≈ 340 ms on Asahi — ~90% of the
         // 2.7 tok/s wall time). Prefill (t>1) keeps the v1 grouped path over the SAME weights via row
@@ -4203,7 +4228,25 @@ impl Gpu {
                     if gate_up.len() != n_expert || down.len() != n_expert {
                         return Err("MoE expert stack isn't row-viewable (unexpected residency format)".into());
                     }
-                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down,
+                    // Shared expert (ffn_{gate,up,down}_shexp.weight — GLM/DeepSeek/Qwen2-MoE):
+                    // width read from the tensor itself (elems/d), order-of-dims-proof; fused
+                    // gate||up concat mirrors the dense wgate_up layout SWIGLU_PACKED consumes.
+                    let shared = if g.tensor(&format!("blk.{i}.ffn_gate_shexp.weight")).is_some()
+                        && g.tensor(&format!("blk.{i}.ffn_up_shexp.weight")).is_some()
+                        && g.tensor(&format!("blk.{i}.ffn_down_shexp.weight")).is_some() {
+                        let gs = fetch(&format!("blk.{i}.ffn_gate_shexp.weight"))?;
+                        let sff = gs.len() / d;
+                        let us = fetch(&format!("blk.{i}.ffn_up_shexp.weight"))?;
+                        let mut cat = Vec::with_capacity(2 * sff * d);
+                        cat.extend_from_slice(&gs); cat.extend_from_slice(&us);
+                        drop(gs); drop(us);
+                        let sgu = self.make_lin(&cat, 2 * sff, d, q, q4_mode);
+                        drop(cat);
+                        let sdn = self.make_lin(&fetch(&format!("blk.{i}.ffn_down_shexp.weight"))?, d, sff, q, q4_mode);
+                        if i == 0 { eprintln!("wgpu-engine: shared-expert MoE — shexp ff={sff} on top of {n_expert} routed"); }
+                        Some((sgu, sdn))
+                    } else { None };
+                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
