@@ -49,6 +49,8 @@ struct VoicetermApp {
     blocks_open: bool,
     /// One-shot scroll target for the tab bar ("N more" pill taps apply next frame).
     tabbar_scroll_to: Option<f32>,
+    /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
+    toasts: uikit_egui::toast::Toasts,
 }
 
 impl eframe::App for VoicetermApp {
@@ -68,6 +70,8 @@ impl eframe::App for VoicetermApp {
             }
         });
 
+        // toast above the bottom chrome (keycap bar ~76px + margin, the QML bind-to-chrome idea)
+        self.toasts.ui(ctx, 84.0);
         egui::TopBottomPanel::bottom("keycaps").show(ctx, |ui| {
             // The pipe/brace gesture chips sit on their own row above the keycaps (the QML toolbar
             // put them in modRow): hold + drag to a cell + release. The brace menu's deadband makes
@@ -90,6 +94,7 @@ impl eframe::App for VoicetermApp {
                     self.theme_menu.show(ui, &theme_host, &theme_menu())
                 {
                     self.theme = snapclone_theme::PaletteId::from_str(&id);
+                    self.toasts.info(format!("Theme: {}", self.theme.display_name()), ctx.input(|i| i.time));
                     // persist: the pick survives restarts (theme.palette in the kv prefs file)
                     self.app.prefs.palette = id;
                     let _ = save_prefs(&self.app.prefs);
@@ -131,11 +136,13 @@ impl eframe::App for VoicetermApp {
                         BlockAction::CopyCommand => {
                             if let Some(cmd) = self.blocks.get_block_command(id) {
                                 ctx.copy_text(cmd.to_string());
+                                self.toasts.success("Copied command", ctx.input(|i| i.time));
                             }
                         }
                         BlockAction::CopyOutput => {
                             if let Some(out) = self.blocks.get_block_output(id) {
                                 ctx.copy_text(out.to_string());
+                                self.toasts.success("Copied output", ctx.input(|i| i.time));
                             }
                         }
                         // the summary worker is backend-side (global toggle in the reference)
@@ -198,10 +205,24 @@ impl eframe::App for VoicetermApp {
                     self.tabbar_scroll_to = Some(out.state.offset.y + page);
                 }
             }
+            let now = ctx.input(|i| i.time);
             for call in &apply {
                 // pane-level calls (split / close pane / web pane) are unhandled by the
                 // single-pane model — same on-device status as the other workspace stubs
-                let _ = self.workspace.apply(call);
+                let handled = self.workspace.apply(call);
+                use voiceterm_egui::gesture_menus::WsCall;
+                match call {
+                    WsCall::ToggleFence(_) => self.toasts.info("Toggled fence", now), // QML's exact string
+                    WsCall::TogglePin(i) => {
+                        let pinned = self.workspace.tabs.get(*i).map(|t| t.pinned).unwrap_or(false);
+                        self.toasts.info(if pinned { "Pinned" } else { "Unpinned" }, now);
+                    }
+                    WsCall::Command(c) if c == "close tab" => self.toasts.info("Closed tab", now),
+                    WsCall::Command(c) if !handled && (c.starts_with("split") || c == "close pane") => {
+                        self.toasts.warning(format!("{c}: needs the workspace backend"), now);
+                    }
+                    _ => {}
+                }
             }
         });
 
@@ -228,7 +249,10 @@ impl eframe::App for VoicetermApp {
             {
                 if let Some(url) = self.link_url.take() {
                     match link_dispatch(&id, &url) {
-                        Some(LinkAction::CopyUrl(u)) => ctx.copy_text(u),
+                        Some(LinkAction::CopyUrl(u)) => {
+                            ctx.copy_text(u);
+                            self.toasts.success("Copied URL", ctx.input(|i| i.time));
+                        }
                         // Open/Read/NewTab drive the web pane / reader — on-device wiring, same
                         // status as the workspace actions above.
                         Some(LinkAction::Open(_)) | Some(LinkAction::Read(_)) | Some(LinkAction::NewTab(_)) => {}
@@ -244,6 +268,7 @@ impl eframe::App for VoicetermApp {
                     Some(PaneAction::CopySelection) => {
                         let text = self.app.selection.take().map(|s| s.text).unwrap_or_else(|| self.app.terminal.screen_text());
                         ctx.copy_text(text);
+                        self.toasts.success("Copied", ctx.input(|i| i.time));
                     }
                     Some(PaneAction::CommandPalette) => self.app.open_search(), // nearest on-device affordance today
                     // Split/Close/NewTab drive the workspace (ws_command) and Mic starts capture —
@@ -329,6 +354,7 @@ fn main() -> eframe::Result<()> {
                 blocks: blocks,
                 blocks_open: false,
                 tabbar_scroll_to: None,
+                toasts: uikit_egui::toast::Toasts::new(),
             }))
         }),
     )
