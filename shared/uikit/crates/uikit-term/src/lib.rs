@@ -195,6 +195,39 @@ impl Grid {
         self.view_offset > 0
     }
 
+    /// Text of a GLOBAL line: index over scrollback (oldest first) then the live rows — the
+    /// same indexing [`Grid::all_lines`] and search matches use.
+    pub fn line_text_global(&self, line: usize) -> String {
+        let sb = self.scrollback.len();
+        if line < sb {
+            self.scrollback[line].iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+        } else {
+            self.row_text((line - sb).min(self.rows.saturating_sub(1)))
+        }
+    }
+
+    /// The view offset that brings GLOBAL `line` into the viewport, about a third of the way
+    /// down (0 when the line is a live row — the live view already shows it).
+    pub fn offset_to_show_line(&self, line: usize) -> usize {
+        let sb = self.scrollback.len();
+        if line >= sb {
+            return 0;
+        }
+        ((sb - line) + self.rows / 3).min(sb)
+    }
+
+    /// Which viewport row (if any) currently shows GLOBAL `line`, honoring the view offset.
+    pub fn viewport_row_of_line(&self, line: usize) -> Option<usize> {
+        let virt_top = self.scrollback.len() - self.view_offset;
+        line.checked_sub(virt_top).filter(|r| *r < self.rows)
+    }
+
+    /// The GLOBAL line a viewport row currently shows (inverse of
+    /// [`Grid::viewport_row_of_line`]).
+    pub fn global_line_of_viewport_row(&self, r: usize) -> usize {
+        self.scrollback.len() - self.view_offset + r
+    }
+
     /// The cell at viewport position (r, c) honoring [`Grid::view_offset`]: a window over
     /// scrollback stitched onto the live rows. Scrollback rows captured before a resize may be
     /// narrower/wider than `cols`; out-of-range columns read as blank (default cell).
@@ -634,6 +667,19 @@ fn lighten(c: egui::Color32, factor: f32) -> egui::Color32 {
     egui::Color32::from_rgb(lerp(c.r()), lerp(c.g()), lerp(c.b()))
 }
 
+/// A span to emphasize in the viewport this frame (search hits, the selection).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Highlight {
+    /// Viewport row.
+    pub row: usize,
+    /// Start column (character cells) and span length; a whole-row wash when `len == 0`.
+    pub col: usize,
+    pub len: usize,
+    /// The active search hit draws stronger than the others.
+    pub active: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn render_grid(
     ui: &egui::Ui,
     grid: &Grid,
@@ -646,6 +692,7 @@ pub fn render_grid(
     cursor_mode: CursorMode,
     cursor_anim: &mut CursorAnim,
     dt: f32,
+    highlights: &[Highlight],
 ) {
     let painter = ui.painter();
     // The terminal viewport's own base is a hardcoded near-black in the QML (Canvas's default
@@ -685,6 +732,28 @@ pub fn render_grid(
             c = end;
         }
     }
+    // search-hit / selection washes: translucent accent over the span (whole row when len==0);
+    // the ACTIVE search hit gets a stroked box so ▲▼ visibly walks the matches.
+    for h in highlights {
+        if h.row >= grid.rows {
+            continue;
+        }
+        let (x0, w) = if h.len == 0 {
+            (origin.x, grid.cols as f32 * cell_w)
+        } else {
+            (origin.x + h.col as f32 * cell_w, h.len as f32 * cell_w)
+        };
+        let rect = egui::Rect::from_min_size(
+            egui::pos2(x0, origin.y + h.row as f32 * cell_h),
+            egui::vec2(w, cell_h),
+        );
+        let accent = filt(colors.accent);
+        painter.rect_filled(rect, 2.0, accent.gamma_multiply(if h.active { 0.35 } else { 0.18 }));
+        if h.active {
+            painter.rect_stroke(rect, egui::CornerRadius::same(2), egui::Stroke::new(1.0, accent), egui::StrokeKind::Outside);
+        }
+    }
+
     // scrolled-back badge: a small top-right pill showing how far above live the view is, so
     // "why is nothing updating" is never a mystery (the cursor is hidden in this state).
     if grid.is_scrolled_back() {
@@ -894,11 +963,16 @@ impl App {
             let n = self.search.count();
             let cur = if n == 0 { 0 } else { self.search.active + 1 };
             ui.label(format!("{cur}/{n}"));
+            if resp.changed() || resp.lost_focus() {
+                self.scroll_to_search_active();
+            }
             if ui.button("▲").clicked() {
                 self.search.prev();
+                self.scroll_to_search_active();
             }
             if ui.button("▼").clicked() {
                 self.search.next();
+                self.scroll_to_search_active();
             }
             if ui.button("✕").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                 self.search_open = false;
@@ -935,7 +1009,10 @@ impl App {
                 uikit_egui::touch::Gesture::Pinch { rel, .. } => self.apply_pinch(rel),
                 uikit_egui::touch::Gesture::Tap(p) => {
                     if let Some((col, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
-                        let word = word_at(&self.terminal.grid.row_text(row), col);
+                        // view-aware: while scrolled back, the tapped viewport row shows a
+                        // scrollback line — select THAT text, not the live row hidden under it
+                        let line = self.terminal.grid.global_line_of_viewport_row(row);
+                        let word = word_at(&self.terminal.grid.line_text_global(line), col);
                         // a tap on a URL is a link tap (the QML blue-link affordance); the word
                         // selection still happens, so copy-word flows keep working
                         if let Some(url) = url_in_word(&word) {
@@ -946,7 +1023,8 @@ impl App {
                 }
                 uikit_egui::touch::Gesture::LongPress(p) => {
                     if let Some((_, row)) = self.cell_at(origin, egui::pos2(p.x, p.y)) {
-                        self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.row_text(row) });
+                        let line = self.terminal.grid.global_line_of_viewport_row(row);
+                        self.selection = Some(Selection { row: Some(row), text: self.terminal.grid.line_text_global(line) });
                     }
                     self.long_press = Some(egui::pos2(p.x, p.y));
                 }
@@ -980,11 +1058,39 @@ impl App {
         self.link_tap.take()
     }
 
+    /// Bring the active search match into view — pages into scrollback when the match line is
+    /// up there, or back to live when it's on screen.
+    pub fn scroll_to_search_active(&mut self) {
+        if let Some(m) = self.search.matches.get(self.search.active) {
+            self.terminal.grid.view_offset = self.terminal.grid.offset_to_show_line(m.line);
+        }
+    }
+
+    /// This frame's viewport highlights: every visible search hit (active one stronger) plus a
+    /// whole-row wash on the selection.
+    fn viewport_highlights(&self) -> Vec<Highlight> {
+        let mut out = Vec::new();
+        for (i, m) in self.search.matches.iter().enumerate() {
+            if let Some(row) = self.terminal.grid.viewport_row_of_line(m.line) {
+                out.push(Highlight { row, col: m.col, len: m.len.max(1), active: i == self.search.active });
+            }
+        }
+        if let Some(sel) = &self.selection {
+            if let Some(row) = sel.row {
+                if row < self.terminal.grid.rows {
+                    out.push(Highlight { row, col: 0, len: 0, active: false });
+                }
+            }
+        }
+        out
+    }
+
     /// Draw the terminal into the current UI region.
     pub fn render(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         let origin = ui.min_rect().min;
         let dt = ui.input(|i| i.stable_dt).min(0.1); // clamp a stalled first frame's huge dt
-        render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size, self.cursor_mode, &mut self.cursor_anim, dt);
+        let highlights = self.viewport_highlights();
+        render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size, self.cursor_mode, &mut self.cursor_anim, dt, &highlights);
 
         // Highlight search hits that fall in the visible region (matches in scrollback still count in
         // the n/N tally, they just aren't on screen to box). The active hit gets a solid box.
@@ -1212,6 +1318,49 @@ mod tests {
         assert!((a.cell.0 - b.cell.0).abs() < 1e-3);
         assert!((a.cell.1 - b.cell.1).abs() < 1e-3);
         assert_eq!(a.font_size, b.font_size);
+    }
+
+    #[test]
+    fn global_line_mapping_and_search_jump_offsets() {
+        let mut g = Grid::new(4, 3);
+        let mut p = Parser::new();
+        for i in 0..10 {
+            p.feed(&format!("l{i}\r\n"), &mut g);
+        }
+        let sb = g.scrollback.len();
+        assert!(sb >= 7);
+        // live rows map with offset 0
+        assert_eq!(g.viewport_row_of_line(sb), Some(0));
+        assert_eq!(g.global_line_of_viewport_row(0), sb);
+        // a live line needs no offset
+        assert_eq!(g.offset_to_show_line(sb + 1), 0);
+        // a scrollback line: the computed offset actually makes it visible
+        let target = 2usize;
+        g.view_offset = g.offset_to_show_line(target);
+        let row = g.viewport_row_of_line(target).expect("target line visible after jump");
+        assert!(row < g.rows);
+        // and the text read through the global index matches the viewport cell content
+        let via_global = g.line_text_global(target);
+        let via_display: String = (0..g.cols).map(|c| g.display_cell(row, c).ch).collect();
+        assert_eq!(via_global, via_display.trim_end());
+        // clamped for very early lines
+        assert!(g.offset_to_show_line(0) <= sb);
+    }
+
+    #[test]
+    fn scrolled_back_tap_selects_the_scrollback_line_not_the_live_row() {
+        let mut app = App::new(8, 2);
+        for i in 0..6 {
+            app.terminal.feed(&format!("line{i}\r\n"));
+        }
+        app.terminal.grid.page_up(3);
+        let shown = app.terminal.grid.global_line_of_viewport_row(0);
+        let expect = app.terminal.grid.line_text_global(shown);
+        // simulate what the LongPress handler now does
+        let line = app.terminal.grid.global_line_of_viewport_row(0);
+        app.selection = Some(Selection { row: Some(0), text: app.terminal.grid.line_text_global(line) });
+        assert_eq!(app.selection.as_ref().unwrap().text, expect);
+        assert_ne!(expect, app.terminal.grid.row_text(0), "scrolled view must not read the live row");
     }
 
     #[test]
