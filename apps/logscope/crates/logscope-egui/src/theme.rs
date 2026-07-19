@@ -290,9 +290,17 @@ pub const ATLANTIS: Palette = Palette {
 };
 
 thread_local! { static ACTIVE: std::cell::Cell<Palette> = const { std::cell::Cell::new(FOLDING_AT_HOME) }; }
+thread_local! { static BASE: std::cell::Cell<Palette> = const { std::cell::Cell::new(FOLDING_AT_HOME) }; }
+thread_local! { static DAY_BUCKET: std::cell::Cell<i64> = const { std::cell::Cell::new(-1) }; }
 
 /// Swap the active palette (call `install` afterwards to re-skin egui's own widgets/Visuals).
-pub fn set_palette(p: Palette) { ACTIVE.with(|a| a.set(p)); }
+/// The palette handed in is the BASE; what actually activates is its day/night adaptation for
+/// the current clock (see `day_night_adjust_at`), and `tick_day_night` keeps it tracking.
+pub fn set_palette(p: Palette) {
+    BASE.with(|b| b.set(p));
+    DAY_BUCKET.with(|d| d.set(day_bucket_now()));
+    ACTIVE.with(|a| a.set(day_night_adjust_at(p, daylight01())));
+}
 /// The active palette.
 pub fn active() -> Palette { ACTIVE.with(|a| a.get()) }
 /// Find a palette by name (e.g. a persisted setting); falls back to the default.
@@ -535,6 +543,145 @@ fn add_leaf(mesh: &mut egui::epaint::Mesh, c: Pos2, sz: f32, rot: f32, col: Colo
 #[inline] fn warm_tint(c: Color32, f: f32) -> Color32 { lerp_col(c, Color32::from_rgb(0xff, 0xa0, 0x46), f) } // → sunset orange
 #[inline] fn cool_tint(c: Color32, f: f32) -> Color32 { lerp_col(c, Color32::from_rgb(0x78, 0x96, 0xd2), f) } // → moonlight blue
 
+// ── day/night palette adaptation ─────────────────────────────────────────────
+//
+// The scenes were already clock-lit (`sun_from_clock`), but the UI PALETTE underneath stayed
+// frozen: a bright paper theme at 2am glares, a cave theme at noon fights the room. So the
+// active palette now adapts: LIGHT palettes darken as night deepens (surfaces dim toward a
+// lamplit version of themselves — ink stays put, and stays readable because the dimming is
+// bounded), and DARK palettes lift slightly through the day (surfaces gain a little daylight so
+// they don't read as a void at noon). The adaptation is a pure function of (palette, daylight),
+// so it's unit-tested across every palette; the clock only picks the input.
+
+/// Daylight at hour-of-day `h` (0..24): 0 at night, 1 at solar noon — the same half-sine
+/// `sun_from_clock` uses, so the UI dims exactly when the canopy sun does.
+pub fn daylight01_at(h: f32) -> f32 {
+    (std::f32::consts::PI * ((h - 6.0) / 12.0)).sin().clamp(0.0, 1.0)
+}
+
+/// Daylight for the current wall clock (same TZ convention as `sun_from_clock`).
+pub fn daylight01() -> f32 {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(43_200);
+    daylight01_at(((secs.rem_euclid(86_400)) as f32) / 3600.0)
+}
+
+/// 5-minute clock bucket — the granularity at which the adaptation re-evaluates.
+fn day_bucket_now() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) / 300
+}
+
+#[inline] fn scale_col(c: Color32, f: f32) -> Color32 {
+    Color32::from_rgb(
+        ((c.r() as f32) * f).round().clamp(0.0, 255.0) as u8,
+        ((c.g() as f32) * f).round().clamp(0.0, 255.0) as u8,
+        ((c.b() as f32) * f).round().clamp(0.0, 255.0) as u8,
+    )
+}
+#[inline] fn lift_col(c: Color32, amt: u8) -> Color32 {
+    Color32::from_rgb(c.r().saturating_add(amt), c.g().saturating_add(amt), c.b().saturating_add(amt))
+}
+
+/// The day/night adaptation, pure: `day` in [0,1] (1 = noon). Light palettes dim their SURFACES
+/// toward a 0.42× lamplit version by up to 55% at deep night (ink/accents untouched — the
+/// bounded dim keeps dark-ink-on-light readable, verified by the contrast tests). Dark palettes
+/// lift surfaces by up to +26 luma at noon — subtle, so the identity survives.
+pub fn day_night_adjust_at(p: Palette, day: f32) -> Palette {
+    let mut q = p;
+    let surf = |c: Color32, out: &mut Color32, f: f32, dark: bool| {
+        *out = if dark { lerp_col(c, lift_col(c, 26), f) } else { lerp_col(c, scale_col(c, 0.42), f) };
+    };
+    let mut f = if p.dark { 0.9 * day } else { 0.55 * (1.0 - day) };
+    // bound the night dim by the palette's own headroom: never dim a light surface past the
+    // point its ink drops under 4.5:1 (Reading Room is already lamplit — it dims less than
+    // bright paper does). Palettes whose ink starts below 4.5 don't dim at all.
+    if !p.dark && f > 0.0 {
+        let dim_bg = |f: f32| lerp_col(p.bg, scale_col(p.bg, 0.42), f);
+        if contrast_ratio(p.ink, dim_bg(f)) < 4.5 {
+            let (mut lo, mut hi) = (0.0f32, f);
+            for _ in 0..12 {
+                let mid = (lo + hi) * 0.5;
+                if contrast_ratio(p.ink, dim_bg(mid)) >= 4.5 { lo = mid; } else { hi = mid; }
+            }
+            f = lo;
+        }
+    }
+    surf(p.bg, &mut q.bg, f, p.dark);
+    surf(p.window, &mut q.window, f, p.dark);
+    surf(p.panel, &mut q.panel, f, p.dark);
+    surf(p.panel2, &mut q.panel2, f, p.dark);
+    surf(p.track_bg, &mut q.track_bg, f, p.dark);
+    surf(p.line, &mut q.line, f, p.dark);
+    // night also cools/warms the lamp a touch, matching the canopy sun's mood
+    q.light = if p.dark { p.light } else { lerp_col(p.light, cool_tint(p.light, 0.5), (1.0 - day) * 0.6) };
+    q
+}
+
+/// Per-frame hook (piggybacked on `paint_ambience`): when the 5-minute clock bucket rolls over,
+/// recompute the active palette from the BASE and re-install visuals. Cheap the rest of the time.
+pub fn tick_day_night(ctx: &Context) {
+    let now = day_bucket_now();
+    let prev = DAY_BUCKET.with(|d| d.get());
+    if now != prev {
+        DAY_BUCKET.with(|d| d.set(now));
+        let base = BASE.with(|b| b.get());
+        ACTIVE.with(|a| a.set(day_night_adjust_at(base, daylight01())));
+        install(ctx);
+    }
+}
+
+// ── contrast machinery (markdown legibility on every palette) ────────────────
+//
+// Cloudscape reads because near-black ink on near-white paper has ~15:1 contrast; several other
+// palettes hand markdown colors that fail on THEIR backgrounds (neon cyan inline code on a pale
+// panel, dark ink over dark wood). Instead of hand-retuning 19 palettes, the markdown layer asks
+// for CONTRAST-ENSURED colors: the palette's color, nudged toward black or white (whichever side
+// can actually reach the target ratio against the current background) just far enough to hit a
+// WCAG-style ratio. Palettes keep their identity; text keeps its legibility. Pure + tested
+// across every palette in `PALETTES`.
+
+/// WCAG relative luminance of an sRGB color.
+pub fn rel_luminance(c: Color32) -> f32 {
+    fn lin(u: u8) -> f32 {
+        let s = u as f32 / 255.0;
+        if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+    }
+    0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+}
+
+/// WCAG contrast ratio (≥ 1.0; 21 max).
+pub fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (rel_luminance(a), rel_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// `fg`, nudged toward black or white until it reaches `min` contrast against `bg` (or the best
+/// that side can do). The side is chosen by which pole achieves more contrast against `bg`, so
+/// light palettes darken failing colors and dark palettes lighten them — the hue survives, only
+/// the value moves. Binary search on the blend factor keeps the nudge minimal.
+pub fn ensure_contrast(fg: Color32, bg: Color32, min: f32) -> Color32 {
+    if contrast_ratio(fg, bg) >= min { return fg; }
+    let toward = if contrast_ratio(Color32::WHITE, bg) >= contrast_ratio(Color32::BLACK, bg) { Color32::WHITE } else { Color32::BLACK };
+    if contrast_ratio(toward, bg) < min { return toward; } // bg is mid-grey; give it the pole
+    let (mut lo, mut hi) = (0.0f32, 1.0f32);
+    for _ in 0..12 {
+        let mid = (lo + hi) * 0.5;
+        if contrast_ratio(lerp_col(fg, toward, mid), bg) >= min { hi = mid; } else { lo = mid; }
+    }
+    lerp_col(fg, toward, hi)
+}
+
+/// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the chat background — or the best the background
+/// can support (a true mid-tone surface caps below any fixed target; `ensure_contrast` then
+/// returns the stronger pole).
+pub fn md_ink() -> Color32 { ensure_contrast(INK(), BG(), 4.5) }
+/// Markdown accent (inline code / links), guaranteed ≥ 4.5:1 — the neon-fade fix.
+pub fn md_accent() -> Color32 { ensure_contrast(CYAN(), BG(), 4.5) }
+/// Markdown secondary (bullets, quote text), guaranteed ≥ 4.0:1.
+pub fn md_dim() -> Color32 { ensure_contrast(DIM(), BG(), 4.0) }
+/// Blockquote bar/wash accent, guaranteed ≥ 3.0:1 (a decorative element needs less).
+pub fn md_quote_accent() -> Color32 { ensure_contrast(AMBER(), BG(), 3.0) }
+
 /// The sun for the canopy theme, derived from the real system clock: a low warm sun at dawn/dusk, bright
 /// and near-overhead at noon, dim and cool at night. Returns (shaft direction, colour, intensity 0..1).
 /// Set `SUN_TZ_OFFSET_SECS` to your local UTC offset (e.g. -5*3600 for EST) so noon lines up with midday.
@@ -685,6 +832,7 @@ thread_local! {
 /// `time` is seconds (for the fog drift). Cheap per frame; bakes only on resize/theme change. Draw behind
 /// content, then call `paint_light`. Opaque cards sit on top of all of it.
 pub fn paint_ambience(ctx: &Context, painter: &egui::Painter, rect: egui::Rect, time: f64) {
+    tick_day_night(ctx); // per-frame hook: cheap bucket check; re-adapts the palette as the clock moves
     let p = active();
     if !(p.lit || p.material != Material::None) { return; }
     if rect.width() < 4.0 || rect.height() < 4.0 { return; }
@@ -1617,6 +1765,75 @@ pub fn grid_fit(ui: &mut egui::Ui, min_col_w: f32, gap: f32, count: usize, mut r
         });
         i += row_n;
         ui.add_space(gap);
+    }
+}
+
+#[cfg(test)]
+mod day_night_tests {
+    use super::*;
+
+    #[test]
+    fn daylight_curve_hits_night_and_noon() {
+        assert_eq!(daylight01_at(0.0), 0.0);
+        assert_eq!(daylight01_at(3.0), 0.0);
+        assert!((daylight01_at(12.0) - 1.0).abs() < 1e-5);
+        assert!(daylight01_at(9.0) > 0.5 && daylight01_at(9.0) < 1.0);
+        assert_eq!(daylight01_at(22.0), 0.0);
+    }
+
+    #[test]
+    fn light_palettes_darken_at_night_dark_palettes_lift_by_day() {
+        for p in PALETTES {
+            let night = day_night_adjust_at(*p, 0.0);
+            let noon = day_night_adjust_at(*p, 1.0);
+            let lum = rel_luminance;
+            if p.dark {
+                // vice versa: dark palettes gain a little daylight at noon, untouched at night
+                assert!(lum(noon.bg) >= lum(p.bg), "{} should lift by day", p.name);
+                assert_eq!(night.bg, p.bg, "{} unchanged at night", p.name);
+            } else {
+                // light palettes dim at night, untouched at noon
+                assert!(lum(night.bg) < lum(p.bg), "{} should dim at night", p.name);
+                assert_eq!(noon.bg, p.bg, "{} unchanged at noon", p.name);
+                // the dim is bounded: dark ink still reads on the dimmed surface
+                assert!(contrast_ratio(p.ink, night.bg) >= 4.5, "{} ink stays readable at night ({})", p.name, contrast_ratio(p.ink, night.bg));
+            }
+        }
+    }
+
+    #[test]
+    fn contrast_helpers_and_md_colors_reach_targets_on_every_palette() {
+        assert!((contrast_ratio(Color32::WHITE, Color32::BLACK) - 21.0).abs() < 0.1);
+        assert_eq!(contrast_ratio(Color32::WHITE, Color32::WHITE), 1.0);
+        for p in PALETTES {
+            for day in [0.0f32, 0.5, 1.0] {
+                let q = day_night_adjust_at(*p, day);
+                // a target is only demandable up to what the background can support: the
+                // stronger pole's ratio is the ceiling; ensure_contrast must reach
+                // min(target, ceiling)
+                let demand = |fg: Color32, bg: Color32, target: f32, what: &str| {
+                    let ceiling = contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg));
+                    let got = contrast_ratio(ensure_contrast(fg, bg, target), bg);
+                    assert!(got >= target.min(ceiling) - 0.1, "{} {}: got {got:.2}, target {target}, ceiling {ceiling:.2}", p.name, what);
+                };
+                demand(q.ink, q.bg, 4.5, "ink");
+                demand(q.cyan, q.bg, 4.5, "cyan (neon-fade fix)");
+                demand(q.dim, q.bg, 4.0, "dim");
+                demand(q.amber, q.bg, 3.0, "quote accent");
+                demand(q.ink, q.panel2, 4.5, "ink on panel2");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_contrast_moves_minimally_and_keeps_passing_colors() {
+        let bg = Color32::from_rgb(0xf6, 0xf3, 0xea); // paper
+        let ink = Color32::from_rgb(0x22, 0x1e, 0x18);
+        assert_eq!(ensure_contrast(ink, bg, 6.0), ink); // already passing: untouched
+        let neon = Color32::from_rgb(0x57, 0xd6, 0xc9); // the fading cyan
+        let fixed = ensure_contrast(neon, bg, 4.5);
+        assert!(contrast_ratio(fixed, bg) >= 4.5);
+        assert!(rel_luminance(fixed) < rel_luminance(neon), "on paper the fix darkens");
     }
 }
 
