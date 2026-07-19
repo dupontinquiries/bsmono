@@ -86,6 +86,8 @@ pub const SPECS: &[CmdSpec] = &[
         help: "fold filled Q/A answers back into a focused, targeted generation", example: ":ans" },
     CmdSpec { name: "check", aliases: &["chk"], usage: ":check", arg: ArgKind::None,
         help: "verify the assembled result in the sandbox", example: ":check" },
+    CmdSpec { name: "explore", aliases: &["xp"], usage: ":explore", arg: ArgKind::None,
+        help: "exploratory compilation over the fan: compile each distinct candidate once (batched cache) and keep the best-building one per subtask", example: ":explore" },
     CmdSpec { name: "assemble", aliases: &["asm"], usage: ":assemble", arg: ArgKind::None,
         help: "assemble the selected branches into one artifact", example: ":asm" },
     CmdSpec { name: "fill", aliases: &[], usage: ":fill [path]", arg: ArgKind::Path,
