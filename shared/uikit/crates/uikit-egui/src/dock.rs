@@ -58,18 +58,26 @@ impl<'a> Chip<'a> {
 /// Wraps to a new line if the row doesn't fit (`ui.horizontal_wrapped`). Returns the index of a
 /// clicked chip, if any.
 pub fn chip_row(ui: &mut Ui, chips: &[Chip], height: f32, c: &PaletteColors) -> Option<usize> {
+    chip_row_ex(ui, chips, height, c).0
+}
+
+/// `chip_row` plus every chip's `Response` — for callers that need press/hold state (the keycap
+/// bar's held-arrow auto-repeat) rather than just clicks.
+pub fn chip_row_ex(ui: &mut Ui, chips: &[Chip], height: f32, c: &PaletteColors) -> (Option<usize>, Vec<egui::Response>) {
     let mut clicked = None;
+    let mut responses = Vec::with_capacity(chips.len());
     ui.horizontal_wrapped(|ui| {
         for (i, chip) in chips.iter().enumerate() {
             let w = chip.width_chars as f32 * 8.0 + 22.0;
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, height), Sense::click());
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, height), Sense::click_and_drag());
             let fill = if resp.is_pointer_button_down_on() { c.accent_soft } else if resp.hovered() { c.bg_hover } else { c.bg_raised };
             ui.painter().rect(rect, CornerRadius::same(6), fill, Stroke::new(1.0, c.border), StrokeKind::Inside);
             ui.painter().text(rect.center(), Align2::CENTER_CENTER, chip.label, FontId::proportional(13.0), c.text);
             if resp.clicked() { clicked = Some(i); }
+            responses.push(resp);
         }
     });
-    clicked
+    (clicked, responses)
 }
 
 /// Where a floating action button docks — the bottom-right corner of `content_rect`, overlapping
