@@ -75,7 +75,7 @@ impl Backend for LlamaCpp {
 /// a clear stub so the default build stays light. Burn lives in `burn-probe/` as
 /// a Vulkan correctness oracle, not a shipped backend.
 #[cfg(feature = "wgpu-engine")]
-mod engine {
+pub(crate) mod engine {
     use super::TemplateKind;
     use gpu_kernels::tokenizer::Tokenizer;
     use gpu_kernels::{Gpu, Model, SamplerParams, Session};
@@ -88,7 +88,13 @@ mod engine {
     /// memory (~hundreds of KB per token), so this is the backstop against OOMing the device.
     const MAX_CONTEXT: usize = 32768;
     pub struct Engine {
-        gpu: Gpu, model: Model, tok: Tokenizer, eos: Option<u32>, rng: u64,
+        // gpu / model / tok are shared, read-only-after-load state (RULESET K9: weights never mutate
+        // during inference) — behind `Arc` so `lane()` can derive sibling engines that reuse the SAME
+        // resident weights, device, and pipeline cache. Per-lane state is everything below: the KV
+        // anchors, the rng, the tuner. This is PREWARM.md's "an instance is a session, not a second
+        // copy of the weights", applied to the in-app engine.
+        gpu: std::sync::Arc<Gpu>, model: std::sync::Arc<Model>, tok: std::sync::Arc<Tokenizer>,
+        eos: Option<u32>, rng: u64,
         /// Every token that ends a turn for this model — the GGUF-declared eos plus all stop
         /// specials. The model may emit ANY of them (llama.cpp's EOG set for DeepSeek-R1-Distill is
         /// {128001,128008,128009}); watching only one (the old <|eot_id|> bug) misses the real stop
@@ -315,8 +321,11 @@ mod engine {
                 let probe = gpu.submit_stride_probe(gpu_kernels::SUBMIT_PROFILES);
                 let table: Vec<String> = probe.iter().map(|(c, ms)| format!("{c}:{ms:.0}ms")).collect();
                 let winner = probe.first().map(|&(c, _)| c).unwrap_or(64);
+                // Winner's neighborhood, plus winner/4: the probe ranks by raw speed on synthetic tiny
+                // passes, but the LIVE tuner settles under the per-submit smoothness budget — it needs a
+                // clearly-smoother candidate in its set to fall to when the raw winner's submits run long.
                 let neighborhood: Vec<u32> = gpu_kernels::SUBMIT_PROFILES.iter().cloned()
-                    .filter(|&c| c == winner || c == winner.saturating_mul(2) || c == winner / 2)
+                    .filter(|&c| c == winner || c == winner.saturating_mul(2) || c == winner / 2 || c == winner / 4)
                     .collect();
                 let t = gpu_kernels::SubmitTuner::new(
                     Box::leak(neighborhood.clone().into_boxed_slice()), 2);
@@ -360,9 +369,30 @@ mod engine {
                 }
                 _ => None,
             };
-            Ok(Self { gpu, model, tok, eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, draft })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, draft })
         }
         pub fn template(&self) -> TemplateKind { self.template }
+        /// The loaded model's file basename (log/UI tag).
+        pub fn model_name(&self) -> &str { &self.name }
+        /// Derive a sibling engine that SHARES this one's resident weights, device, and pipeline cache
+        /// (all read-only after load — RULESET K9), with its own KV anchors, rng stream, and log tag.
+        /// This is what makes N concurrent lanes cost N KV caches instead of N model copies: spinning a
+        /// lane is O(ms) (no GGUF read, no dequant, no pipeline compile), and every lane's submits
+        /// interleave on the one shared queue — the submit governor keeps any single lane from
+        /// monopolizing it. Lanes carry NO submit tuner (the primary tunes the shared flush_every, and
+        /// concurrent sweeps would fight) and NO draft model (speculative decode stays a primary-lane
+        /// feature); kv_cap is 1 because a lane runs one linear task, so one warm resume anchor is the
+        /// whole win and the pool's memory stays bounded at ~one KV cache per lane.
+        pub fn lane(&self, n: usize) -> Engine {
+            Engine {
+                gpu: self.gpu.clone(), model: self.model.clone(), tok: self.tok.clone(),
+                eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
+                rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
+                anchors: Vec::new(), kv_cap: 1, warm: self.warm,
+                name: format!("{}#L{n}", self.name),
+                submit_tuner: None, draft: None,
+            }
+        }
 
         /// Token-level generation for a fabric Worker: prefill `prefix`, decode `max_new` tokens with
         /// `temperature`/`seed`, halting on the model's stop set. Tokens in → tokens out, `&self` so
@@ -560,13 +590,17 @@ mod engine {
             if let Some(t) = self.submit_tuner.as_mut() {
                 if produced >= 8 {
                     let spt = secs as f64 / per; // mean seconds per decoded token this turn
+                    let subs_per_tok = (ds as f64 / per).max(1.0).round() as u64; // this turn's submits/token
                     let used = self.gpu.flush_every();
-                    if let Some(chosen) = t.record(spt) {
+                    if let Some(chosen) = t.record(spt, subs_per_tok) {
                         gpu_kernels::store::flush_put(&self.gpu.adapter_name, chosen);
-                        eprintln!("wgpu-engine: submit-tuner SETTLED flush_every={chosen} passes/submit (cached for this GPU); sweep:");
-                        for (f, ms) in t.results() { eprintln!("wgpu-engine:   flush {f:>4} → {:.1} ms/tok", ms * 1000.0); }
+                        let b = t.budget_ms();
+                        let btxt = if b.is_finite() { format!("{b:.0} ms/submit budget") } else { "no submit budget".into() };
+                        eprintln!("wgpu-engine: submit-tuner SETTLED flush_every={chosen} passes/submit ({btxt}; cached for this GPU); sweep:");
+                        for (f, tok, sub) in t.results() { eprintln!("wgpu-engine:   flush {f:>4} → {:.1} ms/tok · {:.1} ms/submit", tok * 1000.0, sub); }
                     } else {
-                        eprintln!("wgpu-engine: submit-tuner sampled flush_every={used} → {:.1} ms/tok ({}/{} candidates done)", spt * 1000.0, t.results().len(), gpu_kernels::SUBMIT_PROFILES.len());
+                        eprintln!("wgpu-engine: submit-tuner sampled flush_every={used} → {:.1} ms/tok · {:.1} ms/submit ({} candidate(s) done)",
+                            spt * 1000.0, spt * 1000.0 / subs_per_tok as f64, t.results().len());
                     }
                     self.gpu.set_flush_every(t.current()); // value for the next reply
                 }
