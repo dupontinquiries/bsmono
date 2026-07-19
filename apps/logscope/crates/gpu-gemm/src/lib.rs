@@ -74,10 +74,19 @@ pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
 const DIMS_RETAIN_CAP: usize = 8192;
+/// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
+/// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
+const DIMS_CACHE_CAP: usize = 4096;
+/// Reusable dims-ring size: how many uniform buffers the cache-full path rotates through. Bounds the
+/// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
+/// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
+/// a slot is never rewritten while an in-flight dispatch still reads it.
+const DIMS_RING_SIZE: usize = 2048;
+/// Fixed uniform-buffer size for every dims buffer (largest dims payload is 16 u32 = 64 bytes; round up).
+const DIMS_BUF_SIZE: u64 = 256;
 /// How many times the retain-cap forced a mid-window poll+free (test/telemetry).
 pub static DIMS_RETAIN_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub fn dims_retain_polls() -> u64 { DIMS_RETAIN_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn dims_cache_hits() -> u64 { DIMS_HITS.load(std::sync::atomic::Ordering::Relaxed) }
+pub fn dims_retain_polls() -> u64 { DIMS_RETAIN_POLLS.load(std::sync::atomic::Ordering::Relaxed) }pub fn dims_cache_hits() -> u64 { DIMS_HITS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 /// Buffer-pool accounting: a MISS is a real `create_buffer` (allocation churn — the other half of
 /// "upload locking"); a HIT recycles a same-size buffer freed by a dropped Tensor. Hardware-independent.
@@ -183,6 +192,10 @@ pub struct Gpu {
     /// "Buffer 'dims' is invalid". Flush points move their keep here instead of dropping it; the next
     /// poll (which waits for GPU completion) clears it. Bounded: cleared every readback.
     pending_keep: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
+    /// Reusable dims-uniform ring (see ring_dims): a fixed set of UNIFORM buffers rewritten in rotation
+    /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
+    /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
+    dims_ring: Mutex<(Vec<std::sync::Arc<wgpu::Buffer>>, usize, usize)>,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -456,7 +469,7 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1090,6 +1103,55 @@ impl Gpu {
     /// Whether LOGSCOPE_FLUSH_EVERY pins the knob (then the tuner should not run).
     pub fn flush_every_pinned(&self) -> bool { std::env::var_os("LOGSCOPE_FLUSH_EVERY").is_some() }
 
+    /// Return a reusable dims UNIFORM buffer holding `dims`, rotating a bounded ring so the total live
+    /// dims-buffer count stays capped (fixes the M4 buffer-count exhaustion). The ring fills lazily to
+    /// DIMS_RING_SIZE; once full it rewrites the oldest slot. Rewriting a slot whose previous use is
+    /// still in-flight would corrupt that dispatch, so when the ring WRAPS (returns to slot 0) we first
+    /// flush the open frame and poll to completion — a rare fence (~once per DIMS_RING_SIZE dispatches)
+    /// that guarantees every slot's prior read is done before it's reused.
+    fn ring_dims(&self, dims: &[u8]) -> std::sync::Arc<wgpu::Buffer> {
+        let mut ring = self.dims_ring.lock().unwrap();
+        let (buffers, next, _writes) = &mut *ring;
+        if buffers.len() < DIMS_RING_SIZE {
+            // still growing the ring — allocate a new reusable slot (bounded by DIMS_RING_SIZE total)
+            let b = std::sync::Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("dims"), size: DIMS_BUF_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false }));
+            self.queue.write_buffer(&b, 0, dims);
+            buffers.push(b.clone());
+            *next = buffers.len() % DIMS_RING_SIZE;
+            return b;
+        }
+        // ring full: reuse slot `next`. If we're about to wrap to slot 0, fence first so no in-flight
+        // dispatch is still reading a slot we're about to overwrite.
+        let idx = *next;
+        if idx == 0 {
+            drop(ring); // release the ring lock before touching the frame/queue
+            self.flush_and_wait();
+            ring = self.dims_ring.lock().unwrap();
+        }
+        let (buffers, next, _writes) = &mut *ring;
+        let b = buffers[idx].clone();
+        self.queue.write_buffer(&b, 0, dims);
+        *next = (idx + 1) % DIMS_RING_SIZE;
+        b
+    }
+    /// Total live dims UNIFORM buffers (content cache + reuse ring). Bounded by DIMS_CACHE_CAP +
+    /// DIMS_RING_SIZE regardless of generation length — the invariant the M4 buffer-count fix rests on.
+    pub fn dims_buffer_count(&self) -> usize {
+        self.dims_cache.lock().unwrap().len() + self.dims_ring.lock().unwrap().0.len()
+    }
+    /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
+    fn flush_and_wait(&self) {
+        if let Some(frame) = self.frame.lock().unwrap().take() {
+            self.submit(frame.enc);
+            self.retain_keep(frame.keep);
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        self.clear_retained();
+    }
+
     /// Move a flushed frame's keep-list into the pending set: buffers referenced by a submitted-
     /// but-not-completed frame must outlive the async GPU work. Drained by `clear_retained` after
     /// the next poll (which waits for completion).
@@ -1181,18 +1243,28 @@ impl Gpu {
                 b.clone()
             } else {
                 DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                // Create WITHOUT mapped_at_creation and fill via the queue. create_buffer_init maps
-                // at creation (get_mapped_range_mut) — on Metal, under memory pressure or a poisoned
-                // device that map ABORTS the process (the "Buffer 'dims' invalid" panic). A plain
-                // create_buffer + write_buffer records a recoverable error instead of aborting, and
-                // is what every other resident upload already uses on non-UMA. Uniform dims are tiny.
-                let b = std::sync::Arc::new(dev.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("dims"), size: (dims.len().max(16)) as u64,
-                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false }));
-                self.queue.write_buffer(&b, 0, dims);
-                if cache.len() < 4096 { cache.insert(dims.to_vec(), b.clone()); }
-                b
+                if cache.len() < DIMS_CACHE_CAP {
+                    // Room in the content cache: stable per-shape dims (linears/attention) live here and
+                    // hit forever after warmup. Create+write once.
+                    let b = std::sync::Arc::new(dev.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("dims"), size: DIMS_BUF_SIZE,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false }));
+                    self.queue.write_buffer(&b, 0, dims);
+                    cache.insert(dims.to_vec(), b.clone());
+                    b
+                } else {
+                    // Cache FULL → per-position dims (sampler abs_step, decode pos) that never repeat.
+                    // Do NOT create a new Metal buffer per dispatch: over a long/windowed generation that
+                    // is thousands of tiny buffer objects and blows past Metal's buffer-count ceiling →
+                    // create_buffer fails → the next write_buffer reports "Buffer 'dims' invalid" (the
+                    // real M4 crash). Instead rewrite a BOUNDED RING of reusable uniform buffers, so the
+                    // total live dims-buffer count is capped forever. The ring is drained/rotated only at
+                    // frame flush boundaries (retain discipline), so a rewrite never races an in-flight
+                    // read of the same slot within a frame.
+                    drop(cache);
+                    self.ring_dims(dims)
+                }
             }
         };
         let n = inputs.len() as u32;
