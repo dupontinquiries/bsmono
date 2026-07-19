@@ -1,0 +1,10 @@
+[package]
+name = "logscope-fan"
+version = "0.1.0"
+edition = "2021"
+description = "logscope's egui-free orchestration core: the coordinator fan-out, enlist/dispatch, verdicts, consensus, and the command language"
+
+# ZERO dependencies, on purpose. Everything in here is std-only (the whole point of the
+# extraction: editing orchestration logic recompiles this crate in seconds, not the 37k-line
+# egui app), and any new dep should be looked at hard before it lands.
+[dependencies]

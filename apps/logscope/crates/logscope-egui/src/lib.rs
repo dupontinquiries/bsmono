@@ -22,18 +22,18 @@ pub mod chat_layout;
 pub mod backend;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;
-#[allow(dead_code)] pub mod consensus;
-#[allow(dead_code)] pub mod vimmode;
-#[allow(dead_code)] pub mod treeexport;
-#[allow(dead_code)] pub mod bestregion;
+pub use logscope_fan::consensus;
+pub use logscope_fan::vimmode;
+pub use logscope_fan::treeexport;
+pub use logscope_fan::bestregion;
 #[allow(dead_code)] pub mod kvtree;
-#[allow(dead_code)] pub mod decompose;
+pub use logscope_fan::decompose;
 #[allow(dead_code)] pub mod devloop;
-#[allow(dead_code)] pub mod enlist;
-#[allow(dead_code)] pub mod dispatch;
-#[allow(dead_code)] pub mod explore;
-#[allow(dead_code)] pub mod ollama;
-#[allow(dead_code)] pub mod bridge;
+pub use logscope_fan::enlist;
+pub use logscope_fan::dispatch;
+pub use logscope_fan::explore;
+pub use logscope_fan::ollama;
+pub use logscope_fan::bridge;
 #[allow(dead_code)] pub mod localexec;
 #[allow(dead_code)] pub mod speculate;
 #[allow(dead_code)] pub mod voicefan;
@@ -47,7 +47,7 @@ pub mod imprint;
 pub mod picking;
 pub mod physui;
 pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
-pub mod stepwise;   // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
+pub use logscope_fan::stepwise; // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
 pub mod docorg; // document-organization convention: front-matter, generated index, branch merge
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
 pub mod assets;
@@ -63,14 +63,14 @@ pub mod voice_intent_de;
 pub mod voice_lang;
 #[allow(dead_code)] pub mod explain;
 #[allow(dead_code)] pub mod ctxplan;
-#[allow(dead_code)] pub mod quest;
-#[allow(dead_code)] pub mod verdict;
+pub use logscope_fan::quest;
+pub use logscope_fan::verdict;
 #[allow(dead_code)] pub mod script;
 #[allow(dead_code)] pub mod runner;
 #[allow(dead_code)] pub mod chatdump;
 #[allow(dead_code)] pub mod refresh;
 #[allow(dead_code)] pub mod prompts;
-#[allow(dead_code)] pub mod cmdpalette;
+pub use logscope_fan::cmdpalette;
 
 // ── GUI + its supporting modules (need egui/eframe/rfd/tree-sitter) ───────────
 #[cfg(feature = "gui")] pub mod analysis;
@@ -98,7 +98,7 @@ pub mod voice_lang;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod palette;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod corpus;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod merge;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod coordinator;
+pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan compiles it standalone)
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod sandbox;
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod walkcam;
