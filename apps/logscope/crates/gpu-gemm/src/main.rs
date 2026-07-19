@@ -4559,8 +4559,13 @@ fn main() {
                 &gpu_kernels::EmbedT::F32(&et), &nc, |t| { toks2.push(t); true });
             gpu.set_flush_every(saved2);
             let retain_polls = gpu_kernels::dims_retain_polls();
-            println!("  big-window + high flush (retain cap must fire): produced {n2} tokens, {retain_polls} retain-polls");
-            check("mid-window retain cap bounds live buffers (poll fired)", if n2 == big2 && retain_polls > 0 { 0.0 } else { 1.0 }, 0.5);
+            let dims_bufs = gpu.dims_buffer_count();
+            println!("  big-window + high flush (retain cap must fire): produced {n2} tokens, {retain_polls} retain-polls, {dims_bufs} live dims buffers");
+            // The M4 crash was Metal running out of buffer OBJECTS because each per-position sampler dims
+            // created a fresh buffer. The reuse ring must cap total dims buffers regardless of how many
+            // tokens/dispatches ran — this is the invariant that actually fixes the crash.
+            let bounded = dims_bufs <= 4096 + 2048; // DIMS_CACHE_CAP + DIMS_RING_SIZE
+            check("dims buffer count bounded (no per-token buffer growth)", if n2 == big2 && bounded { 0.0 } else { 1.0 }, 0.5);
         }
     }
 
