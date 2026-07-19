@@ -81,47 +81,83 @@ pub struct Keycap {
     /// What `handle_input`-equivalent code this sends when tapped (a raw string the terminal/PTY
     /// layer interprets — e.g. "\x1b" for Esc, "\x03" for Ctrl-C).
     pub send: &'static str,
+    /// Auto-repeat while held (the QML rep:true arrows — v0.1.140).
+    pub repeat: bool,
 }
 
 /// The default keycap row (terminal-focused — matches the base screenshot). A web pane in focus
 /// shows more keys (C-r, C-a, C-e, ~, /, -, _) per the reference; callers needing that longer row
 /// can build their own `&[Keycap]` — the rendering function takes a slice, not a fixed set.
 pub const TERMINAL_KEYCAPS: &[Keycap] = &[
-    Keycap { label: "Esc", send: "\x1b" },
-    Keycap { label: "Tab", send: "\t" },
-    Keycap { label: "↑", send: "\x1b[A" },
-    Keycap { label: "↓", send: "\x1b[B" },
-    Keycap { label: "←", send: "\x1b[D" },
-    Keycap { label: "→", send: "\x1b[C" },
-    Keycap { label: "C-c", send: "\x03" },
-    Keycap { label: "C-d", send: "\x04" },
-    Keycap { label: "C-z", send: "\x1a" },
-    Keycap { label: "C-l", send: "\x0c" },
+    Keycap { label: "Esc", send: "\x1b", repeat: false },
+    Keycap { label: "Tab", send: "\t", repeat: false },
+    // v0.1.140: arrows auto-repeat while held — 500 ms initial delay, then ~30/sec
+    Keycap { label: "↑", send: "\x1b[A", repeat: true },
+    Keycap { label: "↓", send: "\x1b[B", repeat: true },
+    Keycap { label: "←", send: "\x1b[D", repeat: true },
+    Keycap { label: "→", send: "\x1b[C", repeat: true },
+    Keycap { label: "C-c", send: "\x03", repeat: false },
+    Keycap { label: "C-d", send: "\x04", repeat: false },
+    Keycap { label: "C-z", send: "\x1a", repeat: false },
+    Keycap { label: "C-l", send: "\x0c", repeat: false },
 ];
+
+/// The QML arrow auto-repeat timing (v0.1.140): held past 500 ms, then a 33 ms cadence.
+pub const REPEAT_DELAY: f64 = 0.5;
+pub const REPEAT_CADENCE: f64 = 0.033;
+
+/// Pure repeat scheduler: given now, when the key was pressed, and when it last emitted,
+/// should a repeat fire this frame? (The initial press emits via the normal click path;
+/// repeats begin only after the delay.)
+pub fn repeat_due(now: f64, held_since: f64, last_emit: f64) -> bool {
+    now - held_since >= REPEAT_DELAY && now - last_emit >= REPEAT_CADENCE
+}
 
 /// The extended row shown when a web/rich pane has focus (adds C-r/C-a/C-e + a few punctuation
 /// keys that are awkward to reach one-handed on touch).
 pub const EXTENDED_KEYCAPS: &[Keycap] = &[
-    Keycap { label: "Esc", send: "\x1b" }, Keycap { label: "Tab", send: "\t" },
-    Keycap { label: "↑", send: "\x1b[A" }, Keycap { label: "↓", send: "\x1b[B" },
-    Keycap { label: "←", send: "\x1b[D" }, Keycap { label: "→", send: "\x1b[C" },
-    Keycap { label: "C-c", send: "\x03" }, Keycap { label: "C-d", send: "\x04" },
-    Keycap { label: "C-z", send: "\x1a" }, Keycap { label: "C-l", send: "\x0c" },
-    Keycap { label: "C-r", send: "\x12" }, Keycap { label: "C-a", send: "\x01" },
-    Keycap { label: "C-e", send: "\x05" }, Keycap { label: "~", send: "~" },
-    Keycap { label: "/", send: "/" }, Keycap { label: "-", send: "-" }, Keycap { label: "_", send: "_" },
+    Keycap { label: "Esc", send: "\x1b", repeat: false }, Keycap { label: "Tab", send: "\t", repeat: false },
+    Keycap { label: "↑", send: "\x1b[A", repeat: true }, Keycap { label: "↓", send: "\x1b[B", repeat: true },
+    Keycap { label: "←", send: "\x1b[D", repeat: true }, Keycap { label: "→", send: "\x1b[C", repeat: true },
+    Keycap { label: "C-c", send: "\x03", repeat: false }, Keycap { label: "C-d", send: "\x04", repeat: false },
+    Keycap { label: "C-z", send: "\x1a", repeat: false }, Keycap { label: "C-l", send: "\x0c", repeat: false },
+    Keycap { label: "C-r", send: "\x12", repeat: false }, Keycap { label: "C-a", send: "\x01", repeat: false },
+    Keycap { label: "C-e", send: "\x05", repeat: false }, Keycap { label: "~", send: "~", repeat: false },
+    Keycap { label: "/", send: "/", repeat: false }, Keycap { label: "-", send: "-", repeat: false }, Keycap { label: "_", send: "_", repeat: false },
 ];
 
 /// Render the bottom keycap bar plus the "Sel · Copy · Paste" hint row beneath it. Returns the
 /// `send` string of a tapped keycap, if any.
 pub fn keycap_bar_ui(ui: &mut Ui, keys: &[Keycap], c: &PaletteColors) -> Option<&'static str> {
     let chips: Vec<Chip> = keys.iter().map(|k| Chip::new(k.label)).collect();
-    let clicked = dock::chip_row(ui, &chips, 30.0, c);
+    let (clicked, responses) = dock::chip_row_ex(ui, &chips, 30.0, c);
+    // held-arrow auto-repeat (v0.1.140): repeat-tagged chips keep emitting while held —
+    // 500 ms delay then 33 ms cadence, state in egui memory per chip
+    let mut repeated: Option<&'static str> = None;
+    let now = ui.input(|i| i.time);
+    for (i, resp) in responses.iter().enumerate() {
+        if !keys[i].repeat {
+            continue;
+        }
+        let id = resp.id.with("kc-rep");
+        if resp.is_pointer_button_down_on() {
+            let (held_since, mut last_emit) =
+                ui.ctx().data_mut(|d| *d.get_temp_mut_or(id, (now, now)));
+            if repeat_due(now, held_since, last_emit) {
+                repeated = Some(keys[i].send);
+                last_emit = now;
+            }
+            ui.ctx().data_mut(|d| d.insert_temp(id, (held_since, last_emit)));
+            ui.ctx().request_repaint(); // poll the hold
+        } else {
+            ui.ctx().data_mut(|d| d.remove::<(f64, f64)>(id));
+        }
+    }
     ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Sel · Copy · Paste").color(c.text_weak).size(11.0));
     });
-    clicked.map(|i| keys[i].send)
+    clicked.map(|i| keys[i].send).or(repeated)
 }
 
 /// Where the mic FAB docks — the bottom-right corner of `terminal_rect`, overlapping its border
@@ -449,6 +485,22 @@ mod tests {
             assert_eq!(snapclone_theme::PaletteId::from_str(&o.id).as_str(), o.id);
         }
         assert!(opts.iter().any(|o| o.id == "voice"));
+    }
+
+    #[test]
+    fn arrow_repeat_waits_500ms_then_fires_at_33ms_cadence() {
+        // before the delay: never
+        assert!(!repeat_due(0.3, 0.0, 0.0));
+        assert!(!repeat_due(0.499, 0.0, 0.0));
+        // past the delay: fires, then respects the cadence
+        assert!(repeat_due(0.5, 0.0, 0.0));
+        assert!(!repeat_due(0.52, 0.0, 0.5)); // 20ms since last emit < 33ms
+        assert!(repeat_due(0.534, 0.0, 0.5));
+        // the repeat-tagged keys are exactly the arrows, in both keycap sets
+        for set in [TERMINAL_KEYCAPS, EXTENDED_KEYCAPS] {
+            let arrows: Vec<&str> = set.iter().filter(|k| k.repeat).map(|k| k.label).collect();
+            assert_eq!(arrows, ["↑", "↓", "←", "→"]);
+        }
     }
 
     #[test]
