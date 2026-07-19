@@ -191,16 +191,18 @@ pub fn ring_slot(streamed_index: u32, ring_slots: u32) -> u32 { streamed_index %
 /// residency the GPU then can't allocate (the "70B → Failed to allocate BO VMA" crash). Takes the smaller
 /// of the RAM budget and this cap. `LOGSCOPE_MAX_GPU_GB` overrides; otherwise a conservative fraction of RAM
 /// that the loader's OOM-downgrade ladder tightens further at runtime.
-pub fn gpu_buffer_budget(ram_budget: u64) -> u64 {
+/// `conservative_vma` = the Asahi/Honeykrisp case (Vulkan on an Apple GPU): that driver's BO-VMA ceiling
+/// is far below what it advertises — a 40.3 GiB q4-70B and a ~31 GiB MoE-int8 both passed a 48 GiB cap and
+/// then died in BO VMA allocation mid-upload — so it gets a 24 GiB cap that keeps every observed-working
+/// load in and pushes oversized ones to q4/refusal up front. This is a PLATFORM fact, not a policy: Metal
+/// (macOS) has no such ceiling and gets the standard 48 GiB cap so bigger residencies (q4-70B) stay
+/// reachable there. LOGSCOPE_MAX_GPU_GB overrides everything.
+pub fn gpu_buffer_budget(ram_budget: u64, conservative_vma: bool) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
     }
-    // conservative default: half of RAM budget, capped at 24 GiB. Empirical (M2 Ultra Asahi/Honeykrisp):
-    // a 40.3 GiB q4-70B and a ~31 GiB MoE-int8 BOTH passed the old 48 GiB cap and then died in BO VMA
-    // allocation mid-upload — the driver's addressable-buffer ceiling is well below what it advertises.
-    // 24 GiB keeps every observed-working load in and pushes oversized ones to q4/refusal up front.
-    // Boxes that can take more (macOS/Metal) override with LOGSCOPE_MAX_GPU_GB.
-    (ram_budget / 2).min((24.0 * GIB) as u64)
+    let cap = if conservative_vma { 24.0 } else { 48.0 };
+    (ram_budget / 2).min((cap * GIB) as u64)
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -317,13 +319,16 @@ mod tests {
         // 170 GiB of RAM (M2 Ultra) → GPU budget capped at 48 GiB, so a 70B-int8 (~70 GiB) is rejected up
         // front instead of crashing the driver mid-upload.
         let ram = (170.0 * GIB) as u64;
-        let gpu = gpu_buffer_budget(ram);
+        let gpu = gpu_buffer_budget(ram, false);
         assert!(gpu <= (48.0 * GIB) as u64 && gpu < ram, "GPU budget {} capped below RAM {}", gib(gpu), gib(ram));
+        // the Asahi VMA clamp is PLATFORM-scoped: Vulkan-on-Apple gets 24 GiB, Metal keeps 48
+        assert_eq!(gpu_buffer_budget(ram, true), (24.0 * GIB) as u64);
+        assert_eq!(gpu_buffer_budget(ram, false), (48.0 * GIB) as u64);
         assert!(fitting_residencies(&llama_70b(), gpu, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8),
                 "under the GPU budget the 70B won't attempt int8");
         // explicit override wins
         std::env::set_var("LOGSCOPE_MAX_GPU_GB", "96");
-        assert_eq!(gpu_buffer_budget(ram), (96.0 * GIB) as u64);
+        assert_eq!(gpu_buffer_budget(ram, true), (96.0 * GIB) as u64);
         std::env::remove_var("LOGSCOPE_MAX_GPU_GB");
     }
 

@@ -161,13 +161,15 @@ pub enum LoopAction {
 #[derive(Clone, Debug)]
 pub struct LoopGuard {
     recent_sigs: Vec<u64>,
+    /// path-hash → (last content-hash, write count) for the file-write churn guard.
+    writes: std::collections::HashMap<u64, (u64, u32)>,
     strikes: usize,
     max_strikes: usize,
     keep: usize,
 }
 
 impl Default for LoopGuard {
-    fn default() -> Self { Self { recent_sigs: Vec::new(), strikes: 0, max_strikes: 3, keep: 6 } }
+    fn default() -> Self { Self { recent_sigs: Vec::new(), writes: std::collections::HashMap::new(), strikes: 0, max_strikes: 3, keep: 6 } }
 }
 
 impl LoopGuard {
@@ -185,6 +187,32 @@ impl LoopGuard {
             h = h.wrapping_mul(0x100_0000_01b3);
         }
         h
+    }
+
+    /// Record a strike from an external detector (e.g. the file-write churn guard) so it escalates on the
+    /// same counter as text/action repeats.
+    pub fn note_strike(&mut self) -> LoopAction {
+        self.strikes += 1;
+        if self.strikes >= self.max_strikes { LoopAction::Abort } else { LoopAction::Proceed }
+    }
+
+    /// File-write churn guard — catches the loop the text/action signature CANNOT: a model rewriting the
+    /// same path every turn with slightly different prose around it (text differs → signature differs →
+    /// no repeat detected → "writes files multiple times forever, even if coherent"). Two triggers:
+    /// an IDENTICAL rewrite (semantic no-op — the model re-emitted a file it already wrote), or the same
+    /// path written `4+` times in one run regardless of content (churn). Returns a nudge message when hit.
+    pub fn observe_write(&mut self, path: &str, contents: &str) -> Option<&'static str> {
+        let ph = Self::signature(path, "");
+        let ch = Self::signature(contents, "");
+        let e = self.writes.entry(ph).or_insert((0u64, 0u32));
+        e.1 += 1;
+        let identical = e.0 == ch && e.1 > 1;
+        e.0 = ch;
+        if identical {
+            Some("You re-wrote a file with IDENTICAL contents to what it already has. That is a no-op loop. Do not write this file again — verify it (list/read/build), move to the next step, or reply TASK_COMPLETE.")
+        } else if e.1 >= 4 {
+            Some("You have rewritten the same file 4+ times this run. Stop churning it: verify the current contents (read/build/test), then take a DIFFERENT step or reply TASK_COMPLETE.")
+        } else { None }
     }
 
     /// Observe a completed turn. `action_sig` distinguishes what the turn DID (e.g. the tool calls it made,
@@ -219,6 +247,24 @@ impl LoopGuard {
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod write_guard_tests {
+    use super::*;
+    #[test]
+    fn identical_rewrite_and_churn_flagged() {
+        let mut g = LoopGuard::default();
+        assert!(g.observe_write("src/lib.rs", "fn a(){}").is_none(), "first write is fine");
+        assert!(g.observe_write("src/lib.rs", "fn a(){}").is_some(), "identical rewrite = no-op loop");
+        assert!(g.observe_write("src/lib.rs", "fn b(){}").is_none(), "changed content, 3rd write, below churn cap");
+        assert!(g.observe_write("src/lib.rs", "fn c(){}").is_some(), "4th write = churn even with new content");
+        assert!(g.observe_write("src/main.rs", "fn main(){}").is_none(), "other paths unaffected");
+        // strikes escalate through the same counter
+        let mut g2 = LoopGuard::new(2);
+        assert!(matches!(g2.note_strike(), LoopAction::Proceed));
+        assert!(matches!(g2.note_strike(), LoopAction::Abort));
+    }
+}
 
 #[cfg(test)]
 mod tests {
