@@ -4543,20 +4543,24 @@ fn main() {
             println!("  big-window (k={big}, one frame): produced {n} tokens, no dims-buffer invalidation");
             check("big-window dims-cache overflow survives one giant frame", if n == big && toks.len() == big { 0.0 } else { 1.0 }, 0.5);
 
-            // The ACTUAL M4 crash sequence: a LOW flush fires mid-window submits whose keep-buffers
-            // (dims uniforms) must survive until the end-of-window download maps its staging buffer.
-            // Before the retain-until-poll fix, those buffers were dropped at flush → recycled →
-            // "Buffer 'dims' is invalid" when the readback mapped. Force it: big window, small flush.
+            // The ACTUAL M4 crash sequence: stream_session_window pins flush VERY HIGH (65536) to
+            // batch the whole window into one frame — so the pass-budget flush never fires, and the
+            // window's tens of thousands of unique (uncached) dims uniforms would all stay live until
+            // its single readback, exhausting Metal's uniform pool → "Buffer 'dims' invalid". The
+            // retain-cap poll (fires on keep-list size, independent of flush) must keep live buffers
+            // bounded AND the run must complete + match. Force it: high flush, big window.
             let saved2 = gpu.flush_every();
-            gpu.set_flush_every(37); // < one token's dispatches → many mid-window flushes
-            let mut s2 = gpu.session_new(&m3, prompt.len() + big + 2, 456);
+            gpu.set_flush_every(65536); // as the windowed path pins it — pass-budget flush disabled
+            let big2 = 3000usize;       // enough per-slot dims to cross DIMS_RETAIN_CAP mid-window
+            let mut s2 = gpu.session_new(&m3, prompt.len() + big2 + 2, 456);
             gpu.session_prefill(&m3, &mut s2, &prompt);
             let mut seen2 = prompt.to_vec(); let mut rng2 = 456u64; let mut toks2 = Vec::new();
-            let n2 = gpu.stream_session_window(&m3, &mut s2, &mut seen2, big, None, &sp, &mut rng2, big,
+            let n2 = gpu.stream_session_window(&m3, &mut s2, &mut seen2, big2, None, &sp, &mut rng2, big2,
                 &gpu_kernels::EmbedT::F32(&et), &nc, |t| { toks2.push(t); true });
             gpu.set_flush_every(saved2);
-            println!("  big-window + low flush (mid-window submits): produced {n2} tokens, keep-buffers survived to readback");
-            check("mid-window flush keep-buffers survive to readback", if n2 == big { 0.0 } else { 1.0 }, 0.5);
+            let retain_polls = gpu_kernels::dims_retain_polls();
+            println!("  big-window + high flush (retain cap must fire): produced {n2} tokens, {retain_polls} retain-polls");
+            check("mid-window retain cap bounds live buffers (poll fired)", if n2 == big2 && retain_polls > 0 { 0.0 } else { 1.0 }, 0.5);
         }
     }
 
