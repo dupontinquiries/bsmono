@@ -4542,6 +4542,21 @@ fn main() {
             gpu.set_flush_every(saved);
             println!("  big-window (k={big}, one frame): produced {n} tokens, no dims-buffer invalidation");
             check("big-window dims-cache overflow survives one giant frame", if n == big && toks.len() == big { 0.0 } else { 1.0 }, 0.5);
+
+            // The ACTUAL M4 crash sequence: a LOW flush fires mid-window submits whose keep-buffers
+            // (dims uniforms) must survive until the end-of-window download maps its staging buffer.
+            // Before the retain-until-poll fix, those buffers were dropped at flush → recycled →
+            // "Buffer 'dims' is invalid" when the readback mapped. Force it: big window, small flush.
+            let saved2 = gpu.flush_every();
+            gpu.set_flush_every(37); // < one token's dispatches → many mid-window flushes
+            let mut s2 = gpu.session_new(&m3, prompt.len() + big + 2, 456);
+            gpu.session_prefill(&m3, &mut s2, &prompt);
+            let mut seen2 = prompt.to_vec(); let mut rng2 = 456u64; let mut toks2 = Vec::new();
+            let n2 = gpu.stream_session_window(&m3, &mut s2, &mut seen2, big, None, &sp, &mut rng2, big,
+                &gpu_kernels::EmbedT::F32(&et), &nc, |t| { toks2.push(t); true });
+            gpu.set_flush_every(saved2);
+            println!("  big-window + low flush (mid-window submits): produced {n2} tokens, keep-buffers survived to readback");
+            check("mid-window flush keep-buffers survive to readback", if n2 == big { 0.0 } else { 1.0 }, 0.5);
         }
     }
 
