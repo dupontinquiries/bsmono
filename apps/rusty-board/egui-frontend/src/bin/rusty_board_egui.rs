@@ -6,11 +6,16 @@
 //! Run:  cargo run --bin rusty-board-egui --features app   (from apps/rusty-board/egui-frontend)
 
 use eframe::egui;
+use rusty_board_egui::real_layout::{Press, RealBoard};
 use rusty_board_egui::{apply_theme, keyboard_ui, Board};
 use uikit_egui::Adaptive;
 
 struct Feel {
     board: Board,
+    /// The REAL layout files (resources/layouts/*.json), with shift/caps + the symbols toggle —
+    /// shown when the sidebar's real-layout tabs are active (indices past the demo layouts).
+    real: RealBoard,
+    real_active: bool,
     typed: String,
 }
 
@@ -46,16 +51,44 @@ impl eframe::App for Feel {
             ui.horizontal(|ui| {
                 let sidebar_w = 64.0_f32.max(adaptive.min_touch_target * 1.3);
                 ui.allocate_ui(egui::vec2(sidebar_w, ui.available_height()), |ui| {
-                    let names = self.board.layout_names();
+                    // demo layouts first, then the REAL layout files (shift/symbols live)
+                    let mut names: Vec<String> = self.board.layout_names().iter().map(|s| s.to_string()).collect();
+                    let demo_n = names.len();
+                    for f in &self.real.files {
+                        if f.name != "symbols" { // symbols is reached via the ?123 key, not a tab
+                            names.push(format!("{} ⌨", f.display_name));
+                        }
+                    }
                     let tabs: Vec<uikit_egui::vertical_tabs::Tab> = names.iter().map(|n| uikit_egui::vertical_tabs::Tab::new(n)).collect();
+                    let sel = if self.real_active { demo_n + self.real.active.min(1) } else { self.board.layout_index() };
                     let colors = uikit_egui::palette_colors(self.board.palette());
-                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, self.board.layout_index(), adaptive.min_touch_target, &colors) {
-                        self.board.set_layout(i);
+                    if let Some(i) = uikit_egui::vertical_tabs::show(ui, &tabs, sel, adaptive.min_touch_target, &colors) {
+                        if i < demo_n {
+                            self.real_active = false;
+                            self.board.set_layout(i);
+                        } else {
+                            self.real_active = true;
+                            self.real.active = i - demo_n; // qwerty=0, dvorak=1 (symbols excluded)
+                            self.real.shift = rusty_board_egui::real_layout::Shift::Off;
+                        }
                     }
                 });
                 ui.separator();
                 ui.vertical(|ui| {
-                    if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
+                    if self.real_active {
+                        // the real layout files: render via the projection, feed emissions through
+                        // the board's state machine (shift/symbols absorbed), act on the rest
+                        let render = self.real.render();
+                        if let Some(e) = keyboard_ui(ui, &render, &adaptive, self.board.palette()) {
+                            match self.real.press(&e) {
+                                Some(Press::Text(t)) => self.typed.push_str(&t),
+                                Some(Press::Backspace) => { self.typed.pop(); }
+                                Some(Press::Return) => self.typed.push('\n'),
+                                Some(Press::Voice) | None => {}
+                                Some(_) => {}
+                            }
+                        }
+                    } else if let Some(e) = keyboard_ui(ui, self.board.current(), &adaptive, self.board.palette()) {
                         if e == "\u{8}" {
                             self.typed.pop();
                         } else {
@@ -72,6 +105,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "rusty-board · feel",
         eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(Feel { board: Board::new(), typed: String::new() }))),
+        Box::new(|_cc| Ok(Box::new(Feel { board: Board::new(), real: RealBoard::new(), real_active: false, typed: String::new() }))),
     )
 }
