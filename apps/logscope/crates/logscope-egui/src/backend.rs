@@ -123,6 +123,11 @@ pub(crate) mod engine {
         /// Adapts passes-per-submit across replies (sweeps SUBMIT_PROFILES, settles on the fastest by
         /// per-token decode time, caches it). None when env-pinned, cached, or autotune is disabled.
         submit_tuner: Option<gpu_kernels::SubmitTuner>,
+        /// Int8-resident embedding table, built lazily on the first windowed sampled decode
+        /// (`LOGSCOPE_SAMPLE_WINDOW`, default 4): the GPU-side row gather that keeps a whole sample→
+        /// embed→decode window on-device. ~350 MB for a 151k×2048 vocab (vs 1.2 GB f32); skipped
+        /// entirely when the window is disabled or the sampler is ineligible.
+        embed_q8: Option<gpu_kernels::QWeight>,
         /// Optional small DRAFT model for speculative decoding (opt-in via `LOGSCOPE_SPEC_DRAFT`).
         /// When present, `generate` routes through the engine's `speculative_generate_stats`: the
         /// draft proposes a block of tokens that the target verifies in ONE forward — bit-exact to
@@ -369,7 +374,7 @@ pub(crate) mod engine {
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, draft })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, embed_q8: None, draft })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -390,7 +395,7 @@ pub(crate) mod engine {
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, warm: self.warm,
                 name: format!("{}#L{n}", self.name),
-                submit_tuner: None, draft: None,
+                submit_tuner: None, embed_q8: None, draft: None,
             }
         }
 
@@ -517,6 +522,21 @@ pub(crate) mod engine {
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
+            // Windowed SAMPLED decode (LOGSCOPE_SAMPLE_WINDOW, default 4; 0 disables): the whole
+            // sample→embed→decode cycle stays on-device for k tokens per readback — no per-token
+            // full-vocab logits sync and no per-token O(v·log v) CPU sort. Eligibility mirrors the
+            // SAMPLE_AT host contract (temperature > 0, 2 ≤ top_k ≤ 64); anything else takes the
+            // per-token path unchanged. The int8 embed table it gathers from is built ONCE, lazily.
+            let sample_win = std::env::var("LOGSCOPE_SAMPLE_WINDOW").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+            let windowed = sample_win >= 2 && sp.temperature > 0.0 && (2..=64).contains(&sp.top_k);
+            if windowed && self.embed_q8.is_none() {
+                let tq = Instant::now();
+                self.embed_q8 = Some(self.gpu.embed_q8(&self.model));
+                eprintln!("wgpu-engine: [{}] windowed sampling ON (k={sample_win}) — int8 embed table resident ({:.0} MiB, {:.2}s)",
+                    self.name, (self.model.vocab * self.model.d) as f32 / (1024.0 * 1024.0), tq.elapsed().as_secs_f32());
+            }
+            let embed_q8 = self.embed_q8.as_ref();
             let (gpu, model, tok, eos, stop) = (&self.gpu, &self.model, &self.tok, self.eos, &self.stop_ids);
             // Diagnostic: which stop token (if any) ended the stream, captured from the decode callback —
             // distinguishes "model emitted im_end/eot early" from "hit the cap / runaway guard / cancel".
@@ -528,7 +548,7 @@ pub(crate) mod engine {
                 let mut seen = prompt_ids.clone();
                 let mut pending: Vec<u8> = Vec::new();
                 let mut recent = String::new(); // tail of generated text, for the runaway guard
-                let p = gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, |next| {
+                let step = |next: u32| {
                     if stop.contains(&next) { stop_tok.set(Some(next)); return false; }   // halt on ANY stop token, not just primary eos
                     if tok.is_special(next) { return true; }     // other specials: swallow, keep going
                     pending.extend_from_slice(&tok.decode_bytes(&[next]));
@@ -549,7 +569,12 @@ pub(crate) mod engine {
                     }
                     if crate::genguard::runaway_stop(&recent, 0.5) != crate::genguard::StopReason::None { return false; }
                     cont
-                });
+                };
+                let p = match (windowed, embed_q8) {
+                    (true, Some(eq)) => gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
+                                                                  &gpu_kernels::EmbedT::Q8(eq), cancel, step),
+                    _ => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
+                };
                 if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
                 p
             };

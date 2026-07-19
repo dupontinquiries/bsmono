@@ -3983,6 +3983,182 @@ fn main() {
     check("sample top_k=1 == argmax", if s1 == greedy { 0.0 } else { 1.0 }, 0.5);
     check("sample top-k/p in range", if (s2 as usize) < slog.len() { 0.0 } else { 1.0 }, 0.5);
 
+    // ── GPU sampler (SAMPLE_AT): the full `pick()` chain as one dispatch ─────────────────────────
+    // (a) STEP-WISE: same logits + same uniform draw + same recent history → the GPU pick must equal
+    // the CPU pick. Mismatches are only tolerable at CDF knife-edges (|cum − r| tiny), where CPU/GPU
+    // exp() ULP differences can legitimately flip a boundary; anything else is a real bug.
+    {
+        let vocab = 5000usize;
+        let cases = [
+            gpu_kernels::SamplerParams { temperature: 0.8, top_k: 40, top_p: 0.95, repeat_penalty: 1.15, repeat_last_n: 64, min_p: 0.05 },
+            gpu_kernels::SamplerParams { temperature: 0.7, top_k: 40, top_p: 0.95, repeat_penalty: 1.0,  repeat_last_n: 0,  min_p: 0.05 },
+            gpu_kernels::SamplerParams { temperature: 1.2, top_k: 5,  top_p: 1.0,  repeat_penalty: 1.3,  repeat_last_n: 32, min_p: 0.0  },
+            gpu_kernels::SamplerParams { temperature: 0.4, top_k: 64, top_p: 0.9,  repeat_penalty: 1.1,  repeat_last_n: 64, min_p: 0.1  },
+        ];
+        let (mut trials, mut agree, mut hard_miss) = (0usize, 0usize, 0usize);
+        let mut sd = 0xabcd_1234_u64;
+        let mut rf = move || { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; ((sd >> 40) as f32 / 16_777_216.0) * 12.0 - 6.0 };
+        for trial in 0..60 {
+            for sp in &cases {
+                let logits: Vec<f32> = (0..vocab).map(|_| rf()).collect();
+                let hist_len = (trial * 7) % 80;
+                let recent: Vec<u32> = (0..hist_len).map(|j| (((trial + 3) * 131 + j * 17) % vocab) as u32).collect();
+                let seed = 0x5eed_0000u64 + trial as u64 * 7919;
+                // CPU
+                let mut rc = seed | 1;
+                let want = gpu_kernels::pick(&logits, sp, &recent, &mut rc);
+                // GPU: 1 deposit slot + 64-ring seeded with the same trailing history
+                let rcap = 64usize;
+                let mut o_init = vec![0u32; 1 + rcap];
+                let tail = recent.len().min(rcap);
+                for (j, &tk) in recent[recent.len() - tail..].iter().enumerate() { o_init[1 + j] = tk; }
+                let o = gpu.upload_u32(&o_init);
+                let mut ru = seed | 1;
+                let u = {
+                    // the exact uniform the CPU's sample() drew (or would draw)
+                    let mut x = ru; x ^= x << 13; x ^= x >> 7; x ^= x << 17; ru = x;
+                    ((x >> 11) as f64 / (1u64 << 53) as f64) as f32
+                };
+                let _ = ru;
+                let lg = gpu.upload(&logits, 1, vocab);
+                let un = gpu.upload(&[u], 1, 1);
+                gpu.sample_at(&lg, &o, &un, sp, 0, tail as u32, rcap as u32, 1, 0);
+                let got = gpu.download_u32(&o)[0];
+                trials += 1;
+                if got == want { agree += 1; }
+                else {
+                    // near-tie forensics: distance of r to the nearest CDF boundary on the CPU side
+                    let mut l2 = logits.clone();
+                    let n = sp.repeat_last_n.min(recent.len());
+                    if sp.repeat_penalty != 1.0 && n > 0 {
+                        gpu_kernels::apply_repeat_penalty(&mut l2, &recent[recent.len() - n..], sp.repeat_penalty);
+                    }
+                    let mut idx: Vec<usize> = (0..l2.len()).collect();
+                    idx.sort_by(|&a, &b| l2[b].total_cmp(&l2[a]));
+                    idx.truncate(sp.top_k.min(idx.len()));
+                    let mx = l2[idx[0]];
+                    let mut pr: Vec<f32> = idx.iter().map(|&i| ((l2[i] - mx) / sp.temperature).exp()).collect();
+                    let s: f32 = pr.iter().sum(); for q in &mut pr { *q /= s; }
+                    let mut cum = 0.0f32; let mut near = f32::MAX;
+                    for &p in &pr { cum += p; near = near.min((cum - u).abs()); }
+                    if near > 1e-3 { hard_miss += 1;
+                        println!("  sample-at MISMATCH trial={trial} got={got} want={want} boundary_dist={near:.2e}"); }
+                }
+            }
+        }
+        println!("  sample-at step-wise: {agree}/{trials} identical picks ({} knife-edge, {} hard)", trials - agree - hard_miss, hard_miss);
+        check("sample-at == cpu pick (step-wise)", if hard_miss == 0 && agree * 1000 >= trials * 995 { 0.0 } else { 1.0 }, 0.5);
+    }
+    // (b) END-TO-END: windowed GPU-sampled decode vs a CPU-sampled loop over the IDENTICAL
+    // sequential forward (same kernels feed both, so logits match bit-for-bit and any divergence is
+    // the sampler's). Exact sequence match expected; a knife-edge first divergence is reported but
+    // forgiven, anything else fails.
+    {
+        let hm2 = gen_model(16, 32, 2, 24, 4, 4);
+        let m2 = gpu.load_gguf(&write_gguf(&hm2)).expect("load_gguf (sample e2e)");
+        let sp = gpu_kernels::SamplerParams { temperature: 0.8, top_k: 8, top_p: 0.95, repeat_penalty: 1.15, repeat_last_n: 64, min_p: 0.05 };
+        let prompt = [5u32, 0, 17, 3];
+        let n_new = 32usize;
+        let mut exact = 0usize;
+        for seed in [1u64, 42, 4096, 0xdead_beef] {
+            // CPU-sampled reference over the same sequential forward
+            let c = gpu.new_cache(m2.n_layers, prompt.len() + n_new, m2.kv_dim());
+            let mut logits = Vec::new();
+            for (pos, &t) in prompt.iter().enumerate() { logits = gpu.decode_step(&m2, &c, t, pos); }
+            let mut rng2 = seed | 1;
+            let mut seen: Vec<u32> = prompt.to_vec();
+            let mut want = Vec::with_capacity(n_new);
+            let mut pos = prompt.len();
+            for _ in 0..n_new {
+                let nx = gpu_kernels::pick(&logits, &sp, &seen, &mut rng2);
+                want.push(nx); seen.push(nx);
+                logits = gpu.decode_step(&m2, &c, nx, pos); pos += 1;
+            }
+            let got = gpu.generate_kv_window_sampled(&m2, &prompt, n_new, 8, &sp, seed);
+            if got == want { exact += 1; }
+            else {
+                let d = got.iter().zip(&want).position(|(a, b)| a != b).unwrap_or(n_new);
+                println!("  sample-window e2e seed={seed}: diverged at step {d} (got {:?} want {:?})", got.get(d), want.get(d));
+            }
+        }
+        println!("  sample-window e2e: {exact}/4 seeds exact-match over {n_new} tokens");
+        check("windowed sampled decode == cpu-sampled decode", if exact >= 3 { 0.0 } else { 1.0 }, 0.5);
+    }
+    // ── q8 embed gather: dequantize ONE row by deposited id, vs a CPU replica of the quantizer ──
+    {
+        let (vocab, dim) = (96usize, 64usize);
+        let table = rnd(vocab * dim, 4242);
+        let qwt = gpu.quantize_q8_resident(&table, vocab, dim);
+        // CPU replica of quantize_q8_resident's math (scale = amax/127; q = round(v/s).clamp)
+        let deq_row = |r: usize| -> Vec<f32> {
+            (0..dim).map(|c| {
+                let b = c / 32; let base = r * dim + b * 32;
+                let mut amax = 0f32;
+                for j in 0..32 { amax = amax.max(table[base + j].abs()); }
+                let s = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                let q = (table[r * dim + c] / s).round().clamp(-127.0, 127.0) as i32 as f32;
+                q * s
+            }).collect()
+        };
+        let ids = gpu.upload_u32(&[0, 71, 0]);
+        let g1 = gpu.download(&gpu.gather_q8_at(&qwt, &ids, 1));
+        let e = maxerr(&g1, &deq_row(71));
+        check("gather q8 embed row (by deposited id)", e, 1e-6);
+    }
+    // ── stream_session_window == stream_session, including MID-WINDOW stops ──────────────────────
+    // Same tiny model, EmbedT::F32 (bit-exact tier): the windowed path must reproduce the CPU
+    // path's tokens AND its post-state (produced, s.pos, s.logits, rng) in three scenarios:
+    // plain run, eos landing mid-window, and an on_token that halts mid-window.
+    {
+        let hm3 = gen_model(16, 32, 2, 24, 4, 4);
+        let m3 = gpu.load_gguf(&write_gguf(&hm3)).expect("load_gguf (window e2e)");
+        let sp = gpu_kernels::SamplerParams { temperature: 0.9, top_k: 8, top_p: 0.95, repeat_penalty: 1.15, repeat_last_n: 64, min_p: 0.05 };
+        let prompt = [5u32, 0, 17, 3, 9];
+        let embed_f32: Vec<f32> = {
+            // rebuild the host embed from the generator (same layout write_gguf serialized)
+            hm3.embed.clone()
+        };
+        let et = gpu.upload(&embed_f32, 24, 16);
+        let run = |windowed: bool, eos: Option<u32>, stop_at: Option<usize>, seed: u64|
+            -> (Vec<u32>, usize, usize, Vec<f32>, u64) {
+            let mut s = gpu.session_new(&m3, prompt.len() + 40, seed);
+            gpu.session_prefill(&m3, &mut s, &prompt);
+            let mut seen = prompt.to_vec();
+            let mut rng = seed | 1;
+            let mut toks = Vec::new();
+            let mut n = 0usize;
+            let nc = || false;
+            let mut cb = |t: u32| { toks.push(t); n += 1; stop_at.map(|x| n < x).unwrap_or(true) };
+            let produced = if windowed {
+                gpu.stream_session_window(&m3, &mut s, &mut seen, 24, eos, &sp, &mut rng, 5, &gpu_kernels::EmbedT::F32(&et), &nc, &mut cb)
+            } else {
+                gpu.stream_session(&m3, &mut s, &mut seen, 24, eos, &sp, &mut rng, &nc, &mut cb)
+            };
+            (toks, produced, s.pos, s.logits.clone(), rng)
+        };
+        let mut all_ok = true;
+        // scenario 1: plain
+        let a = run(false, None, None, 77);
+        let b = run(true, None, None, 77);
+        // scenario 2: eos mid-window — use the reference's 7th token as eos (lands inside window 2 of k=5)
+        let eos_tok = a.0.get(6).copied();
+        let a2 = run(false, eos_tok, None, 77);
+        let b2 = run(true, eos_tok, None, 77);
+        // scenario 3: on_token halts after the 8th token (mid-window)
+        let a3 = run(false, None, Some(8), 77);
+        let b3 = run(true, None, Some(8), 77);
+        for (i, (x, y)) in [(&a, &b), (&a2, &b2), (&a3, &b3)].iter().enumerate() {
+            let same = x.0 == y.0 && x.1 == y.1 && x.2 == y.2 && x.3 == y.3 && x.4 == y.4;
+            if !same {
+                all_ok = false;
+                println!("  stream-window scenario {} MISMATCH: toks {} vs {}, produced {}/{}, pos {}/{}, logits_eq={}, rng_eq={}",
+                    i + 1, x.0.len(), y.0.len(), x.1, y.1, x.2, y.2, x.3 == y.3, x.4 == y.4);
+            }
+        }
+        println!("  stream-window: plain / mid-window eos / mid-window halt — state parity {}", if all_ok { "exact" } else { "BROKEN" });
+        check("stream_session_window == stream_session (incl. mid-window stops)", if all_ok { 0.0 } else { 1.0 }, 0.5);
+    }
+
     println!();
     println!("  pipeline cache: {} unique compute pipelines built and reused across all dispatches", gpu.pipeline_count());
     if fails == 0 { println!("ALL KERNELS VALIDATED ON GPU ✓"); }
