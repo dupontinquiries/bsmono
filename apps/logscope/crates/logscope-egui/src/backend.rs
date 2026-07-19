@@ -405,6 +405,25 @@ pub(crate) mod engine {
             }
         }
 
+        /// Windowed sampled decode: is it eligible for `sp`, and how big a window? Shared by BOTH
+        /// the fresh-prompt path (`generate`) and the warm-resume path (`continue_last`) so they can
+        /// never drift — the auto-continue silently reverting to token-by-token (36 submits/token on
+        /// Metal, where encoder setup is the whole wall) was exactly that drift. Builds the int8
+        /// embed table lazily on first eligible use. Returns the window size, or None to take the
+        /// per-token path. Eligibility mirrors SAMPLE_AT's host contract (temp>0, 2≤top_k≤64).
+        fn windowed_ready(&mut self, sp: &SamplerParams) -> Option<usize> {
+            let sample_win = std::env::var("LOGSCOPE_SAMPLE_WINDOW").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+            if !(sample_win >= 2 && sp.temperature > 0.0 && (2..=64).contains(&sp.top_k)) { return None; }
+            if self.embed_q8.is_none() {
+                let tq = Instant::now();
+                self.embed_q8 = Some(self.gpu.embed_q8(&self.model));
+                eprintln!("wgpu-engine: [{}] windowed sampling ON (k={sample_win}) — int8 embed table resident ({:.0} MiB, {:.2}s)",
+                    self.name, (self.model.vocab * self.model.d) as f32 / (1024.0 * 1024.0), tq.elapsed().as_secs_f32());
+            }
+            Some(sample_win)
+        }
+
         /// Token-level generation for a fabric Worker: prefill `prefix`, decode `max_new` tokens with
         /// `temperature`/`seed`, halting on the model's stop set. Tokens in → tokens out, `&self` so
         /// one resident model can serve many prefixes. The portable unit is tokens (KV stays local).
@@ -528,20 +547,11 @@ pub(crate) mod engine {
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
-            // Windowed SAMPLED decode (LOGSCOPE_SAMPLE_WINDOW, default 4; 0 disables): the whole
-            // sample→embed→decode cycle stays on-device for k tokens per readback — no per-token
-            // full-vocab logits sync and no per-token O(v·log v) CPU sort. Eligibility mirrors the
-            // SAMPLE_AT host contract (temperature > 0, 2 ≤ top_k ≤ 64); anything else takes the
-            // per-token path unchanged. The int8 embed table it gathers from is built ONCE, lazily.
-            let sample_win = std::env::var("LOGSCOPE_SAMPLE_WINDOW").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
-            let windowed = sample_win >= 2 && sp.temperature > 0.0 && (2..=64).contains(&sp.top_k);
-            if windowed && self.embed_q8.is_none() {
-                let tq = Instant::now();
-                self.embed_q8 = Some(self.gpu.embed_q8(&self.model));
-                eprintln!("wgpu-engine: [{}] windowed sampling ON (k={sample_win}) — int8 embed table resident ({:.0} MiB, {:.2}s)",
-                    self.name, (self.model.vocab * self.model.d) as f32 / (1024.0 * 1024.0), tq.elapsed().as_secs_f32());
-            }
+            // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
+            // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
+            // CPU sort. Eligibility + lazy int8-embed build live in `windowed_ready` so the resume
+            // path shares them exactly. LOGSCOPE_SAMPLE_WINDOW (default 4; 0/1 disables).
+            let sample_win_opt = self.windowed_ready(&sp);
             let embed_q8 = self.embed_q8.as_ref();
             let (gpu, model, tok, eos, stop) = (&self.gpu, &self.model, &self.tok, self.eos, &self.stop_ids);
             // Diagnostic: which stop token (if any) ended the stream, captured from the decode callback —
@@ -576,8 +586,8 @@ pub(crate) mod engine {
                     if crate::genguard::runaway_stop(&recent, 0.5) != crate::genguard::StopReason::None { return false; }
                     cont
                 };
-                let p = match (windowed, embed_q8) {
-                    (true, Some(eq)) => gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
+                let p = match (sample_win_opt, embed_q8) {
+                    (Some(sample_win), Some(eq)) => gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
                                                                   &gpu_kernels::EmbedT::Q8(eq), cancel, step),
                     _ => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
                 };
@@ -719,12 +729,16 @@ pub(crate) mod engine {
             s.logits = old.logits.clone(); // resume from the live next-token distribution
             drop(old);
             let td = Instant::now();
+            // Same windowed-decode eligibility as the fresh path (this is the fix for auto-continue
+            // reverting to token-by-token: it used to call stream_session unconditionally).
+            let sample_win_opt = self.windowed_ready(&sp);
+            let embed_q8 = self.embed_q8.as_ref();
             let (gpu, model, tok, eos, stop) = (&self.gpu, &self.model, &self.tok, self.eos, &self.stop_ids);
             let mut seen = toks;
             let mut pending: Vec<u8> = Vec::new();
             let mut recent = String::new();
             let mut rng = self.rng;
-            let produced = gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, |next| {
+            let step = |next: u32| {
                 if stop.contains(&next) { return false; }
                 if tok.is_special(next) { return true; }
                 pending.extend_from_slice(&tok.decode_bytes(&[next]));
@@ -741,11 +755,17 @@ pub(crate) mod engine {
                 }
                 if crate::genguard::runaway_stop(&recent, 0.5) != crate::genguard::StopReason::None { return false; }
                 cont
-            });
+            };
+            let produced = match (sample_win_opt, embed_q8) {
+                (Some(sample_win), Some(eq)) => gpu.stream_session_window(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, sample_win,
+                                                              &gpu_kernels::EmbedT::Q8(eq), cancel, step),
+                _ => gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step),
+            };
             if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
             self.rng = rng;
             let secs = td.elapsed().as_secs_f32().max(1e-3);
-            eprintln!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill)", self.name, produced as f32 / secs);
+            eprintln!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
+                self.name, produced as f32 / secs, if sample_win_opt.is_some() { ", windowed" } else { "" });
             self.anchors.push((seen, s, prefill_len));
             while self.anchors.len() > self.kv_cap.max(1) { self.anchors.remove(0); }
             Some(Ok(produced))
