@@ -4610,6 +4610,7 @@ impl Chat {
             // :check — the compile oracle lives in logscope-cli (a synchronous compile would block the UI
             // thread); the GUI keeps the code-block proxy for :best.
             Command::Check => { self.note = ":check (compile oracle) runs in logscope-cli; the GUI uses the code-block proxy for :best".into(); }
+            Command::Explore => { self.note = ":explore (exploratory compilation over the fan) runs in logscope-cli — it needs the compile oracle (rustc/cargo check)".into(); }
             // :best — the summary agent's pick: highlight + focus the subtree that verified best.
             Command::Best => {
                 let parents = self.effective_parents();
