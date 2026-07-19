@@ -27,6 +27,7 @@ pub use logscope_fan::vimmode;
 pub use logscope_fan::treeexport;
 pub use logscope_fan::bestregion;
 #[allow(dead_code)] pub mod kvtree;
+#[cfg(feature = "wgpu-engine")] #[allow(dead_code)] pub mod anchorpool; // tiered warm-resume KV pool (Hot f32 / Warm int8 / Cold host-RAM)
 pub use logscope_fan::decompose;
 #[allow(dead_code)] pub mod devloop;
 pub use logscope_fan::enlist;
