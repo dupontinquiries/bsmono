@@ -112,10 +112,13 @@ pub const SPECS: &[CmdSpec] = &[
         help: "fan out agents to write DOCS under the organization convention (front-matter + section tree), each a slice; then :merge-docs", example: ":docs write install, config, and API reference" },
     CmdSpec { name: "merge-docs", aliases: &[], usage: ":merge-docs", arg: ArgKind::None,
         help: "merge all doc-fan branches into one organized tree, regenerate the index, and commit (collisions reported)", example: ":merge-docs" },
-    CmdSpec { name: "longterm", aliases: &["lt"], usage: ":longterm [--deep|--quick] <objective>", arg: ArgKind::Free,
-        help: "plan + orchestrate a long-horizon objective: decompose into sibling lanes, fan out by directive, prune/expand under budget", example: ":longterm unify the code duplications across the repo" },
-    CmdSpec { name: "interject", aliases: &["ij"], usage: ":interject <change>", arg: ArgKind::Free,
-        help: "queue a targeted edit for the tapped file/line span (the workspace-explorer interjection pipe) instead of a chat turn", example: ":interject rename this to run()" },
+    // NOTE: `:longterm` (src/longterm.rs, the long-horizon planner) is deliberately NOT listed:
+    // the module landed cfg'd dead (#[allow(dead_code)], no vimmode parser arm, no dispatcher),
+    // and the parity test below rightly refuses to advertise a command the user can't run.
+    // Restore the CmdSpec { name: "longterm", aliases: &["lt"], .. } entry when the parser arm
+    // and dispatch land.
+    // NOTE: `:interject` (src/interject.rs) is in the same condition — module landed cfg'd dead,
+    // no parser arm; restore CmdSpec { name: "interject", aliases: &["ij"], .. } with it.
 ];
 
 /// Look up a command by its name or any alias (a leading `:` is tolerated).
