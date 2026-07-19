@@ -164,6 +164,12 @@ pub struct Gpu {
     /// Vulkan-on-Apple (Asahi/Honeykrisp): the platform with the low BO-VMA ceiling; scopes the
     /// conservative GPU-buffer budget clamp to where it's actually needed.
     pub conservative_vma: bool,
+    /// ROUTE_TRACE (colibrì borrow): when Some, the v1 MoE path appends each token's per-layer
+    /// routed-expert set here for offline coupling analysis (does this model's routing predict the
+    /// next layer's, like GLM's 71.6%?). The current decode layer is stashed here by the block loop;
+    /// -1 = not tracing. Measurement only — zero effect on computation, and only wired on the v1
+    /// readback path (which already has the CPU-side routing) so it never adds a sync.
+    pub trace_layer: std::sync::atomic::AtomicI32,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -250,6 +256,38 @@ fn fused_qkv_enabled() -> bool {
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
 fn fuse_norm_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0")
+}
+
+/// Whether ROUTE_TRACE is armed (env set + v1 path forced so routing is CPU-visible). Cached once.
+fn route_trace_armed() -> bool {
+    use std::sync::OnceLock;
+    static ARMED: OnceLock<bool> = OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var("LOGSCOPE_ROUTE_TRACE").is_ok())
+}
+
+/// ROUTE_TRACE writer (colibrì borrow, measurement only). Appends one line per (token, layer):
+/// `<call> <layer> <e0> <e1> …` — the routed-expert ids the CPU router just selected. An offline
+/// tool cross-tabulates layer L's set against L+1's to measure one-layer-ahead predictability; the
+/// question that decides whether MoE-streaming prefetch is worth building for THIS model. Opened once
+/// (a process-lifetime handle), guarded so a trace-off run pays nothing.
+fn route_trace(layer: i32, experts: &[u32]) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static FP: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let slot = FP.get_or_init(|| {
+        std::env::var("LOGSCOPE_ROUTE_TRACE").ok().and_then(|p| {
+            std::fs::File::create(&p).ok().map(std::sync::Mutex::new)
+        })
+    });
+    if let Some(m) = slot {
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut f) = m.lock() {
+            let mut line = format!("{call} {layer}");
+            for e in experts { line.push_str(&format!(" {e}")); }
+            let _ = writeln!(f, "{line}");
+        }
+    }
 }
 /// Flash split-K decode attention above the 4096-row shared-memory cap (LOGSCOPE_FLASH_ATTN=0 →
 /// the old single-workgroup-per-head serial fallback).
@@ -405,7 +443,7 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1134,7 +1172,11 @@ impl Gpu {
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, &bg, &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
-            frame.keep.push(Box::new(bg)); // dims buf is cached (or kept alive by `bg` until flush) — no separate keep
+            frame.keep.push(Box::new(bg)); // bind group kept until flush
+            frame.keep.push(Box::new(dbuf.clone())); // AND its dims uniform: the uncached (cache-full)
+            // path's Arc would otherwise drop at end-of-dispatch, and wgpu 29 doesn't keep the raw
+            // buffer alive through the bind group alone → "Buffer 'dims' is invalid" on a big frame.
+            // A 256-token sampler window is ~9000 uncached per-slot dims in ONE frame; this is the fix.
             frame.passes += 1;
             // Bound submit duration so a shared GPU still services the display between chunks.
             if frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1879,7 +1921,7 @@ impl Gpu {
         // views — which is also the built-in cross-check: if prefill output is coherent and decode isn't,
         // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
         if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
-            && std::env::var("LOGSCOPE_MOE_V1").is_err()
+            && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
                 return self.moe_v2_check(m, n2, d, x2);
@@ -1896,7 +1938,15 @@ impl Gpu {
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
         let mut groups: Vec<Vec<(u32, f32)>> = vec![Vec::new(); ne]; // expert → [(token_row, weight)]
         for tok in 0..t {
-            for sel in crate::moe::route(&logits[tok * ne..(tok + 1) * ne], &m.cfg) {
+            let sels = crate::moe::route(&logits[tok * ne..(tok + 1) * ne], &m.cfg);
+            // ROUTE_TRACE: record this token's routed set for the traced layer (measurement only,
+            // and only on this readback path so it never adds a sync).
+            let tl = self.trace_layer.load(std::sync::atomic::Ordering::Relaxed);
+            if tl >= 0 {
+                let ids: Vec<u32> = sels.iter().map(|s| s.expert).collect();
+                route_trace(tl, &ids);
+            }
+            for sel in sels {
                 groups[sel.expert as usize].push((tok as u32, sel.weight));
             }
         }
@@ -5428,11 +5478,14 @@ impl Gpu {
         let s = token as usize * m.d;
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
         let fused = fused_qkv_enabled();
+        let tracing = route_trace_armed();
         for li in 0..m.n_layers {
+            if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let l = &m.layers[li]; let (kq, ks, vq, vs) = (&c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li]);
             x = if fused { self.block_decode_q8_fused(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode_q8(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
+        if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
     }
@@ -5604,11 +5657,14 @@ impl Gpu {
         let s = token as usize * m.d;
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
         let fused = fused_qkv_enabled();
+        let tracing = route_trace_armed();
         for li in 0..m.n_layers {
+            if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
+        if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
     }
@@ -6083,11 +6139,14 @@ impl Gpu {
     /// tensor — no begin_frame, no readback (caller owns the frame). Honors LOGSCOPE_FUSED_QKV.
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
         let fused = fused_qkv_enabled();
+        let tracing = route_trace_armed();
         for li in 0..m.n_layers {
+            if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
+        if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         m.output.apply(self, &xn, 1)
     }
