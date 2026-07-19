@@ -15,6 +15,32 @@ pub fn is_gitmind_project(project: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Turn a plain directory (a Cargo root, say) into a `.gitmind` project this module can load: write the
+/// minimal `[gitmind]` marker config and `git init` if no repo exists (load/reapply need a baseline to
+/// diff/commit against). ADDITIVE ONLY — refuses to touch an existing `.gitmind/config.toml`, and an
+/// existing `.git` is left exactly as-is. This is the Cargo tab's "make this repo workable" button.
+pub fn init_gitmind(project: &Path, name: &str) -> Result<(), String> {
+    let cfg = project.join(".gitmind").join("config.toml");
+    if cfg.exists() {
+        return Err(format!("{} already exists — this is already a gitmind project", cfg.display()));
+    }
+    if !project.is_dir() {
+        return Err(format!("{} is not a directory", project.display()));
+    }
+    std::fs::create_dir_all(cfg.parent().unwrap_or(project)).map_err(|e| format!("mkdir .gitmind: {e}"))?;
+    let name = if name.trim().is_empty() { "project" } else { name.trim() };
+    std::fs::write(&cfg, format!("[gitmind]\nname = \"{name}\"\ncreated_by = \"logscope cargo tab\"\n"))
+        .map_err(|e| format!("write config.toml: {e}"))?;
+    if !project.join(".git").exists() {
+        let ok = std::process::Command::new("git").args(["init", "-q"]).current_dir(project)
+            .status().map(|s| s.success()).unwrap_or(false);
+        if !ok {
+            return Err("config.toml written, but `git init` failed — init a repo manually, then :load-gitmind".into());
+        }
+    }
+    Ok(())
+}
+
 /// A loaded work session: the original project, the session name, and the isolated `/tmp` scratch
 /// (a `mount::Workspace` — mirrored with a fresh git baseline, so a session can commit/diff there).
 #[derive(Debug, Clone)]
@@ -159,6 +185,19 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_gitmind_marks_a_plain_dir_and_refuses_twice() {
+        let d = std::env::temp_dir().join(format!("gm-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join(".git")).unwrap(); // pre-existing repo → init never shells out to git
+        assert!(!is_gitmind_project(&d));
+        init_gitmind(&d, "demo").expect("first init succeeds");
+        assert!(is_gitmind_project(&d), "the marker config makes it loadable");
+        let again = init_gitmind(&d, "demo");
+        assert!(again.is_err() && again.unwrap_err().contains("already"), "additive: never clobbers");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn write(p: &Path, s: &str) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
