@@ -246,6 +246,11 @@ fn env_decode_tile() -> Option<u32> {
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
+/// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
+/// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
+fn fuse_norm_enabled() -> bool {
+    std::env::var("LOGSCOPE_FUSE_NORM").as_deref() != Ok("0")
+}
 /// Flash split-K decode attention above the 4096-row shared-memory cap (LOGSCOPE_FLASH_ATTN=0 →
 /// the old single-workgroup-per-head serial fallback).
 fn flash_attn_enabled() -> bool {
@@ -928,6 +933,20 @@ impl Lin {
         gpu.add_t(&out, resid)
     }
     pub fn is_quantized(&self) -> bool { matches!(self.kind, LinKind::Q8(_) | LinKind::Q4(_)) }
+
+    /// Apply the linear to the RMSNorm of `a` (norm weight `nw`, `eps`) in ONE fused dispatch for the
+    /// m=1 Q8 decode case — the norm→matmul pair that fires twice per layer. Any other case (F32/Q4
+    /// weight, prefill m>1, biased, or the fusion disabled via LOGSCOPE_FUSE_NORM=0) falls back to an
+    /// explicit rmsnorm_t then apply(), so this is a pure speed swap with identical output.
+    pub fn norm_apply(&self, gpu: &Gpu, a: &Tensor, nw: &Tensor, cols: usize, eps: f32, m: usize) -> Tensor {
+        if m == 1 && self.bias.is_none() && fuse_norm_enabled() {
+            if let LinKind::Q8(q) = &self.kind {
+                return gpu.linear_q8_0_norm(a, nw, q, cols, eps);
+            }
+        }
+        let n1 = gpu.rmsnorm_t(a, nw, m, cols, eps);
+        self.apply(gpu, &n1, m)
+    }
 }
 
 impl Gpu {
@@ -1672,6 +1691,19 @@ impl Gpu {
         out
     }
 
+    /// Fused RMSNorm + int8 mat-vec (m=1): the RMSNORM_MATVEC_Q8 kernel normalizes `a` (weight `nw`,
+    /// `eps`) in its prologue, then does the [n×k] matvec — one dispatch replacing rmsnorm+matvec.
+    /// Bit-identical to the two-dispatch chain (same reduction, same accumulation order).
+    pub fn linear_q8_0_norm(&self, a: &Tensor, nw: &Tensor, w: &QWeight, cols: usize, eps: f32) -> Tensor {
+        debug_assert_eq!(cols, w.k, "fused norm-matvec: norm width must equal the matmul's k");
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768);
+        let gy = (w.n as u32).div_ceil(gx);
+        let kb = (w.k / 32) as u32;
+        let dims = [1u32, w.n as u32, w.k as u32, kb, gx, eps.to_bits(), 0, 0];
+        self.dispatch(RMSNORM_MATVEC_Q8, &[a, nw, &w.qw, &w.qs], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
     pub fn linear_q8_0_t(&self, a: &Tensor, w: &QWeight, m: usize) -> Tensor {
         if m == 1 {
             // decode: env override (manual A/B) → per-shape autotuned (kernel, tile) → global profile.
@@ -1804,9 +1836,13 @@ impl Gpu {
     /// motif every block fn used inline (rmsnorm → wgate_up → swiglu → wdown+residual), factored so the
     /// MoE branch slots in at every call site (prefill, all decode variants, batched) identically.
     fn ffn_apply(&self, w: &BlockWeights, x2: &Tensor, t: usize, d: usize, eps: f32) -> Tensor {
-        let n2 = self.rmsnorm_t(x2, &w.g2, t, d, eps);
-        if let Some(m) = w.moe.as_deref() { return self.moe_ffn(m, &n2, t, d, x2); }
-        let gu = w.wgate_up.apply(self, &n2, t);
+        if let Some(m) = w.moe.as_deref() {
+            let n2 = self.rmsnorm_t(x2, &w.g2, t, d, eps);
+            return self.moe_ffn(m, &n2, t, d, x2);
+        }
+        // Dense SwiGLU FFN. norm_apply fuses norm2→wgate_up in the m=1 decode case (one dispatch),
+        // and falls back to explicit rmsnorm_t+apply for prefill (t>1) — identical output either way.
+        let gu = w.wgate_up.norm_apply(self, x2, &w.g2, d, eps, t);
         let hmid = self.swiglu_packed(&gu);
         w.wdown.apply_add(self, &hmid, t, x2)
     }
@@ -2381,6 +2417,56 @@ fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3
 // optimal, vs the GEMM's per-thread strided rows), then tree-reduce. 2D grid (col = wg.y*gx +
 // wg.x) so n>65535 (the vocab projection) fits the per-dimension workgroup limit. The reduction
 // reorders the dot sum, so this is numerically equivalent but not bit-identical (~1e-6).
+// Fused RMSNorm + int8 mat-vec (decode m=1): folds the input row's RMSNorm into the matvec's
+// prologue so a norm→matmul pair becomes ONE dispatch. On Metal, where per-dispatch encoder setup
+// (not GPU sync) is the decode wall, removing a dispatch is removing real time — and this pair fires
+// TWICE per layer (attention-in, FFN-in). Each workgroup independently computes the row's
+// inv = 1/sqrt(mean(x²)+eps) via a k-length reduction, then reads a[kk]·inv·nw[kk] in place of
+// a[kk]. TRADEOFF: the reduction is recomputed once per output column (workgroup) — k extra input
+// reads each — but the matmul's weight traffic is n·k and dominates bandwidth, so the redundant
+// 2·k input reads are noise next to saving a whole dispatch's encoder setup. Net win exactly when
+// setup cost > the extra reduction, which is the M4/Metal decode regime; LOGSCOPE_FUSE_NORM=0 backs
+// out to the two-dispatch path for the A/B. Output is bit-identical to RMSNORM then MATVEC_Q8_0.
+const RMSNORM_MATVEC_Q8: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;      // raw (un-normed) input row [k]
+@group(0)@binding(1) var<storage,read> nw: array<f32>;     // RMSNorm weight [k]
+@group(0)@binding(2) var<storage,read> qw: array<u32>;
+@group(0)@binding(3) var<storage,read> qs: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+var<workgroup> inv_sh: f32;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  // --- RMS reduction over the input row (every workgroup; cheap vs the matmul) ---
+  var ss=0.0; var j=tid;
+  loop { if(j>=d.k){break;} let v=a[j]; ss=ss+v*v; j=j+64u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ inv_sh = 1.0/sqrt(red[0]/f32(d.k)+bitcast<f32>(d.eps)); }
+  workgroupBarrier();
+  let inv = inv_sh;
+  if(col>=d.n){ return; }
+  // --- int8 mat-vec over the normalized row ---
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    let an = a[kk]*inv*nw[kk];              // fused: normalize the activation in-place
+    acc=acc+an*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]; }
+}"#;
+
 const MATVEC_Q8_0: &str = r#"
 struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -5401,8 +5487,8 @@ impl Gpu {
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
-        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, ad+2kv] — one matmul (was three)
+        // Fused norm→QKV: RMSNorm(x) folds into the wqkv matvec (one dispatch instead of two).
+        let qkv = w.wqkv.norm_apply(self, x, &w.g1, d, eps, 1);            // [1, ad+2kv]
         let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
             // Qwen3/3.5 QK-Norm: FUSED norm+rope — one dispatch replaces the old 4-chain
             // (norm q → norm k → rope q → rope k); output layout identical (q ‖ k).
