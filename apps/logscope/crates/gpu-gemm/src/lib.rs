@@ -392,8 +392,12 @@ impl Gpu {
         let env_tile = std::env::var("LOGSCOPE_MATVEC_TILE").ok().and_then(|v| v.parse::<u32>().ok());
         let profile_forced = env_tile.is_some();
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
+        // Ceiling raised to 65536: windowed sampled decode legitimately wants a whole window
+        // (k·~36 dispatches) in ONE submit, since on Metal encoder setup — not GPU sync — is the
+        // wall. A pinned FLUSH_EVERY=8192 used to be silently clamped to 1024 (≈28 tokens), so a
+        // 128-window still flushed ~5×; the higher ceiling lets the window actually be one submit.
         let flush_every = std::sync::atomic::AtomicU32::new(
-            std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
+            std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
         let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma };
@@ -998,7 +1002,7 @@ impl Gpu {
     /// override always wins over the adaptive tuner. Returns the value in effect after the call.
     pub fn set_flush_every(&self, n: u32) -> u32 {
         if std::env::var_os("LOGSCOPE_FLUSH_EVERY").is_none() {
-            self.flush_every.store(n.clamp(1, 1024), std::sync::atomic::Ordering::Relaxed);
+            self.flush_every.store(n.clamp(1, 65536), std::sync::atomic::Ordering::Relaxed);
         }
         self.flush_every()
     }
@@ -6344,6 +6348,16 @@ impl Gpu {
         let rcap = 64usize;
         if s.logits.is_empty() { return 0; }
         let cache_rows = s.cache.k.first().map(|t| t.rows).unwrap_or(0);
+        // The window's whole point is ONE submit per k tokens (on Metal, encoder setup — not GPU
+        // sync — is the wall: ~36 dispatches/token, each a separate submit if flush fires mid-window).
+        // A window is w·(dispatches/token) passes; pin flush above that ceiling so `begin_frame`
+        // batches the entire window into one encoder, then restore the caller's flush. Env-pinned
+        // flush (LOGSCOPE_FLUSH_EVERY) is respected as a floor — the user set it deliberately.
+        let saved_flush = self.flush_every();
+        if !self.flush_every_pinned() {
+            let per_tok = 64u32; // generous upper bound on dispatches/token; keeps a full window in one frame
+            self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
+        }
         let mut logits_t = Some(self.upload(&s.logits, 1, s.logits.len()));
         let mut produced = 0usize;
         let mut halted = false;
@@ -6405,6 +6419,7 @@ impl Gpu {
         if !halted {
             if let Some(t) = logits_t { s.logits = self.download(&t); }
         }
+        if !self.flush_every_pinned() { self.set_flush_every(saved_flush); } // restore the caller's pacing
         produced
     }
 }
