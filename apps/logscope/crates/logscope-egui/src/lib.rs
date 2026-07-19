@@ -31,6 +31,7 @@ pub mod genguard;
 #[allow(dead_code)] pub mod devloop;
 #[allow(dead_code)] pub mod enlist;
 #[allow(dead_code)] pub mod dispatch;
+#[allow(dead_code)] pub mod explore;
 #[allow(dead_code)] pub mod ollama;
 #[allow(dead_code)] pub mod bridge;
 #[allow(dead_code)] pub mod localexec;
