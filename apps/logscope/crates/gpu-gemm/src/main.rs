@@ -2813,6 +2813,65 @@ fn main() {
         }
     }
 
+    // ── shared-expert MoE (GLM/DeepSeek stepping stone): routed + shared vs CPU reference ────────
+    // Synthetic F32 MoeLayer (drives the v1 grouped path — F32 stacks make the v2 kernels decline,
+    // so routing runs through the pure moe::route we can mirror on CPU exactly). Checks BOTH
+    // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
+    {
+        let (d, ff, sff, ne, t) = (8usize, 6usize, 10usize, 4usize, 3usize);
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax };
+        let rw = rnd(ne * d, 51);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 60 + e)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 70 + e)).collect();
+        let (sguw, sdnw) = (rnd(2 * sff * d, 80), rnd(d * sff, 81));
+        let xin = rnd(t * d, 90);
+        let n2v = rnd(t * d, 91); // the (already-normed) FFN input
+        // CPU reference
+        let matv = |w: &[f32], x: &[f32], n: usize, k: usize| -> Vec<f32> {
+            (0..n).map(|r| (0..k).map(|c| w[r * k + c] * x[c]).sum()).collect()
+        };
+        let silu = |v: f32| v / (1.0 + (-v).exp());
+        let ffn = |gu: &[f32], dn: &[f32], x: &[f32], fw: usize| -> Vec<f32> {
+            let g = matv(gu, x, 2 * fw, d);
+            let h: Vec<f32> = (0..fw).map(|j| silu(g[j]) * g[fw + j]).collect();
+            matv(dn, &h, d, fw)
+        };
+        let reference = |with_shared: bool| -> Vec<f32> {
+            let mut out = xin.clone();
+            for tok in 0..t {
+                let x = &n2v[tok * d..(tok + 1) * d];
+                let logits = matv(&rw, x, ne, d);
+                for sel in gpu_kernels::moe::route(&logits, &cfgm) {
+                    let y = ffn(&gus[sel.expert as usize], &dns[sel.expert as usize], x, ff);
+                    for c in 0..d { out[tok * d + c] += sel.weight * y[c]; }
+                }
+                if with_shared {
+                    let y = ffn(&sguw, &sdnw, x, sff);
+                    for c in 0..d { out[tok * d + c] += y[c]; }
+                }
+            }
+            out
+        };
+        let mk_layer = |with_shared: bool| gpu_kernels::MoeLayer {
+            router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+            gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
+            down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
+            stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&gus.concat(), ne * 2 * ff, d)),
+            stacked_down: gpu_kernels::Lin::f32(gpu.upload(&dns.concat(), ne * d, ff)),
+            cfg: cfgm,
+            shared: if with_shared {
+                Some((gpu_kernels::Lin::f32(gpu.upload(&sguw, 2 * sff, d)),
+                      gpu_kernels::Lin::f32(gpu.upload(&sdnw, d, sff))))
+            } else { None },
+        };
+        let n2t = gpu.upload(&n2v, t, d);
+        let x2t = gpu.upload(&xin, t, d);
+        let got0 = gpu.download(&gpu.moe_ffn_t(&mk_layer(false), &n2t, t, d, &x2t));
+        check("moe routed-only forward (baseline)", maxerr(&got0, &reference(false)), 1e-4);
+        let got1 = gpu.download(&gpu.moe_ffn_t(&mk_layer(true), &n2t, t, d, &x2t));
+        check("moe shared-expert forward (routed + dense SwiGLU)", maxerr(&got1, &reference(true)), 1e-4);
+    }
+
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
     // rope), vs CPU. The full-forward sweep diverged only when base was large.
     for &(base, heads) in &[(10000.0f32, 8usize), (500000.0, 8), (500000.0, 2)] {
