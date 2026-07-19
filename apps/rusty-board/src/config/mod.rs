@@ -402,13 +402,9 @@ pub struct ThumbArc {
     pub polygon: Vec<(f64, f64)>,
 }
 
-/// Anchor corner for the thumb in single-hand mode.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ThumbAnchor {
-    BottomLeft,
-    BottomRight,
-}
+/// Anchor corner for the thumb in single-hand mode — moved to board-layouts (the cardinal
+/// builders place utility rows by it); re-exported so `crate::config::ThumbAnchor` holds.
+pub use board_layouts::ThumbAnchor;
 
 impl ThumbArc {
     /// Construct a default arc for the given anchor and approximate

@@ -1,75 +1,19 @@
-//! real_layout — the GTK app's layout *files*, consumed natively. The standalone `Layout` in
-//! `lib.rs` was a stopgap ("a faithful subset … so the crate builds on its own"); this module is
-//! the real thing: a serde model of `resources/layouts/*.json` (the exact schema
-//! `src/layouts/mod.rs` reads — field names, defaults, and the `action.kind` strings), the three
-//! shipped layouts embedded at compile time, and the keyboard STATE the GTK `keyboard_view`
-//! carried: shift (off → one-shot → caps-lock cycle), the symbols toggle (via each layout's
-//! `symbols_layout` name, returning to the previous layout on toggle-back), and typed key
-//! presses so the host maps actions instead of sniffing strings.
+//! real_layout — the GTK app's layout layer, consumed natively via the shared `board-layouts`
+//! crate. The first version of this module MIRRORED the JSON schema with its own serde structs;
+//! that duplicate is gone — both frontends now read ONE model (`board_layouts::{Layout, Row}`,
+//! `board_layouts::key::{Key, KeyAction}`), so a schema change lands in exactly one place and
+//! this module's tests parse the same embedded resource files the GTK app ships.
 //!
-//! Composition, not duplication: [`to_render`] projects a parsed file + shift state onto the
-//! existing render [`crate::Layout`] — `keyboard_ui`/`paint_key`/the hold-variants popup all work
-//! unchanged. Action keys ride through the render layer as reserved emit tokens ([`classify`]
-//! turns them back into [`Press`]); `extended` becomes the hold-variants popup; `shifted` is the
-//! emitted text under shift. Everything here is pure and tested against the REAL resource files
-//! (parsed from the embedded bytes), so schema drift in the GTK app fails these tests loudly.
+//! What stays here is the egui-side composition: the shift cycle (off → one-shot → caps, as the
+//! GTK `keyboard_view` carried it), the symbols toggle via each layout's `symbols_layout` name,
+//! typed [`Press`]es for the host, and [`to_render`] projecting layout + shift onto the existing
+//! render [`crate::Layout`] — `keyboard_ui`, the glass painter, and the hold-variants popup all
+//! work unchanged. Action keys cross the render layer as `\u{0}`-prefixed reserved tokens
+//! ([`classify`] maps them back); the typed [`KeyAction`] is the source, so new action kinds are
+//! a compile-time concern, not a string drift.
 
-use serde::Deserialize;
-
-// ── the file schema (mirrors src/layouts/mod.rs; serde defaults match) ───────
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct LayoutFile {
-    pub name: String,
-    pub display_name: String,
-    #[serde(default)]
-    pub language: String,
-    #[serde(default)]
-    pub direction: String,
-    /// The layout switched to by the `symbols_toggle` action (a layout `name`).
-    #[serde(default)]
-    pub symbols_layout: Option<String>,
-    #[serde(default)]
-    pub ortholinear: bool,
-    pub rows: Vec<RowDef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RowDef {
-    #[serde(default = "one")]
-    pub weight: f32,
-    pub keys: Vec<KeyDef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct KeyDef {
-    pub label: String,
-    /// Emitted text under shift; text keys without it emit `label` in every shift state.
-    #[serde(default)]
-    pub shifted: Option<String>,
-    /// Long-press alternates — the hold-variants popup.
-    #[serde(default)]
-    pub extended: Vec<String>,
-    /// Action keys (shift / backspace / return / space / symbols_toggle / voice).
-    #[serde(default)]
-    pub action: Option<ActionDef>,
-    #[serde(default)]
-    pub key_type: Option<String>,
-    /// Relative width in row units (the GTK `width`; the render layer calls it `weight`).
-    #[serde(default = "one")]
-    pub width: f32,
-    #[serde(default)]
-    pub swipe_target: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ActionDef {
-    pub kind: String,
-}
-
-fn one() -> f32 {
-    1.0
-}
+use board_layouts::key::{Key as KeyDef, KeyAction};
+use board_layouts::Layout as LayoutFile;
 
 // ── the shipped layouts, embedded (no runtime path needed) ───────────────────
 
@@ -77,13 +21,15 @@ pub const QWERTY_JSON: &str = include_str!("../../resources/layouts/en_us_qwerty
 pub const DVORAK_ORTHO_JSON: &str = include_str!("../../resources/layouts/en_us_dvorak_ortho.json");
 pub const SYMBOLS_JSON: &str = include_str!("../../resources/layouts/symbols.json");
 
-/// Parse one layout file.
+/// Parse one layout file — `board_layouts::io::import_from_string`, stringly-errored for the
+/// frontend's plumbing.
 pub fn parse(json: &str) -> Result<LayoutFile, String> {
-    serde_json::from_str(json).map_err(|e| e.to_string())
+    board_layouts::io::import_from_string(json).map_err(|e| e.to_string())
 }
 
-/// The three shipped layouts, parsed from the embedded bytes. Panics only if the repo's own
-/// resource files are broken — which the tests catch first.
+/// The three shipped layouts, parsed (and validated by the shared `io::validate`) from the
+/// embedded bytes. Panics only if the repo's own resource files are broken — which the tests
+/// catch first.
 pub fn builtin() -> Vec<LayoutFile> {
     [QWERTY_JSON, DVORAK_ORTHO_JSON, SYMBOLS_JSON]
         .iter()
@@ -127,7 +73,8 @@ impl Shift {
 // ── typed presses (action keys ride the render layer as reserved tokens) ─────
 
 /// What a key press means to the host. `Text` covers plain keys, shifted keys, hold-variants,
-/// and space (as `" "` — hosts treat it as text, matching the GTK path).
+/// space (as `" "`), tab (as `"\t"`), and `Literal` keys — hosts treat them all as text,
+/// matching the GTK path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Press {
     Text(String),
@@ -142,8 +89,25 @@ pub enum Press {
 /// layout text, so tokens never collide with real emissions.
 const ACT: &str = "\u{0}act:";
 
-fn action_token(kind: &str) -> String {
-    format!("{ACT}{kind}")
+/// The render-layer token for a typed action. `Character` never gets a token (it's a text key);
+/// `Literal`/`Keysym` carry their payload as plain text (keysym injection is the wayland side's
+/// job — in this frontend it degrades to the name, documented).
+fn action_emit(action: &KeyAction, text: &str) -> String {
+    match action {
+        KeyAction::Character => text.to_string(),
+        KeyAction::Literal(s) => s.clone(),
+        KeyAction::Keysym(name) => name.clone(),
+        KeyAction::Backspace => format!("{ACT}backspace"),
+        KeyAction::Return => format!("{ACT}return"),
+        KeyAction::Space => format!("{ACT}space"),
+        KeyAction::Tab => format!("{ACT}tab"),
+        KeyAction::Shift => format!("{ACT}shift"),
+        KeyAction::SymbolsToggle => format!("{ACT}symbols_toggle"),
+        KeyAction::Voice => format!("{ACT}voice"),
+        // pages/system actions this demo host doesn't implement: cross as their kind so
+        // `classify` degrades them to visible-but-inert text (never a silent drop)
+        other => format!("{ACT}{other:?}"),
+    }
 }
 
 /// Turn a `keyboard_ui` emission back into a typed [`Press`].
@@ -153,20 +117,30 @@ pub fn classify(emit: &str) -> Press {
         Some("backspace") => Press::Backspace,
         Some("return") => Press::Return,
         Some("space") => Press::Text(" ".to_string()),
+        Some("tab") => Press::Text("\t".to_string()),
         Some("symbols_toggle") => Press::SymbolsToggle,
         Some("voice") => Press::Voice,
-        Some(other) => Press::Text(other.to_string()), // unknown action: degrade to its kind text
+        Some(other) => Press::Text(other.to_string()),
         None => Press::Text(emit.to_string()),
     }
 }
 
 // ── projection onto the existing render layer ────────────────────────────────
 
-/// Project a parsed layout + shift state onto the render [`crate::Layout`] `keyboard_ui` draws:
-/// text keys emit `shifted` when shift is active (label otherwise) and show it as their label
-/// (the GTK view relabels under shift); `extended` becomes the hold-variants popup; action keys
-/// carry their reserved token and show their file label (⇧ highlighted by state is the host's
-/// paint concern, out of scope here).
+/// The label/emitted text for a key under a shift state — the shared model's documented default:
+/// `shifted` falls back to `label.to_uppercase()` when missing.
+fn key_text(k: &KeyDef, shift: Shift) -> String {
+    if shift.active() {
+        k.shifted.clone().unwrap_or_else(|| k.label.to_uppercase())
+    } else {
+        k.label.clone()
+    }
+}
+
+/// Project a layout + shift state onto the render [`crate::Layout`] `keyboard_ui` draws: text
+/// keys relabel/emit per shift (the GTK view relabels under shift); `extended` (or
+/// `extended_shifted` while shifted) becomes the hold-variants popup; action keys carry their
+/// reserved token and show their file label.
 pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
     let rows = file
         .rows
@@ -176,20 +150,20 @@ pub fn to_render(file: &LayoutFile, shift: Shift) -> crate::Layout {
                 .keys
                 .iter()
                 .map(|k| {
-                    if let Some(a) = &k.action {
-                        let mut key = crate::Key::emitting(&k.label, &action_token(&a.kind), k.width);
-                        key.variants = k.extended.clone();
-                        key
+                    let is_text = matches!(k.action, KeyAction::Character);
+                    let text = key_text(k, shift);
+                    let (label, emit) = if is_text {
+                        (text.clone(), text)
                     } else {
-                        let text = if shift.active() {
-                            k.shifted.clone().unwrap_or_else(|| k.label.clone())
-                        } else {
-                            k.label.clone()
-                        };
-                        let mut key = crate::Key::emitting(&text, &text, k.width);
-                        key.variants = k.extended.clone();
-                        key
-                    }
+                        (k.label.clone(), action_emit(&k.action, &k.label))
+                    };
+                    let mut key = crate::Key::emitting(&label, &emit, k.width);
+                    key.variants = if shift.active() && !k.extended_shifted.is_empty() {
+                        k.extended_shifted.clone()
+                    } else {
+                        k.extended.clone()
+                    };
+                    key
                 })
                 .collect();
             crate::Row { keys, weight: r.weight }
@@ -271,7 +245,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_three_shipped_layout_files_parse() {
+    fn all_three_shipped_layout_files_parse_through_the_shared_model() {
         let files = builtin();
         assert_eq!(files.len(), 3);
         let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
@@ -279,14 +253,13 @@ mod tests {
         // qwerty declares the symbols layout by name, and that name resolves
         assert_eq!(files[0].symbols_layout.as_deref(), Some("symbols"));
         assert!(files.iter().any(|f| f.name == "symbols"));
-        // the dvorak variant is ortholinear per its file
         assert!(files[1].ortholinear);
-        // schema spot-pins against the real bytes: q/Q with extended, the wide shift action key
+        // schema spot-pins against the real bytes, now through board_layouts types
         let q = &files[0].rows[0].keys[0];
         assert_eq!((q.label.as_str(), q.shifted.as_deref()), ("q", Some("Q")));
         assert!(q.extended.contains(&"1".to_string()));
         let shift_key = files[0].rows[2].keys.first().unwrap();
-        assert_eq!(shift_key.action.as_ref().map(|a| a.kind.as_str()), Some("shift"));
+        assert_eq!(shift_key.action, KeyAction::Shift, "typed action, no string sniffing");
         assert_eq!(shift_key.width, 1.5);
     }
 
@@ -303,33 +276,38 @@ mod tests {
     }
 
     #[test]
-    fn to_render_relabels_under_shift_and_carries_extended_as_variants() {
+    fn to_render_relabels_under_shift_with_the_uppercase_default() {
         let files = builtin();
         let low = to_render(&files[0], Shift::Off);
         let up = to_render(&files[0], Shift::Caps);
         assert_eq!(low.rows[0].keys[0].emit, "q");
         assert_eq!(up.rows[0].keys[0].emit, "Q");
         assert_eq!(up.rows[0].keys[0].label, "Q", "the view relabels under shift, like GTK");
-        // extended → hold-variants popup
         assert!(low.rows[0].keys[2].variants.contains(&"é".to_string()));
-        // action keys carry reserved tokens the render layer can't collide with
         let shift_render = &low.rows[2].keys[0];
         assert_eq!(classify(&shift_render.emit), Press::Shift);
         assert_eq!(shift_render.weight, 1.5, "file width flows into render weight");
+        // the shared model's documented default: missing `shifted` uppercases the label
+        let mut k = files[0].rows[0].keys[0].clone();
+        k.shifted = None;
+        assert_eq!(key_text(&k, Shift::Caps), "Q");
     }
 
     #[test]
     fn classify_round_trips_every_action_and_passes_text_through() {
-        for (kind, press) in [
-            ("shift", Press::Shift),
-            ("backspace", Press::Backspace),
-            ("return", Press::Return),
-            ("symbols_toggle", Press::SymbolsToggle),
-            ("voice", Press::Voice),
+        for (a, press) in [
+            (KeyAction::Shift, Press::Shift),
+            (KeyAction::Backspace, Press::Backspace),
+            (KeyAction::Return, Press::Return),
+            (KeyAction::SymbolsToggle, Press::SymbolsToggle),
+            (KeyAction::Voice, Press::Voice),
         ] {
-            assert_eq!(classify(&action_token(kind)), press);
+            assert_eq!(classify(&action_emit(&a, "x")), press);
         }
-        assert_eq!(classify(&action_token("space")), Press::Text(" ".to_string()));
+        assert_eq!(classify(&action_emit(&KeyAction::Space, "x")), Press::Text(" ".to_string()));
+        assert_eq!(classify(&action_emit(&KeyAction::Tab, "x")), Press::Text("\t".to_string()));
+        // Literal/Keysym carry payloads as text; plain text passes through
+        assert_eq!(classify(&action_emit(&KeyAction::Literal(":-)".into()), "x")), Press::Text(":-)".to_string()));
         assert_eq!(classify("é"), Press::Text("é".to_string()));
     }
 
@@ -337,21 +315,19 @@ mod tests {
     fn board_presses_drive_shift_and_symbols_state() {
         let mut b = RealBoard::new();
         assert_eq!(b.current().name, "en_us_qwerty");
-        // shift tap is absorbed by the board; the next text key comes out shifted and consumes it
-        assert_eq!(b.press(&action_token("shift")), None);
+        let shift_tok = action_emit(&KeyAction::Shift, "");
+        assert_eq!(b.press(&shift_tok), None);
         assert_eq!(b.shift, Shift::Once);
         let r = b.render();
         assert_eq!(r.rows[0].keys[0].emit, "Q");
         assert_eq!(b.press("Q"), Some(Press::Text("Q".to_string())));
         assert_eq!(b.shift, Shift::Off, "one-shot consumed");
-        // symbols toggle switches by the layout's declared name, and toggles back
-        assert_eq!(b.press(&action_token("symbols_toggle")), None);
+        let sym_tok = action_emit(&KeyAction::SymbolsToggle, "");
+        assert_eq!(b.press(&sym_tok), None);
         assert_eq!(b.current().name, "symbols");
-        assert_eq!(b.press(&action_token("symbols_toggle")), None);
+        assert_eq!(b.press(&sym_tok), None);
         assert_eq!(b.current().name, "en_us_qwerty");
-        // actions the host owns pass through
-        assert_eq!(b.press(&action_token("backspace")), Some(Press::Backspace));
-        assert_eq!(b.press(&action_token("return")), Some(Press::Return));
-        assert_eq!(b.press(&action_token("space")), Some(Press::Text(" ".to_string())));
+        assert_eq!(b.press(&action_emit(&KeyAction::Backspace, "")), Some(Press::Backspace));
+        assert_eq!(b.press(&action_emit(&KeyAction::Space, "")), Some(Press::Text(" ".to_string())));
     }
 }
