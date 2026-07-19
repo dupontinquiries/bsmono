@@ -170,6 +170,12 @@ pub struct Gpu {
     /// -1 = not tracing. Measurement only — zero effect on computation, and only wired on the v1
     /// readback path (which already has the CPU-side routing) so it never adds a sync.
     pub trace_layer: std::sync::atomic::AtomicI32,
+    /// Keep-alive for buffers (dims uniforms, bind groups) whose frames have been SUBMITTED but not
+    /// yet completed. submit() is async; wgpu 29 does not tie buffer lifetime to in-flight work, so a
+    /// mid-window flush that drops its frame.keep recycles dims buffers the GPU is still reading →
+    /// "Buffer 'dims' is invalid". Flush points move their keep here instead of dropping it; the next
+    /// poll (which waits for GPU completion) clears it. Bounded: cleared every readback.
+    pending_keep: Mutex<Vec<Box<dyn std::any::Any + Send>>>,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -443,7 +449,7 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -591,6 +597,7 @@ impl Gpu {
         let data = slice.get_mapped_range();
         let bytes = data.to_vec();
         drop(data); staging.unmap();
+        self.clear_retained();
         bytes
     }
 
@@ -727,20 +734,25 @@ impl Gpu {
         let bytes = (t.len() * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        if let Some(mut frame) = self.frame.lock().unwrap().take() {
+        let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(frame.enc);
+            self.retain_keep(frame.keep);
+            None::<()>
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(enc);
-        }
+            None
+        };
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
         self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
-        drop(data); staging.unmap(); v
+        drop(data); staging.unmap();
+        self.clear_retained();
+        v
     }
 }
 
@@ -1034,10 +1046,13 @@ impl Gpu {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // If a frame is open, append the readback copy to it and flush the whole frame in one
-        // submit — so a decode token's entire compute + its logits readback is a single flush.
+        // submit. frame.keep (dims uniforms + bind groups) is RETAINED past the submit — it's async,
+        // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
+        // 'dims' is invalid" on Metal. clear_retained() after the poll frees them safely.
         if let Some(mut frame) = self.frame.lock().unwrap().take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(frame.enc);
+            self.retain_keep(frame.keep);
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
@@ -1050,7 +1065,9 @@ impl Gpu {
         GPU_SYNC_NS.fetch_add(t_sync.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice(&data).to_vec();
-        drop(data); staging.unmap(); v
+        drop(data); staging.unmap();
+        self.clear_retained(); // poll waited for completion → retained dims/bind-groups are safe to free
+        v
     }
 
     /// Current passes-per-submit (the submit-overhead knob).
@@ -1065,6 +1082,19 @@ impl Gpu {
     }
     /// Whether LOGSCOPE_FLUSH_EVERY pins the knob (then the tuner should not run).
     pub fn flush_every_pinned(&self) -> bool { std::env::var_os("LOGSCOPE_FLUSH_EVERY").is_some() }
+
+    /// Move a flushed frame's keep-list into the pending set: buffers referenced by a submitted-
+    /// but-not-completed frame must outlive the async GPU work. Drained by `clear_retained` after
+    /// the next poll (which waits for completion).
+    fn retain_keep(&self, keep: Vec<Box<dyn std::any::Any + Send>>) {
+        if keep.is_empty() { return; }
+        self.pending_keep.lock().unwrap().extend(keep);
+    }
+    /// Drop everything retained by `retain_keep`. Call ONLY after a poll that waited for GPU
+    /// completion — at that point the submitted work is done and its buffers are safe to free.
+    fn clear_retained(&self) {
+        self.pending_keep.lock().unwrap().clear();
+    }
 
     /// Single point through which every command buffer is flushed, so submits can be
     /// counted (see GPU_SUBMITS). Each call is one CPU→GPU flush.
@@ -1118,7 +1148,7 @@ impl Gpu {
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
-        if let Some(frame) = self.frame.lock().unwrap().take() { self.submit(frame.enc); }
+        if let Some(frame) = self.frame.lock().unwrap().take() { self.submit(frame.enc); self.retain_keep(frame.keep); }
     }
 
     /// Dispatch over resident tensors: inputs at 0..n (read-only), out at n (read_write),
@@ -1173,15 +1203,16 @@ impl Gpu {
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
             frame.keep.push(Box::new(bg)); // bind group kept until flush
-            frame.keep.push(Box::new(dbuf.clone())); // AND its dims uniform: the uncached (cache-full)
-            // path's Arc would otherwise drop at end-of-dispatch, and wgpu 29 doesn't keep the raw
-            // buffer alive through the bind group alone → "Buffer 'dims' is invalid" on a big frame.
-            // A 256-token sampler window is ~9000 uncached per-slot dims in ONE frame; this is the fix.
+            frame.keep.push(Box::new(dbuf.clone())); // AND its dims uniform Arc explicitly — the whole
+            // keep-list is RETAINED past each async submit (retain_keep) and freed only after the next
+            // poll, so buffers the GPU is still reading can't be recycled → fixes "Buffer 'dims' is
+            // invalid" on Metal (a big sampler window flushes mid-window, long before its readback).
             frame.passes += 1;
             // Bound submit duration so a shared GPU still services the display between chunks.
             if frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed) {
                 let old = fr.take().unwrap();
                 self.submit(old.enc);
+                self.retain_keep(old.keep); // hold dims/bind-groups until the next poll (async submit)
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
             }
         } else {
