@@ -1481,6 +1481,9 @@ impl Chat {
             BackendKind::Wgpu => match self.template {
                 TemplateKind::ChatML => self.build_prompt_chatml(&sys, upto),
                 TemplateKind::Llama3 => self.build_prompt_llama3(&sys, upto),
+                // Llama4: build with Llama-3 markers — the worker's normalize_prompt_template
+                // rewrites them to <|header_start|>/<|eot|> authoritatively at generate time.
+                TemplateKind::Llama4 => self.build_prompt_llama3(&sys, upto),
                 TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
             },
@@ -1502,7 +1505,7 @@ impl Chat {
         let last = self.msgs.len().saturating_sub(1);
         let partial = neutralize_markers(&self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default());
         let chatml = self.backend == BackendKind::Wgpu && self.template == TemplateKind::ChatML;
-        let llama3 = self.backend == BackendKind::Wgpu && self.template == TemplateKind::Llama3;
+        let llama3 = self.backend == BackendKind::Wgpu && matches!(self.template, TemplateKind::Llama3 | TemplateKind::Llama4);
         if chatml {
             let mut s = format!("<|im_start|>system\n{}<|im_end|>\n", sys);
             for m in self.chosen_msgs(8, &sys, last) {

@@ -108,8 +108,8 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             arch: Arch::Llama4, prefix: "llama4", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: true, moe: true, moe_shared_expert: true, interleaved_nope: true,
             logit_softcap: None, attn_softcap: None, tied_embed_default: false,
-            supported: false, dense_supported: false,
-            note: "Llama4 is mixture-of-experts (routed + one shared expert) with interleaved NoPE layers (some attention layers use no positional encoding) and QK-Norm. Needs the MoE routing/expert-gather kernel + a per-layer RoPE/NoPE switch (M2-gated).",
+            supported: true, dense_supported: false,
+            note: "Llama4 MoE: 16 routed (top-1, raw-sigmoid gate on the expert INPUT) + 1 shared expert, interleaved NoPE every 4th layer, weightless QK-Norm on RoPE layers. Runs the v1 routed path (v2 GPU-routing covers softmax gating only, so far); attn temperature tuning (matters past 8K positions) not yet applied.",
         },
         "gemma" | "gemma2" => ArchConfig {
             arch: Arch::Gemma2, prefix: "gemma2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::RmsGemma, act: Act::GeGlu,
@@ -195,6 +195,10 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -
         n_used: if n_used == 0 { 8.min(n_routed.max(1)) } else { n_used },
         n_shared: if cfg.moe_shared_expert { n_shared.max(1) } else { n_shared },
         norm: route_norm(cfg),
+        // Llama4: raw-sigmoid top-1 gate applied to the expert's INPUT (weight-before-FFN);
+        // everything else: normalized weights combined on the output.
+        normalize: !matches!(cfg.arch, Arch::Llama4),
+        weight_before: matches!(cfg.arch, Arch::Llama4),
     }
 }
 
@@ -268,7 +272,8 @@ mod tests {
         assert!(c.moe && c.moe_shared_expert, "llama4 has routed + one shared expert");
         assert!(c.interleaved_nope, "llama4's iRoPE: some layers use no positional encoding");
         assert!(c.attn_qk_norm);
-        assert!(!c.supported && !c.dense_supported, "inherently MoE + NoPE — no dense forward to fall back to");
+        assert!(c.supported, "llama4 runs: shared expert + NoPE switch + sigmoid weight-before gating landed");
+        assert!(!c.dense_supported, "inherently MoE + NoPE — no dense forward to fall back to");
         assert!(!c.tied_embed_default);
         // shared-expert tensors present alongside the routed stacks
         let mt = moe_tensors(&c, 0);

@@ -2702,12 +2702,55 @@ fn main() {
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
+        nope: false,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
     let ones = gpu.upload(&vec![1.0f32; bd / 2], 1, bd / 2); // plain RoPE (no llama3 scaling)
     let resident = gpu.download(&gpu.block_forward(&bw, &xt, &ones, bt, bd, bh, 1, 1, BASE, EPS));
     check("transformer block (resident)", maxerr(&resident, &cpu_block(&blk, &x, bt, bd, bh)), 1e-2);
+
+    // NoPE block (Llama4 iRoPE): the SAME weights with nope=true must match a CPU reference with
+    // rope REMOVED — proving the per-layer switch reaches every projection and nothing else moves.
+    {
+        let bw_nope = gpu_kernels::BlockWeights {
+            wq: Lin::f32(gpu.upload(&blk.wq, bd, bd)), wk: Lin::f32(gpu.upload(&blk.wk, bd, bd)),
+            wv: Lin::f32(gpu.upload(&blk.wv, bd, bd)), wo: Lin::f32(gpu.upload(&blk.wo, bd, bd)),
+            wqkv: Lin::f32(gpu.upload(&[&blk.wq[..], &blk.wk[..], &blk.wv[..]].concat(), 3 * bd, bd)),
+            wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
+            wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
+            g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
+            q_norm: None, k_norm: None, nope: true, moe: None,
+        };
+        let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
+        // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
+        let bw_rope = gpu_kernels::BlockWeights {
+            wq: Lin::f32(gpu.upload(&blk.wq, bd, bd)), wk: Lin::f32(gpu.upload(&blk.wk, bd, bd)),
+            wv: Lin::f32(gpu.upload(&blk.wv, bd, bd)), wo: Lin::f32(gpu.upload(&blk.wo, bd, bd)),
+            wqkv: Lin::f32(gpu.upload(&[&blk.wq[..], &blk.wk[..], &blk.wv[..]].concat(), 3 * bd, bd)),
+            wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
+            wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
+            g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
+            q_norm: None, k_norm: None, nope: false, moe: None,
+        };
+        let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
+        // CPU: cpu_block minus the rope step
+        let n1 = cpu_rmsnorm(&x, &blk.g1, bt, bd, EPS);
+        let q = cpu_linear(&n1, &blk.wq, bt, bd, bd);
+        let k = cpu_linear(&n1, &blk.wk, bt, bd, bd);
+        let v = cpu_linear(&n1, &blk.wv, bt, bd, bd);
+        let attn = cpu_attention(&q, &k, &v, bt, bd);
+        let o = cpu_linear(&attn, &blk.wo, bt, bd, bd);
+        let x2: Vec<f32> = x.iter().zip(&o).map(|(a, b)| a + b).collect();
+        let n2 = cpu_rmsnorm(&x2, &blk.g2, bt, bd, EPS);
+        let gate = cpu_linear(&n2, &blk.wgate, bt, bh, bd);
+        let up = cpu_linear(&n2, &blk.wup, bt, bh, bd);
+        let hmid: Vec<f32> = gate.iter().zip(&up).map(|(gv, uv)| (gv / (1.0 + (-gv).exp())) * uv).collect();
+        let down = cpu_linear(&hmid, &blk.wdown, bt, bd, bh);
+        let want: Vec<f32> = x2.iter().zip(&down).map(|(a, b)| a + b).collect();
+        let sanity_differs = maxerr(&got, &roped) > 1e-3; // rope vs no-rope must actually differ
+        check("nope block (rope skipped end-to-end)", maxerr(&got, &want) + if sanity_differs { 0.0 } else { 1.0 }, 1e-2);
+    }
 
     // RoPE with per-dimension frequency factors (llama3 scaling from rope_freqs.weight):
     // theta = pos·base^(-2i/hd) / factor[i]. Validate the GPU multi-head rope against a
@@ -2819,7 +2862,7 @@ fn main() {
     // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
     {
         let (d, ff, sff, ne, t) = (8usize, 6usize, 10usize, 4usize, 3usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
         let rw = rnd(ne * d, 51);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 60 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 70 + e)).collect();
@@ -2870,6 +2913,31 @@ fn main() {
         check("moe routed-only forward (baseline)", maxerr(&got0, &reference(false)), 1e-4);
         let got1 = gpu.download(&gpu.moe_ffn_t(&mk_layer(true), &n2t, t, d, &x2t));
         check("moe shared-expert forward (routed + dense SwiGLU)", maxerr(&got1, &reference(true)), 1e-4);
+
+        // Llama4 mode: top-1 by logit, gate = RAW sigmoid(top logit), applied to the expert's
+        // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
+        // semantics directly (FFN(w·x), combined with weight 1).
+        let l4cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 1, n_shared: 1,
+            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true };
+        let l4_ref = {
+            let mut out = xin.clone();
+            for tok in 0..t {
+                let x = &n2v[tok * d..(tok + 1) * d];
+                let logits = matv(&rw, x, ne, d);
+                let top = (0..ne).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
+                let w = 1.0 / (1.0 + (-logits[top]).exp());
+                let xs: Vec<f32> = x.iter().map(|v| v * w).collect();
+                let y = ffn(&gus[top], &dns[top], &xs, ff);
+                for c in 0..d { out[tok * d + c] += y[c]; }
+                let ysh = ffn(&sguw, &sdnw, x, sff);
+                for c in 0..d { out[tok * d + c] += ysh[c]; }
+            }
+            out
+        };
+        let mut l4 = mk_layer(true);
+        l4.cfg = l4cfg;
+        let got2 = gpu.download(&gpu.moe_ffn_t(&l4, &n2t, t, d, &x2t));
+        check("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared)", maxerr(&got2, &l4_ref), 1e-4);
     }
 
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's

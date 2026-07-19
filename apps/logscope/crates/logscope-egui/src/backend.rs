@@ -182,10 +182,16 @@ pub(crate) mod engine {
                 // stop check halts cleanly instead of leaking "<|im_start|>user…" into the reply.
                 tok.special_id("<|im_start|>"),
                 tok.special_id("<|start_header_id|>"),
+                // Llama4 (Scout/Maverick): <|eot|>/<|eom|> end a turn; <|header_start|> opens one.
+                tok.special_id("<|eot|>"),
+                tok.special_id("<|eom|>"),
+                tok.special_id("<|header_start|>"),
             ]).into_iter().collect();
             // Template family: a ChatML model carries <|im_end|> but none of the Llama-3 header
             // markers; a Llama-3 model carries <|eot_id|>/<|start_header_id|>. Anything else → Plain.
-            let template = if tok.special_id("<|im_end|>").is_some()
+            let template = if tok.special_id("<|header_start|>").is_some() {
+                TemplateKind::Llama4 // Llama4: <|header_start|>role<|header_end|> … <|eot|>
+            } else if tok.special_id("<|im_end|>").is_some()
                 && tok.special_id("<|start_header_id|>").is_none() {
                 TemplateKind::ChatML
             } else if tok.special_id("<|eot_id|>").is_some() || tok.special_id("<|start_header_id|>").is_some() {
@@ -836,10 +842,10 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// must match the model: a ChatML model (smollm2, `<|im_end|>`) fed Llama-3 markers drifts into
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TemplateKind { Llama3, ChatML, Plain, Gemma }
+pub enum TemplateKind { Llama3, ChatML, Plain, Gemma, Llama4 }
 impl TemplateKind {
-    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3 } }
-    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, _ => return None }) }
+    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4 } }
+    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, _ => return None }) }
 }
 
 /// What a successful load reports back to the UI.
@@ -895,6 +901,19 @@ fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
                 .replace("<|end_header_id|>\n\n", "\n")
                 .replace("<|eot_id|>", "<|im_end|>\n");
             Some(s)
+        }
+        TemplateKind::Llama4 if prompt.contains("<|start_header_id|>") || prompt.contains("<|im_start|>") => {
+            // Same header discipline as Llama-3, different marker spellings (+ <|eot|> for <|eot_id|>).
+            let mut b = prompt.replace("<|begin_of_text|>", "")
+                .replace("<|start_header_id|>", "<|header_start|>")
+                .replace("<|end_header_id|>", "<|header_end|>")
+                .replace("<|eot_id|>", "<|eot|>")
+                .replace("<|im_start|>", "<|header_start|>");
+            for r in ["system", "user", "assistant"] {
+                b = b.replace(&format!("<|header_start|>{r}\n"), &format!("<|header_start|>{r}<|header_end|>\n\n"));
+            }
+            b = b.replace("<|im_end|>\n", "<|eot|>");
+            Some(format!("<|begin_of_text|>{b}"))
         }
         TemplateKind::Llama3 if prompt.contains("<|im_start|>") => {
             let mut b = prompt.replace("<|im_start|>", "<|start_header_id|>");

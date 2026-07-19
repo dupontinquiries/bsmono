@@ -32,6 +32,13 @@ pub struct MoeConfig {
     pub n_used: u32,    // top-k activated per token (k)
     pub n_shared: u32,  // always-on shared experts (Llama4/DeepSeek); 0 for Qwen-style
     pub norm: RouteNorm,
+    /// Renormalize the selected weights to sum to 1 (softmax gating and DeepSeek-style sigmoid).
+    /// Llama4: FALSE — the combine weight is the raw sigmoid of the selected logit (with top-1
+    /// routing, normalizing would erase the gate entirely: every weight would become 1.0).
+    pub normalize: bool,
+    /// Apply the combine weight to the expert's INPUT instead of its output (Llama4). NOT
+    /// equivalent through SwiGLU's nonlinearity: silu(Wg·(w·x))·(Wu·(w·x)) ≠ w·silu(Wg·x)·(Wu·x).
+    pub weight_before: bool,
 }
 
 impl MoeConfig {
@@ -83,10 +90,15 @@ pub fn route(logits: &[f32], cfg: &MoeConfig) -> Vec<Selected> {
             idx.iter().zip(w).map(|(&i, weight)| Selected { expert: i as u32, weight }).collect()
         }
         RouteNorm::Sigmoid => {
-            // normalize the selected sigmoid gates to sum to 1
             let raw: Vec<f32> = idx.iter().map(|&i| sigmoid(logits[i])).collect();
-            let s: f32 = raw.iter().sum();
-            idx.iter().zip(raw).map(|(&i, r)| Selected { expert: i as u32, weight: if s > 0.0 { r / s } else { 0.0 } }).collect()
+            if cfg.normalize {
+                // DeepSeek-style: selected sigmoid gates renormalized to sum to 1
+                let s: f32 = raw.iter().sum();
+                idx.iter().zip(raw).map(|(&i, r)| Selected { expert: i as u32, weight: if s > 0.0 { r / s } else { 0.0 } }).collect()
+            } else {
+                // Llama4-style: the RAW sigmoid is the gate (top-1: weight = sigmoid(top logit))
+                idx.iter().zip(raw).map(|(&i, r)| Selected { expert: i as u32, weight: r }).collect()
+            }
         }
     };
     // keep a stable, descending-weight order for deterministic accumulation
@@ -142,7 +154,7 @@ mod tests {
     #[test]
     fn softmax_route_picks_top_k_and_normalizes() {
         // 4 experts, top-2. logits favor experts 2 and 0.
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
         let sel = route(&[2.0, 0.5, 3.0, -1.0], &cfg);
         assert_eq!(sel.len(), 2);
         let ids: Vec<u32> = sel.iter().map(|s| s.expert).collect();
@@ -158,7 +170,7 @@ mod tests {
     fn softmax_topk_equals_global_softmax_renormalized() {
         // the identity the doc claims: top-k softmax == global softmax restricted to the top-k
         let logits = [1.0f32, 2.0, 0.0, 3.0, -1.0];
-        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax };
+        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
         let sel = route(&logits, &cfg);
         // global softmax
         let mut g = logits.to_vec(); softmax_in_place(&mut g);
@@ -171,7 +183,7 @@ mod tests {
 
     #[test]
     fn sigmoid_route_normalizes_selected_gates() {
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: true, weight_before: false };
         let sel = route(&[3.0, -2.0, 1.0, 0.0], &cfg);
         assert_eq!(sel.len(), 2);
         assert_eq!(sel[0].expert, 0, "highest logit → highest sigmoid gate");
@@ -184,7 +196,7 @@ mod tests {
     #[test]
     fn k_clamped_and_offsets() {
         // k larger than n clamps to n; offsets index the stacked tensor by row
-        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax };
+        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
         let sel = route(&[0.1, 0.2, 0.3], &cfg);
         assert_eq!(sel.len(), 3, "k clamps to the number of experts");
         assert_eq!(expert_row_offset(0, 4096), 0);
@@ -213,8 +225,22 @@ mod tests {
 
     #[test]
     fn dense_config_is_not_moe() {
-        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax };
+        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
         assert!(!dense.is_moe());
         assert!(route(&[], &dense).is_empty());
+    }
+
+    #[test]
+    fn llama4_gating_is_raw_sigmoid_top1() {
+        // Llama4: top-1 by logit, weight = sigmoid(top logit) UNNORMALIZED (normalizing top-1
+        // would always give 1.0 and erase the gate).
+        let cfg = MoeConfig { n_routed: 16, n_used: 1, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: false, weight_before: true };
+        let mut logits = vec![-1.0f32; 16];
+        logits[7] = 0.6;
+        let sel = route(&logits, &cfg);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].expert, 7);
+        let want = 1.0 / (1.0 + (-0.6f32).exp());
+        assert!((sel[0].weight - want).abs() < 1e-6, "raw sigmoid gate, got {}", sel[0].weight);
     }
 }
