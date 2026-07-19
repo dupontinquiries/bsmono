@@ -770,7 +770,13 @@ pub struct BlockWeights {
     pub wgate_up: Lin, pub wdown: Lin, pub g1: Tensor, pub g2: Tensor,
     /// Qwen3/3.5 per-head QK-Norm weights ([head_dim] each), applied as an RMSNorm to Q and K before RoPE.
     /// None for llama/qwen2 (→ pass-through). Loaded from blk.N.attn_{q,k}_norm.weight.
+    /// Llama4 Scout: WEIGHTLESS QK-Norm (≡ all-ones weights) on RoPE layers only — the loader
+    /// injects ones tensors there and leaves NoPE layers None.
     pub q_norm: Option<Tensor>, pub k_norm: Option<Tensor>,
+    /// Llama4 iRoPE: this layer uses NO positional encoding (every 4th layer). Block fns map this
+    /// to the rope hosts' base==0.0 identity sentinel, so K enters the cache unroped and Q stays
+    /// unrotated — attention itself is unchanged.
+    pub nope: bool,
     /// Mixture-of-experts FFN (qwen3moe): replaces wgate_up/wdown (which hold 1-row placeholders when this
     /// is Some). Router is a small F32 Lin [n_expert, d]; experts are per-expert quantized Lins so the
     /// existing matvec/SwiGLU kernels apply unchanged at an expert's rows (no weight slicing needed).
@@ -1832,7 +1838,7 @@ impl Gpu {
         // 2.7 tok/s wall time). Prefill (t>1) keeps the v1 grouped path over the SAME weights via row
         // views — which is also the built-in cross-check: if prefill output is coherent and decode isn't,
         // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
-        if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax)
+        if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
@@ -1866,6 +1872,13 @@ impl Gpu {
             let rows = self.alloc(n, d);
             let dims = [n as u32, d as u32, 0, 0];
             self.dispatch(GATHER_ROWS, &[n2, &idx], &rows, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
+            // Llama4 weight-before-FFN: gate the expert's INPUT rows (then combine with unit
+            // weights — the gate has already been applied and must not be applied twice).
+            let (rows, wgt) = if m.cfg.weight_before {
+                let scaled = self.alloc(n, d);
+                self.dispatch(ROW_SCALE, &[&rows, &wgt], &scaled, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
+                (scaled, self.upload(&vec![1.0f32; n], 1, n))
+            } else { (rows, wgt) };
             // expert FFN, batched over its n tokens (existing kernels; gate/up unfused per expert)
             let gu = m.gate_up[e].apply(self, &rows, n);
             let hmid = self.swiglu_packed(&gu);
@@ -2209,6 +2222,7 @@ impl Gpu {
     /// One Llama-style transformer block, fully resident (weights uploaded once,
     /// no intermediate leaves the GPU). `n_heads` splits `d` into attention heads.
     pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
@@ -2225,6 +2239,7 @@ impl Gpu {
     /// decode can continue from position `t`. K is rope'd per-row at positions 0..t-1,
     /// which is exactly what sequential decode would have stored.
     fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
@@ -2243,6 +2258,7 @@ impl Gpu {
     /// rows `[base, base+s)`, then segment attention runs over the full `[0, base+s)` cache.
     /// Mirrors `block_prefill` but starting from a non-zero base with a populated cache.
     fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
+        let base_freq = if w.nope { 0.0 } else { base_freq }; // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd);
@@ -3297,6 +3313,19 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
   let r=i/d.c; let col=i%d.c; o[idx[r]*d.c+col]=o[idx[r]*d.c+col]+wgt[r]*src[i]; }"#;
 
+// Row-broadcast scale: o[r,c] = x[r,c]·w[r]. The Llama4 weight-before-FFN step — the router gate
+// multiplies the expert's INPUT rows (not equivalent to output-weighting through SwiGLU).
+const ROW_SCALE: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> w: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  o[i]=x[i]*w[i/d.c]; }"#;
+
 const ADD: &str = r#"
 struct D { n:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> a: array<f32>;
@@ -3998,7 +4027,14 @@ impl Gpu {
                 }
             }
         };
-        let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
+        // Qwen3/3.5: real blk.N.attn_{q,k}_norm.weight tensors. Llama4: attn_qk_norm is set in the
+        // registry but the GGUF carries NO norm-weight tensors — its QK-Norm is WEIGHTLESS (an
+        // L2/RMS norm ≡ all-ones weights), applied on RoPE layers only; handled per-layer below.
+        let is_llama4 = matches!(acfg.arch, crate::archcfg::Arch::Llama4);
+        let has_qk_norm = acfg.attn_qk_norm && !is_llama4;
+        // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
+        // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
+        let nope_step = if is_llama4 { 4usize } else { 0 };
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
         // real-word, positionally-scrambled output (the dense-Qwen salad). Set from the arch registry.
@@ -4250,8 +4286,13 @@ impl Gpu {
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
-                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) } else { None },
-                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) } else { None },
+                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
+                        else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
+                        else { None },
+                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) }
+                        else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
+                        else { None },
+                nope: nope_step > 0 && (i + 1) % nope_step == 0,
             });
         }
         let out_norm = self.upload(&fetch("output_norm.weight")?, 1, d);
@@ -4364,7 +4405,7 @@ impl Gpu {
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -5120,6 +5161,9 @@ impl Gpu {
     /// RoPE applied per head (split-half within each head_dim slice) at position `pos0`.
     pub fn rope_mh_t(&self, x: &Tensor, ff: &Tensor, t: usize, dm: usize, base: f32, pos0: usize, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
+        // base == 0.0 is the NoPE sentinel (Llama4 iRoPE layers): identity pass-through, so every
+        // block fn keeps one shape/flow and the per-layer switch is a single line at its top.
+        if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; }
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
         let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0];
@@ -5242,6 +5286,7 @@ impl Gpu {
     /// One decode block using the int8 KV cache: compute q/k/v (f32), quantize this
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
@@ -5259,6 +5304,7 @@ impl Gpu {
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
@@ -5323,6 +5369,7 @@ impl Gpu {
     }
     /// One block for a single token at absolute `pos`, attending to its KV cache.
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
@@ -5348,6 +5395,7 @@ impl Gpu {
     /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
     /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, ad+2kv] — one matmul (was three)
@@ -5383,6 +5431,7 @@ impl Gpu {
     /// Per-row-position RoPE: each row uses its own absolute position from `pos`.
     pub fn rope_mh_rows(&self, x: &Tensor, ff: &Tensor, pos: &Tensor, t: usize, dm: usize, base: f32, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
+        if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; } // NoPE sentinel
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
         let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, 0];
@@ -5395,6 +5444,7 @@ impl Gpu {
     /// so a ring buffer can overwrite an evicted slot with no shifting. `block_decode` is
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd);
@@ -5410,6 +5460,7 @@ impl Gpu {
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
@@ -5513,8 +5564,9 @@ impl Gpu {
         for li in 0..m.n_layers {
             let w = &m.layers[li];
             let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
-            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, m.base, hd);
-            let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, m.base, hd);
+            let rb = if w.nope { 0.0 } else { m.base }; // Llama4 iRoPE NoPE switch (rows path)
+            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, rb, hd);
+            let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, rb, hd);
             let vb = w.wv.apply(self, &n1, n);
             // per-session: append this layer's K/V to each cache, attend each cache
             let attn = self.alloc(n, ad);
@@ -5847,8 +5899,9 @@ impl Gpu {
         for li in 0..m.n_layers {
             let w = &m.layers[li];
             let n1 = self.rmsnorm_t(&x, &w.g1, n, d, m.eps);
-            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, m.base, hd);
-            let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, m.base, hd);
+            let rb = if w.nope { 0.0 } else { m.base }; // Llama4 iRoPE NoPE switch (rows path)
+            let qb = self.rope_mh_rows(&w.wq.apply(self, &n1, n), &m.rope_factors, &pos, n, ad, rb, hd);
+            let kb = self.rope_mh_rows(&w.wk.apply(self, &n1, n), &m.rope_factors, &pos, n, kv, rb, hd);
             let vb = w.wv.apply(self, &n1, n);
             // quantize this layer's K/V for the whole batch once, then scatter per session
             let (kqb, ksb) = self.quantize_rows(&kb, n, kv);

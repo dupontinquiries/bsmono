@@ -688,6 +688,16 @@ fn build_prompt(tmpl: TemplateKind, system: &str, turns: &[(Role, &str)]) -> Str
             }
             s.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
         }
+        TemplateKind::Llama4 => {
+            // Llama-3's header discipline with Llama4's marker spellings (<|header_start|>, <|eot|>).
+            s.push_str("<|begin_of_text|>");
+            if !system.is_empty() { s.push_str(&format!("<|header_start|>system<|header_end|>\n\n{}<|eot|>", neutralize(system))); }
+            for (role, text) in turns {
+                let r = if *role == Role::User { "user" } else { "assistant" };
+                s.push_str(&format!("<|header_start|>{r}<|header_end|>\n\n{}<|eot|>", neutralize(text)));
+            }
+            s.push_str("<|header_start|>assistant<|header_end|>\n\n");
+        }
         TemplateKind::Gemma => {
             // Gemma 4: <|turn>ROLE\n…<turn|> (changed from Gemma 3), native system role; BOS added by backend.
             if !system.is_empty() { s.push_str(&format!("<|turn>system\n{}<turn|>\n", neutralize(system))); }
