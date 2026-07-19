@@ -107,6 +107,9 @@ pub enum Command {
                          // files appear live in the scene, then :reapply lands them as one commit
     FanAgent(String),    // :fan-agent <task> — spin up several agent branches (one isolated workspace each),
                          // run them interleaved on the one worker, then prune to the keeper
+    Lanes(String),       // :lanes <N|off> — spin N concurrent generation lanes over the loaded local model
+                         // (ONE resident weights copy shared read-only, one KV cache per lane) so fan
+                         // branches genuinely decode in parallel instead of round-robin; `off` tears down
     Pick(usize),         // :pick <n> — land fan branch n's changes over the project (keep it, discard the rest)
     DocFan(String),      // :docs <task> — fan out several agents to WRITE DOCS (doc-organization convention on),
                          // each a slice of the tree in its own workspace; then :merge-docs to union them
@@ -474,6 +477,7 @@ pub fn parse_command(line: &str) -> Command {
         "reapply" | "ra" => Command::Reapply,
         "agent" | "ag" => Command::Agent(arg.to_string()),
         "fan-agent" | "faa" => Command::FanAgent(arg.to_string()),
+        "lanes" | "ln" => Command::Lanes(arg.to_string()),
         "pick" => Command::Pick(arg.trim().parse::<usize>().unwrap_or(0)),
         "docs" | "doc-fan" => Command::DocFan(arg.to_string()),
         "merge-docs" | "mergedocs" => Command::MergeDocs,
@@ -600,6 +604,8 @@ mod tests {
         assert_eq!(parse_command(":agent add a test for foo"), Command::Agent("add a test for foo".into()));
         assert_eq!(parse_command(":ag build a CLI"), Command::Agent("build a CLI".into()));
         assert_eq!(parse_command(":fan-agent try anyhow and thiserror"), Command::FanAgent("try anyhow and thiserror".into()));
+        assert_eq!(parse_command(":lanes 3"), Command::Lanes("3".into()));
+        assert_eq!(parse_command(":ln off"), Command::Lanes("off".into()));
         assert_eq!(parse_command(":pick 2"), Command::Pick(2));
         assert_eq!(parse_command(":docs write user + api docs"), Command::DocFan("write user + api docs".into()));
         assert_eq!(parse_command(":merge-docs"), Command::MergeDocs);
