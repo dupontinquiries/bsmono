@@ -114,6 +114,12 @@ pub struct Workspace {
     max_output: usize,
     timeout: Duration,
     events: Vec<FileEvent>,
+    /// Library roots for READ-ONLY virtual paths (`~deps/<crate>/…` = cargo registry source,
+    /// `~std/…` = the Rust toolchain's stdlib source, doc comments and all). The source IS the
+    /// documentation — this is what lets a small model check an exact method signature instead of
+    /// hallucinating one. Writes/edits under `~` are always refused.
+    cargo_home: PathBuf,
+    rust_src: std::cell::OnceCell<Result<PathBuf, String>>,
 }
 
 impl Workspace {
@@ -126,6 +132,9 @@ impl Workspace {
             max_output: 64 * 1024,
             timeout: Duration::from_secs(120),
             events: Vec::new(),
+            cargo_home: std::env::var_os("CARGO_HOME").map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cargo")),
+            rust_src: std::cell::OnceCell::new(),
         }
     }
 
@@ -182,11 +191,110 @@ impl Workspace {
         }
     }
 
+    /// Guarded join: components of `rel` appended under `base`, `..`/absolute rejected — the same
+    /// discipline as `sandbox_path`, reusable for the virtual library roots.
+    fn join_guarded(base: &Path, rel: &str) -> Result<PathBuf, String> {
+        let mut out = base.to_path_buf();
+        for comp in Path::new(rel).components() {
+            match comp {
+                Component::Normal(c) => out.push(c),
+                Component::CurDir => {}
+                Component::ParentDir => return Err(format!("path escapes its root: {rel}")),
+                Component::RootDir | Component::Prefix(_) => return Err(format!("absolute paths are not allowed: {rel}")),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Resolve a READ path: workspace-relative as before, or one of the read-only virtual roots —
+    /// `~std/<lib>/…` (stdlib source: Vec/String in ~std/alloc, io/fs in ~std/std, Option/Iterator
+    /// in ~std/core) and `~deps/<crate>/…` (the dependency's source exactly as cargo fetched it,
+    /// version picked from this workspace's Cargo.lock).
+    fn resolve_read(&self, rel: &str) -> Result<PathBuf, String> {
+        if let Some(rest) = rel.strip_prefix("~std/").or(if rel == "~std" { Some("") } else { None }) {
+            let root = self.rust_src_root()?;
+            return Self::join_guarded(&root, rest);
+        }
+        if let Some(rest) = rel.strip_prefix("~deps/").or(if rel == "~deps" { Some("") } else { None }) {
+            let mut it = rest.splitn(2, '/');
+            let name = it.next().unwrap_or("");
+            if name.is_empty() { return Err("~deps needs a crate: ~deps/<crate>/… (list_dir ~deps to see them)".into()); }
+            let dir = self.dep_dir(name)?;
+            return Self::join_guarded(&dir, it.next().unwrap_or(""));
+        }
+        if rel.starts_with('~') {
+            return Err(format!("unknown virtual root in {rel} — only ~std/… and ~deps/<crate>/… exist"));
+        }
+        self.sandbox_path(rel)
+    }
+
+    /// The stdlib source root: LOGSCOPE_RUST_SRC override, else `rustc --print sysroot` +
+    /// lib/rustlib/src/rust/library. Missing → a teachable error (rust-src component).
+    fn rust_src_root(&self) -> Result<PathBuf, String> {
+        self.rust_src.get_or_init(|| {
+            if let Ok(p) = std::env::var("LOGSCOPE_RUST_SRC") {
+                let p = PathBuf::from(p);
+                return if p.is_dir() { Ok(p) } else { Err(format!("LOGSCOPE_RUST_SRC={} is not a directory", p.display())) };
+            }
+            let out = std::process::Command::new("rustc").arg("--print").arg("sysroot").output()
+                .map_err(|e| format!("rustc not found ({e}) — set LOGSCOPE_RUST_SRC to the stdlib source"))?;
+            let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let p = PathBuf::from(sysroot).join("lib/rustlib/src/rust/library");
+            if p.is_dir() { Ok(p) } else {
+                Err("stdlib source not installed — `rustup component add rust-src` (or set LOGSCOPE_RUST_SRC)".into())
+            }
+        }).clone()
+    }
+
+    /// Locate a dependency's source dir in the cargo registry, preferring the version this
+    /// workspace's Cargo.lock pins; else the highest version present.
+    fn dep_dir(&self, name: &str) -> Result<PathBuf, String> {
+        let locked = std::fs::read_to_string(self.root.join("Cargo.lock")).ok()
+            .and_then(|t| cargo_lock_versions(&t).into_iter().find(|(n, _)| n == name).map(|(_, v)| v));
+        let src = self.cargo_home.join("registry").join("src");
+        let mut best: Option<(Vec<u64>, PathBuf)> = None;
+        if let Ok(rd) = std::fs::read_dir(&src) {
+            for reg in rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+                if let Some(v) = &locked {
+                    let exact = reg.join(format!("{name}-{v}"));
+                    if exact.is_dir() { return Ok(exact); }
+                }
+                if let Ok(rd2) = std::fs::read_dir(&reg) {
+                    for e in rd2.flatten() {
+                        let fname = e.file_name().to_string_lossy().into_owned();
+                        if let Some(vs) = fname.strip_prefix(&format!("{name}-")) {
+                            if vs.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) && e.path().is_dir() {
+                                let key = version_key(vs);
+                                if best.as_ref().map(|(k, _)| key > *k).unwrap_or(true) { best = Some((key, e.path())); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|(_, p)| p).ok_or_else(|| format!(
+            "dependency '{name}' not found in the cargo registry — list_dir ~deps shows this project's deps"))
+    }
+
+    /// `list_dir ~deps`: this workspace's dependencies (from Cargo.lock), each marked readable or not.
+    fn list_deps(&self) -> ToolResult {
+        let Ok(text) = std::fs::read_to_string(self.root.join("Cargo.lock")) else {
+            return ToolResult::err("no Cargo.lock in the workspace — build once, or name the crate directly (~deps/<crate>/…)");
+        };
+        let mut lines: Vec<String> = cargo_lock_versions(&text).into_iter().map(|(n, v)| {
+            let ok = self.dep_dir(&n).is_ok();
+            format!("{n} {v}{}", if ok { "" } else { "  (source not in registry — path/workspace dep?)" })
+        }).collect();
+        lines.sort();
+        lines.truncate(200);
+        ToolResult::ok(format!("dependencies (read any with ~deps/<name>/src/lib.rs):\n{}", lines.join("\n")))
+    }
+
     fn search(&self, pattern: &str, rel: &str) -> ToolResult {
         let base = if rel.is_empty() || rel == "." {
             self.root.clone()
         } else {
-            match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
+            match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
         };
         let mut hits = Vec::new();
         fn walk(dir: &Path, root: &Path, pat: &str, hits: &mut Vec<String>, cap: usize) {
@@ -214,7 +322,7 @@ impl Workspace {
     }
 
     fn read_range(&self, rel: &str, start: usize, end: usize) -> ToolResult {
-        let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let text = match std::fs::read_to_string(&abs) { Ok(s) => s, Err(e) => return ToolResult::err(format!("read {rel}: {e}")) };
         let (start, end) = (start.max(1), end.max(start));
         let out: String = text.lines().enumerate()
@@ -263,6 +371,7 @@ impl Workspace {
     }
 
     fn write_file(&mut self, rel: &str, contents: &str) -> ToolResult {
+        if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         let existed = abs.exists();
         if let Some(parent) = abs.parent() {
@@ -286,6 +395,7 @@ impl Workspace {
     /// enforced so an edit can never land somewhere the model didn't mean; every failure tells the
     /// model exactly how to recover (re-read for a stale anchor, extend an ambiguous one).
     fn edit_file(&mut self, rel: &str, find: &str, replace: &str) -> ToolResult {
+        if rel.starts_with('~') { return ToolResult::err(format!("{rel}: library roots (~std/~deps) are READ-ONLY")); }
         let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         if find.is_empty() {
             return ToolResult::err(format!("edit {rel}: empty find anchor — copy the exact text to replace"));
@@ -317,7 +427,7 @@ impl Workspace {
     }
 
     fn read_file(&self, rel: &str) -> ToolResult {
-        let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        let abs = match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
         match std::fs::read_to_string(&abs) {
             Ok(s) => {
                 let capped: String = s.chars().take(self.max_output).collect();
@@ -329,10 +439,11 @@ impl Workspace {
     }
 
     fn list_dir(&self, rel: &str) -> ToolResult {
+        if rel == "~deps" || rel == "~deps/" { return self.list_deps(); }
         let abs = if rel.is_empty() || rel == "." {
             self.root.clone()
         } else {
-            match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
+            match self.resolve_read(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) }
         };
         let rd = match std::fs::read_dir(&abs) { Ok(r) => r, Err(e) => return ToolResult::err(format!("ls {rel}: {e}")) };
         let mut names: Vec<String> = rd.flatten().map(|e| {
@@ -775,6 +886,30 @@ pub const DONE_MARKER: &str = "TASK_COMPLETE";
 /// Build the system prompt that teaches a local model the tool protocol. Kept explicit and example-led
 /// because small models follow a shown format far more reliably than a described one. `cfg` shapes it:
 /// the read tools offered depend on `read_policy`, and the verify promise is stated when verification is on.
+/// Minimal Cargo.lock reader: every `[[package]]` name/version pair. Pure; drives the `~deps`
+/// virtual root (version pinning + `list_dir ~deps`).
+pub fn cargo_lock_versions(text: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let (mut name, mut in_pkg) = (None::<String>, false);
+    for line in text.lines() {
+        let l = line.trim();
+        if l == "[[package]]" { in_pkg = true; name = None; continue; }
+        if l.starts_with('[') && l != "[[package]]" { in_pkg = false; continue; }
+        if !in_pkg { continue; }
+        if let Some(v) = l.strip_prefix("name = \"").and_then(|r| r.strip_suffix('"')) { name = Some(v.to_string()); }
+        else if let Some(v) = l.strip_prefix("version = \"").and_then(|r| r.strip_suffix('"')) {
+            if let Some(n) = name.take() { out.push((n, v.to_string())); }
+        }
+    }
+    out
+}
+
+/// Sortable key for a semver-ish version string ("1.0.219" > "1.0.9").
+fn version_key(v: &str) -> Vec<u64> {
+    v.split(|c: char| !c.is_ascii_digit()).filter(|s| !s.is_empty())
+        .map(|s| s.parse().unwrap_or(0)).collect()
+}
+
 /// A bounded file tree of the workspace for the agent's turn-0 context: relative paths, source-ish
 /// files first-class, generated trees skipped, capped at `cap` entries (+ a truncation note). This is
 /// what stops a model from asking the user what the repository contains — it can SEE it.
@@ -903,6 +1038,13 @@ turns are reconnaissance — list_dir, read the README / Cargo.toml, search the 
 and once you understand the lay of the land, write a `doc` named \"survey\" (module map, where the
 task's concepts live, the pattern to follow) so later workers inherit what you learned instead of
 re-crawling. Then make the change, and let the automatic verification tell you if it compiles.
+
+LIBRARY SOURCE IS READABLE TOO — the same read tools accept two READ-ONLY virtual roots:
+  ~deps/<crate>/…   a dependency's source exactly as cargo fetched it (list_dir {{ \"path\":\"~deps\" }} lists them)
+  ~std/…            the Rust stdlib source (Vec/String → ~std/alloc/src, io/fs → ~std/std/src, Option/Iterator → ~std/core/src)
+The source includes the doc comments — it IS the documentation. When unsure of an exact method name,
+signature, or trait bound, READ it (e.g. search {{ \"pattern\":\"pub fn drain\", \"path\":\"~std/alloc/src/vec\" }},
+read_file {{ \"path\":\"~deps/serde/src/lib.rs\" }}) instead of guessing an API that may not exist.
 
 Rules:
 - Paths are relative to the workspace root; you cannot escape it.
@@ -2190,5 +2332,88 @@ error: could not compile `demo` (lib) due to 3 previous errors
         // no context → no empty section
         let p2 = system_prompt("t", &AgentConfig::default());
         assert!(!p2.contains("WORKSPACE OVERVIEW"));
+    }
+
+    #[test]
+    fn cargo_lock_versions_parses_packages() {
+        let lock = r#"
+# auto-generated
+[[package]]
+name = "serde"
+version = "1.0.219"
+
+[[package]]
+name = "lodash-rs"
+version = "0.2.0"
+dependencies = ["serde"]
+
+[metadata]
+foo = "bar"
+"#;
+        let v = cargo_lock_versions(lock);
+        assert!(v.contains(&("serde".to_string(), "1.0.219".to_string())));
+        assert!(v.contains(&("lodash-rs".to_string(), "0.2.0".to_string())));
+        assert!(!v.iter().any(|(n, _)| n == "foo"), "metadata section is not a package");
+        assert!(version_key("1.0.219") > version_key("1.0.9"), "numeric, not lexical");
+    }
+
+    #[test]
+    fn library_roots_are_read_only_and_reject_escapes() {
+        let d = std::env::temp_dir().join(format!("wslib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut ex = Workspace::new(&d);
+        // writes/edits under ~ are refused
+        let w = ex.apply(&Tool::WriteFile { path: "~std/core/src/hack.rs".into(), contents: "x".into() });
+        assert!(!w.ok && w.output.contains("READ-ONLY"));
+        let e = ex.apply(&Tool::Edit { path: "~deps/serde/src/lib.rs".into(), find: "a".into(), replace: "b".into() });
+        assert!(!e.ok && e.output.contains("READ-ONLY"));
+        // path traversal out of a virtual root is rejected
+        assert!(ex.resolve_read("~deps/serde/../../../etc/passwd").is_err());
+        // unknown virtual root named clearly
+        let u = ex.apply(&Tool::ReadFile { path: "~bogus/x".into() });
+        assert!(!u.ok && u.output.contains("~std") && u.output.contains("~deps"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reads_real_dependency_and_stdlib_source() {
+        // Uses the container's own registry + toolchain — skips cleanly if either is absent so the
+        // test is portable, but in this build both exist (we depend on serde-ish crates + have rust-src).
+        let d = std::env::temp_dir().join(format!("wsdep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut ex = Workspace::new(&d);
+        // pick any crate actually present in the registry
+        let src = ex.cargo_home.join("registry").join("src");
+        let sample = std::fs::read_dir(&src).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).filter(|p| p.is_dir())
+              .find_map(|reg| std::fs::read_dir(&reg).ok().and_then(|r2| {
+                  r2.flatten().map(|e| e.file_name().to_string_lossy().into_owned())
+                    .find(|n| n.contains('-') && n.rsplit_once('-').map(|(_, v)| v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false)).unwrap_or(false))
+              }))
+        });
+        if let Some(fname) = sample {
+            let name = fname.rsplit_once('-').unwrap().0.to_string();
+            let dir = ex.dep_dir(&name).expect("dep dir resolves");
+            assert!(dir.is_dir() && dir.file_name().unwrap().to_string_lossy().starts_with(&name));
+            // list_dir ~deps/<name> works through the tool surface
+            let ls = ex.apply(&Tool::ListDir { path: format!("~deps/{name}") });
+            assert!(ls.ok, "{}", ls.output);
+        }
+        // stdlib: read_range on core's Option source if rust-src is present
+        if let Ok(root) = ex.rust_src_root() {
+            assert!(root.join("core/src/option.rs").exists() || root.join("core").is_dir());
+            let r = ex.apply(&Tool::ReadRange { path: "~std/core/src/option.rs".into(), start: 1, end: 5 });
+            assert!(r.ok || r.output.contains("read"), "stdlib read reached the file layer");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn prompt_teaches_library_roots() {
+        let p = system_prompt("use serde", &AgentConfig::default());
+        assert!(p.contains("~deps/<crate>") && p.contains("~std/"), "both roots documented");
+        assert!(p.contains("IS the documentation"), "explains source-as-docs");
     }
 }
