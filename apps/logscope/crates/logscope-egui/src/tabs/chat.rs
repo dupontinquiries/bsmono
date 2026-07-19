@@ -1762,6 +1762,9 @@ impl Chat {
         // Composer command routing: a line the user submits that begins with ':' is executed as a
         // command HERE, not sent to the model. '::text' escapes a literal message that starts with a
         // colon. Everything else is a normal chat turn.
+        // '::' before compose: the escape hatch OUT of the workspace auto-route below — a message
+        // the user explicitly wants as plain chat even with a repository loaded.
+        let plain_escape = self.input.trim_start().starts_with("::");
         match compose_input(&self.input) {
             Composed::Empty => {}
             Composed::Command(cmd) => {
@@ -1775,6 +1778,18 @@ impl Chat {
             }
             Composed::Message(qt) => {
                 self.input.clear();
+                // WORKSPACE AUTO-ROUTE: with a repository loaded, a plain message IS a task on that
+                // repository — run it through the agent loop (which can read/search/edit the code)
+                // instead of plain chat (which cannot; the log's "add more blocks" got a generic
+                // clarification reply because the model never saw a single file). `::text` still
+                // escapes a literal chat message, and a busy model falls through to the normal queue.
+                if !plain_escape && self.gitmind_session.is_some() && self.agent_run.is_none() && self.agent_fan.is_none() && self.stream.is_none() {
+                    self.start_agent_task(qt, "task");
+                    if self.agent_run.is_some() {
+                        self.note = format!("{} — auto-routed to the workspace agent ('::' prefix for plain chat)", self.note);
+                    }
+                    return;
+                }
                 // Branch point: a human interjection forks off the selected node (or the previous tip).
                 let parent = self.branch_from.take().or(self.active_leaf).or(self.msgs.len().checked_sub(1));
                 // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
@@ -1944,7 +1959,41 @@ impl Chat {
     }
 
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
+    /// Turn-0 context for any agent/fan run over the loaded workspace: bounded file tree + shared
+    /// crew docs. This is what makes "add more blocks" land on a model that can SEE the repo.
+    fn agent_context(&self) -> String {
+        let Some(sess) = self.gitmind_session.as_ref() else { return String::new() };
+        let root = sess.work_dir();
+        let tree = crate::workspace_exec::repo_tree(root, 300);
+        let docs = crate::workspace_exec::collect_shared_docs(root, 6_000);
+        if docs.is_empty() { tree } else { format!("{tree}\n\n{docs}") }
+    }
+
+    /// Start a single agent run over the loaded workspace (shared by `:agent` and the plain-message
+    /// auto-route when a workspace is loaded). Assumes idle-ness was checked by the caller's flow;
+    /// re-checks defensively and notes instead of colliding.
+    fn start_agent_task(&mut self, task: String, via: &str) {
+        if task.is_empty() { self.note = format!("{via} needs a task"); return; }
+        if self.gitmind_session.is_none() {
+            self.note = format!("{via} — load a workspace first (:load-gitmind <path>)"); return;
+        }
+        if self.agent_run.is_some() { self.note = format!("{via} — a run is already active (:stop to cancel)"); return; }
+        if self.stream.is_some() { self.note = format!("{via} — the model is busy; wait or :stop"); return; }
+        let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
+        let mut cfg = crate::workspace_exec::AgentConfig::default();
+        cfg.context = self.agent_context();
+        let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
+        self.agent_run = Some(run);
+        self.agent_task = task.clone();
+        self.agent_pending_submit = Some(first);
+        self.agent_files.clear();
+        self.agent_plan.clear();
+        self.note = format!("agent started: {task} — surveying the workspace…");
+    }
+
     fn start_fan(&mut self, task: &str, cfg: crate::workspace_exec::AgentConfig, doc_fan: bool, label: &str) {
+        let mut cfg = cfg;
+        if cfg.context.is_empty() { cfg.context = self.agent_context(); } // every branch starts sighted
         let task = task.trim().to_string();
         if task.is_empty() {
             self.note = format!(":{label} needs a task");
@@ -4856,29 +4905,9 @@ impl Chat {
                 }
             }
             Command::Agent(task) => {
-                let task = task.trim().to_string();
-                if task.is_empty() {
-                    self.note = ":agent needs a task (e.g. :agent add a unit test for the parser)".into();
-                } else if self.gitmind_session.is_none() {
-                    self.note = ":agent — load a workspace first (:load-gitmind <path>), then :agent <task>".into();
-                } else if self.agent_run.is_some() {
-                    self.note = ":agent — a run is already active (:stop to cancel it first)".into();
-                } else if self.stream.is_some() {
-                    self.note = ":agent — the model is busy; wait for the reply or :stop".into();
-                } else {
-                    // NON-BLOCKING: build the driver over the session's isolated /tmp workspace and hand its
-                    // first prompt to the inference worker. The Evt loop (apply_evt) advances it turn by turn
-                    // via on_token/on_done; the frame never blocks, and :stop / barge-in interrupt it.
-                    let work_dir = self.gitmind_session.as_ref().unwrap().work_dir().to_path_buf();
-                    let cfg = crate::workspace_exec::AgentConfig::default();
-                    let (run, first) = crate::workspace_exec::AgentRun::start(work_dir, &task, cfg);
-                    self.agent_run = Some(run);
-                    self.agent_task = task.clone();
-                    self.agent_pending_submit = Some(first);
-                    self.agent_files.clear();
-                    self.agent_plan.clear();
-                    self.note = format!("agent started: {task} — planning…");
-                }
+                // NON-BLOCKING: the driver runs over the session's isolated /tmp workspace; the Evt
+                // loop advances it turn by turn, and :stop / barge-in interrupt it.
+                self.start_agent_task(task.trim().to_string(), ":agent");
             }
             Command::FanAgent(task) => {
                 let cfg = crate::workspace_exec::AgentConfig::default();

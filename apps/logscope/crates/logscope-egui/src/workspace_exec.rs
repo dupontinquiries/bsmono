@@ -55,6 +55,12 @@ pub enum Tool {
     /// which small models drift on (line numbers, context hashes) — either applies exactly or fails
     /// with a teachable error (0 matches = stale anchor, >1 = grow the anchor).
     Edit { path: String, find: String, replace: String },
+    /// Write a SHARED doc for the whole crew: `.logscope/docs/<name>.md` in the workspace. Every
+    /// agent run and fan worker gets all shared docs injected into its prompt (see
+    /// `collect_shared_docs`), so this is how one worker's reconnaissance ("here is the module map",
+    /// "the block registry lives in blocks.rs, add via register()") becomes everyone's context.
+    /// Never triggers verification (docs aren't code) and never counts as task output.
+    Doc { name: String, content: String },
 }
 
 impl Tool {
@@ -68,6 +74,7 @@ impl Tool {
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
             Tool::Edit { path, find, replace } => format!("edit {} (−{} +{} B)", path, find.len(), replace.len()),
+            Tool::Doc { name, content } => format!("doc {} ({} B, shared)", name, content.len()),
         }
     }
 }
@@ -171,6 +178,7 @@ impl Workspace {
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
             Tool::Edit { path, find, replace } => self.edit_file(path, find, replace),
+            Tool::Doc { name, content } => self.write_doc(name, content),
         }
     }
 
@@ -236,6 +244,22 @@ impl Workspace {
             bytes: bytes.len() as u64,
         });
         ToolResult::ok(format!("ingested {dest_rel} ({} bytes)", bytes.len()))
+    }
+
+    /// `Tool::Doc`: write a shared crew doc at `.logscope/docs/<name>.md`. Name is sanitized to a
+    /// bare slug (no paths, no traversal); collisions overwrite — docs are living documents the crew
+    /// keeps current, not an append-only log.
+    fn write_doc(&mut self, name: &str, content: &str) -> ToolResult {
+        let slug: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' }).collect();
+        let slug = slug.trim_matches('-').to_string();
+        if slug.is_empty() { return ToolResult::err("doc: name must contain letters/digits"); }
+        let dir = self.root.join(".logscope").join("docs");
+        if let Err(e) = std::fs::create_dir_all(&dir) { return ToolResult::err(format!("doc mkdir: {e}")); }
+        let path = dir.join(format!("{slug}.md"));
+        match std::fs::write(&path, content) {
+            Ok(()) => ToolResult::ok(format!("shared doc '{slug}' written ({} B) — every worker's next prompt includes it", content.len())),
+            Err(e) => ToolResult::err(format!("doc write: {e}")),
+        }
     }
 
     fn write_file(&mut self, rel: &str, contents: &str) -> ToolResult {
@@ -421,6 +445,10 @@ pub struct AgentConfig {
     /// summarizes the check for the big model" pipeline — a Delegate-slot model can rewrite the digest
     /// conversationally, but the loop never depends on one being loaded.
     pub digest_verify: bool,
+    /// Pre-gathered context injected into the system prompt: the workspace's file tree plus any
+    /// shared docs earlier workers wrote (`collect_shared_docs`). Turn 0 should never be blind —
+    /// a model that can't see the repo asks the user about it instead of exploring it.
+    pub context: String,
 }
 
 impl Default for AgentConfig {
@@ -434,6 +462,7 @@ impl Default for AgentConfig {
             doc_mode: false,
             prefer_patches: true,
             digest_verify: true,
+            context: String::new(),
         }
     }
 }
@@ -620,6 +649,10 @@ fn parse_one(block: &str) -> Option<Tool> {
             path: json_str(block, "path").unwrap_or_default(),
         }),
         "list_dir" => Some(Tool::ListDir { path: json_str(block, "path").unwrap_or_default() }),
+        "doc" | "share_doc" | "write_doc" => Some(Tool::Doc {
+            name: json_str(block, "name")?,
+            content: json_str(block, "content").or_else(|| json_str(block, "contents"))?,
+        }),
         "run" => {
             let argv = json_str_array(block, "argv")
                 .or_else(|| json_str(block, "cmd").map(|s| s.split_whitespace().map(String::from).collect()))?;
@@ -742,14 +775,75 @@ pub const DONE_MARKER: &str = "TASK_COMPLETE";
 /// Build the system prompt that teaches a local model the tool protocol. Kept explicit and example-led
 /// because small models follow a shown format far more reliably than a described one. `cfg` shapes it:
 /// the read tools offered depend on `read_policy`, and the verify promise is stated when verification is on.
+/// A bounded file tree of the workspace for the agent's turn-0 context: relative paths, source-ish
+/// files first-class, generated trees skipped, capped at `cap` entries (+ a truncation note). This is
+/// what stops a model from asking the user what the repository contains — it can SEE it.
+pub fn repo_tree(root: &std::path::Path, cap: usize) -> String {
+    const SKIP: [&str; 7] = ["target", ".git", ".gitmind", ".logscope", "node_modules", "dist", ".cargo"];
+    let mut out: Vec<String> = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut truncated = false;
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > 6 { continue; }
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            if out.len() >= cap { truncated = true; break; }
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().into_owned();
+            if p.is_dir() {
+                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') { stack.push((p, depth + 1)); }
+            } else if !name.starts_with('.') {
+                if let Ok(rel) = p.strip_prefix(root) {
+                    let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                    out.push(format!("{} ({} B)", rel.to_string_lossy(), size));
+                }
+            }
+        }
+        if truncated { break; }
+    }
+    out.sort();
+    let mut s = out.join("\n");
+    if truncated { s.push_str(&format!("\n… (truncated at {cap} entries — use list_dir/search for the rest)")); }
+    s
+}
+
+/// Concatenate every shared crew doc (`.logscope/docs/*.md`) under a total `budget` in chars — the
+/// other half of `Tool::Doc`: one worker's write-up becomes every later worker's prompt context.
+pub fn collect_shared_docs(root: &std::path::Path, budget: usize) -> String {
+    let dir = root.join(".logscope").join("docs");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return String::new() };
+    let mut files: Vec<_> = rd.flatten().map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("md")).collect();
+    files.sort();
+    let mut s = String::new();
+    for f in files {
+        if s.len() >= budget { s.push_str("\n… (docs truncated)"); break; }
+        let name = f.file_stem().map(|x| x.to_string_lossy().into_owned()).unwrap_or_default();
+        let body = std::fs::read_to_string(&f).unwrap_or_default();
+        let take = (budget - s.len()).min(body.len());
+        // cut on a char boundary
+        let mut cut = take; while cut < body.len() && !body.is_char_boundary(cut) { cut += 1; }
+        s.push_str(&format!("### shared doc: {name}\n{}\n\n", &body[..cut.min(body.len())]));
+    }
+    s
+}
+
 pub fn system_prompt(task: &str, cfg: &AgentConfig) -> String {
+    // ALL read/navigation tools are always on the menu; the policy only changes which one the
+    // prompt recommends leading with. (Hiding search from the primary agent taught it to ask the
+    // user about the code instead of grepping it.)
     let read_tools = match cfg.read_policy {
         ReadPolicy::Full => "\
-- read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (reads the whole file — prefer this; context is cheap)"
+- read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (whole file — prefer this; context is cheap)
+- search      { \"tool\":\"search\", \"pattern\":\"<text>\", \"path\":\"<rel or empty>\" }  (grep the repo — find where a concept lives)
+- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (a slice of a big file)"
             .to_string(),
         ReadPolicy::Surgical => "\
 - search      { \"tool\":\"search\", \"pattern\":\"<text>\", \"path\":\"<rel or empty>\" }  (grep the repo — use this first)
-- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (read just the lines you need)"
+- read_range  { \"tool\":\"read_range\", \"path\":\"<rel path>\", \"start\":<line>, \"end\":<line> }  (read just the lines you need)
+- read_file   { \"tool\":\"read_file\", \"path\":\"<rel path>\" }  (whole file — only when it is small)"
             .to_string(),
     };
     let verify_note = if cfg.verify_cmd.is_empty() {
@@ -764,6 +858,9 @@ you. Favor code that compiles over clever code that might not; when you see erro
         )
     };
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
+    // Turn-0 context: the workspace tree + shared crew docs, so no model starts blind.
+    let ctx_note = if cfg.context.is_empty() { String::new() }
+        else { format!("\n\nWORKSPACE OVERVIEW (you can read any of these with the tools above):\n{}", cfg.context) };
     let patch_note = if cfg.prefer_patches {
         "\n\nEDITING EXISTING FILES: use `edit` — copy a UNIQUE anchor VERBATIM from read output (keep its \
 whitespace and newlines) and give the replacement. Do NOT re-emit whole existing files with write_file; \
@@ -794,6 +891,18 @@ Available tools (one JSON object per block):
 {read_tools}
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
+- doc         {{ \"tool\":\"doc\", \"name\":\"survey\", \"content\":\"<markdown>\" }}  (SHARED crew doc — every worker's next prompt includes it)
+
+THE CODE IS RIGHT THERE — LOOK AT IT. This workspace is a real repository (overview below). Every
+claim about it must come from tool results, never from guessing and never from asking the user: the
+user will NOT answer questions, so a reply that only asks for clarification is a wasted turn. If the
+task is vague (\"add more blocks\"), that vagueness is an instruction to figure out what \"blocks\"
+means IN THIS CODEBASE: search for the word, read the files that define it, find the existing
+pattern (a registry, an enum, a directory of implementations), then extend that pattern. Your first
+turns are reconnaissance — list_dir, read the README / Cargo.toml, search the task's key words —
+and once you understand the lay of the land, write a `doc` named \"survey\" (module map, where the
+task's concepts live, the pattern to follow) so later workers inherit what you learned instead of
+re-crawling. Then make the change, and let the automatic verification tell you if it compiles.
 
 Rules:
 - Paths are relative to the workspace root; you cannot escape it.
@@ -801,7 +910,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}{ctx_note}"
     )
 }
 
@@ -1761,7 +1870,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
             format!("All set. {DONE_MARKER}"),
         ]};
         // verification off (scripted model, no cargo in the sandbox); tests the plan + loop + files.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -1781,7 +1890,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -1830,7 +1939,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -1849,7 +1958,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -1926,7 +2035,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -1936,7 +2045,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -1977,7 +2086,7 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
+        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false, context: String::new() };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
@@ -2026,5 +2135,60 @@ error: could not compile `demo` (lib) due to 3 previous errors
         let s = run_agent(&mut Never, &mut ws, "loop forever", 3);
         assert_eq!(s.stop, Stop::StepLimit);
         assert_eq!(s.turns.len(), 3);
+    }
+
+    #[test]
+    fn doc_tool_parses_and_shares_across_workers() {
+        // parse
+        let t = parse_one(r##"{ "tool": "doc", "name": "survey", "content": "# Map\nblocks live in src/blocks.rs" }"##)
+            .expect("doc parses");
+        assert!(matches!(&t, Tool::Doc { name, .. } if name == "survey"));
+        // exec: writes .logscope/docs/<slug>.md; traversal-ish names are slugged harmless
+        let d = std::env::temp_dir().join(format!("wsdoc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let mut ex = Workspace::new(&d);
+        let r = ex.apply(&t);
+        assert!(r.ok, "{}", r.output);
+        assert!(d.join(".logscope/docs/survey.md").is_file());
+        let evil = ex.apply(&Tool::Doc { name: "../../etc/passwd".into(), content: "x".into() });
+        assert!(evil.ok, "slugged, not rejected: {}", evil.output);
+        assert!(d.join(".logscope/docs/etc-passwd.md").is_file() || std::fs::read_dir(d.join(".logscope/docs")).unwrap().count() >= 2);
+        // collection: what one worker wrote shows up in the next prompt's context
+        let docs = collect_shared_docs(&d, 4096);
+        assert!(docs.contains("shared doc: survey") && docs.contains("blocks live in src/blocks.rs"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn repo_tree_is_bounded_and_skips_generated() {
+        let d = std::env::temp_dir().join(format!("wstree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("src")).unwrap();
+        std::fs::create_dir_all(d.join("target/debug")).unwrap();
+        std::fs::write(d.join("Cargo.toml"), "[package]").unwrap();
+        for i in 0..12 { std::fs::write(d.join(format!("src/m{i}.rs")), "//").unwrap(); }
+        std::fs::write(d.join("target/debug/junk.rs"), "").unwrap();
+        let full = repo_tree(&d, 300);
+        assert!(full.contains("Cargo.toml") && full.contains("m3.rs"));
+        assert!(!full.contains("target"), "generated trees stay out:\n{full}");
+        let capped = repo_tree(&d, 5);
+        assert!(capped.contains("truncated"), "cap note present:\n{capped}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn prompt_teaches_explore_first_and_carries_context() {
+        let mut cfg = AgentConfig::default();
+        cfg.context = "src/blocks.rs (120 B)".into();
+        let p = system_prompt("add more blocks", &cfg);
+        assert!(p.contains("LOOK AT IT"), "explore-first policy present");
+        assert!(p.contains("asking the user"), "anti-clarification instruction present");
+        assert!(p.contains("WORKSPACE OVERVIEW") && p.contains("src/blocks.rs"), "turn-0 tree injected");
+        assert!(p.contains("\"tool\":\"doc\"") || p.contains("\\\"doc\\\"") || p.contains("- doc"), "shared-doc tool on the menu");
+        assert!(p.contains("search"), "search always on the menu (Full policy included it)");
+        // no context → no empty section
+        let p2 = system_prompt("t", &AgentConfig::default());
+        assert!(!p2.contains("WORKSPACE OVERVIEW"));
     }
 }
