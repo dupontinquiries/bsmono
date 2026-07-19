@@ -297,6 +297,12 @@ struct State {
     egui_state: egui_winit::State,
     egui_render: crate::egui_render::EguiRender,
     menu: clawbound_rs::menu::Menu,
+    /// Fleet online play (netcode::multiplayer, game id "clawbound"): presence + host/join over
+    /// the shared control plane. The bsgames handoff (BSGAMES_HANDOFF_*) hosts/joins at startup;
+    /// the Title menu's Multiplayer entry toggles hosting. Gameplay-byte sync over mp.socket is
+    /// the marked follow-up (src/net.rs is the transport-agnostic protocol waiting for it).
+    mp: Option<netcode::multiplayer::Multiplayer>,
+    mp_status: String,
     keys: Keys,
     pbgl: wgpu::BindGroupLayout,
     samp: wgpu::Sampler,
@@ -439,9 +445,26 @@ impl State {
         let egui_ctx = egui::Context::default();
         let egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &*window, None, None);
         let egui_render = crate::egui_render::EguiRender::new(&device, config.format);
-        let menu = clawbound_rs::menu::Menu::new();
+        let mut menu = clawbound_rs::menu::Menu::new();
+        // ── bsgames handoff: host/join a friend's match before the title screen ever shows ──
+        let handoff = netcode::handoff::from_env();
+        let mut mp: Option<netcode::multiplayer::Multiplayer> = None;
+        let mut mp_status = String::new();
+        if let Some(h) = &handoff {
+            eprintln!("[handoff] {h:?}");
+            let mut m = netcode::multiplayer::for_startup("clawbound", "cat", Some(h));
+            match m.apply_handoff(h) {
+                Ok(status) => {
+                    menu.open = false; // straight past the title into the live scene
+                    mp_status = status;
+                }
+                Err(e) => mp_status = e,
+            }
+            eprintln!("[handoff] result: {mp_status}");
+            mp = Some(m);
+        }
 
-        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
+        State { _window: window, surface, device, queue, config, scene_pipe, post_pipe, ubuf, ubg, world_vbuf, world_vcount, ent_vbuf, ent_vcount: 0, ent_cap, game, prowl: None, capture: None, tutorial: None, kind, mode, over_timer: 0.0, debug_cone: false, egui_ctx, egui_state, egui_render, menu, mp, mp_status, keys: Keys::default(), pbgl, samp, fxbuf, scene_view, depth_view, ss_on: false, scene_w: w as f32, scene_h: h as f32, flick: (0.0, 0.0), mleft_prev: false, pbg, focus, frame: 0.0, last: web_time::Instant::now(), anim_t: 0.0, yaw: 0.55, pitch: 0.62, captured: false, death_t: 0.0, prev_player_alive: true }
     }
 
     fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
@@ -1524,7 +1547,25 @@ fn run_loop(event_loop: EventLoop<()>, window: Arc<Window>, mut state: State) {
                                             }
                                             MenuCmd::Quit => elwt.exit(),
                                             MenuCmd::Close => state.menu.open = false,
-                                            MenuCmd::Multiplayer | MenuCmd::None => {}
+                                            MenuCmd::Multiplayer => {
+                                                // toggle hosting on the shared control plane — presence
+                                                // flips InGame so friends' bsgames can "▶ join" and hand
+                                                // a second clawbound straight to us
+                                                let mp = state.mp.get_or_insert_with(|| {
+                                                    netcode::multiplayer::for_startup("clawbound", "cat", None)
+                                                });
+                                                state.mp_status = if mp.token.is_some() {
+                                                    mp.stop_hosting();
+                                                    "stopped hosting".to_string()
+                                                } else {
+                                                    match mp.host("0.0.0.0:0") {
+                                                        Ok(t) => format!("hosting: {t}"),
+                                                        Err(e) => format!("couldn't host: {e}"),
+                                                    }
+                                                };
+                                                eprintln!("[multiplayer] {}", state.mp_status);
+                                            }
+                                            MenuCmd::None => {}
                                         },
                                         KeyCode::Escape => { if state.menu.back() == MenuCmd::Close { state.menu.open = false; } }
                                         _ => {}
