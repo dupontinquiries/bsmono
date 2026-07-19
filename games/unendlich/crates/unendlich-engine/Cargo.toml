@@ -11,6 +11,8 @@ ogg = { version = "0.9", optional = true }  # ogg demux for ogg-opus; audio feat
 linkme = "0.3"
 # Workspace deps
 unendlich-shared = { path = "../unendlich-shared" }
+# Fleet online play: the shared handoff + session control plane (games/shared/netcode)
+netcode = { path = "../../../shared/netcode" }
 
 # Math
 nalgebra-glm = "0.18"

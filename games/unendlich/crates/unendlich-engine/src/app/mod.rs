@@ -18,6 +18,8 @@
 #[cfg(feature = "egui")]
 pub mod menu_view;
 
+pub mod multiplayer_svc;
+
 use crate::sim::affinity_access::Fields;
 use crate::sim::bending_runtime::{BenderState, BenderTick, GestureInput};
 use crate::sim::command_parse::GameMode;
@@ -90,6 +92,10 @@ pub struct App {
     vitality: crate::sim::feeding::Vitality,
     /// r121: is the player currently in water (shell-detected via block query).
     swimming: bool,
+    /// Fleet online play (bsgames handoff + host/join control plane) — see
+    /// [`multiplayer_svc::MultiplayerSvc`]. Built from `BSGAMES_HANDOFF_*` at startup; the shell
+    /// reads `handoff_started` to skip the title screen toward the match.
+    pub multiplayer: multiplayer_svc::MultiplayerSvc,
 }
 
 /// One frame of gameplay context the shell feeds to the whitelisted services.
@@ -125,6 +131,7 @@ impl App {
             stamina: crate::sim::stamina::Stamina::full(),
             vitality: crate::sim::feeding::Vitality::full(),
             swimming: false,
+            multiplayer: multiplayer_svc::MultiplayerSvc::from_env(),
         }
     }
 
@@ -143,6 +150,7 @@ impl App {
             stamina: crate::sim::stamina::Stamina::full(),
             vitality: crate::sim::feeding::Vitality::full(),
             swimming: false,
+            multiplayer: multiplayer_svc::MultiplayerSvc::from_env(),
         }
     }
 
@@ -157,6 +165,7 @@ impl App {
             stamina: crate::sim::stamina::Stamina::full(),
             vitality: crate::sim::feeding::Vitality::full(),
             swimming: false,
+            multiplayer: multiplayer_svc::MultiplayerSvc::from_env(),
         }
     }
 
