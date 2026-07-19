@@ -3651,6 +3651,25 @@ fn main() {
         let ok_store = a_hot && b_warm && c_warm && store.usage() <= 2600;
         check("smart cache ranked two-tier eviction", if ok_store { 0.0 } else { 1.0 }, 0.5);
 
+        // Fused RMSNorm+matvec (decode norm→matmul pair): must be bit-identical to the explicit
+        // two-dispatch chain rmsnorm_t → linear_q8_0_t. Same reduction, same accumulation order.
+        {
+            let (n, k) = (96usize, 128usize);
+            let w = rnd(n * k, 11);
+            let nw = rnd(k, 12);              // rmsnorm weight
+            let act = rnd(k, 13);
+            let qw = gpu.quantize_q8_resident(&w, n, k);
+            let a = gpu.upload(&act, 1, k);
+            let nwt = gpu.upload(&nw, 1, k);
+            let eps = 1e-5f32;
+            // reference: explicit rmsnorm then matvec
+            let n1 = gpu.rmsnorm_t(&a, &nwt, 1, k, eps);
+            let want = gpu.download(&gpu.linear_q8_0_t(&n1, &qw, 1));
+            // fused
+            let got = gpu.download(&gpu.linear_q8_0_norm(&a, &nwt, &qw, k, eps));
+            check("fused rmsnorm+matvec == rmsnorm then matvec", maxerr(&got, &want), 1e-5);
+        }
+
         // KV tier round-trip fidelity (the AnchorPool Cold path): a prefix demoted to int8, its
         // packed bytes sent to host RAM and back, then promoted to f32 and seeded, must continue a
         // sequence within the int8-KV tolerance of seeding the original f32 cache directly. This is
