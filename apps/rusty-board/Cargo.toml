@@ -42,6 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0"
+# the gtk-free layout/input-model layer (shared with egui-frontend)
+board-layouts = { path = "crates/board-layouts" }
 
 # Voice input (whisper-rs)
 whisper-rs = { version = "0.13", optional = true }

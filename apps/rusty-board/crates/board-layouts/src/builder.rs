@@ -11,7 +11,7 @@
 //!
 //! The builder is the data-model core behind the in-settings keyboard
 //! builder UI: the UI manipulates a builder (or the [`Layout`] it
-//! produces), then persists via [`crate::layouts::io::save_user_layout`].
+//! produces), then persists via [`crate::io::save_user_layout`].
 //!
 //! A "mixed" layout is just a [`Layout`] whose rows contain different key
 //! kinds; nothing special is needed to combine them. The layout's
@@ -21,7 +21,7 @@
 //! cardinal cell.
 
 use super::{Layout, LayoutStyle, Row, TextDirection};
-use crate::keyboard::{Key, KeyAction, KeyGestures};
+use crate::key::{Key, KeyAction, KeyGestures};
 
 /// Per-direction outputs for a cardinal cell. All fields optional; unset
 /// directions produce no gesture. Build with [`CardinalCell::new`] then
@@ -206,7 +206,7 @@ impl LayoutBuilder {
     }
 
     /// Finish building. The result is NOT validated here; callers that
-    /// persist should go through [`crate::layouts::io::save_user_layout`]
+    /// persist should go through [`crate::io::save_user_layout`]
     /// which validates first.
     pub fn build(self) -> Layout {
         Layout {
@@ -226,7 +226,7 @@ impl LayoutBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layouts::io;
+    use crate::io;
 
     #[test]
     fn builds_simple_regular_row() {
