@@ -830,6 +830,10 @@ pub struct Chat {
     fan_is_docs: bool, // the active/just-finished fan is a DOC fan → suggest :merge-docs (union) over :pick (keep one)
     agent_pending_submit: Option<String>, // next agent prompt to hand the inference worker (drained in sync_worker)
     agent_task: String, // the in-flight :agent task text (for the snapshot message + reaction seeding)
+    lanes: Option<crate::lanes::LanePool>, // :lanes N — concurrent generation lanes over ONE resident model; fan branches decode in parallel through this instead of round-robin on the single worker
+    lane_jobs: std::collections::HashMap<crate::lanes::JobId, usize>, // in-flight pool job → fan branch (routes tagged Token/Done events)
+    lanes_ready: bool, // the pool's async model load completed (LaneEvt::Ready seen)
+    local_model_path: Option<String>, // the picker's selected LOCAL .gguf, captured each frame for :lanes
     rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
@@ -926,6 +930,8 @@ impl Default for Chat {
             fan_is_docs: false,
             agent_pending_submit: None,
             agent_task: String::new(),
+            lanes: None, lane_jobs: std::collections::HashMap::new(), lanes_ready: false,
+            local_model_path: None,
             rep_monitor: crate::repetition::RepeatMonitor::default(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
@@ -1967,14 +1973,41 @@ impl Chat {
             self.agent_candidates.clear();
             self.agent_task = task.clone();
             self.fan_is_docs = doc_fan;
-            match fan.next() {
-                crate::workspace_exec::FanStep::Submit { prompt, .. } => {
-                    self.agent_pending_submit = Some(prompt);
-                    let n = fan.len();
-                    self.agent_fan = Some(fan);
-                    self.note = format!("{label}: {n} branches spinning up — planning…");
+            if self.lanes.is_some() {
+                // Lane mode: every branch decodes CONCURRENTLY on the pool (one resident weights copy,
+                // one KV cache per lane) — the single Inference worker stays free for the chat itself.
+                // Jobs queue safely even if the pool's model is still loading; lanes pull on Ready.
+                let lane_n = self.lanes.as_ref().map(|p| p.lanes()).unwrap_or(1);
+                fan.set_width(lane_n);
+                let steps = fan.fill();
+                let n = fan.len();
+                let params = logscope::llm_backend::GenParams {
+                    max_tokens: self.ctx.max_tokens as usize, n_ctx: self.ctx.n_ctx, n_batch: self.ctx.n_ctx,
+                    temperature: self.ctx.temperature, ..Default::default()
+                };
+                let mut launched = 0;
+                if let Some(pool) = self.lanes.as_mut() {
+                    for s in steps {
+                        if let crate::workspace_exec::FanStep::Submit { branch, prompt } = s {
+                            let id = pool.submit(prompt, params.clone());
+                            self.lane_jobs.insert(id, branch);
+                            launched += 1;
+                        }
+                    }
                 }
-                crate::workspace_exec::FanStep::AllDone => self.note = format!(":{label} — nothing to run"),
+                self.agent_fan = Some(fan);
+                let ready = if self.lanes_ready { "decoding in parallel" } else { "queued (lanes still loading)" };
+                self.note = format!("{label}: {n} branches — {launched} {ready} on {lane_n} lane(s)");
+            } else {
+                match fan.next() {
+                    crate::workspace_exec::FanStep::Submit { prompt, .. } => {
+                        self.agent_pending_submit = Some(prompt);
+                        let n = fan.len();
+                        self.agent_fan = Some(fan);
+                        self.note = format!("{label}: {n} branches spinning up — planning… (tip: :lanes 2 runs them in parallel)");
+                    }
+                    crate::workspace_exec::FanStep::AllDone => self.note = format!(":{label} — nothing to run"),
+                }
             }
         }
     }
@@ -2123,6 +2156,66 @@ impl Chat {
 
     /// Finalize a fan: fold the per-branch summaries for pruning. Doesn't auto-land anything — the user
     /// picks the keeper (:pick N) after comparing. Highlights which branches verified.
+    /// Drain the lane pool's tagged events into the fan and keep every free lane loaded. Called once per
+    /// frame — the pool is a second, PARALLEL event source next to the single `Inference` worker (whose
+    /// fan intercept lives in the Evt loop). Two-phase for borrow clarity: collect events, apply them to
+    /// the fan (collecting backfill submissions), then re-borrow the pool to submit those.
+    fn pump_lanes(&mut self) {
+        if self.lanes.is_none() { return; }
+        let mut evts = Vec::new();
+        if let Some(pool) = self.lanes.as_mut() {
+            while let Ok(e) = pool.rx.try_recv() { evts.push(e); }
+        }
+        if evts.is_empty() && self.lane_jobs.is_empty() { return; }
+        let mut steps: Vec<crate::workspace_exec::FanStep> = Vec::new();
+        let mut dead = false;
+        for e in evts {
+            match e {
+                crate::lanes::LaneEvt::Ready { lanes, model, .. } => {
+                    self.lanes_ready = true;
+                    self.note = format!("lanes: {lanes} × {model} up — one weights copy, {lanes} KV caches; fans now decode {lanes} branches at once");
+                    // Widen a fan that's already pool-driven (jobs queued before the load finished).
+                    if !self.lane_jobs.is_empty() {
+                        if let Some(f) = self.agent_fan.as_mut() { f.set_width(lanes); steps.extend(f.fill()); }
+                    }
+                }
+                crate::lanes::LaneEvt::LoadError(e) => { self.note = format!("lanes: load failed — {e}"); dead = true; }
+                crate::lanes::LaneEvt::Token { job, text } => {
+                    if let Some(&b) = self.lane_jobs.get(&job) {
+                        if let Some(f) = self.agent_fan.as_mut() { f.on_token_branch(b, &text); }
+                    }
+                }
+                crate::lanes::LaneEvt::Done { job, .. } => {
+                    if let Some(b) = self.lane_jobs.remove(&job) {
+                        if let Some(f) = self.agent_fan.as_mut() { steps.extend(f.on_done_branch(b)); }
+                    }
+                }
+                crate::lanes::LaneEvt::Error { job, err } => {
+                    if let Some(b) = self.lane_jobs.remove(&job) {
+                        if let Some(f) = self.agent_fan.as_mut() { steps.extend(f.on_error_branch(b, err)); }
+                    }
+                }
+            }
+        }
+        if dead { self.lanes = None; self.lanes_ready = false; self.lane_jobs.clear(); }
+        if !steps.is_empty() {
+            let params = logscope::llm_backend::GenParams {
+                max_tokens: self.ctx.max_tokens as usize, n_ctx: self.ctx.n_ctx, n_batch: self.ctx.n_ctx,
+                temperature: self.ctx.temperature, ..Default::default()
+            };
+            if let Some(pool) = self.lanes.as_mut() {
+                for s in steps {
+                    if let crate::workspace_exec::FanStep::Submit { branch, prompt } = s {
+                        let id = pool.submit(prompt, params.clone());
+                        self.lane_jobs.insert(id, branch);
+                    }
+                }
+            }
+        }
+        let fan_done = self.agent_fan.as_ref().map(|f| f.all_done()).unwrap_or(false);
+        if fan_done && self.lane_jobs.is_empty() { self.finish_agent_fan(); }
+    }
+
     fn finish_agent_fan(&mut self) {
         let fan = match self.agent_fan.take() { Some(f) => f, None => return };
         let best = fan.best().map(|i| i + 1).unwrap_or(1);
@@ -4475,6 +4568,8 @@ impl Chat {
             }
             Command::Stop => {
                 let n = self.queue.len(); self.queue.clear(); self.fan = None;
+                if let Some(p) = &self.lanes { p.cancel_all(); }
+                self.lane_jobs.clear();
                 if self.agent_run.take().is_some() || self.agent_fan.take().is_some() {
                     self.agent_pending_submit = None;
                     self.pending_cancel = true; // stop the in-flight generation too
@@ -4785,6 +4880,27 @@ impl Chat {
             Command::FanAgent(task) => {
                 let cfg = crate::workspace_exec::AgentConfig::default();
                 self.start_fan(task.trim(), cfg, false, "fan-agent");
+            }
+            Command::Lanes(arg) => {
+                let a = arg.trim();
+                if a.eq_ignore_ascii_case("off") || a == "0" {
+                    if let Some(p) = self.lanes.take() { p.shutdown(); }
+                    self.lane_jobs.clear(); self.lanes_ready = false;
+                    self.note = "lanes: off — fans round-robin on the single worker again".into();
+                } else {
+                    let n = a.parse::<usize>().ok().filter(|&n| (1..=8).contains(&n)).unwrap_or(2);
+                    match self.local_model_path.clone() {
+                        None => self.note = ":lanes — pick a LOCAL .gguf in the model list first (lanes share its resident weights)".into(),
+                        Some(path) => {
+                            if let Some(p) = self.lanes.take() { p.shutdown(); }
+                            self.lane_jobs.clear(); self.lanes_ready = false;
+                            let name = std::path::Path::new(&path).file_name()
+                                .map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| path.clone());
+                            self.lanes = Some(crate::lanes::LanePool::spawn(path, n));
+                            self.note = format!("lanes: loading {n} lane(s) over {name} — one weights copy, one KV cache per lane…");
+                        }
+                    }
+                }
             }
             Command::DocFan(task) => {
                 // A DOC fan: each branch writes a slice of the docs under the organization convention, so the
@@ -5228,10 +5344,12 @@ impl Chat {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, model: &mut ModelState, doc: &crate::analysis::Doc, infer: &Inference, model_loaded: bool) {
         self.sync_worker(infer);
+        self.local_model_path = model.selected_local_path(); // for :lanes (run_command has no ModelState)
+        self.pump_lanes(); // lane-pool events → fan (a second, parallel event source next to the worker)
         self.check_restore(); // first frame: offer to recover a crashed/closed conversation
         if self.pending_cancel { infer.cancel(); self.pending_cancel = false; }
         let streaming = self.stream.is_some();
-        if streaming || self.agent_run.is_some() || self.agent_fan.is_some() { ui.ctx().request_repaint(); }
+        if streaming || self.agent_run.is_some() || self.agent_fan.is_some() || !self.lane_jobs.is_empty() { ui.ctx().request_repaint(); }
         self.pump_voice(infer, doc, ui, streaming); // mic → whisper → route utterances / barge-in (no-op when mic off)
         self.handle_modal(ui, infer, doc); // modal (vim) keys — both views; default Insert keeps typing free
 
