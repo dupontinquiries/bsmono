@@ -116,4 +116,5 @@ pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod interject;
 #[allow(dead_code)] pub mod mount; // pure (git/workspace, no egui) + imported by lean modules → not gui-gated
 #[allow(dead_code)] pub mod workspace_exec; // pure (std-only agent loop over an isolated tmp workspace) → not gui-gated
+#[allow(dead_code)] pub mod lanes; // concurrent generation lanes over one resident model (scheduling tested via the LaneGen seam)
 #[cfg(feature = "gui")] pub mod tabs;
