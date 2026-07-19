@@ -2740,6 +2740,44 @@ fn main() {
         check("rope freq-factors (llama3 scaling)", maxerr(&got, &want), 1e-4);
     }
 
+    // ── YaRN long-context scaling: factor math + kernels with mscale ─────────────────────────────
+    {
+        // (a) pure factor math at Qwen3-like shape (hd=128, base=1e6, 4× over 32768):
+        // high-frequency dims untouched (ff=1), low-frequency fully interpolated (ff=s),
+        // monotonic ramp between, mscale = 1 + 0.1·ln s.
+        let (ffv, ms) = gpu_kernels::yarn_factors(128, 1.0e6, 4.0, 32768, 32.0, 1.0, 1.0);
+        let mono = ffv.windows(2).all(|w| w[1] >= w[0] - 1e-6);
+        let ok = (ffv[0] - 1.0).abs() < 1e-5 && (ffv[63] - 4.0).abs() < 1e-4 && mono
+            && (ms - (1.0 + 0.1 * 4.0f32.ln())).abs() < 1e-6;
+        println!("  yarn: ff[0]={:.4} ff[63]={:.4} monotonic={} mscale={:.4}", ffv[0], ffv[63], mono, ms);
+        check("yarn factor math (ramp bounds + mscale)", if ok { 0.0 } else { 1.0 }, 0.5);
+
+        // (b) GPU rope with yarn ff + mscale vs a CPU reference doing the same math (mscale
+        // multiplies the rotated output). rope_mscale is Gpu-level state — restore 1.0 after.
+        let (t, hd, heads) = (4usize, 16usize, 2usize);
+        let dm = hd * heads;
+        let (yff, yms) = gpu_kernels::yarn_factors(hd, 5.0e5, 8.0, 4096, 32.0, 1.0, 1.0);
+        let mut sd = 0x1a2b_3c4d_u64;
+        let mut r = || { sd ^= sd << 13; sd ^= sd >> 7; sd ^= sd << 17; (sd >> 40) as f32 / 16_777_216.0 - 0.5 };
+        let xin: Vec<f32> = (0..t * dm).map(|_| r()).collect();
+        let base = 5.0e5f32;
+        let mut want = xin.clone();
+        for tok in 0..t { for h in 0..heads { let off = tok * dm + h * hd;
+            for i in 0..hd / 2 {
+                let theta = tok as f32 / (base.powf(2.0 * i as f32 / hd as f32) * yff[i]);
+                let (c, s) = (theta.cos() * yms, theta.sin() * yms);
+                let (x0, x1) = (xin[off + 2 * i], xin[off + 2 * i + 1]);
+                want[off + 2 * i] = x0 * c - x1 * s;
+                want[off + 2 * i + 1] = x0 * s + x1 * c;
+            } } }
+        gpu.rope_mscale.store(yms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        let xg = gpu.upload(&xin, t, dm);
+        let fg = gpu.upload(&yff, 1, hd / 2);
+        let got = gpu.download(&gpu.rope_mh_t(&xg, &fg, t, dm, base, 0, hd));
+        gpu.rope_mscale.store(1.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        check("yarn rope (per-dim factors + mscale on GPU)", maxerr(&got, &want), 1e-4);
+    }
+
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
     // rope), vs CPU. The full-forward sweep diverged only when base was large.
     for &(base, heads) in &[(10000.0f32, 8usize), (500000.0, 8), (500000.0, 2)] {
