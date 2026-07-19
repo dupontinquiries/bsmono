@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 math-kit = { path = "../../shared/math-kit" }
+netcode = { path = "../shared/netcode" }
 wgpu = "22"
 pollster = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }

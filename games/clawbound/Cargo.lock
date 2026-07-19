@@ -330,6 +330,7 @@ dependencies = [
  "image",
  "log",
  "math-kit",
+ "netcode",
  "pollster",
  "snapclone-theme",
  "wasm-bindgen",
@@ -1219,6 +1220,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "netcode"
+version = "0.1.0"
+dependencies = [
+ "snapcore",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1741,10 @@ version = "0.1.0"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "snapcore"
+version = "0.1.0"
 
 [[package]]
 name = "spirv"
