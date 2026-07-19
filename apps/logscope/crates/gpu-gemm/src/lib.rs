@@ -70,6 +70,13 @@ pub static GPU_SYNC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// hardware-INDEPENDENT structural number, valid here on lavapipe.
 pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
+/// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
+/// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
+const DIMS_RETAIN_CAP: usize = 8192;
+/// How many times the retain-cap forced a mid-window poll+free (test/telemetry).
+pub static DIMS_RETAIN_POLLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub fn dims_retain_polls() -> u64 { DIMS_RETAIN_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn dims_cache_hits() -> u64 { DIMS_HITS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn dims_cache_misses() -> u64 { DIMS_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 /// Buffer-pool accounting: a MISS is a real `create_buffer` (allocation churn — the other half of
@@ -1175,8 +1182,6 @@ impl Gpu {
             } else {
                 DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let b = std::sync::Arc::new(dev.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("dims"), contents: dims, usage: wgpu::BufferUsages::UNIFORM }));
-                // Cap growth: stable dims are inserted during warmup and hit forever; once full,
-                // varying per-position dims fall back to create-without-cache (never worse than before).
                 if cache.len() < 4096 { cache.insert(dims.to_vec(), b.clone()); }
                 b
             }
@@ -1209,11 +1214,28 @@ impl Gpu {
             // invalid" on Metal (a big sampler window flushes mid-window, long before its readback).
             frame.passes += 1;
             // Bound submit duration so a shared GPU still services the display between chunks.
-            if frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed) {
+            // ALSO bound live uniform buffers: a windowed decode pins flush very high to batch the
+            // whole window into one frame, so the flush-driven poll below never fires — and the
+            // window's tens of thousands of unique (uncached) dims uniforms would all stay live until
+            // the window's readback, exhausting Metal's uniform pool → "Buffer 'dims' invalid". So
+            // flush when EITHER the pass budget is hit OR the frame's keep-list crosses the retain cap.
+            let over_flush = frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
+            let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
+            if over_flush || over_retain {
                 let old = fr.take().unwrap();
                 self.submit(old.enc);
-                self.retain_keep(old.keep); // hold dims/bind-groups until the next poll (async submit)
+                self.retain_keep(old.keep);
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
+                drop(fr);
+                // When we flushed because live buffers grew (not the normal pass budget), poll to
+                // COMPLETION and free them — a rare sync inside a big window that keeps memory bounded
+                // without a per-token readback. Bit-exact: poll only waits, it changes no state.
+                if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
+                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    self.clear_retained();
+                    DIMS_RETAIN_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return;
             }
         } else {
             drop(fr);
