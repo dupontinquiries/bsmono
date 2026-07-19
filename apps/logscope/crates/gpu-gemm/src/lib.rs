@@ -119,6 +119,20 @@ pub struct Gpu {
     /// Raising this cuts submits/token (less overhead) but lengthens each submit (a shared GPU's display
     /// can stutter); `SubmitTuner` adapts it on live tokens. Tunable, env-pinnable (LOGSCOPE_FLUSH_EVERY).
     flush_every: std::sync::atomic::AtomicU32,
+    /// SUBMIT GOVERNOR — bound how many submits may be in flight at once (0 = off). flush_every bounds
+    /// each submit's *duration*; this bounds queue *depth*. Without it a decode token fires its ~24
+    /// submits back-to-back and the queue holds hundreds of ms of compute — on a shared GPU the
+    /// compositor's tiny flip job then waits behind ALL of it (the "frame pacing stutters while a model
+    /// runs" symptom: submit-bound, not bandwidth/compute-bound). Capping in-flight to 2 keeps the GPU
+    /// saturated (one executing + one queued) while guaranteeing display work is never more than ~2
+    /// submit-durations away from the front of the queue. Env `LOGSCOPE_SUBMIT_INFLIGHT` (default 2,
+    /// 0 disables). Purely a pacing change: grouping and order are untouched, so output is bit-exact.
+    inflight_cap: std::sync::atomic::AtomicU32,
+    /// Submits handed to the queue whose completion callback hasn't fired yet (governor bookkeeping).
+    pending_submits: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// One-shot escape: if completion callbacks ever stop arriving (a driver quirk), the governor
+    /// disables itself instead of spinning forever, and says so once.
+    governor_dead: std::sync::atomic::AtomicBool,
     /// Content-keyed cache of the small per-dispatch `dims` UNIFORM buffers. The dims for a given op
     /// (m,k,n,grid,…) are byte-identical every token, but `dispatch_with` used to `create_buffer_init`
     /// a fresh one per dispatch — ~250–380 tiny buffer creations+uploads per token (the "upload locking"
@@ -243,51 +257,85 @@ const FLUSH_EVERY_DEFAULT: u32 = 32;
 /// Candidate passes-per-submit the `SubmitTuner` sweeps on live decode tokens. Smaller = more submits =
 /// more overhead but smoother display; larger = fewer submits = less overhead but longer submits.
 pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256, 512];
+/// Default in-flight submit cap for the governor (see `Gpu::submit`): one executing + one queued keeps
+/// the GPU saturated while bounding how far display work can fall behind. `LOGSCOPE_SUBMIT_INFLIGHT`
+/// overrides; 0 disables.
+pub const SUBMIT_INFLIGHT_DEFAULT: u32 = 2;
+/// Default per-submit duration budget (ms) the tuner may not exceed when settling — roughly half a 60 Hz
+/// frame, so the compositor can land a flip between any two submits. `LOGSCOPE_SUBMIT_BUDGET_MS`
+/// overrides; 0 (or negative) disables the constraint (pure-speed settle, the old behaviour).
+pub const SUBMIT_BUDGET_MS_DEFAULT: f64 = 8.0;
+/// The active per-submit budget: env override, else the default. 0/negative → +∞ (unconstrained).
+pub fn submit_budget_ms() -> f64 {
+    let v = std::env::var("LOGSCOPE_SUBMIT_BUDGET_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(SUBMIT_BUDGET_MS_DEFAULT);
+    if v > 0.0 { v } else { f64::INFINITY }
+}
 
 /// Online controller that adapts passes-per-submit on LIVE decode tokens. It sweeps `cands`, sampling
-/// `per_cand` tokens at each value, takes the median token time, and SETTLES on the fastest — then holds
-/// it for the rest of the stream. Pure (no GPU): each token the caller sets
-/// `gpu.set_flush_every(tuner.current())`, generates, then feeds the token's wall-time to `record()`.
-/// Safe to adapt mid-stream because batching is bit-exact (it changes only submit grouping, not output).
+/// `per_cand` tokens at each value, takes the median token time, and SETTLES — then holds it for the
+/// rest of the stream. Pure (no GPU): each token the caller sets `gpu.set_flush_every(tuner.current())`,
+/// generates, then feeds the token's wall-time AND its submit count to `record()`. Safe to adapt
+/// mid-stream because batching is bit-exact (it changes only submit grouping, not output).
+///
+/// SETTLE RULE (smoothness-constrained speed): fastest median token time among candidates whose median
+/// per-submit duration fits the budget (`submit_budget_ms`, default 8 ms). Bigger flush values are often
+/// fastest in raw ms/tok but each submit then monopolizes a shared GPU long enough to stutter the
+/// display — the pure min-median rule reliably picked exactly those. If NO candidate fits the budget
+/// (a big model where even flush=16 exceeds it), the smoothest one (min per-submit ms) wins, because at
+/// that point the machine's usability is the binding constraint, not tok/s.
 pub struct SubmitTuner {
     cands: Vec<u32>,
     per_cand: usize,
-    idx: usize,               // candidate currently being sampled
-    samples: Vec<f64>,        // token times (s) for the current candidate
-    results: Vec<(u32, f64)>, // (candidate, median token time)
+    idx: usize,                     // candidate currently being sampled
+    samples: Vec<(f64, f64)>,       // (token secs, per-submit ms) for the current candidate
+    results: Vec<(u32, f64, f64)>,  // (candidate, median token secs, median per-submit ms)
+    budget_ms: f64,
     settled: Option<u32>,
 }
 impl SubmitTuner {
     pub fn new(cands: &[u32], per_cand: usize) -> Self {
         SubmitTuner { cands: cands.to_vec(), per_cand: per_cand.max(1), idx: 0, samples: Vec::new(), results: Vec::new(),
+            budget_ms: submit_budget_ms(),
             settled: if cands.is_empty() { Some(FLUSH_EVERY_DEFAULT) } else { None } }
     }
+    /// Override the per-submit budget (tests; callers wanting a different smoothness point).
+    pub fn with_budget(mut self, ms: f64) -> Self { self.budget_ms = if ms > 0.0 { ms } else { f64::INFINITY }; self }
     /// The flush_every to use for the NEXT token.
     pub fn current(&self) -> u32 {
         self.settled.unwrap_or_else(|| self.cands[self.idx.min(self.cands.len().saturating_sub(1))])
     }
-    /// Feed the wall-time (seconds) of the token just produced under `current()`. Advances the sweep;
-    /// when every candidate has `per_cand` samples it settles on the min-median. Returns Some(chosen) on
-    /// the transition to settled (for one-time logging), else None.
-    pub fn record(&mut self, secs: f64) -> Option<u32> {
+    /// Feed the wall-time (seconds) and submit count of the token just produced under `current()`.
+    /// Advances the sweep; when every candidate has `per_cand` samples it settles (see SETTLE RULE).
+    /// Returns Some(chosen) on the transition to settled (for one-time logging), else None.
+    pub fn record(&mut self, secs: f64, submits: u64) -> Option<u32> {
         if self.settled.is_some() { return None; }
-        self.samples.push(secs);
+        self.samples.push((secs, secs * 1000.0 / submits.max(1) as f64));
         if self.samples.len() < self.per_cand { return None; }
-        self.samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let med = self.samples[self.samples.len() / 2];
-        self.results.push((self.cands[self.idx], med));
+        let med = |mut v: Vec<f64>| -> f64 {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)); v[v.len() / 2]
+        };
+        let tok = med(self.samples.iter().map(|s| s.0).collect());
+        let sub = med(self.samples.iter().map(|s| s.1).collect());
+        self.results.push((self.cands[self.idx], tok, sub));
         self.samples.clear();
         self.idx += 1;
         if self.idx >= self.cands.len() {
-            let best = self.results.iter().copied().min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            self.settled = best.map(|(c, _)| c).or(Some(FLUSH_EVERY_DEFAULT));
+            let within = |r: &&(u32, f64, f64)| r.2 <= self.budget_ms;
+            let by_tok = |a: &&(u32, f64, f64), b: &&(u32, f64, f64)| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+            let by_sub = |a: &&(u32, f64, f64), b: &&(u32, f64, f64)| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal);
+            let best = self.results.iter().filter(within).min_by(by_tok)          // fastest that fits
+                .or_else(|| self.results.iter().min_by(by_sub));                  // else smoothest available
+            self.settled = best.map(|&(c, _, _)| c).or(Some(FLUSH_EVERY_DEFAULT));
             return self.settled;
         }
         None
     }
     pub fn is_settled(&self) -> bool { self.settled.is_some() }
     pub fn settled(&self) -> Option<u32> { self.settled }
-    pub fn results(&self) -> &[(u32, f64)] { &self.results }
+    /// The active per-submit budget (ms; +∞ = unconstrained).
+    pub fn budget_ms(&self) -> f64 { self.budget_ms }
+    /// `(candidate, median token secs, median per-submit ms)` for every fully-sampled candidate.
+    pub fn results(&self) -> &[(u32, f64, f64)] { &self.results }
 }
 
 impl Gpu {
@@ -336,7 +384,9 @@ impl Gpu {
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), conservative_vma };
+        let inflight_cap = std::sync::atomic::AtomicU32::new(
+            std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), conservative_vma };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -908,8 +958,43 @@ impl Gpu {
     /// Single point through which every command buffer is flushed, so submits can be
     /// counted (see GPU_SUBMITS). Each call is one CPU→GPU flush.
     fn submit(&self, enc: wgpu::CommandEncoder) {
-        GPU_SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        GPU_SUBMITS.fetch_add(1, Relaxed);
         self.queue.submit([enc.finish()]);
+        // SUBMIT GOVERNOR (see `inflight_cap`): bound queue depth so a display sharing this GPU is
+        // serviced between submits. flush_every already bounds each submit's duration; without a depth
+        // bound the encoder outruns the GPU and stacks hundreds of ms of compute in front of the
+        // compositor. One executing + `cap-1` queued keeps the GPU fed; the wait is a NON-blocking
+        // poll pump (PollType::Poll fires completion callbacks without sleeping the queue).
+        let cap = self.inflight_cap.load(Relaxed);
+        if cap == 0 || self.governor_dead.load(Relaxed) { return; }
+        let pending = self.pending_submits.clone();
+        pending.fetch_add(1, Relaxed);
+        let done = self.pending_submits.clone();
+        self.queue.on_submitted_work_done(move || { done.fetch_sub(1, Relaxed); });
+        if pending.load(Relaxed) <= cap { return; }
+        let t0 = std::time::Instant::now();
+        while pending.load(Relaxed) > cap {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            std::thread::sleep(std::time::Duration::from_micros(50));
+            // Safety escape: if callbacks never arrive (driver quirk), don't spin forever — turn the
+            // governor off for this Gpu and say so once. 5s of a full queue means something else is wrong.
+            if t0.elapsed().as_secs() >= 5 {
+                self.governor_dead.store(true, Relaxed);
+                eprintln!("wgpu-engine: submit governor DISABLED — completion callbacks not arriving on this driver (LOGSCOPE_SUBMIT_INFLIGHT=0 silences this)");
+                break;
+            }
+        }
+    }
+    /// Current in-flight submit cap (0 = governor off).
+    pub fn submit_inflight(&self) -> u32 { self.inflight_cap.load(std::sync::atomic::Ordering::Relaxed) }
+    /// Set the in-flight submit cap (0 disables). Ignored when LOGSCOPE_SUBMIT_INFLIGHT pins it, so a
+    /// manual env choice survives callers that adjust it programmatically.
+    pub fn set_submit_inflight(&self, n: u32) -> u32 {
+        if std::env::var_os("LOGSCOPE_SUBMIT_INFLIGHT").is_none() {
+            self.inflight_cap.store(n.min(64), std::sync::atomic::Ordering::Relaxed);
+        }
+        self.submit_inflight()
     }
 
     /// Open a recording frame: subsequent `dispatch`/copy ops record into one shared command

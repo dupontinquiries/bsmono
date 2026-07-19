@@ -1543,21 +1543,35 @@ fn main() {
         eprintln!("gate-submit: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
 
-        // (1) SubmitTuner: current() tracks the candidate under test, settles on the min-median.
+        // (1) SubmitTuner: current() tracks the candidate under test; the settle rule is smoothness-
+        // constrained speed (fastest whose per-submit ms fits the budget; else the smoothest).
         {
-            let mut t = SubmitTuner::new(&[16, 32, 64], 2);
-            let feed = [(16u32, 0.10f64), (16, 0.12), (32, 0.08), (32, 0.09), (64, 0.20), (64, 0.22)]; // 32 fastest
+            // Unconstrained (budget=∞): the old min-median-token-time behaviour.
+            let mut t = SubmitTuner::new(&[16, 32, 64], 2).with_budget(0.0);
+            // (candidate under test, token secs, submits that token) — 32 fastest by token time
+            let feed = [(16u32, 0.10f64, 48u64), (16, 0.12, 48), (32, 0.08, 24), (32, 0.09, 24), (64, 0.20, 12), (64, 0.22, 12)];
             let mut tracks = true; let mut settled = None;
-            for (expect_cur, secs) in feed {
+            for (expect_cur, secs, subs) in feed {
                 if t.current() != expect_cur { tracks = false; }
-                if let Some(c) = t.record(secs) { settled = Some(c); }
+                if let Some(c) = t.record(secs, subs) { settled = Some(c); }
             }
             ck("SubmitTuner.current() tracks the candidate being sampled", tracks);
-            ck("SubmitTuner settles on the min-median candidate (32)", settled == Some(32) && t.settled() == Some(32));
+            ck("SubmitTuner (unconstrained) settles on the min-median candidate (32)", settled == Some(32) && t.settled() == Some(32));
             ck("SubmitTuner recorded one median per candidate", t.results().len() == 3);
-            let held = t.current(); t.record(0.001); // post-settle samples ignored
+            let held = t.current(); t.record(0.001, 1); // post-settle samples ignored
             ck("SubmitTuner holds the settled value", t.current() == held && held == 32);
             ck("empty candidate set settles to the default", SubmitTuner::new(&[], 2).is_settled());
+            // Budgeted: 32 is fastest but its per-submit ms (0.08s/24 ≈ 3.3ms) fits an 8ms budget while
+            // 64's (0.07s/2 = 35ms) does not — the tuner must refuse the "fast but janky" candidate.
+            let mut b = SubmitTuner::new(&[32, 64], 1).with_budget(8.0);
+            let _ = b.record(0.08, 24);                 // 32 → 3.3 ms/submit, fits
+            let chosen = b.record(0.07, 2);             // 64 → 35 ms/submit, faster token, over budget
+            ck("budgeted settle rejects the faster-but-over-budget candidate", chosen == Some(32));
+            // Nothing fits: the smoothest (min per-submit ms) wins — usability over tok/s.
+            let mut n = SubmitTuner::new(&[32, 64], 1).with_budget(1.0);
+            let _ = n.record(0.20, 10);                 // 32 → 20 ms/submit
+            let chosen = n.record(0.15, 3);             // 64 → 50 ms/submit (faster token)
+            ck("with no candidate in budget, the smoothest per-submit wins", chosen == Some(32));
         }
 
         // (2)(3) framed dependent chain: square weight so each mat-vec feeds the next; 30 dependent passes.
