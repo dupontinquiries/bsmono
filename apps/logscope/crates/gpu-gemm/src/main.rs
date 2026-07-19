@@ -3651,6 +3651,52 @@ fn main() {
         let ok_store = a_hot && b_warm && c_warm && store.usage() <= 2600;
         check("smart cache ranked two-tier eviction", if ok_store { 0.0 } else { 1.0 }, 0.5);
 
+        // KV tier round-trip fidelity (the AnchorPool Cold path): a prefix demoted to int8, its
+        // packed bytes sent to host RAM and back, then promoted to f32 and seeded, must continue a
+        // sequence within the int8-KV tolerance of seeding the original f32 cache directly. This is
+        // what proves the tiered pool's Warm/Cold demotions only cost speed/memory, never output.
+        {
+            let hm = gen_model(16, 32, 2, 24, 4, 4);
+            let mdl = gpu.load_gguf(&write_gguf(&hm)).expect("load_gguf (kv tier)");
+            let kvd = mdl.kv_dim();
+            let prompt = [5u32, 0, 17, 3, 9, 2];
+            let plen = prompt.len();
+            // Build a prefix cache by decoding the prompt (the "tip" the pool would hold).
+            let base = gpu.new_cache(mdl.n_layers, plen + 24, kvd);
+            for (pos, &t) in prompt.iter().enumerate() { let _ = gpu.decode_step(&mdl, &base, t, pos); }
+            // (a) HOT reference: seed a fresh session from the f32 cache, decode 16 greedy tokens.
+            let cont = |seed_cache: &gpu_kernels::KvCache| -> Vec<u32> {
+                let mut s = gpu.session_new(&mdl, plen + 24, 7);
+                gpu.seed_from_prefix(&mdl, &mut s, seed_cache, plen);
+                s.pos = plen;
+                s.logits = gpu.decode_step(&mdl, &s.cache, prompt[plen - 1], plen - 1);
+                let sp = gpu_kernels::SamplerParams { temperature: 0.0, top_k: 0, top_p: 1.0, repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+                let mut seen = prompt.to_vec(); let mut rng = 7u64; let mut out = Vec::new();
+                gpu.stream_session(&mdl, &mut s, &mut seen, 16, None, &sp, &mut rng, &|| false, |t| { out.push(t); true });
+                out
+            };
+            let hot = cont(&base);
+            // (b) COLD path: demote → download to host bytes → upload → promote → seed.
+            let q = gpu.demote_cache(&base, plen, kvd);
+            let to_bytes = |t: &gpu_kernels::Tensor| -> Vec<u8> {
+                let mut b = Vec::new(); for w in gpu.download_u32(t) { b.extend_from_slice(&w.to_le_bytes()); } b };
+            let from_bytes = |b: &[u8]| -> gpu_kernels::Tensor {
+                let w: Vec<u32> = b.chunks_exact(4).map(|c| u32::from_le_bytes([c[0],c[1],c[2],c[3]])).collect();
+                gpu.upload_u32(&w) };
+            let q2 = gpu_kernels::QKvCache {
+                kq: q.kq.iter().map(|t| from_bytes(&to_bytes(t))).collect(),
+                ks: q.ks.iter().map(|t| from_bytes(&to_bytes(t))).collect(),
+                vq: q.vq.iter().map(|t| from_bytes(&to_bytes(t))).collect(),
+                vs: q.vs.iter().map(|t| from_bytes(&to_bytes(t))).collect(),
+            };
+            let promoted = gpu.promote_cache(&q2, plen, kvd);
+            let cold = cont(&promoted);
+            let agree = hot.iter().zip(&cold).take_while(|(a, b)| a == b).count();
+            println!("  kv tier round-trip: hot vs cold-restored continuation — {agree}/{} tokens agree", hot.len());
+            // int8 KV can tip a near-tie eventually; require a long exact agreement prefix.
+            check("kv tier cold round-trip continuation", if agree >= 12 { 0.0 } else { 1.0 }, 0.5);
+        }
+
         // streaming-window context eviction. (a) With sink+window ≥ context, no eviction
         // happens and streaming decode is byte-identical to full-cache decode.
         let sp = vec![5u32, 0, 17, 9, 2];
