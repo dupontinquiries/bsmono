@@ -8,6 +8,7 @@ pub mod gitmind_session;
 pub mod repo;
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
 #[allow(dead_code)] pub mod filescan;
+pub mod filesummary;
 #[allow(dead_code)] pub mod swarmview;
 #[allow(dead_code)] pub mod vision_cli;
 #[allow(dead_code)] pub mod tts_cli;

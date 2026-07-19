@@ -6117,17 +6117,60 @@ impl Chat {
                                                 }
                                             }
                                             Seg::Code { lang, body } => {
+                                                // ── file summary toggle (gitmind integration) ──
+                                                // Blocks naming a file get a [✨ Summary | Raw] switch. Files inside the
+                                                // loaded .gitmind session's /tmp workspace DEFAULT to summary — the
+                                                // session's own files are the ones you want described, not re-scrolled.
+                                                // Summary = the instant structural digest, upgraded in place by the
+                                                // small-model summary once the ollama sidecar delivers it (cached by
+                                                // content hash; see filesummary.rs).
+                                                let fpath = crate::filesummary::code_block_path(lang);
+                                                let in_session = fpath.as_deref().map(|p| {
+                                                    self.gitmind_session.as_ref().is_some_and(|s| crate::filesummary::is_session_file(p, s.work_dir()))
+                                                }).unwrap_or(false);
+                                                let sum_id = egui::Id::new(("codesum", i, si));
+                                                let mut show_summary = fpath.is_some()
+                                                    && ui.ctx().data_mut(|d| *d.get_temp_mut_or(sum_id, in_session));
                                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6),
                                                     inner_margin: egui::Margin::same(theme::PAD_SM), stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
                                                         let l = lang.split_whitespace().next().unwrap_or("");
-                                                        if !l.is_empty() { ui.label(RichText::new(l).color(theme::CYAN()).small().monospace()); }
+                                                        if !l.is_empty() { ui.label(RichText::new(l).color(theme::md_accent()).small().monospace()); }
+                                                        if let Some(p) = &fpath {
+                                                            let mut sw = show_summary;
+                                                            if ui.selectable_label(sw, RichText::new("\u{2728} Summary").small()).on_hover_text("Describe this file instead of showing the code").clicked() { sw = true; }
+                                                            if ui.selectable_label(!sw, RichText::new("Raw").small()).clicked() { sw = false; }
+                                                            if sw != show_summary {
+                                                                show_summary = sw;
+                                                                ui.ctx().data_mut(|d| d.insert_temp(sum_id, sw));
+                                                            }
+                                                            if in_session { ui.label(RichText::new("session").color(theme::md_dim()).small()).on_hover_text(format!("{p} is in the gitmind /tmp workspace")); }
+                                                        }
                                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                             if ui.small_button("Copy").on_hover_text("Copy this block").clicked() { ui.ctx().copy_text(body.clone()); }
                                                         });
                                                     });
-                                                    ui.label(RichText::new(format!("{body}{tail}")).monospace().color(theme::INK()));
+                                                    if show_summary {
+                                                        let p = fpath.as_deref().unwrap_or("");
+                                                        let key = crate::filesummary::content_key(p, body);
+                                                        crate::filesummary::request_model_summary(key, p, body);
+                                                        match crate::filesummary::model_summary(key) {
+                                                            Some(text) => { render_markdown(ui, &text, ""); }
+                                                            None => {
+                                                                render_markdown(ui, &crate::filesummary::structural_digest(p, body), "");
+                                                                let note = if std::env::var("LOGSCOPE_OLLAMA").is_ok() && crate::filesummary::in_flight(key) {
+                                                                    "\u{2728} model summary generating…"
+                                                                } else {
+                                                                    "structural digest (set LOGSCOPE_OLLAMA for model summaries)"
+                                                                };
+                                                                ui.label(RichText::new(note).color(theme::FAINT()).small().italics());
+                                                                if crate::filesummary::in_flight(key) { ui.ctx().request_repaint_after(std::time::Duration::from_millis(500)); }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        ui.label(RichText::new(format!("{body}{tail}")).monospace().color(theme::md_ink()));
+                                                    }
                                                 });
                                             }
                                         }
