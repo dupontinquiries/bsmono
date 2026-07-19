@@ -116,6 +116,12 @@ pub(crate) mod engine {
         /// the original single-anchor behaviour; newest evicted last / oldest first).
         anchors: Vec<(Vec<u32>, Session, usize)>,
         kv_cap: usize,
+        /// Opt-in tiered warm-resume pool (LOGSCOPE_KV_POOL). When Some, replaces the FIFO `anchors`
+        /// Vec: value-ranked eviction with demote-before-drop across Hot(f32)/Warm(int8)/Cold(host)
+        /// tiers, so a hot compaction prefix or a fan's shared ancestor survives sibling churn that
+        /// the FIFO's remove(0) would have dropped. Keyed + selected by token prefix exactly like
+        /// the FIFO (kvtree::pick_anchor), so it's a drop-in whose only visible effect is more hits.
+        pool: Option<crate::anchorpool::AnchorPool>,
         warm: usize,
         /// The loaded model's file name (basename) — printed on each generation log line so a log
         /// reader can tell which model produced a reply (e.g. after switching models mid-session).
@@ -356,6 +362,18 @@ pub(crate) mod engine {
                 .map(|v| v.trim().parse::<usize>().unwrap_or(6).max(1)).unwrap_or(3);
             if std::env::var("LOGSCOPE_KV_OFF").is_ok() { eprintln!("wgpu-engine: KV reuse DISABLED (LOGSCOPE_KV_OFF) — full prefill every turn, graph speedups off"); }
             else if kv_cap > 1 { eprintln!("wgpu-engine: KV prefix tree ON — pool cap {kv_cap} (each entry holds a KV cache; trades memory for fewer prefills on branchy/fan-out chats)"); }
+            // Tiered pool (opt-in): value-ranked eviction with int8/host demotion. Budget the
+            // GPU-resident KV at kv_cap full f32 caches' worth of a typical 4k-token tip; the pool
+            // then holds MORE tips than kv_cap by demoting the cold ones to int8/host instead of
+            // dropping them. LOGSCOPE_KV_POOL_MB overrides the budget directly.
+            let pool = if std::env::var("LOGSCOPE_KV_POOL").is_ok() && std::env::var("LOGSCOPE_KV_OFF").is_err() {
+                let kv_dim = model.n_kv_heads * model.head_dim;
+                let per_tip = 2 * 4096 * kv_dim * 4 * model.n_layers; // f32 KV for a 4k-token tip
+                let budget = std::env::var("LOGSCOPE_KV_POOL_MB").ok().and_then(|v| v.parse::<usize>().ok())
+                    .map(|mb| mb * 1_000_000).unwrap_or(per_tip * kv_cap);
+                eprintln!("wgpu-engine: KV pool ON (tiered Hot/Warm/Cold, value-ranked) — budget {:.0} MB, entry cap {}", budget as f32 / 1e6, kv_cap * 4);
+                Some(crate::anchorpool::AnchorPool::new(budget, model.n_layers, kv_dim))
+            } else { None };
             // Speculative decoding (opt-in): if LOGSCOPE_SPEC_DRAFT points at a GGUF, load it as a
             // small DRAFT model. It must share the target's vocab/tokenizer (same family, smaller
             // size — e.g. a 1B draft for an 8B target). `generate` then runs the engine's
@@ -380,7 +398,7 @@ pub(crate) mod engine {
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, warm, name, submit_tuner, embed_q8: None, draft })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -399,7 +417,7 @@ pub(crate) mod engine {
                 gpu: self.gpu.clone(), model: self.model.clone(), tok: self.tok.clone(),
                 eos: self.eos, stop_ids: self.stop_ids.clone(), template: self.template,
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
-                anchors: Vec::new(), kv_cap: 1, warm: self.warm,
+                anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
                 name: format!("{}#L{n}", self.name),
                 submit_tuner: None, embed_q8: None, draft: None,
             }
@@ -502,22 +520,39 @@ pub(crate) mod engine {
                     st.accepted as f64 / st.rounds.max(1) as f64, st.rounds, st.emitted as f64 / st.rounds.max(1) as f64);
                 return Ok(produced);
             }
-            // Which cached branch tip shares the longest usable prefix with this prompt? `pick_anchor`
-            // applies the same thresholds the single-anchor path used (≥16 shared, ≤256 divergent), but
-            // searches the whole pool — so a sibling switch or an Nth fan-out continuation reuses ITS
-            // lineage's KV, not just the last turn's. Build the lightweight (toks, prefill_len, pos) view;
-            // cloning a few hundred token ids per entry is negligible next to a prefill.
-            let meta: Vec<(Vec<u32>, usize, usize)> =
-                self.anchors.iter().map(|(t, sess, pf)| (t.clone(), *pf, sess.pos)).collect();
+            // Which cached branch tip shares the longest usable prefix with this prompt? Both the
+            // FIFO and the tiered pool select with kvtree::pick_anchor (≥16 shared, ≤256 divergent),
+            // searching the whole pool so a sibling switch or an Nth fan-out continuation reuses ITS
+            // lineage's KV, not just the last turn's. The pool additionally MATERIALIZES the chosen
+            // tip to a seedable f32 Session (promoting from int8/host if it had been demoted) and
+            // removes it — we re-insert the extended tip after generating.
             let kv_off = std::env::var("LOGSCOPE_KV_OFF").is_ok();
-            let pick = if kv_off { None } else { crate::kvtree::pick_anchor(&meta, &prompt_ids, 16, 256) };
-            let (reuse, l, pick_idx) = match pick { Some((i, ln)) => (true, ln, i), None => (false, 0, 0) };
+            let mut picked_session: Option<Session> = None; // Some ⇒ pool path (owns the source)
+            let (reuse, l, pick_idx) = if kv_off {
+                (false, 0, 0)
+            } else if let Some(pool) = self.pool.as_mut() {
+                match pool.pick(&self.gpu, &self.model, &prompt_ids, 16, 256) {
+                    Some((i, ln, sess)) => { picked_session = Some(sess); (true, ln, i) }
+                    None => (false, 0, 0),
+                }
+            } else {
+                let meta: Vec<(Vec<u32>, usize, usize)> =
+                    self.anchors.iter().map(|(t, sess, pf)| (t.clone(), *pf, sess.pos)).collect();
+                match crate::kvtree::pick_anchor(&meta, &prompt_ids, 16, 256) {
+                    Some((i, ln)) => (true, ln, i), None => (false, 0, 0),
+                }
+            };
             let suffix_len = prompt_ids.len() - l;
             let mut s = self.gpu.session_new(&self.model, cap, self.rng);
             let t0 = Instant::now();
             if reuse {
-                let src = &self.anchors[pick_idx].1.cache; // borrow ends after the copy
-                self.gpu.seed_from_prefix(&self.model, &mut s, src, l);
+                // Seed from the picked tip: the pool handed us an owned Session; the FIFO borrows in place.
+                if let Some(src) = picked_session.as_ref() {
+                    self.gpu.seed_from_prefix(&self.model, &mut s, &src.cache, l);
+                } else {
+                    let src = &self.anchors[pick_idx].1.cache; // borrow ends after the copy
+                    self.gpu.seed_from_prefix(&self.model, &mut s, src, l);
+                }
                 // Prefill the divergent suffix with the BATCHED kernel (verify_forward / block_
                 // prefill_ext at offset l) — the same path a full prefill uses — instead of per-
                 // token decode_step. Per-token vs batched differ by ~1e-6, which is enough to tip a
@@ -665,12 +700,19 @@ pub(crate) mod engine {
                 eprintln!("wgpu-engine: [{}]   generated ids (≤16) = {:?}", self.name, tail);
             }
             // This turn (prompt + what we generated) joins the pool as a branch tip; `prefill_len` is how
-            // many leading rows were batch-prefilled — the only region ever re-seeded. Evict oldest first
-            // so the pool stays within `kv_cap` (each entry holds a full KV cache).
+            // many leading rows were batch-prefilled — the only region ever re-seeded.
             let mut anchor_toks = prompt_ids.clone();
             anchor_toks.extend_from_slice(&s.generated);
-            self.anchors.push((anchor_toks, s, prefill_len));
-            while self.anchors.len() > self.kv_cap.max(1) { self.anchors.remove(0); }
+            if let Some(pool) = self.pool.as_mut() {
+                pool.insert(&self.gpu, anchor_toks, prefill_len, s, self.kv_cap * 4);
+                if std::env::var("LOGSCOPE_KV_CENSUS").is_ok() {
+                    eprintln!("wgpu-engine: [{}] KV pool — {}", self.name, pool.census());
+                }
+            } else {
+                // FIFO fallback: evict oldest to stay within kv_cap (each entry holds a full KV cache).
+                self.anchors.push((anchor_toks, s, prefill_len));
+                while self.anchors.len() > self.kv_cap.max(1) { self.anchors.remove(0); }
+            }
             Ok(produced)
         }
 
@@ -717,8 +759,16 @@ pub(crate) mod engine {
         }
 
         pub fn continue_last(&mut self, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Option<Result<usize, String>> {
-            let (toks, old, prefill_len) = self.anchors.pop()?;
-            if old.logits.is_empty() || old.pos == 0 { self.anchors.push((toks, old, prefill_len)); return Some(Ok(0)); }
+            let (toks, old, prefill_len) = if let Some(pool) = self.pool.as_mut() {
+                pool.take_last(&self.gpu, &self.model)?
+            } else {
+                self.anchors.pop()?
+            };
+            if old.logits.is_empty() || old.pos == 0 {
+                if let Some(pool) = self.pool.as_mut() { pool.insert(&self.gpu, toks, prefill_len, old, self.kv_cap * 4); }
+                else { self.anchors.push((toks, old, prefill_len)); }
+                return Some(Ok(0));
+            }
             let n_new = (p.max_tokens).max(1);
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             // Copy the live KV into a session with room for the continuation (buffer copy, no forward).
@@ -766,8 +816,12 @@ pub(crate) mod engine {
             let secs = td.elapsed().as_secs_f32().max(1e-3);
             eprintln!("wgpu-engine: [{}] continued {produced} tokens in {secs:.1}s = {:.2} tok/s (warm resume, no prefill{})",
                 self.name, produced as f32 / secs, if sample_win_opt.is_some() { ", windowed" } else { "" });
-            self.anchors.push((seen, s, prefill_len));
-            while self.anchors.len() > self.kv_cap.max(1) { self.anchors.remove(0); }
+            if let Some(pool) = self.pool.as_mut() {
+                pool.insert(&self.gpu, seen, prefill_len, s, self.kv_cap * 4);
+            } else {
+                self.anchors.push((seen, s, prefill_len));
+                while self.anchors.len() > self.kv_cap.max(1) { self.anchors.remove(0); }
+            }
             Some(Ok(produced))
         }
     }
