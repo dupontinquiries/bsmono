@@ -156,6 +156,11 @@ pub struct Gpu {
     /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
     /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
     pub rope_neox: std::sync::atomic::AtomicBool,
+    /// YaRN attention scale (f32 bits; 1.0 = off), set by the loader when the GGUF declares
+    /// rope.scaling.type = "yarn". Applied inside every rope host fn (multiplies the rotated
+    /// output — the ggml formulation: both q and k scaled, so scores scale by mscale²). Gpu-level
+    /// state like `rope_neox` above, so the 13 rope call sites need no signature change.
+    pub rope_mscale: std::sync::atomic::AtomicU32,
     /// Vulkan-on-Apple (Asahi/Honeykrisp): the platform with the low BO-VMA ceiling; scopes the
     /// conservative GPU-buffer budget clamp to where it's actually needed.
     pub conservative_vma: bool,
@@ -386,7 +391,7 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), conservative_vma };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1767,8 +1772,9 @@ impl Gpu {
         let ad = n_heads * hd; let kv = n_kv_heads * hd;
         let out = self.alloc(1, ad + kv);
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
         let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
-                    pos as u32, neox, eps.to_bits(), 0u32];
+                    pos as u32, neox, eps.to_bits(), msc];
         self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
                       ((n_heads + n_kv_heads) as u32, 1, 1));
         out
@@ -3201,7 +3207,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
 // standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
 const QKNORM_ROPE: &str = r#"
-struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,_p:u32 };
+struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,msc:f32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> qn: array<f32>;
 @group(0)@binding(2) var<storage,read> kn: array<f32>;
@@ -3229,7 +3235,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // one rotation pair per thread (branch-free NORM/NEOX pairing, same arithmetic as ROPE_MH)
   if(tid<half){
     let freq=f32(d.pos)/(pow(d.base,(2.0*f32(tid))/f32(hd))*ff[tid]);
-    let c=cos(freq); let s=sin(freq);
+    let c=cos(freq)*d.msc; let s=sin(freq)*d.msc;
     let j0=tid*(2u-d.neox);
     let j1=j0 + 1u + d.neox*(half-1u);
     let x0=nx[j0]; let x1=nx[j1];
@@ -4215,6 +4221,24 @@ impl Gpu {
             Some(_) => { let v = fetch("rope_freqs.weight")?; if v.len() == hd_half { v } else { vec![1.0; hd_half] } }
             None => vec![1.0; hd_half],
         };
+        // YaRN long-context scaling (`rope.scaling.type = "yarn"` — Qwen 128K+ checkpoints, GLM,
+        // DeepSeek): the per-dim frequency factors fold into the SAME ff buffer every rope kernel
+        // already divides by — zero kernel changes for the frequencies — and the attention mscale
+        // rides the Gpu-level `rope_mscale` (multiplies the rotated output, both q and k: the ggml
+        // formulation, so scores scale by mscale²). Stored per load like `rope_neox`.
+        let mut rope_vals = rope_vals;
+        let mut mscale = 1.0f32;
+        if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("yarn") {
+            let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
+            let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(0);
+            let attnf = g.get_f32(&format!("{pfx}.rope.scaling.attn_factor")).unwrap_or(1.0);
+            if sf > 1.0 && orig > 0 {
+                let (ffv, ms) = yarn_factors(head_dim, base, sf, orig, 32.0, 1.0, attnf);
+                rope_vals = ffv; mscale = ms;
+                eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}× over {orig} native ctx (mscale {mscale:.4})");
+            }
+        }
+        self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let rope_factors = self.upload(&rope_vals, 1, hd_half);
         Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps })
     }
@@ -4428,7 +4452,7 @@ impl Gpu {
 }
 
 const ROPE_MH: &str = r#"
-struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,_b:u32,_c:u32 };
+struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)
 @group(0)@binding(2) var<storage,read_write> o: array<f32>;
@@ -4439,7 +4463,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let tok=p/per; let within=p%per; let head=within/half; let i=within%half;
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(tok+dd.pos0)/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
-  let c=cos(freq); let s=sin(freq);
+  let c=cos(freq)*dd.msc; let s=sin(freq)*dd.msc;
   // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
   // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
   // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
@@ -4456,7 +4480,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 // from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
 // are N different sessions at N different positions.
 const ROPE_MH_ROWS: &str = r#"
-struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,_b:u32,_c:u32 };
+struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
 @group(0)@binding(0) var<storage,read> x: array<f32>;
 @group(0)@binding(1) var<storage,read> ff: array<f32>;
 @group(0)@binding(2) var<storage,read> pos: array<u32>;
@@ -4468,7 +4492,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let tok=p/per; let within=p%per; let head=within/half; let i=within%half;
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(pos[tok])/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
-  let c=cos(freq); let s=sin(freq);
+  let c=cos(freq)*dd.msc; let s=sin(freq)*dd.msc;
   // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
   //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
   //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
@@ -4982,7 +5006,8 @@ impl Gpu {
     pub fn rope_mh_t(&self, x: &Tensor, ff: &Tensor, t: usize, dm: usize, base: f32, pos0: usize, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
-        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, 0, 0];
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
@@ -5223,7 +5248,8 @@ impl Gpu {
     pub fn rope_mh_rows(&self, x: &Tensor, ff: &Tensor, pos: &Tensor, t: usize, dm: usize, base: f32, head_dim: usize) -> Tensor {
         let out = self.alloc(t, dm);
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
-        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, 0, 0];
+        let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
+        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, 0];
         self.dispatch(ROPE_MH_ROWS, &[x, ff, pos], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
     /// Process one token through all layers using the cache; returns logits [vocab].
@@ -6231,6 +6257,31 @@ pub fn pick(logits: &[f32], sampler: &SamplerParams, recent: &[u32], rng: &mut u
         return if sampler.temperature > 0.0 { sample(&l, sampler, rng) } else { argmax(&l) };
     }
     if sampler.temperature > 0.0 { sample(logits, sampler, rng) } else { argmax(logits) }
+}
+
+/// YaRN per-dimension rope factors + attention mscale (pure; unit-checked in --validate).
+/// Kernels compute theta = pos·base^(−2i/hd) / ff[i], so ff[i] = 1 / ((1−γᵢ)/s + γᵢ) where γᵢ is
+/// the extrapolation weight from the β-ramp: γ=1 for high-frequency dims (many rotations inside
+/// the original context — left untouched), γ=0 for low-frequency dims (full 1/s interpolation),
+/// linear between the correction bounds. Bounds follow ggml's find_correction_range:
+/// dim(β) = hd·ln(orig/(β·2π)) / (2·ln base), low = ⌊dim(β_fast)⌋, high = ⌈dim(β_slow)⌉ (defaults
+/// 32/1). mscale = attn_factor·(1 + 0.1·ln s) for s>1, multiplying the ROTATED output of both q
+/// and k (the ggml formulation → attention scores scale by mscale²).
+pub fn yarn_factors(hd: usize, base: f32, s: f32, orig_ctx: u32, beta_fast: f32, beta_slow: f32,
+                    attn_factor: f32) -> (Vec<f32>, f32) {
+    let half = hd / 2;
+    let dim_of = |beta: f32| -> f32 {
+        (hd as f32) * (orig_ctx as f32 / (beta * 2.0 * std::f32::consts::PI)).ln() / (2.0 * base.ln())
+    };
+    let low = dim_of(beta_fast).floor().max(0.0);
+    let high = dim_of(beta_slow).ceil().min(hd as f32 - 1.0);
+    let ff = (0..half).map(|i| {
+        let y = (i as f32 - low) / (high - low).max(0.001);
+        let gamma = 1.0 - y.clamp(0.0, 1.0);
+        1.0 / ((1.0 - gamma) / s + gamma)
+    }).collect();
+    let mscale = if s > 1.0 { attn_factor * (1.0 + 0.1 * s.ln()) } else { attn_factor };
+    (ff, mscale)
 }
 
 fn xorshift01(state: &mut u64) -> f32 {
