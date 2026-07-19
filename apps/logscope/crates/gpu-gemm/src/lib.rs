@@ -25,6 +25,25 @@ pub mod store;
 /// per-tensor f32 stay in RAM, and a content-key sample (head/mid/tail) faults a few pages, not GB.
 /// The returned `Mmap` derefs to `&[u8]` — pass it anywhere bytes are taken. Unsafe because the file
 /// could be mutated underneath us; for immutable model files that's fine.
+/// File bytes for loading: normally an mmap (pages in on demand), but LOGSCOPE_NO_MMAP=1 reads the whole
+/// file into RAM instead. Escape hatch for volumes where mmap returns ZEROS while read() returns real data
+/// (FUSE-backed mounts — exFAT/NTFS drivers, cloud-sync mounts — and some network filesystems don't
+/// implement mmap coherence; the checksum looks fine because checksums use read()). Costs file-size RAM
+/// transiently; on unified-memory boxes with headroom that's an acceptable diagnosis-and-workaround mode.
+pub enum FileBytes { Mapped(memmap2::Mmap), Owned(Vec<u8>) }
+impl std::ops::Deref for FileBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { FileBytes::Mapped(m) => m, FileBytes::Owned(v) => v } }
+}
+/// Open model bytes honoring LOGSCOPE_NO_MMAP (see FileBytes).
+pub fn file_bytes(path: &str) -> std::io::Result<FileBytes> {
+    if std::env::var("LOGSCOPE_NO_MMAP").is_ok() {
+        eprintln!("wgpu-engine: LOGSCOPE_NO_MMAP — reading the whole file via read() (mmap bypass)");
+        return Ok(FileBytes::Owned(std::fs::read(path)?));
+    }
+    Ok(FileBytes::Mapped(mmap_ro(path)?))
+}
+
 pub fn mmap_ro(path: &str) -> std::io::Result<memmap2::Mmap> {
     let f = std::fs::File::open(path)?;
     unsafe { memmap2::Mmap::map(&f) }
@@ -123,6 +142,9 @@ pub struct Gpu {
     /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
     /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
     pub rope_neox: std::sync::atomic::AtomicBool,
+    /// Vulkan-on-Apple (Asahi/Honeykrisp): the platform with the low BO-VMA ceiling; scopes the
+    /// conservative GPU-buffer budget clamp to where it's actually needed.
+    pub conservative_vma: bool,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -220,7 +242,7 @@ struct Frame { enc: wgpu::CommandEncoder, keep: Vec<Box<dyn std::any::Any + Send
 const FLUSH_EVERY_DEFAULT: u32 = 32;
 /// Candidate passes-per-submit the `SubmitTuner` sweeps on live decode tokens. Smaller = more submits =
 /// more overhead but smoother display; larger = fewer submits = less overhead but longer submits.
-pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256];
+pub const SUBMIT_PROFILES: &[u32] = &[16, 32, 64, 128, 256, 512];
 
 /// Online controller that adapts passes-per-submit on LIVE decode tokens. It sweeps `cands`, sampling
 /// `per_cand` tokens at each value, takes the median token time, and SETTLES on the fastest — then holds
@@ -285,6 +307,10 @@ impl Gpu {
         // higher occupancy, the diagnosed decode bottleneck). Harmless where unsupported (flag stays false).
         let want_subgroup = adapter.features().contains(wgpu::Features::SUBGROUP);
         let backend = adapter.get_info().backend;
+        // Asahi/Honeykrisp detection (Vulkan driving an Apple GPU): the platform whose BO-VMA ceiling is
+        // far below its advertised limits — scoped budget clamp lives behind this, so macOS/Metal keeps
+        // its full addressable range (bigger dense residencies stay reachable there).
+        let conservative_vma = backend == wgpu::Backend::Vulkan && info.name.contains("Apple");
         let req_features = if want_subgroup { wgpu::Features::SUBGROUP } else { wgpu::Features::empty() };
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kernels"), required_features: req_features,
@@ -310,7 +336,7 @@ impl Gpu {
         let profile = std::sync::atomic::AtomicU32::new(env_tile.map(profile_for_tile).unwrap_or(0));
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 1024)).unwrap_or(FLUSH_EVERY_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), conservative_vma };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -667,9 +693,40 @@ pub struct MoeLayer {
     /// Per-expert FUSED gate||up projection [2ff, d] — same fusion as the dense wgate_up (one matmul emits
     /// [t, 2ff] = [gate | up], consumed by SWIGLU_PACKED); per-row quant of the concat is identical to
     /// quantizing separately. Cuts one matvec dispatch + weight bind per expert per token.
-    pub gate_up: Vec<Lin>,           // n_expert × [2ff, d]
-    pub down: Vec<Lin>,              // n_expert × [d, ff]
+    pub gate_up: Vec<Lin>,           // n_expert × [2ff, d] — zero-copy row VIEWS into stacked_gu (prefill path)
+    pub down: Vec<Lin>,              // n_expert × [d, ff] — views into stacked_down
+    /// The full expert stacks as single quantized Lins ([n_expert·2ff, d] / [n_expert·d, ff]) — what the
+    /// v2 decode kernels index by GPU-side expert selection (row = sel[slot]·rstride + col, no readback).
+    pub stacked_gu: Lin,
+    pub stacked_down: Lin,
     pub cfg: crate::moe::MoeConfig,  // n_routed / n_used / norm (softmax for qwen3moe)
+}
+/// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
+/// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
+/// slice of the qwen3moe shapes (k=2048/768; scales 32-block → whole f32s per row). F32 Lins (router)
+/// aren't row-viewed. Returns None if the Lin kind can't be viewed.
+fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
+    fn tview(t: &Tensor, byte_off: u64, byte_len: u64, rows: usize, cols: usize) -> Tensor {
+        let base = t.view.map(|(o, _)| o).unwrap_or(0);
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((base + byte_off, byte_len)) }
+    }
+    match &l.kind {
+        LinKind::Q8(w) => {
+            let kb = w.k / 32;
+            Some(Lin { kind: LinKind::Q8(QWeight {
+                qw: tview(&w.qw, (row0 * w.k) as u64, (rows * w.k) as u64, rows, w.k),
+                qs: tview(&w.qs, (row0 * kb * 4) as u64, (rows * kb * 4) as u64, rows, kb),
+                n: rows, k: w.k }), bias: None })
+        }
+        LinKind::Q4(w) => {
+            let kb = w.k / 32;
+            Some(Lin { kind: LinKind::Q4(Q4Weight {
+                qw: tview(&w.qw, (row0 * w.k / 2) as u64, (rows * w.k / 2) as u64, rows, w.k / 2),
+                qs: tview(&w.qs, (row0 * kb * 4) as u64, (rows * kb * 4) as u64, rows, kb),
+                n: rows, k: w.k }), bias: None })
+        }
+        LinKind::F32(_) => None,
+    }
 }
 /// One Z-Image/DiT transformer block (Peebles & Xie AdaLN-Zero design): non-affine LayerNorm →
 /// AdaLN modulate → bidirectional MHA → AdaLN gated residual → non-affine LayerNorm → AdaLN modulate →
@@ -1584,6 +1641,20 @@ impl Gpu {
         let out = self.alloc(t, d); let dims = [t as u32, d as u32, 1u32, 0];
         self.dispatch(ATTENTION, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t as u32).div_ceil(64), 1, 1)); out
     }
+    /// Fused QK-Norm + RoPE (decode t=1): one dispatch for what was a 4-dispatch chain. Input `qkv` is
+    /// the fused projection [1, ad+2kv]; returns [1, ad+kv] = roped q ‖ roped k (v stays in `qkv`).
+    fn qknorm_rope_fused(&self, qkv: &Tensor, qn: &Tensor, kn: &Tensor, ff: &Tensor,
+                         n_heads: usize, n_kv_heads: usize, hd: usize, base: f32, pos: usize, eps: f32) -> Tensor {
+        let ad = n_heads * hd; let kv = n_kv_heads * hd;
+        let out = self.alloc(1, ad + kv);
+        let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
+        let dims = [n_heads as u32, n_kv_heads as u32, hd as u32, base.to_bits(),
+                    pos as u32, neox, eps.to_bits(), 0u32];
+        self.dispatch(QKNORM_ROPE, &[qkv, qn, kn, ff], &out, bytemuck::cast_slice(&dims),
+                      ((n_heads + n_kv_heads) as u32, 1, 1));
+        out
+    }
+
     /// FFN half of a transformer block: norm2 → (dense SwiGLU | MoE) → residual. Dense path is the exact
     /// motif every block fn used inline (rmsnorm → wgate_up → swiglu → wdown+residual), factored so the
     /// MoE branch slots in at every call site (prefill, all decode variants, batched) identically.
@@ -1601,6 +1672,24 @@ impl Gpu {
     /// then weighted SCATTER-ADD into the output. Correctness-first v1: the per-layer router readback is a
     /// GPU sync (~1-3 ms) — the known perf ceiling (~5-10 tok/s decode) until GPU-side top-k lands.
     fn moe_ffn(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        // v2 DECODE FAST PATH: route ON the GPU — top-k kernel + expert-indexed matvecs over the stacked
+        // weights. Zero readbacks (v1 paid 48 submit+poll syncs per token ≈ 340 ms on Asahi — ~90% of the
+        // 2.7 tok/s wall time). Prefill (t>1) keeps the v1 grouped path over the SAME weights via row
+        // views — which is also the built-in cross-check: if prefill output is coherent and decode isn't,
+        // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
+        if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax)
+            && std::env::var("LOGSCOPE_MOE_V1").is_err()
+        {
+            if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
+                return self.moe_v2_check(m, n2, d, x2);
+            }
+            if let Some(out) = self.moe_ffn_gpu_routed(m, n2, d, x2) { return out; }
+        }
+        self.moe_ffn_v1(m, n2, t, d, x2)
+    }
+
+    /// v1 readback-routed MoE FFN (the proven path): router → download → CPU route → grouped experts.
+    fn moe_ffn_v1(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
         let ne = m.cfg.n_routed as usize;
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
@@ -1630,6 +1719,154 @@ impl Gpu {
             self.dispatch(SCATTER_ADD_W, &[&dn, &idx, &wgt], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
         }
         out
+    }
+
+    /// Differential checker (LOGSCOPE_MOE_V2_CHECK=1): run BOTH MoE paths on the same token, report which
+    /// stage diverges, and RETURN THE V1 RESULT so output stays correct while diagnosing. Per layer it
+    /// compares (a) the GPU top-k selection vs the tested CPU route (indices + weights) and (b) the final
+    /// FFN output tensors (max |Δ|). Prints the first ~96 layer-calls (≈ 2 tokens) then goes quiet.
+    fn moe_v2_check(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Tensor {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        let call = CALLS.fetch_add(1, Ordering::Relaxed);
+        let v1 = self.moe_ffn_v1(m, n2, 1, d, x2);
+        if call >= 96 { return v1; }
+        let Some((v2, selw)) = self.moe_ffn_gpu_routed_inner(m, n2, d, x2) else {
+            eprintln!("moe-check[{call}]: v2 path unavailable (non-quant stacked)"); return v1;
+        };
+        // selection: GPU selw vs CPU route on the same logits
+        let logits = self.download(&m.router.apply(self, n2, 1));
+        let cpu = crate::moe::route(&logits, &m.cfg);
+        let raw = self.download_u32(&selw);
+        let k = m.cfg.n_used.clamp(1, 16) as usize;
+        let gsel: Vec<u32> = raw[..k].to_vec();
+        let gwgt: Vec<f32> = raw[k..2 * k].iter().map(|&b| f32::from_bits(b)).collect();
+        let csel: Vec<u32> = cpu.iter().map(|s| s.expert).collect();
+        let sel_ok = gsel == csel;
+        let wgt_dmax = cpu.iter().zip(&gwgt).map(|(c, g)| (c.weight - g).abs()).fold(0.0f32, f32::max);
+        // outputs
+        let a = self.download(&v1);
+        let b = self.download(&v2);
+        let out_dmax = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        let out_ref = a.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let line = format!("moe-check[{call:>2}]: sel {} (gpu {:?} vs cpu {:?}) | wgtΔmax {:.2e} | outΔmax {:.3e} (ref max {:.3e})",
+            if sel_ok { "OK " } else { "MISMATCH" }, gsel, csel, wgt_dmax, out_dmax, out_ref);
+        eprintln!("{line}");
+        // If the env value looks like a path (contains '/'), ALSO append there — the reliable sharing
+        // channel (attachments keep arriving empty; the GGUF dump-to-file pattern has worked every time).
+        if let Ok(v) = std::env::var("LOGSCOPE_MOE_V2_CHECK") {
+            if v.contains('/') {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&v) {
+                    let _ = writeln!(f, "{line}");
+                }
+            }
+        }
+        v1
+    }
+
+    /// The GPU-routed MoE decode step (t=1): router matvec → MOE_TOPK (selection + softmax weights stay
+    /// on-GPU) → per-slot expert-indexed matvecs over the stacked gate_up/down → weighted combine folded
+    /// with the residual. ~20 dispatches, ZERO polls. Returns None if the stacked weights aren't a
+    /// quantized kind these kernels read (then the caller runs the v1 readback path).
+    fn moe_ffn_gpu_routed(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<Tensor> {
+        self.moe_ffn_gpu_routed_inner(m, n2, d, x2).map(|(t, _)| t)
+    }
+    fn moe_ffn_gpu_routed_inner(&self, m: &MoeLayer, n2: &Tensor, d: usize, x2: &Tensor) -> Option<(Tensor, Tensor)> {
+        let (gu_qw, gu_qs, gu_k, sh) = match &m.stacked_gu.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            LinKind::F32(_) => return None,
+        };
+        let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
+            LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
+            LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            LinKind::F32(_) => return None,
+        };
+        let slots = m.cfg.n_used.clamp(1, 16) as usize;
+        let ne = m.cfg.n_routed as usize;
+        let ff2 = 2 * dn_k;              // fused gate||up rows per expert = 2·ff (ff == down's k)
+        // 1) router logits stay on-GPU
+        let logits = m.router.apply(self, n2, 1);
+        // 2) top-k selection + combine weights → selw [k idx (u32) | k weights (f32 bitcast)]
+        let selw = self.alloc(1, 2 * slots);
+        let tk = [ne as u32, slots as u32, 0, 0];
+        self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
+        // 3) fused gate||up for each selected expert (broadcast activation)
+        // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
+        // per-layer dispatch cost; on Asahi each submit batch costs ~4-5 ms of sync, so dispatch count
+        // is the wall clock now that the polls are gone)
+        let gu_out = self.alloc(slots, ff2);
+        {
+            let gx = (ff2 as u32).min(32768);
+            let gy = (ff2 as u32).div_ceil(gx);
+            let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
+            self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
+        }
+        // 4) SwiGLU over the packed [slots, 2ff]
+        let hmid = self.swiglu_packed(&gu_out);
+        // 5) down projection per expert (per-slot activation rows)
+        let dn_out = self.alloc(slots, d);
+        {
+            let gx = (d as u32).min(32768);
+            let gy = (d as u32).div_ceil(gx);
+            let dims = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx, 0u32, d as u32, 1u32, 0u32];
+            self.dispatch(sh_dn, &[&hmid, dn_qw, dn_qs, &selw], &dn_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
+        }
+        // 6) weighted combine + residual
+        let out = self.alloc(1, d);
+        let wd = [d as u32, slots as u32, 0, 0];
+        self.dispatch(MOE_WSUM, &[&dn_out, &selw, x2], &out, bytemuck::cast_slice(&wd), wg1(d as u32));
+        Some((out, selw))
+    }
+
+    /// Startup submit-stride probe: measure the SUBMIT_PROFILES ladder with synthetic chained dispatches
+    /// (the decode regime — each depends on the previous) and return (candidate, ms) sorted fastest-first.
+    /// The per-submit sync tax is machine-specific (Asahi ~0.5 ms, Metal far less), so the best
+    /// passes-per-submit is too; probing at load lets every system find its stride immediately instead of
+    /// converging over ~a dozen live replies. The ceiling is one submit per TOKEN regardless (the logits
+    /// readback forces it), so past ~dispatches-per-token the ladder flattens — the probe sees that too.
+    /// Cost: ~256 tiny dispatches per candidate (≈1 s worst-case on Asahi, once per GPU until cached).
+    pub fn submit_stride_probe(&self, cands: &[u32]) -> Vec<(u32, f64)> {
+        let n = 2048usize;
+        let a = self.upload(&vec![1.0f32; n], 1, n);
+        let b = self.upload(&vec![0.5f32; n], 1, n);
+        let keep = self.flush_every();
+        let mut out: Vec<(u32, f64)> = cands.iter().map(|&c| {
+            self.set_flush_every(c);
+            let mut chain = self.add_t(&a, &b);
+            let t0 = std::time::Instant::now();
+            for _ in 0..256 { chain = self.add_t(&chain, &b); }
+            let _ = self.download(&chain); // final submit + poll, like a token boundary
+            (c, t0.elapsed().as_secs_f64() * 1000.0)
+        }).collect();
+        self.set_flush_every(keep);
+        out.sort_by(|x, y| x.1.total_cmp(&y.1));
+        out
+    }
+
+    /// Dispatch-latency microbench (LOGSCOPE_DISPATCH_BENCH=1, printed once after load): times 256 CHAINED
+    /// tiny dispatches (each reads the previous output — hazard-serialized, the decode regime) vs 256
+    /// INDEPENDENT ones (parallelizable) vs 8 big matvec-sized ones, all in one submit each. Splits the
+    /// per-dispatch cost into launch latency vs serialization vs real compute — the number that decides
+    /// whether kernel FUSION is the right next investment (decode is currently ~0.4-0.5 ms × dispatch
+    /// count on Honeykrisp by inference; this measures it).
+    pub fn dispatch_bench(&self) {
+        let n = 4096usize;
+        let a = self.upload(&vec![1.0f32; n], 1, n);
+        let b = self.upload(&vec![2.0f32; n], 1, n);
+        let mut chain = self.add_t(&a, &b);
+        let t0 = std::time::Instant::now();
+        for _ in 0..256 { chain = self.add_t(&chain, &b); }
+        let _ = self.download(&chain);
+        let chained = t0.elapsed().as_secs_f64() * 1000.0;
+        let t1 = std::time::Instant::now();
+        let outs: Vec<Tensor> = (0..256).map(|_| self.add_t(&a, &b)).collect();
+        let _ = self.download(outs.last().unwrap());
+        let indep = t1.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("dispatch-bench: 256 chained tiny = {chained:.1} ms ({:.3} ms/dispatch) | 256 independent tiny = {indep:.1} ms ({:.3} ms/dispatch) | serialization tax = {:.3} ms/dispatch",
+            chained / 256.0, indep / 256.0, (chained - indep).max(0.0) / 256.0);
+        eprintln!("dispatch-bench: decode ≈ dispatches/token × the CHAINED number — if that matches observed ms/token, fusion (fewer, fatter kernels) is the speed lever; if independent ≈ chained, it's pure launch overhead and fan-out parallelism is near-free");
     }
 
     pub fn add_t(&self, a: &Tensor, b: &Tensor) -> Tensor {
@@ -2723,6 +2960,165 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[d0+1u]=x0*s+x1*c;
 }"#;
 
+// ===== MoE v2 decode kernels: GPU-side routing (zero readbacks) =====
+// MOE_TOPK: serial top-k over the router logits (n<=512, k<=16 — trivial work, the win is staying on-GPU).
+// Selection order = descending logit; weights = softmax over the SELECTED logits (bit-faithful to
+// moe::route's Softmax path: global softmax renormalized to the top-k == softmax over the selected).
+// Output selw: [0..k) = expert index (u32), [k..2k) = combine weight (f32 bitcast to u32).
+const MOE_TOPK: &str = r#"
+struct D { n:u32,k:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> logits: array<f32>;
+@group(0)@binding(1) var<storage,read_write> selw: array<u32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(1,1,1)
+fn main(){
+  var idx: array<u32,16>; var lg: array<f32,16>;
+  for(var s=0u;s<d.k;s=s+1u){
+    var bi=0u; var bv=-3.4e38;
+    for(var i=0u;i<d.n;i=i+1u){
+      var taken=false;
+      for(var t=0u;t<s;t=t+1u){ if(idx[t]==i){ taken=true; } }
+      if(!taken && logits[i]>bv){ bv=logits[i]; bi=i; }
+    }
+    idx[s]=bi; lg[s]=bv;
+  }
+  // softmax over the selected (selection is descending, so lg[0] is the max — hoist it BEFORE the loop
+  // mutates lg in place; using lg[0] inside the loop reads exp(0)=1.0 for s>=1, mis-weighting slot 0 by
+  // exp(max-1) after normalization — the exact wgtΔmax the differential checker caught)
+  let mx=lg[0];
+  var sum=0.0;
+  for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
+  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/sum); }
+}"#;
+
+// MOE_MATVEC_Q8 / MOE_MATVEC_Q4: the base MATVEC_Q8_0/MATVEC_Q4 kernels with the weight row indexed
+// through a GPU-side expert selection — row = sel[slot]*rstride + col — so the CPU never learns which
+// experts won (no readback). `xper=1` reads a per-slot activation row (the down projection consumes
+// hmid[slot]); `xper=0` broadcasts one activation row (gate_up consumes n2). Output c[slot*n + col].
+const MOE_MATVEC_Q8: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let row=selw[slot]*d.rstride+col;
+  let wbase=row*(d.k/4u); let sbase=row*d.kb;
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
+}"#;
+
+const MOE_MATVEC_Q4: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let row=selw[slot]*d.rstride+col;
+  let wbase=row*(d.k/8u); let sbase=row*d.kb;
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
+}"#;
+
+// MOE_WSUM: out[col] = resid[col] + Σ_s weight[s] · down[s·d + col] — the routed-expert combine, folded
+// with the residual add. Weights come from MOE_TOPK's selw (f32 bitcast at [k..2k)).
+const MOE_WSUM: &str = r#"
+struct D { n:u32,k:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> selw: array<u32>;
+@group(0)@binding(2) var<storage,read> resid: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;}
+  var acc=resid[i];
+  for(var s=0u;s<d.k;s=s+1u){ acc=acc+bitcast<f32>(selw[d.k+s])*src[s*d.n+i]; }
+  o[i]=acc;
+}"#;
+
+// Fused QK-Norm + RoPE for the decode step (t=1): ONE dispatch replaces the 4-chain
+// (qk_norm(q) → qk_norm(k) → rope(q) → rope(k)) on the Qwen path. One workgroup per HEAD (q heads then
+// k heads): 64 threads reduce the head's RMS (hd=128 → 2 elems/thread), normalize with the head's own
+// weight (q_norm for q heads, k_norm for k heads), then each thread rotates exactly one pair (hd/2=64
+// pairs) with the branch-free NORM/NEOX arithmetic. Output layout identical to the old chain:
+// [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
+// standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
+const QKNORM_ROPE: &str = r#"
+struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,_p:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> qn: array<f32>;
+@group(0)@binding(2) var<storage,read> kn: array<f32>;
+@group(0)@binding(3) var<storage,read> ff: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+var<workgroup> nx: array<f32,128>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let head=wg.x; let tid=lid.x; let hd=d.hd; let half=hd/2u;
+  let off=head*hd; // heads are contiguous: q heads [0,nq), then k heads
+  // per-head sum of squares (each thread covers hd/64 elems)
+  var ss=0.0; var i=tid;
+  loop { if(i>=hd){break;} let v=x[off+i]; ss=ss+v*v; i=i+64u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s2=32u;s2>0u;s2=s2>>1u){ if(tid<s2){ red[tid]=red[tid]+red[tid+s2]; } workgroupBarrier(); }
+  let inv=inverseSqrt(red[0]/f32(hd)+d.eps);
+  // normalize with the head-family weight into workgroup memory
+  i=tid;
+  loop { if(i>=hd){break;}
+    let w=select(kn[i], qn[i], head<d.nq);
+    nx[i]=x[off+i]*inv*w; i=i+64u; }
+  workgroupBarrier();
+  // one rotation pair per thread (branch-free NORM/NEOX pairing, same arithmetic as ROPE_MH)
+  if(tid<half){
+    let freq=f32(d.pos)/(pow(d.base,(2.0*f32(tid))/f32(hd))*ff[tid]);
+    let c=cos(freq); let s=sin(freq);
+    let j0=tid*(2u-d.neox);
+    let j1=j0 + 1u + d.neox*(half-1u);
+    let x0=nx[j0]; let x1=nx[j1];
+    o[off+j0]=x0*c-x1*s;
+    o[off+j1]=x0*s+x1*c;
+  }
+}"#;
+
 const GATHER_ROWS: &str = r#"
 struct D { n:u32,c:u32,_b:u32,_d:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;
@@ -3090,6 +3486,26 @@ pub struct Model {
     pub base: f32, pub eps: f32,
 }
 impl Model {
+    /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
+    /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
+    /// a mismatch between boxes means the UPLOAD path corrupted weights on one of them (e.g. the UMA
+    /// zero-copy mapped write on one backend), independent of any kernel. Cheap: a few KB downloaded.
+    pub fn weight_probe(&self, gpu: &Gpu) -> String {
+        let f = |t: &Tensor, n: usize| -> (Vec<f32>, f64) {
+            let v = gpu.download(t);
+            let head: Vec<f32> = v.iter().take(n).cloned().collect();
+            let sum: f64 = v.iter().map(|x| x.abs() as f64).sum();
+            (head, sum)
+        };
+        let (g1h, g1s) = f(&self.layers[0].g1, 4);
+        let (onh, ons) = f(&self.out_norm, 4);
+        let (rfh, rfs) = f(&self.rope_factors, 4);
+        let qn = self.layers[0].q_norm.as_ref().map(|t| f(t, 4));
+        format!("weight-probe: blk0.g1 {:?} Σ|{:.4e}| | out_norm {:?} Σ|{:.4e}| | rope_ff {:?} Σ|{:.4e}|{}",
+            g1h, g1s, onh, ons, rfh, rfs,
+            qn.map(|(h, s)| format!(" | q_norm {h:?} Σ|{s:.4e}|")).unwrap_or_default())
+    }
+
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
@@ -3154,6 +3570,29 @@ impl Gpu {
     }
     pub fn load_gguf_opt(&self, bytes: &[u8], q: bool) -> Result<Model, String> {
         let g = gguf::parse(bytes)?;
+        // Data-integrity gate (unconditional, ~8 KB): read a small F32 tensor's RAW bytes straight from the
+        // mapped file — before any dequant, upload, or GPU involvement. An all-zeros norm weight is
+        // impossible in a real checkpoint; it means the file's DATA section is corrupt (partial download /
+        // bad copy — metadata parses fine, so size checks and dumps look healthy). This exact failure
+        // burned a full debugging cycle on the M4 (weights probed zero on GPU; every engine path was
+        // exonerated one by one). Refuse loudly with the fix instead of generating symbol soup.
+        if let Some(t) = g.tensor("blk.0.attn_norm.weight").filter(|t| t.ggml_type == 0) {
+            let off = (g.data_offset + t.offset) as usize;
+            let n = (t.dims.iter().product::<u64>() as usize * 4).min(8192);
+            if let Some(raw) = bytes.get(off..off + n) {
+                if raw.iter().all(|&b| b == 0) {
+                    return Err(format!(
+                        "GGUF data section is corrupt: blk.0.attn_norm.weight is ALL ZEROS in the file                          (raw bytes at offset {off}). The header parses fine, so the file LOOKS healthy —                          this is a partial download or bad copy. Re-download or re-copy the file                          (verify with a sha256 checksum against a known-good copy)."));
+                }
+                if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() {
+                    let head: Vec<f32> = raw.chunks_exact(4).take(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                    let sum: f64 = raw.chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).abs() as f64).sum();
+                    eprintln!("wgpu-engine: raw-file-probe blk0.attn_norm {head:?} Σ|{sum:.4e}| (read from disk, pre-GPU)");
+                }
+            }
+        }
         // Guard the LLM path: a diffusion checkpoint (z-image, flux, SD) or an mmproj has no tokenizer and
         // would die deep in tokenizer loading with a cryptic error. Classify up front and refuse with a
         // message that points at the right subsystem (the image pipeline) instead.
@@ -3200,7 +3639,23 @@ impl Gpu {
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
-        let pfx = acfg.prefix; // metadata key prefix: "llama" / "qwen2" / "qwen3" / "qwen3_5"
+        // Metadata key prefix. Normally the registry's ("llama"/"qwen3"/...), but some conversions write
+        // general.architecture with one spelling and the hparam keys under ANOTHER (seen live: a Qwen3.5
+        // GGUF resolving to 'qwen3_5' with ZERO keys under that prefix). Rather than guess spellings,
+        // SNIFF the real prefix: any '<pfx>.embedding_length' key in the metadata names it authoritatively.
+        let pfx: &str = {
+            let reg = acfg.prefix;
+            if g.metadata.contains_key(&format!("{reg}.embedding_length")) { reg } else {
+                match g.metadata.keys().find_map(|k| k.strip_suffix(".embedding_length")) {
+                    Some(real) => {
+                        eprintln!("loader: hparam prefix is '{real}.' (registry expected '{reg}.') — using the file's prefix");
+                        // leak: one tiny string per load, avoids threading a String through 30 format! sites
+                        Box::leak(real.to_string().into_boxed_str())
+                    }
+                    None => reg,
+                }
+            }
+        };
         let has_qk_norm = acfg.attn_qk_norm; // Qwen3/3.5: load blk.N.attn_{q,k}_norm.weight below
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
@@ -3220,8 +3675,11 @@ impl Gpu {
                         .map(|s| s.as_str()).collect();
                     present.sort_unstable();
                     let listed = if present.is_empty() { "(none)".to_string() } else { present.join(", ") };
+                    // also name the prefixes that ARE in the file, so a spelling mismatch is visible at a glance
+                    let mut pfxs: Vec<&str> = g.metadata.keys().filter_map(|k| k.split('.').next()).collect();
+                    pfxs.sort_unstable(); pfxs.dedup();
                     format!("missing embedding_length: the GGUF has no '{key}' key (resolved arch '{pfx}'); \
-                        keys under '{pfx}.' present: {listed} — the file may be truncated, non-standard, or not a supported LLM")
+                        keys under '{pfx}.' present: {listed}; metadata prefixes in the file: {} — the file may be truncated, non-standard, or not a supported LLM", pfxs.join(", "))
                 }
             })? as usize;
         // MoE (qwen3moe): expert config from metadata. is_moe additionally requires the stacked expert
@@ -3272,7 +3730,7 @@ impl Gpu {
                     // drivers (Asahi/Honeykrisp). Plan against that cap, not RAM — otherwise int8 for a 70B
                     // (~70 GiB) "fits" the ~170 GiB RAM budget and then the driver refuses the allocation
                     // mid-upload ("Failed to allocate BO VMA"). The cap makes it pick q4 (or refuse) up front.
-                    let gpu_budget = gpu_buffer_budget(budget);
+                    let gpu_budget = gpu_buffer_budget(budget, self.conservative_vma);
                     match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
                         Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
@@ -3311,7 +3769,18 @@ impl Gpu {
         let vocab = vocab_meta.unwrap_or(embed.len() / d);
         // Build a resident linear, preferring the DIRECT q8_0 → int8 path (no f32 round-trip) when the
         // source tensor is q8_0 and we want int8 residency; otherwise dequant-then-quantize as before.
-        let q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
+        let mut q4_mode = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok() || auto_q4;
+        // MoE ⇒ q4 residency, always. int8-resident MoE is the ONE configuration never validated anywhere
+        // (the M2's 24 GiB budget always auto-selects q4 for the 30B) — and when the M4's raised budget
+        // finally ran it, GPU-resident weights probed ZERO while the raw file bytes were real, producing
+        // symbol soup; the SAME machine + file on q4 generates correctly (4.81 tok/s). q4 experts are also
+        // simply the right call (half the residency of int8). The broken int8 path stays reachable via
+        // LOGSCOPE_MOE_INT8=1 for a dedicated hunt when it ever matters.
+        if is_moe && !q4_mode && std::env::var("LOGSCOPE_MOE_INT8").is_err() {
+            eprintln!("loader: MoE ⇒ q4-resident (int8-MoE residency is unvalidated/broken — override with LOGSCOPE_MOE_INT8=1)");
+            q4_mode = true;
+        }
+        let q4_mode = q4_mode;
         // Optional arena packing: route resident weights into a few large slabs instead of one buffer
         // per tensor. Guard clears the bump state when this load returns/unwinds (slabs persist via the
         // weight tensors). Off by default — opt in with LOGSCOPE_ARENA (slab MiB via LOGSCOPE_ARENA_SLAB_MB).
@@ -3392,22 +3861,32 @@ impl Gpu {
                     // Stacked expert tensors: expert dim OUTERMOST, so expert e's matrix is the contiguous
                     // f32 slice [e·rows·cols, (e+1)·rows·cols) after fetch's dequant (which reads each
                     // tensor's ACTUAL ggml type — Q4_K vs Q6_K varies per layer). gate/up: [ff, d]; down: [d, ff].
-                    // Fuse each expert's gate||up at load (same pattern as dense wgate_up): one [2ff, d]
-                    // Lin per expert instead of two [ff, d] — one matvec + one bind saved per expert/token.
+                    // v2 layout: ONE quantized Lin per kind for the whole expert stack (interleaved
+                    // [e: gate||up] for the fused projection), then per-expert Lins are zero-copy row
+                    // VIEWS into it. One quant pass instead of n_expert (faster load), and the stacked
+                    // buffer is what the GPU-routed decode kernels index (row = sel·rstride + col).
                     let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
                     let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
                     let ec = expert_ff * d;
-                    let gate_up: Vec<Lin> = (0..n_expert).map(|e| {
-                        let mut gu = Vec::with_capacity(2 * ec);
-                        gu.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
-                        gu.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
-                        self.make_lin(&gu, 2 * expert_ff, d, q, q4_mode)
-                    }).collect();
+                    let mut inter = Vec::with_capacity(2 * ec * n_expert);
+                    for e in 0..n_expert {
+                        inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                        inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                    }
                     drop(gsrc); drop(usrc);
+                    let stacked_gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
+                    drop(inter);
                     let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                    let down: Vec<Lin> = (0..n_expert).map(|e| self.make_lin(&dsrc[e * ec..(e + 1) * ec], d, expert_ff, q, q4_mode)).collect();
+                    let stacked_down = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
                     drop(dsrc);
-                    Some(Box::new(MoeLayer { router, gate_up, down,
+                    let gate_up: Vec<Lin> = (0..n_expert)
+                        .filter_map(|e| lin_row_view(&stacked_gu, e * 2 * expert_ff, 2 * expert_ff)).collect();
+                    let down: Vec<Lin> = (0..n_expert)
+                        .filter_map(|e| lin_row_view(&stacked_down, e * d, d)).collect();
+                    if gate_up.len() != n_expert || down.len() != n_expert {
+                        return Err("MoE expert stack isn't row-viewable (unexpected residency format)".into());
+                    }
+                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
@@ -3657,8 +4136,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let c=cos(freq); let s=sin(freq);
   // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
   // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
-  let j0=select(off+2u*i, off+i, dd.neox==1u);
-  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
   let x0=x[j0]; let x1=x[j1];
   o[j0]=x0*c-x1*s;
   o[j1]=x0*s+x1*c;
@@ -3681,8 +4163,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   let off=tok*dd.dm + head*dd.hd;
   let freq=f32(pos[tok])/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
   let c=cos(freq); let s=sin(freq);
-  let j0=select(off+2u*i, off+i, dd.neox==1u);
-  let j1=select(off+2u*i+1u, off+i+half, dd.neox==1u);
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
   let x0=x[j0]; let x1=x[j1];
   o[j0]=x0*c-x1*s;
   o[j1]=x0*s+x1*c;
@@ -4310,9 +4795,11 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: QK-Norm has its own per-head weight for Q vs K, so it can't ride the single
-            // combined RoPE dispatch — split, normalize each, then RoPE each (matches block_decode_fused).
+        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Fused QK-Norm+RoPE (see block_decode_fused) — one dispatch for the old 4-chain.
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            (self.slice_cols(&qk, 0, ad), self.slice_cols(&qk, ad, kv))
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
@@ -4397,10 +4884,16 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);                          // [1, ad+2kv] — one matmul (was three)
-        let (q, kr) = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: QK-Norm is a per-head RMSNorm with its OWN weight for Q vs K, so it can't ride
-            // the single combined RoPE dispatch below — Q and K must be split, normalized separately,
-            // then roped separately.
+        let (q, kr) = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Qwen3/3.5 QK-Norm: FUSED norm+rope — one dispatch replaces the old 4-chain
+            // (norm q → norm k → rope q → rope k); output layout identical (q ‖ k).
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, pos, eps);
+            let qr = self.slice_cols(&qk, 0, ad);
+            let kr = self.slice_cols(&qk, ad, kv);
+            self.write_row(kc, &kr, pos, kv);
+            (qr, kr)
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
+            // single-sided norm (no known arch does this) — keep the unfused chain for correctness
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, pos, hd);
@@ -4452,9 +4945,14 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let qkv = w.wqkv.apply(self, &n1, 1);
-        let q = if w.q_norm.is_some() || w.k_norm.is_some() {
-            // Qwen3/3.5: see block_decode_fused — QK-Norm needs Q and K split and normalized with their
-            // own weight before RoPE, so it can't ride the single combined dispatch below.
+        let q = if let (Some(qnw), Some(knw)) = (&w.q_norm, &w.k_norm) {
+            // Fused QK-Norm+RoPE (see block_decode_fused) — one dispatch for the old 4-chain.
+            let qk = self.qknorm_rope_fused(&qkv, qnw, knw, ff, n_heads, n_kv_heads, hd, base, rope_pos, eps);
+            let qr = self.slice_cols(&qk, 0, ad);
+            let kr = self.slice_cols(&qk, ad, kv);
+            self.write_row(kc, &kr, slot, kv);
+            qr
+        } else if w.q_norm.is_some() || w.k_norm.is_some() {
             let qn = self.qk_norm(self.slice_cols(&qkv, 0, ad), &w.q_norm, 1, ad, hd, eps);
             let kn = self.qk_norm(self.slice_cols(&qkv, ad, kv), &w.k_norm, 1, kv, hd, eps);
             let qr = self.rope_mh_t(&qn, ff, 1, ad, base, rope_pos, hd);
