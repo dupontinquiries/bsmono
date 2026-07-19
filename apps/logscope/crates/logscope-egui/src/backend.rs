@@ -129,7 +129,7 @@ mod engine {
             // cache HIT shouldn't pull GB into RAM just to compute a content key. The OS pages bytes
             // on demand; `bytes` derefs to &[u8] exactly like the old fs::read Vec, and the mapping
             // is dropped at the end of load once tensors are resident.
-            let mm = gpu_kernels::mmap_ro(path).map_err(|e| format!("mmap {path}: {e}"))?;
+            let mm = gpu_kernels::file_bytes(path).map_err(|e| format!("open {path}: {e}"))?;
             let bytes: &[u8] = &mm;
             let gpu = Gpu::new();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
@@ -227,6 +227,8 @@ mod engine {
             eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
                 t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
+            if std::env::var("LOGSCOPE_DISPATCH_BENCH").is_ok() { gpu.dispatch_bench(); }
+            if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() { eprintln!("wgpu-engine: {}", model.weight_probe(&gpu)); }
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
             // first user token runs at steady speed instead of crawling up from ~0.1 tok/s
             // while shaders compile. The returned count is the "warm" signal.
@@ -306,9 +308,20 @@ mod engine {
             } else if std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_some() {
                 None
             } else {
-                let t = gpu_kernels::SubmitTuner::new(gpu_kernels::SUBMIT_PROFILES, 2);
-                gpu.set_flush_every(t.current());
-                eprintln!("wgpu-engine: submit batch = adapting over next replies (SUBMIT_PROFILES {:?}, 2 samples each; pin with LOGSCOPE_FLUSH_EVERY)", gpu_kernels::SUBMIT_PROFILES);
+                // Startup stride probe: measure the whole ladder synthetically (~1 s worst-case, once per
+                // GPU until the live tuner's settle is cached), start at the winner, and hand the LIVE
+                // tuner only the winner's neighborhood — so real replies begin near-optimal and settling
+                // takes ~3 candidates instead of the full ladder. LOGSCOPE_FLUSH_EVERY still pins.
+                let probe = gpu.submit_stride_probe(gpu_kernels::SUBMIT_PROFILES);
+                let table: Vec<String> = probe.iter().map(|(c, ms)| format!("{c}:{ms:.0}ms")).collect();
+                let winner = probe.first().map(|&(c, _)| c).unwrap_or(64);
+                let neighborhood: Vec<u32> = gpu_kernels::SUBMIT_PROFILES.iter().cloned()
+                    .filter(|&c| c == winner || c == winner.saturating_mul(2) || c == winner / 2)
+                    .collect();
+                let t = gpu_kernels::SubmitTuner::new(
+                    Box::leak(neighborhood.clone().into_boxed_slice()), 2);
+                gpu.set_flush_every(winner);
+                eprintln!("wgpu-engine: submit batch = {winner} passes/submit (startup stride probe [{}]); live tuner refines {:?} over next replies; pin with LOGSCOPE_FLUSH_EVERY", table.join(" "), neighborhood);
                 Some(t)
             };
             let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path).to_string();
