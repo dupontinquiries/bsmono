@@ -17,7 +17,7 @@ use crate::math::Vec3;
 use crate::game::Game;
 use crate::hud::*; // shared HUD painters (draw_hud, draw_killfeed, …)
 use crate::level::MapTheme;
-use crate::multiplayer::Multiplayer;
+use crate::multiplayer::{Multiplayer, SharedMultiplayer};
 use crate::player::Input;
 use crate::creatures::{Creature, HuntRole};
 use crate::builder::{AssetKind, CustomMap, Placed};
@@ -358,7 +358,7 @@ pub struct FpsApp {
     /// Real online-play control-plane state (see multiplayer.rs): session announce/discover over
     /// the fleet DHT. `mp_status` is the last host/join result shown in the Multiplayer menu;
     /// `mp_friend_input` is the "Join" text field.
-    mp: Multiplayer,
+    mp: SharedMultiplayer,
     mp_status: String,
     mp_friend_input: String,
     /// Set true for one frame when a bsgames handoff (see handoff.rs) successfully hosted/joined
