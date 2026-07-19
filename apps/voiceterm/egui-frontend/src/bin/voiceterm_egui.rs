@@ -14,7 +14,7 @@
 use eframe::egui;
 use voiceterm_egui::action_compass::ActionCompass;
 use voiceterm_egui::gesture_menus::{brace_bytes, brace_menu, brace_slide_menu, link_dispatch, link_menu, pane_dispatch, pane_menu, pipe_char, pipe_menu, pipe_slide_menu, tab_dispatch, tab_menu, tab_slide_menu, BlockAction, LinkAction, PaneAction};
-use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
+use voiceterm_egui::shell::{blocks_drawer_ui, fab_rect, keycap_bar_ui, load_prefs, mic_fab_ui, overflow_counts, paint_terminal_border, save_prefs, settings_panel, tab_row, theme_menu, Session, Sidebar, SidebarAction, Workspace, TERMINAL_KEYCAPS};
 use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
@@ -51,6 +51,9 @@ struct VoicetermApp {
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
     toasts: uikit_egui::toast::Toasts,
+    /// The settings screen (QML settings page): sidebar ⚙ toggles the right panel; edits apply
+    /// live (App::apply_settings + palette each frame) and persist to prefs.kv on change.
+    settings_open: bool,
 }
 
 impl eframe::App for VoicetermApp {
@@ -65,7 +68,7 @@ impl eframe::App for VoicetermApp {
                     SidebarAction::SelectSession(_) => {} // on-device: switch the active PTY/session
                     SidebarAction::New => {} // on-device: spawn a new session
                     SidebarAction::Graph => {} // on-device: open the session graph view
-                    SidebarAction::Settings => {} // on-device: open the settings panel (setup_wizard.rs)
+                    SidebarAction::Settings => self.settings_open = !self.settings_open,
                 }
             }
         });
@@ -110,6 +113,30 @@ impl eframe::App for VoicetermApp {
                 self.app.terminal.feed(send);
             }
         });
+
+        // the settings screen (QML settings page) as a right panel; edits persist + re-apply live
+        if self.settings_open {
+            egui::SidePanel::right("settings").resizable(true).default_width(300.0).show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("Settings");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("\u{2715}").clicked() {
+                            self.settings_open = false;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if settings_panel(ui, &mut self.app.prefs) {
+                        // palette is owned by prefs; keep the frame-applied theme in sync
+                        self.theme = snapclone_theme::PaletteId::from_str(&self.app.prefs.palette);
+                        let prefs = self.app.prefs.clone();
+                        self.app.apply_settings(ctx, &prefs);
+                        let _ = save_prefs(&self.app.prefs);
+                    }
+                });
+            });
+        }
 
         // the blocks drawer slides in at the left edge (QML Drawer, LeftEdge)
         if self.blocks_open {
@@ -355,6 +382,7 @@ fn main() -> eframe::Result<()> {
                 blocks_open: false,
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
+                settings_open: false,
             }))
         }),
     )
