@@ -171,10 +171,27 @@ pub fn blocks_drawer_ui(
                         ui.weak(badge);
                     });
                 });
-                // preview: first output line, dimmed
-                if let Some(first) = b.output.lines().next() {
-                    ui.weak(egui::RichText::new(first).monospace().small());
+                // preview: first output line, dimmed — CLICK to expand the full captured
+                // output inline (the QML drawer opened term_block_output in a pane; inline
+                // expansion is the drawer-native equivalent)
+                let expanded_id = ui.id().with("expanded");
+                let mut expanded = ui.ctx().data_mut(|d| d.get_temp::<bool>(expanded_id).unwrap_or(false));
+                if expanded {
+                    egui::ScrollArea::vertical().max_height(180.0).id_salt(b.id).show(ui, |ui| {
+                        ui.label(egui::RichText::new(&b.output).monospace().small());
+                    });
+                    if ui.small_button("collapse \u{25B4}").clicked() {
+                        expanded = false;
+                    }
+                } else if let Some(first) = b.output.lines().next() {
+                    if ui
+                        .add(egui::Label::new(egui::RichText::new(first).monospace().small().weak()).sense(egui::Sense::click()))
+                        .clicked()
+                    {
+                        expanded = true;
+                    }
                 }
+                ui.ctx().data_mut(|d| d.insert_temp(expanded_id, expanded));
                 // inline actions + the ⋯ hold-menu host
                 ui.horizontal(|ui| {
                     if ui.small_button("\u{25B6}").clicked() {
