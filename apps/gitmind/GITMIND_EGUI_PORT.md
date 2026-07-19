@@ -50,11 +50,18 @@ Warning-clean on egui 0.34 (uikit-egui Context renames + gitmind-egui Panel::* w
 allow(deprecated) for eframe's top-level show(ctx)). **DevicePicker** embedded in Push (scan the LAN
 via deploy::scan_ssh, pick a device to fill the host).
 
+## Ported (the last Qt flow)
+**Duplicates & roll-up** (`pages/dupes.rs`, a card at the bottom of Settings — where QML kept it):
+scan roots for duplicate checkouts (`flow::duplicates_all`), pick an (older, newer) pair, preview /
+apply the ff-only roll-up, run a merge **exploration** (`flow::explore` → per-strategy `gm-<id>`
+trial branches), preview a chosen strategy (`flow::merge_preview` — the action previously listed as
+remaining), and land it (`flow::land_merge`). Blocking calls ride the shared Task; structured
+results cross Task's single-String channel on a tiny `\x1E/\x1F` wire with unit-tested
+encode/decode pairs (8 lib tests total).
+
 ## Remaining (minor)
-merge_preview action on Branches; other DevicePicker (discovery component to embed in Push, replacing
-its manual user/host fields), merge_preview action on Branches. Network extras (fleet health card, advertise, bluetooth, daemon control/logs stream),
-Timeline, Files/PeekViewer, Import, Branches, DevicePicker, Settings. Each is a mechanical
-port of an existing QML page onto the pattern above; the cockpit functions all exist already.
+Stale-Bluetooth/advertise items from the old Network list if ever needed; everything else on the
+original list has landed. The Qt `gui` crate remains the untouched fallback.
 
 ## Notes
 - Build headless: `cargo build -p gitmind-egui --lib` (RUSTFLAGS='' if the mold pin bites).

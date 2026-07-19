@@ -2,6 +2,7 @@ pub mod fleet;
 pub mod network;
 pub mod apps;
 pub mod branches;
+pub mod dupes;
 pub mod files;
 pub mod import;
 pub mod push;
