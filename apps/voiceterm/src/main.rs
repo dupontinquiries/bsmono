@@ -22,6 +22,7 @@ use qmetaobject::*;
 use std::sync::OnceLock;
 
 mod qml_gen;
+mod qml_locate;
 use qml_gen::{generate_safe_qml, RenderStyle, select_body, esc, resolve_url};
 
 mod ad_filter;
@@ -23289,40 +23290,12 @@ fn main() {
         bp.borrow_mut().load_page(QString::from(url.as_str()), depth);
     }
 
-    // Load QML — try several locations, with explicit logging
-    let qml_search_paths = [
-        "qml/main.qml",
-        "./qml/main.qml",
-        "../qml/main.qml",
-    ];
-
-    let mut loaded_path: Option<String> = None;
-    eprintln!("Searching for QML in:");
-    for p in &qml_search_paths {
-        let path = std::path::Path::new(p);
-        let exists = path.exists();
-        eprintln!("  {} -> {}", p, if exists { "FOUND" } else { "no" });
-        if exists && loaded_path.is_none() {
-            loaded_path = Some(p.to_string());
-        }
-    }
-
-    // Also try exe-relative paths
-    if loaded_path.is_none() {
-        if let Ok(exe) = std::env::current_exe() {
-            for rel in &["qml/main.qml", "../qml/main.qml", "../../qml/main.qml"] {
-                if let Some(dir) = exe.parent() {
-                    let candidate = dir.join(rel);
-                    let exists = candidate.exists();
-                    eprintln!("  {} -> {}", candidate.display(), if exists { "FOUND" } else { "no" });
-                    if exists {
-                        loaded_path = Some(candidate.to_string_lossy().to_string());
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    // Load QML — qml_locate probes (in order) $VOICETERM_QML_DIR, the original CWD-relative
+    // paths, every CWD ancestor's apps/voiceterm/qml (so launching from anywhere inside a
+    // checkout works — e.g. a gitmind-installed binary run from apps/gitmind), the original
+    // exe-relative paths, XDG data dirs (the ~/.local/bin install case), and the compile-time
+    // source dir. Each candidate is logged as before.
+    let loaded_path: Option<String> = qml_locate::locate();
 
     match loaded_path {
         Some(p) => {
