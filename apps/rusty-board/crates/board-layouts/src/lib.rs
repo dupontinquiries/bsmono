@@ -1,12 +1,30 @@
-//! Keyboard layouts: loaded from JSON files in `resources/layouts/`.
+//! board-layouts — rusty-board's keyboard-layout layer, extracted so the GTK app and the egui
+//! frontend share ONE model (the egui side previously mirrored the serde schema by hand — that
+//! duplicate is gone). gtk-free by construction: the Key/KeyAction/KeyGestures data model
+//! (`key`), Layout/Row + JSON io, the layout builders, and `ThumbAnchor` (single-hand layout
+//! geometry, re-exported back through the app's `config`). Layout JSON lives in the app's
+//! `resources/layouts/`; `io` loads it, and frontends may also embed the files directly.
 
 pub mod builder;
+pub mod code_mode;
 pub mod io;
+pub mod key;
+pub mod state;
 
-use crate::keyboard::{Key, KeyAction, KeyGestures};
+use crate::key::{Key, KeyAction, KeyGestures};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Anchor corner for the thumb in single-hand mode. Moved here from the app's `config` (which
+/// re-exports it, so `crate::config::ThumbAnchor` paths still work) because the cardinal
+/// builders place utility rows by it — layout geometry, not app config.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThumbAnchor {
+    BottomLeft,
+    BottomRight,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Layout {
@@ -227,8 +245,8 @@ impl Layout {
     /// letters, the next `?123` tap toggles Symbols→Normal (because
     /// engine says we're already on Symbols) and nothing changes
     /// visually. The user sees a dead button.
-    pub fn corresponding_keypad_state(&self) -> crate::keyboard::KeypadState {
-        use crate::keyboard::KeypadState;
+    pub fn corresponding_keypad_state(&self) -> crate::state::KeypadState {
+        use crate::state::KeypadState;
         match self.name.as_str() {
             "symbols" => KeypadState::Symbols,
             "numbers" => KeypadState::Numbers,
@@ -984,7 +1002,7 @@ impl Layout {
     /// tap. The cycle handler is in the UI event listener (see
     /// `keyboard_view`'s KeyAction match).
     pub fn default_cardinal_grid_words() -> Self {
-        use crate::keyboard::code_mode::{current, CodeMode};
+        use crate::code_mode::{current, CodeMode};
 
         // Letter cells — same set as default_cardinal_grid so users
         // who already know that layout's a/n/i/t/s/c/h/r positions
@@ -1343,7 +1361,7 @@ impl Layout {
         // `default_cardinal_grid_dvorak_for_anchor` to flip for a
         // left-handed user.
         Self::default_cardinal_grid_dvorak_for_anchor(
-            crate::config::ThumbAnchor::BottomRight,
+            crate::ThumbAnchor::BottomRight,
         )
     }
 
@@ -1355,7 +1373,7 @@ impl Layout {
     /// For right-handed (anchor=BottomRight): ⚙ left, ⏎ middle, ⌫ right.
     /// For left-handed (anchor=BottomLeft):  ⌫ left, ⏎ middle, ⚙ right.
     pub fn default_cardinal_grid_dvorak_for_anchor(
-        anchor: crate::config::ThumbAnchor,
+        anchor: crate::ThumbAnchor,
     ) -> Self {
         // ---- Row 0: vowels on outer cells, e-r-t-h-l hot cluster in middle.
         //
@@ -1532,12 +1550,12 @@ impl Layout {
                         let llm = Key::modifier("✨", KeyAction::Llm).with_width(0.5);
                         let settings = Key::modifier("⚙", KeyAction::Settings).with_width(0.5);
                         match anchor {
-                            crate::config::ThumbAnchor::BottomRight => {
+                            crate::ThumbAnchor::BottomRight => {
                                 // Dominant right: backspace on the
                                 // right (closest to thumb).
                                 vec![settings, llm, return_key, backspace, undo]
                             }
-                            crate::config::ThumbAnchor::BottomLeft => {
+                            crate::ThumbAnchor::BottomLeft => {
                                 vec![undo, backspace, return_key, llm, settings]
                             }
                         }
@@ -1896,7 +1914,7 @@ mod tests {
     fn shift_is_modifier_type() {
         let l = Layout::default_qwerty();
         let shift = l.rows[2].keys.iter().find(|k| matches!(k.action, KeyAction::Shift)).unwrap();
-        assert_eq!(shift.key_type, crate::keyboard::KeyType::Modifier);
+        assert_eq!(shift.key_type, crate::key::KeyType::Modifier);
     }
 
     #[test]
@@ -2018,7 +2036,7 @@ mod tests {
 
     #[test]
     fn cardinal_grid_words_has_5_rows_5_cols_each_summing_to_5() {
-        crate::keyboard::code_mode::set(crate::keyboard::code_mode::CodeMode::Prose);
+        crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         assert_eq!(l.rows.len(), 5, "letter rows + utility + action = 5");
         assert_eq!(l.grid_columns, 5.0);
@@ -2039,7 +2057,7 @@ mod tests {
         // already learned default_cardinal_grid's a/n/i/t/s/c/h/r
         // muscle memory carry it directly into the words layout.
         // If the letter cells diverge, that promise breaks.
-        crate::keyboard::code_mode::set(crate::keyboard::code_mode::CodeMode::Prose);
+        crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let words = Layout::default_cardinal_grid_words();
         let plain = Layout::default_cardinal_grid();
 
@@ -2060,7 +2078,7 @@ mod tests {
 
     #[test]
     fn cardinal_grid_words_has_lang_cycle_button_in_bottom_row() {
-        crate::keyboard::code_mode::set(crate::keyboard::code_mode::CodeMode::Prose);
+        crate::code_mode::set(crate::code_mode::CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         let bottom = &l.rows[4];
         let lang = bottom
@@ -2076,7 +2094,7 @@ mod tests {
 
     #[test]
     fn cardinal_grid_words_cycle_button_label_follows_mode() {
-        use crate::keyboard::code_mode::{set, CodeMode};
+        use crate::code_mode::{set, CodeMode};
         for (mode, expected_label) in [
             (CodeMode::Prose, "EN"),
             (CodeMode::C, "C"),
@@ -2105,7 +2123,7 @@ mod tests {
         // Pick a known prose cluster cell (row 0 col 3 = articles
         // cluster: tap "the") and verify the Literal emission has a
         // trailing space so chaining works without manual space taps.
-        use crate::keyboard::code_mode::{set, CodeMode};
+        use crate::code_mode::{set, CodeMode};
         set(CodeMode::Prose);
         let l = Layout::default_cardinal_grid_words();
         let articles = &l.rows[0].keys[3];
@@ -2127,7 +2145,7 @@ mod tests {
         // Verifies that switching the code_mode actually changes the
         // emissions on the word column. Word column starts at index 3
         // (rows 0/1/2 keep columns 3 and 4 as word/template cells).
-        use crate::keyboard::code_mode::{set, CodeMode};
+        use crate::code_mode::{set, CodeMode};
 
         set(CodeMode::Prose);
         let prose = Layout::default_cardinal_grid_words();
