@@ -64,4 +64,10 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             .weak()
             .small(),
     );
+
+    // the last Qt flow to come across: duplicates -> roll-up / merge exploration (QML kept it in
+    // Settings too)
+    ui.add_space(14.0);
+    ui.separator();
+    super::dupes::card(app, ui);
 }
