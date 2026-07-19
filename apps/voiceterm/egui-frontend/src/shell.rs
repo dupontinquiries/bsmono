@@ -178,6 +178,84 @@ pub fn mic_fab_ui(ui: &mut Ui, rect: Rect, c: &PaletteColors) -> Response {
     dock::fab_button(ui, rect, "\u{1F3A4}", c)
 }
 
+// ── settings screen (QML settings page: theme grid + sliders, live) ──────────
+
+/// The voiceterm settings screen body — edits `Prefs` live, mirroring the proven gitmind-egui
+/// binding pattern (animation picker, palette grid, draft-on-drag text scale so the slider
+/// doesn't jump under the cursor, opacity) plus voiceterm's own sections: the gesture knobs the
+/// terminal's touch layer reads (sensitivity / commit fraction / flick velocity) and the voice
+/// mesh (mic, offload + compute host, speaker id). Returns `true` when anything changed this
+/// frame — the caller persists (`save_prefs`) and re-applies (`App::apply_settings`).
+pub fn settings_panel(ui: &mut Ui, prefs: &mut settings_kit::Prefs) -> bool {
+    let before = prefs.to_kv();
+
+    ui.label(egui::RichText::new("animation").strong());
+    ui.horizontal_wrapped(|ui| {
+        for a in settings_kit::AnimationStyle::all() {
+            if ui.selectable_label(prefs.gesture.animation == a, a.label()).clicked() {
+                prefs.gesture.animation = a;
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("palette").strong());
+    ui.horizontal_wrapped(|ui| {
+        for p in snapclone_theme::PaletteId::all() {
+            let sel = prefs.palette == p.as_str();
+            if ui.selectable_label(sel, p.display_name()).clicked() {
+                prefs.palette = p.as_str().to_string();
+            }
+        }
+    });
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("display").strong());
+    // Text size re-scales the whole window; draft during the drag, commit on release (the
+    // gitmind-egui fix for the slider jumping under the cursor).
+    {
+        let id = egui::Id::new("vt_text_scale_draft");
+        let mut draft: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(prefs.touch.text_scale);
+        let resp = ui.add(egui::Slider::new(&mut draft, 0.75..=1.5).step_by(0.25).text("text size"));
+        if resp.dragged() {
+            ui.data_mut(|d| d.insert_temp(id, draft));
+        } else {
+            if resp.drag_stopped() || resp.changed() {
+                prefs.touch.text_scale = draft;
+            }
+            ui.data_mut(|d| d.insert_temp(id, prefs.touch.text_scale));
+        }
+    }
+    ui.add(egui::Slider::new(&mut prefs.display.opacity, 0.4..=1.0).text("surface opacity"));
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("gestures").strong());
+    ui.add(egui::Slider::new(&mut prefs.gesture.sensitivity, 0.5..=2.0).text("sensitivity"));
+    ui.add(egui::Slider::new(&mut prefs.gesture.commit_fraction, 0.2..=0.9).text("commit fraction"));
+    ui.add(egui::Slider::new(&mut prefs.gesture.flick_velocity, 200.0..=2000.0).text("flick velocity (px/s)"));
+    ui.add_space(8.0);
+
+    ui.label(egui::RichText::new("voice").strong());
+    ui.checkbox(&mut prefs.voice.mic_enabled, "microphone");
+    ui.checkbox(&mut prefs.voice.offload_enabled, "offload transcription to a compute host");
+    if prefs.voice.offload_enabled {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("host:").weak().small());
+            ui.text_edit_singleline(&mut prefs.voice.compute_host);
+        });
+    }
+    ui.checkbox(&mut prefs.voice.speaker_id, "speaker identification");
+
+    ui.add_space(10.0);
+    ui.label(
+        egui::RichText::new("changes apply live and persist to prefs.kv")
+            .weak()
+            .small(),
+    );
+
+    prefs.to_kv() != before
+}
+
 // ── blocks drawer (QML blocksDrawer, left edge) ──────────────────────────────
 
 /// One frame of the blocks drawer body: rows most-recent-first, each with the command, an
