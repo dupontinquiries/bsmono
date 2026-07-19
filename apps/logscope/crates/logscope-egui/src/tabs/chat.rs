@@ -535,12 +535,16 @@ fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egu
     let strong = ui.visuals().strong_text_color();
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
+    // inline code/links use the CONTRAST-ENSURED accent: the raw palette cyan is neon on several
+    // themes and simply fades against pale panels (the Cloudscape-only-legible bug) — md_accent
+    // keeps the hue but nudges its value until it actually reads on the active background.
+    let accent = theme::md_accent();
     for r in parse_inline(line) {
         let font = FontId::new(size, if r.code { FontFamily::Monospace } else { FontFamily::Proportional });
-        let color = if r.code || r.link { theme::CYAN() } else if r.bold { strong } else { base };
+        let color = if r.code || r.link { accent } else if r.bold { strong } else { base };
         let mut fmt = TextFormat { font_id: font, color, ..Default::default() };
         fmt.italics = r.italic;
-        if r.link { fmt.underline = egui::Stroke::new(1.0, theme::CYAN()); }
+        if r.link { fmt.underline = egui::Stroke::new(1.0, accent); }
         job.append(&r.text, 0.0, fmt);
     }
     job
@@ -560,21 +564,42 @@ fn render_markdown(ui: &mut egui::Ui, text: &str, tail: &str) {
         if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
             let body = trimmed[hashes..].trim_start();
             let size = match hashes { 1 => base + 6.0, 2 => base + 3.0, 3 => base + 1.0, _ => base };
-            ui.label(RichText::new(format!("{body}{suffix}")).size(size).strong().color(theme::INK()));
+            ui.label(RichText::new(format!("{body}{suffix}")).size(size).strong().color(theme::md_ink()));
+            continue;
+        }
+        // blockquote: '>' prefixed — a left accent bar + dimmed (but contrast-ensured) text on a
+        // faint wash, the Cloudscape look generalized to every palette
+        if let Some(rest) = trimmed.strip_prefix("> ").or_else(|| trimmed.strip_prefix(">")) {
+            let bar = theme::md_quote_accent();
+            let text_col = theme::md_dim();
+            let resp = ui.horizontal_wrapped(|ui| {
+                ui.add_space(10.0);
+                ui.label(md_line_job(ui, &format!("{rest}{suffix}"), base, text_col));
+            }).response;
+            let r = resp.rect;
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(egui::pos2(r.left(), r.top()), egui::pos2(r.right(), r.bottom())),
+                2.0,
+                bar.gamma_multiply(0.07),
+            );
+            ui.painter().line_segment(
+                [egui::pos2(r.left() + 3.0, r.top() + 1.0), egui::pos2(r.left() + 3.0, r.bottom() - 1.0)],
+                egui::Stroke::new(2.5, bar),
+            );
             continue;
         }
         // bullet list item
         if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) {
             ui.horizontal_wrapped(|ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new("•").color(theme::DIM()));
+                ui.label(RichText::new("•").color(theme::md_dim()));
                 ui.add_space(4.0);
-                ui.label(md_line_job(ui, &format!("{rest}{suffix}"), base, theme::INK()));
+                ui.label(md_line_job(ui, &format!("{rest}{suffix}"), base, theme::md_ink()));
             });
             continue;
         }
         if t.is_empty() { ui.add_space(4.0); continue; }
-        ui.label(md_line_job(ui, &format!("{t}{suffix}"), base, theme::INK()));
+        ui.label(md_line_job(ui, &format!("{t}{suffix}"), base, theme::md_ink()));
     }
 }
 
