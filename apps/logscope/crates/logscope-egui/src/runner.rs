@@ -12,7 +12,7 @@
 
 use crate::backend::{Backend, TemplateKind};
 use crate::vimmode::{self, Command};
-use crate::{bestregion, consensus, decompose, quest, treeexport, verdict};
+use crate::{bestregion, consensus, decompose, explore, quest, treeexport, verdict};
 use logscope::llm_backend::GenParams;
 use crate::script::Step;
 
@@ -400,6 +400,56 @@ impl Runner {
                 }
                 self.log.push(format!(":check → {checked} graded: {pass} pass / {fail} fail  (`{}`)", self.check_cmd));
                 Some(format!("# check: {pass}/{checked} compile  (cmd: {})", self.check_cmd))
+            }
+            // :explore — exploratory compilation over the current fan. Each assistant leaf under the active
+            // node is a candidate; group them by parent (the subtask). Compile every DISTINCT candidate
+            // exactly once through a batched verdict cache, write the verdicts back onto the nodes (like
+            // :check), then keep the best-BUILDING candidate per subtask — a Pass beats a higher-quality
+            // Fail, because a thing that doesn't compile isn't a candidate. The batched cache means K
+            // samples × N subtasks collapse onto the set of things that are actually different.
+            Command::Explore => {
+                let leaves = self.subtree_leaves(self.active);
+                let mut idx: Vec<usize> = Vec::new(); // node id per candidate (parallel to cands/evals)
+                let mut cands: Vec<explore::Candidate> = Vec::new();
+                for l in leaves {
+                    if self.nodes[l].role != Role::Assistant { continue; }
+                    let subtask = self.nodes[l].parent.unwrap_or(l) as u64;
+                    // quality proxy: non-empty extracted-code length — a weak "more complete" tiebreak,
+                    // only ever compared among candidates that reached the SAME verdict.
+                    let q = verdict::extract_code(&self.nodes[l].text).trim().len() as f32;
+                    idx.push(l);
+                    cands.push(explore::Candidate::new(subtask, self.nodes[l].text.clone(), q));
+                }
+                if cands.is_empty() { self.log.push(":explore — no assistant candidates in the fan".into()); return None; }
+                let mut oracle = explore::CompileOracle::new(self.check_cmd.clone(), self.check_file.clone());
+                let mut cache = explore::VerdictCache::new();
+                let evals = explore::evaluate_batch(&cands, &mut cache, &mut oracle);
+                for (l, e) in idx.iter().zip(&evals) { self.verdicts[*l] = e.verdict; } // fold verdicts back
+                let winners = explore::select_winners(&cands, &evals);
+                let (hits, misses) = cache.stats();
+                let built = winners.iter().filter(|w| w.built).count();
+                // Land the tree on the best-building branch (like :best): the first node whose winning
+                // candidate actually compiled.
+                if let Some(w) = winners.iter().find(|w| w.built) {
+                    if let Some(pos) = evals.iter().position(|e| e.hash == w.hash && e.verdict == bestregion::Verdict::Pass) {
+                        self.active = Some(idx[pos]);
+                    }
+                }
+                self.log.push(format!(
+                    ":explore → {} subtask(s), {} candidate(s); {} distinct compile(s), {} served from cache; {}/{} build",
+                    winners.len(), cands.len(), misses, hits, built, winners.len()));
+                let mut report = format!("# explore: {}/{} subtasks build  ({} compiles, {} saved by the batched cache)\n",
+                    built, winners.len(), misses, hits);
+                // Surface the winning code per subtask — the actual compiling deliverable.
+                for (subtask, content) in explore::winner_content(&winners, &cands) {
+                    let w = winners.iter().find(|w| w.subtask == subtask);
+                    let tag = if w.map(|w| w.built).unwrap_or(false) { "BUILDS" } else { "best-effort (nothing built)" };
+                    let code = verdict::extract_code(content);
+                    let code = code.trim();
+                    report.push_str(&format!("\n## subtask {subtask} — {tag}\n```rust\n{}\n```\n",
+                        if code.is_empty() { "(no code in reply)" } else { code }));
+                }
+                Some(report)
             }
             // :quest [N] — clarify first. Ask the model (out of band — no tree nodes) for the N most
             // important questions about the task, upgrade open ones to multiple-choice from sibling-branch

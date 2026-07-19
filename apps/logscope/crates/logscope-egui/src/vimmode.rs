@@ -74,6 +74,9 @@ pub enum Command {
     Quest(usize),      // :quest [N]           — generate N clarifying questions (breadth) as a fillable Q/A template
     Answer(String),    // :ans [path]          — fold filled Q/A answers into a focused, targeted generation
     Check,             // :check / :chk     — compile every leaf's code and store a real pass/fail verdict
+    Explore,           // :explore / :xp    — exploratory compilation over the current fan: compile every
+                       // candidate through a batched verdict cache (each distinct one once) and report the
+                       // best-BUILDING candidate per subtask (a Pass beats a higher-quality Fail)
     Best,              // :best                 — highlight + focus the region that verified best (agent pick)
     Linear,            // :linear              — switch to the linear chat view
     Spatial,           // :spatial             — switch to the spatial view
@@ -282,6 +285,7 @@ static CATALOG: &[CmdSpec] = &[
     CmdSpec { name: "quest",     aliases: &[],                      args: "[N]",           help: "generate N clarifying questions as a fillable template" },
     CmdSpec { name: "ans",       aliases: &["answer"],              args: "[path]",        help: "fold filled Q/A answers into a targeted generation" },
     CmdSpec { name: "check",     aliases: &["chk"],                 args: "",              help: "compile every leaf and store a real pass/fail verdict" },
+    CmdSpec { name: "explore",   aliases: &["xp"],                  args: "",              help: "exploratory compilation over the fan: best-building candidate per subtask (batched cache)" },
     CmdSpec { name: "best",      aliases: &[],                      args: "",              help: "highlight + focus the region that verified best" },
     CmdSpec { name: "export",    aliases: &["e"],                   args: "[ascii|md|git]",help: "write the whole tree in that format" },
     CmdSpec { name: "linear",    aliases: &[],                      args: "",              help: "switch to the linear chat view" },
@@ -452,6 +456,7 @@ pub fn parse_command(line: &str) -> Command {
         "fill" => Command::Fill(arg.to_string()),
         "assemble" | "asm" => Command::Assemble,
         "check" | "chk" => Command::Check,
+        "explore" | "xp" => Command::Explore,
         "best" => Command::Best,
         "linear" => Command::Linear,
         "spatial" => Command::Spatial,
