@@ -776,8 +776,106 @@ fn run_coordinator<S: gpu_kernels::KvSession>(
     println!("  raise budget_mb to admit more; int8-KV (`q8`) fits ~4× the f32 count at the same budget.");
 }
 
+/// Offline routing-coupling analysis over a ROUTE_TRACE dump. Each line is "<call> <layer> <e…>";
+/// consecutive layers of the SAME token (contiguous calls with increasing layer, resetting at
+/// layer 0) form one forward. For each adjacent layer pair we build a co-activation table
+/// (layer-L expert → most-frequent layer-(L+1) experts) over the FIRST half of forwards, then
+/// measure on the SECOND half how often L+1's actual routed set is predicted by summing L's experts'
+/// top co-activations — i.e. how much cheaper a router-lookahead prefetch would make the next layer.
+/// Baseline is marginal heat (predict L+1's globally-hottest experts, ignoring L). The lift of
+/// coupling over marginal is the colibrì signal: >0 means the streaming-prefetch edifice can pay.
+fn route_analyze(path: &str) {
+    use std::collections::HashMap;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t, Err(e) => { eprintln!("route-analyze: cannot read {path}: {e}"); std::process::exit(1); }
+    };
+    // Parse into forwards: Vec<Vec<(layer, Vec<expert>)>>
+    let mut forwards: Vec<Vec<(i32, Vec<u32>)>> = Vec::new();
+    let mut cur: Vec<(i32, Vec<u32>)> = Vec::new();
+    let mut last_layer = i32::MAX;
+    for line in text.lines() {
+        let mut it = line.split_whitespace();
+        let _call = it.next();
+        let layer: i32 = match it.next().and_then(|s| s.parse().ok()) { Some(l) => l, None => continue };
+        let experts: Vec<u32> = it.filter_map(|s| s.parse().ok()).collect();
+        // a new forward starts when the layer index drops (wraps back toward 0)
+        if layer <= last_layer && !cur.is_empty() { forwards.push(std::mem::take(&mut cur)); }
+        cur.push((layer, experts));
+        last_layer = layer;
+    }
+    if !cur.is_empty() { forwards.push(cur); }
+    if forwards.len() < 4 { eprintln!("route-analyze: only {} forwards — generate a longer trace", forwards.len()); std::process::exit(1); }
+
+    let k_top = 8usize; // co-activation table width per (L, expert)
+    let split = forwards.len() / 2;
+    // Build co-activation counts on the train half: pair[(L, e_at_L)][e_at_L+1] += 1
+    let mut pair: HashMap<(i32, u32), HashMap<u32, u32>> = HashMap::new();
+    let mut marg: HashMap<i32, HashMap<u32, u32>> = HashMap::new(); // layer → expert → count (marginal heat)
+    for fwd in &forwards[..split] {
+        for w in fwd.windows(2) {
+            let (la, ea) = (&w[0].0, &w[0].1);
+            let (lb, eb) = (&w[1].0, &w[1].1);
+            if *lb != la + 1 { continue; }
+            for &x in ea { for &y in eb { *pair.entry((*la, x)).or_default().entry(y).or_insert(0) += 1; } }
+            for &y in eb { *marg.entry(*lb).or_default().entry(y).or_insert(0) += 1; }
+        }
+    }
+    // top-k co-activated per (L, e); top-k marginal per layer
+    let topk = |m: &HashMap<u32, u32>, k: usize| -> Vec<u32> {
+        let mut v: Vec<_> = m.iter().map(|(&e, &c)| (c, e)).collect();
+        v.sort_unstable_by(|a, b| b.cmp(a)); v.truncate(k); v.into_iter().map(|(_, e)| e).collect()
+    };
+    let marg_top: HashMap<i32, Vec<u32>> = marg.iter().map(|(&l, m)| (l, topk(m, k_top * 2))).collect();
+
+    // Evaluate on the test half: recall of L+1's actual set under a FIXED prediction budget B —
+    // both methods may name exactly B experts, so the comparison is apples-to-apples (a per-source
+    // union would trivially cover the space when experts are few). Coupling scores candidates by
+    // summing co-activation counts over L's routed set; marginal uses the layer's global heat.
+    let budget = k_top; // name B=top_k experts, same for both
+    let (mut coup_hit, mut coup_tot, mut marg_hit, mut marg_tot) = (0u64, 0u64, 0u64, 0u64);
+    for fwd in &forwards[split..] {
+        for w in fwd.windows(2) {
+            let (la, ea) = (&w[0].0, &w[0].1);
+            let (lb, eb) = (&w[1].0, &w[1].1);
+            if *lb != la + 1 { continue; }
+            // coupling: sum co-activation counts over L's experts, take the top-B scored candidates
+            let mut score: HashMap<u32, u32> = HashMap::new();
+            for &x in ea { if let Some(m) = pair.get(&(*la, x)) { for (&e, &c) in m { *score.entry(e).or_insert(0) += c; } } }
+            let pred: std::collections::HashSet<u32> = topk(&score, budget).into_iter().collect();
+            for &y in eb { coup_tot += 1; if pred.contains(&y) { coup_hit += 1; } }
+            // marginal baseline: the layer's globally-hottest B
+            if let Some(mt) = marg_top.get(lb) {
+                let ms: std::collections::HashSet<u32> = mt.iter().take(budget).copied().collect();
+                for &y in eb { marg_tot += 1; if ms.contains(&y) { marg_hit += 1; } }
+            }
+        }
+    }
+    let coup = if coup_tot > 0 { coup_hit as f64 / coup_tot as f64 } else { 0.0 };
+    let marg_r = if marg_tot > 0 { marg_hit as f64 / marg_tot as f64 } else { 0.0 };
+    println!("route-analyze: {} forwards ({} train / {} test), top-{k_top} co-activation table", forwards.len(), split, forwards.len() - split);
+    println!("  one-layer-ahead recall of L+1's routed set:");
+    println!("    coupling  (predict from L's experts):  {:.1}%", coup * 100.0);
+    println!("    marginal  (predict L+1's hottest):     {:.1}%", marg_r * 100.0);
+    println!("    LIFT of coupling over marginal:        {:+.1} pp", (coup - marg_r) * 100.0);
+    if coup - marg_r > 0.05 {
+        println!("  → routing IS predictable one layer ahead here — router-lookahead prefetch would pay (colibrì's bet holds for this model).");
+    } else {
+        println!("  → little lift over marginal heat — for this model, a learned hot-set (pin the globally-hottest experts) is as good as coupling; prefetch buys less.");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--route-analyze") {
+        // Offline routing-coupling analysis (the colibrì measurement, adapted). Reads a
+        // LOGSCOPE_ROUTE_TRACE dump ("<call> <layer> <e0> <e1> …" per token·layer) and reports
+        // one-layer-ahead predictability: for each token, how much does layer L's routed set
+        // constrain layer L+1's? The number that decides whether MoE-streaming prefetch is worth
+        // building for THIS model (colibrì measured GLM at 71.6%).
+        let path = args.get(i + 1).expect("--route-analyze <trace-file>");
+        route_analyze(path);
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == "--inspect") {
         if let Some(p) = args.get(i + 1) { inspect_gguf(p); return; }
     }
@@ -4422,6 +4520,29 @@ fn main() {
         }
         println!("  stream-window: plain / mid-window eos / mid-window halt — state parity {}", if all_ok { "exact" } else { "BROKEN" });
         check("stream_session_window == stream_session (incl. mid-window stops)", if all_ok { 0.0 } else { 1.0 }, 0.5);
+
+        // BIG WINDOW / dims-cache overflow (regression for the M4 k=256 crash): a large window
+        // batches thousands of per-slot dispatches into ONE frame, each with a UNIQUE (uncached,
+        // once the 4096-cap is hit) dims uniform. If those buffers aren't kept alive until flush,
+        // wgpu recycles them mid-frame → "Buffer 'dims' is invalid". Force a big window and a high
+        // flush so the whole thing is one frame; it must complete AND match the per-token path.
+        {
+            let et = gpu.upload(&hm3.embed, 24, 16);
+            let sp = gpu_kernels::SamplerParams { temperature: 0.8, top_k: 8, top_p: 0.95, repeat_penalty: 1.1, repeat_last_n: 16, min_p: 0.0 };
+            let prompt = [5u32, 0, 9, 2, 7, 1];
+            let big = 200usize; // > 64: forces many windows' worth of unique per-slot dims in-frame
+            let saved = gpu.flush_every();
+            gpu.set_flush_every(65536); // hold the whole run in one frame (the crash condition)
+            let mut s = gpu.session_new(&m3, prompt.len() + big + 2, 123);
+            gpu.session_prefill(&m3, &mut s, &prompt);
+            let mut seen = prompt.to_vec(); let mut rng = 123u64; let mut toks = Vec::new();
+            let nc = || false;
+            let n = gpu.stream_session_window(&m3, &mut s, &mut seen, big, None, &sp, &mut rng, big,
+                &gpu_kernels::EmbedT::F32(&et), &nc, |t| { toks.push(t); true });
+            gpu.set_flush_every(saved);
+            println!("  big-window (k={big}, one frame): produced {n} tokens, no dims-buffer invalidation");
+            check("big-window dims-cache overflow survives one giant frame", if n == big && toks.len() == big { 0.0 } else { 1.0 }, 0.5);
+        }
     }
 
     println!();
