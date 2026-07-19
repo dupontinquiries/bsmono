@@ -17,6 +17,18 @@ The common substrate is **enet-based netcode** — every game has it. Target: a 
 crate and cybertron links as a C lib, so they share one wire protocol + lobby model. clawbound's
 WebRTC becomes an alternate transport behind the same seam.
 
+**Landed (control plane, all four games):** `netcode::handoff` (the `BSGAMES_HANDOFF_*` env
+protocol, lifted verbatim from soldier) + `netcode::multiplayer` (soldier's host/announce/join
+generalized by one parameter, the registry game id) are the shared layer. Consumers: soldier
+(repointed, thin wrapper pins its 2-arg constructor), clawbound (startup handoff skips the
+title + the Title menu's Multiplayer entry toggles hosting), unendlich
+(`app::multiplayer_svc` service on the app core, headless-tested incl. the skip-title signal),
+and blackstar (C port `exengine/bsgames_handoff.{h,c}` + `tests/test_handoff.c` pinning the
+SAME cases as the Rust suite; main.c parses + surfaces it). bsgames' join/host spawn side was
+already game-generic. **Remaining:** per-game data-plane sync over the established socket
+(clawbound's `net.rs` protocol, blackstar's `ex_net_client_open` + control-plane store read),
+and auto-advancing unendlich's GameFlow into a world on `handoff_started`.
+
 ## Abstract the graphics engines ("abstract all, pick best of each")
 Split stack: wgpu (clawbound/early-fps), a custom Vulkan/OpenGL C++ engine (cybertron), a custom
 Rust engine (unendlich). Target: a thin **render abstraction** (device/surface/pipeline/mesh/
