@@ -932,6 +932,11 @@ impl App {
                     egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
+                    egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
+                        if modifiers.command || modifiers.ctrl =>
+                    {
+                        self.open_search();
+                    }
                     _ => {}
                 }
             }
