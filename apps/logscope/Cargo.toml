@@ -4,7 +4,7 @@
 # are excluded from the default build to keep it light; build them on demand.
 [workspace]
 resolver = "2"
-members = ["crates/logscope", "crates/logscope-egui"]
+members = ["crates/logscope", "crates/logscope-egui", "crates/logscope-fan"]
 exclude = ["crates/gpu-gemm", "burn-probe"]
 
 [profile.release]

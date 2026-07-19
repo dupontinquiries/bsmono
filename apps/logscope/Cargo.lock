@@ -2632,6 +2632,8 @@ dependencies = [
  "gpu-gemm",
  "libc",
  "logscope",
+ "logscope-fan",
+ "math-kit",
  "noise-kit",
  "png",
  "regex",
@@ -2646,6 +2648,10 @@ dependencies = [
  "uikit-egui",
  "whisper-rs",
 ]
+
+[[package]]
+name = "logscope-fan"
+version = "0.1.0"
 
 [[package]]
 name = "mach2"
@@ -2664,6 +2670,10 @@ checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
 dependencies = [
  "regex-automata",
 ]
+
+[[package]]
+name = "math-kit"
+version = "0.1.0"
 
 [[package]]
 name = "memchr"

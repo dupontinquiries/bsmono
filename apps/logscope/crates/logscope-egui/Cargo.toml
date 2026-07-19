@@ -9,6 +9,8 @@ math-kit = { path = "../../../../shared/math-kit" }
 noise-kit = { path = "../../../../shared/noise-kit" }
 libc = "0.2"  # fabric daemon: signals (SIGTERM) + double-fork
 repo-map = { path = "../../../../shared/repo-map" }
+# the egui-free orchestration core (fan-out, dispatch, verdicts, command language)
+logscope-fan = { path = "../logscope-fan" }
 png = "0.18"
 # glow-only backend (eframe default pulls wgpu, whose default limits exceed the
 # Asahi driver's max_color_attachments=5). glow sidesteps it.
