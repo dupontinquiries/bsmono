@@ -60,6 +60,7 @@ pub struct App {
     pub timeline: pages::timeline::State,
     pub import: pages::import::State,
     pub branches: pages::branches::State,
+    pub dupes: pages::dupes::State,
     pub files: pages::files::State,
     /// Horizontal swipe-between-tabs gesture (with detent), used on the phone's bottom-bar layout.
     pub nav_gesture: uikit_egui::GestureLayer,
@@ -84,6 +85,7 @@ impl Default for App {
             timeline: pages::timeline::State::default(),
             import: pages::import::State::default(),
             branches: pages::branches::State::default(),
+            dupes: pages::dupes::State::default(),
             files: pages::files::State::default(),
             nav_gesture: uikit_egui::GestureLayer::horizontal_page(320.0),
         }
