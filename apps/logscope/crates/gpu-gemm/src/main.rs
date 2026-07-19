@@ -2778,6 +2778,41 @@ fn main() {
         check("yarn rope (per-dim factors + mscale on GPU)", maxerr(&got, &want), 1e-4);
     }
 
+    // ── flash split-K decode attention vs an independent CPU reference ───────────────────────────
+    // Long-context lengths: past the 4096 shared-memory cap, a +1 chunk edge, a non-divisible
+    // length, and a multi-chunk stretch — with GQA head sharing. The CPU reference is a plain
+    // per-head softmax attention (no chunking), so this validates the whole split/rescale scheme.
+    {
+        let (nh, nkv, hd) = (8usize, 2usize, 64usize);
+        let (dm, kvdm) = (nh * hd, nkv * hd);
+        for &l in &[4097usize, 6000, 12288] {
+            let qv = rnd(dm, 900 + l);
+            let kv = rnd(l * kvdm, 901 + l);
+            let vv = rnd(l * kvdm, 902 + l);
+            let mut want = vec![0f32; dm];
+            for h in 0..nh {
+                let kb = (h / (nh / nkv)) * hd;
+                let scale = 1.0 / (hd as f32).sqrt();
+                let mut sc: Vec<f32> = (0..l).map(|j| {
+                    (0..hd).map(|c| qv[h * hd + c] * kv[j * kvdm + kb + c]).sum::<f32>() * scale
+                }).collect();
+                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0f32;
+                for x in &mut sc { *x = (*x - mx).exp(); sum += *x; }
+                for c in 0..hd {
+                    want[h * hd + c] = (0..l).map(|j| sc[j] * vv[j * kvdm + kb + c]).sum::<f32>() / sum;
+                }
+            }
+            let qt = gpu.upload(&qv, 1, dm);
+            let kt = gpu.upload(&kv, l, kvdm);
+            let vt = gpu.upload(&vv, l, kvdm);
+            let got = gpu.download(&gpu.decode_attention_flash(&qt, &kt, &vt, l, dm, nh, nkv));
+            let e = maxerr(&got, &want);
+            println!("  flash-attn l={l} ({} chunks) -> max|gpu-cpu|={e:.2e}", l.div_ceil(2048));
+            check(&format!("flash split-K decode attention (l={l})"), e, 1e-4);
+        }
+    }
+
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
     // rope), vs CPU. The full-forward sweep diverged only when base was large.
     for &(base, heads) in &[(10000.0f32, 8usize), (500000.0, 8), (500000.0, 2)] {
