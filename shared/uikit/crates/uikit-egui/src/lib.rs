@@ -39,6 +39,7 @@ pub mod model_picker;
 pub mod log_view;
 pub mod mono_tile;
 pub mod slide_menu;
+pub mod toast;
 pub mod split_pane;
 pub mod toggle_grid;
 pub mod theme_bridge;
