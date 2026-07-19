@@ -630,11 +630,40 @@ impl Gpu {
         self.dispatch(GATHER, &[table, ids], &out, bytemuck::cast_slice(&dims), ((d as u32).div_ceil(64), 1, 1));
         out
     }
+    /// Gather ONE embedding row from an int8-resident table, by an id read from `ids[id_off]` —
+    /// the q8 twin of `gather_at`. This is what lets windowed decode stay GPU-side on a real model
+    /// without a full f32 embed copy (151k×2048: ~350 MB int8 vs ~1.2 GB f32); the int8 embed row
+    /// is the same tolerance tier as the int8-resident weights the model already runs on.
+    pub fn gather_q8_at(&self, table: &QWeight, ids: &Tensor, id_off: u32) -> Tensor {
+        let out = self.alloc(1, table.k);
+        let dims = [table.k as u32, id_off, (table.k / 32) as u32, 0];
+        self.dispatch(GATHER_Q8_AT, &[&table.qw, &table.qs, ids], &out, bytemuck::cast_slice(&dims),
+                      ((table.k as u32).div_ceil(64), 1, 1));
+        out
+    }
     /// argmax_t writing the chosen index into slot `out_slot` of an existing ids buffer (in place), so a
     /// window of K steps can each deposit their token into one buffer without a per-step readback.
     pub fn argmax_at(&self, logits: &Tensor, ids: &Tensor, out_slot: u32) {
         let dims = [logits.cols as u32, out_slot, 0, 0];
         self.dispatch(ARGMAX, &[logits], ids, bytemuck::cast_slice(&dims), (1, 1, 1));
+    }
+
+    /// The full sampler (`pick`: repeat-penalty → top-k → temperature softmax → min-p → top-p →
+    /// CDF walk) as ONE dispatch, depositing the chosen id into `o[out_slot]` — the sampled twin of
+    /// `argmax_at`, which is what lets SAMPLED decode (what chat actually runs) use the windowed
+    /// no-per-token-readback loop that greedy already had. `o` is `[kids deposit slots | rcap
+    /// recent-ring]`; the ring is seeded with the prompt tail once and extended by the kernel
+    /// itself, so the repeat penalty sees the same trailing context the CPU sampler would.
+    /// `uni[out_slot]` holds this step's uniform draw (CPU-precomputed xorshift01 stream — rng
+    /// stays on the CPU so a seed produces the identical stream the CPU sampler consumes).
+    /// Host contract: `temperature > 0` and `2 ≤ top_k ≤ 64`; other configs take the CPU path.
+    pub fn sample_at(&self, logits: &Tensor, o: &Tensor, uni: &Tensor, sp: &SamplerParams,
+                     out_slot: u32, seeded: u32, rcap: u32, kids: u32, abs_step: u32) {
+        let rlast = sp.repeat_last_n.min(64) as u32;
+        let dims = [logits.cols as u32, out_slot, sp.top_k as u32, rlast,
+                    sp.temperature.to_bits(), sp.top_p.to_bits(), sp.min_p.to_bits(), sp.repeat_penalty.to_bits(),
+                    seeded, rcap, kids, abs_step, 0, 0, 0, 0];
+        self.dispatch(SAMPLE_AT, &[logits, uni], o, bytemuck::cast_slice(&dims), (1, 1, 1));
     }
     /// Read back a u32 tensor (e.g. the argmax id). Mirrors `download` but reinterprets bytes as u32.
     pub fn download_u32(&self, t: &Tensor) -> Vec<u32> {
@@ -1150,6 +1179,11 @@ impl Gpu {
     }
     /// Quantize a row-major [n,k] f32 weight into a resident int8 `QWeight`
     /// (symmetric per-32-block scales). `k` must be a multiple of 32.
+    /// Quantize the (host-side) embedding table into an int8-resident `QWeight` for windowed
+    /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
+    /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
+    pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed, m.vocab, m.d) }
+
     pub fn quantize_q8_resident(&self, w: &[f32], n: usize, k: usize) -> QWeight {
         let kb = k / 32;
         let mut qs = vec![0f32; n * kb];
@@ -3517,6 +3551,24 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   let i=p/dd.d; let c=p%dd.d;
   o[p]=table[ids[dd.id_off+i]*dd.d+c];
 }"#;
+// GATHER from an int8-resident (Q8_0-style) table: dequantize ONE row selected by ids[id_off].
+// Dequant expression verbatim from MATVEC_Q8_0 (extractBits + select for AGX-safe signed bytes).
+const GATHER_Q8_AT: &str = r#"
+struct D { k:u32, id_off:u32, kb:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> qw: array<u32>;
+@group(0)@binding(1) var<storage,read> qs: array<f32>;
+@group(0)@binding(2) var<storage,read> ids: array<u32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let c=g.x; if(c>=d.k){return;}
+  let row=ids[d.id_off];
+  let word=qw[row*(d.k/4u)+c/4u];
+  let ub=extractBits(word,(c%4u)*8u,8u);
+  let q=select(i32(ub), i32(ub)-256, ub>=128u);
+  o[c]=qs[row*d.kb+(c/32u)]*f32(q);
+}"#;
 // GPU argmax over a [1, n] row → index of the max into a 1-element u32 buffer. Single workgroup:
 // grid-stride scan + shared-memory reduction. Tie-break MATCHES the CPU `argmax` (lowest index wins):
 // strict `>` keeps the earlier index within a thread, and the reduction prefers the smaller index on
@@ -3553,6 +3605,175 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     stride = stride >> 1u;
   }
   if (t == 0u) { o[d.out_slot] = si[0]; }
+}"#;
+
+// Full CPU `pick()` on the GPU, depositing like ARGMAX: repeat-penalty → top-k → temperature
+// softmax → min-p → top-p → uniform CDF walk, writing the chosen id into o[out_slot] AND into a
+// rolling recent-context ring (o[kids..kids+rcap]) that the NEXT step's penalty reads — so a whole
+// window of sampled steps runs with no CPU round-trip (greedy already had this via ARGMAX; sampled
+// decode — what chat actually runs — did a full-vocab readback + a 151k-element CPU sort per token).
+// The uniform draw comes from a CPU-precomputed xorshift01 stream (uni[out_slot]) so behavior is
+// deterministic given the seed and directly comparable against the CPU sampler.
+//
+// Selection strategy (the part that must scale to a 151k vocab in ONE workgroup): penalties only
+// LOWER logits (x/p keeps sign and shrinks; negative×p sinks further), so every member of the true
+// post-penalty top-k lies within the RAW top-(top_k + n_penalized). We iterate raw maxima in exact
+// descending (value, then ascending index) order — which makes exclusion of already-picked elements
+// a single compare against the LAST pick (v < last_v || (v == last_v && i > last_i)) instead of any
+// membership test — collect top_k+n_over candidates, then thread 0 applies the (≤64-entry) penalty
+// override table, re-sorts the candidates by (post value desc, index asc) — exactly the CPU's
+// stable descending sort semantics — truncates to top_k, and replays the CPU's serial float-op
+// order for softmax/min-p/top-p/CDF. Host guarantees temperature>0 and 2 ≤ top_k ≤ 64.
+const SAMPLE_AT: &str = r#"
+struct D { n:u32, out_slot:u32, top_k:u32, rlast:u32,
+           temp:u32, top_p:u32, min_p:u32, penalty:u32,
+           seeded:u32, rcap:u32, kids:u32, abs_step:u32,
+           _p0:u32, _p1:u32, _p2:u32, _p3:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> uni: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<u32>;
+@group(0)@binding(3) var<uniform> d: D;
+var<workgroup> sv: array<f32,256>;
+var<workgroup> si: array<u32,256>;
+var<workgroup> cand_v: array<f32,128>;
+var<workgroup> cand_i: array<u32,128>;
+var<workgroup> ov_i: array<u32,64>;
+var<workgroup> ov_v: array<f32,64>;
+var<workgroup> n_over: u32;
+var<workgroup> last_v: f32;
+var<workgroup> last_i: u32;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let t = lid.x;
+  let temp = bitcast<f32>(d.temp);
+  let pen  = bitcast<f32>(d.penalty);
+  // ── phase 1 (thread 0, serial): replay the CPU penalty over the last rlast ring entries ──
+  if (t == 0u) {
+    n_over = 0u;
+    let valid = min(d.rcap, d.seeded + d.abs_step);
+    let neff = min(d.rlast, valid);
+    if (pen != 1.0 && neff > 0u) {
+      let head = d.seeded + d.abs_step; // next write position (ring index modulo rcap)
+      var j: u32 = neff;
+      loop { // oldest → newest, exactly the CPU slice order (order is commutative but kept anyway)
+        if (j == 0u) { break; }
+        let tok = o[d.kids + ((head - j) % d.rcap)];
+        if (tok < d.n) {
+          // current value: staged override if present, else the raw logit
+          var cur = x[tok]; var slot = n_over;
+          var q = 0u;
+          loop { if (q >= n_over) { break; }
+                 if (ov_i[q] == tok) { cur = ov_v[q]; slot = q; break; } q = q + 1u; }
+          if (cur > 0.0) { cur = cur / pen; } else { cur = cur * pen; }
+          ov_i[slot] = tok; ov_v[slot] = cur;
+          if (slot == n_over) { n_over = n_over + 1u; }
+        }
+        j = j - 1u;
+      }
+    }
+    last_v = 3.4028235e38; last_i = 0xffffffffu; // sentinel: nothing picked yet
+  }
+  workgroupBarrier();
+  // ── phase 2: iterate raw maxima in exact (value desc, index asc) order ──
+  let want = min(d.top_k + n_over, min(128u, d.n));
+  var c: u32 = 0u;
+  loop {
+    if (c >= want) { break; }
+    var bv = -3.4028235e38;
+    var bi = 0xffffffffu;
+    var i = t;
+    loop {
+      if (i >= d.n) { break; }
+      let v = x[i];
+      // exclusion by order: already-picked ⇔ NOT (v < last_v || (v == last_v && i > last_i))
+      if (v < last_v || (v == last_v && i > last_i)) {
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+      }
+      i = i + 256u;
+    }
+    sv[t] = bv; si[t] = bi;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+      if (stride == 0u) { break; }
+      if (t < stride) {
+        let ovv = sv[t + stride]; let oii = si[t + stride];
+        if (ovv > sv[t] || (ovv == sv[t] && oii < si[t])) { sv[t] = ovv; si[t] = oii; }
+      }
+      workgroupBarrier();
+      stride = stride >> 1u;
+    }
+    if (t == 0u) {
+      cand_v[c] = sv[0]; cand_i[c] = si[0];
+      last_v = sv[0]; last_i = si[0];
+    }
+    workgroupBarrier();
+    c = c + 1u;
+  }
+  // ── phase 3 (thread 0, serial): overrides → stable re-sort → the CPU sampler tail verbatim ──
+  if (t == 0u) {
+    // apply penalty overrides to the candidate set
+    var a: u32 = 0u;
+    loop { if (a >= want) { break; }
+      var q = 0u;
+      loop { if (q >= n_over) { break; }
+        if (ov_i[q] == cand_i[a]) { cand_v[a] = ov_v[q]; break; } q = q + 1u; }
+      a = a + 1u; }
+    // insertion sort by (value desc, index asc) — the CPU's stable descending order
+    a = 1u;
+    loop { if (a >= want) { break; }
+      let vv = cand_v[a]; let ii = cand_i[a];
+      var b = a;
+      loop { if (b == 0u) { break; }
+        let pv = cand_v[b - 1u]; let pi = cand_i[b - 1u];
+        if (pv > vv || (pv == vv && pi < ii)) { break; }
+        cand_v[b] = pv; cand_i[b] = pi; b = b - 1u; }
+      cand_v[b] = vv; cand_i[b] = ii;
+      a = a + 1u; }
+    let k = min(d.top_k, want);
+    // temperature softmax over the k picks (same op order as CPU: exp((v-mx)/T), sum, divide)
+    let mx = cand_v[0];
+    var sum = 0.0;
+    var pi2: u32 = 0u;
+    loop { if (pi2 >= k) { break; }
+      let e = exp((cand_v[pi2] - mx) / temp);
+      cand_v[pi2] = e; sum = sum + e; pi2 = pi2 + 1u; }
+    pi2 = 0u;
+    loop { if (pi2 >= k) { break; } cand_v[pi2] = cand_v[pi2] / sum; pi2 = pi2 + 1u; }
+    var cut = k;
+    let minp = bitcast<f32>(d.min_p);
+    if (minp > 0.0) {
+      let thresh = minp * cand_v[0];
+      var f = cut; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; }
+        if (cand_v[pi2] < thresh) { f = pi2; break; } pi2 = pi2 + 1u; }
+      cut = max(f, 1u);
+      var s2 = 0.0; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } s2 = s2 + cand_v[pi2]; pi2 = pi2 + 1u; }
+      pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } cand_v[pi2] = cand_v[pi2] / s2; pi2 = pi2 + 1u; }
+    }
+    let topp = bitcast<f32>(d.top_p);
+    if (topp < 1.0) {
+      var cum = 0.0; var f = cut; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; }
+        cum = cum + cand_v[pi2];
+        if (cum >= topp) { f = pi2 + 1u; break; } pi2 = pi2 + 1u; }
+      cut = f;
+      var s3 = 0.0; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } s3 = s3 + cand_v[pi2]; pi2 = pi2 + 1u; }
+      pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } cand_v[pi2] = cand_v[pi2] / s3; pi2 = pi2 + 1u; }
+    }
+    let r = uni[d.out_slot];
+    var picked = cand_i[cut - 1u];
+    var cum2 = 0.0; pi2 = 0u;
+    loop { if (pi2 >= cut) { break; }
+      cum2 = cum2 + cand_v[pi2];
+      if (r < cum2) { picked = cand_i[pi2]; break; } pi2 = pi2 + 1u; }
+    o[d.out_slot] = picked;
+    o[d.kids + ((d.seeded + d.abs_step) % d.rcap)] = picked; // extend the ring for the NEXT step
+  }
 }"#;
 
 // ── model: load a GGUF into resident weights and run a stacked forward pass ──
@@ -5626,6 +5847,53 @@ impl Gpu {
         out
     }
 
+    /// SAMPLED twin of `generate_kv_window`: k tokens per readback with the FULL sampler running
+    /// GPU-side (`sample_at`). This removes, per token: the full-vocab logits readback (a hard GPU
+    /// sync + ~600 KB copy on a 151k vocab), and the CPU's O(vocab·log vocab) descending sort in
+    /// `sample()`. The rng stays on the CPU — each window uploads its k xorshift01 draws — so a
+    /// given seed consumes the identical uniform stream `generate_kv_stream` would; `--gate-sample`
+    /// checks agreement per step and end-to-end. EOS can't halt mid-window (fixed n_new here; the
+    /// engine's streaming adopter trims at the stop and rewinds `pos`, which is safe because
+    /// attention length is pos-derived and stale rows get overwritten).
+    pub fn generate_kv_window_sampled(&self, m: &Model, prompt: &[u32], n_new: usize, k: usize,
+                                      sp: &SamplerParams, seed: u64) -> Vec<u32> {
+        let k = k.max(1);
+        let rcap: usize = 64; // ring capacity == the kernel's override-table bound (rlast ≤ 64)
+        let embed_t = self.upload(&m.embed, m.vocab, m.d);
+        let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
+        // o = [k deposit slots | rcap ring]; seed the ring with the prompt tail (what `seen` ends with)
+        let mut o_init = vec![0u32; k + rcap];
+        let tail = prompt.len().min(rcap);
+        for (j, &tkn) in prompt[prompt.len() - tail..].iter().enumerate() { o_init[k + j] = tkn; }
+        let o = self.upload_u32(&o_init);
+        let seeded = tail as u32;
+        let l = prompt.len();
+        for pos in 0..l.saturating_sub(1) { let _ = self.decode_step(m, &c, prompt[pos], pos); }
+        let mut rng = seed | 1;
+        self.begin_frame();
+        let x0 = self.upload(&m.embed[prompt[l - 1] as usize * m.d..prompt[l - 1] as usize * m.d + m.d], 1, m.d);
+        let mut logits_t = self.decode_layers_t(m, &c, x0, l - 1);
+        let mut out = Vec::with_capacity(n_new);
+        let mut step = 0usize;
+        while step < n_new {
+            let w = (n_new - step).min(k);
+            let us: Vec<f32> = (0..w).map(|_| xorshift01(&mut rng)).collect();
+            let uni = self.upload(&us, 1, w);
+            for j in 0..w {
+                self.sample_at(&logits_t, &o, &uni, sp, j as u32, seeded, rcap as u32, k as u32, (step + j) as u32);
+                if step + j + 1 < n_new {
+                    let x = self.gather_at(&embed_t, &o, j as u32, m.d);
+                    logits_t = self.decode_layers_t(m, &c, x, l + step + j);
+                }
+            }
+            let win = self.download_u32(&o);
+            out.extend_from_slice(&win[..w]);
+            step += w;
+            if step < n_new { self.begin_frame(); }
+        }
+        out
+    }
+
     /// Forward `tokens` as a contiguous block at absolute positions `start..start+len`, appending
     /// their K/V into the existing cache `c` and returning logits for EVERY position ([len,vocab]).
     /// This is the speculative-decode verify primitive: the target consumes a whole drafted block
@@ -5839,7 +6107,97 @@ impl Gpu {
         }
         produced
     }
+
+    /// WINDOWED `stream_session`: k sampled tokens per GPU round-trip. The whole sample→embed→
+    /// decode cycle runs on-device (`sample_at` + `gather_at`/`gather_q8_at` + `decode_layers_t`);
+    /// the CPU reads back k token ids per window instead of a full-vocab logits row per token, and
+    /// skips the per-token O(v·log v) sort in `sample()`. Semantics mirror `stream_session`
+    /// EXACTLY, replayed from the window readback: eos halts uncounted with `s.logits` left at the
+    /// distribution that produced it; an `on_token` false halts with the token counted and
+    /// `s.logits`/`s.pos` in the same state the CPU path leaves (its decode never ran); the rng
+    /// advances by exactly the draws the CPU path would have made (uniforms are drawn from a
+    /// snapshot and committed post-hoc), so a mid-window stop keeps the streams aligned for any
+    /// continuation. Stale KV rows past a rewound `s.pos` are harmless: attention length is
+    /// pos-derived and the rows get overwritten. Cancellation is per-window (k-token granularity).
+    /// `--gate` coverage: exact-match vs `stream_session` (EmbedT::F32) incl. mid-window stops.
+    pub fn stream_session_window(
+        &self, m: &Model, s: &mut Session, seen: &mut Vec<u32>, n_new: usize, eos: Option<u32>,
+        sampler: &SamplerParams, rng: &mut u64, k: usize, embed: &EmbedT<'_>,
+        cancel: &dyn Fn() -> bool, mut on_token: impl FnMut(u32) -> bool,
+    ) -> usize {
+        let k = k.max(2);
+        let rcap = 64usize;
+        if s.logits.is_empty() { return 0; }
+        let cache_rows = s.cache.k.first().map(|t| t.rows).unwrap_or(0);
+        let mut logits_t = Some(self.upload(&s.logits, 1, s.logits.len()));
+        let mut produced = 0usize;
+        let mut halted = false;
+        while produced < n_new {
+            if cancel() { break; }
+            let w = (n_new - produced).min(k).min(cache_rows.saturating_sub(s.pos));
+            if w == 0 { break; }
+            // Ring ← the CPU-truth trailing context, re-seeded each window (rewinds stay trivial).
+            let mut o_init = vec![0u32; k + rcap];
+            let tail = seen.len().min(rcap);
+            for (j, &tk) in seen[seen.len() - tail..].iter().enumerate() { o_init[k + j] = tk; }
+            let o = self.upload_u32(&o_init);
+            // Uniforms from a SNAPSHOT of the rng; the real rng is committed after replay by the
+            // number of draws the CPU path would actually have consumed.
+            let rng0 = *rng;
+            let mut rtmp = rng0;
+            let us: Vec<f32> = (0..w).map(|_| xorshift01(&mut rtmp)).collect();
+            let uni = self.upload(&us, 1, w);
+            self.begin_frame();
+            // pre[j] = the distribution BEFORE slot j; pre[w] = the decode after the last slot.
+            let mut pre: Vec<Tensor> = Vec::with_capacity(w + 1);
+            pre.push(logits_t.take().unwrap());
+            for j in 0..w {
+                self.sample_at(&pre[j], &o, &uni, sampler, j as u32, tail as u32, rcap as u32, k as u32, j as u32);
+                let x = match embed {
+                    EmbedT::F32(t) => self.gather_at(t, &o, j as u32, m.d),
+                    EmbedT::Q8(q) => self.gather_q8_at(q, &o, j as u32),
+                };
+                pre.push(self.decode_layers_t(m, &s.cache, x, s.pos + j));
+            }
+            let win = self.download_u32(&o);
+            // Replay with exact stream_session semantics.
+            let mut draws = w;
+            for j in 0..w {
+                let next = win[j];
+                if Some(next) == eos {
+                    draws = j + 1;
+                    s.logits = self.download(&pre[j]);
+                    s.pos += j;
+                    halted = true;
+                    break;
+                }
+                produced += 1; seen.push(next); s.generated.push(next);
+                if !on_token(next) {
+                    draws = j + 1;
+                    s.logits = self.download(&pre[j]);
+                    s.pos += j;
+                    halted = true;
+                    break;
+                }
+            }
+            let mut rc = rng0;
+            for _ in 0..draws { let _ = xorshift01(&mut rc); }
+            *rng = rc;
+            if halted { break; }
+            s.pos += w;
+            logits_t = pre.pop(); // pre[w]
+        }
+        if !halted {
+            if let Some(t) = logits_t { s.logits = self.download(&t); }
+        }
+        produced
+    }
 }
+
+/// Embedding-table handle for windowed decode: `F32` is the bit-exact tier (test/gate path, or a
+/// model small enough to keep an f32 copy), `Q8` is the int8-resident tier a big model actually
+/// uses (~4× smaller; same tolerance class as its int8-resident weights).
+pub enum EmbedT<'a> { F32(&'a Tensor), Q8(&'a QWeight) }
 
 /// Sampling parameters. Greedy when `temperature <= 0` or `top_k == 1`. `repeat_penalty`
 /// (1.0 = off) divides the logit of recently-seen tokens to curb the repetition/looping a
