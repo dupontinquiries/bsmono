@@ -49,6 +49,12 @@ pub enum Tool {
     Search { pattern: String, path: String },
     /// Read a line range of a file (1-based, inclusive) — the surgical companion to `Search` for workers.
     ReadRange { path: String, start: usize, end: usize },
+    /// PATCH an existing file: replace exactly ONE occurrence of a verbatim `find` anchor with
+    /// `replace`. The context-economy primitive: big models re-emitting whole files is what fills the
+    /// window and drags tok/s; an anchored edit is a few dozen tokens and — unlike unified diffs,
+    /// which small models drift on (line numbers, context hashes) — either applies exactly or fails
+    /// with a teachable error (0 matches = stale anchor, >1 = grow the anchor).
+    Edit { path: String, find: String, replace: String },
 }
 
 impl Tool {
@@ -61,6 +67,7 @@ impl Tool {
             Tool::Run { argv } => format!("run {}", argv.join(" ")),
             Tool::Search { pattern, path } => format!("search /{}/ in {}", pattern, if path.is_empty() { "." } else { path }),
             Tool::ReadRange { path, start, end } => format!("read {path}:{start}-{end}"),
+            Tool::Edit { path, find, replace } => format!("edit {} (−{} +{} B)", path, find.len(), replace.len()),
         }
     }
 }
@@ -163,6 +170,7 @@ impl Workspace {
             Tool::Run { argv } => self.run(argv),
             Tool::Search { pattern, path } => self.search(pattern, path),
             Tool::ReadRange { path, start, end } => self.read_range(path, *start, *end),
+            Tool::Edit { path, find, replace } => self.edit_file(path, find, replace),
         }
     }
 
@@ -248,6 +256,40 @@ impl Workspace {
             bytes,
         });
         ToolResult::ok(format!("wrote {rel} ({bytes} bytes)"))
+    }
+
+    /// The patch primitive behind [`Tool::Edit`]: one verbatim anchor, one replacement. Uniqueness is
+    /// enforced so an edit can never land somewhere the model didn't mean; every failure tells the
+    /// model exactly how to recover (re-read for a stale anchor, extend an ambiguous one).
+    fn edit_file(&mut self, rel: &str, find: &str, replace: &str) -> ToolResult {
+        let abs = match self.sandbox_path(rel) { Ok(p) => p, Err(e) => return ToolResult::err(e) };
+        if find.is_empty() {
+            return ToolResult::err(format!("edit {rel}: empty find anchor — copy the exact text to replace"));
+        }
+        let text = match std::fs::read_to_string(&abs) {
+            Ok(s) => s,
+            Err(e) => return ToolResult::err(format!(
+                "edit {rel}: {e} (edit patches EXISTING files — use write_file to create a new one)")),
+        };
+        let n = text.matches(find).count();
+        if n == 0 {
+            return ToolResult::err(format!(
+                "edit {rel}: anchor not found — the file's text differs; read_file it and copy the anchor \
+                 verbatim, including whitespace and newlines"));
+        }
+        if n > 1 {
+            return ToolResult::err(format!(
+                "edit {rel}: anchor matches {n} places — include more surrounding lines so it is unique"));
+        }
+        let at = text.find(find).unwrap_or(0);
+        let line = text[..at].bytes().filter(|&b| b == b'\n').count() + 1;
+        let new_text = text.replacen(find, replace, 1);
+        if let Err(e) = std::fs::write(&abs, &new_text) {
+            return ToolResult::err(format!("edit {rel}: write failed: {e}"));
+        }
+        let delta = new_text.len() as i64 - text.len() as i64;
+        self.events.push(FileEvent { path: rel.to_string(), change: FileChange::Modified, bytes: new_text.len() as u64 });
+        ToolResult::ok(format!("edited {rel} @ line {line} ({}{delta} bytes)", if delta >= 0 { "+" } else { "" }))
     }
 
     fn read_file(&self, rel: &str) -> ToolResult {
@@ -368,6 +410,17 @@ pub struct AgentConfig {
     /// Doc mode: teach the agent the document-organization convention (front-matter + section tree +
     /// generated index) so its docs stay organized and, in a fan, merge cleanly across branches.
     pub doc_mode: bool,
+    /// Patch-first editing (context economy for big models): instruct the model to modify EXISTING
+    /// files with the `edit` tool (anchored find→replace) rather than re-emitting whole files.
+    /// Whole-file output is what fills the window and drags tok/s; anchored patches keep each turn a
+    /// few dozen tokens and the KV resume warm.
+    pub prefer_patches: bool,
+    /// Fold a structured DIGEST of the verify output (counts + top error locations + the first error's
+    /// detail) into the observation instead of the raw compiler dump. The raw dump is capped at 64 KB
+    /// and routinely swamps a small window; the digest is the deterministic half of the "small model
+    /// summarizes the check for the big model" pipeline — a Delegate-slot model can rewrite the digest
+    /// conversationally, but the loop never depends on one being loaded.
+    pub digest_verify: bool,
 }
 
 impl Default for AgentConfig {
@@ -379,6 +432,8 @@ impl Default for AgentConfig {
             gate_done_on_verify: true,
             read_policy: ReadPolicy::Full,
             doc_mode: false,
+            prefer_patches: true,
+            digest_verify: true,
         }
     }
 }
@@ -391,7 +446,8 @@ impl AgentConfig {
     /// The worker preset: surgical reads, no auto-verify (the coordinator verifies the stitched whole),
     /// tighter step budget — for fast parallel spin-off, per the coordinator-mode discussion.
     pub fn worker() -> Self {
-        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Surgical, doc_mode: false }
+        Self { max_steps: 10, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false,
+               read_policy: ReadPolicy::Surgical, doc_mode: false, ..Default::default() }
     }
 }
 
@@ -546,6 +602,11 @@ fn parse_one(block: &str) -> Option<Tool> {
             contents: json_str(block, "contents").unwrap_or_default(),
         }),
         "read_file" => Some(Tool::ReadFile { path: json_str(block, "path")? }),
+        "edit" | "edit_file" | "patch" => Some(Tool::Edit {
+            path: json_str(block, "path")?,
+            find: json_str(block, "find").or_else(|| json_str(block, "old"))?,
+            replace: json_str(block, "replace").or_else(|| json_str(block, "new")).unwrap_or_default(),
+        }),
         "read_range" => {
             let path = json_str(block, "path")?;
             let start = json_str(block, "start").and_then(|s| s.parse().ok())
@@ -703,6 +764,12 @@ you. Favor code that compiles over clever code that might not; when you see erro
         )
     };
     let doc_note = if cfg.doc_mode { format!("\n\n{}", crate::docorg::DOC_ORG_GUIDE) } else { String::new() };
+    let patch_note = if cfg.prefer_patches {
+        "\n\nEDITING EXISTING FILES: use `edit` — copy a UNIQUE anchor VERBATIM from read output (keep its \
+whitespace and newlines) and give the replacement. Do NOT re-emit whole existing files with write_file; \
+that wastes your context and slows you down. write_file is for NEW files, or a full rewrite you were \
+explicitly asked for. Several small edits in one turn are fine."
+    } else { "" };
     format!(
 "You are a coding agent working inside an isolated workspace. Complete this task:
 
@@ -723,6 +790,7 @@ THEN act by emitting TOOL CALLS. Each tool call is a fenced block:
 
 Available tools (one JSON object per block):
 - write_file  {{ \"tool\":\"write_file\", \"path\":\"<rel path>\", \"contents\":\"<file text>\" }}
+- edit        {{ \"tool\":\"edit\", \"path\":\"<rel path>\", \"find\":\"<verbatim unique anchor>\", \"replace\":\"<replacement>\" }}
 {read_tools}
 - list_dir    {{ \"tool\":\"list_dir\", \"path\":\"<rel path or empty for root>\" }}
 - run         {{ \"tool\":\"run\", \"argv\":[\"cargo\",\"test\"] }}
@@ -733,7 +801,7 @@ Rules:
 - After each tool call you will see its result, then decide the next step.
 - When the task is finished and verified, reply with the single line: {DONE_MARKER}
 
-Emit one or a few tool calls per turn, then wait for results.{verify_note}{doc_note}"
+Emit one or a few tool calls per turn, then wait for results.{patch_note}{verify_note}{doc_note}"
     )
 }
 
@@ -821,7 +889,7 @@ fn step_turn(
     let mut results = Vec::new();
     let mut wrote_verifiable = false;
     for tool in tools {
-        if let Tool::WriteFile { path, .. } = &tool {
+        if let Tool::WriteFile { path, .. } | Tool::Edit { path, .. } = &tool {
             if cfg.verify_exts.iter().any(|e| path.rsplit('.').next() == Some(e.as_str())) {
                 wrote_verifiable = true;
             }
@@ -835,16 +903,83 @@ fn step_turn(
     if wrote_verifiable && !cfg.verify_cmd.is_empty() && step + 1 < cfg.max_steps {
         let vres = ws.apply(&Tool::Run { argv: cfg.verify_cmd.clone() });
         *verified = vres.ok;
+        let body = if cfg.digest_verify { digest_check_output(&vres.output, 6) } else { vres.output.clone() };
         prompt.push_str(&format!(
             "\n\nAUTOMATIC VERIFICATION ({}): {}\n{}\n",
             cfg.verify_cmd.join(" "),
             if vres.ok { "PASSED" } else { "FAILED — fix these before continuing" },
-            vres.output,
+            body,
         ));
     }
 
     plan.advance();
     (results, None)
+}
+
+/// Compress a compiler/test dump into the few lines the model actually needs: totals, up to
+/// `max_items` `headline — file:line` entries, and the FIRST error's detail block. The raw dump is
+/// capped at 64 KB and routinely swamps a small context window — every token it occupies is a token
+/// the model can't spend on code. This is the deterministic core of the check-summarizer pipeline;
+/// output that doesn't look like rustc diagnostics falls back to a plain truncation so non-cargo
+/// verify commands still surface something useful.
+pub fn digest_check_output(raw: &str, max_items: usize) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
+    let is_headline = |t: &str| -> Option<bool> {
+        let t = t.trim_start();
+        if t.starts_with("error[") { return Some(true); }
+        if t.starts_with("error:") {
+            // rustc's roll-up lines aren't diagnostics of their own.
+            if t.starts_with("error: aborting") || t.starts_with("error: could not compile") { return None; }
+            return Some(true);
+        }
+        if t.starts_with("warning:") && !t.contains("generated") && !t.contains("warning emitted") {
+            return Some(false);
+        }
+        None
+    };
+    let (mut errors, mut warnings) = (0usize, 0usize);
+    let mut items: Vec<String> = Vec::new();
+    let mut first_detail: Vec<String> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(is_err) = is_headline(line) else { continue };
+        if is_err { errors += 1; } else { warnings += 1; }
+        if is_err && items.len() < max_items {
+            // The location is on a ` --> path:line:col` line within the next few lines.
+            let loc = lines[i + 1..].iter().take(4)
+                .find_map(|l| l.trim_start().strip_prefix("--> ").map(|p| p.trim().to_string()))
+                .unwrap_or_default();
+            let head = line.trim_start();
+            items.push(if loc.is_empty() { head.to_string() } else { format!("{head} — {loc}") });
+        }
+        if is_err && first_detail.is_empty() {
+            for l in lines[i..].iter().take(12) {
+                if l.trim().is_empty() { break; }
+                first_detail.push((*l).to_string());
+            }
+        }
+    }
+    if errors == 0 && warnings == 0 && !raw.contains("Finished") && !raw.trim().is_empty() {
+        // Not rustc-shaped (a test harness, a script): keep it, just bounded.
+        let capped: String = raw.chars().take(1500).collect();
+        let note = if capped.len() < raw.len() { "\n…(truncated)" } else { "" };
+        return format!("{capped}{note}");
+    }
+    if errors == 0 {
+        return format!("clean — 0 errors, {warnings} warning(s)");
+    }
+    let mut out = format!("{errors} error(s), {warnings} warning(s). Top errors:\n");
+    for (n, it) in items.iter().enumerate() {
+        out.push_str(&format!("  {}. {}\n", n + 1, it));
+    }
+    if errors > items.len() {
+        out.push_str(&format!("  …and {} more.\n", errors - items.len()));
+    }
+    if !first_detail.is_empty() {
+        out.push_str("First error detail:\n");
+        out.push_str(&first_detail.join("\n"));
+    }
+    if out.len() > 2400 { out.truncate(2400); out.push_str("\n…(digest capped)"); }
+    out
 }
 
 /// Back-compat: run with defaults but an explicit step budget.
@@ -1065,7 +1200,13 @@ pub enum FanStep {
 pub struct AgentFan {
     branches: Vec<AgentBranch>,
     cursor: usize,
-    in_flight: Option<InFlight>,
+    /// Branches generating RIGHT NOW. On the single `Inference` worker this holds at most one entry
+    /// (`width` 1 — the historical round-robin). With a `lanes::LanePool` the chat raises `width` to
+    /// the lane count and drives the tagged `*_branch` API instead, so K branches genuinely decode at
+    /// the same time; the untagged `on_token`/`on_done`/`on_error` keep their exact old semantics by
+    /// operating on the FIRST in-flight entry.
+    in_flight: Vec<InFlight>,
+    width: usize,
     phase: Phase,
     task: String,
     cfg: AgentConfig,
@@ -1082,7 +1223,7 @@ impl AgentFan {
             let (run, first) = AgentRun::start(dir, &task, cfg.clone());
             AgentBranch { run, state: BranchState::Ready(first), label, verdict: None }
         }).collect();
-        Self { branches, cursor: 0, in_flight: None, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
+        Self { branches, cursor: 0, in_flight: Vec::new(), width: 1, phase: Phase::Running, task, cfg: cfg.clone(), diff_fn }
     }
 
     /// Upgrade a single, already-running `AgentRun` into a fan whose FIRST branch IS that run — so a reaction
@@ -1093,18 +1234,25 @@ impl AgentFan {
     pub fn adopt(run: AgentRun, pending: Option<String>, task: &str, label: &str,
                  cfg: &AgentConfig, diff_fn: Box<dyn Fn(&Path) -> String>) -> Self {
         let (state, in_flight) = match pending {
-            Some(p) => (BranchState::Ready(p), None),
-            None => (BranchState::InFlight, Some(InFlight { branch: 0, review: false })),
+            Some(p) => (BranchState::Ready(p), Vec::new()),
+            None => (BranchState::InFlight, vec![InFlight { branch: 0, review: false }]),
         };
         let branches = vec![AgentBranch { run, state, label: label.to_string(), verdict: None }];
-        Self { branches, cursor: 0, in_flight, phase: Phase::Running, task: task.to_string(), cfg: cfg.clone(), diff_fn }
+        Self { branches, cursor: 0, in_flight, width: 1, phase: Phase::Running, task: task.to_string(), cfg: cfg.clone(), diff_fn }
     }
 
     pub fn len(&self) -> usize { self.branches.len() }
     pub fn is_empty(&self) -> bool { self.branches.is_empty() }
-    pub fn active_branch(&self) -> Option<usize> { self.in_flight.map(|f| f.branch) }
+    pub fn active_branch(&self) -> Option<usize> { self.in_flight.first().map(|f| f.branch) }
+    /// Every branch generating right now (lane mode shows them all in the HUD).
+    pub fn active_branches(&self) -> Vec<usize> { self.in_flight.iter().map(|f| f.branch).collect() }
     pub fn reviewing(&self) -> bool { self.phase == Phase::Reviewing }
     pub fn all_done(&self) -> bool { self.phase == Phase::Done }
+    /// How many branches may generate concurrently. 1 (default) is the single-worker round-robin; a
+    /// lane pool raises it to its lane count. Width only gates NEW submissions — lowering it mid-run
+    /// lets in-flight work drain naturally.
+    pub fn set_width(&mut self, w: usize) { self.width = w.max(1); }
+    pub fn width(&self) -> usize { self.width }
 
     /// Add a branch mid-run (a live reaction seeding another parallel approach). Only during the Running
     /// phase — once reviewing has begun, the field is closed. The new branch joins the round-robin.
@@ -1131,68 +1279,125 @@ impl AgentFan {
     }
 
     /// Pick the next thing to run: a ready branch's agent turn (Running), or the next unreviewed branch's
-    /// review (Reviewing). Transitions Running→Reviewing→Done as each pass drains.
+    /// review (Reviewing). Transitions Running→Reviewing→Done as each pass drains. Submits only while
+    /// fewer than `width` branches are in flight — call in a loop (or use [`fill`]) to load every lane.
     pub fn next(&mut self) -> FanStep {
-        if self.in_flight.is_some() { return FanStep::AllDone; } // caller must wait for the in-flight Done
+        if self.in_flight.len() >= self.width { return FanStep::AllDone; } // lanes full — wait for a Done
         match self.phase {
             Phase::Running => {
                 if let Some((i, prompt)) = self.take_ready() {
-                    self.in_flight = Some(InFlight { branch: i, review: false });
+                    self.in_flight.push(InFlight { branch: i, review: false });
                     return FanStep::Submit { branch: i, prompt };
                 }
-                if self.branches.iter().all(|b| matches!(b.state, BranchState::Finished(_))) {
+                if self.in_flight.is_empty()
+                    && self.branches.iter().all(|b| matches!(b.state, BranchState::Finished(_))) {
                     self.phase = Phase::Reviewing;
                     return self.next();
                 }
                 FanStep::AllDone
             }
             Phase::Reviewing => {
-                if let Some(i) = self.branches.iter().position(|b| b.verdict.is_none()) {
+                let busy = |me: &Self, i: usize| me.in_flight.iter().any(|f| f.branch == i);
+                if let Some(i) = (0..self.branches.len())
+                    .find(|&i| self.branches[i].verdict.is_none() && !busy(self, i)) {
                     let diff = (self.diff_fn)(self.branches[i].run.root());
                     let prompt = review_prompt(&self.task, &diff);
-                    self.in_flight = Some(InFlight { branch: i, review: true });
+                    self.in_flight.push(InFlight { branch: i, review: true });
                     return FanStep::Submit { branch: i, prompt };
                 }
-                self.phase = Phase::Done;
+                if self.in_flight.is_empty() && self.branches.iter().all(|b| b.verdict.is_some()) {
+                    self.phase = Phase::Done;
+                }
                 FanStep::AllDone
             }
             Phase::Done => FanStep::AllDone,
         }
     }
 
+    /// Load every free lane: repeated [`next`] until nothing more can be submitted. The lane-pool
+    /// driver calls this at start and after each branch completion; width=1 yields at most one step,
+    /// identical to the historical single-worker flow.
+    pub fn fill(&mut self) -> Vec<FanStep> {
+        let mut out = Vec::new();
+        loop {
+            match self.next() {
+                s @ FanStep::Submit { .. } => out.push(s),
+                FanStep::AllDone => break,
+            }
+        }
+        out
+    }
+
     /// Stream a token to whichever branch is in flight (agent turn or review).
     pub fn on_token(&mut self, t: &str) {
-        if let Some(f) = self.in_flight { self.branches[f.branch].run.on_token(t); }
+        if let Some(f) = self.in_flight.first().copied() { self.branches[f.branch].run.on_token(t); }
     }
 
     /// The in-flight generation finished: advance the branch (agent turn) or record its verdict (review),
-    /// then schedule the next.
+    /// then schedule the next. Single-worker semantics: completes the FIRST in-flight entry.
     pub fn on_done(&mut self) -> FanStep {
-        if let Some(f) = self.in_flight.take() {
-            if f.review {
-                let text = self.branches[f.branch].run.take_reply();
-                self.branches[f.branch].verdict = Some(parse_verdict(&text));
-            } else {
-                match self.branches[f.branch].run.on_done() {
-                    AgentStep::Submit(p) => self.branches[f.branch].state = BranchState::Ready(p),
-                    AgentStep::Finished(s) => self.branches[f.branch].state = BranchState::Finished(s),
-                }
-            }
+        if !self.in_flight.is_empty() {
+            let f = self.in_flight.remove(0);
+            self.settle(f, None);
         }
         self.next()
     }
 
-    /// The in-flight generation errored.
+    /// The in-flight generation errored. Single-worker semantics: fails the FIRST in-flight entry.
     pub fn on_error(&mut self, e: String) -> FanStep {
-        if let Some(f) = self.in_flight.take() {
-            if f.review {
+        if !self.in_flight.is_empty() {
+            let f = self.in_flight.remove(0);
+            self.settle(f, Some(e));
+        }
+        self.next()
+    }
+
+    // ── lane-tagged flow (the LanePool driver) — same machine, events routed by branch ───────────
+
+    /// Stream a token to a specific in-flight branch (lane mode: pool events carry the branch).
+    pub fn on_token_branch(&mut self, branch: usize, t: &str) {
+        if self.in_flight.iter().any(|f| f.branch == branch) {
+            if let Some(b) = self.branches.get_mut(branch) { b.run.on_token(t); }
+        }
+    }
+
+    /// A specific branch's generation finished; returns the submissions that now fit the free lanes.
+    pub fn on_done_branch(&mut self, branch: usize) -> Vec<FanStep> {
+        if let Some(pos) = self.in_flight.iter().position(|f| f.branch == branch) {
+            let f = self.in_flight.remove(pos);
+            self.settle(f, None);
+        }
+        self.fill()
+    }
+
+    /// A specific branch's generation errored; returns the submissions that now fit the free lanes.
+    pub fn on_error_branch(&mut self, branch: usize, e: String) -> Vec<FanStep> {
+        if let Some(pos) = self.in_flight.iter().position(|f| f.branch == branch) {
+            let f = self.in_flight.remove(pos);
+            self.settle(f, Some(e));
+        }
+        self.fill()
+    }
+
+    /// Shared completion: apply a finished/errored generation to its branch's state machine.
+    fn settle(&mut self, f: InFlight, err: Option<String>) {
+        match (f.review, err) {
+            (true, None) => {
+                let text = self.branches[f.branch].run.take_reply();
+                self.branches[f.branch].verdict = Some(parse_verdict(&text));
+            }
+            (true, Some(e)) => {
                 self.branches[f.branch].verdict = Some(Verdict { approve: false, notes: format!("review errored: {e}") });
-            } else {
+            }
+            (false, None) => match self.branches[f.branch].run.on_done() {
+                AgentStep::Submit(p) => self.branches[f.branch].state = BranchState::Ready(p),
+                AgentStep::Finished(s) => self.branches[f.branch].state = BranchState::Finished(s),
+            },
+            (false, Some(e)) => {
                 let _ = self.branches[f.branch].run.on_error(e.clone());
                 self.branches[f.branch].state = BranchState::Finished(Stop::ModelError(e));
             }
         }
-        self.next()
     }
 
     /// Fold: a summary per branch for the prune UI, carrying the review verdict.
@@ -1323,6 +1528,117 @@ pub fn reconcile_doc_conflicts(llm: &mut dyn Llm, result: &mut crate::docorg::Me
 mod tests {
     use super::*;
 
+    #[test]
+    fn edit_replaces_one_unique_anchor_and_records_the_event() {
+        let d = tmp("edit-ok");
+        let mut ws = Workspace::new(&d);
+        ws.apply(&Tool::WriteFile { path: "src/a.rs".into(), contents: "fn one() {}\nfn two() {}\n".into() });
+        let r = ws.apply(&Tool::Edit { path: "src/a.rs".into(), find: "fn two() {}".into(), replace: "fn two() -> u8 { 2 }".into() });
+        assert!(r.ok, "{}", r.output);
+        assert!(r.output.contains("@ line 2"), "reports the line: {}", r.output);
+        let back = ws.apply(&Tool::ReadFile { path: "src/a.rs".into() });
+        assert!(back.output.contains("fn two() -> u8 { 2 }") && back.output.contains("fn one() {}"));
+        assert!(matches!(ws.events().last(), Some(FileEvent { change: FileChange::Modified, .. })));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_teaches_recovery_on_stale_and_ambiguous_anchors() {
+        let d = tmp("edit-err");
+        let mut ws = Workspace::new(&d);
+        ws.apply(&Tool::WriteFile { path: "x.rs".into(), contents: "let a = 1;\nlet a = 1;\n".into() });
+        let stale = ws.apply(&Tool::Edit { path: "x.rs".into(), find: "let b = 2;".into(), replace: "".into() });
+        assert!(!stale.ok && stale.output.contains("anchor not found"));
+        let ambig = ws.apply(&Tool::Edit { path: "x.rs".into(), find: "let a = 1;".into(), replace: "let a = 2;".into() });
+        assert!(!ambig.ok && ambig.output.contains("matches 2 places"));
+        let missing = ws.apply(&Tool::Edit { path: "nope.rs".into(), find: "x".into(), replace: "y".into() });
+        assert!(!missing.ok && missing.output.contains("write_file to create"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn edit_tool_calls_parse_including_synonyms() {
+        let text = "```tool\n{ \"tool\": \"edit\", \"path\": \"src/a.rs\", \"find\": \"old text\", \"replace\": \"new text\" }\n```\n\
+                    ```tool\n{ \"tool\": \"patch\", \"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\" }\n```";
+        let tools = parse_tools(text);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0], Tool::Edit { path: "src/a.rs".into(), find: "old text".into(), replace: "new text".into() });
+        assert_eq!(tools[1], Tool::Edit { path: "b.rs".into(), find: "x".into(), replace: "y".into() });
+    }
+
+    #[test]
+    fn digest_compresses_rustc_output_to_counts_locations_and_first_detail() {
+        let raw = "\
+   Compiling demo v0.1.0
+error[E0382]: borrow of moved value: `to_request`
+  --> src/world/chunk_manager.rs:412:9
+   |
+412|     self.prefetch(to_request);
+   |                   ^^^^^^^^^^ value borrowed here after move
+
+error[E0308]: mismatched types
+  --> src/render/world_renderer.rs:88:13
+
+warning: unused variable: `frame_idx`
+  --> src/render/world_renderer.rs:88:9
+
+error: aborting due to 2 previous errors; 1 warning emitted
+error: could not compile `demo` (lib) due to 3 previous errors
+";
+        let d = digest_check_output(raw, 6);
+        assert!(d.starts_with("2 error(s), 1 warning(s)"), "totals exclude roll-up lines: {d}");
+        assert!(d.contains("E0382") && d.contains("src/world/chunk_manager.rs:412:9"));
+        assert!(d.contains("E0308") && d.contains("src/render/world_renderer.rs:88:13"));
+        assert!(d.contains("First error detail:") && d.contains("value borrowed here after move"));
+        assert!(!d.contains("could not compile"), "roll-up noise stays out of the digest");
+        assert!(d.len() < raw.len(), "the digest must be smaller than the dump");
+    }
+
+    #[test]
+    fn digest_says_clean_when_green_and_passes_through_non_cargo_output() {
+        assert_eq!(digest_check_output("   Finished dev profile in 0.3s\n", 6), "clean — 0 errors, 0 warning(s)");
+        let other = digest_check_output("test result: FAILED. 1 passed; 1 failed\n", 6);
+        assert!(other.contains("1 passed; 1 failed"), "non-rustc output survives, bounded: {other}");
+    }
+
+    #[test]
+    fn fan_width_runs_that_many_branches_at_once_and_backfills() {
+        let cfg = AgentConfig { verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, ..Default::default() };
+        let dirs: Vec<PathBuf> = (0..3).map(|i| tmp(&format!("fanw-{i}"))).collect();
+        let specs = dirs.iter().enumerate()
+            .map(|(i, d)| (d.clone(), format!("goal {i}"), format!("b{i}"))).collect();
+        let mut fan = AgentFan::new(specs, &cfg, Box::new(|_| String::new()));
+        fan.set_width(2);
+        let first = fan.fill();
+        assert_eq!(first.len(), 2, "width 2 loads two lanes immediately");
+        assert_eq!(fan.active_branches(), vec![0, 1]);
+        // Branch 1 completes FIRST (out of order — lanes finish whenever they finish): the freed lane
+        // backfills with branch 2 while 0 is still generating.
+        let next = fan.on_done_branch(1);
+        assert_eq!(next.len(), 1);
+        assert!(matches!(next[0], FanStep::Submit { branch: 2, .. }));
+        let act = fan.active_branches();
+        assert!(act.contains(&0) && act.contains(&2) && act.len() == 2);
+        for d in &dirs { let _ = std::fs::remove_dir_all(d); }
+    }
+
+    #[test]
+    fn fan_width_one_is_the_historical_round_robin() {
+        let cfg = AgentConfig { verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, ..Default::default() };
+        let dirs: Vec<PathBuf> = (0..2).map(|i| tmp(&format!("fan1-{i}"))).collect();
+        let specs = dirs.iter().enumerate()
+            .map(|(i, d)| (d.clone(), format!("goal {i}"), format!("b{i}"))).collect();
+        let mut fan = AgentFan::new(specs, &cfg, Box::new(|_| String::new()));
+        assert_eq!(fan.fill().len(), 1, "default width submits exactly one");
+        assert_eq!(fan.active_branch(), Some(0));
+        // The untagged single-worker API still drives it: Done advances to the NEXT branch.
+        match fan.on_done() {
+            FanStep::Submit { branch, .. } => assert_eq!(branch, 1),
+            FanStep::AllDone => panic!("expected the round-robin to rotate to branch 1"),
+        }
+        for d in &dirs { let _ = std::fs::remove_dir_all(d); }
+    }
+
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wsx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -1445,7 +1761,7 @@ mod tests {
             format!("All set. {DONE_MARKER}"),
         ]};
         // verification off (scripted model, no cargo in the sandbox); tests the plan + loop + files.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         let s = run_agent_cfg(&mut llm, &mut ws, "make a hello world", &cfg);
         assert_eq!(s.stop, Stop::Done);
         assert_eq!(s.files.len(), 1);
@@ -1465,7 +1781,7 @@ mod tests {
         let (d0, d1) = (base.join("b0"), base.join("b1"));
         std::fs::create_dir_all(&d0).unwrap();
         std::fs::create_dir_all(&d1).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         // diff_fn returns a per-branch canned diff (no git needed in the test)
         let diff_fn = Box::new(|root: &Path| format!("diff for {}", root.display()));
         let mut fan = AgentFan::new(vec![
@@ -1514,7 +1830,7 @@ mod tests {
         let base = tmp("fanadd");
         std::fs::create_dir_all(base.join("b0")).unwrap();
         std::fs::create_dir_all(base.join("b1")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         let mut fan = AgentFan::new(vec![(base.join("b0"), "A".into(), "one".into())], &cfg, Box::new(|_| String::new()));
         // first branch starts running
         let s0 = fan.next();
@@ -1533,7 +1849,7 @@ mod tests {
         let base = tmp("adopt");
         std::fs::create_dir_all(base.join("orig")).unwrap();
         std::fs::create_dir_all(base.join("react")).unwrap();
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         // a single run in progress, with a queued next prompt
         let (run, first) = AgentRun::start(base.join("orig"), "build a thing", cfg.clone());
         let mut fan = AgentFan::adopt(run, Some(first), "build a thing", "original", &cfg, Box::new(|_| String::new()));
@@ -1610,7 +1926,7 @@ mod tests {
                 Ok("I'll write it.\n```tool\n{\"tool\":\"write_file\",\"path\":\"x.txt\",\"contents\":\"same\"}\n```".into())
             }
         }
-        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 30, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         let s = run_agent_cfg(&mut Repeater, &mut ws, "task", &cfg);
         assert_eq!(s.stop, Stop::Stalled, "a repeating agent is aborted as a bad actor");
         assert!(s.turns.len() < 30, "aborted well before the step limit ({} turns)", s.turns.len());
@@ -1620,7 +1936,7 @@ mod tests {
     fn async_driver_matches_sync_behavior() {
         // Drive AgentRun by hand with scripted completed replies (no worker), asserting it writes the file,
         // captures the plan, and finishes — the same state machine the sync loop uses.
-        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 8, verify_cmd: Vec::new(), verify_exts: Vec::new(), gate_done_on_verify: false, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         let (mut run, first) = AgentRun::start(tmp("async"), "make a lib", cfg);
         assert!(first.contains("PLAN")); // prompt asks for a plan
         let replies = [
@@ -1661,7 +1977,7 @@ mod tests {
         let mut ws = Workspace::new(tmp("gate"));
         struct ClaimsDone;
         impl Llm for ClaimsDone { fn generate(&mut self, _p: &str) -> Result<String, String> { Ok(format!("{DONE_MARKER}")) } }
-        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false };
+        let cfg = AgentConfig { max_steps: 3, verify_cmd: vec!["cargo".into(), "check".into()], verify_exts: vec!["rs".into()], gate_done_on_verify: true, read_policy: ReadPolicy::Full, doc_mode: false, prefer_patches: false, digest_verify: false };
         let s = run_agent_cfg(&mut ClaimsDone, &mut ws, "task", &cfg);
         // verified never became true (nothing verifiable ran) ⇒ done rejected ⇒ step limit
         assert_eq!(s.stop, Stop::StepLimit);
