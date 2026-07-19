@@ -246,6 +246,11 @@ fn env_decode_tile() -> Option<u32> {
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
 }
+/// Flash split-K decode attention above the 4096-row shared-memory cap (LOGSCOPE_FLASH_ATTN=0 →
+/// the old single-workgroup-per-head serial fallback).
+fn flash_attn_enabled() -> bool {
+    std::env::var("LOGSCOPE_FLASH_ATTN").as_deref() != Ok("0")
+}
 /// LOGSCOPE_GEMM_TILE override for the prefill GEMM workgroup tile (manual A/B; read once, cached).
 fn env_gemm_tile() -> Option<u32> {
     use std::sync::OnceLock;
@@ -4560,6 +4565,73 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]/sum;}
 }"#;
 
+// Flash-style SPLIT-K decode attention, pass 1 of 2 — the long-context kernel. One workgroup per
+// (query head, KV chunk): each computes its chunk's LOCAL softmax pieces — running max, exp-sum,
+// and the unnormalized V-weighted accumulation — into a partials buffer [nh][nch][hd+2]. Pass 2
+// combines chunks with the standard online-softmax rescale. Parallelism grows with context
+// (heads × chunks workgroups) instead of saturating at n_heads; nothing needs scores[l] in shared
+// memory, so there is no 4096-row cap. Numerics: per-chunk max + rescale reorders the summation
+// vs the monolithic kernels — same tolerance class as the other fused paths (~1e-6 rel).
+const DECODE_ATTN_FLASH_P1: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> part: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let ch=wg.y; let tid=lid.x;
+  let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  let j0=ch*dd.chunk; let j1=min(dd.l, j0+dd.chunk);
+  let pbase=(hh*dd.nch+ch)*(dd.hd+2u);
+  var lmax=-3.4e38; var j=j0+tid;
+  loop { if(j>=j1){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[b+c]*kc[j*kvdm+kb+c];} let s=dot*scale; sc[j-j0]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=j0+tid;
+  loop { if(j>=j1){break;} let p=exp(sc[j-j0]-mx); sc[j-j0]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  var c=tid;
+  loop { if(c>=dd.hd){break;} var acc=0.0; for(var jj=j0;jj<j1;jj=jj+1u){ acc=acc+sc[jj-j0]*vc[jj*kvdm+kb+c]; } part[pbase+c]=acc; c=c+64u; }
+  if(tid==0u){ part[pbase+dd.hd]=mx; part[pbase+dd.hd+1u]=sum; }
+}"#;
+
+// Split-K decode attention, pass 2: one workgroup per head folds its chunks — global max M,
+// rescaled sum S = Σ sᵢ·exp(mᵢ−M), and o = Σ oᵢ·exp(mᵢ−M) / S.
+const DECODE_ATTN_FLASH_P2: &str = r#"
+struct D { hd:u32,nch:u32,nh:u32,_a:u32 };
+@group(0)@binding(0) var<storage,read> part: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+var<workgroup> wm: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let tid=lid.x;
+  var m=-3.4e38; var i=tid;
+  loop { if(i>=dd.nch){break;} m=max(m, part[(hh*dd.nch+i)*(dd.hd+2u)+dd.hd]); i=i+64u; }
+  wm[tid]=m; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ wm[tid]=max(wm[tid],wm[tid+st]); } workgroupBarrier(); }
+  let M=wm[0]; workgroupBarrier();
+  var s=0.0; i=tid;
+  loop { if(i>=dd.nch){break;} let pb=(hh*dd.nch+i)*(dd.hd+2u); s=s+part[pb+dd.hd+1u]*exp(part[pb+dd.hd]-M); i=i+64u; }
+  wm[tid]=s; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ wm[tid]=wm[tid]+wm[tid+st]; } workgroupBarrier(); }
+  let S=wm[0];
+  var c=tid;
+  loop { if(c>=dd.hd){break;}
+    var acc=0.0;
+    for(var ii=0u;ii<dd.nch;ii=ii+1u){ let pb=(hh*dd.nch+ii)*(dd.hd+2u); acc=acc+part[pb+c]*exp(part[pb+dd.hd]-M); }
+    o[hh*dd.hd+c]=acc/S; c=c+64u; }
+}"#;
+
 const DECODE_ATTN_MH_PAR: &str = r#"
 struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -5047,12 +5119,33 @@ impl Gpu {
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
         // Rule-based by shape: the parallel kernel (one workgroup per head, KV rows split across
         // threads) uses the whole GPU and dominates at long context, but needs scores[l] in
-        // shared memory (cap 4096). Above that, fall back to the single-workgroup serial kernel.
+        // shared memory (cap 4096). Above that: the flash split-K pair (parallelism grows with
+        // context — heads × chunks workgroups — no shared-memory cap); LOGSCOPE_FLASH_ATTN=0
+        // restores the old single-workgroup-per-head serial fallback.
         if l <= 4096 {
             self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
+        } else if flash_attn_enabled() {
+            return self.decode_attention_flash(q, kc, vc, l, dm, n_heads, n_kv_heads);
         } else {
             self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         }
+        out
+    }
+
+    /// Flash-style split-K decode attention (see DECODE_ATTN_FLASH_P1/P2): pass 1 computes local
+    /// softmax pieces per 2048-row KV chunk, pass 2 combines with the online-softmax rescale.
+    /// The structural long-context decode kernel — per-token attention cost parallelizes across
+    /// the sequence instead of one workgroup per head crawling all of KV.
+    pub fn decode_attention_flash(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let hd = dm / n_heads;
+        let chunk = 2048usize;
+        let nch = l.div_ceil(chunk);
+        let part = self.alloc(1, n_heads * nch * (hd + 2));
+        let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dims), (n_heads as u32, nch as u32, 1));
+        let out = self.alloc(1, dm);
+        let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
         out
     }
 
