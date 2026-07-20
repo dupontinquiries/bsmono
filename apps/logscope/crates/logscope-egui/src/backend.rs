@@ -91,7 +91,10 @@ pub(crate) mod engine {
     /// The effective prefill chunk: env override, else the const default. Lower this (e.g. 64, 32) if the
     /// GPU watchdog fires during prefill on a long prompt.
     fn prefill_chunk() -> usize {
-        std::env::var("LOGSCOPE_PREFILL_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(PREFILL_CHUNK)
+        // Accept the prefixed form, and the bare PREFILL_CHUNK as a forgiving fallback (the LOGSCOPE_
+        // prefix is easy to drop and a silently-ignored override wastes a whole watchdog-bisection run).
+        std::env::var("LOGSCOPE_PREFILL_CHUNK").or_else(|_| std::env::var("PREFILL_CHUNK")).ok()
+            .and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(PREFILL_CHUNK)
     }
     /// Hard ceiling on the context window regardless of the n_ctx slider — the KV cache is O(window)
     /// memory (~hundreds of KB per token), so this is the backstop against OOMing the device.
@@ -580,7 +583,14 @@ pub(crate) mod engine {
                 // O(1)-bandwidth batched prefill of the whole prompt (one [T,d] pass).
                 // O(chunk·T) chunked prefill — NOT one O(T²) batched pass — so a long pasted
                 // context can't balloon attention scratch to tens of GB and OOM the device.
-                s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, prefill_chunk());
+                let pc = prefill_chunk();
+                {
+                    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("wgpu-engine: prefill chunk = {pc} tokens/dispatch{}", if pc != PREFILL_CHUNK { " (overridden)" } else { " (default; set LOGSCOPE_PREFILL_CHUNK to lower for GPU-watchdog hangs)" });
+                    }
+                }
+                s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, pc);
                 s.pos = prompt_ids.len();
             }
             eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
