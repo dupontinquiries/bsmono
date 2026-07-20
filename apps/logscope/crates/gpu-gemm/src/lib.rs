@@ -5372,6 +5372,35 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=o[vb+c]/sum;}
 }"#;
 
+// DSA lightning-indexer scoring (see dsa.rs::indexer_scores). One thread per cached key t computes
+//   score[t] = (1/√nh) · Σ_h w[h] · ReLU( (q_idx[h]·k_idx[t]) / √hd )
+// q_idx is [nh·hd] (rope'd), k_idx is [nk, hd] (one hd-wide key per position, shared across heads), w is
+// [nh]. Bit-exact to the CPU reference: same per-head ReLU-then-weight, same √hd / √nh scaling, same order
+// (heads inner, so the fp accumulation matches). This is the score that ranks keys for top-k selection.
+const DSA_INDEXER: &str = r#"
+struct D { nk:u32, nh:u32, hd:u32, _p:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;   // [nh*hd]
+@group(0)@binding(1) var<storage,read> k: array<f32>;   // [nk*hd]
+@group(0)@binding(2) var<storage,read> w: array<f32>;   // [nh]
+@group(0)@binding(3) var<storage,read_write> o: array<f32>; // [nk]
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let t=g.x; if(t>=d.nk){return;}
+  let wsc=1.0/sqrt(f32(d.nh));
+  let rs=1.0/sqrt(f32(d.hd));
+  let kbase=t*d.hd;
+  var a=0.0;
+  for(var h=0u;h<d.nh;h=h+1u){
+    let qbase=h*d.hd;
+    var d0=0.0;
+    for(var i=0u;i<d.hd;i=i+1u){ d0=d0+q[qbase+i]*k[kbase+i]; }
+    d0=d0*rs;
+    if(d0>0.0){ a=a+w[h]*d0; }   // ReLU on the per-head score, then weight
+  }
+  o[t]=a*wsc;
+}"#;
+
 const ATTENTION_MH: &str = r#"
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -6182,6 +6211,16 @@ impl Gpu {
         let rot = self.slice_cols(&kva, dm.kv_lora, dm.qk_rope);
         let rot = self.rope_neox_at_t(&rot, 1, dm.qk_rope, dm.base, pos);
         self.write_row(&cache.rot[layer], &rot, pos, dm.qk_rope);
+    }
+
+    /// DSA lightning-indexer scores on GPU: one score per cached key, bit-exact to dsa.rs::indexer_scores.
+    /// `q_idx` [nh·hd], `k_idx` [nk·hd], `w` [nh] → [nk] scores. These rank keys for the top-k sparse
+    /// selection; the selection is then fed to the main attention mask (above the index_topk threshold).
+    pub fn dsa_indexer_scores_t(&self, q_idx: &Tensor, k_idx: &Tensor, w: &Tensor, nk: usize, nh: usize, hd: usize) -> Tensor {
+        let out = self.alloc(1, nk);
+        let dims = [nk as u32, nh as u32, hd as u32, 0u32];
+        self.dispatch(DSA_INDEXER, &[q_idx, k_idx, w], &out, bytemuck::cast_slice(&dims), ((nk as u32).div_ceil(64), 1, 1));
+        out
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
