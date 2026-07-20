@@ -109,6 +109,26 @@ impl Tokenizer {
         self.specials.iter().find(|(s, _)| s == text).map(|(_, id)| *id)
     }
 
+    /// Every CONTROL special token id — the tokenizer's special set minus the ones that carry real
+    /// response content. A model that emits a control token (<|user|>, <|assistant|>, <|observation|>,
+    /// <sop>, [gMASK], image/video/audio markers, …) has ended its turn: those must stop generation, not
+    /// be detokenized into the chat as text (the "added stuff on the end" bug on converted checkpoints,
+    /// Colibri #298). Content-bearing specials — <think>, <tool_call>, <arg_key>, <arg_value> and their
+    /// end tags — are EXCLUDED so reasoning/tool-call output is preserved. Reading the tokenizer's own
+    /// special flags (not a hardcoded eos name list) is what catches control tokens a converted GGUF's
+    /// config forgot to declare.
+    pub fn control_stop_ids(&self) -> Vec<u32> {
+        // substrings that mark a special as CONTENT, not a turn boundary — kept out of the stop set
+        const CONTENT: &[&str] = &["think", "tool_call", "arg_key", "arg_value", "tool_response", "code", "answer"];
+        self.specials.iter()
+            .filter(|(text, _)| {
+                let t = text.to_ascii_lowercase();
+                !CONTENT.iter().any(|c| t.contains(c))
+            })
+            .map(|(_, id)| *id)
+            .collect()
+    }
+
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
     pub fn is_byte_level(&self) -> bool { self.byte_level }
 
@@ -246,5 +266,43 @@ impl Tokenizer {
             tk.special_id("<|endoftext|>"), tk.special_id("<|eot_id|>"),
             show(151643), show(151644), show(151645));
         Ok(tk)
+    }
+}
+
+#[cfg(test)]
+mod control_stop_tests {
+    use super::*;
+
+    fn tok_with_specials(specials: &[(&str, u32)]) -> Tokenizer {
+        // minimal byte-level tokenizer; only the special set matters for this test
+        let tokens: Vec<Vec<u8>> = (0..256u32).map(|b| vec![b as u8]).collect();
+        let mut t = Tokenizer::new_byte_level(tokens, Vec::new());
+        t.set_specials(specials.iter().map(|(s, id)| (s.to_string(), *id)).collect());
+        t
+    }
+
+    #[test]
+    fn control_stop_ids_excludes_content_specials() {
+        // Mix of turn-boundary control tokens and content-bearing specials (GLM/Llama-ish).
+        let t = tok_with_specials(&[
+            ("<|user|>", 1), ("<|assistant|>", 2), ("<|observation|>", 3),
+            ("<sop>", 4), ("[gMASK]", 5), ("<|begin_of_image|>", 6),
+            ("<think>", 10), ("</think>", 11), ("<tool_call>", 12), ("<arg_key>", 13),
+        ]);
+        let stop: std::collections::HashSet<u32> = t.control_stop_ids().into_iter().collect();
+        // control tokens → stop
+        for id in [1u32, 2, 3, 4, 5, 6] {
+            assert!(stop.contains(&id), "control special {id} must be a stop");
+        }
+        // content-bearing specials → NOT stop (reasoning / tool-call output is real content)
+        for id in [10u32, 11, 12, 13] {
+            assert!(!stop.contains(&id), "content special {id} must NOT be a stop");
+        }
+    }
+
+    #[test]
+    fn control_stop_ids_empty_when_no_specials() {
+        let t = tok_with_specials(&[]);
+        assert!(t.control_stop_ids().is_empty());
     }
 }
