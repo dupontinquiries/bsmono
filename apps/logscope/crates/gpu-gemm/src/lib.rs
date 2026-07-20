@@ -3568,6 +3568,25 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[d0+1u]=x0*s+x1*c;
 }"#;
 
+// NEOX split-half RoPE (DeepSeek/Qwen/Gemma convention): rotates dim i with i+half, unlike ROPE's
+// adjacent (2i, 2i+1) pairing. Used by the MLA forward; matches mla.rs's rope_neox reference exactly.
+const ROPE_NEOX: &str = r#"
+struct D { t:u32,d:u32,base:f32,pos0:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let half=dd.d/2u; let p=g.x; if(p>=dd.t*half){return;}
+  let row=p/half; let i=p%half;
+  let freq=f32(row+dd.pos0)/pow(dd.base,(2.0*f32(i))/f32(dd.d));
+  let c=cos(freq); let s=sin(freq);
+  let base=row*dd.d;
+  let x0=x[base+i]; let x1=x[base+i+half];
+  o[base+i]=x0*c-x1*s;
+  o[base+i+half]=x0*s+x1*c;
+}"#;
+
 // ===== MoE v2 decode kernels: GPU-side routing (zero readbacks) =====
 // MOE_TOPK: serial top-k over the router logits (n<=512, k<=16 — trivial work, the win is staying on-GPU).
 // Selection order = descending logit; weights = softmax over the SELECTED logits (bit-faithful to
@@ -5838,6 +5857,65 @@ impl Gpu {
     pub fn rope_at_t(&self, x: &Tensor, t: usize, d: usize, base: f32, pos0: usize) -> Tensor {
         let out = self.alloc(t, d); let dims = [t as u32, d as u32, base.to_bits(), pos0 as u32];
         self.dispatch(ROPE, &[x], &out, bytemuck::cast_slice(&dims), (((t * d / 2) as u32).div_ceil(64), 1, 1)); out
+    }
+    /// NEOX split-half RoPE at position `pos0` over [t, d] (rotates i with i+d/2). Matches mla.rs.
+    pub fn rope_neox_at_t(&self, x: &Tensor, t: usize, d: usize, base: f32, pos0: usize) -> Tensor {
+        let out = self.alloc(t, d); let dims = [t as u32, d as u32, base.to_bits(), pos0 as u32];
+        self.dispatch(ROPE_NEOX, &[x], &out, bytemuck::cast_slice(&dims), (((t * d / 2) as u32).div_ceil(64), 1, 1)); out
+    }
+
+    /// GPU MLA attention for one new query token at `pos`, over a compressed latent cache. Composes the
+    /// already-validated primitives (linear_t / rmsnorm_t / rope_neox / softmax) so it can be checked
+    /// bit-for-bit against the mla.rs CPU reference. Un-absorbed form: reconstruct per-head K(nope)+V from
+    /// each cached latent via kv_b, then ordinary attention. Inputs are uploaded weights + the cache latent
+    /// [pos+1, kv_lora] and rot [pos+1, qk_rope]; returns [1, d] (post o-proj). NOT wired into decode yet —
+    /// this proves the GPU forward matches the reference before it's threaded into a live model.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attention_step_t(&self, x: &Tensor, w: &crate::mla::MlaWeightsT, dm: &crate::mla::MlaDims,
+                                c_kv: &Tensor, k_rot: &Tensor, pos: usize) -> Tensor {
+        let h = dm.n_heads; let qk = dm.qk_head(); let rec = dm.qk_nope + dm.v_head;
+        // Q: x[1,d] → q_a[q_lora] → norm → q_b[h·qk] ; RoPE the rope tail of each head.
+        let qa = self.linear_t(x, &w.q_a, 1, dm.q_lora, dm.d);
+        let qa = self.rmsnorm_t(&qa, &w.q_a_ln, 1, dm.q_lora, dm.eps);
+        let q = self.linear_t(&qa, &w.q_b, 1, h * qk, dm.q_lora);
+        // rope each head's [qk_nope..qk_head) slice. Do it on CPU-shaped slices via a gather? Simpler: pull
+        // the q row, rope the rope-parts per head to match the reference, re-upload. (Small: h·qk floats.)
+        let mut qh = self.download(&q);
+        for head in 0..h {
+            let off = head * qk + dm.qk_nope;
+            let slice = self.upload(&qh[off..off + dm.qk_rope].to_vec(), 1, dm.qk_rope);
+            let roped = self.download(&self.rope_neox_at_t(&slice, 1, dm.qk_rope, dm.base, pos));
+            qh[off..off + dm.qk_rope].copy_from_slice(&roped);
+        }
+        // reconstruct K(nope)+V for all cached positions: kv_b · c_kv → [pos+1, h·rec]
+        let kvb = self.linear_t(c_kv, &w.kv_b, pos + 1, h * rec, dm.kv_lora);
+        let kvb_host = self.download(&kvb);
+        let krot_host = self.download(k_rot);
+        let scale = 1.0 / (qk as f32).sqrt();
+        let mut out = vec![0f32; h * dm.v_head];
+        for head in 0..h {
+            let qslice = &qh[head * qk..head * qk + qk];
+            let mut scores = vec![0f32; pos + 1];
+            for t in 0..=pos {
+                let k_nope = &kvb_host[t * h * rec + head * rec..t * h * rec + head * rec + dm.qk_nope];
+                let mut s = 0f32;
+                for i in 0..dm.qk_nope { s += qslice[i] * k_nope[i]; }
+                for i in 0..dm.qk_rope { s += qslice[dm.qk_nope + i] * krot_host[t * dm.qk_rope + i]; }
+                scores[t] = s * scale;
+            }
+            let mx = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0f32;
+            for s in scores.iter_mut() { *s = (*s - mx).exp(); denom += *s; }
+            for s in scores.iter_mut() { *s /= denom; }
+            for t in 0..=pos {
+                let v = &kvb_host[t * h * rec + head * rec + dm.qk_nope..t * h * rec + head * rec + dm.qk_nope + dm.v_head];
+                let a = scores[t];
+                for i in 0..dm.v_head { out[head * dm.v_head + i] += a * v[i]; }
+            }
+        }
+        // o-proj [d, h·v_head]
+        let out_t = self.upload(&out, 1, h * dm.v_head);
+        self.linear_t(&out_t, &w.o, 1, dm.d, h * dm.v_head)
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
