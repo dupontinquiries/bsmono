@@ -20,6 +20,10 @@ pub enum CardKind {
     Conflict,
     /// A partial-edit file arrived → "merge as a commit/branch?"
     MergeEdit,
+    /// The coordinator (esp. Aggressive mode) is problem-solving and the local corpus likely holds
+    /// relevant prior notes/decisions/logs → "search your database to boost context?". On accept, RAG
+    /// (rag::Bm25) runs and the top hits are injected; on dismiss, we don't nag again this session.
+    SearchDatabase,
     /// Generic info.
     Note,
 }
