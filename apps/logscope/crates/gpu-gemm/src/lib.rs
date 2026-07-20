@@ -7460,13 +7460,19 @@ impl Gpu {
     }
 
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
-        // NOTE: do NOT flush the frame mid-loop here (e.g. every N layers to bound scratch). The caller
-        // opens ONE frame around the whole token; an intermediate end_frame() submits asynchronously and
-        // then lets the next layer's alloc recycle pool buffers whose in-flight GPU work hasn't completed
-        // (no completion fence), AND leaves the frame closed so later layers auto-submit unordered — both
-        // corrupt the residual stream (observed: gibberish on windowed Asahi decode). Scratch bounding, if
-        // needed, must poll for completion before recycling. The device OOM handler catches the alloc
-        // failure gracefully instead.
+        // Optional scratch-bounding for the memory-tight path (q4-30B OOMs on big prompts). DEFAULT OFF:
+        // the confirmed-good decode path is unchanged unless LOGSCOPE_DECODE_FLUSH_LAYERS is set > 0.
+        //
+        // The earlier attempt (reverted in _111) corrupted output because it end_frame()'d mid-loop and let
+        // the next layer's alloc recycle pool buffers whose async GPU work was STILL RUNNING (no fence), and
+        // left the frame closed so later layers submitted unordered. The correct sequence flushes THEN WAITS
+        // for completion before anything recycles, then re-opens the frame so ordering is preserved:
+        //   end_frame (submit) → poll(wait) → clear_retained → begin_frame
+        // After the wait, `x` (held live here) contains valid data and the dropped per-layer scratch buffers
+        // are safe to return to the pool — no race. Cost: one full GPU sync per `flush` layers (only on this
+        // opt-in path), trading throughput for a bounded live-buffer set that fits the VMA budget.
+        // Still OPT-IN + hardware-untested for the windowed-frame interaction — enable to test the OOM case.
+        let flush = std::env::var("LOGSCOPE_DECODE_FLUSH_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
         for li in 0..m.n_layers {
@@ -7474,6 +7480,14 @@ impl Gpu {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            if flush != 0 && (li + 1) % flush == 0 && li + 1 < m.n_layers {
+                // FENCED flush: submit, WAIT for completion (so x is valid + scratch is done), release
+                // retained bind-groups, re-open the frame. The wait is what makes recycling safe.
+                self.end_frame();
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                self.clear_retained();
+                self.begin_frame();
+            }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
