@@ -2954,6 +2954,56 @@ fn main() {
         }
     }
 
+    // ── TWO-SPAN attention (staged KV stage 3): one online softmax over a warm int8 tail + a hot f32
+    // window must equal attention over the concatenated [warm|hot] f32 sequence (within int8 tolerance),
+    // AND reduce bit-exactly to the f32 flash path when the warm span is empty (the no-op gate). This is
+    // the fusion the staged cache decodes through.
+    {
+        let (nh, nkv, hd) = (8usize, 2usize, 64usize);
+        let (dm, kvdm) = (nh * hd, nkv * hd);
+        // total sequence split at `wl` warm (older) + `hl` hot (recent)
+        for &(wl, hl) in &[(0usize, 300usize), (500, 200), (2600, 400), (4000, 512)] {
+            let l = wl + hl;
+            let qv = rnd(dm, 1300 + l);
+            let kv = rnd(l * kvdm, 1301 + l);
+            let vv = rnd(l * kvdm, 1302 + l);
+            // CPU reference: full-precision attention over the whole concatenated sequence
+            let mut want = vec![0f32; dm];
+            for h in 0..nh {
+                let kb = (h / (nh / nkv)) * hd;
+                let scale = 1.0 / (hd as f32).sqrt();
+                let mut sc: Vec<f32> = (0..l).map(|j| (0..hd).map(|c| qv[h*hd+c] * kv[j*kvdm+kb+c]).sum::<f32>() * scale).collect();
+                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0f32;
+                for x in &mut sc { *x = (*x - mx).exp(); sum += *x; }
+                for c in 0..hd { want[h*hd+c] = (0..l).map(|j| sc[j] * vv[j*kvdm+kb+c]).sum::<f32>() / sum; }
+            }
+            let qt = gpu.upload(&qv, 1, dm);
+            // hot f32 rows are the RECENT [wl, l); warm int8 rows are the OLDER [0, wl)
+            let hot_k = gpu.upload(&kv[wl*kvdm..], hl, kvdm);
+            let hot_v = gpu.upload(&vv[wl*kvdm..], hl, kvdm);
+            let (kq, ks, vq, vs) = if wl > 0 {
+                let wkf = gpu.upload(&kv[..wl*kvdm], wl, kvdm);
+                let wvf = gpu.upload(&vv[..wl*kvdm], wl, kvdm);
+                let (kq, ks) = gpu.quantize_rows(&wkf, wl, kvdm);
+                let (vq, vs) = gpu.quantize_rows(&wvf, wl, kvdm);
+                (kq, ks, vq, vs)
+            } else {
+                // empty warm span — dummy 1-row buffers (unused when wl==0)
+                let z = gpu.upload(&vec![0f32; kvdm], 1, kvdm);
+                let (kq, ks) = gpu.quantize_rows(&z, 1, kvdm);
+                let (vq, vs) = gpu.quantize_rows(&z, 1, kvdm);
+                (kq, ks, vq, vs)
+            };
+            let got = gpu.download(&gpu.decode_attention_two_span(&qt, &kq, &ks, &vq, &vs, wl, &hot_k, &hot_v, hl, dm, nh, nkv));
+            let e = maxerr(&got, &want);
+            // int8 warm tail loosens tolerance; the all-hot (wl=0) case must be tight (pure f32 path)
+            let tol = if wl == 0 { 1e-4 } else { 3e-2 };
+            println!("  two-span attn warm={wl}(int8) hot={hl}(f32) -> max|gpu-cpu|={e:.2e} (tol {tol:.0e})");
+            check(&format!("two-span attention warm={wl} hot={hl}"), e, tol);
+        }
+    }
+
     // ── shared-expert MoE (GLM/DeepSeek stepping stone): routed + shared vs CPU reference ────────
     // Synthetic F32 MoeLayer (drives the v1 grouped path — F32 stacks make the v2 kernels decline,
     // so routing runs through the pure moe::route we can mirror on CPU exactly). Checks BOTH
