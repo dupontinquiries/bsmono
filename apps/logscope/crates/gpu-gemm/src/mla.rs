@@ -94,6 +94,24 @@ impl MlaDims {
 #[derive(Clone)]
 pub struct MlaCacheRow { pub c_kv: Vec<f32>, pub k_rot: Vec<f32> }
 
+/// GPU-resident compressed MLA cache: one latent [max_seq, kv_lora] and one rot [max_seq, qk_rope] tensor
+/// per layer. The long-context memory win in concrete form — O(kv_lora + qk_rope) per token instead of
+/// O(n_kv_heads · head_dim). Rows are appended as tokens decode.
+pub struct MlaCache {
+    pub latent: Vec<crate::Tensor>,
+    pub rot: Vec<crate::Tensor>,
+    pub kv_lora: usize,
+    pub qk_rope: usize,
+    pub max_seq: usize,
+}
+
+impl MlaCache {
+    /// Memory-saving ratio vs an equivalent standard per-head KV cache (K+V).
+    pub fn compression_vs_standard(&self, n_kv_heads: usize, head_dim: usize) -> f64 {
+        (n_kv_heads * head_dim * 2) as f64 / (self.kv_lora + self.qk_rope) as f64
+    }
+}
+
 /// Compress a token's hidden state into its MLA cache row (kv_a down-proj → norm the latent part → RoPE the
 /// rot part). This is what gets stored per token — the memory-win representation.
 pub fn compress_kv(x: &[f32], w: &MlaWeights, dm: &MlaDims, pos: usize) -> MlaCacheRow {
