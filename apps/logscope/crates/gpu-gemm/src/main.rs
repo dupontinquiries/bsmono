@@ -4635,6 +4635,25 @@ fn main() {
                 println!("  staged demote round-trip: demoted={demoted} k max|deq-orig|={rt_ok:.2e}");
                 check("staged KV demotion preserves rows through int8", rt_ok, 5e-2);
             }
+
+            // NO-OP GATE (stage 4): decoding through decode_step_staged with an all-hot policy must equal
+            // decoding through the plain f32 decode_step, token-for-token. This proves the staged plumbing
+            // (hot-relative writes, two-span attention reducing to the f32 flash path when warm is empty)
+            // changes ZERO tokens before any demotion is enabled — the safety gate for turning staging on.
+            {
+                let prompt2: Vec<u32> = vec![1u32, 5, 9, 3, 7, 2, 8, 4, 6, 1, 0, 5];
+                // reference: plain f32 session decode
+                let cref = gpu.new_cache(m3.n_layers, 200, m3.kv_dim());
+                let mut logits_ref = Vec::new();
+                for (i, &t) in prompt2.iter().enumerate() { logits_ref = gpu.decode_step(&m3, &cref, t, i); }
+                // staged all-hot decode of the same tokens
+                let staged4 = gpu.staged_new(m3.n_layers, 200, m3.kv_dim(), gpu_kernels::kvstage::StagePolicy::all_hot());
+                let mut logits_st = Vec::new();
+                for (i, &t) in prompt2.iter().enumerate() { logits_st = gpu.decode_step_staged(&m3, &staged4, t, i); }
+                let e = maxerr(&logits_st, &logits_ref);
+                println!("  staged no-op gate: staged(all_hot) vs f32 decode max|diff|={e:.2e}");
+                check("staged KV all-hot decode == f32 decode (no-op gate)", e, 1e-4);
+            }
         }
 
         // BIG WINDOW / dims-cache overflow (regression for the M4 k=256 crash): a large window
