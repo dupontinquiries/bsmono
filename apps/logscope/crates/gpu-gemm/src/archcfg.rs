@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, DeepseekV3, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -123,6 +123,19 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: false, dense_supported: false,
             note: "fused qkv tensor + partial-rotary RoPE; needs a split + partial-dim rope kernel",
         },
+        // DeepSeek-V2/V3 + GLM-MoE-DSA family: Multi-head Latent Attention (MLA) — Q/KV go through
+        // low-rank down/up projections and the KV CACHE stores only the compressed latent
+        // [kv_lora_rank + qk_rope_head_dim] per token (a large KV-memory saving for long context), plus
+        // a shared-expert MoE. Detected here with the right prefix so dim parsing can read the MLA ranks,
+        // but the MLA attention forward (down/up proj, latent norm, absorption) isn't wired yet, so it's
+        // refused with a clear message rather than mis-loaded through the dense MHA path.
+        "deepseek2" | "deepseek3" | "deepseekv3" | "glm4moe" => ArchConfig {
+            arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            supported: false, dense_supported: false,
+            note: "Multi-head Latent Attention (MLA): compressed-KV latent cache + low-rank q/kv projections. \
+                   Detected but the MLA forward isn't wired yet — use the llama.cpp backend for now.",
+        },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: true, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
@@ -224,7 +237,17 @@ mod tests {
     fn llama_is_supported_today() {
         let c = for_arch("llama");
         assert!(c.supported && c.note.is_empty());
-        assert_eq!(for_arch(""), c, "missing arch string falls back to llama");
+        assert_eq!(for_arch(""), c, "missing arch string falls back to llama");    }
+
+    #[test]
+    fn deepseek_mla_is_detected_but_not_yet_wired() {
+        for name in ["deepseek2", "deepseek3", "deepseekv3", "glm4moe"] {
+            let c = for_arch(name);
+            assert_eq!(c.arch, Arch::DeepseekV3, "{name} should map to the MLA arch");
+            assert!(c.moe && c.moe_shared_expert, "DeepSeek/GLM-MoE has routed + shared experts");
+            assert!(!c.supported && !c.dense_supported, "MLA forward isn't wired yet → refuse cleanly");
+            assert!(c.note.contains("MLA") || c.note.contains("Latent"), "note must explain the MLA gap");
+        }
     }
 
     #[test]
