@@ -827,6 +827,11 @@ impl Gpu {
     }
     /// Read back a u32 tensor (e.g. the argmax id). Mirrors `download` but reinterprets bytes as u32.
     pub fn download_u32(&self, t: &Tensor) -> Vec<u32> {
+        // If the device already signalled OOM this step, the staging buffer below may fail to allocate and
+        // mapping an INVALID buffer is a FATAL wgpu error (get_mapped_range panics past the uncaptured-error
+        // handler — seen on the q4-30B long second prompt). Bail early with an empty result; the caller
+        // treats empty as "step failed, back off" rather than crashing.
+        if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1147,6 +1152,9 @@ impl Gpu {
         Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None }
     }
     pub fn download(&self, t: &Tensor) -> Vec<f32> {
+        // Post-OOM safety (see download_u32): mapping a buffer that failed to allocate is a fatal wgpu
+        // error, so bail early with an empty result once the device has signalled OOM this step.
+        if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -1185,6 +1193,9 @@ impl Gpu {
     /// that just failed one. Cleared by `clear_oom` once the caller has backed off (freed a window / cache).
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
+    /// Test/validation hook: force the OOM-backoff flag so the download guards can be exercised without an
+    /// actual device OOM (which can't be provoked deterministically in-container).
+    pub fn set_oom_for_test(&self, v: bool) { self.oom_flag.store(v, std::sync::atomic::Ordering::Relaxed); }
     /// Whether we should avoid the fragile fast-path kernels (barrier-heavy attention, collapsed submits).
     pub fn degraded(&self) -> bool { self.degrade_level() >= 1 }
     /// Raise the degrade latch (monotonic — only ever increases). Logged once per level so a degrade is
@@ -2312,6 +2323,7 @@ impl Gpu {
         let logits = self.download(&m.router.apply(self, n2, 1));
         let cpu = crate::moe::route(&logits, &m.cfg);
         let raw = self.download_u32(&selw);
+        if raw.len() < 2 * (m.cfg.n_used.clamp(1, 16) as usize) { return v1; } // OOM backoff: skip the debug compare
         let k = m.cfg.n_used.clamp(1, 16) as usize;
         let gsel: Vec<u32> = raw[..k].to_vec();
         let gwgt: Vec<f32> = raw[k..2 * k].iter().map(|&b| f32::from_bits(b)).collect();
@@ -7472,6 +7484,7 @@ impl Gpu {
     /// logits, and the next input is gathered on-device. Bit-exact to generate_kv (--gate-gpusample);
     /// the prerequisite for windowed (K-steps-per-submit) decode.
     pub fn generate_kv_gpu(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
+        self.clear_oom(); // fresh generation: a prior step's OOM must not poison this run's downloads
         let embed_t = self.upload(&m.embed, m.vocab, m.d);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         // Prefill all but the last prompt token via the normal (downloaded) path; keep the LAST prompt
@@ -7484,7 +7497,8 @@ impl Gpu {
         let mut out = Vec::with_capacity(n_new);
         for step in 0..n_new {
             let id_t = self.argmax_t(&logits_t);             // on-GPU argmax, recorded into the open frame
-            let id = self.download_u32(&id_t)[0];            // flush + 4-byte readback (not [vocab])
+            let idv = self.download_u32(&id_t);              // flush + 4-byte readback (not [vocab])
+            let id = match idv.first() { Some(&id) => id, None => break }; // empty ⇒ OOM backoff: stop cleanly
             out.push(id);
             if step + 1 == n_new { break; }
             self.begin_frame();
@@ -7521,6 +7535,7 @@ impl Gpu {
                 }
             }
             let win = self.download_u32(&ids_buf);                         // flush window; one readback for w tokens
+            if win.len() < w { break; } // empty/short ⇒ OOM backoff: stop cleanly instead of panicking
             out.extend_from_slice(&win[..w]);
             step += w;
             if step < n_new { self.begin_frame(); }
@@ -7568,6 +7583,7 @@ impl Gpu {
                 }
             }
             let win = self.download_u32(&o);
+            if win.len() < w { break; } // OOM backoff: stop cleanly
             out.extend_from_slice(&win[..w]);
             step += w;
             if step < n_new { self.begin_frame(); }
@@ -7964,6 +7980,7 @@ impl Gpu {
                 }
             }
             let win = self.download_u32(&o);
+            if win.len() < w { break; } // OOM backoff: stop cleanly instead of indexing an empty readback
             // Replay with exact stream_session semantics.
             let mut draws = w;
             for j in 0..w {
