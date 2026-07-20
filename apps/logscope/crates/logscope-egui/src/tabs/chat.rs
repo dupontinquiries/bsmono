@@ -6338,8 +6338,8 @@ impl Chat {
                     for (i, m) in self.msgs.iter_mut().enumerate() {
                         if Some(i) == scroll_to { ui.scroll_to_cursor(Some(egui::Align::Center)); }
                         let (who, c, fill) = match m.role {
-                            Role::User => ("you", theme::AMBER(), theme::PANEL2()),
-                            Role::Assistant => ("assistant", theme::GREEN(), theme::PANEL()),
+                            Role::User => ("you", theme::ensure_contrast(theme::AMBER(), theme::PANEL2(), 4.5), theme::PANEL2()),
+                            Role::Assistant => ("assistant", theme::ensure_contrast(theme::GREEN(), theme::PANEL(), 4.5), theme::PANEL()),
                         };
                         let a = theme::appear(m.born, 0.18);
                         if a < 1.0 { ui.ctx().request_repaint(); }
@@ -6354,7 +6354,7 @@ impl Chat {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(who).color(c).small().strong());
                                     // node id — highlighted so it can be referenced in :mergectx (git-style prefix)
-                                    ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::VIOLET()))
+                                    ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::ensure_contrast(theme::VIOLET(), theme::BG(), 4.5)))
                                         .on_hover_text("node id — reference it in :mergectx (a unique prefix works, e.g. :mergectx a9j,3df)");
                                     if m.variants.len() > 1 {
                                         if ui.small_button("‹").on_hover_text("Previous branch").clicked() { action = Some(MsgAction::PrevVar(i)); }
