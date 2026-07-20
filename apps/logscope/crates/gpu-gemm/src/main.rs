@@ -3205,6 +3205,17 @@ fn main() {
             check(&format!("MoE fused down+combine {label} == unfused (bit-identical)"), ed, 0.0);
             check(&format!("MoE both fusions {label} == fully unfused (bit-identical)"), eb, 0.0);
         }
+        // Umbrella flag LOGSCOPE_FAST_DECODE=1 must enable the fusions (same bit-identical result as
+        // fully-unfused). Verifies the one-switch convenience path routes through the same kernels.
+        {
+            let base = gpu.download(&gpu.moe_ffn_t(&mk_q4(), &n2t, 1, d, &x2t));
+            std::env::set_var("LOGSCOPE_FAST_DECODE", "1");
+            let umb = gpu.download(&gpu.moe_ffn_t(&mk_q4(), &n2t, 1, d, &x2t));
+            std::env::remove_var("LOGSCOPE_FAST_DECODE");
+            let eu = umb.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("  LOGSCOPE_FAST_DECODE umbrella (q4): max|diff|={eu:.2e}");
+            check("MoE FAST_DECODE umbrella == unfused (bit-identical)", eu, 0.0);
+        }
     }
 
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
