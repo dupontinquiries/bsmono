@@ -7159,7 +7159,20 @@ impl Gpu {
         let saved_flush = self.flush_every();
         if !self.flush_every_pinned() {
             let per_tok = 64u32; // generous upper bound on dispatches/token; keeps a full window in one frame
-            self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
+            // On the conservative (Asahi/Honeykrisp) path, completion callbacks are unreliable — the submit
+            // governor disables itself, leaving NO backpressure on queue depth. Batching a whole window into
+            // ONE unflushed submit then hands the firmware one huge job the watchdog can kill (a decode hang
+            // with no single-kernel cause — serial-forcing the decode attention didn't clear it). So here we
+            // DON'T collapse the window into one submit; we keep a bounded flush (split the work — the same
+            // watchdog fix as prefill chunking) and accept a little per-token submit overhead. This is
+            // proactive (not gated on governor_dead, which only latches AFTER the first stalled submit — too
+            // late for the first window). LOGSCOPE_WINDOW_ONE_SUBMIT=1 restores the collapse for A/B.
+            let force_collapse = std::env::var_os("LOGSCOPE_WINDOW_ONE_SUBMIT").is_some();
+            if self.conservative_vma && !force_collapse {
+                self.set_flush_every(saved_flush.clamp(1, 64));
+            } else {
+                self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
+            }
         }
         let mut logits_t = Some(self.upload(&s.logits, 1, s.logits.len()));
         let mut produced = 0usize;
