@@ -77,6 +77,17 @@ pub fn stop_token_set(declared_eos: Option<u32>, specials: &[Option<u32>]) -> Ha
     s
 }
 
+/// Augment a stop set with EVERY control special the tokenizer carries (see Tokenizer::control_stop_ids).
+/// This is the defense-in-depth over `stop_token_set`'s hardcoded eos-name list: a converted checkpoint
+/// whose config omits a control token (e.g. <|observation|>, <sop>, [gMASK]) would otherwise print it as
+/// chat text and generate past the turn end. Content specials (<think>/<tool_call>/…) are already excluded
+/// by control_stop_ids, so reasoning/tool output is preserved.
+pub fn stop_token_set_with_controls(base: HashSet<u32>, control_ids: &[u32]) -> HashSet<u32> {
+    let mut s = base;
+    s.extend(control_ids.iter().copied());
+    s
+}
+
 pub fn gate_stop() {
     // DeepSeek-R1-Distill-Llama: GGUF declares 128001; <|eot_id|>=128009, <|end_of_text|>=128001.
     // The app watched only 128009 → missed the model's real stop (128001) → looped.
@@ -97,4 +108,28 @@ pub fn gate_stop() {
         println!("  [{}] {}", if ok { "\u{2713}" } else { "\u{2717} FAIL" }, label);
     }
     println!("gate-stop: {}", if ds_ok && llama_ok && smol_ok { "stop-set resolution checks \u{2713}" } else { "FAIL \u{2717}" });
+}
+
+#[cfg(test)]
+mod control_augment_tests {
+    use super::*;
+
+    #[test]
+    fn control_ids_are_added_to_the_stop_set() {
+        // base = declared eos + a couple named specials; controls = extra tokenizer control ids the
+        // config never declared. The augmented set must contain BOTH.
+        let base = stop_token_set(Some(128009), &[Some(128001)]);
+        let controls = [40000u32, 40001, 40002]; // e.g. <|observation|>, <sop>, [gMASK]
+        let s = stop_token_set_with_controls(base, &controls);
+        for id in [128009u32, 128001, 40000, 40001, 40002] {
+            assert!(s.contains(&id), "augmented stop set must contain {id}");
+        }
+    }
+
+    #[test]
+    fn no_controls_leaves_base_unchanged() {
+        let base = stop_token_set(Some(2), &[]);
+        let s = stop_token_set_with_controls(base.clone(), &[]);
+        assert_eq!(s, base);
+    }
 }

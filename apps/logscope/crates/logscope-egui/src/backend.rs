@@ -217,7 +217,7 @@ pub(crate) mod engine {
             // the full set every decode callback also checks (covers eot/eom/end_of_text/im_end).
             let declared = g.get_u32("tokenizer.ggml.eos_token_id");
             let eos = declared.or_else(|| tok.special_id("<|eot_id|>"));
-            let stop_ids: Vec<u32> = crate::genguard::stop_token_set(declared, &[
+            let base_stops = crate::genguard::stop_token_set(declared, &[
                 tok.special_id("<|eot_id|>"),
                 tok.special_id("<|eom_id|>"),
                 tok.special_id("<|end_of_text|>"),
@@ -234,7 +234,14 @@ pub(crate) mod engine {
                 tok.special_id("<|eot|>"),
                 tok.special_id("<|eom|>"),
                 tok.special_id("<|header_start|>"),
-            ]).into_iter().collect();
+            ]);
+            // Defense-in-depth (Colibri #298): also stop on EVERY control special the tokenizer carries,
+            // not just the hardcoded names above. A converted GGUF whose config omits a control token
+            // (<|observation|>, <sop>, [gMASK], image/audio markers, …) would otherwise print it as chat
+            // text and run past the turn end. Content specials (<think>/<tool_call>/…) are excluded by
+            // control_stop_ids, so reasoning/tool output survives.
+            let stop_ids: Vec<u32> = crate::genguard::stop_token_set_with_controls(
+                base_stops, &tok.control_stop_ids()).into_iter().collect();
             // Template family: a ChatML model carries <|im_end|> but none of the Llama-3 header
             // markers; a Llama-3 model carries <|eot_id|>/<|start_header_id|>. Anything else → Plain.
             let template = if tok.special_id("<|header_start|>").is_some() {
