@@ -4891,6 +4891,28 @@ fn main() {
         let es = g_sparse.iter().zip(&cpu_sparse).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         println!("  DSA masked-attn (top-k selection) GPU vs CPU: max|diff|={es:.2e}");
         check("DSA masked attention (top-k) == CPU reference on GPU", es, 1e-5);
+        // (b2) GPU top-k MASK must equal the CPU select_topk set exactly (incl. tie-break), for a keep that
+        // actually prunes (index_topk < nk).
+        {
+            let dm2 = DsaDims { index_nh: dm.index_nh, index_hd: dm.index_hd, index_topk: 12 };
+            let keep = nk.min(dm2.index_topk);
+            let cpu_sel = select_topk(&cpu, &dm2);
+            let cpu_mask = mask_from_selection(&cpu_sel, nk);
+            let g_scores = gpu.upload(&cpu, 1, nk);
+            let gpu_mask = gpu.download(&gpu.dsa_topk_mask_t(&g_scores, nk, keep));
+            let em = gpu_mask.iter().zip(&cpu_mask).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let gpu_kept: usize = gpu_mask.iter().filter(|&&x| x != 0.0).count();
+            println!("  DSA top-k MASK GPU vs CPU select_topk (keep={keep} of {nk}): max|diff|={em:.2e}, kept={gpu_kept}");
+            check("DSA top-k mask == CPU select_topk set on GPU", em, 0.0);
+            check("DSA top-k mask keeps exactly `keep` keys", (gpu_kept as f32) - (keep as f32), 0.0);
+            // chain: GPU score → GPU top-k mask → GPU masked attention == CPU masked attention over same set
+            let g_ma = gpu.download(&gpu.dsa_masked_attention_t(&g_q, &g_k, &g_v,
+                &gpu.dsa_topk_mask_t(&g_scores, nk, keep), nk, dk, dv));
+            let cpu_ma = masked_attention(&mq, &mk, &mv, &cpu_mask, nk, dk, dv);
+            let ec = g_ma.iter().zip(&cpu_ma).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("  DSA full chain (score→topk→masked-attn) GPU vs CPU: max|diff|={ec:.2e}");
+            check("DSA full GPU chain == CPU reference", ec, 1e-5);
+        }
         // (c) at nk <= index_topk the selection keeps ALL keys → sparse must equal dense (the anchor)
         let small_nk = dm.index_topk.min(nk); // <= index_topk
         let sel_all = select_topk(&cpu[..small_nk], &dm);
