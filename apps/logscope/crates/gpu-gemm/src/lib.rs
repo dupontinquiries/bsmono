@@ -196,6 +196,9 @@ pub struct Gpu {
     /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
     /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
     dims_ring: Mutex<(Vec<std::sync::Arc<wgpu::Buffer>>, usize, usize)>,
+    /// Set when a dims-uniform allocation was rejected by the device (validation error captured, not
+    /// aborted). The windowed generate path checks it to fall back to leaner per-token decode.
+    dims_alloc_failed: std::sync::atomic::AtomicBool,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -469,7 +472,7 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), dims_alloc_failed: std::sync::atomic::AtomicBool::new(false) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1103,6 +1106,33 @@ impl Gpu {
     /// Whether LOGSCOPE_FLUSH_EVERY pins the knob (then the tuner should not run).
     pub fn flush_every_pinned(&self) -> bool { std::env::var_os("LOGSCOPE_FLUSH_EVERY").is_some() }
 
+    /// Create + fill one dims UNIFORM buffer, capturing any device error instead of letting it abort.
+    /// The M4 "Buffer 'dims' invalid" crash is a validation error raised at write_buffer against a
+    /// buffer whose creation actually failed; wrapping both in a Validation error scope lets us LOG the
+    /// real first error (once) and continue, turning a hard abort into a diagnosable, survivable event.
+    fn make_dims_buffer(&self, dims: &[u8]) -> std::sync::Arc<wgpu::Buffer> {
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let b = std::sync::Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dims"), size: DIMS_BUF_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false }));
+        self.queue.write_buffer(&b, 0, dims);
+        if let Some(err) = pollster::block_on(scope.pop()) {
+            self.dims_alloc_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+            static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let cc = self.dims_cache.try_lock().map(|c| c.len()).unwrap_or(usize::MAX);
+                eprintln!("wgpu-engine: DIMS BUFFER ALLOC FAILED — {err:?}\n  \
+                    (dims_cache≈{cc}; the device rejected a tiny uniform alloc → memory/handle pressure. \
+                    Falling back to per-token decode for this turn.)");
+            }
+        }
+        b
+    }
+    /// Whether a dims-buffer allocation has failed (device memory/handle pressure). The engine checks
+    /// this after a windowed attempt and retries the turn on the leaner per-token path if set.
+    pub fn dims_alloc_failed(&self) -> bool { self.dims_alloc_failed.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn clear_dims_alloc_failed(&self) { self.dims_alloc_failed.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Return a reusable dims UNIFORM buffer holding `dims`, rotating a bounded ring so the total live
     /// dims-buffer count stays capped (fixes the M4 buffer-count exhaustion). The ring fills lazily to
     /// DIMS_RING_SIZE; once full it rewrites the oldest slot. Rewriting a slot whose previous use is
@@ -1114,11 +1144,7 @@ impl Gpu {
         let (buffers, next, _writes) = &mut *ring;
         if buffers.len() < DIMS_RING_SIZE {
             // still growing the ring — allocate a new reusable slot (bounded by DIMS_RING_SIZE total)
-            let b = std::sync::Arc::new(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("dims"), size: DIMS_BUF_SIZE,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false }));
-            self.queue.write_buffer(&b, 0, dims);
+            let b = self.make_dims_buffer(dims);
             buffers.push(b.clone());
             *next = buffers.len() % DIMS_RING_SIZE;
             return b;
@@ -1244,24 +1270,10 @@ impl Gpu {
             } else {
                 DIMS_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if cache.len() < DIMS_CACHE_CAP {
-                    // Room in the content cache: stable per-shape dims (linears/attention) live here and
-                    // hit forever after warmup. Create+write once.
-                    let b = std::sync::Arc::new(dev.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("dims"), size: DIMS_BUF_SIZE,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false }));
-                    self.queue.write_buffer(&b, 0, dims);
+                    let b = self.make_dims_buffer(dims);
                     cache.insert(dims.to_vec(), b.clone());
                     b
                 } else {
-                    // Cache FULL → per-position dims (sampler abs_step, decode pos) that never repeat.
-                    // Do NOT create a new Metal buffer per dispatch: over a long/windowed generation that
-                    // is thousands of tiny buffer objects and blows past Metal's buffer-count ceiling →
-                    // create_buffer fails → the next write_buffer reports "Buffer 'dims' invalid" (the
-                    // real M4 crash). Instead rewrite a BOUNDED RING of reusable uniform buffers, so the
-                    // total live dims-buffer count is capped forever. The ring is drained/rotated only at
-                    // frame flush boundaries (retain discipline), so a rewrite never races an in-flight
-                    // read of the same slot within a frame.
                     drop(cache);
                     self.ring_dims(dims)
                 }
