@@ -166,6 +166,31 @@ pub(crate) mod engine {
             let bytes: &[u8] = &mm;
             let gpu = Gpu::new();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
+            // Preflight readiness report (cf. Colibri's doctor): surface detected fragilities + the
+            // mitigations they trigger ONCE at load, so a driver quirk or a mis-set knob is visible before
+            // the first token instead of as an opaque mid-decode hang. Cheap; read-only.
+            {
+                let asahi = gpu.conservative_vma;
+                let mut notes: Vec<String> = Vec::new();
+                if asahi {
+                    // Honeykrisp/Asahi: the fragile path we've hardened against (subgroup hangs, unreliable
+                    // completion callbacks → bounded submits, watchdog-sensitive dispatches).
+                    notes.push("Asahi/Honeykrisp Vulkan detected → subgroup matvec OFF, decode window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan budget".into());
+                }
+                // Report env overrides and whether each PARSED (the PREFILL_CHUNK-vs-LOGSCOPE_PREFILL_CHUNK
+                // class of silent-ignore cost real test cycles; make it visible).
+                for (name, alias) in [("LOGSCOPE_PREFILL_CHUNK", Some("PREFILL_CHUNK")),
+                                      ("LOGSCOPE_MATVEC_SG", None), ("LOGSCOPE_DECODE_ATTN_SERIAL", None),
+                                      ("LOGSCOPE_FLUSH_EVERY", None), ("LOGSCOPE_WINDOW_ONE_SUBMIT", None)] {
+                    let val = std::env::var(name).ok().or_else(|| alias.and_then(|a| std::env::var(a).ok()));
+                    if let Some(v) = val { notes.push(format!("env {name}={v} (active)")); }
+                }
+                if notes.is_empty() {
+                    eprintln!("wgpu-engine: preflight — no special fragilities or overrides detected (standard path)");
+                } else {
+                    for n in notes { eprintln!("wgpu-engine: preflight — {n}"); }
+                }
+            }
             let g = gpu_kernels::gguf::parse(&bytes)?;
             // Pre-flight: the loader auto-selects q4-resident (≈half the int8 footprint) when int8 won't
             // fit, and falls back to q4 on a GPU OOM. So only refuse when even q4 can't fit the budget;
