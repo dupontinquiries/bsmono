@@ -5014,6 +5014,61 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if(tid==0u){ part[pbase+dd.hd]=mx; part[pbase+dd.hd+1u]=sum; }
 }"#;
 
+// Two-span attention: the WARM (int8) span emitted as flash pass-1 partials. Same partial layout as
+// DECODE_ATTN_FLASH_P1 ([hd accumulators | local_max | local_sum] per (head, chunk)) so the SAME pass-2
+// combine folds warm chunks together with the hot f32 chunks — one online-softmax over the union. Reads
+// int8 K/V (packed u32 + per-row f32 scale) with inline dequant, matching DECODE_ATTN_MH_Q8's layout.
+// Writing into a shared `part` buffer at a chunk offset means warm and hot partials coexist and pass-2
+// needs no changes. `coff` = the chunk index where this span's chunks start (hot span occupies [0,coff)).
+const DECODE_ATTN_FLASH_P1_Q8: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,coff:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kq: array<u32>;
+@group(0)@binding(2) var<storage,read> ks: array<f32>;
+@group(0)@binding(3) var<storage,read> vq: array<u32>;
+@group(0)@binding(4) var<storage,read> vs: array<f32>;
+@group(0)@binding(5) var<storage,read_write> part: array<f32>;
+@group(0)@binding(6) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let ch=wg.y; let tid=lid.x;
+  let kvdm=dd.nkv*dd.hd; let kvw=kvdm/4u;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
+  let scale=1.0/sqrt(f32(dd.hd));
+  let j0=ch*dd.chunk; let j1=min(dd.l, j0+dd.chunk);
+  // this span's chunks are placed AFTER the hot span's chunks (coff), so pass-2 sees one chunk list
+  let pbase=(hh*dd.nch+(dd.coff+ch))*(dd.hd+2u);
+  var lmax=-3.4e38; var j=j0+tid;
+  loop { if(j>=j1){break;}
+    let ksc=ks[j]; var dot=0.0;
+    for(var c=0u;c<dd.hd;c=c+1u){
+      let idx=kb+c; let word=kq[j*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      dot=dot+q[b+c]*(f32(qi)*ksc);
+    }
+    let s=dot*scale; sc[j-j0]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=j0+tid;
+  loop { if(j>=j1){break;} let p=exp(sc[j-j0]-mx); sc[j-j0]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  var c=tid;
+  loop { if(c>=dd.hd){break;}
+    var acc=0.0;
+    for(var jj=j0;jj<j1;jj=jj+1u){
+      let idx=kb+c; let word=vq[jj*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      acc=acc+sc[jj-j0]*(f32(qi)*vs[jj]);
+    }
+    part[pbase+c]=acc; c=c+64u; }
+  if(tid==0u){ part[pbase+dd.hd]=mx; part[pbase+dd.hd+1u]=sum; }
+}"#;
+
 // Split-K decode attention, pass 2: one workgroup per head folds its chunks — global max M,
 // rescaled sum S = Σ sᵢ·exp(mᵢ−M), and o = Σ oᵢ·exp(mᵢ−M) / S.
 const DECODE_ATTN_FLASH_P2: &str = r#"
@@ -5575,6 +5630,38 @@ impl Gpu {
         let part = self.alloc(1, n_heads * nch * (hd + 2));
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
         self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dims), (n_heads as u32, nch as u32, 1));
+        let out = self.alloc(1, dm);
+        let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
+        out
+    }
+
+    /// Two-span decode attention: one online softmax over a WARM int8 K/V tail (`wl` rows) followed by a
+    /// HOT f32 K/V window (`hl` rows) — the staged-KV read. Each span emits flash pass-1 partials into a
+    /// shared buffer (hot chunks first, warm chunks after), then the existing pass-2 folds ALL chunks with
+    /// the online-softmax rescale — so the result is identical to attention over the concatenated
+    /// [warm | hot] sequence, regardless of the precision split. When `wl==0` this is exactly the f32
+    /// flash path (the staged no-op gate reduces to it). Query/positions: the caller passes q for the
+    /// current token; warm rows are the older positions [0,wl), hot rows the recent [wl, wl+hl).
+    pub fn decode_attention_two_span(&self, q: &Tensor,
+            kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, wl: usize,      // warm int8 span
+            kc: &Tensor, vc: &Tensor, hl: usize,                                 // hot f32 span
+            dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let hd = dm / n_heads;
+        let chunk = 2048usize;
+        let hot_nch = hl.div_ceil(chunk).max(1);
+        let warm_nch = if wl == 0 { 0 } else { wl.div_ceil(chunk) };
+        let nch = hot_nch + warm_nch;
+        let part = self.alloc(1, n_heads * nch * (hd + 2));
+        // hot span → chunks [0, hot_nch). Reuse the f32 pass-1 unchanged (coff=0 implicit in its layout).
+        let dh = [hl as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dh), (n_heads as u32, hot_nch as u32, 1));
+        // warm span → chunks [hot_nch, nch). The int8 pass-1 writes at chunk offset coff=hot_nch so both
+        // spans' partials live in one buffer and pass-2 needs no changes.
+        if warm_nch > 0 {
+            let dw = [wl as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, hot_nch as u32, 0];
+            self.dispatch(DECODE_ATTN_FLASH_P1_Q8, &[q, kq, ks, vq, vs], &part, bytemuck::cast_slice(&dw), (n_heads as u32, warm_nch as u32, 1));
+        }
         let out = self.alloc(1, dm);
         let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
         self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
