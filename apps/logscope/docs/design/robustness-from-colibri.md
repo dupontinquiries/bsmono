@@ -104,7 +104,7 @@ constants — not "use it all and hope."
 - **Keep-alive spin** (`LOGSCOPE_GPU_SPIN`) — DONE (opt-in): holds the GPU clock warm between dispatch-bound decode bursts.
 - **Hostile-dimension guard** — DONE (load): rejects corrupt/absurd GGUF dims before they overflow allocation arithmetic (Colibri "absurd n" + shape-overflow checks).
 - **NaN/Inf sampler poison guard (CPU)** — DONE (Colibri #369): argmax skips non-finite, sample() falls back to finite argmax. A single NaN/+Inf logit no longer collapses the draw to token-0-forever.
-- **NaN/Inf guard (GPU SAMPLE_AT / argmax_t)** — TODO: the windowed-decode GPU sampler has the same vulnerability class. Needs an `isfinite`/`select` guard in the WGSL max+softmax so a poisoned logit on the GPU path is caught too. Deferred (the WGSL kernel is large and the NaN path is hard to validate in-container); the CPU guard covers non-windowed + speculative decode meanwhile.
+- **NaN/Inf guard (GPU SAMPLE_AT / argmax_t)** — DONE: SAMPLE_AT's max-selection reads non-finite logits as -inf so a poisoned logit is never picked (bit-identical on finite logits: sample-window still 0.00e0 vs CPU). Closes the windowed-decode half of the #369 vulnerability.
 - **Bounded submits cross-backend** — PARTIAL: Asahi + degraded sessions keep bounded window submits; other backends still cap at a high (finite) ceiling. Generalizing the ceiling is low-priority since it's already finite.
 
 ## Model support ported
