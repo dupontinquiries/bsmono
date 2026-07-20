@@ -14,6 +14,8 @@ use crate::spatial::{OrbitCam, Vec3};
 #[inline] fn v(x: f32, y: f32, z: f32) -> Vec3 { Vec3::new(x, y, z) }
 #[inline] fn sub(a: Vec3, b: Vec3) -> Vec3 { v(a.x - b.x, a.y - b.y, a.z - b.z) }
 #[inline] fn addv(a: Vec3, b: Vec3) -> Vec3 { v(a.x + b.x, a.y + b.y, a.z + b.z) }
+#[inline] fn subv(a: Vec3, b: Vec3) -> Vec3 { v(a.x - b.x, a.y - b.y, a.z - b.z) }
+#[inline] fn len(a: Vec3) -> f32 { (a.x * a.x + a.y * a.y + a.z * a.z).sqrt() }
 #[inline] fn mul(a: Vec3, s: f32) -> Vec3 { v(a.x * s, a.y * s, a.z * s) }
 #[inline] fn dot(a: Vec3, b: Vec3) -> f32 { a.x * b.x + a.y * b.y + a.z * b.z }
 #[inline] fn cross(a: Vec3, b: Vec3) -> Vec3 { v(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x) }
@@ -38,8 +40,18 @@ pub struct Mesh3 {
     /// own and the bloom pass catches it. 0 = inert. This is how runes, crystal, and "lit-from-within" text
     /// read as magic rather than paint. The glow takes the mesh's own `color`/`vcol` as its tint.
     pub emissive: f32,
+    /// UI-OVERLAY depth bias (0 = normal scenery). When >0, this mesh is a physical-UI element (message
+    /// panel, dock button, reading plaque) that must read as *in front of* the world it floats over — so
+    /// its sort/relative depth is pulled toward the camera by this many world units before depth-testing.
+    /// Fixes physical UI being occluded by foliage/props whose triangles happen to sort nearer. It's a
+    /// bias, not a disable: overlay elements still depth-sort *among themselves* (bezel behind slab behind
+    /// text) so the panel keeps its own internal layering. Default 0.0 for every scenery mesh.
+    pub overlay: f32,
 }
 impl Mesh3 {
+    /// Flag this mesh as a UI overlay pulled `bias` world-units toward the camera for depth (draws over
+    /// scenery it floats against, while overlay elements still layer correctly among themselves).
+    pub fn as_overlay(mut self, bias: f32) -> Self { self.overlay = bias; self }
     /// Builder: flag this mesh as self-illuminated (glows + blooms in its own colour).
     pub fn emit(mut self, e: f32) -> Self { self.emissive = e; self }
 }
@@ -139,7 +151,7 @@ pub fn load_obj_str(src: &str, color: Color32, mat: f32) -> Mesh3 {
             _ => {}
         }
     }
-    Mesh3 { verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat, emissive: 0.0 }
+    Mesh3 { verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat, emissive: 0.0, overlay: 0.0 }
 }
 
 pub fn uv_sphere(center: Vec3, r: f32, segs: usize, rings: usize, color: Color32) -> Mesh3 {
@@ -164,7 +176,7 @@ pub fn uv_sphere(center: Vec3, r: f32, segs: usize, rings: usize, color: Color32
             tris.push([a + 1, c, c + 1]);
         }
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// An open tube (cylinder wall) between `a` and `b` of radius `r`, smooth around the ring. Good for edges.
@@ -186,7 +198,7 @@ pub fn tube(a: Vec3, b: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
         tris.push([a0, a0 + 2, a0 + 1]);
         tris.push([a0 + 1, a0 + 2, a0 + 3]);
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A tapered, gently CURVED branch (not a straight pillar): a multi-ring tube swept along a curve that bows in
@@ -235,7 +247,7 @@ pub fn branch_curved(a: Vec3, dir: Vec3, len: f32, r0: f32, r1: f32, side: Vec3,
             tris.push([a0 + 1, b0, b0 + 1]);
         }
     }
-    (Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }, cen[rings], tan[rings])
+    (Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }, cen[rings], tan[rings])
 }
 pub fn rock(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
     let base = uv_sphere(center, r, 16, 12, color); // higher-res base (also scales with detail)
@@ -257,7 +269,7 @@ pub fn rock(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
         for &vi in t { norms[vi as usize] = addv(norms[vi as usize], nf); }
     }
     for nn in &mut norms { *nn = norm(*nn); }
-    Mesh3 { emissive: 0.0, verts: pv, norms, tris: base.tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts: pv, norms, tris: base.tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A zen cairn — a stack of rocks of decreasing size, jittered a little off-axis. Returns one mesh per
@@ -389,8 +401,6 @@ pub fn anim_cell(mode: TextAnim, t: f32, cf: f32, ci: usize, scale: f32) -> (f32
 /// message plaque. 6×4 (≈24 triangles) reads as a genuinely round dot instead of a diamond-ish blob,
 /// roughly doubling per-dot triangle count — a deliberate moderate bump, not maxed out, since a single
 /// 32-char plaque line can already place 100+ dots (up to 5×7×32) and this scene renders many labels.
-const DOT_SEGMENTS: usize = 6;
-const DOT_RINGS: usize = 4;
 
 /// A scene's PHYSICAL light source that "writes" the reading plaque's text via a real in-scene
 /// process — dappled leaf-light, refraction through a rotating pearl's facets, bioluminescent motes
@@ -584,7 +594,12 @@ pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: 
                     // RainbowRefraction, its hue) — see SceneLight's doc comment for the full ledger.
                     let (bright, hue_shift_deg) = modulate_dot(scene_light, ci as f32 * 6.0 + x as f32, y as f32, seed, t);
                     let dot_col = if hue_shift_deg != 0.0 { hue_rotate(col, hue_shift_deg) } else { col };
-                    let mut m = uv_sphere(p, scale * 0.46, DOT_SEGMENTS, DOT_RINGS, dot_col);
+                    // A glyph pixel is a small camera-facing QUAD, not a glowing ball — quads tile into
+                    // clean strokes (a ball-per-pixel reads as a cheesy dot-matrix and blooms into mush).
+                    // Sized just over one cell so adjacent lit pixels touch into solid strokes; kept flat
+                    // to the view plane (right/up) so it stays crisp at any angle.
+                    let r = scale * 0.60;
+                    let mut m = quad_facing(p, right, up, r, r, dot_col);
                     m.emissive = emis * lit * bright;
                     out.push(m);
                 }
@@ -592,6 +607,22 @@ pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: 
         }
     }
     out
+}
+
+/// A small flat quad centered at `c`, spanning `hw`×`hh` (half-extents) in the `right`/`up` plane —
+/// a camera-facing "pixel" for crisp billboard text (see label_cells). Two triangles, uniform colour,
+/// normal facing the camera so it lights flat and reads as a clean stroke rather than a glossy bead.
+pub fn quad_facing(c: Vec3, right: Vec3, up: Vec3, hw: f32, hh: f32, color: Color32) -> Mesh3 {
+    let n = norm(cross(right, up));
+    let verts = vec![
+        addv(c, addv(mul(right, -hw), mul(up, -hh))),
+        addv(c, addv(mul(right,  hw), mul(up, -hh))),
+        addv(c, addv(mul(right,  hw), mul(up,  hh))),
+        addv(c, addv(mul(right, -hw), mul(up,  hh))),
+    ];
+    let norms = vec![n, n, n, n];
+    let tris = vec![[0u32, 1, 2], [0, 2, 3]];
+    Mesh3 { verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0, overlay: 0.0 }
 }
 
 #[inline] fn shade(albedo: Color32, light: &Light, ny: f32, ndotl: f32) -> Color32 {
@@ -613,6 +644,7 @@ pub fn label_cells(center: Vec3, right: Vec3, up: Vec3, toward_cam: Vec3, text: 
 /// (so floating objects move without rebuilding); triangles behind the camera are dropped; painted far→near.
 pub fn render(meshes: &[Mesh3], cam: &OrbitCam, cx: f32, cy: f32, scale: f32, light: &Light) -> Mesh {
     let l = norm(light.dir);
+    let eye = cam.eye_world();
     let mut tris: Vec<(f32, [Pos2; 3], [Color32; 3])> = Vec::new();
     for m in meshes {
         for tri in &m.tris {
@@ -622,7 +654,16 @@ pub fn render(meshes: &[Mesh3], cam: &OrbitCam, cx: f32, cy: f32, scale: f32, li
             let mut cols = [Color32::BLACK; 3];
             let mut ok = true;
             for k in 0..3 {
-                match cam.project(addv(m.verts[idx[k]], m.offset), cx, cy, scale) {
+                let mut wp = addv(m.verts[idx[k]], m.offset);
+                if m.overlay > 0.0 {
+                    // pull toward the eye so UI slabs paint over foliage they float against (same bias as
+                    // the GPU packer); painter's algorithm here means the reduced depth also draws it later.
+                    let dv = subv(eye, wp);
+                    let d = len(dv).max(1e-3);
+                    let s = m.overlay.min(d * 0.6) / d;
+                    wp = addv(wp, mul(dv, s));
+                }
+                match cam.project(wp, cx, cy, scale) {
                     Some((sx, sy, d)) => { sp[k] = Pos2::new(sx, sy); dep[k] = d; }
                     None => { ok = false; break; }
                 }
@@ -668,7 +709,7 @@ pub fn torus(center: Vec3, big_r: f32, tube_r: f32, nmaj: usize, nmin: usize, co
             tris.push([a + 1, c, c + 1]);
         }
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A flat disc on the XZ plane facing up — ground / water / a floating-island top.
@@ -681,7 +722,7 @@ pub fn disc(center: Vec3, r: f32, segs: usize, color: Color32) -> Mesh3 {
         norms.push(v(0.0, 1.0, 0.0));
     }
     for j in 0..segs as u32 { tris.push([0, j + 1, j + 2]); }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// Local-clock hour (0..24, fractional). Uses the OS timezone so the scene tracks the real time of day.
@@ -746,7 +787,7 @@ pub fn panel(center: Vec3, right: Vec3, up: Vec3, w: f32, h: f32, color: Color32
     let verts = vec![sub(sub(center, r), u), sub(addv(center, r), u), addv(addv(center, r), u), addv(sub(center, r), u)];
     let norms = vec![n; 4];
     let tris = vec![[0u32, 1, 2], [0, 2, 3]];
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A tall arched window: a `w`×`h` rectangular pane topped by a semicircular arch (radius w/2), all in the
@@ -825,7 +866,7 @@ pub fn arch_window_styled(center: Vec3, right: Vec3, up: Vec3, w: f32, h: f32, s
     let m = crown.len() as u32;
     for j in 0..m - 1 { tris.push([cidx, cidx + 1 + j, cidx + 2 + j]); }
     let norms = vec![n; verts.len()];
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A COMPOSITE (multi-opening) window assembly — a large central arch flanked by side openings, the forms a
@@ -915,7 +956,7 @@ pub fn leaded_arch(center: Vec3, right: Vec3, up: Vec3, w: f32, h: f32,
 /// A single flat triangle (for mosaic facets). Normal from the winding.
 pub fn tri(a: Vec3, b: Vec3, cc: Vec3, color: Color32) -> Mesh3 {
     let n = norm(cross(sub(b, a), sub(cc, a)));
-    Mesh3 { emissive: 0.0, verts: vec![a, b, cc], norms: vec![n; 3], tris: vec![[0, 1, 2]], color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts: vec![a, b, cc], norms: vec![n; 3], tris: vec![[0, 1, 2]], color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A real leaded STAINED-GLASS arch: a dark leading backing + a MOSAIC of many small glass tiles, each a
@@ -976,7 +1017,7 @@ pub fn wall_ring(center: Vec3, radius: f32, height: f32, segs: usize, color: Col
         tris.push([a, a + 2, a + 1]);
         tris.push([a + 1, a + 2, a + 3]);
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// Non-uniformly scale a mesh in the XZ plane about the origin (Y untouched). Lets a circular builder
@@ -1026,7 +1067,7 @@ pub fn wall_ring_gapped(center: Vec3, radius: f32, height: f32, segs: usize, col
         tris.push([a, a + 2, a + 1]);
         tris.push([a + 1, a + 2, a + 3]);
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A flat ring (annulus) lying in the XZ plane, facing up — one concentric terrace step. `r_inner`..`r_outer`.
@@ -1044,7 +1085,7 @@ pub fn annulus(center: Vec3, r_inner: f32, r_outer: f32, segs: usize, color: Col
         tris.push([a, a + 2, a + 1]);
         tris.push([a + 1, a + 2, a + 3]);
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// An inward-facing dome cap closing the top of an enclosure: rings sweep up from `base_r` (at `center.y`)
@@ -1073,7 +1114,7 @@ pub fn dome_cap(center: Vec3, base_r: f32, rise: f32, oculus_r: f32, segs: usize
             tris.push([b, cc, d]);
         }
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 /// reads as a real folded sheet rather than a flat triangle. `size` is the half-width, `rise` the fold
 /// height. Smooth-averaged normals (the geometry still carries the creases).
@@ -1106,7 +1147,7 @@ pub fn paper_fold(center: Vec3, size: f32, rise: f32, color: Color32) -> Mesh3 {
         for &vi in t { norms[vi as usize] = addv(norms[vi as usize], nf); }
     }
     for nn in &mut norms { *nn = norm(*nn); }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 pub fn leaf_cluster(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
@@ -1165,7 +1206,7 @@ pub fn leaf_cluster_lod(center: Vec3, r: f32, seed: u32, color: Color32, detail:
         tris.push([si, si + 2, si + 1]);
         tris.push([si + 1, si + 2, si + 3]);
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A SINGLE leaf blade (one cupped blade with a raised midrib), tilted up-and-out by `seed`. Used for leaf-style
@@ -1191,7 +1232,7 @@ pub fn leaf_single(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
         verts.push(p); norms.push(nrm);
     }
     for j in 0..BLADE.len() as u32 { tris.push([0, 1 + j, 1 + ((j + 1) % BLADE.len() as u32)]); }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// A rippling strand between `a` and `b`: a tube around a wavy centreline that bows out in the middle
@@ -1234,7 +1275,7 @@ pub fn strand(a: Vec3, b: Vec3, r: f32, around: usize, segments: usize, t: f32, 
             tris.push([a0 + 1, a1, a1 + 1]);
         }
     }
-    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0 }
+    Mesh3 { emissive: 0.0, verts, norms, tris, color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, overlay: 0.0 }
 }
 
 /// What a graph node's body looks like — chosen per scene/palette.
@@ -1264,7 +1305,7 @@ fn mesh_merge(into: &mut Mesh3, add: &Mesh3) {
 /// tome, for a normal prose turn) · 2 scroll (code/file/long turns; `unroll` 0..1 = how far the sheet spills
 /// open, so longer content unrolls further). Returns one merged mesh; pair with the PAPER material.
 pub fn library_node(kind: u32, center: Vec3, r: f32, unroll: f32, seed: u32, color: Color32) -> Mesh3 {
-    let mut m = Mesh3 { verts: Vec::new(), norms: Vec::new(), tris: Vec::new(), color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0 };
+    let mut m = Mesh3 { verts: Vec::new(), norms: Vec::new(), tris: Vec::new(), color, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0, overlay: 0.0 };
     let yaw = ((seed % 17) as f32 / 17.0 - 0.5) * 0.9;       // a little per-node turn so they don't line up
     let right = v(yaw.cos(), 0.0, yaw.sin());
     let fwd = v(-yaw.sin(), 0.0, yaw.cos());
@@ -1344,7 +1385,7 @@ pub fn cracked_pearl(center: Vec3, r: f32, seed: u32, color: Color32) -> Mesh3 {
         for p in [a, b, cc] { verts.push(addv(p, center)); norms.push(n); vcol.push(fc); }
         tris.push([bi, bi + 1, bi + 2]);
     }
-    Mesh3 { verts, norms, tris, color, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0 }
+    Mesh3 { verts, norms, tris, color, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0, overlay: 0.0 }
 }
 
 /// A symmetric identicon for `seed`: the filled cells of a `grid`×`grid` pattern, mirrored left↔right (so
@@ -1458,21 +1499,22 @@ mod tests {
     }
 
     #[test]
-    fn label_dots_are_rounder_than_the_old_low_res_blob() {
-        // the literal "dots too low-res" complaint: each lit pixel used to be a 4×3 sphere (~12 tris,
-        // reads as a faceted diamond up close). Confirms the fix actually raised the segment counts,
-        // and that label_cells uses the shared constants rather than a hand-rolled number that could
-        // silently drift back down.
-        assert!(DOT_SEGMENTS > 4 && DOT_RINGS > 3, "must be a real improvement over the old 4×3");
+    fn label_pixels_are_crisp_quads_not_blobs() {
+        // the "cheesy dot-matrix" complaint: each lit pixel used to be a glowing uv_sphere (a bead),
+        // which blooms into mush and reads as a low-res dot grid. Now each pixel is a flat camera-facing
+        // QUAD (2 tris) sized to tile into solid strokes. Confirm label_cells emits quad-shaped meshes
+        // (4 verts / 2 tris each) rather than spheres.
         let dots = label_cells(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, Vec3 { x: 1.0, y: 0.0, z: 0.0 }, Vec3 { x: 0.0, y: 1.0, z: 0.0 },
             Vec3 { x: 0.0, y: 0.0, z: 1.0 }, "Hi", 0.2, 0.0, Color32::WHITE, 1.0, 0.0, TextAnim::Plain, SceneLight::Uniform, 0);
         assert!(!dots.is_empty());
-        // a uv_sphere(segs, rings) mesh has 2 + segs*(rings-1) vertices and 2*segs + segs*(rings-2)*2
-        // triangles (poles + rings of quads) — just check it's meaningfully more detailed than the old
-        // 4×3 sphere would have produced, without hard-coding uv_sphere's internal formula here.
-        let old_tri_count = uv_sphere(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.1, 4, 3, Color32::WHITE).tris.len();
-        let new_tri_count = uv_sphere(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.1, DOT_SEGMENTS, DOT_RINGS, Color32::WHITE).tris.len();
-        assert!(new_tri_count > old_tri_count, "new dot ({new_tri_count} tris) should be more detailed than the old one ({old_tri_count} tris)");
+        // every glyph pixel is a quad: exactly 4 vertices, 2 triangles
+        for d in &dots {
+            assert_eq!(d.verts.len(), 4, "glyph pixel should be a quad (4 verts), got {}", d.verts.len());
+            assert_eq!(d.tris.len(), 2, "glyph pixel should be 2 triangles, got {}", d.tris.len());
+        }
+        // a quad is far cheaper than the old 4×3 sphere (~12 tris) AND reads crisper
+        let old_sphere_tris = uv_sphere(Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0.1, 4, 3, Color32::WHITE).tris.len();
+        assert!(2 < old_sphere_tris, "quad glyph ({} tris) is lighter than the old blob ({old_sphere_tris} tris)", 2);
     }
 
     #[test]
