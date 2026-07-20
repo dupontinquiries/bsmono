@@ -334,6 +334,11 @@ fn bind_group_cache_enabled() -> bool {
 fn moe_glu_fused() -> bool {
     std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
 }
+/// Fuse the MoE down-projection with the weighted combine + residual into one kernel (one fewer dispatch
+/// per MoE layer, no [slots,d] scratch). OPT-IN (default off); bit-identical to the unfused path.
+fn moe_down_fused() -> bool {
+    std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
+}
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
 fn fuse_norm_enabled() -> bool {
@@ -2455,6 +2460,18 @@ impl Gpu {
             // 4) SwiGLU over the packed [slots, 2ff]
             self.swiglu_packed(&gu_out)
         };
+        // 5+6) down projection + weighted combine + residual.
+        if moe_down_fused() {
+            // ONE fused dispatch: per output column, reduce each expert's down row, combine weight[s]·result,
+            // add residual. No [slots,d] scratch, no separate MOE_WSUM. Bit-identical.
+            let dn_sh = match &m.stacked_down.kind { LinKind::Q4(_) => MOE_DOWN_COMBINE_Q4, _ => MOE_DOWN_COMBINE_Q8 };
+            let out = self.alloc(1, d);
+            let gx = (d as u32).min(32768);
+            let gy = (d as u32).div_ceil(gx);
+            let dims = [d as u32, dn_k as u32, (dn_k / 32) as u32, gx, slots as u32, 0u32, 0u32, 0u32];
+            self.dispatch(dn_sh, &[&hmid, dn_qw, dn_qs, &selw, x2], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+            return Some((out, selw));
+        }
         // 5) down projection per expert (per-slot activation rows)
         let dn_out = self.alloc(slots, d);
         {
@@ -3879,6 +3896,87 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   workgroupBarrier();
   for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
   if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+}"#;
+
+// Fused down-projection + weighted-combine + residual (Q8). The unfused path was: MOE_MATVEC (down,
+// write [slots,d]) → MOE_WSUM (out[col] = resid[col] + Σ_s w[s]·down[s·d+col]) — two dispatches + a
+// [slots,d] scratch. This does both in ONE: one workgroup per output column `col` loops over the selected
+// experts, reduces each expert's down row against that slot's hmid activation, accumulates weight[s]·result
+// (weights are the f32-bitcast tail of selw), adds the residual, and writes o[col]. Bit-identical to the
+// two-step path (same reductions, same combine order s=0..slots). Removes 1 dispatch/MoE-layer + scratch.
+const MOE_DOWN_COMBINE_Q8: &str = r#"
+struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> hmid: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read> resid: array<f32>;
+@group(0)@binding(5) var<storage,read_write> o: array<f32>;
+@group(0)@binding(6) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.d){ return; }
+  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  for(var s=0u;s<d.slots;s=s+1u){
+    let expert=selw[s];
+    let w=bitcast<f32>(selw[d.slots+s]);
+    let row=expert*d.d+col;
+    let wbase=row*(d.k/4u); let sbase=row*d.kb; let abase=s*d.k;
+    var acc=0.0; var kk=tid;
+    loop { if(kk>=d.k){break;}
+      let scale=qs[sbase+(kk/32u)];
+      let word=qw[wbase+(kk/4u)];
+      let ub=extractBits(word,(kk%4u)*8u,8u);
+      let q=select(i32(ub), i32(ub)-256, ub>=128u);
+      acc=acc+hmid[abase+kk]*scale*f32(q);
+      kk=kk+64u;
+    }
+    red[tid]=acc; workgroupBarrier();
+    for(var st=32u;st>0u;st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    if(tid==0u){ total=total+w*red[0]; }
+    workgroupBarrier();
+  }
+  if(tid==0u){ o[col]=total; }
+}"#;
+
+// Fused down + combine + residual (Q4) — identical structure, 4-bit weights (nibble − 8).
+const MOE_DOWN_COMBINE_Q4: &str = r#"
+struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> hmid: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read> resid: array<f32>;
+@group(0)@binding(5) var<storage,read_write> o: array<f32>;
+@group(0)@binding(6) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.d){ return; }
+  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  for(var s=0u;s<d.slots;s=s+1u){
+    let expert=selw[s];
+    let w=bitcast<f32>(selw[d.slots+s]);
+    let row=expert*d.d+col;
+    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=s*d.k;
+    var acc=0.0; var kk=tid;
+    loop { if(kk>=d.k){break;}
+      let scale=qs[sbase+(kk/32u)];
+      let word=qw[wbase+(kk/8u)];
+      let nib=extractBits(word,(kk%8u)*4u,4u);
+      let q=i32(nib)-8;
+      acc=acc+hmid[abase+kk]*scale*f32(q);
+      kk=kk+64u;
+    }
+    red[tid]=acc; workgroupBarrier();
+    for(var st=32u;st>0u;st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    if(tid==0u){ total=total+w*red[0]; }
+    workgroupBarrier();
+  }
+  if(tid==0u){ o[col]=total; }
 }"#;
 const MOE_WSUM: &str = r#"
 struct D { n:u32,k:u32,_b:u32,_c:u32 };

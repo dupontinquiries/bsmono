@@ -3188,6 +3188,23 @@ fn main() {
         let e4 = fused4.iter().zip(&unfused4).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         println!("  fused gate‖up+SwiGLU vs unfused (q4 MoE): max|diff|={e4:.2e}");
         check("MoE fused-GLU kernel Q4 == unfused path (bit-identical)", e4, 0.0);
+
+        // Down+combine fusion (LOGSCOPE_FUSE_DOWN): must also be bit-identical, on q8 and q4, and compose
+        // with the GLU fusion (both on) — the full-fused MoE forward must equal the fully-unfused one.
+        for (label, mk) in [("q8", &mk_q8 as &dyn Fn() -> gpu_kernels::MoeLayer), ("q4", &mk_q4)] {
+            let base = gpu.download(&gpu.moe_ffn_t(&mk(), &n2t, 1, d, &x2t)); // all unfused
+            std::env::set_var("LOGSCOPE_FUSE_DOWN", "1");
+            let dfused = gpu.download(&gpu.moe_ffn_t(&mk(), &n2t, 1, d, &x2t));
+            std::env::set_var("LOGSCOPE_FUSE_GLU", "1"); // both fusions on
+            let bothf = gpu.download(&gpu.moe_ffn_t(&mk(), &n2t, 1, d, &x2t));
+            std::env::remove_var("LOGSCOPE_FUSE_DOWN");
+            std::env::remove_var("LOGSCOPE_FUSE_GLU");
+            let ed = dfused.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let eb = bothf.iter().zip(&base).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!("  fused down+combine ({label}): max|diff|={ed:.2e} | both fusions: max|diff|={eb:.2e}");
+            check(&format!("MoE fused down+combine {label} == unfused (bit-identical)"), ed, 0.0);
+            check(&format!("MoE both fusions {label} == fully unfused (bit-identical)"), eb, 0.0);
+        }
     }
 
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
