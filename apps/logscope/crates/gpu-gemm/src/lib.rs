@@ -5162,6 +5162,94 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
   o[j1]=x0*s+x1*c;
 }"#;
 
+// MLA attention with SEPARATE score dim (qk) and value dim (vh) — MLA's qk_head (nope+rope) and v_head
+// generally differ (DeepSeek-V3: 192 vs 128), so the standard ATTENTION_MH (single hd) can't be reused.
+// One query row (decode step) at position `p` = t-1, causal over t cached rows. K is [t, nh·qk] with each
+// head's [k_nope | k_rot] already materialized; V is [t, nh·vh]; Q is [1, nh·qk]. One thread per head.
+// Pack the kv_b reconstruction [t, nh·(qk_nope+v_head)] + shared rot cache [t, qk_rope] into full per-head
+// K [t, nh·qk_head] (each head = [k_nope | k_rot]) and V [t, nh·v_head]. One thread per (row, head).
+// NEOX-rope the rope-part [qk_nope, qk_head) of each head of an MLA query [1, nh*qk_head] at position pos.
+const MLA_QROPE: &str = r#"
+struct D { nh:u32, qk_nope:u32, qk_rope:u32, pos:u32, base:f32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let qk=d.qk_nope+d.qk_rope; let half=d.qk_rope/2u;
+  let n=d.nh*qk;
+  let id=g.x; if(id>=n){return;}
+  let hh=id/qk; let c=id%qk;
+  // copy through by default; overwrite the rope-half pairs
+  o[id]=x[id];
+  if(c>=d.qk_nope && c<d.qk_nope+half){
+    let i=c-d.qk_nope;
+    let base_i=hh*qk+d.qk_nope;
+    let freq=f32(d.pos)/pow(d.base,(2.0*f32(i))/f32(d.qk_rope));
+    let cs=cos(freq); let sn=sin(freq);
+    let x0=x[base_i+i]; let x1=x[base_i+i+half];
+    o[base_i+i]=x0*cs-x1*sn;
+    o[base_i+i+half]=x0*sn+x1*cs;
+  }
+}"#;
+
+// Pack the kv_b reconstruction [t, nh·(qk_nope+v_head)] into full per-head K [t, nh·qk_head] by
+// concatenating the shared rot cache [t, qk_rope] onto each head's k_nope. One thread per (row, head).
+const MLA_PACK_K: &str = r#"
+struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> rec: array<f32>;
+@group(0)@binding(1) var<storage,read> rot: array<f32>;
+@group(0)@binding(2) var<storage,read_write> kout: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; let n=d.t*d.nh; if(id>=n){return;}
+  let row=id/d.nh; let hh=id%d.nh;
+  let recw=d.nh*(d.qk_nope+d.v_head); let recb=row*recw+hh*(d.qk_nope+d.v_head);
+  let qk=d.qk_nope+d.qk_rope; let kb=row*(d.nh*qk)+hh*qk;
+  for(var c=0u;c<d.qk_nope;c=c+1u){ kout[kb+c]=rec[recb+c]; }
+  for(var c=0u;c<d.qk_rope;c=c+1u){ kout[kb+d.qk_nope+c]=rot[row*d.qk_rope+c]; }
+}"#;
+
+const MLA_PACK_V: &str = r#"
+struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> rec: array<f32>;
+@group(0)@binding(1) var<storage,read_write> vout: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; let n=d.t*d.nh; if(id>=n){return;}
+  let row=id/d.nh; let hh=id%d.nh;
+  let recw=d.nh*(d.qk_nope+d.v_head); let recb=row*recw+hh*(d.qk_nope+d.v_head);
+  let vb=row*(d.nh*d.v_head)+hh*d.v_head;
+  for(var c=0u;c<d.v_head;c=c+1u){ vout[vb+c]=rec[recb+d.qk_nope+c]; }
+}"#;
+
+const MLA_ATTN: &str = r#"
+struct D { t:u32, nh:u32, qk:u32, vh:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> k: array<f32>;
+@group(0)@binding(2) var<storage,read> v: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let hh=g.x; if(hh>=d.nh){return;}
+  let qkdm=d.nh*d.qk; let vdm=d.nh*d.vh;
+  let qb=hh*d.qk; let vb=hh*d.vh;
+  let scale=1.0/sqrt(f32(d.qk));
+  var mx=-3.4e38;
+  for(var j=0u;j<d.t;j=j+1u){ var dot=0.0; for(var c=0u;c<d.qk;c=c+1u){dot=dot+q[qb+c]*k[j*qkdm+qb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<d.t;j=j+1u){
+    var dot=0.0; for(var c=0u;c<d.qk;c=c+1u){dot=dot+q[qb+c]*k[j*qkdm+qb+c];}
+    let pw=exp(dot*scale-mx); sum=sum+pw;
+    for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=o[vb+c]+pw*v[j*vdm+vb+c];}
+  }
+  for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=o[vb+c]/sum;}
+}"#;
+
 const ATTENTION_MH: &str = r#"
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -5916,6 +6004,36 @@ impl Gpu {
         // o-proj [d, h·v_head]
         let out_t = self.upload(&out, 1, h * dm.v_head);
         self.linear_t(&out_t, &w.o, 1, dm.d, h * dm.v_head)
+    }
+
+    /// Fully-on-GPU MLA attention step: same math as `mla_attention_step_t` but the score/softmax/ΣV inner
+    /// loop and the query-rope + KV-pack run as GPU kernels (no CPU readback mid-attention). Validated
+    /// bit-for-bit against the CPU reference. This is the MLA perf path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mla_attention_step_gpu(&self, x: &Tensor, w: &crate::mla::MlaWeightsT, dm: &crate::mla::MlaDims,
+                                  c_kv: &Tensor, k_rot: &Tensor, pos: usize) -> Tensor {
+        let h = dm.n_heads; let qk = dm.qk_head(); let rec = dm.qk_nope + dm.v_head; let t = pos + 1;
+        // Q: x → q_a → norm → q_b → per-head q; NEOX-rope the rope part of each head (GPU).
+        let qa = self.linear_t(x, &w.q_a, 1, dm.q_lora, dm.d);
+        let qa = self.rmsnorm_t(&qa, &w.q_a_ln, 1, dm.q_lora, dm.eps);
+        let q = self.linear_t(&qa, &w.q_b, 1, h * qk, dm.q_lora);
+        let q_roped = self.alloc(1, h * qk);
+        let qd = [h as u32, dm.qk_nope as u32, dm.qk_rope as u32, pos as u32, dm.base.to_bits(), 0, 0, 0];
+        self.dispatch(MLA_QROPE, &[&q], &q_roped, bytemuck::cast_slice(&qd), (((h * qk) as u32).div_ceil(64), 1, 1));
+        // Reconstruct per-head K_nope+V from the whole latent cache (GPU matmul): [t, h·rec].
+        let recon = self.linear_t(c_kv, &w.kv_b, t, h * rec, dm.kv_lora);
+        // Pack into full per-head K [t, h·qk] and V [t, h·vh] (GPU, two single-output kernels).
+        let k_full = self.alloc(t, h * qk);
+        let v_full = self.alloc(t, h * dm.v_head);
+        let pd = [t as u32, h as u32, dm.qk_nope as u32, dm.qk_rope as u32, dm.v_head as u32, 0, 0, 0];
+        self.dispatch(MLA_PACK_K, &[&recon, k_rot], &k_full, bytemuck::cast_slice(&pd), (((t * h) as u32).div_ceil(64), 1, 1));
+        self.dispatch(MLA_PACK_V, &[&recon], &v_full, bytemuck::cast_slice(&pd), (((t * h) as u32).div_ceil(64), 1, 1));
+        // MLA attention over the packed K/V (GPU): one query row, causal over t.
+        let ctx = self.alloc(1, h * dm.v_head);
+        let ad = [t as u32, h as u32, qk as u32, dm.v_head as u32];
+        self.dispatch(MLA_ATTN, &[&q_roped, &k_full, &v_full], &ctx, bytemuck::cast_slice(&ad), ((h as u32).div_ceil(64), 1, 1));
+        // o-proj.
+        self.linear_t(&ctx, &w.o, 1, dm.d, h * dm.v_head)
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
