@@ -4581,7 +4581,7 @@ fn main() {
             // all-hot: drive the slide across a long decode, assert it's inert
             let mut staged = gpu.staged_new(16, 600, kv_dim, gpu_kernels::kvstage::StagePolicy::all_hot());
             let mut demoted_total = 0usize;
-            for pos in 1..=520usize { demoted_total += gpu.staged_slide(&mut staged, pos); }
+            for pos in 1..=520usize { demoted_total += gpu.staged_slide(&mut staged, pos, kv_dim); }
             let allhot_ok = demoted_total == 0 && staged.warm_len == 0 && staged.policy.warm_len() == 0;
             println!("  staged all_hot: demoted={demoted_total} warm_len={} (expect 0/0)", staged.warm_len);
 
@@ -4589,13 +4589,34 @@ fn main() {
             let mut st2 = gpu.staged_new(16, 4200, kv_dim, gpu_kernels::kvstage::StagePolicy::new(128, 64));
             let mut conserve_ok = true;
             for pos in 1..=4000usize {
-                gpu.staged_slide(&mut st2, pos);
+                gpu.staged_slide(&mut st2, pos, kv_dim);
                 if st2.policy.warm_len() + st2.policy.hot_len(pos) != pos { conserve_ok = false; break; }
             }
             let staged_bulk_warm = st2.warm_len > 3500 && st2.warm_len == st2.policy.warm_len();
             println!("  staged window=128: warm_len={} conserve={} (bulk warm, tokens conserved)", st2.warm_len, conserve_ok);
             check("staged KV all_hot is a no-op + windowed policy conserves tokens",
                 if allhot_ok && conserve_ok && staged_bulk_warm { 0.0 } else { 1.0 }, 0.5);
+
+            // Demotion round-trip: fill a hot cache with known values, force one demote, dequant the warm
+            // block back and confirm it matches within int8 tolerance — proves staged_slide's quantize+
+            // append actually preserves the KV (not just the bookkeeping).
+            {
+                let policy = gpu_kernels::kvstage::StagePolicy::new(128, 128);
+                let mut st3 = gpu.staged_new(2, 600, kv_dim, policy);
+                // write known values into hot rows [0,128) of layer 0 by replacing the hot tensors
+                let known: Vec<f32> = (0..128 * kv_dim).map(|i| ((i % 37) as f32 - 18.0) / 6.0).collect();
+                st3.hot.k[0] = gpu.upload(&known, 128, kv_dim);
+                st3.hot.v[0] = gpu.upload(&known, 128, kv_dim);
+                // drive to a position that triggers exactly one demote of block [0,128)
+                let mut demoted = 0;
+                for pos in 1..=(128 + 128 + 2) { demoted += gpu.staged_slide(&mut st3, pos, kv_dim); }
+                let rt_ok = if demoted >= 128 && !st3.warm.kq.is_empty() {
+                    let deq = gpu.download(&gpu.dequant_rows(&st3.warm.kq[0], &st3.warm.ks[0], 128, kv_dim));
+                    maxerr(&deq, &known)
+                } else { 999.0 };
+                println!("  staged demote round-trip: demoted={demoted} k max|deq-orig|={rt_ok:.2e}");
+                check("staged KV demotion preserves rows through int8", rt_ok, 5e-2);
+            }
         }
 
         // BIG WINDOW / dims-cache overflow (regression for the M4 k=256 crash): a large window
