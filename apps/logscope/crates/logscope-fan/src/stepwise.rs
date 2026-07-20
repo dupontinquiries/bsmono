@@ -14,7 +14,9 @@ pub const STEPWISE_PROMPT: &str = "\n\nSTEPWISE PROTOCOL: Structure your work as
 then do ONE step at a time. After completing each step, output on its own line exactly:\n\
 ⏸ STEP <k>/<n> — <one-line summary of what you just did>\n\
 and then STOP. You will be told to continue. Do not do more than one step between markers. \
-On the final step, write your marker line and then TASK_COMPLETE.";
+If the work needs more steps than you first planned, just keep numbering past <n> (e.g. 4/3, 5/3) — the \
+plan can grow. The run ends ONLY when you write TASK_COMPLETE on its own line, NOT when k reaches n; so on \
+your actual final step, write your marker line and then TASK_COMPLETE.";
 
 /// A parsed step marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,11 +53,47 @@ pub fn should_pause(text: &str, last_paused: u32) -> Option<StepMark> {
     if m.k > last_paused { Some(m) } else { None }
 }
 
-/// Auto-continue policy after a pause: continue while steps remain, under a hard cap so a confused model
-/// can't loop the harness forever. Final step (k==n) or TASK_COMPLETE in the text ends the run.
-pub fn should_continue(mark: &StepMark, text: &str, continues_so_far: u32, cap: u32) -> bool {
-    mark.k < mark.n && continues_so_far < cap && !text.contains("TASK_COMPLETE")
+/// Explicit "I'm finished" signals a model emits. `k==n` is deliberately NOT one of these — models
+/// routinely under-plan (say 3 steps, need 5), so treating the nominal last step as "done" was the main
+/// cause of the harness stopping too early. Completion must be stated, not merely counted.
+pub fn signals_complete(text: &str) -> bool {
+    // scan only the tail — an early "TASK_COMPLETE" inside a plan/quote shouldn't end the run.
+    let tail_start = text.len().saturating_sub(400);
+    let tail = &text[tail_start..];
+    const DONE: &[&str] = &["TASK_COMPLETE", "TASK COMPLETE", "ALL STEPS COMPLETE", "ALL DONE", "<DONE>"];
+    DONE.iter().any(|d| tail.contains(d))
 }
+
+/// Auto-continue policy after a pause. Redesigned so the harness stops UNDER-continuing:
+/// - An explicit completion signal (`signals_complete`) always stops — the clean finish.
+/// - Reaching the nominal last step (`k==n`) NO LONGER stops on its own. A model that planned too few
+///   steps gets a bounded GRACE of extra continues past `n` to actually finish (it can also just renumber
+///   to a larger `n`, which this naturally follows). Only an explicit signal — or the grace running out —
+///   ends a run that overshoots its plan.
+/// - Two caps: `cap` bounds total continues (confused-model backstop); `grace` bounds how far PAST the
+///   nominal plan length we'll keep going without an explicit completion (so `k==n` with no TASK_COMPLETE
+///   doesn't silently ride the full `cap`). Returns whether to continue.
+pub fn should_continue_ex(mark: &StepMark, text: &str, continues_so_far: u32, cap: u32, grace: u32) -> bool {
+    if signals_complete(text) { return false; }     // explicit finish — the intended stop
+    if continues_so_far >= cap { return false; }     // hard backstop against loops
+    if mark.k < mark.n { return true; }              // mid-plan — obviously continue
+    // At/past the nominal last step with NO completion signal: the model likely under-planned. Grant a
+    // bounded grace of extra continues so it can finish, rather than cutting it off at a miscounted `n`.
+    let past_nominal = continues_so_far.saturating_sub(mark.n.saturating_sub(1));
+    past_nominal < grace
+}
+
+/// Back-compat wrapper: the old signature, now routed through the improved policy with a default grace so
+/// existing callers stop under-continuing without a code change. `k==n` no longer hard-stops; an explicit
+/// completion signal (or the caps) does. Prefer `should_continue_ex` for an explicit grace.
+pub fn should_continue(mark: &StepMark, text: &str, continues_so_far: u32, cap: u32) -> bool {
+    should_continue_ex(mark, text, continues_so_far, cap, DEFAULT_GRACE)
+}
+
+/// Default grace: how many continues past the model's nominal plan length we allow without an explicit
+/// completion signal. Enough for a typical under-plan (planned N, needed a few more) without letting a
+/// truly stuck model ride the whole `cap`.
+pub const DEFAULT_GRACE: u32 = 4;
 
 /// Extract the checklist for rendering: every step marker in order, plus whether the run is finished.
 /// The UI shows these as a compact steps guide; the marker lines can then be de-emphasized in the body.
@@ -66,8 +104,9 @@ pub fn checklist(text: &str) -> (Vec<StepMark>, bool) {
             if steps.last().map_or(true, |p| m.k > p.k) { steps.push(m); }
         }
     }
-    let done = text.contains("TASK_COMPLETE")
-        || steps.last().map_or(false, |m| m.k == m.n);
+    // "done" means the model explicitly signalled completion — NOT merely that the last emitted marker had
+    // k==n (models under-plan, so k==n is not a reliable terminator; matches should_continue's policy).
+    let done = signals_complete(text);
     (steps, done)
 }
 
@@ -96,10 +135,34 @@ mod tests {
         assert_eq!(m.k, 1);
         assert!(should_pause(text, 1).is_none(), "already paused on step 1");
         assert!(should_continue(&m, text, 0, 12), "steps remain → continue");
+        // NEW behavior: reaching the nominal last step does NOT stop on its own (models under-plan).
         let last = StepMark { k: 3, n: 3, summary: String::new() };
-        assert!(!should_continue(&last, text, 0, 12), "final step → stop");
+        assert!(should_continue(&last, text, 0, 12), "k==n alone no longer stops — grace to finish");
         assert!(!should_continue(&m, text, 12, 12), "cap reached → stop");
         assert!(!should_continue(&m, "…TASK_COMPLETE", 0, 12), "explicit completion → stop");
+    }
+
+    #[test]
+    fn grace_lets_underplanned_runs_finish_then_bounds_them() {
+        let last = StepMark { k: 4, n: 4, summary: "did step 4".into() };
+        let body = "working...\n⏸ STEP 4/4 — did step 4\n";
+        // just past the plan: keep going (grace not exhausted) so a model that needed step 5,6 can get there
+        assert!(should_continue_ex(&last, body, 4, 20, 4), "within grace past nominal plan → continue");
+        assert!(should_continue_ex(&last, body, 6, 20, 4), "still within grace → continue");
+        // grace exhausted: stop even though the global cap isn't hit (don't ride the full cap on a miscount)
+        assert!(!should_continue_ex(&last, body, 8, 20, 4), "grace past nominal exhausted → stop");
+        // explicit completion always wins, even with grace remaining
+        assert!(!should_continue_ex(&last, "done\nTASK_COMPLETE", 4, 20, 4), "explicit finish → stop");
+    }
+
+    #[test]
+    fn completion_signal_only_counts_at_the_tail() {
+        // a plan that MENTIONS TASK_COMPLETE up front (as instructions) must not be treated as finished
+        let planny = format!("I'll end with TASK_COMPLETE when done.\n{}⏸ STEP 1/2 — began", "x".repeat(500));
+        assert!(!signals_complete(&planny), "early mention isn't a finish");
+        assert!(signals_complete("…\n⏸ STEP 2/2 — wrapped up\nTASK_COMPLETE"), "tail signal counts");
+        // tolerant variants
+        assert!(signals_complete("all done, ALL STEPS COMPLETE"));
     }
 
     #[test]

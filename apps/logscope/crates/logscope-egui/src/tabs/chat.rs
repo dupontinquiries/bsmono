@@ -896,6 +896,7 @@ pub struct Chat {
     preview: Option<usize>,                 // index of the generated file whose body is expanded
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
+    patch_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
     step_last_paused: u32,                  // dedup: highest step number already paused on this reply
     step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
     step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
@@ -983,7 +984,7 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_shell: None, step_inject: None, hit_cap: false,
+            auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -1183,7 +1184,11 @@ impl Chat {
                         if let Some(m) = self.msgs.get(s.idx) {
                             if let Some(mark) = crate::stepwise::should_pause(m.text(), self.step_last_paused) {
                                 self.step_last_paused = mark.k;
-                                let cont = crate::stepwise::should_continue(&mark, m.text(), self.step_continues, 12);
+                                // Continue policy: k==n no longer stops on its own (models under-plan);
+                                // an explicit TASK_COMPLETE ends the run, with a bounded grace past the
+                                // nominal plan so an under-planned reply still finishes. cap is the loop
+                                // backstop; grace bounds overshoot beyond n without an explicit finish.
+                                let cont = crate::stepwise::should_continue_ex(&mark, m.text(), self.step_continues, 24, crate::stepwise::DEFAULT_GRACE);
                                 self.step_pending_continue = cont;
                                 self.note = format!("step {}/{} — {}", mark.k, mark.n, mark.summary);
                                 // tests→cargo hook: a test/build step pauses, we materialize the reply's
@@ -1537,6 +1542,7 @@ impl Chat {
     fn build_prompt_upto(&self, upto: usize, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         match self.backend {
             BackendKind::Wgpu => match self.template {
@@ -1562,6 +1568,7 @@ impl Chat {
     fn build_continue_prompt(&self, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
         let partial = neutralize_markers(&self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default());
@@ -6241,6 +6248,8 @@ impl Chat {
                         .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
                     ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
                         .on_hover_text("When a reply hits the length cap, keep generating to finish it");
+                    ui.checkbox(&mut self.patch_mode, RichText::new("patch mode").small())
+                        .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
                     if self.hit_cap && !streaming {
                         if theme::action_button(ui, "⏭ Continue", theme::CYAN(), true)
                             .on_hover_text("The last reply hit the length cap — resume it").clicked() { do_continue = true; }
