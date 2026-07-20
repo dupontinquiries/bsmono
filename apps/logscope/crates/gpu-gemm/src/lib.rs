@@ -326,18 +326,25 @@ fn fused_qkv_enabled() -> bool {
 /// Bind-group caching in dispatch_with. OPT-IN (default off) while it proves out on hardware: reuses the
 /// bind group for a repeated (pipeline, buffers, dims) instead of recreating it per dispatch — targets the
 /// Asahi dispatch-bound (CPU command-setup) cost. LOGSCOPE_BG_CACHE=1 enables. Bit-identical either way.
+/// Umbrella flag: LOGSCOPE_FAST_DECODE=1 turns on ALL the validated (opt-in) dispatch-reduction levers at
+/// once — bind-group cache + the two MoE fusions — so a user testing decode speed on the M2 Ultra flips one
+/// switch instead of three. Each individual flag still works on its own; this just ORs in. All three are
+/// proven bit-identical to the default path, so the umbrella changes speed only, never output.
+fn fast_decode_enabled() -> bool {
+    std::env::var("LOGSCOPE_FAST_DECODE").as_deref() == Ok("1")
+}
 fn bind_group_cache_enabled() -> bool {
-    std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
+    fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
 /// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
 /// scratch). OPT-IN (default off) while it proves out on hardware; bit-identical to the unfused path.
 fn moe_glu_fused() -> bool {
-    std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
+    fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
 }
 /// Fuse the MoE down-projection with the weighted combine + residual into one kernel (one fewer dispatch
 /// per MoE layer, no [slots,d] scratch). OPT-IN (default off); bit-identical to the unfused path.
 fn moe_down_fused() -> bool {
-    std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
+    fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
 }
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
