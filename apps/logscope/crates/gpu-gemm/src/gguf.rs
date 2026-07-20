@@ -209,6 +209,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         12 => if n % 256 == 0 { Some(n / 256 * 144) } else { None }, // Q4_K super-block
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
+        20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
         _ => None,
     }
 }
@@ -407,7 +408,69 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             }
             Ok(out)
         }
+        20 => {
+            // IQ4_NL: 18-byte blocks of 32 — f16 scale `d`, then 16 bytes of packed 4-bit indices into a
+            // FIXED 16-entry non-linear codebook (the same kvalues llama.cpp uses). weight = d · codebook[q].
+            // Non-linear spacing (denser near 0) fits weight distributions better than uniform Q4_0 at the
+            // same 4 bits. No importance matrix at dequant time — that only shaped which values were chosen
+            // at quantization. Nibble layout mirrors Q4_0: low nibble = weight j, high nibble = weight j+16.
+            // NOTE: the codebook is the standard llama.cpp kvalues_iq4nl; it is NOT yet round-trip-verified
+            // against a real IQ4_NL tensor here (no such checkpoint in-container). A wrong codebook would
+            // silently corrupt weights, so validate against an actual IQ4_NL GGUF before trusting output.
+            const KV: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+            if n % 32 != 0 { return Err("iq4_nl element count not a multiple of 32".into()); }
+            let mut out = Vec::with_capacity(n);
+            for blk in data[..n / 32 * 18].chunks(18) {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let qs = &blk[2..18];
+                let mut vals = [0f32; 32];
+                for j in 0..16 {
+                    vals[j] = d * KV[(qs[j] & 0xF) as usize] as f32;
+                    vals[j + 16] = d * KV[(qs[j] >> 4) as usize] as f32;
+                }
+                out.extend_from_slice(&vals);
+            }
+            Ok(out)
+        }
         other => Err(format!("unsupported ggml type {other}")),
+    }
+}
+
+#[cfg(test)]
+mod iq4nl_tests {
+    use super::*;
+    #[test]
+    fn iq4_nl_dequant_matches_codebook() {
+        // Build one 32-weight IQ4_NL block with scale d=1.0 (f16 0x3C00). Indices 0..15 in the low nibbles
+        // and 0..15 again in the high nibbles → dequant must return the codebook values twice (d=1).
+        const KV: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+        for j in 0..16u8 { blk.push(j | (j << 4)); }     // low nibble j, high nibble j
+        assert_eq!(blk.len(), 18);
+        // sizing
+        assert_eq!(type_nbytes(20, 32), Some(18));
+        let got = dequantize(20, &blk, 32).unwrap();
+        assert_eq!(got.len(), 32);
+        for j in 0..16 {
+            assert!((got[j] - KV[j] as f32).abs() < 1e-6, "low nibble {j}: {} vs {}", got[j], KV[j]);
+            assert!((got[j + 16] - KV[j] as f32).abs() < 1e-6, "high nibble {j}");
+        }
+    }
+
+    #[test]
+    fn iq4_nl_scale_applies() {
+        // d = 2.0 (f16 0x4000): every value doubles.
+        let mut blk = Vec::new();
+        blk.extend_from_slice(&0x4000u16.to_le_bytes());
+        for _ in 0..16u8 { blk.push(0x00); } // all index 0 → codebook[-127]
+        let got = dequantize(20, &blk, 32).unwrap();
+        assert!((got[0] - (-127.0 * 2.0)).abs() < 1e-4, "scaled: {}", got[0]);
+    }
+
+    #[test]
+    fn iq4_nl_rejects_bad_length() {
+        assert!(dequantize(20, &[0u8; 18], 20).is_err(), "n not a multiple of 32");
     }
 }
 
