@@ -2780,6 +2780,26 @@ fn main() {
     // new small kernels
     let xr = rnd(6 * 16, 9);
     check("rope (interleaved NORM)", maxerr(&gpu.rope(&xr, 6, 16, 10000.0), &cpu_rope(&xr, 6, 16, 10000.0)), 1e-3);
+    // NEOX split-half rope (MLA/DeepSeek convention): rotate i with i+half. Reference matches mla.rs.
+    {
+        let (t, d, base, pos0) = (3usize, 8usize, 10000.0f32, 5usize);
+        let xr2 = rnd(t * d, 71);
+        let got = gpu.download(&gpu.rope_neox_at_t(&gpu.upload(&xr2, t, d), t, d, base, pos0));
+        let mut want = xr2.clone();
+        let half = d / 2;
+        for row in 0..t {
+            for i in 0..half {
+                let freq = (base).powf(-2.0 * i as f32 / d as f32);
+                let ang = (row + pos0) as f32 * freq;
+                let (s, c) = ang.sin_cos();
+                let b = row * d;
+                let (a0, a1) = (xr2[b + i], xr2[b + i + half]);
+                want[b + i] = a0 * c - a1 * s;
+                want[b + i + half] = a0 * s + a1 * c;
+            }
+        }
+        check("rope NEOX (split-half, MLA)", maxerr(&got, &want), 1e-3);
+    }
     let (aa, bb) = (rnd(100, 10), rnd(100, 11));
     check("add", maxerr(&gpu.add(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x + y).collect::<Vec<_>>()), 1e-5);
     check("mul", maxerr(&gpu.mul(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x * y).collect::<Vec<_>>()), 1e-5);
@@ -4765,6 +4785,43 @@ fn main() {
     // Gpu-wide latch, so this must come after all fast-path tests. A degraded session uses the serial
     // (barrier-free) decode attention + bounded submits instead of the fragile fast paths; that safe path
     // must produce the SAME logits as the fast path — degrading is a speed choice, never a correctness one.
+    // MLA GPU forward == mla.rs CPU reference. Same dims + weights through both paths; the compressed-latent
+    // attention must match bit-for-bit (this is why the CPU reference exists — it caught nothing to fix only
+    // if the GPU path is right). Multi-position so the softmax/scores actually exercise.
+    {
+        use gpu_kernels::mla::{MlaDims, MlaWeights, MlaWeightsT, compress_kv, attention_step};
+        let dm = MlaDims { d: 16, n_heads: 2, q_lora: 8, kv_lora: 6, qk_nope: 4, qk_rope: 4, v_head: 4, base: 10000.0, eps: 1e-6 };
+        let qk = dm.qk_head(); let rec = dm.qk_nope + dm.v_head;
+        let seeded = |n: usize, s0: u64| -> Vec<f32> { let mut s = s0; (0..n).map(|_| { s = s.wrapping_mul(6364136223846793005).wrapping_add(1); ((s >> 33) as f32 / (1u64 << 31) as f32) - 1.0 }).collect() };
+        let (q_a, q_a_ln) = (seeded(dm.q_lora * dm.d, 1), vec![1.0f32; dm.q_lora]);
+        let q_b = seeded(dm.n_heads * qk * dm.q_lora, 2);
+        let (kv_a, kv_a_ln) = (seeded((dm.kv_lora + dm.qk_rope) * dm.d, 3), vec![1.0f32; dm.kv_lora]);
+        let kv_b = seeded(dm.n_heads * rec * dm.kv_lora, 4);
+        let o = seeded(dm.d * dm.n_heads * dm.v_head, 5);
+        let w = MlaWeights { q_a: &q_a, q_a_ln: &q_a_ln, q_b: &q_b, kv_a: &kv_a, kv_a_ln: &kv_a_ln, kv_b: &kv_b, o: &o };
+        // build the compressed cache over a few tokens (CPU compress_kv is the cache-writer reference)
+        let toks: Vec<Vec<f32>> = (0..4).map(|i| seeded(dm.d, 100 + i)).collect();
+        let cache: Vec<_> = toks.iter().enumerate().map(|(p, x)| compress_kv(x, &w, &dm, p)).collect();
+        let pos = cache.len() - 1;
+        let cpu_out = attention_step(&toks[pos], &w, &dm, &cache, pos);
+        // GPU path: upload weights + the latent/rot cache columns
+        let wt = MlaWeightsT {
+            q_a: gpu.upload(&q_a, dm.q_lora, dm.d), q_a_ln: gpu.upload(&q_a_ln, 1, dm.q_lora),
+            q_b: gpu.upload(&q_b, dm.n_heads * qk, dm.q_lora),
+            kv_a: gpu.upload(&kv_a, dm.kv_lora + dm.qk_rope, dm.d), kv_a_ln: gpu.upload(&kv_a_ln, 1, dm.kv_lora),
+            kv_b: gpu.upload(&kv_b, dm.n_heads * rec, dm.kv_lora), o: gpu.upload(&o, dm.d, dm.n_heads * dm.v_head),
+        };
+        let mut clat = Vec::new(); let mut crot = Vec::new();
+        for row in &cache { clat.extend_from_slice(&row.c_kv); crot.extend_from_slice(&row.k_rot); }
+        let c_kv_t = gpu.upload(&clat, cache.len(), dm.kv_lora);
+        let k_rot_t = gpu.upload(&crot, cache.len(), dm.qk_rope);
+        let xq = gpu.upload(&toks[pos], 1, dm.d);
+        let gpu_out = gpu.download(&gpu.mla_attention_step_t(&xq, &wt, &dm, &c_kv_t, &k_rot_t, pos));
+        let e = maxerr(&gpu_out, &cpu_out);
+        println!("  MLA GPU forward vs CPU reference (4 tokens): max|diff|={e:.2e}");
+        check("MLA compressed-KV attention: GPU == CPU reference", e, 1e-3);
+    }
+
     {
         let hmd = gen_model(64, 128, 2, 48, 4, 2);
         let md = gpu.load_gguf(&write_gguf(&hmd)).expect("load_gguf (degrade test)");

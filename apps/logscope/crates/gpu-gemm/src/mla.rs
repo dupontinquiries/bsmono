@@ -68,6 +68,15 @@ pub struct MlaWeights<'a> {
     pub o: &'a [f32],
 }
 
+/// MLA weight set as uploaded GPU tensors (used by the GPU forward `mla_attention_step_t`).
+pub struct MlaWeightsT {
+    pub q_a: crate::Tensor, pub q_a_ln: crate::Tensor,
+    pub q_b: crate::Tensor,
+    pub kv_a: crate::Tensor, pub kv_a_ln: crate::Tensor,
+    pub kv_b: crate::Tensor,
+    pub o: crate::Tensor,
+}
+
 /// MLA dims for one layer.
 #[derive(Clone, Copy)]
 pub struct MlaDims {
