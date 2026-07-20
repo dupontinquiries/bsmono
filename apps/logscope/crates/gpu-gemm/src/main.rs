@@ -3614,6 +3614,19 @@ fn main() {
             println!("  speculative(K={k}) == target greedy generate_kv = {ok}");
         }
         check("speculative decode == target greedy", if all_ok { 0.0 } else { 1.0 }, 0.5);
+
+        // Model-FREE n-gram speculation must ALSO equal target greedy, for every K — the lossless property
+        // wired end-to-end (draft from the running history via prompt-lookup, same verify). A prompt with a
+        // repeated span gives the draft something to hit; correctness must hold regardless of hit rate.
+        let ng_prompt = [5u32, 9, 1, 7, 3, 5, 9, 1, 7, 3]; // repeated span → n-gram draft fires
+        let ng_ref = gpu.generate_kv(&tm, &ng_prompt, n_new);
+        let mut ng_ok = true;
+        for k in [1usize, 2, 4] {
+            let spec = gpu.speculative_generate_ngram(&tm, &ng_prompt, n_new, k);
+            let ok = spec == ng_ref; ng_ok &= ok;
+            println!("  n-gram speculative(K={k}) == target greedy generate_kv = {ok}");
+        }
+        check("n-gram (model-free) speculative decode == target greedy", if ng_ok { 0.0 } else { 1.0 }, 0.5);
     }
 
     // Decode throughput profile: count GPU command submits + blocking syncs per token. Each

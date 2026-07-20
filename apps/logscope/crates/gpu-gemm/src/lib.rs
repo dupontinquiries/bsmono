@@ -7660,6 +7660,58 @@ impl Gpu {
         gen
     }
 
+    /// Model-free speculative decode: draft up to `k` tokens by prompt-lookup (ngram::ngram_draft) on the
+    /// running token history instead of a draft model, then verify the block in ONE target forward exactly
+    /// like `speculative_generate`. Because the verify accepts only the target's own greedy tokens, the
+    /// output is BIT-IDENTICAL to `generate_kv` — the n-gram draft only changes speed (fewer target
+    /// forwards when it guesses right on repetitive/structured text). No second set of weights, no draft
+    /// session. Returns the `n_new` generated tokens.
+    pub fn speculative_generate_ngram(&self, target: &Model, prompt: &[u32], n_new: usize, k: usize) -> Vec<u32> {
+        let mut st = SpecStats::default();
+        self.speculative_generate_ngram_stats(target, prompt, n_new, k, &mut st)
+    }
+
+    /// As `speculative_generate_ngram`, recording acceptance stats.
+    pub fn speculative_generate_ngram_stats(&self, target: &Model, prompt: &[u32], n_new: usize, k: usize, st: &mut SpecStats) -> Vec<u32> {
+        let k = k.max(1);
+        let max_seq = prompt.len() + n_new + 2 * k + 8;
+        let tc = self.new_cache(target.n_layers, max_seq, target.kv_dim());
+        let mut prev = Vec::new();
+        for pos in 0..prompt.len() { prev = self.decode_step(target, &tc, prompt[pos], pos); }
+        let mut pos = prompt.len();
+        // running token history the draft looks up (prompt + everything emitted so far)
+        let mut hist: Vec<u32> = prompt.to_vec();
+        let mut gen: Vec<u32> = Vec::new();
+        while gen.len() < n_new {
+            // draft from the history via prompt-lookup (may be empty → plain target step)
+            let draft_toks = crate::ngram::ngram_draft(&hist, k);
+            st.rounds += 1;
+            if draft_toks.is_empty() {
+                let t = argmax(&prev); gen.push(t); hist.push(t); st.emitted += 1;
+                prev = self.decode_step(target, &tc, t, pos); pos += 1;
+                continue;
+            }
+            // verify the whole drafted block in one target forward (identical to the model-draft path)
+            let vlog = self.verify_forward(target, &tc, &draft_toks, pos);
+            let kk = draft_toks.len();
+            let mut cur = prev.clone();
+            let mut accepted = 0usize; let mut emit: Vec<u32> = Vec::new(); let mut mism = false;
+            for j in 0..kk {
+                let tt = argmax(&cur); emit.push(tt);
+                if draft_toks[j] == tt { accepted += 1; cur = vlog[j * target.vocab..(j + 1) * target.vocab].to_vec(); }
+                else { mism = true; break; }
+            }
+            if !mism { emit.push(argmax(&cur)); } // all accepted → free bonus token
+            st.accepted += accepted;
+            let correction = *emit.last().unwrap();
+            prev = self.decode_step(target, &tc, correction, pos + accepted);
+            pos += accepted + 1;
+            for t in emit { if gen.len() >= n_new { break; } gen.push(t); hist.push(t); st.emitted += 1; }
+        }
+        gen.truncate(n_new);
+        gen
+    }
+
     /// Run `tokens` through a fresh KV cache and return the last position's logits
     /// (for cross-checking the cached path against the full forward, numerically).
     pub fn forward_kv(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
