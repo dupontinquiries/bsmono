@@ -4654,6 +4654,29 @@ fn main() {
                 println!("  staged no-op gate: staged(all_hot) vs f32 decode max|diff|={e:.2e}");
                 check("staged KV all-hot decode == f32 decode (no-op gate)", e, 1e-4);
             }
+
+            // MULTI-BLOCK staged decode (stage 4b): decode a longer sequence with a SMALL hot window so
+            // several blocks demote to the warm int8 tail, then compare the final logits to the all-f32
+            // reference. With most of the context now int8 this is within quant tolerance, not bit-exact —
+            // it proves the multi-block two-span attention (hot f32 window + N warm int8 blocks folded in
+            // one online softmax) is correct, and that staged_slide's real demotion feeds it properly.
+            {
+                let seq: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % 11).collect();
+                let cref = gpu.new_cache(m3.n_layers, 200, m3.kv_dim());
+                let mut lref = Vec::new();
+                for (i, &t) in seq.iter().enumerate() { lref = gpu.decode_step(&m3, &cref, t, i); }
+                // hot window 8, demote block 4 → by pos 40 several blocks are warm
+                let policy = gpu_kernels::kvstage::StagePolicy::new(8, 4);
+                let mut st = gpu.staged_new(m3.n_layers, 200, m3.kv_dim(), policy);
+                let mut lst = Vec::new();
+                for (i, &t) in seq.iter().enumerate() {
+                    lst = gpu.decode_step_staged(&m3, &st, t, i);
+                    gpu.staged_slide(&mut st, i + 1, m3.kv_dim());
+                }
+                let e = maxerr(&lst, &lref);
+                println!("  staged multi-block: {} warm blocks, warm_len={}, staged vs f32 max|diff|={e:.2e}", st.warm_block_rows.len(), st.warm_len);
+                check("staged KV multi-block decode matches f32 within int8 tolerance", e, 8e-2);
+            }
         }
 
         // BIG WINDOW / dims-cache overflow (regression for the M4 k=256 crash): a large window
