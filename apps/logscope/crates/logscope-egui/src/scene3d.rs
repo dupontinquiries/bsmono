@@ -1657,7 +1657,7 @@ fn stalactite(s: &mut Scene, x: f32, z: f32, top: f32, len: f32, wdt: f32, lo: C
         tris.push([0, i1, i0]);   // taper side
         tris.push([ct, i0, i1]);  // top cap
     }
-    let mut m = Mesh3 { verts, norms, tris, color: lo, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0 };
+    let mut m = Mesh3 { verts, norms, tris, color: lo, vcol: None, offset: v(0.0, 0.0, 0.0), mat: 0.0, emissive: 0.0, overlay: 0.0 };
     m3::tint_height(&mut m, top - len, top, lo, hi); m.mat = M::STONE; s.add(m, Float::STILL);
 }
 
@@ -2392,7 +2392,7 @@ fn seafloor(s: &mut Scene, r_inner: f32, r_outer: f32, y_base: f32, sz: f32, see
         for &i in t.iter() { norms[i as usize] = addv(norms[i as usize], n); }
     }
     for nrm in norms.iter_mut() { *nrm = normv(*nrm); }
-    s.add(Mesh3 { verts, norms, tris, color: sand, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat: M::STONE, emissive: 0.0 }, Float::STILL);
+    s.add(Mesh3 { verts, norms, tris, color: sand, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat: M::STONE, emissive: 0.0, overlay: 0.0 }, Float::STILL);
 }
 
 /// Generic ground RELIEF — layered fbm displacing a flat ground into gentle rolling terrain. Shared by land
@@ -2445,7 +2445,7 @@ fn terrain_disc(s: &mut Scene, r: f32, y_base: f32, seed: u32, amp: f32, freq: f
         for &i in t.iter() { norms[i as usize] = addv(norms[i as usize], nrm); }
     }
     for nrm in norms.iter_mut() { *nrm = normv(*nrm); }
-    s.add(Mesh3 { verts, norms, tris, color: lo, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat, emissive: 0.0 }, Float::STILL);
+    s.add(Mesh3 { verts, norms, tris, color: lo, vcol: Some(vcol), offset: v(0.0, 0.0, 0.0), mat, emissive: 0.0, overlay: 0.0 }, Float::STILL);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
