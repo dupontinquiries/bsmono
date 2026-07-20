@@ -901,6 +901,8 @@ pub struct Chat {
     step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
     step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
     step_arm_continue: bool,                // set by the Done handler; consumed by the frame loop
+    step_was_continue: bool,                // the in-flight stream is a stepwise continuation (not a fresh reply)
+    step_empty_retries: u32,                // consecutive 0-token continues nudged (bounded, anti-loop)
     step_shell: Option<std::sync::mpsc::Receiver<String>>, // in-flight cargo test at a step pause
     step_inject: Option<String>,            // shell results to splice into the next continue
     hit_cap: bool,                          // last finished reply ran the full budget (offer manual Continue)
@@ -984,7 +986,7 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_shell: None, step_inject: None, hit_cap: false,
+            auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -1291,6 +1293,30 @@ impl Chat {
                         }
                     }
                 }
+                // Empty-continuation catch: the model emitted its ⏸ STEP marker as the LAST thing (an
+                // announcement, no step work) and then the warm-resume immediately hit EOS → 0 new tokens,
+                // and the harness silently stopped mid-plan. Seen on 4B: planned 6 steps, marked STEP 1/6,
+                // produced nothing, stalled. When a CONTINUATION comes back near-empty, the run isn't
+                // complete, and we're mid-plan, splice an explicit "do the next step's actual work" nudge
+                // and retry — bounded so a truly-finished model can't loop.
+                if self.step_was_continue && tokens <= 1 && !self.step_arm_continue {
+                    if let Some(m) = idx.and_then(|i| self.msgs.get(i)) {
+                        let t = m.text();
+                        let mid_plan = crate::stepwise::last_step_mark(t).map(|mk| mk.k < mk.n).unwrap_or(false);
+                        if self.step_empty_retries < 2
+                            && !crate::stepwise::signals_complete(t)
+                            && mid_plan
+                        {
+                            self.step_empty_retries += 1;
+                            self.step_continues += 1;
+                            self.step_arm_continue = true;
+                            self.step_inject = Some(crate::stepwise::CONTINUE_NUDGE.to_string());
+                            self.note = "auto-continue: step marker had no work — nudging the next step".into();
+                        }
+                    }
+                }
+                if tokens > 1 { self.step_empty_retries = 0; } // real progress resets the anti-loop guard
+                self.step_was_continue = false;
                 if self.last_prompt_tokens > 0 { // bank this run for future progress estimates
                     self.gen_samples.push(crate::estimate::GenSample { prompt_tokens: self.last_prompt_tokens, output_tokens: tokens, secs });
                     let n = self.gen_samples.len();
@@ -1647,6 +1673,7 @@ impl Chat {
         }
         let fallback = self.build_continue_prompt(doc); // used only if the engine can't warm-resume
         self.hit_cap = false;
+        self.step_was_continue = true; // Done handler uses this to catch a 0-token (marker-only) resume
         self.stream = Some(Stream { idx: last, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
         infer.continue_stream(fallback);

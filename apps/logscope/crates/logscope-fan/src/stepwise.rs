@@ -11,12 +11,21 @@
 /// The instruction block appended to the system prompt when stepwise mode is on. Kept short and
 /// mechanical — models follow format contracts better than prose requests.
 pub const STEPWISE_PROMPT: &str = "\n\nSTEPWISE PROTOCOL: Structure your work as a short numbered plan (2-9 steps), state the plan first, \
-then do ONE step at a time. After completing each step, output on its own line exactly:\n\
+then do ONE step at a time. IMPORTANT: the plan itself is NOT a step — after stating the plan, immediately \
+begin doing step 1 (write its actual code/content), and only THEN output the marker. After completing each \
+step's real work, output on its own line exactly:\n\
 ⏸ STEP <k>/<n> — <one-line summary of what you just did>\n\
-and then STOP. You will be told to continue. Do not do more than one step between markers. \
+and then STOP. You will be told to continue; when you do, produce the NEXT step's actual work (not another \
+plan or restatement). Do not do more than one step between markers. \
 If the work needs more steps than you first planned, just keep numbering past <n> (e.g. 4/3, 5/3) — the \
 plan can grow. The run ends ONLY when you write TASK_COMPLETE on its own line, NOT when k reaches n; so on \
 your actual final step, write your marker line and then TASK_COMPLETE.";
+
+/// Spliced into a continuation when the previous resume produced no step work (the model emitted a bare
+/// marker then stopped). An explicit, concrete push to produce the next step's real content.
+pub const CONTINUE_NUDGE: &str = "(Continue: produce the NEXT step's actual code/content now — not a plan, \
+not a restatement. Do the work, then write your ⏸ STEP marker. If everything is truly done, write \
+TASK_COMPLETE instead.)";
 
 /// A parsed step marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +267,18 @@ mod tests {
     fn strip_noop_when_no_solicitation() {
         let text = "Here is the code:\nfn main() {}";
         assert_eq!(strip_trailing_solicitation(text), text);
+    }
+
+    #[test]
+    fn bare_marker_parses_mid_plan_for_empty_continue_nudge() {
+        // The 4B log: model wrote a plan then `⏸ STEP 1/6` with no step work, and stopped. The marker
+        // parses with k<n → the harness sees mid-plan and (on a 0-token resume) nudges the next step.
+        let text = "### Plan\n1. thing\n2. thing\n\n⏸ STEP 1/6";
+        let m = last_step_mark(text).expect("bare marker parses");
+        assert_eq!((m.k, m.n), (1, 6));
+        assert!(m.k < m.n, "mid-plan → eligible for the empty-continue nudge");
+        assert!(!signals_complete(text), "no TASK_COMPLETE → not done");
+        assert!(!CONTINUE_NUDGE.is_empty());
     }
 }
 
