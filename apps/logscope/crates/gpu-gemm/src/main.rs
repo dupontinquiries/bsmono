@@ -2385,17 +2385,20 @@ fn main() {
         let (bytes, _eff) = build_quantized_gguf(&hm);
         let model = gpu.load_gguf_quantized(&bytes).expect("load synth");
         let mut worst = 0.0f32; let mut argmax_ok = true;
-        for &t in &[5usize, 16, 17, 40, 100] {
+        for &t in &[5usize, 16, 17, 40, 100, 2100] {
             let prompt: Vec<u32> = (0..t).map(|j| (j as u32 * 7 + 1) % vocab as u32).collect();
             let cb = gpu.new_cache(model.n_layers, t + 4, model.kv_dim());
             let lb = gpu.prefill_batched(&model, &cb, &prompt);
-            for &chunk in &[1usize, 8, 16, 4096] {
+            // t=2100 crosses the parallel kernel's 2048-row tile → exercises the cross-tile online-softmax
+            // rescale. Use large chunks for the long prompt so we don't do thousands of tiny prefill steps.
+            let chunks: &[usize] = if t > 500 { &[256, 4096] } else { &[1, 8, 16, 4096] };
+            for &chunk in chunks {
                 let cc = gpu.new_cache(model.n_layers, t + 4, model.kv_dim());
                 let lc = gpu.prefill_chunked(&model, &cc, &prompt, chunk);
                 let md = lb.iter().zip(&lc).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
                 let am = gpu_kernels::argmax(&lb) == gpu_kernels::argmax(&lc);
                 worst = worst.max(md); argmax_ok &= am;
-                eprintln!("  t={t:>3} chunk={chunk:>4}: max|Δlogit|={md:.3e} argmax_match={am}");
+                eprintln!("  t={t:>4} chunk={chunk:>4}: max|Δlogit|={md:.3e} argmax_match={am}");
             }
         }
         let verdict = if worst == 0.0 && argmax_ok { "BIT-EXACT ✓" }
