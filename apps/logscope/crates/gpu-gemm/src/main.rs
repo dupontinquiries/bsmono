@@ -4820,6 +4820,11 @@ fn main() {
         let e = maxerr(&gpu_out, &cpu_out);
         println!("  MLA GPU forward vs CPU reference (4 tokens): max|diff|={e:.2e}");
         check("MLA compressed-KV attention: GPU == CPU reference", e, 1e-3);
+        // fully-on-GPU path (score/softmax/ΣV + q-rope + KV-pack all as kernels)
+        let gpu_out2 = gpu.download(&gpu.mla_attention_step_gpu(&xq, &wt, &dm, &c_kv_t, &k_rot_t, pos));
+        let e2 = maxerr(&gpu_out2, &cpu_out);
+        println!("  MLA fully-on-GPU forward vs CPU reference: max|diff|={e2:.2e}");
+        check("MLA fully-on-GPU attention: GPU == CPU reference", e2, 1e-3);
     }
 
     {
