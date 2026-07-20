@@ -6641,7 +6641,15 @@ impl Gpu {
         sampler: &SamplerParams, rng: &mut u64, k: usize, embed: &EmbedT<'_>,
         cancel: &dyn Fn() -> bool, mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
-        let k = k.max(2);
+        // Device-safe window cap. The windowed path holds k slots' worth of dispatches + their dims +
+        // the k+1 pre[] logits live before its single readback; on Metal, a large k (the user forcing
+        // 128) creates enough live buffer OBJECTS to hit the device's buffer-count ceiling → an
+        // unrecoverable "Buffer invalid" abort at the first sample_at. Per-token (k=1) always fits.
+        // Cap the effective k so the footprint stays bounded regardless of the requested window; keeps
+        // most of the throughput win (k=32 already amortizes ~97% of the per-token submit overhead) while
+        // staying well under the ceiling. LOGSCOPE_WINDOW_MAX overrides for hardware that can go higher.
+        let kcap = std::env::var("LOGSCOPE_WINDOW_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16).max(2);
+        let k = k.max(2).min(kcap);
         let rcap = 64usize;
         if s.logits.is_empty() { return 0; }
         let cache_rows = s.cache.k.first().map(|t| t.rows).unwrap_or(0);
