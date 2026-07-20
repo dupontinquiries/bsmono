@@ -121,16 +121,34 @@ pub struct Governor {
 
 impl Governor {
     pub fn new(budget: Budget) -> Self {
-        // Start the learned cap at the budget's static estimate against a fresh (baseline-only) device.
-        let start = budget.safe_k(0);
+        // Start the probe CONSERVATIVE and let clean runs climb it — starting at the budget's full
+        // static estimate would jump straight to a large window and risk the ceiling before learning
+        // anything. Begin at a safe floor (a small window that fits almost any device) and creep up.
+        let start = budget.safe_k(0).min(8).max(2);
         Governor { budget, learned_cap: start, pressure_ceiling: None, proven_safe: 2 }
     }
 
     /// The window k to actually use this turn, given the caller's request and the live object count.
     /// Takes the MIN of: the request, the budget's live headroom, and the learned/pressure ceilings.
-    pub fn window_for(&self, requested_k: usize, live_objects: usize) -> usize {
+    /// The window k to actually use this turn. The requested k is a STARTING HINT, not a ceiling: on a
+    /// device with headroom the governor probes UPWARD toward its learned cap and the live budget, so a
+    /// conservative default (e.g. SAMPLE_WINDOW=4) still converges to the device's real safe window over a
+    /// few turns instead of staying pinned low. The upper bound is the device's live headroom, the learned
+    /// cap (which creeps up on clean runs), and any latched pressure ceiling — never the request itself.
+    /// `pinned` (user hard-set the window) makes the request an exact value, disabling the probe.
+    pub fn window_for(&self, requested_k: usize, live_objects: usize, pinned: bool) -> usize {
         let live_cap = self.budget.safe_k(live_objects);
-        let mut k = requested_k.min(live_cap).min(self.learned_cap);
+        if pinned {
+            // user pinned an exact window — respect it, but still never exceed the hard device budget
+            // or a latched pressure ceiling (those are safety, not preference).
+            let mut k = requested_k.min(live_cap);
+            if let Some(pc) = self.pressure_ceiling { k = k.min(pc); }
+            return k.max(2);
+        }
+        // unpinned: probe toward the learned cap, bounded by live headroom + pressure latch. The request
+        // seeds a floor (never go below what was asked) but does NOT cap the probe.
+        let mut k = self.learned_cap.min(live_cap).max(requested_k);
+        k = k.min(live_cap); // re-clamp: the request floor must still respect the hard budget
         if let Some(pc) = self.pressure_ceiling { k = k.min(pc); }
         k.max(2)
     }
@@ -186,10 +204,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn probes_upward_past_a_low_request_on_a_healthy_device() {
+        // the bug this fixes: a conservative SAMPLE_WINDOW=4 used to pin the window at 4 forever, even on
+        // a device with headroom. Unpinned, the governor must climb ABOVE the request as clean runs prove
+        // the device can take it.
+        let mut g = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        let start = g.window_for(4, 0, false); // request only 4
+        // several clean runs at the current cap should let it grow above 4
+        for _ in 0..8 {
+            let k = g.window_for(4, 0, false);
+            g.observe_clean(k);
+        }
+        let grown = g.window_for(4, 0, false);
+        assert!(grown > start, "governor must probe upward past the low request: {start} -> {grown}");
+        assert!(grown > 4, "should climb above the requested 4 on a healthy device, got {grown}");
+    }
+
+    #[test]
+    fn pinned_window_disables_the_probe() {
+        // with the pin, the request is exact — the governor must NOT climb above it (user knows their box)
+        let mut g = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        for _ in 0..10 { let k = g.window_for(6, 0, false); g.observe_clean(k); }
+        assert_eq!(g.window_for(6, 0, true), 6, "pinned request is honored exactly");
+    }
+
+    #[test]
     fn metal_budget_clamps_a_huge_request_down() {
         let g = Governor::new(Budget::for_backend(WgpuBackend::Metal, true, false));
         // fresh device, user asks for 128 — must clamp well below (the crash was here)
-        let k = g.window_for(128, 0);
+        let k = g.window_for(128, 0, false);
         assert!(k >= 2 && k < 128, "Metal must clamp 128 down, got {k}");
     }
 
@@ -223,10 +266,10 @@ mod tests {
         // now the device signals pressure at k=24
         g.observe_pressure(24);
         assert_eq!(g.pressure_ceiling(), Some(23));
-        assert!(g.window_for(128, 0) <= 23, "must never exceed the pressure ceiling again");
+        assert!(g.window_for(128, 0, false) <= 23, "must never exceed the pressure ceiling again");
         // even many clean runs afterward can't climb back above the latch
         for _ in 0..20 { g.observe_clean(g.learned_cap()); }
-        assert!(g.window_for(128, 0) <= 23, "latch holds against optimistic creep");
+        assert!(g.window_for(128, 0, false) <= 23, "latch holds against optimistic creep");
     }
 
     #[test]
@@ -236,8 +279,8 @@ mod tests {
         g.observe_clean(12); // 12 proven safe
         g.observe_pressure(20); // pressure at 20
         // after the ratchet, we still trust the proven-safe floor (<= ceiling)
-        assert!(g.window_for(128, 0) >= 2);
-        assert!(g.window_for(128, 0) <= 19);
+        assert!(g.window_for(128, 0, false) >= 2);
+        assert!(g.window_for(128, 0, false) <= 19);
     }
 
     #[test]
@@ -251,7 +294,7 @@ mod tests {
     #[test]
     fn bytes_only_backends_still_get_a_sane_window() {
         let g = Governor::new(Budget::for_backend(WgpuBackend::Gl, true, false));
-        let k = g.window_for(128, 0);
+        let k = g.window_for(128, 0, false);
         assert!(k >= 2, "even a generous backend keeps a floor");
     }
 }

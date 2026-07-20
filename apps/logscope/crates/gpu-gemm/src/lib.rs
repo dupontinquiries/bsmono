@@ -6673,7 +6673,10 @@ impl Gpu {
         // count) and self-tunes: a clean window nudges its cap up toward the request; any pressure signal
         // ratchets it down and latches. LOGSCOPE_WINDOW_MAX still hard-caps on top for manual control.
         let live_objs = self.dims_buffer_count() + self.pool_live_estimate();
-        let gov_k = self.governor.lock().unwrap().window_for(k, live_objs);
+        // LOGSCOPE_WINDOW_PIN=1 makes the requested window an exact value (governor won't probe up);
+        // otherwise the request is a hint and the governor autotunes toward the device's real ceiling.
+        let pinned = std::env::var("LOGSCOPE_WINDOW_PIN").ok().as_deref() == Some("1");
+        let gov_k = self.governor.lock().unwrap().window_for(k, live_objs, pinned);
         let hard_cap = std::env::var("LOGSCOPE_WINDOW_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(usize::MAX).max(2);
         let k_req = k;
         let k = k.max(2).min(gov_k).min(hard_cap);
@@ -6792,7 +6795,15 @@ impl Gpu {
         // The window ran to completion without device pressure — let the governor nudge its safe-k cap
         // up toward the request (bounded, one step) so a device with headroom converges to a bigger,
         // faster window over a few turns instead of staying pinned at the conservative start.
-        self.governor.lock().unwrap().observe_clean(k);
+        {
+            let mut g = self.governor.lock().unwrap();
+            let before = g.learned_cap();
+            g.observe_clean(k);
+            let after = g.learned_cap();
+            if after > before {
+                eprintln!("wgpu-engine: governor — window autotuned up {before}→{after} (device has headroom; clean run at k={k})");
+            }
+        }
         produced
     }
 }
