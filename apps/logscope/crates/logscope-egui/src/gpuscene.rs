@@ -207,21 +207,36 @@ pub fn pack_sorted(meshes: &[Mesh3], cam: &Camera, min_ndc: f32) -> Vec<f32> {
                     if cw <= 0.05 || cx.abs() > cw * margin || cy.abs() > cw * margin { continue; }
                 }
             }
-            order.push((cam.depth(c), mi, ti));
+            order.push((cam.depth(c) - m.overlay, mi, ti));
         }
     }
     order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)); // far → near
+    // Overlay (physical-UI) meshes are pulled toward the camera in WORLD space by `overlay` units
+    // before packing, so their fragments win the depth test against scenery/foliage they float over —
+    // fixing "the panel is occluded by leaves" without a new vertex attribute or shader change. The
+    // pull is along the eye→point direction, a constant per-mesh shift, so the slab keeps its shape
+    // and internal layering; only its distance to the eye shrinks. Scenery (overlay==0) is untouched.
+    let eye = cam.eye();
+    let eye = Vec3::new(eye[0], eye[1], eye[2]);
     let mut out = Vec::with_capacity(order.len() * 36);
     for (_, mi, ti) in order {
         let m = &meshes[mi];
         let tri = m.tris[ti];
         for &vi in &tri {
             let vi = vi as usize;
-            let p = m.verts[vi];
+            let mut p = m.verts[vi];
+            p = Vec3::new(p.x + m.offset.x, p.y + m.offset.y, p.z + m.offset.z);
+            if m.overlay > 0.0 {
+                // shift toward the eye by min(overlay, most of the eye-distance) so it never crosses behind
+                let dx = eye.x - p.x; let dy = eye.y - p.y; let dz = eye.z - p.z;
+                let d = (dx * dx + dy * dy + dz * dz).sqrt().max(1e-3);
+                let s = m.overlay.min(d * 0.6) / d;
+                p = Vec3::new(p.x + dx * s, p.y + dy * s, p.z + dz * s);
+            }
             let n = m.norms[vi];
             let c = m.vcol.as_ref().map_or(m.color, |vc| vc[vi]);
             let cc = col4(c);
-            out.extend_from_slice(&[p.x + m.offset.x, p.y + m.offset.y, p.z + m.offset.z, n.x, n.y, n.z, cc[0], cc[1], cc[2], cc[3], m.mat, m.emissive]);
+            out.extend_from_slice(&[p.x, p.y, p.z, n.x, n.y, n.z, cc[0], cc[1], cc[2], cc[3], m.mat, m.emissive]);
         }
     }
     out
