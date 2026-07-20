@@ -5716,13 +5716,25 @@ impl Gpu {
     /// warm int8 tail and advance the boundary. Called by the decode loop AFTER writing the current token
     /// into the hot cache and advancing `pos`. A no-op when the policy says nothing's due (or all-hot), so
     /// short contexts and the no-op gate never touch the warm tier. Returns tokens demoted (0 = nothing).
-    /// NOTE: the actual per-block quantize of hot rows [from,from+len) into the warm stacks is the stage-3
-    /// kernel work; this stage wires the policy + boundary bookkeeping + the all-hot no-op, so a
-    /// StagedKvCache decodes identically to the f32 path until demotion is turned on.
-    pub fn staged_slide(&self, cache: &mut StagedKvCache, pos: usize) -> usize {
+    ///
+    /// Real demotion (stage 4): for each layer, quantize the hot rows [from, from+len) to int8 and APPEND
+    /// them to the per-layer warm stacks as one more block. The warm tier is stored as a list of int8
+    /// blocks per layer (kq/ks/vq/vs each a Vec of block tensors); two-span attention reads them in order.
+    /// Keeping blocks separate (vs one growing buffer) means a demote is a bounded quantize+push, no
+    /// realloc/copy of the whole warm tail each time.
+    pub fn staged_slide(&self, cache: &mut StagedKvCache, pos: usize, kv_dim: usize) -> usize {
         match cache.policy.plan(pos) {
             crate::kvstage::StageAction::Nothing => 0,
-            crate::kvstage::StageAction::Demote { from: _, len } => {
+            crate::kvstage::StageAction::Demote { from, len } => {
+                for li in 0..cache.hot.k.len() {
+                    // view the block of hot rows [from, from+len) for this layer, quantize, append to warm
+                    let kblk = self.rows_view(&cache.hot.k[li], from, len, kv_dim);
+                    let vblk = self.rows_view(&cache.hot.v[li], from, len, kv_dim);
+                    let (qk, sk) = self.quantize_rows(&kblk, len, kv_dim);
+                    let (qv, sv) = self.quantize_rows(&vblk, len, kv_dim);
+                    cache.warm.kq.push(qk); cache.warm.ks.push(sk);
+                    cache.warm.vq.push(qv); cache.warm.vs.push(sv);
+                }
                 cache.policy.commit_demote(len);
                 cache.warm_len += len;
                 len
@@ -5851,6 +5863,14 @@ impl Gpu {
     fn slice_cols(&self, src: &Tensor, col_off: usize, width: usize) -> Tensor {
         let out = self.alloc(1, width);
         self.copy_buf(src, (col_off * 4) as u64, &out, 0, (width * 4) as u64);
+        out
+    }
+    /// Copy a contiguous range of `len` rows starting at `row0` from an f32 `[rows, cols]` tensor into a
+    /// fresh `[len, cols]` tensor. Used by staged-KV demotion to isolate the hot block being quantized.
+    /// A real copy (like slice_cols) rather than a view, so the quantize kernel reads a clean dense buffer.
+    fn rows_view(&self, src: &Tensor, row0: usize, len: usize, cols: usize) -> Tensor {
+        let out = self.alloc(len, cols);
+        self.copy_buf(src, (row0 * cols * 4) as u64, &out, 0, (len * cols * 4) as u64);
         out
     }
     /// block_decode with the three Q/K/V projections fused into one wqkv matmul (one weight-bind, one
