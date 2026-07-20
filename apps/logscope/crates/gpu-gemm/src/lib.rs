@@ -1246,11 +1246,18 @@ impl Gpu {
         while pending.load(Relaxed) > cap {
             let _ = self.device.poll(wgpu::PollType::Poll);
             std::thread::sleep(std::time::Duration::from_micros(50));
-            // Safety escape: if callbacks never arrive (driver quirk), don't spin forever — turn the
-            // governor off for this Gpu and say so once. 5s of a full queue means something else is wrong.
-            if t0.elapsed().as_secs() >= 5 {
+            // Safety escape: if callbacks arrive slowly or never (a driver quirk — seen on some Vulkan
+            // drivers where on_submitted_work_done lags the actual GPU completion), don't stall the decode
+            // waiting on them. A healthy submit clears in well under 250ms; if the queue stays full past
+            // that, the callback pipeline is unreliable on THIS driver, so disable the governor and run
+            // unthrottled (the poll-on-readback path still bounds memory). Fast bail keeps a laggy driver
+            // from turning every submit into a multi-second stall that reads as a hang.
+            if t0.elapsed().as_millis() >= 250 {
                 self.governor_dead.store(true, Relaxed);
-                eprintln!("wgpu-engine: submit governor DISABLED — completion callbacks not arriving on this driver (LOGSCOPE_SUBMIT_INFLIGHT=0 silences this)");
+                eprintln!("wgpu-engine: submit governor DISABLED — completion callbacks slow/absent on this driver (submit stalled {}ms; LOGSCOPE_SUBMIT_INFLIGHT=0 silences this)", t0.elapsed().as_millis());
+                // don't leave this submit counted as forever-pending: the work will still complete, but
+                // the governor is off now, so clear our bookkeeping so a stale count can't wedge later.
+                pending.store(0, Relaxed);
                 break;
             }
         }
