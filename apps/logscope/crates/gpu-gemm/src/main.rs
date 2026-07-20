@@ -4747,6 +4747,27 @@ fn main() {
         }
     }
 
+    // DEGRADE PATH (Colibri-style fault→safe-kernel fallback) — RUN LAST: raise_degrade sets a monotonic
+    // Gpu-wide latch, so this must come after all fast-path tests. A degraded session uses the serial
+    // (barrier-free) decode attention + bounded submits instead of the fragile fast paths; that safe path
+    // must produce the SAME logits as the fast path — degrading is a speed choice, never a correctness one.
+    {
+        let hmd = gen_model(64, 128, 2, 48, 4, 2);
+        let md = gpu.load_gguf(&write_gguf(&hmd)).expect("load_gguf (degrade test)");
+        let prompt3: Vec<u32> = vec![2u32, 7, 1, 8, 3, 9, 4, 0, 6, 5, 2, 7];
+        let cref = gpu.new_cache(md.n_layers, 200, md.kv_dim());
+        let mut fast = Vec::new();
+        for (i, &t) in prompt3.iter().enumerate() { fast = gpu.decode_step(&md, &cref, t, i); }
+        gpu.raise_degrade("test: simulated fault");
+        assert!(gpu.degraded(), "raise_degrade must set degraded()");
+        let cdeg = gpu.new_cache(md.n_layers, 200, md.kv_dim());
+        let mut deg = Vec::new();
+        for (i, &t) in prompt3.iter().enumerate() { deg = gpu.decode_step(&md, &cdeg, t, i); }
+        let e = maxerr(&deg, &fast);
+        println!("  degrade path: serial-kernel decode vs fast-path decode max|diff|={e:.2e}");
+        check("degraded (safe-kernel) decode == fast-path decode", e, 1e-4);
+    }
+
     println!();
     println!("  pipeline cache: {} unique compute pipelines built and reused across all dispatches", gpu.pipeline_count());
     if fails == 0 { println!("ALL KERNELS VALIDATED ON GPU ✓"); }
