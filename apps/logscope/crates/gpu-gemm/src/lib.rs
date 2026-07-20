@@ -4373,6 +4373,11 @@ pub struct Model {
     /// DSA (DeepSeek Sparse Attention) lightning-indexer config, present only when the indexer weights ship.
     /// When set (and seq > index_topk) attention is sparse; `None` = dense attention.
     pub dsa: Option<DsaConfig>,
+    /// Number of trailing multi-token-prediction (MTP / nextn_predict) blocks the checkpoint ships (GLM-5.2,
+    /// DeepSeek-V3). These aren't standard transformer layers (loaded depth excludes them), but recording
+    /// the count marks that a native MTP draft head is PRESENT — the prerequisite for wiring MTP speculative
+    /// decode (a lossless speedup, like the n-gram draft) later. 0 = no MTP head.
+    pub mtp_layers: usize,
 }
 
 /// Multi-head Latent Attention config (DeepSeek-V2/V3, GLM-MoE-DSA). The dims that make MLA's compressed
@@ -4449,6 +4454,10 @@ impl Model {
     /// Width of one K/V cache row = n_kv_heads × head_dim (== d for plain MHA, but NOT for Qwen3 where
     /// head_dim is decoupled from d/n_heads).
     pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+    /// Whether the checkpoint ships a native multi-token-prediction draft head (GLM-5.2/DeepSeek-V3). When
+    /// true, an MTP speculative-decode path could draft tokens from the head (lossless, verified) — not yet
+    /// wired, but the presence is now recorded rather than silently dropped at load.
+    pub fn has_mtp(&self) -> bool { self.mtp_layers > 0 }
     /// The width Q and attention operate on = n_heads × head_dim (== d for plain MHA).
     pub fn attn_dim(&self) -> usize { self.n_heads * self.head_dim }
     /// The per-rotary-pair RoPE frequency factors (llama3 scaling); all-ones if none loaded.
@@ -4666,7 +4675,7 @@ impl Gpu {
         let mtp = g.get_u32(&format!("{pfx}.nextn_predict_layers")).unwrap_or(0) as usize;
         let n = if mtp > 0 && mtp < n_blocks
             && g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none() {
-            eprintln!("loader: dropping {mtp} nextn-predict (MTP) block(s) — {} transformer layers", n_blocks - mtp);
+            eprintln!("loader: {mtp} nextn-predict (MTP draft head) block(s) present, not loaded as layers — {} transformer layers", n_blocks - mtp);
             n_blocks - mtp
         } else { n_blocks };
         // vocab_size is often absent in real GGUFs; derive it from the embedding below.
@@ -5022,7 +5031,7 @@ impl Gpu {
                 Some(DsaConfig { index_topk, index_n_heads, index_head_dim })
             } else { None }
         };
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa })
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -5102,7 +5111,7 @@ impl Gpu {
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
