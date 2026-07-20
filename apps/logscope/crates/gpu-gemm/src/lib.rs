@@ -5306,6 +5306,9 @@ pub struct StagedKvCache {
     pub policy: crate::kvstage::StagePolicy,
     /// Warm tail length in tokens (== policy.hot_start; cached to avoid recomputm). Kept in sync on demote.
     pub warm_len: usize,
+    /// Row count of each demoted warm block, in demote order (same for every layer). Lets multi-block
+    /// attention size each block's flash chunks. `warm_block_rows.iter().sum() == warm_len`.
+    pub warm_block_rows: Vec<usize>,
 }
 
 /// A generation session backed by the int8 KV cache (4x smaller). Mirrors `Session`.
@@ -5700,6 +5703,43 @@ impl Gpu {
         out
     }
 
+    /// Multi-block staged attention: the warm tier is a LIST of int8 blocks (one per demote event), each
+    /// `(kq,ks,vq,vs, rows)`. Generalizes `decode_attention_two_span` to any number of warm blocks — each
+    /// block contributes its own flash chunks at the right offset, and the single pass-2 folds hot + all
+    /// warm chunks in one online softmax. This is the steady-state staged decode read (a long context has
+    /// many demoted blocks). Warm blocks are the OLDER positions; hot is the recent window. `warm_blocks`
+    /// is ordered oldest→newest but order doesn't affect the softmax (it's over the union).
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_attention_multi_span(&self, q: &Tensor,
+            warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], // (kq,ks,vq,vs,rows) per block
+            kc: &Tensor, vc: &Tensor, hl: usize,
+            dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let hd = dm / n_heads;
+        let chunk = 2048usize;
+        let hot_nch = hl.div_ceil(chunk).max(1);
+        // each warm block contributes ceil(rows/chunk) chunks
+        let warm_nchs: Vec<usize> = warm_blocks.iter().map(|&(_, _, _, _, r)| r.div_ceil(chunk)).collect();
+        let warm_total: usize = warm_nchs.iter().sum();
+        let nch = hot_nch + warm_total;
+        let part = self.alloc(1, n_heads * nch * (hd + 2));
+        // hot span → chunks [0, hot_nch)
+        let dh = [hl as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, 0, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P1, &[q, kc, vc], &part, bytemuck::cast_slice(&dh), (n_heads as u32, hot_nch as u32, 1));
+        // each warm block → its own chunk range, starting after the hot chunks
+        let mut coff = hot_nch;
+        for (bi, &(kq, ks, vq, vs, rows)) in warm_blocks.iter().enumerate() {
+            let bnch = warm_nchs[bi];
+            if bnch == 0 { continue; }
+            let dw = [rows as u32, hd as u32, n_heads as u32, n_kv_heads as u32, chunk as u32, nch as u32, coff as u32, 0];
+            self.dispatch(DECODE_ATTN_FLASH_P1_Q8, &[q, kq, ks, vq, vs], &part, bytemuck::cast_slice(&dw), (n_heads as u32, bnch as u32, 1));
+            coff += bnch;
+        }
+        let out = self.alloc(1, dm);
+        let dims2 = [hd as u32, nch as u32, n_heads as u32, 0];
+        self.dispatch(DECODE_ATTN_FLASH_P2, &[&part], &out, bytemuck::cast_slice(&dims2), (n_heads as u32, 1, 1));
+        out
+    }
+
     /// Quantize `[n,c]` f32 rows to packed int8 `[n,c/4]` (u32) + per-row f32 scales.
     /// `c` must be a multiple of 4. Returns (packed, scales).
     pub fn quantize_rows(&self, x: &Tensor, n: usize, c: usize) -> (Tensor, Tensor) {
@@ -5740,7 +5780,7 @@ impl Gpu {
             hot: self.new_cache(n_layers, max_seq, kv_dim),
             warm: QKvCache { kq: vec![], ks: vec![], vq: vec![], vs: vec![] },
             policy,
-            warm_len: 0,
+            warm_len: 0, warm_block_rows: Vec::new(),
         }
     }
 
@@ -5768,7 +5808,7 @@ impl Gpu {
                     cache.warm.vq.push(qv); cache.warm.vs.push(sv);
                 }
                 cache.policy.commit_demote(len);
-                cache.warm_len += len;
+                cache.warm_len += len; cache.warm_block_rows.push(len);
                 len
             }
         }
@@ -5902,7 +5942,7 @@ impl Gpu {
     /// only storage is split). `hot_start` is the warm/hot boundary; `warm_len == hot_start`. When
     /// `warm_len == 0` (nothing demoted yet — e.g. the HOT_WINDOW=∞ no-op gate) two-span reduces to the
     /// f32 flash path, so this is bit-exact to `block_decode` until demotion turns on.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn block_decode_staged(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
             kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
             pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
@@ -5926,6 +5966,41 @@ impl Gpu {
                 self.decode_attention_two_span(&q, kq, ks, vq, vs, warm_len, kc, vc, hot_len, ad, n_heads, n_kv_heads),
             // no warm tail → identical to the normal decode attention over the hot cache
             _ => self.decode_attention_mh(&q, kc, vc, hot_len, ad, n_heads, n_kv_heads),
+        };
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
+        self.ffn_apply(w, &x2, 1, d, eps)
+    }
+    /// Staged block decode with a MULTI-BLOCK warm tail (steady state). Same as `block_decode_staged` but
+    /// attention reads all warm int8 blocks + the hot window via `decode_attention_multi_span`. Reduces to
+    /// the f32 path when there are no warm blocks (no-op gate still holds).
+    #[allow(clippy::too_many_arguments)]
+    fn block_decode_staged_multi(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
+            kc: &Tensor, vc: &Tensor, warm_blocks: &[(&Tensor, &Tensor, &Tensor, &Tensor, usize)], warm_len: usize,
+            pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base };
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
+        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        let q = match w.attn_temp {
+            Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
+            _ => q,
+        };
+        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let vr = w.wv.apply(self, &n1, 1);
+        // Write at the ABSOLUTE position (like the normal cache), NOT hot-relative: demotion reads old
+        // rows [from,from+len) by absolute index, so the hot cache must be absolutely-indexed too. The hot
+        // WINDOW is then rows [hot_start, pos] — a sub-range of the absolutely-filled cache. (max_seq sized.)
+        self.write_row(kc, &kr, pos, kv);
+        self.write_row(vc, &vr, pos, kv);
+        let hot_len = pos - hot_start + 1; // hot window rows [hot_start, pos]
+        let attn = if warm_len > 0 && !warm_blocks.is_empty() {
+            // hot span is the sub-range starting at hot_start; two-span reads it via a row-offset view
+            let hot_k = self.rows_view(kc, hot_start, hot_len, kv);
+            let hot_v = self.rows_view(vc, hot_start, hot_len, kv);
+            self.decode_attention_multi_span(&q, warm_blocks, &hot_k, &hot_v, hot_len, ad, n_heads, n_kv_heads)
+        } else {
+            // no warm tail → attend over [0, pos] directly (hot_start==0 here), identical to normal decode
+            self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads)
         };
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
@@ -6592,16 +6667,16 @@ impl Gpu {
     fn decode_layers_staged(&self, m: &Model, sc: &StagedKvCache, mut x: Tensor, pos: usize) -> Tensor {
         let hot_start = sc.policy.hot_start;
         let warm_len = sc.warm_len;
-        // warm tier holds demoted blocks per layer; index for layer li, block bi is (bi*n_layers + li).
-        // No-op/single-block path: pass the layer's one warm block when warm_len>0 and exactly one block.
-        let blocks = if m.n_layers > 0 { sc.warm.kq.len() / m.n_layers } else { 0 };
+        let nblocks = sc.warm_block_rows.len();
         for li in 0..m.n_layers {
             let (w, k, v) = (&m.layers[li], &sc.hot.k[li], &sc.hot.v[li]);
-            let warm = if warm_len > 0 && blocks == 1 {
-                Some((&sc.warm.kq[li], &sc.warm.ks[li], &sc.warm.vq[li], &sc.warm.vs[li]))
-            } else { None };
-            let wl = if warm.is_some() { warm_len } else { 0 };
-            x = self.block_decode_staged(w, &x, &m.rope_factors, k, v, warm, wl,
+            // gather this layer's warm blocks: block bi, layer li is at index (bi*n_layers + li)
+            let warm_blocks: Vec<(&Tensor, &Tensor, &Tensor, &Tensor, usize)> = (0..nblocks)
+                .map(|bi| {
+                    let idx = bi * m.n_layers + li;
+                    (&sc.warm.kq[idx], &sc.warm.ks[idx], &sc.warm.vq[idx], &sc.warm.vs[idx], sc.warm_block_rows[bi])
+                }).collect();
+            x = self.block_decode_staged_multi(w, &x, &m.rope_factors, k, v, &warm_blocks, warm_len,
                 pos, hot_start, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
         }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
