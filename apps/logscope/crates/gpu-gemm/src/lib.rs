@@ -4980,6 +4980,46 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // attends over a cache already holding [0, base+s) rows (parent prefix + this segment),
 // causal by global position. Lets a shared segment be prefilled on top of a parent cache
 // in O(s·(base+s)) instead of recomputing the parent — the batched `extend_prefix`.
+// PARALLEL prefill attention: one workgroup per (query row, head), 64 threads splitting the causal KV
+// loop [0, qpos] with a shared-memory softmax reduction — instead of ATTENTION_MH_EXT's single serial
+// thread crawling the whole cache per row. Same math, same causal mask, but the per-row O(qpos·hd) work
+// is spread across the GPU. This is what keeps each prefill dispatch SHORT (no watchdog trip) and fast:
+// the serial kernel is why a 3B "prefills" in tens of seconds and can hang the Asahi firmware timeout.
+// Scores are held in shared memory (cap 4096 KV rows / workgroup — callers above that fall back).
+const ATTENTION_MH_EXT_PAR: &str = r#"
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,4096>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let row=wg.x;                                       // which (query row, head) this workgroup handles
+  let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;   // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  let qpos=dd.base+i;                                 // causal bound: attend to [0, qpos]
+  let l=qpos+1u;
+  // threads split the KV rows: QK dot + running local max
+  var lmax=-3.4e38; var j=tid;
+  loop { if(j>=l){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*kc[j*kvdm+kb+c];} let s=dot*scale; sc[j]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=tid;
+  loop { if(j>=l){break;} let p=exp(sc[j]-mx); sc[j]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  // threads split head_dim for the V-weighted sum (coalesced)
+  var c=tid;
+  loop { if(c>=dd.hd){break;} var acc=0.0; for(var jj=0u;jj<l;jj=jj+1u){ acc=acc+sc[jj]*vc[jj*kvdm+kb+c]; } o[i*dm+b+c]=acc/sum; c=c+64u; }
+}"#;
+
 const ATTENTION_MH_EXT: &str = r#"
 struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -5633,7 +5673,17 @@ impl Gpu {
     fn attention_mh_ext(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         let out = self.alloc(s, dm); let hd = dm / n_heads;
         let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, 0, 0, 0];
-        self.dispatch(ATTENTION_MH_EXT, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (((s * n_heads) as u32).div_ceil(64), 1, 1)); out
+        // The longest causal row in this chunk attends to base+s rows; if that fits the parallel kernel's
+        // shared-memory score buffer (4096), use it — one workgroup per (query row, head), threads split
+        // the KV loop, so the per-row O(qpos·hd) work spreads across the GPU instead of one serial thread
+        // crawling the cache. That's the fix for the tens-of-seconds prefill (and the Asahi watchdog hang).
+        // Above 4096 rows, fall back to the serial kernel (correct, just slow) until a split-K prefill lands.
+        if base + s <= 4096 {
+            self.dispatch(ATTENTION_MH_EXT_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((s * n_heads) as u32, 1, 1));
+        } else {
+            self.dispatch(ATTENTION_MH_EXT, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (((s * n_heads) as u32).div_ceil(64), 1, 1));
+        }
+        out
     }
     /// Multi-head/GQA decode attention: single query row over a cache of `l` rows.
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
