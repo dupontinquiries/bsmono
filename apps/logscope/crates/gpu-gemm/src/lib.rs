@@ -4514,6 +4514,41 @@ impl Gpu {
             .unwrap_or_else(|| d / n_heads.max(1));
         let attn_dim = n_heads * head_dim;      // Q / attention width (e.g. 4096 for Qwen3-4B, while d=2560)
         let kv = n_kv_heads * head_dim;         // K/V projection + cache row width (GQA when < attn_dim)
+        // HOSTILE-DIMENSION GUARD (cf. Colibri's "absurd n from hostile model files" + matmul shape-overflow
+        // checks): a corrupt or malicious GGUF header can carry dims that overflow the size arithmetic we do
+        // below (d·vocab for the embed table, etc.) and wrap into a small allocation → out-of-bounds writes.
+        // Metadata parses fine, so nothing else catches it. Reject absurd values up front with a clear
+        // message instead of computing a wrapped size. Bounds are far above any real model (d≤1M, layers≤
+        // 1024, heads≤4096, vocab≤16M) so no legitimate checkpoint is refused. Also require the products we
+        // actually allocate to fit in usize via checked_mul.
+        {
+            let checks: [(&str, usize, usize); 6] = [
+                ("embedding_length (d)", d, 1_048_576),
+                ("block_count (layers)", n, 1_024),
+                ("head_count", n_heads, 4_096),
+                ("head_count_kv", n_kv_heads, 4_096),
+                ("head_dim", head_dim, 65_536),
+                ("feed_forward_length", h, 1_048_576),
+            ];
+            for (name, val, max) in checks {
+                if val == 0 || val > max {
+                    return Err(format!("GGUF hyperparameter '{name}' = {val} is out of the sane range (1..={max}) \
+                        — the header is corrupt or hostile (a wrapped/absurd dim would overflow the allocation \
+                        arithmetic). Re-download or verify the file."));
+                }
+            }
+            if n_kv_heads > n_heads || n_heads % n_kv_heads != 0 {
+                return Err(format!("GGUF head_count_kv ({n_kv_heads}) must divide head_count ({n_heads}) for \
+                    GQA — the header is inconsistent."));
+            }
+            // the largest products we feed into allocations must not overflow usize
+            let vocab_guess = vocab_meta.unwrap_or(0).max(256);
+            if d.checked_mul(vocab_guess).and_then(|x| x.checked_mul(4)).is_none()
+                || attn_dim.checked_mul(d).is_none() || h.checked_mul(d).is_none() {
+                return Err("GGUF dimensions overflow the address space when sized for allocation — \
+                    the header is corrupt or hostile.".into());
+            }
+        }
         // Bigger-model memory pre-flight: estimate the resident footprint from metadata (cheap — tensor
         // dims only, no dequant) and refuse gracefully WITH the number instead of OOMing mid-load.
         let vocab_est = vocab_meta.unwrap_or_else(|| g.tensor("token_embd.weight")
