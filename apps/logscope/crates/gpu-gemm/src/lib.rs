@@ -5896,6 +5896,40 @@ impl Gpu {
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
+    /// Staged-KV block decode: K/V for the current token go into the HOT f32 cache at its hot-relative
+    /// row, and attention reads the WARM int8 tail + the HOT f32 window in one online-softmax pass
+    /// (`decode_attention_two_span`). RoPE still uses the ABSOLUTE position `pos` (positions are global;
+    /// only storage is split). `hot_start` is the warm/hot boundary; `warm_len == hot_start`. When
+    /// `warm_len == 0` (nothing demoted yet — e.g. the HOT_WINDOW=∞ no-op gate) two-span reduces to the
+    /// f32 flash path, so this is bit-exact to `block_decode` until demotion turns on.
+    #[allow(clippy::too_many_arguments)]
+    fn block_decode_staged(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
+            kc: &Tensor, vc: &Tensor, warm: Option<(&Tensor, &Tensor, &Tensor, &Tensor)>, warm_len: usize,
+            pos: usize, hot_start: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = if w.nope { 0.0 } else { base };
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
+        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
+        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        let q = match w.attn_temp {
+            Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
+            _ => q,
+        };
+        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let vr = w.wv.apply(self, &n1, 1);
+        // hot-relative write position: the token at absolute `pos` is row `pos - hot_start` of the hot cache
+        let hrow = pos - hot_start;
+        self.write_row(kc, &kr, hrow, kv);
+        self.write_row(vc, &vr, hrow, kv);
+        let hot_len = hrow + 1; // hot rows [0, hrow] are live this step
+        let attn = match warm {
+            Some((kq, ks, vq, vs)) if warm_len > 0 =>
+                self.decode_attention_two_span(&q, kq, ks, vq, vs, warm_len, kc, vc, hot_len, ad, n_heads, n_kv_heads),
+            // no warm tail → identical to the normal decode attention over the hot cache
+            _ => self.decode_attention_mh(&q, kc, vc, hot_len, ad, n_heads, n_kv_heads),
+        };
+        let x2 = w.wo.apply_add(self, &attn, 1, x);
+        self.ffn_apply(w, &x2, 1, d, eps)
+    }
     /// Multiply a single-row `[1, width]` query tensor by a scalar (Llama 4 attention temperature). Uses
     /// the row-broadcast scale kernel with a 1-row weight — one small dispatch, only invoked on NoPE
     /// layers past the temperature floor (long context), so it's off the hot path in the common case.
@@ -6074,6 +6108,17 @@ impl Gpu {
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
         self.download(&m.output.apply(self, &xn, 1))
+    }
+
+    /// Staged-KV decode of one token: writes K/V into the hot f32 window and reads warm int8 tail + hot
+    /// window via two-span attention. Bit-exact to `decode_step` while the warm tail is empty (all-hot),
+    /// which is the no-op gate. The caller runs `staged_slide` after this to demote a block when due.
+    pub fn decode_step_staged(&self, m: &Model, sc: &StagedKvCache, token: u32, pos: usize) -> Vec<f32> {
+        self.begin_frame();
+        let s = token as usize * m.d;
+        let x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+        let out = self.decode_layers_staged(m, sc, x, pos);
+        self.download(&out)
     }
 
     /// Token-level generation: prefill `prefix`, then decode up to `max_new` tokens, sampling each
@@ -6544,6 +6589,25 @@ impl Gpu {
     /// Decode one token whose input ACTIVATION is already a GPU tensor `x` [1, d] (e.g. gathered on
     /// device): runs the layers + final norm + output projection and returns logits [1, vocab] as a
     /// tensor — no begin_frame, no readback (caller owns the frame). Honors LOGSCOPE_FUSED_QKV.
+    fn decode_layers_staged(&self, m: &Model, sc: &StagedKvCache, mut x: Tensor, pos: usize) -> Tensor {
+        let hot_start = sc.policy.hot_start;
+        let warm_len = sc.warm_len;
+        // warm tier holds demoted blocks per layer; index for layer li, block bi is (bi*n_layers + li).
+        // No-op/single-block path: pass the layer's one warm block when warm_len>0 and exactly one block.
+        let blocks = if m.n_layers > 0 { sc.warm.kq.len() / m.n_layers } else { 0 };
+        for li in 0..m.n_layers {
+            let (w, k, v) = (&m.layers[li], &sc.hot.k[li], &sc.hot.v[li]);
+            let warm = if warm_len > 0 && blocks == 1 {
+                Some((&sc.warm.kq[li], &sc.warm.ks[li], &sc.warm.vq[li], &sc.warm.vs[li]))
+            } else { None };
+            let wl = if warm.is_some() { warm_len } else { 0 };
+            x = self.block_decode_staged(w, &x, &m.rope_factors, k, v, warm, wl,
+                pos, hot_start, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+        }
+        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
+        m.output.apply(self, &xn, 1)
+    }
+
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
