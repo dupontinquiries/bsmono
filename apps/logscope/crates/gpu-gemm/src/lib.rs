@@ -4306,6 +4306,35 @@ pub struct Model {
     pub d: usize, pub h: usize, pub vocab: usize, pub n_layers: usize, pub n_heads: usize,
     pub n_kv_heads: usize, pub head_dim: usize,
     pub base: f32, pub eps: f32,
+    /// MLA (Multi-head Latent Attention) rank config, present only for DeepSeek-V3/GLM-MoE checkpoints.
+    /// When set, the KV cache stores the compressed latent instead of per-head K/V. `None` = standard MHA/GQA.
+    pub mla: Option<MlaConfig>,
+}
+
+/// Multi-head Latent Attention config (DeepSeek-V2/V3, GLM-MoE-DSA). The dims that make MLA's compressed
+/// KV cache work: instead of caching `n_kv_heads·head_dim` per token, MLA caches only the down-projected
+/// latent (`kv_lora`) plus the shared rotary part (`qk_rope`) — e.g. 512+64=576 vs 32768 values/token —
+/// and reconstructs per-head K (nope part) and V from the latent via the kv_b up-projection at use time.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MlaConfig {
+    /// Rank of the Q down-projection (0 = no Q compression; Q is projected directly). DeepSeek-V3: 1536.
+    pub q_lora: usize,
+    /// Rank of the KV down-projection — the width of the cached latent. DeepSeek-V3: 512.
+    pub kv_lora: usize,
+    /// Per-head non-rotary key/query dim (reconstructed from the latent). DeepSeek-V3: 128.
+    pub qk_nope: usize,
+    /// Per-head rotary key/query dim (RoPE part, shared across heads in the cache). DeepSeek-V3: 64.
+    pub qk_rope: usize,
+    /// Per-head value dim (reconstructed from the latent). DeepSeek-V3: 128.
+    pub v_head: usize,
+}
+
+impl MlaConfig {
+    /// Cached latent width per token = the compressed KV row. This is the memory win: compare to
+    /// `n_kv_heads · head_dim` for standard KV.
+    pub fn latent_width(&self) -> usize { self.kv_lora + self.qk_rope }
+    /// Full per-head query/key dim (nope + rope), the width attention scores are computed over.
+    pub fn qk_head(&self) -> usize { self.qk_nope + self.qk_rope }
 }
 impl Model {
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
@@ -4820,7 +4849,33 @@ impl Gpu {
         }
         self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
         let rope_factors = self.upload(&rope_vals, 1, hd_half);
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps })
+        // MLA rank config (DeepSeek-V3 / GLM-MoE): read the compressed-attention dims when present. llama.cpp's
+        // deepseek2 GGUF convention: attention.{kv_lora_rank,q_lora_rank,key_length(qk_nope),value_length},
+        // rope.dimension_count (qk_rope). Only build MlaConfig when the KV latent rank is present — that's the
+        // MLA signature. Validated by the same hostile-dim bounds as the other hyperparameters.
+        let mla = {
+            let kv_lora = g.get_u32(&format!("{pfx}.attention.kv_lora_rank")).unwrap_or(0) as usize;
+            if kv_lora > 0 {
+                let q_lora = g.get_u32(&format!("{pfx}.attention.q_lora_rank")).unwrap_or(0) as usize;
+                let qk_rope = g.get_u32(&format!("{pfx}.rope.dimension_count")).unwrap_or(0) as usize;
+                let qk_nope = g.get_u32(&format!("{pfx}.attention.key_length")).map(|v| v as usize)
+                    .unwrap_or(head_dim.saturating_sub(qk_rope));
+                let v_head = g.get_u32(&format!("{pfx}.attention.value_length")).map(|v| v as usize).unwrap_or(qk_nope);
+                // sanity-bound the MLA ranks (cf. the hostile-dim guard) before they size the latent cache
+                for (name, val, max) in [("kv_lora_rank", kv_lora, 65_536usize), ("q_lora_rank", q_lora, 65_536),
+                                         ("qk_rope", qk_rope, 4_096), ("qk_nope", qk_nope, 4_096), ("v_head", v_head, 4_096)] {
+                    if val > max || (name != "q_lora_rank" && val == 0) {
+                        return Err(format!("MLA rank '{name}' = {val} is out of range (max {max}) — corrupt/hostile header"));
+                    }
+                }
+                Some(MlaConfig { q_lora, kv_lora, qk_nope, qk_rope, v_head })
+            } else { None }
+        };
+        if let Some(m) = &mla {
+            eprintln!("wgpu-engine: MLA config detected — kv_lora={} q_lora={} qk_nope={} qk_rope={} v_head={} (latent {} vs {} per-token KV) — forward not yet wired",
+                m.kv_lora, m.q_lora, m.qk_nope, m.qk_rope, m.v_head, m.latent_width(), n_kv_heads * head_dim);
+        }
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -4900,7 +4955,7 @@ impl Gpu {
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -7829,6 +7884,17 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
 #[cfg(test)]
 mod decode_cfg_tests {
     use super::*;
+
+    #[test]
+    fn mla_config_latent_width_is_the_memory_win() {
+        // DeepSeek-V3 dims: the cached latent is kv_lora + qk_rope = 512 + 64 = 576, vs a standard
+        // GQA cache of n_kv_heads·head_dim. The whole point of MLA is that 576 << the per-head KV.
+        let m = MlaConfig { q_lora: 1536, kv_lora: 512, qk_nope: 128, qk_rope: 64, v_head: 128 };
+        assert_eq!(m.latent_width(), 576);
+        assert_eq!(m.qk_head(), 192); // nope + rope, the score width
+        // a standard 128-kv-head × 128-dim cache would be 16384/token — MLA caches 28× less here
+        assert!(m.latent_width() * 28 < 128 * 128);
+    }
 
     #[test]
     fn argmax_skips_nonfinite_and_never_pins_to_zero() {
