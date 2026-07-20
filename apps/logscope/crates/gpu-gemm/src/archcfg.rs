@@ -109,7 +109,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             rope_interleaved: true, moe: true, moe_shared_expert: true, interleaved_nope: true,
             logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: true, dense_supported: false,
-            note: "Llama4 MoE: 16 routed (top-1, raw-sigmoid gate on the expert INPUT) + 1 shared expert, interleaved NoPE every 4th layer, weightless QK-Norm on RoPE layers. Runs the v1 routed path (v2 GPU-routing covers softmax gating only, so far); attn temperature tuning (matters past 8K positions) not yet applied.",
+            note: "Llama4 MoE: 16 routed (top-1, raw-sigmoid gate on the expert INPUT) + 1 shared expert, interleaved NoPE every 4th layer, weightless QK-Norm on RoPE layers, iRoPE attention temperature tuning on NoPE layers (length generalization past 8K). Runs the v1 routed path (v2 GPU-routing covers softmax gating only, so far).",
         },
         "gemma" | "gemma2" => ArchConfig {
             arch: Arch::Gemma2, prefix: "gemma2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::RmsGemma, act: Act::GeGlu,
