@@ -13,6 +13,7 @@ pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) befo
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
 pub mod governor; // backend-agnostic GPU resource governor: per-device budget + adaptive window k
+#[allow(dead_code)] pub mod kvstage; // staging policy for the hot(f32)/warm(int8) KV cache — speed + 1M ctx
 pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
