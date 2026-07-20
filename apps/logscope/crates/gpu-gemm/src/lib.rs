@@ -212,6 +212,11 @@ pub struct Gpu {
     /// Set when a dims-uniform allocation was rejected by the device (validation error captured, not
     /// aborted). The windowed generate path checks it to fall back to leaner per-token decode.
     dims_alloc_failed: std::sync::atomic::AtomicBool,
+    /// Generic fault→degrade latch (cf. Colibri: GPU is a try-and-return shortcut in front of a safe
+    /// path). Monotonic, only ever raised: 0 = fast path; >=1 = a GPU op faulted, so future ops prefer the
+    /// conservative kernels (serial attention, bounded submits) that can't wedge the driver. This makes an
+    /// unknown driver quirk a one-time slowdown instead of a hang — we catch the fault once and stay safe.
+    degrade_level: std::sync::atomic::AtomicU32,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -498,7 +503,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level: std::sync::atomic::AtomicU32::new(0) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1138,6 +1143,38 @@ impl Gpu {
     }
 
     /// Current passes-per-submit (the submit-overhead knob).
+    /// Current degrade level (0 = fast path). Kernels consult this to pick a conservative variant after a
+    /// prior GPU fault, so one caught fault protects the rest of the session (cf. Colibri's per-block CPU
+    /// fallback — here we degrade to the safe GPU kernels rather than CPU, since our whole engine is GPU).
+    pub fn degrade_level(&self) -> u32 { self.degrade_level.load(std::sync::atomic::Ordering::Relaxed) }
+    /// Whether we should avoid the fragile fast-path kernels (barrier-heavy attention, collapsed submits).
+    pub fn degraded(&self) -> bool { self.degrade_level() >= 1 }
+    /// Raise the degrade latch (monotonic — only ever increases). Logged once per level so a degrade is
+    /// visible, not silent. Called when a guarded GPU op faults.
+    pub fn raise_degrade(&self, reason: &str) {
+        let prev = self.degrade_level.fetch_max(1, std::sync::atomic::Ordering::Relaxed);
+        if prev < 1 {
+            eprintln!("wgpu-engine: DEGRADED to safe kernels — {reason} (a GPU op faulted; using conservative paths for the rest of the session to avoid a hang)");
+        }
+    }
+    /// Run a GPU closure inside a validation+OOM error scope and a bounded device poll, returning whether
+    /// it completed cleanly. On a captured error this raises the degrade latch and returns false, so the
+    /// CALLER can fall through to a safe path — the Colibri "GPU is a try-and-return shortcut in front of
+    /// the safe path" shape. `poll_ms` bounds the wait so a wedged submit surfaces as a fault instead of an
+    /// indefinite hang (0 = wait indefinitely, for backends where that's safe).
+    pub fn run_guarded<R>(&self, what: &str, f: impl FnOnce() -> R) -> Option<R> {
+        let vscope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let r = f();
+        // flush any open frame so the work is actually submitted before we poll for completion
+        self.end_frame();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let verr = pollster::block_on(vscope.pop());
+        if verr.is_some() {
+            self.raise_degrade(what);
+            return None;
+        }
+        Some(r)
+    }
     pub fn flush_every(&self) -> u32 { self.flush_every.load(std::sync::atomic::Ordering::Relaxed) }
     /// Set passes-per-submit. Clamped to [1,1024]. Ignored when LOGSCOPE_FLUSH_EVERY pins it, so a manual
     /// override always wins over the adaptive tuner. Returns the value in effect after the call.
@@ -5731,7 +5768,9 @@ impl Gpu {
         // DECODE_ATTN_MH_PAR is barrier-heavy; on Asahi (which hangs barrier/subgroup-heavy kernels)
         // it's the prime suspect for a decode hang. LOGSCOPE_DECODE_ATTN_SERIAL=1 forces the serial
         // kernel at ANY length so that hypothesis can be A/B-tested (and pins a safe path if true).
-        let decode_serial = std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
+        // DECODE_ATTN_MH_PAR is barrier-heavy; if a prior GPU op faulted (degraded), or the diagnostic
+        // flag is set, use the serial (barrier-free) kernel that can't wedge a fragile driver.
+        let decode_serial = self.degraded() || std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
         if decode_serial {
             self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
         } else if l <= 4096 {
@@ -7168,7 +7207,7 @@ impl Gpu {
             // proactive (not gated on governor_dead, which only latches AFTER the first stalled submit — too
             // late for the first window). LOGSCOPE_WINDOW_ONE_SUBMIT=1 restores the collapse for A/B.
             let force_collapse = std::env::var_os("LOGSCOPE_WINDOW_ONE_SUBMIT").is_some();
-            if self.conservative_vma && !force_collapse {
+            if (self.conservative_vma || self.degraded()) && !force_collapse {
                 self.set_flush_every(saved_flush.clamp(1, 64));
             } else {
                 self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
