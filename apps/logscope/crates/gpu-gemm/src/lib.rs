@@ -5728,7 +5728,13 @@ impl Gpu {
         // shared memory (cap 4096). Above that: the flash split-K pair (parallelism grows with
         // context — heads × chunks workgroups — no shared-memory cap); LOGSCOPE_FLASH_ATTN=0
         // restores the old single-workgroup-per-head serial fallback.
-        if l <= 4096 {
+        // DECODE_ATTN_MH_PAR is barrier-heavy; on Asahi (which hangs barrier/subgroup-heavy kernels)
+        // it's the prime suspect for a decode hang. LOGSCOPE_DECODE_ATTN_SERIAL=1 forces the serial
+        // kernel at ANY length so that hypothesis can be A/B-tested (and pins a safe path if true).
+        let decode_serial = std::env::var_os("LOGSCOPE_DECODE_ATTN_SERIAL").is_some();
+        if decode_serial {
+            self.dispatch(DECODE_ATTN_MH, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1));
+        } else if l <= 4096 {
             self.dispatch(DECODE_ATTN_MH_PAR, &[q, kc, vc], &out, bytemuck::cast_slice(&dims), (n_heads as u32, 1, 1));
         } else if flash_attn_enabled() {
             return self.decode_attention_flash(q, kc, vc, l, dm, n_heads, n_kv_heads);
