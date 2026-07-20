@@ -983,7 +983,12 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
                 qs: tview(&w.qs, (row0 * kb * 4) as u64, (rows * kb * 4) as u64, rows, kb),
                 n: rows, k: w.k }), bias: None })
         }
-        LinKind::F32(_) => None,
+        LinKind::F32(t) => {
+            // f32 expert stack (small models, or dims not ÷32 so quant fell back to f32): slice `rows`
+            // rows of `k = cols` floats out of the [n, k] tensor as a byte-offset view.
+            let k = t.cols;
+            Some(Lin { kind: LinKind::F32(tview(t, (row0 * k * 4) as u64, (rows * k * 4) as u64, rows, k)), bias: None })
+        }
     }
 }
 /// One Z-Image/DiT transformer block (Peebles & Xie AdaLN-Zero design): non-affine LayerNorm →
@@ -4556,7 +4561,24 @@ impl Gpu {
         // mislabeled-but-supported model loads, and a genuinely unsupported one is named correctly below.
         let arch = g.arch();
         let acfg = crate::archcfg::for_arch(&arch);
-        if !acfg.supported {
+        // MLA is detected by TENSOR PRESENCE, not arch name. The glm4moe family ships in two forms: some
+        // use Multi-head Latent Attention (attn_kv_a/kv_b down/up projections — not wired yet), but others
+        // use ordinary GQA attention (attn_q/k/v, often with QK-norm + bias) plus shared-expert MoE, which
+        // we DO support. So only treat this arch as unsupported-MLA when the MLA projection tensors are
+        // actually present; otherwise fall through to the standard attention+MoE path.
+        let has_mla_tensors = g.tensor("blk.0.attn_kv_a_mqa.weight").is_some()
+            || g.tensor("blk.0.attn_kv_a.weight").is_some()
+            || g.tensor("blk.0.attn_kv_b.weight").is_some();
+        let arch_is_mla_family = matches!(acfg.arch, crate::archcfg::Arch::DeepseekV3 | crate::archcfg::Arch::Glm4Moe);
+        // If an MLA-family checkpoint actually ships MLA projection tensors, we can't run it yet (MLA
+        // forward unwired) — refuse clearly. If it has standard attention tensors instead, proceed.
+        if arch_is_mla_family && has_mla_tensors {
+            let layout = g.dump_tensors("blk.0.");
+            return Err(format!("architecture '{arch}' uses Multi-head Latent Attention (attn_kv_a/kv_b present) \
+                which isn't wired in the wgpu engine yet — use the llama.cpp backend for this model.\n{layout}"));
+        }
+        let treat_unsupported = !acfg.supported;
+        if treat_unsupported {
             // MoE-aware escape: some architectures (e.g. Qwen4) are only PARTIALLY unsupported — their MoE
             // routing kernel isn't wired, but a DENSE checkpoint of the same arch runs on the existing
             // forward path. Read the expert count from metadata: 0/absent ⇒ dense ⇒ allow; >0 ⇒ real MoE ⇒
@@ -4628,13 +4650,24 @@ impl Gpu {
         let n_expert = g.get_u32(&format!("{pfx}.expert_count")).unwrap_or(0) as usize;
         let n_expert_used = g.get_u32(&format!("{pfx}.expert_used_count")).unwrap_or(8) as usize;
         let expert_ff = g.get_u32(&format!("{pfx}.expert_feed_forward_length")).unwrap_or(0) as usize;
-        let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0 && g.tensor("blk.0.ffn_gate_exps.weight").is_some();
+        let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0
+            && (0..g.get_u32(&format!("{pfx}.block_count")).unwrap_or(0)).any(|b| g.tensor(&format!("blk.{b}.ffn_gate_exps.weight")).is_some());
         let h = match g.get_u32(&format!("{pfx}.feed_forward_length")) {
             Some(v) => v as usize,
             None if is_moe => expert_ff, // MoE GGUFs may omit the dense FFN width entirely
             None => return Err("missing feed_forward_length".into()),
         };
-        let n = g.get_u32(&format!("{pfx}.block_count")).ok_or("missing block_count")? as usize;
+        let n_blocks = g.get_u32(&format!("{pfx}.block_count")).ok_or("missing block_count")? as usize;
+        // GLM4-MoE / DeepSeek-V3 ship `nextn_predict_layers` extra "blocks" for multi-token prediction (MTP)
+        // speculative heads — these are counted in block_count but are NOT standard transformer layers (no
+        // attn_q/k/v), so loading them as layers fails. Drop them: the real transformer depth is the
+        // remainder. Only trust the MTP count if those trailing blocks genuinely lack attention tensors.
+        let mtp = g.get_u32(&format!("{pfx}.nextn_predict_layers")).unwrap_or(0) as usize;
+        let n = if mtp > 0 && mtp < n_blocks
+            && g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none() {
+            eprintln!("loader: dropping {mtp} nextn-predict (MTP) block(s) — {} transformer layers", n_blocks - mtp);
+            n_blocks - mtp
+        } else { n_blocks };
         // vocab_size is often absent in real GGUFs; derive it from the embedding below.
         let vocab_meta = g.get_u32(&format!("{pfx}.vocab_size")).map(|v| v as usize);
         let base = g.get_f32(&format!("{pfx}.rope.freq_base")).unwrap_or(10000.0);
@@ -4786,6 +4819,12 @@ impl Gpu {
         };
         let mut layers = Vec::with_capacity(n);
         for i in 0..n {
+            // Per-layer MoE detection. GLM4-MoE (and DeepSeek) use `leading_dense_block_count` dense blocks
+            // before the MoE blocks start, so MoE-ness is PER LAYER, not model-wide: block 0 may be dense
+            // (ffn_gate/up/down) while block 1+ are MoE (ffn_gate_exps + router). Detect by this layer's
+            // expert tensor rather than trusting block 0. Falls back to the model-wide flag for archs where
+            // every layer is uniform.
+            let layer_is_moe = is_moe && g.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some();
             // Qwen2 carries a bias on Q/K/V (llama doesn't). Fetch the f32 bias once so it can both
             // attach to the separate projections AND concatenate for the fused wqkv bias.
             let has_qkv_bias = g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
@@ -4816,22 +4855,23 @@ impl Gpu {
                 wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
                 wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
                 wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
-                g2: self.upload(&fetch(&format!("blk.{i}.ffn_norm.weight"))?, 1, d),
+                g2: self.upload(&fetch(&format!("blk.{i}.ffn_norm.weight"))
+                    .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
                 // [t, 2h] = [gate(h) | up(h)] per row, which SWIGLU_PACKED then consumes.
                 // Halves the FFN projection dispatches/weight-binds; per-row int8 quant of
                 // the concatenation is identical to quantizing the two weights separately.
                 // MoE layers have no dense FFN tensors — tiny F32 placeholders, never applied
                 // (ffn_apply branches to the moe field first).
-                wgate_up: if is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+                wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
                     let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
                     let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
                     let mut gu = Vec::with_capacity(gt.len() + u.len());
                     gu.extend_from_slice(&gt); gu.extend_from_slice(&u);
                     self.make_lin(&gu, 2 * h, d, q, q4_mode)
                 },
-                wdown: if is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else { lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)? },
-                moe: if is_moe {
+                wdown: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else { lin(&format!("blk.{i}.ffn_down.weight"), d, h, q)? },
+                moe: if layer_is_moe {
                     // Router stays F32 (small: [n_expert, d]) — routing precision decides WHICH weights run.
                     let router = self.make_lin(&fetch(&format!("blk.{i}.ffn_gate_inp.weight"))?, n_expert, d, false, false);
                     // Stacked expert tensors: expert dim OUTERMOST, so expert e's matrix is the contiguous
@@ -4941,9 +4981,17 @@ impl Gpu {
             if kv_lora > 0 {
                 let q_lora = g.get_u32(&format!("{pfx}.attention.q_lora_rank")).unwrap_or(0) as usize;
                 let qk_rope = g.get_u32(&format!("{pfx}.rope.dimension_count")).unwrap_or(0) as usize;
-                let qk_nope = g.get_u32(&format!("{pfx}.attention.key_length")).map(|v| v as usize)
+                // The per-head reconstructed key/value dims. GLM-5.2 (glm-dsa) names them *_mla and uses
+                // `key_length` for the FULL qk_head (nope+rope) — e.g. key_length=576 = 512-latent?/… no:
+                // key_length=576 is qk_head, key_length_mla=256 is the reconstructed nope part, rope=64.
+                // Prefer the explicit *_mla keys; else derive nope = key_length - qk_rope; else fall back.
+                let key_len = g.get_u32(&format!("{pfx}.attention.key_length")).map(|v| v as usize);
+                let qk_nope = g.get_u32(&format!("{pfx}.attention.key_length_mla")).map(|v| v as usize)
+                    .or_else(|| key_len.map(|kl| kl.saturating_sub(qk_rope)))
                     .unwrap_or(head_dim.saturating_sub(qk_rope));
-                let v_head = g.get_u32(&format!("{pfx}.attention.value_length")).map(|v| v as usize).unwrap_or(qk_nope);
+                let v_head = g.get_u32(&format!("{pfx}.attention.value_length_mla")).map(|v| v as usize)
+                    .or_else(|| g.get_u32(&format!("{pfx}.attention.value_length")).map(|v| v as usize))
+                    .unwrap_or(qk_nope);
                 // sanity-bound the MLA ranks (cf. the hostile-dim guard) before they size the latent cache
                 for (name, val, max) in [("kv_lora_rank", kv_lora, 65_536usize), ("q_lora_rank", q_lora, 65_536),
                                          ("qk_rope", qk_rope, 4_096), ("qk_nope", qk_nope, 4_096), ("v_head", v_head, 4_096)] {
@@ -4961,9 +5009,13 @@ impl Gpu {
         // DSA (DeepSeek Sparse Attention) indexer config: present only when index_topk is declared AND the
         // indexer weights ship. Detected here so it's visible; the sparse selection forward isn't wired yet.
         let dsa = {
-            let index_topk = g.get_u32(&format!("{pfx}.attention.index_topk")).unwrap_or(0) as usize;
-            let index_n_heads = g.get_u32(&format!("{pfx}.attention.index_head_count")).unwrap_or(0) as usize;
-            let index_head_dim = g.get_u32(&format!("{pfx}.attention.index_head_dim")).unwrap_or(0) as usize;
+            // GLM-5.2 (glm-dsa) key names: attention.indexer.{top_k,head_count,key_length}.
+            let index_topk = g.get_u32(&format!("{pfx}.attention.indexer.top_k"))
+                .or_else(|| g.get_u32(&format!("{pfx}.attention.index_topk"))).unwrap_or(0) as usize;
+            let index_n_heads = g.get_u32(&format!("{pfx}.attention.indexer.head_count"))
+                .or_else(|| g.get_u32(&format!("{pfx}.attention.index_head_count"))).unwrap_or(0) as usize;
+            let index_head_dim = g.get_u32(&format!("{pfx}.attention.indexer.key_length"))
+                .or_else(|| g.get_u32(&format!("{pfx}.attention.index_head_dim"))).unwrap_or(0) as usize;
             if index_topk > 0 && index_n_heads > 0 && index_head_dim > 0 && index_head_dim <= 256 {
                 eprintln!("wgpu-engine: DSA indexer detected — index_topk={index_topk} heads={index_n_heads} head_dim={index_head_dim} (sparse above {index_topk} tokens, dense at/below) — forward not yet wired");
                 Some(DsaConfig { index_topk, index_n_heads, index_head_dim })
@@ -8191,6 +8243,19 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
 #[cfg(test)]
 mod decode_cfg_tests {
     use super::*;
+
+    #[test]
+    fn mla_config_matches_real_glm52_dims() {
+        // Pinned from the real GLM-5.2 (glm-dsa) GGUF: kv_lora=512, q_lora=2048, qk_nope(=key_length_mla)=
+        // 256, qk_rope(=rope.dimension_count)=64, v_head(=value_length_mla)=256. The cached latent is
+        // kv_lora+qk_rope=576 (== the file's attention.key_length), and without MLA a 64-head model would
+        // cache 64·(256+256)=32768 values/token → the ~57x reduction Colibri cites.
+        let m = MlaConfig { q_lora: 2048, kv_lora: 512, qk_nope: 256, qk_rope: 64, v_head: 256 };
+        assert_eq!(m.latent_width(), 576);
+        assert_eq!(m.qk_head(), 320);
+        let standard = 64 * (m.qk_nope + m.v_head); // per-head K(nope)+V across 64 heads
+        assert!(standard / m.latent_width() >= 50, "MLA should be ~57x smaller than per-head KV here");
+    }
 
     #[test]
     fn mla_config_latent_width_is_the_memory_win() {
