@@ -134,6 +134,10 @@ pub(crate) mod engine {
         /// embed→decode window on-device. ~350 MB for a 151k×2048 vocab (vs 1.2 GB f32); skipped
         /// entirely when the window is disabled or the sampler is ineligible.
         embed_q8: Option<gpu_kernels::QWeight>,
+        /// Latched off once windowed decode hits device buffer pressure (the M4 ceiling) and falls back
+        /// to per-token: keeps the rest of the session on the path that actually fits, instead of
+        /// re-attempting the window and re-failing every turn.
+        disable_windowing: bool,
         /// Optional small DRAFT model for speculative decoding (opt-in via `LOGSCOPE_SPEC_DRAFT`).
         /// When present, `generate` routes through the engine's `speculative_generate_stats`: the
         /// draft proposes a block of tokens that the target verifies in ONE forward — bit-exact to
@@ -398,7 +402,7 @@ pub(crate) mod engine {
                 }
                 _ => None,
             };
-            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft })
+            Ok(Self { gpu: std::sync::Arc::new(gpu), model: std::sync::Arc::new(model), tok: std::sync::Arc::new(tok), eos, stop_ids, template, rng: 0x2545_F491_4F6C_DD1D, anchors: Vec::new(), kv_cap, pool, warm, name, submit_tuner, embed_q8: None, draft, disable_windowing: false })
         }
         pub fn template(&self) -> TemplateKind { self.template }
         /// The loaded model's file basename (log/UI tag).
@@ -419,7 +423,7 @@ pub(crate) mod engine {
                 rng: self.rng ^ 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(n as u64 + 1),
                 anchors: Vec::new(), kv_cap: 1, pool: None, warm: self.warm,
                 name: format!("{}#L{n}", self.name),
-                submit_tuner: None, embed_q8: None, draft: None,
+                submit_tuner: None, embed_q8: None, draft: None, disable_windowing: false,
             }
         }
 
@@ -430,6 +434,7 @@ pub(crate) mod engine {
         /// embed table lazily on first eligible use. Returns the window size, or None to take the
         /// per-token path. Eligibility mirrors SAMPLE_AT's host contract (temp>0, 2≤top_k≤64).
         fn windowed_ready(&mut self, sp: &SamplerParams) -> Option<usize> {
+            if self.disable_windowing { return None; } // latched off after a device-pressure fallback
             let sample_win = std::env::var("LOGSCOPE_SAMPLE_WINDOW").ok()
                 .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
             if !(sample_win >= 2 && sp.temperature > 0.0 && (2..=64).contains(&sp.top_k)) { return None; }
@@ -599,7 +604,7 @@ pub(crate) mod engine {
                 let mut seen = prompt_ids.clone();
                 let mut pending: Vec<u8> = Vec::new();
                 let mut recent = String::new(); // tail of generated text, for the runaway guard
-                let step = |next: u32| {
+                let mut step = |next: u32| {
                     if stop.contains(&next) { stop_tok.set(Some(next)); return false; }   // halt on ANY stop token, not just primary eos
                     if tok.is_special(next) { return true; }     // other specials: swallow, keep going
                     pending.extend_from_slice(&tok.decode_bytes(&[next]));
@@ -622,8 +627,20 @@ pub(crate) mod engine {
                     cont
                 };
                 let p = match (sample_win_opt, embed_q8) {
-                    (Some(sample_win), Some(eq)) => gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
-                                                                  &gpu_kernels::EmbedT::Q8(eq), cancel, step),
+                    (Some(sample_win), Some(eq)) => {
+                        let w = gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
+                                                          &gpu_kernels::EmbedT::Q8(eq), cancel, &mut step);
+                        if w == usize::MAX {
+                            // Windowed decode aborted on device buffer-object pressure (the M4 ceiling).
+                            // It cleared its poisoned frame + set the alloc-failed flag; clear the flag,
+                            // disable windowing for the rest of this session, and retry this turn on the
+                            // per-token path (which frees buffers every step and stays under the ceiling).
+                            gpu.clear_dims_alloc_failed();
+                            self.disable_windowing = true;
+                            eprintln!("wgpu-engine: [{}] windowed decode hit device buffer pressure — falling back to per-token for this session", self.name);
+                            gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step)
+                        } else { w }
+                    }
                     _ => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
                 };
                 if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }
@@ -788,7 +805,7 @@ pub(crate) mod engine {
             let mut pending: Vec<u8> = Vec::new();
             let mut recent = String::new();
             let mut rng = self.rng;
-            let step = |next: u32| {
+            let mut step = |next: u32| {
                 if stop.contains(&next) { return false; }
                 if tok.is_special(next) { return true; }
                 pending.extend_from_slice(&tok.decode_bytes(&[next]));
@@ -807,8 +824,16 @@ pub(crate) mod engine {
                 cont
             };
             let produced = match (sample_win_opt, embed_q8) {
-                (Some(sample_win), Some(eq)) => gpu.stream_session_window(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, sample_win,
-                                                              &gpu_kernels::EmbedT::Q8(eq), cancel, step),
+                (Some(sample_win), Some(eq)) => {
+                    let w = gpu.stream_session_window(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, sample_win,
+                                                      &gpu_kernels::EmbedT::Q8(eq), cancel, &mut step);
+                    if w == usize::MAX {
+                        gpu.clear_dims_alloc_failed();
+                        self.disable_windowing = true;
+                        eprintln!("wgpu-engine: [{}] windowed decode hit device buffer pressure — falling back to per-token for this session", self.name);
+                        gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step)
+                    } else { w }
+                }
                 _ => gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step),
             };
             if !pending.is_empty() { let _ = on(&String::from_utf8_lossy(&pending)); }

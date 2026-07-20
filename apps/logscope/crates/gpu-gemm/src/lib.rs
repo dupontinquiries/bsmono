@@ -6684,12 +6684,23 @@ impl Gpu {
                     EmbedT::Q8(q) => self.gather_q8_at(q, &o, j as u32),
                 };
                 pre.push(self.decode_layers_t(m, &s.cache, x, s.pos + j));
+                // If a dims uniform allocation was rejected by the device (buffer-object/VMA ceiling —
+                // the M4 windowed crash surfaces at the FIRST sample_at, slot 0), the frame is poisoned:
+                // the next readback would map_async an invalid buffer and abort the process. Bail the
+                // window HERE — every slot, not just at the flush cadence — before download_u32, so the
+                // caller falls back to per-token decode (which doesn't hit the ceiling). Restore flush.
+                if self.dims_alloc_failed() {
+                    self.end_frame();
+                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    self.clear_retained();
+                    if !self.flush_every_pinned() { self.set_flush_every(saved_flush); }
+                    return usize::MAX; // sentinel: windowed decode aborted on device pressure
+                }
                 // Bound live buffers WITHIN the window. Pinning flush high batches the window into one
                 // frame for throughput, but on Metal that lets a big k's per-slot dispatches (~36×k bind
                 // groups + dims + decode intermediates) accumulate until the device runs out of buffer
-                // OBJECTS → "Buffer 'dims'/'dl_u32' invalid". Every SLOT_FLUSH slots, flush the frame and
-                // poll to completion so those buffers free; the `pre` logits (needed for the replay) are
-                // held by us, not the frame, so they survive. Bit-exact — poll only waits.
+                // OBJECTS. Every SLOT_FLUSH slots, flush the frame and poll so those buffers free; the
+                // `pre` logits (needed for the replay) are held by us, not the frame, so they survive.
                 if (j + 1) % SLOT_FLUSH == 0 {
                     self.end_frame();
                     let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
