@@ -7319,23 +7319,20 @@ impl Gpu {
     }
 
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
+        // NOTE: do NOT flush the frame mid-loop here (e.g. every N layers to bound scratch). The caller
+        // opens ONE frame around the whole token; an intermediate end_frame() submits asynchronously and
+        // then lets the next layer's alloc recycle pool buffers whose in-flight GPU work hasn't completed
+        // (no completion fence), AND leaves the frame closed so later layers auto-submit unordered — both
+        // corrupt the residual stream (observed: gibberish on windowed Asahi decode). Scratch bounding, if
+        // needed, must poll for completion before recycling. The device OOM handler catches the alloc
+        // failure gracefully instead.
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
-        // On the memory-tight path (Asahi's low BO-VMA ceiling, or after an OOM degrade), don't let a whole
-        // token's per-layer scratch (MoE expert buffers especially) accumulate in one unflushed frame — it
-        // piled up and blew the VMA budget on a q4-30B second prompt. Flushing every few layers lets dropped
-        // Tensors return their buffers to the pool so the next layers REUSE them, bounding the live set.
-        let flush_layers = if self.conservative_vma || self.degraded() {
-            std::env::var("LOGSCOPE_DECODE_FLUSH_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8)
-        } else { 0 };
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
-            // periodic flush so scratch buffers recycle; `x` is kept (it feeds the next layer). Skipped on
-            // roomy backends (flush_layers==0) where batching the whole token in one submit is the win.
-            if flush_layers != 0 && (li + 1) % flush_layers == 0 { self.end_frame(); }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
