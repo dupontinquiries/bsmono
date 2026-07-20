@@ -76,6 +76,8 @@ pub static GPU_SYNC_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// hardware-INDEPENDENT structural number, valid here on lavapipe.
 pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static BG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
@@ -89,6 +91,13 @@ const SLOT_FLUSH: usize = 16;
 /// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
 /// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
 const DIMS_CACHE_CAP: usize = 4096;
+/// Cache cap for bind groups (opt-in bg cache). Sized for a large-layer MoE decode's distinct
+/// (pipeline, buffers, dims) combos across the recycled activation set; once full it falls back to
+/// create-without-cache, so it's never worse than the old always-create path.
+const BG_CACHE_CAP: usize = 8192;
+/// Bind-group cache key: pipeline identity + the ordered buffer handles (inputs, then output) + the dims
+/// buffer handle. wgpu::Buffer is Eq/Hash on its inner handle, so equal keys ⇒ identical bindings.
+type BgKey = (usize, Vec<wgpu::Buffer>, wgpu::Buffer);
 /// Reusable dims-ring size: how many uniform buffers the cache-full path rotates through. Bounds the
 /// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
@@ -171,6 +180,14 @@ pub struct Gpu {
     /// fill the rest and, once full, fall back to create-without-cache (i.e. never worse than before).
     /// Bit-exact: identical bytes, identical binding — every `--gate-*` is unchanged.
     dims_cache: Mutex<HashMap<Vec<u8>, std::sync::Arc<wgpu::Buffer>>>,
+    /// Bind-group cache (opt-in via LOGSCOPE_BG_CACHE): a fresh bind group was created on EVERY dispatch,
+    /// which the Asahi profile shows as a dispatch-bound (CPU-setup) hotspot — ~480 creations/token on a
+    /// 48-layer MoE decode. A bind group only encodes WHICH buffers bind to WHICH slots (not their
+    /// contents), so it's safe to reuse when the same pipeline runs on the same buffer identities; the
+    /// pool recycles a small set of activation buffers so those identities repeat across tokens. Key =
+    /// (pipeline ptr, input+out buffer handles, dims buffer handle); wgpu::Buffer is Eq/Hash on its inner
+    /// handle. Bit-identical by construction (same buffers, same bindings). Capped like the dims cache.
+    bg_cache: Mutex<HashMap<BgKey, std::sync::Arc<wgpu::BindGroup>>>,
     /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
     pool: std::sync::Arc<BufferPool>,
     arena: Mutex<Option<ResidentArena>>,
@@ -305,6 +322,12 @@ fn env_decode_tile() -> Option<u32> {
 /// matches the original inline env check) so it can be toggled for the A/B equivalence gate.
 fn fused_qkv_enabled() -> bool {
     std::env::var("LOGSCOPE_FUSED_QKV").as_deref() != Ok("0")
+}
+/// Bind-group caching in dispatch_with. OPT-IN (default off) while it proves out on hardware: reuses the
+/// bind group for a repeated (pipeline, buffers, dims) instead of recreating it per dispatch — targets the
+/// Asahi dispatch-bound (CPU command-setup) cost. LOGSCOPE_BG_CACHE=1 enables. Bit-identical either way.
+fn bind_group_cache_enabled() -> bool {
+    std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
@@ -531,7 +554,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1441,6 +1464,7 @@ impl Gpu {
     fn dispatch_with(&self, pipe: &Pipe, inputs: &[&Tensor], out: &Tensor, dims: &[u8], wg: (u32, u32, u32)) {
         let dev = &self.device;
         let t_setup = std::time::Instant::now();
+        let pipe_ptr = std::sync::Arc::as_ptr(pipe) as usize; // stable identity for this pipeline
         // Reuse the dims UNIFORM buffer for this op's byte-identical (m,k,n,grid) instead of
         // creating+uploading a fresh one every dispatch — the per-dispatch "upload locking" fix.
         let dbuf = {
@@ -1462,6 +1486,24 @@ impl Gpu {
         };
         let n = inputs.len() as u32;
         let (bgl, pipeline) = (&pipe.0, &pipe.1);
+        // Opt-in bind-group cache: reuse the bind group for this exact (pipeline, buffers, dims) instead of
+        // recreating it every dispatch (the Asahi dispatch-bound hotspot). Only viable when no input uses a
+        // sub-buffer VIEW (those carry per-call offsets/sizes that aren't in the key); views fall through to
+        // the create path. Bit-identical: the key pins the same buffers to the same slots.
+        let bg_cache_on = bind_group_cache_enabled();
+        let cache_key: Option<BgKey> = if bg_cache_on && inputs.iter().all(|t| t.view.is_none()) {
+            let mut bufs: Vec<wgpu::Buffer> = inputs.iter().map(|t| t.buf.clone()).collect();
+            bufs.push(out.buf.clone());
+            Some((pipe_ptr, bufs, (*dbuf).clone()))
+        } else { None };
+        if let Some(key) = &cache_key {
+            if let Some(bg) = self.bg_cache.lock().unwrap().get(key).cloned() {
+                BG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                self.record_dispatch(pipeline, &bg, wg, None);
+                return;
+            }
+        }
         let mut bg_entries = Vec::new();
         for (i, t) in inputs.iter().enumerate() {
             let resource = match t.view {
@@ -1473,26 +1515,33 @@ impl Gpu {
         bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out.buf.as_entire_binding() });
         bg_entries.push(wgpu::BindGroupEntry { binding: n + 1, resource: dbuf.as_entire_binding() });
         let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: bgl, entries: &bg_entries });
+        let bg = std::sync::Arc::new(bg);
+        if let Some(key) = cache_key {
+            BG_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut cache = self.bg_cache.lock().unwrap();
+            if cache.len() < BG_CACHE_CAP { cache.insert(key, bg.clone()); }
+        }
         GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.record_dispatch(pipeline, &bg, wg, Some(&dbuf));
+    }
+
+    /// Record one compute dispatch into the open frame (or submit standalone if no frame is open). The bind
+    /// group is passed as an Arc so a CACHED bind group can be recorded without recreating it; the Arc (and
+    /// the dims uniform, if any) are pushed onto the frame keep-list so neither is freed while the GPU may
+    /// still read them — the same retain discipline as before, just with a shared bind group. `dbuf` is None
+    /// on the cache-hit fast path (already pinned by an earlier miss's keep or the dims cache).
+    fn record_dispatch(&self, pipeline: &wgpu::ComputePipeline, bg: &std::sync::Arc<wgpu::BindGroup>, wg: (u32, u32, u32), dbuf: Option<&std::sync::Arc<wgpu::Buffer>>) {
+        let dev = &self.device;
         let mut fr = self.frame.lock().unwrap();
         if let Some(frame) = fr.as_mut() {
             {
                 let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-                pass.set_pipeline(pipeline); pass.set_bind_group(0, &bg, &[]);
+                pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
-            frame.keep.push(Box::new(bg)); // bind group kept until flush
-            frame.keep.push(Box::new(dbuf.clone())); // AND its dims uniform Arc explicitly — the whole
-            // keep-list is RETAINED past each async submit (retain_keep) and freed only after the next
-            // poll, so buffers the GPU is still reading can't be recycled → fixes "Buffer 'dims' is
-            // invalid" on Metal (a big sampler window flushes mid-window, long before its readback).
+            frame.keep.push(Box::new(bg.clone())); // Arc<BindGroup> kept until flush (cached or fresh)
+            if let Some(d) = dbuf { frame.keep.push(Box::new(d.clone())); } // AND its dims uniform Arc
             frame.passes += 1;
-            // Bound submit duration so a shared GPU still services the display between chunks.
-            // ALSO bound live uniform buffers: a windowed decode pins flush very high to batch the
-            // whole window into one frame, so the flush-driven poll below never fires — and the
-            // window's tens of thousands of unique (uncached) dims uniforms would all stay live until
-            // the window's readback, exhausting Metal's uniform pool → "Buffer 'dims' invalid". So
-            // flush when EITHER the pass budget is hit OR the frame's keep-list crosses the retain cap.
             let over_flush = frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
@@ -1501,22 +1550,18 @@ impl Gpu {
                 self.retain_keep(old.keep);
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
                 drop(fr);
-                // When we flushed because live buffers grew (not the normal pass budget), poll to
-                // COMPLETION and free them — a rare sync inside a big window that keeps memory bounded
-                // without a per-token readback. Bit-exact: poll only waits, it changes no state.
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
                     let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
                     self.clear_retained();
                     DIMS_RETAIN_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-                return;
             }
         } else {
             drop(fr);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
-                pass.set_pipeline(pipeline); pass.set_bind_group(0, &bg, &[]);
+                pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
             self.submit(enc); // queue order makes each op's writes visible to the next

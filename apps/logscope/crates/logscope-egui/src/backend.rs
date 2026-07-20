@@ -639,6 +639,7 @@ pub(crate) mod engine {
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
+            let (bgh0, bgm0) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed), gpu_kernels::BG_MISSES.load(AOrd::Relaxed));
             // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
             // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
             // CPU sort. Eligibility + lazy int8-embed build live in `windowed_ready` so the resume
@@ -728,6 +729,11 @@ pub(crate) mod engine {
             let per = produced.max(1) as f64;
             eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms ({}-bound)",
                 self.name, ds as f64 / per, if setup_ms >= sync_ms { "dispatch" } else { "GPU" });
+            let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
+            if bgh + bgm > 0 {
+                eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
+                    self.name, bgh + bgm, 100.0 * bgh as f64 / (bgh + bgm).max(1) as f64, bgh as f64 / per);
+            }
             // Adapt passes-per-submit: feed this turn's per-token decode time to the tuner, which sweeps
             // SUBMIT_PROFILES across replies and settles on the fastest, then caches it. Bit-exact across
             // flush (--gate-submit), so adapting between replies never changes output. Needs enough tokens
