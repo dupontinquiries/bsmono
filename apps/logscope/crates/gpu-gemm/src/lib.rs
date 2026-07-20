@@ -4807,6 +4807,10 @@ impl DsaConfig {
     }
 }
 impl Model {
+    /// True if any block is a routed-MoE layer — the dispatch levers (bind-group cache, MoE fusions) only
+    /// bear on MoE decode, so the magical A/B autotune skips the probe entirely on dense models.
+    pub fn is_moe(&self) -> bool { self.layers.iter().any(|b| b.moe.is_some()) }
+
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
     /// prints first values + abs-sums. The same GGUF must produce IDENTICAL lines on every machine —
     /// a mismatch between boxes means the UPLOAD path corrupted weights on one of them (e.g. the UMA
