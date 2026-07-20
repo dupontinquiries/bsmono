@@ -437,6 +437,67 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
 }
 
 #[cfg(test)]
+mod kquant_tests {
+    use super::*;
+
+    // f32 → f16 bits (round-to-nearest-even), for building exact test blocks.
+    fn f16_bits(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = b & 0x7FFFFF;
+        if exp <= 0 { return sign; }
+        if exp >= 0x1F { return sign | 0x7C00; }
+        sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    #[test]
+    fn q4_k_dequant_recovers_known_superblock() {
+        // Build ONE Q4_K super-block (256 weights, 144 bytes) with dmin=0 so the min path drops out and the
+        // output is simply d·scale·nibble. All 8 sub-block scales = 1 (low-4 path of get_scale_min_k4), all
+        // nibbles = 5, d = 0.5. Expected: every weight = 0.5·1·5 = 2.5.
+        let d: f32 = 0.5;
+        let mut blk = vec![0u8; 144];
+        blk[0..2].copy_from_slice(&f16_bits(d).to_le_bytes());   // d
+        blk[2..4].copy_from_slice(&f16_bits(0.0).to_le_bytes()); // dmin = 0
+        // scales[0..12]: get_scale_min_k4(j<4) reads q[j]&63 for the scale. Set the first 4 bytes' low-6
+        // bits to 1 → sub-block scales 0..3 = 1. The 6-bit-min bytes (q[4..8]) stay 0 → mins = 0. For j>=4
+        // the packed path also yields scale 1 if we set bytes appropriately; simplest: set all 12 to a value
+        // whose low-6 bits are 1 AND whose high-2 bits are 0 → 0x01. Then j<4: q[j]&63=1. j>=4:
+        // (q[j+4]&0x0F)|((q[j-4]>>6)<<4) = (1&0xF)|((1>>6)<<4) = 1. Good — all scales = 1, all mins:
+        // j<4: q[j+4]&63 = 1 (!), so mins would be 1 — but dmin=0 zeroes the min term regardless. OK.
+        for b in blk[4..16].iter_mut() { *b = 0x01; }
+        // 128 nibble bytes: nibble 5 in both low and high → byte 0x55.
+        for b in blk[16..144].iter_mut() { *b = 0x55; }
+        let out = dequantize(12, &blk, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for (i, &w) in out.iter().enumerate() {
+            assert!((w - 2.5).abs() < 1e-3, "weight {i} = {w}, expected 2.5 (d·sc·nib = 0.5·1·5)");
+        }
+    }
+
+    #[test]
+    fn q4_k_min_term_subtracts() {
+        // Same block but dmin = 1.0 and the min 6-bit fields = 1 (from the 0x01 scale bytes, j<4 path).
+        // Now w = d·sc·nib − dmin·m = 0.5·1·5 − 1.0·1 = 1.5 for the first two sub-blocks (j=0,1 use mins
+        // from q[4],q[5] low-6 = 1). We only assert the very first weight to keep the min-index reasoning
+        // simple (sub-block 0, min from get_scale_min_k4(0) = q[4]&63 = 1).
+        let mut blk = vec![0u8; 144];
+        blk[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        blk[2..4].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        for b in blk[4..16].iter_mut() { *b = 0x01; }
+        for b in blk[16..144].iter_mut() { *b = 0x55; }
+        let out = dequantize(12, &blk, 256).unwrap();
+        assert!((out[0] - 1.5).abs() < 1e-3, "first weight = {} , expected 1.5 (2.5 − 1.0)", out[0]);
+    }
+
+    #[test]
+    fn q4_k_rejects_bad_length() {
+        assert!(dequantize(12, &[0u8; 144], 200).is_err());
+    }
+}
+
+#[cfg(test)]
 mod iq4nl_tests {
     use super::*;
     #[test]
