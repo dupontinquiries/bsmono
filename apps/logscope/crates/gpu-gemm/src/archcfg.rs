@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, DeepseekV3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, Glm4Moe, DeepseekV3, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -123,13 +123,17 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: false, dense_supported: false,
             note: "fused qkv tensor + partial-rotary RoPE; needs a split + partial-dim rope kernel",
         },
-        // DeepSeek-V2/V3 + GLM-MoE-DSA family: Multi-head Latent Attention (MLA) — Q/KV go through
-        // low-rank down/up projections and the KV CACHE stores only the compressed latent
-        // [kv_lora_rank + qk_rope_head_dim] per token (a large KV-memory saving for long context), plus
-        // a shared-expert MoE. Detected here with the right prefix so dim parsing can read the MLA ranks,
-        // but the MLA attention forward (down/up proj, latent norm, absorption) isn't wired yet, so it's
-        // refused with a clear message rather than mis-loaded through the dense MHA path.
-        "deepseek2" | "deepseek3" | "deepseekv3" | "glm4moe" => ArchConfig {
+        // GLM-4-MoE (general.architecture = "glm4moe"). Two sub-forms exist; this registry entry is the
+        // STANDARD-attention one (GQA + per-head QK-Norm + qkv bias, like Qwen3, plus shared-expert MoE).
+        // The MLA sub-form is detected by tensor presence in the loader and refused there. NEOX rope.
+        "glm4moe" => ArchConfig {
+            arch: Arch::Glm4Moe, prefix: "glm4moe", attn_qkv_bias: true, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            supported: true, dense_supported: true,
+            note: "",
+        },
+        // DeepSeek-V2/V3 (+ GLM-MoE with MLA): Multi-head Latent Attention. Detected here with the right
+        "deepseek2" | "deepseek3" | "deepseekv3" | "glm-dsa" | "glm_dsa" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
@@ -240,14 +244,21 @@ mod tests {
         assert_eq!(for_arch(""), c, "missing arch string falls back to llama");    }
 
     #[test]
-    fn deepseek_mla_is_detected_but_not_yet_wired() {
-        for name in ["deepseek2", "deepseek3", "deepseekv3", "glm4moe"] {
+    fn deepseek_and_glmdsa_are_mla_but_glm4moe_is_standard() {
+        // Corrected against real checkpoints: the MLA family (DeepSeek-V3, GLM-5.2 'glm-dsa') is detected
+        // but unwired; GLM4-MoE ('glm4moe') uses STANDARD GQA attention + shared-expert MoE and IS supported.
+        for name in ["deepseek2", "deepseek3", "deepseekv3", "glm-dsa", "glm_dsa"] {
             let c = for_arch(name);
             assert_eq!(c.arch, Arch::DeepseekV3, "{name} should map to the MLA arch");
-            assert!(c.moe && c.moe_shared_expert, "DeepSeek/GLM-MoE has routed + shared experts");
-            assert!(!c.supported && !c.dense_supported, "MLA forward isn't wired yet → refuse cleanly");
+            assert!(c.moe && c.moe_shared_expert, "DeepSeek/GLM-DSA has routed + shared experts");
+            assert!(!c.supported, "MLA forward isn't wired yet → refuse cleanly");
             assert!(c.note.contains("MLA") || c.note.contains("Latent"), "note must explain the MLA gap");
         }
+        // glm4moe: standard attention (QK-norm + bias) + shared-expert MoE — supported.
+        let g = for_arch("glm4moe");
+        assert_eq!(g.arch, Arch::Glm4Moe);
+        assert!(g.supported && g.moe && g.moe_shared_expert && g.attn_qk_norm && g.attn_qkv_bias,
+            "glm4moe is a supported standard-attention shared-expert MoE with QK-norm + bias");
     }
 
     #[test]
