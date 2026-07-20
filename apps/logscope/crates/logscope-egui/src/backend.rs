@@ -165,6 +165,7 @@ pub(crate) mod engine {
             let mm = gpu_kernels::file_bytes(path).map_err(|e| format!("open {path}: {e}"))?;
             let bytes: &[u8] = &mm;
             let gpu = Gpu::new();
+            gpu.maybe_start_gpu_spin();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
             // Preflight readiness report (cf. Colibri's doctor): surface detected fragilities + the
             // mitigations they trigger ONCE at load, so a driver quirk or a mis-set knob is visible before
