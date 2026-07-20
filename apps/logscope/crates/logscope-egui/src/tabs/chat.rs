@@ -267,6 +267,45 @@ fn text_anim_for(name: &str) -> crate::mesh3d::TextAnim {
 /// scrolling (jk / impakt-cam glide) rather than being truncated with a trailing "…".
 const PLAQUE_WINDOW: usize = 4;
 
+/// Summarize the LATEST activity from an in-flight assistant reply for a temporary progress line —
+/// so a long or quiet turn (a coordinator "add more blocks" run that thinks before emitting visible
+/// prose) still shows what it's doing. Pure + heuristic (no second model): prefers the most recent
+/// structural signal in the tail — a ⏸ STEP marker, a markdown heading, a `// file:` path, a fenced
+/// block's language, or a `- `/`* ` bullet — else the last non-trivial sentence, trimmed to ~64 chars.
+/// Returns None if there's nothing meaningful yet (pure whitespace / still inside an empty think block).
+fn summarize_progress(text: &str) -> Option<String> {
+    let clip = |s: &str| -> String {
+        let s = s.trim();
+        let mut out: String = s.chars().take(64).collect();
+        if s.chars().count() > 64 { out.push('…'); }
+        out
+    };
+    for line in text.lines().rev() {
+        let l = line.trim();
+        if l.is_empty() { continue; }
+        if (l.contains('⏸') || l.starts_with("STEP")) && l.contains("STEP") {
+            if let Some((_, rest)) = l.split_once("STEP") { return Some(clip(&format!("step{rest}"))); }
+        }
+        if let Some(h) = l.strip_prefix('#') {
+            return Some(clip(h.trim_start_matches('#').trim()));
+        }
+        if let Some(idx) = l.find("// file:").or_else(|| l.find("file:")) {
+            return Some(clip(&format!("writing {}", l[idx..].trim_start_matches("// ").trim_start_matches("file:").trim())));
+        }
+        if let Some(lang) = l.strip_prefix("```") {
+            let lang = lang.trim();
+            if !lang.is_empty() { return Some(clip(&format!("writing {lang}"))); }
+        }
+        if let Some(item) = l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")) {
+            return Some(clip(item));
+        }
+        if l.len() > 3 && l != "```" {
+            return Some(clip(l));
+        }
+    }
+    None
+}
+
 fn wrap_label(text: &str, cols: usize, max_lines: usize) -> Vec<String> {
     let cols = cols.max(1);
     let mut lines: Vec<String> = Vec::new();
@@ -322,7 +361,14 @@ impl Msg {
 /// A structural edit requested from a message's controls, applied after the render pass (so the
 /// render can borrow `msgs` immutably-ish while the buttons just record intent).
 enum MsgAction { Copy(usize), EditStart(usize), EditSave(usize), EditCancel(usize), Regenerate(usize), Delete(usize), PrevVar(usize), NextVar(usize) }
-struct Stream { idx: usize, started: Instant, tokens: usize }
+struct Stream { idx: usize, started: Instant, tokens: usize,
+    /// Live progress summary shown as a temporary status while the turn generates: the latest meaningful
+    /// line pulled from the streaming tail, refreshed on an interval so a long/quiet turn (a coordinator
+    /// "add more blocks" run that thinks for a while before emitting visible text) still shows motion.
+    /// `(text, last_refresh)`. Cheap heuristic — no second model — but structured so a small summarizer
+    /// model can replace `summarize_progress` later without touching the render path.
+    progress: Option<(String, Instant)>,
+}
 /// A background `cargo check` of the latest generated files (the sandbox oracle), run off-thread so
 /// the UI stays responsive. `result` = (passed, compiler_output, sandboxed).
 struct VerifyJob {
@@ -972,6 +1018,12 @@ impl Chat {
         if let Ok(s) = std::env::var("LOGSCOPE_FAN_DEBUG") { if !s.is_empty() { return Some(s); } }
         let mut parts: Vec<String> = Vec::new();
         if self.stream.is_some() { parts.push("generating".into()); }
+        // live progress summary (refreshed ~5s from the streaming tail): what the turn is doing RIGHT now
+        if let Some(s) = &self.stream {
+            if let Some((sum, _)) = &s.progress {
+                if !sum.is_empty() { parts.push(format!("… {sum}")); }
+            }
+        }
         let q = self.queue.len();
         if q > 0 { parts.push(format!("{q} queued")); }
         if let Some(f) = &self.fan {
@@ -1111,6 +1163,15 @@ impl Chat {
                         }
                         // sample the reply periodically for a repetition loop (cheap; bounded window)
                         if !stop && ntok % 24 == 0 { check_text = Some(m.text().to_string()); }
+                        // LIVE PROGRESS: every ~5s refresh a one-line summary of the latest activity from
+                        // the streaming tail, shown as a temporary status while the turn runs (so a long or
+                        // quiet coordinator turn still shows motion instead of an empty message body).
+                        let due = s.progress.as_ref().map(|(_, at)| at.elapsed().as_secs_f32() >= 5.0).unwrap_or(true);
+                        if due {
+                            if let Some(sum) = summarize_progress(m.text()) {
+                                s.progress = Some((sum, Instant::now()));
+                            }
+                        }
                     }
                 }
                 // Stepwise checkpoints: a fresh ⏸ STEP k/n marker in the stream pauses generation here.
@@ -1467,7 +1528,7 @@ impl Chat {
         self.msgs[aid].parent = Some(leaf);
         self.active_leaf = Some(aid);
         self.hit_cap = false;
-        self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0 });
+        self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
         infer.generate(prompt);
     }
@@ -1545,7 +1606,7 @@ impl Chat {
         }
         let fallback = self.build_continue_prompt(doc); // used only if the engine can't warm-resume
         self.hit_cap = false;
-        self.stream = Some(Stream { idx: last, started: Instant::now(), tokens: 0 });
+        self.stream = Some(Stream { idx: last, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
         infer.continue_stream(fallback);
     }
@@ -1830,7 +1891,7 @@ impl Chat {
         let aid = self.msgs.len() - 1;
         self.msgs[aid].parent = Some(uid);
         self.active_leaf = Some(aid);
-        self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0 });
+        self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
         infer.generate(prompt);
     }
@@ -1858,7 +1919,7 @@ impl Chat {
                 self.msgs[idx].parent = Some(i);
                 self.active_leaf = Some(idx);
                 self.pruned.retain(|&p| p < self.msgs.len());
-                self.stream = Some(Stream { idx, started: Instant::now(), tokens: 0 });
+                self.stream = Some(Stream { idx, started: Instant::now(), tokens: 0, progress: None });
                 self.last = None;
                 infer.generate(prompt);
             }
@@ -1869,7 +1930,7 @@ impl Chat {
                 self.msgs[i].variants.push(String::new());    // new branch alongside the old reply
                 self.msgs[i].cur = self.msgs[i].variants.len() - 1;
                 self.active_leaf = Some(i);
-                self.stream = Some(Stream { idx: i, started: Instant::now(), tokens: 0 });
+                self.stream = Some(Stream { idx: i, started: Instant::now(), tokens: 0, progress: None });
                 self.last = None;
                 infer.generate(prompt);
             }
@@ -3982,8 +4043,12 @@ impl Chat {
                     // bezel + slab in the scene palette/material
                     let bez = egui::Color32::from_rgb((pc[0] as f32 * 0.5) as u8, (pc[1] as f32 * 0.5) as u8, (pc[2] as f32 * 0.5) as u8);
                     let fcen = V3::new(rc.x + fwd.x * 0.05, rc.y + fwd.y * 0.05, rc.z + fwd.z * 0.05);
-                    let mut frame = m3::panel(fcen, right, up, pw + 0.28, ph + 0.24, bez); frame.mat = pmat; frame.emissive = pemis * 0.4; m3::set_alpha(&mut frame, (palpha as u16 + 50).min(255) as u8); graph.push(frame);
-                    let mut slab = m3::panel(rc, right, up, pw, ph, egui::Color32::from_rgb(pc[0], pc[1], pc[2])); slab.mat = pmat; slab.emissive = pemis * sheen; m3::set_alpha(&mut slab, palpha); graph.push(slab); slab_glint(&mut graph, rc, right, up, toward, pw * 0.5, ph * 0.5, sun, tglow);
+                    // OVERLAY BIAS: the plaque is physical UI floating in front of the world — pull it
+                    // toward the camera for depth so canopy leaves / props between it and the graph can't
+                    // occlude it, while its own bezel→slab→text still layer correctly among themselves.
+                    let ov = 0.9_f32;
+                    let mut frame = m3::panel(fcen, right, up, pw + 0.28, ph + 0.24, bez); frame.mat = pmat; frame.emissive = pemis * 0.4; m3::set_alpha(&mut frame, (palpha as u16 + 50).min(255) as u8); frame.overlay = ov; graph.push(frame);
+                    let mut slab = m3::panel(rc, right, up, pw, ph, egui::Color32::from_rgb(pc[0], pc[1], pc[2])); slab.mat = pmat; slab.emissive = pemis * sheen; m3::set_alpha(&mut slab, palpha); slab.overlay = ov; graph.push(slab); slab_glint(&mut graph, rc, right, up, toward, pw * 0.5, ph * 0.5, sun, tglow);
                     // left-edge origin: label_cells centres on its origin, so offset each line by +half its width
                     let left_edge = pw * 0.5 - pw * 0.06;
                     // the plaque's text is lit by the CURRENT SCENE's physical light source (dappled
@@ -3997,14 +4062,34 @@ impl Chat {
                         let o = V3::new(rc.x - toward.x * 0.30 - right.x * left_edge + right.x * (w * 0.5) + up.x * y,
                                         rc.y - toward.y * 0.30 - right.y * left_edge + right.y * (w * 0.5) + up.y * y,
                                         rc.z - toward.z * 0.30 - right.z * left_edge + right.z * (w * 0.5) + up.z * y);
-                        for cell in m3::label_cells(o, right, up, toward, text, scale, t, col, lit, 0.0, tanim, scene_light, plaque_seed) { g.push(cell); }
+                        for mut cell in m3::label_cells(o, right, up, toward, text, scale, t, col, lit, 0.0, tanim, scene_light, plaque_seed) { cell.overlay = 1.05; g.push(cell); }
                     };
                     put_line(&mut graph, &head, ph * 0.5 - ph * 0.13, hscale, egui::Color32::from_rgb(0xff, 0xc2, 0x6a), 0.85);
                     for (li, line) in lines.iter().enumerate() {
                         put_line(&mut graph, line, ph * 0.5 - ph * 0.38 - li as f32 * ph * 0.17, bscale, egui::Color32::from_rgb(tc[0], tc[1], tc[2]), 0.85 * tglow.max(0.5));
                     }
                     if let Some(pr) = project_slab_rect(&view_cam, rc, right, up, pw, ph, cx, cy, scale) {
-                        ui.interact(pr, egui::Id::new("scene_reader"), egui::Sense::hover()).on_hover_text(format!("{head}: {}", raw.chars().take(160).collect::<String>()));
+                        let resp = ui.interact(pr, egui::Id::new("scene_reader"), egui::Sense::click())
+                            .on_hover_text(format!("{head}: {}", raw.chars().take(160).collect::<String>()));
+                        // RIGHT-CLICK CONTEXT MENU — the plaque is a real object, so a secondary click opens
+                        // actions on the focused turn (copy, jump the composer to it, clear focus). This is the
+                        // in-scene equivalent of a desktop context menu, driven off the same projected rect.
+                        resp.context_menu(|ui| {
+                            if ui.button("Copy turn text").clicked() {
+                                ui.ctx().copy_text(raw.clone());
+                                ui.close_menu();
+                            }
+                            if ui.button(format!("Reference :{} in composer", fid + 1)).clicked() {
+                                if !self.input.ends_with(' ') && !self.input.is_empty() { self.input.push(' '); }
+                                self.input.push_str(&format!(":{} ", fid + 1));
+                                ui.ctx().memory_mut(|m| m.request_focus(egui::Id::new("logscope_chat_composer")));
+                                ui.close_menu();
+                            }
+                            if ui.button("Clear focus").clicked() {
+                                self.walk_focus = None;
+                                ui.close_menu();
+                            }
+                        });
                     }
                 }
             }
@@ -6896,5 +6981,31 @@ mod long_horizon_prompt_tests {
         // it's the default persona
         assert_eq!(super::PERSONAS[0].0, "longhorizon");
         assert_eq!(super::PERSONAS[0].2, p);
+    }
+
+    #[test]
+    fn summarize_progress_pulls_latest_signal() {
+        use super::summarize_progress;
+        // nothing meaningful yet
+        assert_eq!(summarize_progress("   \n\n  "), None);
+        // last substantial prose line
+        assert_eq!(summarize_progress("Analyzing the request.\nWiring the module together now").as_deref(),
+                   Some("Wiring the module together now"));
+        // a step marker as the latest line is surfaced as a step (scan is newest-first)
+        let s = summarize_progress("intro text\n⏸ STEP 2/5: add the coordinator block").unwrap();
+        assert!(s.starts_with("step") && s.contains("2/5"), "got {s:?}");
+        // a heading is surfaced as the current section
+        assert_eq!(summarize_progress("blah\n## Adding blocks\n").as_deref(), Some("Adding blocks"));
+        // a fence-open as the latest line shows the language
+        assert_eq!(summarize_progress("prose\n```rust").as_deref(), Some("writing rust"));
+        // a file marker as the latest line
+        let f = summarize_progress("text\n// file: src/lib.rs").unwrap();
+        assert!(f.starts_with("writing") && f.contains("src/lib.rs"), "got {f:?}");
+        // a bullet (the model enumerating blocks)
+        assert_eq!(summarize_progress("- first block\n- second block").as_deref(), Some("second block"));
+        // long lines are clipped with an ellipsis
+        let long = "x".repeat(200);
+        let out = summarize_progress(&long).unwrap();
+        assert!(out.chars().count() <= 65 && out.ends_with('…'), "got {} chars", out.chars().count());
     }
 }
