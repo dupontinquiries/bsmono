@@ -12,6 +12,7 @@ pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) befo
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
+pub mod governor; // backend-agnostic GPU resource governor: per-device budget + adaptive window k
 pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
@@ -202,6 +203,10 @@ pub struct Gpu {
     /// for the per-position dims that would otherwise create a new Metal buffer every dispatch. `(buffers,
     /// next_index, writes_since_fence)`. Lazily filled up to DIMS_RING_SIZE. Caps total dims buffer count.
     dims_ring: Mutex<(Vec<std::sync::Arc<wgpu::Buffer>>, usize, usize)>,
+    /// Backend-agnostic resource governor: knows this device's budget shape (Metal buffer-objects /
+    /// Vulkan allocation-count / …) and self-tunes the safe windowed-decode k from live pressure, so the
+    /// window never marches into the device's ceiling. Replaces the hardcoded LOGSCOPE_WINDOW_MAX guess.
+    governor: Mutex<crate::governor::Governor>,
     /// Set when a dims-uniform allocation was rejected by the device (validation error captured, not
     /// aborted). The windowed generate path checks it to fall back to leaner per-token decode.
     dims_alloc_failed: std::sync::atomic::AtomicBool,
@@ -478,7 +483,20 @@ impl Gpu {
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_SUBMIT_INFLIGHT").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.min(64)).unwrap_or(SUBMIT_INFLIGHT_DEFAULT));
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), dims_alloc_failed: std::sync::atomic::AtomicBool::new(false) };
+        // Governor: map the wgpu backend into the governor's budget model so the windowed-decode k is
+        // tuned to THIS device's ceiling (Metal buffer-objects / Vulkan allocation-count / …) instead of a
+        // hardcoded guess. apple_vulkan (conservative_vma) = the tight Honeykrisp path.
+        let governor = {
+            let gb = match backend {
+                wgpu::Backend::Metal => crate::governor::WgpuBackend::Metal,
+                wgpu::Backend::Vulkan => crate::governor::WgpuBackend::Vulkan,
+                wgpu::Backend::Dx12 => crate::governor::WgpuBackend::Dx12,
+                wgpu::Backend::Gl => crate::governor::WgpuBackend::Gl,
+                _ => crate::governor::WgpuBackend::Other,
+            };
+            Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
+        };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false) };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1173,6 +1191,14 @@ impl Gpu {
     /// DIMS_RING_SIZE regardless of generation length — the invariant the M4 buffer-count fix rests on.
     pub fn dims_buffer_count(&self) -> usize {
         self.dims_cache.lock().unwrap().len() + self.dims_ring.lock().unwrap().0.len()
+    }
+    /// A rough count of live tensor-storage buffers for the governor's headroom sum: the pool's free-list
+    /// holds recyclable buffers; net allocated ≈ misses (created) − current free (returned). This is an
+    /// estimate (KV + resident weights aren't pooled), not exact — the governor treats it as a lower
+    /// bound and its baseline_objects covers the fixed remainder.
+    pub fn pool_live_estimate(&self) -> usize {
+        let free: usize = self.pool.free.lock().unwrap().values().map(|v| v.len()).sum();
+        (POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed) as usize).saturating_sub(free)
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
@@ -6641,15 +6667,26 @@ impl Gpu {
         sampler: &SamplerParams, rng: &mut u64, k: usize, embed: &EmbedT<'_>,
         cancel: &dyn Fn() -> bool, mut on_token: impl FnMut(u32) -> bool,
     ) -> usize {
-        // Device-safe window cap. The windowed path holds k slots' worth of dispatches + their dims +
-        // the k+1 pre[] logits live before its single readback; on Metal, a large k (the user forcing
-        // 128) creates enough live buffer OBJECTS to hit the device's buffer-count ceiling → an
-        // unrecoverable "Buffer invalid" abort at the first sample_at. Per-token (k=1) always fits.
-        // Cap the effective k so the footprint stays bounded regardless of the requested window; keeps
-        // most of the throughput win (k=32 already amortizes ~97% of the per-token submit overhead) while
-        // staying well under the ceiling. LOGSCOPE_WINDOW_MAX overrides for hardware that can go higher.
-        let kcap = std::env::var("LOGSCOPE_WINDOW_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16).max(2);
-        let k = k.max(2).min(kcap);
+        // GOVERNOR: derive a device-safe window from the live buffer-object count instead of a hardcoded
+        // cap. The governor knows this backend's ceiling shape (Metal buffer-objects / Vulkan allocation-
+        // count) and self-tunes: a clean window nudges its cap up toward the request; any pressure signal
+        // ratchets it down and latches. LOGSCOPE_WINDOW_MAX still hard-caps on top for manual control.
+        let live_objs = self.dims_buffer_count() + self.pool_live_estimate();
+        let gov_k = self.governor.lock().unwrap().window_for(k, live_objs);
+        let hard_cap = std::env::var("LOGSCOPE_WINDOW_MAX").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(usize::MAX).max(2);
+        let k_req = k;
+        let k = k.max(2).min(gov_k).min(hard_cap);
+        // Surface the governor's decision once per session when it actually trims the request, so a
+        // clamped window is visible (not a silent slowdown) — the "alert" half of the governor.
+        {
+            static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if k < k_req && !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let g = self.governor.lock().unwrap();
+                let b = g.budget();
+                eprintln!("wgpu-engine: governor — requested window k={k_req} clamped to k={k} ({:?} budget: soft cap {} objects, ~{} live); it will self-tune upward if the device has headroom",
+                    b.kind, b.soft_object_cap, live_objs);
+            }
+        }
         let rcap = 64usize;
         if s.logits.is_empty() { return 0; }
         let cache_rows = s.cache.k.first().map(|t| t.rows).unwrap_or(0);
@@ -6702,6 +6739,9 @@ impl Gpu {
                     let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
                     self.clear_retained();
                     if !self.flush_every_pinned() { self.set_flush_every(saved_flush); }
+                    // Tell the governor this k caused real device pressure so it ratchets the cap down and
+                    // latches — the next window (this or a later turn) won't climb back to a failing size.
+                    self.governor.lock().unwrap().observe_pressure(k);
                     return usize::MAX; // sentinel: windowed decode aborted on device pressure
                 }
                 // Bound live buffers WITHIN the window. Pinning flush high batches the window into one
@@ -6748,6 +6788,10 @@ impl Gpu {
             if let Some(t) = logits_t { s.logits = self.download(&t); }
         }
         if !self.flush_every_pinned() { self.set_flush_every(saved_flush); } // restore the caller's pacing
+        // The window ran to completion without device pressure — let the governor nudge its safe-k cap
+        // up toward the request (bounded, one step) so a device with headroom converges to a bigger,
+        // faster window over a few turns instead of staying pinned at the conservative start.
+        self.governor.lock().unwrap().observe_clean(k);
         produced
     }
 }
