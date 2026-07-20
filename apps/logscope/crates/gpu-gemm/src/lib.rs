@@ -6035,6 +6035,32 @@ impl Gpu {
         // o-proj.
         self.linear_t(&ctx, &w.o, 1, dm.d, h * dm.v_head)
     }
+
+    /// Allocate a compressed MLA cache: per-layer latent [max_seq, kv_lora] + rot [max_seq, qk_rope]. This
+    /// is the long-context memory win — the cache is O(kv_lora+qk_rope)/token instead of O(n_kv_heads·hd).
+    pub fn mla_new_cache(&self, n_layers: usize, max_seq: usize, dm: &crate::mla::MlaDims) -> crate::mla::MlaCache {
+        crate::mla::MlaCache {
+            latent: (0..n_layers).map(|_| self.alloc(max_seq, dm.kv_lora)).collect(),
+            rot: (0..n_layers).map(|_| self.alloc(max_seq, dm.qk_rope)).collect(),
+            kv_lora: dm.kv_lora, qk_rope: dm.qk_rope, max_seq,
+        }
+    }
+
+    /// Compress one token's hidden state into its MLA cache row and append at `pos` in the given layer:
+    /// x → kv_a → [latent | rot]; RMSNorm the latent, NEOX-rope the rot; write both into the cache. Returns
+    /// nothing — the cache holds the compressed row. Mirrors mla.rs::compress_kv on-GPU.
+    pub fn mla_compress_append(&self, x: &Tensor, w: &crate::mla::MlaWeightsT, dm: &crate::mla::MlaDims,
+                               cache: &crate::mla::MlaCache, layer: usize, pos: usize) {
+        let kva = self.linear_t(x, &w.kv_a, 1, dm.kv_lora + dm.qk_rope, dm.d);
+        // latent part [0,kv_lora) → RMSNorm → cache.latent[layer][pos]
+        let latent = self.slice_cols(&kva, 0, dm.kv_lora);
+        let latent = self.rmsnorm_t(&latent, &w.kv_a_ln, 1, dm.kv_lora, dm.eps);
+        self.write_row(&cache.latent[layer], &latent, pos, dm.kv_lora);
+        // rot part [kv_lora, kv_lora+qk_rope) → NEOX rope at pos → cache.rot[layer][pos]
+        let rot = self.slice_cols(&kva, dm.kv_lora, dm.qk_rope);
+        let rot = self.rope_neox_at_t(&rot, 1, dm.qk_rope, dm.base, pos);
+        self.write_row(&cache.rot[layer], &rot, pos, dm.qk_rope);
+    }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
                   v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect() }

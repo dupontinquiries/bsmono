@@ -4825,6 +4825,23 @@ fn main() {
         let e2 = maxerr(&gpu_out2, &cpu_out);
         println!("  MLA fully-on-GPU forward vs CPU reference: max|diff|={e2:.2e}");
         check("MLA fully-on-GPU attention: GPU == CPU reference", e2, 1e-3);
+        // compressed CACHE path: compress+append each token on-GPU, then attend from the cache. The cache
+        // is the long-context memory win — [kv_lora + qk_rope]/token, not per-head KV.
+        {
+            let cache = gpu.mla_new_cache(1, 64, &dm);
+            for (p, x) in toks.iter().enumerate() {
+                let xt = gpu.upload(x, 1, dm.d);
+                gpu.mla_compress_append(&xt, &wt, &dm, &cache, 0, p);
+            }
+            // attend using the on-GPU-built cache directly — mla_attention_step_gpu reads rows [0,pos+1),
+            // which are exactly the live rows we appended (the cache is max_seq-tall but zero beyond pos).
+            let cout = gpu.download(&gpu.mla_attention_step_gpu(&xq, &wt, &dm, &cache.latent[0], &cache.rot[0], pos));
+            let e3 = maxerr(&cout, &cpu_out);
+            println!("  MLA on-GPU compressed cache (compress+append→attend): max|diff|={e3:.2e}");
+            check("MLA compressed cache decode == CPU reference", e3, 1e-3);
+            let ratio = cache.compression_vs_standard(dm.n_heads, dm.qk_head());
+            println!("  MLA cache compression vs standard KV: {ratio:.1}x smaller");
+        }
     }
 
     {
