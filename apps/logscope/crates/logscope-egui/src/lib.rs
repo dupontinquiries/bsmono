@@ -89,6 +89,7 @@ pub use logscope_fan::cmdpalette;
 #[allow(dead_code)] pub mod fabric_net; // pure std (TCP fabric) — available to the lean CLI too, not gui-gated
 #[cfg(feature = "gui")] pub mod context_graph;
 #[cfg(feature = "gui")] pub mod retrieval;
+#[cfg(feature = "gui")] #[allow(dead_code)] pub mod rag; // BM25 retrieval over the LogScope corpus (RAG)
 #[cfg(feature = "gui")] pub mod pipeline;
 #[cfg(feature = "gui")] pub mod diff;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod scroll;
