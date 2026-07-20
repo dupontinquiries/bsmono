@@ -5195,6 +5195,25 @@ pub struct KvCache { pub k: Vec<Tensor>, pub v: Vec<Tensor> }
 /// is the cap once compute scales). ~4x smaller than the f32 cache.
 pub struct QKvCache { pub kq: Vec<Tensor>, pub ks: Vec<Tensor>, pub vq: Vec<Tensor>, pub vs: Vec<Tensor> }
 
+/// A STAGED KV cache: a hot f32 window (recent tokens, full precision) over a warm int8 tail (older
+/// tokens, 4× smaller). Combines `KvCache` (hot) + `QKvCache` (warm) at a moving boundary owned by a
+/// `kvstage::StagePolicy`. Recent tokens dominate attention, so they stay f32; the cold tail is demoted.
+/// This is the middle ground between the all-f32 `KvCache` (best quality, biggest) and the all-int8
+/// `QKvCache` (smallest, lower quality), and the substrate 1M context + DSA build on.
+///
+/// Bit-exactness contract: with `policy = StagePolicy::all_hot()` NOTHING is ever demoted — the warm
+/// tail stays empty and this behaves exactly like a plain `KvCache`. That is the no-op validation gate.
+pub struct StagedKvCache {
+    /// Hot tier: f32 K/V for tokens `[policy.hot_start, pos)`. Written every step like the f32 cache.
+    pub hot: KvCache,
+    /// Warm tier: int8 K/V for tokens `[0, policy.hot_start)`. Empty until the first block demotes.
+    pub warm: QKvCache,
+    /// The staging boundary + demotion rules (pure; see kvstage.rs).
+    pub policy: crate::kvstage::StagePolicy,
+    /// Warm tail length in tokens (== policy.hot_start; cached to avoid recomputm). Kept in sync on demote.
+    pub warm_len: usize,
+}
+
 /// A generation session backed by the int8 KV cache (4x smaller). Mirrors `Session`.
 pub struct SessionQ8 {
     pub cache: QKvCache,
@@ -5586,8 +5605,37 @@ impl Gpu {
             c.k.push(self.dequant_rows(&q.kq[li], &q.ks[li], len, kv_dim));
             c.v.push(self.dequant_rows(&q.vq[li], &q.vs[li], len, kv_dim));
         }
-        c
+        c    }
+
+    /// Create a staged KV cache. `max_seq` sizes the hot f32 buffers; `policy` owns the hot/warm split.
+    /// With `StagePolicy::all_hot()` this is a plain f32 cache wearing a staged wrapper (the no-op gate).
+    pub fn staged_new(&self, n_layers: usize, max_seq: usize, kv_dim: usize, policy: crate::kvstage::StagePolicy) -> StagedKvCache {
+        StagedKvCache {
+            hot: self.new_cache(n_layers, max_seq, kv_dim),
+            warm: QKvCache { kq: vec![], ks: vec![], vq: vec![], vs: vec![] },
+            policy,
+            warm_len: 0,
+        }
     }
+
+    /// Slide the staging boundary if the hot window has overflowed: demote the oldest hot block to the
+    /// warm int8 tail and advance the boundary. Called by the decode loop AFTER writing the current token
+    /// into the hot cache and advancing `pos`. A no-op when the policy says nothing's due (or all-hot), so
+    /// short contexts and the no-op gate never touch the warm tier. Returns tokens demoted (0 = nothing).
+    /// NOTE: the actual per-block quantize of hot rows [from,from+len) into the warm stacks is the stage-3
+    /// kernel work; this stage wires the policy + boundary bookkeeping + the all-hot no-op, so a
+    /// StagedKvCache decodes identically to the f32 path until demotion is turned on.
+    pub fn staged_slide(&self, cache: &mut StagedKvCache, pos: usize) -> usize {
+        match cache.policy.plan(pos) {
+            crate::kvstage::StageAction::Nothing => 0,
+            crate::kvstage::StageAction::Demote { from: _, len } => {
+                cache.policy.commit_demote(len);
+                cache.warm_len += len;
+                len
+            }
+        }
+    }
+
     /// int8-KV decode attention: single query row over `l` packed int8 rows + scales.
     fn decode_attention_mh_q8(&self, q: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         let out = self.alloc(1, dm); let hd = dm / n_heads;
