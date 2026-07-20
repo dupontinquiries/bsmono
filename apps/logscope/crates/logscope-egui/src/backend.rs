@@ -82,8 +82,17 @@ pub(crate) mod engine {
     use logscope::llm_backend::GenParams;
     use std::time::Instant;
     /// Prefill block size. Attention scratch peaks at O(PREFILL_CHUNK · prompt_len), so this bounds
-    /// the memory a long context can demand (vs O(prompt_len²) for a single batched prefill).
+    /// the memory a long context can demand (vs O(prompt_len²) for a single batched prefill). ALSO caps
+    /// how much work lands in each prefill dispatch: a GPU watchdog (Windows TDR, or the Asahi/Linux
+    /// firmware timeout) kills any single dispatch that runs longer than ~1-2s, so an over-large chunk on
+    /// a big prompt can hang the GPU ("GPU timeout / Halted" in dmesg). Smaller chunks = shorter dispatches
+    /// = safe under the watchdog, at a small throughput cost. LOGSCOPE_PREFILL_CHUNK overrides.
     const PREFILL_CHUNK: usize = 256;
+    /// The effective prefill chunk: env override, else the const default. Lower this (e.g. 64, 32) if the
+    /// GPU watchdog fires during prefill on a long prompt.
+    fn prefill_chunk() -> usize {
+        std::env::var("LOGSCOPE_PREFILL_CHUNK").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n >= 1).unwrap_or(PREFILL_CHUNK)
+    }
     /// Hard ceiling on the context window regardless of the n_ctx slider — the KV cache is O(window)
     /// memory (~hundreds of KB per token), so this is the backstop against OOMing the device.
     const MAX_CONTEXT: usize = 32768;
@@ -571,7 +580,7 @@ pub(crate) mod engine {
                 // O(1)-bandwidth batched prefill of the whole prompt (one [T,d] pass).
                 // O(chunk·T) chunked prefill — NOT one O(T²) batched pass — so a long pasted
                 // context can't balloon attention scratch to tens of GB and OOM the device.
-                s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, PREFILL_CHUNK);
+                s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, prefill_chunk());
                 s.pos = prompt_ids.len();
             }
             eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
@@ -659,7 +668,7 @@ pub(crate) mod engine {
             if reuse && produced == 0 && !cancel() {
                 eprintln!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
                 let mut s2 = self.gpu.session_new(&self.model, cap, self.rng);
-                s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, PREFILL_CHUNK);
+                s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk());
                 s2.pos = prompt_ids.len();
                 produced = stream_from(&mut s2, &mut rng);
                 s = s2;
@@ -760,7 +769,7 @@ pub(crate) mod engine {
             let reply = p.reply_ceiling.max(p.max_tokens).max(1);
             let max_seq = window;
             let mut pc = self.gpu.session_new(&self.model, max_seq, self.rng);
-            if !shared.is_empty() { let _ = self.gpu.prefill_chunked(&self.model, &pc.cache, &shared, PREFILL_CHUNK); pc.pos = shared.len(); }
+            if !shared.is_empty() { let _ = self.gpu.prefill_chunked(&self.model, &pc.cache, &shared, prefill_chunk()); pc.pos = shared.len(); }
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             let queue: Vec<(usize, Vec<u32>, usize)> = enc.iter().enumerate()
                 .map(|(i, e)| (i, e[shared.len().min(e.len())..].to_vec(), reply.min(window.saturating_sub(e.len())).max(1)))
