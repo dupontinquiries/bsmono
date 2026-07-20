@@ -1319,8 +1319,9 @@ impl Toaster {
                         else if age > HOLD { (1.0 - (age - HOLD) / FOUT).clamp(0.0, 1.0) as f32 }
                         else { 1.0 };
                     Frame {
-                        inner_margin: Margin::symmetric(14, 9),
-                        outer_margin: Margin { bottom: 6, ..Default::default() },
+                        inner_margin: Margin::symmetric(15, 11),
+                        // clearer separation between stacked toasts so a burst doesn't read as one slab
+                        outer_margin: Margin { bottom: 10, ..Default::default() },
                         fill: PANEL2().gamma_multiply(a),
                         stroke: Stroke::new(1.0, t.accent.gamma_multiply(0.7 * a)),
                         corner_radius: r(10),
@@ -1330,11 +1331,14 @@ impl Toaster {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.painter(); // ensure layout
-                            let (bar, _) = ui.allocate_exact_size(egui::vec2(3.0, 12.0), Sense::hover());
+                            // accent bar height tracks the text cap-height; centred by the row layout
+                            let (bar, _) = ui.allocate_exact_size(egui::vec2(3.0, 13.0), Sense::hover());
                             ui.painter().rect_filled(bar, r(1), t.accent.gamma_multiply(a));
-                            ui.add_space(7.0);
+                            ui.add_space(9.0);
                             ui.label(RichText::new(&t.text).size(11.5).color(INK().gamma_multiply(a)));
                         });
+                        // breathing room before the lifetime bar so it doesn't crowd the text baseline
+                        ui.add_space(7.0);
                         // thin lifetime bar that depletes left→right over the hold window
                         let remain = (1.0 - ((age) / (HOLD + FOUT)) as f32).clamp(0.0, 1.0);
                         let full = ui.min_rect().width();

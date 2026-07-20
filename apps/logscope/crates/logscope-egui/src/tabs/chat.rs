@@ -1873,6 +1873,34 @@ impl Chat {
 
     /// Actually begin a generation: checkpoint, append the user turn (forked at `parent`) + an empty
     /// assistant turn, build the prompt for the live branch, and stream. Shared by send + the queue.
+    /// Clear the conversation: wipe the transcript/tree AND the per-conversation generation bookkeeping
+    /// (stepwise checkpoint counters, in-flight queue/fan, live estimate samples). The Clear button used to
+    /// reset only the transcript, so the ⏸ STEP counters and generation estimate carried into the next
+    /// conversation — this centralizes the reset so the two can't drift apart again.
+    fn clear_conversation(&mut self) {
+        self.msgs.clear();
+        self.last = None;
+        self.active_leaf = None;
+        self.branch_from = None;
+        self.pruned.clear();
+        self.queue.clear();
+        self.fold_pos.clear();
+        self.region = None;
+        self.fan = None;
+        self.count_pending = None;
+        // stepwise/generation state that was leaking across a clear
+        self.stepwise = false;
+        self.step_last_paused = 0;
+        self.step_continues = 0;
+        self.step_pending_continue = false;
+        self.step_arm_continue = false;
+        self.step_shell = None;
+        self.step_inject = None;
+        self.hit_cap = false;
+        self.gen_samples.clear();
+        self.last_prompt_tokens = 0;
+    }
+
     fn start_generation(&mut self, qt: String, parent: Option<usize>, infer: &Inference, doc: &crate::analysis::Doc) {
         // fresh reply → fresh stepwise accounting
         self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
@@ -5530,7 +5558,7 @@ impl Chat {
                 }
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Clear").clicked() { self.msgs.clear(); self.last = None; self.active_leaf = None; self.branch_from = None; self.pruned.clear(); self.queue.clear(); self.fold_pos.clear(); self.region = None; self.fan = None; self.count_pending = None; }
+                if ui.button("Clear").clicked() { self.clear_conversation(); }
                 ui.add_space(6.0);
                 // PEARL: toggle the in-scene refractive composer pearl + pick its optical variant
                 if self.pearl_on {
