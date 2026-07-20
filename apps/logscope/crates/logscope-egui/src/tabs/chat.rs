@@ -1224,6 +1224,18 @@ impl Chat {
                                         });
                                     }
                                 }
+                                // Tripwire self-review: if we're continuing and NOT already running a
+                                // cargo-test check for this pause (that's the stronger ground-truth signal,
+                                // prefer it), scan the code so far for mechanical breaks. On a hit, queue a
+                                // ⟲ CHECK self-review nudge so the model looks back and fixes it in place on
+                                // resume — a review point offered, not a correction imposed.
+                                if cont && self.step_shell.is_none() && self.step_inject.is_none() {
+                                    let sig = crate::tripwire::scan(m.text());
+                                    if let Some(note) = crate::tripwire::review_note(&sig) {
+                                        self.step_inject = Some(note);
+                                        self.note = "review point — model will self-check the code".into();
+                                    }
+                                }
                                 stop = true;
                             }
                         }
@@ -1259,6 +1271,25 @@ impl Chat {
                     self.step_pending_continue = false;
                     self.step_continues += 1;
                     self.step_arm_continue = true;
+                }
+                // Trailing-solicitation catch: small models often END a step by ASKING to continue
+                // ("Let me know when you're ready to proceed") instead of writing a marker or
+                // TASK_COMPLETE. With stepwise/auto-continue on that's a soft "keep going", not a real
+                // stop — so if nothing else armed a continue, the reply isn't complete, and we're under
+                // the loop cap, treat the ask as a continue. (The continue prompt strips the trailing
+                // question so the model doesn't re-read its own "let me know" and stall again.)
+                if (self.stepwise || self.auto_continue) && !self.step_arm_continue {
+                    if let Some(m) = idx.and_then(|i| self.msgs.get(i)) {
+                        let t = m.text();
+                        if self.step_continues < 24
+                            && !crate::stepwise::signals_complete(t)
+                            && crate::stepwise::trailing_solicitation(t)
+                        {
+                            self.step_continues += 1;
+                            self.step_arm_continue = true;
+                            self.note = "auto-continue: model asked to proceed — continuing".into();
+                        }
+                    }
                 }
                 if self.last_prompt_tokens > 0 { // bank this run for future progress estimates
                     self.gen_samples.push(crate::estimate::GenSample { prompt_tokens: self.last_prompt_tokens, output_tokens: tokens, secs });
@@ -1571,7 +1602,10 @@ impl Chat {
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
-        let partial = neutralize_markers(&self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default());
+        let raw_partial = self.msgs.get(last).map(|m| m.text().to_string()).unwrap_or_default();
+        // If the reply ended by asking to continue, drop that trailing question before resuming IN PLACE —
+        // otherwise the model reads its own "let me know when you're ready" and stalls or answers itself.
+        let partial = neutralize_markers(crate::stepwise::strip_trailing_solicitation(&raw_partial));
         let chatml = self.backend == BackendKind::Wgpu && self.template == TemplateKind::ChatML;
         let llama3 = self.backend == BackendKind::Wgpu && matches!(self.template, TemplateKind::Llama3 | TemplateKind::Llama4);
         if chatml {

@@ -65,6 +65,22 @@ impl Reason {
     }
 }
 
+/// Turn a fired signal into a SELF-REVIEW nudge spliced into the model's continuation. Per the design: the
+/// model isn't corrected FOR — it's handed a specific thing to look at and asked to check its own work and
+/// fix it in place if needed. Phrased as the model's own review beat (⟲ CHECK), not an external command, so
+/// it reads as "a coder pausing to look back," and left open so the model decides whether it actually
+/// drifted. Returns None for WaitAndSee.
+pub fn review_note(sig: &Signal) -> Option<String> {
+    match sig {
+        Signal::WaitAndSee => None,
+        Signal::Interject(reason) => Some(format!(
+            "⟲ CHECK — before continuing, review the code so far: {}. \
+             Am I still on task and does this hold together? If it's wrong, fix it in place; if it's fine, carry on.",
+            reason.describe()
+        )),
+    }
+}
+
 /// Run every scanner over the code generated so far, returning the FIRST (most certain) signal. Order is
 /// by precision: truncation/unbalanced/fence are near-certain; undefined-symbol is conservative and last.
 pub fn scan(code: &str) -> Signal {
@@ -341,5 +357,15 @@ mod tests {
     fn reason_descriptions_are_actionable() {
         let r = Reason::UndefinedSymbolUsed { symbol: "Player".into() };
         assert!(r.describe().contains("Player"));
+    }
+
+    #[test]
+    fn review_note_is_a_self_review_nudge() {
+        let sig = Signal::Interject(Reason::UndefinedSymbolUsed { symbol: "Player".into() });
+        let note = review_note(&sig).unwrap();
+        assert!(note.contains("⟲ CHECK"));
+        assert!(note.contains("Player"));
+        assert!(note.to_lowercase().contains("fix it in place")); // self-correct, not external splice
+        assert_eq!(review_note(&Signal::WaitAndSee), None);
     }
 }
