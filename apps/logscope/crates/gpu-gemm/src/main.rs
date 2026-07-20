@@ -4933,6 +4933,23 @@ fn main() {
         check("DSA no-op below threshold keeps all keys", (sel_all.len() as f32) - (small_nk as f32), 0.0);
     }
 
+    // OOM-backoff download guard: after a device OOM, mapping a possibly-invalid staging buffer is a FATAL
+    // wgpu error (the crash seen on the q4-30B long second prompt). The guard makes download/download_u32
+    // return empty once oom_backoff is set, so the decode loop stops cleanly instead of panicking. Verify
+    // the guard fires and clears (can't provoke a real device OOM deterministically in-container).
+    {
+        let t = gpu.upload(&[1.0f32, 2.0, 3.0, 4.0], 1, 4);
+        gpu.set_oom_for_test(true);
+        let f = gpu.download(&t);
+        let u = gpu.download_u32(&t);
+        check("download() returns empty under OOM backoff (no fatal map)", f.len() as f32, 0.5);
+        check("download_u32() returns empty under OOM backoff", u.len() as f32, 0.5);
+        gpu.set_oom_for_test(false);
+        // after clearing, downloads work normally again
+        let f2 = gpu.download(&t);
+        check("download() recovers after OOM flag clears", (f2.len() as f32) - 4.0, 0.5);
+    }
+
     {
         let hmd = gen_model(64, 128, 2, 48, 4, 2);
         let md = gpu.load_gguf(&write_gguf(&hmd)).expect("load_gguf (degrade test)");
