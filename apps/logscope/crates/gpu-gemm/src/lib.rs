@@ -5437,6 +5437,30 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[c]=acc/denom;
 }"#;
 
+// DSA top-k selection as a MASK (see dsa.rs::select_topk). One thread per key t sets mask[t]=1 iff key t is
+// among the top `keep` by score, breaking ties by position (earlier wins) — exactly the reference's
+// "> thr then == thr in ascending position order" rule, computed as a stable rank:
+//   rank(t) = #{j: score[j] > score[t]} + #{j: score[j] == score[t] AND j < t};  mask[t] = rank(t) < keep.
+// When keep >= nk every rank < nk <= keep, so all keys select (the no-op-below-threshold case) with no
+// special branch. O(nk²) but nk is bounded by index_topk; matches the CPU set bit-for-bit incl. ties.
+const DSA_TOPK_MASK: &str = r#"
+struct D { nk:u32, keep:u32, _a:u32, _b:u32 };
+@group(0)@binding(0) var<storage,read> s: array<f32>;        // [nk] scores
+@group(0)@binding(1) var<storage,read_write> mask: array<f32>; // [nk]
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let t=g.x; if(t>=d.nk){return;}
+  let st=s[t];
+  var rank=0u;
+  for(var j=0u;j<d.nk;j=j+1u){
+    let sj=s[j];
+    if(sj>st){ rank=rank+1u; }
+    else if(sj==st && j<t){ rank=rank+1u; }   // stable tie-break: earlier position ranks higher
+  }
+  if(rank<d.keep){ mask[t]=1.0; } else { mask[t]=0.0; }
+}"#;
+
 const ATTENTION_MH: &str = r#"
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -6266,6 +6290,16 @@ impl Gpu {
         let out = self.alloc(1, dv);
         let dims = [nk as u32, dk as u32, dv as u32, 0u32];
         self.dispatch(DSA_MASKED_ATTN, &[q, k, v, mask], &out, bytemuck::cast_slice(&dims), ((dv as u32).div_ceil(64), 1, 1));
+        out
+    }
+
+    /// DSA top-k selection as a mask on GPU: mask[t]=1 iff key t is among the top `keep` scores (ties by
+    /// position). `keep` = min(nk, index_topk); when keep>=nk all keys select (no-op below threshold).
+    /// Bit-exact to dsa.rs::select_topk (as a mask). This is the selection the masked attention consumes.
+    pub fn dsa_topk_mask_t(&self, scores: &Tensor, nk: usize, keep: usize) -> Tensor {
+        let out = self.alloc(1, nk);
+        let dims = [nk as u32, keep as u32, 0u32, 0u32];
+        self.dispatch(DSA_TOPK_MASK, &[scores], &out, bytemuck::cast_slice(&dims), ((nk as u32).div_ceil(64), 1, 1));
         out
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
