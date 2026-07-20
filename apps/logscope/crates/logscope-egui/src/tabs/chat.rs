@@ -6354,7 +6354,7 @@ impl Chat {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new(who).color(c).small().strong());
                                     // node id — highlighted so it can be referenced in :mergectx (git-style prefix)
-                                    ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::ensure_contrast(theme::VIOLET(), theme::BG(), 4.5)))
+                                    ui.label(RichText::new(crate::vimmode::short_id(i)).monospace().small().color(theme::md_run_violet()))
                                         .on_hover_text("node id — reference it in :mergectx (a unique prefix works, e.g. :mergectx a9j,3df)");
                                     if m.variants.len() > 1 {
                                         if ui.small_button("‹").on_hover_text("Previous branch").clicked() { action = Some(MsgAction::PrevVar(i)); }
