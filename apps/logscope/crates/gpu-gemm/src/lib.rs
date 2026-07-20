@@ -74,6 +74,12 @@ pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
 const DIMS_RETAIN_CAP: usize = 8192;
+/// Windowed-decode mid-loop flush cadence: flush+poll every N sampler slots so a large window's
+/// per-slot buffers (bind groups, dims, decode intermediates) free instead of accumulating in one
+/// pinned frame until the device runs out of buffer objects. Small enough to bound live buffers on
+/// Metal, large enough that the flush cost amortizes over many dispatches. The `pre` logits the replay
+/// needs are held by the caller, not the frame, so they survive the flush.
+const SLOT_FLUSH: usize = 16;
 /// Content-cache cap: distinct (shape) dims that get their own permanent buffer. Sized to comfortably
 /// hold every stable per-shape uniform a model uses after warmup; per-position dims spill to the ring.
 const DIMS_CACHE_CAP: usize = 4096;
@@ -6678,6 +6684,18 @@ impl Gpu {
                     EmbedT::Q8(q) => self.gather_q8_at(q, &o, j as u32),
                 };
                 pre.push(self.decode_layers_t(m, &s.cache, x, s.pos + j));
+                // Bound live buffers WITHIN the window. Pinning flush high batches the window into one
+                // frame for throughput, but on Metal that lets a big k's per-slot dispatches (~36×k bind
+                // groups + dims + decode intermediates) accumulate until the device runs out of buffer
+                // OBJECTS → "Buffer 'dims'/'dl_u32' invalid". Every SLOT_FLUSH slots, flush the frame and
+                // poll to completion so those buffers free; the `pre` logits (needed for the replay) are
+                // held by us, not the frame, so they survive. Bit-exact — poll only waits.
+                if (j + 1) % SLOT_FLUSH == 0 {
+                    self.end_frame();
+                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    self.clear_retained();
+                    self.begin_frame();
+                }
             }
             let win = self.download_u32(&o);
             // Replay with exact stream_session semantics.
