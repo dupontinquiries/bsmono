@@ -5499,6 +5499,15 @@ impl Chat {
                 if self.auto_continue && toks >= chunk {
                     ui.label(RichText::new(format!("· chunk {}/{}", toks / chunk + 1, 1 + MAX_AUTO_CONTINUE)).color(theme::FAINT()).small());
                 }
+                // LIVE PROGRESS NOTIFIER — the one-line "what it's doing right now" summary, refreshed
+                // ~5s from the streaming tail, shown right next to the decode status so it's actually seen
+                // (it was previously tucked in the fan HUD). Amber arrow + text so it reads as live intent.
+                if let Some((sum, _)) = &s.progress {
+                    if !sum.is_empty() {
+                        ui.label(RichText::new(format!("→ {sum}")).color(theme::CYAN()).small().italics())
+                            .on_hover_text("live summary of the latest activity in this reply (refreshes every ~5s)");
+                    }
+                }
             } else if let Some((t, secs)) = self.last {
                 if std::env::var("LOGSCOPE_DEBUG").is_ok() {
                     ui.label(RichText::new(format!("· {t} tok · {:.1} tok/s", t as f32 / secs.max(0.001))).color(theme::FAINT()).small());
