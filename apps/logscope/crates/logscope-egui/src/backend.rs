@@ -530,11 +530,11 @@ pub(crate) mod engine {
                 eprintln!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {})", if on { "ON" } else { "OFF" }, self.gpu.adapter_name);
                 return;
             }
-            // only worth probing on MoE models (the levers are MoE-decode dispatch reductions)
-            if !self.model.is_moe() {
-                gpu_kernels::ab_set_decided(false);
-                return;
-            }
+            // Probe on MoE AND dense models. The two MoE fusions are no-ops on a dense model, but the
+            // bind-group cache cuts per-dispatch SETUP cost on ANY dispatch-bound decode — and the feedback
+            // profiles (setup≫sync even on a dense 4B) show dense decode is dispatch-bound here too. So the
+            // A/B measures the cache's effect via the same timing comparison; MoE models additionally get
+            // the fusions. (Only skip is the env/persisted-verdict short-circuits above.)
             // A throwaway prefix: a few tokens so decode actually routes MoE experts. Content is irrelevant;
             // BOS (id 0 fallback) + a short run keeps it cheap. Warm the pipelines first so neither phase
             // eats shader-compile time.
