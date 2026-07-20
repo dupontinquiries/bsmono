@@ -671,17 +671,25 @@ pub fn ensure_contrast(fg: Color32, bg: Color32, min: f32) -> Color32 {
     lerp_col(fg, toward, hi)
 }
 
-/// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the chat background — or the best the background
-/// can support (a true mid-tone surface caps below any fixed target; `ensure_contrast` then
-/// returns the stronger pole).
-pub fn md_ink() -> Color32 { ensure_contrast(INK(), BG(), 4.5) }
-/// Markdown accent (inline code / links), guaranteed ≥ 4.5:1 — the neon-fade fix.
-pub fn md_accent() -> Color32 { ensure_contrast(CYAN(), BG(), 4.5) }
-/// Markdown secondary (bullets, quote text), guaranteed ≥ 4.5:1 (WCAG AA) — bullet/quote bodies are real
-/// reading content, not decoration, so they get the full body-text floor (was 4.0, which read washed out).
-pub fn md_dim() -> Color32 { ensure_contrast(DIM(), BG(), 4.5) }
+/// Nudge `fg` until it clears `min` contrast against the surface markdown actually renders on. Assistant/
+/// user messages render inside a frame filled with PANEL, so that's the surface to guarantee — the old
+/// helpers guarded BG, and on palettes where PANEL is lighter than BG an accent tuned for BG faded on the
+/// panel (the washed-out backticks). A single text color can't satisfy two surfaces on opposite sides of
+/// mid-grey, so we target the one the glyphs sit on: the panel.
+fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast(fg, PANEL(), min) }
+/// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the message panel.
+pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
+/// Markdown accent (inline code / links), ≥ 4.5:1 on the panel — the neon-fade + panel-fade fix. Inline
+/// `code` renders inside the message frame, so it must clear the PANEL, not just the background.
+pub fn md_accent() -> Color32 { md_on_panel(CYAN(), 4.5) }
+/// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
+/// body floor on the surface it lands on.
+pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
 /// Blockquote bar/wash accent, guaranteed ≥ 3.0:1 (a decorative element needs less).
-pub fn md_quote_accent() -> Color32 { ensure_contrast(AMBER(), BG(), 3.0) }
+pub fn md_quote_accent() -> Color32 { md_on_panel(AMBER(), 3.0) }
+/// A colored inline run (e.g. the workflow-word sequence RECONSTRUCT→MODEL→…) that keeps the violet hue but
+/// is guaranteed to read on the message panel.
+pub fn md_run_violet() -> Color32 { md_on_panel(VIOLET(), 4.5) }
 
 /// The sun for the canopy theme, derived from the real system clock: a low warm sun at dawn/dusk, bright
 /// and near-overhead at noon, dim and cool at night. Returns (shaft direction, colour, intensity 0..1).
@@ -1823,6 +1831,11 @@ mod day_night_tests {
                 };
                 demand(q.ink, q.bg, 4.5, "ink");
                 demand(q.cyan, q.bg, 4.5, "cyan (neon-fade fix)");
+                // Inline `code`, links, and colored runs render ON THE PANEL (message frames), so they must
+                // clear the panel too — the washed-out-backticks fix. md_accent/md_ink/md_run guard PANEL.
+                demand(q.cyan, q.panel, 4.5, "cyan on panel (inline code)");
+                demand(q.violet, q.panel, 4.5, "violet on panel (colored run)");
+                demand(q.ink, q.panel, 4.5, "ink on panel (md body)");
                 demand(q.dim, q.bg, 4.5, "dim (md body — raised from 4.0)");
                 demand(q.amber, q.bg, 3.0, "quote accent");
                 demand(q.ink, q.panel2, 4.5, "ink on panel2");
