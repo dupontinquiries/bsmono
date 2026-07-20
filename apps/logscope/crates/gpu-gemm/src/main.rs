@@ -4865,6 +4865,37 @@ fn main() {
         let e = got.iter().zip(&cpu).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         println!("  DSA indexer scores GPU vs CPU reference ({nk} keys): max|diff|={e:.2e}");
         check("DSA indexer scores: GPU == CPU reference", e, 1e-5);
+
+        // Masked attention on GPU must match the CPU reference, and — the anchor — with an all-ones mask it
+        // must equal DENSE attention (so DSA never changes short-context output). q/k/v for the main attn:
+        use gpu_kernels::dsa::{masked_attention, mask_from_selection, select_topk};
+        let (dk, dv) = (24usize, 20usize);
+        let mq = seeded(dk, 404);
+        let mk = seeded(nk * dk, 505);
+        let mv = seeded(nk * dv, 606);
+        // (a) all-ones mask == dense
+        let ones = vec![1f32; nk];
+        let cpu_dense = masked_attention(&mq, &mk, &mv, &ones, nk, dk, dv);
+        let g_q = gpu.upload(&mq, 1, dk); let g_k = gpu.upload(&mk, nk, dk);
+        let g_v = gpu.upload(&mv, nk, dv); let g_m = gpu.upload(&ones, 1, nk);
+        let g_dense = gpu.download(&gpu.dsa_masked_attention_t(&g_q, &g_k, &g_v, &g_m, nk, dk, dv));
+        let ed = g_dense.iter().zip(&cpu_dense).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("  DSA masked-attn (all-ones) GPU vs CPU dense: max|diff|={ed:.2e}");
+        check("DSA masked attention (all keys) == dense reference on GPU", ed, 1e-5);
+        // (b) a real top-k selection mask, GPU vs CPU
+        let sel = select_topk(&cpu, &dm);            // cpu = indexer scores from above
+        let selmask = mask_from_selection(&sel, nk);
+        let cpu_sparse = masked_attention(&mq, &mk, &mv, &selmask, nk, dk, dv);
+        let g_sm = gpu.upload(&selmask, 1, nk);
+        let g_sparse = gpu.download(&gpu.dsa_masked_attention_t(&g_q, &g_k, &g_v, &g_sm, nk, dk, dv));
+        let es = g_sparse.iter().zip(&cpu_sparse).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("  DSA masked-attn (top-k selection) GPU vs CPU: max|diff|={es:.2e}");
+        check("DSA masked attention (top-k) == CPU reference on GPU", es, 1e-5);
+        // (c) at nk <= index_topk the selection keeps ALL keys → sparse must equal dense (the anchor)
+        let small_nk = dm.index_topk.min(nk); // <= index_topk
+        let sel_all = select_topk(&cpu[..small_nk], &dm);
+        println!("  DSA at nk={small_nk} <= topk={} → keeps {} keys (all ⇒ dense)", dm.index_topk, sel_all.len());
+        check("DSA no-op below threshold keeps all keys", (sel_all.len() as f32) - (small_nk as f32), 0.0);
     }
 
     {

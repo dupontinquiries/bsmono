@@ -65,6 +65,41 @@ pub fn select_topk(scores: &[f32], dm: &DsaDims) -> Vec<usize> {
 /// Whether the indexer is a no-op at this length (all keys kept → dense-exact).
 pub fn is_noop(nk: usize, dm: &DsaDims) -> bool { nk <= dm.index_topk }
 
+/// Single-query attention over only the keys whose `mask[t] != 0` (softmax renormalized over the selected
+/// set). This is the downstream consumer of the DSA selection: `q` is [dk], `k` is [nk·dk], `v` is [nk·dv],
+/// `mask` is [nk]. With an all-ones mask this is plain dense attention (the dense-equivalence anchor). Pure
+/// CPU reference for the GPU DSA_MASKED_ATTN kernel.
+pub fn masked_attention(q: &[f32], k: &[f32], v: &[f32], mask: &[f32], nk: usize, dk: usize, dv: usize) -> Vec<f32> {
+    let scale = 1.0 / (dk as f32).sqrt();
+    let mut mx = f32::NEG_INFINITY;
+    for t in 0..nk {
+        if mask[t] == 0.0 { continue; }
+        let kt = &k[t * dk..(t + 1) * dk];
+        let s: f32 = q.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale;
+        if s > mx { mx = s; }
+    }
+    let mut denom = 0f32;
+    let mut out = vec![0f32; dv];
+    for t in 0..nk {
+        if mask[t] == 0.0 { continue; }
+        let kt = &k[t * dk..(t + 1) * dk];
+        let s: f32 = q.iter().zip(kt).map(|(a, b)| a * b).sum::<f32>() * scale;
+        let p = (s - mx).exp();
+        denom += p;
+        let vt = &v[t * dv..(t + 1) * dv];
+        for i in 0..dv { out[i] += p * vt[i]; }
+    }
+    for o in out.iter_mut() { *o /= denom; }
+    out
+}
+
+/// Build a selection mask [nk] (1.0 = attend, 0.0 = skip) from a top-k index list.
+pub fn mask_from_selection(sel: &[usize], nk: usize) -> Vec<f32> {
+    let mut m = vec![0f32; nk];
+    for &t in sel { if t < nk { m[t] = 1.0; } }
+    m
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
