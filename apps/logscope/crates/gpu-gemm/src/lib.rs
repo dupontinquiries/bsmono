@@ -512,9 +512,23 @@ impl Gpu {
         // shape before ever trusting it — a buggy subgroupAdd (driver bugs are real) is caught here instead
         // of corrupting a token. Cheap (one small mat-vec pair); disable with LOGSCOPE_MATVEC_NOSG.
         if subgroups && std::env::var_os("LOGSCOPE_MATVEC_NOSG").is_none() {
-            let ok = gpu.self_check_sg();
-            gpu.sg_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
-            if !ok { eprintln!("wgpu-engine: subgroup decode kernel failed its load-time self-check on {} — using the barrier-reduction kernel instead", gpu.adapter_name); }
+            // Asahi/Honeykrisp (Apple GPU on Linux via Vulkan) advertises the SUBGROUP feature, but its
+            // subgroup support is incomplete enough that the subgroup mat-vec kernel can HANG the GPU on
+            // large projections (e.g. the n=128256 output matmul) — the firmware watchdog then times out
+            // and halts the GPU ("GPU timeout" in dmesg). The tiny load-time self-check passes (it's a
+            // correctness check, not a scale/occupancy check), so it doesn't catch this. Be conservative:
+            // on this driver, skip the subgroup kernel by default and use the barrier-reduction kernel,
+            // which is robust here. LOGSCOPE_MATVEC_SG=1 forces it back on for experimentation.
+            let asahi_vulkan = conservative_vma; // set above iff Vulkan + adapter name contains "Apple"
+            let force_sg = std::env::var_os("LOGSCOPE_MATVEC_SG").is_some();
+            if asahi_vulkan && !force_sg {
+                eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} (Asahi/Honeykrisp subgroup support can hang large matmuls; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
+                gpu.sg_ok.store(false, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                let ok = gpu.self_check_sg();
+                gpu.sg_ok.store(ok, std::sync::atomic::Ordering::Relaxed);
+                if !ok { eprintln!("wgpu-engine: subgroup decode kernel failed its load-time self-check on {} — using the barrier-reduction kernel instead", gpu.adapter_name); }
+            }
         }
         gpu
     }
