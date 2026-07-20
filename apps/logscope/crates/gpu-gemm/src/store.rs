@@ -134,6 +134,29 @@ pub fn flush_put(adapter: &str, flush: u32) {
     let _ = std::fs::write(flush_file(), out);
 }
 
+fn fast_ab_file() -> std::path::PathBuf { cache_root().join("fast_ab.tsv") }
+/// The persisted dispatch-lever A/B verdict for this adapter: Some(true)=ON, Some(false)=OFF, None=never
+/// measured (probe on next load). Keyed by adapter so each GPU keeps its own answer.
+pub fn fast_ab_get(adapter: &str) -> Option<bool> {
+    let txt = std::fs::read_to_string(fast_ab_file()).ok()?;
+    for line in txt.lines() {
+        let mut f = line.split('\t');
+        if f.next() == Some(adapter) { return f.next().map(|v| v == "1"); }
+    }
+    None
+}
+/// Persist the A/B verdict for this adapter (replaces any prior row).
+pub fn fast_ab_put(adapter: &str, on: bool) {
+    let _ = ensure_cache_dir();
+    let prev = std::fs::read_to_string(fast_ab_file()).unwrap_or_default();
+    let mut out = String::new();
+    for line in prev.lines() {
+        if line.split('\t').next() != Some(adapter) && !line.trim().is_empty() { out.push_str(line); out.push('\n'); }
+    }
+    out.push_str(&format!("{adapter}\t{}\n", if on { 1 } else { 0 }));
+    let _ = std::fs::write(fast_ab_file(), out);
+}
+
 /// Size cap for the cache dir, in bytes. `LOGSCOPE_CACHE_MAX_GB` overrides (default 10 GiB).
 pub fn cache_cap_bytes() -> u64 {
     std::env::var("LOGSCOPE_CACHE_MAX_GB").ok().and_then(|s| s.trim().parse::<f64>().ok())

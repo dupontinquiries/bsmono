@@ -507,6 +507,58 @@ pub(crate) mod engine {
             let sp = SamplerParams { temperature, top_k: 40, top_p: 0.95, repeat_penalty: 1.15, repeat_last_n: 64, min_p: 0.05 };
             self.gpu.run_tokens(&self.model, prefix, max_new, &sp, &self.stop_ids, seed)
         }
+
+        /// Magical dispatch-lever autotune (hidden). Before the user's first real message, decide whether
+        /// the (bit-identical) dispatch levers make THIS device+model faster — by running a small throwaway
+        /// decode with the levers OFF, then ON, comparing wall-clock, and switching on if ON wins. The
+        /// generated tokens are discarded and never shown. The verdict is cached per-GPU so this runs once.
+        ///
+        /// Precedence: an explicit LOGSCOPE_FAST_DECODE env override skips the probe (user intent wins); a
+        /// persisted verdict skips it (already answered on this GPU); a dense (non-MoE) model skips it (the
+        /// levers don't bear on it). Otherwise: probe now, so the first real reply is already on the fast path.
+        pub fn ab_probe(&self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            // env override wins — set the state directly, no probe
+            match std::env::var("LOGSCOPE_FAST_DECODE").as_deref() {
+                Ok("1") => { gpu_kernels::ab_set_decided(true);  eprintln!("wgpu-engine: fast-decode levers ON (LOGSCOPE_FAST_DECODE=1) — A/B skipped"); return; }
+                Ok("0") => { gpu_kernels::ab_set_decided(false); eprintln!("wgpu-engine: fast-decode levers OFF (LOGSCOPE_FAST_DECODE=0) — A/B skipped"); return; }
+                _ => {}
+            }
+            // persisted verdict for this GPU → apply and skip
+            if let Some(on) = gpu_kernels::store::fast_ab_get(&self.gpu.adapter_name) {
+                gpu_kernels::ab_set_decided(on);
+                eprintln!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {})", if on { "ON" } else { "OFF" }, self.gpu.adapter_name);
+                return;
+            }
+            // only worth probing on MoE models (the levers are MoE-decode dispatch reductions)
+            if !self.model.is_moe() {
+                gpu_kernels::ab_set_decided(false);
+                return;
+            }
+            // A throwaway prefix: a few tokens so decode actually routes MoE experts. Content is irrelevant;
+            // BOS (id 0 fallback) + a short run keeps it cheap. Warm the pipelines first so neither phase
+            // eats shader-compile time.
+            let seed_prefix: Vec<u32> = { let t = self.tok.encode("The"); if t.is_empty() { vec![0] } else { t } };
+            const WARM: usize = 4;   // discard: pipeline fill / cache warmup
+            const WIN: usize = 12;   // timed tokens per phase (median over these)
+            let time_phase = |on: bool| -> f32 {
+                gpu_kernels::ab_set_decided(on); // force levers for this phase (bit-identical either way)
+                let _warm = self.run_tokens(&seed_prefix, WARM, 0.0, 0x51ED);
+                let t0 = std::time::Instant::now();
+                let toks = self.run_tokens(&seed_prefix, WIN, 0.0, 0x51ED);
+                let dt = t0.elapsed().as_secs_f32();
+                let n = toks.len().max(1);
+                (dt / n as f32) * 1000.0 // ms/token
+            };
+            let off = time_phase(false);
+            let on = time_phase(true);
+            // ON wins only if it beats OFF by ≥5% (margin guards against noise flipping it on).
+            let decision = on < off * 0.95;
+            gpu_kernels::ab_set_decided(decision);
+            gpu_kernels::store::fast_ab_put(&self.gpu.adapter_name, decision);
+            eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
+                if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
+        }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
             let mut prompt_ids = if toks.is_empty() { vec![0] } else { toks };
@@ -964,7 +1016,7 @@ impl Backend for Wgpu {
         #[cfg(not(feature = "wgpu-engine"))] { false }
     }
     fn load(&mut self, path: &str, _p: &GenParams) -> Result<(), String> {
-        #[cfg(feature = "wgpu-engine")] { self.engine = Some(engine::Engine::load(path)?); Ok(()) }
+        #[cfg(feature = "wgpu-engine")] { let e = engine::Engine::load(path)?; e.ab_probe(); self.engine = Some(e); Ok(()) }
         #[cfg(not(feature = "wgpu-engine"))]
         { let _ = path; Err("wgpu engine: rebuild with --features wgpu-engine for clean-room GGUF inference (kernels validated in gpu-gemm)".into()) }
     }
