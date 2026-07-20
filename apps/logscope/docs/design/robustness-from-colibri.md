@@ -114,3 +114,27 @@ constants — not "use it all and hope."
 - **DSA (DeepSeek Sparse Attention)** — CONFIG DONE: DsaConfig parsed + the no-op-below-threshold invariant tested (dense/exact at seq≤index_topk, sparse above → sub-quadratic long context). Remaining: the indexer forward + top-k key selection, validated against a dense reference where they must agree (seq≤index_topk).
 - **Absorption optimization** — NOT PORTED, deliberately: Colibri does NOT use it (it reconstructs K/V on the fly, which is what keeps the cache small). Building absorption would diverge from the reference; skipped unless a measured need appears.
 
+
+## GLM-5.2 (glm-dsa) — confirmed real-model parameters
+
+Verified against Unsloth's GLM-5.2 GGUF metadata shard + run guide (the model Colibri targets). These are
+the concrete dims the MLA/DSA code is built for; regression-tested in lib.rs (mla_config_matches_real_glm52_dims).
+
+- Arch string `glm-dsa`; 744B params / 40B active; 256 experts (8 used + 1 shared); 79 blocks
+  (leading_dense_block_count=3 dense, then MoE; nextn_predict_layers=1 MTP head); d=6144; 64 heads / 1 KV
+  head (extreme GQA); vocab 154880; **context 1,048,576**.
+- **MLA**: kv_lora_rank=512, q_lora_rank=2048, key_length_mla(qk_nope)=256, value_length_mla(v_head)=256,
+  rope.dimension_count(qk_rope)=64. Cached latent = kv_lora + qk_rope = **576** (== the file's
+  attention.key_length). Without MLA a 64-head cache would be 64·(256+256)=32768 values/token → the ~57x
+  reduction. GGUF keys: attention.{kv_lora_rank,q_lora_rank,key_length_mla,value_length_mla},
+  rope.dimension_count.
+- **DSA**: attention.indexer.{top_k=2048, head_count=32, key_length=128}. No-op at seq≤2048 (dense/exact),
+  sparse above → sub-quadratic toward 1M ctx.
+- **Long context in practice** (Unsloth guide): llama.cpp reaches longer context via KV-cache quantization
+  (`--cache-type-k/v q4_1`, ~5 bits ⇒ ~3.2x longer). This is the SAME lever as our staged-KV hot-f32 +
+  warm-int8 cache — MLA's 576-latent compression and KV-quant stack multiplicatively for 1M ctx.
+- **Sampling defaults**: temp=1.0, top_p=0.95, min_p=0.01 (SWE-Bench Pro: top_p=1.0). Thinking modes via
+  chat-template kwargs (enable_thinking, reasoning_effort=high/max) — a template/tokenizer concern, not engine.
+- **Scale reality**: even 1-bit needs ~223 GB total memory; 2-bit ~245 GB. So GLM-5.2 can't run in-container
+  or above ~1-bit + heavy MoE offload on a 192 GB M2 Ultra. Our support target is correct detection + the
+  validated MLA/DSA forward, proven against smaller MLA proxies (e.g. DeepSeek-V2-Lite), not a full local run here.
