@@ -218,7 +218,11 @@ pub struct Gpu {
     /// path). Monotonic, only ever raised: 0 = fast path; >=1 = a GPU op faulted, so future ops prefer the
     /// conservative kernels (serial attention, bounded submits) that can't wedge the driver. This makes an
     /// unknown driver quirk a one-time slowdown instead of a hang — we catch the fault once and stay safe.
-    degrade_level: std::sync::atomic::AtomicU32,
+    degrade_level: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Set by the device uncaptured-error handler when an OOM fires (shared with degrade_level's Arc via a
+    /// separate flag the handler can flip without the whole Gpu). A decode step checks it and aborts the
+    /// step gracefully instead of the process panicking through wgpu's default handler.
+    oom_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -468,6 +472,27 @@ impl Gpu {
             memory_hints: wgpu::MemoryHints::Performance, trace: wgpu::Trace::Off,
         })).expect("no device");
         let subgroups = want_subgroup;
+        // Catch OTHERWISE-FATAL device errors (notably OOM: "Failed to allocate BO VMA" on the tight
+        // Apple-Vulkan budget) here instead of letting wgpu's default handler panic the whole process.
+        // The handler flips shared flags the decode loop checks so it can abort THIS step and degrade,
+        // turning a crash into a recoverable "out of memory, backing off" event. Seen on a q4-30B MoE
+        // second-prompt prefill where per-layer expert scratch piled up in one unflushed window submit.
+        let degrade_level = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let oom_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let dl = degrade_level.clone(); let of = oom_flag.clone();
+            device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
+                let msg = format!("{e}");
+                if matches!(e, wgpu::Error::OutOfMemory { .. }) || msg.contains("Out of Memory") || msg.contains("VMA") {
+                    of.store(true, std::sync::atomic::Ordering::Relaxed);
+                    dl.fetch_max(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("wgpu-engine: DEVICE OOM caught (VMA exhausted) — degrading + backing off this step instead of crashing. Free VRAM or lower context/window.");
+                } else {
+                    // non-OOM validation/internal errors: log loudly (these were the old default-panic set)
+                    eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
+                }
+            }));
+        }
         // Unified-memory detection: on Apple/Asahi the buffer backing IS host RAM, so weight uploads can
         // skip the staging-belt copy (zero-copy map-at-creation). Env override for testing on other HW.
         let unified = match std::env::var("LOGSCOPE_UMA").ok().as_deref() {
@@ -505,7 +530,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level: std::sync::atomic::AtomicU32::new(0) };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1149,6 +1174,11 @@ impl Gpu {
     /// prior GPU fault, so one caught fault protects the rest of the session (cf. Colibri's per-block CPU
     /// fallback — here we degrade to the safe GPU kernels rather than CPU, since our whole engine is GPU).
     pub fn degrade_level(&self) -> u32 { self.degrade_level.load(std::sync::atomic::Ordering::Relaxed) }
+    /// Whether the device signalled OOM since the last clear (set by the uncaptured-error handler). The
+    /// decode loop checks this to abort a step gracefully instead of pushing more allocations at a device
+    /// that just failed one. Cleared by `clear_oom` once the caller has backed off (freed a window / cache).
+    pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
+    pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Whether we should avoid the fragile fast-path kernels (barrier-heavy attention, collapsed submits).
     pub fn degraded(&self) -> bool { self.degrade_level() >= 1 }
     /// Raise the degrade latch (monotonic — only ever increases). Logged once per level so a degrade is
@@ -7239,11 +7269,21 @@ impl Gpu {
     fn decode_layers_t(&self, m: &Model, c: &KvCache, mut x: Tensor, pos: usize) -> Tensor {
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
+        // On the memory-tight path (Asahi's low BO-VMA ceiling, or after an OOM degrade), don't let a whole
+        // token's per-layer scratch (MoE expert buffers especially) accumulate in one unflushed frame — it
+        // piled up and blew the VMA budget on a q4-30B second prompt. Flushing every few layers lets dropped
+        // Tensors return their buffers to the pool so the next layers REUSE them, bounding the live set.
+        let flush_layers = if self.conservative_vma || self.degraded() {
+            std::env::var("LOGSCOPE_DECODE_FLUSH_LAYERS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(8)
+        } else { 0 };
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            // periodic flush so scratch buffers recycle; `x` is kept (it feeds the next layer). Skipped on
+            // roomy backends (flush_layers==0) where batching the whole token in one submit is the win.
+            if flush_layers != 0 && (li + 1) % flush_layers == 0 { self.end_frame(); }
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
