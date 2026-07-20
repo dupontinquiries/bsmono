@@ -365,6 +365,14 @@ pub(crate) mod engine {
                     }
                 }
                 eprintln!("wgpu-engine: tile overrides — LOGSCOPE_DECODE_TILE / LOGSCOPE_GEMM_TILE pin, LOGSCOPE_NO_AUTOTUNE skips, LOGSCOPE_PREFILL_TILED=1 enables the tiled prefill GEMM");
+                // Dispatch-reduction levers for dispatch-bound decode (Asahi): all bit-identical to default,
+                // OPT-IN. One switch enables the set; the profile prints the bind-group hit rate when active.
+                let fast = std::env::var("LOGSCOPE_FAST_DECODE").as_deref() == Ok("1");
+                if fast {
+                    eprintln!("wgpu-engine: LOGSCOPE_FAST_DECODE=1 — dispatch levers ON (bind-group cache + MoE gate‖up/SwiGLU + down/combine fusions); bit-identical, decode-speed only");
+                } else {
+                    eprintln!("wgpu-engine: dispatch levers available (dispatch-bound decode): LOGSCOPE_FAST_DECODE=1 enables all (bind-group cache + 2 MoE fusions), or set LOGSCOPE_BG_CACHE / LOGSCOPE_FUSE_GLU / LOGSCOPE_FUSE_DOWN individually");
+                }
             }
             // Submit batching: a 14B decode is ~24 submits/token and the profile is sync-dominated, so the
             // passes-per-submit knob matters. Pinned (env) → fixed; cached → use it; else adapt across the
