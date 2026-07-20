@@ -330,19 +330,133 @@ fn fused_qkv_enabled() -> bool {
 /// once — bind-group cache + the two MoE fusions — so a user testing decode speed on the M2 Ultra flips one
 /// switch instead of three. Each individual flag still works on its own; this just ORs in. All three are
 /// proven bit-identical to the default path, so the umbrella changes speed only, never output.
+/// Magical dispatch-lever autotune: rather than leaving the (bit-identical, opt-in) dispatch levers off by
+/// default, MEASURE on the first real decode tokens whether they help THIS device+model and switch on
+/// mid-session if they do — no restart, no env vars. Because all three levers are proven bit-identical to
+/// the default path, flipping this state mid-generation changes speed only, never output; that's what makes
+/// a silent mid-session switch safe. Persisted per-GPU (like the tile cache) so later loads skip re-probing.
+/// State: 0=unmeasured, 1=measuring-OFF phase, 2=measuring-ON phase, 3=decided ON, 4=decided OFF.
+pub static FAST_AB_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const AB_UNMEASURED: u8 = 0;
+const AB_MEASURING_OFF: u8 = 1;
+const AB_MEASURING_ON: u8 = 2;
+const AB_DECIDED_ON: u8 = 3;
+const AB_DECIDED_OFF: u8 = 4;
+
+/// Whether the dispatch levers should be active right now. Precedence: an explicit env override always wins
+/// (user intent); otherwise the A/B state decides (ON during the measuring-ON phase and once decided ON).
+fn dispatch_levers_active() -> bool {
+    match std::env::var("LOGSCOPE_FAST_DECODE").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false, // hard-disable: user opted out, skip the A/B entirely
+        _ => {}
+    }
+    matches!(FAST_AB_STATE.load(std::sync::atomic::Ordering::Relaxed), AB_MEASURING_ON | AB_DECIDED_ON)
+}
+
+/// Pure A/B decision core for the magical dispatch-lever autotune. Fed one decode-token duration at a time,
+/// it runs the state machine: warm-up (discard the first few tokens — pipeline fill, pipeline compiles),
+/// then a window with levers OFF, then a window with levers ON, then decides. Median (not mean) per phase so
+/// one GC/scheduler hiccup can't skew it. Decides ON only if ON is meaningfully faster (beats OFF by a
+/// margin), so noise never flips it on when it doesn't help. Entirely testable without a GPU.
+#[derive(Clone, Debug)]
+pub struct FastAb {
+    warmup: usize,           // tokens to discard before measuring (pipeline fill)
+    window: usize,           // tokens to time in each phase
+    seen: usize,             // total tokens observed
+    off_ms: Vec<f32>,        // per-token ms with levers OFF
+    on_ms: Vec<f32>,         // per-token ms with levers ON
+    margin: f32,             // ON must be at least this fraction faster to win (e.g. 0.05 = 5%)
+    decided: Option<bool>,   // Some(true)=ON, Some(false)=OFF once resolved
+}
+
+impl Default for FastAb {
+    fn default() -> Self { FastAb { warmup: 3, window: 8, seen: 0, off_ms: Vec::new(), on_ms: Vec::new(), margin: 0.05, decided: None } }
+}
+
+/// What phase the A/B wants the levers in for the NEXT token (drives FAST_AB_STATE).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbPhase { Warmup, MeasuringOff, MeasuringOn, DecidedOn, DecidedOff }
+
+impl FastAb {
+    pub fn new(warmup: usize, window: usize, margin: f32) -> Self {
+        FastAb { warmup, window, margin, ..Default::default() }
+    }
+    fn median(v: &[f32]) -> f32 {
+        if v.is_empty() { return f32::INFINITY; }
+        let mut s = v.to_vec(); s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s[s.len() / 2]
+    }
+    /// The phase the NEXT token should run in (before observing it). The harness sets FAST_AB_STATE from
+    /// this so the token is generated in the right lever configuration, then calls `observe` with its time.
+    pub fn phase(&self) -> AbPhase {
+        if let Some(d) = self.decided { return if d { AbPhase::DecidedOn } else { AbPhase::DecidedOff }; }
+        if self.seen < self.warmup { return AbPhase::Warmup; }
+        if self.off_ms.len() < self.window { return AbPhase::MeasuringOff; }
+        if self.on_ms.len() < self.window { return AbPhase::MeasuringOn; }
+        // both windows full but not yet folded into a decision — decide now (see resolve)
+        AbPhase::MeasuringOn
+    }
+    /// Record one decode token's wall-time (ms). Returns Some(decision) on the token that resolves the A/B.
+    pub fn observe(&mut self, ms: f32) -> Option<bool> {
+        if self.decided.is_some() { return None; }
+        let phase = self.phase();
+        self.seen += 1;
+        match phase {
+            AbPhase::Warmup => {}
+            AbPhase::MeasuringOff => self.off_ms.push(ms),
+            AbPhase::MeasuringOn => self.on_ms.push(ms),
+            _ => {}
+        }
+        if self.off_ms.len() >= self.window && self.on_ms.len() >= self.window {
+            let (off, on) = (Self::median(&self.off_ms), Self::median(&self.on_ms));
+            // ON wins only if it beats OFF by the margin (lower ms = faster).
+            let decision = on < off * (1.0 - self.margin);
+            self.decided = Some(decision);
+            return Some(decision);
+        }
+        None
+    }
+    pub fn decided(&self) -> Option<bool> { self.decided }
+    /// Median ms of each phase (for logging the measured delta). (off, on) — INFINITY if a phase is empty.
+    pub fn medians(&self) -> (f32, f32) { (Self::median(&self.off_ms), Self::median(&self.on_ms)) }
+}
+
+/// Push a FastAb phase into the process-global FAST_AB_STATE the lever flags read. Called by the harness
+/// BEFORE generating each measured token so the token runs in the intended configuration.
+pub fn ab_apply_phase(p: AbPhase) {
+    let s = match p {
+        AbPhase::Warmup | AbPhase::MeasuringOff => AB_MEASURING_OFF, // levers OFF
+        AbPhase::MeasuringOn => AB_MEASURING_ON,                     // levers ON
+        AbPhase::DecidedOn => AB_DECIDED_ON,
+        AbPhase::DecidedOff => AB_DECIDED_OFF,
+    };
+    FAST_AB_STATE.store(s, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Force the A/B to a resolved state (used when a persisted decision is loaded, so a returning model skips
+/// re-measuring). true → levers ON, false → OFF.
+pub fn ab_set_decided(on: bool) {
+    FAST_AB_STATE.store(if on { AB_DECIDED_ON } else { AB_DECIDED_OFF }, std::sync::atomic::Ordering::Relaxed);
+}
+/// Whether the A/B has already resolved (so the harness stops feeding it timings).
+pub fn ab_is_decided() -> bool {
+    matches!(FAST_AB_STATE.load(std::sync::atomic::Ordering::Relaxed), AB_DECIDED_ON | AB_DECIDED_OFF)
+}
+
 fn fast_decode_enabled() -> bool {
-    std::env::var("LOGSCOPE_FAST_DECODE").as_deref() == Ok("1")
+    dispatch_levers_active()
 }
 fn bind_group_cache_enabled() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
 /// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
-/// scratch). OPT-IN (default off) while it proves out on hardware; bit-identical to the unfused path.
+/// scratch). Bit-identical to the unfused path; enabled by the magical A/B (or LOGSCOPE_FUSE_GLU=1).
 fn moe_glu_fused() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
 }
 /// Fuse the MoE down-projection with the weighted combine + residual into one kernel (one fewer dispatch
-/// per MoE layer, no [slots,d] scratch). OPT-IN (default off); bit-identical to the unfused path.
+/// per MoE layer, no [slots,d] scratch). Bit-identical to the unfused path; enabled by the A/B (or _DOWN=1).
 fn moe_down_fused() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_FUSE_DOWN").as_deref() == Ok("1")
 }
@@ -8696,6 +8810,89 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
         if let Some((b, _)) = self.warm.iter().find(|(b, _)| b.id == id) { return Some(&b.emitted); }
         if let Some(b) = self.done.iter().find(|b| b.id == id) { return Some(&b.emitted); }
         None
+    }
+}
+
+#[cfg(test)]
+mod fast_ab_tests {
+    use super::*;
+
+    // Feed a stream of per-token times; the harness would set the phase before each. Here we just drive
+    // observe() in order — phase() advances warmup → off-window → on-window → decided deterministically.
+    fn run(ab: &mut FastAb, off_time: f32, on_time: f32) -> Option<bool> {
+        let mut decision = None;
+        for _ in 0..64 {
+            if ab.decided().is_some() { break; }
+            let ms = match ab.phase() {
+                AbPhase::MeasuringOn => on_time,
+                _ => off_time, // warmup + off-window both run at the OFF speed
+            };
+            if let Some(d) = ab.observe(ms) { decision = Some(d); }
+        }
+        decision
+    }
+
+    #[test]
+    fn turns_on_when_levers_are_faster() {
+        let mut ab = FastAb::new(3, 8, 0.05);
+        // ON is 20% faster (16ms vs 20ms) → decide ON
+        assert_eq!(run(&mut ab, 20.0, 16.0), Some(true));
+        assert_eq!(ab.phase(), AbPhase::DecidedOn);
+    }
+
+    #[test]
+    fn stays_off_when_no_real_gain() {
+        let mut ab = FastAb::new(3, 8, 0.05);
+        // ON only 2% faster (19.6 vs 20) — under the 5% margin → stay OFF (don't flip on noise)
+        assert_eq!(run(&mut ab, 20.0, 19.6), Some(false));
+        assert_eq!(ab.phase(), AbPhase::DecidedOff);
+    }
+
+    #[test]
+    fn stays_off_when_levers_are_slower() {
+        let mut ab = FastAb::new(3, 8, 0.05);
+        assert_eq!(run(&mut ab, 20.0, 24.0), Some(false)); // ON slower → OFF
+    }
+
+    #[test]
+    fn median_ignores_a_single_spike() {
+        let mut ab = FastAb::new(0, 5, 0.05);
+        // OFF window: one huge GC spike among fast tokens; median must ignore it
+        for &t in &[20.0, 20.0, 200.0, 20.0, 20.0] { ab.observe(t); } // off median = 20
+        // ON window: steadily faster
+        let mut dec = None;
+        for &t in &[16.0, 16.0, 16.0, 16.0, 16.0] { if let Some(d) = ab.observe(t) { dec = Some(d); } }
+        assert_eq!(dec, Some(true), "spike in OFF must not prevent an honest ON win");
+        let (off, on) = ab.medians();
+        assert_eq!((off, on), (20.0, 16.0));
+    }
+
+    #[test]
+    fn warmup_tokens_are_discarded() {
+        let mut ab = FastAb::new(3, 4, 0.05);
+        // first 3 tokens (warmup) are absurdly slow (pipeline compile) but must NOT count as OFF timing
+        for _ in 0..3 { assert_eq!(ab.phase(), AbPhase::Warmup); ab.observe(999.0); }
+        assert_eq!(ab.phase(), AbPhase::MeasuringOff);
+        for _ in 0..4 { ab.observe(20.0); }
+        assert_eq!(ab.phase(), AbPhase::MeasuringOn);
+        let (off, _) = ab.medians();
+        assert_eq!(off, 20.0, "warmup 999ms tokens excluded from the OFF median");
+    }
+
+    #[test]
+    fn phase_to_atomic_bridge_sets_levers() {
+        // ab_apply_phase drives the global the lever flags read (env must be unset for this to be meaningful)
+        if std::env::var("LOGSCOPE_FAST_DECODE").is_err() {
+            ab_apply_phase(AbPhase::MeasuringOn);
+            assert!(dispatch_levers_active(), "measuring-ON phase turns levers on");
+            ab_apply_phase(AbPhase::MeasuringOff);
+            assert!(!dispatch_levers_active(), "measuring-OFF phase turns levers off");
+            ab_set_decided(true);
+            assert!(dispatch_levers_active() && ab_is_decided());
+            ab_set_decided(false);
+            assert!(!dispatch_levers_active() && ab_is_decided());
+            FAST_AB_STATE.store(AB_UNMEASURED, std::sync::atomic::Ordering::Relaxed); // reset for other tests
+        }
     }
 }
 
