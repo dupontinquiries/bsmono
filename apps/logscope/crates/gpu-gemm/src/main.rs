@@ -4521,6 +4521,33 @@ fn main() {
         println!("  stream-window: plain / mid-window eos / mid-window halt — state parity {}", if all_ok { "exact" } else { "BROKEN" });
         check("stream_session_window == stream_session (incl. mid-window stops)", if all_ok { 0.0 } else { 1.0 }, 0.5);
 
+        // ── STAGED KV no-op gate (stage 2): a StagedKvCache with all_hot() must never demote, keep the
+        // warm tail empty, and hold every token in the hot f32 cache — proving the staging wrapper is a
+        // true no-op vs the plain f32 cache. Then a small-window policy must demote in aligned blocks with
+        // the boundary bookkeeping conserving every token. (The GPU two-span attention is stage 3; here we
+        // validate the policy+cache wiring end to end on the real Gpu.)
+        {
+            let kv_dim = m3.kv_dim();
+            // all-hot: drive the slide across a long decode, assert it's inert
+            let mut staged = gpu.staged_new(16, 600, kv_dim, gpu_kernels::kvstage::StagePolicy::all_hot());
+            let mut demoted_total = 0usize;
+            for pos in 1..=520usize { demoted_total += gpu.staged_slide(&mut staged, pos); }
+            let allhot_ok = demoted_total == 0 && staged.warm_len == 0 && staged.policy.warm_len() == 0;
+            println!("  staged all_hot: demoted={demoted_total} warm_len={} (expect 0/0)", staged.warm_len);
+
+            // small hot window: must demote in blocks, boundary conserves tokens at every step
+            let mut st2 = gpu.staged_new(16, 4200, kv_dim, gpu_kernels::kvstage::StagePolicy::new(128, 64));
+            let mut conserve_ok = true;
+            for pos in 1..=4000usize {
+                gpu.staged_slide(&mut st2, pos);
+                if st2.policy.warm_len() + st2.policy.hot_len(pos) != pos { conserve_ok = false; break; }
+            }
+            let staged_bulk_warm = st2.warm_len > 3500 && st2.warm_len == st2.policy.warm_len();
+            println!("  staged window=128: warm_len={} conserve={} (bulk warm, tokens conserved)", st2.warm_len, conserve_ok);
+            check("staged KV all_hot is a no-op + windowed policy conserves tokens",
+                if allhot_ok && conserve_ok && staged_bulk_warm { 0.0 } else { 1.0 }, 0.5);
+        }
+
         // BIG WINDOW / dims-cache overflow (regression for the M4 k=256 crash): a large window
         // batches thousands of per-slot dispatches into ONE frame, each with a UNIQUE (uncached,
         // once the 4096-cap is hit) dims uniform. If those buffers aren't kept alive until flush,
