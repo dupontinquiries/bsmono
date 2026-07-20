@@ -1,0 +1,18 @@
+--- a/games/bsgames/src/centre.rs
++++ b/games/bsgames/src/centre.rs
+@@ -23,13 +23,14 @@
+     pub kind: LaunchKind,
+ }
+ 
+-/// The four fleet games.
++/// The five fleet games.
+ pub fn registry() -> Vec<GameEntry> {
+     vec![
+         GameEntry { id: "clawbound".into(), name: "Clawbound".into(), engine: "wgpu".into(), dir: "games/clawbound".into(), kind: LaunchKind::Cargo },
+         GameEntry { id: "soldier".into(), name: "Soldier".into(), engine: "wgpu".into(), dir: "games/soldier".into(), kind: LaunchKind::Cargo },
+         GameEntry { id: "unendlich".into(), name: "Unendlich".into(), engine: "custom".into(), dir: "games/unendlich".into(), kind: LaunchKind::Cargo },
+         GameEntry { id: "blackstar".into(), name: "Blackstar".into(), engine: "vulkan/opengl".into(), dir: "games/blackstar".into(), kind: LaunchKind::CmakeBin("blackstar".into()) },
++        GameEntry { id: "skydribble".into(), name: "Skydribble".into(), engine: "wgpu".into(), dir: "games/skydribble".into(), kind: LaunchKind::Cargo },
+     ]
+ }
+ 

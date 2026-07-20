@@ -1,0 +1,47 @@
+[package]
+name = "skydribble"
+version = "1.26.0"
+edition = "2021"
+description = "Rocket-League-inspired open-world air-dribble playground: Rust + wgpu, SDF-generated playful shapes, real RL car/ball models."
+
+[features]
+default = ["audio", "analog"]
+# Procedural sound + music via cpal (needs ALSA headers on Linux: libasound2-dev).
+# Build with --no-default-features for a silent binary with zero extra system deps.
+audio = ["dep:cpal"]
+# Controller support via gilrs (needs libudev-dev on Linux).
+gamepad = ["dep:gilrs"]
+# Wooting analog keyboard input: loads the installed Wooting Analog SDK
+# runtime at launch (falls back to digital keys if it isn't there).
+analog = ["dep:libloading"]
+
+[dependencies]
+# Same proven combo as the reference repo's games (clawbound/soldier): wgpu 22 + winit 0.29.
+wgpu = "22"
+winit = "0.29"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.28"
+image = { version = "0.25", default-features = false, features = ["png"] }
+gltf = { version = "1", default-features = false, features = ["utils", "names"] }
+log = "0.4"
+env_logger = "0.11"
+# The fleet's control plane, vendored from the logscope-c4-273 monorepo:
+# netcode (profiles/sessions/handoff) over the snapcore DHT store.
+netcode = { path = "vendor/netcode" }
+cpal = { version = "0.15", optional = true }
+gilrs = { version = "0.11", optional = true }
+libloading = { version = "0.8", optional = true }
+
+[dev-dependencies]
+# Offline WGSL validation so shader errors are caught by `cargo test`, not at runtime.
+naga = { version = "22", features = ["wgsl-in"] }
+
+[profile.dev]
+opt-level = 2          # physics + png decode are unusable at opt 0
+# line tables only: readable backtraces at a fraction of the disk cost
+debug = "line-tables-only"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

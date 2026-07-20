@@ -1,0 +1,17 @@
+[package]
+name = "netcode"
+version = "0.1.0"
+edition = "2021"
+description = "Unified fleet game netcode: player profiles + presence over a DHT (OpenDHT primary, a pure micro-DHT fallback for LAN/offline). The identity + discovery layer all four games share."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+snapcore = { path = "../snapcore" }
+
+[features]
+default = []
+# OpenDHT FFI backend (needs the system libopendht); off by default so the crate + micro-DHT build
+# and test with no external lib.
+opendht = []
