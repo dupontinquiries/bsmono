@@ -4566,6 +4566,23 @@ fn main() {
             // tokens/dispatches ran — this is the invariant that actually fixes the crash.
             let bounded = dims_bufs <= 4096 + 2048; // DIMS_CACHE_CAP + DIMS_RING_SIZE
             check("dims buffer count bounded (no per-token buffer growth)", if n2 == big2 && bounded { 0.0 } else { 1.0 }, 0.5);
+
+            // The M4 windowed-decode exhaustion: a real k=128 window over many tokens. Even with the
+            // dims ring, per-slot bind groups + decode intermediates accumulated in one pinned frame and
+            // ran the device out of buffer objects (the _81 log: "Buffer 'dims'/'dl_u32' invalid"). The
+            // mid-window SLOT_FLUSH must keep the run alive AND bit-exact over a k that matches the field.
+            let saved3 = gpu.flush_every();
+            gpu.set_flush_every(65536); // pinned high as the real windowed path does
+            let big3 = 300usize;
+            let mut s3 = gpu.session_new(&m3, prompt.len() + big3 + 2, 789);
+            gpu.session_prefill(&m3, &mut s3, &prompt);
+            let mut seen3 = prompt.to_vec(); let mut rng3 = 789u64; let mut toks3 = Vec::new();
+            let n3 = gpu.stream_session_window(&m3, &mut s3, &mut seen3, big3, None, &sp, &mut rng3, 128,
+                &gpu_kernels::EmbedT::F32(&et), &nc, |t| { toks3.push(t); true });
+            gpu.set_flush_every(saved3);
+            let dims_bufs3 = gpu.dims_buffer_count();
+            println!("  k=128 window, mid-window flush: produced {n3} tokens, {dims_bufs3} live dims buffers");
+            check("k=128 windowed decode survives with bounded buffers", if n3 == big3 && dims_bufs3 <= 6144 { 0.0 } else { 1.0 }, 0.5);
         }
     }
 
