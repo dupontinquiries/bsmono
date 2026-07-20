@@ -18,6 +18,7 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
 #[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
+#[allow(dead_code)] pub mod llama4;  // Llama 4 iRoPE attention temperature tuning (long-context length gen)
 pub mod netserve;
 pub mod store;
 
@@ -884,6 +885,10 @@ pub struct BlockWeights {
     /// to the rope hosts' base==0.0 identity sentinel, so K enters the cache unroped and Q stays
     /// unrotated — attention itself is unchanged.
     pub nope: bool,
+    /// Llama 4 iRoPE attention temperature tuning: on NoPE layers, the query is scaled by a per-position
+    /// factor (grows logarithmically past floor_scale) to keep long-context attention sharp. `None` =
+    /// disabled (all non-Llama4 archs, and Llama4 RoPE layers). See llama4::AttnTemp.
+    pub attn_temp: Option<crate::llama4::AttnTemp>,
     /// Mixture-of-experts FFN (qwen3moe): replaces wgate_up/wdown (which hold 1-row placeholders when this
     /// is Some). Router is a small F32 Lin [n_expert, d]; experts are per-expert quantized Lins so the
     /// existing matvec/SwiGLU kernels apply unchanged at an expert's rows (no weight slicing needed).
@@ -4619,6 +4624,11 @@ impl Gpu {
                         else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
                         else { None },
                 nope: nope_step > 0 && (i + 1) % nope_step == 0,
+                // Llama 4 iRoPE attention temperature tuning on NoPE layers (Meta defaults floor_scale
+                // 8192, attn_scale 0.1). RoPE layers and non-Llama4 archs get None (identity).
+                attn_temp: if is_llama4 && nope_step > 0 && (i + 1) % nope_step == 0 {
+                    Some(crate::llama4::AttnTemp::default())
+                } else { None },
             });
         }
         let out_norm = self.upload(&fetch("output_norm.weight")?, 1, d);
@@ -4731,7 +4741,7 @@ impl Gpu {
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -5849,6 +5859,13 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        // Llama 4 iRoPE: on NoPE layers past floor_scale, scale the query by the attention temperature so
+        // long-context softmax stays sharp (the length-generalization mechanism). Skipped below the floor
+        // (active_at == false) so short contexts pay nothing; RoPE layers carry attn_temp None.
+        let q = match w.attn_temp {
+            Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
+            _ => q,
+        };
         let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, pos, kv);
@@ -5856,6 +5873,16 @@ impl Gpu {
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
+    }
+    /// Multiply a single-row `[1, width]` query tensor by a scalar (Llama 4 attention temperature). Uses
+    /// the row-broadcast scale kernel with a 1-row weight — one small dispatch, only invoked on NoPE
+    /// layers past the temperature floor (long context), so it's off the hot path in the common case.
+    pub fn scale_query_temp(&self, q: &Tensor, s: f32, width: usize) -> Tensor {
+        let out = self.alloc(1, width);
+        let wgt = self.upload(&[s], 1, 1);
+        let dims = [1u32, width as u32, 0, 0];
+        self.dispatch(ROW_SCALE, &[q, &wgt], &out, bytemuck::cast_slice(&dims), wg1(width as u32));
+        out
     }
     /// Extract columns [col_off, col_off+width) of a single-row [1, N] tensor as a fresh [1, width],
     /// via a buffer copy (a transfer, NOT a compute dispatch). Splits the fused QKV projection's

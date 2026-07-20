@@ -2800,7 +2800,7 @@ fn main() {
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false,
+        nope: false, attn_temp: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -2818,7 +2818,7 @@ fn main() {
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -2829,7 +2829,7 @@ fn main() {
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step
@@ -3004,7 +3004,25 @@ fn main() {
         }
     }
 
-    // ── shared-expert MoE (GLM/DeepSeek stepping stone): routed + shared vs CPU reference ────────
+    // ── Llama 4 iRoPE attention temperature: the per-position query scale (NoPE layers, long context).
+    // Verify the scalar query-scale kernel matches the pure formula, and that it's the identity below the
+    // floor (so short contexts and RoPE layers are unaffected).
+    {
+        let t = gpu_kernels::llama4::AttnTemp::default();
+        let width = 256usize;
+        let qv = rnd(width, 4242);
+        let qt = gpu.upload(&qv, 1, width);
+        // at a position past the floor, the kernel-scaled query must equal q * scale(pos)
+        let pos = 40_000usize;
+        let s = t.scale(pos);
+        let got = gpu.download(&gpu.scale_query_temp(&qt, s, width));
+        let want: Vec<f32> = qv.iter().map(|x| x * s).collect();
+        let e = maxerr(&got, &want);
+        println!("  llama4 attn-temp: pos={pos} scale={s:.4} (floor 8192) max|gpu-cpu|={e:.2e}");
+        check("llama4 attn temperature query scale matches formula", e, 1e-5);
+        // identity below the floor: active_at false, scale exactly 1.0
+        check("llama4 attn temp is identity below floor", if !t.active_at(5000) && (t.scale(5000) - 1.0).abs() < 1e-7 { 0.0 } else { 1.0 }, 0.5);
+    }
     // Synthetic F32 MoeLayer (drives the v1 grouped path — F32 stacks make the v2 kernels decline,
     // so routing runs through the pure moe::route we can mirror on CPU exactly). Checks BOTH
     // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
