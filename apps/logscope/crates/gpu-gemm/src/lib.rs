@@ -2510,6 +2510,16 @@ impl Gpu {
         self.dispatch(SWIGLU_PACKED, &[gu], &out, bytemuck::cast_slice(&dims), wg1(n)); out
     }
 
+    /// GeGLU over a packed `[m, 2h]` gate||up buffer — the Gemma-family FFN gate (tanh-approx GELU on the
+    /// gate half instead of SiLU). Same layout/contract as `swiglu_packed`, so it drops into the fused-FFN
+    /// path with only the activation swapped.
+    pub fn geglu_packed(&self, gu: &Tensor) -> Tensor {
+        let (m, h) = (gu.rows, gu.cols / 2);
+        let out = self.alloc(m, h); let n = (m * h) as u32;
+        let dims = [n, h as u32, 0, 0];
+        self.dispatch(GEGLU_PACKED, &[gu], &out, bytemuck::cast_slice(&dims), wg1(n)); out
+    }
+
     // ─────────────── vision-tower primitives (ViT/CLIP) ───────────────
     /// True LayerNorm over each of `rows` rows of width `cols`: subtract the row mean, divide by the
     /// row std (population variance + eps), then per-channel scale `g` and bias `b`. Distinct from
@@ -4029,6 +4039,21 @@ struct D { n:u32,h:u32,_b:u32,_c:u32 };
 @group(0)@binding(2) var<uniform> d: D;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let r=i/d.h; let c=i%d.h; let base=r*2u*d.h; let v=gu[base+c]; o[i]=(v/(1.0+exp(-v)))*gu[base+d.h+c]; }"#;
+
+// GeGLU-packed: gemma-family MLP gate. Same [gate|up] packed layout as SWIGLU_PACKED but the gate uses
+// tanh-approx GELU (gelu_pytorch_tanh) instead of SiLU: gelu(v)·up. The building block for Gemma2 FFN.
+const GEGLU_PACKED: &str = r#"
+struct D { n:u32,h:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> gu: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let r=i/d.h; let c=i%d.h; let base=r*2u*d.h;
+  let v=gu[base+c];
+  let gelu=0.5*v*(1.0+tanh(0.7978845608028654*(v+0.044715*v*v*v)));  // √(2/π)=0.79788456
+  o[i]=gelu*gu[base+d.h+c];
+}"#;
 
 const GATHER: &str = r#"
 struct D { n:u32,d:u32,id_off:u32,_c:u32 };

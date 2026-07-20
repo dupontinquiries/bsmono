@@ -2784,6 +2784,20 @@ fn main() {
     check("add", maxerr(&gpu.add(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x + y).collect::<Vec<_>>()), 1e-5);
     check("mul", maxerr(&gpu.mul(&aa, &bb), &aa.iter().zip(&bb).map(|(x, y)| x * y).collect::<Vec<_>>()), 1e-5);
     check("silu", maxerr(&gpu.silu(&aa), &aa.iter().map(|v| v / (1.0 + (-v).exp())).collect::<Vec<_>>()), 1e-4);
+    // GeGLU packed (Gemma FFN gate): gelu_tanh(gate) * up over a [m, 2h] gate||up buffer.
+    {
+        let (m, h) = (3usize, 8usize);
+        let gu = rnd(m * 2 * h, 4242);
+        let gut = gpu.upload(&gu, m, 2 * h);
+        let got = gpu.download(&gpu.geglu_packed(&gut));
+        let gelu = |v: f32| 0.5 * v * (1.0 + (0.7978845608028654 * (v + 0.044715 * v * v * v)).tanh());
+        let mut want = vec![0f32; m * h];
+        for r in 0..m { for c in 0..h {
+            let base = r * 2 * h;
+            want[r * h + c] = gelu(gu[base + c]) * gu[base + h + c];
+        }}
+        check("geglu packed (gemma FFN gate)", maxerr(&got, &want), 1e-4);
+    }
     let table = rnd(20 * 8, 12); let ids = [3u32, 0, 19, 7, 12];
     let mut gw = Vec::new(); for &id in &ids { gw.extend_from_slice(&table[id as usize * 8..id as usize * 8 + 8]); }
     check("gather (embed)", maxerr(&gpu.gather(&table, &ids, 8), &gw), 0.0);
