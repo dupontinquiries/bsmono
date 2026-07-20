@@ -5738,8 +5738,14 @@ pub fn stream_slot(p: usize, sink: usize, window: usize) -> (usize, usize) {
 }
 
 pub fn argmax(v: &[f32]) -> u32 {
-    let mut bi = 0usize; let mut bv = f32::MIN;
-    for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i; } }
+    // Skip non-finite entries (NaN/±Inf): a single poisoned logit must not pin the argmax. `x > bv` is
+    // false for NaN, so a leading NaN with `bv=f32::MIN` would silently return index 0 forever (the
+    // Colibri #369 failure). Seed from the first FINITE value and only compare finite entries.
+    let mut bi = 0usize; let mut bv = f32::NEG_INFINITY; let mut seen = false;
+    for (i, &x) in v.iter().enumerate() {
+        if x.is_finite() && (!seen || x > bv) { bv = x; bi = i; seen = true; }
+    }
+    // all-non-finite (fully poisoned row): fall back to index 0 rather than an out-of-range/garbage pick.
     bi as u32
 }
 
@@ -7486,6 +7492,10 @@ fn xorshift01(state: &mut u64) -> f32 {
 /// xorshift64 state the caller threads across steps.
 pub fn sample(logits: &[f32], p: &SamplerParams, rng: &mut u64) -> u32 {
     if p.temperature <= 0.0 || p.top_k == 1 { return argmax(logits); }
+    // NaN/Inf guard (Colibri #369): one +Inf becomes mx → exp(NaN) → every prob NaN → sum NaN → the
+    // draw silently collapses to token 0 forever. If any logit is non-finite, fall back to the
+    // finite-aware argmax (a valid token) instead of sampling from a poisoned distribution.
+    if logits.iter().any(|x| !x.is_finite()) { return argmax(logits); }
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
     let k = if p.top_k == 0 { idx.len() } else { p.top_k.min(idx.len()) };
@@ -7819,6 +7829,32 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
 #[cfg(test)]
 mod decode_cfg_tests {
     use super::*;
+
+    #[test]
+    fn argmax_skips_nonfinite_and_never_pins_to_zero() {
+        // a leading NaN must NOT pin the pick to index 0 (the Colibri #369 failure)
+        assert_eq!(argmax(&[f32::NAN, 1.0, 5.0, 2.0]), 2);
+        // +Inf is non-finite → skipped; the finite max wins (we never emit an Inf "token")
+        assert_eq!(argmax(&[1.0, f32::INFINITY, 3.0]), 2);
+        // normal case unchanged
+        assert_eq!(argmax(&[0.1, 0.9, 0.3]), 1);
+        // all non-finite → falls back to 0 (a valid in-range index), not garbage
+        assert_eq!(argmax(&[f32::NAN, f32::NAN]), 0);
+    }
+
+    #[test]
+    fn sample_falls_back_to_argmax_on_poisoned_logits() {
+        let sp = SamplerParams { temperature: 0.8, top_k: 40, top_p: 0.95, repeat_penalty: 1.0, repeat_last_n: 64, min_p: 0.0 };
+        let mut rng = 12345u64;
+        // one +Inf would poison the softmax → all-NaN probs → silent token-0 forever. Guard must return a
+        // valid finite-argmax token instead.
+        let poisoned = vec![0.2f32, f32::INFINITY, 0.5, 0.1];
+        let t = sample(&poisoned, &sp, &mut rng);
+        assert!((t as usize) < poisoned.len(), "must return an in-range token");
+        // a NaN anywhere also triggers the fallback (deterministic argmax of the finite entries)
+        let nanny = vec![1.0f32, f32::NAN, 9.0, 3.0];
+        assert_eq!(sample(&nanny, &sp, &mut rng), 2);
+    }
 
     /// The scale-hoist in the WG128 / SG / V3 decode kernels replaces N per-lane `qs[base + k/32]` loads
     /// with ONE `qs[base + kk0/32]`. That is only bit-identical if every k in the group shares one 32-block.
