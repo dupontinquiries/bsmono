@@ -5401,6 +5401,42 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   o[t]=a*wsc;
 }"#;
 
+// DSA masked attention (see dsa.rs::masked_attention). One thread per value-dim column; a single query
+// attends over only the keys whose mask[t] != 0, softmax renormalized over the selected set. q is [dk], k
+// is [nk·dk], v is [nk·dv], mask is [nk]. With an all-ones mask this is exactly dense attention (the
+// dense-equivalence anchor). Each thread owns one output column c and streams the selected keys twice
+// (max, then weighted sum) so no shared memory is needed and it's bit-comparable to the CPU reference.
+const DSA_MASKED_ATTN: &str = r#"
+struct D { nk:u32, dk:u32, dv:u32, _p:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;    // [dk]
+@group(0)@binding(1) var<storage,read> k: array<f32>;    // [nk*dk]
+@group(0)@binding(2) var<storage,read> v: array<f32>;    // [nk*dv]
+@group(0)@binding(3) var<storage,read> mask: array<f32>; // [nk]
+@group(0)@binding(4) var<storage,read_write> o: array<f32>; // [dv]
+@group(0)@binding(5) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let c=g.x; if(c>=d.dv){return;}
+  let scale=1.0/sqrt(f32(d.dk));
+  // pass 1: max over selected keys (same score each thread recomputes — cheap, dk small; keeps it
+  // one-output-per-thread with no cross-thread reduction).
+  var mx=-3.4e38;
+  for(var t=0u;t<d.nk;t=t+1u){
+    if(mask[t]==0.0){continue;}
+    var dot=0.0; let kb=t*d.dk; for(var i=0u;i<d.dk;i=i+1u){dot=dot+q[i]*k[kb+i];}
+    let s=dot*scale; if(s>mx){mx=s;}
+  }
+  // pass 2: weighted sum of this column
+  var denom=0.0; var acc=0.0;
+  for(var t=0u;t<d.nk;t=t+1u){
+    if(mask[t]==0.0){continue;}
+    var dot=0.0; let kb=t*d.dk; for(var i=0u;i<d.dk;i=i+1u){dot=dot+q[i]*k[kb+i];}
+    let p=exp(dot*scale-mx); denom=denom+p;
+    acc=acc+p*v[t*d.dv+c];
+  }
+  o[c]=acc/denom;
+}"#;
+
 const ATTENTION_MH: &str = r#"
 struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
@@ -6220,6 +6256,16 @@ impl Gpu {
         let out = self.alloc(1, nk);
         let dims = [nk as u32, nh as u32, hd as u32, 0u32];
         self.dispatch(DSA_INDEXER, &[q_idx, k_idx, w], &out, bytemuck::cast_slice(&dims), ((nk as u32).div_ceil(64), 1, 1));
+        out
+    }
+
+    /// DSA masked attention on GPU: single query attends over only the keys with mask[t] != 0, bit-exact to
+    /// dsa.rs::masked_attention. q [dk], k [nk·dk], v [nk·dv], mask [nk] → [dv]. All-ones mask == dense
+    /// attention (the dense-equivalence anchor). This is where the DSA selection meets the main attention.
+    pub fn dsa_masked_attention_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor, nk: usize, dk: usize, dv: usize) -> Tensor {
+        let out = self.alloc(1, dv);
+        let dims = [nk as u32, dk as u32, dv as u32, 0u32];
+        self.dispatch(DSA_MASKED_ATTN, &[q, k, v, mask], &out, bytemuck::cast_slice(&dims), ((dv as u32).div_ceil(64), 1, 1));
         out
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
