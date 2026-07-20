@@ -4201,7 +4201,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     var i = t;
     loop {
       if (i >= d.n) { break; }
-      let v = x[i];
+      // NaN/Inf guard (Colibri #369): a poisoned logit must not be selected. Reading non-finite as
+      // -inf excludes it from the max so the pick stays a finite, in-range token id (a lone +Inf would
+      // otherwise win and skew the softmax; a NaN sentinel could leave bi out of range).
+      var v = x[i];
+      if (!(v == v) || v > 3.0e38 || v < -3.0e38) { v = -3.4028235e38; }
       // exclusion by order: already-picked ⇔ NOT (v < last_v || (v == last_v && i > last_i))
       if (v < last_v || (v == last_v && i > last_i)) {
         if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
