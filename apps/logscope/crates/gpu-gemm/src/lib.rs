@@ -2524,6 +2524,10 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
+        let q = match w.attn_temp {
+            Some(at) if w.nope && at.active_at(t.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, t, ad),
+            _ => q,
+        };
         let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
         let v = w.wv.apply(self, &n1, t);
         self.write_rows(kc, &k, 0, t, kv);
@@ -2543,6 +2547,10 @@ impl Gpu {
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
         let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd);
+        let q = match w.attn_temp {
+            Some(at) if w.nope && at.active_at(base + s.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, base, s, ad),
+            _ => q,
+        };
         let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, s), &w.k_norm, s, kv, hd, eps), ff, s, kv, base_freq, base, hd);
         let v = w.wv.apply(self, &n1, s);
         self.write_rows(kc, &k, base, s, kv);
@@ -5884,6 +5892,18 @@ impl Gpu {
         self.dispatch(ROW_SCALE, &[q, &wgt], &out, bytemuck::cast_slice(&dims), wg1(width as u32));
         out
     }
+    /// Per-ROW query temperature for prefill NoPE layers: query row `r` (at absolute position `base+r`)
+    /// is scaled by AttnTemp::scale(base+r). `rows` query rows of `width` cols; uses the row-broadcast
+    /// ROW_SCALE with a per-row weight vector. Callers guard with `t.active_at(base+rows-1)` so this only
+    /// runs when some row is past the floor (long prompts) — short prompts skip it and pay nothing.
+    pub fn scale_query_temp_rows(&self, q: &Tensor, t: crate::llama4::AttnTemp, base: usize, rows: usize, width: usize) -> Tensor {
+        let weights: Vec<f32> = (0..rows).map(|r| t.scale(base + r)).collect();
+        let wgt = self.upload(&weights, rows, 1);
+        let out = self.alloc(rows, width);
+        let dims = [rows as u32, width as u32, 0, 0];
+        self.dispatch(ROW_SCALE, &[q, &wgt], &out, bytemuck::cast_slice(&dims), wg1((rows * width) as u32));
+        out
+    }
     /// Extract columns [col_off, col_off+width) of a single-row [1, N] tensor as a fresh [1, width],
     /// via a buffer copy (a transfer, NOT a compute dispatch). Splits the fused QKV projection's
     /// [1, d+2kv] output into q/k/v slices for the decode path. (t=1 only — the row is contiguous.)
@@ -5935,6 +5955,11 @@ impl Gpu {
         };
         let _ = &kr; // k already written to cache above in both branches
         self.copy_buf(&qkv, ((ad + kv) * 4) as u64, vc, (pos * kv * 4) as u64, (kv * 4) as u64); // v → V-cache row
+        // Llama 4 iRoPE attention temperature on NoPE layers past the floor (see block_decode).
+        let q = match w.attn_temp {
+            Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
+            _ => q,
+        };
         let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
