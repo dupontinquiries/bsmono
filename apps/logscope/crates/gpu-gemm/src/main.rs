@@ -3629,6 +3629,28 @@ fn main() {
         check("n-gram (model-free) speculative decode == target greedy", if ng_ok { 0.0 } else { 1.0 }, 0.5);
     }
 
+    // Opt-in fenced scratch-bounding (LOGSCOPE_DECODE_FLUSH_LAYERS): mid-decode flush MUST NOT change
+    // output. This is the exact identity the reverted _107 version violated (it corrupted the residual by
+    // recycling in-flight buffers). With the completion fence, flush-every-N decode must be BIT-IDENTICAL to
+    // no-flush decode. Force the env var on a synthetic model and compare.
+    {
+        let mut fm = gen_model(64, 128, 6, 48, 4, 2); fm.base = 100000.0; // 6 layers so flush=2 fires
+        let model = gpu.load_gguf(&write_gguf(&fm)).expect("flush-identity model");
+        let prompt = [3u32, 8, 1, 5, 2, 9];
+        let n_new = 10;
+        std::env::remove_var("LOGSCOPE_DECODE_FLUSH_LAYERS");
+        let baseline = gpu.generate_kv_gpu(&model, &prompt, n_new);
+        let mut all_id = true;
+        for fl in [2usize, 3, 4] {
+            std::env::set_var("LOGSCOPE_DECODE_FLUSH_LAYERS", fl.to_string());
+            let flushed = gpu.generate_kv_gpu(&model, &prompt, n_new);
+            let ok = flushed == baseline; all_id &= ok;
+            println!("  fenced flush(every {fl}) decode == no-flush decode = {ok}");
+        }
+        std::env::remove_var("LOGSCOPE_DECODE_FLUSH_LAYERS");
+        check("fenced mid-decode flush is bit-identical to no-flush (the reverted-regression guard)", if all_id { 0.0 } else { 1.0 }, 0.5);
+    }
+
     // Decode throughput profile: count GPU command submits + blocking syncs per token. Each
     // decode op is a tiny 1-row kernel, so per-token latency is dominated by the COUNT of
     // submits/syncs (CPU→GPU flushes), not by compute. This quantifies the structural cost
