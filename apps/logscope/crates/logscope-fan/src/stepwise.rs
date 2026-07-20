@@ -95,6 +95,57 @@ pub fn should_continue(mark: &StepMark, text: &str, continues_so_far: u32, cap: 
 /// truly stuck model ride the whole `cap`.
 pub const DEFAULT_GRACE: u32 = 4;
 
+/// Does the tail of the reply end by ASKING PERMISSION to continue rather than finishing or pausing on a
+/// marker? Small models (see the 4B transcripts) habitually close a step with "Let me know when you'd like
+/// to proceed" / "Shall I continue?" / "Ready for the next step?" — a natural-language stop that is neither
+/// a `⏸ STEP` marker nor `TASK_COMPLETE`. With auto-continue ON that's a SOFT CONTINUE signal, not a real
+/// stop: the model has more to do and is just being polite. The harness should answer "yes, continue"
+/// rather than surfacing it as a wait-for-user. High precision — only fires on a trailing solicitation in
+/// the last line or two, so a mid-reply "let me know if you have questions" doesn't trip it.
+pub fn trailing_solicitation(text: &str) -> bool {
+    // an explicit completion beats a solicitation (a model can say "…done. Let me know if you need more")
+    if signals_complete(text) { return false; }
+    let tail = text.trim_end();
+    // look only at the final ~2 lines / 200 chars — a solicitation is a closing line
+    let start = tail.len().saturating_sub(200);
+    let window = tail[start..].to_ascii_lowercase();
+    // must actually be at the end: the last non-empty line should contain it
+    let last_line = tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_ascii_lowercase();
+    const SOLICIT: &[&str] = &[
+        "let me know when you", "let me know if you", "let me know how you",
+        "would you like me to", "shall i continue", "shall i proceed", "should i continue",
+        "should i proceed", "ready to proceed", "ready for the next", "want me to continue",
+        "want me to proceed", "when you're ready", "when you are ready", "just let me know",
+        "let me know and i", "proceed to the next step", "move on to the next step",
+    ];
+    // fire only when the solicitation is in the CLOSING line (not buried mid-reply)
+    SOLICIT.iter().any(|s| last_line.contains(s) || (window.contains(s) && window.rfind(s).unwrap_or(0) > window.len().saturating_sub(120)))
+}
+
+/// Strip a trailing permission-asking question from a reply so the continuation doesn't re-read the model's
+/// own "let me know…" and stall again. Removes the final line(s) that are pure solicitation, keeping the
+/// substantive content. Used to clean the text handed into the auto-continue prompt.
+pub fn strip_trailing_solicitation(text: &str) -> &str {
+    if !trailing_solicitation(text) { return text; }
+    let trimmed = text.trim_end();
+    // drop trailing lines while they look like solicitation / are empty, stop at real content
+    let mut end = trimmed.len();
+    for line in trimmed.lines().rev() {
+        let low = line.trim().to_ascii_lowercase();
+        let is_solicit = low.is_empty() || SOLICIT_ANY.iter().any(|s| low.contains(s));
+        if is_solicit { end = end.saturating_sub(line.len() + 1); } else { break; }
+    }
+    trimmed[..end.min(trimmed.len())].trim_end()
+}
+
+/// The solicitation phrases, shared by detection and stripping.
+const SOLICIT_ANY: &[&str] = &[
+    "let me know", "would you like me to", "shall i continue", "shall i proceed",
+    "should i continue", "should i proceed", "ready to proceed", "ready for the next",
+    "want me to continue", "want me to proceed", "when you're ready", "when you are ready",
+    "proceed to the next step", "move on to the next step",
+];
+
 /// Extract the checklist for rendering: every step marker in order, plus whether the run is finished.
 /// The UI shows these as a compact steps guide; the marker lines can then be de-emphasized in the body.
 pub fn checklist(text: &str) -> (Vec<StepMark>, bool) {
@@ -172,6 +223,41 @@ mod tests {
         assert_eq!(steps.len(), 3);
         assert!(done);
         assert_eq!(steps[1].summary, "b");
+    }
+
+    #[test]
+    fn trailing_solicitation_detected() {
+        // straight from the 4B feedback: the model closes a step by asking permission
+        assert!(trailing_solicitation("Here's the setup.\n\nLet me know when you're ready to proceed."));
+        assert!(trailing_solicitation("...added the terrain.\nShall I continue to the next step?"));
+        assert!(trailing_solicitation("Done with step 2.\nWould you like me to proceed?"));
+    }
+
+    #[test]
+    fn task_complete_beats_solicitation() {
+        // a polite sign-off after finishing must NOT be read as "keep going"
+        assert!(!trailing_solicitation("All done.\nTASK_COMPLETE\nLet me know if you need anything else."));
+    }
+
+    #[test]
+    fn mid_reply_let_me_know_does_not_trip() {
+        // a "let me know if you have questions" buried mid-reply, with real content AFTER it, isn't a stop
+        let text = "Let me know if this is unclear.\n\nHere is the full implementation:\n\nfn main() {}\n\nThe code compiles and runs.";
+        assert!(!trailing_solicitation(text), "solicitation not in the closing line → not a trailing ask");
+    }
+
+    #[test]
+    fn strip_removes_the_trailing_ask_only() {
+        let text = "Added the grid terrain component.\n\nLet me know when you'd like to proceed.";
+        let stripped = strip_trailing_solicitation(text);
+        assert_eq!(stripped, "Added the grid terrain component.");
+        assert!(!stripped.to_ascii_lowercase().contains("let me know"));
+    }
+
+    #[test]
+    fn strip_noop_when_no_solicitation() {
+        let text = "Here is the code:\nfn main() {}";
+        assert_eq!(strip_trailing_solicitation(text), text);
     }
 }
 
