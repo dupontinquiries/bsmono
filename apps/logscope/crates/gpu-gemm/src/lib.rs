@@ -329,6 +329,11 @@ fn fused_qkv_enabled() -> bool {
 fn bind_group_cache_enabled() -> bool {
     std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
+/// Fuse the MoE gate‖up matvec with SwiGLU into one kernel (one fewer dispatch per MoE layer, no 2ff
+/// scratch). OPT-IN (default off) while it proves out on hardware; bit-identical to the unfused path.
+fn moe_glu_fused() -> bool {
+    std::env::var("LOGSCOPE_FUSE_GLU").as_deref() == Ok("1")
+}
 /// Fused RMSNorm+matvec for the m=1 decode norm→matmul pairs (LOGSCOPE_FUSE_NORM=0 → the explicit
 /// two-dispatch rmsnorm then matvec). One fewer dispatch per pair, twice per layer.
 fn fuse_norm_enabled() -> bool {
@@ -2427,15 +2432,29 @@ impl Gpu {
         // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
         // per-layer dispatch cost; on Asahi each submit batch costs ~4-5 ms of sync, so dispatch count
         // is the wall clock now that the polls are gone)
-        let gu_out = self.alloc(slots, ff2);
-        {
-            let gx = (ff2 as u32).min(32768);
-            let gy = (ff2 as u32).div_ceil(gx);
-            let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
-            self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
-        }
-        // 4) SwiGLU over the packed [slots, 2ff]
-        let hmid = self.swiglu_packed(&gu_out);
+        // With LOGSCOPE_FUSE_GLU, gate||up AND SwiGLU run as ONE kernel emitting silu(gate)·up directly
+        // ([slots,ff]) — one fewer dispatch per MoE layer and no 2ff scratch. Bit-identical.
+        let hmid = if moe_glu_fused() {
+            let glu_sh = match &m.stacked_gu.kind { LinKind::Q4(_) => MOE_MATVEC_GLU_Q4, _ => MOE_MATVEC_GLU_Q8 };
+            let ff = dn_k; // output width per expert = ff (down's k)
+            let hmid = self.alloc(slots, ff);
+            let gx = (ff as u32).min(32768);
+            let gy = (ff as u32).div_ceil(gx);
+            // d.n = ff (output width), rstride = 2ff (gate at col, up at col+ff)
+            let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
+            self.dispatch(glu_sh, &[n2, gu_qw, gu_qs, &selw], &hmid, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
+            hmid
+        } else {
+            let gu_out = self.alloc(slots, ff2);
+            {
+                let gx = (ff2 as u32).min(32768);
+                let gy = (ff2 as u32).div_ceil(gx);
+                let dims = [ff2 as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
+                self.dispatch(sh, &[n2, gu_qw, gu_qs, &selw], &gu_out, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
+            }
+            // 4) SwiGLU over the packed [slots, 2ff]
+            self.swiglu_packed(&gu_out)
+        };
         // 5) down projection per expert (per-slot activation rows)
         let dn_out = self.alloc(slots, d);
         {
@@ -3778,8 +3797,89 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if(tid==0u){ c[slot*d.n+col]=red[0]; }
 }"#;
 
-// MOE_WSUM: out[col] = resid[col] + Σ_s weight[s] · down[s·d + col] — the routed-expert combine, folded
-// with the residual add. Weights come from MOE_TOPK's selw (f32 bitcast at [k..2k)).
+// Fused gate‖up + SwiGLU (Q8). The unfused path was: MOE_MATVEC (write [slots,2ff]) → SWIGLU_PACKED
+// (reduce to [slots,ff]) — two dispatches + a 2ff scratch buffer. This does both in ONE dispatch: each
+// workgroup owns output column j in [0,ff), reduces BOTH the gate row (col=j) and the up row (col=ff+j)
+// against the same activation, and writes silu(gate)·up straight to o[slot·ff + j]. Bit-identical to the
+// two-step path (same reductions, same silu(v)=v/(1+exp(-v))). Halves the launch grid (ff not 2ff) and
+// drops the intermediate buffer. `d.n` here is ff (the OUTPUT width); gate/up rows live at col and col+ff
+// of the stacked weight (row stride rstride = 2ff).
+const MOE_MATVEC_GLU_Q8: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> rg: array<f32,64>;
+var<workgroup> ru: array<f32,64>;
+fn dotq8(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
+  let wbase=row*(k/4u); let sbase=row*kb;
+  var acc=0.0; var kk=tid;
+  loop { if(kk>=k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  return acc;
+}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  let expert=selw[slot];
+  let grow=expert*d.rstride+col;         // gate row: column j
+  let urow=expert*d.rstride+d.n+col;     // up row:   column ff+j
+  rg[tid]=dotq8(grow,tid,d.k,d.kb,abase);
+  ru[tid]=dotq8(urow,tid,d.k,d.kb,abase);
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+}"#;
+
+// Fused gate‖up + SwiGLU (Q4) — identical structure, 4-bit weights (nibble − 8).
+const MOE_MATVEC_GLU_Q4: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> rg: array<f32,64>;
+var<workgroup> ru: array<f32,64>;
+fn dotq4(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
+  let wbase=row*(k/8u); let sbase=row*kb;
+  var acc=0.0; var kk=tid;
+  loop { if(kk>=k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  return acc;
+}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  let expert=selw[slot];
+  let grow=expert*d.rstride+col;
+  let urow=expert*d.rstride+d.n+col;
+  rg[tid]=dotq4(grow,tid,d.k,d.kb,abase);
+  ru[tid]=dotq4(urow,tid,d.k,d.kb,abase);
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+}"#;
 const MOE_WSUM: &str = r#"
 struct D { n:u32,k:u32,_b:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<f32>;

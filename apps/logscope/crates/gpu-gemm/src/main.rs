@@ -3143,6 +3143,53 @@ fn main() {
         check("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared)", maxerr(&got2, &l4_ref), 1e-4);
     }
 
+    // Fused gate‖up+SwiGLU MoE kernel (LOGSCOPE_FUSE_GLU) must be BIT-IDENTICAL to the unfused
+    // matvec→swiglu path. Build a QUANTIZED MoE layer (the fused kernel only runs on the q8/q4 routed
+    // path) and compare the two forwards value-for-value. This is the correctness proof for the speed
+    // fusion — the dispatch count drops, the numbers must not move.
+    {
+        let (d, ff, ne) = (64usize, 32usize, 4usize);
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let rw = rnd(ne * d, 151);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();
+        let mk_q8 = || gpu_kernels::MoeLayer {
+            router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+            gate_up: gus.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, 2 * ff, d))).collect(),
+            down: dns.iter().map(|w| gpu_kernels::Lin::q8(gpu.quantize_q8_resident(w, d, ff))).collect(),
+            stacked_gu: gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&gus.concat(), ne * 2 * ff, d)),
+            stacked_down: gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&dns.concat(), ne * d, ff)),
+            cfg: cfgm, shared: None,
+        };
+        let n2t = gpu.upload(&rnd(d, 191), 1, d);
+        let x2t = gpu.upload(&rnd(d, 192), 1, d);
+        std::env::remove_var("LOGSCOPE_FUSE_GLU");
+        let unfused = gpu.download(&gpu.moe_ffn_t(&mk_q8(), &n2t, 1, d, &x2t));
+        std::env::set_var("LOGSCOPE_FUSE_GLU", "1");
+        let fused = gpu.download(&gpu.moe_ffn_t(&mk_q8(), &n2t, 1, d, &x2t));
+        std::env::remove_var("LOGSCOPE_FUSE_GLU");
+        let e = fused.iter().zip(&unfused).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("  fused gate‖up+SwiGLU vs unfused matvec→swiglu (q8 MoE): max|diff|={e:.2e}");
+        check("MoE fused-GLU kernel == unfused path (bit-identical)", e, 0.0);
+
+        // same for Q4-resident (the q4-30B's actual MoE path)
+        let mk_q4 = || gpu_kernels::MoeLayer {
+            router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+            gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
+            down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
+            stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
+            stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
+            cfg: cfgm, shared: None,
+        };
+        let unfused4 = gpu.download(&gpu.moe_ffn_t(&mk_q4(), &n2t, 1, d, &x2t));
+        std::env::set_var("LOGSCOPE_FUSE_GLU", "1");
+        let fused4 = gpu.download(&gpu.moe_ffn_t(&mk_q4(), &n2t, 1, d, &x2t));
+        std::env::remove_var("LOGSCOPE_FUSE_GLU");
+        let e4 = fused4.iter().zip(&unfused4).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        println!("  fused gate‖up+SwiGLU vs unfused (q4 MoE): max|diff|={e4:.2e}");
+        check("MoE fused-GLU kernel Q4 == unfused path (bit-identical)", e4, 0.0);
+    }
+
     // Isolate the 1B regression: run ROPE_MH alone at base=500000, head_dim=64 (the 1B's
     // rope), vs CPU. The full-forward sweep diverged only when base was large.
     for &(base, heads) in &[(10000.0f32, 8usize), (500000.0, 8), (500000.0, 2)] {
