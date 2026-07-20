@@ -161,6 +161,10 @@ pub enum LoopAction {
 #[derive(Clone, Debug)]
 pub struct LoopGuard {
     recent_sigs: Vec<u64>,
+    /// Recent turns' word-shingle sets (for NEAR-duplicate detection): a model looping on the same
+    /// task re-emits semantically identical turns with minor wording drift, which dodges the exact-hash
+    /// `recent_sigs` check. Jaccard overlap against these catches "same block, reworded" repeats.
+    recent_shingles: Vec<std::collections::HashSet<u64>>,
     /// path-hash → (last content-hash, write count) for the file-write churn guard.
     writes: std::collections::HashMap<u64, (u64, u32)>,
     strikes: usize,
@@ -169,7 +173,7 @@ pub struct LoopGuard {
 }
 
 impl Default for LoopGuard {
-    fn default() -> Self { Self { recent_sigs: Vec::new(), writes: std::collections::HashMap::new(), strikes: 0, max_strikes: 3, keep: 6 } }
+    fn default() -> Self { Self { recent_sigs: Vec::new(), recent_shingles: Vec::new(), writes: std::collections::HashMap::new(), strikes: 0, max_strikes: 3, keep: 6 } }
 }
 
 impl LoopGuard {
@@ -221,12 +225,24 @@ impl LoopGuard {
         // An internally-looping turn (the reply itself is a runaway) counts as a strike on its own.
         let internal_loop = tail_cycle(model_text, 3).is_some();
         let sig = Self::signature(model_text, action_sig);
-        let repeated = self.recent_sigs.contains(&sig);
+        let exact_repeat = self.recent_sigs.contains(&sig);
+        // NEAR-duplicate: a semantically-identical turn with minor wording drift (the "add more blocks"
+        // loop — same block regenerated each turn at temp>0, dodging the exact hash). If this turn's
+        // word-shingles overlap ≥0.8 with any recent turn, it's a repeat even without an exact match.
+        let shingles = Self::shingles(model_text);
+        let near_repeat = !shingles.is_empty()
+            && self.recent_shingles.iter().any(|prev| jaccard(&shingles, prev) >= 0.6);
+        let repeated = exact_repeat || near_repeat;
 
         self.recent_sigs.push(sig);
         if self.recent_sigs.len() > self.keep {
             let drop = self.recent_sigs.len() - self.keep;
             self.recent_sigs.drain(..drop);
+        }
+        self.recent_shingles.push(shingles);
+        if self.recent_shingles.len() > self.keep {
+            let drop = self.recent_shingles.len() - self.keep;
+            self.recent_shingles.drain(..drop);
         }
 
         if repeated || internal_loop {
@@ -244,6 +260,35 @@ impl LoopGuard {
             LoopAction::Proceed
         }
     }
+
+    /// Word-level BIGRAM shingle set (FNV-hashed) for a turn — the fingerprint the near-duplicate check
+    /// compares. Bigrams (not 4-grams): a reworded-but-identical turn keeps most of its adjacent word
+    /// pairs, so bigram Jaccard stays high (~0.7) while genuinely different turns score ~0; 4-grams are
+    /// too brittle (a single inserted word breaks four of them). Lowercased; empty for trivially-short
+    /// text (nothing to compare).
+    fn shingles(text: &str) -> std::collections::HashSet<u64> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut set = std::collections::HashSet::new();
+        if words.len() < 2 { return set; }
+        for w in words.windows(2) {
+            let mut h = 0xcbf2_9ce4_8422_2325u64;
+            for tok in w {
+                for b in tok.to_ascii_lowercase().bytes().chain(b" ".iter().copied()) {
+                    h ^= b as u64; h = h.wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            set.insert(h);
+        }
+        set
+    }
+}
+
+/// Jaccard overlap between two shingle sets: |A∩B| / |A∪B|, in 0..1. 1.0 = identical shingles.
+fn jaccard(a: &std::collections::HashSet<u64>, b: &std::collections::HashSet<u64>) -> f64 {
+    if a.is_empty() || b.is_empty() { return 0.0; }
+    let inter = a.iter().filter(|x| b.contains(x)).count();
+    let union = a.len() + b.len() - inter;
+    if union == 0 { 0.0 } else { inter as f64 / union as f64 }
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
@@ -338,5 +383,31 @@ mod tests {
         // a single turn whose TEXT is a runaway loop is struck even if its signature is new
         let runaway = "ok ".repeat(20);
         assert!(matches!(g.observe(&runaway, "noop"), LoopAction::Nudge(_)));
+    }
+
+    #[test]
+    fn loopguard_catches_reworded_near_duplicate() {
+        // The "add more blocks" loop: each turn regenerates a semantically identical block with minor
+        // wording drift at temp>0, so the EXACT-hash signature differs every time and the old guard
+        // proceeded forever. The shingle/Jaccard check must catch it as a repeat.
+        let mut g = LoopGuard::new(3);
+        let a = "Here is a new block that adds a coordinator module to manage the worker pool and dispatch tasks across lanes efficiently";
+        let b = "Here is a new block which adds a coordinator module to manage the worker pool and dispatch tasks across the lanes efficiently"; // one word swapped + inserted
+        // exact hashes differ (proves the old path would have proceeded)
+        assert_ne!(LoopGuard::signature(a, "noop"), LoopGuard::signature(b, "noop"));
+        assert!(matches!(g.observe(a, "noop"), LoopAction::Proceed));
+        // the near-identical follow-up is caught despite the different hash
+        assert!(matches!(g.observe(b, "noop"), LoopAction::Nudge(_)), "reworded near-duplicate must strike");
+    }
+
+    #[test]
+    fn loopguard_allows_genuinely_distinct_turns() {
+        // don't over-trigger: two turns about different things must NOT read as near-duplicates
+        let mut g = LoopGuard::new(3);
+        let a = "Add a coordinator module that manages the worker pool and dispatches tasks across lanes";
+        let b = "Write the KV cache eviction policy using a value-ranked heap with demote-before-drop tiers";
+        assert!(matches!(g.observe(a, "noop"), LoopAction::Proceed));
+        assert!(matches!(g.observe(b, "noop"), LoopAction::Proceed), "distinct turns must not strike");
+        assert_eq!(g.strikes(), 0);
     }
 }
