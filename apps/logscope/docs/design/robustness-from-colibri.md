@@ -96,3 +96,19 @@ constants — not "use it all and hope."
    undetected fragility" that cost us test cycles.
 4. **Pattern 3 (CPU/GPU threshold)** and **Pattern 6 (headroom constants)** — incremental perf/safety.
 5. **Pattern 4 (keep-alive spinner)** — only if latency, not hangs, is the post-fix bottleneck.
+
+## Ported so far (status)
+
+- **Preflight readiness report** — DONE (backend.rs): logs detected fragilities + active env overrides once at load.
+- **Generic fault→degrade latch** (`run_guarded`, `degrade_level`) — DONE: a caught GPU fault drops the session to safe kernels (serial attention, bounded submits). Catches recoverable faults; does NOT un-hang a synchronous wait on a watchdog dispatch (prevention stays front-line).
+- **Keep-alive spin** (`LOGSCOPE_GPU_SPIN`) — DONE (opt-in): holds the GPU clock warm between dispatch-bound decode bursts.
+- **Hostile-dimension guard** — DONE (load): rejects corrupt/absurd GGUF dims before they overflow allocation arithmetic (Colibri "absurd n" + shape-overflow checks).
+- **NaN/Inf sampler poison guard (CPU)** — DONE (Colibri #369): argmax skips non-finite, sample() falls back to finite argmax. A single NaN/+Inf logit no longer collapses the draw to token-0-forever.
+- **NaN/Inf guard (GPU SAMPLE_AT / argmax_t)** — TODO: the windowed-decode GPU sampler has the same vulnerability class. Needs an `isfinite`/`select` guard in the WGSL max+softmax so a poisoned logit on the GPU path is caught too. Deferred (the WGSL kernel is large and the NaN path is hard to validate in-container); the CPU guard covers non-windowed + speculative decode meanwhile.
+- **Bounded submits cross-backend** — PARTIAL: Asahi + degraded sessions keep bounded window submits; other backends still cap at a high (finite) ceiling. Generalizing the ceiling is low-priority since it's already finite.
+
+## Model support ported
+
+- **GeGLU packed kernel** — DONE (Gemma-family FFN gate, gelu(gate)·up), validated 5.96e-8. Still needs Gemma RMSNorm (1+w) + attention logit soft-capping + a real checkpoint before Gemma2 is end-to-end.
+- **MLA (DeepSeek/GLM compressed-KV attention)** — NOT STARTED: the big context+model lever. Colibri stores only the compressed latent `[kv_lora + qk_rope]` per token instead of full per-head K/V — a large KV-memory reduction for long context. Config dims: q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, n_shared_experts. Substantial multi-turn port (down/up projections, latent norm, the absorption trick); the shared-expert MoE stepping stone is already in.
+
