@@ -243,6 +243,16 @@ impl OrbitCam {
         c
     }
 
+    /// The camera's world-space eye position: back from the target along the view direction by `dist`.
+    /// Matches the `toward` basis the physical-UI code uses (target + toward·dist).
+    pub fn eye_world(&self) -> Vec3 {
+        let (cyw, syw) = (self.yaw.cos(), self.yaw.sin());
+        let (cpt, spt) = (self.pitch.cos(), self.pitch.sin());
+        let toward = Vec3::new(-(cpt * syw), spt, cpt * cyw);
+        Vec3::new(self.target.x + toward.x * self.dist,
+                  self.target.y + toward.y * self.dist,
+                  self.target.z + toward.z * self.dist)
+    }
     /// Project a world point to screen. Returns (sx, sy, depth) where depth is distance in front of the
     /// camera (>0). None if behind the camera. (cx,cy)=viewport center; `scale` ties world units to px
     /// (and is divided by depth for perspective, so nearer points project larger and farther smaller).
