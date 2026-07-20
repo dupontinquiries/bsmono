@@ -1175,6 +1175,42 @@ impl Gpu {
         }
         Some(r)
     }
+    /// GPU keep-alive spin (cf. Colibri's COLI_METAL_SPIN). Decode is dispatch-bound: our own profile says
+    /// "encoder setup, not GPU sync, is the wall", and on Apple Silicon the GPU ramps its clock DOWN
+    /// between the short per-token bursts, so the next burst starts on a cold clock (Colibri measured this
+    /// tripling attention-kernel time). A background thread submitting a trivial dispatch in a tight loop
+    /// keeps the clock warm. Opt-in (LOGSCOPE_GPU_SPIN=1) since it costs power; detached so it never blocks
+    /// exit; self-throttled with a tiny sleep so it doesn't flood the queue. No correctness effect (writes
+    /// a 4-float scratch buffer nothing reads).
+    pub fn maybe_start_gpu_spin(&self) {
+        if std::env::var_os("LOGSCOPE_GPU_SPIN").is_none() { return; }
+        static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+        let device = self.device.clone();
+        let queue = self.queue.clone();
+        eprintln!("wgpu-engine: GPU keep-alive spin ON (LOGSCOPE_GPU_SPIN) — holds the GPU clock warm between decode bursts (costs power)");
+        std::thread::spawn(move || {
+            const KA: &str = "@group(0)@binding(0) var<storage,read_write> b: array<f32>;\n@compute @workgroup_size(4,1,1)\nfn main(@builtin(global_invocation_id) g:vec3<u32>){ b[g.x]=b[g.x]*1.0+f32(g.x); }";
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("keepalive"), source: wgpu::ShaderSource::Wgsl(KA.into()) });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("keepalive"), layout: None, module: &module, entry_point: Some("main"),
+                compilation_options: Default::default(), cache: None });
+            let buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ka"), size: 16,
+                usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }] });
+            loop {
+                let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                { let mut p = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
+                  p.set_pipeline(&pipeline); p.set_bind_group(0, &bg, &[]); p.dispatch_workgroups(1, 1, 1); }
+                queue.submit(Some(enc.finish()));
+                // ~1ms cadence: frequent enough to hold the clock, cheap enough to not contend with decode.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+    }
     pub fn flush_every(&self) -> u32 { self.flush_every.load(std::sync::atomic::Ordering::Relaxed) }
     /// Set passes-per-submit. Clamped to [1,1024]. Ignored when LOGSCOPE_FLUSH_EVERY pins it, so a manual
     /// override always wins over the adaptive tuner. Returns the value in effect after the call.
