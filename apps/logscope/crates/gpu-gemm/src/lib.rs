@@ -4333,6 +4333,9 @@ pub struct Model {
     /// MLA (Multi-head Latent Attention) rank config, present only for DeepSeek-V3/GLM-MoE checkpoints.
     /// When set, the KV cache stores the compressed latent instead of per-head K/V. `None` = standard MHA/GQA.
     pub mla: Option<MlaConfig>,
+    /// DSA (DeepSeek Sparse Attention) lightning-indexer config, present only when the indexer weights ship.
+    /// When set (and seq > index_topk) attention is sparse; `None` = dense attention.
+    pub dsa: Option<DsaConfig>,
 }
 
 /// Multi-head Latent Attention config (DeepSeek-V2/V3, GLM-MoE-DSA). The dims that make MLA's compressed
@@ -4359,6 +4362,31 @@ impl MlaConfig {
     pub fn latent_width(&self) -> usize { self.kv_lora + self.qk_rope }
     /// Full per-head query/key dim (nope + rope), the width attention scores are computed over.
     pub fn qk_head(&self) -> usize { self.qk_nope + self.qk_rope }
+}
+
+/// DSA (DeepSeek Sparse Attention) lightning-indexer config, present only for GLM-MoE-DSA / DeepSeek
+/// checkpoints that ship the indexer weights. The indexer scores every key with a small separate
+/// attention (index_n_heads × index_head_dim) and, when the sequence is long, keeps only the top
+/// `index_topk` keys for the main attention — making attention sub-quadratic at long context. Crucially
+/// it's a NO-OP for seq ≤ index_topk (selects all keys → dense, exact), so short contexts are unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DsaConfig {
+    /// How many keys the indexer keeps per query once the sequence exceeds this length. Below it: all keys.
+    pub index_topk: usize,
+    /// Indexer attention heads (separate, small).
+    pub index_n_heads: usize,
+    /// Indexer per-head dim.
+    pub index_head_dim: usize,
+}
+impl DsaConfig {
+    /// Whether sparse selection is active at this sequence length. At or below `index_topk` the indexer is
+    /// a no-op (all keys selected → dense-and-exact), so DSA can never regress short contexts — the
+    /// property that makes it safe to enable unconditionally. Mirrors Colibri glm.c: `seq > index_topk`.
+    pub fn sparse_active(&self, seq_len: usize) -> bool { seq_len > self.index_topk }
+    /// Keys actually attended at this length: min(seq_len, index_topk) once past the threshold.
+    pub fn selected_keys(&self, seq_len: usize) -> usize {
+        if self.sparse_active(seq_len) { self.index_topk } else { seq_len }
+    }
 }
 impl Model {
     /// Fingerprint a few GPU-resident weights (LOGSCOPE_WEIGHT_CHECK=1): downloads small tensors and
@@ -4899,7 +4927,18 @@ impl Gpu {
             eprintln!("wgpu-engine: MLA config detected — kv_lora={} q_lora={} qk_nope={} qk_rope={} v_head={} (latent {} vs {} per-token KV) — forward not yet wired",
                 m.kv_lora, m.q_lora, m.qk_nope, m.qk_rope, m.v_head, m.latent_width(), n_kv_heads * head_dim);
         }
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla })
+        // DSA (DeepSeek Sparse Attention) indexer config: present only when index_topk is declared AND the
+        // indexer weights ship. Detected here so it's visible; the sparse selection forward isn't wired yet.
+        let dsa = {
+            let index_topk = g.get_u32(&format!("{pfx}.attention.index_topk")).unwrap_or(0) as usize;
+            let index_n_heads = g.get_u32(&format!("{pfx}.attention.index_head_count")).unwrap_or(0) as usize;
+            let index_head_dim = g.get_u32(&format!("{pfx}.attention.index_head_dim")).unwrap_or(0) as usize;
+            if index_topk > 0 && index_n_heads > 0 && index_head_dim > 0 && index_head_dim <= 256 {
+                eprintln!("wgpu-engine: DSA indexer detected — index_topk={index_topk} heads={index_n_heads} head_dim={index_head_dim} (sparse above {index_topk} tokens, dense at/below) — forward not yet wired");
+                Some(DsaConfig { index_topk, index_n_heads, index_head_dim })
+            } else { None }
+        };
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -4979,7 +5018,7 @@ impl Gpu {
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -8121,6 +8160,19 @@ mod decode_cfg_tests {
         assert_eq!(m.qk_head(), 192); // nope + rope, the score width
         // a standard 128-kv-head × 128-dim cache would be 16384/token — MLA caches 28× less here
         assert!(m.latent_width() * 28 < 128 * 128);
+    }
+
+    #[test]
+    fn dsa_is_a_noop_below_threshold_then_sparse() {
+        // The property that makes DSA safe to enable unconditionally: at or below index_topk it selects ALL
+        // keys (dense, exact — no regression on short contexts); only past it does it go sparse.
+        let d = DsaConfig { index_topk: 2048, index_n_heads: 4, index_head_dim: 128 };
+        assert!(!d.sparse_active(100), "short context must be dense");
+        assert!(!d.sparse_active(2048), "at the threshold it's still dense (<=, not <)");
+        assert!(d.sparse_active(2049), "just past the threshold it goes sparse");
+        assert_eq!(d.selected_keys(100), 100, "dense: attend all keys");
+        assert_eq!(d.selected_keys(8192), 2048, "sparse: attend only index_topk keys");
+        assert!(d.selected_keys(1_000_000) == 2048, "long context: bounded key count (sub-quadratic)");
     }
 
     #[test]
