@@ -631,14 +631,14 @@ pub(crate) mod engine {
                         let w = gpu.stream_session_window(model, s, &mut seen, n_new, eos, &sp, rng, sample_win,
                                                           &gpu_kernels::EmbedT::Q8(eq), cancel, &mut step);
                         if w == usize::MAX {
-                            // Windowed decode aborted on device buffer-object pressure (the M4 ceiling).
-                            // It cleared its poisoned frame + set the alloc-failed flag; clear the flag,
-                            // disable windowing for the rest of this session, and retry this turn on the
-                            // per-token path (which frees buffers every step and stays under the ceiling).
-                            gpu.clear_dims_alloc_failed();
+                            // Windowed decode hit the device buffer-object ceiling. The device is
+                            // FATALLY poisoned once this happens (a captured validation error still
+                            // leaves every subsequent alloc invalid — confirmed on M4), so retrying
+                            // per-token on the same device would just abort again. Latch windowing off so
+                            // the NEXT turn uses per-token from the start, and end this turn cleanly.
                             self.disable_windowing = true;
-                            eprintln!("wgpu-engine: [{}] windowed decode hit device buffer pressure — falling back to per-token for this session", self.name);
-                            gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step)
+                            eprintln!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled; the NEXT turn will use per-token. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
+                            0
                         } else { w }
                     }
                     _ => gpu.stream_session(model, s, &mut seen, n_new, eos, &sp, rng, cancel, step),
@@ -828,10 +828,9 @@ pub(crate) mod engine {
                     let w = gpu.stream_session_window(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, sample_win,
                                                       &gpu_kernels::EmbedT::Q8(eq), cancel, &mut step);
                     if w == usize::MAX {
-                        gpu.clear_dims_alloc_failed();
                         self.disable_windowing = true;
-                        eprintln!("wgpu-engine: [{}] windowed decode hit device buffer pressure — falling back to per-token for this session", self.name);
-                        gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step)
+                        eprintln!("wgpu-engine: [{}] windowed decode hit the device buffer ceiling — windowing disabled for the next turn. (Lower LOGSCOPE_WINDOW_MAX to avoid this.)", self.name);
+                        0
                     } else { w }
                 }
                 _ => gpu.stream_session(model, &mut s, &mut seen, n_new, eos, &sp, &mut rng, cancel, step),
