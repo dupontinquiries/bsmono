@@ -22,6 +22,7 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod dsa;     // DeepSeek Sparse Attention lightning indexer — CPU reference
 #[allow(dead_code)] pub mod ngram;   // prompt-lookup (n-gram) speculative draft source — lossless speedup
 #[allow(dead_code)] pub mod expert_predict; // context-conditioned MoE expert predictor for SSD-streaming prefetch
+#[allow(dead_code)] pub mod expert_cache; // MoE expert-streaming policy: pin store + per-layer LRU slots + prefetch
 #[allow(dead_code)] pub mod llama4;  // Llama 4 iRoPE attention temperature tuning (long-context length gen)
 pub mod netserve;
 pub mod store;
