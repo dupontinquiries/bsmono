@@ -2651,6 +2651,106 @@ fn main() {
         return;
     }
     // A typo'd gate (e.g. --gate-map for --gate-mmap) used to fall through and silently run the full
+    if args.iter().any(|a| a == "--gate-stream-slots") {
+        // Milestone-1 of the streaming MECHANISM: the GPU slot pool fills from host bytes (write_buffer, the
+        // M2 fast path) and reads back intact, and the pure expert_cache policy drives WHICH slot to fill.
+        // Verifies the policy→mechanism bridge on real GPU buffers before any decode wiring.
+        use gpu_kernels::{StreamSlots, expert_cache::{LayerSlots, Access}};
+        let gpu = Gpu::new();
+        eprintln!("gate-stream-slots: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+
+        // small slots for the test (256 KiB), 3-slot ring
+        let slot_bytes = 256 * 1024u64;
+        let slots = StreamSlots::new(&gpu, 3, slot_bytes);
+        ck("slot pool allocates n buffers of the requested size", slots.n_slots() == 3 && slots.slot_bytes() == slot_bytes);
+
+        // fill slot 1 with a known pattern, read it back — the fill must land byte-exact
+        let pat: Vec<u8> = (0..slot_bytes as usize).map(|i| i.wrapping_mul(2654435761usize) as u8).collect();
+        slots.fill(&gpu, 1, &pat);
+        let got = slots.readback(&gpu, 1, pat.len());
+        ck("write_buffer fill round-trips byte-exact", got == pat);
+
+        // policy drives the mechanism: expert_cache says which slot; we fill it with that expert's "bytes".
+        // Simulate 3 experts' bytes (distinct patterns), route a token, fill misses, verify each slot holds
+        // the right expert.
+        let ebytes = |e: u32| -> Vec<u8> { (0..slot_bytes as usize).map(|i| ((i as u32) ^ e.wrapping_mul(0x9E3779B1)) as u8).collect() };
+        let mut policy = LayerSlots::new(&[], 3); // no pins, 3 slots
+        let routed = [10u32, 20, 30];
+        let plan = policy.resolve_token(&routed);
+        ck("policy: cold token → all misses", plan.misses.len() == 3 && plan.resident.is_empty());
+        for (e, slot) in &plan.misses { slots.fill(&gpu, *slot as usize, &ebytes(*e)); }
+        // verify each miss's slot holds that expert's bytes
+        let mut all_match = true;
+        for (e, slot) in &plan.misses {
+            if slots.readback(&gpu, *slot as usize, slot_bytes as usize) != ebytes(*e) { all_match = false; }
+        }
+        ck("each streamed expert's bytes land in the policy-chosen slot", all_match);
+
+        // re-route the same experts → now all resident (hits), no fills needed
+        let plan2 = policy.resolve_token(&routed);
+        ck("policy: re-routed experts are now hits (no re-fill)", plan2.misses.is_empty() && plan2.resident.len() == 3);
+
+        // a new expert evicts the LRU slot; the evicted slot gets refilled with the new expert
+        let plan3 = policy.resolve_token(&[10, 20, 99]); // 30 is LRU → evicted for 99
+        let miss99 = plan3.misses.iter().find(|(e, _)| *e == 99).map(|(_, s)| *s);
+        ck("policy: a new expert misses and reuses an LRU slot", miss99.is_some());
+        if let Some(slot) = miss99 { slots.fill(&gpu, slot as usize, &ebytes(99)); ck("refilled slot holds the new expert", slots.readback(&gpu, slot as usize, slot_bytes as usize) == ebytes(99)); }
+        let _ = Access::Pinned;
+
+        println!("gate-stream-slots: {}", if ok { "policy→mechanism bridge validated \u{2713} (fills land, policy picks slots, LRU refills)" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-moe-stream") {
+        // Correctness gate for the LIVE streaming decode path: a streaming MoeLayer (cold experts filled
+        // into GPU slots on demand) must produce BIT-EXACT the same output as the fully-resident MoeLayer,
+        // because the streamed q4 bytes are identical to the resident q4 bytes — only their residency
+        // differs. Runs the v1 per-expert path (LOGSCOPE_MOE_V1=1) since the streaming intercept lives there.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-stream: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (d, ff, ne, n_used) = (128usize, 256usize, 8usize, 2usize);
+        // deterministic pseudo-random weights
+        let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
+        let rw = mk(1, ne * d);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let n2v = mk(7, d); let xin = mk(8, d);
+        let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
+        // force the v1 path so both resident and streaming take the same code (streaming intercept is in v1)
+        std::env::set_var("LOGSCOPE_MOE_V1", "1");
+        let resident = gpu_kernels::MoeLayer {
+            router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+            gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
+            down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
+            stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
+            stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
+            cfg: cfgm.clone(), shared: None, stream: None,
+        };
+        let want = gpu.download(&gpu.moe_ffn_t(&resident, &n2t, 1, d, &x2t));
+
+        // streaming layer at several pin levels: 0 (all streamed), 4 (half pinned), 8 (all pinned)
+        for pin in [0usize, 4, ne] {
+            let stream = gpu.build_moe_stream_from_weights(&gus, &dns, ff, d, n_used, pin);
+            let streaming = gpu_kernels::MoeLayer {
+                router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+                gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
+                down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
+                stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
+                stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
+                cfg: cfgm.clone(), shared: None, stream: Some(std::sync::Mutex::new(stream)),
+            };
+            // run twice — second run exercises slot REUSE (hits) and eviction, not just cold fills
+            let _warm = gpu.download(&gpu.moe_ffn_t(&streaming, &n2t, 1, d, &x2t));
+            let got = gpu.download(&gpu.moe_ffn_t(&streaming, &n2t, 1, d, &x2t));
+            let e = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("streamed decode == resident decode (pin={pin}/{ne}): max|diff|={e:.2e}"), e == 0.0);
+        }
+        std::env::remove_var("LOGSCOPE_MOE_V1");
+        println!("gate-moe-stream: {}", if ok { "live streaming decode is BIT-EXACT to resident \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
@@ -3293,6 +3393,7 @@ fn main() {
                 Some((gpu_kernels::Lin::f32(gpu.upload(&sguw, 2 * sff, d)),
                       gpu_kernels::Lin::f32(gpu.upload(&sdnw, d, sff))))
             } else { None },
+            stream: None,
         };
         let n2t = gpu.upload(&n2v, t, d);
         let x2t = gpu.upload(&xin, t, d);
@@ -3344,6 +3445,7 @@ fn main() {
             stacked_gu: gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&gus.concat(), ne * 2 * ff, d)),
             stacked_down: gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&dns.concat(), ne * d, ff)),
             cfg: cfgm, shared: None,
+            stream: None,
         };
         let n2t = gpu.upload(&rnd(d, 191), 1, d);
         let x2t = gpu.upload(&rnd(d, 192), 1, d);
@@ -3364,6 +3466,7 @@ fn main() {
             stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
             stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
             cfg: cfgm, shared: None,
+            stream: None,
         };
         let unfused4 = gpu.download(&gpu.moe_ffn_t(&mk_q4(), &n2t, 1, d, &x2t));
         std::env::set_var("LOGSCOPE_FUSE_GLU", "1");
