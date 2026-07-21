@@ -51,6 +51,7 @@ pub mod physui;
 pub mod repetition; // pure repetition detection + graded recovery (decode + agent loops)
 #[allow(dead_code)] pub mod tripwire; // pure deterministic scanners over in-progress code → review-point signal
 #[allow(dead_code)] pub mod segment; // detect explain↔code / new-thought seams → pause, branch, checkpoint, predict
+#[allow(dead_code)] pub mod taskclass; // classify one-shot/long-horizon × maintenance/greenfield → build posture
 pub use logscope_fan::stepwise; // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
 pub mod docorg; // document-organization convention: front-matter, generated index, branch merge
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
