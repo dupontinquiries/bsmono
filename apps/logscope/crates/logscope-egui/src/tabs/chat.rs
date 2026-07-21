@@ -1781,6 +1781,17 @@ impl Chat {
         if let Some(latest) = self.msgs.iter().rev().find(|m| m.role == Role::User) {
             let class = crate::taskclass::classify(latest.text());
             if let Some(p) = crate::taskclass::posture(class) { s.push_str(p); }
+            // Educate-then-defer: for substantive tasks, inform once then respect an informed directive
+            // (the antidote to the re-litigation loop). Applied to long-horizon work where there's actually
+            // something worth flagging.
+            if class.wants_orchestration() { s.push_str(crate::taskclass::EDUCATE_THEN_DEFER); }
+            // If the user reaffirmed a request after the model pushed back, tell the model to proceed now
+            // rather than decline again — the signal that would have unstuck the refused transcript.
+            if let Some(prev) = self.msgs.iter().rev().filter(|m| m.role == Role::Assistant).find(|m| !m.text().is_empty()) {
+                if crate::taskclass::reaffirmed_after_pushback(prev.text(), latest.text()) {
+                    s.push_str(crate::taskclass::REAFFIRMED_PROCEED);
+                }
+            }
         }
         s
     }
