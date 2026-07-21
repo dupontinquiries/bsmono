@@ -1698,41 +1698,44 @@ fn main() {
     }
     if args.iter().any(|a| a == "--probe-expert-stream") {
         // The M2 go/no-go for MoE streaming: does filling a slot from host RAM overlap a compute dispatch on
-        // Honeykrisp? Size the streamed expert with --expert-mib N (default 512; use ~a real expert size on
-        // the M2), iters with --iters N (default 20). lavapipe (in-container) has no real host/device split
-        // so its numbers aren't representative — this is a HARDWARE probe; run it on the M2.
+        // Honeykrisp? The streamed unit is ONE expert in ONE layer (~64-128 MiB for Scout), NOT a whole
+        // expert. By default we SWEEP that realistic range in one run so a single M2 invocation gives the
+        // whole curve; --slot-mib N probes a single size. --iters N (default 20) averages noise.
         let get = |flag: &str, dflt: usize| -> usize {
             args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(dflt)
         };
-        let expert_mib = get("--expert-mib", 512);
         let iters = get("--iters", 20);
         let gpu = Gpu::new();
         eprintln!("probe-expert-stream: adapter = {}", gpu.adapter_name);
-        eprintln!("probe-expert-stream: streamed expert = {expert_mib} MiB, {iters} iters");
-        let (copy, dispatch, overlapped, serial) = gpu.probe_expert_stream(expert_mib, iters);
-        // overlap ratio: serial / overlapped. ~2 = perfect overlap (copy fully hidden under compute); ~1 =
-        // serialized (copy adds on top). The decisive number is how much of the copy hides.
-        let overlap_ratio = if overlapped > 0.0 { serial / overlapped } else { 0.0 };
-        // how much of the copy is hidden: (serial - overlapped) / copy. 1.0 = fully hidden, 0 = not at all.
-        let hidden_frac = if copy > 0.0 { ((serial - overlapped) / copy).clamp(0.0, 1.0) } else { 0.0 };
-        println!("probe-expert-stream results ({expert_mib} MiB expert):");
-        println!("  copy alone (host→device):   {copy:.3} ms");
-        println!("  dispatch alone (matmul):    {dispatch:.3} ms");
-        println!("  overlapped (both, 1 fence): {overlapped:.3} ms");
-        println!("  serial (fenced between):    {serial:.3} ms");
-        println!("  overlap ratio (serial/overlapped): {overlap_ratio:.2}  (1=serialized, 2=perfect overlap)");
-        println!("  copy hidden under compute:  {:.0}%", hidden_frac * 100.0);
-        let verdict = if hidden_frac > 0.6 {
-            "GO — the streamed copy largely hides under compute; the full expert-streaming path is worth wiring."
-        } else if hidden_frac > 0.25 {
-            "PARTIAL — some overlap; streaming may pay with smaller stream granularity or more resident pins. Re-probe at a smaller expert size."
+        let is_sw = gpu.adapter_name.to_lowercase().contains("llvmpipe") || gpu.adapter_name.to_lowercase().contains("lavapipe");
+        // sizes to probe: a single one if --slot-mib given, else the realistic per-expert-layer sweep
+        let sizes: Vec<usize> = if args.iter().any(|a| a == "--slot-mib") {
+            vec![get("--slot-mib", 96)]
+        } else { vec![32, 64, 96, 128, 192, 256] };
+        eprintln!("probe-expert-stream: slot = one expert-layer; sweeping {sizes:?} MiB, {iters} iters each");
+        println!("probe-expert-stream (streamed unit = one expert in one layer):");
+        println!("  {:>6} {:>9} {:>10} {:>11} {:>9} {:>8} {:>7}", "MiB", "copy_ms", "matmul_ms", "overlap_ms", "serial_ms", "hidden%", "ratio");
+        let mut best_hidden = 0.0f64; let mut best_mib = 0usize; let mut any_clamped = false;
+        for &sz in &sizes {
+            let (copy, dispatch, overlapped, serial, actual) = gpu.probe_expert_stream(sz, iters);
+            if actual < sz { any_clamped = true; }
+            let ratio = if overlapped > 0.0 { serial / overlapped } else { 0.0 };
+            let hidden = if copy > 0.0 { ((serial - overlapped) / copy).clamp(0.0, 1.0) } else { 0.0 };
+            let flag = if actual < sz { " (clamped to max_buffer_size)" } else if copy < 0.001 { " (copy ~0 — buffer may be invalid)" } else { "" };
+            println!("  {:>6} {:>9.3} {:>10.3} {:>11.3} {:>9.3} {:>7.0}% {:>7.2}{}", actual, copy, dispatch, overlapped, serial, hidden * 100.0, ratio, flag);
+            if hidden > best_hidden { best_hidden = hidden; best_mib = actual; }
+        }
+        println!();
+        let verdict = if best_hidden > 0.6 {
+            format!("GO — at {best_mib} MiB the streamed copy largely hides under compute ({:.0}% hidden). Wire the full expert-streaming path; use ~{best_mib} MiB slots.", best_hidden * 100.0)
+        } else if best_hidden > 0.25 {
+            format!("PARTIAL — best {:.0}% hidden at {best_mib} MiB. Streaming can pay but needs more resident pins (fewer streamed experts) or a finer grain. Worth wiring cautiously.", best_hidden * 100.0)
         } else {
-            "NO-GO on this path — the copy serializes with compute, so streaming adds ~copy time per token. Prefer Metal for oversized models, or stream at a much finer grain."
+            "NO-GO on this path — the copy serializes with compute at every size, so streaming adds ~copy time per token. Keep oversized MoE on Metal; don't wire the streaming execution.".to_string()
         };
         println!("  VERDICT: {verdict}");
-        if gpu.adapter_name.to_lowercase().contains("llvmpipe") || gpu.adapter_name.to_lowercase().contains("lavapipe") {
-            println!("  NOTE: this is software Vulkan (lavapipe) — no real host/device split, so these numbers are NOT representative. Run on the M2 for the real verdict.");
-        }
+        if any_clamped { println!("  NOTE: some sizes were clamped to the device max_buffer_size — those rows aren't the size you asked for."); }
+        if is_sw { println!("  NOTE: software Vulkan (lavapipe) — no real host/device split, so these numbers are NOT representative. Run on the M2."); }
         return;
     }
     if args.iter().any(|a| a == "--gate-submit") {
