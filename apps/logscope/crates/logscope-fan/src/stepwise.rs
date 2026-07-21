@@ -27,6 +27,17 @@ pub const CONTINUE_NUDGE: &str = "(Continue: produce the NEXT step's actual code
 not a restatement. Do the work, then write your ⏸ STEP marker. If everything is truly done, write \
 TASK_COMPLETE instead.)";
 
+/// Optional addendum encouraging the model to break its work at NATURAL SEAMS — the explain↔code boundary
+/// and each new thought — not just at numbered steps. These are the points where a review, a checkpoint, or
+/// a fan-out is most useful. The harness detects the same seams deterministically (segment.rs); this just
+/// aligns the model's own structure with them so the pauses land on real cognitive boundaries. Kept as a
+/// separate const so callers can add it independently of the numbered-step protocol.
+pub const SEAM_PROTOCOL: &str = "\n\nWORK IN NATURAL UNITS: finish one coherent thought or one code unit \
+before moving on. When you shift from explaining to writing code (or from code back to explaining what it \
+does), that's a natural checkpoint — a good moment to glance back and confirm the code you just wrote \
+matches what you described. Prefer a clean seam (finish the function, close the code block) over stopping \
+mid-construct.";
+
 /// A parsed step marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StepMark { pub k: u32, pub n: u32, pub summary: String }
