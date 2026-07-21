@@ -1143,6 +1143,33 @@ pub struct MoeLayer {
     /// down [d, sff] (sff read from the tensor itself; shared width differs from the routed ff).
     /// None for qwen3moe. This is the GLM-5.2 / DeepSeek-path stepping stone.
     pub shared: Option<(Lin, Lin)>,
+    /// STREAMING (LOGSCOPE_MOE_STREAM): when set, the routed experts are NOT all resident — cold experts'
+    /// q4 bytes live host-side here and are filled into GPU slots on demand at decode. None = fully resident
+    /// (unchanged path). Built by the loader only when streaming is enabled and the model is over-ceiling.
+    pub stream: Option<std::sync::Mutex<MoeStream>>,
+}
+
+/// Host-side streaming store for one MoE layer's routed experts. Holds each expert's already-quantized q4
+/// bytes (gate_up + down) host-resident, a GPU slot pool (StreamSlots) sized to hold the cold working set,
+/// and the LRU policy (expert_cache::LayerSlots) that decides which slot each cold expert lands in. Leans
+/// on Colibri's pin∪LRU∪load tiering: pinned hot experts stay resident in `pinned_gu`/`pinned_dn`; the rest
+/// stream through the slots. Filled per token in moe_ffn_v1.
+pub struct MoeStream {
+    pub n_expert: usize,
+    pub gu_rows: usize, pub gu_k: usize,   // gate_up expert shape [2ff, d]
+    pub dn_rows: usize, pub dn_k: usize,   // down expert shape [d, ff]
+    // per-expert host q4 bytes (qw ‖ qs concatenated per matrix); indexed [expert] → (gu_bytes, dn_bytes)
+    pub host_gu: Vec<Vec<u8>>,
+    pub host_dn: Vec<Vec<u8>>,
+    pub gu_qs_off: usize,                   // byte offset where qs begins within a gu blob (qw len)
+    pub dn_qs_off: usize,
+    // GPU slots: 2 per ring entry (gate_up + down). policy tracks expert→slot-index.
+    pub gu_slots: StreamSlots,
+    pub dn_slots: StreamSlots,
+    pub policy: crate::expert_cache::LayerSlots,
+    // pinned hot experts resident (Colibri's hot-store): expert id → (qw buffer, qs buffer) for gate_up/down
+    pub pinned_gu: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
+    pub pinned_dn: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
 }
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
@@ -1221,6 +1248,77 @@ pub struct QWeight { pub qw: Tensor, pub qs: Tensor, pub n: usize, pub k: usize 
 /// (~40 GiB). Symmetric f32-scale (not the GGUF q4_0 f16-scale on-disk format) so CPU and GPU dequant
 /// identically and the matmul is bit-exact against a reference.
 pub struct Q4Weight { pub qw: Tensor, pub qs: Tensor, pub n: usize, pub k: usize }
+
+/// GPU-side stream slots: the MECHANISM half of MoE expert streaming (the policy half is the pure
+/// `expert_cache::LayerSlots`). A fixed pool of resident buffers, each holding one streamed (cold) expert's
+/// weight bytes. When the policy returns Miss(slot), `fill(slot, bytes)` writes that expert's q4 bytes into
+/// the slot via `write_buffer` — the path the M2 probe measured fastest (~1-2 ms for a 32-64 MiB
+/// expert-layer). The slot buffer is then bound like any resident weight for the expert's matvec.
+///
+/// Deliberately isolated from the live decode path: this is milestone-1 of the streaming mechanism, built
+/// and round-trip tested on its own before any wiring into moe_ffn. slot_bytes = one expert-layer at
+/// residency (q4); n_slots ≥ the streaming ring (top_k + a prefetch spare).
+pub struct StreamSlots {
+    slots: Vec<wgpu::Buffer>,
+    slot_bytes: u64,
+}
+
+impl StreamSlots {
+    /// Allocate `n_slots` resident buffers of `slot_bytes` each. Each buffer is STORAGE (bound for the
+    /// matvec) + COPY_DST (filled by write_buffer) + COPY_SRC (readback for verification). slot_bytes must
+    /// not exceed the device max_buffer_size (an expert-layer is far under it; caller sizes to ~32-64 MiB).
+    pub fn new(gpu: &Gpu, n_slots: usize, slot_bytes: u64) -> Self {
+        let cap = gpu.device.limits().max_buffer_size;
+        let slot_bytes = slot_bytes.min(cap).max(4);
+        let slots = (0..n_slots).map(|i| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("expert-stream-slot"),
+            size: slot_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        })).collect::<Vec<_>>();
+        StreamSlots { slots, slot_bytes }
+    }
+
+    pub fn n_slots(&self) -> usize { self.slots.len() }
+    pub fn slot_bytes(&self) -> u64 { self.slot_bytes }
+
+    /// Fill slot `idx` with a cold expert's bytes (the M2 fast path: write_buffer). `bytes` is one
+    /// expert-layer's q4 weights, mmap'd straight from the GGUF — no intermediate copy. Bytes longer than
+    /// the slot are truncated (shouldn't happen: slots are sized to the expert-layer); shorter is fine.
+    pub fn fill(&self, gpu: &Gpu, idx: usize, bytes: &[u8]) {
+        let Some(buf) = self.slots.get(idx) else { return };
+        let n = (bytes.len() as u64).min(self.slot_bytes) as usize;
+        if n == 0 { return; }
+        gpu.queue.write_buffer(buf, 0, &bytes[..n]);
+    }
+
+    /// The raw slot buffer handle (cloned; wgpu buffers are Arc-backed) for binding as a weight.
+    pub fn slot_buf(&self, idx: usize) -> wgpu::Buffer { self.slots[idx.min(self.slots.len().saturating_sub(1))].clone() }
+
+    /// The slot buffer, wrapped as a Tensor view so it binds in a kernel like any resident weight. `rows`,
+    /// `cols` describe the expert weight matrix living in the slot.
+    pub fn tensor(&self, idx: usize, rows: usize, cols: usize) -> Option<Tensor> {
+        let buf = self.slots.get(idx)?.clone();
+        Some(Tensor { buf, rows, cols, pool: None, view: None })
+    }
+
+    /// Read `len` bytes back from slot `idx` — for verification/tests (fills must land intact).
+    pub fn readback(&self, gpu: &Gpu, idx: usize, len: usize) -> Vec<u8> {
+        let Some(buf) = self.slots.get(idx) else { return Vec::new() };
+        let len = (len as u64).min(self.slot_bytes) as usize;
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor { label: Some("slot-readback"),
+            size: len.max(4) as u64, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, len as u64);
+        gpu.queue.submit(Some(enc.finish()));
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range().to_vec();
+        staging.unmap();
+        data
+    }
+}
 
 /// Little-endian cursor over the int8 cache blob. Every read is bounds-checked and returns Option,
 /// so any truncation/corruption makes `load_int8_cache` fail cleanly (→ fall back to GGUF).
@@ -1987,6 +2085,147 @@ impl Gpu {
         });
         Q4Weight { qw: self.upload_u32_resident(&qw), qs: self.upload_resident(&qs, n, kb), n, k }
     }
+
+    /// Quantize to q4 and return the RESIDENT BYTES host-side (qw ‖ qs) instead of uploading — for the
+    /// streaming store, which keeps cold experts host-resident and fills them into GPU slots on demand.
+    /// Layout: [qw: n*k/8 u32 little-endian][qs: n*kb f32 little-endian]. qs_off = qw byte length.
+    pub fn quantize_q4_host_bytes(&self, w: &[f32], n: usize, k: usize) -> (Vec<u8>, usize) {
+        let q = self.quantize_q4_resident_cpu(w, n, k);
+        let qw_bytes: &[u8] = bytemuck::cast_slice(&q.0);
+        let qs_bytes: &[u8] = bytemuck::cast_slice(&q.1);
+        let qs_off = qw_bytes.len();
+        let mut out = Vec::with_capacity(qw_bytes.len() + qs_bytes.len());
+        out.extend_from_slice(qw_bytes);
+        out.extend_from_slice(qs_bytes);
+        (out, qs_off)
+    }
+
+    /// Resolve one routed expert to its (gate_up, down) q4 Lins via the streaming store: pinned → resident
+    /// Lin; else LRU slot (fill from host bytes on a miss, reuse on a hit). This is the per-expert fill-on-
+    /// demand that lets an over-ceiling MoE decode on Asahi. Leans on Colibri's pin∪LRU∪load tiering.
+    fn stream_expert_lins(&self, sm: &std::sync::Mutex<MoeStream>, e: u32) -> (Lin, Lin) {
+        let mut s = sm.lock().unwrap();
+        let (gu_rows, gu_k, dn_rows, dn_k) = (s.gu_rows, s.gu_k, s.dn_rows, s.dn_k);
+        // pinned hot expert → resident buffers
+        if let (Some((gqw, gqs)), Some((dqw, dqs))) = (s.pinned_gu.get(&e).cloned(), s.pinned_dn.get(&e).cloned()) {
+            let _ = s.policy.access(e);
+            return (self.q4_lin_from_bufs(&gqw, &gqs, gu_rows, gu_k), self.q4_lin_from_bufs(&dqw, &dqs, dn_rows, dn_k));
+        }
+        let (gu_off, dn_off) = (s.gu_qs_off, s.dn_qs_off);
+        let acc = s.policy.access(e);
+        let slot = match acc { crate::expert_cache::Access::Hit(x) | crate::expert_cache::Access::Miss(x) => x as usize, crate::expert_cache::Access::Pinned => 0 };
+        if matches!(acc, crate::expert_cache::Access::Miss(_)) {
+            let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
+            let dn_bytes = std::mem::take(&mut s.host_dn[e as usize]);
+            s.gu_slots.fill(self, slot, &gu_bytes);
+            s.dn_slots.fill(self, slot, &dn_bytes);
+            s.host_gu[e as usize] = gu_bytes;
+            s.host_dn[e as usize] = dn_bytes;
+        }
+        let gu_buf = s.gu_slots.slot_buf(slot);
+        let dn_buf = s.dn_slots.slot_buf(slot);
+        let gu = self.q4_lin_from_slots(&gu_buf, gu_off, gu_rows, gu_k, None);
+        let dn = self.q4_lin_from_slots(&dn_buf, dn_off, dn_rows, dn_k, None);
+        (gu, dn)
+    }
+
+    /// TEST HELPER: build a MoeStream from raw f32 expert weights (same weights a resident MoeLayer would
+    /// use), so --gate-moe-stream can verify the streamed decode path is bit-exact to the resident one.
+    /// `gus[e]` is expert e's [2ff, d] gate‖up; `dns[e]` is [d, ff] down. `pin` experts are pinned resident.
+    pub fn build_moe_stream_from_weights(&self, gus: &[Vec<f32>], dns: &[Vec<f32>], ff: usize, d: usize, n_used: usize, pin: usize) -> MoeStream {
+        let n_expert = gus.len();
+        let gu_rows = 2 * ff; let dn_rows = d;
+        let ring = (n_used + 1).max(2);
+        let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
+        let mut gu_qs_off = 0; let mut dn_qs_off = 0;
+        for e in 0..n_expert {
+            let (gb, goff) = self.quantize_q4_host_bytes(&gus[e], gu_rows, d);
+            gu_qs_off = goff; host_gu.push(gb);
+            let (db, doff) = self.quantize_q4_host_bytes(&dns[e], dn_rows, ff);
+            dn_qs_off = doff; host_dn.push(db);
+        }
+        let gu_slot_bytes = host_gu[0].len() as u64;
+        let dn_slot_bytes = host_dn[0].len() as u64;
+        let mut pinned_gu = std::collections::HashMap::new();
+        let mut pinned_dn = std::collections::HashMap::new();
+        for e in 0..pin.min(n_expert) {
+            pinned_gu.insert(e as u32, self.q4_bufs_from_host(&host_gu[e], gu_qs_off));
+            pinned_dn.insert(e as u32, self.q4_bufs_from_host(&host_dn[e], dn_qs_off));
+        }
+        let pinned_ids: Vec<u32> = (0..pin.min(n_expert) as u32).collect();
+        MoeStream {
+            n_expert, gu_rows, gu_k: d, dn_rows, dn_k: ff,
+            host_gu, host_dn, gu_qs_off, dn_qs_off,
+            gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
+            dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
+            policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
+            pinned_gu, pinned_dn,
+        }
+    }
+
+    /// Upload host q4 bytes (qw ‖ qs) to two resident GPU buffers (qw, qs). For pinned hot experts.
+    pub fn q4_bufs_from_host(&self, blob: &[u8], qs_off: usize) -> (wgpu::Buffer, wgpu::Buffer) {
+        let qw = self.upload_bytes(&blob[..qs_off], "pin-qw");
+        let qs = self.upload_bytes(&blob[qs_off..], "pin-qs");
+        (qw, qs)
+    }
+
+    /// Build a q4 Lin from separate qw/qs GPU buffers (pinned experts or filled slots), with the expert
+    /// shape [n, k]. Zero copy — wraps the existing buffers as Tensors the q4 kernel binds directly.
+    pub fn q4_lin_from_bufs(&self, qw: &wgpu::Buffer, qs: &wgpu::Buffer, n: usize, k: usize) -> Lin {
+        let kb = k / 32;
+        let qw_len = (n * k / 8 * 4) as u64;
+        let qs_len = (n * kb * 4) as u64;
+        let qwt = Tensor { buf: qw.clone(), rows: n, cols: k, pool: None, view: Some((0, qw_len)) };
+        let qst = Tensor { buf: qs.clone(), rows: n, cols: kb, pool: None, view: Some((0, qs_len)) };
+        Lin::q4(Q4Weight { qw: qwt, qs: qst, n, k })
+    }
+
+    /// CPU-only q4 quantization (the compute half of quantize_q4_resident, without the GPU upload). Returns
+    /// (qw u32 words, qs f32 scales).
+    fn quantize_q4_resident_cpu(&self, w: &[f32], n: usize, k: usize) -> (Vec<u32>, Vec<f32>) {
+        let kb = k / 32;
+        let mut qs = vec![0f32; n * kb];
+        let mut nib = vec![0u8; n * k];
+        for r in 0..n {
+            for b in 0..kb {
+                let base = r * k + b * 32;
+                let mut amax = 0f32;
+                for j in 0..32 { amax = amax.max(w[base + j].abs()); }
+                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                qs[r * kb + b] = scale;
+                for j in 0..32 {
+                    let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
+                    nib[r * k + b * 32 + j] = (qv + 8) as u8;
+                }
+            }
+        }
+        let mut qw = vec![0u32; n * k / 8];
+        for (li, word) in qw.iter_mut().enumerate() {
+            let i8b = li * 8;
+            let mut v = 0u32;
+            for b in 0..8 { v |= ((nib[i8b + b] & 0xF) as u32) << (b * 4); }
+            *word = v;
+        }
+        (qw, qs)
+    }
+
+    /// Build a q4 Lin whose weights live in two prefilled STREAM SLOTS (qw slot, qs slot). The slots were
+    /// filled with quantize_q4_host_bytes output; here we just wrap them as Tensors of the right shape so the
+    /// existing linear_q4_0_t kernel binds them exactly like a resident weight. Zero copy — the bytes are
+    /// already on the GPU from the fill.
+    pub fn q4_lin_from_slots(&self, gu_slot: &wgpu::Buffer, qs_off: usize, n: usize, k: usize, split_buf: Option<&wgpu::Buffer>) -> Lin {
+        let kb = k / 32;
+        let qw_len = (n * k / 8 * 4) as u64;
+        let qs_len = (n * kb * 4) as u64;
+        // qw and qs share one slot buffer (qs at byte qs_off) unless a split buffer is given.
+        let qw = Tensor { buf: gu_slot.clone(), rows: n, cols: k, pool: None, view: Some((0, qw_len)) };
+        let qs = match split_buf {
+            Some(b) => Tensor { buf: b.clone(), rows: n, cols: kb, pool: None, view: Some((0, qs_len)) },
+            None => Tensor { buf: gu_slot.clone(), rows: n, cols: kb, pool: None, view: Some((qs_off as u64, qs_len)) },
+        };
+        Lin::q4(Q4Weight { qw, qs, n, k })
+    }
     /// Resident fused dequant+linear: C[m,n] = A[m,k] · dequant(W)ᵀ, weights int8.
     /// m=1 decode mat-vec with an explicit column tile (1 = classic one-workgroup-per-column;
     /// >1 = tiled, reusing each activation read across `tile` columns). Split out so the tiled and
@@ -2573,10 +2812,19 @@ impl Gpu {
                 self.dispatch(ROW_SCALE, &[&rows, &wgt], &scaled, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
                 (scaled, self.upload(&vec![1.0f32; n], 1, n))
             } else { (rows, wgt) };
-            // expert FFN, batched over its n tokens (existing kernels; gate/up unfused per expert)
-            let gu = m.gate_up[e].apply(self, &rows, n);
-            let hmid = self.swiglu_packed(&gu);
-            let dn = m.down[e].apply(self, &hmid, n);
+            // expert FFN, batched over its n tokens. STREAMING: if this layer streams, resolve expert e
+            // through the pin∪LRU∪fill store (fills a slot from host q4 bytes on a miss); else use the
+            // resident view.
+            let dn = if let Some(sm) = &m.stream {
+                let (gu_lin, dn_lin) = self.stream_expert_lins(sm, e as u32);
+                let gu = gu_lin.apply(self, &rows, n);
+                let hmid = self.swiglu_packed(&gu);
+                dn_lin.apply(self, &hmid, n)
+            } else {
+                let gu = m.gate_up[e].apply(self, &rows, n);
+                let hmid = self.swiglu_packed(&gu);
+                m.down[e].apply(self, &hmid, n)
+            };
             // out[token] += weight * dn[i]
             self.dispatch(SCATTER_ADD_W, &[&dn, &idx, &wgt], &out, bytemuck::cast_slice(&dims), wg1((n * d) as u32));
         }
@@ -5425,7 +5673,57 @@ impl Gpu {
                         if i == 0 { eprintln!("wgpu-engine: shared-expert MoE — shexp ff={sff} on top of {n_expert} routed"); }
                         Some((sgu, sdn))
                     } else { None };
-                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared,
+                    // STREAMING: when LOGSCOPE_MOE_STREAM is set, build a host-side streaming store for the
+                    // routed experts (cold experts filled into GPU slots on demand at decode). Pins the
+                    // hottest N experts resident (Colibri hot-store). The resident stacked_gu/down still
+                    // exist (built above) but on a real over-ceiling model the loader would skip them; here
+                    // we keep them for correctness fallback and let stream, when present, override at decode.
+                    let stream = if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() && q4_mode {
+                        // pin the hottest experts (heuristic: first PIN of them; a heat pass could reorder).
+                        // A real over-ceiling load would skip resident upload of the cold experts; here the
+                        // resident stack still exists as a correctness fallback and stream overrides decode.
+                        let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize).min(n_expert);
+                        let ring = (n_expert_used + 1).max(2); // top_k active + prefetch spare
+                        let gu_rows = 2 * expert_ff; let dn_rows = d;
+                        // per-expert host q4 bytes
+                        let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
+                        let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
+                        let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
+                        let ec = expert_ff * d;
+                        let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
+                        let mut gu_qs_off = 0; let mut dn_qs_off = 0;
+                        for e in 0..n_expert {
+                            let mut cat = Vec::with_capacity(2 * ec);
+                            cat.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                            cat.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                            let (gb, goff) = self.quantize_q4_host_bytes(&cat, gu_rows, d);
+                            gu_qs_off = goff; host_gu.push(gb);
+                            let (db, doff) = self.quantize_q4_host_bytes(&dsrc[e * d * expert_ff..(e + 1) * d * expert_ff], dn_rows, expert_ff);
+                            dn_qs_off = doff; host_dn.push(db);
+                        }
+                        drop(gsrc); drop(usrc); drop(dsrc);
+                        let gu_slot_bytes = host_gu[0].len() as u64;
+                        let dn_slot_bytes = host_dn[0].len() as u64;
+                        // pinned hot experts as resident Lins (upload once)
+                        let mut pinned_gu = std::collections::HashMap::new();
+                        let mut pinned_dn = std::collections::HashMap::new();
+                        for e in 0..pin {
+                            pinned_gu.insert(e as u32, self.q4_bufs_from_host(&host_gu[e], gu_qs_off));
+                            pinned_dn.insert(e as u32, self.q4_bufs_from_host(&host_dn[e], dn_qs_off));
+                        }
+                        let pinned_ids: Vec<u32> = (0..pin as u32).collect();
+                        let stream = MoeStream {
+                            n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
+                            host_gu, host_dn, gu_qs_off, dn_qs_off,
+                            gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
+                            dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
+                            policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
+                            pinned_gu, pinned_dn,
+                        };
+                        if i == 0 { eprintln!("wgpu-engine: MoE STREAMING on — {n_expert} experts host-resident, {pin} pinned, ring={ring}"); }
+                        Some(std::sync::Mutex::new(stream))
+                    } else { None };
+                    Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
