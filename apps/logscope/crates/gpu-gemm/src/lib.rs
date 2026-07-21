@@ -1294,59 +1294,53 @@ impl Gpu {
         Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, view: None }
     }
 
-    /// EXPERT-STREAM PROBE (the M2 go/no-go). The whole MoE-streaming architecture rests on one hardware
-    /// fact we can't measure in-container: on Honeykrisp, does filling a slot buffer from host RAM (the
-    /// streamed cold expert) OVERLAP a compute dispatch (the resident experts' matmuls), or serialize? If it
-    /// overlaps, streaming hides the copy under compute and pays; if it serializes at ~slot-bytes/token, the
-    /// per-token budget blows and Scout only runs on Metal. `slot_mib` sizes the streamed slot — the REAL
-    /// unit is ONE expert in ONE layer (~64-128 MiB for Scout), NOT a whole expert (all layers). Returns
-    /// (copy_ms, dispatch_ms, overlapped_ms, serial_ms, actual_mib) — actual_mib < slot_mib means it was
-    /// clamped to the device's max_buffer_size (a single buffer can't exceed it — Honeykrisp caps ~2047 MiB).
-    pub fn probe_expert_stream(&self, slot_mib: usize, iters: usize) -> (f64, f64, f64, f64, usize) {
-        // Clamp to the device's per-buffer ceiling — a slot bigger than max_buffer_size can't be allocated
-        // (it silently invalidates and write_buffer no-ops, producing meaningless ~0 ms copies). The real
-        // streamed unit (one expert-layer) is far under this, so clamping only guards a mis-sized probe.
+    /// EXPERT-STREAM PROBE (the M2 go/no-go), corrected. The first cut asked "does the copy overlap
+    /// compute?" and used write_buffer — but write_buffer STAGES (copies host→staging belt→device), which on
+    /// unified memory is the wrong path: it measured ~12 GiB/s on an 800 GiB/s machine. And it compared a big
+    /// copy to a tiny matmul, so overlap was unmeasurable. The RIGHT question on UMA isn't overlap (wgpu
+    /// serializes one queue anyway) — it's whether the slot FILL is cheap enough on the fast path that
+    /// streaming pays without overlap. So this measures TWO fill paths for a realistic expert-layer slot:
+    ///   * staged   — queue.write_buffer (the discrete path; staging belt).
+    ///   * mapped    — create(mapped_at_creation) + CPU memcpy into the device-visible backing + unmap (the
+    ///                 UMA direct path the arena uses; host==device RAM so it's a plain memcpy).
+    /// Returns (staged_ms, mapped_ms, actual_mib). Bandwidth = actual_mib/ms; the caller compares the fast
+    /// path's per-expert-layer cost against a real decode token budget.
+    pub fn probe_expert_stream(&self, slot_mib: usize, iters: usize) -> (f64, f64, usize) {
         let max_buf = self.device.limits().max_buffer_size as usize;
         let bytes = (slot_mib * (1 << 20)).min(max_buf & !255).max(4);
         let actual_mib = bytes / (1 << 20);
         let host = vec![0u8; bytes];
-        let slot = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("stream-slot"), size: bytes as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let (n, k) = (2048usize, 2048);
-        let w = self.quantize_q8_resident(&vec![0.1f32; n * k], n, k);
-        let x = self.upload(&vec![0.1f32; k], 1, k);
         let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
 
-        for _ in 0..2 { self.queue.write_buffer(&slot, 0, &host); let _ = self.linear_q8_0_t(&x, &w, 1); }
+        // (1) STAGED fill: re-fillable STORAGE buffer via write_buffer (the discrete-GPU path).
+        let staged_slot = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stream-slot-staged"), size: bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        for _ in 0..2 { self.queue.write_buffer(&staged_slot, 0, &host); }
         wait();
-
         let t = std::time::Instant::now();
-        for _ in 0..iters { self.queue.write_buffer(&slot, 0, &host); wait(); }
-        let copy_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        for _ in 0..iters { self.queue.write_buffer(&staged_slot, 0, &host); wait(); }
+        let staged_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-        let t = std::time::Instant::now();
-        for _ in 0..iters { let y = self.linear_q8_0_t(&x, &w, 1); wait(); let _ = y; }
-        let dispatch_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
+        // (2) MAPPED fill: the UMA direct path — create the slot mapped_at_creation, memcpy the expert bytes
+        // straight into its device-visible backing, unmap. This is what the arena does for resident weights;
+        // a streamed slot recreates a fresh mapped buffer per swap. On UMA the memcpy runs at ~memory
+        // bandwidth (no staging belt). Includes the create+unmap cost (a real per-swap cost).
+        for _ in 0..2 {
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("warm"), size: bytes as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
+            b.slice(..).get_mapped_range_mut().copy_from_slice(&host); b.unmap();
+        }
         let t = std::time::Instant::now();
         for _ in 0..iters {
-            self.queue.write_buffer(&slot, 0, &host);
-            let y = self.linear_q8_0_t(&x, &w, 1);
-            wait();
-            let _ = y;
+            let b = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("stream-slot-mapped"), size: bytes as u64,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: true });
+            b.slice(..).get_mapped_range_mut().copy_from_slice(&host);
+            b.unmap();
         }
-        let overlapped_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+        let mapped_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-        let t = std::time::Instant::now();
-        for _ in 0..iters {
-            self.queue.write_buffer(&slot, 0, &host); wait();
-            let y = self.linear_q8_0_t(&x, &w, 1); wait();
-            let _ = y;
-        }
-        let serial_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-
-        (copy_ms, dispatch_ms, overlapped_ms, serial_ms, actual_mib)
+        (staged_ms, mapped_ms, actual_mib)
     }
     /// Upload `bytes` as a resident STORAGE buffer, zero-copy on unified memory. On UMA (Apple/Asahi) the
     /// buffer's backing IS host RAM, so `mapped_at_creation` + one memcpy writes straight into device memory
