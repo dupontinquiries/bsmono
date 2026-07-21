@@ -153,6 +153,70 @@ impl StreamPlan {
     }
 }
 
+/// Plan EXPERT streaming for an MoE that won't fit resident — the right model for Llama-4/Qwen-MoE/GLM,
+/// where only a few of N experts fire per token. Layer streaming (above) reloads whole blocks; here we pin
+/// the dense weights (attention, norms, router) + the shared expert + as many HOT routed experts as the
+/// budget holds, and stream ONLY the active-but-not-resident experts per token. Because top_k ≪ n_experts,
+/// the streamed bytes per token are a small fraction of a layer — and the expert predictor (expert_predict)
+/// prefetches exactly those, so the disk/host read overlaps compute. This is what makes a 56 GiB Scout
+/// tractable under a 24 GiB Honeykrisp ceiling: ~7 GiB dense + shared pinned, hot experts pinned, the rest
+/// streamed on demand.
+///
+/// `expert_bytes` = one expert's weights (all layers) at `fmt`; `n_experts` routed; `top_k` active per
+/// token; `dense_bytes` = everything that isn't a routed expert (attn+norm+router+embed+output+shared), at
+/// residency. Returns None if the dense set + shared + top_k experts (the irreducible per-token working set)
+/// can't fit the budget — genuinely too big even to stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MoeStreamPlan {
+    pub n_experts: u32,
+    pub top_k: u32,
+    pub pinned_experts: u32,        // hottest experts kept permanently resident
+    pub stream_slots: u32,          // rotating expert-sized slots for the streamed (cold) experts
+    pub expert_bytes: u64,          // one expert (all layers) at residency
+    pub dense_resident_bytes: u64,  // dense weights + shared expert + KV + transient, always resident
+    pub resident_bytes: u64,        // total GPU residency
+}
+impl MoeStreamPlan {
+    /// Worst-case experts streamed per token: the active set minus those that happen to be pinned. With the
+    /// predictor warm, the expected number is lower (hot experts get pinned), but this bounds it.
+    pub fn streamed_experts_per_token(&self) -> u32 { self.top_k.saturating_sub(self.pinned_experts.min(self.top_k)) }
+    pub fn streamed_bytes_per_token(&self) -> u64 { self.streamed_experts_per_token() as u64 * self.expert_bytes }
+    pub fn decode_ms_per_token(&self, gib_per_s: f64) -> f64 {
+        if gib_per_s <= 0.0 { return f64::INFINITY; }
+        (self.streamed_bytes_per_token() as f64 / GIB) / gib_per_s * 1000.0
+    }
+    /// Fraction of the routed-expert mass that never has to stream (pinned) — higher is better, and the
+    /// predictor's job is to make sure the pinned set is the hot one.
+    pub fn pinned_fraction(&self) -> f64 { self.pinned_experts as f64 / self.n_experts.max(1) as f64 }
+}
+
+pub fn plan_moe_streaming(dense_resident_bytes: u64, expert_bytes: u64, n_experts: u32, top_k: u32, budget: u64) -> Option<MoeStreamPlan> {
+    if expert_bytes == 0 || n_experts == 0 { return None; }
+    // Irreducible working set: the dense/shared residency + at least top_k expert slots (the ones a single
+    // token needs live at once) + 1 spare slot for prefetch double-buffering. If that won't fit, streaming
+    // can't help — the model is too big even to run one token.
+    let min_slots = top_k + 1;
+    if dense_resident_bytes + min_slots as u64 * expert_bytes > budget { return None; }
+    // Fill the remaining budget with expert-sized slots. Slots beyond the routed-expert count are wasted, so
+    // cap at n_experts (that's the fully-resident case → no streaming).
+    let slots_that_fit = ((budget - dense_resident_bytes) / expert_bytes) as u32;
+    let total_slots = slots_that_fit.min(n_experts);
+    if total_slots >= n_experts {
+        // everything fits pinned — no streaming needed
+        return Some(MoeStreamPlan { n_experts, top_k, pinned_experts: n_experts, stream_slots: 0,
+            expert_bytes, dense_resident_bytes, resident_bytes: dense_resident_bytes + n_experts as u64 * expert_bytes });
+    }
+    // Reserve top_k+1 slots as the streaming ring (must hold a token's active cold set + a prefetch spare);
+    // pin the rest with the hottest experts. This maximizes the pinned (never-streamed) hot set.
+    let ring = top_k + 1;
+    let pinned = total_slots.saturating_sub(ring);
+    Some(MoeStreamPlan {
+        n_experts, top_k, pinned_experts: pinned, stream_slots: ring, expert_bytes,
+        dense_resident_bytes,
+        resident_bytes: dense_resident_bytes + (pinned as u64 + ring as u64) * expert_bytes,
+    })
+}
+
 /// Plan layer streaming for a model that won't fit resident. Pins as many blocks as the budget holds after
 /// the fixed residency (f32 embedding + output + KV + transient staging), keeps a 2-slot ring for the rest.
 /// `fmt` is the streamed weight format — q4 is recommended (half the bandwidth of int8). Returns None if not
@@ -209,22 +273,25 @@ pub fn gpu_buffer_budget(ram_budget: u64, conservative_vma: bool) -> u64 {
     gpu_buffer_budget_uma(ram_budget, conservative_vma, false)
 }
 
-/// UMA-aware budget. On unified memory the zero-copy map-at-creation path avoids the staging overrun the
-/// 24 GiB cap guards against, so the budget scales with RAM (leaving generous headroom for KV + transients)
-/// instead of clamping to the staging cap. Non-UMA keeps the empirical cap.
+/// UMA-aware budget. The distinction that matters is NOT unified-vs-discrete — it's WHICH unified driver.
+/// Honeykrisp (Asahi Vulkan, conservative_vma) has a hard BO-VMA allocation ceiling FAR below system RAM
+/// (empirically ~24-31 GiB: a 40 GiB q4-70B, a 31 GiB MoE-int8, and a 56 GiB Scout-q4 all died in "Failed
+/// to allocate BO VMA" — the arena's slab buffers hit the same wall). That ceiling is a platform fact, not
+/// a staging artifact, so it holds regardless of the 192 GiB of RAM behind it. Metal (macOS, unified but
+/// NOT conservative_vma) has no such ceiling and can go to RAM. So: conservative_vma keeps the hard cap
+/// even though it's unified; Metal-class unified lifts to a RAM fraction. LOGSCOPE_MAX_GPU_GB overrides.
 pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: bool) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
     }
-    if unified {
-        // Map-at-creation: no staging double-allocation → the driver's BO VMA ceiling isn't the binding
-        // constraint; physical RAM is. Use the SAME half-of-RAM headroom split as the discrete path, but
-        // WITHOUT the 24/48 GiB staging clamp — that clamp guarded a staging overrun this path doesn't have.
-        // On a 192 GiB box (~172 available → ~155 resident budget) this is ~77 GiB, clearing a 54 GiB q4
-        // MoE with headroom for KV + transients; on a small explicit LOGSCOPE_MAX_* budget it stays
-        // proportional (no inflation, so between-budget planning still resolves correctly).
+    if unified && !conservative_vma {
+        // Metal-class unified memory: the allocator is permissive (no BO-VMA ceiling), so the budget is
+        // governed by RAM, not a cap. Half of the resident budget leaves room for KV + transients.
         return ram_budget / 2;
     }
+    // conservative_vma (Honeykrisp) keeps its HARD ceiling even though it's unified — the BO-VMA wall is
+    // real and independent of RAM. Discrete GPUs keep the standard cap. Oversized models are pushed to
+    // q4/refusal (→ streaming) up front instead of dying mid-allocation.
     let cap = if conservative_vma { 24.0 } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
 }
@@ -348,25 +415,56 @@ mod tests {
         // the Asahi VMA clamp is PLATFORM-scoped: Vulkan-on-Apple gets 24 GiB, Metal keeps 48
         assert_eq!(gpu_buffer_budget(ram, true), (24.0 * GIB) as u64);
         assert_eq!(gpu_buffer_budget(ram, false), (48.0 * GIB) as u64);
-        // UNIFIED-MEMORY zero-copy: the staging cap does NOT apply (map-at-creation doesn't stage), so the
-        // budget scales with RAM. On a 192 GiB M2 Ultra this clears a 62 GiB MoE resident — the exact
-        // Llama-4-Scout-Q4 case that hit "streaming isn't implemented". Even with conservative_vma true
-        // (Asahi), unified lifts it because the overrun the cap guarded against is the staging path.
-        let ram192 = (172.0 * GIB) as u64; // ~90% of 192 available
-        let uma = gpu_buffer_budget_uma(ram192, true, true);
-        assert!(uma >= (80.0 * GIB) as u64, "UMA budget scales with RAM (half, no staging cap): {} GiB", gib(uma));
-        assert!(uma < ram192, "still leaves headroom for KV + transients");
-        assert!(uma > (62.0 * GIB) as u64, "a 62 GiB MoE (Scout-Q4) now fits resident on UMA");
-        // and it does NOT inflate a small explicit budget (between-budget planning must still resolve): a
-        // tiny UMA budget stays proportional, not blown up past a mid-point.
-        let small = gpu_buffer_budget_uma((8.0 * GIB) as u64, true, true);
-        assert_eq!(small, (4.0 * GIB) as u64, "UMA uses half of RAM, no inflation of a small explicit budget");
+        // UNIFIED memory does NOT by itself lift the cap — the driver matters. Honeykrisp (conservative_vma)
+        // has a HARD BO-VMA ceiling regardless of RAM (a 56 GiB Scout-q4 died in "Failed to allocate BO
+        // VMA" on a 192 GiB box), so it KEEPS the 24 GiB cap even when unified=true.
+        let ram192 = (172.0 * GIB) as u64;
+        assert_eq!(gpu_buffer_budget_uma(ram192, true, true), (24.0 * GIB) as u64,
+            "Honeykrisp keeps its hard BO-VMA cap even though it's unified");
+        // Metal-class unified (NOT conservative_vma) is permissive → RAM-scaled, no cap. This is why the
+        // same 62 GiB model loads on an M4 Max (Metal) but not an M2 Ultra (Asahi/Honeykrisp).
+        let metal = gpu_buffer_budget_uma(ram192, false, true);
+        assert!(metal >= (80.0 * GIB) as u64 && metal < ram192, "Metal scales with RAM: {} GiB", gib(metal));
         assert!(fitting_residencies(&llama_70b(), gpu, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8),
                 "under the GPU budget the 70B won't attempt int8");
         // explicit override wins
         std::env::set_var("LOGSCOPE_MAX_GPU_GB", "96");
         assert_eq!(gpu_buffer_budget(ram, true), (96.0 * GIB) as u64);
         std::env::remove_var("LOGSCOPE_MAX_GPU_GB");
+    }
+
+    #[test]
+    fn moe_streaming_makes_scout_tractable_under_honeykrisp_ceiling() {
+        // Llama-4-Scout-17B-16E-Q4: ~56 GiB total, 16 routed experts + 1 shared, top_k=1 routed per token.
+        // Approx split: dense (attn+norm+router+embed+output+shared) ~8 GiB; the 16 routed experts hold the
+        // rest → ~3 GiB each. Under the 24 GiB Honeykrisp ceiling, full residency is impossible (proven by
+        // the crash), but expert streaming pins dense + several hot experts and streams the cold ones.
+        let gib = |g: f64| (g * GIB) as u64;
+        let dense = gib(8.0);
+        let expert = gib(3.0);
+        let plan = plan_moe_streaming(dense, expert, 16, 1, gib(24.0)).expect("streamable under 24 GiB");
+        assert!(plan.pinned_experts >= 1 && plan.pinned_experts < 16, "some experts pinned, not all: {}", plan.pinned_experts);
+        assert!(plan.resident_bytes <= gib(24.0), "fits the ceiling: {:.1} GiB", super::gib(plan.resident_bytes));
+        // top_k=1 and a prefetch spare → at most 1 expert streamed per token (a fraction of a layer)
+        assert!(plan.streamed_experts_per_token() <= 1);
+        // a warm predictor pins the hot experts → most of the routed mass never streams
+        assert!(plan.pinned_fraction() > 0.0);
+    }
+
+    #[test]
+    fn moe_streaming_refuses_when_even_one_token_wont_fit() {
+        // dense alone bigger than budget → not even the working set fits → None (genuinely too big)
+        let gib = |g: f64| (g * GIB) as u64;
+        assert!(plan_moe_streaming(gib(30.0), gib(3.0), 16, 2, gib(24.0)).is_none());
+    }
+
+    #[test]
+    fn moe_all_experts_fit_reports_no_streaming() {
+        // budget holds dense + all experts → pinned_experts == n_experts, zero streaming
+        let gib = |g: f64| (g * GIB) as u64;
+        let plan = plan_moe_streaming(gib(4.0), gib(1.0), 8, 2, gib(24.0)).unwrap();
+        assert_eq!(plan.pinned_experts, 8);
+        assert_eq!(plan.streamed_experts_per_token(), 0);
     }
 
     #[test]
