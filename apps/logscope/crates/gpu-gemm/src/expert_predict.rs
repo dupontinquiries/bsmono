@@ -99,6 +99,92 @@ impl ExpertMap {
     pub fn has_lexical(&self, sig: CtxSig, layer: i32) -> bool { self.lexical.contains_key(&(sig, layer)) }
 
     pub fn is_empty(&self) -> bool { self.marginal.is_empty() }
+
+    /// Fold another branch's observations into this map (histogram add). This is how sibling fan-out
+    /// branches POOL their lexical maps: N branches exploring a related sub-problem collectively warm one
+    /// map, so a cold branch inherits every other branch's token→expert discoveries instead of warming from
+    /// scratch. Only ever call with a RELATED branch's map (see `branch_affinity`) — pooling a divergent
+    /// branch pollutes the prediction.
+    pub fn merge_from(&mut self, other: &ExpertMap) {
+        for (&k, m) in &other.lexical { let e = self.lexical.entry(k).or_default(); for (&x, &c) in m { *e.entry(x).or_insert(0) += c; } }
+        for (&k, m) in &other.marginal { let e = self.marginal.entry(k).or_default(); for (&x, &c) in m { *e.entry(x).or_insert(0) += c; } }
+        for (&k, m) in &other.coupling { let e = self.coupling.entry(k).or_default(); for (&x, &c) in m { *e.entry(x).or_insert(0) += c; } }
+    }
+
+    /// The distinct tokens this map has observed (its vocabulary) — the signal a relation-search compares
+    /// across branches to decide whether two fan-outs are exploring related work.
+    pub fn vocabulary(&self) -> std::collections::HashSet<u32> {
+        self.lexical.keys().map(|(sig, _)| sig.tok).collect()
+    }
+}
+
+/// Relation-search primitive: how related are two fan-out branches, by the Jaccard overlap of their token
+/// vocabularies? High = they reuse the same words (type names, keywords, APIs) → their expert-routing maps
+/// are correlated and worth pooling. Low = divergent sub-problems → pooling would pollute. This is the
+/// cheap, deterministic core of "small models searching for relations across fan-outs"; a small model can
+/// supply a semantic version, but lexical overlap is the buildable-now signal and needs no model.
+pub fn branch_affinity(a: &std::collections::HashSet<u32>, b: &std::collections::HashSet<u32>) -> f64 {
+    if a.is_empty() && b.is_empty() { return 1.0; }
+    let inter = a.intersection(b).count();
+    let uni = a.union(b).count();
+    if uni == 0 { 0.0 } else { inter as f64 / uni as f64 }
+}
+
+/// A pool of per-branch expert maps that share discoveries across RELATED fan-out branches. Each branch
+/// warms its own map from its own decode; when predicting, a branch also consults the pooled map built from
+/// every sibling whose `branch_affinity` clears a threshold — so a cold branch rides its relatives' warm-up.
+/// This is the fan-out cache accelerator: instead of N branches each warming independently, related ones
+/// collectively fill a shared map, and the prefetch hit-rate climbs immediately.
+#[derive(Default)]
+pub struct FanoutPool {
+    branches: Vec<BranchEntry>,
+    threshold: f64,
+}
+
+struct BranchEntry {
+    id: u64,
+    vocab: std::collections::HashSet<u32>,
+    map: ExpertMap,
+}
+
+impl FanoutPool {
+    /// `threshold` is the minimum branch_affinity to pool two branches (e.g. 0.2 — a fifth of vocabulary
+    /// shared). Higher = more conservative (only very related branches pool); lower = more sharing, more
+    /// pollution risk.
+    pub fn new(threshold: f64) -> Self { FanoutPool { branches: Vec::new(), threshold } }
+
+    /// Register (or replace) a branch's map + vocabulary. Called as each fan-out branch accumulates routing.
+    pub fn upsert(&mut self, id: u64, map: ExpertMap) {
+        let vocab = map.vocabulary();
+        if let Some(b) = self.branches.iter_mut().find(|b| b.id == id) { b.vocab = vocab; b.map = map; }
+        else { self.branches.push(BranchEntry { id, vocab, map }); }
+    }
+
+    /// Build a pooled map for branch `id`: its own map merged with every sibling whose affinity clears the
+    /// threshold. The result is what that branch predicts from — its own warm-up plus its relatives'. A
+    /// divergent sibling (low affinity) is left out, so its routing can't pollute this branch's prefetch.
+    pub fn pooled_for(&self, id: u64) -> ExpertMap {
+        let mut out = ExpertMap::new();
+        let Some(me) = self.branches.iter().find(|b| b.id == id) else { return out };
+        out.merge_from(&me.map);
+        for other in &self.branches {
+            if other.id == id { continue; }
+            if branch_affinity(&me.vocab, &other.vocab) >= self.threshold {
+                out.merge_from(&other.map);
+            }
+        }
+        out
+    }
+
+    /// How many siblings would pool with `id` at the current threshold (diagnostics / a UI "N related
+    /// branches feeding this one's cache" readout).
+    pub fn related_count(&self, id: u64) -> usize {
+        let Some(me) = self.branches.iter().find(|b| b.id == id) else { return 0 };
+        self.branches.iter().filter(|o| o.id != id && branch_affinity(&me.vocab, &o.vocab) >= self.threshold).count()
+    }
+
+    pub fn len(&self) -> usize { self.branches.len() }
+    pub fn is_empty(&self) -> bool { self.branches.is_empty() }
 }
 
 /// Top-`k` keys of a score map, highest first (deterministic tie-break by expert id for reproducibility).
@@ -181,5 +267,95 @@ mod tests {
         assert!(!m.has_lexical(CtxSig::unigram(3), 0));
         m.observe(CtxSig::unigram(3), 0, &[1], &[]);
         assert!(m.has_lexical(CtxSig::unigram(3), 0));
+    }
+
+    #[test]
+    fn branch_affinity_measures_vocabulary_overlap() {
+        use std::collections::HashSet;
+        let a: HashSet<u32> = [1, 2, 3, 4].into_iter().collect();
+        let b: HashSet<u32> = [3, 4, 5, 6].into_iter().collect(); // 2 shared / 6 union
+        let c: HashSet<u32> = [90, 91].into_iter().collect();     // disjoint
+        assert!((branch_affinity(&a, &b) - 2.0 / 6.0).abs() < 1e-9);
+        assert_eq!(branch_affinity(&a, &c), 0.0);
+    }
+
+    #[test]
+    fn cold_branch_inherits_a_related_sibling_warmup() {
+        // Branch 1 (warm): token 42 → experts {3,7} at layer 0, and shares vocabulary with branch 2.
+        let mut warm = ExpertMap::new();
+        for _ in 0..5 { warm.observe(CtxSig::unigram(42), 0, &[3, 7], &[]); }
+        for t in [10, 11, 12] { warm.observe(CtxSig::unigram(t), 0, &[1], &[]); } // shared vocab
+        // Branch 2 (cold on token 42) but overlapping vocabulary {10,11,12}.
+        let mut cold = ExpertMap::new();
+        for t in [10, 11, 12] { cold.observe(CtxSig::unigram(t), 0, &[1], &[]); }
+        let mut pool = FanoutPool::new(0.2);
+        pool.upsert(1, warm);
+        pool.upsert(2, cold);
+        assert_eq!(pool.related_count(2), 1, "branch 2 sees branch 1 as related");
+        // pooled map for the cold branch now predicts token 42's experts it never saw itself
+        let pooled = pool.pooled_for(2);
+        let pred = pooled.predict(CtxSig::unigram(42), 0, &[], 4);
+        assert!(pred.contains(&3) && pred.contains(&7), "cold branch inherits sibling's warm-up: {pred:?}");
+    }
+
+    #[test]
+    fn divergent_branch_is_not_pooled_no_pollution() {
+        // Branch A: token 42 → {3,7}, vocab {42, 10,11}. Branch B: totally different vocab {900,901,902},
+        // routing token 42 → {50,51} (a DIFFERENT approach). They must NOT pool.
+        let mut a = ExpertMap::new();
+        for _ in 0..5 { a.observe(CtxSig::unigram(42), 0, &[3, 7], &[]); }
+        for t in [10, 11] { a.observe(CtxSig::unigram(t), 0, &[1], &[]); }
+        let mut b = ExpertMap::new();
+        for _ in 0..5 { b.observe(CtxSig::unigram(42), 0, &[50, 51], &[]); }
+        for t in [900, 901, 902] { b.observe(CtxSig::unigram(t), 0, &[2], &[]); }
+        let mut pool = FanoutPool::new(0.2);
+        pool.upsert(1, a);
+        pool.upsert(2, b);
+        assert_eq!(pool.related_count(1), 0, "disjoint vocab → not related");
+        // A's pooled prediction for token 42 must stay {3,7}-led, NOT polluted by B's {50,51}
+        let pred = pool.pooled_for(1).predict(CtxSig::unigram(42), 0, &[], 2);
+        assert!(pred.contains(&3) && pred.contains(&7), "divergent branch didn't pollute: {pred:?}");
+        assert!(!pred.contains(&50) && !pred.contains(&51));
+    }
+
+    #[test]
+    fn merge_is_additive() {
+        let mut a = ExpertMap::new();
+        a.observe(CtxSig::unigram(1), 0, &[5], &[]);
+        let mut b = ExpertMap::new();
+        for _ in 0..3 { b.observe(CtxSig::unigram(1), 0, &[9], &[]); }
+        a.merge_from(&b);
+        // after merge, token 1 at layer 0 has seen 5 once and 9 three times → 9 leads
+        let pred = a.predict(CtxSig::unigram(1), 0, &[], 1);
+        assert_eq!(pred, vec![9]);
+    }
+
+    #[test]
+    fn pooling_lifts_a_thin_branch_recall_quantified() {
+        // The payoff, measured: a task's shared vocabulary of 30 tokens each route to a fixed expert set.
+        // 4 sibling branches each observe only a THIN slice (8 tokens) of that vocabulary — individually
+        // cold on the other 22. Pooled across the (all related) siblings, each branch can predict the whole
+        // vocabulary. Recall for a target branch on the FULL vocab should jump when pooled.
+        let mut pref = std::collections::HashMap::new();
+        for t in 0..30u32 { pref.insert(t, vec![(t % 8), (t % 8) + 8, (t % 8) + 16]); }
+        let mk = |toks: &[u32]| { let mut m = ExpertMap::new(); for &t in toks { for _ in 0..3 { m.observe(CtxSig::unigram(t), 0, &pref[&t], &[]); } } m };
+        let mut pool = FanoutPool::new(0.1);
+        // 4 branches, overlapping thin slices covering the vocab between them
+        pool.upsert(1, mk(&[0,1,2,3,4,5,6,7]));
+        pool.upsert(2, mk(&[6,7,8,9,10,11,12,13]));
+        pool.upsert(3, mk(&[12,13,14,15,16,17,18,19]));
+        pool.upsert(4, mk(&[18,19,20,21,22,23,24,25]));
+        // target = branch 1, alone vs pooled — recall over the full 0..30 vocab (budget covers a set)
+        let alone = mk(&[0,1,2,3,4,5,6,7]);
+        let pooled = pool.pooled_for(1);
+        let score = |m: &ExpertMap| -> f64 {
+            let mut hit = 0.0; let mut n = 0.0;
+            for t in 0..30u32 { let pred = m.predict(CtxSig::unigram(t), 0, &[], 4); hit += recall(&pred, &pref[&t]); n += 1.0; }
+            hit / n
+        };
+        let (r_alone, r_pooled) = (score(&alone), score(&pooled));
+        // pooling related siblings materially lifts recall over the full vocab (measured ~+16pp here; the
+        // real lift grows with how much of the task's vocabulary the siblings collectively cover).
+        assert!(r_pooled > r_alone + 0.1, "pooling related siblings lifts recall: alone {r_alone:.2} → pooled {r_pooled:.2}");
     }
 }
