@@ -197,9 +197,31 @@ pub fn ring_slot(streamed_index: u32, ring_slots: u32) -> u32 { streamed_index %
 /// load in and pushes oversized ones to q4/refusal up front. This is a PLATFORM fact, not a policy: Metal
 /// (macOS) has no such ceiling and gets the standard 48 GiB cap so bigger residencies (q4-70B) stay
 /// reachable there. LOGSCOPE_MAX_GPU_GB overrides everything.
+/// GPU buffer-upload budget in bytes. The conservative_vma (Asahi/Honeykrisp) cap of 24 GiB is an
+/// EMPIRICAL fact about the *staging* upload path: `queue.write_buffer` double-allocates (a transient
+/// staging buffer as big as the data) and that peak overran the driver's BO VMA ceiling on 40–70 GiB loads.
+/// BUT the map-at-creation arena used on unified memory does NOT stage — it writes straight into the
+/// buffer's device-visible backing (host==device RAM), which is exactly what removed the ~2× peak. So on
+/// UMA with the zero-copy path, the real ceiling is a safe fraction of PHYSICAL RAM, not the staging cap:
+/// a 62 GiB MoE loads fine resident on a 192 GiB M2 Ultra, no streaming needed. `unified` gates this — a
+/// discrete GPU (or forced staging) keeps the conservative cap. LOGSCOPE_MAX_GPU_GB overrides everything.
 pub fn gpu_buffer_budget(ram_budget: u64, conservative_vma: bool) -> u64 {
+    gpu_buffer_budget_uma(ram_budget, conservative_vma, false)
+}
+
+/// UMA-aware budget. On unified memory the zero-copy map-at-creation path avoids the staging overrun the
+/// 24 GiB cap guards against, so the budget scales with RAM (leaving generous headroom for KV + transients)
+/// instead of clamping to the staging cap. Non-UMA keeps the empirical cap.
+pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: bool) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
+    }
+    if unified {
+        // Map-at-creation: no staging double-allocation → the driver's BO VMA ceiling isn't the binding
+        // constraint; physical RAM is. Use 75% of the resident RAM budget (which is already 90% of
+        // available), leaving room for the KV cache + transient decode buffers that share the pool. On a
+        // 192 GiB box this is ~115 GiB — a 62 GiB MoE loads resident with headroom.
+        return ram_budget / 4 * 3;
     }
     let cap = if conservative_vma { 24.0 } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
@@ -324,6 +346,15 @@ mod tests {
         // the Asahi VMA clamp is PLATFORM-scoped: Vulkan-on-Apple gets 24 GiB, Metal keeps 48
         assert_eq!(gpu_buffer_budget(ram, true), (24.0 * GIB) as u64);
         assert_eq!(gpu_buffer_budget(ram, false), (48.0 * GIB) as u64);
+        // UNIFIED-MEMORY zero-copy: the staging cap does NOT apply (map-at-creation doesn't stage), so the
+        // budget scales with RAM. On a 192 GiB M2 Ultra this clears a 62 GiB MoE resident — the exact
+        // Llama-4-Scout-Q4 case that hit "streaming isn't implemented". Even with conservative_vma true
+        // (Asahi), unified lifts it because the overrun the cap guarded against is the staging path.
+        let ram192 = (172.0 * GIB) as u64; // ~90% of 192 available
+        let uma = gpu_buffer_budget_uma(ram192, true, true);
+        assert!(uma >= (100.0 * GIB) as u64, "UMA budget scales with RAM: {} GiB", gib(uma));
+        assert!(uma < ram192, "still leaves headroom for KV + transients");
+        assert!(uma > (62.0 * GIB) as u64, "a 62 GiB MoE (Scout-Q4) now fits resident on UMA");
         assert!(fitting_residencies(&llama_70b(), gpu, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8),
                 "under the GPU budget the 70B won't attempt int8");
         // explicit override wins
