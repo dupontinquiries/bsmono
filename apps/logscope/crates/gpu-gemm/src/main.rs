@@ -2718,7 +2718,7 @@ fn main() {
         let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
         let n2v = mk(7, d); let xin = mk(8, d);
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
-        // force the v1 path so both resident and streaming take the same code (streaming intercept is in v1)
+        // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
         std::env::set_var("LOGSCOPE_MOE_V1", "1");
         let resident = gpu_kernels::MoeLayer {
             router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
