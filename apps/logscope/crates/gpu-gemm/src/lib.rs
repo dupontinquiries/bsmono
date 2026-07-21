@@ -5149,12 +5149,12 @@ impl Gpu {
                 let ffn_eff = if is_moe { n_expert * expert_ff } else { h };
                 let shape = crate::memplan::ModelShape { d, ffn: ffn_eff, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
                 if q {
-                    use crate::memplan::{Fit, Residency, gib, plan, gpu_buffer_budget};
-                    // Weights live in GPU BUFFERS, whose total is capped far below RAM on unified-memory
-                    // drivers (Asahi/Honeykrisp). Plan against that cap, not RAM — otherwise int8 for a 70B
-                    // (~70 GiB) "fits" the ~170 GiB RAM budget and then the driver refuses the allocation
-                    // mid-upload ("Failed to allocate BO VMA"). The cap makes it pick q4 (or refuse) up front.
-                    let gpu_budget = gpu_buffer_budget(budget, self.conservative_vma);
+                    use crate::memplan::{Fit, Residency, gib, plan, gpu_buffer_budget_uma};
+                    // Weights live in GPU BUFFERS. On a DISCRETE/staging path the total is capped far below
+                    // RAM (Asahi BO VMA death on 40–70 GiB staged uploads). On UNIFIED memory the zero-copy
+                    // map-at-creation arena doesn't stage, so the cap doesn't apply — the budget scales with
+                    // physical RAM and a 62 GiB MoE loads resident on a 192 GiB box (no streaming needed).
+                    let gpu_budget = gpu_buffer_budget_uma(budget, self.conservative_vma, self.unified);
                     match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
                         Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
