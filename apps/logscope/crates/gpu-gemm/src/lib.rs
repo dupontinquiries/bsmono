@@ -5164,10 +5164,13 @@ impl Gpu {
                         Fit::Resident { fmt: Residency::F32, .. } => {}
                         Fit::Streaming { .. } => {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
+                            let ceiling_note = if self.conservative_vma {
+                                " (this is the Asahi/Honeykrisp BO-VMA ceiling — a hard driver limit well below the machine's RAM; the same model loads on macOS/Metal, which has no such ceiling)"
+                            } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
-                                Some(p) => format!("won't fit resident in ~{:.1} GiB — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s); streaming isn't implemented yet, use the llama.cpp backend or raise LOGSCOPE_MAX_GPU_GB.",
-                                    gib(gpu_budget), p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
-                                None => format!("won't fit even a streaming ring in ~{:.1} GiB; use the llama.cpp backend.", gib(gpu_budget)),
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s); streaming isn't implemented yet. Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
+                                    gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
+                                None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
                             return Err(msg);
                         }
