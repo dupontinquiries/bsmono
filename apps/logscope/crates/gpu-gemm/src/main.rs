@@ -1697,45 +1697,56 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--probe-expert-stream") {
-        // The M2 go/no-go for MoE streaming: does filling a slot from host RAM overlap a compute dispatch on
-        // Honeykrisp? The streamed unit is ONE expert in ONE layer (~64-128 MiB for Scout), NOT a whole
-        // expert. By default we SWEEP that realistic range in one run so a single M2 invocation gives the
-        // whole curve; --slot-mib N probes a single size. --iters N (default 20) averages noise.
-        let get = |flag: &str, dflt: usize| -> usize {
+        // MoE-streaming go/no-go, corrected: the question on UMA is whether the slot FILL is cheap on the
+        // fast (map-at-creation) path — not overlap (wgpu serializes one queue). Sweeps realistic
+        // per-expert-layer sizes and reports BOTH fill paths (staged write_buffer vs UMA mapped memcpy) with
+        // bandwidth and per-fill ms. --token-ms N gives your measured decode ms/token so it can print the
+        // streaming overhead as a % of a real token (default 200 ≈ 5 tok/s). --misses N = expert-layer
+        // fills per token after pinning/prediction (default 12). --iters, --slot-mib as before.
+        let getf = |flag: &str, dflt: f64| -> f64 {
             args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(dflt)
         };
+        let get = |flag: &str, dflt: usize| -> usize { getf(flag, dflt as f64) as usize };
         let iters = get("--iters", 20);
+        let token_ms = getf("--token-ms", 200.0);
+        let misses = get("--misses", 12);
         let gpu = Gpu::new();
         eprintln!("probe-expert-stream: adapter = {}", gpu.adapter_name);
         let is_sw = gpu.adapter_name.to_lowercase().contains("llvmpipe") || gpu.adapter_name.to_lowercase().contains("lavapipe");
-        // sizes to probe: a single one if --slot-mib given, else the realistic per-expert-layer sweep
-        let sizes: Vec<usize> = if args.iter().any(|a| a == "--slot-mib") {
-            vec![get("--slot-mib", 96)]
-        } else { vec![32, 64, 96, 128, 192, 256] };
-        eprintln!("probe-expert-stream: slot = one expert-layer; sweeping {sizes:?} MiB, {iters} iters each");
+        let sizes: Vec<usize> = if args.iter().any(|a| a == "--slot-mib") { vec![get("--slot-mib", 96)] } else { vec![32, 64, 96, 128, 192, 256] };
+        eprintln!("probe-expert-stream: slot = one expert-layer; sweeping {sizes:?} MiB, {iters} iters; token budget {token_ms} ms, {misses} fills/token");
         println!("probe-expert-stream (streamed unit = one expert in one layer):");
-        println!("  {:>6} {:>9} {:>10} {:>11} {:>9} {:>8} {:>7}", "MiB", "copy_ms", "matmul_ms", "overlap_ms", "serial_ms", "hidden%", "ratio");
-        let mut best_hidden = 0.0f64; let mut best_mib = 0usize; let mut any_clamped = false;
+        println!("  {:>6} | {:>9} {:>9} | {:>9} {:>9} | fast fill × {misses}/tok", "MiB", "staged_ms", "GiB/s", "mapped_ms", "GiB/s");
+        let mut best_bw = 0.0f64; let mut best = (0usize, 0.0f64);
         for &sz in &sizes {
-            let (copy, dispatch, overlapped, serial, actual) = gpu.probe_expert_stream(sz, iters);
-            if actual < sz { any_clamped = true; }
-            let ratio = if overlapped > 0.0 { serial / overlapped } else { 0.0 };
-            let hidden = if copy > 0.0 { ((serial - overlapped) / copy).clamp(0.0, 1.0) } else { 0.0 };
-            let flag = if actual < sz { " (clamped to max_buffer_size)" } else if copy < 0.001 { " (copy ~0 — buffer may be invalid)" } else { "" };
-            println!("  {:>6} {:>9.3} {:>10.3} {:>11.3} {:>9.3} {:>7.0}% {:>7.2}{}", actual, copy, dispatch, overlapped, serial, hidden * 100.0, ratio, flag);
-            if hidden > best_hidden { best_hidden = hidden; best_mib = actual; }
+            let (staged, mapped, actual) = gpu.probe_expert_stream(sz, iters);
+            let bw = |ms: f64| if ms > 0.0 { (actual as f64 / 1024.0) / (ms / 1000.0) } else { 0.0 };
+            let (sbw, mbw) = (bw(staged), bw(mapped));
+            let fast_ms = staged.min(mapped);
+            let per_token = fast_ms * misses as f64;
+            let pct = per_token / token_ms * 100.0;
+            println!("  {:>6} | {:>9.3} {:>9.1} | {:>9.3} {:>9.1} | {:>6.1} ms/tok = {:>4.0}% of token", actual, staged, sbw, mapped, mbw, per_token, pct);
+            // track the best (lowest) per-token streaming cost across sizes, and which path/size achieved it
+            let this_bw = bw(fast_ms);
+            if best.1 == 0.0 || per_token < best.1 { best = (actual, per_token); best_bw = this_bw; }
         }
         println!();
-        let verdict = if best_hidden > 0.6 {
-            format!("GO — at {best_mib} MiB the streamed copy largely hides under compute ({:.0}% hidden). Wire the full expert-streaming path; use ~{best_mib} MiB slots.", best_hidden * 100.0)
-        } else if best_hidden > 0.25 {
-            format!("PARTIAL — best {:.0}% hidden at {best_mib} MiB. Streaming can pay but needs more resident pins (fewer streamed experts) or a finer grain. Worth wiring cautiously.", best_hidden * 100.0)
+        // Verdict from the best (cheapest) per-token streaming cost found in the sweep.
+        let per_token = best.1;
+        let pct = per_token / token_ms * 100.0;
+        let verdict = if pct < 15.0 {
+            format!("GO — the cheapest fill path costs ~{per_token:.0} ms/token for {misses} expert-layer fills ({pct:.0}% of a {token_ms:.0} ms token) at ~{} MiB slots. Streaming pays; wire it.", best.0)
+        } else if pct < 40.0 {
+            format!("PARTIAL — ~{per_token:.0} ms/token ({pct:.0}%) at best. Streaming is viable but tighten it: pin more hot experts (fewer misses) or improve prediction to cut the fill count.")
         } else {
-            "NO-GO on this path — the copy serializes with compute at every size, so streaming adds ~copy time per token. Keep oversized MoE on Metal; don't wire the streaming execution.".to_string()
+            format!("EXPENSIVE — ~{per_token:.0} ms/token ({pct:.0}%) even at best. Streaming this model roughly {:.1}×'s the token time; prefer Metal, or only stream with a very high pin/hit rate.", 1.0 + pct/100.0)
         };
+        println!("  best per-token streaming cost: {per_token:.0} ms ({pct:.0}% of token), fill bandwidth ~{best_bw:.0} GiB/s at {} MiB", best.0);
         println!("  VERDICT: {verdict}");
-        if any_clamped { println!("  NOTE: some sizes were clamped to the device max_buffer_size — those rows aren't the size you asked for."); }
-        if is_sw { println!("  NOTE: software Vulkan (lavapipe) — no real host/device split, so these numbers are NOT representative. Run on the M2."); }
+        if best_bw > 0.0 && best_bw < 30.0 {
+            println!("  ⚠ the mapped path is also slow ({best_bw:.0} GiB/s) — if it's not near memory bandwidth, the UMA direct-write isn't kicking in (check `unified` detection / adapter type).");
+        }
+        if is_sw { println!("  NOTE: software Vulkan (lavapipe) — not representative. Run on the M2."); }
         return;
     }
     if args.iter().any(|a| a == "--gate-submit") {
