@@ -21,6 +21,7 @@ pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
 #[allow(dead_code)] pub mod dsa;     // DeepSeek Sparse Attention lightning indexer — CPU reference
 #[allow(dead_code)] pub mod ngram;   // prompt-lookup (n-gram) speculative draft source — lossless speedup
+#[allow(dead_code)] pub mod expert_predict; // context-conditioned MoE expert predictor for SSD-streaming prefetch
 #[allow(dead_code)] pub mod llama4;  // Llama 4 iRoPE attention temperature tuning (long-context length gen)
 pub mod netserve;
 pub mod store;
@@ -215,6 +216,9 @@ pub struct Gpu {
     /// -1 = not tracing. Measurement only — zero effect on computation, and only wired on the v1
     /// readback path (which already has the CPU-side routing) so it never adds a sync.
     pub trace_layer: std::sync::atomic::AtomicI32,
+    /// Current token id for the route trace's lexical signal (context-conditioned expert prediction). Set
+    /// alongside trace_layer during a traced decode; -1 when not tracing / unknown (e.g. prefill batch).
+    pub trace_tok: std::sync::atomic::AtomicI64,
     /// Keep-alive for buffers (dims uniforms, bind groups) whose frames have been SUBMITTED but not
     /// yet completed. submit() is async; wgpu 29 does not tie buffer lifetime to in-flight work, so a
     /// mid-window flush that drops its frame.keep recycles dims buffers the GPU is still reading →
@@ -474,10 +478,9 @@ fn route_trace_armed() -> bool {
 }
 
 /// ROUTE_TRACE writer (colibrì borrow, measurement only). Appends one line per (token, layer):
-/// `<call> <layer> <e0> <e1> …` — the routed-expert ids the CPU router just selected. An offline
-/// tool cross-tabulates layer L's set against L+1's to measure one-layer-ahead predictability; the
-/// question that decides whether MoE-streaming prefetch is worth building for THIS model. Opened once
-/// (a process-lifetime handle), guarded so a trace-off run pays nothing.
+/// `<call> <layer> <tokid> <e0> <e1> …` — the routed-expert ids the CPU router just selected, plus the
+/// vocab token id (or -1 if unknown) so an offline tool can measure CONTEXT-CONDITIONED prediction (the
+/// lexical map) on top of one-layer-ahead coupling. Opened once; guarded so a trace-off run pays nothing.
 fn route_trace(layer: i32, experts: &[u32]) {
     use std::io::Write;
     use std::sync::OnceLock;
@@ -492,6 +495,27 @@ fn route_trace(layer: i32, experts: &[u32]) {
         let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(mut f) = m.lock() {
             let mut line = format!("{call} {layer}");
+            for e in experts { line.push_str(&format!(" {e}")); }
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+/// Route-trace writer that also records the current token id (the lexical signal). `tok` is the vocab id,
+/// or a negative value when unknown. Trace grammar: `<call> <layer> <tok> <e0> <e1> …`.
+fn route_trace_tok(layer: i32, tok: i64, experts: &[u32]) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static FP: OnceLock<Option<std::sync::Mutex<std::fs::File>>> = OnceLock::new();
+    let slot = FP.get_or_init(|| {
+        std::env::var("LOGSCOPE_ROUTE_TRACE").ok().and_then(|p| {
+            std::fs::File::create(&p).ok().map(std::sync::Mutex::new)
+        })
+    });
+    if let Some(m) = slot {
+        static CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let call = CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Ok(mut f) = m.lock() {
+            let mut line = format!("{call} {layer} {tok}");
             for e in experts { line.push_str(&format!(" {e}")); }
             let _ = writeln!(f, "{line}");
         }
@@ -685,7 +709,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -2447,7 +2471,8 @@ impl Gpu {
             let tl = self.trace_layer.load(std::sync::atomic::Ordering::Relaxed);
             if tl >= 0 {
                 let ids: Vec<u32> = sels.iter().map(|s| s.expert).collect();
-                route_trace(tl, &ids);
+                let tok = self.trace_tok.load(std::sync::atomic::Ordering::Relaxed);
+                route_trace_tok(tl, tok, &ids);
             }
             for sel in sels {
                 groups[sel.expert as usize].push((tok as u32, sel.weight));
@@ -7028,6 +7053,7 @@ impl Gpu {
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
+        if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let l = &m.layers[li]; let (kq, ks, vq, vs) = (&c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li]);
@@ -7318,6 +7344,7 @@ impl Gpu {
         let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
+        if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
