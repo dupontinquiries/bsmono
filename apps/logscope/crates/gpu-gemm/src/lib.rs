@@ -1270,7 +1270,7 @@ impl StreamSlots {
     pub fn new(gpu: &Gpu, n_slots: usize, slot_bytes: u64) -> Self {
         let cap = gpu.device.limits().max_buffer_size;
         let slot_bytes = slot_bytes.min(cap).max(4);
-        let slots = (0..n_slots).map(|i| gpu.device.create_buffer(&wgpu::BufferDescriptor {
+        let slots = (0..n_slots).map(|_i| gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("expert-stream-slot"),
             size: slot_bytes,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
@@ -2762,7 +2762,9 @@ impl Gpu {
         // 2.7 tok/s wall time). Prefill (t>1) keeps the v1 grouped path over the SAME weights via row
         // views — which is also the built-in cross-check: if prefill output is coherent and decode isn't,
         // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
-        if t == 1 && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
+        // Streaming (m.stream) MUST use v1: the stacked weights are placeholders under streaming; experts
+        // are served per-expert from the stream store, which the v1 loop intercepts.
+        if t == 1 && m.stream.is_none() && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
@@ -5465,6 +5467,7 @@ impl Gpu {
         // Residency planning (memplan): prefer int8; auto-fall-back to q4 when int8 won't fit the budget;
         // refuse (with a number) only when even q4 won't fit. LOGSCOPE_Q4_RESIDENT forces q4 regardless.
         let mut auto_q4 = false;
+        let mut moe_stream_pin: Option<usize> = None; // Some(pin_count) when MoE expert streaming is planned
         if vocab_est > 0 {
             if let Some(budget) = store::resident_budget_bytes() {
                 // MoE: the FFN weight mass is the EXPERTS — n_expert stacked [expert_ff, d] matrices per
@@ -5487,16 +5490,46 @@ impl Gpu {
                         }
                         Fit::Resident { fmt: Residency::F32, .. } => {}
                         Fit::Streaming { .. } => {
+                            // MoE EXPERT STREAMING (LOGSCOPE_MOE_STREAM): the model won't fit with every
+                            // expert resident, but experts are the whole reason — if we pin the hot ones and
+                            // stream the cold ones from host RAM, only (dense + pinned + ring) is resident.
+                            // Check whether THAT fits; if so, proceed (q4) and let the MoE loader stream.
+                            if is_moe && std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
+                                use crate::memplan::{Residency, resident_weight_bytes, kv_cache_bytes, gib};
+                                // dense residency = whole model MINUS the expert FFN mass (ffn=0 shape) at q4,
+                                // + KV + a transient staging spill. Experts are sized separately.
+                                let dense_shape = crate::memplan::ModelShape { d, ffn: 0, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
+                                let kv = kv_cache_bytes(&dense_shape, 4096, 2);
+                                let dense = resident_weight_bytes(&dense_shape, Residency::Q4) + kv + 256 * (1 << 20);
+                                // IMPLEMENTATION GRANULARITY: slots are per expert-LAYER, and EVERY layer keeps
+                                // (pin + ring) expert-layers resident. So one "pinned expert" costs
+                                // layers × per-expert-layer bytes. Size the pin count to the budget accordingly.
+                                let per_expert_layer = ((2 * expert_ff * d) as u64 + (d * expert_ff) as u64) * 9 / 16; // (gu+dn) q4
+                                let per_expert_all_layers = (n as u64) * per_expert_layer;
+                                let ring = (n_expert_used as u64 + 1).max(2); // per-layer streaming ring
+                                let ring_cost = (n as u64) * ring * per_expert_layer; // ring resident across all layers
+                                if dense + ring_cost > gpu_budget {
+                                    return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB. Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget)));
+                                }
+                                let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
+                                let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(pin_fit).min(pin_fit).min(n_expert);
+                                auto_q4 = true;
+                                moe_stream_pin = Some(pin);
+                                let resident = dense + ring_cost + (pin as u64) * per_expert_all_layers;
+                                eprintln!("loader: MoE won't fit fully resident → EXPERT STREAMING (q4): pin {pin}/{n_expert} experts + {ring}-slot ring per layer, ~{:.1} GiB resident (dense ~{:.1} GiB); {} cold experts stream from host RAM per layer",
+                                    gib(resident), gib(dense), n_expert.saturating_sub(pin));
+                            } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
                             let ceiling_note = if self.conservative_vma {
                                 " (this is the Asahi/Honeykrisp BO-VMA ceiling — a hard driver limit well below the machine's RAM; the same model loads on macOS/Metal, which has no such ceiling)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
-                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s); streaming isn't implemented yet. Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s). For MoE checkpoints, set LOGSCOPE_MOE_STREAM=1 to stream cold experts from host RAM (implemented). Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
                             return Err(msg);
+                            }
                         }
                         Fit::TooBig { min_needed } => return Err(format!("model won't fit at any quant — needs ~{:.1} GiB, GPU-buffer budget is ~{:.1} GiB (raise LOGSCOPE_MAX_GPU_GB to override).", gib(min_needed), gib(gpu_budget))),
                     }
@@ -5634,27 +5667,36 @@ impl Gpu {
                     // [e: gate||up] for the fused projection), then per-expert Lins are zero-copy row
                     // VIEWS into it. One quant pass instead of n_expert (faster load), and the stacked
                     // buffer is what the GPU-routed decode kernels index (row = sel·rstride + col).
+                    let moe_streaming = moe_stream_pin.is_some() && q4_mode;
                     let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
                     let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
                     let ec = expert_ff * d;
-                    let mut inter = Vec::with_capacity(2 * ec * n_expert);
-                    for e in 0..n_expert {
-                        inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
-                        inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
-                    }
-                    drop(gsrc); drop(usrc);
-                    let stacked_gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
-                    drop(inter);
-                    let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                    let stacked_down = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
-                    drop(dsrc);
-                    let gate_up: Vec<Lin> = (0..n_expert)
-                        .filter_map(|e| lin_row_view(&stacked_gu, e * 2 * expert_ff, 2 * expert_ff)).collect();
-                    let down: Vec<Lin> = (0..n_expert)
-                        .filter_map(|e| lin_row_view(&stacked_down, e * d, d)).collect();
-                    if gate_up.len() != n_expert || down.len() != n_expert {
-                        return Err("MoE expert stack isn't row-viewable (unexpected residency format)".into());
-                    }
+                    // STREAMING: skip the resident expert stack entirely (it's the mass that busts the BO-VMA
+                    // ceiling). Build tiny placeholder Lins for the resident fields; decode goes through the
+                    // stream store, which holds cold experts host-side and fills GPU slots on demand.
+                    let (stacked_gu, stacked_down, gate_up, down) = if moe_streaming {
+                        let ph = || self.make_lin(&vec![0.0f32; 32], 1, 32, false, false);
+                        (ph(), ph(), Vec::new(), Vec::new())
+                    } else {
+                        let mut inter = Vec::with_capacity(2 * ec * n_expert);
+                        for e in 0..n_expert {
+                            inter.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
+                            inter.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
+                        }
+                        let stacked_gu = self.make_lin(&inter, n_expert * 2 * expert_ff, d, q, q4_mode);
+                        drop(inter);
+                        let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
+                        let stacked_down = self.make_lin(&dsrc, n_expert * d, expert_ff, q, q4_mode);
+                        drop(dsrc);
+                        let gate_up: Vec<Lin> = (0..n_expert)
+                            .filter_map(|e| lin_row_view(&stacked_gu, e * 2 * expert_ff, 2 * expert_ff)).collect();
+                        let down: Vec<Lin> = (0..n_expert)
+                            .filter_map(|e| lin_row_view(&stacked_down, e * d, d)).collect();
+                        if gate_up.len() != n_expert || down.len() != n_expert {
+                            return Err("MoE expert stack isn't row-viewable (unexpected residency format)".into());
+                        }
+                        (stacked_gu, stacked_down, gate_up, down)
+                    };
                     // Shared expert (ffn_{gate,up,down}_shexp.weight — GLM/DeepSeek/Qwen2-MoE):
                     // width read from the tensor itself (elems/d), order-of-dims-proof; fused
                     // gate||up concat mirrors the dense wgate_up layout SWIGLU_PACKED consumes.
@@ -5673,23 +5715,13 @@ impl Gpu {
                         if i == 0 { eprintln!("wgpu-engine: shared-expert MoE — shexp ff={sff} on top of {n_expert} routed"); }
                         Some((sgu, sdn))
                     } else { None };
-                    // STREAMING: when LOGSCOPE_MOE_STREAM is set, build a host-side streaming store for the
-                    // routed experts (cold experts filled into GPU slots on demand at decode). Pins the
-                    // hottest N experts resident (Colibri hot-store). The resident stacked_gu/down still
-                    // exist (built above) but on a real over-ceiling model the loader would skip them; here
-                    // we keep them for correctness fallback and let stream, when present, override at decode.
-                    let stream = if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() && q4_mode {
-                        // pin the hottest experts (heuristic: first PIN of them; a heat pass could reorder).
-                        // A real over-ceiling load would skip resident upload of the cold experts; here the
-                        // resident stack still exists as a correctness fallback and stream overrides decode.
-                        let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(4usize).min(n_expert);
-                        let ring = (n_expert_used + 1).max(2); // top_k active + prefetch spare
+                    // STREAMING store: cold experts stay host-side (already-quantized q4 bytes), hot experts
+                    // pinned resident, cold ones stream into GPU slots on demand at decode (moe_ffn_v1).
+                    let stream = if let Some(pin) = moe_stream_pin.filter(|_| q4_mode) {
+                        let pin = pin.min(n_expert);
+                        let ring = (n_expert_used + 1).max(2);
                         let gu_rows = 2 * expert_ff; let dn_rows = d;
-                        // per-expert host q4 bytes
-                        let gsrc = fetch(&format!("blk.{i}.ffn_gate_exps.weight"))?;
-                        let usrc = fetch(&format!("blk.{i}.ffn_up_exps.weight"))?;
                         let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
-                        let ec = expert_ff * d;
                         let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
                         let mut gu_qs_off = 0; let mut dn_qs_off = 0;
                         for e in 0..n_expert {
@@ -5701,10 +5733,9 @@ impl Gpu {
                             let (db, doff) = self.quantize_q4_host_bytes(&dsrc[e * d * expert_ff..(e + 1) * d * expert_ff], dn_rows, expert_ff);
                             dn_qs_off = doff; host_dn.push(db);
                         }
-                        drop(gsrc); drop(usrc); drop(dsrc);
+                        drop(dsrc);
                         let gu_slot_bytes = host_gu[0].len() as u64;
                         let dn_slot_bytes = host_dn[0].len() as u64;
-                        // pinned hot experts as resident Lins (upload once)
                         let mut pinned_gu = std::collections::HashMap::new();
                         let mut pinned_dn = std::collections::HashMap::new();
                         for e in 0..pin {
@@ -5712,17 +5743,17 @@ impl Gpu {
                             pinned_dn.insert(e as u32, self.q4_bufs_from_host(&host_dn[e], dn_qs_off));
                         }
                         let pinned_ids: Vec<u32> = (0..pin as u32).collect();
-                        let stream = MoeStream {
+                        if i == 0 { eprintln!("wgpu-engine: MoE STREAMING on — {n_expert} experts host-resident (q4), {pin} pinned, ring={ring} slots/layer"); }
+                        Some(std::sync::Mutex::new(MoeStream {
                             n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
                             host_gu, host_dn, gu_qs_off, dn_qs_off,
                             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
                             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
                             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
                             pinned_gu, pinned_dn,
-                        };
-                        if i == 0 { eprintln!("wgpu-engine: MoE STREAMING on — {n_expert} experts host-resident, {pin} pinned, ring={ring}"); }
-                        Some(std::sync::Mutex::new(stream))
+                        }))
                     } else { None };
+                    drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
                         cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
