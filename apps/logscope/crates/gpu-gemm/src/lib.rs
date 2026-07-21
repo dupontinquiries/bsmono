@@ -5205,10 +5205,20 @@ impl Gpu {
             q4_mode = true;
         }
         let q4_mode = q4_mode;
-        // Optional arena packing: route resident weights into a few large slabs instead of one buffer
-        // per tensor. Guard clears the bump state when this load returns/unwinds (slabs persist via the
-        // weight tensors). Off by default — opt in with LOGSCOPE_ARENA (slab MiB via LOGSCOPE_ARENA_SLAB_MB).
-        let _arena_guard = if std::env::var("LOGSCOPE_ARENA").is_ok() {
+        // Arena packing: route resident weights into a few large slabs instead of one buffer PER TENSOR.
+        // One-BO-per-tensor is what kills Honeykrisp/Asahi on big MoE models — 16 experts × N layers ×
+        // several matrices = thousands of buffer objects, and the driver runs out of BO VMA space
+        // ("Failed to allocate BO VMA") long before it runs out of bytes. Packing into ≤max_buffer_size
+        // slabs cuts that to a couple dozen BOs. AUTO-ON when the driver is BO-constrained (conservative_vma
+        // = Asahi/Honeykrisp) OR explicitly requested; opt out with LOGSCOPE_ARENA=0. Guard clears the bump
+        // state on unwind (slabs persist via the weight tensors).
+        let arena_env = std::env::var("LOGSCOPE_ARENA").ok();
+        let arena_on = match arena_env.as_deref() {
+            Some("0") | Some("false") => false,     // hard opt-out
+            Some(_) => true,                        // explicit opt-in
+            None => self.conservative_vma,          // default: on where BO VMA is the binding constraint
+        };
+        let _arena_guard = if arena_on {
             let max_buf = self.device.limits().max_buffer_size;
             let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
                 .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
@@ -5217,7 +5227,8 @@ impl Gpu {
             // an odd value (Honeykrisp/Asahi: ~2047 MiB = 2^31-1), so `.min(max_buf)` can land on an
             // unaligned size. Rounding DOWN (not up) keeps it within the device limit.
             let slab = slab & !255;
-            eprintln!("wgpu-engine: arena ON — packing resident weights into ≤{} MiB slabs (fewer buffer objects)", slab >> 20);
+            eprintln!("wgpu-engine: arena ON ({}) — packing resident weights into ≤{} MiB slabs (fewer buffer objects)",
+                if arena_env.is_some() { "requested" } else { "auto: BO-VMA-constrained driver" }, slab >> 20);
             *self.arena.lock().unwrap() = Some(ResidentArena { slabs: Vec::new(), slab_size: slab, used: 0, mapped: self.unified });
             Some(ArenaGuard(&self.arena))
         } else { None };
