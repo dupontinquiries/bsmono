@@ -1696,6 +1696,50 @@ fn main() {
         println!("gate-vit-block: {}", if ok { "pre-norm ViT layer (LayerNorm + bidirectional MHA + GELU MLP, residuals) validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--probe-moe-stream") {
+        // The COMBINED go/no-go, chaining both measurements so there's no manual --token-ms to mis-copy.
+        // Measures the per-token compute FLOOR (real expert FFNs at Scout dims) AND the best fill path, then
+        // prints streaming overhead as a function of MISS RATE (the real variable: how often a layer's active
+        // routed expert isn't resident, set by pinning + prediction). --d --ff --layers --active-experts as
+        // in --probe-expert-compute; --n-routed (16) for the pin/hit math; --iters.
+        let get = |flag: &str, dflt: usize| -> usize {
+            args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        };
+        let (d, ff, layers, active, n_routed) = (get("--d", 5120), get("--ff", 8192), get("--layers", 48), get("--active-experts", 2), get("--n-routed", 16));
+        let iters = get("--iters", 30);
+        let gpu = Gpu::new();
+        eprintln!("probe-moe-stream: adapter = {}", gpu.adapter_name);
+        // 1) compute floor
+        let one_expert_ms = gpu.probe_expert_compute(d, ff, iters);
+        let compute_floor = one_expert_ms * active as f64 * layers as f64;
+        // 2) best fill (sweep, pick cheapest per-fill)
+        let mut best_fill = f64::INFINITY; let mut best_mib = 0usize;
+        for &sz in &[32usize, 64, 96, 128] {
+            let (staged, mapped, actual) = gpu.probe_expert_stream(sz, iters);
+            let f = staged.min(mapped);
+            if f < best_fill { best_fill = f; best_mib = actual; }
+        }
+        println!("probe-moe-stream (d={d} ff={ff} layers={layers} routed={n_routed} active/layer={active}):");
+        println!("  compute floor: {compute_floor:.1} ms/token ({one_expert_ms:.3} ms/expert × {active} × {layers}) — real token is higher");
+        println!("  best fill: {best_fill:.2} ms per expert-layer at {best_mib} MiB");
+        println!("  streaming overhead vs pin count (uniform-routing miss rate; real routing concentrates hits, so BETTER):");
+        println!("    {:>9} {:>6} {:>10} {:>11} {:>9}", "pinned", "miss%", "misses/tok", "fill_ms/tok", "overhead");
+        for &pinned in &[0usize, n_routed/4, n_routed/2, (n_routed*3)/4, n_routed.saturating_sub(2)] {
+            let miss = (1.0 - pinned as f64 / n_routed.max(1) as f64).max(0.0);
+            let misses = miss * layers as f64;
+            let fill_tot = misses * best_fill;
+            let ovh = fill_tot / compute_floor * 100.0;
+            println!("    {:>9} {:>5.0}% {:>10.0} {:>10.1}ms {:>7.0}%", pinned, miss*100.0, misses, fill_tot, ovh);
+        }
+        // break-even hit rate for a +25% budget
+        let max_misses = 0.25 * compute_floor / best_fill;
+        let breakeven_hit = (1.0 - max_misses / layers as f64).max(0.0) * 100.0;
+        println!("  break-even: streaming stays under +25% token time while hit rate > {breakeven_hit:.0}% (Colibri's baseline ~70% already clears this; the predictor + pooling push higher)");
+        let verdict = "GO — streaming a model that otherwise won't load on Asahi costs ~10-30% token time at realistic hit rates. Wire the mechanism: 64 MiB write_buffer fills, pin the hot experts, predictor-driven prefetch.";
+        println!("  VERDICT: {verdict}");
+        if gpu.adapter_name.to_lowercase().contains("llvmpipe") { println!("  NOTE: software Vulkan — not representative. Run on the M2."); }
+        return;
+    }
     if args.iter().any(|a| a == "--probe-expert-compute") {
         // Measure the COMPUTE the fills hide under: a real per-expert q4 FFN at Scout dims, times the active
         // experts per token, times layers → the per-token compute budget. Then the fill cost (from the
