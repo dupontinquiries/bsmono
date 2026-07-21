@@ -1293,6 +1293,64 @@ impl Gpu {
         let bytes: &[u8] = bytemuck::cast_slice(data);
         Tensor { buf: self.upload_bytes(bytes, "tensor"), rows, cols, pool: None, view: None }
     }
+
+    /// EXPERT-STREAM PROBE (the M2 go/no-go). The whole MoE-streaming architecture rests on one hardware
+    /// fact we can't measure in-container: on Honeykrisp, does filling a slot buffer from host RAM (the
+    /// streamed cold expert) OVERLAP a compute dispatch (the resident experts' matmuls), or serialize? If it
+    /// overlaps, streaming hides the copy under compute and pays; if it serializes at ~expert-bytes/token,
+    /// the per-token budget blows and Scout only runs on Metal. This times three things and reports the
+    /// overlap ratio: `expert_mib` sizes the streamed slot (use a realistic ~expert size on the M2, e.g.
+    /// 512-3072), `iters` averages out noise. Returns (copy_ms, dispatch_ms, overlapped_ms, serial_ms).
+    pub fn probe_expert_stream(&self, expert_mib: usize, iters: usize) -> (f64, f64, f64, f64) {
+        let bytes = expert_mib * (1 << 20);
+        let host = vec![0u8; bytes];                                  // the "cold expert" bytes to stream in
+        // a re-fillable slot buffer (write_buffer target — the realistic streaming fill, not one-shot map)
+        let slot = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stream-slot"), size: bytes.max(4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        // a resident weight + input for the "compute the resident experts" dispatch (sized to be a
+        // meaningful matmul — square so it chains cleanly)
+        let (n, k) = (2048usize, 2048);
+        let w = self.quantize_q8_resident(&vec![0.1f32; n * k], n, k);
+        let x = self.upload(&vec![0.1f32; k], 1, k);
+        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+
+        // warm up (compile pipeline, first-touch allocations)
+        for _ in 0..2 { self.queue.write_buffer(&slot, 0, &host); let _ = self.linear_q8_0_t(&x, &w, 1); }
+        wait();
+
+        // (1) COPY alone: host→device fill, fenced each iter
+        let t = std::time::Instant::now();
+        for _ in 0..iters { self.queue.write_buffer(&slot, 0, &host); wait(); }
+        let copy_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // (2) DISPATCH alone: resident matmul, fenced each iter
+        let t = std::time::Instant::now();
+        for _ in 0..iters { let y = self.linear_q8_0_t(&x, &w, 1); wait(); let _ = y; }
+        let dispatch_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // (3) OVERLAPPED: issue BOTH, then a single wait — if the driver overlaps copy with compute, this is
+        // ~max(copy,dispatch); if it serializes, ~copy+dispatch.
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            self.queue.write_buffer(&slot, 0, &host);   // start the streamed fill
+            let y = self.linear_q8_0_t(&x, &w, 1);      // and the resident compute
+            wait();                                     // one fence for both
+            let _ = y;
+        }
+        let overlapped_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        // (4) SERIAL reference: same two ops but fenced BETWEEN them (no overlap possible)
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            self.queue.write_buffer(&slot, 0, &host); wait();
+            let y = self.linear_q8_0_t(&x, &w, 1); wait();
+            let _ = y;
+        }
+        let serial_ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+
+        (copy_ms, dispatch_ms, overlapped_ms, serial_ms)
+    }
     /// Upload `bytes` as a resident STORAGE buffer, zero-copy on unified memory. On UMA (Apple/Asahi) the
     /// buffer's backing IS host RAM, so `mapped_at_creation` + one memcpy writes straight into device memory
     /// — no staging-belt copy, no transient staging allocation (which is what doubled the 70B load peak).
