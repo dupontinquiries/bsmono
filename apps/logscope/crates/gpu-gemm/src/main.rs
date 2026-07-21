@@ -789,35 +789,67 @@ fn route_analyze(path: &str) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t, Err(e) => { eprintln!("route-analyze: cannot read {path}: {e}"); std::process::exit(1); }
     };
-    // Parse into forwards: Vec<Vec<(layer, Vec<expert>)>>
-    let mut forwards: Vec<Vec<(i32, Vec<u32>)>> = Vec::new();
-    let mut cur: Vec<(i32, Vec<u32>)> = Vec::new();
+    // Parse into forwards: Vec<Vec<(layer, tok, Vec<expert>)>>. Trace grammar is `<call> <layer> [<tok>]
+    // <e0> <e1> …`; the token field is present in newer traces (lexical signal) and -1/absent in older ones.
+    // We detect the token by whether the field count implies it: if the 3rd field parses and there are
+    // experts after, treat it as tok; older traces (no tok) set tok=-1.
+    let mut forwards: Vec<Vec<(i32, i64, Vec<u32>)>> = Vec::new();
+    let mut cur: Vec<(i32, i64, Vec<u32>)> = Vec::new();
     let mut last_layer = i32::MAX;
+    let mut saw_tok = false;
     for line in text.lines() {
-        let mut it = line.split_whitespace();
-        let _call = it.next();
-        let layer: i32 = match it.next().and_then(|s| s.parse().ok()) { Some(l) => l, None => continue };
-        let experts: Vec<u32> = it.filter_map(|s| s.parse().ok()).collect();
-        // a new forward starts when the layer index drops (wraps back toward 0)
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 2 { continue; }
+        let _call = f[0];
+        let layer: i32 = match f[1].parse() { Ok(l) => l, Err(_) => continue };
+        // Heuristic: a token field is an id that may be large; experts are also ids. We disambiguate by
+        // reading the trace convention — if the writer emitted a token it's field[2] and experts follow.
+        // Newer traces always include it (route_trace_tok). Assume token present when set via env.
+        let has_tok = std::env::var("LOGSCOPE_ROUTE_TRACE_HASTOK").is_ok() || {
+            // auto-detect: a token line has one extra leading number before experts; we can't be fully
+            // certain per-line, so default to treating field[2] as token when the file's first data line
+            // has ≥4 fields. Set once.
+            f.len() >= 4
+        };
+        let (tok, experts): (i64, Vec<u32>) = if has_tok && f.len() >= 3 {
+            saw_tok = true;
+            (f[2].parse().unwrap_or(-1), f[3..].iter().filter_map(|s| s.parse().ok()).collect())
+        } else {
+            (-1, f[2..].iter().filter_map(|s| s.parse().ok()).collect())
+        };
         if layer <= last_layer && !cur.is_empty() { forwards.push(std::mem::take(&mut cur)); }
-        cur.push((layer, experts));
+        cur.push((layer, tok, experts));
         last_layer = layer;
     }
     if !cur.is_empty() { forwards.push(cur); }
     if forwards.len() < 4 { eprintln!("route-analyze: only {} forwards — generate a longer trace", forwards.len()); std::process::exit(1); }
+    let _ = saw_tok;
 
     let k_top = 8usize; // co-activation table width per (L, expert)
     let split = forwards.len() / 2;
     // Build co-activation counts on the train half: pair[(L, e_at_L)][e_at_L+1] += 1
     let mut pair: HashMap<(i32, u32), HashMap<u32, u32>> = HashMap::new();
     let mut marg: HashMap<i32, HashMap<u32, u32>> = HashMap::new(); // layer → expert → count (marginal heat)
+    // Lexical map (context-conditioned): the new predictor, trained on the same half.
+    let mut emap = gpu_kernels::expert_predict::ExpertMap::new();
+    let have_tok = forwards.iter().flatten().any(|(_, t, _)| *t >= 0);
     for fwd in &forwards[..split] {
         for w in fwd.windows(2) {
-            let (la, ea) = (&w[0].0, &w[0].1);
-            let (lb, eb) = (&w[1].0, &w[1].1);
+            let (la, _ta, ea) = (&w[0].0, &w[0].1, &w[0].2);
+            let (lb, _tb, eb) = (&w[1].0, &w[1].1, &w[1].2);
             if *lb != la + 1 { continue; }
             for &x in ea { for &y in eb { *pair.entry((*la, x)).or_default().entry(y).or_insert(0) += 1; } }
             for &y in eb { *marg.entry(*lb).or_default().entry(y).or_insert(0) += 1; }
+        }
+        // lexical: observe each (token, layer) → experts, plus the previous layer's set for coupling
+        if have_tok {
+            let mut prev: &[u32] = &[];
+            for (l, t, e) in fwd {
+                if *t >= 0 {
+                    emap.observe(gpu_kernels::expert_predict::CtxSig::unigram(*t as u32), *l, e, prev);
+                }
+                prev = e;
+            }
         }
     }
     // top-k co-activated per (L, e); top-k marginal per layer
@@ -833,10 +865,12 @@ fn route_analyze(path: &str) {
     // summing co-activation counts over L's routed set; marginal uses the layer's global heat.
     let budget = k_top; // name B=top_k experts, same for both
     let (mut coup_hit, mut coup_tot, mut marg_hit, mut marg_tot) = (0u64, 0u64, 0u64, 0u64);
+    let (mut lex_hit, mut lex_tot) = (0u64, 0u64);   // lexical predictor recall
+    let mut lex_warm = 0u64;                          // eval rows where the lexical map had an entry
     for fwd in &forwards[split..] {
         for w in fwd.windows(2) {
-            let (la, ea) = (&w[0].0, &w[0].1);
-            let (lb, eb) = (&w[1].0, &w[1].1);
+            let (la, _ta, ea) = (&w[0].0, &w[0].1, &w[0].2);
+            let (lb, _tb, eb) = (&w[1].0, &w[1].1, &w[1].2);
             if *lb != la + 1 { continue; }
             // coupling: sum co-activation counts over L's experts, take the top-B scored candidates
             let mut score: HashMap<u32, u32> = HashMap::new();
@@ -849,6 +883,20 @@ fn route_analyze(path: &str) {
                 for &y in eb { marg_tot += 1; if ms.contains(&y) { marg_hit += 1; } }
             }
         }
+        // lexical predictor: predict each layer's set from (token, prev-layer set) BEFORE the router runs
+        if have_tok {
+            let mut prev: &[u32] = &[];
+            for (l, t, e) in fwd {
+                if *t >= 0 {
+                    let sig = gpu_kernels::expert_predict::CtxSig::unigram(*t as u32);
+                    if emap.has_lexical(sig, *l) { lex_warm += 1; }
+                    let pred = emap.predict(sig, *l, prev, budget);
+                    let pset: std::collections::HashSet<u32> = pred.into_iter().collect();
+                    for &y in e { lex_tot += 1; if pset.contains(&y) { lex_hit += 1; } }
+                }
+                prev = e;
+            }
+        }
     }
     let coup = if coup_tot > 0 { coup_hit as f64 / coup_tot as f64 } else { 0.0 };
     let marg_r = if marg_tot > 0 { marg_hit as f64 / marg_tot as f64 } else { 0.0 };
@@ -857,6 +905,23 @@ fn route_analyze(path: &str) {
     println!("    coupling  (predict from L's experts):  {:.1}%", coup * 100.0);
     println!("    marginal  (predict L+1's hottest):     {:.1}%", marg_r * 100.0);
     println!("    LIFT of coupling over marginal:        {:+.1} pp", (coup - marg_r) * 100.0);
+    if have_tok && lex_tot > 0 {
+        let lex = lex_hit as f64 / lex_tot as f64;
+        let warm_frac = lex_warm as f64 / lex_tot.max(1) as f64;
+        println!("  context-conditioned (lexical map + coupling + marginal):");
+        println!("    lexical predictor recall:              {:.1}%  (over ALL layers, not just L+1)", lex * 100.0);
+        println!("    LIFT of lexical over coupling:         {:+.1} pp", (lex - coup) * 100.0);
+        println!("    lexical map warm on {:.0}% of eval rows (rises with a longer/《more repetitive》 task)", warm_frac * 100.0);
+        if lex > coup + 0.05 {
+            println!("  → the lexical map BEATS coupling — the tree's token lineage is a real prefetch signal; build the streaming predictor on it.");
+        } else if lex_warm == 0 {
+            println!("  → lexical map never warmed on the eval half (token vocabulary didn't recur). Longer trace / a real long-horizon task needed to see the lift.");
+        } else {
+            println!("  → lexical ≈ coupling here; the context signal isn't adding over co-activation for this trace.");
+        }
+    } else {
+        println!("  (no token ids in trace — rerun with a token-tagged LOGSCOPE_ROUTE_TRACE to measure the lexical predictor)");
+    }
     if coup - marg_r > 0.05 {
         println!("  → routing IS predictable one layer ahead here — router-lookahead prefetch would pay (colibrì's bet holds for this model).");
     } else {
