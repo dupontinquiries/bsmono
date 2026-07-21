@@ -1696,6 +1696,45 @@ fn main() {
         println!("gate-vit-block: {}", if ok { "pre-norm ViT layer (LayerNorm + bidirectional MHA + GELU MLP, residuals) validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--probe-expert-stream") {
+        // The M2 go/no-go for MoE streaming: does filling a slot from host RAM overlap a compute dispatch on
+        // Honeykrisp? Size the streamed expert with --expert-mib N (default 512; use ~a real expert size on
+        // the M2), iters with --iters N (default 20). lavapipe (in-container) has no real host/device split
+        // so its numbers aren't representative — this is a HARDWARE probe; run it on the M2.
+        let get = |flag: &str, dflt: usize| -> usize {
+            args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        };
+        let expert_mib = get("--expert-mib", 512);
+        let iters = get("--iters", 20);
+        let gpu = Gpu::new();
+        eprintln!("probe-expert-stream: adapter = {}", gpu.adapter_name);
+        eprintln!("probe-expert-stream: streamed expert = {expert_mib} MiB, {iters} iters");
+        let (copy, dispatch, overlapped, serial) = gpu.probe_expert_stream(expert_mib, iters);
+        // overlap ratio: serial / overlapped. ~2 = perfect overlap (copy fully hidden under compute); ~1 =
+        // serialized (copy adds on top). The decisive number is how much of the copy hides.
+        let overlap_ratio = if overlapped > 0.0 { serial / overlapped } else { 0.0 };
+        // how much of the copy is hidden: (serial - overlapped) / copy. 1.0 = fully hidden, 0 = not at all.
+        let hidden_frac = if copy > 0.0 { ((serial - overlapped) / copy).clamp(0.0, 1.0) } else { 0.0 };
+        println!("probe-expert-stream results ({expert_mib} MiB expert):");
+        println!("  copy alone (host→device):   {copy:.3} ms");
+        println!("  dispatch alone (matmul):    {dispatch:.3} ms");
+        println!("  overlapped (both, 1 fence): {overlapped:.3} ms");
+        println!("  serial (fenced between):    {serial:.3} ms");
+        println!("  overlap ratio (serial/overlapped): {overlap_ratio:.2}  (1=serialized, 2=perfect overlap)");
+        println!("  copy hidden under compute:  {:.0}%", hidden_frac * 100.0);
+        let verdict = if hidden_frac > 0.6 {
+            "GO — the streamed copy largely hides under compute; the full expert-streaming path is worth wiring."
+        } else if hidden_frac > 0.25 {
+            "PARTIAL — some overlap; streaming may pay with smaller stream granularity or more resident pins. Re-probe at a smaller expert size."
+        } else {
+            "NO-GO on this path — the copy serializes with compute, so streaming adds ~copy time per token. Prefer Metal for oversized models, or stream at a much finer grain."
+        };
+        println!("  VERDICT: {verdict}");
+        if gpu.adapter_name.to_lowercase().contains("llvmpipe") || gpu.adapter_name.to_lowercase().contains("lavapipe") {
+            println!("  NOTE: this is software Vulkan (lavapipe) — no real host/device split, so these numbers are NOT representative. Run on the M2 for the real verdict.");
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-submit") {
         // Validate the submit-batching knob + the adaptive SubmitTuner. (1) the tuner's pure sweep/settle
         // logic; (2) flush_every actually controls how many submits a framed op-chain costs; (3) batching
