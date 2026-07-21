@@ -218,10 +218,12 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     }
     if unified {
         // Map-at-creation: no staging double-allocation → the driver's BO VMA ceiling isn't the binding
-        // constraint; physical RAM is. Use 75% of the resident RAM budget (which is already 90% of
-        // available), leaving room for the KV cache + transient decode buffers that share the pool. On a
-        // 192 GiB box this is ~115 GiB — a 62 GiB MoE loads resident with headroom.
-        return ram_budget / 4 * 3;
+        // constraint; physical RAM is. Use the SAME half-of-RAM headroom split as the discrete path, but
+        // WITHOUT the 24/48 GiB staging clamp — that clamp guarded a staging overrun this path doesn't have.
+        // On a 192 GiB box (~172 available → ~155 resident budget) this is ~77 GiB, clearing a 54 GiB q4
+        // MoE with headroom for KV + transients; on a small explicit LOGSCOPE_MAX_* budget it stays
+        // proportional (no inflation, so between-budget planning still resolves correctly).
+        return ram_budget / 2;
     }
     let cap = if conservative_vma { 24.0 } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
@@ -352,9 +354,13 @@ mod tests {
         // (Asahi), unified lifts it because the overrun the cap guarded against is the staging path.
         let ram192 = (172.0 * GIB) as u64; // ~90% of 192 available
         let uma = gpu_buffer_budget_uma(ram192, true, true);
-        assert!(uma >= (100.0 * GIB) as u64, "UMA budget scales with RAM: {} GiB", gib(uma));
+        assert!(uma >= (80.0 * GIB) as u64, "UMA budget scales with RAM (half, no staging cap): {} GiB", gib(uma));
         assert!(uma < ram192, "still leaves headroom for KV + transients");
         assert!(uma > (62.0 * GIB) as u64, "a 62 GiB MoE (Scout-Q4) now fits resident on UMA");
+        // and it does NOT inflate a small explicit budget (between-budget planning must still resolve): a
+        // tiny UMA budget stays proportional, not blown up past a mid-point.
+        let small = gpu_buffer_budget_uma((8.0 * GIB) as u64, true, true);
+        assert_eq!(small, (4.0 * GIB) as u64, "UMA uses half of RAM, no inflation of a small explicit budget");
         assert!(fitting_residencies(&llama_70b(), gpu, 4096, 2, (500 * (1 << 20)) as u64).iter().all(|&r| r != Residency::Int8),
                 "under the GPU budget the 70B won't attempt int8");
         // explicit override wins
