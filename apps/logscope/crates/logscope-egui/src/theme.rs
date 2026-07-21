@@ -671,25 +671,57 @@ pub fn ensure_contrast(fg: Color32, bg: Color32, min: f32) -> Color32 {
     lerp_col(fg, toward, hi)
 }
 
+/// Like `ensure_contrast` but HUE-PRESERVING — for accent colors (inline code, links) that must keep their
+/// identity. Instead of lerping toward pure black/white (which desaturates a mid-tone accent into mud — the
+/// washed-out backticks), it moves the accent's LIGHTNESS: lighter (scale up toward white-ish) when the
+/// surface is dark, darker (scale down) when the surface is light, keeping hue+saturation. Steps until it
+/// clears `min` against `bg`, or returns the strongest step it can reach. `bg` is the LIVE (day/night
+/// adjusted) surface, so this tracks the Catalina-style brightness curve automatically.
+pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
+    if contrast_ratio(fg, bg) >= min { return fg; }
+    // Which way improves contrast? Compare a lighter vs a darker nudge of the accent itself.
+    let lighter = lift_col(fg, 40);
+    let darker = scale_col(fg, 0.6);
+    let go_lighter = contrast_ratio(lighter, bg) >= contrast_ratio(darker, bg);
+    let mut best = fg;
+    // up to 24 fine steps in the chosen direction; keep the first that clears, else the strongest.
+    for i in 1..=24u32 {
+        let t = i as f32 / 24.0;
+        let cand = if go_lighter {
+            // toward a light, still-saturated version: lift toward white but retain the hue by blending
+            // with a lightened copy rather than pure white.
+            lerp_col(fg, lift_col(fg, 200), t)
+        } else {
+            // toward a dark version: scale down (keeps hue, drops value).
+            scale_col(fg, 1.0 - 0.85 * t)
+        };
+        best = cand;
+        if contrast_ratio(cand, bg) >= min { return cand; }
+    }
+    // couldn't reach the target with hue-preserving moves (very mid-tone surface): fall back to the
+    // guaranteed pole so text is at least legible, accepting some desaturation only in that corner case.
+    ensure_contrast(fg, bg, min)
+}
+
 /// Nudge `fg` until it clears `min` contrast against the surface markdown actually renders on. Assistant/
-/// user messages render inside a frame filled with PANEL, so that's the surface to guarantee — the old
-/// helpers guarded BG, and on palettes where PANEL is lighter than BG an accent tuned for BG faded on the
-/// panel (the washed-out backticks). A single text color can't satisfy two surfaces on opposite sides of
-/// mid-grey, so we target the one the glyphs sit on: the panel.
+/// user messages render inside a frame filled with PANEL, so that's the surface to guarantee. PANEL() reads
+/// the LIVE day/night-adjusted palette, so these track the brightness curve. Accents use the hue-preserving
+/// adjuster (backticks stay cyan, not mud); body/ink use the plain one (a value shift is fine for text).
 fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast(fg, PANEL(), min) }
+fn md_accent_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast_accent(fg, PANEL(), min) }
 /// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the message panel.
 pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
-/// Markdown accent (inline code / links), ≥ 4.5:1 on the panel — the neon-fade + panel-fade fix. Inline
-/// `code` renders inside the message frame, so it must clear the PANEL, not just the background.
-pub fn md_accent() -> Color32 { md_on_panel(CYAN(), 4.5) }
+/// Markdown accent (inline code / links), ≥ 4.5:1 on the panel — hue-preserving so `code` stays its accent
+/// color across light/dark themes and the day/night curve instead of collapsing toward black/white.
+pub fn md_accent() -> Color32 { md_accent_on_panel(CYAN(), 4.5) }
 /// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
 /// body floor on the surface it lands on.
 pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
 /// Blockquote bar/wash accent, guaranteed ≥ 3.0:1 (a decorative element needs less).
-pub fn md_quote_accent() -> Color32 { md_on_panel(AMBER(), 3.0) }
+pub fn md_quote_accent() -> Color32 { md_accent_on_panel(AMBER(), 3.0) }
 /// A colored inline run (e.g. the workflow-word sequence RECONSTRUCT→MODEL→…) that keeps the violet hue but
 /// is guaranteed to read on the message panel.
-pub fn md_run_violet() -> Color32 { md_on_panel(VIOLET(), 4.5) }
+pub fn md_run_violet() -> Color32 { md_accent_on_panel(VIOLET(), 4.5) }
 
 /// The sun for the canopy theme, derived from the real system clock: a low warm sun at dawn/dusk, bright
 /// and near-overhead at noon, dim and cool at night. Returns (shaft direction, colour, intensity 0..1).
@@ -1829,12 +1861,21 @@ mod day_night_tests {
                     let got = contrast_ratio(ensure_contrast(fg, bg, target), bg);
                     assert!(got >= target.min(ceiling) - 0.1, "{} {}: got {got:.2}, target {target}, ceiling {ceiling:.2}", p.name, what);
                 };
+                // accent demand uses the HUE-PRESERVING adjuster (what inline code / links / colored runs
+                // actually render through), verified on the DAY/NIGHT-ADJUSTED panel — the surface + curve
+                // the earlier pass failed to check.
+                let demand_accent = |fg: Color32, bg: Color32, target: f32, what: &str| {
+                    let ceiling = contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg));
+                    let got = contrast_ratio(ensure_contrast_accent(fg, bg, target), bg);
+                    assert!(got >= target.min(ceiling) - 0.2, "{} {}: got {got:.2}, target {target}, ceiling {ceiling:.2}", p.name, what);
+                };
                 demand(q.ink, q.bg, 4.5, "ink");
                 demand(q.cyan, q.bg, 4.5, "cyan (neon-fade fix)");
-                // Inline `code`, links, and colored runs render ON THE PANEL (message frames), so they must
-                // clear the panel too — the washed-out-backticks fix. md_accent/md_ink/md_run guard PANEL.
-                demand(q.cyan, q.panel, 4.5, "cyan on panel (inline code)");
-                demand(q.violet, q.panel, 4.5, "violet on panel (colored run)");
+                // Inline `code`, links, and colored runs render ON THE PANEL (message frames) and through the
+                // hue-preserving adjuster, across the full day/night brightness curve.
+                demand_accent(q.cyan, q.panel, 4.5, "cyan on panel (inline code)");
+                demand_accent(q.violet, q.panel, 4.5, "violet on panel (colored run)");
+                demand_accent(q.amber, q.panel, 3.0, "amber on panel (quote accent)");
                 demand(q.ink, q.panel, 4.5, "ink on panel (md body)");
                 demand(q.dim, q.bg, 4.5, "dim (md body — raised from 4.0)");
                 demand(q.amber, q.bg, 3.0, "quote accent");
