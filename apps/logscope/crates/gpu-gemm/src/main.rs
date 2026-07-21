@@ -1696,6 +1696,28 @@ fn main() {
         println!("gate-vit-block: {}", if ok { "pre-norm ViT layer (LayerNorm + bidirectional MHA + GELU MLP, residuals) validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--probe-expert-compute") {
+        // Measure the COMPUTE the fills hide under: a real per-expert q4 FFN at Scout dims, times the active
+        // experts per token, times layers → the per-token compute budget. Then the fill cost (from the
+        // stream probe) is judged against a MEASURED number, closing the go/no-go honestly. --d --ff set the
+        // expert dims (default Scout 5120/8192); --layers (48), --active-experts (2 = shared+1 routed).
+        let get = |flag: &str, dflt: usize| -> usize {
+            args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(dflt)
+        };
+        let (d, ff, layers, active) = (get("--d", 5120), get("--ff", 8192), get("--layers", 48), get("--active-experts", 2));
+        let iters = get("--iters", 30);
+        let gpu = Gpu::new();
+        eprintln!("probe-expert-compute: adapter = {}", gpu.adapter_name);
+        let one_expert_ms = gpu.probe_expert_compute(d, ff, iters);
+        // per token: attention+norms+router are extra, but expert FFNs dominate a MoE decode. Estimate the
+        // compute-bound floor from experts alone; the real token is ≥ this (dispatch overhead adds more).
+        let per_token_experts = one_expert_ms * active as f64 * layers as f64;
+        println!("probe-expert-compute (d={d} ff={ff} layers={layers} active-experts/layer={active}):");
+        println!("  one expert FFN (gate+up+down q4 matvec): {one_expert_ms:.3} ms");
+        println!("  expert compute per token (× {active} × {layers}): {per_token_experts:.1} ms  (a FLOOR — attention + dispatch overhead add more)");
+        println!("  → use this as --token-ms for the stream probe (or higher, since it's a floor).");
+        return;
+    }
     if args.iter().any(|a| a == "--probe-expert-stream") {
         // MoE-streaming go/no-go, corrected: the question on UMA is whether the slot FILL is cheap on the
         // fast (map-at-creation) path — not overlap (wgpu serializes one queue). Sweeps realistic

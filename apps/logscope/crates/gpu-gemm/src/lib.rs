@@ -1296,15 +1296,41 @@ impl Gpu {
 
     /// EXPERT-STREAM PROBE (the M2 go/no-go), corrected. The first cut asked "does the copy overlap
     /// compute?" and used write_buffer — but write_buffer STAGES (copies host→staging belt→device), which on
-    /// unified memory is the wrong path: it measured ~12 GiB/s on an 800 GiB/s machine. And it compared a big
-    /// copy to a tiny matmul, so overlap was unmeasurable. The RIGHT question on UMA isn't overlap (wgpu
-    /// serializes one queue anyway) — it's whether the slot FILL is cheap enough on the fast path that
-    /// streaming pays without overlap. So this measures TWO fill paths for a realistic expert-layer slot:
-    ///   * staged   — queue.write_buffer (the discrete path; staging belt).
-    ///   * mapped    — create(mapped_at_creation) + CPU memcpy into the device-visible backing + unmap (the
-    ///                 UMA direct path the arena uses; host==device RAM so it's a plain memcpy).
-    /// Returns (staged_ms, mapped_ms, actual_mib). Bandwidth = actual_mib/ms; the caller compares the fast
-    /// path's per-expert-layer cost against a real decode token budget.
+    /// unified memory is the wrong path to *assume* is slow: MEASURED on the M2 Ultra it's actually the FAST
+    /// path at a specific size. Key hardware findings (M2 Ultra / Honeykrisp, expert-layer slot fills):
+    ///   * write_buffer @ 64 MiB = ~32 GiB/s, 1.9 ms/fill — a sharp staging-belt sweet spot.
+    ///   * write_buffer @ 32/96/128+ MiB = ~10 GiB/s (3× slower) — 64 MiB is special.
+    ///   * create(mapped_at_creation)+memcpy+unmap PER SWAP = 4-14 GiB/s — SLOWER than staged, because the
+    ///     per-swap buffer CREATION cost dominates the memcpy. (My prediction that this UMA path would hit
+    ///     memory bandwidth was WRONG; mapped-at-creation only wins for load-once resident weights, not for
+    ///     re-filled streaming slots.) So the streaming mechanism should fill via write_buffer in 64 MiB
+    ///     chunks, NOT recreate mapped buffers.
+    /// The probe measures both paths so the mechanism picks the empirically-fast one. Returns
+    /// (staged_ms, mapped_ms, actual_mib); bandwidth = actual_mib/ms.
+    /// Companion to probe_expert_stream: time the COMPUTE side an expert-layer fill hides under — a real
+    /// per-expert q4 FFN at decode (batch=1). One expert = gate[ff,d] + up[ff,d] + down[d,ff] matvecs. Given
+    /// the model's (d, ff, layers, experts_per_token) this estimates the per-token compute, so the fill cost
+    /// from probe_expert_stream can be judged against a MEASURED budget instead of a guessed --token-ms.
+    /// Returns ms for ONE expert's 3 matvecs. Scout dims: d=5120, ff=8192.
+    pub fn probe_expert_compute(&self, d: usize, ff: usize, iters: usize) -> f64 {
+        let gate = self.quantize_q4_resident(&vec![0.05f32; ff * d], ff, d);
+        let up = self.quantize_q4_resident(&vec![0.05f32; ff * d], ff, d);
+        let down = self.quantize_q4_resident(&vec![0.05f32; d * ff], d, ff);
+        let x = self.upload(&vec![0.1f32; d], 1, d);
+        let xff = self.upload(&vec![0.1f32; ff], 1, ff);
+        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+        for _ in 0..2 { let _ = self.linear_q4_0_t(&x, &gate, 1); let _ = self.linear_q4_0_t(&x, &up, 1); let _ = self.linear_q4_0_t(&xff, &down, 1); }
+        wait();
+        let t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _g = self.linear_q4_0_t(&x, &gate, 1);
+            let _u = self.linear_q4_0_t(&x, &up, 1);
+            let _o = self.linear_q4_0_t(&xff, &down, 1);
+            wait();
+        }
+        t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+    }
+
     pub fn probe_expert_stream(&self, slot_mib: usize, iters: usize) -> (f64, f64, usize) {
         let max_buf = self.device.limits().max_buffer_size as usize;
         let bytes = (slot_mib * (1 << 20)).min(max_buf & !255).max(4);
