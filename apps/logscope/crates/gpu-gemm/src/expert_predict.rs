@@ -26,16 +26,22 @@ use std::collections::HashMap;
 
 /// A compact context signature to condition routing on. Keeping it small keeps the map dense (more hits)
 /// and cheap. `tok` is the current token id; `prev` is the previous token (0 = none), which sharpens the
-/// prediction where a single token is ambiguous but a bigram isn't.
+/// prediction where a single token is ambiguous but a bigram isn't. `mode` tags whether the model is
+/// emitting CODE or PROSE right now (0 = prose, 1 = code): expert routing differs between the two, so the
+/// same token routed differently in code vs prose gets separate map entries — a sharper prefetch signal.
+/// The segmentation layer (logscope-egui::segment) supplies the mode from the stream's fence state.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct CtxSig {
     pub tok: u32,
     pub prev: u32,
+    pub mode: u8,
 }
 
 impl CtxSig {
-    pub fn unigram(tok: u32) -> Self { CtxSig { tok, prev: 0 } }
-    pub fn bigram(prev: u32, tok: u32) -> Self { CtxSig { tok, prev } }
+    pub fn unigram(tok: u32) -> Self { CtxSig { tok, prev: 0, mode: 0 } }
+    pub fn bigram(prev: u32, tok: u32) -> Self { CtxSig { tok, prev, mode: 0 } }
+    /// With an explicit generation mode (0 = prose, 1 = code) — the seam-aware signature.
+    pub fn moded(prev: u32, tok: u32, mode: u8) -> Self { CtxSig { tok, prev, mode } }
 }
 
 /// Per-(signature, layer) expert histogram — the lexical map. Also holds the marginal (per-layer global
@@ -259,6 +265,18 @@ mod tests {
         let p_after8 = m.predict(CtxSig::bigram(8, 5), 0, &[], 1);
         assert_eq!(p_after1, vec![2]);
         assert_eq!(p_after8, vec![4], "the bigram context disambiguates the same token");
+    }
+
+    #[test]
+    fn mode_bit_separates_code_from_prose_routing() {
+        // the SAME token routes to different experts in code vs prose — the mode bit must keep them apart
+        let mut m = ExpertMap::new();
+        for _ in 0..6 { m.observe(CtxSig::moded(0, 5, 1), 0, &[2], &[]); } // token 5 in CODE → expert 2
+        for _ in 0..6 { m.observe(CtxSig::moded(0, 5, 0), 0, &[4], &[]); } // token 5 in PROSE → expert 4
+        let in_code = m.predict(CtxSig::moded(0, 5, 1), 0, &[], 1);
+        let in_prose = m.predict(CtxSig::moded(0, 5, 0), 0, &[], 1);
+        assert_eq!(in_code, vec![2], "code-mode routing predicted");
+        assert_eq!(in_prose, vec![4], "prose-mode routing predicted — mode disambiguates the token");
     }
 
     #[test]
