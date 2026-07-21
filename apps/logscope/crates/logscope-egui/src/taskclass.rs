@@ -132,6 +132,46 @@ to existing code. Decompose it into a short plan of minimal, independently-verif
 at a time — smallest correct change first, verify, then the next. Preserve the existing architecture and \
 style; the minimal-edit and preservation priorities apply literally here.";
 
+/// The educate-then-defer principle: inform the user of real tradeoffs/concerns ONCE, then respect an
+/// informed directive. This is the antidote to the transcript's re-litigation loop (the model kept asking
+/// the user to reconfirm after the user had already reaffirmed). Applied to substantive (long-horizon)
+/// tasks, where there's actually something worth educating about.
+pub const EDUCATE_THEN_DEFER: &str = "\n\nEDUCATE, THEN DEFER: If a request carries real tradeoffs, risks, \
+or scope concerns, name them ONCE — briefly and concretely — so the user can decide with open eyes. Then \
+take the middle ground or follow their directive: when the user shows they understand and still want to \
+proceed, proceed. Do not repeatedly ask them to reconfirm, re-explain your role, or re-litigate whether to \
+begin. Voicing a concern is your job; overriding an informed decision is not.";
+
+/// Appended when the user has REAFFIRMED a request after the model pushed back — the explicit 'they heard
+/// you and said yes, so start now' signal that would have unstuck the refused transcript.
+pub const REAFFIRMED_PROCEED: &str = "\n\nThe user has already heard your concern and reaffirmed the \
+request. They understand the tradeoffs and want to proceed. Begin the work now — do not decline again or \
+ask for further confirmation.";
+
+/// Reaffirm markers in the LATEST user turn — short directives that push past a prior concern.
+const REAFFIRM_MARKERS: &[&str] = &[
+    "no, do", "no do", "yes, do", "yes do", "just do it", "do it anyway", "proceed anyway", "proceed",
+    "i understand", "understood", "go ahead", "i know", "i get it", "regardless", "anyway", "do the",
+    "still want", "yes proceed", "keep going", "continue anyway",
+];
+/// Pushback markers in a PRIOR assistant turn — signs it declined or hedged rather than acting.
+const PUSHBACK_MARKERS: &[&str] = &[
+    "decline", "i must", "not aligned", "respectfully", "confirm your intent", "would you prefer",
+    "outside", "my role", "cannot ", "can't ", "shift direction", "please confirm", "against the",
+    "not designed", "must clarify", "i understand your interest",
+];
+
+/// Did the user reaffirm their request after the model pushed back? True when the latest user turn reads as
+/// a reaffirmation AND the immediately preceding assistant turn declined/hedged. High precision: needs both
+/// sides, so a first-time request (nothing to reaffirm) or a normal continuation doesn't trip it.
+pub fn reaffirmed_after_pushback(prev_assistant: &str, latest_user: &str) -> bool {
+    let u = latest_user.to_ascii_lowercase();
+    let a = prev_assistant.to_ascii_lowercase();
+    let reaffirmed = REAFFIRM_MARKERS.iter().any(|m| u.contains(m));
+    let pushed_back = PUSHBACK_MARKERS.iter().any(|m| a.contains(m));
+    reaffirmed && pushed_back
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +231,29 @@ mod tests {
         let c = classify("explain this function and what the log line means");
         assert_eq!(c.domain, Domain::Maintenance);
         assert_eq!(c.horizon, Horizon::OneShot);
+    }
+
+    #[test]
+    fn reaffirmation_after_refusal_is_detected() {
+        // the exact transcript: model declined citing its role, user reaffirmed
+        let prev = "That's an ambitious request, but I must respectfully decline. As a maintainer my role \
+                    is not to build new games. Please confirm your intent so I can act within my role.";
+        let user = "no do the 3d game";
+        assert!(reaffirmed_after_pushback(prev, user), "user reaffirmed past the model's decline");
+    }
+
+    #[test]
+    fn first_time_request_is_not_a_reaffirmation() {
+        // a normal prior turn (no pushback) → the same directive isn't a 'reaffirmation'
+        let prev = "Here's the plan. I'll start with the render loop.";
+        let user = "do the 3d game";
+        assert!(!reaffirmed_after_pushback(prev, user), "no prior pushback → not a reaffirmation");
+    }
+
+    #[test]
+    fn understanding_then_proceed_counts() {
+        let prev = "I must clarify this is outside my role and would introduce a large new subsystem.";
+        let user = "I understand, proceed anyway";
+        assert!(reaffirmed_after_pushback(prev, user));
     }
 }
