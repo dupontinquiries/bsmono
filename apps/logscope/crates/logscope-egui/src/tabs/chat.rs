@@ -1773,6 +1773,15 @@ impl Chat {
         let mut s = self.sys().to_string();
         if let Some(b) = self.log_block(doc) { s.push_str("\n\n"); s.push_str(&b); }
         if self.fix_mode { s.push_str("\n\n"); s.push_str(FIX_MODE); }
+        // Task posture: classify the latest user turn so a maintenance-tuned identity prompt doesn't refuse
+        // a legitimate greenfield build. The posture reframes minimal-edit as "build the smallest working
+        // version, then grow it" for new-build requests, and keeps the literal minimal-edit posture for
+        // maintenance — humility channeled into HOW to build, not WHETHER to. (Only the long-horizon
+        // quadrants add text; one-shot asks get nothing.)
+        if let Some(latest) = self.msgs.iter().rev().find(|m| m.role == Role::User) {
+            let class = crate::taskclass::classify(latest.text());
+            if let Some(p) = crate::taskclass::posture(class) { s.push_str(p); }
+        }
         s
     }
 
