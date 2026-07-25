@@ -52,6 +52,41 @@ pub fn file_bytes(path: &str) -> std::io::Result<FileBytes> {
     Ok(FileBytes::Mapped(mmap_ro(path)?))
 }
 
+/// Process-lifetime map registry, mirroring Colibri's `g_maps` / `map_of_fd`: a model's file bytes are
+/// mapped ONCE and kept for as long as the process might reference them, reused by path on a repeat load
+/// rather than mapped again.
+///
+/// This exists so weights can be VIEWS into the file instead of copies. Colibri's expert cache depends on
+/// exactly this ("gli expert diventano VISTE dentro mmap … la page cache del kernel È la cache") — you
+/// cannot hand out `&[u8]` into a mapping that gets dropped when the loader returns, which is what ours
+/// does today and why the MoE store has to copy ~50 GiB instead of pointing at the file.
+///
+/// Deliberately never unmapped, like Colibri's. The kernel reclaims file-backed pages under pressure on
+/// its own, so an idle mapping costs address space rather than memory; reusing by path keeps repeated
+/// loads of the same model from accumulating mappings.
+static RETAINED_MAPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static [u8]>>>
+    = std::sync::OnceLock::new();
+
+pub fn retain_map(path: &str) -> std::io::Result<&'static [u8]> {
+    let reg = RETAINED_MAPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(b) = reg.lock().unwrap().get(path) { return Ok(b); }
+    let fb = file_bytes(path)?;
+    // Leak the mapping so the byte slice is 'static. This is the point of the registry: the borrow has to
+    // outlive the loader for weights to reference the file rather than copy it.
+    let leaked: &'static FileBytes = Box::leak(Box::new(fb));
+    let bytes: &'static [u8] = leaked;
+    reg.lock().unwrap().insert(path.to_string(), bytes);
+    Ok(bytes)
+}
+
+/// How many files are currently mapped for the process lifetime, and their total size.
+pub fn retained_map_stats() -> (usize, u64) {
+    match RETAINED_MAPS.get() {
+        None => (0, 0),
+        Some(m) => { let g = m.lock().unwrap(); (g.len(), g.values().map(|b| b.len() as u64).sum()) }
+    }
+}
+
 pub fn mmap_ro(path: &str) -> std::io::Result<memmap2::Mmap> {
     let f = std::fs::File::open(path)?;
     unsafe { memmap2::Mmap::map(&f) }
