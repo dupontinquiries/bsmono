@@ -367,6 +367,13 @@ mod tests {
             .evidence("entropy decode is serial — would erase the 32 GiB/s write_buffer advantage")
             .confidence(0.9)
             .status(Status::Failed { reason: "absmax quantization maximizes nibble entropy by design".into() }));
+        t.add(Branch::new("repin", "Correct the pin set live from observed expert heat (Colibri tier_pick_lfru)")
+            .assume("the loader must choose a pin set before it has ever seen the model route")
+            .evidence("wrong pin set {0,1} vs routed {4,5,6,7}: 0% hit rate, total ring thrash")
+            .evidence("repin corrected pins to {6,7} in 2 swaps; hit rate 0% -> 62%, output bit-exact")
+            .bench("hit_rate_after", 0.62)
+            .confidence(0.9).parent("moe-stream").hardware("any")
+            .status(Status::Succeeded { gain: 0.62 }));
         t.add(Branch::new("couple-prefetch", "Cross-layer coupling prefetch of experts (Colibri couple_prefetch)")
             .evidence("coupling predictor measured 72% accurate")
             .evidence("capacity-bound not accuracy-bound: displacing variant turned 113 demand fills into 183 total")
@@ -484,7 +491,7 @@ mod tests {
         let sys = t.digest(Audience::Systems);
         assert!(sys.len() > op.len());
         let counts = status_counts(&t);
-        assert_eq!(counts.get("succeeded"), Some(&2));
+        assert_eq!(counts.get("succeeded"), Some(&3));
         assert_eq!(counts.get("failed"), Some(&1));
         assert_eq!(counts.get("deferred"), Some(&1));
     }
@@ -493,7 +500,8 @@ mod tests {
     fn children_link_to_parents() {
         let t = real_history();
         let kids = children_of(&t, "moe-stream");
-        assert_eq!(kids.len(), 1);
-        assert_eq!(kids[0].id, "q8-embed");
+        assert_eq!(kids.len(), 2, "q8-embed and repin both descend from the streaming branch");
+        assert!(kids.iter().any(|b| b.id == "q8-embed"));
+        assert!(kids.iter().any(|b| b.id == "repin"));
     }
 }

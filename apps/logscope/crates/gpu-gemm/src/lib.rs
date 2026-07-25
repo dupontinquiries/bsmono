@@ -1171,6 +1171,10 @@ pub struct MoeStream {
     // pinned hot experts resident (Colibri's hot-store): expert id → (qw buffer, qs buffer) for gate_up/down
     pub pinned_gu: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
     pub pinned_dn: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
+    /// REPIN bookkeeping: how many times this layer's pin set has been corrected from observed heat, and
+    /// the access counter that gates how often we even look (Colibri checks at a ~16-token safe point).
+    pub repins: u64,
+    pub visits: u64,
 }
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
@@ -1283,6 +1287,11 @@ pub struct MoeRouteHistory {
 }
 
 static MOE_ROUTE_HIST: std::sync::OnceLock<std::sync::Mutex<MoeRouteHistory>> = std::sync::OnceLock::new();
+
+/// How often (in per-layer visits ≈ tokens) to consider correcting the pin set. Colibri checks at a
+/// ~16-token safe point; a swap costs a full expert-layer re-upload, so checking every token would spend
+/// more bandwidth than the better pin set saves.
+const REPIN_EVERY: u64 = 16;
 pub fn moe_route_hist() -> &'static std::sync::Mutex<MoeRouteHistory> {
     MOE_ROUTE_HIST.get_or_init(|| std::sync::Mutex::new(MoeRouteHistory {
         map: crate::expert_predict::ExpertMap::new(),
@@ -2154,6 +2163,32 @@ impl Gpu {
         (out, qs_off)
     }
 
+    /// Apply a REPIN on the GPU: the pinned buffers holding `evict` are refilled in place with `admit`'s
+    /// bytes and re-keyed. Pinned buffers for a layer are all one expert-layer in size, so the swap is a
+    /// `write_buffer` into the EXISTING allocation — no new BO, which is what makes this affordable under a
+    /// VMA ceiling. Queue ordering guarantees the refill lands after any previously submitted dispatch that
+    /// read those buffers.
+    fn stream_repin(&self, sm: &std::sync::Mutex<MoeStream>, evict: u32, admit: u32) -> bool {
+        let mut s = sm.lock().unwrap();
+        let (Some((gqw, gqs)), Some((dqw, dqs))) = (s.pinned_gu.remove(&evict), s.pinned_dn.remove(&evict)) else {
+            return false; // nothing pinned under that id — leave the policy untouched
+        };
+        let (gu_off, dn_off) = (s.gu_qs_off, s.dn_qs_off);
+        let gu = std::mem::take(&mut s.host_gu[admit as usize]);
+        let dn = std::mem::take(&mut s.host_dn[admit as usize]);
+        self.queue.write_buffer(&gqw, 0, &gu[..gu_off]);
+        self.queue.write_buffer(&gqs, 0, &gu[gu_off..]);
+        self.queue.write_buffer(&dqw, 0, &dn[..dn_off]);
+        self.queue.write_buffer(&dqs, 0, &dn[dn_off..]);
+        s.host_gu[admit as usize] = gu;
+        s.host_dn[admit as usize] = dn;
+        s.pinned_gu.insert(admit, (gqw, gqs));
+        s.pinned_dn.insert(admit, (dqw, dqs));
+        s.policy.repin(evict, admit);
+        s.repins += 1;
+        true
+    }
+
     /// Speculatively bring expert `e` resident in this layer's slots WITHOUT counting a demand miss —
     /// Colibri's `couple_prefetch`. Returns true if a fill was issued. Called BEFORE the layer's router
     /// matvec/readback, so the fill occupies the queue during the CPU-side routing stall (the window where
@@ -2239,7 +2274,7 @@ impl Gpu {
             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-            pinned_gu, pinned_dn,
+            pinned_gu, pinned_dn, repins: 0, visits: 0,
         }
     }
 
@@ -2878,6 +2913,21 @@ impl Gpu {
                 let mut h = moe_route_hist().lock().unwrap();
                 h.prefetched += issued.len() as u64;
                 h.pred_total += predicted.len() as u64;
+            }
+        }
+        // REPIN SAFE POINT (Colibri): periodically re-decide WHICH experts deserve the never-evicted pin
+        // slots, from observed heat. The loader had to choose a pin set before it had ever seen the model
+        // route, so its choice is a guess; this is where the guess gets corrected. Checked at layer entry
+        // (nothing of this layer's is in flight) and rate-limited, since each swap costs a re-upload.
+        if let Some(sm) = &m.stream {
+            let (do_check, n_expert) = {
+                let mut s = sm.lock().unwrap();
+                s.visits += 1;
+                (s.visits % REPIN_EVERY == 0, s.n_expert as u32)
+            };
+            if do_check && std::env::var("LOGSCOPE_MOE_NOREPIN").is_err() {
+                let pick = sm.lock().unwrap().policy.pick_repin(n_expert);
+                if let Some((evict, admit)) = pick { self.stream_repin(sm, evict, admit); }
             }
         }
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
@@ -5871,7 +5921,7 @@ impl Gpu {
                             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
                             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
                             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-                            pinned_gu, pinned_dn,
+                            pinned_gu, pinned_dn, repins: 0, visits: 0,
                         }))
                     } else { None };
                     drop(gsrc); drop(usrc);

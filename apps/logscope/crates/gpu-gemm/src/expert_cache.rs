@@ -79,6 +79,10 @@ impl LayerSlots {
     }
 
     fn is_pinned(&self, e: u32) -> bool { self.pinned.binary_search(&e).is_ok() }
+    /// Is this expert in the never-evicted pin store?
+    pub fn is_pinned_pub(&self, e: u32) -> bool { self.is_pinned(e) }
+    /// The current pin set (sorted) — for a caller that mirrors it in GPU buffers.
+    pub fn pinned_ids(&self) -> &[u32] { &self.pinned }
 
     /// Resolve one expert to its residency, updating recency/stats. On a miss, selects the LRU victim slot,
     /// reassigns it to `e` (so a subsequent fill + dispatch targets it), and returns Miss(slot). The caller
@@ -112,6 +116,34 @@ impl LayerSlots {
     /// Is this expert resident right now (pin or LRU) WITHOUT changing state? Used to split a token's routed
     /// set into resident (dispatch now) vs misses (load first) for the GPU/disk overlap.
     pub fn resident(&self, e: u32) -> bool { self.is_pinned(e) || self.expert_slot.contains_key(&e) }
+
+    /// Colibri's REPIN decision (glm.c `tier_pick_lfru` + its 25%+4 hysteresis): should a pinned expert be
+    /// swapped out for a hotter unpinned one? Returns `(evict, admit)` only when the incoming expert beats
+    /// the coldest pinned one by a clear margin — without that hysteresis the pin set ping-pongs between
+    /// two near-equal experts and every swap costs a full re-upload.
+    ///
+    /// This is what makes the pin set *earned* rather than arbitrary. The loader has to choose a pin set
+    /// before it has ever seen the model route (a chicken-and-egg it cannot win), so the initial choice is
+    /// necessarily a guess; this corrects it from observed routing.
+    pub fn pick_repin(&self, n_expert: u32) -> Option<(u32, u32)> {
+        if self.pinned.is_empty() { return None; }
+        let clk = self.clock as u32;
+        let score = |e: u32| lfru_score(*self.heat.get(&e).unwrap_or(&0), *self.last_access.get(&e).unwrap_or(&0), clk);
+        let cold = *self.pinned.iter().min_by_key(|&&e| score(e))?;
+        let hot = (0..n_expert).filter(|e| !self.is_pinned(*e)).max_by_key(|&e| score(e))?;
+        let (cs, hs) = (score(cold), score(hot));
+        if hs <= cs + (cs >> 2) + (4u64 << 8) { return None; } // hysteresis: must be clearly hotter
+        Some((cold, hot))
+    }
+
+    /// Apply a repin decided by [`pick_repin`]: `evict` leaves the pin store, `admit` joins it. If `admit`
+    /// was occupying an LRU slot it is released (it is resident by pin now), which hands a slot back to the
+    /// streaming ring.
+    pub fn repin(&mut self, evict: u32, admit: u32) {
+        self.pinned.retain(|&e| e != evict);
+        if let Err(pos) = self.pinned.binary_search(&admit) { self.pinned.insert(pos, admit); }
+        if let Some(slot) = self.expert_slot.remove(&admit) { self.slot_expert[slot as usize] = None; }
+    }
 
     /// Speculative fill that can NEVER displace a demand-loaded expert — it takes only a genuinely spare
     /// slot: empty, or holding a previous speculative fill that was never used (heat 0, i.e. the model has
@@ -227,6 +259,35 @@ mod tests {
         }
         assert_eq!(s.hits_lru, 1);
         assert_eq!(s.misses, 1);
+    }
+
+    #[test]
+    fn repin_corrects_a_wrong_pin_set_but_only_on_a_clear_margin() {
+        // The loader pinned {0,1} before it had ever seen routing. The model actually routes to {6,7}.
+        let mut s = LayerSlots::new(&[0, 1], 3);
+        for _ in 0..10 { s.access(6); s.access(7); }
+        // expert 6/7 are now far hotter than the pinned 0/1 → a repin is warranted
+        let (evict, admit) = s.pick_repin(8).expect("hot unpinned expert should trigger a repin");
+        assert!(evict == 0 || evict == 1, "evicts a cold pinned expert, got {evict}");
+        assert!(admit == 6 || admit == 7, "admits a hot routed expert, got {admit}");
+        s.repin(evict, admit);
+        assert!(s.is_pinned_pub(admit), "admitted expert is now pinned");
+        assert!(!s.is_pinned_pub(evict), "evicted expert is no longer pinned");
+        // a second, near-equal candidate must NOT ping-pong: with both hot experts now
+        // one-pinned/one-not and similar heat, hysteresis should hold the line
+        let before = s.pick_repin(8);
+        if let Some((e2, a2)) = before {
+            assert_ne!((e2, a2), (admit, evict), "must not immediately swap back");
+        }
+    }
+
+    #[test]
+    fn repin_declines_when_nothing_is_clearly_hotter() {
+        // uniform routing: every expert equally warm → no swap is justified, so the pin set holds
+        let mut s = LayerSlots::new(&[0, 1], 3);
+        for _ in 0..4 { for e in 0..8u32 { s.access(e); } }
+        // the pinned experts were accessed exactly as often as everyone else
+        assert!(s.pick_repin(8).is_none(), "no clear winner → hysteresis blocks a pointless re-upload");
     }
 
     #[test]
