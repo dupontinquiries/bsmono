@@ -3264,6 +3264,48 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-q4k") {
+        // GPU Q4_K dequant vs the CPU implementation that every loading Q4_K model already depends on.
+        // This is the enabling step for the Colibri approach — never convert on load, let the GPU read the
+        // file's own blocks — and the CPU path is the reference that makes it checkable rather than a
+        // layout reconstructed from memory.
+        let gpu = Gpu::new();
+        eprintln!("gate-q4k: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        // Deterministic pseudo-random super-blocks. Byte-level randomness exercises every field: the f16
+        // d/dmin, both branches of the 6-bit scale/min unpack, and both nibble halves.
+        let nblk = 37usize; // deliberately not a round number
+        let n = nblk * 256;
+        let raw: Vec<u8> = (0..nblk * 144).map(|i| {
+            let x = (i as u32).wrapping_mul(2654435761).wrapping_add(0x9E37);
+            (x >> 13) as u8
+        }).collect();
+        let want = gpu_kernels::gguf::dequantize(12, &raw, n).expect("cpu q4_k");
+        let got = gpu.dequant_q4k(&raw, n);
+        ck(&format!("output length matches ({} values)", want.len()), got.len() == want.len());
+        let maxdiff = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let mismatches = got.iter().zip(&want).filter(|(a, b)| (*a - *b).abs() > 0.0).count();
+        ck(&format!("GPU dequant == CPU dequant: max|diff|={maxdiff:.3e}, {mismatches} differing"), maxdiff == 0.0);
+        // A real weight distribution, not just random bytes: build blocks whose nibbles vary smoothly so a
+        // scale/min mix-up shows up as structure rather than noise.
+        let raw2: Vec<u8> = (0..nblk * 144).map(|i| ((i * 7) % 251) as u8).collect();
+        let want2 = gpu_kernels::gguf::dequantize(12, &raw2, n).expect("cpu q4_k 2");
+        let got2 = gpu.dequant_q4k(&raw2, n);
+        let d2 = got2.iter().zip(&want2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("second pattern also exact: max|diff|={d2:.3e}"), d2 == 0.0);
+        if maxdiff != 0.0 {
+            for (i, (a, b)) in got.iter().zip(&want).enumerate().take(4000) {
+                if (a - b).abs() > 0.0 {
+                    println!("      first mismatch at {i} (block {}, pos {}): gpu {a} vs cpu {b}", i / 256, i % 256);
+                    break;
+                }
+            }
+        }
+        println!("gate-q4k: {}", if ok {
+            "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
