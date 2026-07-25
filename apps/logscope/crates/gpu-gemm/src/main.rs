@@ -3413,6 +3413,32 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
         }
 
+        // CHUNK BOUNDARIES: the deferred path splits a big tensor into 16384-super-block dispatches to
+        // stay under the GPU watchdog, shifting the qw/qs bases per chunk. Off-by-one there corrupts only
+        // the weights near a boundary — invisible in a small test, and invisible in output until the model
+        // is subtly worse. So convert a tensor spanning several chunks and compare against the CPU path.
+        {
+            let (rows, k) = (300usize, 512usize);   // 600 super-blocks; chunked at a small size below
+            let total = rows * k;
+            let nb = total / 256;
+            let raw: Vec<u8> = (0..nb * 144).map(|i| ((i * 17 + 3) % 251) as u8).collect();
+            let out = gpu.alloc_words(total / 8 + total / 32);
+            // deliberately small chunks so the boundary logic is exercised many times
+            let mut b0 = 0usize;
+            while b0 < nb {
+                let cnt = 64usize.min(nb - b0);
+                let sub = &raw[b0 * 144..(b0 + cnt) * 144];
+                gpu.q4k_convert_into(&out, sub, cnt * 256 / k, k, b0 * 32, total / 8 + b0 * 8);
+                b0 += cnt;
+            }
+            let got = gpu.download_words(&out);
+            let f32ref = gpu_kernels::gguf::dequantize(12, &raw, total).expect("cpu");
+            let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
+            let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
+            let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
+            ck(&format!("chunked conversion is exact across boundaries ({diff} words differ)"), diff == 0);
+        }
+
         println!("gate-q4k: {}", if ok {
             "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
         } else { "FAIL \u{2717}" });
