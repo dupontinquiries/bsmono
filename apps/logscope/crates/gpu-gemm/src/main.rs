@@ -2944,12 +2944,15 @@ fn main() {
         println!("gate-quant-survey: {path}");
         println!("  arch = {}   tensors = {}", g.arch(), g.tensors.len());
 
-        // sort tensors by data offset so the next offset bounds this tensor's real byte span
+        // sort tensors by data offset so the next offset bounds this tensor's real byte span. The LAST
+        // tensor has no successor, so bound it with the end of the file (offsets are relative to
+        // data_offset) — without this it contributes elements but zero bytes and drags every bits/wt down.
         let mut order: Vec<usize> = (0..g.tensors.len()).collect();
         order.sort_by_key(|&i| g.tensors[i].offset);
+        let data_end = (bytes.len() as u64).saturating_sub(g.data_offset);
         let mut span: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
         for (k, &i) in order.iter().enumerate() {
-            let end = order.get(k + 1).map(|&j| g.tensors[j].offset).unwrap_or(g.tensors[i].offset);
+            let end = order.get(k + 1).map(|&j| g.tensors[j].offset).unwrap_or(data_end);
             if end > g.tensors[i].offset { span.insert(i, end - g.tensors[i].offset); }
         }
 
@@ -2982,6 +2985,60 @@ fn main() {
             println!("  {:<10} {:>7} {:>14} {:>11.3} {:>9}  {note}",
                 format!("{name}({t})"), count, elems, bits, if supported { "yes" } else { "NO" });
             if !supported { blocked.push((t, elems)); }
+        }
+
+        // CALIBRATION: F32 is definitionally 32.000 bits/weight. If the measurement says otherwise, the
+        // span arithmetic is wrong (padding, alignment, an unbounded final tensor) and EVERY figure in the
+        // table is suspect — including the one an unsupported-quant implementation would be built on. So
+        // the table checks itself before anyone trusts it.
+        if let Some(&(_, elems, mbytes)) = tally.get(&0) {
+            if elems > 0 && mbytes > 0 {
+                let f32_bits = mbytes as f64 * 8.0 / elems as f64;
+                let off = (f32_bits - 32.0).abs();
+                if off < 0.001 {
+                    println!("  calibration: F32 measures {f32_bits:.3} bits/wt \u{2713} — span arithmetic is exact, \
+the figures above are trustworthy");
+                } else {
+                    println!("  calibration: F32 measures {f32_bits:.3}, expected 32.000 \u{2717} — spans are off by \
+{:.2}%; treat every bits/wt above as approximate and DO NOT build a block layout on them",
+                        off / 32.0 * 100.0);
+                }
+            }
+        }
+
+        // ARCHITECTURE WIRING — the other blocker class, and the one these quant results do NOT cover.
+        // A model can have entirely supported quant types and still not load, because the loader is driven
+        // by tensor NAMES: it needs an embedding, per-layer attention projections, and either a dense FFN
+        // or MoE expert stacks. Report which of those this file actually has, so "will it load" is answered
+        // before a 60 GiB load attempt rather than after it.
+        let has = |n: &str| g.tensor(n).is_some();
+        let any = |suffix: &str| g.tensors.iter().any(|t| t.name.ends_with(suffix));
+        println!("  architecture wiring ({}):", g.arch());
+        let embed = has("token_embd.weight");
+        let attn = any(".attn_q.weight") || any(".attn_qkv.weight") || any(".wq.weight");
+        let dense_ffn = any(".ffn_gate.weight") || any(".ffn_up.weight");
+        let moe_ffn = any(".ffn_gate_exps.weight") || any(".ffn_up_exps.weight");
+        let router = any(".ffn_gate_inp.weight");
+        let norm = has("output_norm.weight");
+        for (label, ok_) in [("token embedding", embed), ("attention projections", attn),
+                             ("output norm", norm)] {
+            println!("    {} {label}", if ok_ { "\u{2713}" } else { "\u{2717} MISSING" });
+        }
+        println!("    {} FFN: {}", if dense_ffn || moe_ffn { "\u{2713}" } else { "\u{2717} MISSING" },
+            match (dense_ffn, moe_ffn, router) {
+                (_, true, true) => "MoE (expert stacks + router)",
+                (_, true, false) => "MoE expert stacks but NO router tensor — routing would be unwired",
+                (true, false, _) => "dense",
+                _ => "none found",
+            });
+        // MLA / DSA are the GLM-family shapes whose compute paths exist but are not wired into decode;
+        // flag them explicitly rather than letting a load fail obscurely.
+        if any(".attn_kv_a_mqa.weight") || any(".attn_kv_b.weight") {
+            println!("    ! this model uses MLA (compressed KV) — the compute path is validated but NOT wired into live decode");
+        }
+        if !(embed && attn && (dense_ffn || moe_ffn)) {
+            println!("  → architecture is NOT fully wired: the loader is tensor-name driven and something \
+essential is absent under the names it expects (this is separate from quant support).");
         }
 
         if blocked.is_empty() {
