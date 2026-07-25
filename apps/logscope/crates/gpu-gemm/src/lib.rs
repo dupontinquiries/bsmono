@@ -5385,6 +5385,11 @@ impl DsaConfig {
     }
 }
 impl Model {
+    /// Cache key fragment describing what kind of decode this model performs. MoE and dense decode have
+    /// very different dispatch profiles (a MoE layer issues per-expert work; a dense one does not), so
+    /// anything tuned per-GPU must also be keyed on this — a verdict measured on a dense model does not
+    /// transfer to a MoE one.
+    pub fn decode_class(&self) -> &'static str { if self.is_moe() { "moe" } else { "dense" } }
     /// True if any block is a routed-MoE layer — the dispatch levers (bind-group cache, MoE fusions) only
     /// bear on MoE decode, so the magical A/B autotune skips the probe entirely on dense models.
     pub fn is_moe(&self) -> bool { self.layers.iter().any(|b| b.moe.is_some()) }
@@ -5841,7 +5846,20 @@ impl Gpu {
             // (ffn_gate/up/down) while block 1+ are MoE (ffn_gate_exps + router). Detect by this layer's
             // expert tensor rather than trusting block 0. Falls back to the model-wide flag for archs where
             // every layer is uniform.
-            let layer_is_moe = is_moe && g.tensor(&format!("blk.{i}.ffn_gate_exps.weight")).is_some();
+            // Llama-4 style INTERLEAVED MoE: expert tensors are not present on every block, so a layer is
+            // MoE only if it carries the WHOLE expert set. Testing just ffn_gate_exps mis-classifies a
+            // block that has some but not all of them, and the mistake surfaces far downstream as a bare
+            // "missing tensor blk.N.ffn_up_exps.weight" with no indication that the block was never MoE.
+            let exp_names = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
+            let present: Vec<&str> = exp_names.iter().copied()
+                .filter(|n| g.tensor(&format!("blk.{i}.{n}.weight")).is_some()).collect();
+            let layer_is_moe = is_moe && present.len() == exp_names.len();
+            if is_moe && !present.is_empty() && present.len() != exp_names.len() {
+                let missing: Vec<&str> = exp_names.iter().copied().filter(|n| !present.contains(n)).collect();
+                eprintln!("wgpu-engine: blk.{i} carries a PARTIAL expert set — has {present:?}, missing \
+{missing:?}; treating this block as DENSE. If the model is meant to be MoE here, its expert tensors use \
+names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to see them).");
+            }
             // Qwen2 carries a bias on Q/K/V (llama doesn't). Fetch the f32 bias once so it can both
             // attach to the separate projections AND concatenate for the fused wqkv bias.
             let has_qkv_bias = g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
