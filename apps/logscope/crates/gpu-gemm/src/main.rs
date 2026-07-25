@@ -3392,6 +3392,27 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
                got.len() == want.len() && got == want);
         }
 
+        // LARGE TENSOR: every previous check used a few dozen super-blocks, so all of them fit in a 1-D
+        // dispatch and none exercised the 65535 per-dimension limit. A real weight matrix does not — this
+        // one needs 70000+ workgroups, and before the grid wrapped it produced a validation error that the
+        // loader logs and continues past, leaving the output UNWRITTEN. Silent garbage weights.
+        {
+            let (rows, k) = (35000usize, 512usize);   // 70000 super-blocks, over the limit
+            let total = rows * k;
+            let nb = total / 256;
+            assert!(nb > 65535, "this check is pointless unless it exceeds the dispatch limit");
+            let raw: Vec<u8> = (0..nb * 144).map(|i| ((i * 31) % 253) as u8).collect();
+            let got = gpu.q4k_to_q4_words(&raw, rows, k);
+            ck(&format!("large tensor dispatches ({nb} super-blocks, past the 65535 limit)"),
+               got.len() == total / 8 + total / 32);
+            // spot-check the tail: a wrapped grid that mis-computes the block index leaves the end untouched
+            let f32ref = gpu_kernels::gguf::dequantize(12, &raw, total).expect("cpu");
+            let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
+            let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
+            let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
+            ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
+        }
+
         println!("gate-q4k: {}", if ok {
             "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
         } else { "FAIL \u{2717}" });
