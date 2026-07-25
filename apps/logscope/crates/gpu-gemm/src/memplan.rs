@@ -536,3 +536,41 @@ mod ram_tests {
         assert!(r == 0 || r > (1u64 << 30), "implausible RAM reading: {r}");
     }
 }
+
+/// Resident memory of this process, split by kind: (anonymous, file-backed, total) in bytes.
+///
+/// The split is the whole point. Anonymous pages are our own allocations — host weight copies, buffers —
+/// and are real pressure that ends in an OOM kill. Clean file-backed pages are the mmap'd model, and the
+/// kernel drops them the moment anything else needs the memory. A process monitor shows one number and
+/// cannot tell you which you are looking at, which is how "90 GiB" becomes alarming without being
+/// actionable. Linux only; zeros elsewhere, so callers treat it as unavailable rather than assume.
+pub fn rss_split() -> (u64, u64, u64) {
+    let Ok(s) = std::fs::read_to_string("/proc/self/smaps_rollup") else { return (0, 0, 0) };
+    let kb = |key: &str| -> u64 {
+        s.lines().find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024
+    };
+    let anon = kb("Anonymous:");
+    let total = kb("Rss:");
+    (anon, total.saturating_sub(anon), total)
+}
+
+/// One line describing where this process's memory actually is.
+pub fn rss_report() -> String {
+    let (anon, file, total) = rss_split();
+    if total == 0 { return "resident memory: unavailable on this platform".into(); }
+    format!("resident memory: {:.1} GiB total = {:.1} GiB anonymous (our allocations) + {:.1} GiB file-backed \
+(mmap'd model; reclaimable by the kernel under pressure)",
+        gib(total), gib(anon), gib(file))
+}
+
+#[cfg(test)]
+mod rss_tests {
+    #[test]
+    fn split_is_consistent_or_honestly_zero() {
+        let (a, f, t) = super::rss_split();
+        if t == 0 { assert_eq!((a, f), (0, 0), "unavailable must be all-zero, not partial"); }
+        else { assert_eq!(a + f, t, "the two halves must reconcile to the total"); }
+    }
+}
