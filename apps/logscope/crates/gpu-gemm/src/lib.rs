@@ -881,6 +881,31 @@ impl Gpu {
         bytemuck::cast_slice(&bytes).to_vec()
     }
 
+    /// As `run_f32` but the output is read back as raw u32 words — needed when the buffer holds packed
+    /// bit patterns (quantized nibbles) rather than numbers, where a round-trip through f32 could alter
+    /// NaN payloads.
+    fn run_u32(&self, shader: &str, inputs: &[&[u8]], out_len: usize, dims: &[u8], wg: (u32, u32, u32)) -> Vec<u32> {
+        let bytes = self.run(shader, inputs, (out_len * 4) as u64, dims, wg);
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    /// Convert raw Q4_K bytes straight into our resident q4 layout ON THE GPU, returning the qw‖qs blob as
+    /// words (`qs` starts at word `n*k/8`). No host dequantization and no f32 intermediate — this is what
+    /// lets the loader stop building a ~50 GiB host copy and lets an expert slot be filled from mmap'd
+    /// file bytes. `k` must be a multiple of 256 (one Q4_K super-block).
+    pub fn q4k_to_q4_words(&self, raw: &[u8], n: usize, k: usize) -> Vec<u32> {
+        assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
+        let total = n * k;
+        let nblk = total / 256;
+        let need = nblk * 144;
+        let mut padded = raw[..need.min(raw.len())].to_vec();
+        padded.resize(need.div_ceil(4) * 4, 0);
+        let (qw_words, qs_words) = (total / 8, total / 32);
+        let dims = [nblk as u32, qw_words as u32, 0u32, 0u32];
+        self.run_u32(Q4K_TO_Q4, &[bytemuck::cast_slice(&padded)], qw_words + qs_words,
+                     bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
+    }
+
     pub fn gemm(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let dims = [m as u32, n as u32, k as u32, 0u32];
         self.run_f32(GEMM, &[bytemuck::cast_slice(a), bytemuck::cast_slice(b)], m * n,
@@ -9913,6 +9938,83 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let q = byte_at(qbase + grp * 32u + l);
         let nib = select(q & 0xFu, q >> 4u, half == 1u);
         dst[blk * 256u + grp * 64u + half * 32u + l] = d * sm.x * f32(nib) - dmin * sm.y;
+    }
+}
+"#;
+
+/// Q4_K → our resident q4 layout, entirely on the GPU.
+///
+/// This is what removes the CPU load pass. Today the loader does Q4_K → f32 (CPU) → our q4 (CPU) → upload,
+/// which for Scout is ~50 GiB of host copies and many minutes. With this kernel the raw file blocks go up
+/// as-is and the conversion happens on the GPU, so nothing is materialized host-side and nothing is
+/// dequantized to f32 at any point.
+///
+/// Output is a single buffer laid out qw‖qs, matching `quantize_q4_host_bytes` — so `q4_lin_from_slots`
+/// wraps it unchanged. One workgroup per 256-weight super-block; its 8 lanes each own one 32-element
+/// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
+/// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
+pub const Q4K_TO_Q4: &str = r#"
+struct D { nblk:u32, qs_off:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
+@group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
+@group(0)@binding(2) var<uniform> dims: D;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+fn f16(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u; let e = (h >> 10u) & 0x1Fu; let m = h & 0x3FFu;
+    var v: f32;
+    if (e == 0u) { v = f32(m) * 0.00000005960464477539063; }
+    else if (e == 31u) { v = select(3.4028235e38, 0.0, m != 0u); }
+    else { v = ldexp(1.0 + f32(m) / 1024.0, i32(e) - 15); }
+    return select(v, -v, s == 1u);
+}
+
+fn scale_min(j: u32, base: u32) -> vec2<f32> {
+    var sc: u32; var mn: u32;
+    if (j < 4u) { sc = byte_at(base + j) & 63u; mn = byte_at(base + j + 4u) & 63u; }
+    else {
+        sc = (byte_at(base + j + 4u) & 0x0Fu) | ((byte_at(base + j - 4u) >> 6u) << 4u);
+        mn = (byte_at(base + j + 4u) >> 4u) | ((byte_at(base + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+/// weight at position `t` (0..256) of super-block `blk`
+fn wq(blk: u32, t: u32) -> f32 {
+    let bbase = blk * 144u;
+    let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
+    let dmin = f16(byte_at(bbase + 2u) | (byte_at(bbase + 3u) << 8u));
+    let grp = t / 64u; let idx = t % 64u; let half = idx / 32u; let l = idx % 32u;
+    let sm = scale_min(grp * 2u + half, bbase + 4u);
+    let q = byte_at(bbase + 16u + grp * 32u + l);
+    let nib = select(q & 0xFu, q >> 4u, half == 1u);
+    return d * sm.x * f32(nib) - dmin * sm.y;
+}
+
+@compute @workgroup_size(8)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let blk = wg.x;
+    if (blk >= dims.nblk) { return; }
+    let j = lid.x;                       // which 32-element block inside this super-block
+    let t0 = j * 32u;
+    // absmax over the 32 weights, then the same scale rule as the CPU quantizer
+    var amax = 0.0;
+    for (var l = 0u; l < 32u; l = l + 1u) { amax = max(amax, abs(wq(blk, t0 + l))); }
+    var scale = 1.0;
+    if (amax > 0.0) { scale = amax / 7.0; }
+    let bi = blk * 8u + j;               // global index of this 32-block
+    dst[dims.qs_off + bi] = bitcast<u32>(scale);
+    // pack 8 nibbles per word, 4 words per 32-block
+    for (var w = 0u; w < 4u; w = w + 1u) {
+        var acc = 0u;
+        for (var b = 0u; b < 8u; b = b + 1u) {
+            let v = wq(blk, t0 + w * 8u + b);
+            let qv = clamp(round(v / scale), -7.0, 7.0);
+            let nib = u32(i32(qv) + 8) & 0xFu;
+            acc = acc | (nib << (b * 4u));
+        }
+        dst[bi * 4u + w] = acc;
     }
 }
 "#;
