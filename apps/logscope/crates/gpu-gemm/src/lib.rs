@@ -64,22 +64,63 @@ pub fn file_bytes(path: &str) -> std::io::Result<FileBytes> {
 /// Deliberately never unmapped, like Colibri's. The kernel reclaims file-backed pages under pressure on
 /// its own, so an idle mapping costs address space rather than memory; reusing by path keeps repeated
 /// loads of the same model from accumulating mappings.
-static RETAINED_MAPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static [u8]>>>
+static RETAINED_MAPS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static FileBytes>>>
     = std::sync::OnceLock::new();
 
 pub fn retain_map(path: &str) -> std::io::Result<&'static [u8]> {
     let reg = RETAINED_MAPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(b) = reg.lock().unwrap().get(path) { return Ok(b); }
+    if let Some(b) = reg.lock().unwrap().get(path) { return Ok(*b); }
     let fb = file_bytes(path)?;
     // Leak the mapping so the byte slice is 'static. This is the point of the registry: the borrow has to
     // outlive the loader for weights to reference the file rather than copy it.
     let leaked: &'static FileBytes = Box::leak(Box::new(fb));
+    // Expert fills touch scattered blocks, not a stream — tell the kernel so it stops reading ahead pages
+    // we will never look at.
+    if let FileBytes::Mapped(m) = leaked { let _ = m.advise(memmap2::Advice::Random); }
     let bytes: &'static [u8] = leaked;
-    reg.lock().unwrap().insert(path.to_string(), bytes);
+    reg.lock().unwrap().insert(path.to_string(), leaked);
     Ok(bytes)
 }
 
+/// Drop the resident pages of every retained map, keeping the mappings themselves.
+///
+/// The load pass reads every byte of the model, so afterwards the whole file sits in page cache —
+/// ~61 GiB for Scout, which dominates RSS and looks alarming even though it is clean, file-backed and
+/// reclaimable. Releasing it hands that decision back to the kernel immediately instead of leaving it to
+/// memory pressure. Nothing is lost: a later expert fill re-faults the pages it needs, which is precisely
+/// the streaming design ("the kernel page cache IS the cache").
+pub fn release_map_residency() -> usize {
+    let Some(reg) = RETAINED_MAPS.get() else { return 0 };
+    let g = reg.lock().unwrap();
+    let mut n = 0;
+    for fb in g.values() {
+        if let FileBytes::Mapped(m) = *fb {
+            // SAFETY: memmap2 gates MADV_DONTNEED because on a PRIVATE mapping it discards written data.
+            // Ours is a read-only, file-backed, shared mapping of a model file we never write, so dropping
+            // resident pages loses nothing — any later read re-faults them from the file.
+            if unsafe { m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) }.is_ok() { n += 1; }
+        }
+    }
+    n
+}
+
+/// Process memory split from /proc/self/smaps_rollup: (anonymous KiB, file-backed KiB).
+///
+/// Worth reporting because the two are not comparable: anonymous memory is real pressure that can get the
+/// process OOM-killed, while clean file-backed pages are reclaimable and mostly cosmetic. A single RSS
+/// number conflates them and makes a healthy run look like a leak.
+pub fn memory_split_kb() -> Option<(u64, u64)> {
+    let s = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+    let get = |key: &str| -> Option<u64> {
+        s.lines().find(|l| l.starts_with(key))?
+            .split_whitespace().nth(1)?.parse().ok()
+    };
+    Some((get("Anonymous:")?, get("Pss_File:").or_else(|| get("RssFile:"))?))
+}
+
 /// How many files are currently mapped for the process lifetime, and their total size.
+pub fn gguf_retained_stats() -> (usize, u64) { retained_map_stats() }
+
 pub fn retained_map_stats() -> (usize, u64) {
     match RETAINED_MAPS.get() {
         None => (0, 0),
@@ -2609,6 +2650,13 @@ impl Gpu {
                     let (o0, o1) = (0usize, al(g.len()));
                     let o2 = o1 + al(u.len());
                     let stage = self.moe_stage(o2 + al(dw.len()));
+                    // ORDERING, and this is the subtle one: Queue::write_buffer data is applied at the
+                    // START of a submit, before every command buffer in it. With passes batched into a
+                    // frame, the NEXT expert's staging writes would land before THIS expert's conversion
+                    // dispatches ran — every fill would read the last-written expert's bytes. Closing the
+                    // open frame first, and again after the dispatches, makes a fill atomic with respect
+                    // to submits. Symptom when this is wrong is not a crash but fluent garbage.
+                    self.end_frame();
                     self.queue.write_buffer(&stage.buf, o0 as u64, g);
                     self.queue.write_buffer(&stage.buf, o1 as u64, u);
                     self.queue.write_buffer(&stage.buf, o2 as u64, dw);
@@ -2618,6 +2666,9 @@ impl Gpu {
                     self.q4k_convert_from(&view(o0, g.len()), &gu_buf, ff, d, 0, gu_qs_off / 4);
                     self.q4k_convert_from(&view(o1, u.len()), &gu_buf, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
                     self.q4k_convert_from(&view(o2, dw.len()), &dn_buf, d, ff, 0, dn_qs_off / 4);
+                    // close the frame again so these conversions are submitted before the staging buffer
+                    // can be rewritten by the next fill
+                    self.end_frame();
                 }
             } else {
                 let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
@@ -6721,7 +6772,26 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
         // Run every deferred Q4_K conversion before the model escapes. Until this returns, the weights
         // recorded above reference buffers that have been ALLOCATED but not written — so this must happen
         // here, not lazily at first use. Sealing the arena is part of the flush.
+        // Where the memory actually went, split anonymous vs file-backed, plus what we are keeping mapped.
+        {
+            let (nmaps, mapped) = crate::gguf_retained_stats();
+            eprintln!("wgpu-engine: {}", crate::memplan::rss_report());
+            if nmaps > 0 {
+                eprintln!("wgpu-engine: {nmaps} model file(s) retained mapped ({:.1} GiB of address space; \
+file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
+            }
+        }
         let converted = self.flush_q4k();
+        // The load pass read the whole file; hand that page cache back rather than holding ~61 GiB
+        // resident for the life of the process.
+        let released = release_map_residency();
+        if released > 0 {
+            if let Some((anon, file)) = memory_split_kb() {
+                eprintln!("wgpu-engine: released page cache from {released} mapped file(s) — RSS now anon {:.1} GiB + file {:.1} GiB \
+(anon is the real footprint; file-backed is reclaimable)",
+                    anon as f64 / (1 << 20) as f64, file as f64 / (1 << 20) as f64);
+            }
+        }
         if converted > 0 {
             eprintln!("wgpu-engine: Q4_K → q4 on GPU — {converted} tensors converted in batch (no host copy, no f32 round-trip)");
         }
