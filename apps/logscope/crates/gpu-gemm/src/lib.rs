@@ -1249,6 +1249,21 @@ pub struct QWeight { pub qw: Tensor, pub qs: Tensor, pub n: usize, pub k: usize 
 /// identically and the matmul is bit-exact against a reference.
 pub struct Q4Weight { pub qw: Tensor, pub qs: Tensor, pub n: usize, pub k: usize }
 
+/// The GPU-resident embedding table, either full f32 or int8-quantized (q8). Built by
+/// `Gpu::resident_embed`; `gather_row` reads one row by id regardless of format, so the windowed-decode
+/// loop is identical in both cases. Q8 is used under MoE streaming to reclaim ~2.9 GiB of VMA budget.
+pub enum ResidentEmbed { F32(Tensor), Q8(QWeight) }
+impl ResidentEmbed {
+    /// Gather the row for the id at `ids[id_off]` → [1, d]. f32 path is byte-identical to the old
+    /// `gather_at(&embed_t, …)`; q8 path uses the validated `gather_q8_at` twin.
+    pub fn gather_row(&self, gpu: &Gpu, ids: &Tensor, id_off: u32, d: usize) -> Tensor {
+        match self {
+            ResidentEmbed::F32(t) => gpu.gather_at(t, ids, id_off, d),
+            ResidentEmbed::Q8(q) => gpu.gather_q8_at(q, ids, id_off),
+        }
+    }
+}
+
 /// GPU-side stream slots: the MECHANISM half of MoE expert streaming (the policy half is the pure
 /// `expert_cache::LayerSlots`). A fixed pool of resident buffers, each holding one streamed (cold) expert's
 /// weight bytes. When the policy returns Miss(slot), `fill(slot, bytes)` writes that expert's q4 bytes into
@@ -1970,6 +1985,19 @@ impl Gpu {
     /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
     /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
     pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed, m.vocab, m.d) }
+
+    /// The GPU-resident embedding table for windowed decode. Under MoE streaming (tight VMA budget) the
+    /// table is q8 — ~4× smaller than f32, saving ~2.9 GiB on a Scout-class vocab, at ~0.5% RMSE (the
+    /// input lookup is robust to it; logits use the separate output projection, untouched). Otherwise f32,
+    /// byte-identical to before. Kept in sync with the memplan streaming preflight, which counts the embed
+    /// q8 under the same flag so the budget matches what actually gets allocated.
+    pub fn resident_embed(&self, m: &Model) -> ResidentEmbed {
+        if std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
+            ResidentEmbed::Q8(self.embed_q8(m))
+        } else {
+            ResidentEmbed::F32(self.upload(&m.embed, m.vocab, m.d))
+        }
+    }
 
     pub fn quantize_q8_resident(&self, w: &[f32], n: usize, k: usize) -> QWeight {
         let kb = k / 32;
@@ -5500,7 +5528,11 @@ impl Gpu {
                                 // + KV + a transient staging spill. Experts are sized separately.
                                 let dense_shape = crate::memplan::ModelShape { d, ffn: 0, layers: n, vocab: vocab_est, n_heads, n_kv_heads, tied_embed: g.tensor("output.weight").is_none() };
                                 let kv = kv_cache_bytes(&dense_shape, 4096, 2);
-                                let dense = resident_weight_bytes(&dense_shape, Residency::Q4) + kv + 256 * (1 << 20);
+                                // Under streaming the embedding is resident as q8 (resident_embed), not f32:
+                                // reclaim the f32→q8 delta (~2.9 GiB on a Scout-class vocab) from the budget.
+                                let embed_params = (vocab_est as u64) * (d as u64);
+                                let embed_saving = embed_params * 4 - embed_params * 9 / 8; // f32 − (i8 + f32 scales/32)
+                                let dense = (resident_weight_bytes(&dense_shape, Residency::Q4) + kv + 256 * (1 << 20)).saturating_sub(embed_saving);
                                 // IMPLEMENTATION GRANULARITY: slots are per expert-LAYER, and EVERY layer keeps
                                 // (pin + ring) expert-layers resident. So one "pinned expert" costs
                                 // layers × per-expert-layer bytes. Size the pin count to the budget accordingly.
@@ -8313,7 +8345,7 @@ impl Gpu {
     /// the prerequisite for windowed (K-steps-per-submit) decode.
     pub fn generate_kv_gpu(&self, m: &Model, prompt: &[u32], n_new: usize) -> Vec<u32> {
         self.clear_oom(); // fresh generation: a prior step's OOM must not poison this run's downloads
-        let embed_t = self.upload(&m.embed, m.vocab, m.d);
+        let embed_t = self.resident_embed(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         // Prefill all but the last prompt token via the normal (downloaded) path; keep the LAST prompt
         // token's logits on the GPU to seed the on-device loop.
@@ -8330,7 +8362,7 @@ impl Gpu {
             out.push(id);
             if step + 1 == n_new { break; }
             self.begin_frame();
-            let x = self.gather_t(&embed_t, &id_t, 1, m.d);  // next input gathered on-device from id_t
+            let x = embed_t.gather_row(self, &id_t, 0, m.d);  // next input gathered on-device from id_t
             logits_t = self.decode_layers_t(m, &c, x, prompt.len() + step);
         }
         out
@@ -8343,7 +8375,7 @@ impl Gpu {
     /// submit). EOS can't halt mid-window — generate to k then trim (no over-gen here: fixed n_new).
     pub fn generate_kv_window(&self, m: &Model, prompt: &[u32], n_new: usize, k: usize) -> Vec<u32> {
         let k = k.max(1);
-        let embed_t = self.upload(&m.embed, m.vocab, m.d);
+        let embed_t = self.resident_embed(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         let ids_buf = self.alloc(1, k);                       // [1, k] u32 — one slot per windowed step
         let l = prompt.len();
@@ -8358,7 +8390,7 @@ impl Gpu {
             for j in 0..w {
                 self.argmax_at(&logits_t, &ids_buf, j as u32);            // token (step+j) → ids_buf[j]
                 if step + j + 1 < n_new {                                  // skip the final unneeded decode
-                    let x = self.gather_at(&embed_t, &ids_buf, j as u32, m.d);
+                    let x = embed_t.gather_row(self, &ids_buf, j as u32, m.d);
                     logits_t = self.decode_layers_t(m, &c, x, l + step + j);
                 }
             }
@@ -8383,7 +8415,7 @@ impl Gpu {
                                       sp: &SamplerParams, seed: u64) -> Vec<u32> {
         let k = k.max(1);
         let rcap: usize = 64; // ring capacity == the kernel's override-table bound (rlast ≤ 64)
-        let embed_t = self.upload(&m.embed, m.vocab, m.d);
+        let embed_t = self.resident_embed(m);
         let c = self.new_cache(m.n_layers, prompt.len() + n_new, m.kv_dim());
         // o = [k deposit slots | rcap ring]; seed the ring with the prompt tail (what `seen` ends with)
         let mut o_init = vec![0u32; k + rcap];
@@ -8406,7 +8438,7 @@ impl Gpu {
             for j in 0..w {
                 self.sample_at(&logits_t, &o, &uni, sp, j as u32, seeded, rcap as u32, k as u32, (step + j) as u32);
                 if step + j + 1 < n_new {
-                    let x = self.gather_at(&embed_t, &o, j as u32, m.d);
+                    let x = embed_t.gather_row(self, &o, j as u32, m.d);
                     logits_t = self.decode_layers_t(m, &c, x, l + step + j);
                 }
             }
