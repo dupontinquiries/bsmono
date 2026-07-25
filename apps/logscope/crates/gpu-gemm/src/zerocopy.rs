@@ -124,9 +124,10 @@ pub mod imp {
     }
 
     /// Whether this adapter's device ADVERTISES `VK_EXT_external_memory_host`. Cheap, safe, no device
-    /// created — call this FIRST. On Honeykrisp/Mesa this returns false (the extension isn't there), which
-    /// is the clean answer that says "pivot to streaming" instead of panicking on a request for a missing
-    /// extension.
+    /// created — call this FIRST. CONFIRMED by measurement on an M2 Ultra (--gate-zerocopy, 2026-07):
+    /// Honeykrisp does NOT advertise this extension, so import is unavailable and streaming is the only
+    /// route. llama.cpp hits the same wall here and allocates like we do — the ceiling is the driver's,
+    /// not an artifact of wgpu. This prediction was in the comment before it was measured; it was right.
     ///
     /// # Safety
     /// `adapter` must be a Vulkan-backed wgpu adapter.
