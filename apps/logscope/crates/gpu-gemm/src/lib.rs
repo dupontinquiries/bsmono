@@ -5801,6 +5801,25 @@ impl Gpu {
                                 }
                                 let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
                                 let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(pin_fit).min(pin_fit).min(n_expert);
+                                // HOST COST, stated before any work happens. Streaming keeps every routed
+                                // expert's requantized weights in host RAM, and the loader also touches the
+                                // whole GGUF (so the file lands in page cache). Both are large, and the
+                                // failure mode without this check is an OOM kill ~18 minutes into a load —
+                                // after the expensive dequant/requant pass, with nothing to show for it.
+                                let host_store = (n_expert as u64) * per_expert_all_layers;
+                                let set_data_len = set.data_len();
+                                let ram = crate::memplan::system_ram_bytes();
+                                eprintln!("loader: MoE streaming will hold ~{:.1} GiB of expert weights in HOST RAM \
+(plus ~{:.1} GiB of this file in page cache while loading)", gib(host_store), gib(set_data_len));
+                                if ram > 0 && host_store + set_data_len > ram * 3 / 4 {
+                                    return Err(format!(
+                                        "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights plus \
+~{:.1} GiB of page cache for the file, against {:.1} GiB of system RAM — this would be OOM-killed partway \
+through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here. \
+Options: run a smaller checkpoint, use the llama.cpp backend (which reads the file's native Q4_K blocks \
+directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the resident-fit error instead.",
+                                        gib(host_store), gib(set_data_len), gib(ram)));
+                                }
                                 auto_q4 = true;
                                 moe_stream_pin = Some(pin);
                                 let resident = dense + ring_cost + (pin as u64) * per_expert_all_layers;
@@ -6047,6 +6066,19 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         }
                         let pinned_ids: Vec<u32> = (0..pin as u32).collect();
                         if i == 0 { eprintln!("wgpu-engine: MoE STREAMING on — {n_expert} experts host-resident (q4), {pin} pinned, ring={ring} slots/layer"); }
+                        // Progress. This pass dequantizes every expert from the file's Q4_K and requantizes
+                        // it to our q4 layout — tens of GiB of CPU work that otherwise runs silently for
+                        // many minutes, which reads as a hang and gets killed before it finishes.
+                        {
+                            static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                            let t0 = *T0.get_or_init(std::time::Instant::now);
+                            if i == 0 || (i + 1) % 4 == 0 || i + 1 == n {
+                                let el = t0.elapsed().as_secs_f32();
+                                let done = i + 1;
+                                let eta = if done > 0 { el / done as f32 * (n.saturating_sub(done)) as f32 } else { 0.0 };
+                                eprintln!("wgpu-engine: MoE streaming — quantized {done}/{n} layers ({el:.0}s elapsed, ~{eta:.0}s left)");
+                            }
+                        }
                         Some(std::sync::Mutex::new(MoeStream {
                             layer: i, n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
                             host_gu, host_dn, gu_qs_off, dn_qs_off,
