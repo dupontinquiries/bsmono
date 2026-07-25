@@ -2751,6 +2751,118 @@ fn main() {
         println!("gate-moe-stream: {}", if ok { "live streaming decode is BIT-EXACT to resident \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-moe-prefetch") {
+        // Cross-layer coupling prefetch (Colibri couple_prefetch). TWO streaming MoE layers run in
+        // sequence, like decode: layer 0's routed set predicts layer 1's. Two properties are checked:
+        //   (1) CORRECTNESS — prefetch changes RESIDENCY only, so outputs must be bit-exact to no-prefetch.
+        //   (2) VALUE — does the coupling signal actually raise the slot hit rate (fewer demand fills)?
+        // Inputs cycle through a small set, the way recurring contexts recur in real text, so the coupling
+        // table has something real to learn.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-prefetch: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        // Ring under PRESSURE: 16 experts, 4 routed/token, but only a 5-slot ring — the regime where
+        // prefetch can actually convert demand fills into hits. (With ring >= working set everything is
+        // already resident and prefetch is a no-op, which is itself worth knowing.)
+        let (d, ff, ne, n_used) = (128usize, 256usize, 16usize, 4usize);
+        let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        // two layers, each with its own router + experts
+        let rw: Vec<Vec<f32>> = (0..2).map(|l| mk(1 + l as u32, ne * d)).collect();
+        let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
+        let dns: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(900 + l as u32 * 50 + e as u32, d * ff)).collect()).collect();
+        // 4 distinct inputs, cycled 3× = 12 "tokens"
+        let inputs: Vec<Vec<f32>> = (0..4).map(|i| mk(7000 + i as u32, d)).collect();
+
+        // Routing must actually VARY for prefetch to matter. With random weights every input routes to the
+        // same experts (nothing evicts, nothing to prefetch), so drive routing explicitly: an input built as
+        // the sum of router rows for a chosen expert set makes exactly that set win the top-k (rows are
+        // near-orthogonal in d=128). Layer 0 walks a rotating set; layer 1's set is a fixed function of
+        // layer 0's — the learnable cross-layer coupling this whole mechanism is premised on. Each layer
+        // gets its own controlled input (rather than chaining) so BOTH layers' routing is pinned down;
+        // that is not decode's dataflow, but it is what isolates the prefetch mechanism under test.
+        let row = |l: usize, e: usize| -> Vec<f32> { rw[l][e * d..(e + 1) * d].to_vec() };
+        let set0 = |s: usize| -> Vec<usize> { (0..n_used).map(|j| (s * n_used + j) % ne).collect() };
+        let set1 = |s0: &[usize]| -> Vec<usize> { s0.iter().map(|&e| (e * 3 + 1) % ne).collect() };
+        let mix = |l: usize, set: &[usize]| -> Vec<f32> {
+            let mut v = vec![0f32; d];
+            for &e in set { let r = row(l, e); for i in 0..d { v[i] += r[i]; } }
+            v
+        };
+
+        let run = |prefetch: bool, ring: usize| -> (Vec<f32>, u64, u64, u64, u64) {
+            if prefetch { std::env::set_var("LOGSCOPE_MOE_PREFETCH", "1"); } else { std::env::remove_var("LOGSCOPE_MOE_PREFETCH"); }
+            { let mut h = gpu_kernels::moe_route_hist().lock().unwrap();
+              h.map = gpu_kernels::expert_predict::ExpertMap::new(); h.prev_experts.clear();
+              h.prev_layer = -1; h.prefetched = 0; h.prefetch_hits = 0; h.pred_total = 0; h.pred_correct = 0; }
+            let layers: Vec<gpu_kernels::MoeLayer> = (0..2).map(|l| {
+                let mut st = gpu.build_moe_stream_ring(&gus[l], &dns[l], ff, d, n_used, 0, Some(ring));
+                st.layer = l; // cross-layer coupling key
+                gpu_kernels::MoeLayer {
+                    router: gpu_kernels::Lin::f32(gpu.upload(&rw[l], ne, d)),
+                    gate_up: Vec::new(), down: Vec::new(),
+                    stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                    stacked_down: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                    cfg: cfgm, shared: None, stream: Some(std::sync::Mutex::new(st)),
+                }
+            }).collect();
+            let mut last = Vec::new();
+            for step in 0..24usize {
+                let s0 = set0(step % (ne / n_used) + (step / (ne / n_used)) % 2); // rotating, repeating
+                let s1 = set1(&s0);
+                for (l, set) in [(0usize, &s0), (1usize, &s1)] {
+                    let xin = mix(l, set);
+                    let x = gpu.upload(&xin, 1, d);
+                    let n2 = gpu.upload(&xin, 1, d);
+                    last = gpu.download(&gpu.moe_ffn_t(&layers[l], &n2, 1, d, &x));
+                }
+            }
+            let (mut hits, mut misses) = (0u64, 0u64);
+            for l in &layers { if let Some(sm) = &l.stream { let s = sm.lock().unwrap();
+                hits += s.policy.hits_lru; misses += s.policy.misses; } }
+            let h = gpu_kernels::moe_route_hist().lock().unwrap();
+            (last, hits, misses, h.prefetched, h.prefetch_hits)
+        };
+
+        // ring == working set (5 slots, 4 routed): no spare capacity.
+        let (out_off, hit_off, miss_off, _, _) = run(false, 5);
+        let (out_on, hit_on, miss_on, pf, pf_hit) = run(true, 5);
+        let (pt, pc) = { let h = gpu_kernels::moe_route_hist().lock().unwrap(); (h.pred_total, h.pred_correct) };
+        // ring WITH headroom (9 slots, 4 routed): spare slots exist for speculation.
+        let (_, hit_hoff, miss_hoff, _, _) = run(false, 9);
+        let (_, hit_hon, miss_hon, pf_h, pf_hit_h) = run(true, 9);
+        std::env::remove_var("LOGSCOPE_MOE_PREFETCH");
+
+        let maxdiff = out_on.iter().zip(&out_off).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("prefetch changes residency only — output bit-exact: max|diff|={maxdiff:.2e}"), maxdiff == 0.0);
+        let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { h as f64 / (h + m) as f64 * 100.0 };
+        println!("      ring=5 (== working set, no spare capacity):");
+        println!("        off: {hit_off} hits / {miss_off} fills ({:.0}% hit)   on: {hit_on} hits / {miss_on} demand + {pf} speculative ({:.0}% hit)",
+                 rate(hit_off, miss_off), rate(hit_on, miss_on));
+        println!("      ring=9 (headroom for speculation):");
+        println!("        off: {hit_hoff} hits / {miss_hoff} fills ({:.0}% hit)   on: {hit_hon} hits / {miss_hon} demand + {pf_h} speculative ({:.0}% hit), {pf_hit_h} of the speculative fills used",
+                 rate(hit_hoff, miss_hoff), rate(hit_hon, miss_hon));
+        println!("      predictor accuracy (coupling): {pc}/{pt} ({:.0}%)", if pt == 0 { 0.0 } else { pc as f64 / pt as f64 * 100.0 });
+        let _ = pf_hit;
+        // SAFETY is the property that must hold: a non-displacing prefetch can never make things worse.
+        ck("prefetch never costs demand fills or hits (ring == working set)",
+           miss_on <= miss_off && hit_on >= hit_off);
+        ck("prefetch never costs demand fills or hits (ring with headroom)",
+           miss_hon <= miss_hoff && hit_hon >= hit_hoff);
+        // MEASURED FINDING, recorded rather than asserted: the coupling predictor is accurate (72%), but
+        // speculation still issues ~nothing, because the binding constraint is SLOT CAPACITY, not
+        // prediction quality. A slot is only safely speculatable while nothing demanded has claimed it;
+        // once the ring is warm every slot holds a real resident, so a non-displacing prefetch is a no-op.
+        // Allowing it to displace instead (the earlier variant) lifted the hit rate 41%→46% but turned 113
+        // demand fills into 103 demand + 80 speculative — a bandwidth LOSS on hardware where a fill does not
+        // overlap compute, which the M2 probe showed is the case on Asahi's single serialized queue.
+        // Conclusion: cross-layer prefetch pays only with genuine ring headroom AND overlapping fills.
+        // Scout under the ~24 GiB ceiling has neither (ring is sized to the minimum that fits), so this
+        // stays default-OFF until a hardware run says otherwise.
+        println!("      FINDING: capacity-bound, not accuracy-bound — see the gate's source comment.");
+        println!("gate-moe-prefetch: {}", if ok { "mechanism correct + safe \u{2713} (bit-exact, never harmful; pays only with ring headroom + overlapping fills)" } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");

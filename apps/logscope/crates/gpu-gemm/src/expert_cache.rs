@@ -113,6 +113,26 @@ impl LayerSlots {
     /// set into resident (dispatch now) vs misses (load first) for the GPU/disk overlap.
     pub fn resident(&self, e: u32) -> bool { self.is_pinned(e) || self.expert_slot.contains_key(&e) }
 
+    /// Speculative fill that can NEVER displace a demand-loaded expert — it takes only a genuinely spare
+    /// slot: empty, or holding a previous speculative fill that was never used (heat 0, i.e. the model has
+    /// not routed to it). Returns None when every slot holds an expert the model actually demanded.
+    ///
+    /// This is the economics fix. Plain `prefetch` raises the hit rate but evicts real residents to do it,
+    /// so total fills (demand + speculative) go UP — a loss on hardware where a fill costs bandwidth and
+    /// does not overlap compute (measured: Asahi's single serialized queue). Restricting prefetch to spare
+    /// capacity makes it strictly non-harmful: it can only ever convert an idle slot into a hit.
+    pub fn prefetch_spare(&mut self, e: u32) -> Option<u32> {
+        if self.resident(e) { return None; }
+        let spare = self.slot_expert.iter().position(|s| match s {
+            None => true,
+            Some(x) => *self.heat.get(x).unwrap_or(&0) == 0, // never-demanded (unused prefetch / decayed cold)
+        })? as u32;
+        if let Some(old) = self.slot_expert[spare as usize] { self.expert_slot.remove(&old); }
+        self.slot_expert[spare as usize] = Some(e);
+        self.expert_slot.insert(e, spare);
+        Some(spare)
+    }
+
     /// Prefetch: bring `e` resident if it isn't, WITHOUT counting a demand miss (it's speculative). Returns
     /// Some(slot) if a slot was assigned to fill (the mechanism should start the copy), None if already
     /// resident. An unused prefetch is the first non-empty LRU victim (so a wrong prediction self-corrects),
