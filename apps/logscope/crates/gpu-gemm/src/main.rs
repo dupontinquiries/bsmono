@@ -2944,6 +2944,55 @@ fn main() {
         println!("gate-quant-survey: {path}");
         println!("  arch = {}   tensors = {}", g.arch(), g.tensors.len());
 
+        // --tensors <prefix> dumps the raw tensor names for one block, which is how you find out what a
+        // model ACTUALLY calls its weights rather than assuming. Use it when a layer fails to load:
+        //   --gate-quant-survey model.gguf --tensors blk.36.
+        if let Some(pfx) = args.iter().position(|a| a == "--tensors").and_then(|i| args.get(i + 1)) {
+            let mut hits: Vec<&gpu_kernels::gguf::TensorInfo> =
+                g.tensors.iter().filter(|t| t.name.starts_with(pfx.as_str())).collect();
+            hits.sort_by(|a, b| a.name.cmp(&b.name));
+            println!("  tensors matching '{pfx}' ({}):", hits.len());
+            for t in &hits {
+                println!("    {:<44} {:<10} dims={:?}", t.name,
+                    gpu_kernels::gguf::ggml_type_name(t.ggml_type), t.dims);
+            }
+            if hits.is_empty() { println!("    (none — check the prefix, e.g. 'blk.36.')"); }
+        }
+
+        // Per-block MoE/dense pattern: interleaved-MoE architectures (Llama-4) carry expert tensors on
+        // only some blocks, and a loader that assumes uniformity fails deep into the load. Report the
+        // pattern up front so the shape of the model is visible before a 60 GiB attempt.
+        {
+            let nblk = g.tensors.iter().filter_map(|t| t.name.strip_prefix("blk."))
+                .filter_map(|s| s.split('.').next()).filter_map(|s| s.parse::<usize>().ok())
+                .max().map(|m| m + 1).unwrap_or(0);
+            if nblk > 0 {
+                let has = |i: usize, n: &str| g.tensor(&format!("blk.{i}.{n}.weight")).is_some();
+                let mut full = Vec::new(); let mut partial = Vec::new(); let mut dense = Vec::new();
+                for i in 0..nblk {
+                    let c = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter()
+                        .filter(|n| has(i, n)).count();
+                    match c { 3 => full.push(i), 0 => dense.push(i), _ => partial.push(i) }
+                }
+                if !full.is_empty() || !partial.is_empty() {
+                    println!("  block FFN pattern over {nblk} blocks: {} MoE, {} dense, {} PARTIAL",
+                             full.len(), dense.len(), partial.len());
+                    if !dense.is_empty() && !full.is_empty() {
+                        println!("    interleaved — dense blocks: {:?}", &dense[..dense.len().min(24)]);
+                    }
+                    if !partial.is_empty() {
+                        println!("    ! PARTIAL expert sets at {:?} — these blocks have some but not all of \
+ffn_{{gate,up,down}}_exps; that is what makes a load die on 'missing tensor'", &partial[..partial.len().min(24)]);
+                        for &i in partial.iter().take(2) {
+                            for n in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate", "ffn_up", "ffn_down"] {
+                                if has(i, n) { println!("      blk.{i}.{n}.weight present"); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // sort tensors by data offset so the next offset bounds this tensor's real byte span. The LAST
         // tensor has no successor, so bound it with the end of the file (offsets are relative to
         // data_offset) — without this it contributes elements but zero bytes and drags every bits/wt down.
