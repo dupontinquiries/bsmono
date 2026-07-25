@@ -6562,29 +6562,47 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         // expect, point at the file instead of copying. This is what removes the ~50 GiB
                         // host store and the multi-minute requantize pass — nothing is read here at all,
                         // only sliced.
-                        let raw_src = (|| -> Option<RawExpertSrc> {
-                            if std::env::var("LOGSCOPE_NO_MOE_VIEWS").is_ok() { return None; }
+                        // Returns Err with the REASON when it cannot use views. Silently choosing the slow
+                        // path is what cost a 135-second load with no explanation in the log.
+                        let raw_try = (|| -> Result<RawExpertSrc, String> {
+                            if std::env::var("LOGSCOPE_NO_MOE_VIEWS").is_ok() {
+                                return Err("LOGSCOPE_NO_MOE_VIEWS is set".into());
+                            }
+                            if d % 256 != 0 || expert_ff % 256 != 0 {
+                                return Err(format!("conversion needs d and ff to be multiples of 256 (d={d}, ff={expert_ff})"));
+                            }
+                            let sset = static_set.as_ref()
+                                .ok_or("shards were not retained for the process (loader called without the static entry point)")?;
                             let names = [format!("blk.{i}.ffn_gate_exps.weight"),
                                          format!("blk.{i}.ffn_up_exps.weight"),
                                          format!("blk.{i}.ffn_down_exps.weight")];
                             let mut spans = Vec::new();
                             for (idx, nm) in names.iter().enumerate() {
-                                let t = g.tensor(nm)?;
-                                if t.ggml_type != 12 { return None; }           // Q4_K only
+                                let t = g.tensor(nm).ok_or(format!("{nm} not found"))?;
+                                if t.ggml_type != 12 {
+                                    return Err(format!("{nm} is {}, not Q4_K — Q4_K_M mixes in other types",
+                                        gguf::ggml_type_name(t.ggml_type)));
+                                }
                                 let count = t.dims.iter().product::<u64>() as usize;
                                 let want = if idx == 2 { d * expert_ff * n_expert } else { expert_ff * d * n_expert };
-                                if count != want { return None; }
-                                let nbytes = gguf::type_nbytes(12, count)?;
-                                spans.push(static_set.as_ref()?.slice(t.offset, nbytes)?);
+                                if count != want { return Err(format!("{nm} has {count} elements, expected {want}")); }
+                                let nbytes = gguf::type_nbytes(12, count).ok_or("q4_k size")?;
+                                spans.push(sset.slice(t.offset, nbytes).ok_or(format!("{nm} span escapes the shards"))?);
                             }
-                            if d % 256 != 0 || expert_ff % 256 != 0 { return None; } // conversion needs k%256
-                            Some(RawExpertSrc {
+                            Ok(RawExpertSrc {
                                 gate: spans[0], up: spans[1], down: spans[2],
                                 gu_expert_bytes: expert_ff * d / 256 * 144,
                                 dn_expert_bytes: d * expert_ff / 256 * 144,
                                 ff: expert_ff, d,
                             })
                         })();
+                        if i == 0 {
+                            if let Err(why) = &raw_try {
+                                eprintln!("wgpu-engine: MoE file-views unavailable — {why}; falling back to the \
+host-copy path (dequantize + requantize every expert into RAM)");
+                            }
+                        }
+                        let raw_src = raw_try.ok();
 
                         if let Some(r) = raw_src {
                             let (gu_qs, gu_total) = r.gu_layout();
@@ -6624,14 +6642,38 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
                         let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
                         let mut gu_qs_off = 0; let mut dn_qs_off = 0;
-                        for e in 0..n_expert {
-                            let mut cat = Vec::with_capacity(2 * ec);
-                            cat.extend_from_slice(&gsrc[e * ec..(e + 1) * ec]);
-                            cat.extend_from_slice(&usrc[e * ec..(e + 1) * ec]);
-                            let (gb, goff) = self.quantize_q4_host_bytes(&cat, gu_rows, d);
-                            gu_qs_off = goff; host_gu.push(gb);
-                            let (db, doff) = self.quantize_q4_host_bytes(&dsrc[e * d * expert_ff..(e + 1) * d * expert_ff], dn_rows, expert_ff);
-                            dn_qs_off = doff; host_dn.push(db);
+                        // PARALLEL over experts. Each expert's dequantize+requantize is independent and
+                        // pure CPU, so this is embarrassingly parallel — it was costing ~2.8s per layer
+                        // single-threaded (135s for 48 layers) while the other cores sat idle.
+                        let mut slots: Vec<Option<(Vec<u8>, usize, Vec<u8>, usize)>> =
+                            (0..n_expert).map(|_| None).collect();
+                        {
+                            let nthreads = std::thread::available_parallelism()
+                                .map(|n| n.get()).unwrap_or(4).min(n_expert).max(1);
+                            let per = n_expert.div_ceil(nthreads);
+                            let (gs, us, ds) = (&gsrc, &usrc, &dsrc);
+                            std::thread::scope(|sc| {
+                                for (ti, chunk) in slots.chunks_mut(per).enumerate() {
+                                    let base = ti * per;
+                                    sc.spawn(move || {
+                                        for (j, slot) in chunk.iter_mut().enumerate() {
+                                            let e = base + j;
+                                            let mut cat = Vec::with_capacity(2 * ec);
+                                            cat.extend_from_slice(&gs[e * ec..(e + 1) * ec]);
+                                            cat.extend_from_slice(&us[e * ec..(e + 1) * ec]);
+                                            let (gb, goff) = self.quantize_q4_host_bytes(&cat, gu_rows, d);
+                                            let (db, doff) = self.quantize_q4_host_bytes(
+                                                &ds[e * d * expert_ff..(e + 1) * d * expert_ff], dn_rows, expert_ff);
+                                            *slot = Some((gb, goff, db, doff));
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                        for slot in slots {
+                            let (gb, goff, db, doff) = slot.expect("every expert quantized");
+                            gu_qs_off = goff; dn_qs_off = doff;
+                            host_gu.push(gb); host_dn.push(db);
                         }
                         drop(dsrc);
                         let gu_slot_bytes = host_gu[0].len() as u64;
