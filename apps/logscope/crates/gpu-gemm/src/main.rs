@@ -3301,6 +3301,42 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
                 }
             }
         }
+        // The conversion that actually removes the load pass: raw Q4_K → our resident q4, on the GPU.
+        // Reference is the exact CPU pipeline it replaces: dequantize(Q4_K) → quantize_q4_host_bytes.
+        {
+            let (rows, k) = (7usize, 512usize); // k a multiple of 256; rows deliberately odd
+            let total = rows * k;
+            let nb = total / 256;
+            let raw3: Vec<u8> = (0..nb * 144).map(|i| {
+                let x = (i as u32).wrapping_mul(2246822519).wrapping_add(7);
+                (x >> 11) as u8
+            }).collect();
+            let f32ref = gpu_kernels::gguf::dequantize(12, &raw3, total).expect("cpu q4_k");
+            let (cpu_blob, qs_off) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
+            let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
+            let gpu_words = gpu.q4k_to_q4_words(&raw3, rows, k);
+            ck(&format!("converted blob is the expected size ({} words)", cpu_words.len()),
+               gpu_words.len() == cpu_words.len());
+            // nibbles must match exactly; scales are f32 arithmetic, compared as values
+            let qw_n = total / 8;
+            let nib_bad = gpu_words[..qw_n].iter().zip(&cpu_words[..qw_n]).filter(|(a, b)| a != b).count();
+            ck(&format!("packed nibbles identical to the CPU path ({nib_bad} words differ)"), nib_bad == 0);
+            let gs: &[f32] = bytemuck::cast_slice(&gpu_words[qw_n..]);
+            let cs: &[f32] = bytemuck::cast_slice(&cpu_words[qw_n..]);
+            let sdiff = gs.iter().zip(cs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("block scales identical: max|diff|={sdiff:.3e}"), sdiff == 0.0);
+            if sdiff != 0.0 || nib_bad != 0 {
+                let bad: Vec<usize> = gs.iter().zip(cs).enumerate()
+                    .filter(|(_, (a, b))| (*a - *b).abs() > 0.0).map(|(i, _)| i).collect();
+                println!("      differing scale blocks ({} of {}): {:?}", bad.len(), gs.len(), &bad[..bad.len().min(12)]);
+                if let Some(&b0) = bad.first() {
+                    println!("      block {b0}: gpu scale {} vs cpu {}", gs[b0], cs[b0]);
+                    println!("      (block {b0} lives in super-block {}, lane {})", b0 / 8, b0 % 8);
+                }
+            }
+            assert_eq!(qs_off, qw_n * 4, "qs offset convention drifted");
+        }
+
         println!("gate-q4k: {}", if ok {
             "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
         } else { "FAIL \u{2717}" });
