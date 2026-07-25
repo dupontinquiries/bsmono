@@ -251,6 +251,9 @@ pub fn zip_store(files: &[(String, Vec<u8>)]) -> Vec<u8> {
 }
 
 /// Bundle artifacts into a zip written next to the workspace; returns the zip path.
+///
+/// Kept for callers that want the stable `bundle.zip` name. Prefer [`zip_artifacts_versioned`] — this one
+/// overwrites, which silently destroys the previous export.
 pub fn zip_artifacts(arts: &[Artifact], dir: &Path) -> std::io::Result<PathBuf> {
     let files: Vec<(String, Vec<u8>)> = arts.iter()
         .filter_map(|a| safe_rel(&a.path).map(|p| (p, a.content.clone().into_bytes())))
@@ -260,9 +263,133 @@ pub fn zip_artifacts(arts: &[Artifact], dir: &Path) -> std::io::Result<PathBuf> 
     Ok(zip)
 }
 
+/// The next free export version in `dir` — one past the highest existing `bundle-vN.zip`. Scanning the
+/// directory rather than tracking a counter means the numbering survives restarts and stays correct even
+/// if a user deletes or copies bundles by hand.
+pub fn next_bundle_version(dir: &Path) -> u32 {
+    let mut max = 0u32;
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(n) = name.to_str() else { continue };
+            let Some(rest) = n.strip_prefix("bundle-v") else { continue };
+            let Some(num) = rest.strip_suffix(".zip") else { continue };
+            if let Ok(v) = num.parse::<u32>() { max = max.max(v); }
+        }
+    }
+    max + 1
+}
+
+/// A human- and machine-readable record of what an export contains, written into the zip as MANIFEST.txt.
+/// Without it an exported bundle is anonymous: you cannot tell which conversation or revision produced it,
+/// which is exactly what you need when comparing two exports weeks apart.
+pub fn export_manifest(version: u32, files: &[(String, Vec<u8>)], note: &str) -> String {
+    let mut s = format!("logscope export v{version}\n");
+    if !note.is_empty() { s.push_str(&format!("note: {note}\n")); }
+    s.push_str(&format!("files: {}\n", files.len()));
+    let total: usize = files.iter().map(|(_, b)| b.len()).sum();
+    s.push_str(&format!("bytes: {total}\n\n"));
+    let mut rows: Vec<&(String, Vec<u8>)> = files.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    for (p, b) in rows {
+        // FNV-1a: a cheap content fingerprint, enough to tell "did this file change between exports?"
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &byte in b.iter() { h ^= byte as u64; h = h.wrapping_mul(0x1000_0000_01b3); }
+        s.push_str(&format!("{h:016x}  {:>9}  {p}\n", b.len()));
+    }
+    s
+}
+
+/// Export artifacts as a NEW versioned bundle: `bundle-v1.zip`, `bundle-v2.zip`, … Previous exports are
+/// never touched, so a sequence of exports is a history you can diff rather than a single mutable file.
+/// A MANIFEST.txt inside records the version, file count, sizes and per-file content hashes.
+///
+/// Returns (path, version).
+pub fn zip_artifacts_versioned(arts: &[Artifact], dir: &Path, note: &str) -> std::io::Result<(PathBuf, u32)> {
+    let mut files: Vec<(String, Vec<u8>)> = arts.iter()
+        .filter_map(|a| safe_rel(&a.path).map(|p| (p, a.content.clone().into_bytes())))
+        .collect();
+    let version = next_bundle_version(dir);
+    files.push(("MANIFEST.txt".to_string(), export_manifest(version, &files, note).into_bytes()));
+    let zip = dir.join(format!("bundle-v{version}.zip"));
+    std::fs::write(&zip, zip_store(&files))?;
+    Ok((zip, version))
+}
+
+/// Which files changed between two exports, by comparing their manifests. Answers the question an export
+/// history exists to answer — "what actually differs between v3 and v7?" — without unzipping either.
+/// Returns (added, removed, changed) paths.
+pub fn manifest_delta(old: &str, new: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let parse = |s: &str| -> std::collections::HashMap<String, String> {
+        s.lines().filter_map(|l| {
+            let mut it = l.split_whitespace();
+            let hash = it.next()?;
+            if hash.len() != 16 || !hash.chars().all(|c| c.is_ascii_hexdigit()) { return None; }
+            let _size = it.next()?;
+            let path = it.collect::<Vec<_>>().join(" ");
+            if path.is_empty() { None } else { Some((path, hash.to_string())) }
+        }).collect()
+    };
+    let (o, n) = (parse(old), parse(new));
+    let mut added: Vec<String> = n.keys().filter(|k| !o.contains_key(*k)).cloned().collect();
+    let mut removed: Vec<String> = o.keys().filter(|k| !n.contains_key(*k)).cloned().collect();
+    let mut changed: Vec<String> = n.iter()
+        .filter(|(k, v)| o.get(*k).is_some_and(|ov| ov != *v)).map(|(k, _)| k.clone()).collect();
+    added.sort(); removed.sort(); changed.sort();
+    (added, removed, changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_never_overwrite_a_previous_bundle() {
+        let dir = std::env::temp_dir().join(format!("logscope_ver_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let a1 = vec![Artifact { path: "src/a.rs".into(), content: "fn a() {}".into(),
+                                 kind: Kind::File, fragments: 1 }];
+        let (p1, v1) = zip_artifacts_versioned(&a1, &dir, "first").expect("export 1");
+        let a2 = vec![Artifact { path: "src/a.rs".into(), content: "fn a() { 1 }".into(),
+                                 kind: Kind::File, fragments: 1 }];
+        let (p2, v2) = zip_artifacts_versioned(&a2, &dir, "second").expect("export 2");
+        assert_eq!((v1, v2), (1, 2), "versions increment");
+        assert_ne!(p1, p2);
+        assert!(p1.exists() && p2.exists(), "the earlier export survives the later one");
+        // numbering is derived from the directory, so it stays right across restarts
+        assert_eq!(next_bundle_version(&dir), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manifest_records_size_and_content_hash_per_file() {
+        let files = vec![("b.rs".to_string(), b"xy".to_vec()), ("a.rs".to_string(), b"z".to_vec())];
+        let m = export_manifest(4, &files, "note here");
+        assert!(m.contains("logscope export v4"));
+        assert!(m.contains("note: note here"));
+        assert!(m.contains("files: 2"));
+        assert!(m.contains("bytes: 3"));
+        // sorted by path, so two manifests line up for comparison
+        let a_at = m.find("a.rs").unwrap();
+        let b_at = m.find("b.rs").unwrap();
+        assert!(a_at < b_at);
+    }
+
+    #[test]
+    fn manifest_delta_answers_what_changed_between_exports() {
+        let v1 = export_manifest(1, &[
+            ("keep.rs".into(), b"same".to_vec()),
+            ("edit.rs".into(), b"before".to_vec()),
+            ("gone.rs".into(), b"x".to_vec())], "");
+        let v2 = export_manifest(2, &[
+            ("keep.rs".into(), b"same".to_vec()),
+            ("edit.rs".into(), b"after".to_vec()),
+            ("new.rs".into(), b"y".to_vec())], "");
+        let (added, removed, changed) = manifest_delta(&v1, &v2);
+        assert_eq!(added, vec!["new.rs"]);
+        assert_eq!(removed, vec!["gone.rs"]);
+        assert_eq!(changed, vec!["edit.rs"], "same content must NOT be reported as changed");
+    }
 
     #[test]
     fn parses_named_block_and_patch() {
