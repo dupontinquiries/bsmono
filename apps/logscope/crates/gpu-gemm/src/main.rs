@@ -2944,6 +2944,62 @@ fn main() {
         println!("gate-quant-survey: {path}");
         println!("  arch = {}   tensors = {}", g.arch(), g.tensors.len());
 
+        // DECISIVE INTEGRITY CHECK: the GGUF header declares its own tensor count at bytes 8..16. Read it
+        // straight from the file, independent of the parser, and compare. A mismatch means the table was
+        // truncated (parser stopped early, or the file is one shard of a split model) — which presents
+        // downstream as "missing tensor blk.N.*" and is easily mistaken for an architecture quirk.
+        if bytes.len() >= 24 {
+            let declared = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            let kv = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+            let parsed = g.tensors.len() as u64;
+            if declared == parsed {
+                println!("  header: {declared} tensors declared, {parsed} parsed \u{2713}  ({kv} metadata keys)");
+            } else {
+                println!("  header: {declared} tensors DECLARED but {parsed} parsed \u{2717} — the tensor table is \
+incomplete. Any 'missing tensor' failure downstream is this, not the architecture.");
+            }
+        }
+        // CONCATENATED SHARDS: a split GGUF must be MERGED, not `cat`-ed. Each shard carries its own
+        // header + metadata + tensor table, so concatenation leaves shard 2's header sitting in the middle
+        // as unreadable bytes: the parser reads shard 1's table, and everything after is unreachable. The
+        // symptoms are a short tensor table, a block whose tensors straddle the boundary, and a file far
+        // larger than its table describes. Scan for further plausible headers to say so outright.
+        {
+            let mut extra: Vec<usize> = Vec::new();
+            let mut i = 4usize;
+            while i + 24 <= bytes.len() && extra.len() < 8 {
+                if &bytes[i..i + 4] == b"GGUF" {
+                    // guard against the magic occurring by chance inside weight data: a real header is
+                    // followed by a sane version and plausible counts
+                    let ver = u32::from_le_bytes(bytes[i + 4..i + 8].try_into().unwrap());
+                    let nt = u64::from_le_bytes(bytes[i + 8..i + 16].try_into().unwrap());
+                    let nk = u64::from_le_bytes(bytes[i + 16..i + 24].try_into().unwrap());
+                    if (1..=3).contains(&ver) && nt > 0 && nt < 100_000 && nk < 10_000 { extra.push(i); }
+                }
+                i += 1;
+            }
+            if !extra.is_empty() {
+                println!("  ! CONCATENATED SHARDS: found {} further GGUF header(s) inside this file (first at \
+byte {}). A split model must be MERGED, not joined with `cat` — each shard has its own header and tensor \
+table, so only the first shard's tensors are reachable and a block at the boundary loses tensors.",
+                    extra.len(), extra[0]);
+                println!("    fix: llama-gguf-split --merge <model>-00001-of-0000N.gguf <merged>.gguf");
+            }
+        }
+
+        // Split-model metadata: a sharded GGUF names its part and the total. Loading one shard alone gives
+        // the same symptom — a block whose tensors straddle the file boundary.
+        for k in ["split.no", "split.count", "split.tensors.count"] {
+            if let Some(v) = g.metadata.get(k) { println!("  {k} = {v:?}"); }
+        }
+        {
+            // ...and the filename convention, for models that carry no split metadata.
+            let base = std::path::Path::new(&path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            if base.contains("-of-") {
+                println!("  ! filename indicates a SPLIT model ({base}) — every shard must be loaded together");
+            }
+        }
+
         // --tensors <prefix> dumps the raw tensor names for one block, which is how you find out what a
         // model ACTUALLY calls its weights rather than assuming. Use it when a layer fails to load:
         //   --gate-quant-survey model.gguf --tensors blk.36.
