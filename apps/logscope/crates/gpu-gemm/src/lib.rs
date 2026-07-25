@@ -2807,18 +2807,34 @@ impl Gpu {
         let kb = k / 32;
         let mut qs = vec![0f32; n * kb];
         let mut nib = vec![0u8; n * k];
-        for r in 0..n {
-            for b in 0..kb {
-                let base = r * k + b * 32;
-                let mut amax = 0f32;
-                for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
-                qs[r * kb + b] = scale;
-                for j in 0..32 {
-                    let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
-                    nib[r * k + b * 32 + j] = (qv + 8) as u8;
+        // PARALLEL over rows. Each row's blocks depend only on that row's weights, so this is bit-identical
+        // to the sequential version and simply stops one core doing all of it — this runs for every expert
+        // on the MoE fallback path and for every tensor that misses the GPU conversion.
+        {
+            let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).min(n.max(1));
+            let rows_per = n.div_ceil(threads.max(1));
+            std::thread::scope(|sc| {
+                for (ti, (qs_c, nib_c)) in qs.chunks_mut(rows_per * kb).zip(nib.chunks_mut(rows_per * k)).enumerate() {
+                    let base_row = ti * rows_per;
+                    sc.spawn(move || {
+                        let rows = nib_c.len() / k;
+                        for rr in 0..rows {
+                            let r = base_row + rr;
+                            for b in 0..kb {
+                                let base = r * k + b * 32;
+                                let mut amax = 0f32;
+                                for j in 0..32 { amax = amax.max(w[base + j].abs()); }
+                                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                                qs_c[rr * kb + b] = scale;
+                                for j in 0..32 {
+                                    let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
+                                    nib_c[rr * k + b * 32 + j] = (qv + 8) as u8;
+                                }
+                            }
+                        }
+                    });
                 }
-            }
+            });
         }
         let mut qw = vec![0u32; n * k / 8];
         for (li, word) in qw.iter_mut().enumerate() {
