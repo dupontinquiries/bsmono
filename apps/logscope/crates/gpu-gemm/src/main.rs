@@ -3509,6 +3509,55 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-moe-fusion") {
+        // The dispatch levers advertise themselves as "bit-identical, decode-speed only". That is a claim,
+        // and it has never been checked. It matters now because the A/B verdict is keyed by decode class,
+        // so MoE models turn the two MoE fusions ON — and every MoE model since has produced bad output.
+        // If the fusions change results, this fails and the claim is false.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-fusion: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (d, ff, ne, n_used) = (128usize, 256usize, 8usize, 2usize);
+        let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
+        let rw = mk(1, ne * d);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
+        let xin = mk(8, d);
+        let n2t = gpu.upload(&xin, 1, d); let x2t = gpu.upload(&xin, 1, d);
+
+        // Build with a SHARED expert too — Llama-4 and GLM have one, and a fusion that mishandles the
+        // shared path would only show on those models.
+        let build = |shared: bool| gpu_kernels::MoeLayer {
+            router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+            gate_up: gus.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, 2 * ff, d))).collect(),
+            down: dns.iter().map(|w| gpu_kernels::Lin::q4(gpu.quantize_q4_resident(w, d, ff))).collect(),
+            stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
+            stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
+            cfg: gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
+                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false },
+            shared: if shared {
+                Some((gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(31, 2 * ff * d), 2 * ff, d)),
+                      gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(32, d * ff), d, ff))))
+            } else { None },
+            stream: None,
+        };
+
+        for (label, with_shared) in [("routed only", false), ("with shared expert", true)] {
+            let layer = build(with_shared);
+            gpu_kernels::ab_set_decided(false);   // levers OFF
+            let off = gpu.download(&gpu.moe_ffn_t(&layer, &n2t, 1, d, &x2t));
+            gpu_kernels::ab_set_decided(true);    // levers ON (bind-group cache + MoE fusions)
+            let on = gpu.download(&gpu.moe_ffn_t(&layer, &n2t, 1, d, &x2t));
+            let md = on.iter().zip(&off).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let rel = md / off.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-9);
+            ck(&format!("{label}: fused == unfused (max|diff|={md:.3e}, rel={rel:.2e})"), md == 0.0);
+        }
+        gpu_kernels::ab_set_decided(false);
+        println!("gate-moe-fusion: {}", if ok {
+            "the dispatch levers really are bit-identical \u{2713}"
+        } else { "FAIL \u{2717} — the levers CHANGE RESULTS; 'bit-identical, decode-speed only' is wrong" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
