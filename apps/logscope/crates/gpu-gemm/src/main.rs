@@ -2863,6 +2863,62 @@ fn main() {
         println!("gate-moe-prefetch: {}", if ok { "mechanism correct + safe \u{2713} (bit-exact, never harmful; pays only with ring headroom + overlapping fills)" } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-moe-repin") {
+        // Live heat-driven REPIN (Colibri tier_pick_lfru + hysteresis). The loader must choose a pin set
+        // before it has ever seen the model route, so here we hand it a deliberately WRONG one — pinning
+        // experts {0,1} while the model routes only to {4,5,6,7} — and check that observed heat corrects it.
+        // Ring (3 slots) is smaller than the routed set (4), so without repin the ring thrashes every token.
+        // Two properties: repin must FIX the residency, and must NOT change the arithmetic.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-repin: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (d, ff, ne, n_used, ring, pin) = (128usize, 256usize, 8usize, 4usize, 3usize, 2usize);
+        let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let rw = mk(1, ne * d);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
+        // input built from router rows {4,5,6,7} → exactly those experts win the top-4, every token
+        let hot_set = [4usize, 5, 6, 7];
+        let xin: Vec<f32> = { let mut v = vec![0f32; d];
+            for &e in &hot_set { for i in 0..d { v[i] += rw[e * d + i]; } } v };
+
+        let run = |repin: bool| -> (Vec<f32>, u64, u64, u64, Vec<u32>) {
+            if repin { std::env::remove_var("LOGSCOPE_MOE_NOREPIN"); } else { std::env::set_var("LOGSCOPE_MOE_NOREPIN", "1"); }
+            let st = gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, pin, Some(ring));
+            let layer = gpu_kernels::MoeLayer {
+                router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+                gate_up: Vec::new(), down: Vec::new(),
+                stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                stacked_down: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                cfg: cfgm, shared: None, stream: Some(std::sync::Mutex::new(st)),
+            };
+            let mut last = Vec::new();
+            for _ in 0..40usize {
+                let x = gpu.upload(&xin, 1, d);
+                let n2 = gpu.upload(&xin, 1, d);
+                last = gpu.download(&gpu.moe_ffn_t(&layer, &n2, 1, d, &x));
+            }
+            let sm = layer.stream.as_ref().unwrap().lock().unwrap();
+            (last, sm.policy.hits_pin + sm.policy.hits_lru, sm.policy.misses, sm.repins, sm.policy.pinned_ids().to_vec())
+        };
+
+        let (out_norepin, hit_a, miss_a, rep_a, pins_a) = run(false);
+        let (out_repin, hit_b, miss_b, rep_b, pins_b) = run(true);
+        std::env::remove_var("LOGSCOPE_MOE_NOREPIN");
+
+        let maxdiff = out_repin.iter().zip(&out_norepin).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { h as f64 / (h + m) as f64 * 100.0 };
+        println!("      no-repin: pins {pins_a:?}  {hit_a} hits / {miss_a} fills ({:.0}% hit), {rep_a} repins", rate(hit_a, miss_a));
+        println!("      repin   : pins {pins_b:?}  {hit_b} hits / {miss_b} fills ({:.0}% hit), {rep_b} repins", rate(hit_b, miss_b));
+        ck(&format!("repin changes residency only — output bit-exact: max|diff|={maxdiff:.2e}"), maxdiff == 0.0);
+        ck("the wrong pin set was corrected from observed heat", rep_b > 0);
+        ck("pins moved onto experts the model actually routes to",
+           pins_b.iter().any(|e| hot_set.contains(&(*e as usize))));
+        ck("correcting the pin set reduced demand fills", miss_b < miss_a);
+        println!("gate-moe-repin: {}", if ok { "live repin correct \u{2713} (bit-exact; wrong pin set self-corrects)" } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
