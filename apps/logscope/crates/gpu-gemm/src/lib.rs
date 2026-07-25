@@ -1036,23 +1036,48 @@ impl Gpu {
         // Encode every conversion through the normal dispatch path: the engine's frame batching already
         // groups passes into submits (the autotuned submit batch), so this inherits that rather than
         // hand-rolling an encoder — hundreds of conversions leave as a handful of submits.
+        // CHUNKED, and this is not optional: a single tensor can be enormous — Scout's token embedding is
+        // 202048x5120, over 4 MILLION super-blocks — and one dispatch that large trips the GPU watchdog.
+        // The driver kills the job and the log fills with timeouts. Super-blocks are independent and map
+        // linearly onto the output, so a chunk is just an offset into src plus shifted qw/qs bases.
+        const CHUNK_BLOCKS: usize = 16384;   // ~4M weights per dispatch
+        const CHUNKS_PER_SUBMIT: usize = 8;  // bound how much work rides on one submit
         let mut done = 0usize;
+        let mut since_submit = 0usize;
         for p in pending {
             let total = p.n * p.k;
             let nblk = total / 256;
-            let need = nblk * 144;
-            let mut padded = p.raw[..need.min(p.raw.len())].to_vec();
-            padded.resize(need.div_ceil(4) * 4, 0);
-            let words: Vec<u32> = padded.chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let src = self.upload_u32_resident(&words);
-            let (gx, gy) = wrapped_grid(nblk);
-            let dims = [nblk as u32, p.qs_base_words as u32, p.qw_base_words as u32, gx];
-            // the bind group holds the source buffer alive past this scope, so no manual keep-list
-            let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, view: None };
-            self.dispatch(Q4K_TO_Q4, &[&src], &out_t, bytemuck::cast_slice(&dims), (gx, gy, 1));
+            let mut b0 = 0usize;
+            while b0 < nblk {
+                let cnt = CHUNK_BLOCKS.min(nblk - b0);
+                let byte0 = b0 * 144;
+                let need = cnt * 144;
+                let avail = p.raw.len().saturating_sub(byte0);
+                let mut padded = p.raw[byte0..byte0 + need.min(avail)].to_vec();
+                padded.resize(need.div_ceil(4) * 4, 0);
+                let words: Vec<u32> = padded.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                let src = self.upload_u32_resident(&words);
+                let (gx, gy) = wrapped_grid(cnt);
+                // 32 qw words and 8 qs scales per super-block
+                let dims = [cnt as u32,
+                            (p.qs_base_words + b0 * 8) as u32,
+                            (p.qw_base_words + b0 * 32) as u32,
+                            gx];
+                // the bind group holds the source buffer alive past this scope, so no manual keep-list
+                let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, view: None };
+                self.dispatch(Q4K_TO_Q4, &[&src], &out_t, bytemuck::cast_slice(&dims), (gx, gy, 1));
+                b0 += cnt;
+                since_submit += 1;
+                if since_submit >= CHUNKS_PER_SUBMIT {
+                    self.end_frame();
+                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    since_submit = 0;
+                }
+            }
             done += 1;
         }
+        self.end_frame();
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         done
     }
