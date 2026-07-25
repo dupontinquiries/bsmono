@@ -906,6 +906,39 @@ impl Gpu {
                      bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
     }
 
+    /// As `q4k_to_q4_words` but the result never leaves the GPU: raw Q4_K bytes go up, the converted q4
+    /// weights stay in device memory, and the returned `Q4Weight` is two views into that one buffer.
+    ///
+    /// This is the piece that removes the load pass. The old route was fetch → CPU dequantize to f32 →
+    /// CPU requantize → upload, which for Scout is ~50 GiB of host copies and many minutes of CPU. Here the
+    /// only host traffic is the file's own bytes, which are already mmap'd.
+    ///
+    /// The qs region is placed on a 256-byte boundary so it can be bound as a storage view; the shader is
+    /// told where it starts, so alignment padding costs a few bytes and no special-casing.
+    pub fn q4k_to_q4_resident(&self, raw: &[u8], n: usize, k: usize) -> Q4Weight {
+        assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
+        let total = n * k;
+        let nblk = total / 256;
+        let need = nblk * 144;
+        let mut padded = raw[..need.min(raw.len())].to_vec();
+        padded.resize(need.div_ceil(4) * 4, 0);
+        let words: Vec<u32> = padded.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let src = self.upload_u32_resident(&words);
+        let qw_words = total / 8;
+        let qs_words = total / 32;
+        // round the qw region up to 256 bytes (64 words) so the qs view is bindable
+        let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
+        let out = self.alloc(1, qs_off_words + qs_words);
+        let dims = [nblk as u32, qs_off_words as u32, 0u32, 0u32];
+        self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (nblk as u32, 1, 1));
+        let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
+                          view: Some((0, (qw_words * 4) as u64)) };
+        let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
+                          view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
+        Q4Weight { qw, qs, n, k }
+    }
+
     pub fn gemm(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
         let dims = [m as u32, n as u32, k as u32, 0u32];
         self.run_f32(GEMM, &[bytemuck::cast_slice(a), bytemuck::cast_slice(b)], m * n,
@@ -5958,6 +5991,22 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
                 let raw = set.slice(t.offset, nbytes).ok_or(format!(
                     "tensor {name} out of range — a shard is missing or truncated"))?;
                 return Ok(Lin::q8(self.q8_0_to_resident(raw, n, k)));
+            }
+            // DIRECT Q4_K → q4-resident, the twin of the q8_0 fast path above and the reason the loader no
+            // longer needs a host copy. The file's own super-blocks are uploaded and converted on the GPU
+            // (--gate-q4k proves the conversion is bit-identical to the CPU route it replaces), so the
+            // dequantize-to-f32 and requantize steps disappear entirely. LOGSCOPE_NO_Q4K_GPU falls back to
+            // the CPU path if this ever needs to be bisected against.
+            if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if count == n * k {
+                    if let Some(nbytes) = gguf::type_nbytes(12, count) {
+                        if let Some(raw) = set.slice(t.offset, nbytes) {
+                            return Ok(Lin::q4(self.q4k_to_q4_resident(raw, n, k)));
+                        }
+                    }
+                }
             }
             Ok(self.make_lin(&fetch(name)?, n, k, quantize, q4_mode))
         };

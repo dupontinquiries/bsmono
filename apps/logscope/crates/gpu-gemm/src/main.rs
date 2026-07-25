@@ -3337,6 +3337,31 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             assert_eq!(qs_off, qw_n * 4, "qs offset convention drifted");
         }
 
+        // The resident variant: same conversion, but the result stays on the GPU as two views into one
+        // buffer. Checking the bytes is not enough — the views must also BIND correctly in a real kernel,
+        // so this runs an actual matvec against a Lin built the old CPU way and demands identical output.
+        {
+            let (rows, k) = (8usize, 512usize);
+            let total = rows * k;
+            let nb = total / 256;
+            let raw4: Vec<u8> = (0..nb * 144).map(|i| {
+                let x = (i as u32).wrapping_mul(40503).wrapping_add(12345);
+                (x >> 7) as u8
+            }).collect();
+            // reference Lin: the exact CPU route this replaces
+            let f32ref = gpu_kernels::gguf::dequantize(12, &raw4, total).expect("cpu q4_k");
+            let cpu_lin = gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&f32ref, rows, k));
+            let gpu_lin = gpu_kernels::Lin::q4(gpu.q4k_to_q4_resident(&raw4, rows, k));
+            // a non-trivial activation, then compare the matvec through both
+            let xv: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.017).sin()).collect();
+            let xt = gpu.upload(&xv, 1, k);
+            let a = gpu.download(&cpu_lin.apply(&gpu, &xt, 1));
+            let b = gpu.download(&gpu_lin.apply(&gpu, &xt, 1));
+            ck(&format!("resident conversion produces {} outputs", a.len()), a.len() == b.len() && a.len() == rows);
+            let md = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            ck(&format!("matvec through GPU-converted weights == CPU-converted: max|diff|={md:.3e}"), md == 0.0);
+        }
+
         println!("gate-q4k: {}", if ok {
             "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
         } else { "FAIL \u{2717}" });
