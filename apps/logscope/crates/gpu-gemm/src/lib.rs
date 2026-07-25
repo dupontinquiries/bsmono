@@ -1346,7 +1346,21 @@ impl StreamSlots {
     /// not exceed the device max_buffer_size (an expert-layer is far under it; caller sizes to ~32-64 MiB).
     pub fn new(gpu: &Gpu, n_slots: usize, slot_bytes: u64) -> Self {
         let cap = gpu.device.limits().max_buffer_size;
-        let slot_bytes = slot_bytes.min(cap).max(4);
+        let mut slot_bytes = slot_bytes.min(cap).max(4);
+        // EXPERIMENTAL (LOGSCOPE_SLOT_PAGE=<KiB>, default off): round each slot up to a page multiple, per
+        // the memory spec's "never allocate arbitrary sizes — round upward". The theory is that uniform,
+        // page-aligned allocations fragment the driver's VMA less and make slots interchangeable, which
+        // matters more here than usual because the Honeykrisp ceiling is a VMA limit rather than a capacity
+        // one. Off by default because it is unmeasured on real hardware and costs a little residency
+        // (rounding 67.5 MiB up to a 1 MiB multiple wastes ~0.5 MiB per slot); turn it on and watch whether
+        // the load ceiling moves.
+        if let Ok(kib) = std::env::var("LOGSCOPE_SLOT_PAGE").map(|s| s.parse::<u64>().unwrap_or(0)) {
+            if kib > 0 {
+                let page = kib * 1024;
+                let rounded = slot_bytes.div_ceil(page) * page;
+                if rounded <= cap { slot_bytes = rounded; }
+            }
+        }
         let slots = (0..n_slots).map(|_i| gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("expert-stream-slot"),
             size: slot_bytes,
