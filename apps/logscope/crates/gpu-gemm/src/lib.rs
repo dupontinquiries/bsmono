@@ -936,7 +936,7 @@ impl Gpu {
         let mut padded = raw[..need.min(raw.len())].to_vec();
         padded.resize(need.div_ceil(4) * 4, 0);
         let (qw_words, qs_words) = (total / 8, total / 32);
-        let dims = [nblk as u32, qw_words as u32, 0u32, 0u32];
+        let dims = [nblk as u32, qw_words as u32, 0u32, 0u32]; // qw_base = 0
         self.run_u32(Q4K_TO_Q4, &[bytemuck::cast_slice(&padded)], qw_words + qs_words,
                      bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
     }
@@ -965,13 +965,48 @@ impl Gpu {
         // round the qw region up to 256 bytes (64 words) so the qs view is bindable
         let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
         let out = self.alloc(1, qs_off_words + qs_words);
-        let dims = [nblk as u32, qs_off_words as u32, 0u32, 0u32];
+        let dims = [nblk as u32, qs_off_words as u32, 0u32, 0u32]; // qw_base = 0
         self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (nblk as u32, 1, 1));
         let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
                           view: Some((0, (qw_words * 4) as u64)) };
         let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
                           view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
         Q4Weight { qw, qs, n, k }
+    }
+
+    /// Convert raw Q4_K into an EXISTING output buffer at word offsets `qw_base` / `qs_base`.
+    ///
+    /// This is what a streamed expert slot needs. An expert's gate‖up matrix is [2ff, d], but the file
+    /// stores `ffn_gate_exps` and `ffn_up_exps` as SEPARATE tensors — so a fill converts each half into one
+    /// slot buffer, gate into rows 0..ff and up into rows ff..2ff. That works because our q4 layout is
+    /// row-major with per-row blocks: concatenating two converted halves row-wise IS the conversion of the
+    /// stacked matrix, for both the nibbles and the scales.
+    ///
+    /// No allocation and no host round-trip — with the file mapped for the process lifetime, the `raw`
+    /// slice is a view into the GGUF itself, which is the whole point of Colibri's arrangement.
+    /// A raw word-addressed scratch buffer (one row of `words` f32-sized slots), for kernels that write
+    /// packed data rather than numbers.
+    pub fn alloc_words(&self, words: usize) -> Tensor { self.alloc(1, words) }
+
+    /// Read a word-addressed buffer back as u32s.
+    pub fn download_words(&self, t: &Tensor) -> Vec<u32> {
+        let f = self.download(t);
+        f.iter().map(|v| v.to_bits()).collect()
+    }
+
+    pub fn q4k_convert_into(&self, out: &Tensor, raw: &[u8], n: usize, k: usize,
+                            qw_base_words: usize, qs_base_words: usize) {
+        assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
+        let total = n * k;
+        let nblk = total / 256;
+        let need = nblk * 144;
+        let mut padded = raw[..need.min(raw.len())].to_vec();
+        padded.resize(need.div_ceil(4) * 4, 0);
+        let words: Vec<u32> = padded.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let src = self.upload_u32_resident(&words);
+        let dims = [nblk as u32, qs_base_words as u32, qw_base_words as u32, 0u32];
+        self.dispatch(Q4K_TO_Q4, &[&src], out, bytemuck::cast_slice(&dims), (nblk as u32, 1, 1));
     }
 
     pub fn gemm(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -10049,7 +10084,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
 /// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
 pub const Q4K_TO_Q4: &str = r#"
-struct D { nblk:u32, qs_off:u32, _b:u32, _c:u32 };
+struct D { nblk:u32, qs_off:u32, qw_base:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
 @group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
 @group(0)@binding(2) var<uniform> dims: D;
@@ -10134,7 +10169,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             let nib = u32(i32(qv) + 8) & 0xFu;
             acc = acc | (nib << (b * 4u));
         }
-        dst[bi * 4u + w] = acc;
+        dst[dims.qw_base + bi * 4u + w] = acc;
     }
 }
 "#;
