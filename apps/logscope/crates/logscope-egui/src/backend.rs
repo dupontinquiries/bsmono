@@ -296,7 +296,7 @@ pub(crate) mod engine {
                 Some(m) => { eprintln!("wgpu-engine: loaded int8 cache (skipped dequant) in {:.1}s [{}]", t0.elapsed().as_secs_f32(), cache.display()); m }
                 None => {
                     eprintln!("wgpu-engine: loading {path} ({:.1} MiB) — quantizing to resident weights (int8, or q4 if it won't fit)…", bytes.len() as f32 / (1 << 20) as f32);
-                    let m = gpu.load_gguf_quantized_parts(&parts)?;
+                    let m = gpu.load_gguf_quantized_parts_static(&parts)?;
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
                     // holds old+new; the post-write evict is then just an exact final guard.
