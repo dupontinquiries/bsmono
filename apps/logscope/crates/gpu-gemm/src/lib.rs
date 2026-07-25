@@ -1292,6 +1292,33 @@ static MOE_ROUTE_HIST: std::sync::OnceLock<std::sync::Mutex<MoeRouteHistory>> = 
 /// ~16-token safe point; a swap costs a full expert-layer re-upload, so checking every token would spend
 /// more bandwidth than the better pin set saves.
 const REPIN_EVERY: u64 = 16;
+
+/// Live residency telemetry for expert streaming — the numbers that decide whether streaming is
+/// affordable, gathered on the real run rather than inferred. Atomics rather than a mutex so they can be
+/// touched from inside the per-expert path without any lock-ordering concern.
+///
+/// `MOE_HITS / (MOE_HITS + MOE_FILLS)` is the hit rate the whole break-even analysis turns on (the M2
+/// probe put break-even at >43%), and `MOE_BYTES` is what that costs in bytes actually moved. Printed
+/// periodically under LOGSCOPE_MOE_STATS=1.
+pub static MOE_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static MOE_REPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Reset the residency counters — for a caller that wants per-generation rather than per-process numbers.
+pub fn moe_stream_stats_reset() {
+    use std::sync::atomic::Ordering::Relaxed;
+    MOE_FILLS.store(0, Relaxed); MOE_HITS.store(0, Relaxed);
+    MOE_BYTES.store(0, Relaxed); MOE_REPINS.store(0, Relaxed);
+}
+
+/// Snapshot of the streaming residency counters: (hits, fills, bytes moved, repins, hit rate).
+pub fn moe_stream_stats() -> (u64, u64, u64, u64, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (h, f) = (MOE_HITS.load(Relaxed), MOE_FILLS.load(Relaxed));
+    let rate = if h + f == 0 { 0.0 } else { h as f64 / (h + f) as f64 };
+    (h, f, MOE_BYTES.load(Relaxed), MOE_REPINS.load(Relaxed), rate)
+}
 pub fn moe_route_hist() -> &'static std::sync::Mutex<MoeRouteHistory> {
     MOE_ROUTE_HIST.get_or_init(|| std::sync::Mutex::new(MoeRouteHistory {
         map: crate::expert_predict::ExpertMap::new(),
@@ -2212,11 +2239,13 @@ impl Gpu {
     /// Lin; else LRU slot (fill from host bytes on a miss, reuse on a hit). This is the per-expert fill-on-
     /// demand that lets an over-ceiling MoE decode on Asahi. Leans on Colibri's pin∪LRU∪load tiering.
     fn stream_expert_lins(&self, sm: &std::sync::Mutex<MoeStream>, e: u32) -> (Lin, Lin) {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut s = sm.lock().unwrap();
         let (gu_rows, gu_k, dn_rows, dn_k) = (s.gu_rows, s.gu_k, s.dn_rows, s.dn_k);
         // pinned hot expert → resident buffers
         if let (Some((gqw, gqs)), Some((dqw, dqs))) = (s.pinned_gu.get(&e).cloned(), s.pinned_dn.get(&e).cloned()) {
             let _ = s.policy.access(e);
+            MOE_HITS.fetch_add(1, Relaxed);
             return (self.q4_lin_from_bufs(&gqw, &gqs, gu_rows, gu_k), self.q4_lin_from_bufs(&dqw, &dqs, dn_rows, dn_k));
         }
         let (gu_off, dn_off) = (s.gu_qs_off, s.dn_qs_off);
@@ -2225,10 +2254,14 @@ impl Gpu {
         if matches!(acc, crate::expert_cache::Access::Miss(_)) {
             let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
             let dn_bytes = std::mem::take(&mut s.host_dn[e as usize]);
+            MOE_FILLS.fetch_add(1, Relaxed);
+            MOE_BYTES.fetch_add((gu_bytes.len() + dn_bytes.len()) as u64, Relaxed);
             s.gu_slots.fill(self, slot, &gu_bytes);
             s.dn_slots.fill(self, slot, &dn_bytes);
             s.host_gu[e as usize] = gu_bytes;
             s.host_dn[e as usize] = dn_bytes;
+        } else {
+            MOE_HITS.fetch_add(1, Relaxed);
         }
         let gu_buf = s.gu_slots.slot_buf(slot);
         let dn_buf = s.dn_slots.slot_buf(slot);
@@ -2927,7 +2960,20 @@ impl Gpu {
             };
             if do_check && std::env::var("LOGSCOPE_MOE_NOREPIN").is_err() {
                 let pick = sm.lock().unwrap().policy.pick_repin(n_expert);
-                if let Some((evict, admit)) = pick { self.stream_repin(sm, evict, admit); }
+                if let Some((evict, admit)) = pick {
+                    if self.stream_repin(sm, evict, admit) {
+                        MOE_REPINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+            // Live residency telemetry (LOGSCOPE_MOE_STATS=1): the hit rate and the bytes actually moved,
+            // reported from the real run instead of inferred. Emitted from layer 0 only so one line covers
+            // the model rather than one per layer.
+            if do_check && sm.lock().unwrap().layer == 0 && std::env::var("LOGSCOPE_MOE_STATS").is_ok() {
+                let (h, f, bytes, rep, rate) = moe_stream_stats();
+                eprintln!("moe-stream: hit {:.1}% ({h} hits / {f} fills), {:.2} GiB moved, {rep} repins{}",
+                    rate * 100.0, bytes as f64 / (1u64 << 30) as f64,
+                    if rate < 0.43 { "  [below the 43% break-even — expect streaming to cost more than it saves]" } else { "" });
             }
         }
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
