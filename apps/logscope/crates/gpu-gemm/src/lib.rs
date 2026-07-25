@@ -230,6 +230,8 @@ pub struct Gpu {
     arena: Mutex<Option<ResidentArena>>,
     /// Q4_K conversions recorded during load and run in batches at the end (see `flush_q4k`).
     pending_q4k: Mutex<Vec<PendingQ4k>>,
+    /// Persistent staging buffer for expert-slot fills, so decode never allocates.
+    moe_stage: Mutex<Option<Tensor>>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
     unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
                      // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
@@ -747,7 +749,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -924,6 +926,36 @@ impl Gpu {
     fn run_u32(&self, shader: &str, inputs: &[&[u8]], out_len: usize, dims: &[u8], wg: (u32, u32, u32)) -> Vec<u32> {
         let bytes = self.run(shader, inputs, (out_len * 4) as u64, dims, wg);
         bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    /// Convert from a PRE-UPLOADED source buffer — no allocation, no upload. The inference-path twin of
+    /// `q4k_convert_into`.
+    ///
+    /// This exists because the allocating version must never be called during decode. Every fill would
+    /// create a fresh source buffer, and on a VMA-constrained driver a few thousand of those exhaust the
+    /// address space and the load dies with "Failed to allocate BO VMA" mid-generation. The memory spec's
+    /// rule — never allocate during inference — is not a style preference here; it is the difference
+    /// between running and crashing.
+    pub fn q4k_convert_from(&self, src: &Tensor, out: &Tensor, n: usize, k: usize,
+                            qw_base_words: usize, qs_base_words: usize) {
+        let nblk = n * k / 256;
+        let (gx, gy) = wrapped_grid(nblk);
+        let dims = [nblk as u32, qs_base_words as u32, qw_base_words as u32, gx];
+        self.dispatch(Q4K_TO_Q4, &[src], out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+    }
+
+    /// The shared, persistent upload staging buffer for expert fills: allocated once, grown only if some
+    /// layer needs more, and reused for every fill thereafter. Decode is sequential over layers, so one
+    /// buffer serves the whole model rather than one per layer.
+    pub fn moe_stage(&self, bytes: usize) -> Tensor {
+        let mut g = self.moe_stage.lock().unwrap();
+        let need = bytes.div_ceil(4);
+        let big_enough = g.as_ref().map(|t: &Tensor| t.cols >= need).unwrap_or(false);
+        if !big_enough {
+            *g = Some(self.alloc_words(need.max(1)));
+        }
+        let t = g.as_ref().unwrap();
+        Tensor { buf: t.buf.clone(), rows: 1, cols: t.cols, pool: None, view: None }
     }
 
     /// Record a Q4_K conversion to run later. Returns immediately with the (as yet unwritten) output
@@ -2566,9 +2598,26 @@ impl Gpu {
                 let dn_buf = s.dn_slots.tensor_full(slot);
                 if let (Some(g), Some(u), Some(dw)) = (gate, up, down) {
                     MOE_BYTES.fetch_add((g.len() + u.len() + dw.len()) as u64, Relaxed);
-                    self.q4k_convert_into(&gu_buf, g, ff, d, 0, gu_qs_off / 4);
-                    self.q4k_convert_into(&gu_buf, u, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
-                    self.q4k_convert_into(&dn_buf, dw, d, ff, 0, dn_qs_off / 4);
+                    // ONE persistent staging buffer, written and converted three times. Allocating a source
+                    // buffer per fill (what this used to do) exhausts the driver's VMA within a few
+                    // thousand fills and kills the run mid-generation.
+                    // THREE REGIONS of one buffer, not one region written three times: queued writes are
+                    // all applied BEFORE the command buffers in a submit, so re-writing the same range
+                    // would leave every dispatch reading the last write. Regions are 256-aligned so each
+                    // can be bound as its own storage view.
+                    let al = |x: usize| x.div_ceil(256) * 256;
+                    let (o0, o1) = (0usize, al(g.len()));
+                    let o2 = o1 + al(u.len());
+                    let stage = self.moe_stage(o2 + al(dw.len()));
+                    self.queue.write_buffer(&stage.buf, o0 as u64, g);
+                    self.queue.write_buffer(&stage.buf, o1 as u64, u);
+                    self.queue.write_buffer(&stage.buf, o2 as u64, dw);
+                    let view = |off: usize, len: usize| Tensor {
+                        buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None,
+                        view: Some((off as u64, al(len) as u64)) };
+                    self.q4k_convert_from(&view(o0, g.len()), &gu_buf, ff, d, 0, gu_qs_off / 4);
+                    self.q4k_convert_from(&view(o1, u.len()), &gu_buf, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
+                    self.q4k_convert_from(&view(o2, dw.len()), &dn_buf, d, ff, 0, dn_qs_off / 4);
                 }
             } else {
                 let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
