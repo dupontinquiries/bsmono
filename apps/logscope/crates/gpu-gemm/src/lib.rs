@@ -6167,6 +6167,16 @@ impl Gpu {
         // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
         // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
         let nope_step = if is_llama4 { 4usize } else { 0 };
+        // Warn LOUDLY rather than generate nonsense. Verified against llama.cpp
+        // (src/models/llama4.cpp): Llama-4 applies a weightless RMS norm to Q and K after rope on rope
+        // layers whenever use_kq_norm is set, and llama.cpp sets it for every Llama-4 EXCEPT the 128-expert
+        // Maverick. Scout is 16-expert, so it needs it and we do not do it. The symptom is fluent garbage,
+        // which is indistinguishable from a dozen other bugs unless the engine says so itself.
+        if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
+            eprintln!("wgpu-engine: ⚠ Llama-4 use_kq_norm is NOT implemented — this checkpoint ({} experts) \
+needs a weightless RMS norm on Q/K after rope (llama.cpp Llama4TextL2Norm). Output will be incoherent. \
+This is an architecture gap, not a quantization or streaming problem.", g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0));
+        }
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
         // real-word, positionally-scrambled output (the dense-Qwen salad). Set from the arch registry.
@@ -6764,6 +6774,12 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 nope: nope_step > 0 && (i + 1) % nope_step == 0,
                 // Llama 4 iRoPE attention temperature tuning on NoPE layers (Meta defaults floor_scale
                 // 8192, attn_scale 0.1). RoPE layers and non-Llama4 archs get None (identity).
+// LLAMA-4 GAP (verified against llama.cpp src/models/llama4.cpp): Scout additionally needs
+                // `use_kq_norm` — a WEIGHTLESS RMS norm (Llama4TextL2Norm) applied to Q and K *after* rope,
+                // on rope layers only. llama.cpp sets use_kq_norm = (type != 17B_128E), so it is ON for
+                // Scout (17B_16E) and OFF for Maverick. We do not implement it: our qk_norm is driven by a
+                // learned weight (None here) and runs BEFORE rope, which is the Qwen3 arrangement, not this
+                // one. Missing it produces coherent-looking garbage rather than an error.
                 attn_temp: if is_llama4 && nope_step > 0 && (i + 1) % nope_step == 0 {
                     Some(crate::llama4::AttnTemp::default())
                 } else { None },
