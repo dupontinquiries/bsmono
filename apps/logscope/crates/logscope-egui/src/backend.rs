@@ -524,10 +524,15 @@ pub(crate) mod engine {
                 Ok("0") => { gpu_kernels::ab_set_decided(false); eprintln!("wgpu-engine: fast-decode levers OFF (LOGSCOPE_FAST_DECODE=0) — A/B skipped"); return; }
                 _ => {}
             }
-            // persisted verdict for this GPU → apply and skip
-            if let Some(on) = gpu_kernels::store::fast_ab_get(&self.gpu.adapter_name) {
+            // Persisted verdict, keyed by GPU **and decode class**. Keying on the adapter alone was a
+            // real bug: the two MoE fusions are no-ops on a dense model, so a verdict measured on a dense
+            // model says "levers off" and that verdict was then applied to MoE models — exactly where the
+            // levers matter most, because a MoE layer issues per-expert dispatches and decode here is
+            // dispatch-bound. Same GPU, different question.
+            let ab_key = format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class());
+            if let Some(on) = gpu_kernels::store::fast_ab_get(&ab_key) {
                 gpu_kernels::ab_set_decided(on);
-                eprintln!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {})", if on { "ON" } else { "OFF" }, self.gpu.adapter_name);
+                eprintln!("wgpu-engine: fast-decode levers {} (cached A/B verdict for {ab_key})", if on { "ON" } else { "OFF" });
                 return;
             }
             // Probe on MoE AND dense models. The two MoE fusions are no-ops on a dense model, but the
@@ -555,7 +560,7 @@ pub(crate) mod engine {
             // ON wins only if it beats OFF by ≥5% (margin guards against noise flipping it on).
             let decision = on < off * 0.95;
             gpu_kernels::ab_set_decided(decision);
-            gpu_kernels::store::fast_ab_put(&self.gpu.adapter_name, decision);
+            gpu_kernels::store::fast_ab_put(&format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class()), decision);
             eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
                 if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
         }
