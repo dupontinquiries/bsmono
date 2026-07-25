@@ -3397,6 +3397,71 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-moe-raw") {
+        // The Colibri path end-to-end: experts as VIEWS into the file, converted on the GPU at fill time,
+        // versus the host-copy path that requantizes every expert on load. Same weights, so the decode
+        // must be bit-identical — if it is, the ~50 GiB host store is pure waste and can go.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-raw: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (d, ff, ne, n_used, ring) = (256usize, 256usize, 4usize, 2usize, 3usize);
+        // synthetic Q4_K tensors, laid out as a GGUF does: expert index slowest, so each expert is contiguous
+        let mk = |seed: u32, nb: usize| -> Vec<u8> {
+            (0..nb * 144).map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                (x >> 9) as u8
+            }).collect()
+        };
+        let gu_nb = ff * d / 256; let dn_nb = d * ff / 256;
+        let gate: &'static [u8] = Box::leak(mk(1, gu_nb * ne).into_boxed_slice());
+        let up:   &'static [u8] = Box::leak(mk(2, gu_nb * ne).into_boxed_slice());
+        let down: &'static [u8] = Box::leak(mk(3, dn_nb * ne).into_boxed_slice());
+
+        // reference: the host-copy path, built by converting each expert on the CPU exactly as the loader
+        // does today (dequantize -> quantize into our q4)
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| {
+            let g = gpu_kernels::gguf::dequantize(12, &gate[e * gu_nb * 144..(e + 1) * gu_nb * 144], ff * d).unwrap();
+            let u = gpu_kernels::gguf::dequantize(12, &up[e * gu_nb * 144..(e + 1) * gu_nb * 144], ff * d).unwrap();
+            let mut c = g; c.extend_from_slice(&u); c
+        }).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e|
+            gpu_kernels::gguf::dequantize(12, &down[e * dn_nb * 144..(e + 1) * dn_nb * 144], d * ff).unwrap()).collect();
+
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
+            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let rw: Vec<f32> = (0..ne * d).map(|i| (((i as u32).wrapping_mul(2654435761) >> 9) as f32 / 8_388_608.0) - 1.0).collect();
+        let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
+
+        let run = |stream: gpu_kernels::MoeStream| -> Vec<f32> {
+            let layer = gpu_kernels::MoeLayer {
+                router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+                gate_up: Vec::new(), down: Vec::new(),
+                stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                stacked_down: gpu_kernels::Lin::f32(gpu.upload(&vec![0.0f32; 32], 1, 32)),
+                cfg: cfgm, shared: None, stream: Some(std::sync::Mutex::new(stream)),
+            };
+            let mut last = Vec::new();
+            for _ in 0..6 {   // several tokens so slots evict and refill
+                let x = gpu.upload(&xin, 1, d);
+                let n2 = gpu.upload(&xin, 1, d);
+                last = gpu.download(&gpu.moe_ffn_t(&layer, &n2, 1, d, &x));
+            }
+            last
+        };
+
+        let want = run(gpu.build_moe_stream_ring(&gus, &dns, ff, d, n_used, 0, Some(ring)));
+        let got = run(gpu.build_moe_stream_raw(gate, up, down, ne, ff, d, n_used, ring));
+        ck(&format!("view path produces {} outputs", want.len()), got.len() == want.len() && !want.is_empty());
+        let md = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("decode from FILE VIEWS == decode from host copies: max|diff|={md:.3e}"), md == 0.0);
+        // and the view-backed store genuinely holds no expert bytes
+        let s = gpu.build_moe_stream_raw(gate, up, down, ne, ff, d, n_used, ring);
+        ck("view-backed store holds zero host expert bytes", s.host_gu.is_empty() && s.host_dn.is_empty());
+        println!("gate-moe-raw: {}", if ok {
+            "experts stream straight from the file \u{2713} — the host copy is unnecessary"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
