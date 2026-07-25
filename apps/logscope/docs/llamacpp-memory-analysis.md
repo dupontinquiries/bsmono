@@ -100,3 +100,62 @@ Not memory at all:
 3. **Query the device limits** instead of hard-coding the arena slab cap.
 4. `src/models/<arch>.cpp` is one file per architecture and is the reference to check BEFORE assuming our
    implementation of a model is complete. It is what identified the missing Llama-4 `use_kq_norm`.
+
+## 5. Non-blocking uploads: what llama.cpp has, and why it does not help here
+
+Three mechanisms in `ggml-vulkan.cpp`, in order of how much they would matter:
+
+**Dedicated transfer queue.** llama.cpp looks for a queue family with TRANSFER but *not* compute/graphics —
+a real DMA engine that runs concurrently with compute:
+
+```cpp
+transfer_queue_family_index = ggml_vk_find_queue_family_index(
+        queue_family_props, eTransfer, eCompute | graphics_flag, compute_queue_family_index, 1);
+device->single_queue = compute_queue_family_index == transfer_queue_family_index
+                       && queue_family_props[compute_queue_family_index].queueCount == 1;
+...
+} else {
+    device->transfer_queue = ggml_vk_create_aliased_queue(device, device->compute_queue);
+    device->async_use_transfer_queue = false;      // fall back to the compute queue
+}
+```
+
+Apple GPUs expose a single queue family, so `single_queue` is true and llama.cpp **aliases the transfer
+queue onto the compute queue and disables async transfer**. It gets no overlap here either — which
+independently explains our own M2 probe result that slot fills do not overlap compute. That was measured
+before we knew why; this is why.
+
+wgpu exposes one queue regardless, so this is doubly moot for us.
+
+**Pinned host memory** (`pinned_memory`, registered host allocations) and a **persistent staging buffer**
+(`sync_staging`). We now have the second (one staging buffer reused for every expert fill, _180). The
+first is not reachable through wgpu.
+
+**Conclusion: upload mechanism is not our problem.** The M2 probe already measured staged `write_buffer` at
+~32 GiB/s versus 4–14 GiB/s mapped, and no faster path is available on this hardware to either engine.
+
+## 6. Where the time actually goes — the profile says it plainly
+
+```
+4610 submits (1152/tok), 193 polls | setup 7ms vs sync 3047ms of 3822ms (GPU-sync-bound, 79.9% accounted)
+```
+
+**193 polls / 4 tokens ≈ 48 per token = one per layer.** That is `moe_ffn_v1` downloading the router
+logits every layer to decide routing on the CPU. Each one is a full GPU→CPU sync, and together they are
+the 3047 ms.
+
+llama.cpp never does this: top-k routing is part of the graph (`ggml_top_k`/argsort), so nothing leaves
+the GPU mid-forward. Our v2 GPU-routed path does the same — but **streaming forces v1**, because the CPU
+must know which expert to upload before it can upload it.
+
+So the sync is not incidental, it is the price of streaming as currently designed. The ways out, roughly
+in order of payoff:
+
+1. **Pipeline the readback.** Use layer L's routing to prefetch for the *next* token rather than blocking
+   on it for this one, so the sync overlaps compute instead of stalling it. The coupling predictor
+   (`expert_predict.rs`) already exists for exactly this and measured 72% accurate.
+2. **Keep enough experts resident that the common case needs no fill**, and only sync when the ring
+   misses. With a good pin set (repin measured 0%→62%) most layers would need no CPU decision at all.
+3. **Batch the syncs**: read back several layers' routing in one poll where the dependency allows.
+
+None of these is an upload optimization. The upload is already as fast as this hardware offers.
