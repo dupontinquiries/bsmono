@@ -415,6 +415,34 @@ fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Run a per-super-block transform across cores.
+///
+/// Every k-quant decodes one fixed-size block into a fixed-size run of floats with no cross-block state,
+/// so splitting the range over threads produces bit-identical output — this is a scheduling change, not a
+/// numerical one. It matters because these loops are the CPU cost of loading any model whose tensors do
+/// not take the GPU conversion path (Q6_K tensors, and every expert on the MoE fallback), and they were
+/// running on one core while the rest of the machine idled.
+///
+/// Small inputs stay sequential: thread setup costs more than it saves below a few dozen blocks.
+fn par_blocks<F>(out: &mut [f32], data: &[u8], out_per: usize, in_per: usize, f: F)
+where F: Fn(&mut [f32], &[u8]) + Sync {
+    let nblk = out.len() / out_per.max(1);
+    let threads = std::thread::available_parallelism().map(|t| t.get()).unwrap_or(1).min(nblk);
+    if threads <= 1 || nblk < 64 {
+        for (o, d) in out.chunks_mut(out_per).zip(data.chunks(in_per)) { f(o, d); }
+        return;
+    }
+    let per = nblk.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for (o, d) in out.chunks_mut(out_per * per).zip(data.chunks(in_per * per)) {
+            let f = &f;
+            sc.spawn(move || {
+                for (oo, dd) in o.chunks_mut(out_per).zip(d.chunks(in_per)) { f(oo, dd); }
+            });
+        }
+    });
+}
+
 pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, String> {
     match ggml_type {
         0 => Ok((0..n).map(|i| f32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap())).collect()),
@@ -509,13 +537,13 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             // Q4_K: 144-byte super-block of 256 = 8 sub-blocks of 32. f16 `d`, f16 `dmin`,
             // 12 bytes of packed 6-bit scales/mins, 128 nibble bytes. w = d·sc·nib − dmin·m.
             if n % 256 != 0 { return Err("q4_k element count not a multiple of 256".into()); }
-            let mut out = Vec::with_capacity(n);
-            for blk in data[..n / 256 * 144].chunks(144) {
+            if data.len() < n / 256 * 144 { return Err("q4_k data truncated".into()); }
+            let mut out = vec![0f32; n];
+            par_blocks(&mut out, &data[..n / 256 * 144], 256, 144, |y, blk| {
                 let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
                 let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
                 let scales = &blk[4..16];
                 let qs = &blk[16..144];
-                let mut y = [0f32; 256];
                 let (mut is, mut qoff, mut yoff) = (0usize, 0usize, 0usize);
                 for _ in 0..4 {
                     let (sc1, m1) = get_scale_min_k4(is, scales);
@@ -528,8 +556,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                     }
                     qoff += 32; yoff += 64; is += 2;
                 }
-                out.extend_from_slice(&y);
-            }
+            });
             Ok(out)
         }
         13 => {
@@ -569,10 +596,10 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             // bytes `qh`, 16 int8 sub-block scales, f16 `d`. 6-bit quant = nib | (hi2<<4),
             // recentred by −32. w = d·sc·(q−32). Processed in two 128-wide halves.
             if n % 256 != 0 { return Err("q6_k element count not a multiple of 256".into()); }
-            let mut out = Vec::with_capacity(n);
-            for blk in data[..n / 256 * 210].chunks(210) {
+            if data.len() < n / 256 * 210 { return Err("q6_k data truncated".into()); }
+            let mut out = vec![0f32; n];
+            par_blocks(&mut out, &data[..n / 256 * 210], 256, 210, |y, blk| {
                 let d = f16_to_f32(u16::from_le_bytes([blk[208], blk[209]]));
-                let mut y = [0f32; 256];
                 for half in 0..2usize {
                     let ql = &blk[half * 64..half * 64 + 64];
                     let qh = &blk[128 + half * 32..128 + half * 32 + 32];
@@ -591,8 +618,7 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                         y[o + l + 96] = d * sci(is + 6) * q4 as f32;
                     }
                 }
-                out.extend_from_slice(&y);
-            }
+            });
             Ok(out)
         }
         20 => {
