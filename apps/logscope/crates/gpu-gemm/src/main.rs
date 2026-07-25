@@ -2663,7 +2663,10 @@ fn main() {
         // small slots for the test (256 KiB), 3-slot ring
         let slot_bytes = 256 * 1024u64;
         let slots = StreamSlots::new(&gpu, 3, slot_bytes);
-        ck("slot pool allocates n buffers of the requested size", slots.n_slots() == 3 && slots.slot_bytes() == slot_bytes);
+        // slot_bytes is a FLOOR, not an equality: LOGSCOPE_SLOT_PAGE may round each slot up to a page
+        // multiple, which must still satisfy every caller that asked for `slot_bytes`.
+        ck("slot pool allocates n buffers of at least the requested size",
+           slots.n_slots() == 3 && slots.slot_bytes() >= slot_bytes);
 
         // fill slot 1 with a known pattern, read it back — the fill must land byte-exact
         let pat: Vec<u8> = (0..slot_bytes as usize).map(|i| i.wrapping_mul(2654435761usize) as u8).collect();
@@ -2917,6 +2920,186 @@ fn main() {
            pins_b.iter().any(|e| hot_set.contains(&(*e as usize))));
         ck("correcting the pin set reduced demand fills", miss_b < miss_a);
         println!("gate-moe-repin: {}", if ok { "live repin correct \u{2713} (bit-exact; wrong pin set self-corrects)" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-quant-survey") {
+        // What, exactly, blocks a given model? Point this at any GGUF and it reports every quant type
+        // present, whether this engine can dequantize it, and — for the types it CANNOT — the block layout
+        // derived EMPIRICALLY from the file's own byte spans rather than from anything I assumed.
+        //
+        // That last part is the point. Implementing an unsupported k-/i-quant from memory is how you get a
+        // silently wrong dequant (a wrong codebook produces plausible-looking garbage, not an error), so
+        // this measures the real bytes-per-element off the file and states the implied bits/weight. If a
+        // proposed layout disagrees with the measurement, the layout is wrong — no reference needed for
+        // that much.
+        let path = args.iter().position(|a| a == "--gate-quant-survey")
+            .and_then(|i| args.get(i + 1)).cloned()
+            .or_else(|| std::env::var("LOGSCOPE_MODEL").ok());
+        let Some(path) = path else {
+            eprintln!("usage: kernel-validate --gate-quant-survey <model.gguf>   (or LOGSCOPE_MODEL=<path>)");
+            return;
+        };
+        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(e) => { eprintln!("gate-quant-survey: cannot read {path}: {e}"); return; } };
+        let g = match gpu_kernels::gguf::parse(&bytes) { Ok(g) => g, Err(e) => { eprintln!("gate-quant-survey: not a GGUF: {e}"); return; } };
+        println!("gate-quant-survey: {path}");
+        println!("  arch = {}   tensors = {}", g.arch(), g.tensors.len());
+
+        // sort tensors by data offset so the next offset bounds this tensor's real byte span
+        let mut order: Vec<usize> = (0..g.tensors.len()).collect();
+        order.sort_by_key(|&i| g.tensors[i].offset);
+        let mut span: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+        for (k, &i) in order.iter().enumerate() {
+            let end = order.get(k + 1).map(|&j| g.tensors[j].offset).unwrap_or(g.tensors[i].offset);
+            if end > g.tensors[i].offset { span.insert(i, end - g.tensors[i].offset); }
+        }
+
+        // tally per quant type: tensor count, element count, measured bytes
+        use std::collections::BTreeMap;
+        let mut tally: BTreeMap<u32, (usize, u64, u64)> = BTreeMap::new();
+        for (i, t) in g.tensors.iter().enumerate() {
+            let n: u64 = t.dims.iter().product::<u64>().max(1);
+            let e = tally.entry(t.ggml_type).or_insert((0, 0, 0));
+            e.0 += 1; e.1 += n; e.2 += span.get(&i).copied().unwrap_or(0);
+        }
+
+        let mut blocked: Vec<(u32, u64)> = Vec::new();
+        println!("  {:<10} {:>7} {:>14} {:>11} {:>9}  {}", "type", "tensors", "elements", "bits/wt", "support", "note");
+        for (&t, &(count, elems, mbytes)) in &tally {
+            let name = gpu_kernels::gguf::ggml_type_name(t);
+            // supported iff the engine can both size and dequantize a probe block of this type
+            let probe_n = 256usize;
+            let sized = gpu_kernels::gguf::type_nbytes(t, probe_n);
+            let supported = match sized {
+                Some(nb) => gpu_kernels::gguf::dequantize(t, &vec![0u8; nb], probe_n).is_ok(),
+                None => false,
+            };
+            let bits = if elems > 0 && mbytes > 0 { mbytes as f64 * 8.0 / elems as f64 } else { 0.0 };
+            let note = match (supported, sized) {
+                (true, _) => String::new(),
+                (false, Some(_)) => "sized but no dequant".into(),
+                (false, None) => format!("UNSUPPORTED — measured {:.0} B per 256 weights", bits * 32.0),
+            };
+            println!("  {:<10} {:>7} {:>14} {:>11.3} {:>9}  {note}",
+                format!("{name}({t})"), count, elems, bits, if supported { "yes" } else { "NO" });
+            if !supported { blocked.push((t, elems)); }
+        }
+
+        if blocked.is_empty() {
+            println!("gate-quant-survey: every quant type in this model is supported \u{2713}");
+        } else {
+            let total: u64 = tally.values().map(|v| v.1).sum();
+            let bl: u64 = blocked.iter().map(|(_, e)| *e).sum();
+            println!("gate-quant-survey: BLOCKED by {} type(s) covering {:.1}% of weights:", blocked.len(),
+                     bl as f64 / total.max(1) as f64 * 100.0);
+            for (t, _) in &blocked {
+                println!("    {}({t}) — needs a dequant kernel; the bits/wt above is measured from this file, \
+so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml_type_name(*t));
+            }
+        }
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-iq1s") {
+        // The GLM blocker, made testable on YOUR machine instead of guessed on mine.
+        //
+        // IQ1_S needs llama.cpp's 256-entry codebook (iq1s_grid). I will not reconstruct that table from
+        // memory: a wrong codebook does not fail, it produces plausible garbage, which is the worst
+        // possible failure mode. What this gate does instead is everything that CAN be established without
+        // it, and then validates a candidate the moment you supply one:
+        //
+        //   LOGSCOPE_MODEL=<glm.gguf>        the model to inspect (required)
+        //   LOGSCOPE_IQ1S_GRID=<file>        candidate grid: 256 whitespace/comma-separated u64 values
+        //                                    (hex with 0x or decimal). Structural checks only.
+        //   LOGSCOPE_IQ1S_REF=<file>         reference dequant for one tensor, as f32 text, one per line,
+        //                                    produced by llama.cpp. This is the ONLY decisive check.
+        //   LOGSCOPE_IQ1S_TENSOR=<name>      which tensor the reference corresponds to.
+        let Some(path) = std::env::var("LOGSCOPE_MODEL").ok() else {
+            eprintln!("usage: LOGSCOPE_MODEL=<glm.gguf> kernel-validate --gate-iq1s  [LOGSCOPE_IQ1S_GRID=<file>] [LOGSCOPE_IQ1S_REF=<f32 dump> LOGSCOPE_IQ1S_TENSOR=<name>]");
+            return;
+        };
+        let bytes = match std::fs::read(&path) { Ok(b) => b, Err(e) => { eprintln!("gate-iq1s: cannot read {path}: {e}"); return; } };
+        let g = match gpu_kernels::gguf::parse(&bytes) { Ok(g) => g, Err(e) => { eprintln!("gate-iq1s: not a GGUF: {e}"); return; } };
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        println!("gate-iq1s: {path}\n  arch = {}", g.arch());
+
+        // Which types are present that we cannot decode? Report them by measured footprint, so the block
+        // layout is established from the file rather than assumed.
+        let mut order: Vec<usize> = (0..g.tensors.len()).collect();
+        order.sort_by_key(|&i| g.tensors[i].offset);
+        let mut unsupported: Vec<(usize, u32, u64, u64)> = Vec::new(); // (idx, type, elems, bytes)
+        for (k, &i) in order.iter().enumerate() {
+            let t = &g.tensors[i];
+            let n: u64 = t.dims.iter().product::<u64>().max(1);
+            let end = order.get(k + 1).map(|&j| g.tensors[j].offset).unwrap_or(t.offset);
+            let nb = end.saturating_sub(t.offset);
+            let supported = gpu_kernels::gguf::type_nbytes(t.ggml_type, 256)
+                .map(|b| gpu_kernels::gguf::dequantize(t.ggml_type, &vec![0u8; b], 256).is_ok())
+                .unwrap_or(false);
+            if !supported && nb > 0 { unsupported.push((i, t.ggml_type, n, nb)); }
+        }
+        if unsupported.is_empty() {
+            println!("  no unsupported quant types in this model — nothing for this gate to do.");
+            println!("gate-iq1s: not blocked \u{2713}");
+            return;
+        }
+        let (idx, ty, elems, nbytes) = unsupported[0];
+        let bpw = nbytes as f64 * 8.0 / elems as f64;
+        println!("  blocking type: {}({ty})  across {} tensor(s)", gpu_kernels::gguf::ggml_type_name(ty), unsupported.len());
+        println!("  measured footprint: {bpw:.4} bits/weight  (from real byte spans in this file)");
+        println!("  sample tensor: {} dims={:?} bytes={}", g.tensors[idx].name, g.tensors[idx].dims, nbytes);
+        // A 256-weight super-block must consume a whole number of bytes; report it so any candidate
+        // implementation has a hard number to reproduce.
+        let per256 = bpw * 256.0 / 8.0;
+        println!("  implied bytes per 256 weights: {per256:.2}{}", if (per256 - per256.round()).abs() < 0.01 { " (integral \u{2713})" } else { "  <-- NON-INTEGRAL: block size assumption is wrong" });
+        ck("super-block footprint is integral (a layout that disagrees with this is wrong)",
+           (per256 - per256.round()).abs() < 0.01);
+
+        // Candidate grid: structural checks only. These cannot prove a grid CORRECT — only that it is not
+        // obviously malformed. Stated plainly so a passing structural check is never mistaken for validation.
+        match std::env::var("LOGSCOPE_IQ1S_GRID").ok() {
+            None => println!("  no candidate grid supplied (LOGSCOPE_IQ1S_GRID) — structural checks skipped"),
+            Some(gp) => match std::fs::read_to_string(&gp) {
+                Err(e) => ck(&format!("candidate grid is readable ({gp}: {e})"), false),
+                Ok(txt) => {
+                    let vals: Vec<u64> = txt.split(|c: char| !c.is_ascii_alphanumeric() && c != 'x' && c != 'X')
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                            u64::from_str_radix(h, 16).ok() } else { s.parse::<u64>().ok() })
+                        .collect();
+                    ck(&format!("grid has 256 entries (got {})", vals.len()), vals.len() == 256);
+                    let distinct: std::collections::HashSet<u64> = vals.iter().copied().collect();
+                    ck(&format!("grid entries are distinct ({} unique)", distinct.len()), distinct.len() == vals.len().max(1));
+                    // each entry should pack 8 sub-values in bytes; a grid of all-zero or all-same bytes is junk
+                    let nonzero = vals.iter().filter(|v| **v != 0).count();
+                    ck(&format!("grid is non-degenerate ({nonzero}/256 non-zero)"), nonzero >= 250);
+                    println!("  NOTE: structural checks only. They cannot prove the grid is CORRECT — only a");
+                    println!("        reference comparison (LOGSCOPE_IQ1S_REF) can do that.");
+                }
+            }
+        }
+
+        // The decisive check, when a reference exists.
+        match (std::env::var("LOGSCOPE_IQ1S_REF").ok(), std::env::var("LOGSCOPE_IQ1S_TENSOR").ok()) {
+            (Some(rp), Some(tname)) => {
+                let refv: Vec<f32> = std::fs::read_to_string(&rp).unwrap_or_default()
+                    .split_whitespace().filter_map(|s| s.parse::<f32>().ok()).collect();
+                match g.tensor(&tname) {
+                    None => ck(&format!("reference tensor '{tname}' exists in this model"), false),
+                    Some(t) => {
+                        let n: usize = t.dims.iter().product::<u64>().max(1) as usize;
+                        ck(&format!("reference length matches tensor '{tname}' ({} vs {n})", refv.len()), refv.len() == n);
+                        println!("  reference loaded: {} values, mean {:.5}, absmax {:.5}", refv.len(),
+                                 refv.iter().sum::<f32>() / refv.len().max(1) as f32,
+                                 refv.iter().fold(0f32, |m, v| m.max(v.abs())));
+                        println!("  → wire the dequant, then this gate compares element-wise and reports max|diff|.");
+                    }
+                }
+            }
+            _ => println!("  no reference dump supplied — the decisive check is unavailable"),
+        }
+
+        println!("gate-iq1s: {}", if ok {
+            "structure established \u{2713} — supply LOGSCOPE_IQ1S_REF from llama.cpp to validate a dequant"
+        } else { "FAIL \u{2717}" });
         return;
     }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
