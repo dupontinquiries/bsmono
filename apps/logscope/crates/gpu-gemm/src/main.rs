@@ -3558,6 +3558,47 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717} — the levers CHANGE RESULTS; 'bit-identical, decode-speed only' is wrong" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-zerocopy") {
+        // Does this device support importing an mmap'd file as a GPU buffer? That is the single mechanism
+        // llama.cpp uses to never upload weights (VK_EXT_external_memory_host) and Colibri's Metal
+        // equivalent. If it is available here, our BO-VMA ceiling is largely an artifact of allocating
+        // what we could have imported; if it is not, the ceiling is a real driver limit and streaming was
+        // the right pivot.
+        //
+        // The zerocopy module's own comment ASSERTS Honeykrisp lacks it. This measures instead.
+        #[cfg(feature = "zerocopy")]
+        {
+            let inst = wgpu::Instance::default();
+            let ad = pollster::block_on(inst.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false, compatible_surface: None,
+            }));
+            match ad {
+                Err(e) => println!("gate-zerocopy: no Vulkan adapter ({e:?})"),
+                Ok(adapter) => {
+                    let info = adapter.get_info();
+                    println!("gate-zerocopy: adapter = {} [{:?}]", info.name, info.backend);
+                    let avail = unsafe { gpu_kernels::zerocopy::imp::import_available(&adapter) };
+                    println!("  VK_EXT_external_memory_host advertised: {}", if avail { "YES" } else { "no" });
+                    if avail {
+                        println!("  → this device CAN import an mmap'd file as a GPU buffer, which is how");
+                        println!("    llama.cpp avoids uploading weights entirely. Our ceiling is then largely");
+                        println!("    self-inflicted: we allocate what we could import.");
+                    } else {
+                        println!("  → not available: llama.cpp allocates on this device too, and the BO-VMA");
+                        println!("    ceiling is a genuine driver limit. Streaming was the right pivot, and no");
+                        println!("    amount of ash/unsafe changes that.");
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "zerocopy"))]
+        {
+            println!("gate-zerocopy: built WITHOUT the `zerocopy` feature — nothing measured.");
+            println!("  rebuild with:  cargo run --release --features zerocopy --bin kernel-validate -- --gate-zerocopy");
+        }
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
