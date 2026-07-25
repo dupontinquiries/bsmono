@@ -3362,6 +3362,36 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             ck(&format!("matvec through GPU-converted weights == CPU-converted: max|diff|={md:.3e}"), md == 0.0);
         }
 
+        // Two separate tensors converted into ONE buffer — the shape a streamed expert fill actually has,
+        // since the file keeps ffn_gate_exps and ffn_up_exps apart while the kernel wants [2ff, d]. The
+        // reference is converting the stacked matrix in one go: row-major concatenation of two halves must
+        // be indistinguishable from it, nibbles and scales alike.
+        {
+            let (half, k) = (4usize, 256usize);
+            let per = half * k;               // weights per half
+            let nb_half = per / 256;
+            let mk_raw = |seed: u32, nb: usize| -> Vec<u8> {
+                (0..nb * 144).map(|i| {
+                    let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                    (x >> 9) as u8
+                }).collect()
+            };
+            let raw_a = mk_raw(11, nb_half);
+            let raw_b = mk_raw(22, nb_half);
+            let mut raw_ab = raw_a.clone(); raw_ab.extend_from_slice(&raw_b);
+            // reference: one conversion of the stacked [2*half, k] matrix
+            let want = gpu.q4k_to_q4_words(&raw_ab, half * 2, k);
+            // under test: two conversions into one buffer at row offsets
+            let total = half * 2 * k;
+            let (qw_words, qs_words) = (total / 8, total / 32);
+            let out = gpu.alloc_words(qw_words + qs_words);
+            gpu.q4k_convert_into(&out, &raw_a, half, k, 0, qw_words);
+            gpu.q4k_convert_into(&out, &raw_b, half, k, per / 8, qw_words + per / 32);
+            let got = gpu.download_words(&out);
+            ck(&format!("halves converted into one buffer == stacked conversion ({} words)", want.len()),
+               got.len() == want.len() && got == want);
+        }
+
         println!("gate-q4k: {}", if ok {
             "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
         } else { "FAIL \u{2717}" });
