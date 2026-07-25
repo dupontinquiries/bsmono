@@ -40,16 +40,26 @@ accounts for it against the same pool is unknown from here.
 memory as a buffer. This is a capability gap in our stack, not a design choice we made — and it is the
 single biggest structural difference between our engine and llama.cpp on this hardware.
 
-**Actionable check** (one command on the M2, and it decides how much this matters):
+**MEASURED on the M2 Ultra (`--gate-zerocopy`, 2026-07):**
 
 ```
-vulkaninfo | grep -i external_memory_host
+adapter = Apple M2 Ultra (G14D B1) [Vulkan]
+VK_EXT_external_memory_host advertised: no
 ```
 
-* Present → llama.cpp is importing the mmap and never allocating weight memory; our ceiling is largely
-  self-inflicted by the API we chose, and a small hand-rolled Vulkan path for weights would remove it.
-* Absent → llama.cpp is allocating like we are, its advantage is elsewhere (see below), and the ceiling is
-  a genuine driver limit we cannot dodge by any API.
+**Not available.** So on this hardware llama.cpp cannot import either — it allocates exactly as we do, and
+the BO-VMA ceiling is a genuine driver limit that no API choice, ash, or unsafe code dodges. The
+`zerocopy.rs` comment that predicted this was correct.
+
+Two consequences worth stating plainly:
+
+* **The streaming architecture was the right call.** It is not a workaround for a self-inflicted problem;
+  it addresses a real hardware constraint that the reference implementation also faces.
+* **llama.cpp cannot be holding Scout fully resident on this device either.** A 62 GB checkpoint against a
+  ~24 GiB ceiling means it must be running partially on CPU (`-ngl` below full). So its speed advantage on
+  a model this size is not "it fits and ours does not" — it is a different split of the same problem, and
+  our fully-resident-plus-streaming approach is arguably the more ambitious one. Worth measuring
+  `llama.cpp -ngl` behaviour on Scout before treating its throughput as a target.
 
 Note llama.cpp explicitly *disables* this on MoltenVK (ggml-vulkan.cpp:6090), so on macOS/Metal it takes
 the Metal backend's equivalent instead. The mechanism is not universally available.

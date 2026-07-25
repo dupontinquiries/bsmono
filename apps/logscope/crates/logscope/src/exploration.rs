@@ -374,6 +374,13 @@ mod tests {
             .bench("hit_rate_after", 0.62)
             .confidence(0.9).parent("moe-stream").hardware("any")
             .status(Status::Succeeded { gain: 0.62 }));
+        t.add(Branch::new("zerocopy-import", "Import the mmap'd model as a GPU buffer instead of allocating (llama.cpp / Colibri approach)")
+            .assume("wgpu is the limitation and raw ash could bypass it")
+            .evidence("llama.cpp uses VK_EXT_external_memory_host to never upload weights")
+            .evidence("measured on M2 Ultra: Honeykrisp does NOT advertise the extension")
+            .evidence("so llama.cpp allocates on this device too — the BO-VMA ceiling is the driver's")
+            .confidence(1.0).hardware("asahi")
+            .status(Status::Failed { reason: "VK_EXT_external_memory_host unavailable on Honeykrisp; no API or unsafe code dodges it".into() }));
         t.add(Branch::new("couple-prefetch", "Cross-layer coupling prefetch of experts (Colibri couple_prefetch)")
             .evidence("coupling predictor measured 72% accurate")
             .evidence("capacity-bound not accuracy-bound: displacing variant turned 113 demand fills into 183 total")
@@ -492,7 +499,7 @@ mod tests {
         assert!(sys.len() > op.len());
         let counts = status_counts(&t);
         assert_eq!(counts.get("succeeded"), Some(&3));
-        assert_eq!(counts.get("failed"), Some(&1));
+        assert_eq!(counts.get("failed"), Some(&2));
         assert_eq!(counts.get("deferred"), Some(&1));
     }
 
