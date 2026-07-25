@@ -165,6 +165,193 @@ pub fn f16_to_f32(h: u16) -> f32 {
 }
 
 /// Bytes occupied by `n` elements of the given ggml type (F32/F16/Q4_0).
+/// A split checkpoint presented as ONE tensor namespace.
+///
+/// llama.cpp splits large models at tensor boundaries into `name-00001-of-0000N.gguf`. Each shard is a
+/// complete GGUF — its own header, metadata and tensor table — which is why joining them with `cat` does
+/// not work: the reader sees only shard 1's table and the rest is unreachable.
+///
+/// This unifies them properly. Shard 1's metadata describes the whole model (48 layers, etc.), so it is
+/// kept as-is; every shard's tensor table is concatenated with its offsets rebased onto a virtual
+/// concatenation of the shards' DATA sections. Callers then address tensors by a single global offset and
+/// [`slice`] routes each read to the file that actually holds those bytes. Nothing is copied: the shards
+/// stay memory-mapped by the caller and this borrows them.
+pub struct ShardSet<'a> {
+    /// Unified view: shard 1's metadata, all shards' tensors, offsets rebased. `data_offset` is 0 because
+    /// tensor offsets are already global — use [`slice`] rather than indexing any single file.
+    pub g: Gguf,
+    parts: Vec<&'a [u8]>,
+    doff: Vec<u64>, // each shard's own data_offset
+    base: Vec<u64>, // global start of each shard's data section
+}
+
+impl<'a> ShardSet<'a> {
+    /// Build from shard file bytes **in shard order**. A single-element input is the ordinary
+    /// non-split case and behaves identically to parsing that file alone.
+    pub fn new(parts: Vec<&'a [u8]>) -> Result<Self, String> {
+        if parts.is_empty() { return Err("no shards supplied".into()); }
+        let mut doff = Vec::with_capacity(parts.len());
+        let mut base = Vec::with_capacity(parts.len());
+        let mut tensors: Vec<TensorInfo> = Vec::new();
+        let mut meta = None;
+        let mut version = 3u32;
+        let mut running = 0u64;
+        for (i, p) in parts.iter().enumerate() {
+            let g = parse(p)?;
+            let data_len = (p.len() as u64).saturating_sub(g.data_offset);
+            doff.push(g.data_offset);
+            base.push(running);
+            for mut t in g.tensors.into_iter() {
+                t.offset += running; // rebase onto the virtual concatenation
+                tensors.push(t);
+            }
+            if i == 0 { meta = Some(g.metadata); version = g.version; }
+            running += data_len;
+        }
+        // Shard 1 carries the model-level metadata; later shards repeat only split bookkeeping.
+        let metadata = meta.ok_or("no metadata in shard 1")?;
+        Ok(ShardSet {
+            g: Gguf { version, metadata, tensors, data_offset: 0 },
+            parts, doff, base,
+        })
+    }
+
+    /// Bytes for a tensor at global offset `off`. Returns None if the range escapes the set — which is the
+    /// signature of a MISSING SHARD, and is reported rather than silently truncated, because a short read
+    /// would decode as plausible-looking garbage.
+    pub fn slice(&self, off: u64, len: usize) -> Option<&'a [u8]> {
+        // last shard whose base <= off
+        let k = self.base.iter().rposition(|&b| b <= off)?;
+        let local = off.checked_sub(self.base[k])?;
+        let start: usize = self.doff[k].checked_add(local)?.try_into().ok()?;
+        let end = start.checked_add(len)?;
+        self.parts[k].get(start..end)
+    }
+
+    pub fn shards(&self) -> usize { self.parts.len() }
+
+    /// Total bytes of tensor data across the set.
+    pub fn data_len(&self) -> u64 {
+        self.parts.iter().zip(&self.doff).map(|(p, d)| (p.len() as u64).saturating_sub(*d)).sum()
+    }
+
+    /// Do the shards agree on how many there should be, and are they all here? Reads `split.count` when
+    /// present (llama.cpp writes it), else falls back to the count supplied.
+    pub fn completeness(&self) -> Result<(), String> {
+        if let Some(Value::U32(n)) = self.g.metadata.get("split.count") {
+            let want = *n as usize;
+            if want != 0 && want != self.parts.len() {
+                return Err(format!("split.count says {want} shards but {} were supplied", self.parts.len()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sibling shard paths for a `-00001-of-0000N.gguf` file, in order. Returns None when `first` is not a
+/// shard name. Missing files are still listed, so the caller can report exactly which are absent instead
+/// of loading a partial set.
+pub fn shard_siblings(first: &std::path::Path) -> Option<Vec<std::path::PathBuf>> {
+    let name = first.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, total_s) = stem.rsplit_once("-of-")?;
+    let (base, idx_s) = head.rsplit_once('-')?;
+    let total: u32 = total_s.parse().ok()?;
+    let width = idx_s.len();
+    if total == 0 || idx_s.parse::<u32>().is_err() { return None; }
+    let dir = first.parent()?;
+    Some((1..=total)
+        .map(|i| dir.join(format!("{base}-{i:0width$}-of-{total_s}.gguf", width = width)))
+        .collect())
+}
+
+#[cfg(test)]
+mod shard_tests {
+    use super::*;
+
+    /// One synthetic shard: `n` F32 tensors named t{first}.. each holding `vals`.
+    fn shard(names: &[(&str, &[f32])]) -> Vec<u8> {
+        fn put_str(b: &mut Vec<u8>, s: &str) { b.extend_from_slice(&(s.len() as u64).to_le_bytes()); b.extend_from_slice(s.as_bytes()); }
+        let mut b = Vec::new();
+        b.extend_from_slice(b"GGUF");
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        put_str(&mut b, "general.architecture"); b.extend_from_slice(&8u32.to_le_bytes()); put_str(&mut b, "test");
+        let mut off = 0u64;
+        for (n, v) in names {
+            put_str(&mut b, n);
+            b.extend_from_slice(&1u32.to_le_bytes());                 // n_dims
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());      // dim
+            b.extend_from_slice(&0u32.to_le_bytes());                  // F32
+            b.extend_from_slice(&off.to_le_bytes());
+            off += (v.len() * 4) as u64;
+        }
+        let align = 32usize; let pad = (align - b.len() % align) % align;
+        b.extend(std::iter::repeat(0u8).take(pad));
+        for (_, v) in names { for f in v.iter() { b.extend_from_slice(&f.to_le_bytes()); } }
+        b
+    }
+
+    #[test]
+    fn unifies_two_shards_into_one_tensor_namespace() {
+        let a = shard(&[("blk.0.w", &[1.0, 2.0]), ("blk.1.w", &[3.0, 4.0])]);
+        let bb = shard(&[("blk.2.w", &[5.0, 6.0]), ("blk.3.w", &[7.0, 8.0])]);
+        let set = ShardSet::new(vec![&a, &bb]).expect("build set");
+        assert_eq!(set.shards(), 2);
+        // all four tensors visible through ONE table — the thing a `cat` cannot give you
+        assert_eq!(set.g.tensors.len(), 4);
+        for n in ["blk.0.w", "blk.1.w", "blk.2.w", "blk.3.w"] {
+            assert!(set.g.tensor(n).is_some(), "{n} missing from the unified view");
+        }
+    }
+
+    #[test]
+    fn reads_route_to_the_shard_that_actually_holds_the_bytes() {
+        let a = shard(&[("t0", &[1.0, 2.0])]);
+        let bb = shard(&[("t1", &[3.0, 4.0])]);
+        let set = ShardSet::new(vec![&a, &bb]).expect("build set");
+        // t1 lives in shard 2; its global offset must resolve there, not into shard 1
+        let t1 = set.g.tensor("t1").expect("t1");
+        let raw = set.slice(t1.offset, 8).expect("t1 bytes");
+        let got = dequantize(0, raw, 2).expect("f32");
+        assert_eq!(got, vec![3.0, 4.0], "read landed in the wrong shard");
+        let t0 = set.g.tensor("t0").expect("t0");
+        let got0 = dequantize(0, set.slice(t0.offset, 8).unwrap(), 2).unwrap();
+        assert_eq!(got0, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn a_single_file_behaves_exactly_as_before() {
+        let a = shard(&[("only", &[9.0, 10.0])]);
+        let set = ShardSet::new(vec![&a]).expect("single");
+        let t = set.g.tensor("only").unwrap();
+        assert_eq!(dequantize(0, set.slice(t.offset, 8).unwrap(), 2).unwrap(), vec![9.0, 10.0]);
+        assert_eq!(set.shards(), 1);
+    }
+
+    #[test]
+    fn a_read_past_the_end_reports_rather_than_truncating() {
+        // a missing shard shows up as an out-of-range read; returning a short buffer would decode as
+        // plausible garbage, so it must be None
+        let a = shard(&[("t0", &[1.0, 2.0])]);
+        let set = ShardSet::new(vec![&a]).unwrap();
+        assert!(set.slice(0, 1 << 20).is_none());
+        assert!(set.slice(u64::MAX - 8, 16).is_none());
+    }
+
+    #[test]
+    fn sibling_paths_are_derived_from_the_first_shard() {
+        let p = std::path::Path::new("/m/Llama-4-Scout-Q4_K_M-00001-of-00002.gguf");
+        let sibs = shard_siblings(p).expect("is a shard name");
+        assert_eq!(sibs.len(), 2);
+        assert!(sibs[0].ends_with("Llama-4-Scout-Q4_K_M-00001-of-00002.gguf"));
+        assert!(sibs[1].ends_with("Llama-4-Scout-Q4_K_M-00002-of-00002.gguf"), "{:?}", sibs[1]);
+        // a plain model name is not a shard
+        assert!(shard_siblings(std::path::Path::new("/m/Qwen3.gguf")).is_none());
+    }
+}
+
 /// Human-readable ggml quant type name (for diagnostics / the tensor dump).
 pub fn ggml_type_name(t: u32) -> &'static str {
     match t {
