@@ -11,22 +11,24 @@ pub mod chat;
 pub mod code;
 pub mod modify;
 pub mod bloc;
+pub mod models;
 
 use crate::model::ModelState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Tab { Sources, Peek, Tokens, Blocks, Rotate, Cargo, Chat, Code, Modify, Bloc }
+pub enum Tab { Sources, Peek, Tokens, Blocks, Rotate, Cargo, Chat, Code, Modify, Bloc, Models }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 11] = [
         Tab::Sources, Tab::Peek, Tab::Tokens, Tab::Blocks, Tab::Rotate,
-        Tab::Cargo, Tab::Chat, Tab::Code, Tab::Modify, Tab::Bloc,
+        Tab::Cargo, Tab::Chat, Tab::Code, Tab::Modify, Tab::Bloc, Tab::Models,
     ];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Sources => "Sources", Tab::Peek => "Peek", Tab::Tokens => "Tokens",
             Tab::Blocks => "Blocks", Tab::Rotate => "Rotate", Tab::Cargo => "Cargo",
             Tab::Chat => "Chat", Tab::Code => "Code", Tab::Modify => "Modify", Tab::Bloc => "Bloc",
+            Tab::Models => "Models",
         }
     }
 }
@@ -41,6 +43,7 @@ pub struct Tabs {
     pub code: code::Code,
     pub modify: modify::Modify,
     pub bloc: bloc::Bloc,
+    pub models: models::Models,
 }
 
 impl Tabs {
@@ -58,6 +61,7 @@ impl Tabs {
             Tab::Code => self.code.ui(ui),
             Tab::Modify => { self.modify.ui(ui); None }
             Tab::Bloc => self.bloc.ui(ui, model, scanning),
+            Tab::Models => { self.models.ui(ui); None }
         }
     }
     /// Route a composed prompt from another tab into the Chat input.
