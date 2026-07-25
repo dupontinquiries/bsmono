@@ -22,13 +22,23 @@
 //! matched confidently is REPORTED, never guessed — the human resolves it, same discipline as merge.rs.
 
 /// The instruction block appended to the system prompt when patch mode is on. Mechanical, format-first.
+///
+/// The last two rules carry the Liaison discipline into generation: a hunk's context lines are a CLAIM
+/// about the file's current contents, and application is context-anchored, so invented context does not
+/// fail loudly — it either misapplies or silently fails to match. Asking rather than guessing is therefore
+/// the cheaper behaviour, exactly as the Liaison reports absence rather than fabricating a summary.
 pub const PATCH_MODE_PROMPT: &str = "\n\nPATCH MODE: When you change existing files, emit a UNIFIED DIFF patch \
 instead of rewriting the whole file. For each file, write a header line:\n\
 *** path: <relative/path>\n\
 then one or more hunks. In a hunk, prefix each line with a space (unchanged context), '-' (remove), or \
 '+' (add). Include 2-3 unchanged context lines around each change so the patch can be located. Do NOT \
 reprint unchanged parts of the file. For a brand-new file, use the header then all '+' lines. Keep each \
-patch minimal — only the lines that actually change.";
+patch minimal — only the lines that actually change.\n\
+Context lines must be copied EXACTLY from the file you were given — they are how the patch is located, \
+so approximate or remembered context will not apply. If you have not been shown the part of the file you \
+need to change, say so and ask for it; do not guess at the surrounding lines. If a change is too \
+pervasive to express as hunks, say that and emit the full file instead — an honest full rewrite is better \
+than a patch built on invented context.";
 
 /// One file's changes: the target path and its ordered hunks.
 #[derive(Clone, Debug, PartialEq)]
