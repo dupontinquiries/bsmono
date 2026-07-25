@@ -162,8 +162,10 @@ pub(crate) mod engine {
             // cache HIT shouldn't pull GB into RAM just to compute a content key. The OS pages bytes
             // on demand; `bytes` derefs to &[u8] exactly like the old fs::read Vec, and the mapping
             // is dropped at the end of load once tensors are resident.
-            let mm = gpu_kernels::file_bytes(path).map_err(|e| format!("open {path}: {e}"))?;
-            let bytes: &[u8] = &mm;
+            // Retained for the process lifetime (Colibri's g_maps): weights that want to be VIEWS into
+            // the file cannot borrow a mapping the loader drops on return. Reused by path, so reloading
+            // the same model does not map it twice.
+            let bytes: &'static [u8] = gpu_kernels::retain_map(path).map_err(|e| format!("open {path}: {e}"))?;
             // SPLIT CHECKPOINT: if this is `-00001-of-0000N.gguf`, map the siblings too. A split model's
             // shard 1 carries metadata for the WHOLE model but only its own share of the tensors, so
             // loading it alone fails on a missing tensor with everything looking healthy. Unifying the
@@ -179,13 +181,13 @@ pub(crate) mod engine {
                         return Err(format!("split checkpoint is incomplete — missing {missing:?}. All {} shards must be present (the Models tab lists what to fetch).", paths.len()));
                     }
                     for p in paths.iter().skip(1) {
-                        extra_maps.push(gpu_kernels::file_bytes(p.to_string_lossy().as_ref())
+                        extra_maps.push(gpu_kernels::retain_map(p.to_string_lossy().as_ref())
                             .map_err(|e| format!("open shard {}: {e}", p.display()))?);
                     }
                     eprintln!("wgpu-engine: split checkpoint — {} shards found, loading as one model", paths.len());
                 }
             }
-            let mut parts: Vec<&[u8]> = vec![bytes];
+            let mut parts: Vec<&'static [u8]> = vec![bytes];
             for m in &extra_maps { parts.push(m); }
             let gpu = Gpu::new();
             gpu.maybe_start_gpu_spin();
