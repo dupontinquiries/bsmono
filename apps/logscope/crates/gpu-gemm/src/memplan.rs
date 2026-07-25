@@ -510,3 +510,29 @@ mod tests {
         assert_eq!(ring_slot(5, 1), 0);
     }
 }
+
+/// Total system RAM in bytes, or 0 when it cannot be determined. Linux reads `MemTotal` from
+/// /proc/meminfo; other platforms return 0 so callers treat the check as unavailable rather than
+/// assuming a value and refusing a load that would have worked.
+pub fn system_ram_bytes() -> u64 {
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        for line in s.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod ram_tests {
+    #[test]
+    fn ram_probe_is_either_a_real_size_or_an_honest_zero() {
+        let r = super::system_ram_bytes();
+        // 0 means "unknown" and must disable the guard rather than block a load
+        assert!(r == 0 || r > (1u64 << 30), "implausible RAM reading: {r}");
+    }
+}
