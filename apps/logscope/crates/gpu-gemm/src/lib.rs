@@ -1282,6 +1282,51 @@ pub struct MoeLayer {
 /// and the LRU policy (expert_cache::LayerSlots) that decides which slot each cold expert lands in. Leans
 /// on Colibri's pin∪LRU∪load tiering: pinned hot experts stay resident in `pinned_gu`/`pinned_dn`; the rest
 /// stream through the slots. Filled per token in moe_ffn_v1.
+/// Raw Q4_K expert weights as VIEWS into the retained model file — Colibri's arrangement, where an expert
+/// is a window into the mmap and "la page cache del kernel È la cache" rather than a copy we own.
+///
+/// The alternative, which this replaces, is requantizing every expert into host memory at load: ~50 GiB
+/// and many minutes for Scout. Here nothing is copied and nothing is converted until a slot actually needs
+/// the expert, at which point the conversion happens on the GPU.
+///
+/// Spans are per-expert slices of the three expert tensors. GGUF stores them as [d, ff, n_expert] (gate/up)
+/// and [ff, d, n_expert] (down) with the expert index slowest, so each expert's block is contiguous.
+pub struct RawExpertSrc {
+    pub gate: &'static [u8],
+    pub up: &'static [u8],
+    pub down: &'static [u8],
+    /// Bytes per expert in gate/up (each an [ff, d] matrix) and in down (a [d, ff] matrix).
+    pub gu_expert_bytes: usize,
+    pub dn_expert_bytes: usize,
+    pub ff: usize,
+    pub d: usize,
+}
+
+impl RawExpertSrc {
+    /// Byte span of expert `e` in the gate tensor, or None if it escapes the mapping (a missing shard).
+    pub fn gate_of(&self, e: usize) -> Option<&'static [u8]> {
+        self.gate.get(e * self.gu_expert_bytes..(e + 1) * self.gu_expert_bytes)
+    }
+    pub fn up_of(&self, e: usize) -> Option<&'static [u8]> {
+        self.up.get(e * self.gu_expert_bytes..(e + 1) * self.gu_expert_bytes)
+    }
+    pub fn down_of(&self, e: usize) -> Option<&'static [u8]> {
+        self.down.get(e * self.dn_expert_bytes..(e + 1) * self.dn_expert_bytes)
+    }
+    /// Slot layout for the gate‖up blob: (qs byte offset, total bytes). qs is 256-aligned so it binds.
+    pub fn gu_layout(&self) -> (usize, usize) {
+        let qw = 2 * self.ff * self.d / 2;              // 4 bits per weight
+        let qs_off = qw.div_ceil(256) * 256;
+        (qs_off, qs_off + 2 * self.ff * (self.d / 32) * 4)
+    }
+    /// Slot layout for the down blob.
+    pub fn dn_layout(&self) -> (usize, usize) {
+        let qw = self.d * self.ff / 2;
+        let qs_off = qw.div_ceil(256) * 256;
+        (qs_off, qs_off + self.d * (self.ff / 32) * 4)
+    }
+}
+
 pub struct MoeStream {
     pub layer: usize,                      // this layer's index — the key for cross-layer coupling prediction
     pub n_expert: usize,
@@ -1303,6 +1348,9 @@ pub struct MoeStream {
     /// the access counter that gates how often we even look (Colibri checks at a ~16-token safe point).
     pub repins: u64,
     pub visits: u64,
+    /// When present, expert weights are VIEWS into the model file and `host_gu`/`host_dn` are unused: a
+    /// fill converts straight from the file on the GPU. When None, the legacy host-copy path is used.
+    pub raw: Option<RawExpertSrc>,
 }
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
@@ -1509,6 +1557,12 @@ impl StreamSlots {
         let n = (bytes.len() as u64).min(self.slot_bytes) as usize;
         if n == 0 { return; }
         gpu.queue.write_buffer(buf, 0, &bytes[..n]);
+    }
+
+    /// The whole slot as a word-addressed Tensor, for a kernel that writes packed data into it.
+    pub fn tensor_full(&self, idx: usize) -> Tensor {
+        let buf = self.slots[idx.min(self.slots.len().saturating_sub(1))].clone();
+        Tensor { buf, rows: 1, cols: (self.slot_bytes / 4) as usize, pool: None, view: None }
     }
 
     /// The raw slot buffer handle (cloned; wgpu buffers are Arc-backed) for binding as a weight.
@@ -2394,22 +2448,70 @@ impl Gpu {
         let acc = s.policy.access(e);
         let slot = match acc { crate::expert_cache::Access::Hit(x) | crate::expert_cache::Access::Miss(x) => x as usize, crate::expert_cache::Access::Pinned => 0 };
         if matches!(acc, crate::expert_cache::Access::Miss(_)) {
-            let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
-            let dn_bytes = std::mem::take(&mut s.host_dn[e as usize]);
             MOE_FILLS.fetch_add(1, Relaxed);
-            MOE_BYTES.fetch_add((gu_bytes.len() + dn_bytes.len()) as u64, Relaxed);
-            s.gu_slots.fill(self, slot, &gu_bytes);
-            s.dn_slots.fill(self, slot, &dn_bytes);
-            s.host_gu[e as usize] = gu_bytes;
-            s.host_dn[e as usize] = dn_bytes;
+            if let Some(r) = &s.raw {
+                // VIEW PATH (Colibri): the expert's bytes are a window into the model file. Convert them
+                // on the GPU straight into the slot — gate into rows 0..ff, up into rows ff..2ff — so
+                // nothing was ever copied into host memory and nothing is dequantized to f32.
+                let (ff, d) = (r.ff, r.d);
+                let (gu_qs_off, _) = r.gu_layout();
+                let (dn_qs_off, _) = r.dn_layout();
+                let (gate, up, down) = (r.gate_of(e as usize), r.up_of(e as usize), r.down_of(e as usize));
+                let half_qw_words = ff * d / 8;
+                let half_qs_vals = ff * (d / 32);
+                let gu_buf = s.gu_slots.tensor_full(slot);
+                let dn_buf = s.dn_slots.tensor_full(slot);
+                if let (Some(g), Some(u), Some(dw)) = (gate, up, down) {
+                    MOE_BYTES.fetch_add((g.len() + u.len() + dw.len()) as u64, Relaxed);
+                    self.q4k_convert_into(&gu_buf, g, ff, d, 0, gu_qs_off / 4);
+                    self.q4k_convert_into(&gu_buf, u, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
+                    self.q4k_convert_into(&dn_buf, dw, d, ff, 0, dn_qs_off / 4);
+                }
+            } else {
+                let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
+                let dn_bytes = std::mem::take(&mut s.host_dn[e as usize]);
+                MOE_BYTES.fetch_add((gu_bytes.len() + dn_bytes.len()) as u64, Relaxed);
+                s.gu_slots.fill(self, slot, &gu_bytes);
+                s.dn_slots.fill(self, slot, &dn_bytes);
+                s.host_gu[e as usize] = gu_bytes;
+                s.host_dn[e as usize] = dn_bytes;
+            }
         } else {
             MOE_HITS.fetch_add(1, Relaxed);
         }
+        // Under the view path the qs offset is dictated by the slot layout (256-aligned), not by the
+        // host blob's packing.
+        let (gu_off, dn_off) = match &s.raw {
+            Some(r) => (r.gu_layout().0, r.dn_layout().0),
+            None => (gu_off, dn_off),
+        };
         let gu_buf = s.gu_slots.slot_buf(slot);
         let dn_buf = s.dn_slots.slot_buf(slot);
         let gu = self.q4_lin_from_slots(&gu_buf, gu_off, gu_rows, gu_k, None);
         let dn = self.q4_lin_from_slots(&dn_buf, dn_off, dn_rows, dn_k, None);
         (gu, dn)
+    }
+
+    /// TEST HELPER: build a MoeStream whose experts are VIEWS into raw Q4_K bytes (the Colibri path),
+    /// rather than host copies. `gate`/`up`/`down` are the whole expert tensors as they appear in a file.
+    pub fn build_moe_stream_raw(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
+                                n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize) -> MoeStream {
+        let gu_expert_bytes = ff * d / 256 * 144;
+        let dn_expert_bytes = d * ff / 256 * 144;
+        let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d };
+        let (_, gu_total) = raw.gu_layout();
+        let (_, dn_total) = raw.dn_layout();
+        MoeStream {
+            layer: 0, n_expert,
+            gu_rows: 2 * ff, gu_k: d, dn_rows: d, dn_k: ff,
+            host_gu: Vec::new(), host_dn: Vec::new(), gu_qs_off: 0, dn_qs_off: 0,
+            gu_slots: StreamSlots::new(self, ring, gu_total as u64),
+            dn_slots: StreamSlots::new(self, ring, dn_total as u64),
+            policy: crate::expert_cache::LayerSlots::new(&[], ring as u32),
+            pinned_gu: std::collections::HashMap::new(),
+            pinned_dn: std::collections::HashMap::new(),
+            repins: 0, visits: 0, raw: Some(raw),
+        }
     }
 
     /// TEST HELPER: build a MoeStream from raw f32 expert weights (same weights a resident MoeLayer would
@@ -2449,7 +2551,7 @@ impl Gpu {
             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-            pinned_gu, pinned_dn, repins: 0, visits: 0,
+            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None,
         }
     }
 
@@ -6253,7 +6355,7 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
                             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
                             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-                            pinned_gu, pinned_dn, repins: 0, visits: 0,
+                            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None,
                         }))
                     } else { None };
                     drop(gsrc); drop(usrc);
