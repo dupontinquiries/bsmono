@@ -37,11 +37,26 @@ pub struct LayerSlots {
     pinned: Vec<u32>,             // expert ids kept permanently resident (sorted, small)
     slot_expert: Vec<Option<u32>>, // slot index → expert currently in it (None = empty)
     expert_slot: HashMap<u32, u32>, // expert → slot (LRU tier only)
-    last_used: Vec<u64>,          // slot → recency clock (for LRU victim selection)
+    // LFRU (Colibri tier.h): eviction is frequency-primary, recency-secondary. Per-expert decaying heat
+    // (route frequency) and last-access clock; the victim is the resident expert with the lowest
+    // score = (heat<<8)|recency. Pure LRU pins whatever was touched last; real MoE routing is skewed, so
+    // keeping the *hot* experts resident (even if not the most recent) is what lifts the hit rate.
+    heat: HashMap<u32, u32>,      // expert → decaying access frequency
+    last_access: HashMap<u32, u32>, // expert → clock of last access (recency for the score)
     clock: u64,
+    decay_every: u64,             // auto-decay heat every N accesses (Colibri decays at the ~16-token safe point)
+    since_decay: u64,
     pub hits_pin: u64,
     pub hits_lru: u64,
     pub misses: u64,
+}
+
+/// Colibri's LFRU score (tier.h `tier_lfru_score`): heat in the high bits, recency (capped at 255) in the
+/// low 8 — so frequency dominates and recency only breaks ties among equally-hot experts.
+fn lfru_score(heat: u32, last: u32, clock: u32) -> u64 {
+    let age = clock.wrapping_sub(last);
+    let recent = if age < 255 { 255 - age } else { 0 };
+    ((heat as u64) << 8) | recent as u64
 }
 
 impl LayerSlots {
@@ -52,8 +67,13 @@ impl LayerSlots {
             pinned: p,
             slot_expert: vec![None; n_slots as usize],
             expert_slot: HashMap::new(),
-            last_used: vec![0; n_slots as usize],
+            heat: HashMap::new(),
+            last_access: HashMap::new(),
             clock: 1, // demand accesses increment from here (first access → 2), leaving 1 as the prefetch band
+            // decay ~every 16 tokens' worth of accesses through this per-layer policy; scaled by the working
+            // set so a bigger ring accumulates proportionally more heat before halving.
+            decay_every: (n_slots as u64 * 16).max(32),
+            since_decay: 0,
             hits_pin: 0, hits_lru: 0, misses: 0,
         }
     }
@@ -65,21 +85,29 @@ impl LayerSlots {
     /// must fill that slot's GPU buffer from host bytes before dispatching the expert.
     pub fn access(&mut self, e: u32) -> Access {
         self.clock += 1;
+        self.since_decay += 1;
+        if self.since_decay >= self.decay_every { self.decay(); self.since_decay = 0; }
+        // record heat/recency for LFRU (pinned experts too — so a live repin pass can see their heat)
+        *self.heat.entry(e).or_insert(0) += 1;
+        self.last_access.insert(e, self.clock as u32);
         if self.is_pinned(e) { self.hits_pin += 1; return Access::Pinned; }
         if let Some(&slot) = self.expert_slot.get(&e) {
-            self.last_used[slot as usize] = self.clock;
             self.hits_lru += 1;
             return Access::Hit(slot);
         }
-        // miss → evict the LRU slot (empty slots are victims first: last_used 0)
-        let victim = self.lru_victim();
+        // miss → evict by LFRU (empty slots first, then coldest-by-score)
+        let victim = self.lfru_victim();
         if let Some(old) = self.slot_expert[victim as usize] { self.expert_slot.remove(&old); }
         self.slot_expert[victim as usize] = Some(e);
         self.expert_slot.insert(e, victim);
-        self.last_used[victim as usize] = self.clock;
         self.misses += 1;
         Access::Miss(victim)
     }
+
+    /// Halve every expert's heat — Colibri's `tier_decay`, run periodically (it fires at the repin safe
+    /// point, ~every 16 tokens) so the heat map tracks RECENT frequency rather than all-time counts. The
+    /// caller invokes this once per N tokens; without it, early-hot experts would ossify in the slots.
+    pub fn decay(&mut self) { for h in self.heat.values_mut() { *h >>= 1; } }
 
     /// Is this expert resident right now (pin or LRU) WITHOUT changing state? Used to split a token's routed
     /// set into resident (dispatch now) vs misses (load first) for the GPU/disk overlap.
@@ -93,19 +121,26 @@ impl LayerSlots {
     /// access). So victims are chosen empty → unused-prefetch → coldest demand slot, exactly as wanted.
     pub fn prefetch(&mut self, e: u32) -> Option<u32> {
         if self.resident(e) { return None; }
-        let victim = self.lru_victim();
+        let victim = self.lfru_victim();
         if let Some(old) = self.slot_expert[victim as usize] { self.expert_slot.remove(&old); }
         self.slot_expert[victim as usize] = Some(e);
         self.expert_slot.insert(e, victim);
-        self.last_used[victim as usize] = 1; // low band: above empty, below any demand access
         Some(victim)
     }
 
-    fn lru_victim(&self) -> u32 {
-        // the slot with the smallest last_used (empty slots have 0 → chosen first)
-        let mut best = 0u32; let mut best_t = u64::MAX;
-        for (i, &t) in self.last_used.iter().enumerate() {
-            if t < best_t { best_t = t; best = i as u32; }
+    /// LFRU victim (Colibri tier.h): an empty slot first (nothing to evict), otherwise the resident expert
+    /// with the lowest score = (heat<<8)|recency — i.e. the coldest-by-frequency, breaking ties by least
+    /// recent. Degrades to plain LRU when all heats are equal (every expert seen the same number of times),
+    /// which is why the pre-existing LRU tests still hold.
+    fn lfru_victim(&self) -> u32 {
+        // empty slot wins immediately
+        for (i, s) in self.slot_expert.iter().enumerate() { if s.is_none() { return i as u32; } }
+        let clk = self.clock as u32;
+        let mut best = 0u32; let mut best_score = u64::MAX;
+        for (i, s) in self.slot_expert.iter().enumerate() {
+            let e = s.unwrap();
+            let sc = lfru_score(*self.heat.get(&e).unwrap_or(&0), *self.last_access.get(&e).unwrap_or(&0), clk);
+            if sc < best_score { best_score = sc; best = i as u32; }
         }
         best
     }
@@ -172,6 +207,26 @@ mod tests {
         }
         assert_eq!(s.hits_lru, 1);
         assert_eq!(s.misses, 1);
+    }
+
+    #[test]
+    fn lfru_keeps_the_hot_expert_over_a_recent_cold_one() {
+        // LFRU (Colibri): frequency beats recency. 3 slots. Make 10 HOT (many accesses), 20 and 30 cold.
+        // Then touch a fresh cold expert repeatedly to churn the ring; 10 must survive because its heat is
+        // high, even though it wasn't the most-recently-used. Pure LRU would evict 10 once it aged out.
+        let mut s = LayerSlots::new(&[], 3);
+        for _ in 0..8 { s.access(10); } // 10 is very hot
+        s.access(20);                    // slot fills
+        s.access(30);                    // ring now {10(hot),20,30}
+        // churn: bring in 40 then 50 — each miss must evict a COLD slot (20/30), never hot 10
+        let _ = s.access(40); // evicts coldest of {20,30} by score
+        let _ = s.access(50); // evicts the other cold one
+        assert!(s.resident(10), "hot 10 survives churn (LFRU frequency wins)");
+        assert!(s.resident(40) && s.resident(50), "the two new experts are resident");
+        // decay enough and 10's heat erodes → it becomes evictable like anything else
+        for _ in 0..6 { s.decay(); }
+        let _ = s.access(60); let _ = s.access(70);
+        assert!(!s.resident(10), "after heavy decay, cold-again 10 can finally be evicted");
     }
 
     #[test]
