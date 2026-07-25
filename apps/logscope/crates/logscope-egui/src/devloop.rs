@@ -147,7 +147,67 @@ pub fn should_continue(round: usize, cfg: &Config, last: Verdict) -> bool {
     last != Verdict::Pass && round + 1 < cfg.max_rounds
 }
 
+/// A normalized fingerprint of a build failure, so "the same error again" is recognisable across rounds.
+/// Compiler output varies in line/column numbers, temp paths and ordering even when the underlying defect
+/// is identical, so those are stripped: what remains is the set of distinct error codes and message texts.
+///
+/// This exists because the expensive failure mode of an autonomous fix loop is not failing — it is failing
+/// *identically*, round after round, spending the whole budget to relearn the same thing.
+pub fn failure_signature(output: &str) -> String {
+    let mut keys: Vec<String> = Vec::new();
+    for line in output.lines() {
+        let l = line.trim();
+        if l.is_empty() { continue; }
+        let lower = l.to_ascii_lowercase();
+        if !(lower.starts_with("error") || lower.starts_with("warning: unused")
+             || lower.contains("cannot find") || lower.contains("mismatched")) { continue; }
+        // strip digits (line/col numbers) and anything path-like, keep the diagnostic itself
+        let cleaned: String = l.chars()
+            .filter(|c| !c.is_ascii_digit())
+            .collect::<String>()
+            .split_whitespace()
+            .filter(|w| !w.contains('/') && !w.contains('\\'))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !cleaned.is_empty() { keys.push(cleaned); }
+    }
+    keys.sort();
+    keys.dedup();
+    keys.join(" | ")
+}
+
+/// Has the loop stopped making progress? True when the two most recent rounds produced the SAME non-empty
+/// failure signature — the model is not converging, and further rounds spend budget for nothing. Returning
+/// the budget unspent is strictly better than burning it: it can go to a subtask that might still resolve.
+pub fn stalled(history: &[String]) -> bool {
+    let n = history.len();
+    n >= 2 && !history[n - 1].is_empty() && history[n - 1] == history[n - 2]
+}
+
 // ── the loop ──────────────────────────────────────────────────────────────────────────────────--
+
+/// How a retry frames the previous failure to the model. Liaison discipline applies to the machine reader
+/// too: hand it the OBSERVED compiler output as fact, ask for a diagnosis, and make "I need to see more"
+/// an allowed answer — a loop that forbids uncertainty gets confident nonsense on round two.
+pub const RETRY_FEEDBACK_PROMPT: &str = "The previous attempt did not build. Below is the verbatim \
+compiler output — treat it as the only evidence of what went wrong, and do not assume defects it does not \
+report.\n\nFix the specific errors shown. If the output points at code you have not been shown, say which \
+file or function you need rather than guessing at it. If the same error persists from the last attempt, \
+say what you believe the real cause is instead of retrying the same edit.\n";
+
+/// A plain-language account of why the loop stopped on this subtask — the "what is blocked, and why"
+/// answer for the operator. Grounded strictly in the outcome and the recorded signature: no speculation
+/// about causes the loop did not observe.
+pub fn explain_outcome(o: &SubtaskOutcome, signature: &str) -> String {
+    match o.verdict {
+        Verdict::Pass => format!("Subtask {} built cleanly after {} round(s).", o.index, o.rounds_used),
+        _ if !signature.is_empty() => format!(
+            "Subtask {} stopped after {} round(s): the same failure repeated, so further rounds were not \
+             spent. Last error: {}", o.index, o.rounds_used, signature),
+        _ => format!("Subtask {} did not build within {} round(s); no repeated-failure pattern was \
+                      detected, so the round budget was the limit.", o.index, o.rounds_used),
+    }
+}
 
 /// Run one subtask to resolution: fan K candidates, verify each, pick a winner; on failure feed the
 /// error back and retry until the round budget is spent. Pure w.r.t. IO except through the seams, so
@@ -158,7 +218,10 @@ fn resolve_subtask<G: Generator, V: Verifier>(
 ) -> SubtaskOutcome {
     let mut feedback: Option<String> = None;
     let mut last = Verdict::None;
+    let mut signatures: Vec<String> = Vec::new();
+    let mut rounds_done = 0usize;
     for round in 0..cfg.max_rounds.max(1) {
+        rounds_done = round + 1;
         if round > 0 { on(Phase::Retrying { subtask: index, round }); }
         on(Phase::Proposing { subtask: index, k: cfg.candidates });
         let cands = gen.propose(prompt, cfg.candidates, feedback.as_deref());
@@ -182,14 +245,25 @@ fn resolve_subtask<G: Generator, V: Verifier>(
         on(Phase::Picked { subtask: index, winner, verdict: last });
         if let Some(i) = winner {
             if graded[i].1 == Verdict::Pass {
-                return SubtaskOutcome { index, verdict: Verdict::Pass, rounds_used: round + 1, fill: Some(cands[i].clone()) };
+                return SubtaskOutcome { index, verdict: Verdict::Pass, rounds_used: rounds_done, fill: Some(cands[i].clone()) };
             }
         }
-        // carry the most informative failure forward as the next round's feedback
-        feedback = outputs.into_iter().find(|o| !o.is_empty());
+        // Carry forward the BEST candidate's failure, not an arbitrary one: the closest attempt's error is
+        // the most useful thing to hand back, and feeding a worse candidate's output steers the retry away
+        // from the version that was nearly right.
+        let best_out = winner.and_then(|i| outputs.get(i).cloned()).filter(|o| !o.is_empty());
+        feedback = best_out.clone().or_else(|| outputs.iter().find(|o| !o.is_empty()).cloned());
+        // Stall check: if this round's failure is identical to the previous one, stop — the loop is
+        // relearning the same defect and the remaining budget is better spent elsewhere.
+        signatures.push(failure_signature(feedback.as_deref().unwrap_or("")));
+        if stalled(&signatures) {
+            on(Phase::GaveUp { reason: format!("subtask {index} stalled: identical failure two rounds running — {}",
+                signatures.last().cloned().unwrap_or_default()) });
+            break;
+        }
         if !should_continue(round, cfg, last) { break; }
     }
-    SubtaskOutcome { index, verdict: last, rounds_used: cfg.max_rounds.max(1), fill: None }
+    SubtaskOutcome { index, verdict: last, rounds_used: rounds_done, fill: None }
 }
 
 /// Full long-horizon run over a `skeleton` whose `decompose::find_holes` define the subtasks. Mount and
@@ -298,6 +372,60 @@ fn read_tree(dir: &std::path::Path) -> std::io::Result<Vec<(String, String)>> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn explanations_distinguish_a_stall_from_an_exhausted_budget() {
+        let stall = SubtaskOutcome { index: 2, verdict: Verdict::Fail, rounds_used: 2, fill: None };
+        let msg = explain_outcome(&stall, "error: mismatched types");
+        assert!(msg.contains("same failure repeated"), "{msg}");
+        assert!(msg.contains("mismatched types"), "cites the observed error, not a guess");
+        // budget-limited is a DIFFERENT situation and must not be described as a stall
+        let budget = SubtaskOutcome { index: 3, verdict: Verdict::Fail, rounds_used: 3, fill: None };
+        let msg2 = explain_outcome(&budget, "");
+        assert!(msg2.contains("round budget was the limit"), "{msg2}");
+        assert!(!msg2.contains("same failure repeated"));
+        let ok = SubtaskOutcome { index: 0, verdict: Verdict::Pass, rounds_used: 1, fill: None };
+        assert!(explain_outcome(&ok, "").contains("built cleanly"));
+    }
+
+    #[test]
+    fn retry_prompt_permits_uncertainty() {
+        // the loop must leave the model a way to say it lacks context, or round two invents one
+        assert!(RETRY_FEEDBACK_PROMPT.contains("rather than guessing"));
+        assert!(RETRY_FEEDBACK_PROMPT.contains("verbatim"));
+    }
+
+    #[test]
+    fn failure_signature_ignores_line_numbers_and_paths() {
+        // the same defect reported at different locations must fingerprint identically, or stall
+        // detection never fires on a real compiler
+        let a = "error[E0308]: mismatched types\n  --> /tmp/build1/src/lib.rs:42:9";
+        let b = "error[E0308]: mismatched types\n  --> /tmp/build2/src/lib.rs:117:3";
+        assert_eq!(failure_signature(a), failure_signature(b));
+        assert!(!failure_signature(a).is_empty());
+        // a genuinely different error must NOT collide
+        let c = "error[E0425]: cannot find value `x` in this scope";
+        assert_ne!(failure_signature(a), failure_signature(c));
+    }
+
+    #[test]
+    fn failure_signature_is_order_insensitive() {
+        let a = "error: alpha\nerror: beta";
+        let b = "error: beta\nerror: alpha";
+        assert_eq!(failure_signature(a), failure_signature(b), "ordering is not a difference");
+    }
+
+    #[test]
+    fn stall_fires_on_a_repeated_failure_not_a_changing_one() {
+        assert!(!stalled(&[]), "nothing to compare yet");
+        assert!(!stalled(&["e1".into()]), "one round is not a stall");
+        assert!(stalled(&["e1".into(), "e1".into()]), "identical twice → not converging");
+        assert!(!stalled(&["e1".into(), "e2".into()]), "a different error is progress");
+        // an empty signature (e.g. no parseable diagnostics) must not be treated as a stall,
+        // or a subtask whose verifier says nothing would be abandoned on round two
+        assert!(!stalled(&["".into(), "".into()]));
+    }
     use super::*;
 
     struct CannedGen { by_round: Vec<Vec<String>>, round: usize }
