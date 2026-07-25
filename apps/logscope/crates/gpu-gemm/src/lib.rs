@@ -1155,6 +1155,7 @@ pub struct MoeLayer {
 /// on Colibri's pin∪LRU∪load tiering: pinned hot experts stay resident in `pinned_gu`/`pinned_dn`; the rest
 /// stream through the slots. Filled per token in moe_ffn_v1.
 pub struct MoeStream {
+    pub layer: usize,                      // this layer's index — the key for cross-layer coupling prediction
     pub n_expert: usize,
     pub gu_rows: usize, pub gu_k: usize,   // gate_up expert shape [2ff, d]
     pub dn_rows: usize, pub dn_k: usize,   // down expert shape [d, ff]
@@ -1262,6 +1263,31 @@ impl ResidentEmbed {
             ResidentEmbed::Q8(q) => gpu.gather_q8_at(q, ids, id_off),
         }
     }
+}
+
+/// Cross-layer routing history driving speculative expert prefetch — Colibri's `couple_prefetch`
+/// (glm.c: "the routing of layer L predicts layer L+1's experts"). One shared object for the whole model:
+/// each MoE layer, once its routing is known, OBSERVES (prev-layer experts → this layer's experts) into the
+/// coupling table, and the NEXT layer PREDICTS from it before its own router runs.
+///
+/// A process-global (like Colibri's `g_pilot_*`) rather than a Gpu field: decode is one stream of layers,
+/// and this keeps the change off the Gpu struct and its constructors entirely.
+pub struct MoeRouteHistory {
+    pub map: crate::expert_predict::ExpertMap,
+    pub prev_experts: Vec<u32>,   // the previous MoE layer's routed set (the coupling key)
+    pub prev_layer: i32,
+    pub prefetched: u64,          // speculative fills actually ISSUED (predicted && not already resident)
+    pub prefetch_hits: u64,       // of those issued fills, ones the layer then routed to (the fills that paid)
+    pub pred_total: u64,          // predictions made (whether or not a fill was needed)
+    pub pred_correct: u64,        // of those, ones the layer routed to (raw predictor accuracy)
+}
+
+static MOE_ROUTE_HIST: std::sync::OnceLock<std::sync::Mutex<MoeRouteHistory>> = std::sync::OnceLock::new();
+pub fn moe_route_hist() -> &'static std::sync::Mutex<MoeRouteHistory> {
+    MOE_ROUTE_HIST.get_or_init(|| std::sync::Mutex::new(MoeRouteHistory {
+        map: crate::expert_predict::ExpertMap::new(),
+        prev_experts: Vec::new(), prev_layer: -1, prefetched: 0, prefetch_hits: 0, pred_total: 0, pred_correct: 0,
+    }))
 }
 
 /// GPU-side stream slots: the MECHANISM half of MoE expert streaming (the policy half is the pure
@@ -2128,6 +2154,25 @@ impl Gpu {
         (out, qs_off)
     }
 
+    /// Speculatively bring expert `e` resident in this layer's slots WITHOUT counting a demand miss —
+    /// Colibri's `couple_prefetch`. Returns true if a fill was issued. Called BEFORE the layer's router
+    /// matvec/readback, so the fill occupies the queue during the CPU-side routing stall (the window where
+    /// the GPU would otherwise sit idle waiting on the logits download). A mispredicted prefetch costs one
+    /// fill's bandwidth and is the first LRU victim, so it self-corrects.
+    fn stream_prefetch(&self, sm: &std::sync::Mutex<MoeStream>, e: u32) -> bool {
+        let mut s = sm.lock().unwrap();
+        if e as usize >= s.n_expert { return false; }
+        let Some(slot) = s.policy.prefetch_spare(e) else { return false }; // resident, or no spare slot → skip
+        let slot = slot as usize;
+        let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
+        let dn_bytes = std::mem::take(&mut s.host_dn[e as usize]);
+        s.gu_slots.fill(self, slot, &gu_bytes);
+        s.dn_slots.fill(self, slot, &dn_bytes);
+        s.host_gu[e as usize] = gu_bytes;
+        s.host_dn[e as usize] = dn_bytes;
+        true
+    }
+
     /// Resolve one routed expert to its (gate_up, down) q4 Lins via the streaming store: pinned → resident
     /// Lin; else LRU slot (fill from host bytes on a miss, reuse on a hit). This is the per-expert fill-on-
     /// demand that lets an over-ceiling MoE decode on Asahi. Leans on Colibri's pin∪LRU∪load tiering.
@@ -2161,9 +2206,16 @@ impl Gpu {
     /// use), so --gate-moe-stream can verify the streamed decode path is bit-exact to the resident one.
     /// `gus[e]` is expert e's [2ff, d] gate‖up; `dns[e]` is [d, ff] down. `pin` experts are pinned resident.
     pub fn build_moe_stream_from_weights(&self, gus: &[Vec<f32>], dns: &[Vec<f32>], ff: usize, d: usize, n_used: usize, pin: usize) -> MoeStream {
+        self.build_moe_stream_ring(gus, dns, ff, d, n_used, pin, None)
+    }
+
+    /// As above with an explicit slot-ring size. Ring headroom is the variable that decides whether
+    /// speculative prefetch can do anything: at ring == the routed working set there is no spare slot, so a
+    /// non-displacing prefetch is necessarily a no-op.
+    pub fn build_moe_stream_ring(&self, gus: &[Vec<f32>], dns: &[Vec<f32>], ff: usize, d: usize, n_used: usize, pin: usize, ring_override: Option<usize>) -> MoeStream {
         let n_expert = gus.len();
         let gu_rows = 2 * ff; let dn_rows = d;
-        let ring = (n_used + 1).max(2);
+        let ring = ring_override.unwrap_or((n_used + 1).max(2));
         let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
         let mut gu_qs_off = 0; let mut dn_qs_off = 0;
         for e in 0..n_expert {
@@ -2182,7 +2234,7 @@ impl Gpu {
         }
         let pinned_ids: Vec<u32> = (0..pin.min(n_expert) as u32).collect();
         MoeStream {
-            n_expert, gu_rows, gu_k: d, dn_rows, dn_k: ff,
+            layer: 0, n_expert, gu_rows, gu_k: d, dn_rows, dn_k: ff,
             host_gu, host_dn, gu_qs_off, dn_qs_off,
             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
@@ -2805,6 +2857,29 @@ impl Gpu {
 
     /// v1 readback-routed MoE FFN (the proven path): router → download → CPU route → grouped experts.
     fn moe_ffn_v1(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        // CROSS-LAYER COUPLING PREFETCH (Colibri couple_prefetch), before the router sync below: the
+        // PREVIOUS MoE layer's routed set predicts this layer's, so issue those fills now — they occupy the
+        // queue during the logits download + CPU routing, the window the GPU would otherwise idle through.
+        // Opt-in (LOGSCOPE_MOE_PREFETCH): a mispredict costs one fill's bandwidth, so it earns its keep
+        // only when the coupling signal is real, which is exactly what --gate-moe-prefetch measures.
+        let prefetch_on = m.stream.is_some() && std::env::var("LOGSCOPE_MOE_PREFETCH").is_ok();
+        let mut predicted: Vec<u32> = Vec::new();  // everything the coupling table proposed
+        let mut issued: Vec<u32> = Vec::new();     // of those, the ones that actually needed (and got) a fill
+        if let (Some(sm), true) = (&m.stream, prefetch_on) {
+            let layer = sm.lock().unwrap().layer as i32;
+            let budget = m.cfg.n_used as usize;
+            let (sig, prev) = {
+                let h = moe_route_hist().lock().unwrap();
+                (crate::expert_predict::CtxSig::unigram(0), h.prev_experts.clone())
+            };
+            if !prev.is_empty() {
+                predicted = moe_route_hist().lock().unwrap().map.predict(sig, layer, &prev, budget);
+                for &e in &predicted { if self.stream_prefetch(sm, e) { issued.push(e); } }
+                let mut h = moe_route_hist().lock().unwrap();
+                h.prefetched += issued.len() as u64;
+                h.pred_total += predicted.len() as u64;
+            }
+        }
         let logits = self.download(&m.router.apply(self, n2, t)); // [t, n_expert] — the sync
         let ne = m.cfg.n_routed as usize;
         // CPU routing: per token, top-k experts + combine weights; group token indices per expert.
@@ -2824,6 +2899,20 @@ impl Gpu {
             }
         }
         // residual base: out starts as a copy of x2, experts scatter-add on top
+        // Feed the coupling table: (previous layer's routed set → this layer's), so the NEXT layer can
+        // predict. Also score how many speculative fills this layer actually used.
+        if let (Some(sm), true) = (&m.stream, prefetch_on) {
+            let layer = sm.lock().unwrap().layer as i32;
+            let routed: Vec<u32> = groups.iter().enumerate()
+                .filter(|(_, g)| !g.is_empty()).map(|(e, _)| e as u32).collect();
+            let mut h = moe_route_hist().lock().unwrap();
+            let prev = h.prev_experts.clone();
+            h.prefetch_hits += issued.iter().filter(|e| routed.contains(e)).count() as u64;
+            h.pred_correct += predicted.iter().filter(|e| routed.contains(e)).count() as u64;
+            h.map.observe(crate::expert_predict::CtxSig::unigram(0), layer, &routed, &prev);
+            h.prev_experts = routed;
+            h.prev_layer = layer;
+        }
         let out = self.alloc(t, d);
         self.copy_buf(x2, 0, &out, 0, (t * d * 4) as u64);
         for (e, grp) in groups.iter().enumerate() {
@@ -5777,7 +5866,7 @@ impl Gpu {
                         let pinned_ids: Vec<u32> = (0..pin as u32).collect();
                         if i == 0 { eprintln!("wgpu-engine: MoE STREAMING on — {n_expert} experts host-resident (q4), {pin} pinned, ring={ring} slots/layer"); }
                         Some(std::sync::Mutex::new(MoeStream {
-                            n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
+                            layer: i, n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
                             host_gu, host_dn, gu_qs_off, dn_qs_off,
                             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
                             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
