@@ -924,6 +924,15 @@ impl Gpu {
         bytemuck::cast_slice(&bytes).to_vec()
     }
 
+    /// Is an arena slab currently mapped? While one is, NO submit is legal — wgpu rejects
+    /// `Queue::submit` with "Buffer with 'arena-slab' label is still mapped". The arena's own contract says
+    /// nothing inside `load()` dispatches on arena weights; the GPU Q4_K conversion broke that assumption,
+    /// so it asks first and falls back to the CPU route for the duration rather than emitting submits the
+    /// driver discards (which would leave the converted buffer UNWRITTEN — silent garbage weights).
+    pub fn arena_mapped(&self) -> bool {
+        self.arena.lock().ok().and_then(|g| g.as_ref().map(|a| a.mapped)).unwrap_or(false)
+    }
+
     /// Convert raw Q4_K bytes straight into our resident q4 layout ON THE GPU, returning the qw‖qs blob as
     /// words (`qs` starts at word `n*k/8`). No host dequantization and no f32 intermediate — this is what
     /// lets the loader stop building a ~50 GiB host copy and lets an expert slot be filled from mmap'd
@@ -936,9 +945,10 @@ impl Gpu {
         let mut padded = raw[..need.min(raw.len())].to_vec();
         padded.resize(need.div_ceil(4) * 4, 0);
         let (qw_words, qs_words) = (total / 8, total / 32);
-        let dims = [nblk as u32, qw_words as u32, 0u32, 0u32]; // qw_base = 0
+        let (gx, gy) = wrapped_grid(nblk);
+        let dims = [nblk as u32, qw_words as u32, 0u32, gx]; // qw_base = 0
         self.run_u32(Q4K_TO_Q4, &[bytemuck::cast_slice(&padded)], qw_words + qs_words,
-                     bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
+                     bytemuck::cast_slice(&dims), (gx, gy, 1))
     }
 
     /// As `q4k_to_q4_words` but the result never leaves the GPU: raw Q4_K bytes go up, the converted q4
@@ -965,8 +975,9 @@ impl Gpu {
         // round the qw region up to 256 bytes (64 words) so the qs view is bindable
         let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
         let out = self.alloc(1, qs_off_words + qs_words);
-        let dims = [nblk as u32, qs_off_words as u32, 0u32, 0u32]; // qw_base = 0
-        self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (nblk as u32, 1, 1));
+        let (gx, gy) = wrapped_grid(nblk);
+        let dims = [nblk as u32, qs_off_words as u32, 0u32, gx]; // qw_base = 0
+        self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
                           view: Some((0, (qw_words * 4) as u64)) };
         let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
@@ -1005,8 +1016,9 @@ impl Gpu {
         let words: Vec<u32> = padded.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         let src = self.upload_u32_resident(&words);
-        let dims = [nblk as u32, qs_base_words as u32, qw_base_words as u32, 0u32];
-        self.dispatch(Q4K_TO_Q4, &[&src], out, bytemuck::cast_slice(&dims), (nblk as u32, 1, 1));
+        let (gx, gy) = wrapped_grid(nblk);
+        let dims = [nblk as u32, qs_base_words as u32, qw_base_words as u32, gx];
+        self.dispatch(Q4K_TO_Q4, &[&src], out, bytemuck::cast_slice(&dims), (gx, gy, 1));
     }
 
     pub fn gemm(&self, a: &[f32], b: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
@@ -2589,9 +2601,10 @@ impl Gpu {
         // pad to a u32 boundary so the shader can read each super-block through a word view
         let mut padded = raw[..need.min(raw.len())].to_vec();
         padded.resize(need.div_ceil(4) * 4, 0);
-        let dims = [nblk as u32, 0u32, 0, 0];
+        let (gx, gy) = wrapped_grid(nblk);
+        let dims = [nblk as u32, gx, 0, 0];
         self.run_f32(Q4K_DEQUANT, &[bytemuck::cast_slice(&padded)], n,
-                     bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
+                     bytemuck::cast_slice(&dims), (gx, gy, 1))
     }
 
 
@@ -6214,6 +6227,7 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
             // dequantize-to-f32 and requantize steps disappear entirely. LOGSCOPE_NO_Q4K_GPU falls back to
             // the CPU path if this ever needs to be bisected against.
             if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
+                && !self.arena_mapped()
                 && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
                 if count == n * k {
@@ -6363,6 +6377,9 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         // only sliced.
                         let raw_src = (|| -> Option<RawExpertSrc> {
                             if std::env::var("LOGSCOPE_NO_MOE_VIEWS").is_ok() { return None; }
+                            // Pinned experts are converted here, during load — illegal while an arena slab
+                            // is mapped. Yield rather than emit submits the driver discards.
+                            if self.arena_mapped() { return None; }
                             let names = [format!("blk.{i}.ffn_gate_exps.weight"),
                                          format!("blk.{i}.ffn_up_exps.weight"),
                                          format!("blk.{i}.ffn_down_exps.weight")];
@@ -10201,6 +10218,18 @@ mod decode_cfg_tests {
     }
 }
 
+/// Wrap a 1-D workgroup count into a 2-D grid under the per-dimension dispatch limit.
+///
+/// Every backend caps a dispatch dimension at 65535. A workgroup-per-super-block is natural for Q4_K but
+/// overflows that on any real weight matrix — a 26M-weight tensor needs 102400 — and wgpu reports it as a
+/// validation error the loader logs and continues past, leaving the output buffer UNWRITTEN. Silent
+/// garbage weights, in other words, which is why this is a hard cap rather than a tuning knob.
+pub fn wrapped_grid(units: usize) -> (u32, u32) {
+    const W: usize = 32768; // comfortably under 65535, power of two
+    if units <= W { return (units as u32, 1); }
+    (W as u32, units.div_ceil(W) as u32)
+}
+
 /// Q4_K super-block dequantization. One workgroup per 144-byte super-block (256 weights).
 ///
 /// Ported line-for-line from the CPU `gguf::dequantize` type-12 arm, which is validated by every Q4_K
@@ -10211,7 +10240,7 @@ mod decode_cfg_tests {
 /// scale/min packing (`get_scale_min_k4`) is reproduced exactly, including the j>=4 branch that stitches
 /// the high 2 bits from an earlier byte.
 pub const Q4K_DEQUANT: &str = r#"
-struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
 @group(0)@binding(2) var<uniform> dims: D;                  // n = super-block count
@@ -10260,7 +10289,9 @@ fn scale_min(j: u32, base: u32) -> vec2<f32> {
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let blk = wg.x;
+    // 2D grid: a workgroup-per-super-block overflows the 65535 per-dimension dispatch limit on any
+    // large tensor (a 26M-weight matrix needs 102400 of them), so the grid wraps at grid_w.
+    let blk = wg.y * dims.grid_w + wg.x;
     if (blk >= dims.n) { return; }
     let bbase = blk * 144u;                       // byte offset of this super-block
     let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
@@ -10293,7 +10324,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
 /// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
 pub const Q4K_TO_Q4: &str = r#"
-struct D { nblk:u32, qs_off:u32, qw_base:u32, _c:u32 };
+struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
 @group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
 @group(0)@binding(2) var<uniform> dims: D;
@@ -10347,7 +10378,8 @@ fn wq(blk: u32, t: u32) -> f32 {
 
 @compute @workgroup_size(8)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
-    let blk = wg.x;
+    // see the note on the dequant kernel: the grid wraps at grid_w to stay under 65535 per dimension
+    let blk = wg.y * dims.grid_w + wg.x;
     if (blk >= dims.nblk) { return; }
     let j = lid.x;                       // which 32-element block inside this super-block
     let t0 = j * 32u;
