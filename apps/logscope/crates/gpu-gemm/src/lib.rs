@@ -1351,6 +1351,10 @@ pub struct MoeStream {
     /// When present, expert weights are VIEWS into the model file and `host_gu`/`host_dn` are unused: a
     /// fill converts straight from the file on the GPU. When None, the legacy host-copy path is used.
     pub raw: Option<RawExpertSrc>,
+    /// Pinned experts under the view path: (gate‖up blob, down blob), each a single resident buffer laid
+    /// out like a slot. Converted once from the file; a repin re-converts in place, so a pin swap costs one
+    /// GPU pass rather than a host round-trip.
+    pub pinned_raw: std::collections::HashMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
 }
 /// Build a zero-copy row-range VIEW of a quantized Lin: expert e's [rows, k] slice of a stacked weight,
 /// sharing the underlying buffers (no re-quant, no copy). Offsets are 256-aligned for every per-expert
@@ -2438,7 +2442,18 @@ impl Gpu {
         use std::sync::atomic::Ordering::Relaxed;
         let mut s = sm.lock().unwrap();
         let (gu_rows, gu_k, dn_rows, dn_k) = (s.gu_rows, s.gu_k, s.dn_rows, s.dn_k);
-        // pinned hot expert → resident buffers
+        // pinned under the VIEW path: a single converted blob per matrix, bound like a slot
+        if let Some((gb, db)) = s.pinned_raw.get(&e).cloned() {
+            let (gu_off, dn_off) = match &s.raw {
+                Some(r) => (r.gu_layout().0, r.dn_layout().0),
+                None => (s.gu_qs_off, s.dn_qs_off),
+            };
+            let _ = s.policy.access(e);
+            MOE_HITS.fetch_add(1, Relaxed);
+            return (self.q4_lin_from_slots(&gb, gu_off, gu_rows, gu_k, None),
+                    self.q4_lin_from_slots(&db, dn_off, dn_rows, dn_k, None));
+        }
+        // pinned hot expert → resident buffers (host-copy path)
         if let (Some((gqw, gqs)), Some((dqw, dqs))) = (s.pinned_gu.get(&e).cloned(), s.pinned_dn.get(&e).cloned()) {
             let _ = s.policy.access(e);
             MOE_HITS.fetch_add(1, Relaxed);
@@ -2510,7 +2525,7 @@ impl Gpu {
             policy: crate::expert_cache::LayerSlots::new(&[], ring as u32),
             pinned_gu: std::collections::HashMap::new(),
             pinned_dn: std::collections::HashMap::new(),
-            repins: 0, visits: 0, raw: Some(raw),
+            repins: 0, visits: 0, raw: Some(raw), pinned_raw: std::collections::HashMap::new(),
         }
     }
 
@@ -2551,7 +2566,7 @@ impl Gpu {
             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None,
+            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None, pinned_raw: std::collections::HashMap::new(),
         }
     }
 
@@ -5702,9 +5717,18 @@ impl Gpu {
     /// checkpoints must go through here rather than `load_gguf_parts` directly, or a model that needs the
     /// q4 retry would fail outright instead of shrinking.
     pub fn load_gguf_quantized_parts(&self, parts: &[&[u8]]) -> Result<Model, String> {
+        self.quantized_parts_impl(parts, None)
+    }
+
+    /// Shard-aware AND view-capable: the shards outlive the loader, so MoE experts can point at the file.
+    pub fn load_gguf_quantized_parts_static(&self, parts: &[&'static [u8]]) -> Result<Model, String> {
+        self.quantized_parts_impl(parts, Some(parts))
+    }
+
+    fn quantized_parts_impl(&self, parts: &[&[u8]], stat: Option<&[&'static [u8]]>) -> Result<Model, String> {
         let total: usize = parts.iter().map(|p| p.len()).sum();
         let forced_q4 = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
-        match self.try_load_resident_parts(parts)? {
+        match self.try_load_resident_impl(parts, stat)? {
             Some(m) => return Ok(m),
             None if forced_q4 => return Err(Self::too_big_msg(total)),
             None => {}
@@ -5712,7 +5736,7 @@ impl Gpu {
         self.pool.free.lock().unwrap().clear();
         eprintln!("wgpu-engine: int8-resident exceeded the GPU's allocatable memory — retrying as q4-resident (≈half the footprint)…");
         std::env::set_var("LOGSCOPE_Q4_RESIDENT", "1");
-        let r = self.try_load_resident_parts(parts);
+        let r = self.try_load_resident_impl(parts, stat);
         std::env::remove_var("LOGSCOPE_Q4_RESIDENT");
         return match r? {
             Some(m) => Ok(m),
@@ -5755,8 +5779,12 @@ impl Gpu {
     }
 
     fn try_load_resident_parts(&self, parts: &[&[u8]]) -> Result<Option<Model>, String> {
+        self.try_load_resident_impl(parts, None)
+    }
+
+    fn try_load_resident_impl(&self, parts: &[&[u8]], stat: Option<&[&'static [u8]]>) -> Result<Option<Model>, String> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let res = self.load_gguf_parts(parts, true);
+        let res = self.load_gguf_inner(parts, stat, true);
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let oom = pollster::block_on(scope.pop());
         if oom.is_some() {
@@ -5775,6 +5803,22 @@ impl Gpu {
     /// tensor read is routed to the file that actually holds those bytes. This is why a split model does
     /// not need merging on disk: a 62 GB checkpoint would otherwise have to be duplicated to be loadable.
     pub fn load_gguf_parts(&self, parts: &[&[u8]], q: bool) -> Result<Model, String> {
+        self.load_gguf_inner(parts, None, q)
+    }
+
+    /// As `load_gguf_parts`, but the caller guarantees the shard bytes live for the process (they came
+    /// from `retain_map`). Only this form can back MoE experts with VIEWS into the file — a borrow that
+    /// dies with the loader cannot be handed to a decode path that runs for hours.
+    pub fn load_gguf_parts_static(&self, parts: &[&'static [u8]], q: bool) -> Result<Model, String> {
+        self.load_gguf_inner(parts, Some(parts), q)
+    }
+
+    fn load_gguf_inner(&self, parts: &[&[u8]], stat: Option<&[&'static [u8]]>, q: bool) -> Result<Model, String> {
+        // A second view over the same bytes, carrying the 'static lifetime, used only to cut expert spans.
+        let static_set: Option<gguf::ShardSet<'static>> = match stat {
+            Some(p) => gguf::ShardSet::new(p.to_vec()).ok(),
+            None => None,
+        };
         let set = gguf::ShardSet::new(parts.to_vec())?;
         set.completeness()?;
         if set.shards() > 1 {
@@ -6313,6 +6357,68 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         let pin = pin.min(n_expert);
                         let ring = (n_expert_used + 1).max(2);
                         let gu_rows = 2 * expert_ff; let dn_rows = d;
+                        // VIEW PATH (Colibri): if the three expert tensors are Q4_K with the shapes we
+                        // expect, point at the file instead of copying. This is what removes the ~50 GiB
+                        // host store and the multi-minute requantize pass — nothing is read here at all,
+                        // only sliced.
+                        let raw_src = (|| -> Option<RawExpertSrc> {
+                            if std::env::var("LOGSCOPE_NO_MOE_VIEWS").is_ok() { return None; }
+                            let names = [format!("blk.{i}.ffn_gate_exps.weight"),
+                                         format!("blk.{i}.ffn_up_exps.weight"),
+                                         format!("blk.{i}.ffn_down_exps.weight")];
+                            let mut spans = Vec::new();
+                            for (idx, nm) in names.iter().enumerate() {
+                                let t = g.tensor(nm)?;
+                                if t.ggml_type != 12 { return None; }           // Q4_K only
+                                let count = t.dims.iter().product::<u64>() as usize;
+                                let want = if idx == 2 { d * expert_ff * n_expert } else { expert_ff * d * n_expert };
+                                if count != want { return None; }
+                                let nbytes = gguf::type_nbytes(12, count)?;
+                                spans.push(static_set.as_ref()?.slice(t.offset, nbytes)?);
+                            }
+                            if d % 256 != 0 || expert_ff % 256 != 0 { return None; } // conversion needs k%256
+                            Some(RawExpertSrc {
+                                gate: spans[0], up: spans[1], down: spans[2],
+                                gu_expert_bytes: expert_ff * d / 256 * 144,
+                                dn_expert_bytes: d * expert_ff / 256 * 144,
+                                ff: expert_ff, d,
+                            })
+                        })();
+
+                        if let Some(r) = raw_src {
+                            let (gu_qs, gu_total) = r.gu_layout();
+                            let (dn_qs, dn_total) = r.dn_layout();
+                            // Pinned experts: converted ONCE from the file into a resident blob. A later
+                            // repin re-converts in place, so correcting the pin set costs a GPU pass.
+                            let mut pinned_raw = std::collections::HashMap::new();
+                            for e in 0..pin {
+                                let gb = self.alloc_words(gu_total / 4);
+                                let db = self.alloc_words(dn_total / 4);
+                                if let (Some(gt), Some(ut), Some(dt)) = (r.gate_of(e), r.up_of(e), r.down_of(e)) {
+                                    self.q4k_convert_into(&gb, gt, expert_ff, d, 0, gu_qs / 4);
+                                    self.q4k_convert_into(&gb, ut, expert_ff, d, expert_ff * d / 8, gu_qs / 4 + expert_ff * (d / 32));
+                                    self.q4k_convert_into(&db, dt, d, expert_ff, 0, dn_qs / 4);
+                                }
+                                pinned_raw.insert(e as u32, (gb.buf.clone(), db.buf.clone()));
+                            }
+                            let pinned_ids: Vec<u32> = (0..pin as u32).collect();
+                            if i == 0 {
+                                eprintln!("wgpu-engine: MoE STREAMING on (FILE VIEWS — no host expert copy) — \
+{n_expert} experts, {pin} pinned, ring={ring} slots/layer");
+                            }
+                            Some(std::sync::Mutex::new(MoeStream {
+                                layer: i, n_expert, gu_rows, gu_k: d, dn_rows, dn_k: expert_ff,
+                                host_gu: Vec::new(), host_dn: Vec::new(), gu_qs_off: gu_qs, dn_qs_off: dn_qs,
+                                gu_slots: StreamSlots::new(self, ring, gu_total as u64),
+                                dn_slots: StreamSlots::new(self, ring, dn_total as u64),
+                                policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
+                                pinned_gu: std::collections::HashMap::new(),
+                                pinned_dn: std::collections::HashMap::new(),
+                                repins: 0, visits: 0, raw: Some(r), pinned_raw,
+                            }))
+                        } else {
+                        // LEGACY host-copy path: only reached when the experts are not Q4_K (or views are
+                        // disabled). Costs a full requantize into host memory.
                         let dsrc = fetch(&format!("blk.{i}.ffn_down_exps.weight"))?;
                         let mut host_gu = Vec::with_capacity(n_expert); let mut host_dn = Vec::with_capacity(n_expert);
                         let mut gu_qs_off = 0; let mut dn_qs_off = 0;
@@ -6355,8 +6461,9 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                             gu_slots: StreamSlots::new(self, ring, gu_slot_bytes),
                             dn_slots: StreamSlots::new(self, ring, dn_slot_bytes),
                             policy: crate::expert_cache::LayerSlots::new(&pinned_ids, ring as u32),
-                            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None,
+                            pinned_gu, pinned_dn, repins: 0, visits: 0, raw: None, pinned_raw: std::collections::HashMap::new(),
                         }))
+                        }
                     } else { None };
                     drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
