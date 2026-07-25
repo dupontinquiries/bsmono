@@ -7,6 +7,8 @@ pub mod vision_preprocess;
 pub mod guardrails;
 pub mod synthesis;
 pub mod persona;
+pub mod residency;
+pub mod liaison;
 pub mod exploration;
 pub mod blackboard;
 pub mod budget;
