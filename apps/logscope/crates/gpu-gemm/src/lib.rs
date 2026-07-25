@@ -228,6 +228,8 @@ pub struct Gpu {
     /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
     pool: std::sync::Arc<BufferPool>,
     arena: Mutex<Option<ResidentArena>>,
+    /// Q4_K conversions recorded during load and run in batches at the end (see `flush_q4k`).
+    pending_q4k: Mutex<Vec<PendingQ4k>>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
     unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
                      // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
@@ -745,7 +747,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -922,6 +924,64 @@ impl Gpu {
     fn run_u32(&self, shader: &str, inputs: &[&[u8]], out_len: usize, dims: &[u8], wg: (u32, u32, u32)) -> Vec<u32> {
         let bytes = self.run(shader, inputs, (out_len * 4) as u64, dims, wg);
         bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    /// Record a Q4_K conversion to run later. Returns immediately with the (as yet unwritten) output
+    /// buffer, so callers can build weights that reference it; `flush_q4k` fills them before load returns.
+    pub fn q4k_defer(&self, out: &Tensor, raw: &'static [u8], n: usize, k: usize,
+                     qw_base_words: usize, qs_base_words: usize) {
+        self.pending_q4k.lock().unwrap().push(PendingQ4k {
+            raw, out: out.buf.clone(), n, k, qw_base_words, qs_base_words,
+        });
+    }
+
+    pub fn pending_q4k_count(&self) -> usize { self.pending_q4k.lock().unwrap().len() }
+
+    /// Run every recorded conversion, batched into as few submits as the source budget allows.
+    ///
+    /// Two things happen here that cannot happen inline. First the arena's open slab is SEALED (unmapped),
+    /// because a submit is illegal while one is mapped — this is what lets arena packing and GPU conversion
+    /// coexist instead of one having to be turned off. Second, many dispatches share one command encoder
+    /// and one submit: on a driver where firmware submission is the dominant cost, converting 300 tensors
+    /// in a handful of submits rather than 300 is the whole point.
+    ///
+    /// Source uploads are held alive until their submit completes, so batches are bounded by bytes rather
+    /// than count.
+    pub fn flush_q4k(&self) -> usize {
+        let pending: Vec<PendingQ4k> = std::mem::take(&mut *self.pending_q4k.lock().unwrap());
+        if pending.is_empty() { return 0; }
+        // seal the arena: no submit is legal while a slab is mapped
+        if let Ok(mut g) = self.arena.lock() {
+            if let Some(a) = g.as_mut() {
+                if a.mapped {
+                    if let Some(last) = a.slabs.last() { last.unmap(); }
+                    a.mapped = false;
+                    a.used = a.slab_size; // any later allocation starts a fresh slab
+                }
+            }
+        }
+        // Encode every conversion through the normal dispatch path: the engine's frame batching already
+        // groups passes into submits (the autotuned submit batch), so this inherits that rather than
+        // hand-rolling an encoder — hundreds of conversions leave as a handful of submits.
+        let mut done = 0usize;
+        for p in pending {
+            let total = p.n * p.k;
+            let nblk = total / 256;
+            let need = nblk * 144;
+            let mut padded = p.raw[..need.min(p.raw.len())].to_vec();
+            padded.resize(need.div_ceil(4) * 4, 0);
+            let words: Vec<u32> = padded.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let src = self.upload_u32_resident(&words);
+            let (gx, gy) = wrapped_grid(nblk);
+            let dims = [nblk as u32, p.qs_base_words as u32, p.qw_base_words as u32, gx];
+            // the bind group holds the source buffer alive past this scope, so no manual keep-list
+            let out_t = Tensor { buf: p.out.clone(), rows: 1, cols: 1, pool: None, view: None };
+            self.dispatch(Q4K_TO_Q4, &[&src], &out_t, bytemuck::cast_slice(&dims), (gx, gy, 1));
+            done += 1;
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        done
     }
 
     /// Is an arena slab currently mapped? While one is, NO submit is legal — wgpu rejects
@@ -1194,6 +1254,22 @@ struct BufferPool { free: Mutex<HashMap<u64, Vec<wgpu::Buffer>>> }
 /// allocations + bind bindings, and on some drivers (Asahi) it dodges per-object VMA/count ceilings that
 /// reject a large model even when total memory would fit. Slabs are sized to the device's max buffer.
 struct ResidentArena { slabs: Vec<wgpu::Buffer>, slab_size: u64, used: u64, mapped: bool }
+
+/// A Q4_K conversion recorded during load and executed later, in a batch.
+///
+/// Deferring solves two problems at once. The arena keeps a slab MAPPED for most of a load and no submit
+/// is legal while it is, so a conversion cannot dispatch inline — recording it instead lets the arena and
+/// the GPU converter coexist rather than one disabling the other. And because the work piles up, it can
+/// then go out as a handful of large submits instead of one per tensor, which is the difference that
+/// matters on a driver where firmware submission dominates.
+///
+/// `raw` is a view into the retained model file, so a pending entry costs a pointer, not the weights.
+pub struct PendingQ4k {
+    raw: &'static [u8],
+    out: wgpu::Buffer,
+    n: usize, k: usize,
+    qw_base_words: usize, qs_base_words: usize,
+}
 /// Clears the active arena when a load finishes (or unwinds) so the bump state never leaks into the next
 /// load; the slab buffers themselves stay alive via the weight tensors that cloned them. In zero-copy
 /// (UMA `mapped`) mode it also UNMAPS the final slab here — every earlier slab is unmapped when its
@@ -6227,13 +6303,24 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
             // dequantize-to-f32 and requantize steps disappear entirely. LOGSCOPE_NO_Q4K_GPU falls back to
             // the CPU path if this ever needs to be bisected against.
             if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
-                && !self.arena_mapped()
                 && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
                 if count == n * k {
-                    if let Some(nbytes) = gguf::type_nbytes(12, count) {
-                        if let Some(raw) = set.slice(t.offset, nbytes) {
-                            return Ok(Lin::q4(self.q4k_to_q4_resident(raw, n, k)));
+                    if let (Some(nbytes), Some(sset)) = (gguf::type_nbytes(12, count), static_set.as_ref()) {
+                        if let Some(raw) = sset.slice(t.offset, nbytes) {
+                            // DEFERRED: recorded now, converted in a batch once the arena is sealed. This
+                            // is what lets arena packing and GPU conversion coexist — dispatching here
+                            // would be illegal while a slab is mapped.
+                            let total = n * k;
+                            let (qw_words, qs_words) = (total / 8, total / 32);
+                            let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
+                            let out = self.alloc_words(qs_off_words + qs_words);
+                            self.q4k_defer(&out, raw, n, k, 0, qs_off_words);
+                            let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
+                                              view: Some((0, (qw_words * 4) as u64)) };
+                            let qs = Tensor { buf: out.buf.clone(), rows: n, cols: k / 32, pool: None,
+                                              view: Some(((qs_off_words * 4) as u64, (qs_words * 4) as u64)) };
+                            return Ok(Lin::q4(Q4Weight { qw, qs, n, k }));
                         }
                     }
                 }
@@ -6377,9 +6464,6 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                         // only sliced.
                         let raw_src = (|| -> Option<RawExpertSrc> {
                             if std::env::var("LOGSCOPE_NO_MOE_VIEWS").is_ok() { return None; }
-                            // Pinned experts are converted here, during load — illegal while an arena slab
-                            // is mapped. Yield rather than emit submits the driver discards.
-                            if self.arena_mapped() { return None; }
                             let names = [format!("blk.{i}.ffn_gate_exps.weight"),
                                          format!("blk.{i}.ffn_up_exps.weight"),
                                          format!("blk.{i}.ffn_down_exps.weight")];
@@ -6412,9 +6496,10 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                                 let gb = self.alloc_words(gu_total / 4);
                                 let db = self.alloc_words(dn_total / 4);
                                 if let (Some(gt), Some(ut), Some(dt)) = (r.gate_of(e), r.up_of(e), r.down_of(e)) {
-                                    self.q4k_convert_into(&gb, gt, expert_ff, d, 0, gu_qs / 4);
-                                    self.q4k_convert_into(&gb, ut, expert_ff, d, expert_ff * d / 8, gu_qs / 4 + expert_ff * (d / 32));
-                                    self.q4k_convert_into(&db, dt, d, expert_ff, 0, dn_qs / 4);
+                                    // deferred, like the dense weights, so the arena can stay mapped
+                                    self.q4k_defer(&gb, gt, expert_ff, d, 0, gu_qs / 4);
+                                    self.q4k_defer(&gb, ut, expert_ff, d, expert_ff * d / 8, gu_qs / 4 + expert_ff * (d / 32));
+                                    self.q4k_defer(&db, dt, d, expert_ff, 0, dn_qs / 4);
                                 }
                                 pinned_raw.insert(e as u32, (gb.buf.clone(), db.buf.clone()));
                             }
@@ -6584,6 +6669,13 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                 Some(DsaConfig { index_topk, index_n_heads, index_head_dim })
             } else { None }
         };
+        // Run every deferred Q4_K conversion before the model escapes. Until this returns, the weights
+        // recorded above reference buffers that have been ALLOCATED but not written — so this must happen
+        // here, not lazily at first use. Sealing the arena is part of the flush.
+        let converted = self.flush_q4k();
+        if converted > 0 {
+            eprintln!("wgpu-engine: Q4_K → q4 on GPU — {converted} tensors converted in batch (no host copy, no f32 round-trip)");
+        }
         Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
     }
 
