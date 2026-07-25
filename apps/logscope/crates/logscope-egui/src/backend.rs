@@ -792,8 +792,16 @@ pub(crate) mod engine {
             let (ds, dp) = (gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed) - s0, gpu_kernels::GPU_POLLS.load(AOrd::Relaxed) - p0);
             let (setup_ms, sync_ms) = ((gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed) - su0) as f64 / 1e6, (gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed) - sy0) as f64 / 1e6);
             let per = produced.max(1) as f64;
-            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms ({}-bound)",
-                self.name, ds as f64 / per, if setup_ms >= sync_ms { "dispatch" } else { "GPU" });
+            // Classify against TOTAL wall time, not setup-vs-sync alone. Comparing only those two says
+            // "dispatch-bound" whenever setup >= sync — even when both are a rounding error against the
+            // turn (setup 102ms and sync 0ms out of 46s is 0.2%, i.e. the GPU was simply busy). That
+            // mislabel sends optimisation effort at command setup when the kernels are the cost.
+            let total_ms = (secs as f64) * 1000.0;
+            let accounted = setup_ms + sync_ms;
+            let bound = if accounted < total_ms * 0.15 { "GPU-execution" }
+                        else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
+            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
+                self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
                 eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
