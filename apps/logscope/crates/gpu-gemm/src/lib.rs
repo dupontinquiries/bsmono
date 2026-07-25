@@ -5441,6 +5441,33 @@ impl Gpu {
     /// fall back to the llama.cpp backend. Both attempts run inside an OOM error scope so the wgpu
     /// allocation failure is captured instead of aborting the process.
     pub fn load_gguf_quantized(&self, bytes: &[u8]) -> Result<Model, String> {
+        self.load_gguf_quantized_parts(&[bytes])
+    }
+
+    /// Shard-aware twin of [`load_gguf_quantized`], preserving its int8 → q4 OOM fallback. Split
+    /// checkpoints must go through here rather than `load_gguf_parts` directly, or a model that needs the
+    /// q4 retry would fail outright instead of shrinking.
+    pub fn load_gguf_quantized_parts(&self, parts: &[&[u8]]) -> Result<Model, String> {
+        let total: usize = parts.iter().map(|p| p.len()).sum();
+        let forced_q4 = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
+        match self.try_load_resident_parts(parts)? {
+            Some(m) => return Ok(m),
+            None if forced_q4 => return Err(Self::too_big_msg(total)),
+            None => {}
+        }
+        self.pool.free.lock().unwrap().clear();
+        eprintln!("wgpu-engine: int8-resident exceeded the GPU's allocatable memory — retrying as q4-resident (≈half the footprint)…");
+        std::env::set_var("LOGSCOPE_Q4_RESIDENT", "1");
+        let r = self.try_load_resident_parts(parts);
+        std::env::remove_var("LOGSCOPE_Q4_RESIDENT");
+        return match r? {
+            Some(m) => Ok(m),
+            None => Err(Self::too_big_msg(total)),
+        };
+    }
+
+    #[allow(dead_code)]
+    fn load_gguf_quantized_single(&self, bytes: &[u8]) -> Result<Model, String> {
         let forced_q4 = std::env::var("LOGSCOPE_Q4_RESIDENT").is_ok();
         match self.try_load_resident(bytes)? {
             Some(m) => return Ok(m),
@@ -5470,8 +5497,12 @@ impl Gpu {
     /// Load inside an OutOfMemory error scope. Ok(Some) = loaded; Ok(None) = GPU OOM (captured, the
     /// process is NOT aborted); Err = a genuine (non-OOM) load error.
     fn try_load_resident(&self, bytes: &[u8]) -> Result<Option<Model>, String> {
+        self.try_load_resident_parts(&[bytes])
+    }
+
+    fn try_load_resident_parts(&self, parts: &[&[u8]]) -> Result<Option<Model>, String> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        let res = self.load_gguf_opt(bytes, true);
+        let res = self.load_gguf_parts(parts, true);
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         let oom = pollster::block_on(scope.pop());
         if oom.is_some() {
@@ -5481,7 +5512,22 @@ impl Gpu {
         res.map(Some)
     }
     pub fn load_gguf_opt(&self, bytes: &[u8], q: bool) -> Result<Model, String> {
-        let g = gguf::parse(bytes)?;
+        self.load_gguf_parts(&[bytes], q)
+    }
+
+    /// Load from a SPLIT checkpoint: `parts` are the shard files' bytes in shard order (a one-element
+    /// slice is the ordinary single-file case and behaves identically). The shards are unified into one
+    /// tensor namespace by `gguf::ShardSet` — shard 1's metadata describes the whole model, and every
+    /// tensor read is routed to the file that actually holds those bytes. This is why a split model does
+    /// not need merging on disk: a 62 GB checkpoint would otherwise have to be duplicated to be loadable.
+    pub fn load_gguf_parts(&self, parts: &[&[u8]], q: bool) -> Result<Model, String> {
+        let set = gguf::ShardSet::new(parts.to_vec())?;
+        set.completeness()?;
+        if set.shards() > 1 {
+            eprintln!("wgpu-engine: split checkpoint — {} shards unified ({} tensors, {:.1} GiB of tensor data)",
+                set.shards(), set.g.tensors.len(), set.data_len() as f64 / (1u64 << 30) as f64);
+        }
+        let g = &set.g;
         // Data-integrity gate (unconditional, ~8 KB): read a small F32 tensor's RAW bytes straight from the
         // mapped file — before any dequant, upload, or GPU involvement. An all-zeros norm weight is
         // impossible in a real checkpoint; it means the file's DATA section is corrupt (partial download /
@@ -5489,9 +5535,9 @@ impl Gpu {
         // burned a full debugging cycle on the M4 (weights probed zero on GPU; every engine path was
         // exonerated one by one). Refuse loudly with the fix instead of generating symbol soup.
         if let Some(t) = g.tensor("blk.0.attn_norm.weight").filter(|t| t.ggml_type == 0) {
-            let off = (g.data_offset + t.offset) as usize;
+            let off = t.offset;
             let n = (t.dims.iter().product::<u64>() as usize * 4).min(8192);
-            if let Some(raw) = bytes.get(off..off + n) {
+            if let Some(raw) = set.slice(off, n) {
                 if raw.iter().all(|&b| b == 0) {
                     return Err(format!(
                         "GGUF data section is corrupt: blk.0.attn_norm.weight is ALL ZEROS in the file                          (raw bytes at offset {off}). The header parses fine, so the file LOOKS healthy —                          this is a partial download or bad copy. Re-download or re-copy the file                          (verify with a sha256 checksum against a known-good copy)."));
@@ -5780,9 +5826,11 @@ impl Gpu {
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             let count = t.dims.iter().product::<u64>() as usize;
             let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or(format!("type {} unsupported for {name}", t.ggml_type))?;
-            let start = (g.data_offset + t.offset) as usize;
-            if start + nbytes > bytes.len() { return Err(format!("tensor {name} data out of range")); }
-            gguf::dequantize(t.ggml_type, &bytes[start..start + nbytes], count)
+            // A read that escapes the set means a shard is missing — report which tensor rather than
+            // decoding a short buffer into plausible garbage.
+            let raw = set.slice(t.offset, nbytes).ok_or(format!(
+                "tensor {name} data out of range — a shard is missing or truncated ({} shard(s) loaded)", set.shards()))?;
+            gguf::dequantize(t.ggml_type, raw, count)
         };
         let embed = fetch("token_embd.weight")?;
         // Derive vocab from the embedding matrix (rows = vocab) when metadata omits it.
@@ -5833,9 +5881,9 @@ impl Gpu {
             if quantize && !q4_mode && t.ggml_type == 8 && k % 32 == 0 {
                 let count = t.dims.iter().product::<u64>() as usize;
                 let nbytes = gguf::type_nbytes(8, count).ok_or("q8_0 size")?;
-                let start = (g.data_offset + t.offset) as usize;
-                if start + nbytes > bytes.len() { return Err(format!("tensor {name} out of range")); }
-                return Ok(Lin::q8(self.q8_0_to_resident(&bytes[start..start + nbytes], n, k)));
+                let raw = set.slice(t.offset, nbytes).ok_or(format!(
+                    "tensor {name} out of range — a shard is missing or truncated"))?;
+                return Ok(Lin::q8(self.q8_0_to_resident(raw, n, k)));
             }
             Ok(self.make_lin(&fetch(name)?, n, k, quantize, q4_mode))
         };
