@@ -2325,7 +2325,31 @@ impl Gpu {
         }
     }
 
-    /// Upload host q4 bytes (qw ‖ qs) to two resident GPU buffers (qw, qs). For pinned hot experts.
+    /// Dequantize raw **Q4_K** super-blocks on the GPU — the enabling step for reading a GGUF's native
+    /// blocks instead of requantizing them on load.
+    ///
+    /// This is the Colibri principle applied to our stack: Colibri never converts on load ("container
+    /// pre-quantizzato… niente copia"), because its file format already IS its inference format. We can't
+    /// hand wgpu file-backed pages the way Colibri hands them to Metal, but we CAN stop converting: upload
+    /// the file's own Q4_K bytes and decode them on the GPU. That removes both the f32 round-trip and the
+    /// host-side requantized copy (~50 GiB on Scout).
+    ///
+    /// Layout is taken from the CPU implementation in `gguf::dequantize` (type 12), which is already
+    /// validated by every Q4_K model that loads: 144-byte super-block of 256 weights = f16 `d`, f16 `dmin`,
+    /// 12 bytes of packed 6-bit scales/mins, 128 nibble bytes. `w = d·sc·nib − dmin·m`.
+    pub fn dequant_q4k(&self, raw: &[u8], n: usize) -> Vec<f32> {
+        assert!(n % 256 == 0, "q4_k requires a multiple of 256 weights");
+        let nblk = n / 256;
+        let need = nblk * 144;
+        // pad to a u32 boundary so the shader can read each super-block through a word view
+        let mut padded = raw[..need.min(raw.len())].to_vec();
+        padded.resize(need.div_ceil(4) * 4, 0);
+        let dims = [nblk as u32, 0u32, 0, 0];
+        self.run_f32(Q4K_DEQUANT, &[bytemuck::cast_slice(&padded)], n,
+                     bytemuck::cast_slice(&dims), (nblk as u32, 1, 1))
+    }
+
+
     pub fn q4_bufs_from_host(&self, blob: &[u8], qs_off: usize) -> (wgpu::Buffer, wgpu::Buffer) {
         let qw = self.upload_bytes(&blob[..qs_off], "pin-qw");
         let qs = self.upload_bytes(&blob[qs_off..], "pin-qs");
@@ -9823,3 +9847,72 @@ mod decode_cfg_tests {
         assert_eq!(pass, q, "no norm weight ⇒ unchanged");
     }
 }
+
+/// Q4_K super-block dequantization. One workgroup per 144-byte super-block (256 weights).
+///
+/// Ported line-for-line from the CPU `gguf::dequantize` type-12 arm, which is validated by every Q4_K
+/// model that loads today — so this shader has a reference to be checked against rather than a spec I
+/// reconstructed. `--gate-q4k` asserts they agree exactly.
+///
+/// Bytes are read through a u32 view: super-block b starts at byte b*144, i.e. word b*36. The 6-bit
+/// scale/min packing (`get_scale_min_k4`) is reproduced exactly, including the j>=4 branch that stitches
+/// the high 2 bits from an earlier byte.
+pub const Q4K_DEQUANT: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
+@group(0)@binding(1) var<storage,read_write> dst: array<f32>;
+@group(0)@binding(2) var<uniform> dims: D;                  // n = super-block count
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+// half -> f32 (subnormals and inf/nan handled the same way the CPU helper does)
+fn f16(h: u32) -> f32 {
+    let s = (h >> 15u) & 1u;
+    let e = (h >> 10u) & 0x1Fu;
+    let m = h & 0x3FFu;
+    var v: f32;
+    if (e == 0u) {
+        v = f32(m) * 0.00000005960464477539063; // 2^-24
+    } else if (e == 31u) {
+        v = select(3.4028235e38, 0.0, m != 0u); // inf/nan -> saturate; weights never carry these
+    } else {
+        v = ldexp(1.0 + f32(m) / 1024.0, i32(e) - 15);
+    }
+    return select(v, -v, s == 1u);
+}
+
+// the 6-bit scale/min unpack, byte-for-byte with get_scale_min_k4
+fn scale_min(j: u32, base: u32) -> vec2<f32> {
+    var sc: u32; var mn: u32;
+    if (j < 4u) {
+        sc = byte_at(base + j) & 63u;
+        mn = byte_at(base + j + 4u) & 63u;
+    } else {
+        sc = (byte_at(base + j + 4u) & 0x0Fu) | ((byte_at(base + j - 4u) >> 6u) << 4u);
+        mn = (byte_at(base + j + 4u) >> 4u) | ((byte_at(base + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    let blk = wg.x;
+    if (blk >= dims.n) { return; }
+    let bbase = blk * 144u;                       // byte offset of this super-block
+    let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
+    let dmin = f16(byte_at(bbase + 2u) | (byte_at(bbase + 3u) << 8u));
+    let sbase = bbase + 4u;                       // 12 scale bytes
+    let qbase = bbase + 16u;                      // 128 nibble bytes
+    // 64 lanes each handle 4 of the 256 outputs, mirroring the CPU's 4 groups of 64
+    for (var t = lid.x; t < 256u; t = t + 64u) {
+        let grp = t / 64u;                        // which of the 4 groups
+        let idx = t % 64u;                        // position inside the group
+        let half = idx / 32u;                     // low nibbles then high nibbles
+        let l = idx % 32u;
+        let sm = scale_min(grp * 2u + half, sbase);
+        let q = byte_at(qbase + grp * 32u + l);
+        let nib = select(q & 0xFu, q >> 4u, half == 1u);
+        dst[blk * 256u + grp * 64u + half * 32u + l] = d * sm.x * f32(nib) - dmin * sm.y;
+    }
+}
+"#;
