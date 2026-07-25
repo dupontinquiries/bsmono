@@ -164,6 +164,29 @@ pub(crate) mod engine {
             // is dropped at the end of load once tensors are resident.
             let mm = gpu_kernels::file_bytes(path).map_err(|e| format!("open {path}: {e}"))?;
             let bytes: &[u8] = &mm;
+            // SPLIT CHECKPOINT: if this is `-00001-of-0000N.gguf`, map the siblings too. A split model's
+            // shard 1 carries metadata for the WHOLE model but only its own share of the tensors, so
+            // loading it alone fails on a missing tensor with everything looking healthy. Unifying the
+            // shards here avoids merging them on disk, which for a 62 GB checkpoint would mean having
+            // room for a second copy.
+            let sibling_paths = gpu_kernels::gguf::shard_siblings(std::path::Path::new(path));
+            let mut extra_maps: Vec<_> = Vec::new();
+            if let Some(paths) = &sibling_paths {
+                if paths.len() > 1 {
+                    let missing: Vec<String> = paths.iter().filter(|p| !p.exists())
+                        .map(|p| p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()).collect();
+                    if !missing.is_empty() {
+                        return Err(format!("split checkpoint is incomplete — missing {missing:?}. All {} shards must be present (the Models tab lists what to fetch).", paths.len()));
+                    }
+                    for p in paths.iter().skip(1) {
+                        extra_maps.push(gpu_kernels::file_bytes(p.to_string_lossy().as_ref())
+                            .map_err(|e| format!("open shard {}: {e}", p.display()))?);
+                    }
+                    eprintln!("wgpu-engine: split checkpoint — {} shards found, loading as one model", paths.len());
+                }
+            }
+            let mut parts: Vec<&[u8]> = vec![bytes];
+            for m in &extra_maps { parts.push(m); }
             let gpu = Gpu::new();
             gpu.maybe_start_gpu_spin();
             eprintln!("wgpu-engine: adapter = {}", gpu.adapter_name);
@@ -271,7 +294,7 @@ pub(crate) mod engine {
                 Some(m) => { eprintln!("wgpu-engine: loaded int8 cache (skipped dequant) in {:.1}s [{}]", t0.elapsed().as_secs_f32(), cache.display()); m }
                 None => {
                     eprintln!("wgpu-engine: loading {path} ({:.1} MiB) — quantizing to resident weights (int8, or q4 if it won't fit)…", bytes.len() as f32 / (1 << 20) as f32);
-                    let m = gpu.load_gguf_quantized(&bytes)?;
+                    let m = gpu.load_gguf_quantized_parts(&parts)?;
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
                     // holds old+new; the post-write evict is then just an exact final guard.
