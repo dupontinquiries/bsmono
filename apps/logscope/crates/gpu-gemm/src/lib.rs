@@ -5772,7 +5772,13 @@ impl Gpu {
                             // expert resident, but experts are the whole reason — if we pin the hot ones and
                             // stream the cold ones from host RAM, only (dense + pinned + ring) is resident.
                             // Check whether THAT fits; if so, proceed (q4) and let the MoE loader stream.
-                            if is_moe && std::env::var("LOGSCOPE_MOE_STREAM").is_ok() {
+                            // MoE EXPERT STREAMING. Auto-enabled: at this point we know the checkpoint is
+                            // MoE, that it will not fit resident, and (below) whether streaming would fit.
+                            // Requiring an env var to unlock the one strategy that works — while printing
+                            // a message saying it is implemented — makes the engine fail at something it
+                            // knows how to do. LOGSCOPE_MOE_STREAM=0 opts out.
+                            let stream_opt_out = std::env::var("LOGSCOPE_MOE_STREAM").as_deref() == Ok("0");
+                            if is_moe && !stream_opt_out {
                                 use crate::memplan::{Residency, resident_weight_bytes, kv_cache_bytes, gib};
                                 // dense residency = whole model MINUS the expert FFN mass (ffn=0 shape) at q4,
                                 // + KV + a transient staging spill. Experts are sized separately.
@@ -5798,7 +5804,7 @@ impl Gpu {
                                 auto_q4 = true;
                                 moe_stream_pin = Some(pin);
                                 let resident = dense + ring_cost + (pin as u64) * per_expert_all_layers;
-                                eprintln!("loader: MoE won't fit fully resident → EXPERT STREAMING (q4): pin {pin}/{n_expert} experts + {ring}-slot ring per layer, ~{:.1} GiB resident (dense ~{:.1} GiB); {} cold experts stream from host RAM per layer",
+                                eprintln!("loader: MoE won't fit fully resident → EXPERT STREAMING (q4, auto — LOGSCOPE_MOE_STREAM=0 opts out): pin {pin}/{n_expert} experts + {ring}-slot ring per layer, ~{:.1} GiB resident (dense ~{:.1} GiB); {} cold experts stream from host RAM per layer",
                                     gib(resident), gib(dense), n_expert.saturating_sub(pin));
                             } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
@@ -5806,7 +5812,7 @@ impl Gpu {
                                 " (this is the Asahi/Honeykrisp BO-VMA ceiling — a hard driver limit well below the machine's RAM; the same model loads on macOS/Metal, which has no such ceiling)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
-                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s). For MoE checkpoints, set LOGSCOPE_MOE_STREAM=1 to stream cold experts from host RAM (implemented). Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s). Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
