@@ -165,8 +165,25 @@ def resolve_mod_files(rs_path, src):
             if line.startswith(kw) and line.endswith(";"):
                 name = line[len(kw):-1].strip()
                 if not name.isidentifier(): break
-                prev = lines[n-2].strip() if n >= 2 else ""
-                if "#[path" in prev or "#[cfg" in prev: break
+                # Walk back over the WHOLE contiguous run of attribute/comment
+                # lines, not just the one directly above: attributes stack, and
+                # `#[path = "..."] / #[allow(dead_code)] / mod x;` is ordinary.
+                # Only checking lines[n-2] made a #[path] invisible whenever any
+                # other attribute sat between it and the `mod`, producing a
+                # bogus missing-mod-file (seen on kbm3's population.rs bin).
+                relocated = False
+                k = n - 2
+                while k >= 0:
+                    prev = lines[k].strip()
+                    if prev.startswith("#["):
+                        if "#[path" in prev or "#[cfg" in prev:
+                            relocated = True
+                            break
+                        k -= 1; continue
+                    if prev == "" or prev.startswith("//"):
+                        k -= 1; continue
+                    break
+                if relocated: break
                 if not ((base / f"{name}.rs").exists() or (base / name / "mod.rs").exists()):
                     missing.append((n, name, str(base / f"{name}.rs")))
                 break
