@@ -13,7 +13,8 @@ benchmark is in `maintenance/perf/` and reproduces with plain `rustc -O`. Where 
 
 | Target | Finding | Status |
 | --- | --- | --- |
-| unendlich | `find_greedy_run` re-descends the octree per step — **54% of descents are avoidable** | measured |
+| unendlich | **AO did 12 root descents per emitted face; the tiled halo already held every sample — 99.4% now LDS reads** | measured, **shipped** (r480) |
+| unendlich | ~~`find_greedy_run` leaf-extent reuse, 54%~~ — **RETRACTED**, see below | measured wrong, not shipped |
 | unendlich | No per-node occupancy bitmap; shocovox skips whole nodes with one AND | reasoned |
 | unendlich | GPU→CPU residency feedback via atomics | reasoned, unverified |
 | soldier | Coarse occupancy skip for LOS — **47% SLOWER, do not port** | measured |
@@ -38,43 +39,79 @@ benchmark is in `maintenance/perf/` and reproduces with plain `rustc -O`. Where 
    (`viewport_render.wgsl:222-292`) mark touched nodes with atomics so the CPU can
    evict and stream against real usage rather than a guess.
 
-## unendlich — the one measured win
+## unendlich — RETRACTION, then the real win
 
-`games/unendlich/crates/unendlich-engine/src/shaders/chunk_mesh_octree.comp`
+### What I got wrong first
 
-The mesher's `octree_sample` (`octree_sample.glsl:63`) is a **point query**: it
-restarts at the root and descends up to `OCTREE_DEPTH+1` levels, each level a
-*dependent* SSBO load. Cost is dominated by that dependency chain, not arithmetic.
+I originally reported that `find_greedy_run` (`chunk_mesh_octree.comp:770`) could reuse
+the covering leaf's extent for a **54% cut in descents**, and put it first in the work
+order. That was wrong twice over, and both errors are worth recording.
 
-`find_greedy_run` (`chunk_mesh_octree.comp:770`) extends a greedy-meshing run and calls
-`octree_sample` **from the root on every step** (line 787), up to 32 times.
+**1. The benchmark modelled an unsafe optimization.** A run ends when the next cell's
+block differs **or** its face-direction neighbour is solid — two conditions, both tested
+every step. My model only had the first, so "jump to the leaf's far edge" looked free.
+It is not: jumping skips the face-neighbour test and merges quads across a spot where
+the neighbour turns solid, i.e. wrong geometry. Modelled faithfully — same loop, same
+two conditions, memoizing both samples instead of jumping — the win collapses to **6.9%**
+(699,785 → 651,584 descents), because the face test keeps runs about one step long, and
+a cache needs two hits in a leaf before it pays.
 
-The fix is already in the same file. The halo-fill loop at line 930 uses
-`octree_sample_ext`, which additionally returns the covering leaf's extent, and caches
-it — its own comment reads *"uniform regions (most of a chunk) collapse a 4-cell run to
-a single descent"*. `find_greedy_run` never got that treatment. Since every cell inside
-a uniform leaf holds the same block, a run can jump straight to the leaf's far edge.
+**2. It is not even on the hot path.** `greedy_run_for_face` opens with
+`if (stride == 1u) return stride;` (`:814`) — at **Near LOD it never calls
+`find_greedy_run` at all**. It runs only at Mid (stride 2) and Far (stride 4), where
+cell counts are 8× and 64× lower. I recommended optimizing a function that does not
+execute in the case that matters.
 
-Measured on a terrain-like 32³ chunk (solid below a rolling surface, air above — the
-case that collapses an octree well), counting descents, which is hardware-independent
-and is what the GPU cost tracks:
+Not shipped. `maintenance/perf/bench_octree_descents.rs` now models it correctly and
+asserts the two variants return identical extents for all 318,906 (cell, axis, face)
+combinations, so the retraction is reproducible too.
+
+### The real win: AO was walking the octree past a cache that already had the answer
+
+Per **emitted** face the mesher runs `compute_ao` for 4 corners, each doing 3
+`ao_solid` calls (`:307-370`) — **12 samples per quad**, every one a
+`sample_or_neighbor` → `octree_sample` root descent, up to 6 dependent SSBO loads each.
+
+Meanwhile the tiled path (`:878`, active whenever `tile_enabled && cc >= 4`, so
+including Near LOD) already cooperatively expands a **6³ halo** — the 4³ tile plus a
+one-cell border — into shared memory, one descent per halo cell, precisely so that
+"every cell reads its self + 6 axis neighbors from shared with ZERO further descents".
+
+Every AO sample of a tile cell is inside that halo by construction: local coords 0..3,
+offsets ±1, giving −1..4, which is exactly halo 0..5. AO was descending past a
+shared-memory array that already held the answer.
+
+r480 routes `ao_solid` through `s_halo` at Near LOD. Measured over a terrain-like 32³
+chunk (`maintenance/perf/bench_ao_halo.rs`):
 
 ```
-nodes=6945 (a fully-split 32^3 tree would be 37449)
-current (root each step)   descents=   497969  (run extents summed: 484615)
-leaf-extent reuse          descents=   228480  (run extents summed: 484615)
+emitted faces        5972
+AO samples           71664
+  multi-axis OOB     434    (early-out, behaviour unchanged)
+  served from halo   71230  <- were root descents, now LDS reads
+  still a descent    0
+descents removed:    99.4% of AO samples
 ```
 
-**54% fewer descents, with byte-identical run extents** — it is an optimization, not a
-behaviour change. `maintenance/perf/bench_octree_descents.rs`.
+Correctness details that shaped the patch:
 
-Two caveats worth stating. The count includes one unavoidable `sample_ext` per cell in
-both columns, so the saving *within the run loop* is proportionally larger than 54%.
-And the win scales with how uniform the terrain is: a maximally noisy chunk collapses
-to no leaves and both columns converge.
+- The halo fast path sits **after** the existing multi-axis-OOB rule, not before it.
+  Those cells are filled by `sample_or_neighbor`, whose stated precondition is
+  single-axis OOB, so the halo holds nothing meaningful for them; keeping the early
+  return first preserves the documented artifact exactly.
+- **Near LOD only.** At Mid/Far the AO offsets are ±1 in *source block* coords while
+  halo cells are `stride` apart, so the samples do not land on halo centres and the
+  index mapping would be wrong. Guarded by `stride == 1u`.
+- `shared uint s_halo[216]` was declared *after* `ao_solid`; GLSL needs it first, so it
+  is hoisted. Still written only by the tiled path.
+- The flag is set after the `barrier()` that publishes the halo and before the early
+  return for air cells, so every invocation that reaches AO has it.
 
-`sample_or_neighbor` at line 264 has the same shape, and the AO sampler
-(`chunk_mesh_octree.comp:277+`) likewise re-descends per sample.
+Verified: `glslangValidator` compiles it; the repo's own `harness/spv_reflect.py`
+reflects **36/36 shaders with zero compile failures**, and this shader's descriptors are
+byte-identical to `harness/shader_descriptor_baseline.txt` (shared memory is not a
+descriptor, so nothing in the interface moved). Not verified: on-GPU frame time, and the
+`UNENDLICH_OCTREE_MESH_VERIFY=1` CPU-reference cross-check, both of which need hardware.
 
 ## unendlich — the structural gap
 
@@ -143,8 +180,14 @@ obvious candidate. Flagged as unverified — I did not trace its current residen
 
 ## Order of work
 
-1. `find_greedy_run` leaf-extent reuse — measured, behaviour-preserving, local to one
-   function, and the pattern is already proven 130 lines below it.
-2. Same treatment for `sample_or_neighbor` and the AO sampler.
+1. ~~`find_greedy_run` leaf-extent reuse~~ — retracted; unsafe as benchmarked, ~7% when
+   modelled correctly, and cold at Near LOD. Not shipped.
+2. **AO from the tiled halo — done (r480).** Run `UNENDLICH_OCTREE_MESH_VERIFY=1` on
+   hardware to confirm the CPU reference still matches, and take a frame-time reading.
 3. Prototype the per-node occupancy bitmap behind the falsification probe.
 4. Do **not** port occupancy skipping to soldier.
+
+The lesson under both unendlich items is the same one the soldier result taught: the
+cost here is *dependent memory fetches*, not arithmetic. The wins come from answering a
+query out of memory you have already staged (shared memory, a cached leaf), and the
+losses come from adding work to a path that was already cheap.

@@ -57,59 +57,98 @@ impl Tree {
     }
 }
 
-// CURRENT: find_greedy_run re-samples from the root every step (chunk_mesh_octree.comp:787)
-fn run_current(t: &Tree, x:i32,y:i32,z:i32, axis:usize, self_block:u8) -> u32 {
-    let mut extent = 1; let max_steps = 32;
-    for step in 1..max_steps {
-        let (mut nx, mut ny, mut nz) = (x,y,z);
-        match axis { 0 => nx += step, 1 => ny += step, _ => nz += step };
+// Faithful model of find_greedy_run (chunk_mesh_octree.comp:770): the run ends on a
+// block mismatch OR a solid face-neighbour. BOTH are sampled every step.
+fn face_off(x:i32,y:i32,z:i32, face:usize) -> (i32,i32,i32) {
+    match face { 0=>(x+1,y,z),1=>(x-1,y,z),2=>(x,y+1,z),3=>(x,y-1,z),4=>(x,y,z+1),_=>(x,y,z-1) }
+}
+
+// CURRENT: a full root descent for the cell AND for its face-neighbour, every step.
+fn run_current(t:&Tree, x:i32,y:i32,z:i32, axis:usize, face:usize, self_block:u8) -> u32 {
+    let mut extent = 1;
+    for step in 1..32 {
+        let (mut nx,mut ny,mut nz) = (x,y,z);
+        match axis {0=>nx+=step,1=>ny+=step,_=>nz+=step};
         if nx<0||ny<0||nz<0||nx>=CHUNK||ny>=CHUNK||nz>=CHUNK { break; }
         let (b,_,_) = t.sample_ext(nx,ny,nz);
         if b != self_block { break; }
+        let (fx,fy,fz) = face_off(nx,ny,nz,face);
+        let solid = if fx<0||fy<0||fz<0||fx>=CHUNK||fy>=CHUNK||fz>=CHUNK { false }
+                    else { t.sample_ext(fx,fy,fz).0 != 0 };
+        if solid { break; }
         extent += 1;
     }
     extent
 }
 
-// PROPOSED: reuse the covering leaf's extent, exactly the cache the halo loop already
-// uses at chunk_mesh_octree.comp:930 — skip to the end of a uniform leaf, no re-descent.
-fn run_cached(t: &Tree, x:i32,y:i32,z:i32, axis:usize, self_block:u8) -> u32 {
-    let mut extent = 1; let max_steps = 32;
-    let mut step = 1;
-    while step < max_steps {
-        let (mut nx, mut ny, mut nz) = (x,y,z);
-        match axis { 0 => nx += step, 1 => ny += step, _ => nz += step };
-        if nx<0||ny<0||nz<0||nx>=CHUNK||ny>=CHUNK||nz>=CHUNK { break; }
-        let (b, lo, lsz) = t.sample_ext(nx,ny,nz);
-        if b != self_block { break; }
-        // every cell to the leaf's far edge along `axis` has this same block
-        let (p, l) = match axis { 0 => (nx, lo.0), 1 => (ny, lo.1), _ => (nz, lo.2) };
-        let run_in_leaf = (l + lsz - p).max(1);
-        extent += run_in_leaf as u32;
-        step += run_in_leaf;
+// PROPOSED: identical loop, identical conditions, identical result — but each sample
+// first consults the covering leaf returned by the previous descent. This is exactly the
+// cache the halo loop already uses at chunk_mesh_octree.comp:930. NOT a jump: every step
+// is still evaluated, so the face-neighbour test is never skipped.
+struct LeafBox { lo:(i32,i32,i32), sz:i32, block:u8, valid:bool }
+impl LeafBox {
+    fn new()->Self{ LeafBox{lo:(0,0,0),sz:0,block:0,valid:false} }
+    fn hit(&self,x:i32,y:i32,z:i32)->bool{
+        self.valid && x>=self.lo.0 && x<self.lo.0+self.sz
+                   && y>=self.lo.1 && y<self.lo.1+self.sz
+                   && z>=self.lo.2 && z<self.lo.2+self.sz
     }
-    extent.min(32)
+    fn fill(&mut self,b:u8,lo:(i32,i32,i32),sz:i32){ self.block=b; self.lo=lo; self.sz=sz; self.valid=true; }
+}
+
+fn run_cached(t:&Tree, x:i32,y:i32,z:i32, axis:usize, face:usize, self_block:u8) -> u32 {
+    let mut extent = 1;
+    let mut cs = LeafBox::new();   // cache for the run's own cells
+    let mut cf = LeafBox::new();   // cache for the face-neighbour line
+    for step in 1..32 {
+        let (mut nx,mut ny,mut nz) = (x,y,z);
+        match axis {0=>nx+=step,1=>ny+=step,_=>nz+=step};
+        if nx<0||ny<0||nz<0||nx>=CHUNK||ny>=CHUNK||nz>=CHUNK { break; }
+        let b = if cs.hit(nx,ny,nz) { cs.block } else {
+            let (bb,lo,sz)=t.sample_ext(nx,ny,nz); cs.fill(bb,lo,sz); bb };
+        if b != self_block { break; }
+        let (fx,fy,fz) = face_off(nx,ny,nz,face);
+        let solid = if fx<0||fy<0||fz<0||fx>=CHUNK||fy>=CHUNK||fz>=CHUNK { false } else {
+            let fb = if cf.hit(fx,fy,fz) { cf.block } else {
+                let (bb,lo,sz)=t.sample_ext(fx,fy,fz); cf.fill(bb,lo,sz); bb };
+            fb != 0 };
+        if solid { break; }
+        extent += 1;
+    }
+    extent
 }
 
 fn main() {
-    // terrain-like field: solid below a rolling surface, air above — the realistic case,
-    // large uniform regions with a thin interface (what collapses an octree well).
     let field = |x:i32,y:i32,z:i32| -> u8 {
         let h = 16.0 + 6.0*((x as f32*0.19).sin() + (z as f32*0.23).cos());
         if (y as f32) < h { if (y as f32) < h-4.0 {1} else {2} } else {0}
     };
     let t = Tree::build(&field);
-    println!("nodes={} (a fully-split 32^3 tree would be {})", t.nodes.len(), (0..=5).map(|d| 8usize.pow(d)).sum::<usize>());
+    println!("nodes={}", t.nodes.len());
 
-    for (name, f) in [("current (root each step)", run_current as fn(&Tree,i32,i32,i32,usize,u8)->u32),
-                      ("leaf-extent reuse",       run_cached)] {
+    // 1. equivalence: identical extents for every cell/axis/face
+    let mut checked = 0u64;
+    for z in 0..CHUNK { for y in 0..CHUNK { for x in 0..CHUNK {
+        let (sb,_,_) = t.sample_ext(x,y,z);
+        if sb == 0 { continue; }
+        for axis in 0..3 { for face in 0..6 {
+            assert_eq!(run_current(&t,x,y,z,axis,face,sb), run_cached(&t,x,y,z,axis,face,sb),
+                       "extent differs at {x},{y},{z} axis{axis} face{face}");
+            checked += 1;
+        }}
+    }}}
+    println!("equivalence: {checked} (cell,axis,face) runs identical");
+
+    // 2. descent counts
+    for (name, f) in [("current (2 descents/step)", run_current as fn(&Tree,i32,i32,i32,usize,usize,u8)->u32),
+                      ("leaf-cache memoized",       run_cached)] {
         t.descents.set(0);
         let mut total = 0u64;
         for z in 0..CHUNK { for y in 0..CHUNK { for x in 0..CHUNK {
             let (sb,_,_) = t.sample_ext(x,y,z);
             if sb == 0 { continue; }
-            for axis in 0..3 { total += f(&t,x,y,z,axis,sb) as u64; }
+            for axis in 0..3 { for face in 0..6 { total += f(&t,x,y,z,axis,face,sb) as u64; } }
         }}}
-        println!("{name:26} descents={:>9}  (run extents summed: {total})", t.descents.get());
+        println!("{name:28} descents={:>10}  (extents summed: {total})", t.descents.get());
     }
 }

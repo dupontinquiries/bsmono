@@ -274,6 +274,26 @@ uint sample_or_air(uint octree_base, int x, int y, int z) {
     return octree_sample(octree_base, uvec3(uint(x), uint(y), uint(z)));
 }
 
+// r478: 6^3 halo (4^3 tile + 1-cell border) for the tiled mesher path.
+// Hoisted above ao_solid so the AO sampler can read it (GLSL needs the
+// declaration first); it is still only WRITTEN by the tiled path in main().
+shared uint s_halo[216];
+
+// r480: halo-backed AO. The tiled path already expands a 6^3 halo with one
+// descent per halo cell; every AO sample of a cell in the 4^3 tile lands
+// inside that halo (local coords 0..3, offsets +/-1 => -1..4 == halo 0..5).
+// AO was still walking the octree from the root for each of its samples --
+// 12 descents per emitted quad (4 corners x 3 samples) -- so these let
+// ao_solid read shared memory instead.
+//
+// Near LOD only (stride == 1). At Mid/Far the AO offsets are +/-1 in SOURCE
+// BLOCK coords while halo cells are `stride` apart, so the samples do not
+// land on halo cell centres and the mapping would be wrong.
+bool g_halo_ao = false;   // set true by the tiled path when stride == 1
+int  g_halo_bx = 0;       // tile base in source-block coords
+int  g_halo_by = 0;
+int  g_halo_bz = 0;
+
 // v0.24.37-vertex-ao: AO sampling. Returns true if the cell at
 // (x, y, z) is solid-opaque. For multi-axis OOB (the sample
 // crosses two or more chunk boundaries), returns false — accepted
@@ -287,6 +307,18 @@ bool ao_solid(ChunkMeta meta, int x, int y, int z) {
     if (y < 0 || y >= 32) out_count++;
     if (z < 0 || z >= 32) out_count++;
     if (out_count > 1) return false;
+    // r480: the sample is inside the tile's halo -- read it instead of descending.
+    // Deliberately placed AFTER the multi-axis-OOB rule above so that behaviour is
+    // untouched: those cells are filled by sample_or_neighbor, whose precondition is
+    // single-axis OOB, so the halo holds nothing meaningful for them.
+    if (g_halo_ao) {
+        int hx = x - g_halo_bx + 1;
+        int hy = y - g_halo_by + 1;
+        int hz = z - g_halo_bz + 1;
+        if (hx >= 0 && hx < 6 && hy >= 0 && hy < 6 && hz >= 0 && hz < 6) {
+            return is_solid_opaque(s_halo[uint(hz) * 36u + uint(hy) * 6u + uint(hx)]);
+        }
+    }
     return is_solid_opaque(sample_or_neighbor(meta, x, y, z));
 }
 
@@ -857,9 +889,6 @@ uint coleaf_or_sample(ChunkMeta meta, uvec3 self_lo, uint self_lsz, uint self_bl
     return sample_or_neighbor(meta, nx, ny, nz);
 }
 
-// r478: 6^3 halo (4^3 tile + 1-cell border) for the tiled mesher path.
-shared uint s_halo[216];
-
 void main() {
     uint chunk_idx = gl_WorkGroupID.y;
     if (chunk_idx >= pc.batch_count) return;
@@ -943,6 +972,16 @@ void main() {
             s_halo[k] = block;
         }
         barrier();   // uniform: push-constant branch, all 64 threads, no early return
+
+        // r480: the halo is now populated, so AO may read it. Near LOD only: at
+        // stride 1 a halo cell IS a source block, so halo index hx maps to source
+        // x as `bx + hx - 1` (see the fill above), which is what ao_solid inverts.
+        if (stride == 1u) {
+            g_halo_ao = true;
+            g_halo_bx = int(bx);
+            g_halo_by = int(by);
+            g_halo_bz = int(bz);
+        }
 
         uint lz = li / 16u;
         uint lr = li - lz * 16u;
