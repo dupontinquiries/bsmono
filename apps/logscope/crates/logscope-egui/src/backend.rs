@@ -607,14 +607,23 @@ pub(crate) mod engine {
             // inconclusive measurement must not be written down: run-to-run variance here is easily a few
             // percent, and a cached coin flip persists for every later load while nobody knows why it is
             // there. Within the margin, decline to record and let the next load measure again.
+            // Persist alongside the weight cache, so tuning travels with the install rather than living
+            // only in process memory.
+            let prof_path = gpu_kernels::store::cache_path(0).with_file_name("tuning-profile.json");
+            let (mut prof, warn) = logscope::tuneprofile::Profile::load_or_default(&prof_path, &self.gpu.adapter_name);
+            if let Some(w) = warn { eprintln!("wgpu-engine: {w}"); }
             let v = logscope::tuneprofile::Verdict {
                 option: "fast_decode".into(), chosen: decision,
                 on_ms: on * 1000.0, off_ms: off * 1000.0,
                 note: format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class()),
             };
             let key = format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class());
-            if v.is_decisive(logscope::tuneprofile::Defaults::default().min_verdict_margin) {
+            let tkey = logscope::tuneprofile::TuneKey::new(
+                &self.gpu.adapter_name, self.model.decode_class(),
+                self.model.residency_class());
+            if prof.record(&tkey, v.clone()) {
                 gpu_kernels::store::fast_ab_put(&key, decision);
+                if let Err(e) = prof.save(&prof_path) { eprintln!("wgpu-engine: tuning profile not saved: {e}"); }
                 eprintln!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
                     if decision { "ON" } else { "off" }, v.margin() * 100.0,
                     v.on_ms, v.off_ms, self.model.decode_class());
