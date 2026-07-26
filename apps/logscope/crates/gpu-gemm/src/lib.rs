@@ -2049,6 +2049,19 @@ impl Lin {
     /// m=1 Q8 decode case — the norm→matmul pair that fires twice per layer. Any other case (F32/Q4
     /// weight, prefill m>1, biased, or the fusion disabled via LOGSCOPE_FUSE_NORM=0) falls back to an
     /// explicit rmsnorm_t then apply(), so this is a pure speed swap with identical output.
+    /// Fused SwiGLU + down-projection + residual for the m=1 decode case. Returns None
+    /// when the weight format has no fused kernel (f32) or carries a bias — the caller
+    /// falls back to the two-pass chain, so this is a pure pass-count optimization with
+    /// identical math (the gate is computed in f32 either way; fusing skips one
+    /// intermediate buffer round-trip). LOGSCOPE_NO_FFN_FUSE=1 disables for bisection.
+    pub fn swiglu_apply_add(&self, gpu: &Gpu, gu: &Tensor, resid: &Tensor) -> Option<Tensor> {
+        if self.bias.is_some() { return None; }
+        match &self.kind {
+            LinKind::Q8(w) => Some(gpu.linear_q8_0_swiglu_add(gu, w, resid)),
+            LinKind::Q4(w) => Some(gpu.linear_q4_swiglu_add(gu, w, resid)),
+            _ => None,
+        }
+    }
     pub fn norm_apply(&self, gpu: &Gpu, a: &Tensor, nw: &Tensor, cols: usize, eps: f32, m: usize) -> Tensor {
         if m == 1 && self.bias.is_none() && fuse_norm_enabled() {
             if let LinKind::Q8(q) = &self.kind {
@@ -3224,6 +3237,25 @@ impl Gpu {
         self.dispatch(MATVEC_Q8_0_ADD, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
+    /// SwiGLU fused into the q8_0 down matvec + residual (decode m=1): reads the PACKED
+    /// [gate|up] buffer and gates inline — replaces swiglu_packed + linear_q8_0_add with
+    /// one dispatch per layer (the FFN tail's two-pass chain was the last non-minimal
+    /// pass count in the dense decode block).
+    pub fn linear_q8_0_swiglu_add(&self, gu: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+        self.dispatch(SWIGLU_MATVEC_Q8_0_ADD, &[gu, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
+    /// q4 twin of `linear_q8_0_swiglu_add`.
+    pub fn linear_q4_swiglu_add(&self, gu: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
+        let out = self.alloc(1, w.n);
+        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
+        self.dispatch(SWIGLU_MATVEC_Q4_ADD, &[gu, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
+        out
+    }
     pub fn linear_q4_0_add(&self, a: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
         let out = self.alloc(1, w.n);
         let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
@@ -3605,6 +3637,13 @@ impl Gpu {
         // Dense SwiGLU FFN. norm_apply fuses norm2→wgate_up in the m=1 decode case (one dispatch),
         // and falls back to explicit rmsnorm_t+apply for prefill (t>1) — identical output either way.
         let gu = w.wgate_up.norm_apply(self, x2, &w.g2, d, eps, t);
+        // Dense SiLU decode tail, FUSED: silu(gate)*up folds into the down matvec's input
+        // read, and the residual into its epilogue — one dispatch where there were two.
+        // Gemma (geglu / post_ffn) and prefill (t>1) keep the explicit chain.
+        if t == 1 && !w.geglu && w.post_ffn.is_none()
+            && std::env::var("LOGSCOPE_NO_FFN_FUSE").is_err() {
+            if let Some(y) = w.wdown.swiglu_apply_add(self, &gu, x2) { return y; }
+        }
         // Gemma gates with GELU rather than SiLU. The kernel has always existed; selecting it per block
         // is what turns it from dead code into support.
         let hmid = if w.geglu { self.geglu_packed(&gu) } else { self.swiglu_packed(&gu) };
@@ -6969,8 +7008,9 @@ impl Gpu {
                 else { self.block_decode_q8(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
-        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
+        // fewer pass per token.
+        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
     }
     /// Run `tokens` through a fresh int8 KV cache; returns last-position logits.
     pub fn forward_kv_q8(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
@@ -7366,8 +7406,9 @@ impl Gpu {
             x = if fused { self.block_decode_at_fused(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode_at(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
-        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
+        // fewer pass per token.
+        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
     }
 
     /// Test hooks for the DeltaNet kernels: same dispatches block_decode_delta makes,
@@ -7507,8 +7548,9 @@ impl Gpu {
             };
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
-        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
-        self.download(&m.output.apply(self, &xn, 1))
+        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
+        // fewer pass per token.
+        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
     }
 
     /// Staged-KV decode of one token: writes K/V into the hot f32 window and reads warm int8 tail + hot

@@ -4073,6 +4073,41 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-ffn-fuse") {
+        // Dense-decode pass-count optimization: silu(gate)*up fused into the down matvec
+        // (+ residual), and out_norm folded into the logits matvec. Two guarantees:
+        // (1) EXACTNESS: same synthetic llama, fused vs unfused (LOGSCOPE_NO_FFN_FUSE=1),
+        //     fresh caches — logits must agree to float-accumulation tolerance.
+        // (2) FEWER SUBMITS: the point of the change, measured with the engine's own
+        //     GPU_SUBMITS counter over identical 6-token decodes.
+        let gpu = Gpu::new();
+        eprintln!("gate-ffn-fuse: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let hm = gen_model(64, 128, 4, 48, 4, 2);
+        let m = gpu.load_gguf_quantized(&write_gguf_q8_0(&hm)).unwrap();
+        let toks: [(u32, usize); 6] = [(7, 0), (19, 1), (31, 2), (11, 3), (5, 4), (23, 5)];
+        let run = || -> (Vec<f32>, u64) {
+            let c = gpu.new_cache_for(&m, 8);
+            // flush_every=1 makes each compute pass its own submit, so the submit counter
+            // becomes a PASS counter — the honest unit for a pass-count optimization (at
+            // the default batch this tiny model fits one submit/token either way).
+            gpu.set_flush_every(1);
+            gpu_kernels::gpu_counters_reset();
+            let mut out = Vec::new();
+            for (t, p) in toks { out.extend(gpu.decode_step(&m, &c, t, p)); }
+            (out, gpu_kernels::gpu_submits())
+        };
+        std::env::set_var("LOGSCOPE_NO_FFN_FUSE", "1");
+        let (l_un, s_un) = run();
+        std::env::remove_var("LOGSCOPE_NO_FFN_FUSE");
+        let (l_fu, s_fu) = run();
+        let dmax = l_un.iter().zip(&l_fu).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("fused logits == unfused logits over 6 tokens (max|\u{394}|={dmax:.2e})"), dmax < 1e-4);
+        ck(&format!("fewer passes fused: {s_fu} vs {s_un} ({:.1}/tok vs {:.1}/tok — 2 fewer per layer + 1 at the head)",
+                    s_fu as f64 / 6.0, s_un as f64 / 6.0), s_fu < s_un);
+        println!("gate-ffn-fuse: {}", if ok { "FFN tail + head folds exact and cheaper \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-qwen35") {
         // Qwen3.5 / Ornith: Gated DeltaNet + gated attention. Two proof layers:
         // (1) KERNEL vs CPU: the conv step and the delta rule, CHAINED across 3 tokens so
