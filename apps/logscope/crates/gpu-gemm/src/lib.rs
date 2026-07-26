@@ -1535,6 +1535,12 @@ pub struct BlockWeights {
     /// pre-norms `g1`/`g2`. `post_attn` follows attention, `post_ffn` follows the FFN.
     pub post_attn: Option<Tensor>,
     pub post_ffn: Option<Tensor>,
+    /// Rope frequency base for THIS layer, when it differs from the model's.
+    ///
+    /// Gemma reads `rope.freq_base_swa` and uses it on windowed layers only, so a model alternating
+    /// windowed and full attention rotates them at different frequencies. `None` means use the model's
+    /// base — which is every other architecture.
+    pub rope_base: Option<f32>,
     /// Sliding-window attention for this layer: (window, rule). None = attend to the whole context.
     /// Set per layer because these architectures alternate windowed and full-attention layers.
     pub swa: Option<(u32, crate::swa::SwaType)>,
@@ -4071,6 +4077,10 @@ impl Gpu {
     /// One Llama-style transformer block, fully resident (weights uploaded once,
     /// no intermediate leaves the GPU). `n_heads` splits `d` into attention heads.
     pub fn block_forward(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
@@ -4088,6 +4098,10 @@ impl Gpu {
     /// decode can continue from position `t`. K is rope'd per-row at positions 0..t-1,
     /// which is exactly what sequential decode would have stored.
     fn block_prefill(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
@@ -4111,7 +4125,8 @@ impl Gpu {
     /// rows `[base, base+s)`, then segment attention runs over the full `[0, base+s)` cache.
     /// Mirrors `block_prefill` but starting from a non-zero base with a populated cache.
     fn block_prefill_ext(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base_freq: f32, eps: f32) -> Tensor {
-        let base_freq = if w.nope { 0.0 } else { base_freq }; // Llama4 iRoPE NoPE switch
+        let base_freq = w.rope_base.unwrap_or(base_freq);      // Gemma: windowed layers use freq_base_swa
+        let base_freq = if w.nope { 0.0 } else { base_freq };   // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
         let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd), w, s, ad, hd, eps);
@@ -6377,6 +6392,18 @@ per-layer routing active");
         // but no Gemma checkpoint has ever been loaded end to end here — and this project has repeatedly
         // shown that "validated in isolation" and "works on a real file" are different claims. Saying it
         // costs one line and sets the right expectation for the first person to try it.
+        // Gemma 3 27B scales Q by 1/sqrt(n_embd/n_head) instead of 1/sqrt(head_dim) — the ONLY Gemma 3
+        // where the hparam differs from our hardcoded default. llama.cpp identifies it by block count
+        // (62), so we can name it precisely rather than warning every Gemma 3 user about a size they are
+        // not running.
+        if matches!(acfg.arch, crate::archcfg::Arch::Gemma3)
+            && g.get_u32(&format!("{}.block_count", acfg.prefix)).unwrap_or(0) == 62 {
+            let nh = g.get_u32(&format!("{}.attention.head_count", acfg.prefix)).unwrap_or(1).max(1);
+            let nemb = g.get_u32(&format!("{}.embedding_length", acfg.prefix)).unwrap_or(0);
+            return Err(format!("this is Gemma 3 27B, which scales attention by 1/sqrt(n_embd/n_head) = \
+1/sqrt({}) rather than 1/sqrt(head_dim) — a hyperparameter the engine hardcodes. Smaller Gemma 3 models \
+are unaffected and load fine. Use the llama.cpp backend for the 27B.", nemb / nh));
+        }
         if matches!(acfg.arch, crate::archcfg::Arch::Gemma3) {
             eprintln!("wgpu-engine: gemma3 support is NEW — (1+w) norm, GELU gating, post-norms and \
 sliding-window attention are each unit-gated, but no Gemma model has been run end to end. Report anything \
@@ -7000,6 +7027,16 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // weightless Llama4TextL2Norm. ON for every Llama-4 except the 128-expert Maverick, which
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
+                // Per-layer rope base: Gemma rotates its WINDOWED layers at rope.freq_base_swa and its
+                // full-attention layers at the model base. Only set when the file actually carries the
+                // key AND this layer is windowed — otherwise None, and every other model is untouched.
+                rope_base: {
+                    let swa_base = g.get_f32(&format!("{}.rope.freq_base_swa", acfg.prefix));
+                    match (swa_base, swa_pattern.get(i).copied().unwrap_or(false)) {
+                        (Some(b), true) if b > 0.0 => Some(b),
+                        _ => None,
+                    }
+                },
                 // Gemma gates with GELU. Selected from the arch config rather than sniffed from tensors.
                 geglu: matches!(acfg.act, crate::archcfg::Act::GeGlu),
                 // Gemma's post-attention / post-FFN norms. Absent on every other architecture, so None
@@ -7244,7 +7281,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -8823,6 +8860,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// One decode block using the int8 KV cache: compute q/k/v (f32), quantize this
     /// token's k/v row into the cache, attend the cache (dequant on the fly).
     fn block_decode_q8(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -8842,6 +8883,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// matmul, q/k/v sliced from the packed output, then K and V quantized into the int8 cache exactly
     /// as before. Bit-exact to block_decode_q8 (the fusion never changes the values being quantized).
     fn block_decode_q8_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -9003,6 +9048,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -9148,6 +9197,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// so it's bit-exact to roping them separately), v is copied straight into the V-cache row.
     /// Bit-exact to block_decode (--gate-qkv); saves 2 projection + 1 RoPE dispatch/layer.
     fn block_decode_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         // Fused norm→QKV: RMSNorm(x) folds into the wqkv matvec (one dispatch instead of two).
@@ -9206,6 +9259,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// so a ring buffer can overwrite an evicted slot with no shifting. `block_decode` is
     /// the special case `slot == rope_pos`, `attend_len == rope_pos+1`.
     fn block_decode_at(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
@@ -9222,6 +9279,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Fused-QKV counterpart of block_decode_at (streaming/ring f32 KV cache). Same as
     /// block_decode_fused but K/V are written at physical `slot` and attention spans `attend_len`.
     fn block_decode_at_fused(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, rope_pos: usize, slot: usize, attend_len: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        // Per-layer rope base (Gemma: windowed layers use rope.freq_base_swa), then the Llama-4 NoPE
+        // sentinel — order matters, since a NoPE layer skips rotation regardless of which base it would
+        // otherwise use.
+        let base = w.rope_base.unwrap_or(base);
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
