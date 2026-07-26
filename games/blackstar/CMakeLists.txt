@@ -334,6 +334,11 @@ if(Python3_FOUND)
   add_test(NAME gltf_roundtrip
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_gltf.py)
 endif()
+if(Python3_FOUND)
+  add_test(NAME model_tuning
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_tuning.py
+                   --root ${CMAKE_SOURCE_DIR})
+endif()
 
 add_executable(test_tangents ${CMAKE_SOURCE_DIR}/tests/test_tangents.c)
 target_include_directories(test_tangents PRIVATE ${CMAKE_SOURCE_DIR}/engine_src/exengine)

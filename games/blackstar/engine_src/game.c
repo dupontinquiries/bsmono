@@ -459,6 +459,41 @@ static int   g_imp_tune = 0;                    // live-tune mode toggle (F4)
 static float g_imp_anim_t = 0.0f;               // imported-model gait/idle animation phase
 static float g_imp_spin = 0.0f, g_imp_fan = 0.0f;
 static float g_limb_ang[128];
+static void game_log(const char *fmt, ...);   // defined below; the transform logs its swap
+// KIND-AWARE IMPORTED MODELS (tables baked by install_models.py from gen_tuning.py):
+// g_imp_kind (0 prop, 1 robot, 2 vehicle, 3 weapon, 4 env, 5 ship) drives per-category
+// animation; g_imp_pair links vehicle<->robot forms for the transform.
+static int g_weapon_list[EX_N_IMPORTED]; static int g_weapon_n = 0;   // kind==weapon indices
+int ex_imported_weapon_count(void){ return g_weapon_n; }
+const char *ex_imported_weapon_name(int i){
+  return (i>=0 && i<g_weapon_n) ? g_imported_names[g_weapon_list[i]] : "?"; }
+// TRANSFORM (single-mesh models): crush-spin-swap between g_imp_pair partners. The
+// parts-tagged morph (atag 20) stays the rich path; this is the readable universal one:
+// squash + fast spin down, swap the model at the nadir, rise into the other form.
+static float g_imp_xf_t = 0.0f;     // 0 idle; >0 running (counts down 1..0)
+static int   g_imp_xf_to = -1;      // pair index to swap to at the nadir
+static int   g_imp_xf_swapped = 0;
+// shared transform driver: advances the crush-spin, swaps at the nadir, and returns
+// the visual squash/spin to apply this frame (identity when idle).
+static void imp_transform_step(float dt, float *squash, float *spin_deg){
+  *squash = 1.0f; *spin_deg = 0.0f;
+  if (g_imp_xf_t <= 0.0f) return;
+  g_imp_xf_t -= dt * 1.8f;                       // ~0.55s total (DESIGN_NOTES: snappy, never a dead-time trap)
+  float t = 1.0f - fmaxf(0.0f, g_imp_xf_t);      // 0 -> 1 over the transform
+  float nadir = fabsf(t - 0.5f) * 2.0f;          // 1 at ends, 0 at middle
+  *squash = 0.35f + 0.65f * nadir * nadir;       // crush toward the middle
+  *spin_deg = t * 540.0f;                        // one-and-a-half turns across
+  if (!g_imp_xf_swapped && t >= 0.5f && g_imp_xf_to >= 0) {
+    g_imported_idx = g_imp_xf_to; g_imp_xf_swapped = 1;
+    game_log("transform -> %s", g_imported_names[g_imported_idx]);
+  }
+  if (g_imp_xf_t <= 0.0f) { g_imp_xf_t = 0.0f; g_imp_xf_to = -1; }
+}
+static void imp_transform_start(void){
+  int p = g_imp_pair[g_imported_idx];
+  if (p < 0 || g_imp_xf_t > 0.0f) return;
+  g_imp_xf_t = 1.0f; g_imp_xf_to = p; g_imp_xf_swapped = 0;
+}
 static float g_morph = 1.0f;      // 0 = fully dispersed cloud, 1 = assembled
 static float g_morph_dir = 0.0f;  // set non-zero to drive it   // per-part limb angle, so children can compose from parents  // tire roll + fan spin accumulators
 // ARMOR REACTION: armor/shin-guard parts shift when the body is hit or when the
@@ -3648,6 +3683,7 @@ void game_init()
     g_imp_rx[i] = g_imp_rx_def[i];   // seed orientation from auto-detect + user tuning (overridable in-game)
     g_imp_ry[i] = g_imp_ry_def[i];
     g_imp_rz[i] = g_imp_rz_def[i];
+    if (g_imp_kind[i] == 3) g_weapon_list[g_weapon_n++] = i;   // customize: held-weapon options
     g_imported_tpl[i] = ex_iqm_load_model(scene, g_imported_files[i], 0);
     if (g_imported_tpl[i]) { g_imported_tpl[i]->is_lit=1; g_imported_tpl[i]->is_shadow=1;
       g_imported_tpl[i]->mat_boost=1.8f;   // stronger normal/spec/reflection than the built bots
@@ -5125,20 +5161,51 @@ static void builder_preview(float dt)
   } else {
     pose_body(g_player_parts, origin, 0, EX_BODY_PLAYER, 1.2f, 0.0f, 0.0f, (int)g_menu.loadout.accent, -spin, &g_build, player_signature());
   }
+  // HELD WEAPON (customize row): the chosen imported weapon rides the right hand.
+  // The hand part is already posed, so the prop inherits a real transform instead of
+  // a guessed offset; harness rx/ry/rz still applies per model for grip fixes.
+  { int wp = g_menu.loadout.weapon_prop;
+    if (!g_show_imported && wp > 0 && wp <= g_weapon_n) {
+      int wi = g_weapon_list[wp-1]; ex_model_t *wm = g_imported_tpl[wi];
+      ex_model_t *hand = g_player_parts[EX_PART_HAND_R];
+      if (wm && hand) {
+        float ws = 0.8f * g_imp_scl[wi] / 0.33f;
+        wm->scale3[0]=wm->scale3[1]=wm->scale3[2]=ws;
+        wm->position[0]=hand->position[0]; wm->position[1]=hand->position[1]; wm->position[2]=hand->position[2];
+        wm->rotation[0]=hand->rotation[0]+g_imp_rx[wi]; wm->rotation[1]=hand->rotation[1]+g_imp_ry[wi]+90.0f; wm->rotation[2]=hand->rotation[2]+g_imp_rz[wi];
+        wm->tint[0]=wm->tint[1]=wm->tint[2]=1.0f; wm->is_lit=1;
+      }
+    } }
 
   // IMPORTED MODEL SHOWCASE (F3): swap the built bot for a real imported model,
   // from a browsable list ([ / ] cycle). Placed where the built bot goes so the
   // EXISTING builder camera frames it correctly (no custom camera).
   if (g_show_imported && g_imported_tpl[g_imported_idx]) {
     for (int i=0;i<EX_ROBOT_PARTS;i++) g_player_parts[i]->position[1]=-100000.0f;  // hide built bot
+    // T: transform to the paired form (vehicle<->robot), when this model has one
+    if (ex_keys_down[SDL_SCANCODE_T] && g_imp_pair[g_imported_idx] >= 0) {
+      imp_transform_start(); ex_keys_down[SDL_SCANCODE_T]=0; }
+    float xf_squash, xf_spin; imp_transform_step((float)dt, &xf_squash, &xf_spin);
     for (int i=0;i<EX_N_IMPORTED;i++) if(i!=g_imported_idx && g_imported_tpl[i]) g_imported_tpl[i]->position[1]=-100000.0f;
     ex_model_t *im = g_imported_tpl[g_imported_idx];
-    float s = 2.0f;                    // normalized +/-1 model -> ~4 units tall
-    im->scale3[0]=im->scale3[1]=im->scale3[2]=s;
+    int k = g_imported_idx;
+    float s = 2.0f * g_imp_scl[k] / 0.33f;   // harness scale over the library default
+    // per-kind idle so the plinth already shows the category's motion language:
+    // robots breathe, vehicles settle on their suspension, ships hover, weapons/props sit.
+    float idle_y = 0.0f, idle_rz = 0.0f;
+    switch (g_imp_kind[k]) {
+      case 1: s *= 1.0f + 0.012f*sinf(g_anim_t*1.4f); break;                    // robot: breathing
+      case 2: idle_y = 0.015f*s*sinf(g_anim_t*2.3f); break;                     // vehicle: suspension settle
+      case 5: idle_y = 0.10f*s*sinf(g_anim_t*0.9f); idle_rz = 1.2f*sinf(g_anim_t*0.6f); break; // ship: hover + bank
+      default: break;                                                           // weapon/prop/env: still
+    }
+    im->scale3[0]=im->scale3[2]=s; im->scale3[1]=s*xf_squash;
     im->position[0]=0.0f;             // at origin, like the built bot
-    im->position[1]=s;                // feet (-1*s) on the plinth, centre at y=s
+    im->position[1]=s*xf_squash + idle_y;  // feet stay planted through the crush
     im->position[2]=0.0f;
-    im->rotation[1]=g_prev_yaw + g_imp_ry[g_imported_idx];   // drag-orbit turntable
+    im->rotation[0]=g_imp_rx[k];
+    im->rotation[1]=g_prev_yaw + g_imp_ry[k] + xf_spin;   // drag-orbit turntable (+ transform spin)
+    im->rotation[2]=g_imp_rz[k] + idle_rz;
     im->tint[0]=im->tint[1]=im->tint[2]=1.0f; im->is_lit=1;
   } else {
     for (int i=0;i<EX_N_IMPORTED;i++) if(g_imported_tpl[i]) g_imported_tpl[i]->position[1]=-100000.0f;
@@ -5156,6 +5223,7 @@ static void builder_preview(float dt)
       case 5: focus_y=1.1f; dist=6.0f; break;    // legs
       case 7: focus_y=2.2f; dist=12.0f; break;   // vehicle (pull back + up)
       case 11:focus_y=2.8f; dist=5.5f; break;    // weapon
+      case 24:focus_y=2.6f; dist=6.5f; break;    // held weapon (imported prop in the hand)
       default: focus_y=2.4f; dist=9.0f; break;
     }
   }
@@ -6877,18 +6945,45 @@ void game_update(double dt, double ft)
       float spd = sqrtf(e->velocity[0]*e->velocity[0]+e->velocity[2]*e->velocity[2]);
       float mov = fminf(spd/6.0f, 1.0f);                 // 0 idle .. 1 running
       g_imp_anim_t += (float)dt * (2.2f + mov*6.0f);     // gait phase (faster when moving)
-      float bob   = (0.02f + mov*0.06f) * ph * sinf(g_imp_anim_t*2.0f); // vertical bob
-      float sway  = (1.2f + mov*2.5f) * sinf(g_imp_anim_t);             // side sway (deg)
-      float lean  = mov * 9.0f;                          // forward lean into movement (deg)
-      float breath= (1.0f - mov) * 0.012f * sinf(g_anim_t*1.4f);       // idle breathing scale
+      // PER-KIND animation profile (g_imp_kind): a tank must not sway like a walker.
+      //   robot   -- the original gait: stride-bob, side sway, forward lean, breathing
+      //   vehicle -- DRIVING: no sway/lean; suspension bob (small, fast), roll into
+      //              lateral velocity, nose pitch with speed
+      //   ship    -- slow hover bob + gentle banking, speed-independent
+      //   other   -- rigid (a held sword should not jog in place)
+      float bob=0.0f, sway=0.0f, lean=0.0f, breath=0.0f, roll_extra=0.0f;
+      switch (g_imp_kind[k]) {
+        case 1:  // robot (the tuned original)
+          bob   = (0.02f + mov*0.06f) * ph * sinf(g_imp_anim_t*2.0f);
+          sway  = (1.2f + mov*2.5f) * sinf(g_imp_anim_t);
+          lean  = mov * 9.0f;
+          breath= (1.0f - mov) * 0.012f * sinf(g_anim_t*1.4f);
+          break;
+        case 2: { // vehicle: driving profile
+          bob   = 0.010f * ph * sinf(g_imp_anim_t*5.0f) * (0.3f + 0.7f*mov);   // suspension chatter
+          lean  = mov * 3.0f;                                                   // slight nose-down at speed
+          // roll into the turn: lateral velocity relative to facing
+          float fy = g_body_yaw; float fx = sinf(fy), fz = cosf(fy);
+          float lat = e->velocity[0]*fz - e->velocity[2]*fx;                    // signed sideways speed
+          roll_extra = fmaxf(-8.0f, fminf(8.0f, -lat * 1.2f));
+          break; }
+        case 5:  // ship: hover
+          bob   = 0.05f * ph * sinf(g_anim_t*0.9f);
+          roll_extra = 2.0f * sinf(g_anim_t*0.6f) + fmaxf(-10.0f,fminf(10.0f, -(e->velocity[0])*0.6f));
+          lean  = mov * 4.0f;
+          break;
+        default: break;  // weapon / prop / env: rigid
+      }
+      sway += roll_extra;
       float phb = ph * (1.0f + breath);
-      im->scale3[0]=im->scale3[1]=im->scale3[2]=phb;
+      float xf_squash, xf_spin; imp_transform_step((float)dt, &xf_squash, &xf_spin);
+      im->scale3[0]=im->scale3[2]=phb; im->scale3[1]=phb*xf_squash;
       im->position[0]=e->position[0];
       float anim_y = e->position[1]+ph*0.9f + bob;       // animated body height (save before hiding)
       im->position[1]=anim_y;      // centre + animated bob
       im->position[2]=e->position[2];
       im->rotation[0]=g_imp_rx[k] + lean;        // harness pitch + forward lean
-      im->rotation[1]=g_body_yaw*57.2957795f + g_imp_ry[k];  // facing + harness yaw
+      im->rotation[1]=g_body_yaw*57.2957795f + g_imp_ry[k] + xf_spin;  // facing + harness yaw (+ transform spin)
       im->rotation[2]=g_imp_rz[k] + sway;        // harness roll + animated sway
       im->tint[0]=im->tint[1]=im->tint[2]=1.0f; im->is_lit=1;
       // TEXTURED PARTS: if this model has a textured-parts export, show those parts
@@ -7803,6 +7898,12 @@ void game_update(double dt, double ft)
   if (g_resonance_cd > 0.0f) g_resonance_cd -= dt;
 
   // Pulse blast (T): a focused forward cone shockwave -- shorter range, aimed.
+  // imported-mode transform first: when showcasing a paired model, T is the
+  // transform (vehicle<->robot) and the pulse yields -- DESIGN_NOTES: the flip is
+  // the tactical tool, it must never lose to another binding while in this mode.
+  if (ex_keys_down[SDL_SCANCODE_T] && g_show_imported && g_imp_pair[g_imported_idx] >= 0) {
+    imp_transform_start(); ex_keys_down[SDL_SCANCODE_T]=0;
+  }
   if (ex_keys_down[SDL_SCANCODE_T] && g_pulse_cd <= 0.0f && !g_human_scale) {
     float fx=camera->front[0], fz=camera->front[2]; float fl=sqrtf(fx*fx+fz*fz); if(fl>1e-3f){fx/=fl;fz/=fl;}
     float cx=e->position[0]+fx*14.0f, cz=e->position[2]+fz*14.0f;   // burst out in front
