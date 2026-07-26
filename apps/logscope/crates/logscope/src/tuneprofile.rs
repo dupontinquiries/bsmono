@@ -102,6 +102,23 @@ impl Defaults {
     /// below 16 — past that the dispatch overhead dominates and a watchdog hang is not the binding
     /// problem any more.
     pub fn prefill_chunk(&self, d: usize, ff: usize) -> u32 {
+        self.prefill_chunk_for_model(d, ff, false)
+    }
+
+    /// The prefill chunk, accounting for whether the model STREAMS its experts.
+    ///
+    /// The work budget models the duration of one attention dispatch, which is the right thing to bound
+    /// when the weights are resident. It is the wrong thing to optimise when experts stream, because then
+    /// the dominant cost is not dispatch length but REFILL TRAFFIC, and that scales with 1/chunk: each
+    /// chunk re-pulls the cold experts for every layer.
+    ///
+    /// Measured on Llama-4 Scout (48 layers, 16 experts, ring 2, ~68 MiB per expert-layer, 1839 tokens):
+    ///     chunk 256 ->  8 chunks -> ~4600 fills -> ~304 GiB moved
+    ///     chunk  76 -> 25 chunks -> ~14400 fills -> ~949 GiB moved
+    /// and the measured prefill went 196s -> 314s when the chunk was lowered. Shrinking it was a
+    /// three-fold pessimisation for exactly the models that can least afford one.
+    pub fn prefill_chunk_for_model(&self, d: usize, ff: usize, streams_experts: bool) -> u32 {
+        if streams_experts { return self.prefill_chunk_max; }
         let work = (d.max(1) as u64).saturating_mul(ff.max(1) as u64);
         let scaled = (self.prefill_work_budget / work.max(1)) as u32;
         scaled.clamp(16, self.prefill_chunk_max)
@@ -263,6 +280,18 @@ mod tests {
         assert!(seventy_b < scout, "a bigger model gets a shorter chunk still: {seventy_b}");
         // and it never collapses to something pathological
         assert_eq!(d.prefill_chunk(1_000_000, 1_000_000), 16);
+    }
+
+    #[test]
+    fn a_streaming_model_keeps_the_full_chunk() {
+        // Scout's shape would otherwise be shrunk to 76, which TRIPLES expert refill traffic — the
+        // opposite of what helps a model whose weights do not fit.
+        let d = Defaults::default();
+        assert_eq!(d.prefill_chunk_for_model(5120, 16384, false), 76, "resident: bounded by dispatch work");
+        assert_eq!(d.prefill_chunk_for_model(5120, 16384, true), 256, "streaming: bounded by refill traffic");
+        // a small resident model is unaffected either way
+        assert_eq!(d.prefill_chunk_for_model(3072, 8192, false), 256);
+        assert_eq!(d.prefill_chunk_for_model(3072, 8192, true), 256);
     }
 
     #[test]
