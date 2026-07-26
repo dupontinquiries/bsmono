@@ -6218,21 +6218,20 @@ impl Gpu {
         // If an MLA-family checkpoint actually ships MLA projection tensors, we can't run it yet (MLA
         // forward unwired) — refuse clearly. If it has standard attention tensors instead, proceed.
         if arch_is_mla_family && has_mla_tensors {
-            // Be specific about WHAT is missing, because "MLA isn't wired" hides how much actually works.
-            // The GPU forward (MLA_QROPE / MLA_PACK_K / MLA_PACK_V / MLA_ATTN, the compressed-latent cache
-            // and mla_compress_append) is implemented AND validated against the CPU reference by
-            // the kernel-validation suite (--validate),
-            // including building the cache on-GPU. The per-layer projection weights now load
-            // too (BlockWeights::mla). What remains is the decode plumbing: a block_decode that routes
-            // MLA layers through mla_attention_step_gpu against an MlaCache instead of the standard K/V
-            // cache. Saying that plainly is more useful than a blanket refusal, and it means the next
-            // person picking this up knows the compute is trustworthy.
-            let layout = g.dump_tensors("blk.0.");
-            return Err(format!("architecture '{arch}' uses Multi-head Latent Attention. The MLA forward and \
-compressed-KV cache ARE implemented and validated by the kernel-validation suite, and this \
-checkpoint's projection weights \
-load; what is missing is the decode plumbing that routes MLA layers through them instead of the standard \
-K/V cache. Until that lands, use the llama.cpp backend for this model.\n{layout}"));
+            // No longer a blanket refusal. The MLA forward, the compressed cache, the per-layer
+            // projections, the decode block and the per-layer routing are all in place and checked
+            // (--gate-mla-block plus the kernel-validation suite). What is still worth refusing is a
+            // checkpoint whose MLA metadata is absent, because then the dims are unknown and nothing
+            // downstream can be trusted — that is a real missing input, not an unimplemented feature.
+            let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0;
+            if !have_cfg {
+                let layout = g.dump_tensors("blk.0.");
+                return Err(format!("architecture '{arch}' ships MLA tensors but no kv_lora_rank in its \
+metadata, so the latent dimensions are unknown. The MLA path is implemented and validated; this \
+particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layout}"));
+            }
+            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache (validated); \
+per-layer routing active");
         }
         let treat_unsupported = !acfg.supported;
         if treat_unsupported {
@@ -7917,7 +7916,13 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 }"#;
 
 /// Per-layer key/value cache (resident [max_seq, d] buffers).
-pub struct KvCache { pub k: Vec<Tensor>, pub v: Vec<Tensor> }
+pub struct KvCache {
+    pub k: Vec<Tensor>, pub v: Vec<Tensor>,
+    /// Compressed MLA cache, allocated only for MLA models. Held ALONGSIDE k/v rather than replacing
+    /// them: a checkpoint may mix MLA and standard attention layers, and the per-layer routing decides
+    /// which is used. For a non-MLA model this is None and nothing about the standard path changes.
+    pub mla: Option<crate::mla::MlaCache>,
+}
 
 /// int8-quantized KV cache: K/V stored per-row as packed int8 (4x smaller than f32)
 /// plus one f32 scale per row. Raises the concurrency and context ceilings (KV memory
@@ -8353,8 +8358,24 @@ impl Gpu {
     }
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
-                  v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect() }
+                  v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
+                  mla: None }
     }
+    /// A cache for `m`, adding the compressed MLA side when the model needs it.
+    ///
+    /// The standard k/v vectors are still allocated for MLA models. They cost little relative to the
+    /// weights and a mixed checkpoint — some layers MLA, some standard — would otherwise need a second
+    /// cache type threaded everywhere. Correctness first; trimming the unused allocation is an
+    /// optimisation with a measurement attached, not a guess.
+    pub fn new_cache_for(&self, m: &Model, max_seq: usize) -> KvCache {
+        let mut c = self.new_cache(m.n_layers, max_seq, m.kv_dim());
+        if let Some(cfg) = &m.mla {
+            let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
+            c.mla = Some(self.mla_new_cache(m.n_layers, max_seq, &dm));
+        }
+        c
+    }
+
     /// Buffer-to-buffer copy that records into the open frame if one is active (so cache
     /// writes batch with the token's compute), else submits on its own.
     fn copy_buf(&self, src: &Tensor, src_off: u64, dst: &Tensor, dst_off: u64, bytes: u64) {
@@ -8612,7 +8633,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// Promote an int8 prefix cache (first `len` rows) back to f32 for seeding (lossy).
     pub fn promote_cache(&self, q: &QKvCache, len: usize, kv_dim: usize) -> KvCache {
-        let mut c = KvCache { k: vec![], v: vec![] };
+        let mut c = KvCache { k: vec![], v: vec![], mla: None };
         for li in 0..q.kq.len() {
             c.k.push(self.dequant_rows(&q.kq[li], &q.ks[li], len, kv_dim));
             c.v.push(self.dequant_rows(&q.vq[li], &q.vs[li], len, kv_dim));
@@ -9113,8 +9134,16 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
-            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            // Per-LAYER routing, not per-model: a checkpoint may mix MLA and standard attention, and a
+            // layer takes the MLA path only when it has both the projections and a cache to write into.
+            x = match (&w.mla, &c.mla, &m.mla) {
+                (Some(mw), Some(mc), Some(cfg)) => {
+                    let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
+                    self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
+                }
+                _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+                _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+            };
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
         let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
@@ -9638,8 +9667,16 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         for li in 0..m.n_layers {
             if tracing { self.trace_layer.store(li as i32, std::sync::atomic::Ordering::Relaxed); }
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
-            x = if fused { self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
-                else { self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
+            // Per-LAYER routing, not per-model: a checkpoint may mix MLA and standard attention, and a
+            // layer takes the MLA path only when it has both the projections and a cache to write into.
+            x = match (&w.mla, &c.mla, &m.mla) {
+                (Some(mw), Some(mc), Some(cfg)) => {
+                    let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
+                    self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
+                }
+                _ if fused => self.block_decode_fused(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+                _ => self.block_decode(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
+            };
             if flush != 0 && (li + 1) % flush == 0 && li + 1 < m.n_layers {
                 // FENCED flush: submit, WAIT for completion (so x is valid + scratch is done), release
                 // retained bind-groups, re-open the frame. The wait is what makes recycling safe.
