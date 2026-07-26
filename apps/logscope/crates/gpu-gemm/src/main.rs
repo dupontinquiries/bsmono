@@ -3810,6 +3810,63 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         let c = gpu.download(&gpu.rmsnorm_t(&xt, &wt, 1, n, 1e-5));
         let d3 = c.iter().zip(&plain).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
         ck(&format!("pooled path still correct after scratch_end (max|diff|={d3:.3e})"), d3 == 0.0);
+        // THE CAUSAL CHAIN, measured rather than assumed. The arena's whole purpose is to make bind
+        // groups repeat: same buffers in the same order every token, so the cache hits. If the hit rate
+        // does not actually rise with the arena on, the arena is not earning its complexity.
+        {
+            let ops = 6usize;
+            let inputs: Vec<(gpu_kernels::Tensor, gpu_kernels::Tensor, usize)> =
+                [n, n / 2, n / 4, n, n / 2, n * 2].iter().map(|&w2| {
+                    let xs: Vec<f32> = (0..w2).map(|i| ((i as f32) * 0.01).sin()).collect();
+                    let ws: Vec<f32> = vec![1.0; w2];
+                    (gpu.upload(&xs, 1, w2), gpu.upload(&ws, 1, w2), w2)
+                }).collect();
+            let run = |arena: bool| -> (u64, u64) {
+                let h0 = gpu_kernels::BG_HITS.load(std::sync::atomic::Ordering::Relaxed);
+                let m0 = gpu_kernels::BG_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+                for _ in 0..ops {
+                    if arena { gpu.scratch_begin(); }
+                    // MANY INTERLEAVED SHAPES — the condition that matters. With one or two sizes the
+                    // free list is already deterministic and the arena adds nothing; a real layer touches
+                    // d, kv, ff and attn-sized intermediates in sequence, which is when free-list order
+                    // starts deciding which buffer you get.
+                    //
+                    // Inputs are PRE-UPLOADED outside the timing loop: a freshly uploaded input is a new
+                    // buffer and would miss the cache no matter what the arena does, which would hide the
+                    // very effect being measured.
+                    for (a, b, w2) in &inputs {
+                        let r = gpu.rmsnorm_t(a, b, 1, *w2, 1e-5);
+                        let _ = gpu.download(&gpu.rmsnorm_t(&r, b, 1, *w2, 1e-5));
+                    }
+                    if arena { gpu.scratch_end(); }
+                }
+                (gpu_kernels::BG_HITS.load(std::sync::atomic::Ordering::Relaxed) - h0,
+                 gpu_kernels::BG_MISSES.load(std::sync::atomic::Ordering::Relaxed) - m0)
+            };
+            let (h_off, m_off) = run(false);
+            let (h_on, m_on) = run(true);
+            let rate = |h: u64, m: u64| if h + m == 0 { 0.0 } else { h as f64 / (h + m) as f64 };
+            let (r_off, r_on) = (rate(h_off, m_off), rate(h_on, m_on));
+            println!("      bind-group reuse: arena off {:.0}% ({h_off}/{}) → arena on {:.0}% ({h_on}/{})",
+                r_off * 100.0, h_off + m_off, r_on * 100.0, h_on + m_on);
+            // MEASURED NEGATIVE RESULT, kept as an assertion so it cannot quietly become a claim again.
+            // The arena was built on the theory that free-list order made bind groups differ between
+            // tokens. On a fair test — interleaved shapes, inputs pre-uploaded so a fresh input buffer
+            // cannot mask the effect — reuse is IDENTICAL with and without it. The pool is already
+            // deterministic when the alloc/free pattern repeats, which is exactly what decode does.
+            //
+            // So the 18% reuse in the real profile was NOT buffer identity. It was sub-buffer VIEWS
+            // bypassing the cache entirely, which the view-keyed BgKey fixed. The arena addresses a
+            // problem that was not there.
+            //
+            // It stays because it is bit-exact, off-switchable (LOGSCOPE_NO_SCRATCH) and bounds allocation
+            // during decode — but it must not be sold as the cache fix. What this asserts is that it does
+            // not make things WORSE.
+            ck(&format!("the arena does not REGRESS bind-group reuse ({:.0}% vs {:.0}%)",
+                        r_on * 100.0, r_off * 100.0),
+               r_on >= r_off - 0.01);
+        }
+
         println!("gate-scratch: {}", if ok {
             "per-token arena is stable and bit-identical \u{2713}"
         } else { "FAIL \u{2717}" });
