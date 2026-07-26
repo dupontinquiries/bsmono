@@ -578,7 +578,10 @@ fn parse_inline(s: &str) -> Vec<Run> {
 fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     use egui::{FontFamily, FontId};
-    let strong = ui.visuals().strong_text_color();
+    // Bold through the SAME contrast machinery as every other markdown color: egui's
+    // strong_text_color() is a generic guess that was never checked against these panels
+    // (the low-contrast-bold report). md_strong guarantees a heavier floor than body ink.
+    let strong = theme::md_strong();
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
     // inline code/links use the CONTRAST-ENSURED accent: the raw palette cyan is neon on several

@@ -783,6 +783,13 @@ pub fn md_accent() -> Color32 { md_accent_on_panel(CYAN(), 4.5) }
 /// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
 /// body floor on the surface it lands on.
 pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
+/// Markdown BOLD ink, ≥ 7.0:1 on the panel (ceiling-capped). egui's default fonts carry no
+/// bold weight in this pipeline, so COLOR is the entire bold signal — **bold** must land
+/// visibly HEAVIER than body ink (4.5) on every palette and every point of the day/night
+/// curve, or emphasis reads as de-emphasis. That was the reported bug: bold went through
+/// egui's generic `visuals().strong_text_color()`, the one markdown color that never passed
+/// through the contrast machinery, and washed out against several panels.
+pub fn md_strong() -> Color32 { md_on_panel(INK(), 7.0) }
 /// Blockquote bar/wash accent, guaranteed ≥ 3.0:1 (a decorative element needs less).
 pub fn md_quote_accent() -> Color32 { md_accent_on_panel(AMBER(), 3.0) }
 /// A colored inline run (e.g. the workflow-word sequence RECONSTRUCT→MODEL→…) that keeps the violet hue but
@@ -1943,6 +1950,14 @@ mod day_night_tests {
                 demand_accent(q.violet, q.panel, 4.5, "violet on panel (colored run)");
                 demand_accent(q.amber, q.panel, 3.0, "amber on panel (quote accent)");
                 demand(q.ink, q.panel, 4.5, "ink on panel (md body)");
+                // **bold** on the panel: no bold font weight exists in this pipeline, so the
+                // 7.0-vs-4.5 contrast differential IS the emphasis. Two guarantees: the strong
+                // floor holds (ceiling-capped), and bold NEVER lands lighter than body ink.
+                demand(q.ink, q.panel, 7.0, "ink on panel STRONG (md bold)");
+                let body_got = contrast_ratio(ensure_contrast(q.ink, q.panel, 4.5), q.panel);
+                let strong_got = contrast_ratio(ensure_contrast(q.ink, q.panel, 7.0), q.panel);
+                assert!(strong_got >= body_got - 0.05,
+                    "{} bold ({strong_got:.2}) must not be lighter than body ({body_got:.2})", p.name);
                 demand(q.dim, q.bg, 4.5, "dim (md body — raised from 4.0)");
                 demand(q.amber, q.bg, 3.0, "quote accent");
                 demand(q.ink, q.panel2, 4.5, "ink on panel2");
