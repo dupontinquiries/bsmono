@@ -73,6 +73,10 @@ pub struct Defaults {
     pub prefill_work_budget: u64,
     /// Upper bound on the chunk regardless of the budget.
     pub prefill_chunk_max: u32,
+    /// Upper bound for ROUTED MoE models, where the FFN is split across per-expert dispatches so the
+    /// chunk drives dispatch COUNT more than dispatch duration. Higher than the dense cap, but still a
+    /// cap: attention does scale with the chunk, and that is what a GPU watchdog kills.
+    pub prefill_chunk_max_moe: u32,
     /// Compute passes per queue submission.
     pub submit_batch: u32,
     /// Minimum relative margin for an A/B verdict to be cached at all.
@@ -89,6 +93,7 @@ impl Default for Defaults {
             // 3072 x 8192 is the shape the 256-token chunk was originally tuned on.
             prefill_work_budget: 3072 * 8192 * 256,
             prefill_chunk_max: 256,
+            prefill_chunk_max_moe: 1024,
             submit_batch: 16,
             min_verdict_margin: 0.05,
             subgroup_matvec: true,
@@ -118,10 +123,37 @@ impl Defaults {
     /// and the measured prefill went 196s -> 314s when the chunk was lowered. Shrinking it was a
     /// three-fold pessimisation for exactly the models that can least afford one.
     pub fn prefill_chunk_for_model(&self, d: usize, ff: usize, streams_experts: bool) -> u32 {
+        self.prefill_chunk_moe(d, ff, streams_experts, None)
+    }
+
+    /// As above, accounting for MoE: `(n_expert, n_used)` when the model routes.
+    ///
+    /// The work budget models a DENSE FFN, where one dispatch processes the whole chunk. A routed MoE is
+    /// different: the FFN is split into per-expert dispatches, and each sees only
+    /// `chunk x n_used / n_expert` tokens. So the cap that protects against long FFN dispatches does not
+    /// bind, and holding the chunk down instead multiplies the DISPATCH COUNT — which is what actually
+    /// costs.
+    ///
+    /// Measured on Qwen3-Coder-30B (48 layers, 128 experts, 8 used, 1890-token prompt):
+    ///     chunk  256 -> 8 chunks, 16 tokens per expert group, 49152 expert dispatches (~71 s observed)
+    ///     chunk 1024 -> 2 chunks, 64 tokens per expert group, 12288 expert dispatches
+    /// Same arithmetic, a quarter of the dispatches, and each one four times better occupied.
+    ///
+    /// Attention still scales with the chunk, so this is bounded by `prefill_chunk_max_moe` rather than
+    /// left to grow — a long-context attention dispatch is exactly what the watchdog kills.
+    pub fn prefill_chunk_moe(&self, d: usize, ff: usize, streams_experts: bool,
+                             experts: Option<(usize, usize)>) -> u32 {
         if streams_experts { return self.prefill_chunk_max; }
         let work = (d.max(1) as u64).saturating_mul(ff.max(1) as u64);
         let scaled = (self.prefill_work_budget / work.max(1)) as u32;
-        scaled.clamp(16, self.prefill_chunk_max)
+        match experts {
+            // sparsity = how much of the FFN each dispatch actually touches
+            Some((n_expert, n_used)) if n_expert > n_used && n_used > 0 => {
+                let sparsity = (n_expert / n_used.max(1)) as u32;
+                scaled.saturating_mul(sparsity).clamp(16, self.prefill_chunk_max_moe)
+            }
+            _ => scaled.clamp(16, self.prefill_chunk_max),
+        }
     }
 }
 
@@ -292,6 +324,35 @@ mod tests {
         // a small resident model is unaffected either way
         assert_eq!(d.prefill_chunk_for_model(3072, 8192, false), 256);
         assert_eq!(d.prefill_chunk_for_model(3072, 8192, true), 256);
+    }
+
+    #[test]
+    fn a_routed_moe_gets_a_larger_chunk_because_its_ffn_dispatches_are_small() {
+        let d = Defaults::default();
+        // Qwen3-Coder-30B: d=2048, ff=5472, 128 experts, 8 used. The dense rule caps it at 256, which on
+        // a 1890-token prompt is 8 chunks x 48 layers x 128 experts = 49152 expert dispatches — measured
+        // at ~71 s. Each of those dispatches sees 16 tokens, so the cap is limiting nothing except
+        // throughput.
+        let dense = d.prefill_chunk_moe(2048, 5472, false, None);
+        let moe = d.prefill_chunk_moe(2048, 5472, false, Some((128, 8)));
+        assert_eq!(dense, 256);
+        assert!(moe > dense, "a routed MoE should get a bigger chunk: {moe} vs {dense}");
+        assert!(moe <= d.prefill_chunk_max_moe, "still capped — attention DOES scale with the chunk");
+
+        // A model with few experts, or one active per token, gains little and must not be inflated
+        // recklessly: sparsity is the whole justification.
+        let dense_like = d.prefill_chunk_moe(2048, 5472, false, Some((8, 8)));
+        assert_eq!(dense_like, dense, "n_expert == n_used is not sparse; treat it as dense");
+
+        // Streaming still overrides everything: refill traffic dominates there, not dispatch count.
+        assert_eq!(d.prefill_chunk_moe(5120, 16384, true, Some((16, 1))), d.prefill_chunk_max);
+    }
+
+    #[test]
+    fn a_big_dense_model_is_still_shrunk() {
+        // The MoE rule must not leak into the dense path and undo the watchdog fix.
+        let d = Defaults::default();
+        assert_eq!(d.prefill_chunk_moe(5120, 16384, false, None), 76);
     }
 
     #[test]
