@@ -650,6 +650,16 @@ would mislead every later load",
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
             let mut prompt_ids = if toks.is_empty() { vec![0] } else { toks };
+            // BOS: llama.cpp prepends it whenever the GGUF says add_bos_token, and DeepSeek-
+            // LLM/Coder DEPEND on it — their chat template has no in-body special tokens, so
+            // without this the model never sees its start token (one visible symptom of the
+            // gibberish bug, alongside the unscaled linear rope). Guarded: a template that
+            // already begins with BOS (encoded via the specials scan) is left alone.
+            if self.tok.add_bos {
+                if let Some(b) = self.tok.bos_id {
+                    if prompt_ids.first() != Some(&b) { prompt_ids.insert(0, b); }
+                }
+            }
             // Diagnostic: scan the ENCODED prompt for special tokens + show its tail. A correct ChatML
             // prompt has exactly 2 specials per turn + 1 (the trailing <|im_start|>), and the tail must
             // end on the assistant primer. EXTRA specials = stray markers from injected content (a log
@@ -659,8 +669,8 @@ would mislead every later load",
                 let sp: Vec<(usize, u32)> = prompt_ids.iter().enumerate()
                     .filter(|(_, &t)| self.tok.is_special(t)).map(|(i, &t)| (i, t)).collect();
                 let tail: Vec<u32> = prompt_ids.iter().rev().take(12).rev().copied().collect();
-                eprintln!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}",
-                    self.name, sp.len(), &sp[..sp.len().min(12)], tail);
+                eprintln!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}; bos={:?} add_bos={}",
+                    self.name, sp.len(), &sp[..sp.len().min(12)], tail, self.tok.bos_id, self.tok.add_bos);
             }
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             // Decode budget for this reply. With auto-continue on, `reply_ceiling` is the per-reply

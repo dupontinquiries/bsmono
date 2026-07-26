@@ -461,6 +461,62 @@ fn write_gguf_phi3(m: &HostModel, rot: usize) -> Vec<u8> {
     b
 }
 
+/// `write_gguf_q8_0` plus llama linear rope-scaling metadata — the DeepSeek-Coder-16k /
+/// Llama-2-16k shape (`rope.scaling.type = "linear"`, `rope.scaling.factor`).
+fn write_gguf_llama_linear(m: &HostModel, factor: f32) -> Vec<u8> {
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let q8t = |w: &[f32]| (8u32, enc_q8_0(w));
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let (et, eb) = f32t(&m.embed); ts.push(("token_embd.weight".into(), mat(m.vocab, m.d), et, eb));
+    for (i, b) in m.layers.iter().enumerate() {
+        let (t, by) = f32t(&b.g1); ts.push((format!("blk.{i}.attn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wq); ts.push((format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wk); ts.push((format!("blk.{i}.attn_k.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wv); ts.push((format!("blk.{i}.attn_v.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = q8t(&b.wo); ts.push((format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), t, by));
+        let (t, by) = f32t(&b.g2); ts.push((format!("blk.{i}.ffn_norm.weight"), v1(m.d), t, by));
+        let (t, by) = q8t(&b.wgate); ts.push((format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wup); ts.push((format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), t, by));
+        let (t, by) = q8t(&b.wdown); ts.push((format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), t, by));
+    }
+    let (t, by) = f32t(&m.out_norm); ts.push(("output_norm.weight".into(), v1(m.d), t, by));
+    let (t, by) = q8t(&m.output); ts.push(("output.weight".into(), mat(m.vocab, m.d), t, by));
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 11);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "llama");
+    s(&mut b, "llama.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    s(&mut b, "llama.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    s(&mut b, "llama.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    s(&mut b, "llama.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    s(&mut b, "llama.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    s(&mut b, "llama.vocab_size"); u32b(&mut b, 4); u32b(&mut b, m.vocab as u32);
+    s(&mut b, "llama.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, m.base);
+    s(&mut b, "llama.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    s(&mut b, "llama.rope.scaling.type"); u32b(&mut b, 8); s(&mut b, "linear");
+    s(&mut b, "llama.rope.scaling.factor"); u32b(&mut b, 6); f32b(&mut b, factor);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -3859,6 +3915,47 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         println!("gate-gemma: {}", if ok {
             "Gemma norm and activation are correct \u{2713}"
         } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-rope-linear") {
+        // LINEAR rope scaling (position interpolation). Two layers of proof:
+        // 1) KERNEL ALGEBRA, exact: rope with ff = factor at position p must equal rope
+        //    with ff = 1 at position p/factor — that IS what interpolation means. Checked
+        //    directly through the public rope_mh_t wrapper.
+        // 2) MODEL WIRING: the metadata key must reach the ff buffer. Same weights loaded
+        //    with and without the key decode IDENTICALLY at position 0 (theta(0)=0 — the
+        //    factor cannot matter there, so anything else differing would be a load bug)
+        //    and MUST diverge at later positions.
+        let gpu = Gpu::new();
+        eprintln!("gate-rope-linear: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        // (1) kernel algebra
+        let (heads, hd) = (2usize, 16usize);
+        let dm = heads * hd;
+        let xv: Vec<f32> = (0..dm).map(|i| ((i * 37 + 11) % 97) as f32 * 0.01 - 0.4).collect();
+        let x = gpu.upload(&xv, 1, dm);
+        let f1 = gpu.upload(&vec![1.0f32; hd / 2], 1, hd / 2);
+        let f4 = gpu.upload(&vec![4.0f32; hd / 2], 1, hd / 2);
+        let ya = gpu.download(&gpu.rope_mh_t(&x, &f4, 1, dm, 10000.0, 8, hd));
+        let yb = gpu.download(&gpu.rope_mh_t(&x, &f1, 1, dm, 10000.0, 2, hd));
+        let dk = ya.iter().zip(&yb).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("kernel: ff=4 @ pos 8 == ff=1 @ pos 2 (max|\u{394}|={dk:.2e})"), dk < 1e-5);
+        // (2) model wiring
+        let hm = gen_model(64, 128, 2, 48, 4, 4);
+        let m1 = gpu.load_gguf_quantized(&write_gguf_q8_0(&hm)).unwrap();
+        let m4 = gpu.load_gguf_quantized(&write_gguf_llama_linear(&hm, 4.0)).unwrap();
+        let run = |m: &gpu_kernels::Model| -> Vec<Vec<f32>> {
+            let c = gpu.new_cache_for(m, 8);
+            [(7u32, 0usize), (19, 1), (31, 2), (11, 3)].iter()
+                .map(|&(t, p)| gpu.decode_step(m, &c, t, p)).collect()
+        };
+        let (l1, l4) = (run(&m1), run(&m4));
+        let d0 = l1[0].iter().zip(&l4[0]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("pos 0 identical with and without the factor (max|\u{394}|={d0:.2e})"), d0 < 1e-5);
+        let dl = l1[3].iter().zip(&l4[3]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let fin = l4.iter().flatten().all(|x| x.is_finite());
+        ck(&format!("pos 3 diverges under the factor and stays finite (max|\u{394}|={dl:.2e})"), fin && dl > 1e-3);
+        println!("gate-rope-linear: {}", if ok { "linear rope scaling correct \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-phi3") {

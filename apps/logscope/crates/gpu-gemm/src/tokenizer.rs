@@ -14,6 +14,12 @@ use crate::gguf::{Gguf, Value};
 use std::collections::HashMap;
 
 pub struct Tokenizer {
+    /// `tokenizer.ggml.bos_token_id` — the sequence-start token, when the vocab declares one.
+    pub bos_id: Option<u32>,
+    /// `tokenizer.ggml.add_bos_token` — llama.cpp prepends BOS to every prompt when true.
+    /// DeepSeek-LLM/Coder depend on it: their chat template has NO in-body special tokens,
+    /// so without this the model never sees its start token at all.
+    pub add_bos: bool,
     tokens: Vec<Vec<u8>>,
     vocab: HashMap<Vec<u8>, u32>,
     /// (left_id, right_id) -> (rank, merged_id)
@@ -92,7 +98,7 @@ impl Tokenizer {
         }
         let byte_encoder = byte_to_unicode();
         let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
-        Self { tokens, vocab, merges, byte_level, byte_encoder, byte_decoder,
+        Self { bos_id: None, add_bos: false, tokens, vocab, merges, byte_level, byte_encoder, byte_decoder,
             specials: Vec::new(), special_ids: std::collections::HashSet::new() }
     }
 
@@ -231,6 +237,8 @@ impl Tokenizer {
         };
         let byte_level = matches!(g.get_str("tokenizer.ggml.model"), Some("gpt2") | Some("llama") | Some("bpe"));
         let mut tk = Self::build(tokens, merges, byte_level);
+        tk.bos_id = g.get_u32("tokenizer.ggml.bos_token_id");
+        tk.add_bos = g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false);
         // Register control (3) / user-defined (4) tokens as verbatim specials so
         // chat markers like "<|eot_id|>" tokenize to a single id and decode literally.
         let mut specials = Vec::new();

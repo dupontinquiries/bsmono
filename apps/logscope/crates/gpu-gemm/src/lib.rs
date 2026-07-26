@@ -5576,6 +5576,19 @@ host-copy path (dequantize + requantize every expert into RAM)");
         // formulation, so scores scale by mscale²). Stored per load like `rope_neox`.
         let mut rope_vals = rope_vals;
         let mut mscale = 1.0f32;
+        // LINEAR rope scaling (position interpolation): DeepSeek-LLM/Coder 16k, Llama-2
+        // long-context finetunes. Every frequency divides by `factor` — which is literally
+        // ff[i] *= factor, since every rope kernel divides by ff. No mscale. Composes with
+        // llama3-style per-dim rope_freqs above (uniform factor × per-dim factors). Ignoring
+        // this key put positions 4x out of the trained range on DeepSeek-Coder-16k: prompts
+        // past ~orig/factor tokens decoded as degenerate frequent-token soup.
+        if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("linear") {
+            let f = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
+            if f > 1.0 {
+                for v in rope_vals.iter_mut() { *v *= f; }
+                eprintln!("wgpu-engine: LINEAR rope scaling ON — positions interpolated \u{d7}{f}");
+            }
+        }
         if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("yarn") {
             let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
             let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(0);
