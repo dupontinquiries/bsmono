@@ -136,6 +136,28 @@ impl LayerSlots {
         Some((cold, hot))
     }
 
+    /// As [`pick_repin`], but a set of PREDICTED-hot experts gets a score bonus.
+    ///
+    /// The coupling predictor (72% accurate) cannot be used to speculate into ring slots on a
+    /// capacity-bound model — measured: with ring == working set there is no spare slot, and displacing to
+    /// make one costs more fills than it saves. But it can steer WHICH experts are pinned, which is free:
+    /// the pin set has to hold something, and pinning what is about to be hot beats pinning what was hot.
+    ///
+    /// The bonus is deliberately modest — one notch of heat — so a confident observation still outranks a
+    /// prediction. A predictor that could evict a genuinely hot expert on a wrong guess would be worse
+    /// than not using it.
+    pub fn pick_repin_hinted(&self, n_expert: u32, predicted: &[u32]) -> Option<(u32, u32)> {
+        if self.pinned.is_empty() { return None; }
+        let clk = self.clock as u32;
+        let base = |e: u32| lfru_score(*self.heat.get(&e).unwrap_or(&0), *self.last_access.get(&e).unwrap_or(&0), clk);
+        let score = |e: u32| base(e) + if predicted.contains(&e) { 1u64 << 8 } else { 0 };
+        let cold = *self.pinned.iter().min_by_key(|&&e| score(e))?;
+        let hot = (0..n_expert).filter(|e| !self.is_pinned(*e)).max_by_key(|&e| score(e))?;
+        let (cs, hs) = (score(cold), score(hot));
+        if hs <= cs + (cs >> 2) + (4u64 << 8) { return None; }
+        Some((cold, hot))
+    }
+
     /// Apply a repin decided by [`pick_repin`]: `evict` leaves the pin store, `admit` joins it. If `admit`
     /// was occupying an LRU slot it is released (it is resident by pin now), which hands a slot back to the
     /// streaming ring.
@@ -279,6 +301,23 @@ mod tests {
         if let Some((e2, a2)) = before {
             assert_ne!((e2, a2), (admit, evict), "must not immediately swap back");
         }
+    }
+
+    #[test]
+    fn a_prediction_can_break_a_tie_but_not_outrank_real_heat() {
+        // Two unpinned candidates, 6 and 7, equally warm. The predictor favours 7 → 7 should be admitted.
+        let mut s = LayerSlots::new(&[0, 1], 3);
+        for _ in 0..10 { s.access(6); s.access(7); }
+        let (_, admit) = s.pick_repin_hinted(8, &[7]).expect("a repin is warranted");
+        assert_eq!(admit, 7, "the predicted expert wins between equals");
+
+        // But a prediction must NOT displace a genuinely hotter expert: 6 is far hotter, 5 is merely
+        // predicted, so 6 still wins.
+        let mut s2 = LayerSlots::new(&[0, 1], 3);
+        for _ in 0..30 { s2.access(6); }
+        s2.access(5);
+        let (_, admit2) = s2.pick_repin_hinted(8, &[5]).expect("a repin is warranted");
+        assert_eq!(admit2, 6, "observed heat outranks a guess");
     }
 
     #[test]
