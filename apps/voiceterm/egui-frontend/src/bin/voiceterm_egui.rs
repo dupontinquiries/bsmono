@@ -302,6 +302,51 @@ impl eframe::App for VoicetermApp {
                 self.workspace.focus_pane(id);
             }
 
+            // DIVIDER DRAG. Registered after the pane rects so a grab near a shared edge wins
+            // the hover. The maths lives in the model (Workspace::drag_seam -> TermWorkspace::
+            // resize); this only turns a pointer drag into a seam grab and paints the handle.
+            const SEAM_GRAB: f32 = 5.0;
+            let mut dragged: Option<(voiceterm_egui::shell::PaneSeam, f32)> = None;
+            for (i, s) in self.workspace.pane_seams(area.width(), area.height()).iter().enumerate() {
+                let band = if s.vertical {
+                    egui::Rect::from_min_max(
+                        egui::pos2(area.min.x + s.pos - SEAM_GRAB, area.min.y + s.from),
+                        egui::pos2(area.min.x + s.pos + SEAM_GRAB, area.min.y + s.to),
+                    )
+                } else {
+                    egui::Rect::from_min_max(
+                        egui::pos2(area.min.x + s.from, area.min.y + s.pos - SEAM_GRAB),
+                        egui::pos2(area.min.x + s.to, area.min.y + s.pos + SEAM_GRAB),
+                    )
+                };
+                let resp = ui.interact(band, ui.id().with(("seam", i)), egui::Sense::drag());
+                if resp.hovered() || resp.dragged() {
+                    ui.ctx().set_cursor_icon(if s.vertical {
+                        egui::CursorIcon::ResizeHorizontal
+                    } else {
+                        egui::CursorIcon::ResizeVertical
+                    });
+                    // the shared divider look — uikit-egui exports this precisely for callers
+                    // that own their drag handling (SplitPane itself keeps a `fraction`, which
+                    // would fight TermWorkspace's ratios, so only the visual is reused).
+                    let hair = if s.vertical {
+                        egui::vec2(SEAM_GRAB - 1.0, 0.0)
+                    } else {
+                        egui::vec2(0.0, SEAM_GRAB - 1.0)
+                    };
+                    uikit_egui::split_pane::paint_divider(ui, band.shrink2(hair), self.colors.accent);
+                }
+                if resp.dragged() {
+                    let d = if s.vertical { resp.drag_delta().x } else { resp.drag_delta().y };
+                    if d != 0.0 {
+                        dragged = Some((*s, d));
+                    }
+                }
+            }
+            if let Some((s, d)) = dragged {
+                self.workspace.drag_seam(&s, d);
+            }
+
             self.app.fit_to(term_rect.size()); // the grid matches the FOCUSED pane, not the region
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
