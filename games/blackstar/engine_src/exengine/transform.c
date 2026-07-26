@@ -20,6 +20,7 @@ ex_xform_t* ex_xform_new(ex_model_t *robot_model, ex_model_t *vehicle_model,
   if (size_class < 0) size_class = 0;
   if (size_class > 3) size_class = 3;
   x->size_class = size_class;
+  x->dur_mul = 1.0f;   // chassis may override at deploy
 
   float scale = ex_size_scale[size_class];
   float speed_mod = ex_size_speed_mod[size_class];
@@ -60,7 +61,7 @@ int ex_xform_request(ex_xform_t *x)
     return 0;
 
   x->state = EX_XFORM_STATE_TRANSFORMING;
-  x->blend_timer = EX_XFORM_BLEND_SEC;
+  x->blend_timer = EX_XFORM_BLEND_SEC * (x->dur_mul > 0.0f ? x->dur_mul : 1.0f);
   x->since_last_xform = 0.0f;
 
   // NOTE: actual mode flip + collider swap happens at the end of the

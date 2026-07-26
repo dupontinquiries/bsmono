@@ -1,0 +1,15 @@
+{
+  "_doc": "Signature identities. 'backpiece' indexes the part_groups.backpiece mesh list; combat/stats are the per-signature modifiers applied on top of the weapon. One signature maps 1:1 to a player class (enforced in C by test_signature).",
+  "signatures": {
+    "wing_cannon": { "enum": "EX_SIG_WING_CANNON",    "backpiece": 0, "dmg_mul": 0.95, "fire_mul": 0.95, "taken_mul": 1.15, "speed_mul": 1.10, "extra_pellets": 1, "knockback": 0,  "slow": 0.0, "splash": 0 },
+    "heavy_cannon":{ "enum": "EX_SIG_HEAVY_CANNON",   "backpiece": 1, "dmg_mul": 1.35, "fire_mul": 1.35, "taken_mul": 0.90, "speed_mul": 0.90, "extra_pellets": 0, "knockback": 6,  "slow": 0.0, "splash": 3 },
+    "crest":       { "enum": "EX_SIG_CREST",   "backpiece": 2, "dmg_mul": 1.05, "fire_mul": 1.05, "taken_mul": 0.80, "speed_mul": 0.95, "extra_pellets": 0, "knockback": 4,  "slow": 0.0, "splash": 0 },
+    "cable":       { "enum": "EX_SIG_CABLE",   "backpiece": 3, "dmg_mul": 0.85, "fire_mul": 0.70, "taken_mul": 1.05, "speed_mul": 1.15, "extra_pellets": 0, "knockback": 0,  "slow": 0.3, "splash": 0 },
+    "harpoon":     { "enum": "EX_SIG_HARPOON", "backpiece": 4, "dmg_mul": 1.10, "fire_mul": 1.10, "taken_mul": 1.00, "speed_mul": 1.00, "extra_pellets": 0, "knockback": 10, "slow": 0.4, "splash": 0 },
+    "halo":        { "enum": "EX_SIG_HALO",    "backpiece": 5, "dmg_mul": 1.00, "fire_mul": 1.00, "taken_mul": 1.00, "speed_mul": 1.05, "extra_pellets": 0, "knockback": 0,  "slow": 0.0, "splash": 6 },
+    "solar":       { "enum": "EX_SIG_SOLAR",   "backpiece": 6, "dmg_mul": 1.20, "fire_mul": 1.10, "taken_mul": 1.00, "speed_mul": 1.00, "extra_pellets": 0, "knockback": 0,  "slow": 0.0, "splash": 4 },
+    "aegis":       { "enum": "EX_SIG_AEGIS",   "backpiece": 7, "dmg_mul": 1.00, "fire_mul": 1.00, "taken_mul": 0.70, "speed_mul": 0.95, "extra_pellets": 0, "knockback": 4,  "slow": 0.0, "splash": 0 },
+    "recon":       { "enum": "EX_SIG_RECON",   "backpiece": 8, "dmg_mul": 0.95, "fire_mul": 1.05, "taken_mul": 1.05, "speed_mul": 1.20, "extra_pellets": 0, "knockback": 0,  "slow": 0.0, "splash": 0 },
+    "mortar":      { "enum": "EX_SIG_MORTAR",  "backpiece": 9, "dmg_mul": 1.45, "fire_mul": 1.35, "taken_mul": 0.85, "speed_mul": 0.75, "extra_pellets": 0, "knockback": 14, "slow": 0.0, "splash": 11 }
+  }
+}

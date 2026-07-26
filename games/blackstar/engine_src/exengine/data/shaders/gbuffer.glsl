@@ -43,8 +43,9 @@ void main()
 
   // calculate tbn matrix for normal mapping
   vec3 T = normalize(vec3(u_view * transform * vec4(in_tangents.xyz, 0.0)));
-  vec3 B = normalize(vec3(u_view * transform * in_tangents));
   vec3 N = normalize(vec3(u_view * transform * vec4(in_normals, 0.0)));
+  T = normalize(T - N * dot(N, T));               // re-orthogonalize against N
+  vec3 B = cross(N, T) * in_tangents.w;           // proper bitangent with handedness
   TBN    = mat3(T, B, N);
 }
 #END VS

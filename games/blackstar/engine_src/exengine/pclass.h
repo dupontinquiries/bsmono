@@ -13,6 +13,7 @@ typedef enum {
   EX_CLASS_PYRE,           // fire clone (Billy): a held star -- devastating but fragile
   EX_CLASS_PRIME,          // the steward (Optimus): durable all-rounder, holds the line
   EX_CLASS_SCOUT,          // recon (Bumblebee): fast, light, fragile
+  EX_CLASS_SIEGE,          // artillery bombard: long-range shells, slow, sturdy
   EX_CLASS_COUNT
 } ex_class_t;
 

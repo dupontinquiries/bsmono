@@ -48,6 +48,14 @@ static void element_tint(int el, uint8_t c[3]){
 static void P(ex_part_pose_t *p,float x,float y,float z,float sx,float sy,float sz){
   p->offset[0]=x;p->offset[1]=y;p->offset[2]=z; p->sx=sx;p->sy=sy;p->sz=sz; p->scale=(sx+sy+sz)/3.0f;
 }
+// W: a WHEEL pose. width is the tire thickness along the axle (x); radius is the
+// disc radius, forced EQUAL on y and z so the wheel is always a true round disc
+// (never an asymmetric ellipse), using the dedicated wheel mesh.
+static void W(ex_part_pose_t *p,float x,float y,float z,float width,float radius){
+  p->offset[0]=x;p->offset[1]=y;p->offset[2]=z;
+  p->sx=width; p->sy=radius; p->sz=radius;     // y==z: a symmetric disc
+  p->scale=(width+radius+radius)/3.0f; p->shape=EX_PSHAPE_WHEEL;
+}
 static void tint(ex_part_pose_t *p, const uint8_t c[3]){ p->color[0]=c[0];p->color[1]=c[1];p->color[2]=c[2]; }
 
 void ex_vehicle_layout(ex_part_pose_t *poses, int cap, int *n_out,
@@ -93,10 +101,10 @@ void ex_vehicle_layout(ex_part_pose_t *poses, int cap, int *n_out,
 
   switch (type) {
     case EX_VEH_CAR:
-      P(&poses[n++], -0.66f,0.26f, 0.6f, 0.22f,0.22f,0.22f);
-      P(&poses[n++],  0.66f,0.26f, 0.6f, 0.22f,0.22f,0.22f);
-      P(&poses[n++], -0.66f,0.26f,-0.6f, 0.22f,0.22f,0.22f);
-      P(&poses[n++],  0.66f,0.26f,-0.6f, 0.22f,0.22f,0.22f);
+      W(&poses[n++], -0.66f,0.26f, 0.6f, 0.16f, 0.28f);
+      W(&poses[n++],  0.66f,0.26f, 0.6f, 0.16f, 0.28f);
+      W(&poses[n++], -0.66f,0.26f,-0.6f, 0.16f, 0.28f);
+      W(&poses[n++],  0.66f,0.26f,-0.6f, 0.16f, 0.28f);
       break;
     case EX_VEH_TANK:
       P(&poses[n++], -0.7f,0.35f,0, 0.22f,0.35f,1.1f);   // left tread
@@ -150,8 +158,8 @@ void ex_vehicle_layout(ex_part_pose_t *poses, int cap, int *n_out,
       P(&poses[n++],  0.7f,1.1f,0.3f, 0.14f,0.14f,0.5f);
       break;
     case EX_VEH_CYCLE:
-      P(&poses[n++], 0,0.3f,0.9f, 0.16f,0.3f,0.16f);              // front wheel
-      P(&poses[n++], 0,0.3f,-0.9f, 0.16f,0.3f,0.16f);             // rear wheel
+      W(&poses[n++], 0,0.34f,0.9f, 0.12f, 0.34f);                 // front wheel (disc)
+      W(&poses[n++], 0,0.34f,-0.9f, 0.12f, 0.34f);                // rear wheel (disc)
       P(&poses[n++], 0,0.7f,0.4f, 0.3f,0.06f,0.5f);               // fairing
       break;
     case EX_VEH_GUNSHIP:
@@ -188,6 +196,12 @@ void ex_vehicle_layout(ex_part_pose_t *poses, int cap, int *n_out,
         P(&poses[n++], sd*0.9f, 0.3f+sw, fz, 0.06f,0.3f,0.06f); }
       P(&poses[n++], -0.7f,0.5f,0.8f, 0.2f,0.15f,0.25f);        // claws
       P(&poses[n++],  0.7f,0.5f,0.8f, 0.2f,0.15f,0.25f);
+      break;
+    case EX_VEH_WHEEL:
+      // a giant rolling-wheel juggernaut: two massive outer discs + a hub axle
+      W(&poses[n++], -0.55f, 0.9f, 0.0f, 0.22f, 0.95f);           // left mega-wheel
+      W(&poses[n++],  0.55f, 0.9f, 0.0f, 0.22f, 0.95f);           // right mega-wheel
+      P(&poses[n++], 0, 0.9f, 0.0f, 0.5f, 0.18f, 0.18f);          // hub axle
       break;
     default: break;
   }

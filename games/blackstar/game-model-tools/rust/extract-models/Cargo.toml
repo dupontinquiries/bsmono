@@ -1,0 +1,12 @@
+[package]
+name = "extract-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "extract-models"
+path = "src/main.rs"
+
+[dependencies]
+zip = { version = "0.6", default-features = false, features = ["deflate"] }

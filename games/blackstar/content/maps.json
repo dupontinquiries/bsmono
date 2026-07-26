@@ -1,0 +1,151 @@
+{
+ "_doc": "Map recipes. 'structures' lists the gen_world primitives a theme leans on (for the builder to riff on); 'energon' flags maps that sit on an energon cache (drives the surge mechanic); 'atmo' is the mood tag. id matches the theme id baked into <id>.iqm / <id>.col.",
+ "maps": {
+  "wastes": {
+   "atmo": "rust_daylight",
+   "energon": false,
+   "structures": [
+    "box",
+    "ring"
+   ],
+   "landmark": "dead relay + henge"
+  },
+  "frostline": {
+   "atmo": "cold_blue",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "ice shelves"
+  },
+  "emberpit": {
+   "atmo": "lava_glow",
+   "energon": true,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "lava pools"
+  },
+  "vault": {
+   "atmo": "crystal_violet",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "crystal columns"
+  },
+  "foundry": {
+   "atmo": "furnace_orange",
+   "energon": true,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "smelt channels"
+  },
+  "shield_edge": {
+   "atmo": "gold_boundary",
+   "energon": false,
+   "structures": [
+    "box",
+    "arch"
+   ],
+   "landmark": "failing boundary"
+  },
+  "mining": {
+   "atmo": "dim_industrial",
+   "energon": false,
+   "structures": [
+    "box",
+    "tower"
+   ],
+   "landmark": "ore rigs"
+  },
+  "outer_rim": {
+   "atmo": "void_edge",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "scavenger hulks"
+  },
+  "cybertron": {
+   "atmo": "gold_metal",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire",
+    "arch"
+   ],
+   "landmark": "the reveal + gateways"
+  },
+  "reclaim": {
+   "atmo": "organic_jungle",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "metal jungle"
+  },
+  "trench": {
+   "atmo": "abyssal_cyan",
+   "energon": false,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "rift dais + monoliths"
+  },
+  "pluto": {
+   "atmo": "far_sun_dark",
+   "energon": true,
+   "structures": [
+    "ring",
+    "arch",
+    "spire"
+   ],
+   "landmark": "containment core"
+  },
+  "beach": {
+   "atmo": "dusk_ash",
+   "energon": true,
+   "structures": [
+    "box"
+   ],
+   "landmark": "the energon tear + pier"
+  },
+  "mars": {
+   "atmo": "red_dust",
+   "energon": true,
+   "structures": [
+    "box",
+    "spire"
+   ],
+   "landmark": "cybertron fragment + derricks"
+  },
+  "kuiper": {
+   "atmo": "void_edge",
+   "energon": false,
+   "structures": [
+    "ring",
+    "spire"
+   ],
+   "landmark": "shepherd moons + a frozen debris braid"
+  },
+  "unicron": {
+   "atmo": "devourer_red",
+   "energon": true,
+   "structures": [
+    "arch",
+    "spire",
+    "tower"
+   ],
+   "landmark": "the maw; horizon curves the wrong way"
+  }
+ }
+}

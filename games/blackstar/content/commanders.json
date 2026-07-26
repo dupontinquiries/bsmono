@@ -1,0 +1,101 @@
+{
+  "_doc": "Commander DOCTRINE corpus. Each archetype distills a classical military principle into game BEHAVIOR: tuning params + tactical triggers that emit combat_json commands (flock_to/flock_spread/hold/focus/retreat/ally_follow). This is deliberately NOT a quote dump -- raw passages make flavor, not behavior. Source doctrine is drawn primarily from Sun Tzu's Art of War in the public-domain 1910 Lionel Giles translation; the optional 'flavor' field carries at most a short attributed fragment as an in-game callout. The FSMs (commander_ai.c) consume the params; the eventual Blackstar/Prime LLMs consume the same archetype vocabulary so deterministic + LLM commanders speak one command language.",
+
+  "_principles": [
+    {
+      "id": "concentration",
+      "doctrine": "concentrate force where the enemy is weak; avoid strength",
+      "behavior": "focus fire the player's exposed flank; commit the squad to one collapsing line rather than spreading thin",
+      "source": "Sun Tzu (Giles 1910), Weak Points and Strong",
+      "flavor": "Attack where he is unprepared."
+    },
+    {
+      "id": "envelopment",
+      "doctrine": "when you outnumber the foe, surround him",
+      "behavior": "spread the squad around the player to encircle when the squad is larger",
+      "source": "Sun Tzu (Giles 1910), Attack by Stratagem",
+      "flavor": "If ten to the enemy's one, surround him."
+    },
+    {
+      "id": "evasion",
+      "doctrine": "if weaker, be capable of withdrawing; avoid a losing fight",
+      "behavior": "retreat and harass when outnumbered or the squad is hurt; refuse the direct engagement",
+      "source": "Sun Tzu (Giles 1910), Attack by Stratagem",
+      "flavor": "If unequal in every way, we can flee from him."
+    },
+    {
+      "id": "tempo",
+      "doctrine": "let your rapidity be that of the wind; strike then recede",
+      "behavior": "alternate aggressive focus pushes with pull-backs to keep the player off balance",
+      "source": "Sun Tzu (Giles 1910), Maneuvering",
+      "flavor": "Rapidity is the essence of war."
+    },
+    {
+      "id": "baiting",
+      "doctrine": "hold out baits to entice; feign disorder then crush",
+      "behavior": "hold a tempting exposed line, then focus-collapse on the player when they over-commit to it",
+      "source": "Sun Tzu (Giles 1910), Laying Plans",
+      "flavor": "Hold out baits to entice the enemy."
+    },
+    {
+      "id": "cohesion",
+      "doctrine": "he wins whose ranks are united in purpose; hold the line",
+      "behavior": "keep the squad disciplined at their zones, resist scattering, hold standoff",
+      "source": "Sun Tzu (Giles 1910), Attack by Stratagem",
+      "flavor": "He will win whose army is animated by the same spirit."
+    }
+  ],
+
+  "archetypes": {
+    "aggressor": {
+      "_from": ["concentration", "tempo"],
+      "desc": "Presses relentlessly: concentrates the squad on the player, pushes the line forward, rarely yields ground.",
+      "aggression": 0.85,
+      "caution": 0.15,
+      "encircle_bias": 0.3,
+      "regroup_bias": 0.2,
+      "flavor": "Attack where he is unprepared.",
+      "flavor_src": "Sun Tzu (Giles 1910)"
+    },
+    "surrounder": {
+      "_from": ["envelopment", "concentration"],
+      "desc": "Uses numbers to encircle: spreads the squad around the player, then closes the ring.",
+      "aggression": 0.6,
+      "caution": 0.3,
+      "encircle_bias": 0.9,
+      "regroup_bias": 0.4,
+      "flavor": "If ten to the enemy's one, surround him.",
+      "flavor_src": "Sun Tzu (Giles 1910)"
+    },
+    "skirmisher": {
+      "_from": ["evasion", "tempo"],
+      "desc": "Hit and run: harasses from range, retreats when pressed, never commits to a losing exchange.",
+      "aggression": 0.45,
+      "caution": 0.75,
+      "encircle_bias": 0.5,
+      "regroup_bias": 0.6,
+      "flavor": "Rapidity is the essence of war.",
+      "flavor_src": "Sun Tzu (Giles 1910)"
+    },
+    "baiter": {
+      "_from": ["baiting", "concentration"],
+      "desc": "Feigns weakness: dangles an exposed line, then collapses on the player who takes the bait.",
+      "aggression": 0.55,
+      "caution": 0.5,
+      "encircle_bias": 0.6,
+      "regroup_bias": 0.5,
+      "flavor": "Hold out baits to entice the enemy.",
+      "flavor_src": "Sun Tzu (Giles 1910)"
+    },
+    "warden": {
+      "_from": ["cohesion", "evasion"],
+      "desc": "Holds ground with discipline: keeps the squad in formation at standoff, yields only when badly hurt.",
+      "aggression": 0.3,
+      "caution": 0.8,
+      "encircle_bias": 0.2,
+      "regroup_bias": 0.85,
+      "flavor": "He will win whose army is animated by the same spirit.",
+      "flavor_src": "Sun Tzu (Giles 1910)"
+    }
+  }
+}

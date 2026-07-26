@@ -56,8 +56,23 @@ def sec_star(seg):
         a=i/10*2*math.pi; r=0.5 if i%2 else 1.1
         p.append((math.cos(a)*r, math.sin(a)*r))
     return p
-SECTIONS = {"circle":sec_circle,"square":sec_square,"tri":sec_tri,"star":sec_star,"hex":sec_hex}
-SEC_BY_NUM = {"1":"circle","2":"square","3":"tri","4":"star","5":"hex"}
+def sec_oct(seg):    return [(math.cos(i/8*2*math.pi), math.sin(i/8*2*math.pi)) for i in range(8)]
+def sec_diamond(seg):return [(0,1.25),(1.0,0),(0,-1.25),(-1.0,0)]
+def sec_blade(seg):  return [(1.4,0.0),(0.45,0.16),(-0.45,0.16),(-1.4,0.0),(-0.45,-0.16),(0.45,-0.16)]
+def sec_plus(seg):
+    return [(0.35,1),(-0.35,1),(-0.35,0.35),(-1,0.35),(-1,-0.35),(-0.35,-0.35),
+            (-0.35,-1),(0.35,-1),(0.35,-0.35),(1,-0.35),(1,0.35),(0.35,0.35)]
+def sec_arrow(seg):
+    return [(1.4,0.0),(0.2,0.5),(0.2,0.2),(-1.0,0.2),(-1.0,-0.2),(0.2,-0.2),(0.2,-0.5)]
+def sec_gear(seg):
+    teeth=10; p=[]
+    for i in range(teeth*2):
+        a=i/(teeth*2)*2*math.pi; r=1.0 if i%2==0 else 0.74
+        p.append((math.cos(a)*r, math.sin(a)*r))
+    return p
+SECTIONS = {"circle":sec_circle,"square":sec_square,"tri":sec_tri,"star":sec_star,"hex":sec_hex,
+            "oct":sec_oct,"diamond":sec_diamond,"blade":sec_blade,"plus":sec_plus,"gear":sec_gear,"arrow":sec_arrow}
+SEC_BY_NUM = {"1":"circle","2":"square","3":"tri","4":"star","5":"hex","6":"oct","7":"diamond","8":"blade","9":"plus","0":"gear"}
 
 # growth constants (tuned so a CLI "grow N" reads like the interactive feel)
 SEGLEN     = 0.16   # advance per grow-step
@@ -74,10 +89,12 @@ class Spine:
             self.wobble=parent.wobble; self.section=parent.section
             self.taper=parent.taper; self.ridge=parent.ridge; self.seg=parent.seg
             self.twistAccum=parent.twistAccum
+            self.scale_x=parent.scale_x; self.scale_y=parent.scale_y; self.bend=parent.bend
         else:
             self.pos=(0.0,0.6,0.0); self.dir=(0.0,0.0,1.0); self.up=(0.0,1.0,0.0)
             self.radius=0.35; self.twist=0.0; self.wobble=False; self.section="circle"
             self.taper=1.0; self.ridge=0.0; self.seg=8; self.twistAccum=0.0
+            self.scale_x=1.0; self.scale_y=1.0; self.bend=0.0
         self.wob=0.0
         self.rings=[]
 
@@ -90,6 +107,7 @@ class Spine:
         pts=[]
         for (x,y) in sec:
             rx=x*ca-y*sa; ry=x*sa+y*ca
+            rx*=self.scale_x; ry*=self.scale_y
             spike=(1.0+self.ridge) if (self.ridge>0 and abs(rx)<0.35) else 1.0
             p=vadd(vadd(self.pos, vscale(side, rx*r*spike)), vscale(up2, ry*r))
             pts.append(p)
@@ -99,6 +117,7 @@ class Spine:
         if self.wobble:
             self.wob+=WOB_STEP
             self.dir=vrot(self.dir, self.up, math.sin(self.wob)*WOB_AMP)
+        if self.bend: self.dir=vrot(self.dir, self.up, math.radians(self.bend))
         self.twistAccum+=self.twist*TWIST_DT
         self.pos=vadd(self.pos, vscale(self.dir, SEGLEN))
         self.push_ring()
@@ -110,6 +129,7 @@ class Grower:
         self.stack=[]
         self.active=self.spines[0]
         self.mirror=False
+        self.radial=1             # N-fold radial symmetry around Y (1 = none)
         self.active.push_ring()   # seed first ring
 
     def run(self, tokens):
@@ -171,6 +191,10 @@ class Grower:
                 if self.stack: self.active=self.stack.pop()
             elif op=="mirror":
                 w=word("on"); self.mirror=(w!="off")
+            elif op=="radial":
+                self.radial=max(1,min(24,int(num(6))))   # N copies fanned around the vertical axis
+            elif op=="scale":  S.scale_x=num(1.0); S.scale_y=num(1.0)   # non-uniform cross-section (flat plates, oval tubes)
+            elif op=="bend":   S.bend=num(0.0)                          # degrees of curve per grow step
             elif op.startswith("#"):
                 # skip rest of a comment line -- tokens already whitespace-split,
                 # so consume until we've passed the '#'-token (no-op here)
@@ -206,22 +230,31 @@ class Grower:
                     if (which==0) ^ bool(flip): TRI.append((c,b,a))
                     else:                       TRI.append((c,a,b))
 
-        def emit_spine(sp, mirrored):
-            if len(sp.rings)<2: return
-            # split into runs of equal ring length (handles section swaps)
-            run=[sp.rings[0]]
-            for r in sp.rings[1:]:
-                if len(r)==len(run[-1]): run.append(r)
-                else: loft_run(_reflect(run,mirrored), mirrored); run=[r]
-            loft_run(_reflect(run,mirrored), mirrored)
-
         def _reflect(rings, mirrored):
             if not mirrored: return rings
             return [[(-p[0],p[1],p[2]) for p in r] for r in rings]
 
-        for sp in self.spines:
-            emit_spine(sp, False)
-            if self.mirror: emit_spine(sp, True)
+        def _roty(rings, ang):
+            if not ang: return rings
+            c=math.cos(ang); si=math.sin(ang)
+            return [[(p[0]*c+p[2]*si, p[1], -p[0]*si+p[2]*c) for p in r] for r in rings]
+
+        def emit_spine(sp, mirrored, ang):
+            if len(sp.rings)<2: return
+            def xf(rr): return _roty(_reflect(rr, mirrored), ang)
+            # split into runs of equal ring length (handles section swaps)
+            run=[sp.rings[0]]
+            for r in sp.rings[1:]:
+                if len(r)==len(run[-1]): run.append(r)
+                else: loft_run(xf(run), mirrored); run=[r]
+            loft_run(xf(run), mirrored)
+
+        radial = max(1, getattr(self, "radial", 1))
+        for k in range(radial):
+            ang = (2*math.pi/radial)*k
+            for sp in self.spines:
+                emit_spine(sp, False, ang)
+                if self.mirror: emit_spine(sp, True, ang)
 
         if not V: raise SystemExit("gen_spine: nothing grew (empty mesh)")
 
@@ -308,6 +341,14 @@ PRESETS = {
      "sec circle seg 10 rad 0.30 grow 6 "
      "flare 0.3 grow 2"
   ),
+  # twin swept BLADE FANS: flat blade sections raked back off a short square
+  # root, three blades per side stepped in pitch -- an executioner silhouette.
+  "razor": (
+     "mirror on sec square seg 4 rad 0.34 grow 3 node "
+     "branch 24 pitch -18 sec blade seg 6 rad 0.55 grow 7 pinch 0.25 grow 2 parent "
+     "branch 40 pitch -4  sec blade seg 6 rad 0.48 grow 6 pinch 0.25 grow 2 parent "
+     "branch 56 pitch 12  sec blade seg 6 rad 0.40 grow 5 pinch 0.3 grow 2"
+  ),
   # a heavy horned crest: hex trunk, two forked horns, mirrored.
   "crest": (
      "mirror on sec hex seg 6 rad 0.5 grow 4 "
@@ -329,9 +370,14 @@ def main():
     if a.list_presets:
         print("presets:")
         for k,v in PRESETS.items(): print(f"  {k:12} {v[:70]}{'...' if len(v)>70 else ''}")
-        print("\nops: seg N | sec circle|square|tri|star|hex | rad R | grow N | yaw/pitch/roll DEG |")
-        print("     twist R | thick/thin D | taper R | pinch/flare D | ridge on|off|V | wobble on|off |")
-        print("     node | branch [DEG] | parent | mirror on|off")
+        print("\nops: seg N | sec circle|square|tri|star|hex|oct|diamond|blade|plus|gear|arrow | rad R | grow N |")
+        print("     yaw/pitch/roll DEG | twist R | thick/thin D | taper R | pinch/flare D | ridge on|off|V |")
+        print("     wobble on|off | node | branch [DEG] | parent | mirror on|off | radial N | scale SX SY | bend DEG")
+        print("  sections: circle square tri star hex oct diamond blade plus gear  (blade=wide fin,")
+        print("            plus=cross, gear=cog, diamond=rotated square)")
+        print("  radial N: N copies fanned around the vertical axis (cogs, turbines, crowns, thrusters)")
+        print("  scale SX SY: non-uniform cross-section (1 0.3 = flat plate/fin, 0.5 1 = tall oval)")
+        print("  bend DEG: curve the growth a little each step (horns, tusks, hooks, arcs)")
         return
 
     if not a.out: ap.error("--out is required")

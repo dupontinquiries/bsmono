@@ -1749,6 +1749,43 @@ static void migrate_playlist_requests(ALCcontext *ctx)
     } while (!SDL_AtomicCASPtr(&ctx->device->playback.source_todo_pool, i, todo));
 }
 
+/* ---- WORLD REVERB DSP (ported from monorepo games/unendlich audio.rs r185/r186) ----
+ * Schroeder-lite on the WHOLE mix bus: two feedback combs + one allpass, a mild
+ * soft-knee saturation on the dry sum, and a brick limiter. The game drives the
+ * wet level from world ENCLOSURE (sealed halls ring, open sky stays dry) via
+ * mojoal_reverb_wet; the chain is bypassed entirely at wet ~ 0. */
+float mojoal_reverb_wet = 0.0f;   /* 0 open .. ~0.22 sealed (unendlich's range) */
+static float rvb_c1[4096], rvb_c2[4096], rvb_ap[512];
+static int rvb_c1n = 0, rvb_c2n = 0, rvb_apn = 0;
+static int rvb_i1 = 0, rvb_i2 = 0, rvb_ia = 0;
+static void reverb_bus(float *stream, int len, int freq)
+{
+    const float wet = mojoal_reverb_wet;
+    if (wet < 0.005f) return;                       /* dry world: zero cost */
+    if (rvb_c1n == 0) {                             /* unendlich delay times (mono-ish) */
+        rvb_c1n = (int)(freq * 0.0347f); if (rvb_c1n > 4096) rvb_c1n = 4096; if (rvb_c1n < 64) rvb_c1n = 64;
+        rvb_c2n = (int)(freq * 0.0483f); if (rvb_c2n > 4096) rvb_c2n = 4096; if (rvb_c2n < 64) rvb_c2n = 64;
+        rvb_apn = (int)(freq * 0.005f);  if (rvb_apn > 512)  rvb_apn = 512;  if (rvb_apn < 32) rvb_apn = 32;
+    }
+    const float fb1 = 0.74f, fb2 = 0.68f, apg = 0.5f, drive = 1.08f;
+    for (int k = 0; k < len; k++) {
+        float x = stream[k];
+        float sat = (x * drive) / (1.0f + 0.28f * SDL_fabsf(x * drive));   /* r186 soft knee */
+        float dry = sat;
+        float c1 = rvb_c1[rvb_i1];
+        rvb_c1[rvb_i1] = dry + c1 * fb1; rvb_i1 = (rvb_i1 + 1) % rvb_c1n;
+        float c2 = rvb_c2[rvb_i2];
+        rvb_c2[rvb_i2] = dry + c2 * fb2; rvb_i2 = (rvb_i2 + 1) % rvb_c2n;
+        float rin = (c1 + c2) * 0.5f;
+        float a = rvb_ap[rvb_ia];
+        float aout = -apg * rin + a;
+        rvb_ap[rvb_ia] = rin + apg * aout; rvb_ia = (rvb_ia + 1) % rvb_apn;
+        float mixed = dry * (1.0f - wet) + aout * wet;
+        if (mixed >  0.98f) mixed =  0.98f;         /* r185 brick limiter */
+        if (mixed < -0.98f) mixed = -0.98f;
+        stream[k] = mixed;
+    }
+}
 static void mix_context(ALCcontext *ctx, float *stream, int len)
 {
     const ALboolean force_recalc = ctx->recalc;
@@ -1786,6 +1823,7 @@ static void mix_context(ALCcontext *ctx, float *stream, int len)
         }
         SDL_UnlockMutex(ctx->source_lock);
     }
+    reverb_bus(stream, len, (int)ctx->device->frequency);   /* the world answers back */
 }
 
 /* Disconnected devices move all PLAYING sources to STOPPED, making their buffer queues processed. */

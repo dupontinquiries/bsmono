@@ -9,6 +9,22 @@ static const ex_lore_entry_t ENTRIES[] = {
     "a field that freezes the joints, a hurled ruin, a fan of",
     "fire, a well that drags you in. learn the count and live.",
   }, 3 },
+  { "the frontier weave", {
+    "nanotech cloth with a memory of its shape. it drinks",
+    "radiation, holds warmth, and goes quiet on sensors.",
+    "out past the belt, the cloak is the difference between",
+    "a patrol and a funeral.",
+  }, 4 },
+  { "the under-garden", {
+    "jhiaxus kept his failures. fed them. below the garden",
+    "of helix the roof is alive, and it remembers how to",
+    "hold on. do not trust a ceiling you cannot see.",
+  }, 3 },
+  { "the eye beneath", {
+    "it does not hunt. it does not need to. it watches the",
+    "shore the way the deep watches a swimmer -- patient,",
+    "certain, already home. and sometimes, it blinks.",
+  }, 3 },
   { "I. doomsday", {
     "a sleeping devourer stirs beneath the world.",
     "the first war is not for territory but for whether",
@@ -224,6 +240,56 @@ static const ex_lore_entry_t ENTRIES[] = {
     "earth for the head, the rim for the spine, pluto for the field.",
     "the field is old now. as he stirs, the cage starts to give.",
   }, 3 },
+  { "dossier: cryotek", {
+    "archive enforcement, technocracy era. deep purple",
+    "oxidation over hard geometric lines -- no flashy parts.",
+    "speaks in clipped logic; never monologues. believes",
+    "cybertron fell when it abandoned purity. he wants the",
+    "buried cores. everything else is an obstacle.",
+  }, 5 },
+  { "dossier: blackstar", {
+    "a naval commander scattered into deep orbit by the",
+    "bridge -- he did not return. he adapted. the debris",
+    "field became a kingdom. 'empires burn. i collect the",
+    "ashes.' his array saw the devourer first; no one",
+    "wanted to look. the name was earned, not given.",
+  }, 5 },
+  { "dossier: jhiaxus", {
+    "he helped design the control interface, under the",
+    "technocrats, and regrets nothing. not evil -- clinical.",
+    "cybertron failed, he says, because it hesitated. his",
+    "gardens grow bodies perfected past identity. the",
+    "crawlers in the roots are his drafts.",
+  }, 5 },
+  { "dossier: pale vector", {
+    "thin. pale. hooded. freed from technocrat imprisonment",
+    "and loyal to blackstar for that alone. he maintains the",
+    "relics and the amplifiers, keeps the forgotten codes,",
+    "and whispers to the lattice. he is the crew's memory.",
+    "do not press him. he withdraws, and remembers that too.",
+  }, 5 },
+  { "chicago: the first page", {
+    "the record every archivist calls 'the blackstar material'",
+    "opens here -- in the reconstruction, after the moon's dark",
+    "day. cranes over the river. one bridge leaf still raised.",
+    "a naval commander walked these ruins, read the salvage",
+    "economy in them, and drew his first conclusion: empires",
+    "burn. what he collected afterward, you already know.",
+  }, 6 },
+  { "the space bridge", {
+    "the network was never destroyed -- only unlisted. gates",
+    "sleep in the far places, keyed to relay fragments their",
+    "builders scattered on purpose. each crossing charts a",
+    "region the war forgot. the wardens were left to make",
+    "sure nobody crossed carelessly. kill one and the gate",
+    "reads you as worthy. that is not a malfunction.",
+  }, 6 },
+  { "appendix: hybrid protocol", {
+    "a fragment, unsigned, found threaded through the watch's code:",
+    "'we grew them a body that remembers being both. metal that",
+    "breathes. energon that beats. if you are reading this, archivist,",
+    "the graft is yours to wake.'",
+  }, 4 },
 };
 
 int ex_lore_count(void){ return (int)(sizeof(ENTRIES)/sizeof(ENTRIES[0])); }

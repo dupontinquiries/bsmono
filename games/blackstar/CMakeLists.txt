@@ -78,7 +78,11 @@ set(CYBERTRON_MODULE_SRC
   ${EDIR}/mapfsm.c
   ${EDIR}/keybind.c
   ${EDIR}/combat.c
+  ${EDIR}/combat_json.c
+  ${EDIR}/commander_ai.c
+  ${EDIR}/hive_ai.c
   ${EDIR}/enemy.c
+  ${EDIR}/behavior.c
   ${EDIR}/arena.c
   ${EDIR}/element.c
   ${EDIR}/menu.c
@@ -239,9 +243,10 @@ add_library(cybertron_modules STATIC ${CYBERTRON_MODULE_SRC}
 target_include_directories(cybertron_modules PUBLIC ${ENGINE_INCLUDES})
 target_compile_options(cybertron_modules PRIVATE -Wno-unused)
 
-foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves test_gates harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally test_handoff)
+foreach(t example_usage test_transform test_netcode test_gameplay test_element test_menu test_vfx test_gait test_weapon test_encounter test_pickup test_custom test_mapgen test_waves harness_step test_class test_feel test_material test_movesim test_genome test_signature test_climb test_warp_wave test_tsunami test_arc test_cyclone test_thorns test_photon test_matrix test_spearcon test_resonance test_corrupt test_graviton test_siphon test_truce test_containment test_absorb test_ally test_content_gen test_detail test_behavior test_combat test_weaponmod test_ability test_vehicle test_turret test_wheels test_enemy test_combat_json test_commander_ai test_hive_ai test_bodykind test_gates test_handoff)
   add_executable(${t} ${CMAKE_SOURCE_DIR}/tests/${t}.c)
   target_link_libraries(${t} PRIVATE cybertron_modules m)
+  target_compile_options(${t} PRIVATE -UNDEBUG)   # tests must keep their assert()s even in Release
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
@@ -249,6 +254,7 @@ endforeach()
 # build the binary and run two copies manually (see README).
 add_executable(test_transport ${CMAKE_SOURCE_DIR}/tests/test_transport.c)
 target_link_libraries(test_transport PRIVATE cybertron_modules m)
+target_compile_options(test_transport PRIVATE -UNDEBUG)
 
 # ---------------------------------------------------------------------------
 # Rust FFI bridge (-DUSE_RUST_FSM=ON)
@@ -260,6 +266,7 @@ option(USE_RUST_FSM "Link the Rust fsm.rs gating via C FFI" OFF)
 
 add_executable(test_mapfsm ${CMAKE_SOURCE_DIR}/tests/test_mapfsm.c)
 target_link_libraries(test_mapfsm PRIVATE cybertron_modules m)
+target_compile_options(test_mapfsm PRIVATE -UNDEBUG)
 
 if(USE_RUST_FSM)
   find_program(CARGO_EXECUTABLE cargo)
@@ -283,15 +290,54 @@ if(USE_RUST_FSM)
   message(STATUS "Rust FSM FFI enabled")
 endif()
 add_test(NAME test_mapfsm COMMAND test_mapfsm)
+# data-driven content graph: validate the JSON relations against meshes + C enums
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_FOUND)
+  add_test(NAME content_validate
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/content_build.py
+                   --root ${CMAKE_SOURCE_DIR} --quiet)
+endif()
+if(Python3_FOUND)
+  add_test(NAME lint_dead_fields
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/lint_dead_fields.py
+                   --root ${CMAKE_SOURCE_DIR})
+endif()
+if(Python3_FOUND)
+  add_test(NAME silhouette
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_silhouette.py
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+if(Python3_FOUND)
+  add_test(NAME map_score
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/map_score.py --check
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+if(Python3_FOUND)
+  add_test(NAME openworld
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_openworld.py
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+if(Python3_FOUND)
+  add_test(NAME gltf_roundtrip
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_gltf.py)
+endif()
+
+add_executable(test_tangents ${CMAKE_SOURCE_DIR}/tests/test_tangents.c)
+target_include_directories(test_tangents PRIVATE ${CMAKE_SOURCE_DIR}/engine_src/exengine)
+target_link_libraries(test_tangents PRIVATE m)
+target_compile_options(test_tangents PRIVATE -UNDEBUG)
+add_test(NAME test_tangents COMMAND test_tangents ${CMAKE_SOURCE_DIR}/engine_src/data/pchest.iqm)
 
 add_executable(test_arena_iqm ${CMAKE_SOURCE_DIR}/tests/test_arena_iqm.c)
 target_link_libraries(test_arena_iqm PRIVATE m)
+target_compile_options(test_arena_iqm PRIVATE -UNDEBUG)
 add_test(NAME test_arena_iqm COMMAND test_arena_iqm ${CMAKE_SOURCE_DIR}/engine_src/data/arena.iqm)
 
 # spine-grown character-part IQMs (tools/gen_spine.py) -- same headless format
 # guarantee, plus the unit-slot normalization invariant.
 add_executable(test_spine_iqm ${CMAKE_SOURCE_DIR}/tests/test_spine_iqm.c)
 target_link_libraries(test_spine_iqm PRIVATE m)
+target_compile_options(test_spine_iqm PRIVATE -UNDEBUG)
 add_test(NAME test_spine_iqm COMMAND test_spine_iqm
   ${CMAKE_SOURCE_DIR}/engine_src/data/spine_wing_cannon.iqm
   ${CMAKE_SOURCE_DIR}/engine_src/data/spine_muscle.iqm

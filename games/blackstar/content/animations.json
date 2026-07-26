@@ -1,0 +1,9 @@
+{
+  "_doc": "Procedural animation clips as tunable data. These are the parameters the gait/transform/idle systems read; exposing them here lets animation feel be retuned without recompiling. 'drives' names the part-group slots each clip moves.",
+  "clips": {
+    "gait":      { "cadence": 0.95, "leg_swing": 1.05, "arm_swing": 0.62, "body_bob": 0.19, "drives": ["limb", "hand", "torso"] },
+    "transform": { "blend_sec": 1.30, "fold_spin_from": "chassis", "detach_stagger": true, "drives": ["torso", "limb", "backpiece"] },
+    "idle":      { "sway": 0.06, "breath": 0.03, "drives": ["torso", "head"] },
+    "lean":      { "height_scaled": true, "pivot": "feet", "drives": ["torso", "head", "backpiece"] }
+  }
+}

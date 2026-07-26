@@ -1,0 +1,25 @@
+{
+ "_doc": "Ship hub: rooms, exits and console destinations. Rooms form a GRAPH and every one must be reachable from the bridge; travel is a mode (drive/fly/land) rather than a loading screen, since the engine already has landing and flight.",
+ "rooms": {
+  "bridge": { "name": "Bridge", "kind": "bridge", "pos": [0.0, 0.0, 24.0], "exits": ["corridor_fore", "quarters"], "blurb": "Navigation console. Choose where the ship goes next." },
+  "corridor_fore": { "name": "Forward Corridor", "kind": "quarters", "pos": [0.0, 0.0, 12.0], "exits": ["bridge", "upgrade_bay", "market"], "blurb": "Spine of the ship. Viewports on both sides." },
+  "upgrade_bay": { "name": "Upgrade Bay", "kind": "upgrade", "pos": [-9.0, 0.0, 6.0], "exits": ["corridor_fore", "hangar"], "blurb": "Chassis rigs and part racks. Rebuild your bot here." },
+  "market": { "name": "Trade Deck", "kind": "vendor", "pos": [9.0, 0.0, 6.0], "exits": ["corridor_fore", "quarters"], "blurb": "Whoever docked last is still selling." },
+  "quarters": { "name": "Crew Quarters", "kind": "quest", "pos": [7.0, 0.0, -6.0], "exits": ["market", "bridge", "corridor_aft"], "blurb": "Where the crew bring you problems." },
+  "corridor_aft": { "name": "Aft Corridor", "kind": "quarters", "pos": [0.0, 0.0, -10.0], "exits": ["quarters", "airlock", "hangar"], "blurb": "Colder back here. The hull ticks as it cools." },
+  "airlock": { "name": "Airlock", "kind": "spacewalk", "pos": [0.0, 0.0, -18.0], "exits": ["corridor_aft"], "blurb": "Cycle through and walk the hull. No gravity past this door." },
+  "hangar": { "name": "Hangar", "kind": "hangar", "pos": [-8.0, 0.0, -14.0], "exits": ["corridor_aft", "upgrade_bay"], "blurb": "Drop bay. Launches and landings come through here." }
+ },
+ "destinations": {
+  "pluto_line": { "name": "The Pluto Line", "map": "pluto", "travel": "land", "kind": "mission", "blurb": "Outer containment. Long fall, hard landing." },
+  "rust_flats": { "name": "Rust Flats", "map": "wastes", "travel": "drive", "kind": "free", "blurb": "Open ground. Drive it if you want the scenery." },
+  "frost_shelf": { "name": "Frost Shelf", "map": "frostline", "travel": "land", "kind": "mission", "blurb": "Ice shelves calve under weight. Land light." },
+  "ember_descent": { "name": "Ember Descent", "map": "emberpit", "travel": "fly", "kind": "mission", "blurb": "Thermals from the lava pools. Fly it in." },
+  "the_maw": { "name": "The Maw", "map": "unicron", "travel": "fly", "kind": "raid", "blurb": "Horizon curves the wrong way. Something is awake." },
+  "kuiper_drift": { "name": "Kuiper Drift", "map": "kuiper", "travel": "fly", "kind": "raid", "blurb": "Shepherd moons and a frozen debris braid." },
+  "foundry_run": { "name": "Foundry Run", "map": "foundry", "travel": "drive", "kind": "mission", "blurb": "Smelt channels still running. Mind the heat." },
+  "the_trench": { "name": "The Trench", "map": "trench", "travel": "land", "kind": "mission", "blurb": "Rift dark. Your lights are the only ones." },
+  "shield_edge": { "name": "Shield Edge", "map": "shield_edge", "travel": "drive", "kind": "free", "blurb": "The boundary is failing. Watch it flicker." },
+  "mars_frame": { "name": "Mars Frame", "map": "mars", "travel": "land", "kind": "mission", "blurb": "A piece of Cybertron fell here. It is still warm." }
+ }
+}
