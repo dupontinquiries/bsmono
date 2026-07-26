@@ -56,12 +56,58 @@ pub enum Line { Ctx(String), Del(String), Add(String) }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hunk { pub lines: Vec<Line> }
 
+/// A hunk whose context could not be located, kept with enough detail to act on.
+///
+/// A bare failure COUNT is not actionable: it tells the model something went wrong but not what to look
+/// at, so the retry is a guess. Carrying the expected context back means the next attempt can be told
+/// exactly which lines were not found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailedHunk {
+    /// 0-based index of the hunk within this file's patch.
+    pub index: usize,
+    /// The "before" image the hunk expected: context + removed lines, in order.
+    pub expected: Vec<String>,
+}
+
 /// Result of applying a file's patch.
+///
+/// `text` is the PARTIALLY applied result when some hunks failed. That is deliberate — a caller may want
+/// to inspect it — but writing it out unconditionally silently half-patches the file, which is why
+/// [`is_clean`] exists and [`apply_file_patch_strict`] refuses instead.
 #[derive(Debug, PartialEq)]
 pub struct Applied {
     pub text: String,
     pub hunks_applied: usize,
     pub hunks_failed: usize,   // hunks whose context couldn't be located (reported, not force-applied)
+    /// Which hunks failed, and what each expected to find.
+    pub failures: Vec<FailedHunk>,
+}
+
+impl Applied {
+    /// Did every hunk land? Only then is `text` safe to write without further thought.
+    pub fn is_clean(&self) -> bool { self.hunks_failed == 0 }
+
+    /// Operator-facing account of what did not apply — the Liaison rule: name the observable state, do
+    /// not summarise it away. Empty when clean.
+    pub fn report(&self) -> Vec<String> {
+        self.failures.iter().map(|f| {
+            let head = f.expected.iter().find(|l| !l.trim().is_empty())
+                .map(|l| l.trim().to_string()).unwrap_or_else(|| "(blank context)".into());
+            format!("hunk {} did not apply — could not find {} line(s) starting: {}",
+                    f.index + 1, f.expected.len(), head)
+        }).collect()
+    }
+}
+
+/// Apply only if EVERY hunk lands; otherwise return the original untouched alongside the failures.
+///
+/// The default is partial application, which is right for a UI that shows a diff and lets a human judge.
+/// It is wrong for anything automatic: a half-patched file compiles differently, may still compile, and
+/// the damage is discovered later. This is the variant an autonomous loop should use.
+pub fn apply_file_patch_strict(original: &str, fp: &FilePatch) -> Applied {
+    let out = apply_file_patch(original, fp);
+    if out.is_clean() { return out; }
+    Applied { text: original.to_string(), ..out }
 }
 
 fn strip_path(raw: &str) -> String {
@@ -138,12 +184,13 @@ pub fn apply_file_patch(original: &str, fp: &FilePatch) -> Applied {
         let text: String = fp.hunks.iter().flat_map(|h| h.lines.iter()).filter_map(|l| match l {
             Line::Add(s) => Some(s.clone()), _ => None,
         }).collect::<Vec<_>>().join("\n");
-        return Applied { text, hunks_applied: fp.hunks.len(), hunks_failed: 0 };
+        return Applied { text, hunks_applied: fp.hunks.len(), hunks_failed: 0, failures: Vec::new() };
     }
     let mut lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
     let (mut applied, mut failed) = (0usize, 0usize);
+    let mut failures: Vec<FailedHunk> = Vec::new();
     let mut search_from = 0usize;
-    for h in &fp.hunks {
+    for (hi, h) in fp.hunks.iter().enumerate() {
         // The "before" image this hunk expects: context + removed lines, in order.
         let before: Vec<&String> = h.lines.iter().filter_map(|l| match l {
             Line::Ctx(s) | Line::Del(s) => Some(s), Line::Add(_) => None,
@@ -163,10 +210,17 @@ pub fn apply_file_patch(original: &str, fp: &FilePatch) -> Applied {
                 search_from = at + after.len();
                 applied += 1;
             }
-            None => failed += 1, // context not found → report, don't guess
+            None => {
+                // context not found → report WHAT was expected, don't guess and don't force
+                failed += 1;
+                failures.push(FailedHunk {
+                    index: hi,
+                    expected: before.iter().map(|s| (*s).clone()).collect(),
+                });
+            }
         }
     }
-    Applied { text: lines.join("\n"), hunks_applied: applied, hunks_failed: failed }
+    Applied { text: lines.join("\n"), hunks_applied: applied, hunks_failed: failed, failures }
 }
 
 /// Find `needle` as a contiguous run in `hay` at or after `from`; if not found there, retry from 0 (hunks
@@ -256,6 +310,55 @@ mod tests {
         assert_eq!(fps[0].path, "a.rs");
         assert_eq!(fps[1].path, "b.rs");
         assert!(fps[1].is_new_file);
+    }
+
+    #[test]
+    fn a_failed_hunk_reports_what_it_expected_not_just_a_count() {
+        // A bare failure count tells the model something broke but not what to look at, so the retry is a
+        // guess. The expected context has to come back.
+        let original = "fn a() {}\nfn b() {}\n";
+        let patch = "*** path: src/x.rs\n@@\n fn NOPE() {}\n-fn gone() {}\n+fn added() {}\n";
+        let fps = parse_patches(patch);
+        let out = apply_file_patch(original, &fps[0]);
+        assert_eq!(out.hunks_failed, 1);
+        assert!(!out.is_clean());
+        assert_eq!(out.failures.len(), 1);
+        assert_eq!(out.failures[0].index, 0);
+        assert!(out.failures[0].expected.iter().any(|l| l.contains("NOPE")),
+                "the unmatched context is carried back: {:?}", out.failures[0].expected);
+        let r = out.report();
+        assert_eq!(r.len(), 1);
+        assert!(r[0].contains("hunk 1 did not apply"), "{}", r[0]);
+    }
+
+    #[test]
+    fn strict_apply_refuses_to_half_patch_a_file() {
+        // The dangerous case: one hunk lands, one does not. Partial application leaves a file that may
+        // still COMPILE and is wrong — discovered much later. Strict mode returns the original untouched.
+        let original = "one\ntwo\nthree\n";
+        let patch = "*** path: x\n@@\n one\n+inserted\n@@\n missing-context\n+never\n";
+        let fps = parse_patches(patch);
+        let loose = apply_file_patch(original, &fps[0]);
+        assert!(loose.hunks_applied >= 1 && loose.hunks_failed >= 1, "the setup must be a PARTIAL apply");
+        assert_ne!(loose.text, original, "loose mode does modify the file");
+
+        let strict = apply_file_patch_strict(original, &fps[0]);
+        assert_eq!(strict.text, original, "strict mode leaves the file untouched when any hunk fails");
+        assert_eq!(strict.hunks_failed, loose.hunks_failed, "but still reports what failed");
+        assert!(!strict.failures.is_empty());
+    }
+
+    #[test]
+    fn a_clean_apply_is_marked_clean_and_reports_nothing() {
+        let original = "alpha\nbeta\n";
+        let patch = "*** path: x\n@@\n alpha\n-beta\n+gamma\n";
+        let fps = parse_patches(patch);
+        let out = apply_file_patch(original, &fps[0]);
+        assert!(out.is_clean());
+        assert!(out.report().is_empty(), "nothing to say when everything landed");
+        assert!(out.text.contains("gamma"));
+        // and strict agrees with loose when clean
+        assert_eq!(apply_file_patch_strict(original, &fps[0]).text, out.text);
     }
 
     #[test]
