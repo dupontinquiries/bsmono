@@ -67,6 +67,7 @@ mod engine_config_tests {
 }
 
 pub mod swa;
+pub mod iq1s_grid;
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
 pub mod governor; // backend-agnostic GPU resource governor: per-device budget + adaptive window k
