@@ -338,8 +338,6 @@ pub struct Gpu {
     pending_q4k: Mutex<Vec<PendingQ4k>>,
     /// Persistent staging buffer for expert-slot fills, so decode never allocates.
     moe_stage: Mutex<Option<Tensor>>,
-    /// Stable per-token scratch: (sequence position, shape) -> buffer. See `scratch_begin`.
-    decode_scratch: Mutex<(bool, usize, Vec<(usize, usize, wgpu::Buffer)>)>,
     /// Monotonic fill counter selecting the staging ring slot. See `STAGE_RING`.
     stage_cursor: Mutex<usize>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
@@ -859,7 +857,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), decode_scratch: Mutex::new((false, 0, Vec::new())), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1261,38 +1259,49 @@ impl Gpu {
     /// code path runs per layer. If a shape ever fails to match at a given position the arena falls back
     /// to a fresh allocation for that slot rather than handing back a wrongly-sized buffer.
     pub fn scratch_begin(&self) {
-        let mut g = self.decode_scratch.lock().unwrap();
-        g.0 = true;   // active
-        g.1 = 0;      // rewind to the first slot
+        SCRATCH.with(|c| { let mut g = c.borrow_mut(); g.0 = true; g.1 = 0; });
     }
 
     /// End a token's decode. Subsequent allocations go back to the ordinary pool.
-    pub fn scratch_end(&self) { self.decode_scratch.lock().unwrap().0 = false; }
+    pub fn scratch_end(&self) { SCRATCH.with(|c| c.borrow_mut().0 = false); }
+
+    /// RAII arena scope for one token. Ends on drop, so an early return or a `?` cannot leave the arena
+    /// active — which would hand decode buffers to whatever ran next and is exactly the class of lifetime
+    /// bug that corrupted weights earlier in this project.
+    ///
+    /// LOGSCOPE_NO_SCRATCH=1 disables it, so the arena can be bisected against without a rebuild.
+    pub fn scratch_scope(&self) -> ScratchScope<'_> {
+        let on = std::env::var_os("LOGSCOPE_NO_SCRATCH").is_none();
+        if on { self.scratch_begin(); }
+        ScratchScope { gpu: self, on }
+    }
 
     /// How many distinct scratch slots a token uses — the arena's steady-state size.
-    pub fn scratch_slots(&self) -> usize { self.decode_scratch.lock().unwrap().2.len() }
+    pub fn scratch_slots(&self) -> usize { SCRATCH.with(|c| c.borrow().2.len()) }
 
     /// Take the next scratch buffer for this shape, or None when the arena is inactive or the recorded
     /// slot has a different shape (a divergent path — fall back rather than return the wrong size).
     fn scratch_take(&self, rows: usize, cols: usize) -> Option<wgpu::Buffer> {
-        let mut g = self.decode_scratch.lock().unwrap();
-        if !g.0 { return None; }
-        let i = g.1;
-        g.1 += 1;
-        match g.2.get(i) {
-            Some((r, c, b)) if *r == rows && *c == cols => Some(b.clone()),
-            Some(_) => None,                       // shape drift at this slot: do not reuse
-            None => {
-                let size = (rows * cols * 4) as u64;
-                if size == 0 { return None; }
-                let b = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("decode-scratch"), size,
-                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false });
-                g.2.push((rows, cols, b.clone()));
-                Some(b)
+        SCRATCH.with(|c| {
+            let mut g = c.borrow_mut();
+            if !g.0 { return None; }
+            let i = g.1;
+            g.1 += 1;
+            match g.2.get(i) {
+                Some((r, cc, b)) if *r == rows && *cc == cols => Some(b.clone()),
+                Some(_) => None,                   // shape drift at this slot: do not reuse
+                None => {
+                    let size = (rows * cols * 4) as u64;
+                    if size == 0 { return None; }
+                    let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("decode-scratch"), size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false });
+                    g.2.push((rows, cols, b.clone()));
+                    Some(b)
+                }
             }
-        }
+        })
     }
 
     /// A raw word-addressed SCRATCH buffer. Pooled: it returns to the free list when dropped.
@@ -1546,6 +1555,26 @@ impl Drop for ArenaGuard<'_> {
         }
         *g = None;
     }
+}
+
+thread_local! {
+    /// The per-token scratch arena, PER THREAD.
+    ///
+    /// It was briefly a single shared arena, and the threaded-workers check in `--validate` caught it
+    /// immediately: lanes share one `Gpu`, so every thread's Nth allocation resolved to the SAME buffer
+    /// and concurrent decodes overwrote each other's intermediates (max|gpu-cpu| = 1.0).
+    ///
+    /// That is the part of the game-renderer pattern that does not transfer unexamined: soldier is a
+    /// single-threaded renderer with one frame in flight, while this engine runs N concurrent lanes over
+    /// one device. A per-frame arena is only safe if "the frame" is per-thread.
+    static SCRATCH: std::cell::RefCell<(bool, usize, Vec<(usize, usize, wgpu::Buffer)>)>
+        = std::cell::RefCell::new((false, 0, Vec::new()));
+}
+
+/// Holds the per-token scratch arena open; releases it on drop. See `Gpu::scratch_scope`.
+pub struct ScratchScope<'a> { gpu: &'a Gpu, on: bool }
+impl Drop for ScratchScope<'_> {
+    fn drop(&mut self) { if self.on { self.gpu.scratch_end(); } }
 }
 
 pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)> }
@@ -9013,6 +9042,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// One token through all layers using the int8 KV cache; returns logits [vocab].
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
+        let _scratch = self.scratch_scope();
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
@@ -9413,6 +9443,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// no matter how long the stream runs. Identical to full decode until the cap is hit,
     /// then each new token overwrites the oldest window slot (O(1), see `stream_slot`).
     pub fn decode_step_stream(&self, m: &Model, c: &KvCache, token: u32, pos: usize, sink: usize, window: usize) -> Vec<f32> {
+        let _scratch = self.scratch_scope();
         self.begin_frame();
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
@@ -9428,6 +9459,9 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
+        // Per-token arena (the games/soldier pattern): every token allocates the same shapes in the same
+        // order, so handing out the same buffers makes every bind group repeat and the cache hit.
+        let _scratch = self.scratch_scope();
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
