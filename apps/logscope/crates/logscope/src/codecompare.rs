@@ -204,7 +204,11 @@ Do not simply restate it — a divergence that neither side explains is still un
 #[derive(Clone, Debug)]
 pub struct Coordinator {
     pub max_rounds: usize,
+    /// What runs automatically. Aggressive mode verifies builds, fetches deps and reruns changed
+    /// failures; stepwise and patch verify and rerun but leave the network alone.
+    pub policy: crate::buildpolicy::Policy,
     history: Vec<f32>,
+    builds: crate::buildpolicy::RetryLedger,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +229,8 @@ pub enum StopReason {
     Stalled(f32),
     /// Nothing was produced to compare.
     NothingToCompare,
+    /// The build failed the same way twice, or ran out of rebuild attempts.
+    BuildStuck(String),
 }
 
 impl StopReason {
@@ -238,16 +244,42 @@ impl StopReason {
             StopReason::Stalled(c) => format!(
                 "consensus stopped improving at {:.0}% — another round changed no minds, so the disagreement is substantive rather than a misunderstanding", c * 100.0),
             StopReason::NothingToCompare => "no code blocks were produced".into(),
+            StopReason::BuildStuck(s) => format!("the build is not progressing: {s}"),
         }
     }
 }
 
 impl Default for Coordinator {
-    fn default() -> Self { Coordinator { max_rounds: 3, history: Vec::new() } }
+    fn default() -> Self { Coordinator::for_mode(crate::buildpolicy::Mode::Stepwise, 3) }
 }
 
 impl Coordinator {
-    pub fn new(max_rounds: usize) -> Self { Coordinator { max_rounds: max_rounds.max(1), history: Vec::new() } }
+    pub fn new(max_rounds: usize) -> Self { Coordinator::for_mode(crate::buildpolicy::Mode::Stepwise, max_rounds) }
+
+    pub fn for_mode(mode: crate::buildpolicy::Mode, max_rounds: usize) -> Self {
+        Coordinator { max_rounds: max_rounds.max(1), policy: crate::buildpolicy::Policy::for_mode(mode),
+                      history: Vec::new(), builds: crate::buildpolicy::RetryLedger::new() }
+    }
+
+    /// Feed a build result in. A failing build outranks a comparison: there is no point scoring which
+    /// implementation the models prefer when the code does not compile, and doing so would spend a round
+    /// discussing style while a type error sits underneath.
+    pub fn build_result(&mut self, a: &crate::buildpolicy::Attempt) -> Round {
+        use crate::buildpolicy::{Attempt, Retry};
+        if !self.policy.verify_build { return Round::Continue(String::new()); }
+        match self.builds.record(a, &self.policy) {
+            Retry::Go(_) if matches!(a, Attempt::Failed { .. }) => {
+                let Attempt::Failed { signature } = a else { unreachable!() };
+                Round::Continue(format!(
+                    "The build failed:\n{signature}\n\nFix only what this reports. Do not restructure \
+anything else — a second change in the same round makes the next failure impossible to attribute."))
+            }
+            Retry::SameFailure(s) => Round::Stop(StopReason::BuildStuck(s)),
+            Retry::Exhausted(n) if matches!(a, Attempt::Failed { .. }) =>
+                Round::Stop(StopReason::BuildStuck(format!("{n} rebuild attempts used"))),
+            _ => Round::Continue(String::new()),
+        }
+    }
     pub fn rounds_done(&self) -> usize { self.history.len() }
     pub fn consensus_history(&self) -> &[f32] { &self.history }
 
@@ -416,6 +448,50 @@ mod tests {
         // second call hits the limit before the stall check, and says which
         assert_eq!(co.step(&split), Round::Stop(StopReason::RoundLimit(2)));
         assert_eq!(co.rounds_done(), 2);
+    }
+
+    #[test]
+    fn a_build_failure_outranks_a_comparison() {
+        // Scoring which implementation the models prefer while the code does not compile spends a round
+        // discussing style with a type error sitting underneath.
+        use crate::buildpolicy::{Attempt, Mode};
+        let mut co = Coordinator::for_mode(Mode::Aggressive, 3);
+        let f = Attempt::Failed { signature: "error[E0308]: mismatched types".into() };
+        match co.build_result(&f) {
+            Round::Continue(msg) => {
+                assert!(msg.contains("E0308"));
+                assert!(msg.contains("Fix only what this reports"),
+                    "a second change in the same round makes the next failure unattributable");
+            }
+            other => panic!("expected Continue, got {other:?}"),
+        }
+        // the SAME failure again stops the loop rather than looping on it
+        match co.build_result(&f) {
+            Round::Stop(StopReason::BuildStuck(s)) => {
+                assert!(s.contains("E0308"));
+                assert!(StopReason::BuildStuck(s).needs_human());
+            }
+            other => panic!("expected BuildStuck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn manual_mode_does_not_verify_and_so_never_blocks_on_a_build() {
+        use crate::buildpolicy::{Attempt, Mode};
+        let mut co = Coordinator::for_mode(Mode::Manual, 3);
+        assert!(!co.policy.verify_build);
+        let f = Attempt::Failed { signature: "anything".into() };
+        assert!(matches!(co.build_result(&f), Round::Continue(_)), "manual leaves the build to the operator");
+    }
+
+    #[test]
+    fn aggressive_gets_more_rebuild_attempts_than_stepwise() {
+        use crate::buildpolicy::Mode;
+        assert!(Coordinator::for_mode(Mode::Aggressive, 3).policy.retry_budget
+              > Coordinator::for_mode(Mode::Stepwise, 3).policy.retry_budget,
+            "nobody is waiting to approve an aggressive run, so it may try harder");
+        assert!(Coordinator::for_mode(Mode::Aggressive, 3).policy.fetch_deps);
+        assert!(!Coordinator::for_mode(Mode::Patch, 3).policy.fetch_deps);
     }
 
     #[test]
