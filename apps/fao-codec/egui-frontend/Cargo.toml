@@ -1,0 +1,25 @@
+[package]
+name = "fao-codec-egui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fao-codec-egui"
+path = "src/main.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
+fao_codec_lib = { package = "fao-codec-lib", path = "../fao_codec_lib" }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+settings-kit = { path = "../../../shared/settings-kit" }
+
+[features]
+# app default-on per the -egui house convention: `cargo build --release` = deployable bin.
+# Headless lib for CI: --no-default-features.
+default = ["app"]
+app = ["dep:eframe"]
