@@ -10,10 +10,14 @@
 //! viz, v1/v2 comparison) are the follow-up pages — the pattern is set here.
 
 pub mod lab;
+pub mod library;
+pub mod player;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Lab,
+    Library,
+    Player,
     Settings,
 }
 
@@ -21,13 +25,15 @@ pub struct App {
     pub tab: Tab,
     pub prefs: settings_kit::Prefs,
     pub lab: lab::State,
+    pub library: library::State,
+    pub player: player::State,
 }
 
 impl Default for App {
     fn default() -> Self {
         let mut prefs = settings_kit::Prefs::default();
         prefs.palette = "system".to_string();
-        App { tab: Tab::Lab, prefs, lab: lab::State::default() }
+        App { tab: Tab::Lab, prefs, lab: lab::State::default(), library: library::State::default(), player: player::State::default() }
     }
 }
 
@@ -51,6 +57,8 @@ impl App {
         }
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Lab => lab::ui(self, ui),
+            Tab::Library => library::ui(self, ui),
+            Tab::Player => player::ui(self, ui),
             Tab::Settings => {
                 ui.heading("Settings");
                 ui.label(egui::RichText::new("palette / text follow the shared prefs").weak().small());
@@ -59,7 +67,8 @@ impl App {
     }
 
     fn nav(&mut self, ui: &mut egui::Ui) {
-        for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::Settings, "⚙ Settings")] {
+        for (t, label) in [(Tab::Lab, "🎞 Encode Lab"), (Tab::Library, "🔗 Library"),
+                           (Tab::Player, "▶ Player"), (Tab::Settings, "⚙ Settings")] {
             if ui.selectable_label(self.tab == t, label).clicked() {
                 self.tab = t;
             }
