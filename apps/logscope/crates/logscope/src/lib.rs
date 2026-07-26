@@ -7,6 +7,7 @@ pub mod vision_preprocess;
 pub mod guardrails;
 pub mod synthesis;
 pub mod persona;
+pub mod tuneprofile;
 pub mod modelorg;
 pub mod residency;
 pub mod liaison;
