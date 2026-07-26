@@ -120,6 +120,12 @@ impl Counters {
         if let Some(r) = Self::rate(self.pool_hits, self.pool_misses) {
             out.push(format!("buffer pool reuse {:.0}%", r * 100.0));
         }
+        // The ceiling comes LAST and is the line worth reading: it says whether any of the numbers above
+        // are worth acting on. A cache hit rate is interesting only if CPU time is recoverable at all.
+        if let Some(h) = logscope::gpumetrics::headroom(
+            wall_ns, self.setup_ns, self.sync_ns, self.tokens, self.submits) {
+            out.push(h.verdict());
+        }
         out
     }
 
