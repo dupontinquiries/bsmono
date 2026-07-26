@@ -165,6 +165,41 @@ impl Profile {
 
     pub fn to_toml_like(&self) -> String { serde_json::to_string_pretty(self).unwrap_or_default() }
     pub fn from_str(s: &str) -> Option<Self> { serde_json::from_str(s).ok() }
+
+    /// Load a profile from disk, falling back to this device's defaults.
+    ///
+    /// A missing or unreadable file is NOT an error: the defaults are usable on their own, and refusing
+    /// to start because a tuning cache is corrupt would be a bad trade. A malformed file is reported to
+    /// the caller so it can say so once rather than silently discarding measurements every run.
+    pub fn load_or_default(path: &std::path::Path, adapter: &str) -> (Self, Option<String>) {
+        match std::fs::read_to_string(path) {
+            Err(_) => (Profile::for_device(adapter), None),
+            Ok(text) => match Profile::from_str(&text) {
+                Some(mut p) => {
+                    // Defaults come from the DEVICE, not the file: a profile copied between machines
+                    // must not carry another GPU's hardware workarounds. Only measurements are portable
+                    // within their key, and the key names the adapter.
+                    p.defaults = device_defaults(adapter);
+                    (p, None)
+                }
+                None => (Profile::for_device(adapter),
+                         Some(format!("tuning profile at {} is unreadable and was ignored; \
+measurements will be taken again", path.display()))),
+            },
+        }
+    }
+
+    /// Write the profile, creating the parent directory. Returns the error text rather than panicking —
+    /// failing to save a tuning cache must never take down a load.
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, self.to_toml_like()).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// How many measurements are held, for a one-line startup report.
+    pub fn measurement_count(&self) -> usize { self.verdicts.values().map(|m| m.len()).sum() }
 }
 
 #[cfg(test)]
@@ -237,6 +272,44 @@ mod tests {
         let asahi = device_defaults("Apple M2 Ultra (G14D B1) [Vulkan]");
         assert!(!asahi.subgroup_matvec, "subgroup matvec can hang large matmuls on Honeykrisp");
         assert!(asahi.convert_chunk_blocks > 0);
+    }
+
+    #[test]
+    fn a_missing_profile_is_not_an_error_and_a_corrupt_one_is_reported() {
+        let dir = std::env::temp_dir().join(format!("tp-{}", std::process::id()));
+        let missing = dir.join("nope.json");
+        let (p, err) = Profile::load_or_default(&missing, "Apple M2 Ultra [Vulkan]");
+        assert!(err.is_none(), "a missing file is normal, not a failure");
+        assert!(!p.defaults.subgroup_matvec, "device defaults still applied");
+
+        let bad = dir.join("bad.json");
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(&bad, "{ not json").ok();
+        let (p2, err2) = Profile::load_or_default(&bad, "Apple M2 Ultra [Vulkan]");
+        let msg = err2.expect("a corrupt file must be reported, not silently discarded");
+        assert!(msg.contains("unreadable"), "{msg}");
+        assert_eq!(p2.measurement_count(), 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn defaults_come_from_the_device_even_when_the_file_came_from_elsewhere() {
+        // A profile copied between machines must not carry another GPU's hardware workarounds. The
+        // measurements are keyed by adapter and stay; the defaults are recomputed.
+        let dir = std::env::temp_dir().join(format!("tp2-{}", std::process::id()));
+        let path = dir.join("t.json");
+        let mut written = Profile::for_device("Apple M2 Ultra [Vulkan]");   // subgroup_matvec = false
+        let k = TuneKey::new("Apple M2 Ultra [Vulkan]", "moe", "q4");
+        written.record(&k, Verdict { option: "fast_decode".into(), chosen: true,
+                                     on_ms: 170.8, off_ms: 236.7, note: "m2".into() });
+        written.save(&path).expect("save");
+
+        let (loaded, err) = Profile::load_or_default(&path, "NVIDIA RTX 4090 [Vulkan]");
+        assert!(err.is_none());
+        assert!(loaded.defaults.subgroup_matvec, "the 4090 must NOT inherit Honeykrisp's workaround");
+        assert_eq!(loaded.measurement_count(), 1, "measurements are kept — they are keyed by adapter");
+        assert!(loaded.verdict(&k, "fast_decode").is_some(), "and still reachable under their own key");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
