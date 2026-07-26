@@ -31,3 +31,11 @@ path = "src/bin/derivecheck.rs"
 [[bin]]
 name = "modcheck"
 path = "src/bin/modcheck.rs"
+
+# Compile-speed policy (monorepo-wide, dev only): full DWARF is the single biggest
+# artifact + link cost in these workspaces, and the sandbox/CI boxes are disk-starved.
+# line-tables-only keeps file:line in backtraces (the part actually read) while
+# cutting debuginfo ~10x. Release profiles are untouched. Override locally with
+# CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
+[profile.dev]
+debug = "line-tables-only"

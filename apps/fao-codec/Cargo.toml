@@ -1,3 +1,11 @@
 [workspace]
 members = ["fao_codec_core", "fao_codec_lib", "fao_codec_v1", "fao_codec_v2", "fao_app", "fao_cli", "egui-frontend"]
 resolver = "2"
+
+# Compile-speed policy (monorepo-wide, dev only): full DWARF is the single biggest
+# artifact + link cost in these workspaces, and the sandbox/CI boxes are disk-starved.
+# line-tables-only keeps file:line in backtraces (the part actually read) while
+# cutting debuginfo ~10x. Release profiles are untouched. Override locally with
+# CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
+[profile.dev]
+debug = "line-tables-only"
